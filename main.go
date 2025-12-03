@@ -110,6 +110,7 @@ func main() {
 		Users: map[string]string{
 			"postgres": "postgres",
 		},
+		Extensions: []string{"ducklake"},
 	}
 
 	// Load config file if specified

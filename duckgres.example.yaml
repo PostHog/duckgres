@@ -22,7 +22,9 @@ users:
 # DuckDB extensions to load on database initialization
 # Extensions are installed (downloaded if needed) and loaded automatically
 # Common extensions: httpfs, parquet, json, sqlite, postgres, mysql, excel
+# Default: ducklake (loaded even without config file)
 extensions:
+  - ducklake
   # - httpfs
   # - parquet
 
