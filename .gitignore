@@ -1,0 +1,27 @@
+# Binaries
+duckgres
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Data directory
+data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+go.sum
+
+# Test artifacts
+*.test
+*.out
+coverage.html
