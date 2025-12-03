@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"log"
@@ -15,23 +16,44 @@ type Config struct {
 	Port    int
 	DataDir string
 	Users   map[string]string // username -> password
+
+	// TLS configuration (required)
+	TLSCertFile string // Path to TLS certificate file
+	TLSKeyFile  string // Path to TLS private key file
 }
 
 type Server struct {
-	cfg      Config
-	listener net.Listener
-	dbs      map[string]*sql.DB // username -> db connection
-	dbsMu    sync.RWMutex
-	wg       sync.WaitGroup
-	closed   bool
-	closeMu  sync.Mutex
+	cfg       Config
+	listener  net.Listener
+	tlsConfig *tls.Config
+	dbs       map[string]*sql.DB // username -> db connection
+	dbsMu     sync.RWMutex
+	wg        sync.WaitGroup
+	closed    bool
+	closeMu   sync.Mutex
 }
 
 func New(cfg Config) (*Server, error) {
-	return &Server{
+	// TLS is required
+	if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
+		return nil, fmt.Errorf("TLS certificate and key are required")
+	}
+
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
+	}
+
+	s := &Server{
 		cfg: cfg,
 		dbs: make(map[string]*sql.DB),
-	}, nil
+		tlsConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		},
+	}
+
+	log.Printf("TLS enabled with certificate: %s", cfg.TLSCertFile)
+	return s, nil
 }
 
 func (s *Server) ListenAndServe() error {

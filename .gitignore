@@ -8,6 +8,9 @@ duckgres
 # Data directory
 data/
 
+# Generated certificates
+certs/
+
 # IDE
 .idea/
 .vscode/

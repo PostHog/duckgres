@@ -1,0 +1,20 @@
+# Duckgres Configuration
+# Copy this file to duckgres.yaml and customize as needed
+
+# Server binding
+host: "0.0.0.0"
+port: 5432
+
+# Directory for DuckDB database files (one per user)
+data_dir: "./data"
+
+# TLS configuration (required)
+tls:
+  cert: "./certs/server.crt"
+  key: "./certs/server.key"
+
+# User credentials (username: password)
+users:
+  postgres: "postgres"
+  alice: "alice123"
+  bob: "bob123"

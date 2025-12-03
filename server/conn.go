@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
@@ -74,23 +75,46 @@ func (c *clientConn) serve() error {
 }
 
 func (c *clientConn) handleStartup() error {
+	tlsUpgraded := false
+
 	for {
 		params, err := readStartupMessage(c.reader)
 		if err != nil {
 			return err
 		}
 
-		// Handle SSL request - we don't support SSL, send 'N'
+		// Handle SSL request - upgrade to TLS
 		if params["__ssl_request"] == "true" {
-			if _, err := c.conn.Write([]byte("N")); err != nil {
+			// Send 'S' to indicate we support SSL
+			if _, err := c.conn.Write([]byte("S")); err != nil {
 				return err
 			}
+
+			// Upgrade connection to TLS
+			tlsConn := tls.Server(c.conn, c.server.tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				return fmt.Errorf("TLS handshake failed: %w", err)
+			}
+
+			// Replace connection with TLS connection
+			c.conn = tlsConn
+			c.reader = bufio.NewReader(tlsConn)
+			c.writer = bufio.NewWriter(tlsConn)
+			tlsUpgraded = true
+
+			log.Printf("TLS connection established from %s", c.conn.RemoteAddr())
 			continue
 		}
 
 		// Handle cancel request
 		if params["__cancel_request"] == "true" {
 			return nil
+		}
+
+		// Reject non-TLS connections
+		if !tlsUpgraded {
+			c.sendError("FATAL", "28000", "SSL/TLS connection required")
+			return fmt.Errorf("client did not request SSL")
 		}
 
 		c.username = params["user"]

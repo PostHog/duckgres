@@ -3,30 +3,21 @@
 ## High Priority
 
 ### Security
-- [ ] **TLS/SSL Support**: Add encrypted connections for production use
+- [x] **TLS/SSL Support**: Add encrypted connections for production use
 - [ ] **MD5 Password Authentication**: Support PostgreSQL's MD5-based auth for better security
 - [ ] **SCRAM-SHA-256 Authentication**: Modern PostgreSQL authentication method
 - [ ] **Connection Rate Limiting**: Prevent brute-force attacks
 
 ### Configuration
-- [ ] **Config File Support**: Load configuration from YAML/TOML file instead of hardcoding
-- [ ] **Environment Variables**: Support `DUCKGRES_PORT`, `DUCKGRES_DATA_DIR`, etc.
-- [ ] **Command Line Flags**: `--port`, `--data-dir`, `--config` options
+- [x] **Config File Support**: Load configuration from YAML/TOML file instead of hardcoding
+- [x] **Environment Variables**: Support `DUCKGRES_PORT`, `DUCKGRES_DATA_DIR`, etc.
+- [x] **Command Line Flags**: `--port`, `--data-dir`, `--config` options
 - [ ] **Dynamic User Management**: Add/remove users without restart
 
 ### Protocol Compatibility
 - [ ] **Binary Format Support**: Encode results in binary format for better performance with some clients
 - [ ] **COPY Protocol**: Support `COPY FROM`/`COPY TO` for bulk data loading
-- [ ] **LISTEN/NOTIFY**: PostgreSQL pub/sub notifications (would require custom implementation)
 - [ ] **Cancel Request Handling**: Properly cancel long-running queries
-
-## Medium Priority
-
-### Performance
-- [ ] **Connection Pooling**: Pool DuckDB connections per user for better performance
-- [ ] **Query Caching**: Cache prepared statements more efficiently
-- [ ] **Async I/O**: Use non-blocking I/O for better concurrency
-- [ ] **Connection Limits**: Max connections per user and globally
 
 ### Compatibility
 - [ ] **System Catalog Emulation**: Implement `pg_catalog` views for tool compatibility
@@ -38,6 +29,21 @@
 - [ ] **Information Schema**: Emulate PostgreSQL's `information_schema`
 - [ ] **Session Variables**: Support `SET` commands (timezone, search_path, etc.)
 - [ ] **Type OID Mapping**: Proper PostgreSQL OID mapping for all DuckDB types
+
+### Features
+- [ ] **Extensions**: Load DuckDB extensions on startup
+
+### Operations
+- [ ] **Hot Reload**: Reload config without restart
+- [ ] **Admin Commands**: `\duckgres status`, `\duckgres users`, etc.
+- [ ] **Docker Image**: Official container image
+- [ ] **Graceful Shutdown**: Finish in-flight queries before shutdown
+
+## Medium Priority
+
+### Performance
+- [ ] **DuckDB Per Connection**: each connection for each user is a separate duckdb instance 
+- [ ] **Connection Limits**: Max connections per user and globally
 
 ### Monitoring
 - [ ] **Prometheus Metrics**: Export query count, latency, connection stats
@@ -51,14 +57,6 @@
 - [ ] **Read Replicas**: Support read-only replicas using DuckDB's `ATTACH`
 - [ ] **Multi-Database**: Support multiple named databases per user
 - [ ] **Schema Support**: PostgreSQL schema emulation
-- [ ] **Extensions**: Load DuckDB extensions on startup
-- [ ] **Stored Procedures**: Basic PL/pgSQL compatibility (limited)
-
-### Operations
-- [ ] **Graceful Shutdown**: Finish in-flight queries before shutdown
-- [ ] **Hot Reload**: Reload config without restart
-- [ ] **Admin Commands**: `\duckgres status`, `\duckgres users`, etc.
-- [ ] **Docker Image**: Official container image
 
 ### Testing
 - [ ] **Unit Tests**: Test wire protocol parsing/encoding
@@ -71,7 +69,6 @@
 - **Federation**: Query multiple DuckDB files in single query
 - **Caching Layer**: Redis/memcached for query results
 - **Query Rewriting**: Translate PostgreSQL-specific syntax to DuckDB
-- **WAL Shipping**: Replicate DuckDB changes to remote instances
 - **MotherDuck Integration**: Support MotherDuck cloud backend
 - **Parquet Direct Query**: `SELECT * FROM 's3://bucket/file.parquet'`
 
