@@ -6,7 +6,7 @@
 - [x] **TLS/SSL Support**: Add encrypted connections for production use
 - [ ] **MD5 Password Authentication**: Support PostgreSQL's MD5-based auth for better security
 - [ ] **SCRAM-SHA-256 Authentication**: Modern PostgreSQL authentication method
-- [ ] **Connection Rate Limiting**: Prevent brute-force attacks
+- [x] **Connection Rate Limiting**: Prevent brute-force attacks
 
 ### Configuration
 - [x] **Config File Support**: Load configuration from YAML/TOML file instead of hardcoding

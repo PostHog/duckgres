@@ -18,3 +18,14 @@ users:
   postgres: "postgres"
   alice: "alice123"
   bob: "bob123"
+
+# Rate limiting configuration (optional - these are the defaults)
+rate_limit:
+  # Max failed auth attempts before banning an IP
+  max_failed_attempts: 5
+  # Time window for counting failed attempts (e.g., "5m", "1h")
+  failed_attempt_window: "5m"
+  # How long to ban an IP after too many failed attempts
+  ban_duration: "15m"
+  # Max concurrent connections from a single IP (0 = unlimited)
+  max_connections_per_ip: 100

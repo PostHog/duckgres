@@ -151,9 +151,17 @@ func (c *clientConn) handleStartup() error {
 	// Validate password
 	expectedPassword, ok := c.server.cfg.Users[c.username]
 	if !ok || expectedPassword != password {
+		// Record failed authentication attempt
+		banned := c.server.rateLimiter.RecordFailedAuth(c.conn.RemoteAddr())
+		if banned {
+			log.Printf("IP %s banned after too many failed auth attempts", c.conn.RemoteAddr())
+		}
 		c.sendError("FATAL", "28P01", "password authentication failed")
 		return fmt.Errorf("authentication failed for user %q", c.username)
 	}
+
+	// Record successful authentication (clears failed attempt counter)
+	c.server.rateLimiter.RecordSuccessfulAuth(c.conn.RemoteAddr())
 
 	// Send auth OK
 	if err := writeAuthOK(c.writer); err != nil {

@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/posthog/duckgres/server"
 	"gopkg.in/yaml.v3"
@@ -15,16 +16,24 @@ import (
 
 // FileConfig represents the YAML configuration file structure
 type FileConfig struct {
-	Host    string            `yaml:"host"`
-	Port    int               `yaml:"port"`
-	DataDir string            `yaml:"data_dir"`
-	TLS     TLSConfig         `yaml:"tls"`
-	Users   map[string]string `yaml:"users"`
+	Host      string              `yaml:"host"`
+	Port      int                 `yaml:"port"`
+	DataDir   string              `yaml:"data_dir"`
+	TLS       TLSConfig           `yaml:"tls"`
+	Users     map[string]string   `yaml:"users"`
+	RateLimit RateLimitFileConfig `yaml:"rate_limit"`
 }
 
 type TLSConfig struct {
 	Cert string `yaml:"cert"`
 	Key  string `yaml:"key"`
+}
+
+type RateLimitFileConfig struct {
+	MaxFailedAttempts   int    `yaml:"max_failed_attempts"`
+	FailedAttemptWindow string `yaml:"failed_attempt_window"` // e.g., "5m"
+	BanDuration         string `yaml:"ban_duration"`          // e.g., "15m"
+	MaxConnectionsPerIP int    `yaml:"max_connections_per_ip"`
 }
 
 // loadConfigFile loads configuration from a YAML file
@@ -128,6 +137,28 @@ func main() {
 		}
 		if len(fileCfg.Users) > 0 {
 			cfg.Users = fileCfg.Users
+		}
+
+		// Apply rate limit config
+		if fileCfg.RateLimit.MaxFailedAttempts > 0 {
+			cfg.RateLimit.MaxFailedAttempts = fileCfg.RateLimit.MaxFailedAttempts
+		}
+		if fileCfg.RateLimit.MaxConnectionsPerIP > 0 {
+			cfg.RateLimit.MaxConnectionsPerIP = fileCfg.RateLimit.MaxConnectionsPerIP
+		}
+		if fileCfg.RateLimit.FailedAttemptWindow != "" {
+			if d, err := time.ParseDuration(fileCfg.RateLimit.FailedAttemptWindow); err == nil {
+				cfg.RateLimit.FailedAttemptWindow = d
+			} else {
+				log.Printf("Warning: invalid failed_attempt_window duration: %v", err)
+			}
+		}
+		if fileCfg.RateLimit.BanDuration != "" {
+			if d, err := time.ParseDuration(fileCfg.RateLimit.BanDuration); err == nil {
+				cfg.RateLimit.BanDuration = d
+			} else {
+				log.Printf("Warning: invalid ban_duration duration: %v", err)
+			}
 		}
 	}
 

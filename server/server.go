@@ -20,17 +20,21 @@ type Config struct {
 	// TLS configuration (required)
 	TLSCertFile string // Path to TLS certificate file
 	TLSKeyFile  string // Path to TLS private key file
+
+	// Rate limiting configuration
+	RateLimit RateLimitConfig
 }
 
 type Server struct {
-	cfg       Config
-	listener  net.Listener
-	tlsConfig *tls.Config
-	dbs       map[string]*sql.DB // username -> db connection
-	dbsMu     sync.RWMutex
-	wg        sync.WaitGroup
-	closed    bool
-	closeMu   sync.Mutex
+	cfg         Config
+	listener    net.Listener
+	tlsConfig   *tls.Config
+	rateLimiter *RateLimiter
+	dbs         map[string]*sql.DB // username -> db connection
+	dbsMu       sync.RWMutex
+	wg          sync.WaitGroup
+	closed      bool
+	closeMu     sync.Mutex
 }
 
 func New(cfg Config) (*Server, error) {
@@ -44,15 +48,23 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
 	}
 
+	// Use default rate limit config if not specified
+	if cfg.RateLimit.MaxFailedAttempts == 0 {
+		cfg.RateLimit = DefaultRateLimitConfig()
+	}
+
 	s := &Server{
-		cfg: cfg,
-		dbs: make(map[string]*sql.DB),
+		cfg:         cfg,
+		dbs:         make(map[string]*sql.DB),
+		rateLimiter: NewRateLimiter(cfg.RateLimit),
 		tlsConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		},
 	}
 
 	log.Printf("TLS enabled with certificate: %s", cfg.TLSCertFile)
+	log.Printf("Rate limiting enabled: max %d failed attempts in %v, ban duration %v",
+		cfg.RateLimit.MaxFailedAttempts, cfg.RateLimit.FailedAttemptWindow, cfg.RateLimit.BanDuration)
 	return s, nil
 }
 
@@ -144,7 +156,28 @@ func (s *Server) getOrCreateDB(username string) (*sql.DB, error) {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	remoteAddr := conn.RemoteAddr()
+
+	// Check rate limiting before doing anything
+	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {
+		// Send PostgreSQL error and close
+		log.Printf("Connection from %s rejected: %s", remoteAddr, msg)
+		conn.Close()
+		return
+	}
+
+	// Register this connection
+	if !s.rateLimiter.RegisterConnection(remoteAddr) {
+		log.Printf("Connection from %s rejected: rate limit exceeded", remoteAddr)
+		conn.Close()
+		return
+	}
+
+	// Ensure we unregister when done
+	defer func() {
+		s.rateLimiter.UnregisterConnection(remoteAddr)
+		conn.Close()
+	}()
 
 	c := &clientConn{
 		server: s,
