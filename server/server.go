@@ -132,6 +132,12 @@ func (s *Server) getOrCreateDB(username string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
 	}
 
+	// Initialize pg_catalog schema for PostgreSQL compatibility
+	if err := initPgCatalog(db); err != nil {
+		log.Printf("Warning: failed to initialize pg_catalog for user %q: %v", username, err)
+		// Continue anyway - basic queries will still work
+	}
+
 	s.dbs[username] = db
 	log.Printf("Opened DuckDB database for user %q at %s", username, dbPath)
 	return db, nil

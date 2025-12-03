@@ -20,12 +20,10 @@
 - [ ] **Cancel Request Handling**: Properly cancel long-running queries
 
 ### Compatibility
-- [ ] **System Catalog Emulation**: Implement `pg_catalog` views for tool compatibility
-  - [ ] `pg_database`
-  - [ ] `pg_tables`
-  - [ ] `pg_columns`
-  - [ ] `pg_type`
-  - [ ] `pg_class`
+- [x] **System Catalog Emulation**: Basic `pg_catalog` compatibility for psql
+  - [x] `\dt` (list tables) - working
+  - [x] `\l` (list databases) - working
+  - [ ] `\d <table>` (describe table) - needs more pg_class columns
 - [ ] **Information Schema**: Emulate PostgreSQL's `information_schema`
 - [ ] **Session Variables**: Support `SET` commands (timezone, search_path, etc.)
 - [ ] **Type OID Mapping**: Proper PostgreSQL OID mapping for all DuckDB types

@@ -251,6 +251,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	log.Printf("[%s] Query: %s", c.username, query)
 
+	// Rewrite pg_catalog function calls for compatibility
+	query = rewritePgCatalogQuery(query)
+
 	// Determine command type for proper response
 	upperQuery := strings.ToUpper(query)
 	cmdType := c.getCommandType(upperQuery)
@@ -430,44 +433,58 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 }
 
 func (c *clientConn) mapTypeOID(colType *sql.ColumnType) int32 {
-	// Always return text OID to ensure lib/pq uses text format
-	// This is a simplification - proper implementation would support binary format
-	return 25 // text
+	return getTypeInfo(colType).OID
 }
 
 func (c *clientConn) mapTypeSize(colType *sql.ColumnType) int16 {
-	typeName := strings.ToUpper(colType.DatabaseTypeName())
-
-	switch {
-	case strings.Contains(typeName, "BIGINT"):
-		return 8
-	case strings.Contains(typeName, "SMALLINT"):
-		return 2
-	case strings.Contains(typeName, "INT"):
-		return 4
-	case strings.Contains(typeName, "FLOAT"), strings.Contains(typeName, "DOUBLE"):
-		return 8
-	case strings.Contains(typeName, "REAL"):
-		return 4
-	case strings.Contains(typeName, "BOOL"):
-		return 1
-	default:
-		return -1 // variable length
-	}
+	return getTypeInfo(colType).Size
 }
 
 func (c *clientConn) sendDataRow(values []interface{}) error {
+	return c.sendDataRowWithFormats(values, nil, nil)
+}
+
+// sendDataRowWithFormats sends a data row with optional binary encoding
+// formatCodes: per-column format codes (0=text, 1=binary), or nil for all text
+// typeOIDs: per-column type OIDs for binary encoding, or nil
+func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []int16, typeOIDs []int32) error {
 	var buf bytes.Buffer
 
 	// Number of columns
 	binary.Write(&buf, binary.BigEndian, int16(len(values)))
 
-	for _, v := range values {
+	for i, v := range values {
 		if v == nil {
 			// NULL value
 			binary.Write(&buf, binary.BigEndian, int32(-1))
+			continue
+		}
+
+		// Determine format: binary or text
+		useBinary := false
+		if formatCodes != nil {
+			if len(formatCodes) == 1 {
+				// Single format code applies to all columns
+				useBinary = formatCodes[0] == 1
+			} else if i < len(formatCodes) {
+				useBinary = formatCodes[i] == 1
+			}
+		}
+
+		if useBinary && typeOIDs != nil && i < len(typeOIDs) {
+			// Binary encoding
+			encoded := encodeBinary(v, typeOIDs[i])
+			if encoded == nil {
+				// Fallback to text if binary encoding fails
+				str := formatValue(v)
+				binary.Write(&buf, binary.BigEndian, int32(len(str)))
+				buf.WriteString(str)
+			} else {
+				binary.Write(&buf, binary.BigEndian, int32(len(encoded)))
+				buf.Write(encoded)
+			}
 		} else {
-			// Convert to string representation
+			// Text encoding
 			str := formatValue(v)
 			binary.Write(&buf, binary.BigEndian, int32(len(str)))
 			buf.WriteString(str)
@@ -866,9 +883,16 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	// Get column types for binary encoding
+	colTypes, _ := rows.ColumnTypes()
+	typeOIDs := make([]int32, len(cols))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
 	// Don't send RowDescription here - it should come from Describe
 
-	// Send rows
+	// Send rows with the format codes from Bind
 	rowCount := 0
 	for rows.Next() {
 		if maxRows > 0 && int32(rowCount) >= maxRows {
@@ -887,7 +911,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			return
 		}
 
-		if err := c.sendDataRow(values); err != nil {
+		if err := c.sendDataRowWithFormats(values, p.resultFormats, typeOIDs); err != nil {
 			return
 		}
 		rowCount++
