@@ -19,6 +19,13 @@ users:
   alice: "alice123"
   bob: "bob123"
 
+# DuckDB extensions to load on database initialization
+# Extensions are installed (downloaded if needed) and loaded automatically
+# Common extensions: httpfs, parquet, json, sqlite, postgres, mysql, excel
+extensions:
+  # - httpfs
+  # - parquet
+
 # Rate limiting configuration (optional - these are the defaults)
 rate_limit:
   # Max failed auth attempts before banning an IP

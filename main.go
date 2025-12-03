@@ -16,12 +16,13 @@ import (
 
 // FileConfig represents the YAML configuration file structure
 type FileConfig struct {
-	Host      string              `yaml:"host"`
-	Port      int                 `yaml:"port"`
-	DataDir   string              `yaml:"data_dir"`
-	TLS       TLSConfig           `yaml:"tls"`
-	Users     map[string]string   `yaml:"users"`
-	RateLimit RateLimitFileConfig `yaml:"rate_limit"`
+	Host       string              `yaml:"host"`
+	Port       int                 `yaml:"port"`
+	DataDir    string              `yaml:"data_dir"`
+	TLS        TLSConfig           `yaml:"tls"`
+	Users      map[string]string   `yaml:"users"`
+	RateLimit  RateLimitFileConfig `yaml:"rate_limit"`
+	Extensions []string            `yaml:"extensions"`
 }
 
 type TLSConfig struct {
@@ -159,6 +160,11 @@ func main() {
 			} else {
 				log.Printf("Warning: invalid ban_duration duration: %v", err)
 			}
+		}
+
+		// Apply extensions config
+		if len(fileCfg.Extensions) > 0 {
+			cfg.Extensions = fileCfg.Extensions
 		}
 	}
 

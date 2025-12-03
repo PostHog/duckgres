@@ -23,6 +23,9 @@ type Config struct {
 
 	// Rate limiting configuration
 	RateLimit RateLimitConfig
+
+	// Extensions to load on database initialization
+	Extensions []string
 }
 
 type Server struct {
@@ -144,6 +147,12 @@ func (s *Server) getOrCreateDB(username string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
 	}
 
+	// Load configured extensions
+	if err := s.loadExtensions(db); err != nil {
+		log.Printf("Warning: failed to load some extensions for user %q: %v", username, err)
+		// Continue anyway - database will still work without the extensions
+	}
+
 	// Initialize pg_catalog schema for PostgreSQL compatibility
 	if err := initPgCatalog(db); err != nil {
 		log.Printf("Warning: failed to initialize pg_catalog for user %q: %v", username, err)
@@ -153,6 +162,34 @@ func (s *Server) getOrCreateDB(username string) (*sql.DB, error) {
 	s.dbs[username] = db
 	log.Printf("Opened DuckDB database for user %q at %s", username, dbPath)
 	return db, nil
+}
+
+// loadExtensions installs and loads configured DuckDB extensions
+func (s *Server) loadExtensions(db *sql.DB) error {
+	if len(s.cfg.Extensions) == 0 {
+		return nil
+	}
+
+	var lastErr error
+	for _, ext := range s.cfg.Extensions {
+		// First install the extension (downloads if needed)
+		if _, err := db.Exec("INSTALL " + ext); err != nil {
+			log.Printf("Warning: failed to install extension %q: %v", ext, err)
+			lastErr = err
+			continue
+		}
+
+		// Then load it into the current session
+		if _, err := db.Exec("LOAD " + ext); err != nil {
+			log.Printf("Warning: failed to load extension %q: %v", ext, err)
+			lastErr = err
+			continue
+		}
+
+		log.Printf("Loaded extension: %s", ext)
+	}
+
+	return lastErr
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
