@@ -19,6 +19,32 @@ users:
   alice: "alice123"
   bob: "bob123"
 
+# DuckDB extensions to load on database initialization
+# Extensions are installed (downloaded if needed) and loaded automatically
+# Common extensions: httpfs, parquet, json, sqlite, postgres, mysql, excel
+# Default: ducklake (loaded even without config file)
+extensions:
+  - ducklake
+  # - httpfs
+  # - parquet
+
+# DuckLake configuration (optional)
+# When configured, DuckLake catalog is automatically attached on connection
+# See: https://ducklake.select/docs/stable/duckdb/usage/connecting
+ducklake:
+  # Metadata store connection string (required to enable DuckLake)
+  # Examples:
+  #   - "postgres:dbname=ducklake"
+  #   - "postgres:host=localhost dbname=ducklake user=postgres password=secret"
+  #   - "sqlite:ducklake.db"
+  # metadata_store: "postgres:dbname=ducklake"
+
+  # Data path for table data files (optional)
+  # Examples:
+  #   - "s3://my-bucket/ducklake-data/"
+  #   - "/local/path/to/data/"
+  # data_path: "s3://my-bucket/ducklake-data/"
+
 # Rate limiting configuration (optional - these are the defaults)
 rate_limit:
   # Max failed auth attempts before banning an IP

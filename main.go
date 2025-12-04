@@ -16,12 +16,14 @@ import (
 
 // FileConfig represents the YAML configuration file structure
 type FileConfig struct {
-	Host      string              `yaml:"host"`
-	Port      int                 `yaml:"port"`
-	DataDir   string              `yaml:"data_dir"`
-	TLS       TLSConfig           `yaml:"tls"`
-	Users     map[string]string   `yaml:"users"`
-	RateLimit RateLimitFileConfig `yaml:"rate_limit"`
+	Host       string              `yaml:"host"`
+	Port       int                 `yaml:"port"`
+	DataDir    string              `yaml:"data_dir"`
+	TLS        TLSConfig           `yaml:"tls"`
+	Users      map[string]string   `yaml:"users"`
+	RateLimit  RateLimitFileConfig `yaml:"rate_limit"`
+	Extensions []string            `yaml:"extensions"`
+	DuckLake   DuckLakeFileConfig  `yaml:"ducklake"`
 }
 
 type TLSConfig struct {
@@ -34,6 +36,11 @@ type RateLimitFileConfig struct {
 	FailedAttemptWindow string `yaml:"failed_attempt_window"` // e.g., "5m"
 	BanDuration         string `yaml:"ban_duration"`          // e.g., "15m"
 	MaxConnectionsPerIP int    `yaml:"max_connections_per_ip"`
+}
+
+type DuckLakeFileConfig struct {
+	MetadataStore string `yaml:"metadata_store"` // e.g., "postgres:dbname=ducklake"
+	DataPath      string `yaml:"data_path"`      // e.g., "s3://my-bucket/data/"
 }
 
 // loadConfigFile loads configuration from a YAML file
@@ -109,6 +116,7 @@ func main() {
 		Users: map[string]string{
 			"postgres": "postgres",
 		},
+		Extensions: []string{"ducklake"},
 	}
 
 	// Load config file if specified
@@ -160,6 +168,19 @@ func main() {
 				log.Printf("Warning: invalid ban_duration duration: %v", err)
 			}
 		}
+
+		// Apply extensions config
+		if len(fileCfg.Extensions) > 0 {
+			cfg.Extensions = fileCfg.Extensions
+		}
+
+		// Apply DuckLake config
+		if fileCfg.DuckLake.MetadataStore != "" {
+			cfg.DuckLake.MetadataStore = fileCfg.DuckLake.MetadataStore
+		}
+		if fileCfg.DuckLake.DataPath != "" {
+			cfg.DuckLake.DataPath = fileCfg.DuckLake.DataPath
+		}
 	}
 
 	// Apply environment variables (override config file)
@@ -179,6 +200,12 @@ func main() {
 	}
 	if v := os.Getenv("DUCKGRES_KEY"); v != "" {
 		cfg.TLSKeyFile = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_METADATA_STORE"); v != "" {
+		cfg.DuckLake.MetadataStore = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_DATA_PATH"); v != "" {
+		cfg.DuckLake.DataPath = v
 	}
 
 	// Apply CLI flags (highest priority)
