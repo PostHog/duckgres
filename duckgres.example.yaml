@@ -32,18 +32,11 @@ extensions:
 # When configured, DuckLake catalog is automatically attached on connection
 # See: https://ducklake.select/docs/stable/duckdb/usage/connecting
 ducklake:
-  # Metadata store connection string (required to enable DuckLake)
+  # Full connection string for the DuckLake metadata database
   # Examples:
-  #   - "postgres:dbname=ducklake"
-  #   - "postgres:host=localhost dbname=ducklake user=postgres password=secret"
-  #   - "sqlite:ducklake.db"
-  # metadata_store: "postgres:dbname=ducklake"
-
-  # Data path for table data files (optional)
-  # Examples:
-  #   - "s3://my-bucket/ducklake-data/"
-  #   - "/local/path/to/data/"
-  # data_path: "s3://my-bucket/ducklake-data/"
+  #   - "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
+  #   - "postgres:host=ducklake.example.com user=ducklake password=secret dbname=ducklake"
+  # metadata_store: "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
 
 # Rate limiting configuration (optional - these are the defaults)
 rate_limit:

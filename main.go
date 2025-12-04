@@ -39,8 +39,7 @@ type RateLimitFileConfig struct {
 }
 
 type DuckLakeFileConfig struct {
-	MetadataStore string `yaml:"metadata_store"` // e.g., "postgres:dbname=ducklake"
-	DataPath      string `yaml:"data_path"`      // e.g., "s3://my-bucket/data/"
+	MetadataStore string `yaml:"metadata_store"` // e.g., "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
 }
 
 // loadConfigFile loads configuration from a YAML file
@@ -178,9 +177,6 @@ func main() {
 		if fileCfg.DuckLake.MetadataStore != "" {
 			cfg.DuckLake.MetadataStore = fileCfg.DuckLake.MetadataStore
 		}
-		if fileCfg.DuckLake.DataPath != "" {
-			cfg.DuckLake.DataPath = fileCfg.DuckLake.DataPath
-		}
 	}
 
 	// Apply environment variables (override config file)
@@ -203,9 +199,6 @@ func main() {
 	}
 	if v := os.Getenv("DUCKGRES_DUCKLAKE_METADATA_STORE"); v != "" {
 		cfg.DuckLake.MetadataStore = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_DATA_PATH"); v != "" {
-		cfg.DuckLake.DataPath = v
 	}
 
 	// Apply CLI flags (highest priority)
