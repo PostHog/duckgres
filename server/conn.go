@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -266,6 +267,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 	upperQuery := strings.ToUpper(query)
 	cmdType := c.getCommandType(upperQuery)
 
+	// Handle COPY commands specially
+	if cmdType == "COPY" {
+		return c.handleCopy(query, upperQuery)
+	}
+
 	// For non-SELECT queries, use Exec
 	if cmdType != "SELECT" {
 		result, err := c.db.Exec(query)
@@ -403,6 +409,278 @@ func (c *clientConn) buildCommandTag(cmdType string, result sql.Result) string {
 	default:
 		return cmdType
 	}
+}
+
+// Regular expressions for parsing COPY commands
+var (
+	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
+	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s+(?:\(([^)]+)\)\s+)?FROM\s+STDIN`)
+	copyWithCSVRegex    = regexp.MustCompile(`(?i)\bCSV\b`)
+	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
+	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)
+)
+
+// handleCopy handles COPY TO STDOUT and COPY FROM STDIN commands
+func (c *clientConn) handleCopy(query, upperQuery string) error {
+	// Check if it's COPY TO STDOUT
+	if copyToStdoutRegex.MatchString(upperQuery) {
+		return c.handleCopyOut(query, upperQuery)
+	}
+
+	// Check if it's COPY FROM STDIN
+	if copyFromStdinRegex.MatchString(upperQuery) {
+		return c.handleCopyIn(query, upperQuery)
+	}
+
+	// For other COPY commands (e.g., COPY TO file), pass through to DuckDB
+	result, err := c.db.Exec(query)
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		writeReadyForQuery(c.writer, 'I')
+		c.writer.Flush()
+		return nil
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowsAffected))
+	writeReadyForQuery(c.writer, 'I')
+	c.writer.Flush()
+	return nil
+}
+
+// handleCopyOut handles COPY ... TO STDOUT
+func (c *clientConn) handleCopyOut(query, upperQuery string) error {
+	matches := copyToStdoutRegex.FindStringSubmatch(query)
+	if len(matches) < 2 {
+		c.sendError("ERROR", "42601", "Invalid COPY TO STDOUT syntax")
+		writeReadyForQuery(c.writer, 'I')
+		c.writer.Flush()
+		return nil
+	}
+
+	// Parse options
+	delimiter := "\t"
+	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
+		delimiter = m[1]
+	} else if copyWithCSVRegex.MatchString(upperQuery) {
+		delimiter = ","
+	}
+
+	// The source can be a table name or a query in parentheses
+	source := strings.TrimSpace(matches[1])
+	var selectQuery string
+	if strings.HasPrefix(source, "(") && strings.HasSuffix(source, ")") {
+		selectQuery = source[1 : len(source)-1]
+	} else {
+		selectQuery = fmt.Sprintf("SELECT * FROM %s", source)
+	}
+
+	// Execute the query
+	rows, err := c.db.Query(selectQuery)
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		writeReadyForQuery(c.writer, 'I')
+		c.writer.Flush()
+		return nil
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		writeReadyForQuery(c.writer, 'I')
+		c.writer.Flush()
+		return nil
+	}
+
+	// Send CopyOutResponse
+	if err := writeCopyOutResponse(c.writer, int16(len(cols)), true); err != nil {
+		return err
+	}
+	c.writer.Flush()
+
+	// Send header if CSV with HEADER
+	if copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery) {
+		header := strings.Join(cols, delimiter) + "\n"
+		if err := writeCopyData(c.writer, []byte(header)); err != nil {
+			return err
+		}
+	}
+
+	// Send data rows
+	rowCount := 0
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			break
+		}
+
+		// Format row as tab/comma separated values
+		var rowData []string
+		for _, v := range values {
+			rowData = append(rowData, c.formatCopyValue(v))
+		}
+		line := strings.Join(rowData, delimiter) + "\n"
+		if err := writeCopyData(c.writer, []byte(line)); err != nil {
+			return err
+		}
+		rowCount++
+	}
+
+	// Send CopyDone
+	if err := writeCopyDone(c.writer); err != nil {
+		return err
+	}
+
+	writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	writeReadyForQuery(c.writer, 'I')
+	c.writer.Flush()
+	return nil
+}
+
+// handleCopyIn handles COPY ... FROM STDIN
+func (c *clientConn) handleCopyIn(query, upperQuery string) error {
+	matches := copyFromStdinRegex.FindStringSubmatch(query)
+	if len(matches) < 2 {
+		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
+		writeReadyForQuery(c.writer, 'I')
+		c.writer.Flush()
+		return nil
+	}
+
+	tableName := matches[1]
+	columnList := ""
+	if len(matches) > 2 && matches[2] != "" {
+		columnList = fmt.Sprintf("(%s)", matches[2])
+	}
+
+	// Parse options
+	delimiter := "\t"
+	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
+		delimiter = m[1]
+	} else if copyWithCSVRegex.MatchString(upperQuery) {
+		delimiter = ","
+	}
+	hasHeader := copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery)
+
+	// Get column count for the table
+	colQuery := fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
+	testRows, err := c.db.Query(colQuery)
+	if err != nil {
+		c.sendError("ERROR", "42P01", fmt.Sprintf("relation \"%s\" does not exist", tableName))
+		writeReadyForQuery(c.writer, 'I')
+		c.writer.Flush()
+		return nil
+	}
+	cols, _ := testRows.Columns()
+	testRows.Close()
+
+	// Send CopyInResponse
+	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
+		return err
+	}
+	c.writer.Flush()
+
+	// Read COPY data from client
+	var allData bytes.Buffer
+	rowCount := 0
+	headerSkipped := false
+
+	for {
+		msgType, body, err := readMessage(c.reader)
+		if err != nil {
+			return err
+		}
+
+		switch msgType {
+		case msgCopyData:
+			allData.Write(body)
+
+		case msgCopyDone:
+			// Process all data
+			lines := strings.Split(allData.String(), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+
+				// Skip header if needed
+				if hasHeader && !headerSkipped {
+					headerSkipped = true
+					continue
+				}
+
+				// Parse values and insert
+				values := c.parseCopyLine(line, delimiter)
+				if len(values) == 0 {
+					continue
+				}
+
+				// Build INSERT statement
+				placeholders := make([]string, len(values))
+				args := make([]interface{}, len(values))
+				for i, v := range values {
+					placeholders[i] = "?"
+					if v == "\\N" || v == "" {
+						args[i] = nil
+					} else {
+						args[i] = v
+					}
+				}
+
+				insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES (%s)",
+					tableName, columnList, strings.Join(placeholders, ", "))
+
+				if _, err := c.db.Exec(insertSQL, args...); err != nil {
+					c.sendError("ERROR", "22P02", fmt.Sprintf("invalid input: %v", err))
+					writeReadyForQuery(c.writer, 'I')
+					c.writer.Flush()
+					return nil
+				}
+				rowCount++
+			}
+
+			writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			writeReadyForQuery(c.writer, 'I')
+			c.writer.Flush()
+			return nil
+
+		case msgCopyFail:
+			// Client cancelled COPY
+			errMsg := string(bytes.TrimRight(body, "\x00"))
+			c.sendError("ERROR", "57014", fmt.Sprintf("COPY failed: %s", errMsg))
+			writeReadyForQuery(c.writer, 'I')
+			c.writer.Flush()
+			return nil
+
+		default:
+			c.sendError("ERROR", "08P01", fmt.Sprintf("unexpected message type during COPY: %c", msgType))
+			writeReadyForQuery(c.writer, 'I')
+			c.writer.Flush()
+			return nil
+		}
+	}
+}
+
+// formatCopyValue formats a value for COPY output
+func (c *clientConn) formatCopyValue(v interface{}) string {
+	if v == nil {
+		return "\\N"
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// parseCopyLine parses a line of COPY input
+func (c *clientConn) parseCopyLine(line, delimiter string) []string {
+	// Simple split - doesn't handle quoted values yet
+	return strings.Split(line, delimiter)
 }
 
 func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnType) error {

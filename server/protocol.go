@@ -35,6 +35,13 @@ const (
 	msgBindComplete    = '2'
 	msgCloseComplete   = '3'
 	msgNoData          = 'n'
+
+	// COPY messages (both directions)
+	msgCopyData        = 'd' // Contains COPY data
+	msgCopyDone        = 'c' // COPY completed
+	msgCopyFail        = 'f' // COPY failed (frontend only)
+	msgCopyInResponse  = 'G' // Server ready to receive COPY data
+	msgCopyOutResponse = 'H' // Server about to send COPY data
 )
 
 // Authentication types
@@ -246,4 +253,75 @@ func writeCloseComplete(w io.Writer) error {
 // writeNoData sends no data response
 func writeNoData(w io.Writer) error {
 	return writeMessage(w, msgNoData, nil)
+}
+
+// writeCopyOutResponse tells client we're about to send COPY data
+// Format: overall format (0=text, 1=binary), num columns, format per column
+func writeCopyOutResponse(w io.Writer, numColumns int16, textFormat bool) error {
+	var data []byte
+
+	// Overall format (0=text)
+	if textFormat {
+		data = append(data, 0)
+	} else {
+		data = append(data, 1)
+	}
+
+	// Number of columns
+	colBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(colBytes, uint16(numColumns))
+	data = append(data, colBytes...)
+
+	// Format for each column (0=text)
+	for i := int16(0); i < numColumns; i++ {
+		formatBytes := make([]byte, 2)
+		if textFormat {
+			binary.BigEndian.PutUint16(formatBytes, 0)
+		} else {
+			binary.BigEndian.PutUint16(formatBytes, 1)
+		}
+		data = append(data, formatBytes...)
+	}
+
+	return writeMessage(w, msgCopyOutResponse, data)
+}
+
+// writeCopyInResponse tells client to send COPY data
+func writeCopyInResponse(w io.Writer, numColumns int16, textFormat bool) error {
+	var data []byte
+
+	// Overall format (0=text)
+	if textFormat {
+		data = append(data, 0)
+	} else {
+		data = append(data, 1)
+	}
+
+	// Number of columns
+	colBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(colBytes, uint16(numColumns))
+	data = append(data, colBytes...)
+
+	// Format for each column (0=text)
+	for i := int16(0); i < numColumns; i++ {
+		formatBytes := make([]byte, 2)
+		if textFormat {
+			binary.BigEndian.PutUint16(formatBytes, 0)
+		} else {
+			binary.BigEndian.PutUint16(formatBytes, 1)
+		}
+		data = append(data, formatBytes...)
+	}
+
+	return writeMessage(w, msgCopyInResponse, data)
+}
+
+// writeCopyData sends a row of COPY data
+func writeCopyData(w io.Writer, data []byte) error {
+	return writeMessage(w, msgCopyData, data)
+}
+
+// writeCopyDone signals the end of COPY data
+func writeCopyDone(w io.Writer) error {
+	return writeMessage(w, msgCopyDone, nil)
 }

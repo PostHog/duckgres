@@ -7,11 +7,13 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - **PostgreSQL Wire Protocol**: Full compatibility with PostgreSQL clients
 - **TLS Encryption**: Required TLS connections with auto-generated self-signed certificates
 - **Per-User Databases**: Each authenticated user gets their own isolated DuckDB database file
-- **Password Authentication**: MD5 password authentication
+- **Password Authentication**: Cleartext password authentication over TLS
 - **Extended Query Protocol**: Support for prepared statements, binary format, and parameterized queries
+- **COPY Protocol**: Bulk data import/export with `COPY FROM STDIN` and `COPY TO STDOUT`
 - **DuckDB Extensions**: Configurable extension loading (ducklake enabled by default)
 - **DuckLake Integration**: Auto-attach DuckLake catalogs for lakehouse workflows
 - **Rate Limiting**: Built-in protection against brute-force attacks
+- **Graceful Shutdown**: Waits for in-flight queries before exiting
 - **Flexible Configuration**: YAML config files, environment variables, and CLI flags
 
 ## Quick Start
@@ -144,6 +146,46 @@ ATTACH 'ducklake:postgres:host=localhost dbname=ducklake' (DATA_PATH 's3://my-bu
 
 See [DuckLake documentation](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details.
 
+## COPY Protocol
+
+Duckgres supports PostgreSQL's COPY protocol for efficient bulk data import and export:
+
+```sql
+-- Export data to stdout (tab-separated)
+COPY tablename TO STDOUT;
+
+-- Export as CSV with headers
+COPY tablename TO STDOUT WITH CSV HEADER;
+
+-- Export query results
+COPY (SELECT * FROM tablename WHERE id > 100) TO STDOUT WITH CSV;
+
+-- Import data from stdin
+COPY tablename FROM STDIN;
+
+-- Import CSV with headers
+COPY tablename FROM STDIN WITH CSV HEADER;
+```
+
+This works with psql's `\copy` command and programmatic COPY operations from PostgreSQL drivers.
+
+## Graceful Shutdown
+
+Duckgres handles shutdown signals (SIGINT, SIGTERM) gracefully:
+
+- Stops accepting new connections immediately
+- Waits for in-flight queries to complete (default 30s timeout)
+- Logs active connection count during shutdown
+- Closes all database connections cleanly
+
+The shutdown timeout can be configured:
+
+```go
+cfg := server.Config{
+    ShutdownTimeout: 60 * time.Second,
+}
+```
+
 ## Rate Limiting
 
 Built-in rate limiting protects against brute-force authentication attacks:
@@ -219,6 +261,7 @@ GROUP BY name;
 - `DROP TABLE/INDEX/VIEW`
 - `ALTER TABLE`
 - `BEGIN/COMMIT/ROLLBACK` (DuckDB transaction support)
+- `COPY` - Bulk data loading and export (see below)
 
 ### PostgreSQL Compatibility
 - Extended query protocol (prepared statements)
