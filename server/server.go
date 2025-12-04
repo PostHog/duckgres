@@ -37,10 +37,11 @@ type Config struct {
 	ShutdownTimeout time.Duration
 }
 
-// DuckLakeConfig configures DuckLake metadata store and data path
+// DuckLakeConfig configures DuckLake catalog attachment
 type DuckLakeConfig struct {
-	MetadataStore string // e.g., "postgres:dbname=ducklake" or "sqlite:ducklake.db"
-	DataPath      string // e.g., "s3://my-bucket/data/" or "/local/path"
+	// MetadataStore is the connection string for the DuckLake metadata database
+	// Format: "postgres:host=<host> user=<user> password=<password> dbname=<db>"
+	MetadataStore string
 }
 
 type Server struct {
@@ -293,11 +294,9 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	}
 
 	// Build the ATTACH statement
-	// Format: ATTACH 'ducklake:metadata_store' (DATA_PATH 'data_path')
-	attachStmt := fmt.Sprintf("ATTACH 'ducklake:%s'", s.cfg.DuckLake.MetadataStore)
-	if s.cfg.DuckLake.DataPath != "" {
-		attachStmt += fmt.Sprintf(" (DATA_PATH '%s')", s.cfg.DuckLake.DataPath)
-	}
+	// Format: ATTACH 'ducklake:<connection_string>' AS ducklake
+	// Example: ATTACH 'ducklake:postgres:host=localhost user=ducklake password=secret dbname=ducklake' AS ducklake
+	attachStmt := fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", s.cfg.DuckLake.MetadataStore)
 
 	if _, err := db.Exec(attachStmt); err != nil {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)

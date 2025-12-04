@@ -71,8 +71,7 @@ extensions:
   - httpfs
 
 ducklake:
-  metadata_store: "postgres:dbname=ducklake"
-  data_path: "s3://my-bucket/ducklake-data/"
+  metadata_store: "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
 
 rate_limit:
   max_failed_attempts: 5
@@ -97,8 +96,7 @@ Run with config file:
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
-| `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata store | - |
-| `DUCKGRES_DUCKLAKE_DATA_PATH` | DuckLake data path | - |
+| `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 
 ### CLI Flags
 
@@ -133,15 +131,13 @@ DuckLake provides a SQL-based lakehouse format. When configured, the DuckLake ca
 
 ```yaml
 ducklake:
-  # Metadata store (required to enable DuckLake catalog)
-  metadata_store: "postgres:host=localhost dbname=ducklake"
-  # Data path for table files
-  data_path: "s3://my-bucket/ducklake-data/"
+  # Full connection string for the DuckLake metadata database
+  metadata_store: "postgres:host=ducklake.example.com user=ducklake password=secret dbname=ducklake"
 ```
 
 This runs the equivalent of:
 ```sql
-ATTACH 'ducklake:postgres:host=localhost dbname=ducklake' (DATA_PATH 's3://my-bucket/ducklake-data/')
+ATTACH 'ducklake:postgres:host=ducklake.example.com user=ducklake password=secret dbname=ducklake' AS ducklake;
 ```
 
 See [DuckLake documentation](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details.
