@@ -1,12 +1,15 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -29,6 +32,9 @@ type Config struct {
 
 	// DuckLake configuration
 	DuckLake DuckLakeConfig
+
+	// Graceful shutdown timeout (default: 30s)
+	ShutdownTimeout time.Duration
 }
 
 // DuckLakeConfig configures DuckLake metadata store and data path
@@ -47,6 +53,7 @@ type Server struct {
 	wg          sync.WaitGroup
 	closed      bool
 	closeMu     sync.Mutex
+	activeConns int64 // atomic counter for active connections
 }
 
 func New(cfg Config) (*Server, error) {
@@ -63,6 +70,11 @@ func New(cfg Config) (*Server, error) {
 	// Use default rate limit config if not specified
 	if cfg.RateLimit.MaxFailedAttempts == 0 {
 		cfg.RateLimit = DefaultRateLimitConfig()
+	}
+
+	// Use default shutdown timeout if not specified
+	if cfg.ShutdownTimeout == 0 {
+		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
 	s := &Server{
@@ -114,18 +126,85 @@ func (s *Server) Close() error {
 	s.closed = true
 	s.closeMu.Unlock()
 
+	// Stop accepting new connections
 	if s.listener != nil {
 		s.listener.Close()
 	}
 
-	s.wg.Wait()
+	// Check if there are active connections
+	activeConns := atomic.LoadInt64(&s.activeConns)
+	if activeConns > 0 {
+		log.Printf("Waiting for %d active connection(s) to finish...", activeConns)
+	}
 
+	// Wait for connections with timeout
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("All connections closed gracefully")
+	case <-time.After(s.cfg.ShutdownTimeout):
+		log.Printf("Shutdown timeout (%v) exceeded, force closing remaining connections", s.cfg.ShutdownTimeout)
+	}
+
+	// Close all database connections
 	s.dbsMu.Lock()
 	defer s.dbsMu.Unlock()
 	for _, db := range s.dbs {
 		db.Close()
 	}
+	log.Println("Shutdown complete")
 	return nil
+}
+
+// Shutdown performs a graceful shutdown with the given context
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.closeMu.Lock()
+	s.closed = true
+	s.closeMu.Unlock()
+
+	// Stop accepting new connections
+	if s.listener != nil {
+		s.listener.Close()
+	}
+
+	// Check if there are active connections
+	activeConns := atomic.LoadInt64(&s.activeConns)
+	if activeConns > 0 {
+		log.Printf("Waiting for %d active connection(s) to finish...", activeConns)
+	}
+
+	// Wait for connections with context
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("All connections closed gracefully")
+	case <-ctx.Done():
+		log.Printf("Shutdown context cancelled, force closing remaining connections")
+	}
+
+	// Close all database connections
+	s.dbsMu.Lock()
+	defer s.dbsMu.Unlock()
+	for _, db := range s.dbs {
+		db.Close()
+	}
+	log.Println("Shutdown complete")
+	return nil
+}
+
+// ActiveConnections returns the number of active connections
+func (s *Server) ActiveConnections() int64 {
+	return atomic.LoadInt64(&s.activeConns)
 }
 
 func (s *Server) getOrCreateDB(username string) (*sql.DB, error) {
@@ -230,6 +309,10 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
+
+	// Track active connections
+	atomic.AddInt64(&s.activeConns, 1)
+	defer atomic.AddInt64(&s.activeConns, -1)
 
 	// Check rate limiting before doing anything
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {

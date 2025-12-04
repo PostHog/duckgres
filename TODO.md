@@ -16,26 +16,26 @@
 
 ### Protocol Compatibility
 - [ ] **Binary Format Support**: Encode results in binary format for better performance with some clients
-- [ ] **COPY Protocol**: Support `COPY FROM`/`COPY TO` for bulk data loading
+- [x] **COPY Protocol**: Support `COPY FROM`/`COPY TO` for bulk data loading
 - [ ] **Cancel Request Handling**: Properly cancel long-running queries
 
 ### Compatibility
 - [x] **System Catalog Emulation**: Basic `pg_catalog` compatibility for psql
   - [x] `\dt` (list tables) - working
   - [x] `\l` (list databases) - working
-  - [ ] `\d <table>` (describe table) - needs more pg_class columns
+  - [x] `\d <table>` (describe table) - working
 - [ ] **Information Schema**: Emulate PostgreSQL's `information_schema`
 - [ ] **Session Variables**: Support `SET` commands (timezone, search_path, etc.)
 - [ ] **Type OID Mapping**: Proper PostgreSQL OID mapping for all DuckDB types
 
 ### Features
-- [ ] **Extensions**: Load DuckDB extensions on startup
+- [x] **Extensions**: Load DuckDB extensions on startup
 
 ### Operations
 - [ ] **Hot Reload**: Reload config without restart
 - [ ] **Admin Commands**: `\duckgres status`, `\duckgres users`, etc.
 - [ ] **Docker Image**: Official container image
-- [ ] **Graceful Shutdown**: Finish in-flight queries before shutdown
+- [x] **Graceful Shutdown**: Finish in-flight queries before shutdown
 
 ## Medium Priority
 
@@ -73,7 +73,7 @@
 ## Known Issues
 
 - [ ] Some PostgreSQL drivers may fail with unsupported OIDs
-- [ ] `\d` commands in psql don't work (need system catalog)
+- [x] `\d` commands in psql don't work (need system catalog) - fixed
 - [ ] Transaction isolation may differ from PostgreSQL behavior
 - [ ] Large result sets may cause memory issues (no streaming)
 
