@@ -26,6 +26,15 @@ type Config struct {
 
 	// Extensions to load on database initialization
 	Extensions []string
+
+	// DuckLake configuration
+	DuckLake DuckLakeConfig
+}
+
+// DuckLakeConfig configures DuckLake metadata store and data path
+type DuckLakeConfig struct {
+	MetadataStore string // e.g., "postgres:dbname=ducklake" or "sqlite:ducklake.db"
+	DataPath      string // e.g., "s3://my-bucket/data/" or "/local/path"
 }
 
 type Server struct {
@@ -153,6 +162,12 @@ func (s *Server) getOrCreateDB(username string) (*sql.DB, error) {
 		// Continue anyway - database will still work without the extensions
 	}
 
+	// Attach DuckLake catalog if configured
+	if err := s.attachDuckLake(db); err != nil {
+		log.Printf("Warning: failed to attach DuckLake for user %q: %v", username, err)
+		// Continue anyway - database will still work without DuckLake
+	}
+
 	// Initialize pg_catalog schema for PostgreSQL compatibility
 	if err := initPgCatalog(db); err != nil {
 		log.Printf("Warning: failed to initialize pg_catalog for user %q: %v", username, err)
@@ -190,6 +205,27 @@ func (s *Server) loadExtensions(db *sql.DB) error {
 	}
 
 	return lastErr
+}
+
+// attachDuckLake attaches a DuckLake catalog if configured
+func (s *Server) attachDuckLake(db *sql.DB) error {
+	if s.cfg.DuckLake.MetadataStore == "" {
+		return nil // DuckLake not configured
+	}
+
+	// Build the ATTACH statement
+	// Format: ATTACH 'ducklake:metadata_store' (DATA_PATH 'data_path')
+	attachStmt := fmt.Sprintf("ATTACH 'ducklake:%s'", s.cfg.DuckLake.MetadataStore)
+	if s.cfg.DuckLake.DataPath != "" {
+		attachStmt += fmt.Sprintf(" (DATA_PATH '%s')", s.cfg.DuckLake.DataPath)
+	}
+
+	if _, err := db.Exec(attachStmt); err != nil {
+		return fmt.Errorf("failed to attach DuckLake: %w", err)
+	}
+
+	log.Printf("Attached DuckLake catalog: %s", s.cfg.DuckLake.MetadataStore)
+	return nil
 }
 
 func (s *Server) handleConnection(conn net.Conn) {

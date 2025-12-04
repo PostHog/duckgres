@@ -28,6 +28,23 @@ extensions:
   # - httpfs
   # - parquet
 
+# DuckLake configuration (optional)
+# When configured, DuckLake catalog is automatically attached on connection
+# See: https://ducklake.select/docs/stable/duckdb/usage/connecting
+ducklake:
+  # Metadata store connection string (required to enable DuckLake)
+  # Examples:
+  #   - "postgres:dbname=ducklake"
+  #   - "postgres:host=localhost dbname=ducklake user=postgres password=secret"
+  #   - "sqlite:ducklake.db"
+  # metadata_store: "postgres:dbname=ducklake"
+
+  # Data path for table data files (optional)
+  # Examples:
+  #   - "s3://my-bucket/ducklake-data/"
+  #   - "/local/path/to/data/"
+  # data_path: "s3://my-bucket/ducklake-data/"
+
 # Rate limiting configuration (optional - these are the defaults)
 rate_limit:
   # Max failed auth attempts before banning an IP
