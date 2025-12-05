@@ -40,6 +40,22 @@ type RateLimitFileConfig struct {
 
 type DuckLakeFileConfig struct {
 	MetadataStore string `yaml:"metadata_store"` // e.g., "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
+	ObjectStore   string `yaml:"object_store"`   // e.g., "s3://bucket/path/" for S3/MinIO storage
+
+	// S3 credential provider: "config" (explicit) or "credential_chain" (AWS SDK)
+	S3Provider string `yaml:"s3_provider"`
+
+	// Config provider settings (explicit credentials)
+	S3Endpoint  string `yaml:"s3_endpoint"`   // e.g., "localhost:9000" for MinIO
+	S3AccessKey string `yaml:"s3_access_key"` // S3 access key ID
+	S3SecretKey string `yaml:"s3_secret_key"` // S3 secret access key
+	S3Region    string `yaml:"s3_region"`     // S3 region (default: us-east-1)
+	S3UseSSL    bool   `yaml:"s3_use_ssl"`    // Use HTTPS for S3 connections
+	S3URLStyle  string `yaml:"s3_url_style"`  // "path" or "vhost" (default: path)
+
+	// Credential chain provider settings (AWS SDK credential chain)
+	S3Chain   string `yaml:"s3_chain"`   // e.g., "env;config" - which credential sources to check
+	S3Profile string `yaml:"s3_profile"` // AWS profile name for config chain
 }
 
 // loadConfigFile loads configuration from a YAML file
@@ -177,6 +193,34 @@ func main() {
 		if fileCfg.DuckLake.MetadataStore != "" {
 			cfg.DuckLake.MetadataStore = fileCfg.DuckLake.MetadataStore
 		}
+		if fileCfg.DuckLake.ObjectStore != "" {
+			cfg.DuckLake.ObjectStore = fileCfg.DuckLake.ObjectStore
+		}
+		if fileCfg.DuckLake.S3Provider != "" {
+			cfg.DuckLake.S3Provider = fileCfg.DuckLake.S3Provider
+		}
+		if fileCfg.DuckLake.S3Endpoint != "" {
+			cfg.DuckLake.S3Endpoint = fileCfg.DuckLake.S3Endpoint
+		}
+		if fileCfg.DuckLake.S3AccessKey != "" {
+			cfg.DuckLake.S3AccessKey = fileCfg.DuckLake.S3AccessKey
+		}
+		if fileCfg.DuckLake.S3SecretKey != "" {
+			cfg.DuckLake.S3SecretKey = fileCfg.DuckLake.S3SecretKey
+		}
+		if fileCfg.DuckLake.S3Region != "" {
+			cfg.DuckLake.S3Region = fileCfg.DuckLake.S3Region
+		}
+		cfg.DuckLake.S3UseSSL = fileCfg.DuckLake.S3UseSSL
+		if fileCfg.DuckLake.S3URLStyle != "" {
+			cfg.DuckLake.S3URLStyle = fileCfg.DuckLake.S3URLStyle
+		}
+		if fileCfg.DuckLake.S3Chain != "" {
+			cfg.DuckLake.S3Chain = fileCfg.DuckLake.S3Chain
+		}
+		if fileCfg.DuckLake.S3Profile != "" {
+			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
+		}
 	}
 
 	// Apply environment variables (override config file)
@@ -199,6 +243,36 @@ func main() {
 	}
 	if v := os.Getenv("DUCKGRES_DUCKLAKE_METADATA_STORE"); v != "" {
 		cfg.DuckLake.MetadataStore = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_OBJECT_STORE"); v != "" {
+		cfg.DuckLake.ObjectStore = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROVIDER"); v != "" {
+		cfg.DuckLake.S3Provider = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_ENDPOINT"); v != "" {
+		cfg.DuckLake.S3Endpoint = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_ACCESS_KEY"); v != "" {
+		cfg.DuckLake.S3AccessKey = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_SECRET_KEY"); v != "" {
+		cfg.DuckLake.S3SecretKey = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_REGION"); v != "" {
+		cfg.DuckLake.S3Region = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_USE_SSL"); v == "true" || v == "1" {
+		cfg.DuckLake.S3UseSSL = true
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_URL_STYLE"); v != "" {
+		cfg.DuckLake.S3URLStyle = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_CHAIN"); v != "" {
+		cfg.DuckLake.S3Chain = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
+		cfg.DuckLake.S3Profile = v
 	}
 
 	// Apply CLI flags (highest priority)

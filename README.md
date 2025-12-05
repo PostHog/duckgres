@@ -142,6 +142,136 @@ ATTACH 'ducklake:postgres:host=ducklake.example.com user=ducklake password=secre
 
 See [DuckLake documentation](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details.
 
+### Quick Start with Docker
+
+The easiest way to get started with DuckLake is using the included Docker Compose setup:
+
+```bash
+# Start PostgreSQL (metadata) and MinIO (object storage)
+docker compose up -d
+
+# Wait for services to be ready
+docker compose logs -f  # Look for "Bucket ducklake created successfully"
+
+# Start Duckgres with DuckLake configured
+./duckgres --config duckgres.yaml
+
+# Connect and start using DuckLake
+PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"
+```
+
+The `docker-compose.yaml` creates:
+
+**PostgreSQL** (metadata catalog):
+- Host: `localhost`
+- Port: `5433` (mapped to avoid conflicts)
+- Database: `ducklake`
+- User/Password: `ducklake` / `ducklake`
+
+**MinIO** (S3-compatible object storage):
+- S3 API: `localhost:9000`
+- Web Console: `http://localhost:9001`
+- Access Key: `minioadmin`
+- Secret Key: `minioadmin`
+- Bucket: `ducklake` (auto-created on startup)
+
+The included `duckgres.yaml` is pre-configured to use both services.
+
+### Object Storage Configuration
+
+DuckLake can store data files in S3-compatible object storage (AWS S3, MinIO, etc.). Two credential providers are supported:
+
+#### Option 1: Explicit Credentials (MinIO / Access Keys)
+
+```yaml
+ducklake:
+  metadata_store: "postgres:host=localhost port=5433 user=ducklake password=ducklake dbname=ducklake"
+  object_store: "s3://ducklake/data/"
+  s3_provider: "config"            # Explicit credentials (default if s3_access_key is set)
+  s3_endpoint: "localhost:9000"    # MinIO or custom S3 endpoint
+  s3_access_key: "minioadmin"
+  s3_secret_key: "minioadmin"
+  s3_region: "us-east-1"
+  s3_use_ssl: false
+  s3_url_style: "path"             # "path" for MinIO, "vhost" for AWS S3
+```
+
+#### Option 2: AWS Credential Chain (IAM Roles / Environment)
+
+For AWS S3 with IAM roles, environment variables, or config files:
+
+```yaml
+ducklake:
+  metadata_store: "postgres:host=localhost user=ducklake password=ducklake dbname=ducklake"
+  object_store: "s3://my-bucket/ducklake/"
+  s3_provider: "credential_chain"  # AWS SDK credential chain
+  s3_chain: "env;config"           # Which sources to check (optional)
+  s3_profile: "my-profile"         # AWS profile name (optional)
+  s3_region: "us-west-2"           # Override auto-detected region (optional)
+```
+
+The credential chain checks these sources in order:
+- `env` - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+- `config` - AWS config files (`~/.aws/credentials`, `~/.aws/config`)
+- `sts` - AWS STS assume role
+- `sso` - AWS Single Sign-On
+- `instance` - EC2 instance metadata (IAM roles)
+- `process` - External process credentials
+
+See [DuckDB S3 API docs](https://duckdb.org/docs/stable/core_extensions/httpfs/s3api#credential_chain-provider) for details.
+
+#### Environment Variables
+
+All S3 settings can be configured via environment variables:
+- `DUCKGRES_DUCKLAKE_OBJECT_STORE` - S3 path (e.g., `s3://bucket/path/`)
+- `DUCKGRES_DUCKLAKE_S3_PROVIDER` - `config` or `credential_chain`
+- `DUCKGRES_DUCKLAKE_S3_ENDPOINT` - S3 endpoint (for MinIO)
+- `DUCKGRES_DUCKLAKE_S3_ACCESS_KEY` - Access key ID
+- `DUCKGRES_DUCKLAKE_S3_SECRET_KEY` - Secret access key
+- `DUCKGRES_DUCKLAKE_S3_REGION` - AWS region
+- `DUCKGRES_DUCKLAKE_S3_USE_SSL` - Use HTTPS (true/false)
+- `DUCKGRES_DUCKLAKE_S3_URL_STYLE` - `path` or `vhost`
+- `DUCKGRES_DUCKLAKE_S3_CHAIN` - Credential chain sources
+- `DUCKGRES_DUCKLAKE_S3_PROFILE` - AWS profile name
+
+### Seeding Sample Data
+
+A seed script is provided to populate DuckLake with sample e-commerce and analytics data:
+
+```bash
+# Seed with default connection (localhost:5432, postgres/postgres)
+./scripts/seed_ducklake.sh
+
+# Seed with custom connection
+./scripts/seed_ducklake.sh --host 127.0.0.1 --port 5432 --user postgres --password postgres
+
+# Clean existing tables and reseed
+./scripts/seed_ducklake.sh --clean
+```
+
+The script creates the following tables:
+- `categories` - Product categories (5 rows)
+- `products` - E-commerce products (15 rows)
+- `customers` - Customer records (10 rows)
+- `orders` - Order headers (12 rows)
+- `order_items` - Order line items (20 rows)
+- `events` - Analytics events with JSON properties (15 rows)
+- `page_views` - Web analytics data (15 rows)
+
+Example queries after seeding:
+
+```sql
+-- Top products by price
+SELECT name, price FROM products ORDER BY price DESC LIMIT 5;
+
+-- Orders with customer info
+SELECT o.id, c.first_name, c.last_name, o.total_amount, o.status
+FROM orders o JOIN customers c ON o.customer_id = c.id;
+
+-- Event funnel analysis
+SELECT event_name, COUNT(*) FROM events GROUP BY event_name ORDER BY COUNT(*) DESC;
+```
+
 ## COPY Protocol
 
 Duckgres supports PostgreSQL's COPY protocol for efficient bulk data import and export:

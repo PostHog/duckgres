@@ -1,0 +1,30 @@
+# Duckgres Configuration with DuckLake PostgreSQL metadata store and MinIO object storage
+
+host: "0.0.0.0"
+port: 5432
+
+data_dir: "./data"
+
+tls:
+  cert: "./certs/server.crt"
+  key: "./certs/server.key"
+
+users:
+  postgres: "postgres"
+
+extensions:
+  - ducklake
+  - httpfs  # Required for S3/MinIO access
+
+# DuckLake configuration (via docker-compose)
+ducklake:
+  # PostgreSQL for metadata catalog
+  metadata_store: "postgres:host=localhost port=5433 user=ducklake password=ducklake dbname=ducklake"
+  # MinIO for data file storage (S3-compatible)
+  object_store: "s3://ducklake/data/"
+  # MinIO S3 credentials
+  s3_endpoint: "localhost:9000"
+  s3_access_key: "minioadmin"
+  s3_secret_key: "minioadmin"
+  s3_region: "us-east-1"
+  s3_use_ssl: false

@@ -38,6 +38,30 @@ ducklake:
   #   - "postgres:host=ducklake.example.com user=ducklake password=secret dbname=ducklake"
   # metadata_store: "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
 
+  # S3-compatible object storage for data files (optional)
+  # If not specified, data is stored alongside the metadata
+  # object_store: "s3://bucket/path/"
+
+  # S3 credential provider: "config" (explicit) or "credential_chain" (AWS SDK)
+  # Default: "config" if s3_access_key is set, otherwise "credential_chain"
+  # s3_provider: "config"
+
+  # Option 1: Explicit credentials (for MinIO or when you have access keys)
+  # s3_endpoint: "localhost:9000"      # MinIO or custom S3 endpoint
+  # s3_access_key: "minioadmin"        # Access key ID
+  # s3_secret_key: "minioadmin"        # Secret access key
+  # s3_region: "us-east-1"             # AWS region (default: us-east-1)
+  # s3_use_ssl: false                  # Use HTTPS for S3 connections
+  # s3_url_style: "path"               # "path" or "vhost" (default: path)
+
+  # Option 2: AWS credential chain (for AWS S3 with IAM roles, env vars, etc.)
+  # Uses AWS SDK credential chain: env vars -> config files -> instance metadata
+  # See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api#credential_chain-provider
+  # s3_provider: "credential_chain"
+  # s3_chain: "env;config"             # Which sources to check (env, config, sts, sso, instance, process)
+  # s3_profile: "my-profile"           # AWS profile name (for config chain)
+  # s3_region: "us-west-2"             # Override auto-detected region
+
 # Rate limiting configuration (optional - these are the defaults)
 rate_limit:
   # Max failed auth attempts before banning an IP

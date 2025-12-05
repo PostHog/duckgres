@@ -42,6 +42,30 @@ type DuckLakeConfig struct {
 	// MetadataStore is the connection string for the DuckLake metadata database
 	// Format: "postgres:host=<host> user=<user> password=<password> dbname=<db>"
 	MetadataStore string
+
+	// ObjectStore is the S3-compatible storage path for DuckLake data files
+	// Format: "s3://bucket/path/" for S3/MinIO
+	// If not specified, data is stored alongside the metadata
+	ObjectStore string
+
+	// S3 credential provider: "config" (explicit credentials) or "credential_chain" (AWS SDK chain)
+	// Default: "config" if S3AccessKey is set, otherwise "credential_chain"
+	S3Provider string
+
+	// S3 configuration for "config" provider (explicit credentials for MinIO or S3)
+	S3Endpoint  string // e.g., "localhost:9000" for MinIO
+	S3AccessKey string // S3 access key ID
+	S3SecretKey string // S3 secret access key
+	S3Region    string // S3 region (default: us-east-1)
+	S3UseSSL    bool   // Use HTTPS for S3 connections (default: false for MinIO)
+	S3URLStyle  string // "path" or "vhost" (default: "path" for MinIO compatibility)
+
+	// S3 configuration for "credential_chain" provider (AWS SDK credential chain)
+	// Chain specifies which credential sources to check, semicolon-separated
+	// Options: env, config, sts, sso, instance, process
+	// Default: checks all sources in AWS SDK order
+	S3Chain   string // e.g., "env;config" to check env vars then config files
+	S3Profile string // AWS profile name to use (for "config" chain)
 }
 
 type Server struct {
@@ -293,17 +317,169 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return nil // DuckLake not configured
 	}
 
+	// Create S3 secret if using object store
+	// - With explicit credentials (S3AccessKey set) or custom endpoint
+	// - With credential_chain provider (for AWS S3)
+	if s.cfg.DuckLake.ObjectStore != "" {
+		needsSecret := s.cfg.DuckLake.S3Endpoint != "" ||
+			s.cfg.DuckLake.S3AccessKey != "" ||
+			s.cfg.DuckLake.S3Provider == "credential_chain" ||
+			s.cfg.DuckLake.S3Chain != "" ||
+			s.cfg.DuckLake.S3Profile != ""
+
+		if needsSecret {
+			if err := s.createS3Secret(db); err != nil {
+				return fmt.Errorf("failed to create S3 secret: %w", err)
+			}
+		}
+	}
+
 	// Build the ATTACH statement
-	// Format: ATTACH 'ducklake:<connection_string>' AS ducklake
-	// Example: ATTACH 'ducklake:postgres:host=localhost user=ducklake password=secret dbname=ducklake' AS ducklake
-	attachStmt := fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", s.cfg.DuckLake.MetadataStore)
+	// Format without object store: ATTACH 'ducklake:<metadata_connection>' AS ducklake
+	// Format with object store: ATTACH 'ducklake:<metadata_connection>' AS ducklake (DATA_PATH '<s3_path>')
+	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
+	var attachStmt string
+	if s.cfg.DuckLake.ObjectStore != "" {
+		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
+			s.cfg.DuckLake.MetadataStore, s.cfg.DuckLake.ObjectStore)
+		log.Printf("Attaching DuckLake catalog with object store: metadata=%s, data=%s",
+			s.cfg.DuckLake.MetadataStore, s.cfg.DuckLake.ObjectStore)
+	} else {
+		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", s.cfg.DuckLake.MetadataStore)
+		log.Printf("Attaching DuckLake catalog: %s", s.cfg.DuckLake.MetadataStore)
+	}
 
 	if _, err := db.Exec(attachStmt); err != nil {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
 
-	log.Printf("Attached DuckLake catalog: %s", s.cfg.DuckLake.MetadataStore)
+	log.Printf("Attached DuckLake catalog successfully")
 	return nil
+}
+
+// createS3Secret creates a DuckDB secret for S3/MinIO access
+// Supports two providers:
+//   - "config": explicit credentials (for MinIO or when you have access keys)
+//   - "credential_chain": AWS SDK credential chain (env vars, config files, instance metadata, etc.)
+//
+// See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
+func (s *Server) createS3Secret(db *sql.DB) error {
+	// Determine provider: use credential_chain if explicitly set or if no access key provided
+	provider := s.cfg.DuckLake.S3Provider
+	if provider == "" {
+		if s.cfg.DuckLake.S3AccessKey != "" {
+			provider = "config"
+		} else {
+			provider = "credential_chain"
+		}
+	}
+
+	var secretStmt string
+
+	if provider == "credential_chain" {
+		// Use AWS SDK credential chain
+		secretStmt = s.buildCredentialChainSecret()
+		log.Printf("Creating S3 secret with credential_chain provider")
+	} else {
+		// Use explicit credentials (config provider)
+		secretStmt = s.buildConfigSecret()
+		log.Printf("Creating S3 secret with config provider for endpoint: %s", s.cfg.DuckLake.S3Endpoint)
+	}
+
+	if _, err := db.Exec(secretStmt); err != nil {
+		return err
+	}
+
+	log.Printf("Created S3 secret successfully")
+	return nil
+}
+
+// buildConfigSecret builds a CREATE SECRET statement with explicit credentials
+func (s *Server) buildConfigSecret() string {
+	region := s.cfg.DuckLake.S3Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	urlStyle := s.cfg.DuckLake.S3URLStyle
+	if urlStyle == "" {
+		urlStyle = "path" // Default to path style for MinIO compatibility
+	}
+
+	useSSL := "false"
+	if s.cfg.DuckLake.S3UseSSL {
+		useSSL = "true"
+	}
+
+	// Build base secret with explicit credentials
+	secret := fmt.Sprintf(`
+		CREATE OR REPLACE SECRET ducklake_s3 (
+			TYPE s3,
+			PROVIDER config,
+			KEY_ID '%s',
+			SECRET '%s',
+			REGION '%s',
+			URL_STYLE '%s',
+			USE_SSL %s`,
+		s.cfg.DuckLake.S3AccessKey,
+		s.cfg.DuckLake.S3SecretKey,
+		region,
+		urlStyle,
+		useSSL,
+	)
+
+	// Add endpoint if specified (for MinIO or custom S3-compatible storage)
+	if s.cfg.DuckLake.S3Endpoint != "" {
+		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", s.cfg.DuckLake.S3Endpoint)
+	}
+
+	secret += "\n\t\t)"
+	return secret
+}
+
+// buildCredentialChainSecret builds a CREATE SECRET statement using AWS SDK credential chain
+func (s *Server) buildCredentialChainSecret() string {
+	// Start with base credential_chain secret
+	secret := `
+		CREATE OR REPLACE SECRET ducklake_s3 (
+			TYPE s3,
+			PROVIDER credential_chain`
+
+	// Add chain if specified (e.g., "env;config" to check specific sources)
+	if s.cfg.DuckLake.S3Chain != "" {
+		secret += fmt.Sprintf(",\n\t\t\tCHAIN '%s'", s.cfg.DuckLake.S3Chain)
+	}
+
+	// Add profile if specified (for config chain)
+	if s.cfg.DuckLake.S3Profile != "" {
+		secret += fmt.Sprintf(",\n\t\t\tPROFILE '%s'", s.cfg.DuckLake.S3Profile)
+	}
+
+	// Add region override if specified
+	if s.cfg.DuckLake.S3Region != "" {
+		secret += fmt.Sprintf(",\n\t\t\tREGION '%s'", s.cfg.DuckLake.S3Region)
+	}
+
+	// Add endpoint if specified (for custom S3-compatible storage)
+	if s.cfg.DuckLake.S3Endpoint != "" {
+		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", s.cfg.DuckLake.S3Endpoint)
+
+		// Also set URL style and SSL for custom endpoints
+		urlStyle := s.cfg.DuckLake.S3URLStyle
+		if urlStyle == "" {
+			urlStyle = "path"
+		}
+		secret += fmt.Sprintf(",\n\t\t\tURL_STYLE '%s'", urlStyle)
+
+		useSSL := "false"
+		if s.cfg.DuckLake.S3UseSSL {
+			useSSL = "true"
+		}
+		secret += fmt.Sprintf(",\n\t\t\tUSE_SSL %s", useSSL)
+	}
+
+	secret += "\n\t\t)"
+	return secret
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
