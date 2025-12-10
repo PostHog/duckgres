@@ -22,7 +22,6 @@ certs/
 Thumbs.db
 
 # Go
-go.sum
 
 # Test artifacts
 *.test
