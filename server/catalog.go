@@ -353,6 +353,12 @@ var (
 	regnamespaceCastRegex = regexp.MustCompile(`(?i)::pg_catalog\.regnamespace`)
 	// ::pg_catalog.text -> ::VARCHAR
 	textCastRegex = regexp.MustCompile(`(?i)::pg_catalog\.text`)
+	// SET application_name = 'value' -> SET VARIABLE application_name = 'value'
+	setApplicationNameRegex = regexp.MustCompile(`(?i)^SET\s+application_name\s*=`)
+	// SET application_name TO 'value' -> SET VARIABLE application_name = 'value'
+	setApplicationNameToRegex = regexp.MustCompile(`(?i)^SET\s+application_name\s+TO\s+`)
+	// SHOW application_name -> SELECT getvariable('application_name') AS application_name
+	showApplicationNameRegex = regexp.MustCompile(`(?i)^SHOW\s+application_name\s*;?\s*$`)
 )
 
 // rewritePgCatalogQuery rewrites PostgreSQL-specific syntax for DuckDB compatibility
@@ -406,6 +412,11 @@ func rewritePgCatalogQuery(query string) string {
 	query = regnamespaceTextCastRegex.ReplaceAllString(query, "::VARCHAR")
 	query = regnamespaceCastRegex.ReplaceAllString(query, "::VARCHAR")
 	query = textCastRegex.ReplaceAllString(query, "::VARCHAR")
+
+	// Replace PostgreSQL application_name with DuckDB variable
+	query = setApplicationNameRegex.ReplaceAllString(query, "SET VARIABLE application_name =")
+	query = setApplicationNameToRegex.ReplaceAllString(query, "SET VARIABLE application_name =")
+	query = showApplicationNameRegex.ReplaceAllString(query, "SELECT getvariable('application_name') AS application_name")
 
 	return query
 }
