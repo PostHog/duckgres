@@ -61,6 +61,13 @@ jobs:
         id: sha
         run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum duckgres-linux-amd64/duckgres-linux-amd64 duckgres-linux-arm64/duckgres-linux-arm64 | \
+            sed 's|duckgres-linux-\([^/]*\)/||g' > checksums.txt
+          cat checksums.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -71,6 +78,7 @@ jobs:
           files: |
             artifacts/duckgres-linux-amd64/duckgres-linux-amd64
             artifacts/duckgres-linux-arm64/duckgres-linux-arm64
+            artifacts/checksums.txt
 
       - name: Delete existing latest release
         run: gh release delete latest --yes || true
@@ -94,7 +102,9 @@ jobs:
             ```
             https://github.com/PostHog/duckgres/releases/latest/download/duckgres-linux-amd64
             https://github.com/PostHog/duckgres/releases/latest/download/duckgres-linux-arm64
+            https://github.com/PostHog/duckgres/releases/latest/download/checksums.txt
             ```
           files: |
             artifacts/duckgres-linux-amd64/duckgres-linux-amd64
             artifacts/duckgres-linux-arm64/duckgres-linux-arm64
+            artifacts/checksums.txt
