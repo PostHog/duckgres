@@ -19,12 +19,6 @@ jobs:
           - os: ubuntu-latest
             goos: linux
             goarch: arm64
-          - os: macos-latest
-            goos: darwin
-            goarch: amd64
-          - os: macos-latest
-            goos: darwin
-            goarch: arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -77,5 +71,3 @@ jobs:
           files: |
             artifacts/duckgres-linux-amd64/duckgres-linux-amd64
             artifacts/duckgres-linux-arm64/duckgres-linux-arm64
-            artifacts/duckgres-darwin-amd64/duckgres-darwin-amd64
-            artifacts/duckgres-darwin-arm64/duckgres-darwin-arm64
