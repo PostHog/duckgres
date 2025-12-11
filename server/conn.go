@@ -54,13 +54,22 @@ func (c *clientConn) serve() error {
 		return fmt.Errorf("startup failed: %w", err)
 	}
 
-	// Get/create DuckDB connection for this user
-	db, err := c.server.getOrCreateDB(c.username)
+	// Create a new DuckDB connection for this client session.
+	// Each client gets its own connection to ensure proper isolation of
+	// temporary tables and session state, matching PostgreSQL's behavior.
+	db, err := c.server.createDBConnection(c.username)
 	if err != nil {
 		c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
 		return err
 	}
 	c.db = db
+	// Ensure the database connection is closed when this client disconnects
+	defer func() {
+		if c.db != nil {
+			c.db.Close()
+			log.Printf("Closed DuckDB connection for user %q", c.username)
+		}
+	}()
 
 	// Send initial parameters
 	c.sendInitialParams()

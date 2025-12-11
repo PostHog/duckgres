@@ -73,8 +73,6 @@ type Server struct {
 	listener    net.Listener
 	tlsConfig   *tls.Config
 	rateLimiter *RateLimiter
-	dbs         map[string]*sql.DB // username -> db connection
-	dbsMu       sync.RWMutex
 	wg          sync.WaitGroup
 	closed      bool
 	closeMu     sync.Mutex
@@ -104,7 +102,6 @@ func New(cfg Config) (*Server, error) {
 
 	s := &Server{
 		cfg:         cfg,
-		dbs:         make(map[string]*sql.DB),
 		rateLimiter: NewRateLimiter(cfg.RateLimit),
 		tlsConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
@@ -176,12 +173,7 @@ func (s *Server) Close() error {
 		log.Printf("Shutdown timeout (%v) exceeded, force closing remaining connections", s.cfg.ShutdownTimeout)
 	}
 
-	// Close all database connections
-	s.dbsMu.Lock()
-	defer s.dbsMu.Unlock()
-	for _, db := range s.dbs {
-		db.Close()
-	}
+	// Database connections are now closed by each clientConn when it terminates
 	log.Println("Shutdown complete")
 	return nil
 }
@@ -217,12 +209,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		log.Printf("Shutdown context cancelled, force closing remaining connections")
 	}
 
-	// Close all database connections
-	s.dbsMu.Lock()
-	defer s.dbsMu.Unlock()
-	for _, db := range s.dbs {
-		db.Close()
-	}
+	// Database connections are now closed by each clientConn when it terminates
 	log.Println("Shutdown complete")
 	return nil
 }
@@ -232,22 +219,10 @@ func (s *Server) ActiveConnections() int64 {
 	return atomic.LoadInt64(&s.activeConns)
 }
 
-func (s *Server) getOrCreateDB(username string) (*sql.DB, error) {
-	s.dbsMu.RLock()
-	db, ok := s.dbs[username]
-	s.dbsMu.RUnlock()
-	if ok {
-		return db, nil
-	}
-
-	s.dbsMu.Lock()
-	defer s.dbsMu.Unlock()
-
-	// Double-check after acquiring write lock
-	if db, ok := s.dbs[username]; ok {
-		return db, nil
-	}
-
+// createDBConnection creates a new DuckDB connection for a client session.
+// Each client connection gets its own DB connection to ensure proper isolation
+// of temporary tables and session state, matching PostgreSQL's behavior.
+func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	dbPath := fmt.Sprintf("%s/%s.db", s.cfg.DataDir, username)
 	db, err := sql.Open("duckdb", dbPath)
 	if err != nil {
@@ -278,8 +253,7 @@ func (s *Server) getOrCreateDB(username string) (*sql.DB, error) {
 		// Continue anyway - basic queries will still work
 	}
 
-	s.dbs[username] = db
-	log.Printf("Opened DuckDB database for user %q at %s", username, dbPath)
+	log.Printf("Opened DuckDB connection for user %q at %s", username, dbPath)
 	return db, nil
 }
 
