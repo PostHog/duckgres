@@ -359,7 +359,38 @@ func (c *clientConn) handleQuery(body []byte) error {
 	return nil
 }
 
+// stripLeadingComments removes leading SQL comments from a query.
+// Handles both block comments /* ... */ and line comments -- ...
+func stripLeadingComments(query string) string {
+	for {
+		query = strings.TrimSpace(query)
+		if strings.HasPrefix(query, "/*") {
+			// Block comment - find the closing */
+			end := strings.Index(query, "*/")
+			if end == -1 {
+				// Unclosed comment, return as-is
+				return query
+			}
+			query = query[end+2:]
+		} else if strings.HasPrefix(query, "--") {
+			// Line comment - find the newline
+			end := strings.Index(query, "\n")
+			if end == -1 {
+				// Comment to end of string
+				return ""
+			}
+			query = query[end+1:]
+		} else {
+			// No more leading comments
+			return query
+		}
+	}
+}
+
 func (c *clientConn) getCommandType(upperQuery string) string {
+	// Strip leading comments before determining command type
+	upperQuery = stripLeadingComments(upperQuery)
+
 	switch {
 	case strings.HasPrefix(upperQuery, "SELECT"):
 		return "SELECT"
@@ -375,6 +406,8 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 		return "CREATE INDEX"
 	case strings.HasPrefix(upperQuery, "CREATE VIEW"):
 		return "CREATE VIEW"
+	case strings.HasPrefix(upperQuery, "CREATE SCHEMA"):
+		return "CREATE SCHEMA"
 	case strings.HasPrefix(upperQuery, "CREATE"):
 		return "CREATE"
 	case strings.HasPrefix(upperQuery, "DROP TABLE"):
@@ -383,6 +416,8 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 		return "DROP INDEX"
 	case strings.HasPrefix(upperQuery, "DROP VIEW"):
 		return "DROP VIEW"
+	case strings.HasPrefix(upperQuery, "DROP SCHEMA"):
+		return "DROP SCHEMA"
 	case strings.HasPrefix(upperQuery, "DROP"):
 		return "DROP"
 	case strings.HasPrefix(upperQuery, "ALTER"):
