@@ -1185,7 +1185,14 @@ func (c *clientConn) handleExecute(body []byte) {
 		typeOIDs[i] = getTypeInfo(ct).OID
 	}
 
-	// Don't send RowDescription here - it should come from Describe
+	// Send RowDescription if Describe wasn't called before Execute.
+	// Some clients skip Describe and go straight to Execute, but still
+	// need the column metadata before receiving data rows.
+	if !p.described {
+		if err := c.sendRowDescription(cols, colTypes); err != nil {
+			return
+		}
+	}
 
 	// Send rows with the format codes from Bind
 	rowCount := 0
