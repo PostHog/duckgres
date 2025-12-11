@@ -327,7 +327,13 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
 
-	log.Printf("Attached DuckLake catalog successfully")
+	// Set DuckLake as the default catalog so all queries use it
+	// See: https://duckdb.org/docs/stable/core_extensions/ducklake#usage
+	if _, err := db.Exec("USE ducklake"); err != nil {
+		return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
+	}
+
+	log.Printf("Attached DuckLake catalog successfully and set as default")
 	return nil
 }
 
