@@ -1188,7 +1188,9 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Send RowDescription if Describe wasn't called before Execute.
 	// Some clients skip Describe and go straight to Execute, but still
 	// need the column metadata before receiving data rows.
-	if !p.described {
+	// Skip if there are no columns - queries that return 0 columns (like
+	// DDL accidentally routed here) don't need RowDescription.
+	if !p.described && len(cols) > 0 {
 		if err := c.sendRowDescription(cols, colTypes); err != nil {
 			return
 		}
