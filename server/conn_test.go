@@ -272,3 +272,63 @@ func TestRedactConnectionString(t *testing.T) {
 		})
 	}
 }
+
+func TestTransactionStatusTracking(t *testing.T) {
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// Initially should be idle
+	if c.txStatus != txStatusIdle {
+		t.Errorf("initial txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+
+	// BEGIN should set to transaction
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+
+	// SELECT should not change status
+	c.updateTxStatus("SELECT")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after SELECT txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+
+	// COMMIT should set back to idle
+	c.updateTxStatus("COMMIT")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after COMMIT txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+
+	// Test ROLLBACK path
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after second BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+	c.updateTxStatus("ROLLBACK")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after ROLLBACK txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+}
+
+func TestTransactionErrorStatus(t *testing.T) {
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// Error outside transaction should not change status
+	c.setTxError()
+	if c.txStatus != txStatusIdle {
+		t.Errorf("error outside transaction txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+
+	// Error inside transaction should set to error
+	c.updateTxStatus("BEGIN")
+	c.setTxError()
+	if c.txStatus != txStatusError {
+		t.Errorf("error inside transaction txStatus = %c, want %c", c.txStatus, txStatusError)
+	}
+
+	// ROLLBACK should recover from error state
+	c.updateTxStatus("ROLLBACK")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after ROLLBACK from error txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+}

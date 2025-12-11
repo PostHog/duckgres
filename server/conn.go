@@ -29,6 +29,13 @@ type portal struct {
 	described     bool // true if Describe was called on this portal
 }
 
+// Transaction status constants for PostgreSQL wire protocol
+const (
+	txStatusIdle        = 'I' // Not in a transaction
+	txStatusTransaction = 'T' // In a transaction
+	txStatusError       = 'E' // In a failed transaction
+)
+
 type clientConn struct {
 	server     *Server
 	conn       net.Conn
@@ -40,6 +47,7 @@ type clientConn struct {
 	pid        int32
 	stmts      map[string]*preparedStmt // prepared statements by name
 	portals    map[string]*portal       // portals by name
+	txStatus   byte                     // current transaction status ('I', 'T', or 'E')
 }
 
 func (c *clientConn) serve() error {
@@ -48,6 +56,7 @@ func (c *clientConn) serve() error {
 	c.pid = int32(os.Getpid())
 	c.stmts = make(map[string]*preparedStmt)
 	c.portals = make(map[string]*portal)
+	c.txStatus = txStatusIdle
 
 	// Handle startup
 	if err := c.handleStartup(); err != nil {
@@ -75,7 +84,7 @@ func (c *clientConn) serve() error {
 	c.sendInitialParams()
 
 	// Send ready for query
-	if err := writeReadyForQuery(c.writer, 'I'); err != nil {
+	if err := writeReadyForQuery(c.writer, c.txStatus); err != nil {
 		return err
 	}
 	c.writer.Flush()
@@ -235,7 +244,7 @@ func (c *clientConn) messageLoop() error {
 
 		case msgSync:
 			// Extended query protocol - Sync
-			if err := writeReadyForQuery(c.writer, 'I'); err != nil {
+			if err := writeReadyForQuery(c.writer, c.txStatus); err != nil {
 				return err
 			}
 			c.writer.Flush()
@@ -262,7 +271,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	if query == "" {
 		writeEmptyQueryResponse(c.writer)
-		writeReadyForQuery(c.writer, 'I')
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -286,14 +295,16 @@ func (c *clientConn) handleQuery(body []byte) error {
 		result, err := c.db.Exec(query)
 		if err != nil {
 			c.sendError("ERROR", "42000", err.Error())
-			writeReadyForQuery(c.writer, 'I')
+			c.setTxError()
+			writeReadyForQuery(c.writer, c.txStatus)
 			c.writer.Flush()
 			return nil
 		}
 
+		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
 		writeCommandComplete(c.writer, tag)
-		writeReadyForQuery(c.writer, 'I')
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -302,7 +313,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 	rows, err := c.db.Query(query)
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -312,7 +324,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 	cols, err := rows.Columns()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -320,7 +333,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -350,10 +364,10 @@ func (c *clientConn) handleQuery(body []byte) error {
 		rowCount++
 	}
 
-	// Send command complete
+	// Send command complete (SELECT doesn't change transaction status)
 	tag := fmt.Sprintf("SELECT %d", rowCount)
 	writeCommandComplete(c.writer, tag)
-	writeReadyForQuery(c.writer, 'I')
+	writeReadyForQuery(c.writer, c.txStatus)
 	c.writer.Flush()
 
 	return nil
@@ -434,6 +448,26 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 	}
 }
 
+// updateTxStatus updates the transaction status based on the executed command.
+// This is called after a successful command execution.
+func (c *clientConn) updateTxStatus(cmdType string) {
+	switch cmdType {
+	case "BEGIN":
+		c.txStatus = txStatusTransaction
+	case "COMMIT", "ROLLBACK":
+		c.txStatus = txStatusIdle
+	}
+	// For other commands, keep the current status
+}
+
+// setTxError marks the transaction as failed if we're in a transaction.
+// This should be called when a query fails within a transaction.
+func (c *clientConn) setTxError() {
+	if c.txStatus == txStatusTransaction {
+		c.txStatus = txStatusError
+	}
+}
+
 func (c *clientConn) buildCommandTag(cmdType string, result sql.Result) string {
 	switch cmdType {
 	case "INSERT":
@@ -475,14 +509,15 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	result, err := c.db.Exec(query)
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowsAffected))
-	writeReadyForQuery(c.writer, 'I')
+	writeReadyForQuery(c.writer, c.txStatus)
 	c.writer.Flush()
 	return nil
 }
@@ -492,7 +527,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	matches := copyToStdoutRegex.FindStringSubmatch(query)
 	if len(matches) < 2 {
 		c.sendError("ERROR", "42601", "Invalid COPY TO STDOUT syntax")
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -518,7 +554,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	rows, err := c.db.Query(selectQuery)
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -527,7 +564,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	cols, err := rows.Columns()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -578,7 +616,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	}
 
 	writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-	writeReadyForQuery(c.writer, 'I')
+	writeReadyForQuery(c.writer, c.txStatus)
 	c.writer.Flush()
 	return nil
 }
@@ -588,7 +626,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	matches := copyFromStdinRegex.FindStringSubmatch(query)
 	if len(matches) < 2 {
 		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -613,7 +652,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	testRows, err := c.db.Query(colQuery)
 	if err != nil {
 		c.sendError("ERROR", "42P01", fmt.Sprintf("relation \"%s\" does not exist", tableName))
-		writeReadyForQuery(c.writer, 'I')
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
 		return nil
 	}
@@ -679,7 +719,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 				if _, err := c.db.Exec(insertSQL, args...); err != nil {
 					c.sendError("ERROR", "22P02", fmt.Sprintf("invalid input: %v", err))
-					writeReadyForQuery(c.writer, 'I')
+					c.setTxError()
+					writeReadyForQuery(c.writer, c.txStatus)
 					c.writer.Flush()
 					return nil
 				}
@@ -687,7 +728,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			}
 
 			writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-			writeReadyForQuery(c.writer, 'I')
+			writeReadyForQuery(c.writer, c.txStatus)
 			c.writer.Flush()
 			return nil
 
@@ -695,13 +736,15 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			// Client cancelled COPY
 			errMsg := string(bytes.TrimRight(body, "\x00"))
 			c.sendError("ERROR", "57014", fmt.Sprintf("COPY failed: %s", errMsg))
-			writeReadyForQuery(c.writer, 'I')
+			c.setTxError()
+			writeReadyForQuery(c.writer, c.txStatus)
 			c.writer.Flush()
 			return nil
 
 		default:
 			c.sendError("ERROR", "08P01", fmt.Sprintf("unexpected message type during COPY: %c", msgType))
-			writeReadyForQuery(c.writer, 'I')
+			c.setTxError()
+			writeReadyForQuery(c.writer, c.txStatus)
 			c.writer.Flush()
 			return nil
 		}
@@ -1189,8 +1232,10 @@ func (c *clientConn) handleExecute(body []byte) {
 		result, err := c.db.Exec(p.stmt.convertedQuery, args...)
 		if err != nil {
 			c.sendError("ERROR", "42000", err.Error())
+			c.setTxError()
 			return
 		}
+		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
 		writeCommandComplete(c.writer, tag)
 		return
@@ -1200,6 +1245,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	rows, err := c.db.Query(p.stmt.convertedQuery, args...)
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
 		return
 	}
 	defer rows.Close()
@@ -1207,6 +1253,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	cols, err := rows.Columns()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
 		return
 	}
 
@@ -1244,6 +1291,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 		if err := rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
+			c.setTxError()
 			return
 		}
 
