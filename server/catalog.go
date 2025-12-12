@@ -270,9 +270,6 @@ func initPgCatalog(db *sql.DB) error {
 			END`,
 		// pg_is_in_recovery - check if in recovery mode
 		`CREATE OR REPLACE MACRO pg_is_in_recovery() AS false`,
-		// version - return PostgreSQL-compatible version string
-		// Fivetran and other tools check this to determine compatibility
-		`CREATE OR REPLACE MACRO version() AS 'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'`,
 	}
 
 	for _, f := range functions {
