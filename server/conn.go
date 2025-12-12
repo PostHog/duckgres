@@ -269,7 +269,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	query := string(bytes.TrimRight(body, "\x00"))
 	query = strings.TrimSpace(query)
 
-	if query == "" {
+	// Treat empty queries or queries with just semicolons as empty
+	// PostgreSQL returns EmptyQueryResponse for queries like "" or ";" or ";;;"
+	if query == "" || isEmptyQuery(query) {
 		writeEmptyQueryResponse(c.writer)
 		writeReadyForQuery(c.writer, c.txStatus)
 		c.writer.Flush()
@@ -383,6 +385,17 @@ func (c *clientConn) handleQuery(body []byte) error {
 	return nil
 }
 
+// isEmptyQuery checks if a query contains only semicolons and whitespace.
+// PostgreSQL returns EmptyQueryResponse for queries like ";" or ";;;" or "; ; ;"
+func isEmptyQuery(query string) bool {
+	for _, r := range query {
+		if r != ';' && r != ' ' && r != '\t' && r != '\n' && r != '\r' {
+			return false
+		}
+	}
+	return true
+}
+
 // stripLeadingComments removes leading SQL comments from a query.
 // Handles both block comments /* ... */ and line comments -- ...
 func stripLeadingComments(query string) string {
@@ -458,11 +471,16 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 		return "UPDATE"
 	case strings.HasPrefix(upperQuery, "DELETE"):
 		return "DELETE"
-	case strings.HasPrefix(upperQuery, "CREATE TABLE"):
+	case strings.HasPrefix(upperQuery, "CREATE TABLE"),
+		strings.HasPrefix(upperQuery, "CREATE TEMPORARY TABLE"),
+		strings.HasPrefix(upperQuery, "CREATE TEMP TABLE"),
+		strings.HasPrefix(upperQuery, "CREATE UNLOGGED TABLE"):
 		return "CREATE TABLE"
-	case strings.HasPrefix(upperQuery, "CREATE INDEX"):
+	case strings.HasPrefix(upperQuery, "CREATE INDEX"),
+		strings.HasPrefix(upperQuery, "CREATE UNIQUE INDEX"):
 		return "CREATE INDEX"
-	case strings.HasPrefix(upperQuery, "CREATE VIEW"):
+	case strings.HasPrefix(upperQuery, "CREATE VIEW"),
+		strings.HasPrefix(upperQuery, "CREATE OR REPLACE VIEW"):
 		return "CREATE VIEW"
 	case strings.HasPrefix(upperQuery, "CREATE SCHEMA"):
 		return "CREATE SCHEMA"
@@ -1136,6 +1154,8 @@ func (c *clientConn) handleDescribe(body []byte) {
 			c.sendError("ERROR", "26000", fmt.Sprintf("prepared statement %q does not exist", name))
 			return
 		}
+		log.Printf("[%s] Describe statement %q: %s", c.username, name, ps.query)
+
 		// Send parameter description based on the number of $N placeholders we found
 		// If the client didn't send explicit types, create them
 		paramTypes := ps.paramTypes
@@ -1150,7 +1170,9 @@ func (c *clientConn) handleDescribe(body []byte) {
 
 		// For queries that return results, we need to send RowDescription
 		// For other queries, send NoData
-		if !queryReturnsResults(ps.query) {
+		returnsResults := queryReturnsResults(ps.query)
+		log.Printf("[%s] Describe statement %q: returnsResults=%v", c.username, name, returnsResults)
+		if !returnsResults {
 			writeNoData(c.writer)
 			return
 		}
@@ -1295,6 +1317,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		// Non-result-returning query: use Exec with converted query
 		result, err := c.db.Exec(p.stmt.convertedQuery, args...)
 		if err != nil {
+			log.Printf("[%s] Execute error: %v", c.username, err)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			return
@@ -1308,6 +1331,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Result-returning query: use Query with converted query
 	rows, err := c.db.Query(p.stmt.convertedQuery, args...)
 	if err != nil {
+		log.Printf("[%s] Query error: %v", c.username, err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -1316,6 +1340,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	cols, err := rows.Columns()
 	if err != nil {
+		log.Printf("[%s] Columns error: %v", c.username, err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return

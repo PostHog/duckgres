@@ -4,6 +4,35 @@ import (
 	"testing"
 )
 
+func TestIsEmptyQuery(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		{"empty string", "", true},
+		{"single semicolon", ";", true},
+		{"multiple semicolons", ";;;", true},
+		{"semicolons with spaces", "; ; ;", true},
+		{"semicolons with tabs", ";\t;\t;", true},
+		{"semicolons with newlines", ";\n;\n;", true},
+		{"only whitespace", "   \t\n", true},
+		{"SELECT query", "SELECT 1", false},
+		{"SELECT with semicolon", "SELECT 1;", false},
+		{"comment", "/* comment */", false},
+		{"semicolon then query", ";SELECT 1", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isEmptyQuery(tt.query)
+			if result != tt.expected {
+				t.Errorf("isEmptyQuery(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestStripLeadingComments(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -110,6 +139,21 @@ func TestGetCommandType(t *testing.T) {
 		{
 			name:     "CREATE TABLE",
 			query:    "CREATE TABLE users (id INT)",
+			expected: "CREATE TABLE",
+		},
+		{
+			name:     "CREATE TEMPORARY TABLE",
+			query:    "CREATE TEMPORARY TABLE temp_users (id INT)",
+			expected: "CREATE TABLE",
+		},
+		{
+			name:     "CREATE TEMP TABLE",
+			query:    "CREATE TEMP TABLE temp_users (id INT)",
+			expected: "CREATE TABLE",
+		},
+		{
+			name:     "CREATE TEMPORARY TABLE with Fivetran comment",
+			query:    "/*Fivetran*/CREATE TEMPORARY TABLE temp_users (id INT)",
 			expected: "CREATE TABLE",
 		},
 		{
