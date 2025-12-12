@@ -358,3 +358,163 @@ func TestNestedBeginDetection(t *testing.T) {
 		t.Errorf("txStatus should still be %c after nested BEGIN detection, got %c", txStatusTransaction, c.txStatus)
 	}
 }
+
+func TestQueryReturnsResults(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		// SELECT queries
+		{
+			name:     "simple SELECT",
+			query:    "SELECT * FROM users",
+			expected: true,
+		},
+		{
+			name:     "SELECT with comment",
+			query:    "/*Fivetran*/ SELECT * FROM users",
+			expected: true,
+		},
+		{
+			name:     "SELECT with block and line comment",
+			query:    "/* comment */ -- line\nSELECT 1",
+			expected: true,
+		},
+		// WITH/CTE queries
+		{
+			name:     "WITH clause",
+			query:    "WITH cte AS (SELECT 1) SELECT * FROM cte",
+			expected: true,
+		},
+		{
+			name:     "WITH clause with comment",
+			query:    "/*Fivetran*/ WITH cte AS (SELECT 1) SELECT * FROM cte",
+			expected: true,
+		},
+		// VALUES
+		{
+			name:     "VALUES",
+			query:    "VALUES (1, 2), (3, 4)",
+			expected: true,
+		},
+		// SHOW
+		{
+			name:     "SHOW",
+			query:    "SHOW TABLES",
+			expected: true,
+		},
+		// TABLE
+		{
+			name:     "TABLE command",
+			query:    "TABLE users",
+			expected: true,
+		},
+		// EXPLAIN
+		{
+			name:     "EXPLAIN",
+			query:    "EXPLAIN SELECT * FROM users",
+			expected: true,
+		},
+		// DESCRIBE
+		{
+			name:     "DESCRIBE",
+			query:    "DESCRIBE users",
+			expected: true,
+		},
+		// Non-result queries
+		{
+			name:     "INSERT",
+			query:    "INSERT INTO users VALUES (1)",
+			expected: false,
+		},
+		{
+			name:     "UPDATE",
+			query:    "UPDATE users SET name = 'test'",
+			expected: false,
+		},
+		{
+			name:     "DELETE",
+			query:    "DELETE FROM users",
+			expected: false,
+		},
+		{
+			name:     "CREATE TABLE",
+			query:    "CREATE TABLE test (id INT)",
+			expected: false,
+		},
+		{
+			name:     "CREATE TABLE with comment",
+			query:    "/*Fivetran*/ CREATE TABLE test (id INT)",
+			expected: false,
+		},
+		{
+			name:     "DROP TABLE",
+			query:    "DROP TABLE users",
+			expected: false,
+		},
+		{
+			name:     "BEGIN",
+			query:    "BEGIN",
+			expected: false,
+		},
+		{
+			name:     "COMMIT",
+			query:    "COMMIT",
+			expected: false,
+		},
+		{
+			name:     "ROLLBACK",
+			query:    "ROLLBACK",
+			expected: false,
+		},
+		{
+			name:     "SET",
+			query:    "SET search_path = public",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := queryReturnsResults(tt.query)
+			if result != tt.expected {
+				t.Errorf("queryReturnsResults(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestQueryReturnsResultsWithComments verifies that queries with leading comments
+// are correctly identified as result-returning queries.
+func TestQueryReturnsResultsWithComments(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		// Queries with leading comments that return results
+		{"block comment before SELECT", "/* comment */ SELECT * FROM users", true},
+		{"block comment before SELECT no space", "/*comment*/SELECT 1", true},
+		{"block comment before WITH", "/* query */ WITH cte AS (SELECT 1) SELECT * FROM cte", true},
+		{"line comment before SELECT", "-- comment\nSELECT * FROM users", true},
+		{"multiple block comments", "/* first */ /* second */ SELECT 1", true},
+		{"block comment before SHOW", "/* comment */ SHOW TABLES", true},
+		{"block comment before VALUES", "/* comment */ VALUES (1, 2)", true},
+
+		// Queries with leading comments that don't return results
+		{"block comment before INSERT", "/* comment */ INSERT INTO t VALUES (1)", false},
+		{"block comment before CREATE", "/* comment */ CREATE TABLE t (id INT)", false},
+		{"block comment before DROP", "/* comment */ DROP TABLE t", false},
+		{"block comment before BEGIN", "/* comment */ BEGIN", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := queryReturnsResults(tt.query)
+			if result != tt.expected {
+				t.Errorf("queryReturnsResults(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}

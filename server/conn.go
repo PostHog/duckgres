@@ -406,6 +406,45 @@ func stripLeadingComments(query string) string {
 	}
 }
 
+// queryReturnsResults checks if a SQL query returns a result set.
+// This is used to determine whether to send RowDescription or NoData.
+func queryReturnsResults(query string) bool {
+	upper := strings.ToUpper(stripLeadingComments(query))
+	// SELECT is the most common
+	if strings.HasPrefix(upper, "SELECT") {
+		return true
+	}
+	// WITH ... SELECT (CTEs)
+	if strings.HasPrefix(upper, "WITH") {
+		return true
+	}
+	// VALUES clause returns rows
+	if strings.HasPrefix(upper, "VALUES") {
+		return true
+	}
+	// SHOW commands return results
+	if strings.HasPrefix(upper, "SHOW") {
+		return true
+	}
+	// TABLE is shorthand for SELECT * FROM table
+	if strings.HasPrefix(upper, "TABLE") {
+		return true
+	}
+	// EXECUTE can return results if the prepared statement is a SELECT
+	if strings.HasPrefix(upper, "EXECUTE") {
+		return true
+	}
+	// EXPLAIN returns results
+	if strings.HasPrefix(upper, "EXPLAIN") {
+		return true
+	}
+	// DESCRIBE returns results (DuckDB-specific)
+	if strings.HasPrefix(upper, "DESCRIBE") {
+		return true
+	}
+	return false
+}
+
 func (c *clientConn) getCommandType(upperQuery string) string {
 	// Strip leading comments like /*Fivetran*/ before checking command type
 	upperQuery = stripLeadingComments(upperQuery)
@@ -958,15 +997,18 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
+	// Rewrite pg_catalog function calls for compatibility (same as simple query protocol)
+	rewrittenQuery := rewritePgCatalogQuery(query)
+
 	// Convert PostgreSQL $1, $2 placeholders to ? for database/sql
-	convertedQuery, numParams := convertPlaceholders(query)
+	convertedQuery, numParams := convertPlaceholders(rewrittenQuery)
 
 	// Close existing statement with same name
 	delete(c.stmts, stmtName)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:          query,
-		convertedQuery: convertedQuery,
+		query:          query,          // Keep original for logging and Describe
+		convertedQuery: convertedQuery, // Rewritten and placeholder-converted for execution
 		paramTypes:     paramTypes,
 		numParams:      numParams,
 	}
@@ -1106,10 +1148,9 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 		c.sendParameterDescription(paramTypes)
 
-		// For SELECT queries, we need to send RowDescription
+		// For queries that return results, we need to send RowDescription
 		// For other queries, send NoData
-		upperQuery := strings.ToUpper(strings.TrimSpace(ps.query))
-		if !strings.HasPrefix(upperQuery, "SELECT") {
+		if !queryReturnsResults(ps.query) {
 			writeNoData(c.writer)
 			return
 		}
@@ -1157,9 +1198,8 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// For non-SELECT, send NoData
-		upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))
-		if !strings.HasPrefix(upperQuery, "SELECT") {
+		// For queries that don't return results, send NoData
+		if !queryReturnsResults(p.stmt.query) {
 			writeNoData(c.writer)
 			return
 		}
@@ -1239,10 +1279,11 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))
 	cmdType := c.getCommandType(upperQuery)
+	returnsResults := queryReturnsResults(p.stmt.query)
 
 	log.Printf("[%s] Execute %q with %d params: %s", c.username, portalName, len(args), p.stmt.query)
 
-	if cmdType != "SELECT" {
+	if !returnsResults {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
 		// while DuckDB throws an error. Match PostgreSQL behavior.
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
@@ -1251,7 +1292,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			return
 		}
 
-		// Non-SELECT: use Exec with converted query
+		// Non-result-returning query: use Exec with converted query
 		result, err := c.db.Exec(p.stmt.convertedQuery, args...)
 		if err != nil {
 			c.sendError("ERROR", "42000", err.Error())
@@ -1264,7 +1305,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	// SELECT: use Query with converted query
+	// Result-returning query: use Query with converted query
 	rows, err := c.db.Query(p.stmt.convertedQuery, args...)
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
