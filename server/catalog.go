@@ -361,6 +361,8 @@ var (
 	showApplicationNameRegex = regexp.MustCompile(`(?i)^SHOW\s+application_name\s*;?\s*$`)
 	// Regex to extract SET parameter name
 	setParameterRegex = regexp.MustCompile(`(?i)^SET\s+(?:SESSION\s+|LOCAL\s+)?(\w+)`)
+	// version() -> PostgreSQL-compatible version string (DuckDB's built-in can't be overridden by macro)
+	versionFuncRegex = regexp.MustCompile(`(?i)\bversion\s*\(\s*\)`)
 )
 
 // PostgreSQL-specific SET parameters that DuckDB doesn't support.
@@ -549,6 +551,10 @@ func rewritePgCatalogQuery(query string) string {
 	query = setApplicationNameRegex.ReplaceAllString(query, "SET VARIABLE application_name =")
 	query = setApplicationNameToRegex.ReplaceAllString(query, "SET VARIABLE application_name =")
 	query = showApplicationNameRegex.ReplaceAllString(query, "SELECT getvariable('application_name') AS application_name")
+
+	// Replace version() with PostgreSQL-compatible version string
+	// DuckDB's built-in version() can't be overridden by macros
+	query = versionFuncRegex.ReplaceAllString(query, "'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'")
 
 	return query
 }
