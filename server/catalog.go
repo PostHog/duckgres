@@ -282,3 +282,176 @@ func initPgCatalog(db *sql.DB) error {
 
 	return nil
 }
+
+// initInformationSchema creates the column metadata table and information_schema wrapper views.
+// This enables accurate type information (VARCHAR lengths, NUMERIC precision) in information_schema.
+func initInformationSchema(db *sql.DB) error {
+	// Create metadata table to store column type information that DuckDB doesn't preserve
+	metadataTableSQL := `
+		CREATE TABLE IF NOT EXISTS __duckgres_column_metadata (
+			table_schema VARCHAR NOT NULL,
+			table_name VARCHAR NOT NULL,
+			column_name VARCHAR NOT NULL,
+			character_maximum_length INTEGER,
+			numeric_precision INTEGER,
+			numeric_scale INTEGER,
+			PRIMARY KEY (table_schema, table_name, column_name)
+		)
+	`
+	if _, err := db.Exec(metadataTableSQL); err != nil {
+		// Table might already exist, that's OK
+		// Ignore errors since PRIMARY KEY might not work in all contexts
+	}
+
+	// Create information_schema.columns wrapper view
+	// Transforms DuckDB type names to PostgreSQL-compatible names (e.g., VARCHAR -> text)
+	// First try with metadata table join, fall back to simple view if table doesn't exist
+	columnsViewWithMetaSQL := `
+		CREATE OR REPLACE VIEW information_schema_columns_compat AS
+		SELECT
+			c.table_catalog,
+			c.table_schema,
+			c.table_name,
+			c.column_name,
+			c.ordinal_position,
+			c.column_default,
+			c.is_nullable,
+			CASE
+				WHEN UPPER(c.data_type) = 'VARCHAR' OR UPPER(c.data_type) LIKE 'VARCHAR(%' THEN 'text'
+				ELSE c.data_type
+			END AS data_type,
+			COALESCE(m.character_maximum_length, c.character_maximum_length) AS character_maximum_length,
+			c.character_octet_length,
+			COALESCE(m.numeric_precision, c.numeric_precision) AS numeric_precision,
+			COALESCE(m.numeric_scale, c.numeric_scale) AS numeric_scale,
+			c.datetime_precision,
+			NULL AS interval_type,
+			NULL AS interval_precision,
+			NULL AS character_set_catalog,
+			NULL AS character_set_schema,
+			NULL AS character_set_name,
+			NULL AS collation_catalog,
+			NULL AS collation_schema,
+			NULL AS collation_name,
+			NULL AS domain_catalog,
+			NULL AS domain_schema,
+			NULL AS domain_name,
+			NULL AS udt_catalog,
+			NULL AS udt_schema,
+			NULL AS udt_name,
+			NULL AS scope_catalog,
+			NULL AS scope_schema,
+			NULL AS scope_name,
+			NULL AS maximum_cardinality,
+			NULL AS dtd_identifier,
+			'NO' AS is_self_referencing,
+			'NO' AS is_identity,
+			NULL AS identity_generation,
+			NULL AS identity_start,
+			NULL AS identity_increment,
+			NULL AS identity_maximum,
+			NULL AS identity_minimum,
+			NULL AS identity_cycle,
+			'NEVER' AS is_generated,
+			NULL AS generation_expression,
+			'YES' AS is_updatable
+		FROM information_schema.columns c
+		LEFT JOIN __duckgres_column_metadata m
+			ON c.table_schema = m.table_schema
+			AND c.table_name = m.table_name
+			AND c.column_name = m.column_name
+	`
+	// Try with metadata table first
+	if _, err := db.Exec(columnsViewWithMetaSQL); err != nil {
+		// Metadata table doesn't exist, create simpler view without it
+		columnsViewSimpleSQL := `
+			CREATE OR REPLACE VIEW information_schema_columns_compat AS
+			SELECT
+				table_catalog,
+				table_schema,
+				table_name,
+				column_name,
+				ordinal_position,
+				column_default,
+				is_nullable,
+				CASE
+					WHEN UPPER(data_type) = 'VARCHAR' OR UPPER(data_type) LIKE 'VARCHAR(%' THEN 'text'
+					ELSE data_type
+				END AS data_type,
+				character_maximum_length,
+				character_octet_length,
+				numeric_precision,
+				numeric_scale,
+				datetime_precision,
+				NULL AS interval_type,
+				NULL AS interval_precision,
+				NULL AS character_set_catalog,
+				NULL AS character_set_schema,
+				NULL AS character_set_name,
+				NULL AS collation_catalog,
+				NULL AS collation_schema,
+				NULL AS collation_name,
+				NULL AS domain_catalog,
+				NULL AS domain_schema,
+				NULL AS domain_name,
+				NULL AS udt_catalog,
+				NULL AS udt_schema,
+				NULL AS udt_name,
+				NULL AS scope_catalog,
+				NULL AS scope_schema,
+				NULL AS scope_name,
+				NULL AS maximum_cardinality,
+				NULL AS dtd_identifier,
+				'NO' AS is_self_referencing,
+				'NO' AS is_identity,
+				NULL AS identity_generation,
+				NULL AS identity_start,
+				NULL AS identity_increment,
+				NULL AS identity_maximum,
+				NULL AS identity_minimum,
+				NULL AS identity_cycle,
+				'NEVER' AS is_generated,
+				NULL AS generation_expression,
+				'YES' AS is_updatable
+			FROM information_schema.columns
+		`
+		db.Exec(columnsViewSimpleSQL)
+	}
+
+	// Create information_schema.tables wrapper view with additional PostgreSQL columns
+	tablesViewSQL := `
+		CREATE OR REPLACE VIEW information_schema_tables_compat AS
+		SELECT
+			t.table_catalog,
+			t.table_schema,
+			t.table_name,
+			t.table_type,
+			NULL AS self_referencing_column_name,
+			NULL AS reference_generation,
+			NULL AS user_defined_type_catalog,
+			NULL AS user_defined_type_schema,
+			NULL AS user_defined_type_name,
+			'YES' AS is_insertable_into,
+			'NO' AS is_typed,
+			NULL AS commit_action
+		FROM information_schema.tables t
+	`
+	db.Exec(tablesViewSQL)
+
+	// Create information_schema.schemata wrapper view
+	schemataViewSQL := `
+		CREATE OR REPLACE VIEW information_schema_schemata_compat AS
+		SELECT
+			s.catalog_name,
+			s.schema_name,
+			'duckdb' AS schema_owner,
+			NULL AS default_character_set_catalog,
+			NULL AS default_character_set_schema,
+			NULL AS default_character_set_name,
+			NULL AS sql_path
+		FROM information_schema.schemata s
+	`
+	db.Exec(schemataViewSQL)
+
+	return nil
+}
