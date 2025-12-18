@@ -608,7 +608,7 @@ func (c *clientConn) buildCommandTag(cmdType string, result sql.Result) string {
 // Regular expressions for parsing COPY commands
 var (
 	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
-	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s+(?:\(([^)]+)\)\s+)?FROM\s+STDIN`)
+	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s*(?:\(([^)]+)\)\s*)?FROM\s+STDIN`)
 	copyWithCSVRegex    = regexp.MustCompile(`(?i)\bCSV\b`)
 	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
 	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)
