@@ -292,6 +292,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Rewrite pg_catalog function calls for compatibility
 	query = rewritePgCatalogQuery(query)
 
+	// Rewrite CREATE TABLE for DuckLake compatibility (strip unsupported constraints)
+	query = rewriteForDuckLake(query)
+
 	// Determine command type for proper response
 	upperQuery := strings.ToUpper(query)
 	cmdType := c.getCommandType(upperQuery)
@@ -299,6 +302,15 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Handle COPY commands specially
 	if cmdType == "COPY" {
 		return c.handleCopy(query, upperQuery)
+	}
+
+	// Handle no-op commands (CREATE INDEX, VACUUM, etc.) - DuckLake doesn't support these
+	if isNoOpCommand(cmdType) {
+		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, query)
+		writeCommandComplete(c.writer, getNoOpCommandTag(cmdType))
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
 	}
 
 	// For non-SELECT queries, use Exec
@@ -505,6 +517,12 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 		return "DROP SCHEMA"
 	case strings.HasPrefix(upperQuery, "DROP"):
 		return "DROP"
+	case strings.Contains(upperQuery, "ADD CONSTRAINT") ||
+		strings.Contains(upperQuery, "ADD PRIMARY KEY") ||
+		strings.Contains(upperQuery, "ADD UNIQUE") ||
+		strings.Contains(upperQuery, "ADD FOREIGN KEY") ||
+		strings.Contains(upperQuery, "ADD CHECK"):
+		return "ALTER TABLE ADD CONSTRAINT"
 	case strings.HasPrefix(upperQuery, "ALTER"):
 		return "ALTER TABLE"
 	case strings.HasPrefix(upperQuery, "TRUNCATE"):
@@ -1027,6 +1045,9 @@ func (c *clientConn) handleParse(body []byte) {
 	// Rewrite pg_catalog function calls for compatibility (same as simple query protocol)
 	rewrittenQuery := rewritePgCatalogQuery(query)
 
+	// Rewrite CREATE TABLE for DuckLake compatibility (strip unsupported constraints)
+	rewrittenQuery = rewriteForDuckLake(rewrittenQuery)
+
 	// Convert PostgreSQL $1, $2 placeholders to ? for database/sql
 	convertedQuery, numParams := convertPlaceholders(rewrittenQuery)
 
@@ -1318,6 +1339,13 @@ func (c *clientConn) handleExecute(body []byte) {
 	if isIgnoredSetParameter(p.stmt.query) {
 		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, p.stmt.query)
 		writeCommandComplete(c.writer, "SET")
+		return
+	}
+
+	// Handle no-op commands (CREATE INDEX, VACUUM, etc.) - DuckLake doesn't support these
+	if isNoOpCommand(cmdType) {
+		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, p.stmt.query)
+		writeCommandComplete(c.writer, getNoOpCommandTag(cmdType))
 		return
 	}
 
