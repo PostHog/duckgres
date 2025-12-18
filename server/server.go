@@ -85,6 +85,9 @@ type Server struct {
 	closed      bool
 	closeMu     sync.Mutex
 	activeConns int64 // atomic counter for active connections
+
+	// duckLakeMu serializes DuckLake secret creation to avoid write-write conflicts
+	duckLakeMu sync.Mutex
 }
 
 func New(cfg Config) (*Server, error) {
@@ -358,6 +361,18 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 //
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
 func (s *Server) createS3Secret(db *sql.DB) error {
+	// Serialize secret creation to avoid DuckDB write-write conflicts
+	// when multiple connections try to create the same secret simultaneously
+	s.duckLakeMu.Lock()
+	defer s.duckLakeMu.Unlock()
+
+	// Check if secret already exists to avoid unnecessary creation
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'ducklake_s3'").Scan(&count)
+	if err == nil && count > 0 {
+		return nil // Secret already exists
+	}
+
 	// Determine provider: use credential_chain if explicitly set or if no access key provided
 	provider := s.cfg.DuckLake.S3Provider
 	if provider == "" {
