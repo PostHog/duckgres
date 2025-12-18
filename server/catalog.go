@@ -396,6 +396,8 @@ var (
 	tableCheckRegex = regexp.MustCompile(`(?i),?\s*CHECK\s*\((?:[^()]*|\([^()]*\))*\)`)
 	// CONSTRAINT name prefix (for named constraints)
 	constraintNameRegex = regexp.MustCompile(`(?i),?\s*CONSTRAINT\s+\w+\s+(?:PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK)\s*\([^)]+\)(?:\s+REFERENCES\s+\w+(?:\.\w+)?\s*\([^)]+\))?(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))*`)
+	// Detect CREATE TABLE statements (handles multiple spaces like "CREATE  TABLE")
+	createTableDetectRegex = regexp.MustCompile(`(?i)^CREATE\s+(?:TEMPORARY\s+|TEMP\s+|UNLOGGED\s+)?TABLE\b`)
 )
 
 // PostgreSQL-specific SET parameters that DuckDB doesn't support.
@@ -603,11 +605,22 @@ func rewritePgCatalogQuery(query string) string {
 func rewriteForDuckLake(query string) string {
 	upperQuery := strings.ToUpper(strings.TrimSpace(query))
 
+	// Strip leading SQL comments (e.g., /*Fivetran*/) for detection
+	// This handles tools that prefix queries with comments
+	commentStripped := upperQuery
+	for strings.HasPrefix(commentStripped, "/*") {
+		endIdx := strings.Index(commentStripped, "*/")
+		if endIdx == -1 {
+			break
+		}
+		commentStripped = strings.TrimSpace(commentStripped[endIdx+2:])
+	}
+
 	// Only rewrite CREATE TABLE statements
-	if !strings.HasPrefix(upperQuery, "CREATE TABLE") &&
-		!strings.HasPrefix(upperQuery, "CREATE TEMPORARY TABLE") &&
-		!strings.HasPrefix(upperQuery, "CREATE TEMP TABLE") &&
-		!strings.HasPrefix(upperQuery, "CREATE UNLOGGED TABLE") {
+	// Use regex to handle multiple spaces (e.g., "CREATE  TABLE")
+	isCreateTable := createTableDetectRegex.MatchString(commentStripped)
+
+	if !isCreateTable {
 		return query
 	}
 

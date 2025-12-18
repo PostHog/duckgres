@@ -150,6 +150,17 @@ func TestRewriteForDuckLake(t *testing.T) {
 				created_at TIMESTAMP
 			)`,
 		},
+		// ETL tool queries with comment prefix and double spaces
+		{
+			name:     "comment prefix with PRIMARY KEY",
+			input:    `/*ETL*/CREATE  TABLE "schema"."table" ( "id" CHARACTER VARYING(256) , "created_at" TIMESTAMP WITH TIME ZONE , PRIMARY KEY ("id") )`,
+			expected: `/*ETL*/CREATE  TABLE "schema"."table" ( "id" CHARACTER VARYING(256) , "created_at" TIMESTAMP WITH TIME ZONE  )`,
+		},
+		{
+			name:     "multiple comment prefixes",
+			input:    `/* comment 1 */ /* comment 2 */ CREATE TABLE test (id INTEGER PRIMARY KEY)`,
+			expected: `/* comment 1 */ /* comment 2 */ CREATE TABLE test (id INTEGER)`,
+		},
 	}
 
 	for _, tt := range tests {

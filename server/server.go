@@ -308,6 +308,23 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return nil // DuckLake not configured
 	}
 
+	// Serialize DuckLake attachment to avoid race conditions
+	// Multiple connections trying to attach simultaneously can cause
+	// "database with name '__ducklake_metadata_ducklake' already exists" errors
+	s.duckLakeMu.Lock()
+	defer s.duckLakeMu.Unlock()
+
+	// Check if DuckLake catalog is already attached
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
+	if err == nil && count > 0 {
+		// Already attached, just set as default
+		if _, err := db.Exec("USE ducklake"); err != nil {
+			return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
+		}
+		return nil
+	}
+
 	// Create S3 secret if using object store
 	// - With explicit credentials (S3AccessKey set) or custom endpoint
 	// - With credential_chain provider (for AWS S3)
@@ -359,13 +376,9 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 //   - "config": explicit credentials (for MinIO or when you have access keys)
 //   - "credential_chain": AWS SDK credential chain (env vars, config files, instance metadata, etc.)
 //
+// Note: Caller must hold duckLakeMu to avoid race conditions.
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
 func (s *Server) createS3Secret(db *sql.DB) error {
-	// Serialize secret creation to avoid DuckDB write-write conflicts
-	// when multiple connections try to create the same secret simultaneously
-	s.duckLakeMu.Lock()
-	defer s.duckLakeMu.Unlock()
-
 	// Check if secret already exists to avoid unnecessary creation
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'ducklake_s3'").Scan(&count)
