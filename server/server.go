@@ -251,8 +251,14 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 
 	// Attach DuckLake catalog if configured
 	if err := s.attachDuckLake(db); err != nil {
+		// If DuckLake was explicitly configured, fail the connection.
+		// Silent fallback to local DB causes schema/table mismatches.
+		if s.cfg.DuckLake.MetadataStore != "" {
+			db.Close()
+			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+		}
+		// DuckLake not configured, this warning is just informational
 		log.Printf("Warning: failed to attach DuckLake for user %q: %v", username, err)
-		// Continue anyway - database will still work without DuckLake
 	}
 
 	// Initialize pg_catalog schema for PostgreSQL compatibility

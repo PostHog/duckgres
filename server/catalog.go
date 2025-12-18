@@ -368,6 +368,34 @@ var (
 	// Two patterns: one for version() with existing AS alias, one for version() without
 	versionFuncWithAliasRegex = regexp.MustCompile(`(?i)\bversion\s*\(\s*\)(\s+AS\s+)`)
 	versionFuncRegex          = regexp.MustCompile(`(?i)\bversion\s*\(\s*\)`)
+
+	// DuckLake compatibility: Strip unsupported constraints from CREATE TABLE
+	// PRIMARY KEY constraint (inline or table-level)
+	primaryKeyInlineRegex = regexp.MustCompile(`(?i)\s+PRIMARY\s+KEY`)
+	// UNIQUE constraint (inline)
+	uniqueInlineRegex = regexp.MustCompile(`(?i)\s+UNIQUE`)
+	// REFERENCES / FOREIGN KEY (inline) with optional ON DELETE/UPDATE clauses
+	referencesRegex = regexp.MustCompile(`(?i)\s+REFERENCES\s+\w+(?:\.\w+)?(?:\s*\([^)]+\))?(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))*`)
+	// CHECK constraint (inline) - handles one level of nested parentheses
+	checkConstraintRegex = regexp.MustCompile(`(?i)\s+CHECK\s*\((?:[^()]*|\([^()]*\))*\)`)
+	// SERIAL types -> INTEGER types
+	serialRegex      = regexp.MustCompile(`(?i)\bSERIAL\b`)
+	bigserialRegex   = regexp.MustCompile(`(?i)\bBIGSERIAL\b`)
+	smallserialRegex = regexp.MustCompile(`(?i)\bSMALLSERIAL\b`)
+	// DEFAULT now()/current_timestamp (not supported in DuckLake)
+	defaultNowRegex = regexp.MustCompile(`(?i)\s+DEFAULT\s+(?:now\s*\(\s*\)|current_timestamp|CURRENT_TIMESTAMP)`)
+	// GENERATED columns
+	generatedRegex = regexp.MustCompile(`(?i)\s+GENERATED\s+(?:ALWAYS|BY\s+DEFAULT)\s+AS\s+(?:IDENTITY(?:\s*\([^)]*\))?|[^,)]+)`)
+	// Table-level PRIMARY KEY constraint: PRIMARY KEY (col1, col2)
+	tablePrimaryKeyRegex = regexp.MustCompile(`(?i),?\s*PRIMARY\s+KEY\s*\([^)]+\)`)
+	// Table-level UNIQUE constraint: UNIQUE (col1, col2)
+	tableUniqueRegex = regexp.MustCompile(`(?i),?\s*UNIQUE\s*\([^)]+\)`)
+	// Table-level FOREIGN KEY constraint
+	tableForeignKeyRegex = regexp.MustCompile(`(?i),?\s*FOREIGN\s+KEY\s*\([^)]+\)\s*REFERENCES\s+\w+(?:\.\w+)?\s*\([^)]+\)(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))*`)
+	// Table-level CHECK constraint - handles one level of nested parentheses
+	tableCheckRegex = regexp.MustCompile(`(?i),?\s*CHECK\s*\((?:[^()]*|\([^()]*\))*\)`)
+	// CONSTRAINT name prefix (for named constraints)
+	constraintNameRegex = regexp.MustCompile(`(?i),?\s*CONSTRAINT\s+\w+\s+(?:PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK)\s*\([^)]+\)(?:\s+REFERENCES\s+\w+(?:\.\w+)?\s*\([^)]+\))?(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:CASCADE|SET\s+NULL|SET\s+DEFAULT|RESTRICT|NO\s+ACTION))*`)
 )
 
 // PostgreSQL-specific SET parameters that DuckDB doesn't support.
@@ -566,5 +594,75 @@ func rewritePgCatalogQuery(query string) string {
 	query = versionFuncRegex.ReplaceAllString(query, "'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)' AS version")
 
 	return query
+}
+
+// rewriteForDuckLake rewrites PostgreSQL DDL to be compatible with DuckLake limitations.
+// DuckLake does not support: PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints,
+// SERIAL types, DEFAULT now(), GENERATED columns, or indexes.
+// This function strips these unsupported features so DDL can execute.
+func rewriteForDuckLake(query string) string {
+	upperQuery := strings.ToUpper(strings.TrimSpace(query))
+
+	// Only rewrite CREATE TABLE statements
+	if !strings.HasPrefix(upperQuery, "CREATE TABLE") &&
+		!strings.HasPrefix(upperQuery, "CREATE TEMPORARY TABLE") &&
+		!strings.HasPrefix(upperQuery, "CREATE TEMP TABLE") &&
+		!strings.HasPrefix(upperQuery, "CREATE UNLOGGED TABLE") {
+		return query
+	}
+
+	// Strip named constraints first (CONSTRAINT name PRIMARY KEY/UNIQUE/FOREIGN KEY/CHECK)
+	query = constraintNameRegex.ReplaceAllString(query, "")
+
+	// Strip table-level constraints
+	query = tablePrimaryKeyRegex.ReplaceAllString(query, "")
+	query = tableUniqueRegex.ReplaceAllString(query, "")
+	query = tableForeignKeyRegex.ReplaceAllString(query, "")
+	query = tableCheckRegex.ReplaceAllString(query, "")
+
+	// Strip inline constraints
+	query = primaryKeyInlineRegex.ReplaceAllString(query, "")
+	query = uniqueInlineRegex.ReplaceAllString(query, "")
+	query = referencesRegex.ReplaceAllString(query, "")
+	query = checkConstraintRegex.ReplaceAllString(query, "")
+
+	// Convert SERIAL types to INTEGER types
+	query = smallserialRegex.ReplaceAllString(query, "SMALLINT")
+	query = bigserialRegex.ReplaceAllString(query, "BIGINT")
+	query = serialRegex.ReplaceAllString(query, "INTEGER")
+
+	// Strip DEFAULT now()/current_timestamp (DuckLake only allows literal defaults)
+	query = defaultNowRegex.ReplaceAllString(query, "")
+
+	// Strip GENERATED columns
+	query = generatedRegex.ReplaceAllString(query, "")
+
+	return query
+}
+
+// isNoOpCommand returns true if the command should be acknowledged but not executed.
+// These are PostgreSQL features that DuckLake doesn't support.
+func isNoOpCommand(cmdType string) bool {
+	switch cmdType {
+	case "CREATE INDEX", "DROP INDEX", "REINDEX",
+		"CLUSTER", "VACUUM", "ANALYZE",
+		"GRANT", "REVOKE", "COMMENT",
+		"REFRESH", // REFRESH MATERIALIZED VIEW
+		"ALTER TABLE ADD CONSTRAINT": // Constraints not supported in DuckLake
+		return true
+	default:
+		return false
+	}
+}
+
+// getNoOpCommandTag returns the command tag to send for a no-op command.
+// Some internal command types need to be mapped to standard PostgreSQL tags.
+func getNoOpCommandTag(cmdType string) string {
+	switch cmdType {
+	case "ALTER TABLE ADD CONSTRAINT":
+		return "ALTER TABLE" // PostgreSQL returns "ALTER TABLE" for constraint operations
+	default:
+		return cmdType
+	}
 }
 
