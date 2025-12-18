@@ -563,43 +563,5 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 	}
 }
 
-func TestIsIgnoredSetParameter(t *testing.T) {
-	tests := []struct {
-		name     string
-		query    string
-		expected bool
-	}{
-		// PostgreSQL-specific SET commands that should be ignored
-		{"ssl_renegotiation_limit", "SET ssl_renegotiation_limit = 0", true},
-		{"ssl_renegotiation_limit TO", "SET ssl_renegotiation_limit TO 0", true},
-		{"statement_timeout", "SET statement_timeout = '30s'", true},
-		{"lock_timeout", "SET lock_timeout = 1000", true},
-		{"client_encoding", "SET client_encoding = 'UTF8'", true},
-		{"client_min_messages", "SET client_min_messages = warning", true},
-		{"row_security", "SET row_security = on", true},
-		{"work_mem", "SET work_mem = '64MB'", true},
-		{"enable_seqscan", "SET enable_seqscan = off", true},
-		{"jit", "SET jit = off", true},
-		{"synchronous_commit", "SET synchronous_commit = off", true},
-		{"SESSION prefix", "SET SESSION statement_timeout = 0", true},
-		{"LOCAL prefix", "SET LOCAL lock_timeout = 5000", true},
-		{"case insensitive", "set SSL_RENEGOTIATION_LIMIT = 0", true},
-
-		// SET commands that should NOT be ignored (pass through to DuckDB)
-		{"application_name", "SET application_name = 'myapp'", false},
-		{"timezone", "SET timezone = 'UTC'", false},
-		{"search_path", "SET search_path = public", false},
-		{"random DuckDB setting", "SET threads = 4", false},
-		{"not a SET command", "SELECT 1", false},
-		{"SET in string", "SELECT 'SET ssl_renegotiation_limit = 0'", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := isIgnoredSetParameter(tt.query)
-			if result != tt.expected {
-				t.Errorf("isIgnoredSetParameter(%q) = %v, want %v", tt.query, result, tt.expected)
-			}
-		})
-	}
-}
+// Note: isIgnoredSetParameter tests have been moved to transpiler/transpiler_test.go.
+// The transpiler package now handles SET parameter filtering via AST transformation.

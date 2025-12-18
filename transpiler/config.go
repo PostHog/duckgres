@@ -1,0 +1,41 @@
+package transpiler
+
+// Config controls transpilation behavior
+type Config struct {
+	// DuckLakeMode enables DDL constraint stripping for DuckLake compatibility.
+	// When true, PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints are removed,
+	// SERIAL types are converted to INTEGER, and DEFAULT now() is stripped.
+	DuckLakeMode bool
+
+	// ConvertPlaceholders converts PostgreSQL $1, $2 placeholders to ? for database/sql.
+	// This is needed for the extended query protocol (prepared statements).
+	ConvertPlaceholders bool
+}
+
+// DefaultConfig returns a Config with sensible defaults for simple queries.
+func DefaultConfig() Config {
+	return Config{
+		DuckLakeMode:        false,
+		ConvertPlaceholders: false,
+	}
+}
+
+// Result contains the output of transpilation
+type Result struct {
+	// SQL is the transformed SQL string
+	SQL string
+
+	// ParamCount is the number of parameters found (when ConvertPlaceholders is true)
+	ParamCount int
+
+	// IsNoOp indicates the command should be acknowledged but not executed.
+	// This is true for commands like CREATE INDEX, VACUUM, GRANT, etc.
+	IsNoOp bool
+
+	// NoOpTag is the command tag to return for no-op commands (e.g., "CREATE INDEX")
+	NoOpTag string
+
+	// IsIgnoredSet indicates a SET command for a PostgreSQL-specific parameter
+	// that should be silently acknowledged without execution.
+	IsIgnoredSet bool
+}

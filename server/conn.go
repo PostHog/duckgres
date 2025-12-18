@@ -13,13 +13,18 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/posthog/duckgres/transpiler"
 )
 
 type preparedStmt struct {
-	query         string
+	query          string
 	convertedQuery string
-	paramTypes    []int32
-	numParams     int
+	paramTypes     []int32
+	numParams      int
+	isIgnoredSet   bool   // True if this is an ignored SET parameter
+	isNoOp         bool   // True if this is a no-op command (CREATE INDEX, etc.)
+	noOpTag        string // Command tag for no-op commands
 }
 
 type portal struct {
@@ -48,6 +53,14 @@ type clientConn struct {
 	stmts      map[string]*preparedStmt // prepared statements by name
 	portals    map[string]*portal       // portals by name
 	txStatus   byte                     // current transaction status ('I', 'T', or 'E')
+}
+
+// newTranspiler creates a transpiler configured for this connection.
+func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
+	return transpiler.New(transpiler.Config{
+		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "",
+		ConvertPlaceholders: convertPlaceholders,
+	})
 }
 
 func (c *clientConn) serve() error {
@@ -280,8 +293,19 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	log.Printf("[%s] Query: %s", c.username, query)
 
-	// Check if this is a PostgreSQL-specific SET command that should be ignored
-	if isIgnoredSetParameter(query) {
+	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
+	tr := c.newTranspiler(false)
+	result, err := tr.Transpile(query)
+	if err != nil {
+		// Parse error - send error to client
+		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	// Handle ignored SET parameters
+	if result.IsIgnoredSet {
 		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, query)
 		writeCommandComplete(c.writer, "SET")
 		writeReadyForQuery(c.writer, c.txStatus)
@@ -289,11 +313,23 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
-	// Rewrite pg_catalog function calls for compatibility
-	query = rewritePgCatalogQuery(query)
+	// Handle no-op commands (CREATE INDEX, VACUUM, etc.)
+	if result.IsNoOp {
+		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, query)
+		writeCommandComplete(c.writer, result.NoOpTag)
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
 
-	// Rewrite CREATE TABLE for DuckLake compatibility (strip unsupported constraints)
-	query = rewriteForDuckLake(query)
+	// Use the transpiled SQL
+	originalQuery := query
+	query = result.SQL
+
+	// Log the transpiled query if it differs from the original
+	if query != originalQuery {
+		log.Printf("[%s] Executed: %s", c.username, query)
+	}
 
 	// Determine command type for proper response
 	upperQuery := strings.ToUpper(query)
@@ -302,15 +338,6 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Handle COPY commands specially
 	if cmdType == "COPY" {
 		return c.handleCopy(query, upperQuery)
-	}
-
-	// Handle no-op commands (CREATE INDEX, VACUUM, etc.) - DuckLake doesn't support these
-	if isNoOpCommand(cmdType) {
-		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, query)
-		writeCommandComplete(c.writer, getNoOpCommandTag(cmdType))
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
-		return nil
 	}
 
 	// For non-SELECT queries, use Exec
@@ -1042,26 +1069,31 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
-	// Rewrite pg_catalog function calls for compatibility (same as simple query protocol)
-	rewrittenQuery := rewritePgCatalogQuery(query)
-
-	// Rewrite CREATE TABLE for DuckLake compatibility (strip unsupported constraints)
-	rewrittenQuery = rewriteForDuckLake(rewrittenQuery)
-
-	// Convert PostgreSQL $1, $2 placeholders to ? for database/sql
-	convertedQuery, numParams := convertPlaceholders(rewrittenQuery)
+	// Transpile PostgreSQL SQL to DuckDB-compatible SQL (with placeholder conversion)
+	tr := c.newTranspiler(true) // Enable placeholder conversion for prepared statements
+	result, err := tr.Transpile(query)
+	if err != nil {
+		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		return
+	}
 
 	// Close existing statement with same name
 	delete(c.stmts, stmtName)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:          query,          // Keep original for logging and Describe
-		convertedQuery: convertedQuery, // Rewritten and placeholder-converted for execution
+		query:          query,             // Keep original for logging and Describe
+		convertedQuery: result.SQL,        // Transpiled SQL for execution
 		paramTypes:     paramTypes,
-		numParams:      numParams,
+		numParams:      result.ParamCount,
+		isIgnoredSet:   result.IsIgnoredSet,
+		isNoOp:         result.IsNoOp,
+		noOpTag:        result.NoOpTag,
 	}
 
 	log.Printf("[%s] Prepared statement %q: %s", c.username, stmtName, query)
+	if result.SQL != query {
+		log.Printf("[%s] Prepared statement %q transpiled: %s", c.username, stmtName, result.SQL)
+	}
 	writeParseComplete(c.writer)
 }
 
@@ -1336,16 +1368,18 @@ func (c *clientConn) handleExecute(body []byte) {
 	log.Printf("[%s] Execute %q with %d params: %s", c.username, portalName, len(args), p.stmt.query)
 
 	// Check if this is a PostgreSQL-specific SET command that should be ignored
-	if isIgnoredSetParameter(p.stmt.query) {
+	// (determined by transpiler during Parse)
+	if p.stmt.isIgnoredSet {
 		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, p.stmt.query)
 		writeCommandComplete(c.writer, "SET")
 		return
 	}
 
 	// Handle no-op commands (CREATE INDEX, VACUUM, etc.) - DuckLake doesn't support these
-	if isNoOpCommand(cmdType) {
+	// (determined by transpiler during Parse)
+	if p.stmt.isNoOp {
 		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, p.stmt.query)
-		writeCommandComplete(c.writer, getNoOpCommandTag(cmdType))
+		writeCommandComplete(c.writer, p.stmt.noOpTag)
 		return
 	}
 
@@ -1488,20 +1522,4 @@ func readCString(r *bytes.Reader) (string, error) {
 		buf.WriteByte(b)
 	}
 	return buf.String(), nil
-}
-
-// convertPlaceholders converts PostgreSQL $1, $2 placeholders to ?
-// Returns the converted query and the number of parameters found
-func convertPlaceholders(query string) (string, int) {
-	result := query
-	count := 0
-	for i := 1; i <= 100; i++ {
-		placeholder := fmt.Sprintf("$%d", i)
-		if !strings.Contains(result, placeholder) {
-			break
-		}
-		result = strings.Replace(result, placeholder, "?", 1)
-		count++
-	}
-	return result, count
 }
