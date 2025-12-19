@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"log"
 )
 
 // initPgCatalog creates PostgreSQL compatibility functions and views in DuckDB
@@ -415,7 +416,9 @@ func initInformationSchema(db *sql.DB) error {
 				'YES' AS is_updatable
 			FROM information_schema.columns
 		`
-		db.Exec(columnsViewSimpleSQL)
+		if _, err := db.Exec(columnsViewSimpleSQL); err != nil {
+			log.Printf("Warning: failed to create information_schema_columns_compat view: %v", err)
+		}
 	}
 
 	// Create information_schema.tables wrapper view with additional PostgreSQL columns

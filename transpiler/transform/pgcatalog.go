@@ -12,6 +12,9 @@ type PgCatalogTransform struct {
 	// ViewMappings maps pg_catalog table names to our compatibility views
 	ViewMappings map[string]string
 
+	// InformationSchemaMappings maps information_schema table names to our compatibility views
+	InformationSchemaMappings map[string]string
+
 	// Functions that need pg_catalog prefix stripped
 	Functions map[string]bool
 }
@@ -20,17 +23,20 @@ type PgCatalogTransform struct {
 func NewPgCatalogTransform() *PgCatalogTransform {
 	return &PgCatalogTransform{
 		ViewMappings: map[string]string{
-			"pg_class":             "pg_class_full",
-			"pg_database":          "pg_database",
-			"pg_collation":         "pg_collation",
-			"pg_policy":            "pg_policy",
-			"pg_roles":             "pg_roles",
-			"pg_statistic_ext":     "pg_statistic_ext",
+			"pg_class":              "pg_class_full",
+			"pg_database":           "pg_database",
+			"pg_collation":          "pg_collation",
+			"pg_policy":             "pg_policy",
+			"pg_roles":              "pg_roles",
+			"pg_statistic_ext":      "pg_statistic_ext",
 			"pg_publication_tables": "pg_publication_tables",
-			"pg_rules":             "pg_rules",
-			"pg_publication":       "pg_publication",
-			"pg_publication_rel":   "pg_publication_rel",
-			"pg_inherits":          "pg_inherits",
+			"pg_rules":              "pg_rules",
+			"pg_publication":        "pg_publication",
+			"pg_publication_rel":    "pg_publication_rel",
+			"pg_inherits":           "pg_inherits",
+		},
+		InformationSchemaMappings: map[string]string{
+			"columns": "information_schema_columns_compat",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                  true,
@@ -89,6 +95,15 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 			}
 			n.RangeVar.Schemaname = ""
 			*changed = true
+		}
+		// Table references: information_schema.columns -> information_schema_columns_compat
+		if n.RangeVar != nil && strings.EqualFold(n.RangeVar.Schemaname, "information_schema") {
+			relname := strings.ToLower(n.RangeVar.Relname)
+			if newName, ok := t.InformationSchemaMappings[relname]; ok {
+				n.RangeVar.Relname = newName
+				n.RangeVar.Schemaname = ""
+				*changed = true
+			}
 		}
 
 	case *pg_query.Node_FuncCall:
