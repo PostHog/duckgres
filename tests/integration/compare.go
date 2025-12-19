@@ -49,7 +49,7 @@ type CompareOptions struct {
 func DefaultCompareOptions() CompareOptions {
 	return CompareOptions{
 		IgnoreColumnOrder: false,
-		IgnoreRowOrder:    false,
+		IgnoreRowOrder:    true, // Row order is undefined without ORDER BY
 		IgnoreColumnNames: true, // DuckDB names anonymous columns differently than PostgreSQL
 		FloatTolerance:    1e-9,
 		TimeTolerance:     time.Microsecond,
@@ -524,7 +524,33 @@ func compareValues(a, b interface{}) int {
 		return 1
 	}
 
-	// Convert to string for comparison
+	// Try numeric comparison first
+	if aNum, aOk := toFloat64(a); aOk {
+		if bNum, bOk := toFloat64(b); bOk {
+			if aNum < bNum {
+				return -1
+			}
+			if aNum > bNum {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Try time comparison
+	if aTime, aOk := a.(time.Time); aOk {
+		if bTime, bOk := b.(time.Time); bOk {
+			if aTime.Before(bTime) {
+				return -1
+			}
+			if aTime.After(bTime) {
+				return 1
+			}
+			return 0
+		}
+	}
+
+	// Fall back to string comparison
 	aStr := fmt.Sprintf("%v", a)
 	bStr := fmt.Sprintf("%v", b)
 	if aStr < bStr {
