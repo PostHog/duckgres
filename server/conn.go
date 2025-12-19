@@ -77,15 +77,18 @@ func (c *clientConn) serve() error {
 		return fmt.Errorf("startup failed: %w", err)
 	}
 
-	// Get a DuckDB connection from the pool. Connections are shared across
-	// clients to avoid DuckDB file locking issues from rapid open/close cycles.
-	db, err := c.server.getDBConnection(c.username)
+	// Create a DuckDB connection for this client session
+	db, err := c.server.createDBConnection(c.username)
 	if err != nil {
 		c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
 		return err
 	}
 	c.db = db
-	// Note: Don't close the connection - it's pooled and shared across clients
+	defer func() {
+		if c.db != nil {
+			c.db.Close()
+		}
+	}()
 
 	// Send initial parameters
 	c.sendInitialParams()

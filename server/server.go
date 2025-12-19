@@ -94,12 +94,6 @@ type Server struct {
 	// duckLakeSem serializes DuckLake attachment to avoid write-write conflicts.
 	// Using a channel instead of mutex allows for timeout on acquisition.
 	duckLakeSem chan struct{}
-
-	// dbPool caches sql.DB connections per database file to avoid DuckDB file locking
-	// issues from rapid open/close cycles. Connections are created on first use and
-	// kept open for the server lifetime.
-	dbPool   map[string]*sql.DB
-	dbPoolMu sync.Mutex
 }
 
 func New(cfg Config) (*Server, error) {
@@ -135,7 +129,6 @@ func New(cfg Config) (*Server, error) {
 			Certificates: []tls.Certificate{cert},
 		},
 		duckLakeSem: make(chan struct{}, 1),
-		dbPool:      make(map[string]*sql.DB),
 	}
 
 	log.Printf("TLS enabled with certificate: %s", cfg.TLSCertFile)
@@ -255,36 +248,18 @@ func (s *Server) ActiveConnections() int64 {
 	return atomic.LoadInt64(&s.activeConns)
 }
 
-// getDBConnection returns a DuckDB connection for a client session.
-// Connections are pooled per user. Uses in-memory database as an anchor
-// for DuckLake attachment (actual data lives in RDS/S3).
-func (s *Server) getDBConnection(username string) (*sql.DB, error) {
-	// Check if we already have a connection for this user
-	s.dbPoolMu.Lock()
-	if db, ok := s.dbPool[username]; ok {
-		s.dbPoolMu.Unlock()
-		// Verify connection is still alive
-		if err := db.Ping(); err == nil {
-			return db, nil
-		}
-		// Connection is dead, remove from pool and create new one
-		log.Printf("[%s] Pooled connection dead, creating new one", username)
-		s.dbPoolMu.Lock()
-		delete(s.dbPool, username)
-	}
-	s.dbPoolMu.Unlock()
-
+// createDBConnection creates a DuckDB connection for a client session.
+// Uses in-memory database as an anchor for DuckLake attachment (actual data lives in RDS/S3).
+func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	// Create new in-memory connection (DuckLake provides actual storage)
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
 
-	// Configure connection pool - allow multiple concurrent queries since
-	// this connection is shared across all clients for this user
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(30 * time.Minute)
+	// Single connection per client session
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// Verify connection
 	if err := db.Ping(); err != nil {
@@ -315,12 +290,6 @@ func (s *Server) getDBConnection(username string) (*sql.DB, error) {
 		// Continue anyway - basic queries will still work
 	}
 
-	// Add to pool
-	s.dbPoolMu.Lock()
-	s.dbPool[username] = db
-	s.dbPoolMu.Unlock()
-
-	log.Printf("[%s] DuckDB connection ready", username)
 	return db, nil
 }
 
