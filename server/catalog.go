@@ -2,11 +2,17 @@ package server
 
 import (
 	"database/sql"
+	"log"
 )
 
 // initPgCatalog creates PostgreSQL compatibility functions and views in DuckDB
 // DuckDB already has a pg_catalog schema with basic views, so we just add missing functions
 func initPgCatalog(db *sql.DB) error {
+	// Switch to memory database to avoid creating views in DuckLake
+	// (DuckLake may be the default, but we want views in the local memory db)
+	db.Exec("USE memory")
+	defer db.Exec("USE ducklake") // Switch back if DuckLake is attached
+
 	// Create our own pg_database view that has all the columns psql expects
 	// We put it in main schema and rewrite queries to use it
 	pgDatabaseSQL := `
@@ -286,6 +292,11 @@ func initPgCatalog(db *sql.DB) error {
 // initInformationSchema creates the column metadata table and information_schema wrapper views.
 // This enables accurate type information (VARCHAR lengths, NUMERIC precision) in information_schema.
 func initInformationSchema(db *sql.DB) error {
+	// Switch to memory database to avoid creating views in DuckLake
+	// (DuckLake may be the default, but we want views in the local memory db)
+	db.Exec("USE memory")
+	defer db.Exec("USE ducklake") // Switch back if DuckLake is attached
+
 	// Create metadata table to store column type information that DuckDB doesn't preserve
 	metadataTableSQL := `
 		CREATE TABLE IF NOT EXISTS __duckgres_column_metadata (
@@ -415,7 +426,9 @@ func initInformationSchema(db *sql.DB) error {
 				'YES' AS is_updatable
 			FROM information_schema.columns
 		`
-		db.Exec(columnsViewSimpleSQL)
+		if _, err := db.Exec(columnsViewSimpleSQL); err != nil {
+			log.Printf("Warning: failed to create information_schema_columns_compat view: %v", err)
+		}
 	}
 
 	// Create information_schema.tables wrapper view with additional PostgreSQL columns

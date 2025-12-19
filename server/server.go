@@ -290,6 +290,11 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		// Continue anyway - basic queries will still work
 	}
 
+	// Initialize information_schema wrapper views
+	if err := initInformationSchema(db); err != nil {
+		log.Printf("Warning: failed to initialize information_schema views for user %q: %v", username, err)
+	}
+
 	return db, nil
 }
 

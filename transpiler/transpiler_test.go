@@ -376,6 +376,10 @@ func TestTranspile_ETLPatterns(t *testing.T) {
 			input: "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
 		},
 		{
+			name:  "information_schema.columns rewrite",
+			input: "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'users'",
+		},
+		{
 			name:  "pg_namespace query",
 			input: "SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname NOT LIKE 'pg_%'",
 		},
@@ -436,6 +440,26 @@ func TestTranspile_DDL_Complex(t *testing.T) {
 	// Should still contain NOT NULL (this is allowed)
 	if !strings.Contains(upperSQL, "NOT NULL") {
 		t.Errorf("Result should contain NOT NULL: %s", result.SQL)
+	}
+}
+
+func TestTranspile_InformationSchemaColumnsRewrite(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	input := "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'users'"
+	result, err := tr.Transpile(input)
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+
+	// Should rewrite information_schema.columns to information_schema_columns_compat
+	if !strings.Contains(result.SQL, "information_schema_columns_compat") {
+		t.Errorf("Expected information_schema.columns to be rewritten to information_schema_columns_compat, got: %s", result.SQL)
+	}
+
+	// Should NOT contain original schema-qualified name
+	if strings.Contains(result.SQL, "information_schema.columns") {
+		t.Errorf("Should NOT contain information_schema.columns after rewrite, got: %s", result.SQL)
 	}
 }
 
