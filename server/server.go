@@ -333,6 +333,10 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	// Serialize DuckLake attachment to avoid race conditions
 	// Multiple connections trying to attach simultaneously can cause
 	// "database with name '__ducklake_metadata_ducklake' already exists" errors
+	//
+	// TODO: This mutex can block all incoming connections if DuckLake attachment
+	// is slow (e.g., network latency to metadata store). Consider adding a timeout
+	// or moving attachment to happen asynchronously after connection establishment.
 	s.duckLakeMu.Lock()
 	defer s.duckLakeMu.Unlock()
 
