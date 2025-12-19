@@ -25,6 +25,7 @@ type TestHarness struct {
 	tmpDir      string
 	pgPort      int
 	dgPort      int
+	useDuckLake bool
 	mu          sync.Mutex
 }
 
@@ -36,21 +37,33 @@ type HarnessConfig struct {
 	SkipPostgres bool
 	// Verbose enables verbose logging
 	Verbose bool
+	// UseDuckLake enables DuckLake mode (requires ducklake-metadata and minio)
+	UseDuckLake bool
+	// DuckLakeMetadataPort is the port for the DuckLake metadata PostgreSQL (default: 35433)
+	DuckLakeMetadataPort int
+	// MinIOPort is the port for MinIO S3 API (default: 39000)
+	MinIOPort int
 }
 
 // DefaultConfig returns the default harness configuration
 func DefaultConfig() HarnessConfig {
+	// Default to DuckLake mode unless DUCKGRES_TEST_NO_DUCKLAKE is set
+	useDuckLake := os.Getenv("DUCKGRES_TEST_NO_DUCKLAKE") == ""
 	return HarnessConfig{
-		PostgresPort: 35432,
-		SkipPostgres: false,
-		Verbose:      os.Getenv("DUCKGRES_TEST_VERBOSE") != "",
+		PostgresPort:         35432,
+		SkipPostgres:         false,
+		Verbose:              os.Getenv("DUCKGRES_TEST_VERBOSE") != "",
+		UseDuckLake:          useDuckLake,
+		DuckLakeMetadataPort: 35433,
+		MinIOPort:            39000,
 	}
 }
 
 // NewTestHarness creates a new test harness
 func NewTestHarness(cfg HarnessConfig) (*TestHarness, error) {
 	h := &TestHarness{
-		pgPort: cfg.PostgresPort,
+		pgPort:      cfg.PostgresPort,
+		useDuckLake: cfg.UseDuckLake,
 	}
 
 	// Create temp directory for Duckgres
@@ -61,7 +74,7 @@ func NewTestHarness(cfg HarnessConfig) (*TestHarness, error) {
 	h.tmpDir = tmpDir
 
 	// Start Duckgres server
-	if err := h.startDuckgres(); err != nil {
+	if err := h.startDuckgres(cfg); err != nil {
 		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("failed to start Duckgres: %w", err)
 	}
@@ -90,7 +103,7 @@ func NewTestHarness(cfg HarnessConfig) (*TestHarness, error) {
 }
 
 // startDuckgres starts the Duckgres server
-func (h *TestHarness) startDuckgres() error {
+func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 	port := findAvailablePort()
 	h.dgPort = port
 
@@ -111,6 +124,22 @@ func (h *TestHarness) startDuckgres() error {
 		Users: map[string]string{
 			"testuser": "testpass",
 		},
+		Extensions: []string{"ducklake"},
+	}
+
+	// Configure DuckLake if enabled
+	if harnessCfg.UseDuckLake {
+		cfg.DuckLake = server.DuckLakeConfig{
+			MetadataStore: fmt.Sprintf("postgres:host=127.0.0.1 port=%d user=ducklake password=ducklake dbname=ducklake", harnessCfg.DuckLakeMetadataPort),
+			ObjectStore:   "s3://ducklake/data/",
+			S3Provider:    "config",
+			S3Endpoint:    fmt.Sprintf("127.0.0.1:%d", harnessCfg.MinIOPort),
+			S3AccessKey:   "minioadmin",
+			S3SecretKey:   "minioadmin",
+			S3Region:      "us-east-1",
+			S3UseSSL:      false,
+			S3URLStyle:    "path",
+		}
 	}
 
 	srv, err := server.New(cfg)
@@ -185,7 +214,17 @@ func (h *TestHarness) connectDuckgres() error {
 }
 
 // loadFixtures loads the test schema and data into Duckgres
+// In DuckLake mode, tables are automatically created in ducklake.main
+// because the server runs "USE ducklake" to set the default catalog
 func (h *TestHarness) loadFixtures() error {
+	// In DuckLake mode, drop existing tables first since metadata persists
+	if h.useDuckLake {
+		if err := h.cleanupDuckLakeTables(); err != nil {
+			// Log but don't fail - tables might not exist
+			fmt.Printf("Warning: cleanup failed (may be OK): %v\n", err)
+		}
+	}
+
 	// Read and execute schema
 	schemaPath := filepath.Join(getTestDir(), "fixtures", "schema.sql")
 	schemaSQL, err := os.ReadFile(schemaPath)
@@ -222,6 +261,45 @@ func (h *TestHarness) loadFixtures() error {
 			return fmt.Errorf("failed to execute data statement: %s: %w", truncate(stmt, 50), err)
 		}
 	}
+
+	return nil
+}
+
+// cleanupDuckLakeTables drops existing tables in DuckLake before loading fixtures
+func (h *TestHarness) cleanupDuckLakeTables() error {
+	// Drop views first (they depend on tables)
+	views := []string{"order_details", "user_stats", "active_users"}
+	for _, v := range views {
+		h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", v))
+	}
+
+	// Drop tables in reverse dependency order
+	tables := []string{
+		"test_schema.schema_test",
+		"array_test",
+		"documents",
+		"metrics",
+		"empty_table",
+		"nullable_test",
+		"json_data",
+		"events",
+		"sales",
+		"categories",
+		"order_items",
+		"orders",
+		"products",
+		"users",
+		"types_test",
+	}
+
+	for _, t := range tables {
+		if _, err := h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t)); err != nil {
+			// Ignore errors - table might not exist or schema might not exist
+		}
+	}
+
+	// Drop test schema
+	h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS test_schema")
 
 	return nil
 }
@@ -295,6 +373,39 @@ func IsPostgresRunning(port int) bool {
 	}
 	conn.Close()
 	return true
+}
+
+// IsDuckLakeInfraRunning checks if the DuckLake infrastructure (metadata postgres + minio) is running
+func IsDuckLakeInfraRunning(metadataPort, minioPort int) bool {
+	// Check DuckLake metadata PostgreSQL
+	metaConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", metadataPort), time.Second)
+	if err != nil {
+		return false
+	}
+	metaConn.Close()
+
+	// Check MinIO
+	minioConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", minioPort), time.Second)
+	if err != nil {
+		return false
+	}
+	minioConn.Close()
+
+	return true
+}
+
+// WaitForDuckLakeInfra waits for DuckLake infrastructure to be ready
+func WaitForDuckLakeInfra(metadataPort, minioPort int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if IsDuckLakeInfraRunning(metadataPort, minioPort) {
+			// Give MinIO a bit more time to initialize the bucket
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for DuckLake infrastructure (metadata:%d, minio:%d)", metadataPort, minioPort)
 }
 
 // Helper functions

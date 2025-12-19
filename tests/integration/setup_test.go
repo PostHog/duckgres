@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 )
 
 var (
@@ -16,8 +17,10 @@ var (
 
 // TestMain sets up and tears down the test environment
 func TestMain(m *testing.M) {
-	// Check if PostgreSQL is running
-	pgPort := 35432
+	cfg := DefaultConfig()
+
+	// Check if PostgreSQL (for comparison) is running
+	pgPort := cfg.PostgresPort
 	if !IsPostgresRunning(pgPort) {
 		fmt.Println("PostgreSQL container not running. Starting it...")
 		if err := StartPostgresContainer(); err != nil {
@@ -27,8 +30,20 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	// Create test harness
-	cfg := DefaultConfig()
+	// Check and wait for DuckLake infrastructure if DuckLake mode is enabled
+	if cfg.UseDuckLake {
+		if !IsDuckLakeInfraRunning(cfg.DuckLakeMetadataPort, cfg.MinIOPort) {
+			fmt.Println("DuckLake infrastructure not running. Waiting for it...")
+			if err := WaitForDuckLakeInfra(cfg.DuckLakeMetadataPort, cfg.MinIOPort, 30*time.Second); err != nil {
+				fmt.Printf("DuckLake infrastructure not available: %v\n", err)
+				fmt.Println("Falling back to vanilla DuckDB mode (set DUCKGRES_TEST_NO_DUCKLAKE=1 to suppress this)")
+				cfg.UseDuckLake = false
+			} else {
+				fmt.Println("DuckLake infrastructure is ready")
+			}
+		}
+	}
+
 	cfg.SkipPostgres = skipPostgresCompare
 
 	var err error

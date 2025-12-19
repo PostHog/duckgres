@@ -263,36 +263,47 @@ func (t *DDLTransform) isUnsupportedColumnConstraint(c *pg_query.Constraint) boo
 	return false
 }
 
-// isUnsupportedDefault checks if a DEFAULT expression is unsupported (e.g., now(), current_timestamp)
+// isUnsupportedDefault checks if a DEFAULT expression is unsupported by DuckLake.
+// DuckLake only supports simple numeric and string literals as defaults.
+// Returns true if the default should be stripped.
 func (t *DDLTransform) isUnsupportedDefault(expr *pg_query.Node) bool {
 	if expr == nil {
 		return false
 	}
 
-	// Check for function calls to now() or current_timestamp
+	// Check for function calls (e.g., now(), current_timestamp)
 	if funcCall := expr.GetFuncCall(); funcCall != nil {
-		if len(funcCall.Funcname) == 1 {
-			if name := funcCall.Funcname[0].GetString_(); name != nil {
-				funcName := strings.ToLower(name.Sval)
-				if funcName == "now" || funcName == "current_timestamp" {
-					return true
-				}
-			}
-		}
+		return true // All function calls are unsupported
 	}
 
 	// Check for SQLValueFunction (CURRENT_TIMESTAMP, CURRENT_DATE, etc.)
 	if svf := expr.GetSqlvalueFunction(); svf != nil {
-		switch svf.Op {
-		case pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP,
-			pg_query.SQLValueFunctionOp_SVFOP_CURRENT_TIMESTAMP_N,
-			pg_query.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP,
-			pg_query.SQLValueFunctionOp_SVFOP_LOCALTIMESTAMP_N:
-			return true
+		return true // All SQL value functions are unsupported
+	}
+
+	// Check for boolean constants (DEFAULT true/false)
+	// DuckLake only supports numeric and string literals
+	if typeCast := expr.GetTypeCast(); typeCast != nil {
+		return t.isUnsupportedDefault(typeCast.Arg)
+	}
+
+	// Check for A_Const nodes - only allow Integer and String
+	if aconst := expr.GetAConst(); aconst != nil {
+		switch aconst.Val.(type) {
+		case *pg_query.A_Const_Ival, *pg_query.A_Const_Fval, *pg_query.A_Const_Sval:
+			return false // These are supported
+		default:
+			return true // Booleans, NULLs, etc. are not supported
 		}
 	}
 
-	return false
+	// TypeCast (e.g., 'value'::type)
+	if expr.GetTypeCast() != nil {
+		return true
+	}
+
+	// Column references, expressions, etc. are not supported
+	return true
 }
 
 // isConstraintCommand checks if an ALTER TABLE command is adding a constraint
