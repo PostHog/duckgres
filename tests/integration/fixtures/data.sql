@@ -7,7 +7,7 @@ INSERT INTO types_test VALUES
  '1 day 2 hours', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{"key": "value"}', '\x48656c6c6f'),
 (2, false, -1, -100, -1000000000, -1.5, -2.5, -123.4567, '', '', '          ',
  '2020-12-31', '23:59:59', '2020-12-31 23:59:59', '2020-12-31 23:59:59+00',
- '1 year 2 months', 'b1ffcd00-0d1c-5fg9-cc7e-7cc0ce491b22', '[]', '\x00'),
+ '1 year 2 months', 'b1ffcd00-0d1c-5fa9-cc7e-7cc0ce491b22', '[]', '\x00'),
 (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 

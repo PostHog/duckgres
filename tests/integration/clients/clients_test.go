@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/PostHog/duckgres/server"
+	"github.com/posthog/duckgres/server"
 	_ "github.com/lib/pq"
 )
 
