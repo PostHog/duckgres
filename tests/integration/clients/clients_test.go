@@ -61,6 +61,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// Force single connection - Duckgres uses per-connection in-memory databases
+	testDB.SetMaxOpenConns(1)
+	testDB.SetMaxIdleConns(1)
+
 	// Setup test data
 	setupTestData()
 

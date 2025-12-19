@@ -26,6 +26,7 @@ type preparedStmt struct {
 	isIgnoredSet   bool   // True if this is an ignored SET parameter
 	isNoOp         bool   // True if this is a no-op command (CREATE INDEX, etc.)
 	noOpTag        string // Command tag for no-op commands
+	described      bool   // True if Describe(S) was called on this statement
 }
 
 type portal struct {
@@ -1214,6 +1215,7 @@ func (c *clientConn) handleBind(body []byte) {
 		stmt:          ps,
 		paramValues:   paramValues,
 		resultFormats: resultFormats,
+		described:     ps.described, // Inherit from statement if Describe(S) was called
 	}
 
 	writeBindComplete(c.writer)
@@ -1297,6 +1299,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 
 		log.Printf("[%s] Describe statement: sending RowDescription with %d columns", c.username, len(cols))
 		c.sendRowDescription(cols, colTypes)
+		ps.described = true
 
 	case 'P':
 		// Describe portal
