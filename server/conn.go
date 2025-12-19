@@ -612,6 +612,7 @@ var (
 	copyWithCSVRegex    = regexp.MustCompile(`(?i)\bCSV\b`)
 	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
 	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)
+	copyNullRegex       = regexp.MustCompile(`(?i)\bNULL\s+'([^']*)'`)
 )
 
 // handleCopy handles COPY TO STDOUT and COPY FROM STDIN commands
@@ -768,6 +769,12 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	}
 	hasHeader := copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery)
 
+	// Parse NULL string option (e.g., NULL 'custom-null-value')
+	nullString := "\\N" // Default PostgreSQL null representation
+	if m := copyNullRegex.FindStringSubmatch(query); len(m) > 1 {
+		nullString = m[1]
+	}
+
 	// Get column count for the table
 	colQuery := fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
 	testRows, err := c.db.Query(colQuery)
@@ -828,7 +835,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 				args := make([]interface{}, len(values))
 				for i, v := range values {
 					placeholders[i] = "?"
-					if v == "\\N" || v == "" {
+					if v == nullString || v == "\\N" || v == "" {
 						args[i] = nil
 					} else {
 						args[i] = v
