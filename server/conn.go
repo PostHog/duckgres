@@ -86,6 +86,12 @@ func (c *clientConn) serve() error {
 	c.db = db
 	defer func() {
 		if c.db != nil {
+			// Detach DuckLake to release the RDS metadata connection
+			if c.server.cfg.DuckLake.MetadataStore != "" {
+				if _, err := c.db.Exec("DETACH ducklake"); err != nil {
+					log.Printf("Warning: failed to detach DuckLake for user %q: %v", c.username, err)
+				}
+			}
 			c.db.Close()
 		}
 	}()
