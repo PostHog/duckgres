@@ -26,6 +26,7 @@ type preparedStmt struct {
 	isIgnoredSet   bool   // True if this is an ignored SET parameter
 	isNoOp         bool   // True if this is a no-op command (CREATE INDEX, etc.)
 	noOpTag        string // Command tag for no-op commands
+	described      bool   // True if Describe(S) was called on this statement
 }
 
 type portal struct {
@@ -1032,6 +1033,16 @@ func formatValue(v interface{}) string {
 			return "t"
 		}
 		return "f"
+	case time.Time:
+		// PostgreSQL timestamp format without timezone suffix
+		if val.IsZero() {
+			return ""
+		}
+		// Use microsecond precision if there are sub-second components
+		if val.Nanosecond() != 0 {
+			return val.Format("2006-01-02 15:04:05.999999")
+		}
+		return val.Format("2006-01-02 15:04:05")
 	default:
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)
@@ -1210,6 +1221,7 @@ func (c *clientConn) handleBind(body []byte) {
 		stmt:          ps,
 		paramValues:   paramValues,
 		resultFormats: resultFormats,
+		described:     ps.described, // Inherit from statement if Describe(S) was called
 	}
 
 	writeBindComplete(c.writer)
@@ -1293,6 +1305,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 
 		log.Printf("[%s] Describe statement: sending RowDescription with %d columns", c.username, len(cols))
 		c.sendRowDescription(cols, colTypes)
+		ps.described = true
 
 	case 'P':
 		// Describe portal
