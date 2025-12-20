@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/posthog/duckgres/transpiler"
 )
 
@@ -1089,11 +1090,24 @@ func formatValueWithType(v interface{}, typeOID int32) string {
 		if val.IsZero() {
 			return ""
 		}
+		// Check if this is a TIME value (DuckDB returns TIME as time.Time with date 0001-01-01)
+		// Also check if the type OID indicates TIME
+		isTimeType := typeOID == OidTime || (val.Year() == 1 && val.Month() == 1 && val.Day() == 1)
+		if isTimeType {
+			// Format as TIME only (no date)
+			if val.Nanosecond() != 0 {
+				return val.Format("15:04:05.999999")
+			}
+			return val.Format("15:04:05")
+		}
 		// Use microsecond precision if there are sub-second components
 		if val.Nanosecond() != 0 {
 			return val.Format("2006-01-02 15:04:05.999999")
 		}
 		return val.Format("2006-01-02 15:04:05")
+	case duckdb.Interval:
+		// Format DuckDB interval as PostgreSQL interval string
+		return formatInterval(val)
 	default:
 		// Use reflection to handle maps and slices
 		rv := reflect.ValueOf(v)
@@ -1270,6 +1284,62 @@ func formatArrayElement(v interface{}) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+// formatInterval formats a DuckDB interval as a PostgreSQL interval string
+// DuckDB Interval has: Days (int32), Months (int32), Micros (int64)
+func formatInterval(iv duckdb.Interval) string {
+	var parts []string
+
+	// Handle years and months
+	years := iv.Months / 12
+	months := iv.Months % 12
+	if years != 0 {
+		if years == 1 {
+			parts = append(parts, "1 year")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d years", years))
+		}
+	}
+	if months != 0 {
+		if months == 1 {
+			parts = append(parts, "1 mon")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d mons", months))
+		}
+	}
+
+	// Handle days
+	if iv.Days != 0 {
+		if iv.Days == 1 {
+			parts = append(parts, "1 day")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d days", iv.Days))
+		}
+	}
+
+	// Handle time component (microseconds)
+	if iv.Micros != 0 {
+		// Convert microseconds to hours:minutes:seconds
+		totalSeconds := iv.Micros / 1000000
+		micros := iv.Micros % 1000000
+
+		hours := totalSeconds / 3600
+		minutes := (totalSeconds % 3600) / 60
+		seconds := totalSeconds % 60
+
+		if micros != 0 {
+			parts = append(parts, fmt.Sprintf("%02d:%02d:%02d.%06d", hours, minutes, seconds, micros))
+		} else {
+			parts = append(parts, fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds))
+		}
+	}
+
+	if len(parts) == 0 {
+		return "00:00:00"
+	}
+
+	return strings.Join(parts, " ")
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
