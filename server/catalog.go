@@ -376,12 +376,8 @@ func initPgCatalog(db *sql.DB) error {
 		// atan2
 		`CREATE OR REPLACE MACRO atan2(y, x) AS atan2(y, x)`,
 
-		// JSON functions that PostgreSQL has
-		`CREATE OR REPLACE MACRO json_typeof(j) AS json_type(j)`,
-		`CREATE OR REPLACE MACRO jsonb_typeof(j) AS json_type(j)`,
-
-		// json_array_length
-		`CREATE OR REPLACE MACRO json_array_length(j) AS json_array_length(j)`,
+		// Note: json_typeof, jsonb_typeof are mapped to native DuckDB json_type by transpiler
+		// json_array_length is a native DuckDB function
 
 		// array_agg needs to return array type
 		`CREATE OR REPLACE MACRO array_agg(val) AS list(val)`,

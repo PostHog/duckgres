@@ -151,11 +151,8 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"width_bucket": true,
 			"pi":           true,
 			"radians":      true,
-
-			// JSON functions
-			"json_typeof":       true,
-			"jsonb_typeof":      true,
-			"json_array_length": true,
+			// Note: json_typeof, jsonb_typeof map to native DuckDB json_type
+			// so they should NOT be in CustomMacros (handled by FunctionTransform)
 		},
 	}
 }

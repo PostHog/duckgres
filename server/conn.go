@@ -6,11 +6,13 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -1044,8 +1046,88 @@ func formatValue(v interface{}) string {
 		}
 		return val.Format("2006-01-02 15:04:05")
 	default:
-		// For other types, try to convert to string
-		return fmt.Sprintf("%v", val)
+		// Use reflection to handle maps and slices
+		rv := reflect.ValueOf(v)
+		switch rv.Kind() {
+		case reflect.Map:
+			// Format as JSON object
+			return formatMapAsJSON(rv)
+		case reflect.Slice:
+			// Check if it's a []byte (already handled above, but just in case)
+			if rv.Type().Elem().Kind() == reflect.Uint8 {
+				return string(val.([]byte))
+			}
+			// Format as PostgreSQL array
+			return formatSliceAsPostgresArray(rv)
+		default:
+			// For other types, try to convert to string
+			return fmt.Sprintf("%v", val)
+		}
+	}
+}
+
+// formatMapAsJSON formats a map as a JSON string for PostgreSQL
+func formatMapAsJSON(rv reflect.Value) string {
+	// Try to use json.Marshal for proper JSON formatting
+	jsonBytes, err := json.Marshal(rv.Interface())
+	if err != nil {
+		// Fallback to simple formatting
+		return fmt.Sprintf("%v", rv.Interface())
+	}
+	return string(jsonBytes)
+}
+
+// formatSliceAsPostgresArray formats a slice as a PostgreSQL array literal
+// PostgreSQL arrays use {elem1,elem2,...} format
+func formatSliceAsPostgresArray(rv reflect.Value) string {
+	if rv.Len() == 0 {
+		return "{}"
+	}
+
+	var parts []string
+	for i := 0; i < rv.Len(); i++ {
+		elem := rv.Index(i).Interface()
+		elemStr := formatArrayElement(elem)
+		parts = append(parts, elemStr)
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// formatArrayElement formats a single array element for PostgreSQL array literal
+func formatArrayElement(v interface{}) string {
+	if v == nil {
+		return "NULL"
+	}
+
+	rv := reflect.ValueOf(v)
+
+	switch rv.Kind() {
+	case reflect.String:
+		s := rv.String()
+		// Escape special characters and quote strings
+		if strings.ContainsAny(s, `{},"\`) || strings.ContainsAny(s, " \t\n\r") || s == "" {
+			// Need to quote and escape
+			escaped := strings.ReplaceAll(s, `\`, `\\`)
+			escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+			return `"` + escaped + `"`
+		}
+		return s
+	case reflect.Slice:
+		// Nested array
+		return formatSliceAsPostgresArray(rv)
+	case reflect.Map:
+		// JSON in array - format and quote
+		jsonStr := formatMapAsJSON(rv)
+		escaped := strings.ReplaceAll(jsonStr, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+		return `"` + escaped + `"`
+	case reflect.Bool:
+		if rv.Bool() {
+			return "t"
+		}
+		return "f"
+	default:
+		return fmt.Sprintf("%v", v)
 	}
 }
 
