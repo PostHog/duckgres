@@ -35,6 +35,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 		ViewMappings: map[string]string{
 			"pg_class":              "pg_class_full",
 			"pg_database":           "pg_database",
+			"pg_namespace":          "pg_namespace",
 			"pg_collation":          "pg_collation",
 			"pg_policy":             "pg_policy",
 			"pg_roles":              "pg_roles",
@@ -107,12 +108,21 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 	switch n := node.Node.(type) {
 	case *pg_query.Node_RangeVar:
 		// Table references: pg_catalog.pg_class -> pg_class_full
+		// In DuckLake mode, we need to fully qualify with memory.main
 		if n.RangeVar != nil && strings.EqualFold(n.RangeVar.Schemaname, "pg_catalog") {
 			relname := strings.ToLower(n.RangeVar.Relname)
 			if newName, ok := t.ViewMappings[relname]; ok {
 				n.RangeVar.Relname = newName
+				if t.DuckLakeMode {
+					// In DuckLake mode, our views are in memory.main
+					n.RangeVar.Catalogname = "memory"
+					n.RangeVar.Schemaname = "main"
+				} else {
+					n.RangeVar.Schemaname = ""
+				}
+			} else {
+				n.RangeVar.Schemaname = ""
 			}
-			n.RangeVar.Schemaname = ""
 			*changed = true
 		}
 

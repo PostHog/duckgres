@@ -274,7 +274,9 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 	}
 
 	// Drop tables in reverse dependency order
+	// Include both fixture tables and tables created by other tests (DDL tests, etc.)
 	tables := []string{
+		// Fixture tables
 		"test_schema.schema_test",
 		"array_test",
 		"documents",
@@ -290,6 +292,47 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		"products",
 		"users",
 		"types_test",
+		// DDL test tables that may persist in DuckLake
+		"ddl_test_basic",
+		"ddl_test_types",
+		"ddl_test_pk",
+		"ddl_test_notnull",
+		"ddl_test_default",
+		"ddl_test_unique",
+		"ddl_test_as",
+		"ddl_alter_test",
+		"ddl_drop_test1",
+		"ddl_drop_test2",
+		"ddl_drop_test3",
+		"ddl_index_test",
+		"ddl_truncate_test",
+		"ddl_comment_test",
+		"ddl_constraint_pk",
+		"ddl_constraint_unique",
+		"ddl_constraint_check",
+		"ddl_constraint_fk",
+		// DML test tables
+		"dml_insert_test",
+		"dml_insert_target",
+		"dml_insert_default",
+		"dml_returning_test",
+		"dml_upsert_test",
+		"dml_update_test",
+		"dml_update_returning",
+		"dml_update_target",
+		"dml_update_source",
+		"dml_delete_test",
+		"dml_delete_returning",
+		"dml_delete_main",
+		"dml_delete_filter",
+		"dml_cte_source",
+		"dml_cte_target",
+		// Protocol test tables
+		"protocol_insert_test",
+		"tx_test",
+		"tx_rollback_test",
+		"tx_isolation_test",
+		"interleave_test",
 	}
 
 	for _, t := range tables {

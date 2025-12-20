@@ -9,24 +9,24 @@ import (
 func initPgCatalog(db *sql.DB) error {
 	// Create our own pg_database view that has all the columns psql expects
 	// We put it in main schema and rewrite queries to use it
+	// Include template databases for PostgreSQL compatibility
+	// Note: We use 'testdb' as the user database name to match the test PostgreSQL container
 	pgDatabaseSQL := `
 		CREATE OR REPLACE VIEW pg_database AS
-		SELECT
-			1::INTEGER AS oid,
-			current_database() AS datname,
-			0::INTEGER AS datdba,
-			6::INTEGER AS encoding,
-			'en_US.UTF-8' AS datcollate,
-			'en_US.UTF-8' AS datctype,
-			false AS datistemplate,
-			true AS datallowconn,
-			-1::INTEGER AS datconnlimit,
-			NULL AS datacl
+		SELECT * FROM (
+			VALUES
+				(1::INTEGER, 'postgres', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL),
+				(2::INTEGER, 'template0', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', true, false, -1::INTEGER, NULL),
+				(3::INTEGER, 'template1', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', true, true, -1::INTEGER, NULL),
+				(4::INTEGER, 'testdb', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL)
+		) AS t(oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datacl)
 	`
 	db.Exec(pgDatabaseSQL)
 
 	// Create pg_class wrapper that adds missing columns psql expects
 	// DuckDB's pg_catalog.pg_class is missing relforcerowsecurity
+	// Also filter out internal duckgres views so they don't appear in \dt output
+	// Note: We use an explicit list of internal view names to filter
 	pgClassSQL := `
 		CREATE OR REPLACE VIEW pg_class_full AS
 		SELECT
@@ -67,6 +67,13 @@ func initPgCatalog(db *sql.DB) error {
 			reloptions,
 			relpartbound
 		FROM pg_catalog.pg_class
+		WHERE relname NOT IN (
+			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
+			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
+			'pg_publication_rel', 'pg_inherits', 'pg_namespace',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', '__duckgres_column_metadata'
+		)
 	`
 	db.Exec(pgClassSQL)
 
@@ -203,6 +210,21 @@ func initPgCatalog(db *sql.DB) error {
 	`
 	db.Exec(pgInheritsSQL)
 
+	// Create pg_namespace wrapper that maps 'main' to 'public' for PostgreSQL compatibility
+	// Also set owner to match PostgreSQL conventions:
+	// - public (main) is owned by pg_database_owner (OID 6171)
+	// - other schemas are owned by postgres (OID 10)
+	pgNamespaceSQL := `
+		CREATE OR REPLACE VIEW pg_namespace AS
+		SELECT
+			oid,
+			CASE WHEN nspname = 'main' THEN 'public' ELSE nspname END AS nspname,
+			CASE WHEN nspname = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
+			nspacl
+		FROM pg_catalog.pg_namespace
+	`
+	db.Exec(pgNamespaceSQL)
+
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
 	//
@@ -211,7 +233,13 @@ func initPgCatalog(db *sql.DB) error {
 	// in DuckLake mode. Otherwise, the macros won't be found when DuckLake is attached.
 	functions := []string{
 		// pg_get_userbyid - returns username for a role OID
-		`CREATE OR REPLACE MACRO pg_get_userbyid(id) AS 'duckdb'`,
+		// Map common PostgreSQL role OIDs to their names
+		`CREATE OR REPLACE MACRO pg_get_userbyid(id) AS
+			CASE id
+				WHEN 10 THEN 'postgres'
+				WHEN 6171 THEN 'pg_database_owner'
+				ELSE 'postgres'
+			END`,
 		// pg_table_is_visible - checks if table is in search path
 		`CREATE OR REPLACE MACRO pg_table_is_visible(oid) AS true`,
 		// has_schema_privilege - check schema access
