@@ -420,6 +420,12 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return err
 	}
 
+	// Extract type OIDs for proper JSON vs array formatting
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
 	// Send rows
 	rowCount := 0
 	for rows.Next() {
@@ -434,7 +440,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 			break
 		}
 
-		if err := c.sendDataRow(values); err != nil {
+		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
 			return err
 		}
 		rowCount++
@@ -966,7 +972,23 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 	binary.Write(&buf, binary.BigEndian, int16(len(values)))
 
 	for i, v := range values {
+		// Get the type OID for this column (if available)
+		var oid int32
+		if typeOIDs != nil && i < len(typeOIDs) {
+			oid = typeOIDs[i]
+		}
+
+		// Check if this is a JSON type - JSON null is different from SQL NULL
+		isJSONType := oid == OidJSON || oid == OidJSONB
+
 		if v == nil {
+			// For JSON types, nil represents JSON null value, not SQL NULL
+			if isJSONType {
+				nullStr := "null"
+				binary.Write(&buf, binary.BigEndian, int32(len(nullStr)))
+				buf.WriteString(nullStr)
+				continue
+			}
 			// NULL value
 			binary.Write(&buf, binary.BigEndian, int32(-1))
 			continue
@@ -983,12 +1005,12 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 			}
 		}
 
-		if useBinary && typeOIDs != nil && i < len(typeOIDs) {
+		if useBinary && oid != 0 {
 			// Binary encoding
-			encoded := encodeBinary(v, typeOIDs[i])
+			encoded := encodeBinary(v, oid)
 			if encoded == nil {
 				// Fallback to text if binary encoding fails
-				str := formatValue(v)
+				str := formatValueWithType(v, oid)
 				binary.Write(&buf, binary.BigEndian, int32(len(str)))
 				buf.WriteString(str)
 			} else {
@@ -996,8 +1018,8 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 				buf.Write(encoded)
 			}
 		} else {
-			// Text encoding
-			str := formatValue(v)
+			// Text encoding - pass type OID to handle JSON vs array formatting
+			str := formatValueWithType(v, oid)
 			binary.Write(&buf, binary.BigEndian, int32(len(str)))
 			buf.WriteString(str)
 		}
@@ -1007,15 +1029,42 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 }
 
 // formatValue converts a value to its PostgreSQL text representation
+// This is a convenience wrapper that calls formatValueWithType with no type info
 func formatValue(v interface{}) string {
+	return formatValueWithType(v, 0)
+}
+
+// formatValueWithType converts a value to its PostgreSQL text representation
+// The typeOID helps decide between JSON format vs PostgreSQL array format
+func formatValueWithType(v interface{}, typeOID int32) string {
+	// Check if this is a JSON type - if so, format as JSON not PostgreSQL array
+	isJSONType := typeOID == OidJSON || typeOID == OidJSONB
+
 	if v == nil {
+		if isJSONType {
+			return "null" // JSON null literal
+		}
 		return ""
 	}
 
 	switch val := v.(type) {
 	case []byte:
-		return string(val)
+		s := string(val)
+		// For JSON types, the bytes should already be valid JSON - return as-is
+		if isJSONType {
+			return s
+		}
+		return s
 	case string:
+		// For JSON types, if this is a parsed string value, we need to re-encode it as JSON
+		if isJSONType {
+			// Use json.Marshal to properly quote the string as JSON
+			b, err := json.Marshal(val)
+			if err != nil {
+				return val
+			}
+			return string(b)
+		}
 		return val
 	case *string:
 		if val == nil {
@@ -1050,14 +1099,18 @@ func formatValue(v interface{}) string {
 		rv := reflect.ValueOf(v)
 		switch rv.Kind() {
 		case reflect.Map:
-			// Format as JSON object
+			// Format as JSON object (PostgreSQL style with spaces)
 			return formatMapAsJSON(rv)
 		case reflect.Slice:
 			// Check if it's a []byte (already handled above, but just in case)
 			if rv.Type().Elem().Kind() == reflect.Uint8 {
 				return string(val.([]byte))
 			}
-			// Format as PostgreSQL array
+			// For JSON types, format as JSON array [1, 2, 3]
+			// For other types, format as PostgreSQL array {1,2,3}
+			if isJSONType {
+				return formatSliceAsPostgresJSONArray(rv)
+			}
 			return formatSliceAsPostgresArray(rv)
 		default:
 			// For other types, try to convert to string
@@ -1067,14 +1120,102 @@ func formatValue(v interface{}) string {
 }
 
 // formatMapAsJSON formats a map as a JSON string for PostgreSQL
+// PostgreSQL uses spaces around colons and after commas: {"a" : 1, "b" : 2}
 func formatMapAsJSON(rv reflect.Value) string {
-	// Try to use json.Marshal for proper JSON formatting
-	jsonBytes, err := json.Marshal(rv.Interface())
-	if err != nil {
-		// Fallback to simple formatting
-		return fmt.Sprintf("%v", rv.Interface())
+	return formatValueAsPostgresJSON(rv.Interface())
+}
+
+// formatValueAsPostgresJSON formats any value as PostgreSQL-style JSON
+// PostgreSQL json_build_object uses " : " (space before and after colon)
+// and ", " (comma space) between elements
+func formatValueAsPostgresJSON(v interface{}) string {
+	if v == nil {
+		return "null"
 	}
-	return string(jsonBytes)
+
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map:
+		return formatMapAsPostgresJSON(rv)
+	case reflect.Slice:
+		// Check if it's []byte
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			// JSON string from bytes
+			s := string(rv.Bytes())
+			return formatJSONString(s)
+		}
+		return formatSliceAsPostgresJSONArray(rv)
+	case reflect.String:
+		return formatJSONString(rv.String())
+	case reflect.Bool:
+		if rv.Bool() {
+			return "true"
+		}
+		return "false"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return fmt.Sprintf("%d", rv.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return fmt.Sprintf("%d", rv.Uint())
+	case reflect.Float32, reflect.Float64:
+		return fmt.Sprintf("%v", rv.Float())
+	default:
+		// Fallback to standard JSON
+		jsonBytes, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(jsonBytes)
+	}
+}
+
+// formatMapAsPostgresJSON formats a map with PostgreSQL-style spacing
+func formatMapAsPostgresJSON(rv reflect.Value) string {
+	if rv.Len() == 0 {
+		return "{}"
+	}
+
+	var parts []string
+	iter := rv.MapRange()
+	for iter.Next() {
+		key := iter.Key()
+		val := iter.Value()
+
+		// Format key (must be string for JSON)
+		keyStr := formatJSONString(fmt.Sprintf("%v", key.Interface()))
+		// Format value recursively
+		valStr := formatValueAsPostgresJSON(val.Interface())
+
+		// PostgreSQL uses ": " (colon followed by space, no space before colon)
+		parts = append(parts, fmt.Sprintf("%s: %s", keyStr, valStr))
+	}
+
+	// PostgreSQL uses ", " (comma space) between elements
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// formatSliceAsPostgresJSONArray formats a slice as a PostgreSQL JSON array
+func formatSliceAsPostgresJSONArray(rv reflect.Value) string {
+	if rv.Len() == 0 {
+		return "[]"
+	}
+
+	var parts []string
+	for i := 0; i < rv.Len(); i++ {
+		elem := rv.Index(i).Interface()
+		parts = append(parts, formatValueAsPostgresJSON(elem))
+	}
+
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+// formatJSONString formats a string with proper JSON escaping
+func formatJSONString(s string) string {
+	// Use json.Marshal to properly escape the string
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `"` + s + `"`
+	}
+	return string(b)
 }
 
 // formatSliceAsPostgresArray formats a slice as a PostgreSQL array literal

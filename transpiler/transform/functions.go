@@ -93,8 +93,7 @@ var functionNameMapping = map[string]string{
 	"jsonb_object_agg":   "json_group_object",
 	"json_array_length":  "json_array_length",
 	"jsonb_array_length": "json_array_length",
-	"json_typeof":        "json_type",
-	"jsonb_typeof":       "json_type",
+	// json_typeof/jsonb_typeof use our custom macros (wrap json_type with lower())
 	"json_extract_path":  "json_extract",
 	"jsonb_extract_path": "json_extract",
 	"json_extract_path_text": "json_extract_string",

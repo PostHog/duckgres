@@ -376,8 +376,31 @@ func initPgCatalog(db *sql.DB) error {
 		// atan2
 		`CREATE OR REPLACE MACRO atan2(y, x) AS atan2(y, x)`,
 
-		// Note: json_typeof, jsonb_typeof are mapped to native DuckDB json_type by transpiler
-		// json_array_length is a native DuckDB function
+		// json_typeof - map DuckDB type names to PostgreSQL type names
+		// DuckDB: NULL, BOOLEAN, BIGINT, DOUBLE, VARCHAR, ARRAY, OBJECT
+		// PostgreSQL: null, boolean, number, string, array, object
+		`CREATE OR REPLACE MACRO json_typeof(j) AS CASE json_type(j)
+			WHEN 'VARCHAR' THEN 'string'
+			WHEN 'BIGINT' THEN 'number'
+			WHEN 'UBIGINT' THEN 'number'
+			WHEN 'DOUBLE' THEN 'number'
+			WHEN 'BOOLEAN' THEN 'boolean'
+			WHEN 'ARRAY' THEN 'array'
+			WHEN 'OBJECT' THEN 'object'
+			WHEN 'NULL' THEN 'null'
+			ELSE lower(json_type(j))
+		END`,
+		`CREATE OR REPLACE MACRO jsonb_typeof(j) AS CASE json_type(j)
+			WHEN 'VARCHAR' THEN 'string'
+			WHEN 'BIGINT' THEN 'number'
+			WHEN 'UBIGINT' THEN 'number'
+			WHEN 'DOUBLE' THEN 'number'
+			WHEN 'BOOLEAN' THEN 'boolean'
+			WHEN 'ARRAY' THEN 'array'
+			WHEN 'OBJECT' THEN 'object'
+			WHEN 'NULL' THEN 'null'
+			ELSE lower(json_type(j))
+		END`,
 
 		// array_agg needs to return array type
 		`CREATE OR REPLACE MACRO array_agg(val) AS list(val)`,
