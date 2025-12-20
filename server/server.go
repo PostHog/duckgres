@@ -272,6 +272,14 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		log.Printf("Warning: failed to load some extensions for user %q: %v", username, err)
 	}
 
+	// Initialize pg_catalog schema for PostgreSQL compatibility
+	// Must be done BEFORE attaching DuckLake so macros are created in memory.main,
+	// not in the DuckLake catalog (which doesn't support macro storage).
+	if err := initPgCatalog(db); err != nil {
+		log.Printf("Warning: failed to initialize pg_catalog for user %q: %v", username, err)
+		// Continue anyway - basic queries will still work
+	}
+
 	// Attach DuckLake catalog if configured
 	if err := s.attachDuckLake(db); err != nil {
 		// If DuckLake was explicitly configured, fail the connection.
@@ -282,12 +290,6 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		}
 		// DuckLake not configured, this warning is just informational
 		log.Printf("Warning: failed to attach DuckLake for user %q: %v", username, err)
-	}
-
-	// Initialize pg_catalog schema for PostgreSQL compatibility
-	if err := initPgCatalog(db); err != nil {
-		log.Printf("Warning: failed to initialize pg_catalog for user %q: %v", username, err)
-		// Continue anyway - basic queries will still work
 	}
 
 	return db, nil

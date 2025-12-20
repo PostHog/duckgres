@@ -18,6 +18,10 @@ type Result struct {
 
 	// IsIgnoredSet indicates a SET command for an unsupported parameter
 	IsIgnoredSet bool
+
+	// Error is set when a transform detects an error that should be returned to the client
+	// (e.g., unrecognized configuration parameter in SHOW command)
+	Error error
 }
 
 // Transform defines the interface for SQL transformations.

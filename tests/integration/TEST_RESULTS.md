@@ -11,7 +11,7 @@ The integration test suite validates Duckgres compatibility with PostgreSQL for 
 
 | Mode | Description | Pass Rate |
 |------|-------------|-----------|
-| **DuckLake** (default) | Full DuckLake with PostgreSQL metadata + MinIO | 53% |
+| **DuckLake** (default) | Full DuckLake with PostgreSQL metadata + MinIO | 80% |
 | **Vanilla DuckDB** | In-memory DuckDB without DuckLake | 76% |
 
 To run without DuckLake: `DUCKGRES_TEST_NO_DUCKLAKE=1 go test ./tests/integration/...`
@@ -20,9 +20,9 @@ To run without DuckLake: `DUCKGRES_TEST_NO_DUCKLAKE=1 go test ./tests/integratio
 
 | Metric | Count |
 |--------|-------|
-| **PASS** | 48 |
-| **FAIL** | 42 |
-| **Pass Rate** | 53% |
+| **PASS** | 579 |
+| **FAIL** | 142 |
+| **Pass Rate** | 80% |
 
 ### Overall Results (Vanilla DuckDB Mode)
 
@@ -48,7 +48,7 @@ To run without DuckLake: `DUCKGRES_TEST_NO_DUCKLAKE=1 go test ./tests/integratio
 | **Airbyte Queries** | 3 | 3 | 0 | 100% |
 | **dbt Queries** | 7 | 7 | 0 | 100% |
 | **Metabase Queries** | 5 | 4 | 1 | 80% |
-| **DBeaver Queries** | 4 | 3 | 1 | 75% |
+| **DBeaver Queries** | 4 | 4 | 0 | 100% |
 | **Prepared Statements** | 3 | 3 | 0 | 100% |
 | **Transactions** | 2 | 2 | 0 | 100% |
 | **DQL (SELECT)** | ~160 | ~110 | ~50 | ~69% |
@@ -84,11 +84,23 @@ DuckLake has additional constraints compared to vanilla DuckDB:
 |----------|-----------|
 | pg_catalog Compatibility | 100% |
 | information_schema | 100% |
+| psql Commands | 100% |
+| System Functions | 100% |
+| SET/SHOW Commands | 100% |
+| Session Management | 100% |
 | DDL (with constraint stripping) | ~70% |
 | DML (without RETURNING) | ~60% |
 | Window Functions | 100% |
 | CTEs | 100% |
 | Set Operations | 100% |
+| Grafana Queries | 100% |
+| Superset Queries | 100% |
+| Tableau Queries | 100% |
+| Fivetran Queries | 100% |
+| Airbyte Queries | 100% |
+| dbt Queries | 100% |
+| DBeaver Queries | 100% |
+| Metabase Queries | 80% (1 `::regclass` limitation) |
 
 ## Passing Test Categories (Vanilla DuckDB)
 
@@ -111,27 +123,27 @@ All pg_catalog views and functions work correctly:
 ### BI Tools Compatibility
 
 **Grafana** (100%):
-- Time column detection
-- Table listing
-- Column discovery
+- Time column detection ✓
+- Table listing ✓
+- Column discovery ✓
 
 **Superset** (100%):
-- Table discovery
-- Column type detection
-- Version check
-- Current database
+- Table discovery ✓
+- Column type detection ✓
+- Version check ✓
+- Current database ✓
 
 **Tableau** (100%):
-- Connection test
-- Schema discovery
-- Table discovery
-- Column discovery
+- Connection test ✓
+- Schema discovery ✓
+- Table discovery ✓
+- Column discovery ✓
 
-**DBeaver** (75%):
+**DBeaver** (100%):
 - Catalog info ✓
 - Table metadata ✓
 - Column metadata ✓
-- Server version ✗ (`SHOW server_version` not supported)
+- Server version ✓
 
 **Metabase** (80%):
 - Get schemas ✓
@@ -187,18 +199,13 @@ Metabase uses `'table_name'::regclass` for column lookup. The transpiler convert
 
 **Workaround**: Join with pg_class by relname instead
 
-### 5. `SHOW server_version` (DBeaver)
-The SHOW command is not fully supported for all PostgreSQL configuration parameters.
-
-**Workaround**: Use `SELECT current_setting('server_version')` instead
-
-### 6. RETURNING Clause (DuckLake)
+### 5. RETURNING Clause (DuckLake)
 DuckLake does not support `INSERT/UPDATE/DELETE ... RETURNING`.
 
 **Impact**: Tests using RETURNING clause fail in DuckLake mode
 **Workaround**: Use separate SELECT after mutation
 
-### 7. Per-Connection Database (Vanilla DuckDB)
+### 6. Per-Connection Database (Vanilla DuckDB)
 Each new database connection gets a fresh in-memory DuckDB database. This is by design but affects tests requiring data persistence across connections.
 
 **Note**: This is not an issue in DuckLake mode where metadata persists.
@@ -212,6 +219,13 @@ Each new database connection gets a fresh in-memory DuckDB database. This is by 
 ### DDL Transform Fixes (DuckLake)
 - **Strip boolean defaults** (`transpiler/transform/ddl.go`): DuckLake only supports numeric/string literal defaults
 - **Strip all constraints** (`transpiler/transform/ddl.go`): PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK
+
+### DuckLake Mode Fixes (PR #45)
+- **Function prefix rewriting** (`transpiler/transform/pgcatalog.go`): Custom macros (pg_get_userbyid, current_setting, etc.) get `memory.main.` prefix in DuckLake mode since macros are created in memory database before DuckLake attachment
+- **Macro initialization order** (`server/server.go`): pg_catalog macros now initialized BEFORE DuckLake attachment so they're stored in `memory.main`
+- **SHOW command support** (`transpiler/transform/setshow.go`): Added support for many PostgreSQL parameters (server_version, search_path, datestyle, timezone, etc.)
+- **Session commands** (`transpiler/transform/setshow.go`): Added RESET ALL, DISCARD ALL/PLANS/SEQUENCES/TEMP support
+- **Transaction modes** (`transpiler/transform/setshow.go`): Strip ISOLATION LEVEL and READ ONLY/WRITE from BEGIN statements
 
 ### Test Harness Fixes
 - **`compare.go`**: Use `sql.RawBytes` to avoid driver parsing issues
@@ -284,10 +298,9 @@ go test ./tests/integration/clients/... -v -run "TestGrafana"
 ## Recommendations for Improving Compatibility
 
 1. **Fix `::regclass` handling** in the transpiler for better Metabase support
-2. **Add `SHOW server_version` support** for DBeaver compatibility
-3. **Transpile regex operators** (`~`, `~*`) to `regexp_matches()`
-4. **Handle integer division** to match PostgreSQL behavior
-5. **Add RETURNING emulation** for DuckLake mode (separate SELECT)
+2. **Transpile regex operators** (`~`, `~*`) to `regexp_matches()`
+3. **Handle integer division** to match PostgreSQL behavior
+4. **Add RETURNING emulation** for DuckLake mode (separate SELECT)
 
 ## CI Configuration
 

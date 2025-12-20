@@ -318,6 +318,14 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
+	// Handle transform-detected errors (e.g., unrecognized config parameter)
+	if result.Error != nil {
+		c.sendError("ERROR", "42704", result.Error.Error())
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
 	// Handle ignored SET parameters
 	if result.IsIgnoredSet {
 		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, query)
@@ -1105,6 +1113,12 @@ func (c *clientConn) handleParse(body []byte) {
 	result, err := tr.Transpile(query)
 	if err != nil {
 		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		return
+	}
+
+	// Handle transform-detected errors (e.g., unrecognized config parameter)
+	if result.Error != nil {
+		c.sendError("ERROR", "42704", result.Error.Error())
 		return
 	}
 

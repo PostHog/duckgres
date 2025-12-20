@@ -25,7 +25,7 @@ func New(cfg Config) *Transpiler {
 	// Order matters: more specific transforms should come first
 
 	// 1. pg_catalog schema and view mappings
-	t.transforms = append(t.transforms, transform.NewPgCatalogTransform())
+	t.transforms = append(t.transforms, transform.NewPgCatalogTransformWithConfig(cfg.DuckLakeMode))
 
 	// 2. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, transform.NewTypeMappingTransform())
@@ -83,6 +83,14 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 		changed, err := tr.Transform(tree, transformResult)
 		if err != nil {
 			return nil, err
+		}
+
+		// Check for transform-detected errors (e.g., unrecognized config param)
+		if transformResult.Error != nil {
+			return &Result{
+				SQL:   sql,
+				Error: transformResult.Error,
+			}, nil
 		}
 
 		// Check for early exit conditions

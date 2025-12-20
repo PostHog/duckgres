@@ -14,43 +14,68 @@ type PgCatalogTransform struct {
 
 	// Functions that need pg_catalog prefix stripped
 	Functions map[string]bool
+
+	// CustomMacros are our custom macros that need memory.main. prefix in DuckLake mode
+	// because they're created in the memory database
+	CustomMacros map[string]bool
+
+	// DuckLakeMode indicates whether we're running with DuckLake attached
+	DuckLakeMode bool
 }
 
 // NewPgCatalogTransform creates a new PgCatalogTransform with default mappings.
 func NewPgCatalogTransform() *PgCatalogTransform {
+	return NewPgCatalogTransformWithConfig(false)
+}
+
+// NewPgCatalogTransformWithConfig creates a new PgCatalogTransform with configuration.
+func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 	return &PgCatalogTransform{
+		DuckLakeMode: duckLakeMode,
 		ViewMappings: map[string]string{
-			"pg_class":             "pg_class_full",
-			"pg_database":          "pg_database",
-			"pg_collation":         "pg_collation",
-			"pg_policy":            "pg_policy",
-			"pg_roles":             "pg_roles",
-			"pg_statistic_ext":     "pg_statistic_ext",
+			"pg_class":              "pg_class_full",
+			"pg_database":           "pg_database",
+			"pg_collation":          "pg_collation",
+			"pg_policy":             "pg_policy",
+			"pg_roles":              "pg_roles",
+			"pg_statistic_ext":      "pg_statistic_ext",
 			"pg_publication_tables": "pg_publication_tables",
-			"pg_rules":             "pg_rules",
-			"pg_publication":       "pg_publication",
-			"pg_publication_rel":   "pg_publication_rel",
-			"pg_inherits":          "pg_inherits",
+			"pg_rules":              "pg_rules",
+			"pg_publication":        "pg_publication",
+			"pg_publication_rel":    "pg_publication_rel",
+			"pg_inherits":           "pg_inherits",
 		},
 		Functions: map[string]bool{
-			"pg_get_userbyid":                  true,
-			"pg_table_is_visible":              true,
-			"pg_get_expr":                      true,
-			"pg_encoding_to_char":              true,
-			"format_type":                      true,
-			"obj_description":                  true,
-			"col_description":                  true,
-			"shobj_description":                true,
-			"pg_get_indexdef":                  true,
-			"pg_get_constraintdef":             true,
-			"pg_get_partkeydef":                true,
-			"pg_get_statisticsobjdef_columns":  true,
-			"pg_relation_is_publishable":       true,
-			"current_setting":                  true,
-			"pg_is_in_recovery":                true,
-			"has_schema_privilege":             true,
-			"has_table_privilege":              true,
-			"array_to_string":                  true,
+			"pg_get_userbyid":                 true,
+			"pg_table_is_visible":             true,
+			"pg_get_expr":                     true,
+			"pg_encoding_to_char":             true,
+			"format_type":                     true,
+			"obj_description":                 true,
+			"col_description":                 true,
+			"shobj_description":               true,
+			"pg_get_indexdef":                 true,
+			"pg_get_constraintdef":            true,
+			"pg_get_partkeydef":               true,
+			"pg_get_statisticsobjdef_columns": true,
+			"pg_relation_is_publishable":      true,
+			"current_setting":                 true,
+			"pg_is_in_recovery":               true,
+			"has_schema_privilege":            true,
+			"has_table_privilege":             true,
+			"array_to_string":                 true,
+		},
+		// Our custom macros that are created in memory.main and need explicit qualification
+		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
+		// IMPORTANT: Keep in sync with macros defined in server/catalog.go initPgCatalog()
+		CustomMacros: map[string]bool{
+			"pg_get_userbyid":                 true,
+			"pg_encoding_to_char":             true,
+			"pg_is_in_recovery":               true,
+			"pg_relation_is_publishable":      true,
+			"pg_get_statisticsobjdef_columns": true,
+			"shobj_description":               true,
+			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
 		},
 	}
 }
@@ -93,27 +118,64 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 
 	case *pg_query.Node_FuncCall:
 		// Function calls: pg_catalog.format_type() -> format_type()
-		if n.FuncCall != nil && len(n.FuncCall.Funcname) >= 2 {
-			// Check if first element is pg_catalog
-			if first := n.FuncCall.Funcname[0]; first != nil {
-				if str := first.GetString_(); str != nil && strings.EqualFold(str.Sval, "pg_catalog") {
-					// Get the actual function name
-					if second := n.FuncCall.Funcname[1]; second != nil {
-						if funcStr := second.GetString_(); funcStr != nil {
-							funcName := strings.ToLower(funcStr.Sval)
-							if t.Functions[funcName] {
-								// Remove the pg_catalog prefix
-								n.FuncCall.Funcname = n.FuncCall.Funcname[1:]
-								*changed = true
-							}
-						}
+		// In DuckLake mode, our custom macros need memory.main. prefix
+		if n.FuncCall != nil {
+			funcName := ""
+
+			// Get the function name (last element of funcname)
+			if len(n.FuncCall.Funcname) >= 1 {
+				lastIdx := len(n.FuncCall.Funcname) - 1
+				if last := n.FuncCall.Funcname[lastIdx]; last != nil {
+					if funcStr := last.GetString_(); funcStr != nil {
+						funcName = strings.ToLower(funcStr.Sval)
 					}
 				}
 			}
+
+			// Handle pg_catalog prefixed functions
+			if len(n.FuncCall.Funcname) >= 2 {
+				if first := n.FuncCall.Funcname[0]; first != nil {
+					if str := first.GetString_(); str != nil && strings.EqualFold(str.Sval, "pg_catalog") {
+						if t.Functions[funcName] {
+							// Check if this is a custom macro that needs memory.main. prefix
+							if t.DuckLakeMode && t.CustomMacros[funcName] {
+								// Replace pg_catalog with memory.main
+								n.FuncCall.Funcname[0] = &pg_query.Node{
+									Node: &pg_query.Node_String_{
+										String_: &pg_query.String{Sval: "memory"},
+									},
+								}
+								// Insert main between memory and funcname
+								n.FuncCall.Funcname = append(n.FuncCall.Funcname[:1],
+									append([]*pg_query.Node{{
+										Node: &pg_query.Node_String_{
+											String_: &pg_query.String{Sval: "main"},
+										},
+									}}, n.FuncCall.Funcname[1:]...)...)
+							} else {
+								// Remove the pg_catalog prefix
+								n.FuncCall.Funcname = n.FuncCall.Funcname[1:]
+							}
+							*changed = true
+						}
+					}
+				}
+			} else if len(n.FuncCall.Funcname) == 1 && t.DuckLakeMode && t.CustomMacros[funcName] {
+				// Unqualified call to a custom macro in DuckLake mode
+				// Add memory.main. prefix
+				n.FuncCall.Funcname = []*pg_query.Node{
+					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "memory"}}},
+					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "main"}}},
+					n.FuncCall.Funcname[0],
+				}
+				*changed = true
+			}
 		}
 		// Recurse into function arguments
-		for _, arg := range n.FuncCall.Args {
-			t.walkAndTransform(arg, changed)
+		if n.FuncCall != nil {
+			for _, arg := range n.FuncCall.Args {
+				t.walkAndTransform(arg, changed)
+			}
 		}
 
 	case *pg_query.Node_TypeCast:

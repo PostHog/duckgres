@@ -1,10 +1,16 @@
 package transform
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
+
+// configParamPattern matches PostgreSQL configuration parameter names
+// (lowercase letters, digits, and underscores, starting with a letter)
+var configParamPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // SetShowTransform handles SET and SHOW commands:
 // - SET application_name = 'x' -> SET VARIABLE application_name = 'x'
@@ -135,6 +141,31 @@ func NewSetShowTransform() *SetShowTransform {
 			"synchronous_standby_names": true,
 			"wal_sender_timeout":        true,
 			"wal_receiver_timeout":      true,
+
+			// Search path and session settings (silently accept)
+			"search_path":                  true,
+			"datestyle":                    true,
+			"intervalstyle":                true,
+			"standard_conforming_strings":  true,
+			"escape_string_warning":        true,
+			"array_nulls":                  true,
+			"backslash_quote":              true,
+			"default_with_oids":            true,
+			"quote_all_identifiers":        true,
+			"sql_inheritance":              true,
+			"transform_null_equals":        true,
+			"lo_compat_privileges":         true,
+			"operator_precedence_warning":  true,
+
+			// Server version settings (commonly queried)
+			"server_version":     true,
+			"server_version_num": true,
+			"server_encoding":    true,
+
+			// Timezone (DuckDB has its own timezone setting)
+			"timezone":         true,
+			"log_timezone":     true,
+			"timezone_abbreviations": true,
 		},
 		VariableParams: map[string]bool{
 			// Parameters that need SET VARIABLE syntax in DuckDB
@@ -158,9 +189,15 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 		switch n := stmt.Stmt.Node.(type) {
 		case *pg_query.Node_VariableSetStmt:
 			if n.VariableSetStmt != nil {
+				// Handle RESET ALL (kind = VAR_RESET_ALL = 4)
+				if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_RESET_ALL {
+					result.IsIgnoredSet = true
+					return true, nil
+				}
+
 				paramName := strings.ToLower(n.VariableSetStmt.Name)
 
-				// Check if this is an ignored parameter
+				// Check if this is an ignored parameter (including RESET single param)
 				if t.IgnoredParams[paramName] {
 					result.IsIgnoredSet = true
 					return true, nil
@@ -175,6 +212,23 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 					// Since we can't change the AST node type, we'll need to
 					// handle this at a different level or use a workaround.
 					// For now, let's set a flag and handle in the transpiler.
+					changed = true
+				}
+			}
+
+		case *pg_query.Node_DiscardStmt:
+			// DISCARD ALL/PLANS/SEQUENCES/TEMP - silently ignore
+			result.IsIgnoredSet = true
+			return true, nil
+
+		case *pg_query.Node_TransactionStmt:
+			// Handle BEGIN/START TRANSACTION with isolation level
+			// DuckDB doesn't support ISOLATION LEVEL syntax, so strip it
+			if n.TransactionStmt != nil {
+				// Check if this has options (like ISOLATION LEVEL)
+				if len(n.TransactionStmt.Options) > 0 {
+					// Clear the options to convert to simple BEGIN
+					n.TransactionStmt.Options = nil
 					changed = true
 				}
 			}
@@ -202,6 +256,15 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 						Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt},
 					}
 					changed = true
+					continue
+				}
+
+				// If this looks like a PostgreSQL config parameter (e.g., "some_setting")
+				// but we don't recognize it, return an error rather than letting DuckDB
+				// give a confusing "table not found" error
+				if configParamPattern.MatchString(paramName) {
+					result.Error = fmt.Errorf("unrecognized configuration parameter %q", paramName)
+					return true, nil
 				}
 			}
 		}
@@ -213,14 +276,57 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 // getDefaultValue returns a sensible default value for an ignored parameter
 func (t *SetShowTransform) getDefaultValue(paramName string) string {
 	defaults := map[string]string{
-		"application_name":    "duckgres",
-		"client_encoding":     "UTF8",
-		"statement_timeout":   "0",
-		"lock_timeout":        "0",
-		"extra_float_digits":  "1",
-		"transaction_isolation": "read committed",
-		"synchronous_commit":  "on",
-		"work_mem":            "4MB",
+		// Client connection settings
+		"application_name":   "duckgres",
+		"client_encoding":    "UTF8",
+		"statement_timeout":  "0",
+		"lock_timeout":       "0",
+		"extra_float_digits": "1",
+		"client_min_messages": "notice",
+
+		// Transaction settings
+		"transaction_isolation":         "read committed",
+		"default_transaction_isolation": "read committed",
+		"transaction_read_only":         "off",
+		"transaction_deferrable":        "off",
+		"synchronous_commit":            "on",
+
+		// Memory settings
+		"work_mem":             "4MB",
+		"maintenance_work_mem": "64MB",
+		"effective_cache_size": "4GB",
+
+		// Search path and session settings
+		"search_path":                 "\"$user\", public",
+		"datestyle":                   "ISO, MDY",
+		"intervalstyle":               "postgres",
+		"standard_conforming_strings": "on",
+		"escape_string_warning":       "on",
+		"array_nulls":                 "on",
+		"backslash_quote":             "safe_encoding",
+		"bytea_output":                "hex",
+
+		// Server version settings
+		"server_version":     "15.0",
+		"server_version_num": "150000",
+		"server_encoding":    "UTF8",
+
+		// Timezone
+		"timezone": "UTC",
+
+		// Other commonly queried settings
+		"max_identifier_length":      "63",
+		"default_tablespace":         "",
+		"temp_tablespaces":           "",
+		"lc_collate":                 "en_US.UTF-8",
+		"lc_ctype":                   "en_US.UTF-8",
+		"lc_messages":                "en_US.UTF-8",
+		"lc_monetary":                "en_US.UTF-8",
+		"lc_numeric":                 "en_US.UTF-8",
+		"lc_time":                    "en_US.UTF-8",
+		"integer_datetimes":          "on",
+		"is_superuser":               "on",
+		"session_authorization":      "duckdb",
 	}
 	if val, ok := defaults[paramName]; ok {
 		return val
