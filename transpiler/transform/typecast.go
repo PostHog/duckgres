@@ -17,16 +17,19 @@ type TypeCastTransform struct {
 func NewTypeCastTransform() *TypeCastTransform {
 	return &TypeCastTransform{
 		TypeMappings: map[string]string{
-			"regtype":      "varchar",
-			"regclass":     "varchar",
-			"regnamespace": "varchar",
-			"regproc":      "varchar",
-			"regoper":      "varchar",
-			"regoperator":  "varchar",
-			"regprocedure": "varchar",
-			"regconfig":    "varchar",
+			"regtype":       "varchar",
+			"regclass":      "varchar",
+			"regnamespace":  "varchar",
+			"regproc":       "varchar",
+			"regoper":       "varchar",
+			"regoperator":   "varchar",
+			"regprocedure":  "varchar",
+			"regconfig":     "varchar",
 			"regdictionary": "varchar",
-			"text":         "varchar",
+			"text":          "varchar",
+			// JSON types - DuckDB uses JSON without schema prefix
+			"json":  "json",
+			"jsonb": "json",
 		},
 	}
 }

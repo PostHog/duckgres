@@ -46,6 +46,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_inherits":           "pg_inherits",
 		},
 		Functions: map[string]bool{
+			// pg_catalog compatibility functions
 			"pg_get_userbyid":                 true,
 			"pg_table_is_visible":             true,
 			"pg_get_expr":                     true,
@@ -64,17 +65,97 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_schema_privilege":            true,
 			"has_table_privilege":             true,
 			"array_to_string":                 true,
+
+			// String functions (our macros)
+			"quote_literal":  true,
+			"quote_ident":    true,
+			"quote_nullable": true,
+			"initcap":        true,
+			"overlay":        true,
+			"format":         true,
+			"octet_length":   true,
+
+			// Array functions
+			"array_length": true,
+			"array_ndims":  true,
+			"cardinality":  true,
+
+			// Binary/encoding functions
+			"encode": true,
+			"decode": true,
+
+			// Date/time functions
+			"to_char":      true,
+			"to_date":      true,
+			"to_timestamp": true,
+			"make_time":    true,
+			"age":          true,
+
+			// Numeric functions
+			"width_bucket": true,
+			"pi":           true,
+			"radians":      true,
+
+			// JSON functions
+			"json_typeof":       true,
+			"jsonb_typeof":      true,
+			"json_array_length": true,
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
 		CustomMacros: map[string]bool{
+			// pg_catalog compatibility functions
 			"pg_get_userbyid":                 true,
 			"pg_encoding_to_char":             true,
 			"pg_is_in_recovery":               true,
 			"pg_relation_is_publishable":      true,
 			"pg_get_statisticsobjdef_columns": true,
 			"shobj_description":               true,
-			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
+			"current_setting":                 true,
+			"pg_table_is_visible":             true,
+			"has_schema_privilege":            true,
+			"has_table_privilege":             true,
+			"format_type":                     true,
+			"obj_description":                 true,
+			"col_description":                 true,
+			"pg_get_expr":                     true,
+			"pg_get_indexdef":                 true,
+			"pg_get_constraintdef":            true,
+
+			// String functions
+			"quote_literal":   true,
+			"quote_ident":     true,
+			"quote_nullable":  true,
+			"initcap":         true,
+			"overlay":         true,
+			"format":          true,
+			"octet_length":    true,
+
+			// Array functions
+			"array_length": true,
+			"array_ndims":  true,
+			"cardinality":  true,
+
+			// Binary/encoding functions
+			"encode": true,
+			"decode": true,
+
+			// Date/time functions
+			"to_char":      true,
+			"to_date":      true,
+			"to_timestamp": true,
+			"make_time":    true,
+			"age":          true,
+
+			// Numeric functions
+			"width_bucket": true,
+			"pi":           true,
+			"radians":      true,
+
+			// JSON functions
+			"json_typeof":       true,
+			"jsonb_typeof":      true,
+			"json_array_length": true,
 		},
 	}
 }

@@ -271,6 +271,120 @@ func initPgCatalog(db *sql.DB) error {
 		// version - return PostgreSQL-compatible version string
 		// Fivetran and other tools check this to determine compatibility
 		`CREATE OR REPLACE MACRO version() AS 'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'`,
+
+		// quote_literal - quote a string literal for SQL
+		`CREATE OR REPLACE MACRO quote_literal(val) AS '''' || replace(val::VARCHAR, '''', '''''') || ''''`,
+		// quote_ident - quote an identifier
+		`CREATE OR REPLACE MACRO quote_ident(val) AS '"' || replace(val::VARCHAR, '"', '""') || '"'`,
+		// quote_nullable - like quote_literal but returns 'NULL' for NULL input
+		`CREATE OR REPLACE MACRO quote_nullable(val) AS CASE WHEN val IS NULL THEN 'NULL' ELSE '''' || replace(val::VARCHAR, '''', '''''') || '''' END`,
+
+		// initcap - capitalize first letter of each word
+		`CREATE OR REPLACE MACRO initcap(str) AS (
+			SELECT string_agg(upper(substr(word, 1, 1)) || lower(substr(word, 2)), ' ')
+			FROM (SELECT unnest(string_split(str, ' ')) AS word)
+		)`,
+
+		// lpad with default space character
+		`CREATE OR REPLACE MACRO lpad(str, len) AS lpad(str, len, ' ')`,
+		// rpad with default space character
+		`CREATE OR REPLACE MACRO rpad(str, len) AS rpad(str, len, ' ')`,
+
+		// overlay - replace substring
+		`CREATE OR REPLACE MACRO overlay(str, replacement, start, len) AS
+			substr(str, 1, start - 1) || replacement || substr(str, start + len)`,
+
+		// format function for PostgreSQL %s and %I placeholders
+		// Note: Limited implementation - only handles 2 args
+		`CREATE OR REPLACE MACRO format(fmt, arg1) AS replace(fmt, '%s', arg1::VARCHAR)`,
+
+		// array_length with dimension argument (PostgreSQL has 2 args, DuckDB len has 1)
+		`CREATE OR REPLACE MACRO array_length(arr, dim) AS len(arr)`,
+
+		// array_ndims - return number of array dimensions
+		`CREATE OR REPLACE MACRO array_ndims(arr) AS 1`,
+
+		// cardinality - total number of elements in array
+		`CREATE OR REPLACE MACRO cardinality(arr) AS len(arr)`,
+
+		// octet_length for strings
+		`CREATE OR REPLACE MACRO octet_length(str) AS length(str::BLOB)`,
+
+		// encode/decode for binary data - create as wrapper around DuckDB's base64/hex functions
+		`CREATE OR REPLACE MACRO encode(data, format) AS CASE
+			WHEN lower(format) = 'base64' THEN base64(data)
+			WHEN lower(format) = 'hex' THEN hex(data)
+			ELSE NULL
+		END`,
+		`CREATE OR REPLACE MACRO decode(data, format) AS CASE
+			WHEN lower(format) = 'base64' THEN from_base64(data)
+			WHEN lower(format) = 'hex' THEN unhex(data)
+			ELSE NULL
+		END`,
+
+		// to_char for dates - limited format string support
+		`CREATE OR REPLACE MACRO to_char(val, fmt) AS strftime(val,
+			replace(replace(replace(replace(replace(replace(fmt,
+				'YYYY', '%Y'),
+				'MM', '%m'),
+				'DD', '%d'),
+				'HH24', '%H'),
+				'MI', '%M'),
+				'SS', '%S')
+		)`,
+
+		// to_date - parse date from string with format
+		`CREATE OR REPLACE MACRO to_date(str, fmt) AS strptime(str,
+			replace(replace(replace(fmt,
+				'YYYY', '%Y'),
+				'MM', '%m'),
+				'DD', '%d')
+		)::DATE`,
+
+		// to_timestamp - parse timestamp from string with format
+		`CREATE OR REPLACE MACRO to_timestamp(str, fmt) AS strptime(str,
+			replace(replace(replace(replace(replace(replace(fmt,
+				'YYYY', '%Y'),
+				'MM', '%m'),
+				'DD', '%d'),
+				'HH24', '%H'),
+				'MI', '%M'),
+				'SS', '%S')
+		)::TIMESTAMP`,
+
+		// make_time - create time from hour, minute, second
+		`CREATE OR REPLACE MACRO make_time(hour, minute, second) AS
+			(hour::VARCHAR || ':' || minute::VARCHAR || ':' || second::VARCHAR)::TIME`,
+
+		// age with two arguments
+		`CREATE OR REPLACE MACRO age(ts1, ts2) AS (ts1 - ts2)`,
+
+		// width_bucket
+		`CREATE OR REPLACE MACRO width_bucket(val, lo, hi, buckets) AS
+			CASE
+				WHEN val < lo THEN 0
+				WHEN val >= hi THEN buckets + 1
+				ELSE floor((val - lo) / ((hi - lo) / buckets))::INTEGER + 1
+			END`,
+
+		// pi constant
+		`CREATE OR REPLACE MACRO pi() AS 3.141592653589793`,
+
+		// radians - convert degrees to radians
+		`CREATE OR REPLACE MACRO radians(deg) AS deg * 3.141592653589793 / 180`,
+
+		// atan2
+		`CREATE OR REPLACE MACRO atan2(y, x) AS atan2(y, x)`,
+
+		// JSON functions that PostgreSQL has
+		`CREATE OR REPLACE MACRO json_typeof(j) AS json_type(j)`,
+		`CREATE OR REPLACE MACRO jsonb_typeof(j) AS json_type(j)`,
+
+		// json_array_length
+		`CREATE OR REPLACE MACRO json_array_length(j) AS json_array_length(j)`,
+
+		// array_agg needs to return array type
+		`CREATE OR REPLACE MACRO array_agg(val) AS list(val)`,
 	}
 
 	for _, f := range functions {

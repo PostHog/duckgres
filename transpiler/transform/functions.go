@@ -21,8 +21,7 @@ func (t *FunctionTransform) Name() string {
 // Simple function name mappings (PostgreSQL -> DuckDB)
 // These are direct renames where the semantics are identical or close enough
 var functionNameMapping = map[string]string{
-	// Array functions
-	"array_length":  "len",
+	// Array functions - note: array_length is handled by macro in catalog.go
 	"array_upper":   "len", // approximate - array_upper returns upper bound
 	"array_cat":     "list_concat",
 	"array_append":  "list_append",
@@ -57,9 +56,9 @@ var functionNameMapping = map[string]string{
 	"width_bucket": "width_bucket", // same
 
 	// Date/time functions
-	"date_part":   "date_part",   // same
-	"date_trunc":  "date_trunc",  // same but different behavior
-	"extract":     "extract",     // same
+	"date_part":  "date_part",  // same
+	"date_trunc": "date_trunc", // same but different behavior
+	"extract":    "date_part",  // EXTRACT gets deparsed as extract('part', val), use date_part
 	"age":         "age",         // DuckDB has this
 	"now":         "now",         // same (also current_timestamp)
 	"current_date": "current_date",
@@ -71,9 +70,8 @@ var functionNameMapping = map[string]string{
 	"make_date":   "make_date",   // same
 	"make_time":   "make_time",   // same
 	"make_timestamp": "make_timestamp", // same
-	"to_timestamp": "to_timestamp", // same for unix timestamp
-	"to_date":     "strptime",    // needs format handling
-	"to_char":     "strftime",    // needs format handling
+	// Note: to_timestamp, to_date, to_char are handled by our custom macros in catalog.go
+	// which do proper format string conversion from PostgreSQL to DuckDB format
 
 	// Aggregate functions
 	"string_agg":  "string_agg",  // same
@@ -122,9 +120,8 @@ var functionNameMapping = map[string]string{
 	"least":           "least",           // same
 	"md5":             "md5",             // same
 	"sha256":          "sha256",          // same (DuckDB extension)
-	"encode":          "encode",          // same
-	"decode":          "decode",          // same
-	"pg_typeof":       "typeof",          // DuckDB equivalent
+	// encode/decode are handled by our custom macros in catalog.go
+	"pg_typeof": "typeof", // DuckDB equivalent
 
 	// Information functions (mostly stubs or approximations)
 	"current_database": "current_database",
@@ -137,15 +134,14 @@ var functionNameMapping = map[string]string{
 
 // Functions that need special transformation (not just renaming)
 var specialFunctions = map[string]bool{
-	"to_char":           true, // format string conversion
-	"to_date":           true, // format string conversion
-	"to_timestamp":      true, // may need format handling
-	"date_trunc":        true, // week handling differs
-	"extract":           true, // some parts differ
-	"regexp_matches":    true, // return type differs
-	"array_agg":         true, // becomes list()
-	"string_to_array":   true, // argument order
-	"generate_series":   true, // may need range() for some cases
+	"to_char":         true, // format string conversion
+	"to_date":         true, // format string conversion
+	"to_timestamp":    true, // may need format handling
+	"date_trunc":      true, // week handling differs
+	"regexp_matches":  true, // return type differs
+	"array_agg":       true, // becomes list()
+	"string_to_array": true, // argument order
+	"generate_series": true, // may need range() for some cases
 }
 
 func (t *FunctionTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
