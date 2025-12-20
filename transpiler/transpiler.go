@@ -85,6 +85,14 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 			return nil, err
 		}
 
+		// Check for transform-detected errors (e.g., unrecognized config param)
+		if transformResult.Error != nil {
+			return &Result{
+				SQL:   sql,
+				Error: transformResult.Error,
+			}, nil
+		}
+
 		// Check for early exit conditions
 		if transformResult.IsNoOp || transformResult.IsIgnoredSet {
 			// For no-op commands, return the original SQL (it won't be executed)

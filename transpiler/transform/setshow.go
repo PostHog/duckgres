@@ -1,10 +1,16 @@
 package transform
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
+
+// configParamPattern matches PostgreSQL configuration parameter names
+// (lowercase letters, digits, and underscores, starting with a letter)
+var configParamPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // SetShowTransform handles SET and SHOW commands:
 // - SET application_name = 'x' -> SET VARIABLE application_name = 'x'
@@ -250,6 +256,15 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 						Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt},
 					}
 					changed = true
+					continue
+				}
+
+				// If this looks like a PostgreSQL config parameter (e.g., "some_setting")
+				// but we don't recognize it, return an error rather than letting DuckDB
+				// give a confusing "table not found" error
+				if configParamPattern.MatchString(paramName) {
+					result.Error = fmt.Errorf("unrecognized configuration parameter %q", paramName)
+					return true, nil
 				}
 			}
 		}

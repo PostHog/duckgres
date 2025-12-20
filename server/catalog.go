@@ -205,6 +205,10 @@ func initPgCatalog(db *sql.DB) error {
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
+	//
+	// IMPORTANT: When adding new custom macros here, also add them to the CustomMacros
+	// map in transpiler/transform/pgcatalog.go so they get the memory.main. prefix
+	// in DuckLake mode. Otherwise, the macros won't be found when DuckLake is attached.
 	functions := []string{
 		// pg_get_userbyid - returns username for a role OID
 		`CREATE OR REPLACE MACRO pg_get_userbyid(id) AS 'duckdb'`,

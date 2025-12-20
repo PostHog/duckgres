@@ -38,4 +38,8 @@ type Result struct {
 	// IsIgnoredSet indicates a SET command for a PostgreSQL-specific parameter
 	// that should be silently acknowledged without execution.
 	IsIgnoredSet bool
+
+	// Error is set when a transform detects an error that should be returned to the client
+	// (e.g., unrecognized configuration parameter in SHOW command)
+	Error error
 }

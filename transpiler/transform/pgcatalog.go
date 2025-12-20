@@ -67,6 +67,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
+		// IMPORTANT: Keep in sync with macros defined in server/catalog.go initPgCatalog()
 		CustomMacros: map[string]bool{
 			"pg_get_userbyid":                 true,
 			"pg_encoding_to_char":             true,
