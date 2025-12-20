@@ -322,42 +322,45 @@ func initPgCatalog(db *sql.DB) error {
 			ELSE NULL
 		END`,
 
-		// to_char for dates - limited format string support
+		// to_char for dates - converts PostgreSQL format codes to strftime
+		// Handles common PostgreSQL format codes: YYYY, MM, DD, HH24, MI, SS, Day, Mon, etc.
 		`CREATE OR REPLACE MACRO to_char(val, fmt) AS strftime(val,
-			replace(replace(replace(replace(replace(replace(fmt,
+			replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(fmt,
 				'YYYY', '%Y'),
 				'MM', '%m'),
 				'DD', '%d'),
 				'HH24', '%H'),
+				'HH12', '%I'),
 				'MI', '%M'),
-				'SS', '%S')
+				'SS', '%S'),
+				'Day', '%A'),
+				'Mon', '%b'),
+				'Month', '%B')
 		)`,
 
-		// to_date - parse date from string with format
-		`CREATE OR REPLACE MACRO to_date(str, fmt) AS strptime(str,
-			replace(replace(replace(fmt,
-				'YYYY', '%Y'),
-				'MM', '%m'),
-				'DD', '%d')
-		)::DATE`,
+		// to_date - parse date from string with format (uses CASE for common patterns)
+		// strptime requires constant format, so we handle common PostgreSQL date formats
+		`CREATE OR REPLACE MACRO to_date(str, fmt) AS CASE
+			WHEN fmt = 'YYYY-MM-DD' THEN strptime(str, '%Y-%m-%d')::DATE
+			WHEN fmt = 'DD-MM-YYYY' THEN strptime(str, '%d-%m-%Y')::DATE
+			WHEN fmt = 'MM/DD/YYYY' THEN strptime(str, '%m/%d/%Y')::DATE
+			WHEN fmt = 'YYYY/MM/DD' THEN strptime(str, '%Y/%m/%d')::DATE
+			WHEN fmt = 'DD/MM/YYYY' THEN strptime(str, '%d/%m/%Y')::DATE
+			WHEN fmt = 'YYYYMMDD' THEN strptime(str, '%Y%m%d')::DATE
+			ELSE str::DATE
+		END`,
 
-		// to_timestamp - parse timestamp from string with format
-		`CREATE OR REPLACE MACRO to_timestamp(str, fmt) AS strptime(str,
-			replace(replace(replace(replace(replace(replace(fmt,
-				'YYYY', '%Y'),
-				'MM', '%m'),
-				'DD', '%d'),
-				'HH24', '%H'),
-				'MI', '%M'),
-				'SS', '%S')
-		)::TIMESTAMP`,
+		// to_timestamp - parse timestamp from string with format (uses CASE for common patterns)
+		`CREATE OR REPLACE MACRO to_timestamp(str, fmt) AS CASE
+			WHEN fmt = 'YYYY-MM-DD HH24:MI:SS' THEN strptime(str, '%Y-%m-%d %H:%M:%S')::TIMESTAMP
+			WHEN fmt = 'YYYY-MM-DD HH24:MI' THEN strptime(str, '%Y-%m-%d %H:%M')::TIMESTAMP
+			WHEN fmt = 'YYYY-MM-DD' THEN strptime(str, '%Y-%m-%d')::TIMESTAMP
+			WHEN fmt = 'DD-MM-YYYY HH24:MI:SS' THEN strptime(str, '%d-%m-%Y %H:%M:%S')::TIMESTAMP
+			WHEN fmt = 'MM/DD/YYYY HH24:MI:SS' THEN strptime(str, '%m/%d/%Y %H:%M:%S')::TIMESTAMP
+			ELSE str::TIMESTAMP
+		END`,
 
-		// make_time - create time from hour, minute, second
-		`CREATE OR REPLACE MACRO make_time(hour, minute, second) AS
-			(hour::VARCHAR || ':' || minute::VARCHAR || ':' || second::VARCHAR)::TIME`,
-
-		// age with two arguments
-		`CREATE OR REPLACE MACRO age(ts1, ts2) AS (ts1 - ts2)`,
+		// Note: make_time and age are native DuckDB functions, no macros needed
 
 		// width_bucket
 		`CREATE OR REPLACE MACRO width_bucket(val, lo, hi, buckets) AS

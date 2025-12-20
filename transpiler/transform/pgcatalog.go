@@ -88,8 +88,6 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"to_char":      true,
 			"to_date":      true,
 			"to_timestamp": true,
-			"make_time":    true,
-			"age":          true,
 
 			// Numeric functions
 			"width_bucket": true,
@@ -144,8 +142,6 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"to_char":      true,
 			"to_date":      true,
 			"to_timestamp": true,
-			"make_time":    true,
-			"age":          true,
 
 			// Numeric functions
 			"width_bucket": true,
