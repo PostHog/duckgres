@@ -47,7 +47,7 @@ To run without DuckLake: `DUCKGRES_TEST_NO_DUCKLAKE=1 go test ./tests/integratio
 | **Fivetran Queries** | 4 | 4 | 0 | 100% |
 | **Airbyte Queries** | 3 | 3 | 0 | 100% |
 | **dbt Queries** | 7 | 7 | 0 | 100% |
-| **Metabase Queries** | 5 | 4 | 1 | 80% |
+| **Metabase Queries** | 5 | 5 | 0 | 100% |
 | **DBeaver Queries** | 4 | 4 | 0 | 100% |
 | **Prepared Statements** | 3 | 3 | 0 | 100% |
 | **Transactions** | 2 | 2 | 0 | 100% |
@@ -100,7 +100,7 @@ DuckLake has additional constraints compared to vanilla DuckDB:
 | Airbyte Queries | 100% |
 | dbt Queries | 100% |
 | DBeaver Queries | 100% |
-| Metabase Queries | 80% (1 `::regclass` limitation) |
+| Metabase Queries | 100% |
 
 ## Passing Test Categories (Vanilla DuckDB)
 
@@ -145,12 +145,12 @@ All pg_catalog views and functions work correctly:
 - Column metadata ✓
 - Server version ✓
 
-**Metabase** (80%):
+**Metabase** (100%):
 - Get schemas ✓
 - Get tables ✓
 - Connection test ✓
 - Version check ✓
-- Get columns ✗ (`::regclass` cast not supported)
+- Get columns ✓
 
 ### ETL Tools Compatibility
 
@@ -194,18 +194,13 @@ DuckDB: `10 / 3 = 3.333...` (float)
 **Impact**: Arithmetic tests
 **Solution**: Use explicit `CAST` or `::integer`
 
-### 4. `::regclass` Cast (Metabase)
-Metabase uses `'table_name'::regclass` for column lookup. The transpiler converts this to `::varchar` which doesn't work for attrelid lookups.
-
-**Workaround**: Join with pg_class by relname instead
-
-### 5. RETURNING Clause (DuckLake)
+### 4. RETURNING Clause (DuckLake)
 DuckLake does not support `INSERT/UPDATE/DELETE ... RETURNING`.
 
 **Impact**: Tests using RETURNING clause fail in DuckLake mode
 **Workaround**: Use separate SELECT after mutation
 
-### 6. Per-Connection Database (Vanilla DuckDB)
+### 5. Per-Connection Database (Vanilla DuckDB)
 Each new database connection gets a fresh in-memory DuckDB database. This is by design but affects tests requiring data persistence across connections.
 
 **Note**: This is not an issue in DuckLake mode where metadata persists.
@@ -226,6 +221,9 @@ Each new database connection gets a fresh in-memory DuckDB database. This is by 
 - **SHOW command support** (`transpiler/transform/setshow.go`): Added support for many PostgreSQL parameters (server_version, search_path, datestyle, timezone, etc.)
 - **Session commands** (`transpiler/transform/setshow.go`): Added RESET ALL, DISCARD ALL/PLANS/SEQUENCES/TEMP support
 - **Transaction modes** (`transpiler/transform/setshow.go`): Strip ISOLATION LEVEL and READ ONLY/WRITE from BEGIN statements
+
+### Regclass Cast Fix (PR #48)
+- **`::regclass` subquery rewrite** (`transpiler/transform/typecast.go`): Convert `'tablename'::regclass` to `(SELECT oid FROM pg_class WHERE relname = 'tablename')` for proper OID lookup. This fixes Metabase column discovery queries.
 
 ### Test Harness Fixes
 - **`compare.go`**: Use `sql.RawBytes` to avoid driver parsing issues
@@ -297,10 +295,9 @@ go test ./tests/integration/clients/... -v -run "TestGrafana"
 
 ## Recommendations for Improving Compatibility
 
-1. **Fix `::regclass` handling** in the transpiler for better Metabase support
-2. **Transpile regex operators** (`~`, `~*`) to `regexp_matches()`
-3. **Handle integer division** to match PostgreSQL behavior
-4. **Add RETURNING emulation** for DuckLake mode (separate SELECT)
+1. **Transpile regex operators** (`~`, `~*`) to `regexp_matches()`
+2. **Handle integer division** to match PostgreSQL behavior
+3. **Add RETURNING emulation** for DuckLake mode (separate SELECT)
 
 ## CI Configuration
 

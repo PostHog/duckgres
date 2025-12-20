@@ -8,6 +8,7 @@ import (
 
 // TypeCastTransform converts PostgreSQL-specific type casts to DuckDB equivalents.
 // For example: ::pg_catalog.regtype -> ::VARCHAR
+// Special case: 'tablename'::regclass -> (SELECT oid FROM pg_class WHERE relname = 'tablename')
 type TypeCastTransform struct {
 	// TypeMappings maps pg_catalog types to DuckDB types
 	TypeMappings map[string]string
@@ -17,16 +18,16 @@ type TypeCastTransform struct {
 func NewTypeCastTransform() *TypeCastTransform {
 	return &TypeCastTransform{
 		TypeMappings: map[string]string{
-			"regtype":      "varchar",
-			"regclass":     "varchar",
-			"regnamespace": "varchar",
-			"regproc":      "varchar",
-			"regoper":      "varchar",
-			"regoperator":  "varchar",
-			"regprocedure": "varchar",
-			"regconfig":    "varchar",
+			"regtype":       "varchar",
+			"regnamespace":  "varchar",
+			"regproc":       "varchar",
+			"regoper":       "varchar",
+			"regoperator":   "varchar",
+			"regprocedure":  "varchar",
+			"regconfig":     "varchar",
 			"regdictionary": "varchar",
-			"text":         "varchar",
+			"text":          "varchar",
+			// Note: regclass is handled specially - converted to subquery lookup
 		},
 	}
 }
@@ -58,35 +59,70 @@ func (t *TypeCastTransform) walkAndTransform(node *pg_query.Node, changed *bool)
 		if n.TypeCast != nil && n.TypeCast.TypeName != nil {
 			// Check if this is a pg_catalog type cast
 			typeName := n.TypeCast.TypeName
+			typeLower := ""
+
 			if len(typeName.Names) >= 2 {
 				// Check for pg_catalog.typename pattern
 				if first := typeName.Names[0]; first != nil {
 					if str := first.GetString_(); str != nil && strings.EqualFold(str.Sval, "pg_catalog") {
 						if second := typeName.Names[1]; second != nil {
 							if typeStr := second.GetString_(); typeStr != nil {
-								typeLower := strings.ToLower(typeStr.Sval)
-								if newType, ok := t.TypeMappings[typeLower]; ok {
-									// Replace with just the DuckDB type name
-									typeName.Names = []*pg_query.Node{
-										{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: newType}}},
-									}
-									*changed = true
-								}
+								typeLower = strings.ToLower(typeStr.Sval)
 							}
 						}
 					}
 				}
 			} else if len(typeName.Names) == 1 {
-				// Single name, check if it needs mapping
+				// Single name
 				if first := typeName.Names[0]; first != nil {
 					if str := first.GetString_(); str != nil {
-						typeLower := strings.ToLower(str.Sval)
-						if newType, ok := t.TypeMappings[typeLower]; ok {
-							str.Sval = newType
-							*changed = true
+						typeLower = strings.ToLower(str.Sval)
+					}
+				}
+			}
+
+			// Special handling for ::regclass with string literal argument
+			// Convert 'tablename'::regclass to (SELECT oid FROM pg_class WHERE relname = 'tablename')
+			if typeLower == "regclass" {
+				if sublink := t.createRegclassSubquery(n.TypeCast.Arg); sublink != nil {
+					// Replace the TypeCast node with the SubLink
+					node.Node = &pg_query.Node_SubLink{SubLink: sublink}
+					*changed = true
+					return
+				}
+				// For non-string arguments (like oid::regclass), fall through to varchar mapping
+				typeLower = "regclass_fallback"
+			}
+
+			// Standard type mapping for other types
+			if typeLower == "regclass_fallback" {
+				// Fallback for regclass with non-string arguments
+				if len(typeName.Names) >= 2 {
+					typeName.Names = []*pg_query.Node{
+						{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "varchar"}}},
+					}
+				} else if len(typeName.Names) == 1 {
+					if first := typeName.Names[0]; first != nil {
+						if str := first.GetString_(); str != nil {
+							str.Sval = "varchar"
 						}
 					}
 				}
+				*changed = true
+			} else if newType, ok := t.TypeMappings[typeLower]; ok {
+				if len(typeName.Names) >= 2 {
+					// Replace pg_catalog.typename with just the new type
+					typeName.Names = []*pg_query.Node{
+						{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: newType}}},
+					}
+				} else if len(typeName.Names) == 1 {
+					if first := typeName.Names[0]; first != nil {
+						if str := first.GetString_(); str != nil {
+							str.Sval = newType
+						}
+					}
+				}
+				*changed = true
 			}
 			// Recurse into the argument
 			t.walkAndTransform(n.TypeCast.Arg, changed)
@@ -243,5 +279,109 @@ func (t *TypeCastTransform) walkSelectStmt(stmt *pg_query.SelectStmt, changed *b
 	}
 	if stmt.Rarg != nil {
 		t.walkSelectStmt(stmt.Rarg, changed)
+	}
+}
+
+// createRegclassSubquery creates a SubLink for 'tablename'::regclass
+// This converts: 'users'::regclass
+// To: (SELECT oid FROM pg_class WHERE relname = 'users')
+func (t *TypeCastTransform) createRegclassSubquery(arg *pg_query.Node) *pg_query.SubLink {
+	if arg == nil {
+		return nil
+	}
+
+	// Get the string value from the argument
+	var tableName string
+	if aConst := arg.GetAConst(); aConst != nil {
+		if sval := aConst.GetSval(); sval != nil {
+			tableName = sval.Sval
+		}
+	}
+
+	if tableName == "" {
+		return nil
+	}
+
+	// Build: SELECT oid FROM pg_class WHERE relname = 'tablename'
+	// Create the SELECT target: oid
+	targetList := []*pg_query.Node{
+		{
+			Node: &pg_query.Node_ResTarget{
+				ResTarget: &pg_query.ResTarget{
+					Val: &pg_query.Node{
+						Node: &pg_query.Node_ColumnRef{
+							ColumnRef: &pg_query.ColumnRef{
+								Fields: []*pg_query.Node{
+									{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "oid"}}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Create the FROM clause: pg_class
+	fromClause := []*pg_query.Node{
+		{
+			Node: &pg_query.Node_RangeVar{
+				RangeVar: &pg_query.RangeVar{
+					Relname:        "pg_class",
+					Inh:            true,
+					Relpersistence: "p",
+				},
+			},
+		},
+	}
+
+	// Create the WHERE clause: relname = 'tablename'
+	whereClause := &pg_query.Node{
+		Node: &pg_query.Node_AExpr{
+			AExpr: &pg_query.A_Expr{
+				Kind: pg_query.A_Expr_Kind_AEXPR_OP,
+				Name: []*pg_query.Node{
+					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "="}}},
+				},
+				Lexpr: &pg_query.Node{
+					Node: &pg_query.Node_ColumnRef{
+						ColumnRef: &pg_query.ColumnRef{
+							Fields: []*pg_query.Node{
+								{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "relname"}}},
+							},
+						},
+					},
+				},
+				Rexpr: &pg_query.Node{
+					Node: &pg_query.Node_AConst{
+						AConst: &pg_query.A_Const{
+							Val: &pg_query.A_Const_Sval{
+								Sval: &pg_query.String{Sval: tableName},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Build the SelectStmt
+	// Note: If multiple tables with the same name exist in different schemas,
+	// the subquery may return multiple rows and fail. This matches PostgreSQL's
+	// behavior where ::regclass uses search_path to resolve ambiguity.
+	selectStmt := &pg_query.SelectStmt{
+		TargetList:  targetList,
+		FromClause:  fromClause,
+		WhereClause: whereClause,
+	}
+
+	// Create the SubLink (scalar subquery)
+	return &pg_query.SubLink{
+		SubLinkType: pg_query.SubLinkType_EXPR_SUBLINK,
+		Subselect: &pg_query.Node{
+			Node: &pg_query.Node_SelectStmt{
+				SelectStmt: selectStmt,
+			},
+		},
 	}
 }
