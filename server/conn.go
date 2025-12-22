@@ -89,6 +89,9 @@ func (c *clientConn) serve() error {
 		if c.db != nil {
 			// Detach DuckLake to release the RDS metadata connection
 			if c.server.cfg.DuckLake.MetadataStore != "" {
+				// Must switch away from ducklake before detaching - DuckDB doesn't allow
+				// detaching the default database
+				c.db.Exec("USE memory")
 				if _, err := c.db.Exec("DETACH ducklake"); err != nil {
 					log.Printf("Warning: failed to detach DuckLake for user %q: %v", c.username, err)
 				}
