@@ -280,7 +280,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		// Continue anyway - basic queries will still work
 	}
 
-	// Attach DuckLake catalog if configured
+	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
 	if err := s.attachDuckLake(db); err != nil {
 		// If DuckLake was explicitly configured, fail the connection.
@@ -295,11 +295,20 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		duckLakeMode = true
 	}
 
-	// Initialize information_schema compatibility views
-	// Must be done AFTER attaching DuckLake so views can reference ducklake.information_schema
+	// Initialize information_schema compatibility views in memory.main
+	// Must be done AFTER attaching DuckLake (so views can reference ducklake.information_schema)
+	// but BEFORE setting DuckLake as default (so views are created in memory.main, not ducklake.main)
 	if err := initInformationSchema(db, duckLakeMode); err != nil {
 		log.Printf("Warning: failed to initialize information_schema for user %q: %v", username, err)
 		// Continue anyway - basic queries will still work
+	}
+
+	// Now set DuckLake as the default catalog so all user queries use it
+	if duckLakeMode {
+		if err := setDuckLakeDefault(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
+		}
 	}
 
 	return db, nil
@@ -333,7 +342,8 @@ func (s *Server) loadExtensions(db *sql.DB) error {
 	return lastErr
 }
 
-// attachDuckLake attaches a DuckLake catalog if configured
+// attachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
+// Call setDuckLakeDefault after creating per-connection views in memory.main.
 func (s *Server) attachDuckLake(db *sql.DB) error {
 	if s.cfg.DuckLake.MetadataStore == "" {
 		return nil // DuckLake not configured
@@ -355,10 +365,7 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
 	if err == nil && count > 0 {
-		// Already attached, just set as default
-		if _, err := db.Exec("USE ducklake"); err != nil {
-			return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
-		}
+		// Already attached
 		return nil
 	}
 
@@ -398,13 +405,17 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
 
-	// Set DuckLake as the default catalog so all queries use it
-	// See: https://duckdb.org/docs/stable/core_extensions/ducklake#usage
+	log.Printf("Attached DuckLake catalog successfully")
+	return nil
+}
+
+// setDuckLakeDefault sets the DuckLake catalog as the default so all queries use it.
+// This should be called AFTER creating per-connection views in memory.main.
+func setDuckLakeDefault(db *sql.DB) error {
 	if _, err := db.Exec("USE ducklake"); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
 	}
-
-	log.Printf("Attached DuckLake catalog successfully and set as default")
+	log.Printf("Set DuckLake as default catalog")
 	return nil
 }
 
