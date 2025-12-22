@@ -200,7 +200,6 @@ func TestCatalogPsqlCommands(t *testing.T) {
 				ORDER BY 1, 2
 				LIMIT 20
 			`,
-			DuckgresOnly: true,
 		},
 
 		// \dn - list schemas
@@ -213,7 +212,6 @@ func TestCatalogPsqlCommands(t *testing.T) {
 				WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
 				ORDER BY 1
 			`,
-			DuckgresOnly: true,
 		},
 
 		// \l - list databases
@@ -226,7 +224,6 @@ func TestCatalogPsqlCommands(t *testing.T) {
 				FROM pg_catalog.pg_database d
 				ORDER BY 1
 			`,
-			DuckgresOnly: true,
 		},
 	}
 	runQueryTests(t, tests)
