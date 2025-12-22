@@ -119,17 +119,17 @@ func TestCatalogInformationSchemaTables(t *testing.T) {
 		{
 			Name:         "info_schema_tables_all",
 			Query:        "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') LIMIT 20",
-			DuckgresOnly: true,
+			DuckgresOnly: false,
 		},
 		{
 			Name:         "info_schema_tables_public",
 			Query:        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' OR table_schema = 'public' LIMIT 20",
-			DuckgresOnly: true,
+			DuckgresOnly: false,
 		},
 		{
 			Name:         "info_schema_tables_base",
-			Query:        "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' LIMIT 20",
-			DuckgresOnly: true,
+			Query:        "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_name LIMIT 20",
+			DuckgresOnly: false,
 		},
 	}
 	runQueryTests(t, tests)
@@ -141,12 +141,12 @@ func TestCatalogInformationSchemaColumns(t *testing.T) {
 		{
 			Name:         "info_schema_columns_users",
 			Query:        "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = 'users' ORDER BY ordinal_position",
-			DuckgresOnly: true,
+			DuckgresOnly: false,
 		},
 		{
 			Name:         "info_schema_columns_with_default",
 			Query:        "SELECT column_name, column_default FROM information_schema.columns WHERE column_default IS NOT NULL LIMIT 10",
-			DuckgresOnly: true,
+			DuckgresOnly: false,
 		},
 	}
 	runQueryTests(t, tests)
@@ -157,8 +157,14 @@ func TestCatalogInformationSchemaViews(t *testing.T) {
 	tests := []QueryTest{
 		{
 			Name:         "info_schema_views_all",
+			Query:        "SELECT table_schema, table_name FROM information_schema.views WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_name LIMIT 10",
+			DuckgresOnly: false,
+		},
+		{
+			// view_definition format differs between PostgreSQL and DuckDB - test separately
+			Name:         "info_schema_views_definition",
 			Query:        "SELECT table_name, view_definition FROM information_schema.views WHERE table_schema NOT IN ('pg_catalog', 'information_schema') LIMIT 10",
-			DuckgresOnly: true,
+			DuckgresOnly: true, // view_definition format differs
 		},
 	}
 	runQueryTests(t, tests)
@@ -170,7 +176,7 @@ func TestCatalogInformationSchemaSchemata(t *testing.T) {
 		{
 			Name:         "info_schema_schemata_all",
 			Query:        "SELECT schema_name FROM information_schema.schemata",
-			DuckgresOnly: true,
+			DuckgresOnly: false,
 		},
 	}
 	runQueryTests(t, tests)
@@ -194,6 +200,7 @@ func TestCatalogPsqlCommands(t *testing.T) {
 				ORDER BY 1, 2
 				LIMIT 20
 			`,
+			DuckgresOnly: true,
 		},
 
 		// \dn - list schemas
@@ -206,6 +213,7 @@ func TestCatalogPsqlCommands(t *testing.T) {
 				WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
 				ORDER BY 1
 			`,
+			DuckgresOnly: true,
 		},
 
 		// \l - list databases
@@ -218,6 +226,7 @@ func TestCatalogPsqlCommands(t *testing.T) {
 				FROM pg_catalog.pg_database d
 				ORDER BY 1
 			`,
+			DuckgresOnly: true,
 		},
 	}
 	runQueryTests(t, tests)

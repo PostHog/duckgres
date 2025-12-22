@@ -281,6 +281,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	}
 
 	// Attach DuckLake catalog if configured
+	duckLakeMode := false
 	if err := s.attachDuckLake(db); err != nil {
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
@@ -290,6 +291,15 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		}
 		// DuckLake not configured, this warning is just informational
 		log.Printf("Warning: failed to attach DuckLake for user %q: %v", username, err)
+	} else if s.cfg.DuckLake.MetadataStore != "" {
+		duckLakeMode = true
+	}
+
+	// Initialize information_schema compatibility views
+	// Must be done AFTER attaching DuckLake so views can reference ducklake.information_schema
+	if err := initInformationSchema(db, duckLakeMode); err != nil {
+		log.Printf("Warning: failed to initialize information_schema for user %q: %v", username, err)
+		// Continue anyway - basic queries will still work
 	}
 
 	return db, nil

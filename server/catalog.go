@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"fmt"
 )
 
 // initPgCatalog creates PostgreSQL compatibility functions and views in DuckDB
@@ -243,11 +244,11 @@ func initPgCatalog(db *sql.DB) error {
 		// pg_table_is_visible - checks if table is in search path
 		`CREATE OR REPLACE MACRO pg_table_is_visible(oid) AS true`,
 		// has_schema_privilege - check schema access
-		`CREATE OR REPLACE MACRO has_schema_privilege(schema, priv) AS true`,
-		`CREATE OR REPLACE MACRO has_schema_privilege(u, schema, priv) AS true`,
+		// Note: DuckDB doesn't support macro overloading well, so we only define 2-arg versions
+		// The transpiler should handle 3-arg calls by dropping the user argument
+		`CREATE OR REPLACE MACRO has_schema_privilege(schema_name, priv) AS true`,
 		// has_table_privilege - check table access
 		`CREATE OR REPLACE MACRO has_table_privilege(table_name, priv) AS true`,
-		`CREATE OR REPLACE MACRO has_table_privilege(u, table_name, priv) AS true`,
 		// pg_encoding_to_char - convert encoding ID to name
 		`CREATE OR REPLACE MACRO pg_encoding_to_char(enc) AS 'UTF8'`,
 		// format_type - format a type OID as string
@@ -317,10 +318,21 @@ func initPgCatalog(db *sql.DB) error {
 
 // initInformationSchema creates the column metadata table and information_schema wrapper views.
 // This enables accurate type information (VARCHAR lengths, NUMERIC precision) in information_schema.
-func initInformationSchema(db *sql.DB) error {
+// When duckLakeMode is true, the views query from ducklake.information_schema instead of the
+// local information_schema, since DuckLake is set as the default catalog.
+func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
+	// Determine the source information_schema based on mode
+	// In DuckLake mode, we need to query ducklake.information_schema to see DuckLake tables
+	// In non-DuckLake mode, we query the local information_schema
+	infoSchemaPrefix := "information_schema"
+	if duckLakeMode {
+		infoSchemaPrefix = "ducklake.information_schema"
+	}
+
 	// Create metadata table to store column type information that DuckDB doesn't preserve
+	// Table is created in main schema of current database
 	metadataTableSQL := `
-		CREATE TABLE IF NOT EXISTS __duckgres_column_metadata (
+		CREATE TABLE IF NOT EXISTS main.__duckgres_column_metadata (
 			table_schema VARCHAR NOT NULL,
 			table_name VARCHAR NOT NULL,
 			column_name VARCHAR NOT NULL,
@@ -336,21 +348,53 @@ func initInformationSchema(db *sql.DB) error {
 	}
 
 	// Create information_schema.columns wrapper view
-	// Transforms DuckDB type names to PostgreSQL-compatible names (e.g., VARCHAR -> text)
-	// First try with metadata table join, fall back to simple view if table doesn't exist
-	columnsViewWithMetaSQL := `
-		CREATE OR REPLACE VIEW information_schema_columns_compat AS
+	// Transforms DuckDB type names to PostgreSQL-compatible names
+	// Maps: VARCHAR->text, BOOLEAN->boolean, INTEGER->integer, BIGINT->bigint,
+	//       TIMESTAMP->timestamp without time zone, DECIMAL->numeric, etc.
+	// Views are created in main schema of current database
+	columnsViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 		SELECT
 			c.table_catalog,
-			c.table_schema,
+			CASE WHEN c.table_schema = 'main' THEN 'public' ELSE c.table_schema END AS table_schema,
 			c.table_name,
 			c.column_name,
 			c.ordinal_position,
-			c.column_default,
-			c.is_nullable,
+			-- Normalize column_default to PostgreSQL format
 			CASE
-				WHEN UPPER(c.data_type) = 'VARCHAR' OR UPPER(c.data_type) LIKE 'VARCHAR(%' THEN 'text'
-				ELSE c.data_type
+				WHEN c.column_default IS NULL THEN NULL
+				WHEN c.column_default = 'CAST(''t'' AS BOOLEAN)' THEN 'true'
+				WHEN c.column_default = 'CAST(''f'' AS BOOLEAN)' THEN 'false'
+				WHEN UPPER(c.column_default) = 'CURRENT_TIMESTAMP' THEN 'CURRENT_TIMESTAMP'
+				WHEN UPPER(c.column_default) = 'NOW()' THEN 'now()'
+				ELSE c.column_default
+			END AS column_default,
+			c.is_nullable,
+			-- Normalize data_type to PostgreSQL lowercase format
+			CASE
+				WHEN UPPER(c.data_type) = 'VARCHAR' OR UPPER(c.data_type) LIKE 'VARCHAR(%%' THEN 'text'
+				WHEN UPPER(c.data_type) = 'TEXT' THEN 'text'
+				WHEN UPPER(c.data_type) LIKE 'TEXT(%%' THEN 'character'
+				WHEN UPPER(c.data_type) = 'BOOLEAN' THEN 'boolean'
+				WHEN UPPER(c.data_type) = 'TINYINT' THEN 'smallint'
+				WHEN UPPER(c.data_type) = 'SMALLINT' THEN 'smallint'
+				WHEN UPPER(c.data_type) = 'INTEGER' THEN 'integer'
+				WHEN UPPER(c.data_type) = 'BIGINT' THEN 'bigint'
+				WHEN UPPER(c.data_type) = 'HUGEINT' THEN 'numeric'
+				WHEN UPPER(c.data_type) = 'REAL' OR UPPER(c.data_type) = 'FLOAT4' THEN 'real'
+				WHEN UPPER(c.data_type) = 'DOUBLE' OR UPPER(c.data_type) = 'FLOAT8' THEN 'double precision'
+				WHEN UPPER(c.data_type) LIKE 'DECIMAL%%' THEN 'numeric'
+				WHEN UPPER(c.data_type) LIKE 'NUMERIC%%' THEN 'numeric'
+				WHEN UPPER(c.data_type) = 'DATE' THEN 'date'
+				WHEN UPPER(c.data_type) = 'TIME' THEN 'time without time zone'
+				WHEN UPPER(c.data_type) = 'TIMESTAMP' THEN 'timestamp without time zone'
+				WHEN UPPER(c.data_type) = 'TIMESTAMPTZ' OR UPPER(c.data_type) = 'TIMESTAMP WITH TIME ZONE' THEN 'timestamp with time zone'
+				WHEN UPPER(c.data_type) = 'INTERVAL' THEN 'interval'
+				WHEN UPPER(c.data_type) = 'UUID' THEN 'uuid'
+				WHEN UPPER(c.data_type) = 'BLOB' OR UPPER(c.data_type) = 'BYTEA' THEN 'bytea'
+				WHEN UPPER(c.data_type) = 'JSON' THEN 'json'
+				WHEN UPPER(c.data_type) LIKE '%%[]' THEN 'ARRAY'
+				ELSE LOWER(c.data_type)
 			END AS data_type,
 			COALESCE(m.character_maximum_length, c.character_maximum_length) AS character_maximum_length,
 			c.character_octet_length,
@@ -387,28 +431,57 @@ func initInformationSchema(db *sql.DB) error {
 			'NEVER' AS is_generated,
 			NULL AS generation_expression,
 			'YES' AS is_updatable
-		FROM information_schema.columns c
-		LEFT JOIN __duckgres_column_metadata m
+		FROM %s.columns c
+		LEFT JOIN main.__duckgres_column_metadata m
 			ON c.table_schema = m.table_schema
 			AND c.table_name = m.table_name
 			AND c.column_name = m.column_name
 	`
-	// Try with metadata table first
-	if _, err := db.Exec(columnsViewWithMetaSQL); err != nil {
-		// Metadata table doesn't exist, create simpler view without it
+	if _, err := db.Exec(fmt.Sprintf(columnsViewSQL, infoSchemaPrefix)); err != nil {
+		// If join with metadata table fails, create simpler view without it
 		columnsViewSimpleSQL := `
-			CREATE OR REPLACE VIEW information_schema_columns_compat AS
+			CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 			SELECT
 				table_catalog,
-				table_schema,
+				CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END AS table_schema,
 				table_name,
 				column_name,
 				ordinal_position,
-				column_default,
-				is_nullable,
+				-- Normalize column_default to PostgreSQL format
 				CASE
-					WHEN UPPER(data_type) = 'VARCHAR' OR UPPER(data_type) LIKE 'VARCHAR(%' THEN 'text'
-					ELSE data_type
+					WHEN column_default IS NULL THEN NULL
+					WHEN column_default = 'CAST(''t'' AS BOOLEAN)' THEN 'true'
+					WHEN column_default = 'CAST(''f'' AS BOOLEAN)' THEN 'false'
+					WHEN UPPER(column_default) = 'CURRENT_TIMESTAMP' THEN 'CURRENT_TIMESTAMP'
+					WHEN UPPER(column_default) = 'NOW()' THEN 'now()'
+					ELSE column_default
+				END AS column_default,
+				is_nullable,
+				-- Normalize data_type to PostgreSQL lowercase format
+				CASE
+					WHEN UPPER(data_type) = 'VARCHAR' OR UPPER(data_type) LIKE 'VARCHAR(%%' THEN 'text'
+					WHEN UPPER(data_type) = 'TEXT' THEN 'text'
+					WHEN UPPER(data_type) LIKE 'TEXT(%%' THEN 'character'
+					WHEN UPPER(data_type) = 'BOOLEAN' THEN 'boolean'
+					WHEN UPPER(data_type) = 'TINYINT' THEN 'smallint'
+					WHEN UPPER(data_type) = 'SMALLINT' THEN 'smallint'
+					WHEN UPPER(data_type) = 'INTEGER' THEN 'integer'
+					WHEN UPPER(data_type) = 'BIGINT' THEN 'bigint'
+					WHEN UPPER(data_type) = 'HUGEINT' THEN 'numeric'
+					WHEN UPPER(data_type) = 'REAL' OR UPPER(data_type) = 'FLOAT4' THEN 'real'
+					WHEN UPPER(data_type) = 'DOUBLE' OR UPPER(data_type) = 'FLOAT8' THEN 'double precision'
+					WHEN UPPER(data_type) LIKE 'DECIMAL%%' THEN 'numeric'
+					WHEN UPPER(data_type) LIKE 'NUMERIC%%' THEN 'numeric'
+					WHEN UPPER(data_type) = 'DATE' THEN 'date'
+					WHEN UPPER(data_type) = 'TIME' THEN 'time without time zone'
+					WHEN UPPER(data_type) = 'TIMESTAMP' THEN 'timestamp without time zone'
+					WHEN UPPER(data_type) = 'TIMESTAMPTZ' OR UPPER(data_type) = 'TIMESTAMP WITH TIME ZONE' THEN 'timestamp with time zone'
+					WHEN UPPER(data_type) = 'INTERVAL' THEN 'interval'
+					WHEN UPPER(data_type) = 'UUID' THEN 'uuid'
+					WHEN UPPER(data_type) = 'BLOB' OR UPPER(data_type) = 'BYTEA' THEN 'bytea'
+					WHEN UPPER(data_type) = 'JSON' THEN 'json'
+					WHEN UPPER(data_type) LIKE '%%[]' THEN 'ARRAY'
+					ELSE LOWER(data_type)
 				END AS data_type,
 				character_maximum_length,
 				character_octet_length,
@@ -445,17 +518,19 @@ func initInformationSchema(db *sql.DB) error {
 				'NEVER' AS is_generated,
 				NULL AS generation_expression,
 				'YES' AS is_updatable
-			FROM information_schema.columns
+			FROM %s.columns
 		`
-		db.Exec(columnsViewSimpleSQL)
+		db.Exec(fmt.Sprintf(columnsViewSimpleSQL, infoSchemaPrefix))
 	}
 
 	// Create information_schema.tables wrapper view with additional PostgreSQL columns
+	// Filter out internal duckgres tables/views and DuckDB system views
+	// Normalize 'main' schema to 'public' for PostgreSQL compatibility
 	tablesViewSQL := `
-		CREATE OR REPLACE VIEW information_schema_tables_compat AS
+		CREATE OR REPLACE VIEW main.information_schema_tables_compat AS
 		SELECT
 			t.table_catalog,
-			t.table_schema,
+			CASE WHEN t.table_schema = 'main' THEN 'public' ELSE t.table_schema END AS table_schema,
 			t.table_name,
 			t.table_type,
 			NULL AS self_referencing_column_name,
@@ -466,24 +541,85 @@ func initInformationSchema(db *sql.DB) error {
 			'YES' AS is_insertable_into,
 			'NO' AS is_typed,
 			NULL AS commit_action
-		FROM information_schema.tables t
+		FROM %s.tables t
+		WHERE t.table_name NOT IN (
+			-- Internal duckgres tables
+			'__duckgres_column_metadata',
+			-- pg_catalog compat views
+			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
+			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
+			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext',
+			-- information_schema compat views
+			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', 'information_schema_views_compat'
+		)
+		AND t.table_name NOT LIKE 'duckdb_%%'
+		AND t.table_name NOT LIKE 'sqlite_%%'
+		AND t.table_name NOT LIKE 'pragma_%%'
 	`
-	db.Exec(tablesViewSQL)
+	db.Exec(fmt.Sprintf(tablesViewSQL, infoSchemaPrefix))
 
 	// Create information_schema.schemata wrapper view
+	// Normalize 'main' to 'public' and add synthetic entries for pg_catalog and information_schema
+	// to match PostgreSQL's information_schema.schemata
 	schemataViewSQL := `
-		CREATE OR REPLACE VIEW information_schema_schemata_compat AS
+		CREATE OR REPLACE VIEW main.information_schema_schemata_compat AS
 		SELECT
 			s.catalog_name,
-			s.schema_name,
+			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS schema_name,
 			'duckdb' AS schema_owner,
 			NULL AS default_character_set_catalog,
 			NULL AS default_character_set_schema,
 			NULL AS default_character_set_name,
 			NULL AS sql_path
-		FROM information_schema.schemata s
+		FROM %s.schemata s
+		WHERE s.schema_name NOT IN ('main', 'pg_catalog', 'information_schema')
+		UNION ALL
+		SELECT 'memory' AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
+			NULL, NULL, NULL, NULL
+		UNION ALL
+		SELECT 'memory' AS catalog_name, 'pg_catalog' AS schema_name, 'duckdb' AS schema_owner,
+			NULL, NULL, NULL, NULL
+		UNION ALL
+		SELECT 'memory' AS catalog_name, 'information_schema' AS schema_name, 'duckdb' AS schema_owner,
+			NULL, NULL, NULL, NULL
+		UNION ALL
+		SELECT 'memory' AS catalog_name, 'pg_toast' AS schema_name, 'duckdb' AS schema_owner,
+			NULL, NULL, NULL, NULL
 	`
-	db.Exec(schemataViewSQL)
+	db.Exec(fmt.Sprintf(schemataViewSQL, infoSchemaPrefix))
+
+	// Create information_schema.views wrapper view
+	// Filter out internal duckgres views and DuckDB system views
+	// Normalize 'main' schema to 'public' for PostgreSQL compatibility
+	viewsViewSQL := `
+		CREATE OR REPLACE VIEW main.information_schema_views_compat AS
+		SELECT
+			v.table_catalog,
+			CASE WHEN v.table_schema = 'main' THEN 'public' ELSE v.table_schema END AS table_schema,
+			v.table_name,
+			v.view_definition,
+			v.check_option,
+			v.is_updatable,
+			v.is_insertable_into,
+			v.is_trigger_updatable,
+			v.is_trigger_deletable,
+			v.is_trigger_insertable_into
+		FROM %s.views v
+		WHERE v.table_name NOT IN (
+			-- pg_catalog compat views
+			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
+			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
+			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext',
+			-- information_schema compat views
+			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', 'information_schema_views_compat'
+		)
+		AND v.table_name NOT LIKE 'duckdb_%%'
+		AND v.table_name NOT LIKE 'sqlite_%%'
+		AND v.table_name NOT LIKE 'pragma_%%'
+	`
+	db.Exec(fmt.Sprintf(viewsViewSQL, infoSchemaPrefix))
 
 	return nil
 }

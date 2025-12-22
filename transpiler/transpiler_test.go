@@ -95,6 +95,106 @@ func TestTranspile_PgCatalog(t *testing.T) {
 	}
 }
 
+func TestTranspile_InformationSchema(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "information_schema.columns -> compat view",
+			input:    "SELECT * FROM information_schema.columns",
+			contains: "information_schema_columns_compat",
+			excludes: "information_schema.columns",
+		},
+		{
+			name:     "information_schema.tables -> compat view",
+			input:    "SELECT * FROM information_schema.tables",
+			contains: "information_schema_tables_compat",
+			excludes: "information_schema.tables",
+		},
+		{
+			name:     "information_schema.schemata -> compat view",
+			input:    "SELECT * FROM information_schema.schemata",
+			contains: "information_schema_schemata_compat",
+			excludes: "information_schema.schemata",
+		},
+		{
+			name:     "INFORMATION_SCHEMA.COLUMNS uppercase -> compat view",
+			input:    "SELECT * FROM INFORMATION_SCHEMA.COLUMNS",
+			contains: "information_schema_columns_compat",
+			excludes: "information_schema.columns",
+		},
+		{
+			name:     "aliased information_schema query",
+			input:    "SELECT c.column_name FROM information_schema.columns c WHERE c.table_name = 'test'",
+			contains: "information_schema_columns_compat",
+			excludes: "information_schema.columns",
+		},
+		{
+			name:     "string literal NOT rewritten",
+			input:    "SELECT 'information_schema.columns' AS name",
+			contains: "information_schema.columns",
+		},
+		{
+			name:     "unmapped information_schema table passes through",
+			input:    "SELECT * FROM information_schema.routines",
+			contains: "information_schema.routines",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_InformationSchema_DuckLakeMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			name:     "information_schema.columns with DuckLake -> main qualified",
+			input:    "SELECT * FROM information_schema.columns",
+			contains: "main.information_schema_columns_compat",
+		},
+		{
+			name:     "information_schema.tables with DuckLake -> main qualified",
+			input:    "SELECT * FROM information_schema.tables",
+			contains: "main.information_schema_tables_compat",
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+		})
+	}
+}
+
 func TestTranspile_TypeCast(t *testing.T) {
 	tests := []struct {
 		name     string
