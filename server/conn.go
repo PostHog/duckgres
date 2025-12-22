@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
+	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
@@ -914,8 +915,17 @@ func (c *clientConn) formatCopyValue(v interface{}) string {
 
 // parseCopyLine parses a line of COPY input
 func (c *clientConn) parseCopyLine(line, delimiter string) []string {
-	// Simple split - doesn't handle quoted values yet
-	return strings.Split(line, delimiter)
+	// Use encoding/csv for proper handling of quoted values
+	reader := csv.NewReader(strings.NewReader(line))
+	reader.Comma = rune(delimiter[0])
+	reader.LazyQuotes = true // Be lenient with quotes
+
+	fields, err := reader.Read()
+	if err != nil {
+		// Fall back to simple split if CSV parsing fails
+		return strings.Split(line, delimiter)
+	}
+	return fields
 }
 
 func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnType) error {

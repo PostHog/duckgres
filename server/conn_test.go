@@ -565,3 +565,80 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 
 // Note: isIgnoredSetParameter tests have been moved to transpiler/transpiler_test.go.
 // The transpiler package now handles SET parameter filtering via AST transformation.
+
+func TestParseCopyLine(t *testing.T) {
+	c := &clientConn{}
+
+	tests := []struct {
+		name      string
+		line      string
+		delimiter string
+		expected  []string
+	}{
+		{
+			name:      "simple CSV values",
+			line:      `a,b,c`,
+			delimiter: ",",
+			expected:  []string{"a", "b", "c"},
+		},
+		{
+			name:      "quoted value with embedded comma",
+			line:      `"hello, world",normal,value`,
+			delimiter: ",",
+			expected:  []string{"hello, world", "normal", "value"},
+		},
+		{
+			name:      "multiple quoted values with commas",
+			line:      `"value, one","value, two","value, three"`,
+			delimiter: ",",
+			expected:  []string{"value, one", "value, two", "value, three"},
+		},
+		{
+			name:      "mixed quoted and unquoted",
+			line:      `id,"url with, comma",status`,
+			delimiter: ",",
+			expected:  []string{"id", "url with, comma", "status"},
+		},
+		{
+			name:      "tab-separated values",
+			line:      "a\tb\tc",
+			delimiter: "\t",
+			expected:  []string{"a", "b", "c"},
+		},
+		{
+			name:      "quoted value with embedded tab",
+			line:      "\"hello\tworld\"\tnormal",
+			delimiter: "\t",
+			expected:  []string{"hello\tworld", "normal"},
+		},
+		{
+			name:      "empty values",
+			line:      `a,,c`,
+			delimiter: ",",
+			expected:  []string{"a", "", "c"},
+		},
+		{
+			name:      "URL with comma in quoted field",
+			line:      `"cs_123","https://example.com/success?a=1,b=2",active`,
+			delimiter: ",",
+			expected:  []string{"cs_123", "https://example.com/success?a=1,b=2", "active"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := c.parseCopyLine(tt.line, tt.delimiter)
+			if len(result) != len(tt.expected) {
+				t.Errorf("parseCopyLine(%q, %q) returned %d values, want %d\nGot: %v\nWant: %v",
+					tt.line, tt.delimiter, len(result), len(tt.expected), result, tt.expected)
+				return
+			}
+			for i, v := range result {
+				if v != tt.expected[i] {
+					t.Errorf("parseCopyLine(%q, %q)[%d] = %q, want %q",
+						tt.line, tt.delimiter, i, v, tt.expected[i])
+				}
+			}
+		})
+	}
+}
