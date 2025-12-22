@@ -60,8 +60,8 @@ func (t *InformationSchemaTransform) walkAndTransform(node *pg_query.Node, chang
 
 	switch n := node.Node.(type) {
 	case *pg_query.Node_RangeVar:
-		// Table references: information_schema.columns -> information_schema_columns_compat
-		// Views are created in the main schema of the current database
+		// Table references: information_schema.columns -> memory.main.information_schema_columns_compat
+		// Views are created in the memory.main schema so they're always accessible regardless of default catalog
 		// Skip transformation if catalog is explicitly "ducklake" - those are queries from
 		// within the compat views that need to access the actual DuckLake information_schema
 		if n.RangeVar != nil && strings.EqualFold(n.RangeVar.Schemaname, "information_schema") &&
@@ -69,8 +69,8 @@ func (t *InformationSchemaTransform) walkAndTransform(node *pg_query.Node, chang
 			relname := strings.ToLower(n.RangeVar.Relname)
 			if newName, ok := t.ViewMappings[relname]; ok {
 				n.RangeVar.Relname = newName
-				// Views are in main schema (no catalog prefix needed)
-				n.RangeVar.Catalogname = ""
+				// Views are in memory.main schema - always use explicit catalog for DuckLake compatibility
+				n.RangeVar.Catalogname = "memory"
 				n.RangeVar.Schemaname = "main"
 				*changed = true
 			}

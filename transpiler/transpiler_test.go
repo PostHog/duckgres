@@ -105,31 +105,31 @@ func TestTranspile_InformationSchema(t *testing.T) {
 		{
 			name:     "information_schema.columns -> compat view",
 			input:    "SELECT * FROM information_schema.columns",
-			contains: "information_schema_columns_compat",
+			contains: "memory.main.information_schema_columns_compat",
 			excludes: "information_schema.columns",
 		},
 		{
 			name:     "information_schema.tables -> compat view",
 			input:    "SELECT * FROM information_schema.tables",
-			contains: "information_schema_tables_compat",
+			contains: "memory.main.information_schema_tables_compat",
 			excludes: "information_schema.tables",
 		},
 		{
 			name:     "information_schema.schemata -> compat view",
 			input:    "SELECT * FROM information_schema.schemata",
-			contains: "information_schema_schemata_compat",
+			contains: "memory.main.information_schema_schemata_compat",
 			excludes: "information_schema.schemata",
 		},
 		{
 			name:     "INFORMATION_SCHEMA.COLUMNS uppercase -> compat view",
 			input:    "SELECT * FROM INFORMATION_SCHEMA.COLUMNS",
-			contains: "information_schema_columns_compat",
+			contains: "memory.main.information_schema_columns_compat",
 			excludes: "information_schema.columns",
 		},
 		{
 			name:     "aliased information_schema query",
 			input:    "SELECT c.column_name FROM information_schema.columns c WHERE c.table_name = 'test'",
-			contains: "information_schema_columns_compat",
+			contains: "memory.main.information_schema_columns_compat",
 			excludes: "information_schema.columns",
 		},
 		{
@@ -169,14 +169,14 @@ func TestTranspile_InformationSchema_DuckLakeMode(t *testing.T) {
 		contains string
 	}{
 		{
-			name:     "information_schema.columns with DuckLake -> main qualified",
+			name:     "information_schema.columns with DuckLake -> memory.main qualified",
 			input:    "SELECT * FROM information_schema.columns",
-			contains: "main.information_schema_columns_compat",
+			contains: "memory.main.information_schema_columns_compat",
 		},
 		{
-			name:     "information_schema.tables with DuckLake -> main qualified",
+			name:     "information_schema.tables with DuckLake -> memory.main qualified",
 			input:    "SELECT * FROM information_schema.tables",
-			contains: "main.information_schema_tables_compat",
+			contains: "memory.main.information_schema_tables_compat",
 		},
 	}
 

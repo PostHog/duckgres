@@ -318,19 +318,16 @@ func initPgCatalog(db *sql.DB) error {
 
 // initInformationSchema creates the column metadata table and information_schema wrapper views.
 // This enables accurate type information (VARCHAR lengths, NUMERIC precision) in information_schema.
-// When duckLakeMode is true, the views query from ducklake.information_schema instead of the
-// local information_schema, since DuckLake is set as the default catalog.
+// Views are created in memory.main (before USE ducklake) and query from unqualified information_schema,
+// which resolves to the default catalog's information_schema at query time.
 func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
-	// Determine the source information_schema based on mode
-	// In DuckLake mode, we need to query ducklake.information_schema to see DuckLake tables
-	// In non-DuckLake mode, we query the local information_schema
+	// Use just "information_schema" without catalog prefix
+	// Views are created in memory.main (before USE ducklake) and query from information_schema
+	// which resolves to the current default catalog's information_schema at query time
 	infoSchemaPrefix := "information_schema"
-	if duckLakeMode {
-		infoSchemaPrefix = "ducklake.information_schema"
-	}
 
 	// Create metadata table to store column type information that DuckDB doesn't preserve
-	// Table is created in main schema of current database
+	// Table is created in main schema (which is memory.main before USE ducklake)
 	metadataTableSQL := `
 		CREATE TABLE IF NOT EXISTS main.__duckgres_column_metadata (
 			table_schema VARCHAR NOT NULL,
@@ -351,7 +348,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	// Transforms DuckDB type names to PostgreSQL-compatible names
 	// Maps: VARCHAR->text, BOOLEAN->boolean, INTEGER->integer, BIGINT->bigint,
 	//       TIMESTAMP->timestamp without time zone, DECIMAL->numeric, etc.
-	// Views are created in main schema of current database
+	// Views are created in main schema (which is memory.main before USE ducklake)
 	columnsViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 		SELECT
