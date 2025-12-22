@@ -27,25 +27,28 @@ func New(cfg Config) *Transpiler {
 	// 1. pg_catalog schema and view mappings
 	t.transforms = append(t.transforms, transform.NewPgCatalogTransformWithConfig(cfg.DuckLakeMode))
 
-	// 2. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
+	// 2. information_schema mappings to compat views
+	t.transforms = append(t.transforms, transform.NewInformationSchemaTransformWithConfig(cfg.DuckLakeMode))
+
+	// 3. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, transform.NewTypeMappingTransform())
 
-	// 3. Type casts (::regtype -> ::varchar)
+	// 4. Type casts (::regtype -> ::varchar)
 	t.transforms = append(t.transforms, transform.NewTypeCastTransform())
 
-	// 4. Function mappings (array_agg->list, string_to_array->string_split, etc.)
+	// 5. Function mappings (array_agg->list, string_to_array->string_split, etc.)
 	t.transforms = append(t.transforms, transform.NewFunctionTransform())
 
-	// 5. Operator mappings (regex operators, etc.)
+	// 6. Operator mappings (regex operators, etc.)
 	t.transforms = append(t.transforms, transform.NewOperatorTransform())
 
-	// 6. version() replacement
+	// 7. version() replacement
 	t.transforms = append(t.transforms, transform.NewVersionTransform())
 
-	// 7. SET/SHOW command handling
+	// 8. SET/SHOW command handling
 	t.transforms = append(t.transforms, transform.NewSetShowTransform())
 
-	// 8. ON CONFLICT handling
+	// 9. ON CONFLICT handling
 	t.transforms = append(t.transforms, transform.NewOnConflictTransform())
 
 	// DDL transforms only when DuckLake mode is enabled
