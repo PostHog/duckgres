@@ -85,11 +85,10 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 
 		case *pg_query.Node_AlterTableStmt:
 			if n.AlterTableStmt != nil {
-				// Check for ADD CONSTRAINT commands
+				// Check for unsupported ALTER TABLE commands (constraints, NOT NULL, DEFAULT, etc.)
 				for _, cmd := range n.AlterTableStmt.Cmds {
 					if alterCmd := cmd.GetAlterTableCmd(); alterCmd != nil {
-						// Check if this is adding a constraint
-						if t.isConstraintCommand(alterCmd) {
+						if t.isUnsupportedAlterCommand(alterCmd) {
 							result.IsNoOp = true
 							result.NoOpTag = "ALTER TABLE"
 							return true, nil
@@ -301,11 +300,20 @@ func (t *DDLTransform) isUnsupportedDefault(expr *pg_query.Node) bool {
 	return true
 }
 
-// isConstraintCommand checks if an ALTER TABLE command is adding a constraint
-func (t *DDLTransform) isConstraintCommand(cmd *pg_query.AlterTableCmd) bool {
+// isUnsupportedAlterCommand checks if an ALTER TABLE command is unsupported by DuckLake
+func (t *DDLTransform) isUnsupportedAlterCommand(cmd *pg_query.AlterTableCmd) bool {
 	switch cmd.Subtype {
+	// Constraint commands
 	case pg_query.AlterTableType_AT_AddConstraint,
-		pg_query.AlterTableType_AT_ValidateConstraint:
+		pg_query.AlterTableType_AT_ValidateConstraint,
+		pg_query.AlterTableType_AT_DropConstraint:
+		return true
+	// NOT NULL commands - DuckLake doesn't handle these well
+	case pg_query.AlterTableType_AT_SetNotNull,
+		pg_query.AlterTableType_AT_DropNotNull:
+		return true
+	// DEFAULT commands - DuckLake has limited support
+	case pg_query.AlterTableType_AT_ColumnDefault:
 		return true
 	}
 	return false
