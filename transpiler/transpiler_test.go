@@ -358,6 +358,54 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 	}
 }
 
+func TestTranspile_TempTableReferences(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			name:     "SELECT from staging table",
+			input:    `SELECT * FROM "stripe_test_upcomi-staging-62de57c1-39ce-45c4-93f3-34e0a6dd72f4"`,
+			contains: `temp."stripe_test_upcomi-staging-62de57c1-39ce-45c4-93f3-34e0a6dd72f4"`,
+		},
+		{
+			name:     "INSERT SELECT from staging table",
+			input:    `INSERT INTO target_table SELECT * FROM "schema_table-staging-abc123"`,
+			contains: `FROM temp."schema_table-staging-abc123"`,
+		},
+		{
+			name:     "DELETE USING staging table",
+			input:    `DELETE FROM target USING (SELECT id FROM "test-staging-uuid") AS s WHERE target.id = s.id`,
+			contains: `temp."test-staging-uuid"`,
+		},
+		{
+			name:     "regular table not modified",
+			input:    `SELECT * FROM users`,
+			contains: `FROM users`,
+		},
+		{
+			name:     "schema-qualified table not modified",
+			input:    `SELECT * FROM schema."table-staging-foo"`,
+			contains: `FROM schema."table-staging-foo"`,
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+		})
+	}
+}
+
 func TestTranspile_Placeholders(t *testing.T) {
 	tests := []struct {
 		name       string

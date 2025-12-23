@@ -51,9 +51,12 @@ func New(cfg Config) *Transpiler {
 	// 9. ON CONFLICT handling
 	t.transforms = append(t.transforms, transform.NewOnConflictTransform())
 
-	// DDL transforms only when DuckLake mode is enabled
+	// DuckLake-specific transforms
 	if cfg.DuckLakeMode {
+		// DDL transforms (strip unsupported constraints, handle no-ops)
 		t.transforms = append(t.transforms, transform.NewDDLTransform())
+		// Temp table transforms (qualify staging table references with temp schema)
+		t.transforms = append(t.transforms, transform.NewTempTableTransform())
 	}
 
 	// Placeholder transform only when needed (extended query protocol)
