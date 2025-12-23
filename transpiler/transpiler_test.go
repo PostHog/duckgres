@@ -788,6 +788,42 @@ func TestTranspile_OnConflict(t *testing.T) {
 	}
 }
 
+func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
+	// In DuckLake mode, ON CONFLICT is stripped because PRIMARY KEY/UNIQUE constraints don't exist
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "ON CONFLICT DO NOTHING stripped",
+			input: "INSERT INTO users (id, name) VALUES (1, 'test') ON CONFLICT (id) DO NOTHING",
+		},
+		{
+			name:  "ON CONFLICT DO UPDATE stripped",
+			input: "INSERT INTO users (id, name) VALUES (1, 'test') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			// ON CONFLICT should be stripped in DuckLake mode
+			if strings.Contains(strings.ToUpper(result.SQL), "ON CONFLICT") {
+				t.Errorf("Transpile(%q) = %q, should NOT contain ON CONFLICT in DuckLake mode", tt.input, result.SQL)
+			}
+			// But the INSERT should still work
+			if !strings.Contains(strings.ToUpper(result.SQL), "INSERT INTO") {
+				t.Errorf("Transpile(%q) = %q, should still contain INSERT INTO", tt.input, result.SQL)
+			}
+		})
+	}
+}
+
 func TestTranspile_JSONOperators(t *testing.T) {
 	// DuckDB supports -> and ->> operators
 	tests := []struct {

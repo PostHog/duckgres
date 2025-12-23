@@ -48,8 +48,8 @@ func New(cfg Config) *Transpiler {
 	// 8. SET/SHOW command handling
 	t.transforms = append(t.transforms, transform.NewSetShowTransform())
 
-	// 9. ON CONFLICT handling
-	t.transforms = append(t.transforms, transform.NewOnConflictTransform())
+	// 9. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
+	t.transforms = append(t.transforms, transform.NewOnConflictTransformWithConfig(cfg.DuckLakeMode))
 
 	// DuckLake-specific transforms
 	if cfg.DuckLakeMode {
