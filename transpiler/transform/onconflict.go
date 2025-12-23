@@ -13,10 +13,21 @@ import (
 // Note: DuckDB's ON CONFLICT support has evolved. As of DuckDB 0.9+,
 // it supports ON CONFLICT DO NOTHING and ON CONFLICT DO UPDATE.
 // This transform handles cases where the syntax might differ.
-type OnConflictTransform struct{}
+//
+// In DuckLake mode, PRIMARY KEY and UNIQUE constraints are stripped,
+// so ON CONFLICT clauses will fail with "columns not referenced by constraint".
+// We strip ON CONFLICT entirely in DuckLake mode since there are no constraints
+// to conflict with.
+type OnConflictTransform struct {
+	DuckLakeMode bool
+}
 
 func NewOnConflictTransform() *OnConflictTransform {
-	return &OnConflictTransform{}
+	return &OnConflictTransform{DuckLakeMode: false}
+}
+
+func NewOnConflictTransformWithConfig(duckLakeMode bool) *OnConflictTransform {
+	return &OnConflictTransform{DuckLakeMode: duckLakeMode}
 }
 
 func (t *OnConflictTransform) Name() string {
@@ -44,6 +55,15 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 func (t *OnConflictTransform) transformInsert(insert *pg_query.InsertStmt) bool {
 	if insert == nil || insert.OnConflictClause == nil {
 		return false
+	}
+
+	// In DuckLake mode, we strip PRIMARY KEY and UNIQUE constraints,
+	// so ON CONFLICT clauses will fail with "columns not referenced by constraint".
+	// Strip the ON CONFLICT clause entirely since there are no constraints to conflict with.
+	// The data will be inserted normally. Fivetran's DELETE + INSERT pattern handles updates.
+	if t.DuckLakeMode {
+		insert.OnConflictClause = nil
+		return true
 	}
 
 	// DuckDB now supports ON CONFLICT syntax similar to PostgreSQL
