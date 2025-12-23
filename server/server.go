@@ -406,6 +406,16 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	}
 
 	log.Printf("Attached DuckLake catalog successfully")
+
+	// Set DuckLake max retry count to handle concurrent connections
+	// DuckLake uses optimistic concurrency - when multiple connections commit
+	// simultaneously, they may conflict on snapshot IDs. Default of 10 is too low
+	// for tools like Fivetran that open many concurrent connections.
+	if _, err := db.Exec("SET ducklake_max_retry_count = 100"); err != nil {
+		log.Printf("Warning: failed to set ducklake_max_retry_count: %v", err)
+		// Don't fail - this is not critical, DuckLake will use its default
+	}
+
 	return nil
 }
 
