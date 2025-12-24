@@ -836,23 +836,34 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			allData.Write(body)
 
 		case msgCopyDone:
-			// Process all data
-			lines := strings.Split(allData.String(), "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
+			// Process all data using proper CSV reader
+			// This correctly handles multi-line quoted fields (e.g., JSON with embedded newlines)
+			csvReader := csv.NewReader(&allData)
+			csvReader.Comma = rune(delimiter[0])
+			csvReader.LazyQuotes = true
+			csvReader.FieldsPerRecord = -1 // Allow variable number of fields
+
+			for {
+				values, err := csvReader.Read()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					c.sendError("ERROR", "22P02", fmt.Sprintf("invalid CSV input: %v", err))
+					c.setTxError()
+					writeReadyForQuery(c.writer, c.txStatus)
+					c.writer.Flush()
+					return nil
+				}
+
+				// Skip empty rows
+				if len(values) == 0 || (len(values) == 1 && values[0] == "") {
 					continue
 				}
 
 				// Skip header if needed
 				if hasHeader && !headerSkipped {
 					headerSkipped = true
-					continue
-				}
-
-				// Parse values and insert
-				values := c.parseCopyLine(line, delimiter)
-				if len(values) == 0 {
 					continue
 				}
 

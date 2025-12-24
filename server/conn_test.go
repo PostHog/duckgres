@@ -1,6 +1,9 @@
 package server
 
 import (
+	"encoding/csv"
+	"io"
+	"strings"
 	"testing"
 )
 
@@ -637,6 +640,93 @@ func TestParseCopyLine(t *testing.T) {
 				if v != tt.expected[i] {
 					t.Errorf("parseCopyLine(%q, %q)[%d] = %q, want %q",
 						tt.line, tt.delimiter, i, v, tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseMultiLineCSV(t *testing.T) {
+	// This tests the fix for COPY FROM STDIN with multi-line quoted fields.
+	// Previously, we split by newlines first then parsed each line, which broke
+	// when quoted fields contained embedded newlines (e.g., JSON with formatting).
+	// Now we use csv.Reader on the entire buffer which handles this correctly.
+
+	tests := []struct {
+		name      string
+		input     string
+		delimiter string
+		expected  [][]string
+	}{
+		{
+			name:      "simple rows no newlines",
+			input:     "a,b,c\n1,2,3\n",
+			delimiter: ",",
+			expected:  [][]string{{"a", "b", "c"}, {"1", "2", "3"}},
+		},
+		{
+			name:      "quoted field with embedded newline",
+			input:     "id,json,status\n1,\"{\"\"key\"\":\n\"\"value\"\"}\",active\n",
+			delimiter: ",",
+			expected:  [][]string{{"id", "json", "status"}, {"1", "{\"key\":\n\"value\"}", "active"}},
+		},
+		{
+			name:      "multiple fields with newlines",
+			input:     "a,\"line1\nline2\",b\nc,\"x\ny\nz\",d\n",
+			delimiter: ",",
+			expected:  [][]string{{"a", "line1\nline2", "b"}, {"c", "x\ny\nz", "d"}},
+		},
+		{
+			name:      "JSON metadata like Fivetran sends",
+			input:     "customer_id,metadata,type\ncust_123,\"{\"\"subscription\"\":\n  \"\"active\"\",\n  \"\"plan\"\": \"\"pro\"\"}\",invoice\n",
+			delimiter: ",",
+			expected:  [][]string{{"customer_id", "metadata", "type"}, {"cust_123", "{\"subscription\":\n  \"active\",\n  \"plan\": \"pro\"}", "invoice"}},
+		},
+		{
+			name:      "13 columns with multiline JSON in middle",
+			input:     "c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13\nv1,v2,v3,v4,v5,v6,\"{\"\"a\"\":\n\"\"b\"\"}\",v8,v9,v10,v11,v12,v13\n",
+			delimiter: ",",
+			expected:  [][]string{{"c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "c12", "c13"}, {"v1", "v2", "v3", "v4", "v5", "v6", "{\"a\":\n\"b\"}", "v8", "v9", "v10", "v11", "v12", "v13"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate what handleCopyIn does: use csv.Reader on entire buffer
+			reader := csv.NewReader(strings.NewReader(tt.input))
+			reader.Comma = rune(tt.delimiter[0])
+			reader.LazyQuotes = true
+			reader.FieldsPerRecord = -1
+
+			var rows [][]string
+			for {
+				record, err := reader.Read()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("csv.Read() error: %v", err)
+				}
+				rows = append(rows, record)
+			}
+
+			if len(rows) != len(tt.expected) {
+				t.Errorf("got %d rows, want %d\nGot: %v\nWant: %v",
+					len(rows), len(tt.expected), rows, tt.expected)
+				return
+			}
+
+			for i, row := range rows {
+				if len(row) != len(tt.expected[i]) {
+					t.Errorf("row %d: got %d columns, want %d\nGot: %v\nWant: %v",
+						i, len(row), len(tt.expected[i]), row, tt.expected[i])
+					continue
+				}
+				for j, val := range row {
+					if val != tt.expected[i][j] {
+						t.Errorf("row %d col %d: got %q, want %q",
+							i, j, val, tt.expected[i][j])
+					}
 				}
 			}
 		})
