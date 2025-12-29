@@ -771,6 +771,9 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 // handleCopyIn handles COPY ... FROM STDIN
 func (c *clientConn) handleCopyIn(query, upperQuery string) error {
+	copyStartTime := time.Now()
+	log.Printf("[%s] COPY FROM STDIN: starting", c.username)
+
 	matches := copyFromStdinRegex.FindStringSubmatch(query)
 	if len(matches) < 2 {
 		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
@@ -785,6 +788,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	if len(matches) > 2 && matches[2] != "" {
 		columnList = fmt.Sprintf("(%s)", matches[2])
 	}
+	log.Printf("[%s] COPY FROM STDIN: table=%s columns=%s", c.username, tableName, columnList)
 
 	// Parse options
 	delimiter := "\t"
@@ -819,78 +823,102 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return err
 	}
 	c.writer.Flush()
+	log.Printf("[%s] COPY FROM STDIN: sent CopyInResponse, waiting for data...", c.username)
 
 	// Read COPY data from client
 	var allData bytes.Buffer
 	rowCount := 0
-	headerSkipped := false
+	copyDataMessages := 0
+	dataReceiveStart := time.Now()
 
 	for {
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
+			log.Printf("[%s] COPY FROM STDIN: error reading message: %v", c.username, err)
 			return err
 		}
 
 		switch msgType {
 		case msgCopyData:
 			allData.Write(body)
+			copyDataMessages++
+			if copyDataMessages%10000 == 0 {
+				log.Printf("[%s] COPY FROM STDIN: received %d CopyData messages, %d bytes total",
+					c.username, copyDataMessages, allData.Len())
+			}
 
 		case msgCopyDone:
-			// Process all data using proper CSV reader
-			// This correctly handles multi-line quoted fields (e.g., JSON with embedded newlines)
-			csvReader := csv.NewReader(&allData)
-			csvReader.Comma = rune(delimiter[0])
-			csvReader.LazyQuotes = true
-			csvReader.FieldsPerRecord = -1 // Allow variable number of fields
+			dataReceiveElapsed := time.Since(dataReceiveStart)
+			log.Printf("[%s] COPY FROM STDIN: CopyDone received - %d messages, %d bytes in %v",
+				c.username, copyDataMessages, allData.Len(), dataReceiveElapsed)
 
-			for {
-				values, err := csvReader.Read()
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					c.sendError("ERROR", "22P02", fmt.Sprintf("invalid CSV input: %v", err))
-					c.setTxError()
-					writeReadyForQuery(c.writer, c.txStatus)
-					c.writer.Flush()
-					return nil
-				}
-
-				// Skip empty rows
-				if len(values) == 0 || (len(values) == 1 && values[0] == "") {
-					continue
-				}
-
-				// Skip header if needed
-				if hasHeader && !headerSkipped {
-					headerSkipped = true
-					continue
-				}
-
-				// Build INSERT statement
-				placeholders := make([]string, len(values))
-				args := make([]interface{}, len(values))
-				for i, v := range values {
-					placeholders[i] = "?"
-					if v == nullString || v == "\\N" || v == "" {
-						args[i] = nil
-					} else {
-						args[i] = v
-					}
-				}
-
-				insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES (%s)",
-					tableName, columnList, strings.Join(placeholders, ", "))
-
-				if _, err := c.db.Exec(insertSQL, args...); err != nil {
-					c.sendError("ERROR", "22P02", fmt.Sprintf("invalid input: %v", err))
-					c.setTxError()
-					writeReadyForQuery(c.writer, c.txStatus)
-					c.writer.Flush()
-					return nil
-				}
-				rowCount++
+			// Write data to a temp file and use DuckDB's native COPY FROM for performance.
+			// This approach leverages DuckDB's highly optimized CSV parser which handles
+			// type conversions automatically and can load millions of rows in seconds.
+			// The temp file is created, used, and deleted within this single request.
+			tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
+			if err != nil {
+				log.Printf("[%s] COPY FROM STDIN: failed to create temp file: %v", c.username, err)
+				c.sendError("ERROR", "58000", fmt.Sprintf("failed to create temp file: %v", err))
+				c.setTxError()
+				writeReadyForQuery(c.writer, c.txStatus)
+				c.writer.Flush()
+				return nil
 			}
+			tmpPath := tmpFile.Name()
+			defer os.Remove(tmpPath)
+
+			// Write data to temp file
+			writeStart := time.Now()
+			bytesWritten, err := tmpFile.Write(allData.Bytes())
+			tmpFile.Close()
+			if err != nil {
+				log.Printf("[%s] COPY FROM STDIN: failed to write temp file: %v", c.username, err)
+				c.sendError("ERROR", "58000", fmt.Sprintf("failed to write temp file: %v", err))
+				c.setTxError()
+				writeReadyForQuery(c.writer, c.txStatus)
+				c.writer.Flush()
+				return nil
+			}
+			log.Printf("[%s] COPY FROM STDIN: wrote %d bytes to temp file in %v",
+				c.username, bytesWritten, time.Since(writeStart))
+
+			// Build DuckDB COPY FROM statement
+			// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',')
+			copyOptions := []string{"FORMAT CSV"}
+			if hasHeader {
+				copyOptions = append(copyOptions, "HEADER")
+			}
+			if nullString != "\\N" {
+				copyOptions = append(copyOptions, fmt.Sprintf("NULL '%s'", nullString))
+			}
+			if delimiter != "," {
+				copyOptions = append(copyOptions, fmt.Sprintf("DELIMITER '%s'", delimiter))
+			}
+
+			copySQL := fmt.Sprintf("COPY %s %s FROM '%s' (%s)",
+				tableName, columnList, tmpPath, strings.Join(copyOptions, ", "))
+
+			log.Printf("[%s] COPY FROM STDIN: executing native DuckDB COPY: %s", c.username, copySQL)
+			loadStart := time.Now()
+
+			result, err := c.db.Exec(copySQL)
+			if err != nil {
+				log.Printf("[%s] COPY FROM STDIN: DuckDB COPY failed: %v", c.username, err)
+				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
+				c.setTxError()
+				writeReadyForQuery(c.writer, c.txStatus)
+				c.writer.Flush()
+				return nil
+			}
+
+			rowCount64, _ := result.RowsAffected()
+			rowCount = int(rowCount64)
+
+			totalElapsed := time.Since(copyStartTime)
+			loadElapsed := time.Since(loadStart)
+			log.Printf("[%s] COPY FROM STDIN: completed - %d rows in %v (DuckDB load: %v)",
+				c.username, rowCount, totalElapsed, loadElapsed)
 
 			writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
 			writeReadyForQuery(c.writer, c.txStatus)
