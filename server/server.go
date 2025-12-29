@@ -293,6 +293,13 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		log.Printf("Warning: failed to attach DuckLake for user %q: %v", username, err)
 	} else if s.cfg.DuckLake.MetadataStore != "" {
 		duckLakeMode = true
+
+		// Recreate pg_class_full to source from DuckLake metadata instead of DuckDB's pg_catalog.
+		// This ensures consistent PostgreSQL-compatible OIDs across all pg_class queries.
+		if err := recreatePgClassForDuckLake(db); err != nil {
+			log.Printf("Warning: failed to recreate pg_class_full for DuckLake: %v", err)
+			// Non-fatal: continue with DuckDB-based pg_class_full
+		}
 	}
 
 	// Initialize information_schema compatibility views in memory.main

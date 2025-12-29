@@ -114,7 +114,8 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 			relname := strings.ToLower(n.RangeVar.Relname)
 
 			if strings.EqualFold(n.RangeVar.Schemaname, "pg_catalog") {
-				// Handle pg_catalog prefixed references
+				// Handle pg_catalog prefixed references (with or without catalog qualifier)
+				// e.g., pg_catalog.pg_class, memory.pg_catalog.pg_class, ducklake.pg_catalog.pg_class
 				if newName, ok := t.ViewMappings[relname]; ok {
 					n.RangeVar.Relname = newName
 					if t.DuckLakeMode {
@@ -122,9 +123,11 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 						n.RangeVar.Catalogname = "memory"
 						n.RangeVar.Schemaname = "main"
 					} else {
+						n.RangeVar.Catalogname = ""
 						n.RangeVar.Schemaname = ""
 					}
 				} else {
+					n.RangeVar.Catalogname = ""
 					n.RangeVar.Schemaname = ""
 				}
 				*changed = true

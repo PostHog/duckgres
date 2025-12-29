@@ -635,3 +635,62 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 
 	return nil
 }
+
+// recreatePgClassForDuckLake recreates pg_class_full to source from DuckLake metadata
+// instead of DuckDB's pg_catalog. This ensures consistent PostgreSQL-compatible OIDs.
+// Must be called AFTER DuckLake is attached.
+func recreatePgClassForDuckLake(db *sql.DB) error {
+	pgClassSQL := `
+		CREATE OR REPLACE VIEW pg_class_full AS
+		SELECT
+			oid,
+			relname,
+			relnamespace,
+			reltype,
+			reloftype,
+			relowner,
+			relam,
+			relfilenode,
+			reltablespace,
+			relpages,
+			reltuples,
+			relallvisible,
+			reltoastrelid,
+			0::BIGINT AS reltoastidxid,
+			relhasindex,
+			relisshared,
+			relpersistence,
+			relkind,
+			relnatts,
+			relchecks,
+			false AS relhasoids,
+			EXISTS(
+				SELECT 1 FROM __ducklake_metadata_ducklake.pg_catalog.pg_constraint c
+				WHERE c.conrelid = pg_class.oid AND c.contype = 'p'
+			) AS relhaspkey,
+			relhasrules,
+			relhastriggers,
+			relhassubclass,
+			relrowsecurity,
+			false AS relforcerowsecurity,
+			relispopulated,
+			relreplident,
+			relispartition,
+			relrewrite,
+			relfrozenxid,
+			relminmxid,
+			relacl,
+			reloptions,
+			relpartbound
+		FROM __ducklake_metadata_ducklake.pg_catalog.pg_class pg_class
+		WHERE relname NOT IN (
+			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
+			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
+			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', '__duckgres_column_metadata'
+		)
+	`
+	_, err := db.Exec(pgClassSQL)
+	return err
+}
