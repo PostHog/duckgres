@@ -45,6 +45,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_publication":        "pg_publication",
 			"pg_publication_rel":    "pg_publication_rel",
 			"pg_inherits":           "pg_inherits",
+			"pg_matviews":           "pg_matviews",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,

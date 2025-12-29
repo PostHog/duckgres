@@ -71,7 +71,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE relname NOT IN (
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
-			'pg_publication_rel', 'pg_inherits', 'pg_namespace',
+			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
@@ -210,6 +210,21 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	db.Exec(pgInheritsSQL)
+
+	// Create pg_matviews view (materialized views, empty - DuckDB doesn't support matviews)
+	pgMatviewsSQL := `
+		CREATE OR REPLACE VIEW pg_matviews AS
+		SELECT
+			''::VARCHAR AS schemaname,
+			''::VARCHAR AS matviewname,
+			''::VARCHAR AS matviewowner,
+			NULL::VARCHAR AS tablespace,
+			false AS hasindexes,
+			false AS ispopulated,
+			''::VARCHAR AS definition
+		WHERE false
+	`
+	db.Exec(pgMatviewsSQL)
 
 	// Create pg_namespace wrapper that maps 'main' to 'public' for PostgreSQL compatibility
 	// Also set owner to match PostgreSQL conventions:
@@ -545,7 +560,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			-- pg_catalog compat views
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
-			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext',
+			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -607,7 +622,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			-- pg_catalog compat views
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
-			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext',
+			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
