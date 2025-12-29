@@ -113,7 +113,7 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 		if n.RangeVar != nil {
 			relname := strings.ToLower(n.RangeVar.Relname)
 
-			if strings.EqualFold(n.RangeVar.Schemaname, "pg_catalog") {
+			if strings.EqualFold(n.RangeVar.Schemaname, "pg_catalog") && n.RangeVar.Catalogname == "" {
 				// Handle pg_catalog prefixed references
 				if newName, ok := t.ViewMappings[relname]; ok {
 					n.RangeVar.Relname = newName

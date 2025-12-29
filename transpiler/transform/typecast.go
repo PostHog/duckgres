@@ -284,7 +284,8 @@ func (t *TypeCastTransform) walkSelectStmt(stmt *pg_query.SelectStmt, changed *b
 
 // createRegclassSubquery creates a SubLink for 'tablename'::regclass
 // This converts: 'users'::regclass
-// To: (SELECT oid FROM pg_class WHERE relname = 'users')
+// To: (SELECT oid FROM pg_class_full WHERE relname = 'users')
+// In DuckLake mode, pg_class_full sources from DuckLake metadata for consistent PostgreSQL OIDs.
 func (t *TypeCastTransform) createRegclassSubquery(arg *pg_query.Node) *pg_query.SubLink {
 	if arg == nil {
 		return nil
@@ -302,7 +303,7 @@ func (t *TypeCastTransform) createRegclassSubquery(arg *pg_query.Node) *pg_query
 		return nil
 	}
 
-	// Build: SELECT oid FROM pg_class WHERE relname = 'tablename'
+	// Build: SELECT oid FROM pg_class WHERE relname = 'tablename' LIMIT 1
 	// Create the SELECT target: oid
 	targetList := []*pg_query.Node{
 		{
@@ -322,12 +323,16 @@ func (t *TypeCastTransform) createRegclassSubquery(arg *pg_query.Node) *pg_query
 		},
 	}
 
-	// Create the FROM clause: pg_class
+	// Create the FROM clause: memory.main.pg_class_full
+	// We reference pg_class_full directly since TypeCastTransform runs after PgCatalogTransform.
+	// In DuckLake mode, pg_class_full sources from DuckLake metadata for consistent PostgreSQL OIDs.
 	fromClause := []*pg_query.Node{
 		{
 			Node: &pg_query.Node_RangeVar{
 				RangeVar: &pg_query.RangeVar{
-					Relname:        "pg_class",
+					Catalogname:    "memory",
+					Schemaname:     "main",
+					Relname:        "pg_class_full",
 					Inh:            true,
 					Relpersistence: "p",
 				},
