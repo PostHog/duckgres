@@ -825,63 +825,59 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	c.writer.Flush()
 	log.Printf("[%s] COPY FROM STDIN: sent CopyInResponse, waiting for data...", c.username)
 
-	// Read COPY data from client
-	var allData bytes.Buffer
+	// Create temp file upfront and stream data directly to it (avoids memory buffering)
+	// This approach leverages DuckDB's highly optimized CSV parser which handles
+	// type conversions automatically and can load millions of rows in seconds.
+	tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
+	if err != nil {
+		log.Printf("[%s] COPY FROM STDIN: failed to create temp file: %v", c.username, err)
+		c.sendError("ERROR", "58000", fmt.Sprintf("failed to create temp file: %v", err))
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	// Stream COPY data directly to temp file (no memory buffering)
 	rowCount := 0
 	copyDataMessages := 0
+	bytesWritten := int64(0)
 	dataReceiveStart := time.Now()
 
 	for {
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
 			log.Printf("[%s] COPY FROM STDIN: error reading message: %v", c.username, err)
+			tmpFile.Close()
 			return err
 		}
 
 		switch msgType {
 		case msgCopyData:
-			allData.Write(body)
+			n, err := tmpFile.Write(body)
+			if err != nil {
+				log.Printf("[%s] COPY FROM STDIN: failed to write to temp file: %v", c.username, err)
+				tmpFile.Close()
+				c.sendError("ERROR", "58000", fmt.Sprintf("failed to write to temp file: %v", err))
+				c.setTxError()
+				writeReadyForQuery(c.writer, c.txStatus)
+				c.writer.Flush()
+				return nil
+			}
+			bytesWritten += int64(n)
 			copyDataMessages++
 			if copyDataMessages%10000 == 0 {
-				log.Printf("[%s] COPY FROM STDIN: received %d CopyData messages, %d bytes total",
-					c.username, copyDataMessages, allData.Len())
+				log.Printf("[%s] COPY FROM STDIN: received %d CopyData messages, %d bytes written",
+					c.username, copyDataMessages, bytesWritten)
 			}
 
 		case msgCopyDone:
+			tmpFile.Close()
 			dataReceiveElapsed := time.Since(dataReceiveStart)
 			log.Printf("[%s] COPY FROM STDIN: CopyDone received - %d messages, %d bytes in %v",
-				c.username, copyDataMessages, allData.Len(), dataReceiveElapsed)
-
-			// Write data to a temp file and use DuckDB's native COPY FROM for performance.
-			// This approach leverages DuckDB's highly optimized CSV parser which handles
-			// type conversions automatically and can load millions of rows in seconds.
-			// The temp file is created, used, and deleted within this single request.
-			tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
-			if err != nil {
-				log.Printf("[%s] COPY FROM STDIN: failed to create temp file: %v", c.username, err)
-				c.sendError("ERROR", "58000", fmt.Sprintf("failed to create temp file: %v", err))
-				c.setTxError()
-				writeReadyForQuery(c.writer, c.txStatus)
-				c.writer.Flush()
-				return nil
-			}
-			tmpPath := tmpFile.Name()
-			defer os.Remove(tmpPath)
-
-			// Write data to temp file
-			writeStart := time.Now()
-			bytesWritten, err := tmpFile.Write(allData.Bytes())
-			tmpFile.Close()
-			if err != nil {
-				log.Printf("[%s] COPY FROM STDIN: failed to write temp file: %v", c.username, err)
-				c.sendError("ERROR", "58000", fmt.Sprintf("failed to write temp file: %v", err))
-				c.setTxError()
-				writeReadyForQuery(c.writer, c.txStatus)
-				c.writer.Flush()
-				return nil
-			}
-			log.Printf("[%s] COPY FROM STDIN: wrote %d bytes to temp file in %v",
-				c.username, bytesWritten, time.Since(writeStart))
+				c.username, copyDataMessages, bytesWritten, dataReceiveElapsed)
 
 			// Build DuckDB COPY FROM statement
 			// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',')
