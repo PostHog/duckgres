@@ -656,7 +656,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			reltuples,
 			relallvisible,
 			reltoastrelid,
-			0 AS reltoastidxid,
+			0::BIGINT AS reltoastidxid,
 			relhasindex,
 			relisshared,
 			relpersistence,
