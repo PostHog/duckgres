@@ -569,6 +569,700 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 // Note: isIgnoredSetParameter tests have been moved to transpiler/transpiler_test.go.
 // The transpiler package now handles SET parameter filtering via AST transformation.
 
+func TestCopyToStdoutRegex(t *testing.T) {
+	tests := []struct {
+		name         string
+		query        string
+		shouldMatch  bool
+		expectedPart string // Expected captured group (source table/query)
+	}{
+		{
+			name:         "simple COPY table TO STDOUT",
+			query:        "COPY users TO STDOUT",
+			shouldMatch:  true,
+			expectedPart: "users",
+		},
+		{
+			name:         "COPY with schema",
+			query:        "COPY public.users TO STDOUT",
+			shouldMatch:  true,
+			expectedPart: "public.users",
+		},
+		{
+			name:         "COPY with query",
+			query:        "COPY (SELECT * FROM users WHERE id > 10) TO STDOUT",
+			shouldMatch:  true,
+			expectedPart: "(SELECT * FROM users WHERE id > 10)",
+		},
+		{
+			name:         "COPY with options",
+			query:        "COPY users TO STDOUT WITH (FORMAT CSV)",
+			shouldMatch:  true,
+			expectedPart: "users",
+		},
+		{
+			name:         "case insensitive",
+			query:        "copy users to stdout",
+			shouldMatch:  true,
+			expectedPart: "users",
+		},
+		{
+			name:        "COPY FROM should not match",
+			query:       "COPY users FROM STDIN",
+			shouldMatch: false,
+		},
+		{
+			name:        "COPY TO file should not match",
+			query:       "COPY users TO '/tmp/file.csv'",
+			shouldMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matches := copyToStdoutRegex.FindStringSubmatch(tt.query)
+			matched := len(matches) > 0
+			if matched != tt.shouldMatch {
+				t.Errorf("copyToStdoutRegex.Match(%q) = %v, want %v", tt.query, matched, tt.shouldMatch)
+				return
+			}
+			if tt.shouldMatch && len(matches) > 1 && matches[1] != tt.expectedPart {
+				t.Errorf("copyToStdoutRegex captured %q, want %q", matches[1], tt.expectedPart)
+			}
+		})
+	}
+}
+
+func TestCopyFromStdinRegex(t *testing.T) {
+	tests := []struct {
+		name            string
+		query           string
+		shouldMatch     bool
+		expectedTable   string
+		expectedColumns string
+	}{
+		{
+			name:          "simple COPY table FROM STDIN",
+			query:         "COPY users FROM STDIN",
+			shouldMatch:   true,
+			expectedTable: "users",
+		},
+		{
+			name:          "COPY with schema",
+			query:         "COPY public.users FROM STDIN",
+			shouldMatch:   true,
+			expectedTable: "public.users",
+		},
+		{
+			name:            "COPY with columns",
+			query:           "COPY users (id, name, email) FROM STDIN",
+			shouldMatch:     true,
+			expectedTable:   "users",
+			expectedColumns: "id, name, email",
+		},
+		{
+			name:          "COPY with options",
+			query:         "COPY users FROM STDIN WITH (FORMAT CSV)",
+			shouldMatch:   true,
+			expectedTable: "users",
+		},
+		{
+			name:            "COPY with columns and options",
+			query:           "COPY users (id, name) FROM STDIN CSV HEADER",
+			shouldMatch:     true,
+			expectedTable:   "users",
+			expectedColumns: "id, name",
+		},
+		{
+			name:          "case insensitive",
+			query:         "copy users from stdin",
+			shouldMatch:   true,
+			expectedTable: "users",
+		},
+		{
+			name:        "COPY TO should not match",
+			query:       "COPY users TO STDOUT",
+			shouldMatch: false,
+		},
+		{
+			name:        "COPY FROM file should not match",
+			query:       "COPY users FROM '/tmp/file.csv'",
+			shouldMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matches := copyFromStdinRegex.FindStringSubmatch(tt.query)
+			matched := len(matches) > 0
+			if matched != tt.shouldMatch {
+				t.Errorf("copyFromStdinRegex.Match(%q) = %v, want %v", tt.query, matched, tt.shouldMatch)
+				return
+			}
+			if tt.shouldMatch {
+				if len(matches) < 2 {
+					t.Errorf("copyFromStdinRegex expected at least 2 captures, got %d", len(matches))
+					return
+				}
+				if matches[1] != tt.expectedTable {
+					t.Errorf("table: got %q, want %q", matches[1], tt.expectedTable)
+				}
+				if len(matches) > 2 && matches[2] != tt.expectedColumns {
+					t.Errorf("columns: got %q, want %q", matches[2], tt.expectedColumns)
+				}
+			}
+		})
+	}
+}
+
+func TestCopyOptionRegexes(t *testing.T) {
+	// Tests for CSV and HEADER detection
+	t.Run("CSV and HEADER detection", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			query     string
+			isCSV     bool
+			hasHeader bool
+		}{
+			{
+				name:      "plain text format",
+				query:     "COPY users FROM STDIN",
+				isCSV:     false,
+				hasHeader: false,
+			},
+			{
+				name:      "CSV format",
+				query:     "COPY users FROM STDIN CSV",
+				isCSV:     true,
+				hasHeader: false,
+			},
+			{
+				name:      "CSV with HEADER",
+				query:     "COPY users FROM STDIN CSV HEADER",
+				isCSV:     true,
+				hasHeader: true,
+			},
+			{
+				name:      "WITH FORMAT CSV",
+				query:     "COPY users FROM STDIN WITH (FORMAT CSV)",
+				isCSV:     true,
+				hasHeader: false,
+			},
+			{
+				name:      "WITH FORMAT CSV and HEADER",
+				query:     "COPY users FROM STDIN WITH (FORMAT CSV, HEADER)",
+				isCSV:     true,
+				hasHeader: true,
+			},
+			{
+				name:      "CSV lowercase",
+				query:     "COPY users FROM STDIN csv header",
+				isCSV:     true,
+				hasHeader: true,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				upperQuery := strings.ToUpper(tt.query)
+
+				isCSV := copyWithCSVRegex.MatchString(upperQuery)
+				if isCSV != tt.isCSV {
+					t.Errorf("CSV detection: got %v, want %v", isCSV, tt.isCSV)
+				}
+
+				hasHeader := copyWithHeaderRegex.MatchString(upperQuery)
+				if hasHeader != tt.hasHeader {
+					t.Errorf("HEADER detection: got %v, want %v", hasHeader, tt.hasHeader)
+				}
+			})
+		}
+	})
+
+	// Tests for NULL string detection
+	t.Run("NULL string detection", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			query   string
+			nullStr string
+		}{
+			{
+				name:    "custom NULL string",
+				query:   "COPY users FROM STDIN WITH NULL 'N/A'",
+				nullStr: "N/A",
+			},
+			{
+				name:    "NULL empty string",
+				query:   "COPY users FROM STDIN WITH NULL ''",
+				nullStr: "",
+			},
+			{
+				name:    "NULL with NONE",
+				query:   "COPY users FROM STDIN CSV HEADER NULL 'NONE'",
+				nullStr: "NONE",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				m := copyNullRegex.FindStringSubmatch(tt.query)
+				if len(m) < 2 {
+					t.Errorf("NULL regex didn't match: %q", tt.query)
+					return
+				}
+				if m[1] != tt.nullStr {
+					t.Errorf("NULL string: got %q, want %q", m[1], tt.nullStr)
+				}
+			})
+		}
+	})
+
+	// Test delimiter regex behavior
+	// Note: The current delimiter regex `\bDELIMITER\s+['"](.)['"]\b` requires a word
+	// boundary after the closing quote. This works when DELIMITER is followed by another
+	// option keyword, but may not work with trailing delimiters at end of query.
+	t.Run("delimiter detection with following keyword", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			query     string
+			delimiter string
+			shouldMatch bool
+		}{
+			{
+				name:        "delimiter followed by NULL",
+				query:       "COPY users FROM STDIN CSV DELIMITER ','NULL 'test'",
+				delimiter:   ",",
+				shouldMatch: true,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				m := copyDelimiterRegex.FindStringSubmatch(tt.query)
+				matched := len(m) > 1
+				if matched != tt.shouldMatch {
+					t.Errorf("delimiter match: got %v, want %v", matched, tt.shouldMatch)
+				}
+				if matched && m[1] != tt.delimiter {
+					t.Errorf("delimiter: got %q, want %q", m[1], tt.delimiter)
+				}
+			})
+		}
+	})
+}
+
+func TestFormatCopyValue(t *testing.T) {
+	c := &clientConn{}
+
+	tests := []struct {
+		name     string
+		input    interface{}
+		expected string
+	}{
+		{
+			name:     "nil value",
+			input:    nil,
+			expected: "\\N",
+		},
+		{
+			name:     "string value",
+			input:    "hello",
+			expected: "hello",
+		},
+		{
+			name:     "integer value",
+			input:    42,
+			expected: "42",
+		},
+		{
+			name:     "float value",
+			input:    3.14,
+			expected: "3.14",
+		},
+		{
+			name:     "boolean true",
+			input:    true,
+			expected: "true",
+		},
+		{
+			name:     "boolean false",
+			input:    false,
+			expected: "false",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "string with special chars",
+			input:    "hello\tworld",
+			expected: "hello\tworld",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := c.formatCopyValue(tt.input)
+			if result != tt.expected {
+				t.Errorf("formatCopyValue(%v) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseCopyFromOptions(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantErr    bool
+		tableName  string
+		columnList string
+		delimiter  string
+		hasHeader  bool
+		nullString string
+	}{
+		{
+			name:       "simple COPY FROM STDIN",
+			query:      "COPY users FROM STDIN",
+			tableName:  "users",
+			columnList: "",
+			delimiter:  "\t",
+			hasHeader:  false,
+			nullString: "\\N",
+		},
+		{
+			name:       "COPY with schema",
+			query:      "COPY public.users FROM STDIN",
+			tableName:  "public.users",
+			columnList: "",
+			delimiter:  "\t",
+			hasHeader:  false,
+			nullString: "\\N",
+		},
+		{
+			name:       "COPY with columns",
+			query:      "COPY users (id, name, email) FROM STDIN",
+			tableName:  "users",
+			columnList: "(id, name, email)",
+			delimiter:  "\t",
+			hasHeader:  false,
+			nullString: "\\N",
+		},
+		{
+			name:       "COPY CSV",
+			query:      "COPY users FROM STDIN CSV",
+			tableName:  "users",
+			columnList: "",
+			delimiter:  ",",
+			hasHeader:  false,
+			nullString: "\\N",
+		},
+		{
+			name:       "COPY CSV HEADER",
+			query:      "COPY users FROM STDIN CSV HEADER",
+			tableName:  "users",
+			columnList: "",
+			delimiter:  ",",
+			hasHeader:  true,
+			nullString: "\\N",
+		},
+		{
+			name:       "COPY WITH FORMAT CSV HEADER",
+			query:      "COPY users FROM STDIN WITH (FORMAT CSV, HEADER)",
+			tableName:  "users",
+			columnList: "",
+			delimiter:  ",",
+			hasHeader:  true,
+			nullString: "\\N",
+		},
+		{
+			name:       "COPY with custom NULL",
+			query:      "COPY users FROM STDIN WITH NULL 'NA'",
+			tableName:  "users",
+			columnList: "",
+			delimiter:  "\t",
+			hasHeader:  false,
+			nullString: "NA",
+		},
+		{
+			name:       "COPY CSV with all options",
+			query:      "COPY users (id, name) FROM STDIN CSV HEADER NULL ''",
+			tableName:  "users",
+			columnList: "(id, name)",
+			delimiter:  ",",
+			hasHeader:  true,
+			nullString: "",
+		},
+		{
+			name:    "invalid query - not COPY FROM STDIN",
+			query:   "COPY users TO STDOUT",
+			wantErr: true,
+		},
+		{
+			name:    "invalid query - SELECT",
+			query:   "SELECT * FROM users",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts, err := ParseCopyFromOptions(tt.query)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseCopyFromOptions() expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseCopyFromOptions() unexpected error: %v", err)
+			}
+			if opts.TableName != tt.tableName {
+				t.Errorf("TableName = %q, want %q", opts.TableName, tt.tableName)
+			}
+			if opts.ColumnList != tt.columnList {
+				t.Errorf("ColumnList = %q, want %q", opts.ColumnList, tt.columnList)
+			}
+			if opts.Delimiter != tt.delimiter {
+				t.Errorf("Delimiter = %q, want %q", opts.Delimiter, tt.delimiter)
+			}
+			if opts.HasHeader != tt.hasHeader {
+				t.Errorf("HasHeader = %v, want %v", opts.HasHeader, tt.hasHeader)
+			}
+			if opts.NullString != tt.nullString {
+				t.Errorf("NullString = %q, want %q", opts.NullString, tt.nullString)
+			}
+		})
+	}
+}
+
+func TestParseCopyToOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		query     string
+		wantErr   bool
+		source    string
+		delimiter string
+		hasHeader bool
+		isQuery   bool
+	}{
+		{
+			name:      "simple COPY TO STDOUT",
+			query:     "COPY users TO STDOUT",
+			source:    "users",
+			delimiter: "\t",
+			hasHeader: false,
+			isQuery:   false,
+		},
+		{
+			name:      "COPY with schema",
+			query:     "COPY public.users TO STDOUT",
+			source:    "public.users",
+			delimiter: "\t",
+			hasHeader: false,
+			isQuery:   false,
+		},
+		{
+			name:      "COPY query TO STDOUT",
+			query:     "COPY (SELECT * FROM users WHERE id > 10) TO STDOUT",
+			source:    "(SELECT * FROM users WHERE id > 10)",
+			delimiter: "\t",
+			hasHeader: false,
+			isQuery:   true,
+		},
+		{
+			name:      "COPY CSV",
+			query:     "COPY users TO STDOUT CSV",
+			source:    "users",
+			delimiter: ",",
+			hasHeader: false,
+			isQuery:   false,
+		},
+		{
+			name:      "COPY CSV HEADER",
+			query:     "COPY users TO STDOUT CSV HEADER",
+			source:    "users",
+			delimiter: ",",
+			hasHeader: true,
+			isQuery:   false,
+		},
+		{
+			name:      "COPY WITH FORMAT CSV HEADER",
+			query:     "COPY users TO STDOUT WITH (FORMAT CSV, HEADER)",
+			source:    "users",
+			delimiter: ",",
+			hasHeader: true,
+			isQuery:   false,
+		},
+		{
+			name:    "invalid query - COPY FROM STDIN",
+			query:   "COPY users FROM STDIN",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts, err := ParseCopyToOptions(tt.query)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseCopyToOptions() expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseCopyToOptions() unexpected error: %v", err)
+			}
+			if opts.Source != tt.source {
+				t.Errorf("Source = %q, want %q", opts.Source, tt.source)
+			}
+			if opts.Delimiter != tt.delimiter {
+				t.Errorf("Delimiter = %q, want %q", opts.Delimiter, tt.delimiter)
+			}
+			if opts.HasHeader != tt.hasHeader {
+				t.Errorf("HasHeader = %v, want %v", opts.HasHeader, tt.hasHeader)
+			}
+			if opts.IsQuery != tt.isQuery {
+				t.Errorf("IsQuery = %v, want %v", opts.IsQuery, tt.isQuery)
+			}
+		})
+	}
+}
+
+func TestBuildDuckDBCopyFromSQL(t *testing.T) {
+	tests := []struct {
+		name       string
+		tableName  string
+		columnList string
+		filePath   string
+		opts       *CopyFromOptions
+		want       string
+	}{
+		{
+			name:       "basic text format",
+			tableName:  "users",
+			columnList: "",
+			filePath:   "/tmp/data.csv",
+			opts: &CopyFromOptions{
+				Delimiter:  "\t",
+				HasHeader:  false,
+				NullString: "\\N",
+			},
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, NULL '\\N', DELIMITER '\t')",
+		},
+		{
+			name:       "CSV with header",
+			tableName:  "users",
+			columnList: "",
+			filePath:   "/tmp/data.csv",
+			opts: &CopyFromOptions{
+				Delimiter:  ",",
+				HasHeader:  true,
+				NullString: "\\N",
+			},
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, HEADER, NULL '\\N')",
+		},
+		{
+			name:       "with column list",
+			tableName:  "users",
+			columnList: "(id, name)",
+			filePath:   "/tmp/data.csv",
+			opts: &CopyFromOptions{
+				Delimiter:  ",",
+				HasHeader:  false,
+				NullString: "\\N",
+			},
+			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, NULL '\\N')",
+		},
+		{
+			name:       "custom NULL string",
+			tableName:  "users",
+			columnList: "",
+			filePath:   "/tmp/data.csv",
+			opts: &CopyFromOptions{
+				Delimiter:  ",",
+				HasHeader:  false,
+				NullString: "NA",
+			},
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, NULL 'NA')",
+		},
+		{
+			name:       "empty NULL string",
+			tableName:  "users",
+			columnList: "",
+			filePath:   "/tmp/data.csv",
+			opts: &CopyFromOptions{
+				Delimiter:  ",",
+				HasHeader:  true,
+				NullString: "",
+			},
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, HEADER, NULL '')",
+		},
+		{
+			name:       "schema qualified table",
+			tableName:  "public.users",
+			columnList: "(id, name, email)",
+			filePath:   "/var/tmp/copy-123.csv",
+			opts: &CopyFromOptions{
+				Delimiter:  "\t",
+				HasHeader:  true,
+				NullString: "\\N",
+			},
+			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, HEADER, NULL '\\N', DELIMITER '\t')",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BuildDuckDBCopyFromSQL(tt.tableName, tt.columnList, tt.filePath, tt.opts)
+			if got != tt.want {
+				t.Errorf("BuildDuckDBCopyFromSQL() =\n  %q\nwant:\n  %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCopyCommandTypeDetection(t *testing.T) {
+	c := &clientConn{}
+
+	tests := []struct {
+		name     string
+		query    string
+		expected string
+	}{
+		{
+			name:     "COPY TO STDOUT",
+			query:    "COPY users TO STDOUT",
+			expected: "COPY",
+		},
+		{
+			name:     "COPY FROM STDIN",
+			query:    "COPY users FROM STDIN",
+			expected: "COPY",
+		},
+		{
+			name:     "COPY with options",
+			query:    "COPY users FROM STDIN WITH (FORMAT CSV)",
+			expected: "COPY",
+		},
+		{
+			name:     "lowercase copy",
+			query:    "copy users to stdout",
+			expected: "COPY",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := c.getCommandType(strings.ToUpper(tt.query))
+			if result != tt.expected {
+				t.Errorf("getCommandType(%q) = %q, want %q", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestParseCopyLine(t *testing.T) {
 	c := &clientConn{}
 
