@@ -16,8 +16,8 @@ import (
 //
 // In DuckLake mode, PRIMARY KEY and UNIQUE constraints are stripped,
 // so ON CONFLICT clauses will fail with "columns not referenced by constraint".
-// We strip ON CONFLICT entirely in DuckLake mode since there are no constraints
-// to conflict with.
+// Instead of stripping ON CONFLICT, we convert the INSERT to a MERGE statement
+// which DuckLake supports for upserts.
 type OnConflictTransform struct {
 	DuckLakeMode bool
 }
@@ -43,7 +43,13 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 		}
 
 		if insert := stmt.Stmt.GetInsertStmt(); insert != nil {
-			if t.transformInsert(insert) {
+			if mergeStmt := t.transformInsertToMerge(insert); mergeStmt != nil {
+				// Replace the INSERT statement with MERGE
+				stmt.Stmt = &pg_query.Node{
+					Node: &pg_query.Node_MergeStmt{MergeStmt: mergeStmt},
+				}
+				changed = true
+			} else if t.transformInsert(insert) {
 				changed = true
 			}
 		}
@@ -52,18 +58,308 @@ func (t *OnConflictTransform) Transform(tree *pg_query.ParseResult, result *Resu
 	return changed, nil
 }
 
+// transformInsertToMerge converts INSERT ... ON CONFLICT to MERGE for DuckLake mode
+func (t *OnConflictTransform) transformInsertToMerge(insert *pg_query.InsertStmt) *pg_query.MergeStmt {
+	if !t.DuckLakeMode {
+		return nil
+	}
+
+	if insert == nil || insert.OnConflictClause == nil {
+		return nil
+	}
+
+	occ := insert.OnConflictClause
+
+	// Need conflict columns to build the join condition
+	if occ.Infer == nil || len(occ.Infer.IndexElems) == 0 {
+		return nil
+	}
+
+	// Get column names from INSERT
+	colNames := make([]string, len(insert.Cols))
+	for i, col := range insert.Cols {
+		if rt := col.GetResTarget(); rt != nil {
+			colNames[i] = rt.Name
+		}
+	}
+
+	// Get VALUES from INSERT's SelectStmt
+	selectStmt := insert.SelectStmt.GetSelectStmt()
+	if selectStmt == nil || len(selectStmt.ValuesLists) == 0 {
+		return nil
+	}
+
+	// Build the source subquery: SELECT val1 AS col1, val2 AS col2, ...
+	// We use a VALUES clause in a subquery for multiple rows, or SELECT for single row
+	sourceSelect := t.buildSourceSelect(colNames, selectStmt.ValuesLists)
+	if sourceSelect == nil {
+		return nil
+	}
+
+	// Build source relation as a subquery with alias "excluded"
+	sourceRelation := &pg_query.Node{
+		Node: &pg_query.Node_RangeSubselect{
+			RangeSubselect: &pg_query.RangeSubselect{
+				Subquery: &pg_query.Node{
+					Node: &pg_query.Node_SelectStmt{SelectStmt: sourceSelect},
+				},
+				Alias: &pg_query.Alias{Aliasname: "excluded"},
+			},
+		},
+	}
+
+	// Build join condition from conflict columns
+	joinCondition := t.buildJoinCondition(occ.Infer.IndexElems, insert.Relation.Relname)
+
+	// Build MERGE WHEN clauses
+	var whenClauses []*pg_query.Node
+
+	// If DO UPDATE, add WHEN MATCHED THEN UPDATE
+	if occ.Action == pg_query.OnConflictAction_ONCONFLICT_UPDATE {
+		updateClause := t.buildUpdateClause(occ.TargetList, occ.WhereClause)
+		whenClauses = append(whenClauses, &pg_query.Node{
+			Node: &pg_query.Node_MergeWhenClause{MergeWhenClause: updateClause},
+		})
+	}
+	// For DO NOTHING, we skip WHEN MATCHED (no action on match)
+
+	// Always add WHEN NOT MATCHED THEN INSERT
+	insertClause := t.buildInsertClause(colNames)
+	whenClauses = append(whenClauses, &pg_query.Node{
+		Node: &pg_query.Node_MergeWhenClause{MergeWhenClause: insertClause},
+	})
+
+	return &pg_query.MergeStmt{
+		Relation:         insert.Relation,
+		SourceRelation:   sourceRelation,
+		JoinCondition:    joinCondition,
+		MergeWhenClauses: whenClauses,
+	}
+}
+
+// buildSourceSelect creates a SELECT statement from VALUES for use as MERGE source
+func (t *OnConflictTransform) buildSourceSelect(colNames []string, valuesLists []*pg_query.Node) *pg_query.SelectStmt {
+	if len(valuesLists) == 0 {
+		return nil
+	}
+
+	if len(valuesLists) == 1 {
+		// Single row: SELECT val1 AS col1, val2 AS col2, ...
+		valueList := valuesLists[0].GetList()
+		if valueList == nil || len(valueList.Items) != len(colNames) {
+			return nil
+		}
+
+		targetList := make([]*pg_query.Node, len(colNames))
+		for i, colName := range colNames {
+			targetList[i] = &pg_query.Node{
+				Node: &pg_query.Node_ResTarget{
+					ResTarget: &pg_query.ResTarget{
+						Name: colName,
+						Val:  valueList.Items[i],
+					},
+				},
+			}
+		}
+
+		return &pg_query.SelectStmt{
+			TargetList:  targetList,
+			LimitOption: pg_query.LimitOption_LIMIT_OPTION_DEFAULT,
+			Op:          pg_query.SetOperation_SETOP_NONE,
+		}
+	}
+
+	// Multiple rows: Use UNION ALL of SELECT statements
+	// First row
+	firstList := valuesLists[0].GetList()
+	if firstList == nil || len(firstList.Items) != len(colNames) {
+		return nil
+	}
+
+	targetList := make([]*pg_query.Node, len(colNames))
+	for i, colName := range colNames {
+		targetList[i] = &pg_query.Node{
+			Node: &pg_query.Node_ResTarget{
+				ResTarget: &pg_query.ResTarget{
+					Name: colName,
+					Val:  firstList.Items[i],
+				},
+			},
+		}
+	}
+
+	result := &pg_query.SelectStmt{
+		TargetList:  targetList,
+		LimitOption: pg_query.LimitOption_LIMIT_OPTION_DEFAULT,
+		Op:          pg_query.SetOperation_SETOP_NONE,
+	}
+
+	// Add remaining rows as UNION ALL
+	for i := 1; i < len(valuesLists); i++ {
+		valueList := valuesLists[i].GetList()
+		if valueList == nil || len(valueList.Items) != len(colNames) {
+			continue
+		}
+
+		rightTargetList := make([]*pg_query.Node, len(colNames))
+		for j, colName := range colNames {
+			rightTargetList[j] = &pg_query.Node{
+				Node: &pg_query.Node_ResTarget{
+					ResTarget: &pg_query.ResTarget{
+						Name: colName,
+						Val:  valueList.Items[j],
+					},
+				},
+			}
+		}
+
+		rightSelect := &pg_query.SelectStmt{
+			TargetList:  rightTargetList,
+			LimitOption: pg_query.LimitOption_LIMIT_OPTION_DEFAULT,
+			Op:          pg_query.SetOperation_SETOP_NONE,
+		}
+
+		result = &pg_query.SelectStmt{
+			Op:          pg_query.SetOperation_SETOP_UNION,
+			All:         true,
+			Larg:        result,
+			Rarg:        rightSelect,
+			LimitOption: pg_query.LimitOption_LIMIT_OPTION_DEFAULT,
+		}
+	}
+
+	return result
+}
+
+// buildJoinCondition creates the ON condition for MERGE
+func (t *OnConflictTransform) buildJoinCondition(indexElems []*pg_query.Node, tableName string) *pg_query.Node {
+	if len(indexElems) == 0 {
+		return nil
+	}
+
+	// Build equality conditions for each conflict column
+	var conditions []*pg_query.Node
+	for _, elem := range indexElems {
+		indexElem := elem.GetIndexElem()
+		if indexElem == nil {
+			continue
+		}
+		colName := indexElem.Name
+
+		// excluded.col = table.col
+		condition := &pg_query.Node{
+			Node: &pg_query.Node_AExpr{
+				AExpr: &pg_query.A_Expr{
+					Kind: pg_query.A_Expr_Kind_AEXPR_OP,
+					Name: []*pg_query.Node{
+						{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "="}}},
+					},
+					Lexpr: &pg_query.Node{
+						Node: &pg_query.Node_ColumnRef{
+							ColumnRef: &pg_query.ColumnRef{
+								Fields: []*pg_query.Node{
+									{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "excluded"}}},
+									{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: colName}}},
+								},
+							},
+						},
+					},
+					Rexpr: &pg_query.Node{
+						Node: &pg_query.Node_ColumnRef{
+							ColumnRef: &pg_query.ColumnRef{
+								Fields: []*pg_query.Node{
+									{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: tableName}}},
+									{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: colName}}},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		conditions = append(conditions, condition)
+	}
+
+	if len(conditions) == 1 {
+		return conditions[0]
+	}
+
+	// Multiple columns: combine with AND
+	result := conditions[0]
+	for i := 1; i < len(conditions); i++ {
+		result = &pg_query.Node{
+			Node: &pg_query.Node_BoolExpr{
+				BoolExpr: &pg_query.BoolExpr{
+					Boolop: pg_query.BoolExprType_AND_EXPR,
+					Args:   []*pg_query.Node{result, conditions[i]},
+				},
+			},
+		}
+	}
+
+	return result
+}
+
+// buildUpdateClause creates WHEN MATCHED THEN UPDATE clause
+func (t *OnConflictTransform) buildUpdateClause(targetList []*pg_query.Node, whereClause *pg_query.Node) *pg_query.MergeWhenClause {
+	clause := &pg_query.MergeWhenClause{
+		MatchKind:   pg_query.MergeMatchKind_MERGE_WHEN_MATCHED,
+		CommandType: pg_query.CmdType_CMD_UPDATE,
+	}
+
+	if len(targetList) > 0 {
+		// Specific columns to update - SET col = val, ...
+		clause.TargetList = targetList
+	}
+	// If targetList is empty, it's a full row update (UPDATE without SET)
+
+	if whereClause != nil {
+		clause.Condition = whereClause
+	}
+
+	return clause
+}
+
+// buildInsertClause creates WHEN NOT MATCHED THEN INSERT clause
+func (t *OnConflictTransform) buildInsertClause(colNames []string) *pg_query.MergeWhenClause {
+	// Build target list (column names)
+	targetList := make([]*pg_query.Node, len(colNames))
+	for i, colName := range colNames {
+		targetList[i] = &pg_query.Node{
+			Node: &pg_query.Node_ResTarget{
+				ResTarget: &pg_query.ResTarget{
+					Name: colName,
+				},
+			},
+		}
+	}
+
+	// Build values list (references to excluded.col)
+	values := make([]*pg_query.Node, len(colNames))
+	for i, colName := range colNames {
+		values[i] = &pg_query.Node{
+			Node: &pg_query.Node_ColumnRef{
+				ColumnRef: &pg_query.ColumnRef{
+					Fields: []*pg_query.Node{
+						{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "excluded"}}},
+						{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: colName}}},
+					},
+				},
+			},
+		}
+	}
+
+	return &pg_query.MergeWhenClause{
+		MatchKind:   pg_query.MergeMatchKind_MERGE_WHEN_NOT_MATCHED_BY_TARGET,
+		CommandType: pg_query.CmdType_CMD_INSERT,
+		TargetList:  targetList,
+		Values:      values,
+	}
+}
+
 func (t *OnConflictTransform) transformInsert(insert *pg_query.InsertStmt) bool {
 	if insert == nil || insert.OnConflictClause == nil {
 		return false
-	}
-
-	// In DuckLake mode, we strip PRIMARY KEY and UNIQUE constraints,
-	// so ON CONFLICT clauses will fail with "columns not referenced by constraint".
-	// Strip the ON CONFLICT clause entirely since there are no constraints to conflict with.
-	// The data will be inserted normally. Fivetran's DELETE + INSERT pattern handles updates.
-	if t.DuckLakeMode {
-		insert.OnConflictClause = nil
-		return true
 	}
 
 	// DuckDB now supports ON CONFLICT syntax similar to PostgreSQL

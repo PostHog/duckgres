@@ -741,18 +741,72 @@ func TestTranspile_OnConflict(t *testing.T) {
 }
 
 func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
-	// In DuckLake mode, ON CONFLICT is stripped because PRIMARY KEY/UNIQUE constraints don't exist
+	// In DuckLake mode, ON CONFLICT is converted to MERGE statement
+	// because PRIMARY KEY/UNIQUE constraints don't exist in DuckLake
 	tests := []struct {
-		name  string
-		input string
+		name        string
+		input       string
+		wantMerge   bool
+		contains    []string
+		notContains []string
 	}{
 		{
-			name:  "ON CONFLICT DO NOTHING stripped",
-			input: "INSERT INTO users (id, name) VALUES (1, 'test') ON CONFLICT (id) DO NOTHING",
+			name:      "ON CONFLICT DO NOTHING becomes MERGE with only INSERT",
+			input:     "INSERT INTO users (id, name) VALUES (1, 'test') ON CONFLICT (id) DO NOTHING",
+			wantMerge: true,
+			contains: []string{
+				"MERGE INTO users",
+				"USING (SELECT 1 AS id, 'test' AS name) excluded",
+				"ON excluded.id = users.id",
+				"WHEN NOT MATCHED THEN INSERT",
+			},
+			notContains: []string{
+				"ON CONFLICT",
+				"WHEN MATCHED THEN UPDATE", // DO NOTHING means no update action
+			},
 		},
 		{
-			name:  "ON CONFLICT DO UPDATE stripped",
-			input: "INSERT INTO users (id, name) VALUES (1, 'test') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+			name:      "ON CONFLICT DO UPDATE becomes MERGE with UPDATE and INSERT",
+			input:     "INSERT INTO users (id, name) VALUES (1, 'test') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+			wantMerge: true,
+			contains: []string{
+				"MERGE INTO users",
+				"USING (SELECT 1 AS id, 'test' AS name) excluded",
+				"ON excluded.id = users.id",
+				"WHEN MATCHED THEN UPDATE SET name = excluded.name",
+				"WHEN NOT MATCHED THEN INSERT",
+			},
+			notContains: []string{
+				"ON CONFLICT",
+			},
+		},
+		{
+			name:      "Multiple values become UNION ALL",
+			input:     "INSERT INTO users (id, name) VALUES (1, 'test'), (2, 'test2') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+			wantMerge: true,
+			contains: []string{
+				"MERGE INTO users",
+				"UNION ALL",
+				"WHEN MATCHED THEN UPDATE",
+				"WHEN NOT MATCHED THEN INSERT",
+			},
+			notContains: []string{
+				"ON CONFLICT",
+			},
+		},
+		{
+			name:      "Multiple conflict columns",
+			input:     "INSERT INTO users (id, org_id, name) VALUES (1, 100, 'test') ON CONFLICT (id, org_id) DO UPDATE SET name = EXCLUDED.name",
+			wantMerge: true,
+			contains: []string{
+				"MERGE INTO users",
+				"excluded.id = users.id",
+				"excluded.org_id = users.org_id",
+				"AND", // Multiple conditions joined with AND
+			},
+			notContains: []string{
+				"ON CONFLICT",
+			},
 		},
 	}
 
@@ -764,13 +818,28 @@ func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
 			}
-			// ON CONFLICT should be stripped in DuckLake mode
-			if strings.Contains(strings.ToUpper(result.SQL), "ON CONFLICT") {
-				t.Errorf("Transpile(%q) = %q, should NOT contain ON CONFLICT in DuckLake mode", tt.input, result.SQL)
+
+			sql := result.SQL
+
+			// Check MERGE statement is generated
+			if tt.wantMerge {
+				if !strings.Contains(strings.ToUpper(sql), "MERGE INTO") {
+					t.Errorf("Transpile(%q) = %q, should contain MERGE INTO", tt.input, sql)
+				}
 			}
-			// But the INSERT should still work
-			if !strings.Contains(strings.ToUpper(result.SQL), "INSERT INTO") {
-				t.Errorf("Transpile(%q) = %q, should still contain INSERT INTO", tt.input, result.SQL)
+
+			// Check expected contents
+			for _, want := range tt.contains {
+				if !strings.Contains(sql, want) {
+					t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, sql, want)
+				}
+			}
+
+			// Check contents that should not be present
+			for _, notWant := range tt.notContains {
+				if strings.Contains(strings.ToUpper(sql), strings.ToUpper(notWant)) {
+					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, sql, notWant)
+				}
 			}
 		})
 	}
