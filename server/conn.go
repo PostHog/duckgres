@@ -641,6 +641,107 @@ var (
 	copyNullRegex       = regexp.MustCompile(`(?i)\bNULL\s+'([^']*)'`)
 )
 
+// CopyFromOptions contains parsed options from a COPY FROM STDIN command
+type CopyFromOptions struct {
+	TableName  string
+	ColumnList string // Empty string or "(col1, col2, ...)"
+	Delimiter  string
+	HasHeader  bool
+	NullString string
+}
+
+// ParseCopyFromOptions extracts options from a COPY FROM STDIN command
+func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
+	upperQuery := strings.ToUpper(query)
+
+	matches := copyFromStdinRegex.FindStringSubmatch(query)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid COPY FROM STDIN syntax")
+	}
+
+	opts := &CopyFromOptions{
+		TableName:  matches[1],
+		Delimiter:  "\t", // Default PostgreSQL text format delimiter
+		NullString: "\\N", // Default PostgreSQL null representation
+	}
+
+	// Extract column list if present
+	if len(matches) > 2 && matches[2] != "" {
+		opts.ColumnList = fmt.Sprintf("(%s)", matches[2])
+	}
+
+	// Parse delimiter
+	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
+		opts.Delimiter = m[1]
+	} else if copyWithCSVRegex.MatchString(upperQuery) {
+		opts.Delimiter = ","
+	}
+
+	// Parse header option (only valid with CSV)
+	opts.HasHeader = copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery)
+
+	// Parse NULL string option
+	if m := copyNullRegex.FindStringSubmatch(query); len(m) > 1 {
+		opts.NullString = m[1]
+	}
+
+	return opts, nil
+}
+
+// CopyToOptions contains parsed options from a COPY TO STDOUT command
+type CopyToOptions struct {
+	Source    string // Table name or (SELECT query)
+	Delimiter string
+	HasHeader bool
+	IsQuery   bool // True if Source is a query in parentheses
+}
+
+// ParseCopyToOptions extracts options from a COPY TO STDOUT command
+func ParseCopyToOptions(query string) (*CopyToOptions, error) {
+	upperQuery := strings.ToUpper(query)
+
+	matches := copyToStdoutRegex.FindStringSubmatch(query)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid COPY TO STDOUT syntax")
+	}
+
+	source := strings.TrimSpace(matches[1])
+	opts := &CopyToOptions{
+		Source:    source,
+		Delimiter: "\t", // Default PostgreSQL text format delimiter
+		IsQuery:   strings.HasPrefix(source, "(") && strings.HasSuffix(source, ")"),
+	}
+
+	// Parse delimiter
+	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
+		opts.Delimiter = m[1]
+	} else if copyWithCSVRegex.MatchString(upperQuery) {
+		opts.Delimiter = ","
+	}
+
+	// Parse header option (only valid with CSV)
+	opts.HasHeader = copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery)
+
+	return opts, nil
+}
+
+// BuildDuckDBCopyFromSQL generates a DuckDB COPY FROM statement
+func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFromOptions) string {
+	// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',')
+	copyOptions := []string{"FORMAT CSV"}
+	if opts.HasHeader {
+		copyOptions = append(copyOptions, "HEADER")
+	}
+	// Always specify NULL string - DuckDB doesn't recognize \N by default
+	copyOptions = append(copyOptions, fmt.Sprintf("NULL '%s'", opts.NullString))
+	if opts.Delimiter != "," {
+		copyOptions = append(copyOptions, fmt.Sprintf("DELIMITER '%s'", opts.Delimiter))
+	}
+
+	return fmt.Sprintf("COPY %s %s FROM '%s' (%s)",
+		tableName, columnList, filePath, strings.Join(copyOptions, ", "))
+}
+
 // handleCopy handles COPY TO STDOUT and COPY FROM STDIN commands
 func (c *clientConn) handleCopy(query, upperQuery string) error {
 	// Check if it's COPY TO STDOUT
@@ -774,8 +875,9 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	copyStartTime := time.Now()
 	log.Printf("[%s] COPY FROM STDIN: starting", c.username)
 
-	matches := copyFromStdinRegex.FindStringSubmatch(query)
-	if len(matches) < 2 {
+	// Parse COPY options using the helper function
+	opts, err := ParseCopyFromOptions(query)
+	if err != nil {
 		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
 		c.setTxError()
 		writeReadyForQuery(c.writer, c.txStatus)
@@ -783,27 +885,9 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return nil
 	}
 
-	tableName := matches[1]
-	columnList := ""
-	if len(matches) > 2 && matches[2] != "" {
-		columnList = fmt.Sprintf("(%s)", matches[2])
-	}
+	tableName := opts.TableName
+	columnList := opts.ColumnList
 	log.Printf("[%s] COPY FROM STDIN: table=%s columns=%s", c.username, tableName, columnList)
-
-	// Parse options
-	delimiter := "\t"
-	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
-		delimiter = m[1]
-	} else if copyWithCSVRegex.MatchString(upperQuery) {
-		delimiter = ","
-	}
-	hasHeader := copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery)
-
-	// Parse NULL string option (e.g., NULL 'custom-null-value')
-	nullString := "\\N" // Default PostgreSQL null representation
-	if m := copyNullRegex.FindStringSubmatch(query); len(m) > 1 {
-		nullString = m[1]
-	}
 
 	// Get column count for the table
 	colQuery := fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
@@ -879,21 +963,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			log.Printf("[%s] COPY FROM STDIN: CopyDone received - %d messages, %d bytes in %v",
 				c.username, copyDataMessages, bytesWritten, dataReceiveElapsed)
 
-			// Build DuckDB COPY FROM statement
-			// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',')
-			copyOptions := []string{"FORMAT CSV"}
-			if hasHeader {
-				copyOptions = append(copyOptions, "HEADER")
-			}
-			if nullString != "\\N" {
-				copyOptions = append(copyOptions, fmt.Sprintf("NULL '%s'", nullString))
-			}
-			if delimiter != "," {
-				copyOptions = append(copyOptions, fmt.Sprintf("DELIMITER '%s'", delimiter))
-			}
-
-			copySQL := fmt.Sprintf("COPY %s %s FROM '%s' (%s)",
-				tableName, columnList, tmpPath, strings.Join(copyOptions, ", "))
+			// Build DuckDB COPY FROM statement using the helper function
+			copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, tmpPath, opts)
 
 			log.Printf("[%s] COPY FROM STDIN: executing native DuckDB COPY: %s", c.username, copySQL)
 			loadStart := time.Now()

@@ -333,6 +333,11 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		"tx_rollback_test",
 		"tx_isolation_test",
 		"interleave_test",
+		// COPY test tables
+		"copy_test",
+		"copy_special_test",
+		"copy_json_test",
+		"copy_out_test",
 	}
 
 	for _, t := range tables {
