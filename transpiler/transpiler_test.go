@@ -845,6 +845,64 @@ func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
 	}
 }
 
+func TestTranspile_DropCascade_DuckLakeMode(t *testing.T) {
+	// In DuckLake mode, CASCADE should be stripped from DROP statements
+	// See: https://github.com/duckdb/dbt-duckdb/pull/557
+	tests := []struct {
+		name        string
+		input       string
+		notContains string
+	}{
+		{
+			name:        "DROP TABLE CASCADE becomes DROP TABLE",
+			input:       "DROP TABLE users CASCADE",
+			notContains: "CASCADE",
+		},
+		{
+			name:        "DROP TABLE IF EXISTS CASCADE",
+			input:       "DROP TABLE IF EXISTS users CASCADE",
+			notContains: "CASCADE",
+		},
+		{
+			name:        "DROP VIEW CASCADE",
+			input:       "DROP VIEW my_view CASCADE",
+			notContains: "CASCADE",
+		},
+		{
+			name:        "DROP SCHEMA CASCADE",
+			input:       "DROP SCHEMA my_schema CASCADE",
+			notContains: "CASCADE",
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if strings.Contains(strings.ToUpper(result.SQL), tt.notContains) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.notContains)
+			}
+		})
+	}
+}
+
+func TestTranspile_DropCascade_NonDuckLakeMode(t *testing.T) {
+	// Outside DuckLake mode, CASCADE should be preserved
+	tr := New(DefaultConfig())
+
+	result, err := tr.Transpile("DROP TABLE users CASCADE")
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(result.SQL), "CASCADE") {
+		t.Errorf("Non-DuckLake mode should preserve CASCADE, got: %q", result.SQL)
+	}
+}
+
 func TestTranspile_JSONOperators(t *testing.T) {
 	// DuckDB supports -> and ->> operators
 	tests := []struct {

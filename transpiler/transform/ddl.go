@@ -50,6 +50,13 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 					result.NoOpTag = "DROP INDEX"
 					return true, nil
 				}
+				// DuckLake doesn't support CASCADE on DROP TABLE/VIEW.
+				// Strip CASCADE by converting to RESTRICT (same approach as dbt-duckdb).
+				// See: https://github.com/duckdb/dbt-duckdb/pull/557
+				if n.DropStmt.Behavior == pg_query.DropBehavior_DROP_CASCADE {
+					n.DropStmt.Behavior = pg_query.DropBehavior_DROP_RESTRICT
+					changed = true
+				}
 			}
 
 		case *pg_query.Node_ReindexStmt:
