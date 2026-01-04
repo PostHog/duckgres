@@ -182,3 +182,40 @@ func (t *Transpiler) TranspileMulti(sql string) ([]*Result, error) {
 
 	return results, nil
 }
+
+// ConvertAlterTableToAlterView transforms an ALTER TABLE RENAME statement
+// to ALTER VIEW RENAME. This is used to retry failed ALTER TABLE commands
+// when DuckDB reports that the target is a view, not a table.
+// Returns the transformed SQL and true if successful, or the original SQL
+// and false if the input is not an ALTER TABLE RENAME statement.
+func ConvertAlterTableToAlterView(sql string) (string, bool) {
+	tree, err := pg_query.Parse(sql)
+	if err != nil || len(tree.Stmts) == 0 {
+		return sql, false
+	}
+
+	stmt := tree.Stmts[0].Stmt
+	if stmt == nil {
+		return sql, false
+	}
+
+	renameStmt, ok := stmt.Node.(*pg_query.Node_RenameStmt)
+	if !ok || renameStmt.RenameStmt == nil {
+		return sql, false
+	}
+
+	// Only transform if it's an ALTER TABLE RENAME (renameType == OBJECT_TABLE)
+	if renameStmt.RenameStmt.RenameType != pg_query.ObjectType_OBJECT_TABLE {
+		return sql, false
+	}
+
+	// Change to ALTER VIEW
+	renameStmt.RenameStmt.RenameType = pg_query.ObjectType_OBJECT_VIEW
+	renameStmt.RenameStmt.RelationType = pg_query.ObjectType_OBJECT_VIEW
+
+	result, err := pg_query.Deparse(tree)
+	if err != nil {
+		return sql, false
+	}
+	return result, true
+}

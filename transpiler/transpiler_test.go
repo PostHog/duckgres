@@ -936,3 +936,82 @@ func TestTranspile_JSONOperators(t *testing.T) {
 		})
 	}
 }
+
+func TestConvertAlterTableToAlterView(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantSQL    string
+		wantOK     bool
+		wantChange bool // whether output should differ from input
+	}{
+		{
+			name:       "ALTER TABLE RENAME to ALTER VIEW RENAME",
+			input:      `ALTER TABLE "my_schema"."my_view__tmp" RENAME TO "my_view"`,
+			wantOK:     true,
+			wantChange: true,
+		},
+		{
+			name:       "simple ALTER TABLE RENAME",
+			input:      `ALTER TABLE myview RENAME TO newname`,
+			wantOK:     true,
+			wantChange: true,
+		},
+		{
+			name:       "non-rename ALTER TABLE unchanged",
+			input:      `ALTER TABLE users ADD COLUMN email TEXT`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "SELECT statement unchanged",
+			input:      `SELECT * FROM users`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "CREATE TABLE unchanged",
+			input:      `CREATE TABLE users (id INT)`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "empty string",
+			input:      ``,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "invalid SQL",
+			input:      `NOT VALID SQL AT ALL`,
+			wantOK:     false,
+			wantChange: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, ok := ConvertAlterTableToAlterView(tt.input)
+			if ok != tt.wantOK {
+				t.Errorf("ConvertAlterTableToAlterView(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if tt.wantChange {
+				if result == tt.input {
+					t.Errorf("ConvertAlterTableToAlterView(%q) should change the SQL", tt.input)
+				}
+				// Check that it contains ALTER VIEW
+				if !strings.Contains(strings.ToUpper(result), "ALTER VIEW") {
+					t.Errorf("ConvertAlterTableToAlterView(%q) = %q, should contain ALTER VIEW", tt.input, result)
+				}
+				// Check that it does NOT contain ALTER TABLE
+				if strings.Contains(strings.ToUpper(result), "ALTER TABLE") {
+					t.Errorf("ConvertAlterTableToAlterView(%q) = %q, should not contain ALTER TABLE", tt.input, result)
+				}
+			} else {
+				if result != tt.input {
+					t.Errorf("ConvertAlterTableToAlterView(%q) = %q, should return original", tt.input, result)
+				}
+			}
+		})
+	}
+}

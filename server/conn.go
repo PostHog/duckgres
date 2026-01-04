@@ -380,11 +380,19 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 		result, err := c.db.Exec(query)
 		if err != nil {
-			c.sendError("ERROR", "42000", err.Error())
-			c.setTxError()
-			writeReadyForQuery(c.writer, c.txStatus)
-			c.writer.Flush()
-			return nil
+			// Retry ALTER TABLE as ALTER VIEW if target is a view
+			if isAlterTableNotTableError(err) {
+				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
+					result, err = c.db.Exec(alteredQuery)
+				}
+			}
+			if err != nil {
+				c.sendError("ERROR", "42000", err.Error())
+				c.setTxError()
+				writeReadyForQuery(c.writer, c.txStatus)
+				c.writer.Flush()
+				return nil
+			}
 		}
 
 		c.updateTxStatus(cmdType)
@@ -1561,10 +1569,18 @@ func (c *clientConn) handleExecute(body []byte) {
 		// Non-result-returning query: use Exec with converted query
 		result, err := c.db.Exec(p.stmt.convertedQuery, args...)
 		if err != nil {
-			log.Printf("[%s] Execute error: %v", c.username, err)
-			c.sendError("ERROR", "42000", err.Error())
-			c.setTxError()
-			return
+			// Retry ALTER TABLE as ALTER VIEW if target is a view
+			if isAlterTableNotTableError(err) {
+				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(p.stmt.convertedQuery); ok {
+					result, err = c.db.Exec(alteredQuery, args...)
+				}
+			}
+			if err != nil {
+				log.Printf("[%s] Execute error: %v", c.username, err)
+				c.sendError("ERROR", "42000", err.Error())
+				c.setTxError()
+				return
+			}
 		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
@@ -1688,4 +1704,13 @@ func readCString(r *bytes.Reader) (string, error) {
 		buf.WriteByte(b)
 	}
 	return buf.String(), nil
+}
+
+// isAlterTableNotTableError checks if the error indicates that an ALTER TABLE
+// was attempted on a view. DuckDB returns this error when trying to use
+// ALTER TABLE ... RENAME TO on a view instead of ALTER VIEW.
+func isAlterTableNotTableError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "cannot use alter table") &&
+		strings.Contains(msg, "not a table")
 }
