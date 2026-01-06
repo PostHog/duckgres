@@ -422,6 +422,37 @@ func TestTranspile_SetShow(t *testing.T) {
 			t.Error("SET application_name should be marked as ignored")
 		}
 	})
+
+	// Test SET SESSION CHARACTERISTICS is ignored
+	t.Run("SET SESSION CHARACTERISTICS ignored", func(t *testing.T) {
+		result, err := tr.Transpile("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if !result.IsIgnoredSet {
+			t.Error("SET SESSION CHARACTERISTICS should be marked as ignored")
+		}
+	})
+
+	// Test various SET SESSION CHARACTERISTICS variations
+	t.Run("SET SESSION CHARACTERISTICS variations", func(t *testing.T) {
+		tests := []string{
+			"SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+			"SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+			"SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+			"SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+			"SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
+		}
+		for _, query := range tests {
+			result, err := tr.Transpile(query)
+			if err != nil {
+				t.Errorf("Transpile(%q) error: %v", query, err)
+			}
+			if !result.IsIgnoredSet {
+				t.Errorf("Transpile(%q) should be marked as ignored", query)
+			}
+		}
+	})
 }
 
 func TestTranspile_ComplexQueries(t *testing.T) {

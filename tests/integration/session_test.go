@@ -106,6 +106,33 @@ func TestSessionSetCommands(t *testing.T) {
 			Query:        "SET default_transaction_isolation = 'read committed'",
 			DuckgresOnly: true,
 		},
+
+		// Test SET SESSION CHARACTERISTICS commands
+		{
+			Name:         "set_session_characteristics_isolation_level",
+			Query:        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "set_session_characteristics_read_only",
+			Query:        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "set_session_characteristics_read_committed",
+			Query:        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "set_session_characteristics_repeatable_read",
+			Query:        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "set_session_characteristics_serializable",
+			Query:        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+			DuckgresOnly: true,
+		},
 	}
 	runQueryTests(t, tests)
 }
