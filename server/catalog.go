@@ -72,7 +72,7 @@ func initPgCatalog(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
 	`
@@ -225,6 +225,42 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	db.Exec(pgMatviewsSQL)
+
+	// Create pg_stat_user_tables view (table statistics)
+	// Uses reltuples from pg_class for estimated row counts (same as PostgreSQL - it's an estimate)
+	// Returns 0 for scan/tuple statistics and NULL for timestamps (DuckDB doesn't track these)
+	pgStatUserTablesSQL := `
+		CREATE OR REPLACE VIEW pg_stat_user_tables AS
+		SELECT
+			c.oid AS relid,
+			n.nspname AS schemaname,
+			c.relname AS relname,
+			0::BIGINT AS seq_scan,
+			0::BIGINT AS seq_tup_read,
+			0::BIGINT AS idx_scan,
+			0::BIGINT AS idx_tup_fetch,
+			0::BIGINT AS n_tup_ins,
+			0::BIGINT AS n_tup_upd,
+			0::BIGINT AS n_tup_del,
+			0::BIGINT AS n_tup_hot_upd,
+			CASE WHEN c.reltuples < 0 THEN 0 ELSE c.reltuples::BIGINT END AS n_live_tup,
+			0::BIGINT AS n_dead_tup,
+			0::BIGINT AS n_mod_since_analyze,
+			0::BIGINT AS n_ins_since_vacuum,
+			NULL::TIMESTAMP AS last_vacuum,
+			NULL::TIMESTAMP AS last_autovacuum,
+			NULL::TIMESTAMP AS last_analyze,
+			NULL::TIMESTAMP AS last_autoanalyze,
+			0::BIGINT AS vacuum_count,
+			0::BIGINT AS autovacuum_count,
+			0::BIGINT AS analyze_count,
+			0::BIGINT AS autoanalyze_count
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+		WHERE c.relkind IN ('r', 'p')
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+	`
+	db.Exec(pgStatUserTablesSQL)
 
 	// Create pg_namespace wrapper that maps 'main' to 'public' for PostgreSQL compatibility
 	// Also set owner to match PostgreSQL conventions:
@@ -561,6 +597,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
+			'pg_stat_user_tables',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -623,6 +660,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
+			'pg_stat_user_tables',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -687,7 +725,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'information_schema_columns_compat', 'information_schema_tables_compat',
+			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
 	`
