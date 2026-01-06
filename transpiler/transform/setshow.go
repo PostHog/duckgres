@@ -195,6 +195,20 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 					return true, nil
 				}
 
+				// Handle transaction-related SET commands (VAR_SET_MULTI kind)
+				// This covers multiple PostgreSQL transaction commands:
+				//   - SET SESSION CHARACTERISTICS AS TRANSACTION ... (Name: "SESSION CHARACTERISTICS")
+				//   - SET TRANSACTION ISOLATION LEVEL ... (Name: "TRANSACTION")
+				//   - SET TRANSACTION READ ONLY/WRITE (Name: "TRANSACTION")
+				//   - SET TRANSACTION SNAPSHOT ... (Name: "TRANSACTION SNAPSHOT")
+				// All are ignored since DuckDB/DuckLake use fixed isolation levels:
+				//   - DuckDB: SERIALIZABLE
+				//   - DuckLake: snapshot isolation (equivalent to REPEATABLE READ)
+				if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_MULTI {
+					result.IsIgnoredSet = true
+					return true, nil
+				}
+
 				paramName := strings.ToLower(n.VariableSetStmt.Name)
 
 				// Check if this is an ignored parameter (including RESET single param)
