@@ -300,6 +300,13 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 			log.Printf("Warning: failed to recreate pg_class_full for DuckLake: %v", err)
 			// Non-fatal: continue with DuckDB-based pg_class_full
 		}
+
+		// Recreate pg_namespace to source from DuckLake metadata.
+		// This ensures OIDs match pg_class_full for JOINs (e.g., Metabase table discovery).
+		if err := recreatePgNamespaceForDuckLake(db); err != nil {
+			log.Printf("Warning: failed to recreate pg_namespace for DuckLake: %v", err)
+			// Non-fatal: continue with DuckDB-based pg_namespace
+		}
 	}
 
 	// Initialize information_schema compatibility views in memory.main

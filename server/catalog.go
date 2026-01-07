@@ -732,3 +732,20 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 	_, err := db.Exec(pgClassSQL)
 	return err
 }
+
+// recreatePgNamespaceForDuckLake recreates pg_namespace to source from DuckLake metadata
+// instead of DuckDB's pg_catalog. This ensures consistent OIDs with pg_class_full.
+// Must be called AFTER DuckLake is attached.
+func recreatePgNamespaceForDuckLake(db *sql.DB) error {
+	pgNamespaceSQL := `
+		CREATE OR REPLACE VIEW pg_namespace AS
+		SELECT
+			oid,
+			CASE WHEN nspname = 'main' THEN 'public' ELSE nspname END AS nspname,
+			CASE WHEN nspname = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
+			nspacl
+		FROM __ducklake_metadata_ducklake.pg_catalog.pg_namespace
+	`
+	_, err := db.Exec(pgNamespaceSQL)
+	return err
+}
