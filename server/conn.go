@@ -33,8 +33,54 @@ type preparedStmt struct {
 type portal struct {
 	stmt          *preparedStmt
 	paramValues   [][]byte
+	paramFormats  []int16 // 0=text, 1=binary for each parameter
 	resultFormats []int16
 	described     bool // true if Describe was called on this portal
+}
+
+// decodeParams converts raw parameter bytes to Go values based on format codes.
+// Returns (args, nil) on success, or (nil, error) for malformed binary data.
+// On error, caller should send ErrorResponse with SQLSTATE 08P01.
+func (p *portal) decodeParams() ([]interface{}, error) {
+	args := make([]interface{}, len(p.paramValues))
+	for i, v := range p.paramValues {
+		if v == nil {
+			args[i] = nil
+			continue
+		}
+
+		// Get type OID for this parameter
+		typeOID := int32(0) // Unknown
+		if i < len(p.stmt.paramTypes) {
+			typeOID = p.stmt.paramTypes[i]
+		}
+
+		// Get format code for this parameter
+		format := int16(0) // Default to text
+		if len(p.paramFormats) == 1 {
+			// Single format code applies to all parameters
+			format = p.paramFormats[0]
+		} else if i < len(p.paramFormats) {
+			// Per-parameter format codes
+			format = p.paramFormats[i]
+		}
+
+		// CRITICAL: Per PostgreSQL spec, when type is unknown (OID 0),
+		// IGNORE binary format code and always treat as text.
+		// "Anything you have down as UNKNOWN, send as text."
+		if typeOID == 0 || format == 0 {
+			// Unknown type OR text format: treat as string
+			args[i] = string(v)
+		} else {
+			// Known type AND binary format: decode per type
+			val, err := decodeBinary(v, typeOID)
+			if err != nil {
+				return nil, fmt.Errorf("parameter %d: %w", i+1, err)
+			}
+			args[i] = val
+		}
+	}
+	return args, nil
 }
 
 // Transaction status constants for PostgreSQL wire protocol
@@ -1361,6 +1407,7 @@ func (c *clientConn) handleBind(body []byte) {
 	c.portals[portalName] = &portal{
 		stmt:          ps,
 		paramValues:   paramValues,
+		paramFormats:  paramFormats,
 		resultFormats: resultFormats,
 		described:     ps.described, // Inherit from statement if Describe(S) was called
 	}
@@ -1464,13 +1511,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 
 		// For SELECT, we need to describe the result columns
 		// We'll do a trial query with LIMIT 0 to get column info
-		args := make([]interface{}, len(p.paramValues))
-		for i, v := range p.paramValues {
-			if v == nil {
-				args[i] = nil
-			} else {
-				args[i] = string(v)
-			}
+		args, err := p.decodeParams()
+		if err != nil {
+			// PostgreSQL returns 08P01 (protocol violation) for malformed binary data
+			c.sendError("ERROR", "08P01", fmt.Sprintf("insufficient data left in message: %v", err))
+			return
 		}
 
 		// Try to get column info
@@ -1525,14 +1570,12 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	// Convert parameter values to interface{}
-	args := make([]interface{}, len(p.paramValues))
-	for i, v := range p.paramValues {
-		if v == nil {
-			args[i] = nil
-		} else {
-			args[i] = string(v) // Text format assumed
-		}
+	// Convert parameter values to interface{}, handling binary format
+	args, err := p.decodeParams()
+	if err != nil {
+		// PostgreSQL returns 08P01 (protocol violation) for malformed binary data
+		c.sendError("ERROR", "08P01", fmt.Sprintf("insufficient data left in message: %v", err))
+		return
 	}
 
 	upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))

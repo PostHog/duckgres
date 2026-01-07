@@ -452,3 +452,348 @@ func TestEncodeBinary(t *testing.T) {
 		})
 	}
 }
+
+// Tests for binary parameter decoding functions
+
+func TestDecodeBool(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected bool
+		wantErr  bool
+	}{
+		{"true", []byte{1}, true, false},
+		{"false", []byte{0}, false, false},
+		{"non-zero is true", []byte{42}, true, false},
+		{"empty data", []byte{}, false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeBool(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeBool(%v) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeBool(%v) unexpected error: %v", tt.input, err)
+				return
+			}
+			if result != tt.expected {
+				t.Errorf("decodeBool(%v) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeInt2(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected int16
+		wantErr  bool
+	}{
+		{"positive", []byte{0x00, 0x2A}, 42, false},
+		{"negative", []byte{0xFF, 0xFF}, -1, false},
+		{"max", []byte{0x7F, 0xFF}, 32767, false},
+		{"min", []byte{0x80, 0x00}, -32768, false},
+		{"zero", []byte{0x00, 0x00}, 0, false},
+		{"insufficient data", []byte{0x00}, 0, true},
+		{"empty data", []byte{}, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeInt2(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeInt2(%v) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeInt2(%v) unexpected error: %v", tt.input, err)
+				return
+			}
+			if result != tt.expected {
+				t.Errorf("decodeInt2(%v) = %d, want %d", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeInt4(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected int32
+		wantErr  bool
+	}{
+		{"positive", []byte{0x00, 0x00, 0x00, 0x2A}, 42, false},
+		{"negative", []byte{0xFF, 0xFF, 0xFF, 0xFF}, -1, false},
+		{"max", []byte{0x7F, 0xFF, 0xFF, 0xFF}, 2147483647, false},
+		{"min", []byte{0x80, 0x00, 0x00, 0x00}, -2147483648, false},
+		{"zero", []byte{0x00, 0x00, 0x00, 0x00}, 0, false},
+		{"insufficient data", []byte{0x00, 0x00}, 0, true},
+		{"empty data", []byte{}, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeInt4(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeInt4(%v) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeInt4(%v) unexpected error: %v", tt.input, err)
+				return
+			}
+			if result != tt.expected {
+				t.Errorf("decodeInt4(%v) = %d, want %d", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeInt8(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected int64
+		wantErr  bool
+	}{
+		{"positive", []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A}, 42, false},
+		{"negative", []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, -1, false},
+		{"max", []byte{0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, 9223372036854775807, false},
+		{"min", []byte{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, -9223372036854775808, false},
+		{"zero", []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 0, false},
+		{"insufficient data", []byte{0x00, 0x00, 0x00, 0x00}, 0, true},
+		{"empty data", []byte{}, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeInt8(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeInt8(%v) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeInt8(%v) unexpected error: %v", tt.input, err)
+				return
+			}
+			if result != tt.expected {
+				t.Errorf("decodeInt8(%v) = %d, want %d", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeFloat4(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected float32
+		wantErr  bool
+	}{
+		{"3.14", func() []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, math.Float32bits(3.14)); return b }(), 3.14, false},
+		{"zero", []byte{0x00, 0x00, 0x00, 0x00}, 0, false},
+		{"-1.5", func() []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, math.Float32bits(-1.5)); return b }(), -1.5, false},
+		{"insufficient data", []byte{0x00, 0x00}, 0, true},
+		{"empty data", []byte{}, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeFloat4(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeFloat4(%v) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeFloat4(%v) unexpected error: %v", tt.input, err)
+				return
+			}
+			if result != tt.expected {
+				t.Errorf("decodeFloat4(%v) = %f, want %f", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeFloat8(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected float64
+		wantErr  bool
+	}{
+		{"3.14159", func() []byte { b := make([]byte, 8); binary.BigEndian.PutUint64(b, math.Float64bits(3.14159)); return b }(), 3.14159, false},
+		{"zero", []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 0, false},
+		{"-1e100", func() []byte { b := make([]byte, 8); binary.BigEndian.PutUint64(b, math.Float64bits(-1e100)); return b }(), -1e100, false},
+		{"insufficient data", []byte{0x00, 0x00, 0x00, 0x00}, 0, true},
+		{"empty data", []byte{}, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeFloat8(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeFloat8(%v) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeFloat8(%v) unexpected error: %v", tt.input, err)
+				return
+			}
+			if result != tt.expected {
+				t.Errorf("decodeFloat8(%v) = %f, want %f", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeDate(t *testing.T) {
+	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		input    []byte
+		expected time.Time
+		wantErr  bool
+	}{
+		{"epoch (day 0)", []byte{0x00, 0x00, 0x00, 0x00}, pgEpoch, false},
+		{"day 1", []byte{0x00, 0x00, 0x00, 0x01}, pgEpoch.AddDate(0, 0, 1), false},
+		{"day -1", []byte{0xFF, 0xFF, 0xFF, 0xFF}, pgEpoch.AddDate(0, 0, -1), false},
+		{"insufficient data", []byte{0x00, 0x00}, time.Time{}, true},
+		{"empty data", []byte{}, time.Time{}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeDate(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeDate(%v) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeDate(%v) unexpected error: %v", tt.input, err)
+				return
+			}
+			if !result.Equal(tt.expected) {
+				t.Errorf("decodeDate(%v) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeTimestamp(t *testing.T) {
+	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		input    []byte
+		expected time.Time
+		wantErr  bool
+	}{
+		{"epoch (microsecond 0)", []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, pgEpoch, false},
+		{"one second after", []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x42, 0x40}, pgEpoch.Add(time.Second), false}, // 1000000 microseconds
+		{"insufficient data", []byte{0x00, 0x00, 0x00, 0x00}, time.Time{}, true},
+		{"empty data", []byte{}, time.Time{}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeTimestamp(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeTimestamp(%v) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeTimestamp(%v) unexpected error: %v", tt.input, err)
+				return
+			}
+			if !result.Equal(tt.expected) {
+				t.Errorf("decodeTimestamp(%v) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeBinary(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		oid      int32
+		expected interface{}
+		wantErr  bool
+	}{
+		{"nil data", nil, OidInt4, nil, false},
+		{"bool true", []byte{1}, OidBool, true, false},
+		{"bool false", []byte{0}, OidBool, false, false},
+		{"int2", []byte{0x00, 0x2A}, OidInt2, int16(42), false},
+		{"int4", []byte{0x00, 0x00, 0x00, 0x2A}, OidInt4, int32(42), false},
+		{"int4 zero", []byte{0x00, 0x00, 0x00, 0x00}, OidInt4, int32(0), false},
+		{"int8", []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A}, OidInt8, int64(42), false},
+		{"bytea", []byte{0x01, 0x02, 0x03}, OidBytea, []byte{0x01, 0x02, 0x03}, false},
+		{"text", []byte("hello"), OidText, "hello", false},
+		{"unknown type defaults to text", []byte("test"), int32(9999), "test", false},
+		// Error cases
+		{"int4 insufficient data", []byte{0x00, 0x00}, OidInt4, nil, true},
+		{"int8 insufficient data", []byte{0x00, 0x00, 0x00, 0x00}, OidInt8, nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeBinary(tt.data, tt.oid)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("decodeBinary(%v, %d) expected error, got nil", tt.data, tt.oid)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("decodeBinary(%v, %d) unexpected error: %v", tt.data, tt.oid, err)
+				return
+			}
+
+			// Special handling for byte slices
+			if expectedBytes, ok := tt.expected.([]byte); ok {
+				resultBytes, ok := result.([]byte)
+				if !ok {
+					t.Errorf("decodeBinary(%v, %d) = %T, want []byte", tt.data, tt.oid, result)
+					return
+				}
+				if len(resultBytes) != len(expectedBytes) {
+					t.Errorf("decodeBinary(%v, %d) length = %d, want %d", tt.data, tt.oid, len(resultBytes), len(expectedBytes))
+					return
+				}
+				for i, b := range resultBytes {
+					if b != expectedBytes[i] {
+						t.Errorf("decodeBinary(%v, %d)[%d] = %d, want %d", tt.data, tt.oid, i, b, expectedBytes[i])
+					}
+				}
+				return
+			}
+
+			if result != tt.expected {
+				t.Errorf("decodeBinary(%v, %d) = %v (%T), want %v (%T)", tt.data, tt.oid, result, result, tt.expected, tt.expected)
+			}
+		})
+	}
+}

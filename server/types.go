@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -354,4 +355,101 @@ func encodeBytea(v interface{}) []byte {
 func encodeText(v interface{}) []byte {
 	str := formatValue(v)
 	return []byte(str)
+}
+
+// decodeBinary decodes binary-format parameter bytes based on type OID.
+// Returns (value, nil) on success, or (nil, error) for malformed data.
+// Per PostgreSQL spec, returns error with "insufficient data" for truncated binary data.
+func decodeBinary(data []byte, oid int32) (interface{}, error) {
+	if data == nil {
+		return nil, nil
+	}
+
+	switch oid {
+	case OidBool:
+		return decodeBool(data)
+	case OidInt2:
+		return decodeInt2(data)
+	case OidInt4:
+		return decodeInt4(data)
+	case OidInt8:
+		return decodeInt8(data)
+	case OidFloat4:
+		return decodeFloat4(data)
+	case OidFloat8:
+		return decodeFloat8(data)
+	case OidDate:
+		return decodeDate(data)
+	case OidTimestamp, OidTimestamptz:
+		return decodeTimestamp(data)
+	case OidBytea:
+		return data, nil // raw bytes
+	default:
+		// For text, varchar, and unknown types, return as string
+		return string(data), nil
+	}
+}
+
+func decodeBool(data []byte) (bool, error) {
+	if len(data) < 1 {
+		return false, fmt.Errorf("insufficient data for bool: got %d bytes, need 1", len(data))
+	}
+	return data[0] != 0, nil
+}
+
+func decodeInt2(data []byte) (int16, error) {
+	if len(data) < 2 {
+		return 0, fmt.Errorf("insufficient data for int2: got %d bytes, need 2", len(data))
+	}
+	return int16(binary.BigEndian.Uint16(data)), nil
+}
+
+func decodeInt4(data []byte) (int32, error) {
+	if len(data) < 4 {
+		return 0, fmt.Errorf("insufficient data for int4: got %d bytes, need 4", len(data))
+	}
+	return int32(binary.BigEndian.Uint32(data)), nil
+}
+
+func decodeInt8(data []byte) (int64, error) {
+	if len(data) < 8 {
+		return 0, fmt.Errorf("insufficient data for int8: got %d bytes, need 8", len(data))
+	}
+	return int64(binary.BigEndian.Uint64(data)), nil
+}
+
+func decodeFloat4(data []byte) (float32, error) {
+	if len(data) < 4 {
+		return 0, fmt.Errorf("insufficient data for float4: got %d bytes, need 4", len(data))
+	}
+	bits := binary.BigEndian.Uint32(data)
+	return math.Float32frombits(bits), nil
+}
+
+func decodeFloat8(data []byte) (float64, error) {
+	if len(data) < 8 {
+		return 0, fmt.Errorf("insufficient data for float8: got %d bytes, need 8", len(data))
+	}
+	bits := binary.BigEndian.Uint64(data)
+	return math.Float64frombits(bits), nil
+}
+
+func decodeDate(data []byte) (time.Time, error) {
+	if len(data) < 4 {
+		return time.Time{}, fmt.Errorf("insufficient data for date: got %d bytes, need 4", len(data))
+	}
+	// Days since PostgreSQL epoch (2000-01-01)
+	days := int32(binary.BigEndian.Uint32(data))
+	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	return pgEpoch.AddDate(0, 0, int(days)), nil
+}
+
+func decodeTimestamp(data []byte) (time.Time, error) {
+	if len(data) < 8 {
+		return time.Time{}, fmt.Errorf("insufficient data for timestamp: got %d bytes, need 8", len(data))
+	}
+	// Microseconds since PostgreSQL epoch (2000-01-01)
+	micros := int64(binary.BigEndian.Uint64(data))
+	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	return pgEpoch.Add(time.Duration(micros) * time.Microsecond), nil
 }
