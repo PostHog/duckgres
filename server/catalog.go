@@ -674,77 +674,210 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	return nil
 }
 
-// recreatePgClassForDuckLake recreates pg_class_full to source from DuckLake metadata
-// instead of DuckDB's pg_catalog. This ensures consistent PostgreSQL-compatible OIDs.
+// recreatePgClassForDuckLake recreates pg_class_full to source from DuckDB's native
+// system functions (duckdb_tables, duckdb_views, etc.) filtered to only include
+// objects from the 'ducklake' catalog (user tables/views).
+// This excludes internal DuckLake metadata tables from '__ducklake_metadata_ducklake'.
 // Must be called AFTER DuckLake is attached.
 func recreatePgClassForDuckLake(db *sql.DB) error {
 	pgClassSQL := `
 		CREATE OR REPLACE VIEW pg_class_full AS
+		-- Tables from ducklake catalog
 		SELECT
-			oid,
-			relname,
-			relnamespace,
-			reltype,
-			reloftype,
-			relowner,
-			relam,
-			relfilenode,
-			reltablespace,
-			relpages,
-			reltuples,
-			relallvisible,
-			reltoastrelid,
+			table_oid AS oid,
+			table_name AS relname,
+			schema_oid AS relnamespace,
+			0 AS reltype,
+			0 AS reloftype,
+			0 AS relowner,
+			0 AS relam,
+			0 AS relfilenode,
+			0 AS reltablespace,
+			0 AS relpages,
+			CAST(estimated_size AS FLOAT) AS reltuples,
+			0 AS relallvisible,
+			0 AS reltoastrelid,
 			0::BIGINT AS reltoastidxid,
-			relhasindex,
-			relisshared,
-			relpersistence,
-			relkind,
-			relnatts,
-			relchecks,
+			(index_count > 0) AS relhasindex,
+			false AS relisshared,
+			CASE WHEN temporary THEN 't' ELSE 'p' END AS relpersistence,
+			'r' AS relkind,
+			column_count AS relnatts,
+			check_constraint_count AS relchecks,
 			false AS relhasoids,
-			EXISTS(
-				SELECT 1 FROM __ducklake_metadata_ducklake.pg_catalog.pg_constraint c
-				WHERE c.conrelid = pg_class.oid AND c.contype = 'p'
-			) AS relhaspkey,
-			relhasrules,
-			relhastriggers,
-			relhassubclass,
-			relrowsecurity,
+			has_primary_key AS relhaspkey,
+			false AS relhasrules,
+			false AS relhastriggers,
+			false AS relhassubclass,
+			false AS relrowsecurity,
 			false AS relforcerowsecurity,
-			relispopulated,
-			relreplident,
-			relispartition,
-			relrewrite,
-			relfrozenxid,
-			relminmxid,
-			relacl,
-			reloptions,
-			relpartbound
-		FROM __ducklake_metadata_ducklake.pg_catalog.pg_class pg_class
-		WHERE relname NOT IN (
+			true AS relispopulated,
+			NULL AS relreplident,
+			false AS relispartition,
+			0 AS relrewrite,
+			0 AS relfrozenxid,
+			NULL AS relminmxid,
+			NULL AS relacl,
+			NULL AS reloptions,
+			NULL AS relpartbound
+		FROM duckdb_tables()
+		WHERE database_name = 'ducklake'
+		  AND table_name NOT IN (
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
-		)
+		  )
+		UNION ALL
+		-- Views from ducklake catalog
+		SELECT
+			view_oid AS oid,
+			view_name AS relname,
+			schema_oid AS relnamespace,
+			0 AS reltype,
+			0 AS reloftype,
+			0 AS relowner,
+			0 AS relam,
+			0 AS relfilenode,
+			0 AS reltablespace,
+			0 AS relpages,
+			0 AS reltuples,
+			0 AS relallvisible,
+			0 AS reltoastrelid,
+			0::BIGINT AS reltoastidxid,
+			false AS relhasindex,
+			false AS relisshared,
+			CASE WHEN temporary THEN 't' ELSE 'p' END AS relpersistence,
+			'v' AS relkind,
+			column_count AS relnatts,
+			0 AS relchecks,
+			false AS relhasoids,
+			false AS relhaspkey,
+			false AS relhasrules,
+			false AS relhastriggers,
+			false AS relhassubclass,
+			false AS relrowsecurity,
+			false AS relforcerowsecurity,
+			true AS relispopulated,
+			NULL AS relreplident,
+			false AS relispartition,
+			0 AS relrewrite,
+			0 AS relfrozenxid,
+			NULL AS relminmxid,
+			NULL AS relacl,
+			NULL AS reloptions,
+			NULL AS relpartbound
+		FROM duckdb_views()
+		WHERE database_name = 'ducklake'
+		  AND view_name NOT IN (
+			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
+			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
+			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
+			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
+			'information_schema_schemata_compat', '__duckgres_column_metadata'
+		  )
+		UNION ALL
+		-- Sequences from ducklake catalog
+		SELECT
+			sequence_oid AS oid,
+			sequence_name AS relname,
+			schema_oid AS relnamespace,
+			0 AS reltype,
+			0 AS reloftype,
+			0 AS relowner,
+			0 AS relam,
+			0 AS relfilenode,
+			0 AS reltablespace,
+			0 AS relpages,
+			0 AS reltuples,
+			0 AS relallvisible,
+			0 AS reltoastrelid,
+			0::BIGINT AS reltoastidxid,
+			false AS relhasindex,
+			false AS relisshared,
+			CASE WHEN temporary THEN 't' ELSE 'p' END AS relpersistence,
+			'S' AS relkind,
+			0 AS relnatts,
+			0 AS relchecks,
+			false AS relhasoids,
+			false AS relhaspkey,
+			false AS relhasrules,
+			false AS relhastriggers,
+			false AS relhassubclass,
+			false AS relrowsecurity,
+			false AS relforcerowsecurity,
+			true AS relispopulated,
+			NULL AS relreplident,
+			false AS relispartition,
+			0 AS relrewrite,
+			0 AS relfrozenxid,
+			NULL AS relminmxid,
+			NULL AS relacl,
+			NULL AS reloptions,
+			NULL AS relpartbound
+		FROM duckdb_sequences()
+		WHERE database_name = 'ducklake'
+		UNION ALL
+		-- Indexes from ducklake catalog
+		SELECT
+			index_oid AS oid,
+			index_name AS relname,
+			schema_oid AS relnamespace,
+			0 AS reltype,
+			0 AS reloftype,
+			0 AS relowner,
+			0 AS relam,
+			0 AS relfilenode,
+			0 AS reltablespace,
+			0 AS relpages,
+			0 AS reltuples,
+			0 AS relallvisible,
+			0 AS reltoastrelid,
+			0::BIGINT AS reltoastidxid,
+			false AS relhasindex,
+			false AS relisshared,
+			't' AS relpersistence,
+			'i' AS relkind,
+			NULL AS relnatts,
+			0 AS relchecks,
+			false AS relhasoids,
+			false AS relhaspkey,
+			false AS relhasrules,
+			false AS relhastriggers,
+			false AS relhassubclass,
+			false AS relrowsecurity,
+			false AS relforcerowsecurity,
+			true AS relispopulated,
+			NULL AS relreplident,
+			false AS relispartition,
+			0 AS relrewrite,
+			0 AS relfrozenxid,
+			NULL AS relminmxid,
+			NULL AS relacl,
+			NULL AS reloptions,
+			NULL AS relpartbound
+		FROM duckdb_indexes()
+		WHERE database_name = 'ducklake'
 	`
 	_, err := db.Exec(pgClassSQL)
 	return err
 }
 
-// recreatePgNamespaceForDuckLake recreates pg_namespace to source from DuckLake metadata
-// instead of DuckDB's pg_catalog. This ensures consistent OIDs with pg_class_full.
+// recreatePgNamespaceForDuckLake recreates pg_namespace to source from DuckDB's native
+// duckdb_tables() function to get schema OIDs that are consistent with pg_class_full.
+// We derive namespaces from duckdb_tables() because duckdb_schemas() doesn't have schema_oid.
 // Must be called AFTER DuckLake is attached.
 func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 	pgNamespaceSQL := `
 		CREATE OR REPLACE VIEW pg_namespace AS
-		SELECT
-			oid,
-			CASE WHEN nspname = 'main' THEN 'public' ELSE nspname END AS nspname,
-			CASE WHEN nspname = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
-			nspacl
-		FROM __ducklake_metadata_ducklake.pg_catalog.pg_namespace
+		SELECT DISTINCT
+			schema_oid AS oid,
+			CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname,
+			CASE WHEN schema_name = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
+			NULL AS nspacl
+		FROM duckdb_tables()
+		WHERE database_name = 'ducklake'
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err
