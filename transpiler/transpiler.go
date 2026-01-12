@@ -48,7 +48,10 @@ func New(cfg Config) *Transpiler {
 	// 8. SET/SHOW command handling
 	t.transforms = append(t.transforms, transform.NewSetShowTransform())
 
-	// 9. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
+	// 9. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
+	t.transforms = append(t.transforms, transform.NewExpandArrayTransform())
+
+	// 10. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
 	t.transforms = append(t.transforms, transform.NewOnConflictTransformWithConfig(cfg.DuckLakeMode))
 
 	// DDL transforms only when DuckLake mode is enabled

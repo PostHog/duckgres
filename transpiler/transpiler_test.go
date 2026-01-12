@@ -968,6 +968,146 @@ func TestTranspile_JSONOperators(t *testing.T) {
 	}
 }
 
+func TestTranspile_ExpandArray(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains []string
+		excludes []string
+	}{
+		{
+			name:  "_pg_expandarray with field access .n",
+			input: "SELECT (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ FROM pg_index i",
+			contains: []string{
+				"_pg_exp_1.n",                                     // field access replaced
+				"unnest(i.indkey)",                                // LATERAL join added
+				"generate_subscripts(i.indkey, 1)",                // index generation added
+			},
+			excludes: []string{
+				"_pg_expandarray", // original function removed
+			},
+		},
+		{
+			name:  "_pg_expandarray with field access .x",
+			input: "SELECT (information_schema._pg_expandarray(arr)).x FROM t",
+			contains: []string{
+				"_pg_exp_1.x",
+				"unnest",
+				"generate_subscripts",
+			},
+			excludes: []string{
+				"_pg_expandarray",
+			},
+		},
+		{
+			name:  "_pg_expandarray aliased without field access",
+			input: "SELECT information_schema._pg_expandarray(arr) AS keys FROM t",
+			contains: []string{
+				"struct_pack", // converted to struct for field access
+				"_pg_exp_1",
+			},
+			excludes: []string{
+				"_pg_expandarray",
+			},
+		},
+		{
+			name:  "multiple _pg_expandarray with same array",
+			input: "SELECT (information_schema._pg_expandarray(i.indkey)).n, (information_schema._pg_expandarray(i.indkey)).x FROM pg_index i",
+			contains: []string{
+				"_pg_exp_1.n",
+				"_pg_exp_1.x",
+			},
+			excludes: []string{
+				"_pg_expandarray",
+			},
+		},
+		{
+			name:  "nested subquery pattern (JDBC actual)",
+			input: "SELECT result.key_seq FROM (SELECT (information_schema._pg_expandarray(i.indkey)).n AS key_seq FROM pg_index i) result",
+			contains: []string{
+				"_pg_exp_1.n",
+				"unnest",
+			},
+			excludes: []string{
+				"_pg_expandarray",
+			},
+		},
+		{
+			name:  "case insensitivity - uppercase",
+			input: "SELECT (information_schema._PG_EXPANDARRAY(arr)).n FROM t",
+			contains: []string{
+				"_pg_exp_1.n",
+				"unnest",
+			},
+			excludes: []string{
+				"_PG_EXPANDARRAY",
+			},
+		},
+		{
+			name:  "without information_schema prefix",
+			input: "SELECT (_pg_expandarray(arr)).x FROM t",
+			contains: []string{
+				"_pg_exp_1.x",
+				"unnest",
+			},
+			excludes: []string{
+				"_pg_expandarray",
+			},
+		},
+		{
+			name:  "in WHERE clause",
+			input: "SELECT * FROM t WHERE col = (information_schema._pg_expandarray(arr)).x",
+			contains: []string{
+				"_pg_exp_1.x",
+				"unnest",
+			},
+			excludes: []string{
+				"_pg_expandarray",
+			},
+		},
+		{
+			name:     "passthrough - no _pg_expandarray",
+			input:    "SELECT unnest(arr) FROM t",
+			contains: []string{"unnest(arr)"},
+			excludes: []string{"_pg_exp"},
+		},
+		{
+			name:  "different array expressions - with different arrays",
+			input: "SELECT (information_schema._pg_expandarray(a.arr1)).n, (information_schema._pg_expandarray(b.arr2)).x FROM t1 a, t2 b",
+			contains: []string{
+				"_pg_exp_1",
+				"_pg_exp_2",
+				"unnest(a.arr1)",
+				"unnest(b.arr2)",
+			},
+			excludes: []string{
+				"_pg_expandarray",
+			},
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			for _, c := range tt.contains {
+				if !strings.Contains(result.SQL, c) {
+					t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, c)
+				}
+			}
+			for _, e := range tt.excludes {
+				if strings.Contains(result.SQL, e) {
+					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, e)
+				}
+			}
+		})
+	}
+}
+
 func TestConvertAlterTableToAlterView(t *testing.T) {
 	tests := []struct {
 		name       string
