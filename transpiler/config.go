@@ -22,8 +22,18 @@ func DefaultConfig() Config {
 
 // Result contains the output of transpilation
 type Result struct {
-	// SQL is the transformed SQL string
+	// SQL is the transformed SQL string (backward compatible for single-statement queries)
 	SQL string
+
+	// Statements contains multiple SQL statements when a query is rewritten into
+	// a sequence (e.g., writable CTE rewrite). Includes setup statements and the
+	// final query. When populated, SQL should be ignored.
+	Statements []string
+
+	// CleanupStatements contains statements to execute after obtaining the cursor
+	// for the final query but before streaming results. Typically DROP TEMP TABLE
+	// and COMMIT statements. Execute these with best-effort (ignore errors).
+	CleanupStatements []string
 
 	// ParamCount is the number of parameters found (when ConvertPlaceholders is true)
 	ParamCount int

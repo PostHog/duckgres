@@ -394,6 +394,12 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
+	// Handle multi-statement results (writable CTE rewrites)
+	if len(result.Statements) > 0 {
+		log.Printf("[%s] Multi-statement query (%d statements, %d cleanup)", c.username, len(result.Statements), len(result.CleanupStatements))
+		return c.executeMultiStatement(result.Statements, result.CleanupStatements)
+	}
+
 	// Use the transpiled SQL
 	originalQuery := query
 	query = result.SQL
@@ -511,6 +517,178 @@ func (c *clientConn) handleQuery(body []byte) error {
 	c.writer.Flush()
 
 	return nil
+}
+
+// executeMultiStatement handles execution of multi-statement query rewrites.
+// This is used for writable CTE transformations where a single PostgreSQL query
+// is rewritten into multiple DuckDB statements.
+//
+// Execution order:
+// 1. Execute setup statements (BEGIN, CREATE TEMP TABLE, etc.) - all but the last
+// 2. Execute final statement and obtain cursor (rows object)
+// 3. Execute cleanup statements (DROP temp tables, COMMIT) - cursor still valid
+// 4. Stream rows from cursor to client
+func (c *clientConn) executeMultiStatement(statements []string, cleanup []string) error {
+	if len(statements) == 0 {
+		writeEmptyQueryResponse(c.writer)
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	// Check if we're adding our own transaction wrapper
+	hasOurTransaction := len(statements) >= 2 &&
+		strings.ToUpper(strings.TrimSpace(statements[0])) == "BEGIN" &&
+		len(cleanup) > 0 &&
+		strings.ToUpper(strings.TrimSpace(cleanup[len(cleanup)-1])) == "COMMIT"
+
+	// If already in a transaction, skip our BEGIN/COMMIT wrapper
+	if hasOurTransaction && c.txStatus == txStatusTransaction {
+		statements = statements[1:] // Strip BEGIN
+		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
+	}
+
+	// Execute setup statements (all but last)
+	for i := 0; i < len(statements)-1; i++ {
+		stmt := statements[i]
+		log.Printf("[%s] Multi-stmt setup [%d/%d]: %s", c.username, i+1, len(statements)-1, stmt)
+		_, err := c.db.Exec(stmt)
+		if err != nil {
+			log.Printf("[%s] Multi-stmt setup error: %v", c.username, err)
+			c.setTxError()
+			// On error, still try to cleanup (best effort)
+			c.executeCleanup(cleanup)
+			c.sendError("ERROR", "42000", err.Error())
+			writeReadyForQuery(c.writer, c.txStatus)
+			c.writer.Flush()
+			return nil
+		}
+	}
+
+	// Handle final statement
+	finalStmt := statements[len(statements)-1]
+	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
+	cmdType := c.getCommandType(upperFinal)
+	log.Printf("[%s] Multi-stmt final: %s (cmdType=%s)", c.username, finalStmt, cmdType)
+
+	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
+		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
+		rows, err := c.db.Query(finalStmt)
+		if err != nil {
+			log.Printf("[%s] Multi-stmt final query error: %v", c.username, err)
+			c.setTxError()
+			c.executeCleanup(cleanup)
+			c.sendError("ERROR", "42000", err.Error())
+			writeReadyForQuery(c.writer, c.txStatus)
+			c.writer.Flush()
+			return nil
+		}
+		defer rows.Close()
+
+		// Execute cleanup while cursor is open (data is materialized in cursor)
+		// DuckDB cursor holds result data even after source tables are dropped
+		c.executeCleanup(cleanup)
+
+		// Now stream results from cursor
+		return c.streamRowsToClient(rows, cmdType)
+
+	} else {
+		// DML (INSERT/UPDATE/DELETE): execute then cleanup
+		result, err := c.db.Exec(finalStmt)
+		if err != nil {
+			log.Printf("[%s] Multi-stmt final exec error: %v", c.username, err)
+			c.setTxError()
+			c.executeCleanup(cleanup)
+			c.sendError("ERROR", "42000", err.Error())
+			writeReadyForQuery(c.writer, c.txStatus)
+			c.writer.Flush()
+			return nil
+		}
+
+		// Execute cleanup
+		c.executeCleanup(cleanup)
+
+		// Send completion
+		tag := c.buildCommandTag(cmdType, result)
+		writeCommandComplete(c.writer, tag)
+		writeReadyForQuery(c.writer, c.txStatus)
+		return c.writer.Flush()
+	}
+}
+
+// executeCleanup runs cleanup statements, ignoring errors (best effort).
+// This is used to clean up temp tables after a multi-statement query.
+func (c *clientConn) executeCleanup(cleanup []string) {
+	for _, stmt := range cleanup {
+		log.Printf("[%s] Multi-stmt cleanup: %s", c.username, stmt)
+		_, err := c.db.Exec(stmt)
+		if err != nil {
+			// Log but don't fail - cleanup is best effort
+			log.Printf("[%s] Multi-stmt cleanup error (ignored): %v", c.username, err)
+		}
+	}
+}
+
+// streamRowsToClient sends result rows over the wire protocol.
+// The rows cursor must already be obtained before calling this function.
+func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string) error {
+	// Get column info
+	cols, err := rows.Columns()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	// Send row description
+	if err := c.sendRowDescription(cols, colTypes); err != nil {
+		return err
+	}
+
+	// Stream DataRows
+	rowCount := 0
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			break
+		}
+
+		if err := c.sendDataRow(values); err != nil {
+			return err
+		}
+		rowCount++
+	}
+
+	if err := rows.Err(); err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		writeReadyForQuery(c.writer, c.txStatus)
+		c.writer.Flush()
+		return nil
+	}
+
+	// Send completion
+	tag := fmt.Sprintf("%s %d", cmdType, rowCount)
+	writeCommandComplete(c.writer, tag)
+	writeReadyForQuery(c.writer, c.txStatus)
+	return c.writer.Flush()
 }
 
 // isEmptyQuery checks if a query contains only semicolons and whitespace.
