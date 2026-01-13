@@ -1340,6 +1340,38 @@ func TestParseCopyLine(t *testing.T) {
 	}
 }
 
+// TestPreparedStmtMultiStatement verifies that preparedStmt can store multi-statement
+// results from writable CTE transforms for the extended query protocol.
+func TestPreparedStmtMultiStatement(t *testing.T) {
+	// This test ensures that when a transpiler produces multi-statement results
+	// (e.g., writable CTE rewrites), the preparedStmt struct can store them.
+	//
+	// The extended query protocol (Parse/Bind/Execute) used by tools like Airbyte
+	// must handle multi-statement results just like handleQuery does for simple queries.
+
+	// Test that preparedStmt has the necessary fields for multi-statement results
+	stmt := preparedStmt{
+		query:             "WITH updates AS (UPDATE t SET x = 1 RETURNING *) SELECT * FROM updates",
+		convertedQuery:    "", // Single SQL - would fail with writable CTE
+		statements:        []string{"BEGIN", "CREATE TEMP TABLE _cte_updates AS ...", "UPDATE t SET x = 1", "SELECT * FROM _cte_updates"},
+		cleanupStatements: []string{"DROP TABLE IF EXISTS _cte_updates", "COMMIT"},
+	}
+
+	// Verify that multi-statement fields exist and can be set
+	if len(stmt.statements) != 4 {
+		t.Errorf("expected 4 statements, got %d", len(stmt.statements))
+	}
+	if len(stmt.cleanupStatements) != 2 {
+		t.Errorf("expected 2 cleanup statements, got %d", len(stmt.cleanupStatements))
+	}
+
+	// Verify that we can detect when to use multi-statement execution
+	hasMultiStatement := len(stmt.statements) > 0
+	if !hasMultiStatement {
+		t.Error("expected hasMultiStatement to be true")
+	}
+}
+
 func TestParseMultiLineCSV(t *testing.T) {
 	// This tests the fix for COPY FROM STDIN with multi-line quoted fields.
 	// Previously, we split by newlines first then parsed each line, which broke

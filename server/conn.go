@@ -20,14 +20,16 @@ import (
 )
 
 type preparedStmt struct {
-	query          string
-	convertedQuery string
-	paramTypes     []int32
-	numParams      int
-	isIgnoredSet   bool   // True if this is an ignored SET parameter
-	isNoOp         bool   // True if this is a no-op command (CREATE INDEX, etc.)
-	noOpTag        string // Command tag for no-op commands
-	described      bool   // True if Describe(S) was called on this statement
+	query             string
+	convertedQuery    string
+	paramTypes        []int32
+	numParams         int
+	isIgnoredSet      bool     // True if this is an ignored SET parameter
+	isNoOp            bool     // True if this is a no-op command (CREATE INDEX, etc.)
+	noOpTag           string   // Command tag for no-op commands
+	described         bool     // True if Describe(S) was called on this statement
+	statements        []string // Multi-statement rewrite (e.g., writable CTE)
+	cleanupStatements []string // Cleanup statements for multi-statement (DROP temp tables, COMMIT)
 }
 
 type portal struct {
@@ -627,6 +629,150 @@ func (c *clientConn) executeCleanup(cleanup []string) {
 			log.Printf("[%s] Multi-stmt cleanup error (ignored): %v", c.username, err)
 		}
 	}
+}
+
+// executeMultiStatementExtended handles execution of multi-statement query rewrites
+// for the extended query protocol (Parse/Bind/Execute).
+// Unlike executeMultiStatement, this does NOT send ReadyForQuery (that's done by Sync).
+func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup []string, args []interface{}, resultFormats []int16, described bool) {
+	if len(statements) == 0 {
+		writeEmptyQueryResponse(c.writer)
+		return
+	}
+
+	// Check if we're adding our own transaction wrapper
+	hasOurTransaction := len(statements) >= 2 &&
+		strings.ToUpper(strings.TrimSpace(statements[0])) == "BEGIN" &&
+		len(cleanup) > 0 &&
+		strings.ToUpper(strings.TrimSpace(cleanup[len(cleanup)-1])) == "COMMIT"
+
+	// If already in a transaction, skip our BEGIN/COMMIT wrapper
+	if hasOurTransaction && c.txStatus == txStatusTransaction {
+		statements = statements[1:]            // Strip BEGIN
+		cleanup = cleanup[:len(cleanup)-1]     // Strip COMMIT from cleanup
+	}
+
+	// Execute setup statements (all but last)
+	for i := 0; i < len(statements)-1; i++ {
+		stmt := statements[i]
+		log.Printf("[%s] Multi-stmt-ext setup [%d/%d]: %s", c.username, i+1, len(statements)-1, stmt)
+		_, err := c.db.Exec(stmt, args...)
+		if err != nil {
+			log.Printf("[%s] Multi-stmt-ext setup error: %v", c.username, err)
+			c.setTxError()
+			// On error, still try to cleanup (best effort)
+			c.executeCleanup(cleanup)
+			c.sendError("ERROR", "42000", err.Error())
+			return
+		}
+	}
+
+	// Handle final statement
+	finalStmt := statements[len(statements)-1]
+	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
+	cmdType := c.getCommandType(upperFinal)
+	log.Printf("[%s] Multi-stmt-ext final: %s (cmdType=%s)", c.username, finalStmt, cmdType)
+
+	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
+		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
+		rows, err := c.db.Query(finalStmt, args...)
+		if err != nil {
+			log.Printf("[%s] Multi-stmt-ext final query error: %v", c.username, err)
+			c.setTxError()
+			c.executeCleanup(cleanup)
+			c.sendError("ERROR", "42000", err.Error())
+			return
+		}
+		defer rows.Close()
+
+		// Execute cleanup while cursor is open (data is materialized in cursor)
+		c.executeCleanup(cleanup)
+
+		// Stream results from cursor (extended protocol version)
+		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described)
+
+	} else {
+		// DML (INSERT/UPDATE/DELETE): execute then cleanup
+		result, err := c.db.Exec(finalStmt, args...)
+		if err != nil {
+			log.Printf("[%s] Multi-stmt-ext final exec error: %v", c.username, err)
+			c.setTxError()
+			c.executeCleanup(cleanup)
+			c.sendError("ERROR", "42000", err.Error())
+			return
+		}
+
+		// Execute cleanup
+		c.executeCleanup(cleanup)
+
+		// Send completion (no ReadyForQuery - that's done by Sync)
+		tag := c.buildCommandTag(cmdType, result)
+		writeCommandComplete(c.writer, tag)
+	}
+}
+
+// streamRowsToClientExtended sends result rows for the extended query protocol.
+// Unlike streamRowsToClient, this does NOT send ReadyForQuery, and supports
+// binary result formats and the described flag.
+func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, resultFormats []int16, described bool) {
+	// Get column info
+	cols, err := rows.Columns()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		return
+	}
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		return
+	}
+
+	// Get type OIDs for binary encoding
+	typeOIDs := make([]int32, len(cols))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
+	// Send RowDescription if Describe wasn't called before Execute
+	if !described && len(cols) > 0 {
+		if err := c.sendRowDescription(cols, colTypes); err != nil {
+			return
+		}
+	}
+
+	// Stream DataRows with format codes
+	rowCount := 0
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			c.setTxError()
+			return
+		}
+
+		if err := c.sendDataRowWithFormats(values, resultFormats, typeOIDs); err != nil {
+			return
+		}
+		rowCount++
+	}
+
+	if err := rows.Err(); err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		return
+	}
+
+	// Send completion (no ReadyForQuery - that's done by Sync)
+	tag := fmt.Sprintf("SELECT %d", rowCount)
+	writeCommandComplete(c.writer, tag)
 }
 
 // streamRowsToClient sends result rows over the wire protocol.
@@ -1477,17 +1623,22 @@ func (c *clientConn) handleParse(body []byte) {
 	delete(c.stmts, stmtName)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:          query,             // Keep original for logging and Describe
-		convertedQuery: result.SQL,        // Transpiled SQL for execution
-		paramTypes:     paramTypes,
-		numParams:      result.ParamCount,
-		isIgnoredSet:   result.IsIgnoredSet,
-		isNoOp:         result.IsNoOp,
-		noOpTag:        result.NoOpTag,
+		query:             query,             // Keep original for logging and Describe
+		convertedQuery:    result.SQL,        // Transpiled SQL for execution
+		paramTypes:        paramTypes,
+		numParams:         result.ParamCount,
+		isIgnoredSet:      result.IsIgnoredSet,
+		isNoOp:            result.IsNoOp,
+		noOpTag:           result.NoOpTag,
+		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
+		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}
 
 	log.Printf("[%s] Prepared statement %q: %s", c.username, stmtName, query)
-	if result.SQL != query {
+	if len(result.Statements) > 0 {
+		log.Printf("[%s] Prepared statement %q multi-statement: %d statements, %d cleanup",
+			c.username, stmtName, len(result.Statements), len(result.CleanupStatements))
+	} else if result.SQL != query {
 		log.Printf("[%s] Prepared statement %q transpiled: %s", c.username, stmtName, result.SQL)
 	}
 	writeParseComplete(c.writer)
@@ -1775,6 +1926,14 @@ func (c *clientConn) handleExecute(body []byte) {
 	if p.stmt.isNoOp {
 		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, p.stmt.query)
 		writeCommandComplete(c.writer, p.stmt.noOpTag)
+		return
+	}
+
+	// Handle multi-statement results (e.g., writable CTE rewrites)
+	if len(p.stmt.statements) > 0 {
+		log.Printf("[%s] Execute multi-statement (%d statements, %d cleanup)",
+			c.username, len(p.stmt.statements), len(p.stmt.cleanupStatements))
+		c.executeMultiStatementExtended(p.stmt.statements, p.stmt.cleanupStatements, args, p.resultFormats, p.described)
 		return
 	}
 
