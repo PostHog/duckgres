@@ -24,6 +24,11 @@ func New(cfg Config) *Transpiler {
 	// Core transforms - always applied
 	// Order matters: more specific transforms should come first
 
+	// 0. Writable CTE transform - MUST BE FIRST
+	// This transform rewrites PostgreSQL writable CTEs into multi-statement sequences.
+	// It must run before other transforms because it completely rewrites the query structure.
+	t.transforms = append(t.transforms, transform.NewWritableCTETransform())
+
 	// 1. pg_catalog schema and view mappings
 	t.transforms = append(t.transforms, transform.NewPgCatalogTransformWithConfig(cfg.DuckLakeMode))
 
@@ -96,6 +101,18 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 			return &Result{
 				SQL:   sql,
 				Error: transformResult.Error,
+			}, nil
+		}
+
+		// Check for multi-statement rewrite (e.g., writable CTE)
+		// When a transform produces multiple statements, we skip remaining transforms
+		// and return the statements directly.
+		if len(transformResult.Statements) > 0 {
+			return &Result{
+				SQL:               sql, // Keep original for logging
+				Statements:        transformResult.Statements,
+				CleanupStatements: transformResult.CleanupStatements,
+				ParamCount:        transformResult.ParamCount,
 			}, nil
 		}
 

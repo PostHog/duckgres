@@ -22,6 +22,16 @@ type Result struct {
 	// Error is set when a transform detects an error that should be returned to the client
 	// (e.g., unrecognized configuration parameter in SHOW command)
 	Error error
+
+	// Statements contains multiple SQL statements when a query is rewritten into
+	// a sequence (e.g., writable CTE rewrite). Includes setup statements and the
+	// final query. When populated, the normal deparse result should be ignored.
+	Statements []string
+
+	// CleanupStatements contains statements to execute after obtaining the cursor
+	// for the final query but before streaming results. Typically DROP TEMP TABLE
+	// and COMMIT statements. Execute these with best-effort (ignore errors).
+	CleanupStatements []string
 }
 
 // Transform defines the interface for SQL transformations.

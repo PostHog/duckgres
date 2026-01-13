@@ -1108,6 +1108,162 @@ func TestTranspile_ExpandArray(t *testing.T) {
 	}
 }
 
+func TestTranspile_WritableCTE(t *testing.T) {
+	// Test writable CTE detection and rewriting
+	tests := []struct {
+		name              string
+		input             string
+		wantMultiStmt     bool   // expect multi-statement rewrite
+		wantStmtCount     int    // expected number of statements
+		wantCleanupCount  int    // expected number of cleanup statements
+		firstStmtContains string // first statement should contain this
+		lastStmtContains  string // last statement should contain this (before cleanup)
+	}{
+		{
+			name:          "simple SELECT CTE - no rewrite",
+			input:         "WITH x AS (SELECT 1 AS id) SELECT * FROM x",
+			wantMultiStmt: false,
+		},
+		{
+			name:              "UPDATE CTE with final SELECT",
+			input:             "WITH updates AS (UPDATE users SET active = true WHERE id = 1 RETURNING *) SELECT * FROM updates",
+			wantMultiStmt:     true,
+			wantStmtCount:     4, // BEGIN, CREATE TEMP, UPDATE, SELECT
+			wantCleanupCount:  2, // DROP, COMMIT
+			firstStmtContains: "BEGIN",
+		},
+		{
+			name:              "DELETE CTE with final SELECT",
+			input:             "WITH deleted AS (DELETE FROM users WHERE active = false RETURNING *) SELECT * FROM deleted",
+			wantMultiStmt:     true,
+			wantStmtCount:     4,
+			wantCleanupCount:  2,
+			firstStmtContains: "BEGIN",
+		},
+		{
+			name:              "INSERT CTE with final SELECT",
+			input:             "WITH inserted AS (INSERT INTO users (name) VALUES ('test') RETURNING *) SELECT * FROM inserted",
+			wantMultiStmt:     true,
+			wantStmtCount:     4,
+			wantCleanupCount:  2,
+			firstStmtContains: "BEGIN",
+		},
+		{
+			name:              "mixed read and write CTEs",
+			input:             "WITH source AS (SELECT * FROM staging), updates AS (UPDATE target SET name = s.name FROM source s WHERE target.id = s.id RETURNING *) SELECT * FROM updates",
+			wantMultiStmt:     true,
+			wantStmtCount:     5, // BEGIN, CREATE source, CREATE updates, UPDATE, SELECT
+			wantCleanupCount:  3, // DROP updates, DROP source, COMMIT
+			firstStmtContains: "BEGIN",
+		},
+		{
+			name:              "Airbyte-style upsert pattern",
+			input:             `WITH deduped AS (SELECT * FROM staging WHERE rn = 1), updates AS (UPDATE target SET name = d.name FROM deduped d WHERE target.id = d.id RETURNING *) INSERT INTO target SELECT * FROM deduped WHERE NOT EXISTS (SELECT 1 FROM updates WHERE updates.id = deduped.id)`,
+			wantMultiStmt:     true,
+			wantStmtCount:     5, // BEGIN, CREATE deduped, CREATE updates, UPDATE, INSERT
+			wantCleanupCount:  3, // DROP updates, DROP deduped, COMMIT
+			firstStmtContains: "BEGIN",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+
+			if tt.wantMultiStmt {
+				if len(result.Statements) == 0 {
+					t.Errorf("Transpile(%q) should produce multi-statement result", tt.input)
+					return
+				}
+				if len(result.Statements) != tt.wantStmtCount {
+					t.Errorf("Transpile(%q) produced %d statements, want %d. Statements: %v",
+						tt.input, len(result.Statements), tt.wantStmtCount, result.Statements)
+				}
+				if len(result.CleanupStatements) != tt.wantCleanupCount {
+					t.Errorf("Transpile(%q) produced %d cleanup statements, want %d. Cleanup: %v",
+						tt.input, len(result.CleanupStatements), tt.wantCleanupCount, result.CleanupStatements)
+				}
+				if tt.firstStmtContains != "" && !strings.Contains(result.Statements[0], tt.firstStmtContains) {
+					t.Errorf("First statement %q should contain %q", result.Statements[0], tt.firstStmtContains)
+				}
+			} else {
+				if len(result.Statements) > 0 {
+					t.Errorf("Transpile(%q) should NOT produce multi-statement result, got: %v",
+						tt.input, result.Statements)
+				}
+			}
+		})
+	}
+}
+
+func TestTranspile_WritableCTE_CTEReferences(t *testing.T) {
+	// Test that CTE references are properly rewritten to temp table names
+	tr := New(DefaultConfig())
+
+	input := "WITH updates AS (UPDATE users SET active = true RETURNING *) SELECT * FROM updates"
+	result, err := tr.Transpile(input)
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+
+	if len(result.Statements) == 0 {
+		t.Fatal("Expected multi-statement result")
+	}
+
+	// The final SELECT should reference the temp table, not "updates"
+	finalStmt := result.Statements[len(result.Statements)-1]
+	if strings.Contains(finalStmt, " updates") && !strings.Contains(finalStmt, "_cte_") {
+		t.Errorf("Final statement should use temp table name, got: %s", finalStmt)
+	}
+
+	// Cleanup should contain DROP statements for temp tables
+	hasDrops := false
+	for _, cleanup := range result.CleanupStatements {
+		if strings.Contains(strings.ToUpper(cleanup), "DROP TABLE") {
+			hasDrops = true
+			break
+		}
+	}
+	if !hasDrops {
+		t.Errorf("Cleanup should contain DROP TABLE statements: %v", result.CleanupStatements)
+	}
+}
+
+func TestTranspile_WritableCTE_TempTableNaming(t *testing.T) {
+	// Test that temp table names are safe identifiers
+	tr := New(DefaultConfig())
+
+	input := "WITH my_updates AS (UPDATE t SET x = 1 RETURNING *) SELECT * FROM my_updates"
+	result, err := tr.Transpile(input)
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+
+	if len(result.Statements) == 0 {
+		t.Fatal("Expected multi-statement result")
+	}
+
+	// Find the CREATE TEMP TABLE statement
+	for _, stmt := range result.Statements {
+		if strings.Contains(strings.ToUpper(stmt), "CREATE TEMP TABLE") {
+			// Should contain _cte_ prefix
+			if !strings.Contains(stmt, "_cte_") {
+				t.Errorf("Temp table name should have _cte_ prefix: %s", stmt)
+			}
+			// Should be quoted
+			if !strings.Contains(stmt, `"`) {
+				t.Errorf("Temp table name should be quoted: %s", stmt)
+			}
+			break
+		}
+	}
+}
+
 func TestConvertAlterTableToAlterView(t *testing.T) {
 	tests := []struct {
 		name       string
