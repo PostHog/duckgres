@@ -681,6 +681,17 @@ func (t *WritableCTETransform) rewriteRangeVars(node *pg_query.Node, tempTableNa
 			}
 		}
 
+	case *pg_query.Node_ColumnRef:
+		if n.ColumnRef != nil && len(n.ColumnRef.Fields) >= 2 {
+			// Column reference with table qualifier (e.g., deduped_source.id)
+			// Check if first field is a string matching a CTE name
+			if first := n.ColumnRef.Fields[0].GetString_(); first != nil {
+				if tempName, ok := tempTableNames[first.Sval]; ok {
+					first.Sval = tempName
+				}
+			}
+		}
+
 	case *pg_query.Node_SelectStmt:
 		if n.SelectStmt != nil {
 			for _, from := range n.SelectStmt.FromClause {

@@ -1264,6 +1264,42 @@ func TestTranspile_WritableCTE_TempTableNaming(t *testing.T) {
 	}
 }
 
+func TestTranspile_WritableCTE_ColumnRefRewriting(t *testing.T) {
+	// Test that column references (table.column) in WHERE clauses are rewritten
+	// This is the Airbyte pattern that was failing
+	tr := New(DefaultConfig())
+
+	input := `WITH deduped AS (SELECT * FROM staging), updates AS (UPDATE target SET name = d.name FROM deduped d WHERE target.id = d.id RETURNING *) INSERT INTO target SELECT * FROM deduped WHERE NOT EXISTS (SELECT 1 FROM updates WHERE updates.id = deduped.id)`
+	result, err := tr.Transpile(input)
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+
+	if len(result.Statements) == 0 {
+		t.Fatal("Expected multi-statement result")
+	}
+
+	// Check that column references like "deduped.id" and "updates.id" are rewritten
+	// to use temp table names in the generated statements
+	for _, stmt := range result.Statements {
+		// Skip BEGIN and simple statements
+		if stmt == "BEGIN" {
+			continue
+		}
+		// Column references should use temp table names, not original CTE names
+		// Look for unqualified references that should have been rewritten
+		if strings.Contains(stmt, "deduped.id") || strings.Contains(stmt, "updates.id") {
+			t.Errorf("Column reference should use temp table name, found original CTE name in: %s", stmt)
+		}
+	}
+
+	// The final INSERT should have rewritten column refs in the NOT EXISTS subquery
+	finalStmt := result.Statements[len(result.Statements)-1]
+	if strings.Contains(finalStmt, "deduped.id") {
+		t.Errorf("Final statement should use temp table name for column refs, got: %s", finalStmt)
+	}
+}
+
 func TestConvertAlterTableToAlterView(t *testing.T) {
 	tests := []struct {
 		name       string
