@@ -71,6 +71,12 @@ func TestTranspile_PgCatalog(t *testing.T) {
 			excludes: "pg_catalog.format_type",
 		},
 		{
+			name:     "pg_catalog.version() stripped (SQLAlchemy compatibility)",
+			input:    "SELECT pg_catalog.version()",
+			contains: "PostgreSQL", // VersionTransform inlines the version string
+			excludes: "pg_catalog.version",
+		},
+		{
 			name:     "string literal NOT rewritten",
 			input:    "SELECT 'pg_catalog.pg_class' AS name",
 			contains: "pg_catalog.pg_class",

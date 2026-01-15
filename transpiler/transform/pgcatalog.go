@@ -67,6 +67,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_schema_privilege":            true,
 			"has_table_privilege":             true,
 			"array_to_string":                 true,
+			"version":                         true,
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -79,6 +80,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_get_statisticsobjdef_columns": true,
 			"shobj_description":               true,
 			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
+			"version":                         true, // PostgreSQL-compatible version string for SQLAlchemy
 		},
 	}
 }
