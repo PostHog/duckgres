@@ -398,3 +398,75 @@ func TestCatalogStubs(t *testing.T) {
 	}
 	runQueryTests(t, tests)
 }
+
+// TestCatalogPhase2Views tests Phase 2 pg_catalog views (pg_stat_activity, pg_extension)
+func TestCatalogPhase2Views(t *testing.T) {
+	tests := []QueryTest{
+		// pg_stat_activity - should return empty with correct schema
+		{
+			Name:         "pg_stat_activity",
+			Query:        "SELECT datid, datname, pid, usename, application_name, state, query FROM pg_stat_activity",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "pg_stat_activity_qualified",
+			Query:        "SELECT * FROM pg_catalog.pg_stat_activity",
+			DuckgresOnly: true,
+		},
+
+		// pg_extension - should return plpgsql
+		{
+			Name:         "pg_extension",
+			Query:        "SELECT extname, extversion FROM pg_extension",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "pg_extension_qualified",
+			Query:        "SELECT oid, extname, extowner FROM pg_catalog.pg_extension",
+			DuckgresOnly: true,
+		},
+	}
+	runQueryTests(t, tests)
+}
+
+// TestCatalogPhase2Macros tests Phase 2 macros (row_to_json, set_config, pg_date_trunc)
+func TestCatalogPhase2Macros(t *testing.T) {
+	tests := []QueryTest{
+		// row_to_json - convert struct to JSON
+		{
+			Name:         "row_to_json_simple",
+			Query:        "SELECT row_to_json(row(1, 'test')) IS NOT NULL",
+			DuckgresOnly: true,
+		},
+
+		// set_config - stub that returns the value
+		{
+			Name:         "set_config_returns_value",
+			Query:        "SELECT set_config('myvar', 'myvalue', false)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "set_config_local",
+			Query:        "SELECT set_config('timezone', 'UTC', true)",
+			DuckgresOnly: true,
+		},
+
+		// pg_date_trunc - safe date_trunc wrapper
+		{
+			Name:         "pg_date_trunc_day",
+			Query:        "SELECT pg_date_trunc('day', '2024-01-15 12:30:00'::timestamp)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "pg_date_trunc_month",
+			Query:        "SELECT pg_date_trunc('month', '2024-01-15 12:30:00'::timestamp)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "pg_date_trunc_null_safe",
+			Query:        "SELECT pg_date_trunc('day', NULL::timestamp) IS NULL",
+			DuckgresOnly: true,
+		},
+	}
+	runQueryTests(t, tests)
+}

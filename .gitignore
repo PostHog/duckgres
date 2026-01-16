@@ -27,3 +27,18 @@ Thumbs.db
 *.test
 *.out
 coverage.html
+
+# Local config files with credentials
+duckgres_r2_test.yaml
+duckgres_*.yaml
+!duckgres.yaml.example
+
+# Local convenience scripts
+run-duckgres.sh
+
+# Local Docker setup
+docker-compose-local.yml
+Dockerfile
+
+# Local docs (may contain project-specific notes)
+docs/

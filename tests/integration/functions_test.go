@@ -62,7 +62,7 @@ func TestFunctionsString(t *testing.T) {
 
 		// Formatting
 		{Name: "format_s", Query: "SELECT format('Hello %s', 'world')"},
-		{Name: "format_I", Query: "SELECT format('Column: %I', 'my_column')"},
+		{Name: "format_I", Query: "SELECT format('Column: %I', 'my_column')", Skip: SkipPostgresSpecific}, // %I identifier quoting not supported by DuckDB printf()
 
 		// Regular expressions
 		{Name: "regexp_replace", Query: "SELECT regexp_replace('hello', 'l+', 'L')"},

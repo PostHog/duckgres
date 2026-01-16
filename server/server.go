@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,6 +80,12 @@ type DuckLakeConfig struct {
 	// Default: checks all sources in AWS SDK order
 	S3Chain   string // e.g., "env;config" to check env vars then config files
 	S3Profile string // AWS profile name to use (for "config" chain)
+
+	// R2 (Cloudflare) configuration
+	// Use these instead of S3 settings when ObjectStore uses r2:// URLs
+	R2AccountID string // Cloudflare account ID
+	R2AccessKey string // R2 access key ID (if not set, falls back to S3AccessKey)
+	R2SecretKey string // R2 secret access key (if not set, falls back to S3SecretKey)
 }
 
 type Server struct {
@@ -294,7 +301,16 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	} else if s.cfg.DuckLake.MetadataStore != "" {
 		duckLakeMode = true
 
-		// Recreate pg_class_full to source from DuckLake metadata instead of DuckDB's pg_catalog.
+		// Refresh DuckLake cache tables with table/column metadata.
+		// This caches data from __ducklake_metadata_* tables to prevent SSL timeouts
+		// during long Metabase syncs that repeatedly query catalog metadata.
+		cache := NewDuckLakeCache(db, "ducklake")
+		if err := cache.RefreshSync(); err != nil {
+			log.Printf("Warning: failed to refresh DuckLake cache: %v", err)
+			// Non-fatal: views will fall back to direct queries (slower)
+		}
+
+		// Recreate pg_class_full to source from DuckLake cache tables instead of direct metadata queries.
 		// This ensures consistent PostgreSQL-compatible OIDs across all pg_class queries.
 		if err := recreatePgClassForDuckLake(db); err != nil {
 			log.Printf("Warning: failed to recreate pg_class_full for DuckLake: %v", err)
@@ -306,6 +322,30 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		if err := recreatePgNamespaceForDuckLake(db); err != nil {
 			log.Printf("Warning: failed to recreate pg_namespace for DuckLake: %v", err)
 			// Non-fatal: continue with DuckDB-based pg_namespace
+		}
+
+		// Recreate pg_attribute to source from DuckLake metadata.
+		// Needed for column discovery queries from Metabase/Grafana.
+		if err := recreatePgAttributeForDuckLake(db); err != nil {
+			log.Printf("Warning: failed to recreate pg_attribute for DuckLake: %v", err)
+		}
+
+		// Recreate pg_index with synthetic primary keys for tables without real PKs.
+		// DuckLake doesn't support constraints, so we synthesize PKs from id/*_id columns.
+		if err := recreatePgIndexForDuckLake(db); err != nil {
+			log.Printf("Warning: failed to recreate pg_index for DuckLake: %v", err)
+		}
+
+		// Recreate pg_constraint with synthetic primary keys.
+		// Metabase uses this for primary key discovery.
+		if err := recreatePgConstraintForDuckLake(db); err != nil {
+			log.Printf("Warning: failed to recreate pg_constraint for DuckLake: %v", err)
+		}
+
+		// Recreate pg_tables to source from DuckLake metadata.
+		// This ensures tables are visible with correct schema names.
+		if err := recreatePgTablesForDuckLake(db); err != nil {
+			log.Printf("Warning: failed to recreate pg_tables for DuckLake: %v", err)
 		}
 	}
 
@@ -383,19 +423,30 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		return nil
 	}
 
-	// Create S3 secret if using object store
-	// - With explicit credentials (S3AccessKey set) or custom endpoint
-	// - With credential_chain provider (for AWS S3)
+	// Create storage secret if using object store
+	// Supports both S3 and R2 (Cloudflare) storage
 	if s.cfg.DuckLake.ObjectStore != "" {
-		needsSecret := s.cfg.DuckLake.S3Endpoint != "" ||
-			s.cfg.DuckLake.S3AccessKey != "" ||
-			s.cfg.DuckLake.S3Provider == "credential_chain" ||
-			s.cfg.DuckLake.S3Chain != "" ||
-			s.cfg.DuckLake.S3Profile != ""
+		isR2 := strings.HasPrefix(s.cfg.DuckLake.ObjectStore, "r2://")
 
-		if needsSecret {
-			if err := s.createS3Secret(db); err != nil {
-				return fmt.Errorf("failed to create S3 secret: %w", err)
+		if isR2 {
+			// R2 requires account ID and credentials
+			if s.cfg.DuckLake.R2AccountID != "" {
+				if err := s.createR2Secret(db); err != nil {
+					return fmt.Errorf("failed to create R2 secret: %w", err)
+				}
+			}
+		} else {
+			// S3/MinIO credentials
+			needsSecret := s.cfg.DuckLake.S3Endpoint != "" ||
+				s.cfg.DuckLake.S3AccessKey != "" ||
+				s.cfg.DuckLake.S3Provider == "credential_chain" ||
+				s.cfg.DuckLake.S3Chain != "" ||
+				s.cfg.DuckLake.S3Profile != ""
+
+			if needsSecret {
+				if err := s.createS3Secret(db); err != nil {
+					return fmt.Errorf("failed to create S3 secret: %w", err)
+				}
 			}
 		}
 	}
@@ -574,6 +625,50 @@ func (s *Server) buildCredentialChainSecret() string {
 
 	secret += "\n\t\t)"
 	return secret
+}
+
+// createR2Secret creates a DuckDB secret for Cloudflare R2 access
+// R2 requires TYPE R2 with ACCOUNT_ID, KEY_ID, and SECRET
+func (s *Server) createR2Secret(db *sql.DB) error {
+	// Check if secret already exists to avoid unnecessary creation
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'ducklake_r2'").Scan(&count)
+	if err == nil && count > 0 {
+		log.Printf("R2 secret already exists, skipping creation")
+		return nil
+	}
+
+	// Use R2-specific credentials if set, otherwise fall back to S3 credentials
+	keyID := s.cfg.DuckLake.R2AccessKey
+	if keyID == "" {
+		keyID = s.cfg.DuckLake.S3AccessKey
+	}
+	secret := s.cfg.DuckLake.R2SecretKey
+	if secret == "" {
+		secret = s.cfg.DuckLake.S3SecretKey
+	}
+
+	// Escape single quotes in credentials to prevent SQL syntax errors
+	escapeSQLString := func(s string) string {
+		return strings.ReplaceAll(s, "'", "''")
+	}
+
+	secretStmt := fmt.Sprintf(`
+		CREATE OR REPLACE SECRET ducklake_r2 (
+			TYPE R2,
+			KEY_ID '%s',
+			SECRET '%s',
+			ACCOUNT_ID '%s'
+		)`, escapeSQLString(keyID), escapeSQLString(secret), escapeSQLString(s.cfg.DuckLake.R2AccountID))
+
+	log.Printf("Creating R2 secret for account: %s", s.cfg.DuckLake.R2AccountID)
+
+	if _, err := db.Exec(secretStmt); err != nil {
+		return fmt.Errorf("failed to create R2 secret: %w", err)
+	}
+
+	log.Printf("Created R2 secret successfully")
+	return nil
 }
 
 func (s *Server) handleConnection(conn net.Conn) {

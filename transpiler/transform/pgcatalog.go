@@ -47,6 +47,26 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_inherits":           "pg_inherits",
 			"pg_matviews":           "pg_matviews",
 			"pg_stat_user_tables":   "pg_stat_user_tables",
+			// New views for Metabase/Grafana compatibility
+			"pg_attribute":   "pg_attribute",
+			"pg_type":        "pg_type",
+			"pg_index":       "pg_index",
+			"pg_constraint":  "pg_constraint",
+			"pg_description": "pg_description",
+			"pg_attrdef":     "pg_attrdef",
+			"pg_proc":        "pg_proc",
+			// Also map our compatibility view names to themselves so they get
+			// memory.main. prefix in DuckLake mode when referenced directly
+			"pg_class_full": "pg_class_full",
+			// pg_tables and pg_views wrappers that map 'main' to 'public'
+			"pg_tables": "pg_tables",
+			"pg_views":  "pg_views",
+			// User/credential views for Metabase connection validation
+			"pg_shadow": "pg_shadow",
+			"pg_user":   "pg_user",
+			// Phase 2: Additional views for Grafana/Metabase compatibility
+			"pg_stat_activity": "pg_stat_activity",
+			"pg_extension":     "pg_extension",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
@@ -66,7 +86,23 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_is_in_recovery":               true,
 			"has_schema_privilege":            true,
 			"has_table_privilege":             true,
+			"has_any_column_privilege":        true,
 			"array_to_string":                 true,
+			// New functions for Metabase/Grafana compatibility
+			"current_schemas":         true,
+			"array_upper":             true,
+			"_pg_expandarray":         true, // PostgreSQL information_schema function for array expansion
+			"pg_get_viewdef":          true, // View definition introspection
+			"pg_total_relation_size":  true, // Size functions (stubs)
+			"pg_table_size":           true,
+			"pg_indexes_size":         true,
+			"pg_relation_size":        true,
+			"pg_backend_pid":          true, // Backend process ID
+			"quote_ident":             true, // Identifier quoting
+			// Phase 2: Additional functions
+			"row_to_json":    true, // JSON serialization
+			"set_config":     true, // Configuration stub
+			"pg_date_trunc":  true, // Safe date_trunc wrapper
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -79,6 +115,32 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_get_statisticsobjdef_columns": true,
 			"shobj_description":               true,
 			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
+			// New custom macros for Metabase/Grafana compatibility
+			"current_schemas":          true,
+			"array_upper":              true,
+			"has_schema_privilege":     true,
+			"has_table_privilege":      true,
+			"has_any_column_privilege": true,
+			"format_type":              true,
+			"obj_description":          true,
+			"col_description":          true,
+			"pg_get_expr":              true,
+			"pg_table_is_visible":      true,
+			"pg_get_indexdef":          true,
+			"pg_get_constraintdef":     true,
+			"_pg_expandarray":          true, // PostgreSQL information_schema function
+			// Phase 1: Additional macros for Metabase compatibility
+			"pg_get_viewdef":         true, // View definition introspection
+			"pg_total_relation_size": true, // Size functions (stubs)
+			"pg_table_size":          true,
+			"pg_indexes_size":        true,
+			"pg_relation_size":       true,
+			"pg_backend_pid":         true, // Backend process ID
+			"quote_ident":            true, // Identifier quoting
+			// Phase 2: Additional custom macros
+			"row_to_json":   true, // JSON serialization
+			"set_config":    true, // Configuration stub
+			"pg_date_trunc": true, // Safe date_trunc wrapper
 		},
 	}
 }
@@ -132,6 +194,11 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 					n.RangeVar.Schemaname = ""
 				}
 				*changed = true
+			} else if t.DuckLakeMode && strings.EqualFold(n.RangeVar.Schemaname, "public") {
+				// In DuckLake mode, remap "public" schema to "main" schema for user tables
+				// Metabase/Grafana query "public.TableName" but DuckLake tables are in "main"
+				n.RangeVar.Schemaname = "main"
+				*changed = true
 			} else if t.DuckLakeMode && n.RangeVar.Schemaname == "" && n.RangeVar.Catalogname == "" {
 				// Handle unqualified pg_catalog view names in DuckLake mode
 				// e.g., "SELECT * FROM pg_matviews" -> "SELECT * FROM memory.main.pg_matviews"
@@ -160,14 +227,25 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 				}
 			}
 
-			// Handle pg_catalog prefixed functions
+			// Handle 3-argument privilege functions by dropping the user argument
+			// PostgreSQL: has_schema_privilege(user, schema, priv) -> has_schema_privilege(schema, priv)
+			// PostgreSQL: has_table_privilege(user, table, priv) -> has_table_privilege(table, priv)
+			// PostgreSQL: has_any_column_privilege(user, table, priv) -> has_any_column_privilege(table, priv)
+			if (funcName == "has_schema_privilege" || funcName == "has_table_privilege" || funcName == "has_any_column_privilege") && len(n.FuncCall.Args) == 3 {
+				// Drop the first argument (user) to convert to 2-arg form
+				n.FuncCall.Args = n.FuncCall.Args[1:]
+				*changed = true
+			}
+
+			// Handle pg_catalog or information_schema prefixed functions
 			if len(n.FuncCall.Funcname) >= 2 {
 				if first := n.FuncCall.Funcname[0]; first != nil {
-					if str := first.GetString_(); str != nil && strings.EqualFold(str.Sval, "pg_catalog") {
-						if t.Functions[funcName] {
+					if str := first.GetString_(); str != nil {
+						schemaName := strings.ToLower(str.Sval)
+						if (schemaName == "pg_catalog" || schemaName == "information_schema") && t.Functions[funcName] {
 							// Check if this is a custom macro that needs memory.main. prefix
 							if t.DuckLakeMode && t.CustomMacros[funcName] {
-								// Replace pg_catalog with memory.main
+								// Replace schema with memory.main
 								n.FuncCall.Funcname[0] = &pg_query.Node{
 									Node: &pg_query.Node_String_{
 										String_: &pg_query.String{Sval: "memory"},
@@ -181,7 +259,7 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 										},
 									}}, n.FuncCall.Funcname[1:]...)...)
 							} else {
-								// Remove the pg_catalog prefix
+								// Remove the schema prefix
 								n.FuncCall.Funcname = n.FuncCall.Funcname[1:]
 							}
 							*changed = true
@@ -210,6 +288,16 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 		// Recurse into type cast arguments
 		if n.TypeCast != nil {
 			t.walkAndTransform(n.TypeCast.Arg, changed)
+		}
+
+	case *pg_query.Node_AIndirection:
+		// A_Indirection wraps expressions with field accessors like (func()).field
+		// Recurse into the inner argument to transform any function calls
+		if n.AIndirection != nil {
+			t.walkAndTransform(n.AIndirection.Arg, changed)
+			for _, ind := range n.AIndirection.Indirection {
+				t.walkAndTransform(ind, changed)
+			}
 		}
 
 	case *pg_query.Node_AExpr:
@@ -337,6 +425,19 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 			t.walkAndTransform(n.NullTest.Arg, changed)
 		}
 
+	case *pg_query.Node_ColumnRef:
+		// Column references: public."TableName".column -> main."TableName".column in DuckLake mode
+		// Metabase uses fully-qualified column refs like: SELECT public."Notification".id
+		if n.ColumnRef != nil && t.DuckLakeMode && len(n.ColumnRef.Fields) >= 2 {
+			if first := n.ColumnRef.Fields[0]; first != nil {
+				if str := first.GetString_(); str != nil && strings.EqualFold(str.Sval, "public") {
+					// Remap public to main
+					str.Sval = "main"
+					*changed = true
+				}
+			}
+		}
+
 	case *pg_query.Node_List:
 		if n.List != nil {
 			for _, item := range n.List.Items {
@@ -387,6 +488,31 @@ func (t *PgCatalogTransform) walkSelectStmt(stmt *pg_query.SelectStmt, changed *
 	}
 	t.walkAndTransform(stmt.LimitCount, changed)
 	t.walkAndTransform(stmt.LimitOffset, changed)
+
+	// DuckLake workaround: Add ORDER BY 1 when LIMIT is present but no ORDER BY
+	// This prevents DuckLake from using an optimization that reads stale/deleted data files
+	if t.DuckLakeMode && stmt.LimitCount != nil && len(stmt.SortClause) == 0 {
+		stmt.SortClause = []*pg_query.Node{
+			{
+				Node: &pg_query.Node_SortBy{
+					SortBy: &pg_query.SortBy{
+						Node: &pg_query.Node{
+							Node: &pg_query.Node_AConst{
+								AConst: &pg_query.A_Const{
+									Val: &pg_query.A_Const_Ival{
+										Ival: &pg_query.Integer{Ival: 1},
+									},
+								},
+							},
+						},
+						SortbyDir:   pg_query.SortByDir_SORTBY_DEFAULT,
+						SortbyNulls: pg_query.SortByNulls_SORTBY_NULLS_DEFAULT,
+					},
+				},
+			},
+		}
+		*changed = true
+	}
 
 	if stmt.WithClause != nil {
 		t.walkAndTransform(&pg_query.Node{Node: &pg_query.Node_WithClause{WithClause: stmt.WithClause}}, changed)

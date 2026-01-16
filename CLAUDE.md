@@ -85,10 +85,14 @@ Three-tier configuration (highest to lowest priority):
 ## Testing
 
 ```bash
-# Build
-go build -o duckgres .
+# Build and run with DuckLake config (kills existing, tails logs)
+./run-duckgres.sh
 
-# Run on non-standard port
+# Build and run with limited tables for faster Metabase/Grafana testing
+./run-duckgres.sh 5   # Only show 5 tables (DUCKGRES_TABLE_LIMIT=5)
+
+# Manual build and run
+go build -o duckgres .
 ./duckgres --port 35437
 
 # Connect with psql

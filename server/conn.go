@@ -262,7 +262,7 @@ func (c *clientConn) handleStartup() error {
 
 func (c *clientConn) sendInitialParams() {
 	params := map[string]string{
-		"server_version":          "15.0 (Duckgres)",
+		"server_version":          "15.0",
 		"server_encoding":         "UTF8",
 		"client_encoding":         "UTF8",
 		"DateStyle":               "ISO, MDY",
@@ -358,6 +358,10 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	log.Printf("[%s] Query: %s", c.username, query)
+
+	// Fix JDBC driver escaping of regex operators (e.g., \!~ -> !~)
+	// PostgreSQL JDBC sometimes sends escaped operators which pg_query can't parse
+	query = fixJDBCEscapedOperators(query)
 
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
 	tr := c.newTranspiler(false)
@@ -2100,4 +2104,17 @@ func isAlterTableNotTableError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "cannot use alter table") &&
 		strings.Contains(msg, "not a table")
+}
+
+// fixJDBCEscapedOperators removes backslash escaping from regex operators.
+// PostgreSQL JDBC driver sometimes sends escaped operators like \!~ which
+// pg_query cannot parse. This converts them back to standard operators.
+func fixJDBCEscapedOperators(query string) string {
+	// Fix escaped regex operators: \!~ -> !~, \!~* -> !~*
+	query = strings.ReplaceAll(query, `\!~*`, `!~*`)
+	query = strings.ReplaceAll(query, `\!~`, `!~`)
+	// Fix escaped LIKE operators: \!~~ -> !~~, \!~~* -> !~~*
+	query = strings.ReplaceAll(query, `\!~~*`, `!~~*`)
+	query = strings.ReplaceAll(query, `\!~~`, `!~~`)
+	return query
 }

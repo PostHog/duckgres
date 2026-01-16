@@ -40,7 +40,7 @@ type RateLimitFileConfig struct {
 
 type DuckLakeFileConfig struct {
 	MetadataStore string `yaml:"metadata_store"` // e.g., "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
-	ObjectStore   string `yaml:"object_store"`   // e.g., "s3://bucket/path/" for S3/MinIO storage
+	ObjectStore   string `yaml:"object_store"`   // e.g., "s3://bucket/path/" for S3/MinIO or "r2://bucket/path/" for R2
 
 	// S3 credential provider: "config" (explicit) or "credential_chain" (AWS SDK)
 	S3Provider string `yaml:"s3_provider"`
@@ -56,6 +56,11 @@ type DuckLakeFileConfig struct {
 	// Credential chain provider settings (AWS SDK credential chain)
 	S3Chain   string `yaml:"s3_chain"`   // e.g., "env;config" - which credential sources to check
 	S3Profile string `yaml:"s3_profile"` // AWS profile name for config chain
+
+	// R2 (Cloudflare) settings for r2:// URLs
+	R2AccountID string `yaml:"r2_account_id"` // Cloudflare account ID
+	R2AccessKey string `yaml:"r2_access_key"` // R2 access key ID
+	R2SecretKey string `yaml:"r2_secret_key"` // R2 secret access key
 }
 
 // loadConfigFile loads configuration from a YAML file
@@ -221,6 +226,17 @@ func main() {
 		if fileCfg.DuckLake.S3Profile != "" {
 			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
 		}
+
+		// Apply R2 (Cloudflare) config
+		if fileCfg.DuckLake.R2AccountID != "" {
+			cfg.DuckLake.R2AccountID = fileCfg.DuckLake.R2AccountID
+		}
+		if fileCfg.DuckLake.R2AccessKey != "" {
+			cfg.DuckLake.R2AccessKey = fileCfg.DuckLake.R2AccessKey
+		}
+		if fileCfg.DuckLake.R2SecretKey != "" {
+			cfg.DuckLake.R2SecretKey = fileCfg.DuckLake.R2SecretKey
+		}
 	}
 
 	// Apply environment variables (override config file)
@@ -273,6 +289,16 @@ func main() {
 	}
 	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
+	}
+	// R2 (Cloudflare) environment variables
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_R2_ACCOUNT_ID"); v != "" {
+		cfg.DuckLake.R2AccountID = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_R2_ACCESS_KEY"); v != "" {
+		cfg.DuckLake.R2AccessKey = v
+	}
+	if v := os.Getenv("DUCKGRES_DUCKLAKE_R2_SECRET_KEY"); v != "" {
+		cfg.DuckLake.R2SecretKey = v
 	}
 
 	// Apply CLI flags (highest priority)

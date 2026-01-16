@@ -718,6 +718,18 @@ func TestTranspile_FunctionMappings(t *testing.T) {
 			contains: "json_object",
 			excludes: "json_build_object",
 		},
+		{
+			name:     "format -> printf",
+			input:    "SELECT format('Hello %s', 'world')",
+			contains: "printf",
+			excludes: "format",
+		},
+		{
+			name:     "format with multiple args -> printf",
+			input:    "SELECT format('Name: %s, Age: %s', name, age) FROM users",
+			contains: "printf",
+			excludes: "format",
+		},
 	}
 
 	tr := New(DefaultConfig())

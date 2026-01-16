@@ -1,0 +1,42 @@
+# Duckgres Configuration Example
+# Copy this file to duckgres.yaml and fill in your values
+
+host: "0.0.0.0"
+port: 5432
+
+# Directory for DuckDB database files
+data_dir: "./data"
+
+# User credentials (username: password)
+users:
+  postgres: "your_password_here"
+
+# Optional: TLS certificates (auto-generated if not specified)
+# tls_cert: "./certs/server.crt"
+# tls_key: "./certs/server.key"
+
+# Optional: DuckDB extensions to load
+extensions:
+  - ducklake
+  # - spatial
+  # - httpfs
+
+# Optional: DuckLake configuration for cloud-native lakehouse
+# ducklake:
+#   # PostgreSQL metadata store connection string
+#   metadata_store: "postgres:host=your-host.com port=5432 dbname=ducklake user=your_user password=YOUR_PASSWORD sslmode=require"
+#
+#   # Object store URL (S3, R2, GCS, etc.)
+#   object_store: "s3://your-bucket/"
+#
+#   # For AWS S3:
+#   # s3_region: "us-east-1"
+#   # s3_access_key: "YOUR_ACCESS_KEY"
+#   # s3_secret_key: "YOUR_SECRET_KEY"
+#   # s3_endpoint: ""  # Leave empty for AWS, set for S3-compatible services
+#   # s3_use_ssl: true
+#
+#   # For Cloudflare R2:
+#   # r2_account_id: "YOUR_ACCOUNT_ID"
+#   # r2_access_key: "YOUR_ACCESS_KEY"
+#   # r2_secret_key: "YOUR_SECRET_KEY"

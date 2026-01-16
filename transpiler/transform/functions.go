@@ -114,6 +114,12 @@ var functionNameMapping = map[string]string{
 	"regexp_split_to_array": "regexp_split_to_array",
 	"regexp_split_to_table": "regexp_split_to_table",
 
+	// String formatting
+	// NOTE: PostgreSQL format() supports %s, %I (identifier), %L (literal)
+	// DuckDB printf() only supports standard C-style specifiers (%s, %d, etc.)
+	// Queries using %I or %L will fail - these are PostgreSQL-specific
+	"format": "printf",
+
 	// Misc functions
 	"generate_series": "generate_series", // DuckDB has this now
 	"coalesce":        "coalesce",        // same
