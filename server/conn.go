@@ -1913,6 +1913,13 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	log.Printf("[%s] Execute %q with %d params: %s", c.username, portalName, len(args), p.stmt.query)
 
+	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
+	trimmedQuery := strings.TrimSpace(p.stmt.query)
+	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
+		writeEmptyQueryResponse(c.writer)
+		return
+	}
+
 	// Check if this is a PostgreSQL-specific SET command that should be ignored
 	// (determined by transpiler during Parse)
 	if p.stmt.isIgnoredSet {
