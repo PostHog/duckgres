@@ -289,28 +289,45 @@ func (t *TypeCastTransform) walkSelectStmt(stmt *pg_query.SelectStmt, changed *b
 	}
 }
 
-// createRegclassFromNameSubquery creates a SubLink for 'tablename'::regclass
-// This converts: 'users'::regclass
-// To: (SELECT oid FROM pg_class_full WHERE relname = 'users')
+// createRegclassFromNameSubquery creates a SubLink for 'tablename'::regclass or 'tablename'::text::regclass
+// This converts: 'users'::regclass or 'users'::text::regclass
+// To: (SELECT oid FROM pg_class_full WHERE relname = 'users') or (SELECT oid FROM pg_class_full WHERE relname = 'users'::text)
 // In DuckLake mode, pg_class_full sources from DuckLake metadata for consistent PostgreSQL OIDs.
 func (t *TypeCastTransform) createRegclassFromNameSubquery(arg *pg_query.Node) *pg_query.SubLink {
 	if arg == nil {
 		return nil
 	}
 
-	// Get the string value from the argument
-	var tableName string
+	// Check for string literal or TypeCast to text-like type
+	var whereExpr *pg_query.Node
+
 	if aConst := arg.GetAConst(); aConst != nil {
-		if sval := aConst.GetSval(); sval != nil {
-			tableName = sval.Sval
+		// Direct string literal: 'tablename'::regclass
+		if sval := aConst.GetSval(); sval != nil && sval.Sval != "" {
+			whereExpr = &pg_query.Node{
+				Node: &pg_query.Node_AConst{
+					AConst: &pg_query.A_Const{
+						Val: &pg_query.A_Const_Sval{
+							Sval: &pg_query.String{Sval: sval.Sval},
+						},
+					},
+				},
+			}
+		}
+	} else if typeCast := arg.GetTypeCast(); typeCast != nil {
+		// TypeCast to text-like type: 'tablename'::text::regclass or col::text::regclass
+		innerTypeName := extractTypeNameFromTypeName(typeCast.TypeName)
+		if isTextType(innerTypeName) {
+			// Use the entire TypeCast expression as the WHERE clause value
+			whereExpr = arg
 		}
 	}
 
-	if tableName == "" {
+	if whereExpr == nil {
 		return nil
 	}
 
-	// Build: SELECT oid FROM pg_class WHERE relname = 'tablename' LIMIT 1
+	// Build: SELECT oid FROM pg_class WHERE relname = <expr>
 	// Create the SELECT target: oid
 	targetList := []*pg_query.Node{
 		{
@@ -347,7 +364,7 @@ func (t *TypeCastTransform) createRegclassFromNameSubquery(arg *pg_query.Node) *
 		},
 	}
 
-	// Create the WHERE clause: relname = 'tablename'
+	// Create the WHERE clause: relname = <expr>
 	whereClause := &pg_query.Node{
 		Node: &pg_query.Node_AExpr{
 			AExpr: &pg_query.A_Expr{
@@ -364,15 +381,7 @@ func (t *TypeCastTransform) createRegclassFromNameSubquery(arg *pg_query.Node) *
 						},
 					},
 				},
-				Rexpr: &pg_query.Node{
-					Node: &pg_query.Node_AConst{
-						AConst: &pg_query.A_Const{
-							Val: &pg_query.A_Const_Sval{
-								Sval: &pg_query.String{Sval: tableName},
-							},
-						},
-					},
-				},
+				Rexpr: whereExpr,
 			},
 		},
 	}
@@ -407,7 +416,7 @@ func (t *TypeCastTransform) createRegclassFromOidSubquery(arg *pg_query.Node) *p
 		return nil
 	}
 
-	// Check if argument is an integer constant or a column reference (likely an OID)
+	// Check if argument is an integer constant or an explicit OID type cast
 	var isOidLike bool
 	var argCopy *pg_query.Node
 
@@ -416,18 +425,21 @@ func (t *TypeCastTransform) createRegclassFromOidSubquery(arg *pg_query.Node) *p
 			isOidLike = true
 			argCopy = arg
 		}
-	} else if colRef := arg.GetColumnRef(); colRef != nil {
-		// Only accept QUALIFIED column references (e.g., a.attrelid with 2+ fields)
-		// Unqualified refs like 'oid' would be shadowed by pg_class_full.oid in the subquery
-		if len(colRef.Fields) >= 2 {
+	} else if typeCast := arg.GetTypeCast(); typeCast != nil {
+		// Nested type cast - check the inner cast's target type
+		innerTypeName := extractTypeNameFromTypeName(typeCast.TypeName)
+		if isOIDType(innerTypeName) {
+			// Inner cast is to OID-like type (oid, int4, int8) -> use OID lookup
 			isOidLike = true
 			argCopy = arg
 		}
-	} else if typeCast := arg.GetTypeCast(); typeCast != nil {
-		// Nested type cast - could be something like foo::oid::regclass
-		isOidLike = true
-		argCopy = arg
+		// For text-like types, return nil to let caller try name-based path
+		// For unknown types, fall through to isOidLike = false (safe fallback)
 	}
+	// NOTE: ColumnRef is intentionally not handled here.
+	// Without type information, we cannot reliably determine if a column contains
+	// an OID or a name. Users who need OID lookup from columns should use explicit
+	// cast: col::oid::regclass
 
 	if !isOidLike {
 		return nil
@@ -504,4 +516,55 @@ func (t *TypeCastTransform) createRegclassFromOidSubquery(arg *pg_query.Node) *p
 			},
 		},
 	}
+}
+
+// extractTypeNameFromTypeName extracts the lowercase type name from a TypeName node.
+func extractTypeNameFromTypeName(typeName *pg_query.TypeName) string {
+	if typeName == nil || len(typeName.Names) == 0 {
+		return ""
+	}
+
+	// For pg_catalog.typename pattern, get the second name
+	if len(typeName.Names) >= 2 {
+		if first := typeName.Names[0]; first != nil {
+			if str := first.GetString_(); str != nil && strings.EqualFold(str.Sval, "pg_catalog") {
+				if second := typeName.Names[1]; second != nil {
+					if typeStr := second.GetString_(); typeStr != nil {
+						return strings.ToLower(typeStr.Sval)
+					}
+				}
+			}
+		}
+		// For other schema.typename patterns, get the last name
+		last := typeName.Names[len(typeName.Names)-1]
+		if str := last.GetString_(); str != nil {
+			return strings.ToLower(str.Sval)
+		}
+	}
+
+	// Single name
+	if first := typeName.Names[0]; first != nil {
+		if str := first.GetString_(); str != nil {
+			return strings.ToLower(str.Sval)
+		}
+	}
+	return ""
+}
+
+// isOIDType returns true if the type name represents an OID-like type.
+func isOIDType(typeName string) bool {
+	switch typeName {
+	case "oid", "int4", "int8", "integer", "bigint":
+		return true
+	}
+	return false
+}
+
+// isTextType returns true if the type name represents a text-like type.
+func isTextType(typeName string) bool {
+	switch typeName {
+	case "text", "varchar", "name", "char", "bpchar", "character varying":
+		return true
+	}
+	return false
 }

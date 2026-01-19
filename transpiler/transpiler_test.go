@@ -233,16 +233,43 @@ func TestTranspile_TypeCast(t *testing.T) {
 			excludes: "",
 		},
 		{
-			name:     "regclass cast from qualified column ref",
+			name:     "regclass cast from qualified column ref - fallback to varchar",
 			input:    "SELECT a.attrelid::regclass FROM pg_attribute a",
-			contains: "select relname from",
-			excludes: "",
+			contains: "varchar",             // Now falls back (conservative - no type info)
+			excludes: "select relname from", // No subquery without explicit cast
 		},
 		{
 			name:     "regclass to oid chain",
 			input:    "SELECT 'users'::regclass::oid",
 			contains: "select oid from",
 			excludes: "regclass",
+		},
+		// Bug fix tests: TypeCast to text should use name lookup, not OID lookup
+		{
+			name:     "regclass cast from text typecast - name lookup",
+			input:    "SELECT 'users'::text::regclass",
+			contains: "where relname =", // Name-based lookup
+			excludes: "where oid =",     // NOT OID-based lookup
+		},
+		{
+			name:     "regclass cast from oid typecast - OID lookup",
+			input:    "SELECT foo::oid::regclass FROM bar",
+			contains: "select relname from", // OID-based lookup
+			excludes: "where relname =",     // NOT name-based lookup
+		},
+		// Bug fix: Column refs should fall back to varchar (no type info)
+		{
+			name:     "regclass from column ref - fallback to varchar",
+			input:    "SELECT a.some_col::regclass FROM tab a",
+			contains: "varchar",             // Falls back safely
+			excludes: "select relname from", // No subquery
+		},
+		// Users can explicitly cast to get OID lookup
+		{
+			name:     "regclass from column via explicit oid cast",
+			input:    "SELECT a.attrelid::oid::regclass FROM pg_attribute a",
+			contains: "select relname from", // OID lookup via explicit cast
+			excludes: "",
 		},
 	}
 
