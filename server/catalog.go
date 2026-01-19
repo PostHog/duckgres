@@ -339,6 +339,9 @@ func initPgCatalog(db *sql.DB) error {
 		// pg_get_constraintdef - get constraint definition
 		`CREATE OR REPLACE MACRO pg_get_constraintdef(constraint_oid) AS ''`,
 		`CREATE OR REPLACE MACRO pg_get_constraintdef(constraint_oid, pretty) AS ''`,
+		// pg_get_serial_sequence - get sequence name for a serial/identity column
+		// Returns NULL because DuckDB doesn't have identity columns and regclass casting isn't supported
+		`CREATE OR REPLACE MACRO pg_get_serial_sequence(table_name, column_name) AS NULL`,
 		// pg_get_statisticsobjdef_columns - get column list for extended statistics
 		`CREATE OR REPLACE MACRO pg_get_statisticsobjdef_columns(stat_oid) AS ''`,
 		// pg_relation_is_publishable - check if relation can be published

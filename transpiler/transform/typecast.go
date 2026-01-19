@@ -81,16 +81,23 @@ func (t *TypeCastTransform) walkAndTransform(node *pg_query.Node, changed *bool)
 				}
 			}
 
-			// Special handling for ::regclass with string literal argument
-			// Convert 'tablename'::regclass to (SELECT oid FROM pg_class WHERE relname = 'tablename')
+			// Special handling for ::regclass casts
+			// String literal: 'tablename'::regclass -> (SELECT oid FROM pg_class WHERE relname = 'tablename')
+			// OID/integer: oid_val::regclass -> (SELECT relname FROM pg_class WHERE oid = oid_val)
 			if typeLower == "regclass" {
-				if sublink := t.createRegclassSubquery(n.TypeCast.Arg); sublink != nil {
-					// Replace the TypeCast node with the SubLink
+				// First check if argument is a string literal (table name lookup -> OID)
+				if sublink := t.createRegclassFromNameSubquery(n.TypeCast.Arg); sublink != nil {
 					node.Node = &pg_query.Node_SubLink{SubLink: sublink}
 					*changed = true
 					return
 				}
-				// For non-string arguments (like oid::regclass), fall through to varchar mapping
+				// Check if argument is an integer/OID (OID lookup -> table name, for ::regclass::text pattern)
+				if sublink := t.createRegclassFromOidSubquery(n.TypeCast.Arg); sublink != nil {
+					node.Node = &pg_query.Node_SubLink{SubLink: sublink}
+					*changed = true
+					return
+				}
+				// For other expressions, convert to varchar as fallback
 				typeLower = "regclass_fallback"
 			}
 
@@ -282,11 +289,11 @@ func (t *TypeCastTransform) walkSelectStmt(stmt *pg_query.SelectStmt, changed *b
 	}
 }
 
-// createRegclassSubquery creates a SubLink for 'tablename'::regclass
+// createRegclassFromNameSubquery creates a SubLink for 'tablename'::regclass
 // This converts: 'users'::regclass
 // To: (SELECT oid FROM pg_class_full WHERE relname = 'users')
 // In DuckLake mode, pg_class_full sources from DuckLake metadata for consistent PostgreSQL OIDs.
-func (t *TypeCastTransform) createRegclassSubquery(arg *pg_query.Node) *pg_query.SubLink {
+func (t *TypeCastTransform) createRegclassFromNameSubquery(arg *pg_query.Node) *pg_query.SubLink {
 	if arg == nil {
 		return nil
 	}
@@ -381,6 +388,111 @@ func (t *TypeCastTransform) createRegclassSubquery(arg *pg_query.Node) *pg_query
 	}
 
 	// Create the SubLink (scalar subquery)
+	return &pg_query.SubLink{
+		SubLinkType: pg_query.SubLinkType_EXPR_SUBLINK,
+		Subselect: &pg_query.Node{
+			Node: &pg_query.Node_SelectStmt{
+				SelectStmt: selectStmt,
+			},
+		},
+	}
+}
+
+// createRegclassFromOidSubquery creates a SubLink for oid::regclass
+// This converts: 12345::regclass
+// To: (SELECT relname FROM pg_class_full WHERE oid = 12345)
+// This is used when regclass is then cast to text (::regclass::text pattern)
+func (t *TypeCastTransform) createRegclassFromOidSubquery(arg *pg_query.Node) *pg_query.SubLink {
+	if arg == nil {
+		return nil
+	}
+
+	// Check if argument is an integer constant or a column reference (likely an OID)
+	var isOidLike bool
+	var argCopy *pg_query.Node
+
+	if aConst := arg.GetAConst(); aConst != nil {
+		if aConst.GetIval() != nil {
+			isOidLike = true
+			argCopy = arg
+		}
+	} else if colRef := arg.GetColumnRef(); colRef != nil {
+		// Column references like a.attrelid are likely OIDs
+		isOidLike = true
+		argCopy = arg
+	} else if typeCast := arg.GetTypeCast(); typeCast != nil {
+		// Nested type cast - could be something like foo::oid::regclass
+		isOidLike = true
+		argCopy = arg
+	}
+
+	if !isOidLike {
+		return nil
+	}
+
+	// Build: SELECT relname FROM pg_class_full WHERE oid = arg
+	// Create the SELECT target: relname
+	targetList := []*pg_query.Node{
+		{
+			Node: &pg_query.Node_ResTarget{
+				ResTarget: &pg_query.ResTarget{
+					Val: &pg_query.Node{
+						Node: &pg_query.Node_ColumnRef{
+							ColumnRef: &pg_query.ColumnRef{
+								Fields: []*pg_query.Node{
+									{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "relname"}}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Create the FROM clause: memory.main.pg_class_full
+	fromClause := []*pg_query.Node{
+		{
+			Node: &pg_query.Node_RangeVar{
+				RangeVar: &pg_query.RangeVar{
+					Catalogname:    "memory",
+					Schemaname:     "main",
+					Relname:        "pg_class_full",
+					Inh:            true,
+					Relpersistence: "p",
+				},
+			},
+		},
+	}
+
+	// Create the WHERE clause: oid = arg
+	whereClause := &pg_query.Node{
+		Node: &pg_query.Node_AExpr{
+			AExpr: &pg_query.A_Expr{
+				Kind: pg_query.A_Expr_Kind_AEXPR_OP,
+				Name: []*pg_query.Node{
+					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "="}}},
+				},
+				Lexpr: &pg_query.Node{
+					Node: &pg_query.Node_ColumnRef{
+						ColumnRef: &pg_query.ColumnRef{
+							Fields: []*pg_query.Node{
+								{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "oid"}}},
+							},
+						},
+					},
+				},
+				Rexpr: argCopy,
+			},
+		},
+	}
+
+	selectStmt := &pg_query.SelectStmt{
+		TargetList:  targetList,
+		FromClause:  fromClause,
+		WhereClause: whereClause,
+	}
+
 	return &pg_query.SubLink{
 		SubLinkType: pg_query.SubLinkType_EXPR_SUBLINK,
 		Subselect: &pg_query.Node{

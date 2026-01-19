@@ -77,6 +77,12 @@ func TestTranspile_PgCatalog(t *testing.T) {
 			excludes: "pg_catalog.version",
 		},
 		{
+			name:     "pg_get_serial_sequence prefix stripped",
+			input:    "SELECT pg_catalog.pg_get_serial_sequence('users', 'id')",
+			contains: "pg_get_serial_sequence",
+			excludes: "pg_catalog.pg_get_serial_sequence",
+		},
+		{
 			name:     "string literal NOT rewritten",
 			input:    "SELECT 'pg_catalog.pg_class' AS name",
 			contains: "pg_catalog.pg_class",
@@ -215,9 +221,27 @@ func TestTranspile_TypeCast(t *testing.T) {
 			excludes: "regtype",
 		},
 		{
-			name:     "regclass cast",
+			name:     "regclass cast from oid",
 			input:    "SELECT oid::pg_catalog.regclass FROM pg_class",
-			contains: "varchar",
+			contains: "select relname from",
+			excludes: "",
+		},
+		{
+			name:     "regclass cast from string literal",
+			input:    "SELECT 'users'::regclass",
+			contains: "select oid from",
+			excludes: "",
+		},
+		{
+			name:     "regclass cast from column ref",
+			input:    "SELECT a.attrelid::regclass FROM pg_attribute a",
+			contains: "select relname from",
+			excludes: "",
+		},
+		{
+			name:     "regclass to oid chain",
+			input:    "SELECT 'users'::regclass::oid",
+			contains: "select oid from",
 			excludes: "regclass",
 		},
 	}
