@@ -49,8 +49,6 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_stat_user_tables":   "pg_stat_user_tables",
 			"pg_stat_statements":    "pg_stat_statements",
 			"pg_partitioned_table":  "pg_partitioned_table",
-			"pg_type":               "pg_type",
-			"pg_attribute":          "pg_attribute",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
