@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -504,4 +505,41 @@ func TestCatalogStubs(t *testing.T) {
 		},
 	}
 	runQueryTests(t, tests)
+}
+
+// TestFormatTypeTimePrecision tests that format_type correctly handles time type precision
+func TestFormatTypeTimePrecision(t *testing.T) {
+	db := dgOnly(t)
+
+	tests := []struct {
+		name     string
+		oid      int
+		typemod  int
+		expected string
+	}{
+		// time without time zone (OID 1083)
+		{"time_no_precision", 1083, -1, "time without time zone"},
+		{"time_precision_0", 1083, 0, "time(0) without time zone"},
+		{"time_precision_3", 1083, 3, "time(3) without time zone"},
+		{"time_precision_6", 1083, 6, "time(6) without time zone"},
+		// time with time zone (OID 1266)
+		{"timetz_no_precision", 1266, -1, "time with time zone"},
+		{"timetz_precision_0", 1266, 0, "time(0) with time zone"},
+		{"timetz_precision_3", 1266, 3, "time(3) with time zone"},
+		{"timetz_precision_6", 1266, 6, "time(6) with time zone"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var result string
+			query := fmt.Sprintf("SELECT pg_catalog.format_type(%d, %d)", tc.oid, tc.typemod)
+			err := db.QueryRow(query).Scan(&result)
+			if err != nil {
+				t.Fatalf("query failed: %v", err)
+			}
+			if result != tc.expected {
+				t.Errorf("format_type(%d, %d) = %q, want %q", tc.oid, tc.typemod, result, tc.expected)
+			}
+		})
+	}
 }

@@ -381,9 +381,10 @@ func initPgCatalog(db *sql.DB) error {
 				END
 				-- Date/Time types
 				WHEN 1082 THEN 'date'
-				WHEN 1083 THEN 'time without time zone'
+				WHEN 1083 THEN CASE WHEN typemod >= 0 THEN 'time(' || typemod::VARCHAR || ') without time zone' ELSE 'time without time zone' END
 				WHEN 1114 THEN CASE WHEN typemod >= 0 THEN 'timestamp(' || typemod::VARCHAR || ') without time zone' ELSE 'timestamp without time zone' END
 				WHEN 1184 THEN CASE WHEN typemod >= 0 THEN 'timestamp(' || typemod::VARCHAR || ') with time zone' ELSE 'timestamp with time zone' END
+				WHEN 1266 THEN CASE WHEN typemod >= 0 THEN 'time(' || typemod::VARCHAR || ') with time zone' ELSE 'time with time zone' END
 				WHEN 1186 THEN 'interval'
 				-- UUID
 				WHEN 2950 THEN 'uuid'

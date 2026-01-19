@@ -85,6 +85,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"shobj_description":               true,
 			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
 			"version":                         true, // PostgreSQL-compatible version string for SQLAlchemy
+			"format_type":                     true, // Custom format_type with full PostgreSQL typemod support
 		},
 	}
 }
