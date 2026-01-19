@@ -221,10 +221,10 @@ func TestTranspile_TypeCast(t *testing.T) {
 			excludes: "regtype",
 		},
 		{
-			name:     "regclass cast from oid",
+			name:     "regclass cast from unqualified oid - fallback to varchar (avoids shadowing)",
 			input:    "SELECT oid::pg_catalog.regclass FROM pg_class",
-			contains: "select relname from",
-			excludes: "",
+			contains: "varchar",                // Should fallback, NOT produce subquery
+			excludes: "select relname from",    // Must NOT produce shadowing subquery
 		},
 		{
 			name:     "regclass cast from string literal",
@@ -233,7 +233,7 @@ func TestTranspile_TypeCast(t *testing.T) {
 			excludes: "",
 		},
 		{
-			name:     "regclass cast from column ref",
+			name:     "regclass cast from qualified column ref",
 			input:    "SELECT a.attrelid::regclass FROM pg_attribute a",
 			contains: "select relname from",
 			excludes: "",

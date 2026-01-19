@@ -417,9 +417,12 @@ func (t *TypeCastTransform) createRegclassFromOidSubquery(arg *pg_query.Node) *p
 			argCopy = arg
 		}
 	} else if colRef := arg.GetColumnRef(); colRef != nil {
-		// Column references like a.attrelid are likely OIDs
-		isOidLike = true
-		argCopy = arg
+		// Only accept QUALIFIED column references (e.g., a.attrelid with 2+ fields)
+		// Unqualified refs like 'oid' would be shadowed by pg_class_full.oid in the subquery
+		if len(colRef.Fields) >= 2 {
+			isOidLike = true
+			argCopy = arg
+		}
 	} else if typeCast := arg.GetTypeCast(); typeCast != nil {
 		// Nested type cast - could be something like foo::oid::regclass
 		isOidLike = true
