@@ -417,6 +417,16 @@ func TestCatalogStubs(t *testing.T) {
 			Query:        "SELECT * FROM pg_matviews LIMIT 5",
 			DuckgresOnly: true,
 		},
+		{
+			Name:         "pg_stat_statements",
+			Query:        "SELECT * FROM pg_catalog.pg_stat_statements LIMIT 5",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "pg_partitioned_table",
+			Query:        "SELECT * FROM pg_catalog.pg_partitioned_table LIMIT 5",
+			DuckgresOnly: true,
+		},
 	}
 	runQueryTests(t, tests)
 }

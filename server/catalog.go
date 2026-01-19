@@ -72,7 +72,8 @@ func initPgCatalog(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
+			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
 	`
@@ -225,6 +226,54 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	db.Exec(pgMatviewsSQL)
+
+	// Create pg_stat_statements view (query statistics, empty - pg_stat_statements extension not supported)
+	pgStatStatementsSQL := `
+		CREATE OR REPLACE VIEW pg_stat_statements AS
+		SELECT
+			0::BIGINT AS userid,
+			0::BIGINT AS dbid,
+			0::BIGINT AS queryid,
+			''::TEXT AS query,
+			0::BIGINT AS calls,
+			0::DOUBLE AS total_exec_time,
+			0::DOUBLE AS total_time,
+			0::DOUBLE AS min_exec_time,
+			0::DOUBLE AS max_exec_time,
+			0::DOUBLE AS mean_exec_time,
+			0::DOUBLE AS stddev_exec_time,
+			0::BIGINT AS rows,
+			0::BIGINT AS shared_blks_hit,
+			0::BIGINT AS shared_blks_read,
+			0::BIGINT AS shared_blks_dirtied,
+			0::BIGINT AS shared_blks_written,
+			0::BIGINT AS local_blks_hit,
+			0::BIGINT AS local_blks_read,
+			0::BIGINT AS local_blks_dirtied,
+			0::BIGINT AS local_blks_written,
+			0::BIGINT AS temp_blks_read,
+			0::BIGINT AS temp_blks_written,
+			0::DOUBLE AS blk_read_time,
+			0::DOUBLE AS blk_write_time
+		WHERE false
+	`
+	db.Exec(pgStatStatementsSQL)
+
+	// Create pg_partitioned_table view (partitioning, empty - DuckDB doesn't support table partitioning)
+	pgPartitionedTableSQL := `
+		CREATE OR REPLACE VIEW pg_partitioned_table AS
+		SELECT
+			0::BIGINT AS partrelid,
+			'r'::VARCHAR AS partstrat,
+			0::SMALLINT AS partnatts,
+			0::BIGINT AS partdefid,
+			ARRAY[]::SMALLINT[] AS partattrs,
+			ARRAY[]::BIGINT[] AS partclass,
+			ARRAY[]::BIGINT[] AS partcollation,
+			NULL::TEXT AS partexprs
+		WHERE false
+	`
+	db.Exec(pgPartitionedTableSQL)
 
 	// Create pg_stat_user_tables view (table statistics)
 	// Uses reltuples from pg_class for estimated row counts (same as PostgreSQL - it's an estimate)
@@ -729,7 +778,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
+			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
@@ -777,7 +827,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
+			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
