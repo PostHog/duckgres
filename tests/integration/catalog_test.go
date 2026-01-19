@@ -246,10 +246,80 @@ func TestCatalogSystemFunctions(t *testing.T) {
 			DuckgresOnly: true,
 		},
 
-		// format_type
+		// format_type - basic types
 		{
-			Name:         "format_type",
-			Query:        "SELECT format_type(23, NULL)",
+			Name:         "format_type_integer",
+			Query:        "SELECT format_type(23, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_text",
+			Query:        "SELECT format_type(25, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - types with typemod
+		{
+			Name:         "format_type_varchar_with_length",
+			Query:        "SELECT format_type(1043, 54)", // typemod 54 = length 50 + 4
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_varchar_no_length",
+			Query:        "SELECT format_type(1043, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_numeric_with_precision",
+			Query:        "SELECT format_type(1700, 655366)", // (10 << 16) | 2 + 4 = 655366
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_numeric_no_precision",
+			Query:        "SELECT format_type(1700, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - JSON types
+		{
+			Name:         "format_type_json",
+			Query:        "SELECT format_type(114, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_jsonb",
+			Query:        "SELECT format_type(3802, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - date/time types
+		{
+			Name:         "format_type_interval",
+			Query:        "SELECT format_type(1186, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_timestamp",
+			Query:        "SELECT format_type(1114, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_timestamptz",
+			Query:        "SELECT format_type(1184, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - array types
+		{
+			Name:         "format_type_int_array",
+			Query:        "SELECT format_type(1007, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_text_array",
+			Query:        "SELECT format_type(1009, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - unknown type fallback
+		{
+			Name:         "format_type_unknown",
+			Query:        "SELECT format_type(99999, -1)",
 			DuckgresOnly: true,
 		},
 
