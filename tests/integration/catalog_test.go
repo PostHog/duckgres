@@ -274,6 +274,11 @@ func TestCatalogSystemFunctions(t *testing.T) {
 			DuckgresOnly: true,
 		},
 		{
+			Name:         "format_type_numeric_negative_scale",
+			Query:        "SELECT format_type(1700, 393218)", // (5 << 16) | 65534 + 4 = 393218, scale -2 as two's complement
+			DuckgresOnly: true,
+		},
+		{
 			Name:         "format_type_numeric_no_precision",
 			Query:        "SELECT format_type(1700, -1)",
 			DuckgresOnly: true,

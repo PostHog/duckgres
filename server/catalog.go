@@ -370,9 +370,13 @@ func initPgCatalog(db *sql.DB) error {
 				-- Floating point
 				WHEN 700 THEN 'real'
 				WHEN 701 THEN 'double precision'
-				-- Numeric with precision/scale
+				-- Numeric with precision/scale (scale can be negative, stored as two's complement)
 				WHEN 1700 THEN CASE
-					WHEN typemod > 0 THEN 'numeric(' || ((typemod - 4) >> 16)::VARCHAR || ',' || ((typemod - 4) & 65535)::VARCHAR || ')'
+					WHEN typemod > 0 THEN 'numeric(' || ((typemod - 4) >> 16)::VARCHAR || ',' ||
+						CASE WHEN ((typemod - 4) & 65535) > 32767
+							THEN (((typemod - 4) & 65535) - 65536)::VARCHAR
+							ELSE ((typemod - 4) & 65535)::VARCHAR
+						END || ')'
 					ELSE 'numeric'
 				END
 				-- Date/Time types
