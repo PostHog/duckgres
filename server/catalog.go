@@ -72,7 +72,8 @@ func initPgCatalog(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
+			'pg_stat_user_tables', 'pg_type', 'pg_attribute',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
 	`
@@ -276,6 +277,209 @@ func initPgCatalog(db *sql.DB) error {
 		FROM pg_catalog.pg_namespace
 	`
 	db.Exec(pgNamespaceSQL)
+
+	// Create pg_type wrapper that maps DuckDB types to PostgreSQL type OIDs
+	// This fixes issues where DECIMAL/NUMERIC gets wrong OID (21 instead of 1700)
+	// and ensures proper default values for typlen, typbasetype, typndims
+	// We use DISTINCT ON to deduplicate types that map to the same OID
+	pgTypeSQL := `
+		CREATE OR REPLACE VIEW pg_type AS
+		SELECT * FROM (
+			SELECT DISTINCT ON (computed_oid)
+				computed_oid AS oid,
+				-- For types that map to the same OID, prefer the canonical PostgreSQL name
+				CASE
+					WHEN computed_oid = 1700 THEN 'numeric'
+					WHEN computed_oid = 16 THEN 'boolean'
+					WHEN computed_oid = 17 THEN 'bytea'
+					WHEN computed_oid = 20 THEN 'bigint'
+					WHEN computed_oid = 21 THEN 'smallint'
+					WHEN computed_oid = 23 THEN 'integer'
+					WHEN computed_oid = 25 THEN 'text'
+					WHEN computed_oid = 700 THEN 'real'
+					WHEN computed_oid = 701 THEN 'double precision'
+					WHEN computed_oid = 1043 THEN 'character varying'
+					WHEN computed_oid = 1082 THEN 'date'
+					WHEN computed_oid = 1083 THEN 'time without time zone'
+					WHEN computed_oid = 1114 THEN 'timestamp without time zone'
+					WHEN computed_oid = 1184 THEN 'timestamp with time zone'
+					WHEN computed_oid = 1186 THEN 'interval'
+					WHEN computed_oid = 2950 THEN 'uuid'
+					WHEN computed_oid = 114 THEN 'json'
+					WHEN computed_oid = 3802 THEN 'jsonb'
+					ELSE LOWER(typname)
+				END AS typname,
+				typnamespace,
+				typowner,
+				-- typlen: -1 for variable-length, otherwise use proper sizes
+				CASE
+					WHEN computed_oid = 1700 THEN -1::INTEGER  -- numeric
+					WHEN computed_oid = 17 THEN -1::INTEGER    -- bytea
+					WHEN computed_oid = 25 THEN -1::INTEGER    -- text
+					WHEN computed_oid = 1043 THEN -1::INTEGER  -- varchar
+					WHEN computed_oid = 114 THEN -1::INTEGER   -- json
+					WHEN computed_oid = 3802 THEN -1::INTEGER  -- jsonb
+					WHEN computed_oid = 16 THEN 1::INTEGER     -- boolean
+					WHEN computed_oid = 21 THEN 2::INTEGER     -- smallint
+					WHEN computed_oid = 23 THEN 4::INTEGER     -- integer
+					WHEN computed_oid = 700 THEN 4::INTEGER    -- real
+					WHEN computed_oid = 1082 THEN 4::INTEGER   -- date
+					WHEN computed_oid = 20 THEN 8::INTEGER     -- bigint
+					WHEN computed_oid = 701 THEN 8::INTEGER    -- double
+					WHEN computed_oid = 1083 THEN 8::INTEGER   -- time
+					WHEN computed_oid = 1114 THEN 8::INTEGER   -- timestamp
+					WHEN computed_oid = 1184 THEN 8::INTEGER   -- timestamptz
+					WHEN computed_oid = 2950 THEN 16::INTEGER  -- uuid
+					WHEN computed_oid = 1186 THEN 16::INTEGER  -- interval
+					ELSE COALESCE(typlen, -1::INTEGER)
+				END AS typlen,
+				typbyval,
+				typtype,
+				typcategory,
+				typispreferred,
+				typisdefined,
+				typdelim,
+				typrelid,
+				typsubscript,
+				typelem,
+				typarray,
+				typinput,
+				typoutput,
+				typreceive,
+				typsend,
+				typmodin,
+				typmodout,
+				typanalyze,
+				typalign,
+				typstorage,
+				typnotnull,
+				-- typbasetype: 0 for base types (not domains)
+				COALESCE(typbasetype, 0::BIGINT) AS typbasetype,
+				-- typtypmod: -1 means no modifier
+				COALESCE(typtypmod, -1::INTEGER) AS typtypmod,
+				-- typndims: 0 for non-array types
+				COALESCE(typndims, 0::INTEGER) AS typndims,
+				typcollation,
+				typdefaultbin,
+				typdefault,
+				typacl
+			FROM (
+				SELECT
+					CASE
+						WHEN UPPER(typname) IN ('DECIMAL', 'NUMERIC') THEN 1700::BIGINT
+						WHEN UPPER(typname) = 'HUGEINT' THEN 1700::BIGINT
+						WHEN UPPER(typname) IN ('BOOLEAN', 'BOOL') THEN 16::BIGINT
+						WHEN UPPER(typname) IN ('BYTEA', 'BLOB') THEN 17::BIGINT
+						WHEN UPPER(typname) IN ('BIGINT', 'INT8') THEN 20::BIGINT
+						WHEN UPPER(typname) IN ('SMALLINT', 'INT2', 'TINYINT') THEN 21::BIGINT
+						WHEN UPPER(typname) IN ('INTEGER', 'INT4', 'INT') THEN 23::BIGINT
+						WHEN UPPER(typname) = 'TEXT' THEN 25::BIGINT
+						WHEN UPPER(typname) IN ('REAL', 'FLOAT4', 'FLOAT') THEN 700::BIGINT
+						WHEN UPPER(typname) IN ('DOUBLE', 'FLOAT8') THEN 701::BIGINT
+						WHEN UPPER(typname) = 'VARCHAR' THEN 1043::BIGINT
+						WHEN UPPER(typname) = 'DATE' THEN 1082::BIGINT
+						WHEN UPPER(typname) = 'TIME' THEN 1083::BIGINT
+						WHEN UPPER(typname) = 'TIMESTAMP' THEN 1114::BIGINT
+						WHEN UPPER(typname) IN ('TIMESTAMPTZ', 'TIMESTAMP WITH TIME ZONE') THEN 1184::BIGINT
+						WHEN UPPER(typname) = 'INTERVAL' THEN 1186::BIGINT
+						WHEN UPPER(typname) = 'UUID' THEN 2950::BIGINT
+						WHEN UPPER(typname) = 'JSON' THEN 114::BIGINT
+						WHEN UPPER(typname) = 'JSONB' THEN 3802::BIGINT
+						ELSE COALESCE(oid, 25::BIGINT)
+					END AS computed_oid,
+					*
+				FROM pg_catalog.pg_type
+			) sub
+			ORDER BY computed_oid,
+				-- Prefer canonical names when deduplicating
+				CASE
+					WHEN LOWER(typname) = 'numeric' THEN 1
+					WHEN LOWER(typname) = 'boolean' THEN 1
+					WHEN LOWER(typname) = 'integer' THEN 1
+					WHEN LOWER(typname) = 'bigint' THEN 1
+					WHEN LOWER(typname) = 'smallint' THEN 1
+					WHEN LOWER(typname) = 'text' THEN 1
+					WHEN LOWER(typname) = 'bytea' THEN 1
+					ELSE 2
+				END
+		)
+	`
+	db.Exec(pgTypeSQL)
+
+	// Create pg_attribute wrapper that maps DuckDB types to correct PostgreSQL type OIDs
+	// This fixes JDBC metadata queries that fail when NUMERIC columns are mapped to int2 (21)
+	// We use duckdb_columns() to get the actual type names since pg_catalog.pg_type has incorrect OIDs
+	pgAttributeSQL := `
+		CREATE OR REPLACE VIEW pg_attribute AS
+		SELECT
+			a.attrelid,
+			a.attname,
+			-- Map atttypid correctly based on the actual column type from duckdb_columns()
+			CASE
+				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::BIGINT
+				WHEN UPPER(dc.data_type) = 'HUGEINT' THEN 1700::BIGINT
+				WHEN UPPER(dc.data_type) IN ('BOOLEAN', 'BOOL') THEN 16::BIGINT
+				WHEN UPPER(dc.data_type) IN ('BYTEA', 'BLOB') THEN 17::BIGINT
+				WHEN UPPER(dc.data_type) IN ('BIGINT', 'INT8') THEN 20::BIGINT
+				WHEN UPPER(dc.data_type) IN ('SMALLINT', 'INT2', 'TINYINT') THEN 21::BIGINT
+				WHEN UPPER(dc.data_type) IN ('INTEGER', 'INT4', 'INT') THEN 23::BIGINT
+				WHEN UPPER(dc.data_type) = 'TEXT' THEN 25::BIGINT
+				WHEN UPPER(dc.data_type) IN ('REAL', 'FLOAT4', 'FLOAT') THEN 700::BIGINT
+				WHEN UPPER(dc.data_type) IN ('DOUBLE', 'FLOAT8') THEN 701::BIGINT
+				WHEN UPPER(dc.data_type) LIKE 'VARCHAR%' THEN 1043::BIGINT
+				WHEN UPPER(dc.data_type) = 'DATE' THEN 1082::BIGINT
+				WHEN UPPER(dc.data_type) = 'TIME' THEN 1083::BIGINT
+				WHEN UPPER(dc.data_type) = 'TIMESTAMP' THEN 1114::BIGINT
+				WHEN UPPER(dc.data_type) IN ('TIMESTAMPTZ', 'TIMESTAMP WITH TIME ZONE') THEN 1184::BIGINT
+				WHEN UPPER(dc.data_type) = 'INTERVAL' THEN 1186::BIGINT
+				WHEN UPPER(dc.data_type) = 'UUID' THEN 2950::BIGINT
+				WHEN UPPER(dc.data_type) = 'JSON' THEN 114::BIGINT
+				WHEN UPPER(dc.data_type) = 'JSONB' THEN 3802::BIGINT
+				ELSE COALESCE(a.atttypid, 25::BIGINT)
+			END AS atttypid,
+			a.attstattarget,
+			-- attlen: -1 for variable-length types
+			CASE
+				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN -1::INTEGER
+				WHEN UPPER(dc.data_type) IN ('HUGEINT', 'VARCHAR', 'TEXT', 'BYTEA', 'BLOB', 'JSON', 'JSONB') THEN -1::INTEGER
+				WHEN UPPER(dc.data_type) LIKE 'VARCHAR%' THEN -1::INTEGER
+				WHEN UPPER(dc.data_type) IN ('BOOLEAN', 'BOOL') THEN 1::INTEGER
+				WHEN UPPER(dc.data_type) IN ('SMALLINT', 'INT2', 'TINYINT') THEN 2::INTEGER
+				WHEN UPPER(dc.data_type) IN ('INTEGER', 'INT4', 'INT', 'REAL', 'FLOAT4', 'FLOAT', 'DATE') THEN 4::INTEGER
+				WHEN UPPER(dc.data_type) IN ('BIGINT', 'INT8', 'DOUBLE', 'FLOAT8', 'TIME', 'TIMESTAMP', 'TIMESTAMPTZ') THEN 8::INTEGER
+				WHEN UPPER(dc.data_type) IN ('UUID', 'INTERVAL') THEN 16::INTEGER
+				ELSE COALESCE(a.attlen, -1::INTEGER)
+			END AS attlen,
+			a.attnum,
+			a.attndims,
+			a.attcacheoff,
+			-- atttypmod: -1 means no type modifier
+			COALESCE(a.atttypmod, -1::INTEGER) AS atttypmod,
+			a.attbyval,
+			a.attalign,
+			a.attstorage,
+			a.attcompression,
+			a.attnotnull,
+			a.atthasdef,
+			a.atthasmissing,
+			a.attidentity,
+			a.attgenerated,
+			a.attisdropped,
+			a.attislocal,
+			a.attinhcount,
+			a.attcollation,
+			a.attacl,
+			a.attoptions,
+			a.attfdwoptions,
+			a.attmissingval
+		FROM pg_catalog.pg_attribute a
+		LEFT JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+		LEFT JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+		LEFT JOIN duckdb_columns() dc ON
+			dc.table_oid = a.attrelid
+			AND dc.column_name = a.attname
+	`
+	db.Exec(pgAttributeSQL)
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
@@ -597,7 +801,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
-			'pg_stat_user_tables',
+			'pg_stat_user_tables', 'pg_type', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -660,7 +864,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
-			'pg_stat_user_tables',
+			'pg_stat_user_tables', 'pg_type', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -726,7 +930,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
+			'pg_stat_user_tables', 'pg_type', 'pg_attribute',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
@@ -774,7 +979,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'information_schema_columns_compat', 'information_schema_tables_compat',
+			'pg_stat_user_tables', 'pg_type', 'pg_attribute',
+			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
