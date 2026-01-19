@@ -351,26 +351,57 @@ func initPgCatalog(db *sql.DB) error {
 		`CREATE OR REPLACE MACRO has_table_privilege(table_name, priv) AS true`,
 		// pg_encoding_to_char - convert encoding ID to name
 		`CREATE OR REPLACE MACRO pg_encoding_to_char(enc) AS 'UTF8'`,
-		// format_type - format a type OID as string
+		// format_type - format a type OID as string with typemod support
 		`CREATE OR REPLACE MACRO format_type(type_oid, typemod) AS
 			CASE type_oid
+				-- Boolean
 				WHEN 16 THEN 'boolean'
+				-- Binary
 				WHEN 17 THEN 'bytea'
+				-- Integer types
 				WHEN 20 THEN 'bigint'
 				WHEN 21 THEN 'smallint'
 				WHEN 23 THEN 'integer'
+				WHEN 26 THEN 'oid'
+				-- Text types
 				WHEN 25 THEN 'text'
+				WHEN 1042 THEN CASE WHEN typemod > 0 THEN 'character(' || (typemod - 4)::VARCHAR || ')' ELSE 'character' END
+				WHEN 1043 THEN CASE WHEN typemod > 0 THEN 'character varying(' || (typemod - 4)::VARCHAR || ')' ELSE 'character varying' END
+				-- Floating point
 				WHEN 700 THEN 'real'
 				WHEN 701 THEN 'double precision'
-				WHEN 1042 THEN 'character'
-				WHEN 1043 THEN 'character varying'
+				-- Numeric with precision/scale (scale can be negative, stored as two's complement)
+				WHEN 1700 THEN CASE
+					WHEN typemod > 0 THEN 'numeric(' || ((typemod - 4) >> 16)::VARCHAR || ',' ||
+						CASE WHEN ((typemod - 4) & 65535) > 32767
+							THEN (((typemod - 4) & 65535) - 65536)::VARCHAR
+							ELSE ((typemod - 4) & 65535)::VARCHAR
+						END || ')'
+					ELSE 'numeric'
+				END
+				-- Date/Time types
 				WHEN 1082 THEN 'date'
-				WHEN 1083 THEN 'time'
-				WHEN 1114 THEN 'timestamp'
-				WHEN 1184 THEN 'timestamp with time zone'
-				WHEN 1700 THEN 'numeric'
+				WHEN 1083 THEN CASE WHEN typemod >= 0 THEN 'time(' || typemod::VARCHAR || ') without time zone' ELSE 'time without time zone' END
+				WHEN 1114 THEN CASE WHEN typemod >= 0 THEN 'timestamp(' || typemod::VARCHAR || ') without time zone' ELSE 'timestamp without time zone' END
+				WHEN 1184 THEN CASE WHEN typemod >= 0 THEN 'timestamp(' || typemod::VARCHAR || ') with time zone' ELSE 'timestamp with time zone' END
+				WHEN 1266 THEN CASE WHEN typemod >= 0 THEN 'time(' || typemod::VARCHAR || ') with time zone' ELSE 'time with time zone' END
+				WHEN 1186 THEN 'interval'
+				-- UUID
 				WHEN 2950 THEN 'uuid'
-				ELSE 'unknown'
+				-- JSON types
+				WHEN 114 THEN 'json'
+				WHEN 3802 THEN 'jsonb'
+				-- Array types (common ones)
+				WHEN 1000 THEN 'boolean[]'
+				WHEN 1005 THEN 'smallint[]'
+				WHEN 1007 THEN 'integer[]'
+				WHEN 1016 THEN 'bigint[]'
+				WHEN 1009 THEN 'text[]'
+				WHEN 1015 THEN 'character varying[]'
+				WHEN 1021 THEN 'real[]'
+				WHEN 1022 THEN 'double precision[]'
+				-- Fallback: return type OID for debugging
+				ELSE 'unknown(' || type_oid::VARCHAR || ')'
 			END`,
 		// obj_description - get object comment
 		`CREATE OR REPLACE MACRO obj_description(oid, catalog) AS NULL`,

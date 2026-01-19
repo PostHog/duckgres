@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -246,10 +247,85 @@ func TestCatalogSystemFunctions(t *testing.T) {
 			DuckgresOnly: true,
 		},
 
-		// format_type
+		// format_type - basic types
 		{
-			Name:         "format_type",
-			Query:        "SELECT format_type(23, NULL)",
+			Name:         "format_type_integer",
+			Query:        "SELECT format_type(23, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_text",
+			Query:        "SELECT format_type(25, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - types with typemod
+		{
+			Name:         "format_type_varchar_with_length",
+			Query:        "SELECT format_type(1043, 54)", // typemod 54 = length 50 + 4
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_varchar_no_length",
+			Query:        "SELECT format_type(1043, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_numeric_with_precision",
+			Query:        "SELECT format_type(1700, 655366)", // (10 << 16) | 2 + 4 = 655366
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_numeric_negative_scale",
+			Query:        "SELECT format_type(1700, 393218)", // (5 << 16) | 65534 + 4 = 393218, scale -2 as two's complement
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_numeric_no_precision",
+			Query:        "SELECT format_type(1700, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - JSON types
+		{
+			Name:         "format_type_json",
+			Query:        "SELECT format_type(114, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_jsonb",
+			Query:        "SELECT format_type(3802, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - date/time types
+		{
+			Name:         "format_type_interval",
+			Query:        "SELECT format_type(1186, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_timestamp",
+			Query:        "SELECT format_type(1114, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_timestamptz",
+			Query:        "SELECT format_type(1184, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - array types
+		{
+			Name:         "format_type_int_array",
+			Query:        "SELECT format_type(1007, -1)",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "format_type_text_array",
+			Query:        "SELECT format_type(1009, -1)",
+			DuckgresOnly: true,
+		},
+		// format_type - unknown type fallback
+		{
+			Name:         "format_type_unknown",
+			Query:        "SELECT format_type(99999, -1)",
 			DuckgresOnly: true,
 		},
 
@@ -429,4 +505,41 @@ func TestCatalogStubs(t *testing.T) {
 		},
 	}
 	runQueryTests(t, tests)
+}
+
+// TestFormatTypeTimePrecision tests that format_type correctly handles time type precision
+func TestFormatTypeTimePrecision(t *testing.T) {
+	db := dgOnly(t)
+
+	tests := []struct {
+		name     string
+		oid      int
+		typemod  int
+		expected string
+	}{
+		// time without time zone (OID 1083)
+		{"time_no_precision", 1083, -1, "time without time zone"},
+		{"time_precision_0", 1083, 0, "time(0) without time zone"},
+		{"time_precision_3", 1083, 3, "time(3) without time zone"},
+		{"time_precision_6", 1083, 6, "time(6) without time zone"},
+		// time with time zone (OID 1266)
+		{"timetz_no_precision", 1266, -1, "time with time zone"},
+		{"timetz_precision_0", 1266, 0, "time(0) with time zone"},
+		{"timetz_precision_3", 1266, 3, "time(3) with time zone"},
+		{"timetz_precision_6", 1266, 6, "time(6) with time zone"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var result string
+			query := fmt.Sprintf("SELECT pg_catalog.format_type(%d, %d)", tc.oid, tc.typemod)
+			err := db.QueryRow(query).Scan(&result)
+			if err != nil {
+				t.Fatalf("query failed: %v", err)
+			}
+			if result != tc.expected {
+				t.Errorf("format_type(%d, %d) = %q, want %q", tc.oid, tc.typemod, result, tc.expected)
+			}
+		})
+	}
 }
