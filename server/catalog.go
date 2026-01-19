@@ -381,22 +381,35 @@ func initPgCatalog(db *sql.DB) error {
 		SELECT
 			a.attrelid,
 			a.attname,
-			-- Fix atttypid: DECIMAL/NUMERIC should be 1700, not 21
-			-- Use duckdb_columns() to get actual type since pg_type shows 'int2' for DECIMAL
+			-- Fix atttypid: Map DuckDB internal type OIDs to PostgreSQL standard OIDs
+			-- DuckDB uses different OIDs internally that don't match pg_type
 			CASE
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::BIGINT
+				WHEN dc.data_type = 'INTEGER' OR dc.data_type = 'INT' OR dc.data_type = 'INT4' THEN 23::BIGINT
+				WHEN dc.data_type = 'SMALLINT' OR dc.data_type = 'INT2' THEN 21::BIGINT
+				WHEN dc.data_type = 'BIGINT' OR dc.data_type = 'INT8' THEN 20::BIGINT
 				ELSE a.atttypid
 			END AS atttypid,
 			a.attstattarget,
-			-- Fix attlen: DECIMAL/NUMERIC is variable-length (-1)
+			-- Fix attlen: Ensure type sizes match PostgreSQL
 			CASE
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN -1::INTEGER
+				WHEN dc.data_type = 'INTEGER' OR dc.data_type = 'INT' OR dc.data_type = 'INT4' THEN 4::INTEGER
+				WHEN dc.data_type = 'SMALLINT' OR dc.data_type = 'INT2' THEN 2::INTEGER
+				WHEN dc.data_type = 'BIGINT' OR dc.data_type = 'INT8' THEN 8::INTEGER
 				ELSE a.attlen
 			END AS attlen,
 			a.attnum,
 			a.attndims,
 			a.attcacheoff,
-			a.atttypmod,
+			-- Fix atttypmod: Convert NUMERIC precision/scale from DuckDB to PostgreSQL format
+			-- DuckDB: precision * 1000 + scale
+			-- PostgreSQL: (precision << 16) | (scale + 4)
+			CASE
+				WHEN (dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%') AND a.atttypmod > 0 THEN
+					(((a.atttypmod / 1000)::INTEGER << 16) | ((a.atttypmod % 1000)::INTEGER + 4))::INTEGER
+				ELSE a.atttypmod
+			END AS atttypmod,
 			a.attbyval,
 			a.attalign,
 			a.attstorage,
