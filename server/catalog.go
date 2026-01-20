@@ -328,8 +328,8 @@ func initPgCatalog(db *sql.DB) error {
 	db.Exec(pgNamespaceSQL)
 
 	// Create pg_type wrapper that fixes NULL values for JDBC compatibility
-	// DuckDB's pg_catalog.pg_type has NULL for typlen, typbasetype, typtypmod, typndims
-	// but JDBC clients expect proper integer defaults (not NULL).
+	// DuckDB's pg_catalog.pg_type has NULL for many columns that JDBC clients
+	// expect to have proper defaults.
 	pgTypeSQL := `
 		CREATE OR REPLACE VIEW pg_type AS
 		SELECT
@@ -337,18 +337,22 @@ func initPgCatalog(db *sql.DB) error {
 			typname,
 			typnamespace,
 			typowner,
-			-- typlen: default to value from pg_catalog or -1 (variable length) if NULL
+			-- typlen: -1 for variable length types
 			COALESCE(typlen, -1::SMALLINT) AS typlen,
 			typbyval,
 			typtype,
 			typcategory,
 			typispreferred,
 			typisdefined,
-			typdelim,
-			typrelid,
+			-- typdelim: comma is the default delimiter
+			COALESCE(typdelim, ','::VARCHAR) AS typdelim,
+			-- typrelid: 0 for non-composite types
+			COALESCE(typrelid, 0::BIGINT) AS typrelid,
 			typsubscript,
-			typelem,
-			typarray,
+			-- typelem: 0 for non-array types
+			COALESCE(typelem, 0::BIGINT) AS typelem,
+			-- typarray: 0 if no array type exists
+			COALESCE(typarray, 0::BIGINT) AS typarray,
 			typinput,
 			typoutput,
 			typreceive,
@@ -358,7 +362,7 @@ func initPgCatalog(db *sql.DB) error {
 			typanalyze,
 			typalign,
 			typstorage,
-			-- typnotnull: default to false if NULL
+			-- typnotnull: false for base types
 			COALESCE(typnotnull, false) AS typnotnull,
 			-- typbasetype: 0 for base types (not domains)
 			COALESCE(typbasetype, 0::BIGINT) AS typbasetype,
@@ -366,7 +370,8 @@ func initPgCatalog(db *sql.DB) error {
 			COALESCE(typtypmod, -1::INTEGER) AS typtypmod,
 			-- typndims: 0 for non-array types
 			COALESCE(typndims, 0::INTEGER) AS typndims,
-			typcollation,
+			-- typcollation: 0 for types without collation
+			COALESCE(typcollation, 0::BIGINT) AS typcollation,
 			typdefaultbin,
 			typdefault,
 			typacl
