@@ -351,7 +351,14 @@ func initPgCatalog(db *sql.DB) error {
 			a.attnum,
 			a.attndims,
 			a.attcacheoff,
-			a.atttypmod,
+			-- Fix atttypmod: Convert NUMERIC precision/scale from DuckDB to PostgreSQL format
+			-- DuckDB: precision * 1000 + scale (e.g., 10002 for NUMERIC(10,2))
+			-- PostgreSQL: (precision << 16) | (scale + 4) (e.g., 655366 for NUMERIC(10,2))
+			CASE
+				WHEN (dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%') AND a.atttypmod > 0 THEN
+					(((a.atttypmod / 1000)::INTEGER << 16) | ((a.atttypmod % 1000)::INTEGER + 4))::INTEGER
+				ELSE a.atttypmod
+			END AS atttypmod,
 			a.attbyval,
 			a.attalign,
 			a.attstorage,
