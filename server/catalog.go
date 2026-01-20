@@ -73,7 +73,7 @@ func initPgCatalog(db *sql.DB) error {
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-			'pg_type', 'pg_attribute',
+			'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
@@ -327,52 +327,6 @@ func initPgCatalog(db *sql.DB) error {
 	`
 	db.Exec(pgNamespaceSQL)
 
-	// Create pg_type wrapper that fixes NULL values for typlen, typbasetype, etc.
-	// DuckDB's pg_catalog.pg_type has NULL for these columns, but JDBC expects proper defaults.
-	pgTypeSQL := `
-		CREATE OR REPLACE VIEW pg_type AS
-		SELECT
-			oid,
-			typname,
-			typnamespace,
-			typowner,
-			-- typlen: default to -1 (variable length) if NULL
-			COALESCE(typlen, -1::INTEGER) AS typlen,
-			typbyval,
-			typtype,
-			typcategory,
-			typispreferred,
-			typisdefined,
-			typdelim,
-			typrelid,
-			typsubscript,
-			typelem,
-			typarray,
-			typinput,
-			typoutput,
-			typreceive,
-			typsend,
-			typmodin,
-			typmodout,
-			typanalyze,
-			typalign,
-			typstorage,
-			typnotnull,
-			-- typbasetype: 0 for base types (not domains)
-			COALESCE(typbasetype, 0::BIGINT) AS typbasetype,
-			-- typtypmod: -1 means no modifier
-			COALESCE(typtypmod, -1::INTEGER) AS typtypmod,
-			-- typndims: 0 for non-array types
-			COALESCE(typndims, 0::INTEGER) AS typndims,
-			typcollation,
-			typdefaultbin,
-			typdefault,
-			typacl
-		FROM pg_catalog.pg_type
-	`
-	db.Exec(pgTypeSQL)
-
-
 	// Create pg_attribute wrapper that fixes NUMERIC/DECIMAL type OIDs
 	// DuckDB's pg_catalog.pg_attribute returns atttypid=21 (int2) for DECIMAL columns
 	// but JDBC clients expect atttypid=1700 (numeric). This view fixes that mapping
@@ -382,35 +336,22 @@ func initPgCatalog(db *sql.DB) error {
 		SELECT
 			a.attrelid,
 			a.attname,
-			-- Fix atttypid: Map DuckDB internal type OIDs to PostgreSQL standard OIDs
-			-- DuckDB uses different OIDs internally that don't match pg_type
+			-- Fix atttypid: DECIMAL/NUMERIC should be 1700, not 21
+			-- Use duckdb_columns() to get actual type since pg_type shows 'int2' for DECIMAL
 			CASE
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::BIGINT
-				WHEN dc.data_type = 'INTEGER' OR dc.data_type = 'INT' OR dc.data_type = 'INT4' THEN 23::BIGINT
-				WHEN dc.data_type = 'SMALLINT' OR dc.data_type = 'INT2' THEN 21::BIGINT
-				WHEN dc.data_type = 'BIGINT' OR dc.data_type = 'INT8' THEN 20::BIGINT
 				ELSE a.atttypid
 			END AS atttypid,
 			a.attstattarget,
-			-- Fix attlen: Ensure type sizes match PostgreSQL
+			-- Fix attlen: DECIMAL/NUMERIC is variable-length (-1)
 			CASE
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN -1::INTEGER
-				WHEN dc.data_type = 'INTEGER' OR dc.data_type = 'INT' OR dc.data_type = 'INT4' THEN 4::INTEGER
-				WHEN dc.data_type = 'SMALLINT' OR dc.data_type = 'INT2' THEN 2::INTEGER
-				WHEN dc.data_type = 'BIGINT' OR dc.data_type = 'INT8' THEN 8::INTEGER
 				ELSE a.attlen
 			END AS attlen,
 			a.attnum,
 			a.attndims,
 			a.attcacheoff,
-			-- Fix atttypmod: Convert NUMERIC precision/scale from DuckDB to PostgreSQL format
-			-- DuckDB: precision * 1000 + scale
-			-- PostgreSQL: (precision << 16) | (scale + 4)
-			CASE
-				WHEN (dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%') AND a.atttypmod > 0 THEN
-					(((a.atttypmod / 1000)::INTEGER << 16) | ((a.atttypmod % 1000)::INTEGER + 4))::INTEGER
-				ELSE a.atttypmod
-			END AS atttypmod,
+			a.atttypmod,
 			a.attbyval,
 			a.attalign,
 			a.attstorage,
@@ -917,7 +858,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-			'pg_type', 'pg_attribute',
+			'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
@@ -967,7 +908,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-			'pg_type', 'pg_attribute',
+			'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
