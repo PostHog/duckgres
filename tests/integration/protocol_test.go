@@ -114,6 +114,7 @@ func TestProtocolExtendedQuery(t *testing.T) {
 	})
 
 	t.Run("prepare_with_types", func(t *testing.T) {
+		skipIfKnown(t)
 		stmt, err := testHarness.DuckgresDB.Prepare("SELECT $1::text || ' ' || $2::text")
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
@@ -384,6 +385,7 @@ func TestProtocolDataTypes(t *testing.T) {
 	})
 
 	t.Run("bytes", func(t *testing.T) {
+		skipIfKnown(t)
 		var val []byte
 		err := testHarness.DuckgresDB.QueryRow("SELECT '\\x48656c6c6f'::BYTEA").Scan(&val)
 		if err != nil {

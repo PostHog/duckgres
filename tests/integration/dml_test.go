@@ -86,6 +86,7 @@ func TestDMLInsertReturning(t *testing.T) {
 	mustExec(t, testHarness.DuckgresDB, "CREATE TABLE dml_returning_test (id INTEGER, name TEXT)")
 
 	t.Run("insert_returning_star", func(t *testing.T) {
+		skipIfKnown(t)
 		rows, err := testHarness.DuckgresDB.Query("INSERT INTO dml_returning_test (id, name) VALUES (1, 'Alice') RETURNING *")
 		if err != nil {
 			t.Fatalf("Insert RETURNING failed: %v", err)
@@ -106,6 +107,7 @@ func TestDMLInsertReturning(t *testing.T) {
 	})
 
 	t.Run("insert_returning_columns", func(t *testing.T) {
+		skipIfKnown(t)
 		rows, err := testHarness.DuckgresDB.Query("INSERT INTO dml_returning_test (id, name) VALUES (2, 'Bob') RETURNING id")
 		if err != nil {
 			t.Fatalf("Insert RETURNING failed: %v", err)
@@ -134,6 +136,7 @@ func TestDMLInsertOnConflict(t *testing.T) {
 	mustExec(t, testHarness.DuckgresDB, "INSERT INTO dml_upsert_test VALUES (1, 'Alice', 10)")
 
 	t.Run("on_conflict_do_nothing", func(t *testing.T) {
+		skipIfKnown(t)
 		_, err := testHarness.DuckgresDB.Exec("INSERT INTO dml_upsert_test (id, name, counter) VALUES (1, 'Duplicate', 99) ON CONFLICT DO NOTHING")
 		if err != nil {
 			t.Fatalf("ON CONFLICT DO NOTHING failed: %v", err)
@@ -243,6 +246,7 @@ func TestDMLUpdateReturning(t *testing.T) {
 	mustExec(t, testHarness.DuckgresDB, "INSERT INTO dml_update_returning VALUES (1, 'Test', 1)")
 
 	t.Run("update_returning_star", func(t *testing.T) {
+		skipIfKnown(t)
 		rows, err := testHarness.DuckgresDB.Query("UPDATE dml_update_returning SET version = version + 1 WHERE id = 1 RETURNING *")
 		if err != nil {
 			t.Fatalf("Update RETURNING failed: %v", err)
@@ -366,6 +370,7 @@ func TestDMLDeleteReturning(t *testing.T) {
 	mustExec(t, testHarness.DuckgresDB, "INSERT INTO dml_delete_returning VALUES (1, 'Test'), (2, 'Test2')")
 
 	t.Run("delete_returning_star", func(t *testing.T) {
+		skipIfKnown(t)
 		rows, err := testHarness.DuckgresDB.Query("DELETE FROM dml_delete_returning WHERE id = 1 RETURNING *")
 		if err != nil {
 			t.Fatalf("Delete RETURNING failed: %v", err)

@@ -15,6 +15,37 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    services:
+      # PostgreSQL for comparison tests
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports:
+          - 35432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      # DuckLake metadata store
+      ducklake-metadata:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ducklake
+          POSTGRES_PASSWORD: ducklake
+          POSTGRES_DB: ducklake
+        ports:
+          - 35433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,3 +60,28 @@ jobs:
 
       - name: Build
         run: go build -o duckgres .
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 39000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio:latest server /data
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            curl -sf http://localhost:39000/minio/health/live && break
+            sleep 1
+          done
+
+      - name: Create MinIO bucket
+        run: |
+          # Install mc client
+          curl -sL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+          chmod +x /tmp/mc
+          # Configure and create bucket
+          /tmp/mc alias set minio http://localhost:39000 minioadmin minioadmin
+          /tmp/mc mb minio/ducklake --ignore-existing
+
+      - name: Run integration tests
+        run: go test -v ./tests/integration/...
