@@ -327,45 +327,31 @@ func initPgCatalog(db *sql.DB) error {
 	`
 	db.Exec(pgNamespaceSQL)
 
-	// Create pg_attribute wrapper that fixes type OIDs for JDBC compatibility
-	// DuckDB's pg_catalog.pg_attribute returns incorrect atttypid values:
-	// - DECIMAL/NUMERIC columns show atttypid=21 (int2) instead of 1700 (numeric)
-	// - INTEGER columns may show different OIDs than PostgreSQL standard
-	// This view fixes the mapping by joining with duckdb_columns() to get actual types.
-	// Also converts atttypmod from DuckDB format to PostgreSQL format for NUMERIC.
+	// Create pg_attribute wrapper that fixes NUMERIC/DECIMAL type OIDs
+	// DuckDB's pg_catalog.pg_attribute returns atttypid=21 (int2) for DECIMAL columns
+	// but JDBC clients expect atttypid=1700 (numeric). This view fixes that mapping
+	// by joining with duckdb_columns() to get the actual type name.
 	pgAttributeSQL := `
 		CREATE OR REPLACE VIEW pg_attribute AS
 		SELECT
 			a.attrelid,
 			a.attname,
-			-- Fix atttypid: Map DuckDB internal type OIDs to PostgreSQL standard OIDs
+			-- Fix atttypid: DECIMAL/NUMERIC should be 1700, not 21
+			-- Use duckdb_columns() to get actual type since pg_type shows 'int2' for DECIMAL
 			CASE
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::BIGINT
-				WHEN dc.data_type = 'INTEGER' OR dc.data_type = 'INT' OR dc.data_type = 'INT4' THEN 23::BIGINT
-				WHEN dc.data_type = 'SMALLINT' OR dc.data_type = 'INT2' THEN 21::BIGINT
-				WHEN dc.data_type = 'BIGINT' OR dc.data_type = 'INT8' THEN 20::BIGINT
 				ELSE a.atttypid
 			END AS atttypid,
 			a.attstattarget,
-			-- Fix attlen: Ensure type sizes match PostgreSQL
+			-- Fix attlen: DECIMAL/NUMERIC is variable-length (-1)
 			CASE
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN -1::INTEGER
-				WHEN dc.data_type = 'INTEGER' OR dc.data_type = 'INT' OR dc.data_type = 'INT4' THEN 4::INTEGER
-				WHEN dc.data_type = 'SMALLINT' OR dc.data_type = 'INT2' THEN 2::INTEGER
-				WHEN dc.data_type = 'BIGINT' OR dc.data_type = 'INT8' THEN 8::INTEGER
 				ELSE a.attlen
 			END AS attlen,
 			a.attnum,
 			a.attndims,
 			a.attcacheoff,
-			-- Fix atttypmod: Convert NUMERIC precision/scale from DuckDB to PostgreSQL format
-			-- DuckDB: precision * 1000 + scale (e.g., 10002 for NUMERIC(10,2))
-			-- PostgreSQL: (precision << 16) | (scale + 4) (e.g., 655366 for NUMERIC(10,2))
-			CASE
-				WHEN (dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%') AND a.atttypmod > 0 THEN
-					(((a.atttypmod / 1000)::INTEGER << 16) | ((a.atttypmod % 1000)::INTEGER + 4))::INTEGER
-				ELSE a.atttypmod
-			END AS atttypmod,
+			a.atttypmod,
 			a.attbyval,
 			a.attalign,
 			a.attstorage,
