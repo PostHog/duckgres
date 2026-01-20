@@ -73,7 +73,7 @@ func initPgCatalog(db *sql.DB) error {
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-			'pg_attribute',
+			'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
@@ -326,6 +326,53 @@ func initPgCatalog(db *sql.DB) error {
 		FROM pg_catalog.pg_namespace
 	`
 	db.Exec(pgNamespaceSQL)
+
+	// Create pg_type wrapper that fixes NULL values for JDBC compatibility
+	// DuckDB's pg_catalog.pg_type has NULL for typlen, typbasetype, typtypmod, typndims
+	// but JDBC clients expect proper integer defaults (not NULL).
+	pgTypeSQL := `
+		CREATE OR REPLACE VIEW pg_type AS
+		SELECT
+			oid,
+			typname,
+			typnamespace,
+			typowner,
+			-- typlen: default to value from pg_catalog or -1 (variable length) if NULL
+			COALESCE(typlen, -1::SMALLINT) AS typlen,
+			typbyval,
+			typtype,
+			typcategory,
+			typispreferred,
+			typisdefined,
+			typdelim,
+			typrelid,
+			typsubscript,
+			typelem,
+			typarray,
+			typinput,
+			typoutput,
+			typreceive,
+			typsend,
+			typmodin,
+			typmodout,
+			typanalyze,
+			typalign,
+			typstorage,
+			-- typnotnull: default to false if NULL
+			COALESCE(typnotnull, false) AS typnotnull,
+			-- typbasetype: 0 for base types (not domains)
+			COALESCE(typbasetype, 0::BIGINT) AS typbasetype,
+			-- typtypmod: -1 means no modifier
+			COALESCE(typtypmod, -1::INTEGER) AS typtypmod,
+			-- typndims: 0 for non-array types
+			COALESCE(typndims, 0::INTEGER) AS typndims,
+			typcollation,
+			typdefaultbin,
+			typdefault,
+			typacl
+		FROM pg_catalog.pg_type
+	`
+	db.Exec(pgTypeSQL)
 
 	// Create pg_attribute wrapper that maps DuckDB internal type OIDs to PostgreSQL OIDs
 	// DuckDB's pg_catalog.pg_attribute returns internal OIDs that don't match pg_type.
