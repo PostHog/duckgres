@@ -44,19 +44,22 @@ func New(cfg Config) *Transpiler {
 	// 5. Function mappings (array_agg->list, string_to_array->string_split, etc.)
 	t.transforms = append(t.transforms, transform.NewFunctionTransform())
 
-	// 6. Operator mappings (regex operators, etc.)
+	// 6. Function alias normalization (current_database() -> AS current_database)
+	t.transforms = append(t.transforms, transform.NewFuncAliasTransform())
+
+	// 7. Operator mappings (regex operators, etc.)
 	t.transforms = append(t.transforms, transform.NewOperatorTransform())
 
-	// 7. version() replacement
+	// 8. version() replacement
 	t.transforms = append(t.transforms, transform.NewVersionTransform())
 
-	// 8. SET/SHOW command handling
+	// 9. SET/SHOW command handling
 	t.transforms = append(t.transforms, transform.NewSetShowTransform())
 
-	// 9. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
+	// 10. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
 	t.transforms = append(t.transforms, transform.NewExpandArrayTransform())
 
-	// 10. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
+	// 11. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
 	t.transforms = append(t.transforms, transform.NewOnConflictTransformWithConfig(cfg.DuckLakeMode))
 
 	// DDL transforms only when DuckLake mode is enabled
