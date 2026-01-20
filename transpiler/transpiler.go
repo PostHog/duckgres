@@ -29,29 +29,30 @@ func New(cfg Config) *Transpiler {
 	// It must run before other transforms because it completely rewrites the query structure.
 	t.transforms = append(t.transforms, transform.NewWritableCTETransform())
 
-	// 1. pg_catalog schema and view mappings
+	// 1. version() replacement - MUST run before PgCatalogTransform
+	// Otherwise PgCatalogTransform adds memory.main. prefix and VersionTransform won't match it
+	t.transforms = append(t.transforms, transform.NewVersionTransform())
+
+	// 2. pg_catalog schema and view mappings
 	t.transforms = append(t.transforms, transform.NewPgCatalogTransformWithConfig(cfg.DuckLakeMode))
 
-	// 2. information_schema mappings to compat views
+	// 3. information_schema mappings to compat views
 	t.transforms = append(t.transforms, transform.NewInformationSchemaTransformWithConfig(cfg.DuckLakeMode))
 
-	// 3. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
+	// 4. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, transform.NewTypeMappingTransform())
 
-	// 4. Type casts (::regtype -> ::varchar)
+	// 5. Type casts (::regtype -> ::varchar)
 	t.transforms = append(t.transforms, transform.NewTypeCastTransform())
 
-	// 5. Function mappings (array_agg->list, string_to_array->string_split, etc.)
+	// 6. Function mappings (array_agg->list, string_to_array->string_split, etc.)
 	t.transforms = append(t.transforms, transform.NewFunctionTransform())
 
-	// 6. Function alias normalization (current_database() -> AS current_database)
+	// 7. Function alias normalization (current_database() -> AS current_database)
 	t.transforms = append(t.transforms, transform.NewFuncAliasTransform())
 
-	// 7. Operator mappings (regex operators, etc.)
+	// 8. Operator mappings (regex operators, etc.)
 	t.transforms = append(t.transforms, transform.NewOperatorTransform())
-
-	// 8. version() replacement
-	t.transforms = append(t.transforms, transform.NewVersionTransform())
 
 	// 9. SET/SHOW command handling
 	t.transforms = append(t.transforms, transform.NewSetShowTransform())

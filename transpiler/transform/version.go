@@ -203,13 +203,15 @@ func (t *VersionTransform) getFuncCall(node *pg_query.Node) *pg_query.FuncCall {
 	return nil
 }
 
-// isVersionCall checks if a FuncCall is version()
+// isVersionCall checks if a FuncCall is version() or pg_catalog.version()
 func (t *VersionTransform) isVersionCall(fc *pg_query.FuncCall) bool {
-	if fc == nil || len(fc.Funcname) != 1 || len(fc.Args) != 0 {
+	if fc == nil || len(fc.Funcname) == 0 || len(fc.Args) != 0 {
 		return false
 	}
-	if first := fc.Funcname[0]; first != nil {
-		if str := first.GetString_(); str != nil {
+	// Check the last part of the function name (handles both version() and pg_catalog.version())
+	last := fc.Funcname[len(fc.Funcname)-1]
+	if last != nil {
+		if str := last.GetString_(); str != nil {
 			return strings.EqualFold(str.Sval, "version")
 		}
 	}
