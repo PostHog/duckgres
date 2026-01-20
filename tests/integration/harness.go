@@ -99,6 +99,14 @@ func NewTestHarness(cfg HarnessConfig) (*TestHarness, error) {
 		return nil, fmt.Errorf("failed to load fixtures: %w", err)
 	}
 
+	// Load fixtures into PostgreSQL for comparison tests
+	if !cfg.SkipPostgres {
+		if err := h.loadPostgresFixtures(); err != nil {
+			h.Close()
+			return nil, fmt.Errorf("failed to load PostgreSQL fixtures: %w", err)
+		}
+	}
+
 	return h, nil
 }
 
@@ -259,6 +267,77 @@ func (h *TestHarness) loadFixtures() error {
 		}
 		if _, err := h.DuckgresDB.Exec(stmt); err != nil {
 			return fmt.Errorf("failed to execute data statement: %s: %w", truncate(stmt, 50), err)
+		}
+	}
+
+	return nil
+}
+
+// loadPostgresFixtures loads the test schema and data into PostgreSQL for comparison tests
+func (h *TestHarness) loadPostgresFixtures() error {
+	if h.PostgresDB == nil {
+		return nil
+	}
+
+	// Drop existing objects first (in reverse dependency order)
+	dropStatements := []string{
+		"DROP VIEW IF EXISTS order_details",
+		"DROP VIEW IF EXISTS user_stats",
+		"DROP VIEW IF EXISTS active_users",
+		"DROP TABLE IF EXISTS test_schema.schema_test",
+		"DROP SCHEMA IF EXISTS test_schema CASCADE",
+		"DROP TABLE IF EXISTS array_test",
+		"DROP TABLE IF EXISTS documents",
+		"DROP TABLE IF EXISTS metrics",
+		"DROP TABLE IF EXISTS empty_table",
+		"DROP TABLE IF EXISTS nullable_test",
+		"DROP TABLE IF EXISTS json_data",
+		"DROP TABLE IF EXISTS events",
+		"DROP TABLE IF EXISTS sales",
+		"DROP TABLE IF EXISTS categories",
+		"DROP TABLE IF EXISTS order_items",
+		"DROP TABLE IF EXISTS orders",
+		"DROP TABLE IF EXISTS products",
+		"DROP TABLE IF EXISTS users",
+		"DROP TABLE IF EXISTS types_test",
+	}
+	for _, stmt := range dropStatements {
+		h.PostgresDB.Exec(stmt)
+	}
+
+	// Read and execute schema
+	schemaPath := filepath.Join(getTestDir(), "fixtures", "schema.sql")
+	schemaSQL, err := os.ReadFile(schemaPath)
+	if err != nil {
+		return fmt.Errorf("failed to read schema: %w", err)
+	}
+
+	statements := splitSQLStatements(string(schemaSQL))
+	for _, stmt := range statements {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" || strings.HasPrefix(stmt, "--") {
+			continue
+		}
+		if _, err := h.PostgresDB.Exec(stmt); err != nil {
+			return fmt.Errorf("failed to execute PostgreSQL schema statement: %s: %w", truncate(stmt, 50), err)
+		}
+	}
+
+	// Read and execute data
+	dataPath := filepath.Join(getTestDir(), "fixtures", "data.sql")
+	dataSQL, err := os.ReadFile(dataPath)
+	if err != nil {
+		return fmt.Errorf("failed to read data: %w", err)
+	}
+
+	statements = splitSQLStatements(string(dataSQL))
+	for _, stmt := range statements {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" || strings.HasPrefix(stmt, "--") {
+			continue
+		}
+		if _, err := h.PostgresDB.Exec(stmt); err != nil {
+			return fmt.Errorf("failed to execute PostgreSQL data statement: %s: %w", truncate(stmt, 50), err)
 		}
 	}
 
