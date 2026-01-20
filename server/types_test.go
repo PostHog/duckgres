@@ -35,7 +35,7 @@ func TestMapDuckDBType(t *testing.T) {
 		// Unsigned integers
 		{"UTINYINT", "UTINYINT", OidInt4, 4},
 		{"USMALLINT", "USMALLINT", OidInt4, 4},
-		{"UINTEGER", "UINTEGER", OidInt8, 8},
+		{"UINTEGER", "UINTEGER", OidOid, 4}, // Maps to PostgreSQL oid type for pg_catalog columns
 		{"UBIGINT", "UBIGINT", OidNumeric, -1},
 
 		// Float types
