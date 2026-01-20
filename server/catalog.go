@@ -337,34 +337,93 @@ func initPgCatalog(db *sql.DB) error {
 			a.attrelid,
 			a.attname,
 			-- Map DuckDB internal type OIDs to PostgreSQL standard OIDs
+			-- Comprehensive mapping to ensure all columns join with pg_type
 			CASE
+				-- Numeric types
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::BIGINT
 				WHEN dc.data_type = 'INTEGER' THEN 23::BIGINT
 				WHEN dc.data_type = 'BIGINT' THEN 20::BIGINT
 				WHEN dc.data_type = 'SMALLINT' THEN 21::BIGINT
-				WHEN dc.data_type = 'VARCHAR' THEN 1043::BIGINT
-				WHEN dc.data_type = 'BOOLEAN' THEN 16::BIGINT
-				WHEN dc.data_type = 'DATE' THEN 1082::BIGINT
-				WHEN dc.data_type = 'TIMESTAMP' THEN 1114::BIGINT
-				WHEN dc.data_type LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 1184::BIGINT
+				WHEN dc.data_type = 'TINYINT' THEN 21::BIGINT
+				WHEN dc.data_type = 'HUGEINT' THEN 1700::BIGINT
+				-- Unsigned types (map to larger signed or numeric)
+				WHEN dc.data_type = 'UBIGINT' THEN 1700::BIGINT
+				WHEN dc.data_type = 'UINTEGER' THEN 20::BIGINT
+				WHEN dc.data_type = 'USMALLINT' THEN 23::BIGINT
+				WHEN dc.data_type = 'UTINYINT' THEN 21::BIGINT
+				-- Floating point
 				WHEN dc.data_type = 'FLOAT' OR dc.data_type = 'DOUBLE' THEN 701::BIGINT
 				WHEN dc.data_type = 'REAL' THEN 700::BIGINT
+				-- String types
+				WHEN dc.data_type = 'VARCHAR' THEN 1043::BIGINT
+				WHEN dc.data_type = 'TEXT' THEN 25::BIGINT
+				WHEN dc.data_type = 'CHAR' OR dc.data_type = 'BPCHAR' THEN 1042::BIGINT
+				-- Boolean
+				WHEN dc.data_type = 'BOOLEAN' THEN 16::BIGINT
+				-- Binary
+				WHEN dc.data_type = 'BLOB' OR dc.data_type = 'BYTEA' THEN 17::BIGINT
+				-- Date/Time types
+				WHEN dc.data_type = 'DATE' THEN 1082::BIGINT
+				WHEN dc.data_type = 'TIME' THEN 1083::BIGINT
+				WHEN dc.data_type = 'TIMESTAMP' THEN 1114::BIGINT
+				WHEN dc.data_type LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 1184::BIGINT
+				WHEN dc.data_type LIKE 'TIME WITH TIME ZONE%' THEN 1266::BIGINT
+				WHEN dc.data_type = 'INTERVAL' THEN 1186::BIGINT
+				-- UUID
+				WHEN dc.data_type = 'UUID' THEN 2950::BIGINT
+				-- Bit
+				WHEN dc.data_type = 'BIT' THEN 1560::BIGINT
+				-- JSON
+				WHEN dc.data_type = 'JSON' THEN 114::BIGINT
+				-- Array types
+				WHEN dc.data_type = 'INTEGER[]' THEN 1007::BIGINT
+				WHEN dc.data_type = 'BIGINT[]' THEN 1016::BIGINT
+				WHEN dc.data_type = 'SMALLINT[]' THEN 1005::BIGINT
+				WHEN dc.data_type = 'VARCHAR[]' THEN 1015::BIGINT
+				WHEN dc.data_type = 'TEXT[]' THEN 1009::BIGINT
+				WHEN dc.data_type = 'BOOLEAN[]' THEN 1000::BIGINT
+				WHEN dc.data_type = 'FLOAT[]' OR dc.data_type = 'DOUBLE[]' THEN 1022::BIGINT
+				WHEN dc.data_type = 'REAL[]' THEN 1021::BIGINT
+				WHEN dc.data_type = 'DATE[]' THEN 1182::BIGINT
+				WHEN dc.data_type = 'TIMESTAMP[]' THEN 1115::BIGINT
+				WHEN dc.data_type LIKE 'NUMERIC%[]' OR dc.data_type LIKE 'DECIMAL%[]' THEN 1231::BIGINT
+				WHEN dc.data_type = 'UUID[]' THEN 2951::BIGINT
+				WHEN dc.data_type = 'INTERVAL[]' THEN 1187::BIGINT
+				WHEN dc.data_type = 'BLOB[]' OR dc.data_type = 'BYTEA[]' THEN 1001::BIGINT
 				ELSE a.atttypid
 			END AS atttypid,
 			a.attstattarget,
 			-- Set correct attlen for each type
 			CASE
+				-- Variable length types
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN -1::INTEGER
-				WHEN dc.data_type = 'INTEGER' THEN 4::INTEGER
-				WHEN dc.data_type = 'BIGINT' THEN 8::INTEGER
-				WHEN dc.data_type = 'SMALLINT' THEN 2::INTEGER
-				WHEN dc.data_type = 'VARCHAR' THEN -1::INTEGER
-				WHEN dc.data_type = 'BOOLEAN' THEN 1::INTEGER
-				WHEN dc.data_type = 'DATE' THEN 4::INTEGER
-				WHEN dc.data_type = 'TIMESTAMP' THEN 8::INTEGER
-				WHEN dc.data_type LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 8::INTEGER
+				WHEN dc.data_type = 'VARCHAR' OR dc.data_type = 'TEXT' THEN -1::INTEGER
+				WHEN dc.data_type = 'BLOB' OR dc.data_type = 'BYTEA' THEN -1::INTEGER
+				WHEN dc.data_type = 'BIT' THEN -1::INTEGER
+				WHEN dc.data_type = 'JSON' THEN -1::INTEGER
+				WHEN dc.data_type = 'HUGEINT' OR dc.data_type = 'UBIGINT' THEN -1::INTEGER
+				-- Fixed size integer types
+				WHEN dc.data_type = 'INTEGER' OR dc.data_type = 'USMALLINT' THEN 4::INTEGER
+				WHEN dc.data_type = 'BIGINT' OR dc.data_type = 'UINTEGER' THEN 8::INTEGER
+				WHEN dc.data_type = 'SMALLINT' OR dc.data_type = 'TINYINT' OR dc.data_type = 'UTINYINT' THEN 2::INTEGER
+				-- Floating point
 				WHEN dc.data_type = 'FLOAT' OR dc.data_type = 'DOUBLE' THEN 8::INTEGER
 				WHEN dc.data_type = 'REAL' THEN 4::INTEGER
+				-- Boolean
+				WHEN dc.data_type = 'BOOLEAN' THEN 1::INTEGER
+				-- Date/Time
+				WHEN dc.data_type = 'DATE' THEN 4::INTEGER
+				WHEN dc.data_type = 'TIME' THEN 8::INTEGER
+				WHEN dc.data_type = 'TIMESTAMP' THEN 8::INTEGER
+				WHEN dc.data_type LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 8::INTEGER
+				WHEN dc.data_type LIKE 'TIME WITH TIME ZONE%' THEN 12::INTEGER
+				WHEN dc.data_type = 'INTERVAL' THEN 16::INTEGER
+				-- UUID
+				WHEN dc.data_type = 'UUID' THEN 16::INTEGER
+				-- CHAR (fixed width, but we use -1 since width varies)
+				WHEN dc.data_type = 'CHAR' OR dc.data_type = 'BPCHAR' THEN -1::INTEGER
+				-- All array types are variable length
+				WHEN dc.data_type LIKE '%[]' THEN -1::INTEGER
 				ELSE a.attlen
 			END AS attlen,
 			a.attnum,
