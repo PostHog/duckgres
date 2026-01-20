@@ -53,9 +53,14 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 				// DuckLake doesn't support CASCADE on DROP TABLE/VIEW.
 				// Strip CASCADE by converting to RESTRICT (same approach as dbt-duckdb).
 				// See: https://github.com/duckdb/dbt-duckdb/pull/557
+				// Note: DROP SCHEMA CASCADE is supported by DuckDB natively, so preserve it.
 				if n.DropStmt.Behavior == pg_query.DropBehavior_DROP_CASCADE {
-					n.DropStmt.Behavior = pg_query.DropBehavior_DROP_RESTRICT
-					changed = true
+					if n.DropStmt.RemoveType == pg_query.ObjectType_OBJECT_TABLE ||
+						n.DropStmt.RemoveType == pg_query.ObjectType_OBJECT_VIEW ||
+						n.DropStmt.RemoveType == pg_query.ObjectType_OBJECT_MATVIEW {
+						n.DropStmt.Behavior = pg_query.DropBehavior_DROP_RESTRICT
+						changed = true
+					}
 				}
 			}
 

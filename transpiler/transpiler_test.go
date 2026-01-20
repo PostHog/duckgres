@@ -934,9 +934,13 @@ func TestTranspile_OnConflict_DuckLakeMode(t *testing.T) {
 }
 
 func TestTranspile_DropCascade_DuckLakeMode(t *testing.T) {
-	// In DuckLake mode, CASCADE should be stripped from DROP statements
+	// In DuckLake mode, CASCADE should be stripped from DROP TABLE/VIEW statements
 	// See: https://github.com/duckdb/dbt-duckdb/pull/557
-	tests := []struct {
+	// However, DROP SCHEMA CASCADE is supported by DuckDB natively and should be preserved.
+	tr := New(Config{DuckLakeMode: true})
+
+	// Test cases where CASCADE should be stripped
+	stripCascadeTests := []struct {
 		name        string
 		input       string
 		notContains string
@@ -956,16 +960,9 @@ func TestTranspile_DropCascade_DuckLakeMode(t *testing.T) {
 			input:       "DROP VIEW my_view CASCADE",
 			notContains: "CASCADE",
 		},
-		{
-			name:        "DROP SCHEMA CASCADE",
-			input:       "DROP SCHEMA my_schema CASCADE",
-			notContains: "CASCADE",
-		},
 	}
 
-	tr := New(Config{DuckLakeMode: true})
-
-	for _, tt := range tests {
+	for _, tt := range stripCascadeTests {
 		t.Run(tt.name, func(t *testing.T) {
 			result, err := tr.Transpile(tt.input)
 			if err != nil {
@@ -976,6 +973,17 @@ func TestTranspile_DropCascade_DuckLakeMode(t *testing.T) {
 			}
 		})
 	}
+
+	// Test that DROP SCHEMA CASCADE is preserved (DuckDB supports it natively)
+	t.Run("DROP SCHEMA CASCADE is preserved", func(t *testing.T) {
+		result, err := tr.Transpile("DROP SCHEMA my_schema CASCADE")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if !strings.Contains(strings.ToUpper(result.SQL), "CASCADE") {
+			t.Errorf("DROP SCHEMA CASCADE should be preserved, got: %q", result.SQL)
+		}
+	})
 }
 
 func TestTranspile_DropCascade_NonDuckLakeMode(t *testing.T) {
