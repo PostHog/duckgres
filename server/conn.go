@@ -1429,12 +1429,13 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 		// Column attribute number (0 = not from a table)
 		binary.Write(&buf, binary.BigEndian, int16(0))
 
-		// Data type OID - map DuckDB types to PostgreSQL OIDs
-		oid := c.mapTypeOID(colTypes[i])
+		// Data type OID - check for pg_catalog column name overrides first,
+		// then fall back to DuckDB type mapping
+		oid := c.mapTypeOIDWithColumnName(col, colTypes[i])
 		binary.Write(&buf, binary.BigEndian, oid)
 
-		// Data type size
-		typeSize := c.mapTypeSize(colTypes[i])
+		// Data type size - use appropriate size for overridden types
+		typeSize := c.mapTypeSizeWithColumnName(col, colTypes[i])
 		binary.Write(&buf, binary.BigEndian, typeSize)
 
 		// Type modifier (-1 = no modifier)
@@ -1445,6 +1446,27 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 	}
 
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
+}
+
+func (c *clientConn) mapTypeOIDWithColumnName(colName string, colType *sql.ColumnType) int32 {
+	// Check if this column name has a specific pg_catalog type override
+	if oid, ok := pgCatalogColumnOIDs[colName]; ok {
+		return oid
+	}
+	return getTypeInfo(colType).OID
+}
+
+func (c *clientConn) mapTypeSizeWithColumnName(colName string, colType *sql.ColumnType) int16 {
+	// Return appropriate sizes for overridden types
+	if oid, ok := pgCatalogColumnOIDs[colName]; ok {
+		switch oid {
+		case OidName:
+			return 64 // name is 64 bytes
+		case OidChar:
+			return 1 // "char" is 1 byte
+		}
+	}
+	return getTypeInfo(colType).Size
 }
 
 func (c *clientConn) mapTypeOID(colType *sql.ColumnType) int32 {

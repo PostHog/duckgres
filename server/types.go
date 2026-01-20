@@ -13,6 +13,8 @@ import (
 const (
 	OidBool        int32 = 16
 	OidBytea       int32 = 17
+	OidChar        int32 = 18   // "char" - single-byte internal type
+	OidName        int32 = 19   // name - 64-byte internal type for identifiers
 	OidInt8        int32 = 20   // bigint
 	OidInt2        int32 = 21   // smallint
 	OidInt4        int32 = 23   // integer
@@ -20,6 +22,7 @@ const (
 	OidOid         int32 = 26
 	OidFloat4      int32 = 700  // real
 	OidFloat8      int32 = 701  // double precision
+	OidBpchar      int32 = 1042 // blank-padded char
 	OidVarchar     int32 = 1043
 	OidDate        int32 = 1082
 	OidTime        int32 = 1083
@@ -31,6 +34,31 @@ const (
 	OidJSON        int32 = 114
 	OidJSONB       int32 = 3802
 )
+
+// pgCatalogColumnOIDs maps pg_catalog column names to their correct PostgreSQL type OIDs.
+// This ensures wire protocol compatibility with JDBC clients that expect specific types.
+var pgCatalogColumnOIDs = map[string]int32{
+	// "name" type columns (OID 19) - 64-byte identifiers
+	"nspname":            OidName,
+	"relname":            OidName,
+	"attname":            OidName,
+	"typname":            OidName,
+	"datname":            OidName,
+	"rolname":            OidName,
+	"collname":           OidName,
+	"conname":            OidName,
+	"proname":            OidName,
+	"usename":            OidName,
+	"current_database()": OidName,
+	"current_database":   OidName,
+	// "char" type columns (OID 18) - single-byte internal type
+	"typtype":      OidChar,
+	"typcategory":  OidChar,
+	"typalign":     OidChar,
+	"typstorage":   OidChar,
+	"relkind":      OidChar,
+	"relpersistence": OidChar,
+}
 
 // TypeInfo contains PostgreSQL type information
 type TypeInfo struct {
