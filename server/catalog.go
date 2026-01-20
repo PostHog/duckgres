@@ -659,10 +659,9 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			PRIMARY KEY (table_schema, table_name, column_name)
 		)
 	`
-	if _, err := db.Exec(metadataTableSQL); err != nil {
-		// Table might already exist, that's OK
-		// Ignore errors since PRIMARY KEY might not work in all contexts
-	}
+	// Table might already exist, that's OK
+	// Ignore errors since PRIMARY KEY might not work in all contexts
+	_, _ = db.Exec(metadataTableSQL)
 
 	// Create information_schema.columns wrapper view
 	// Transforms DuckDB type names to PostgreSQL-compatible names

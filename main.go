@@ -79,16 +79,6 @@ func env(key, defaultVal string) string {
 	return defaultVal
 }
 
-// envInt returns the environment variable as int or a default
-func envInt(key string, defaultVal int) int {
-	if v := os.Getenv(key); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			return i
-		}
-	}
-	return defaultVal
-}
-
 func main() {
 	// Define CLI flags with environment variable fallbacks
 	configFile := flag.String("config", env("DUCKGRES_CONFIG", ""), "Path to YAML config file (env: DUCKGRES_CONFIG)")
@@ -315,7 +305,7 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Shutting down...")
-		srv.Close()
+		_ = srv.Close()
 		os.Exit(0)
 	}()
 

@@ -48,13 +48,6 @@ func (t *ExpandArrayTransform) Transform(tree *pg_query.ParseResult, result *Res
 	return changed, nil
 }
 
-// expandArrayCall represents a detected _pg_expandarray call that needs transformation
-type expandArrayCall struct {
-	arrayArg    *pg_query.Node // The array argument to _pg_expandarray
-	fieldName   string         // The field being accessed (n or x)
-	lateralName string         // The name of the lateral alias to use
-}
-
 func (t *ExpandArrayTransform) transformSelectStmt(stmt *pg_query.SelectStmt) bool {
 	if stmt == nil {
 		return false
@@ -225,10 +218,9 @@ func (t *ExpandArrayTransform) collectExpandArrayCalls(node *pg_query.Node, arra
 		}
 	case *pg_query.Node_SubLink:
 		if n.SubLink != nil {
-			if subSelect := n.SubLink.Subselect.GetSelectStmt(); subSelect != nil {
-				// Don't add lateral joins from subqueries to parent
-				// Just recurse to transform the subquery independently
-			}
+			// Don't add lateral joins from subqueries to parent
+			// Just recurse to transform the subquery independently
+			// (subselect transformation happens via recursive transformSelectStmt calls)
 			t.collectExpandArrayCalls(n.SubLink.Testexpr, arrayExprToAlias)
 		}
 	case *pg_query.Node_TypeCast:

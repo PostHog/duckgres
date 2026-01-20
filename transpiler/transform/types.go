@@ -103,15 +103,9 @@ func (t *TypeMappingTransform) Transform(tree *pg_query.ParseResult, result *Res
 				}
 			}
 		case *pg_query.Node_FuncCall:
-			// Handle CAST function calls
-			if n.FuncCall != nil && len(n.FuncCall.Funcname) == 1 {
-				if name := n.FuncCall.Funcname[0].GetString_(); name != nil {
-					if strings.ToLower(name.Sval) == "cast" {
-						// CAST has type as second argument
-						// This is handled differently in the AST
-					}
-				}
-			}
+			// CAST function calls have type as second argument
+			// but are handled differently in the AST (via TypeCast nodes)
+			// so no action needed here
 		}
 		return true
 	})

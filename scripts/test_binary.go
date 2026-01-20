@@ -17,7 +17,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open db: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Printf("failed to close db: %v", err)
+		}
+	}()
 
 	// Test 1: Create a test table with various types
 	fmt.Println("=== Creating test table ===")
@@ -58,7 +62,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Query failed: %v", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			log.Printf("failed to close rows: %v", err)
+		}
+	}()
 
 	for rows.Next() {
 		var id int

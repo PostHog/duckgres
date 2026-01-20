@@ -1469,14 +1469,6 @@ func (c *clientConn) mapTypeSizeWithColumnName(colName string, colType *sql.Colu
 	return getTypeInfo(colType).Size
 }
 
-func (c *clientConn) mapTypeOID(colType *sql.ColumnType) int32 {
-	return getTypeInfo(colType).OID
-}
-
-func (c *clientConn) mapTypeSize(colType *sql.ColumnType) int16 {
-	return getTypeInfo(colType).Size
-}
-
 func (c *clientConn) sendDataRow(values []interface{}) error {
 	return c.sendDataRowWithFormats(values, nil, nil)
 }

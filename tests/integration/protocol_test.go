@@ -87,10 +87,8 @@ func TestProtocolSimpleQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Exec failed: %v", err)
 		}
-		_, err = result.RowsAffected()
-		if err != nil {
-			// This is expected - SELECT doesn't have rows affected
-		}
+		// RowsAffected may return an error for SELECT - this is expected
+		_, _ = result.RowsAffected()
 	})
 }
 

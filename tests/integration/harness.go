@@ -420,9 +420,8 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 	}
 
 	for _, t := range tables {
-		if _, err := h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t)); err != nil {
-			// Ignore errors - table might not exist or schema might not exist
-		}
+		// Ignore errors - table might not exist or schema might not exist
+		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t))
 	}
 
 	// Drop test schema
