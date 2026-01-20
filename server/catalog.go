@@ -327,25 +327,44 @@ func initPgCatalog(db *sql.DB) error {
 	`
 	db.Exec(pgNamespaceSQL)
 
-	// Create pg_attribute wrapper that fixes NUMERIC/DECIMAL type OIDs
-	// DuckDB's pg_catalog.pg_attribute returns atttypid=21 (int2) for DECIMAL columns
-	// but JDBC clients expect atttypid=1700 (numeric). This view fixes that mapping
-	// by joining with duckdb_columns() to get the actual type name.
+	// Create pg_attribute wrapper that maps DuckDB internal type OIDs to PostgreSQL OIDs
+	// DuckDB's pg_catalog.pg_attribute returns internal OIDs that don't match pg_type.
+	// This causes JOIN pg_type ON atttypid = oid to fail, hiding columns from JDBC.
+	// We must map ALL common types so columns join correctly with pg_type.
 	pgAttributeSQL := `
 		CREATE OR REPLACE VIEW pg_attribute AS
 		SELECT
 			a.attrelid,
 			a.attname,
-			-- Fix atttypid: DECIMAL/NUMERIC should be 1700, not 21
-			-- Use duckdb_columns() to get actual type since pg_type shows 'int2' for DECIMAL
+			-- Map DuckDB internal type OIDs to PostgreSQL standard OIDs
 			CASE
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::BIGINT
+				WHEN dc.data_type = 'INTEGER' THEN 23::BIGINT
+				WHEN dc.data_type = 'BIGINT' THEN 20::BIGINT
+				WHEN dc.data_type = 'SMALLINT' THEN 21::BIGINT
+				WHEN dc.data_type = 'VARCHAR' THEN 1043::BIGINT
+				WHEN dc.data_type = 'BOOLEAN' THEN 16::BIGINT
+				WHEN dc.data_type = 'DATE' THEN 1082::BIGINT
+				WHEN dc.data_type = 'TIMESTAMP' THEN 1114::BIGINT
+				WHEN dc.data_type LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 1184::BIGINT
+				WHEN dc.data_type = 'FLOAT' OR dc.data_type = 'DOUBLE' THEN 701::BIGINT
+				WHEN dc.data_type = 'REAL' THEN 700::BIGINT
 				ELSE a.atttypid
 			END AS atttypid,
 			a.attstattarget,
-			-- Fix attlen: DECIMAL/NUMERIC is variable-length (-1)
+			-- Set correct attlen for each type
 			CASE
 				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN -1::INTEGER
+				WHEN dc.data_type = 'INTEGER' THEN 4::INTEGER
+				WHEN dc.data_type = 'BIGINT' THEN 8::INTEGER
+				WHEN dc.data_type = 'SMALLINT' THEN 2::INTEGER
+				WHEN dc.data_type = 'VARCHAR' THEN -1::INTEGER
+				WHEN dc.data_type = 'BOOLEAN' THEN 1::INTEGER
+				WHEN dc.data_type = 'DATE' THEN 4::INTEGER
+				WHEN dc.data_type = 'TIMESTAMP' THEN 8::INTEGER
+				WHEN dc.data_type LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 8::INTEGER
+				WHEN dc.data_type = 'FLOAT' OR dc.data_type = 'DOUBLE' THEN 8::INTEGER
+				WHEN dc.data_type = 'REAL' THEN 4::INTEGER
 				ELSE a.attlen
 			END AS attlen,
 			a.attnum,
