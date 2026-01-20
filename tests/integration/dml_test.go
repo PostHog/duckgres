@@ -91,7 +91,7 @@ func TestDMLInsertReturning(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Insert RETURNING failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		if !rows.Next() {
 			t.Error("Expected 1 row returned")
@@ -112,7 +112,7 @@ func TestDMLInsertReturning(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Insert RETURNING failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		if !rows.Next() {
 			t.Error("Expected 1 row returned")
@@ -251,7 +251,7 @@ func TestDMLUpdateReturning(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Update RETURNING failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		if !rows.Next() {
 			t.Error("Expected 1 row returned")
@@ -375,7 +375,7 @@ func TestDMLDeleteReturning(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Delete RETURNING failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		if !rows.Next() {
 			t.Error("Expected 1 row returned")

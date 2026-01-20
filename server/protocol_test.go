@@ -28,10 +28,10 @@ func TestReadStartupMessage(t *testing.T) {
 		bodyLen++ // final null
 
 		// Write length (includes itself)
-		binary.Write(&buf, binary.BigEndian, int32(bodyLen+4))
+		_ = binary.Write(&buf, binary.BigEndian, int32(bodyLen+4))
 
 		// Write protocol version (3.0 = 196608)
-		binary.Write(&buf, binary.BigEndian, uint32(196608))
+		_ = binary.Write(&buf, binary.BigEndian, uint32(196608))
 
 		// Write params
 		for k, v := range params {
@@ -59,8 +59,8 @@ func TestReadStartupMessage(t *testing.T) {
 		var buf bytes.Buffer
 
 		// SSL request: length=8, version=80877103
-		binary.Write(&buf, binary.BigEndian, int32(8))
-		binary.Write(&buf, binary.BigEndian, uint32(80877103))
+		_ = binary.Write(&buf, binary.BigEndian, int32(8))
+		_ = binary.Write(&buf, binary.BigEndian, uint32(80877103))
 
 		result, err := readStartupMessage(&buf)
 		if err != nil {
@@ -76,10 +76,10 @@ func TestReadStartupMessage(t *testing.T) {
 		var buf bytes.Buffer
 
 		// Cancel request: length=16, version=80877102, pid, key
-		binary.Write(&buf, binary.BigEndian, int32(16))
-		binary.Write(&buf, binary.BigEndian, uint32(80877102))
-		binary.Write(&buf, binary.BigEndian, uint32(12345)) // pid
-		binary.Write(&buf, binary.BigEndian, uint32(67890)) // key
+		_ = binary.Write(&buf, binary.BigEndian, int32(16))
+		_ = binary.Write(&buf, binary.BigEndian, uint32(80877102))
+		_ = binary.Write(&buf, binary.BigEndian, uint32(12345)) // pid
+		_ = binary.Write(&buf, binary.BigEndian, uint32(67890)) // key
 
 		result, err := readStartupMessage(&buf)
 		if err != nil {
@@ -99,7 +99,7 @@ func TestReadMessage(t *testing.T) {
 		query := "SELECT 1"
 		// Query message: 'Q' + length + query + null
 		buf.WriteByte('Q')
-		binary.Write(&buf, binary.BigEndian, int32(len(query)+5)) // length includes itself and null
+		_ = binary.Write(&buf, binary.BigEndian, int32(len(query)+5)) // length includes itself and null
 		buf.WriteString(query)
 		buf.WriteByte(0)
 
@@ -124,7 +124,7 @@ func TestReadMessage(t *testing.T) {
 
 		// Terminate message: 'X' + length (4, just the length itself)
 		buf.WriteByte('X')
-		binary.Write(&buf, binary.BigEndian, int32(4))
+		_ = binary.Write(&buf, binary.BigEndian, int32(4))
 
 		msgType, body, err := readMessage(&buf)
 		if err != nil {
@@ -145,7 +145,7 @@ func TestReadMessage(t *testing.T) {
 
 		data := []byte{0x01, 0x02, 0x03, 0x00, 0xFF}
 		buf.WriteByte('d') // CopyData
-		binary.Write(&buf, binary.BigEndian, int32(len(data)+4))
+		_ = binary.Write(&buf, binary.BigEndian, int32(len(data)+4))
 		buf.Write(data)
 
 		msgType, body, err := readMessage(&buf)

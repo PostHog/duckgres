@@ -412,6 +412,6 @@ func cleanupDDLTables(t *testing.T) {
 		"ddl_test_temporary",
 	}
 	for _, table := range tables {
-		testHarness.DuckgresDB.Exec("DROP TABLE IF EXISTS " + table)
+		_, _ = testHarness.DuckgresDB.Exec("DROP TABLE IF EXISTS " + table)
 	}
 }

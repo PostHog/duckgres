@@ -262,7 +262,7 @@ func TestSessionTransactionModes(t *testing.T) {
 				t.Errorf("Query failed: %v", err)
 			}
 			// Always rollback to clean up
-			testHarness.DuckgresDB.Exec("ROLLBACK")
+			_, _ = testHarness.DuckgresDB.Exec("ROLLBACK")
 		})
 	}
 }

@@ -45,21 +45,10 @@ func (t *VersionTransform) walkAndTransform(node *pg_query.Node, changed *bool) 
 	switch n := node.Node.(type) {
 	case *pg_query.Node_FuncCall:
 		if n.FuncCall != nil {
-			// Check if this is a version() call
-			if len(n.FuncCall.Funcname) == 1 && len(n.FuncCall.Args) == 0 {
-				if first := n.FuncCall.Funcname[0]; first != nil {
-					if str := first.GetString_(); str != nil && strings.EqualFold(str.Sval, "version") {
-						// We can't easily replace a FuncCall with a constant in the AST,
-						// so we'll change it to a different approach:
-						// Replace version() with a literal by modifying the function name
-						// to a macro that returns the string. Since we create the macro in
-						// initPgCatalog, this should work.
-						// Actually, let's just mark this as needing special handling.
-						// The deparser will output version() and we rely on the macro.
-						// For now, leave it unchanged - the macro handles this.
-					}
-				}
-			}
+			// version() calls are handled by a macro defined in initPgCatalog
+			// No AST transformation needed - the deparser outputs version()
+			// and the macro returns the appropriate version string
+
 			// Recurse into function arguments
 			for _, arg := range n.FuncCall.Args {
 				t.walkAndTransform(arg, changed)

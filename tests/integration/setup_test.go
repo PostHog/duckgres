@@ -295,7 +295,7 @@ func TestMain(m *testing.M) {
 
 	// Cleanup
 	if testHarness != nil {
-		testHarness.Close()
+		_ = testHarness.Close()
 	}
 
 	os.Exit(code)
@@ -388,30 +388,12 @@ func mustExec(t *testing.T, db *sql.DB, query string) {
 	}
 }
 
-// mustExecBoth executes a statement on both databases
-func mustExecBoth(t *testing.T, query string) {
-	t.Helper()
-	if testHarness.PostgresDB != nil && !skipPostgresCompare {
-		mustExec(t, testHarness.PostgresDB, query)
-	}
-	mustExec(t, testHarness.DuckgresDB, query)
-}
-
 // truncateQuery truncates a query for display
 func truncateQuery(q string) string {
 	if len(q) > 80 {
 		return q[:80] + "..."
 	}
 	return q
-}
-
-// pgOnly returns the PostgreSQL database, or skips if not available
-func pgOnly(t *testing.T) *sql.DB {
-	t.Helper()
-	if testHarness.PostgresDB == nil || skipPostgresCompare {
-		t.Skip("PostgreSQL not available")
-	}
-	return testHarness.PostgresDB
 }
 
 // dgOnly returns the Duckgres database

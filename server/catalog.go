@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"fmt"
+	"log"
 )
 
 // initPgCatalog creates PostgreSQL compatibility functions and views in DuckDB
@@ -22,7 +23,9 @@ func initPgCatalog(db *sql.DB) error {
 				(4::INTEGER, 'testdb', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL)
 		) AS t(oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datacl)
 	`
-	db.Exec(pgDatabaseSQL)
+	if _, err := db.Exec(pgDatabaseSQL); err != nil {
+		log.Printf("Warning: failed to create pg_database view: %v", err)
+	}
 
 	// Create pg_class wrapper that adds missing columns psql expects
 	// DuckDB's pg_catalog.pg_class is missing relforcerowsecurity
@@ -78,7 +81,9 @@ func initPgCatalog(db *sql.DB) error {
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
 	`
-	db.Exec(pgClassSQL)
+	if _, err := db.Exec(pgClassSQL); err != nil {
+		log.Printf("Warning: failed to create pg_class_full view: %v", err)
+	}
 
 	// Create pg_collation view (DuckDB doesn't have this)
 	pgCollationSQL := `
@@ -96,7 +101,9 @@ func initPgCatalog(db *sql.DB) error {
 			NULL AS collversion
 		WHERE false
 	`
-	db.Exec(pgCollationSQL)
+	if _, err := db.Exec(pgCollationSQL); err != nil {
+		log.Printf("Warning: failed to create pg_collation view: %v", err)
+	}
 
 	// Create pg_policy view for row-level security (empty, DuckDB doesn't support RLS)
 	pgPolicySQL := `
@@ -112,7 +119,9 @@ func initPgCatalog(db *sql.DB) error {
 			NULL AS polwithcheck
 		WHERE false
 	`
-	db.Exec(pgPolicySQL)
+	if _, err := db.Exec(pgPolicySQL); err != nil {
+		log.Printf("Warning: failed to create pg_policy view: %v", err)
+	}
 
 	// Create pg_roles view (minimal for psql compatibility)
 	pgRolesSQL := `
@@ -132,7 +141,9 @@ func initPgCatalog(db *sql.DB) error {
 			NULL AS rolvaliduntil,
 			ARRAY[]::VARCHAR[] AS rolconfig
 	`
-	db.Exec(pgRolesSQL)
+	if _, err := db.Exec(pgRolesSQL); err != nil {
+		log.Printf("Warning: failed to create pg_roles view: %v", err)
+	}
 
 	// Create pg_statistic_ext view (extended statistics, empty)
 	pgStatisticExtSQL := `
@@ -148,7 +159,9 @@ func initPgCatalog(db *sql.DB) error {
 			ARRAY[]::VARCHAR[] AS stxkind
 		WHERE false
 	`
-	db.Exec(pgStatisticExtSQL)
+	if _, err := db.Exec(pgStatisticExtSQL); err != nil {
+		log.Printf("Warning: failed to create pg_statistic_ext view: %v", err)
+	}
 
 	// Create pg_publication_tables view (logical replication, empty)
 	pgPublicationTablesSQL := `
@@ -159,7 +172,9 @@ func initPgCatalog(db *sql.DB) error {
 			'' AS tablename
 		WHERE false
 	`
-	db.Exec(pgPublicationTablesSQL)
+	if _, err := db.Exec(pgPublicationTablesSQL); err != nil {
+		log.Printf("Warning: failed to create pg_publication_tables view: %v", err)
+	}
 
 	// Create pg_rules view (empty, DuckDB doesn't have rules)
 	pgRulesSQL := `
@@ -171,7 +186,9 @@ func initPgCatalog(db *sql.DB) error {
 			'' AS definition
 		WHERE false
 	`
-	db.Exec(pgRulesSQL)
+	if _, err := db.Exec(pgRulesSQL); err != nil {
+		log.Printf("Warning: failed to create pg_rules view: %v", err)
+	}
 
 	// Create pg_publication view (logical replication, empty)
 	pgPublicationSQL := `
@@ -188,7 +205,9 @@ func initPgCatalog(db *sql.DB) error {
 			false AS pubviaroot
 		WHERE false
 	`
-	db.Exec(pgPublicationSQL)
+	if _, err := db.Exec(pgPublicationSQL); err != nil {
+		log.Printf("Warning: failed to create pg_publication view: %v", err)
+	}
 
 	// Create pg_publication_rel view (publication-relation mapping, empty)
 	pgPublicationRelSQL := `
@@ -199,7 +218,9 @@ func initPgCatalog(db *sql.DB) error {
 			0::BIGINT AS prrelid
 		WHERE false
 	`
-	db.Exec(pgPublicationRelSQL)
+	if _, err := db.Exec(pgPublicationRelSQL); err != nil {
+		log.Printf("Warning: failed to create pg_publication_rel view: %v", err)
+	}
 
 	// Create pg_inherits view (table inheritance, empty - DuckDB doesn't support inheritance)
 	pgInheritsSQL := `
@@ -211,7 +232,9 @@ func initPgCatalog(db *sql.DB) error {
 			false AS inhdetachpending
 		WHERE false
 	`
-	db.Exec(pgInheritsSQL)
+	if _, err := db.Exec(pgInheritsSQL); err != nil {
+		log.Printf("Warning: failed to create pg_inherits view: %v", err)
+	}
 
 	// Create pg_matviews view (materialized views, empty - DuckDB doesn't support matviews)
 	pgMatviewsSQL := `
@@ -226,7 +249,9 @@ func initPgCatalog(db *sql.DB) error {
 			''::VARCHAR AS definition
 		WHERE false
 	`
-	db.Exec(pgMatviewsSQL)
+	if _, err := db.Exec(pgMatviewsSQL); err != nil {
+		log.Printf("Warning: failed to create pg_matviews view: %v", err)
+	}
 
 	// Create pg_stat_statements view (query statistics, empty - pg_stat_statements extension not supported)
 	pgStatStatementsSQL := `
@@ -258,7 +283,9 @@ func initPgCatalog(db *sql.DB) error {
 			0::DOUBLE AS blk_write_time
 		WHERE false
 	`
-	db.Exec(pgStatStatementsSQL)
+	if _, err := db.Exec(pgStatStatementsSQL); err != nil {
+		log.Printf("Warning: failed to create pg_stat_statements view: %v", err)
+	}
 
 	// Create pg_partitioned_table view (partitioning, empty - DuckDB doesn't support table partitioning)
 	pgPartitionedTableSQL := `
@@ -274,7 +301,9 @@ func initPgCatalog(db *sql.DB) error {
 			NULL::TEXT AS partexprs
 		WHERE false
 	`
-	db.Exec(pgPartitionedTableSQL)
+	if _, err := db.Exec(pgPartitionedTableSQL); err != nil {
+		log.Printf("Warning: failed to create pg_partitioned_table view: %v", err)
+	}
 
 	// Create pg_stat_user_tables view (table statistics)
 	// Uses reltuples from pg_class for estimated row counts (same as PostgreSQL - it's an estimate)
@@ -310,7 +339,9 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE c.relkind IN ('r', 'p')
 		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
 	`
-	db.Exec(pgStatUserTablesSQL)
+	if _, err := db.Exec(pgStatUserTablesSQL); err != nil {
+		log.Printf("Warning: failed to create pg_stat_user_tables view: %v", err)
+	}
 
 	// Create pg_namespace wrapper that maps 'main' to 'public' for PostgreSQL compatibility
 	// Also set owner to match PostgreSQL conventions:
@@ -325,7 +356,9 @@ func initPgCatalog(db *sql.DB) error {
 			nspacl
 		FROM pg_catalog.pg_namespace
 	`
-	db.Exec(pgNamespaceSQL)
+	if _, err := db.Exec(pgNamespaceSQL); err != nil {
+		log.Printf("Warning: failed to create pg_namespace view: %v", err)
+	}
 
 	// Create pg_type wrapper that fixes NULL values for JDBC compatibility
 	// DuckDB's pg_catalog.pg_type has NULL for many columns that JDBC clients
@@ -377,7 +410,9 @@ func initPgCatalog(db *sql.DB) error {
 			typacl
 		FROM pg_catalog.pg_type
 	`
-	db.Exec(pgTypeSQL)
+	if _, err := db.Exec(pgTypeSQL); err != nil {
+		log.Printf("Warning: failed to create pg_type view: %v", err)
+	}
 
 	// Create pg_attribute wrapper that maps DuckDB internal type OIDs to PostgreSQL OIDs
 	// DuckDB's pg_catalog.pg_attribute returns internal OIDs that don't match pg_type.
@@ -510,7 +545,9 @@ func initPgCatalog(db *sql.DB) error {
 		FROM pg_catalog.pg_attribute a
 		LEFT JOIN duckdb_columns() dc ON dc.table_oid = a.attrelid AND dc.column_name = a.attname
 	`
-	db.Exec(pgAttributeSQL)
+	if _, err := db.Exec(pgAttributeSQL); err != nil {
+		log.Printf("Warning: failed to create pg_attribute view: %v", err)
+	}
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
@@ -659,10 +696,9 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			PRIMARY KEY (table_schema, table_name, column_name)
 		)
 	`
-	if _, err := db.Exec(metadataTableSQL); err != nil {
-		// Table might already exist, that's OK
-		// Ignore errors since PRIMARY KEY might not work in all contexts
-	}
+	// Table might already exist, that's OK
+	// Ignore errors since PRIMARY KEY might not work in all contexts
+	_, _ = db.Exec(metadataTableSQL)
 
 	// Create information_schema.columns wrapper view
 	// Transforms DuckDB type names to PostgreSQL-compatible names
@@ -837,7 +873,9 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 				'YES' AS is_updatable
 			FROM %s.columns
 		`
-		db.Exec(fmt.Sprintf(columnsViewSimpleSQL, infoSchemaPrefix))
+		if _, err := db.Exec(fmt.Sprintf(columnsViewSimpleSQL, infoSchemaPrefix)); err != nil {
+			log.Printf("Warning: failed to create information_schema_columns_compat view: %v", err)
+		}
 	}
 
 	// Create information_schema.tables wrapper view with additional PostgreSQL columns
@@ -875,7 +913,9 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		AND t.table_name NOT LIKE 'sqlite_%%'
 		AND t.table_name NOT LIKE 'pragma_%%'
 	`
-	db.Exec(fmt.Sprintf(tablesViewSQL, infoSchemaPrefix))
+	if _, err := db.Exec(fmt.Sprintf(tablesViewSQL, infoSchemaPrefix)); err != nil {
+		log.Printf("Warning: failed to create information_schema_tables_compat view: %v", err)
+	}
 
 	// Create information_schema.schemata wrapper view
 	// Normalize 'main' to 'public' and add synthetic entries for pg_catalog and information_schema
@@ -905,7 +945,9 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		SELECT 'memory' AS catalog_name, 'pg_toast' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 	`
-	db.Exec(fmt.Sprintf(schemataViewSQL, infoSchemaPrefix))
+	if _, err := db.Exec(fmt.Sprintf(schemataViewSQL, infoSchemaPrefix)); err != nil {
+		log.Printf("Warning: failed to create information_schema_schemata_compat view: %v", err)
+	}
 
 	// Create information_schema.views wrapper view
 	// Filter out internal duckgres views and DuckDB system views
@@ -938,7 +980,9 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		AND v.table_name NOT LIKE 'sqlite_%%'
 		AND v.table_name NOT LIKE 'pragma_%%'
 	`
-	db.Exec(fmt.Sprintf(viewsViewSQL, infoSchemaPrefix))
+	if _, err := db.Exec(fmt.Sprintf(viewsViewSQL, infoSchemaPrefix)); err != nil {
+		log.Printf("Warning: failed to create information_schema_views_compat view: %v", err)
+	}
 
 	return nil
 }

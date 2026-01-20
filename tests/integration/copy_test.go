@@ -21,7 +21,7 @@ func TestCopyFromStdin(t *testing.T) {
 
 		stmt, err := txn.Prepare(pq.CopyIn("copy_test", "id", "name", "value"))
 		if err != nil {
-			txn.Rollback()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to prepare COPY: %v", err)
 		}
 
@@ -39,8 +39,8 @@ func TestCopyFromStdin(t *testing.T) {
 		for _, d := range testData {
 			_, err = stmt.Exec(d.id, d.name, d.value)
 			if err != nil {
-				stmt.Close()
-				txn.Rollback()
+				_ = stmt.Close()
+				_ = txn.Rollback()
 				t.Fatalf("Failed to exec COPY data: %v", err)
 			}
 		}
@@ -48,14 +48,14 @@ func TestCopyFromStdin(t *testing.T) {
 		// Close the statement to flush the COPY
 		_, err = stmt.Exec()
 		if err != nil {
-			stmt.Close()
-			txn.Rollback()
+			_ = stmt.Close()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to flush COPY: %v", err)
 		}
 
 		err = stmt.Close()
 		if err != nil {
-			txn.Rollback()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to close COPY statement: %v", err)
 		}
 
@@ -98,27 +98,27 @@ func TestCopyFromStdin(t *testing.T) {
 
 		stmt, err := txn.Prepare(pq.CopyIn("copy_test", "id", "name", "value"))
 		if err != nil {
-			txn.Rollback()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to prepare COPY: %v", err)
 		}
 
 		// Insert row with NULL values
 		_, err = stmt.Exec(1, nil, nil)
 		if err != nil {
-			stmt.Close()
-			txn.Rollback()
+			_ = stmt.Close()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to exec COPY with NULLs: %v", err)
 		}
 
 		_, err = stmt.Exec()
 		if err != nil {
-			stmt.Close()
-			txn.Rollback()
+			_ = stmt.Close()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to flush COPY: %v", err)
 		}
 
-		stmt.Close()
-		txn.Commit()
+		_ = stmt.Close()
+		_ = txn.Commit()
 
 		// Verify the row was inserted and NULL was handled correctly
 		result, err := ExecuteQuery(testHarness.DuckgresDB, "SELECT COUNT(*) FROM copy_test WHERE id = 1")
@@ -158,7 +158,7 @@ func TestCopyFromStdin(t *testing.T) {
 
 		stmt, err := txn.Prepare(pq.CopyIn("copy_test", "id", "name", "value"))
 		if err != nil {
-			txn.Rollback()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to prepare COPY: %v", err)
 		}
 
@@ -166,21 +166,21 @@ func TestCopyFromStdin(t *testing.T) {
 		for i := 0; i < 1000; i++ {
 			_, err = stmt.Exec(i, "user", float64(i)*1.5)
 			if err != nil {
-				stmt.Close()
-				txn.Rollback()
+				_ = stmt.Close()
+				_ = txn.Rollback()
 				t.Fatalf("Failed to exec COPY data at row %d: %v", i, err)
 			}
 		}
 
 		_, err = stmt.Exec()
 		if err != nil {
-			stmt.Close()
-			txn.Rollback()
+			_ = stmt.Close()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to flush COPY: %v", err)
 		}
 
-		stmt.Close()
-		txn.Commit()
+		_ = stmt.Close()
+		_ = txn.Commit()
 
 		// Verify count
 		result, err := ExecuteQuery(testHarness.DuckgresDB, "SELECT COUNT(*) FROM copy_test")
@@ -209,7 +209,7 @@ func TestCopyFromStdinWithSpecialChars(t *testing.T) {
 
 		stmt, err := txn.Prepare(pq.CopyIn("copy_special_test", "id", "data"))
 		if err != nil {
-			txn.Rollback()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to prepare COPY: %v", err)
 		}
 
@@ -229,21 +229,21 @@ func TestCopyFromStdinWithSpecialChars(t *testing.T) {
 		for _, tc := range testCases {
 			_, err = stmt.Exec(tc.id, tc.data)
 			if err != nil {
-				stmt.Close()
-				txn.Rollback()
+				_ = stmt.Close()
+				_ = txn.Rollback()
 				t.Fatalf("Failed to exec COPY for id=%d: %v", tc.id, err)
 			}
 		}
 
 		_, err = stmt.Exec()
 		if err != nil {
-			stmt.Close()
-			txn.Rollback()
+			_ = stmt.Close()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to flush COPY: %v", err)
 		}
 
-		stmt.Close()
-		txn.Commit()
+		_ = stmt.Close()
+		_ = txn.Commit()
 
 		// Verify each value was stored correctly
 		for _, tc := range testCases {
@@ -280,7 +280,7 @@ func TestCopyFromStdinMultilineJSON(t *testing.T) {
 
 		stmt, err := txn.Prepare(pq.CopyIn("copy_json_test", "id", "metadata"))
 		if err != nil {
-			txn.Rollback()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to prepare COPY: %v", err)
 		}
 
@@ -289,20 +289,20 @@ func TestCopyFromStdinMultilineJSON(t *testing.T) {
 
 		_, err = stmt.Exec(1, jsonData)
 		if err != nil {
-			stmt.Close()
-			txn.Rollback()
+			_ = stmt.Close()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to exec COPY with JSON: %v", err)
 		}
 
 		_, err = stmt.Exec()
 		if err != nil {
-			stmt.Close()
-			txn.Rollback()
+			_ = stmt.Close()
+			_ = txn.Rollback()
 			t.Fatalf("Failed to flush COPY: %v", err)
 		}
 
-		stmt.Close()
-		txn.Commit()
+		_ = stmt.Close()
+		_ = txn.Commit()
 
 		// Verify the JSON was stored correctly
 		var stored string
