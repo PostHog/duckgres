@@ -75,34 +75,34 @@ func NewTestHarness(cfg HarnessConfig) (*TestHarness, error) {
 
 	// Start Duckgres server
 	if err := h.startDuckgres(cfg); err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("failed to start Duckgres: %w", err)
 	}
 
 	// Connect to PostgreSQL (if not skipped)
 	if !cfg.SkipPostgres {
 		if err := h.connectPostgres(); err != nil {
-			h.Close()
+			_ = h.Close()
 			return nil, fmt.Errorf("failed to connect to PostgreSQL: %w", err)
 		}
 	}
 
 	// Connect to Duckgres
 	if err := h.connectDuckgres(); err != nil {
-		h.Close()
+		_ = h.Close()
 		return nil, fmt.Errorf("failed to connect to Duckgres: %w", err)
 	}
 
 	// Load test fixtures into Duckgres
 	if err := h.loadFixtures(); err != nil {
-		h.Close()
+		_ = h.Close()
 		return nil, fmt.Errorf("failed to load fixtures: %w", err)
 	}
 
 	// Load fixtures into PostgreSQL for comparison tests
 	if !cfg.SkipPostgres {
 		if err := h.loadPostgresFixtures(); err != nil {
-			h.Close()
+			_ = h.Close()
 			return nil, fmt.Errorf("failed to load PostgreSQL fixtures: %w", err)
 		}
 	}
@@ -158,7 +158,7 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Start server in background
 	go func() {
-		srv.ListenAndServe()
+		_ = srv.ListenAndServe()
 	}()
 
 	// Wait for server to be ready
@@ -302,7 +302,7 @@ func (h *TestHarness) loadPostgresFixtures() error {
 		"DROP TABLE IF EXISTS types_test",
 	}
 	for _, stmt := range dropStatements {
-		h.PostgresDB.Exec(stmt)
+		_, _ = h.PostgresDB.Exec(stmt)
 	}
 
 	// Read and execute schema
@@ -349,7 +349,7 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 	// Drop views first (they depend on tables)
 	views := []string{"order_details", "user_stats", "active_users"}
 	for _, v := range views {
-		h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", v))
+		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", v))
 	}
 
 	// Drop tables in reverse dependency order
@@ -425,7 +425,7 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 	}
 
 	// Drop test schema
-	h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS test_schema")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS test_schema")
 
 	return nil
 }
@@ -497,7 +497,7 @@ func IsPostgresRunning(port int) bool {
 	if err != nil {
 		return false
 	}
-	conn.Close()
+	_ = conn.Close()
 	return true
 }
 
@@ -508,14 +508,14 @@ func IsDuckLakeInfraRunning(metadataPort, minioPort int) bool {
 	if err != nil {
 		return false
 	}
-	metaConn.Close()
+	_ = metaConn.Close()
 
 	// Check MinIO
 	minioConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", minioPort), time.Second)
 	if err != nil {
 		return false
 	}
-	minioConn.Close()
+	_ = minioConn.Close()
 
 	return true
 }
@@ -542,7 +542,7 @@ func findAvailablePort() int {
 		return 35433 // fallback
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
+	_ = listener.Close()
 	return port
 }
 

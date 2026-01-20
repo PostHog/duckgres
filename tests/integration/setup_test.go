@@ -295,7 +295,7 @@ func TestMain(m *testing.M) {
 
 	// Cleanup
 	if testHarness != nil {
-		testHarness.Close()
+		_ = testHarness.Close()
 	}
 
 	os.Exit(code)

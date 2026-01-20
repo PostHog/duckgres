@@ -160,8 +160,8 @@ func (s *Server) ListenAndServe() error {
 
 		// Enable TCP keepalive to detect dead connections
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetKeepAlive(true)
-			tcpConn.SetKeepAlivePeriod(30 * time.Second)
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		}
 
 		s.wg.Add(1)
@@ -179,7 +179,7 @@ func (s *Server) Close() error {
 
 	// Stop accepting new connections
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 
 	// Check if there are active connections
@@ -215,7 +215,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	// Stop accepting new connections
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 
 	// Check if there are active connections
@@ -263,7 +263,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 
 	// Verify connection
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
 	}
 
@@ -286,7 +286,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
 		if s.cfg.DuckLake.MetadataStore != "" {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 		}
 		// DuckLake not configured, this warning is just informational
@@ -320,7 +320,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	// Now set DuckLake as the default catalog so all user queries use it
 	if duckLakeMode {
 		if err := setDuckLakeDefault(db); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
 		}
 	}
@@ -587,21 +587,21 @@ func (s *Server) handleConnection(conn net.Conn) {
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {
 		// Send PostgreSQL error and close
 		log.Printf("Connection from %s rejected: %s", remoteAddr, msg)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
 	// Register this connection
 	if !s.rateLimiter.RegisterConnection(remoteAddr) {
 		log.Printf("Connection from %s rejected: rate limit exceeded", remoteAddr)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
 	// Ensure we unregister when done
 	defer func() {
 		s.rateLimiter.UnregisterConnection(remoteAddr)
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	c := &clientConn{

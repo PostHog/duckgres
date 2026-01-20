@@ -50,7 +50,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	go dgServer.ListenAndServe()
+	go func() { _ = dgServer.ListenAndServe() }()
 	time.Sleep(200 * time.Millisecond)
 
 	// Connect
@@ -70,18 +70,18 @@ func TestMain(m *testing.M) {
 
 	code := m.Run()
 
-	testDB.Close()
-	dgServer.Close()
-	os.RemoveAll(tmpDir)
+	_ = testDB.Close()
+	_ = dgServer.Close()
+	_ = os.RemoveAll(tmpDir)
 
 	os.Exit(code)
 }
 
 func setupTestData() {
-	testDB.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, active BOOLEAN)`)
-	testDB.Exec(`INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', true), (2, 'Bob', 'bob@example.com', false)`)
-	testDB.Exec(`CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price NUMERIC(10,2))`)
-	testDB.Exec(`INSERT INTO products VALUES (1, 'Widget', 'Hardware', 9.99), (2, 'Gadget', 'Electronics', 29.99)`)
+	_, _ = testDB.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, active BOOLEAN)`)
+	_, _ = testDB.Exec(`INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', true), (2, 'Bob', 'bob@example.com', false)`)
+	_, _ = testDB.Exec(`CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price NUMERIC(10,2))`)
+	_, _ = testDB.Exec(`INSERT INTO products VALUES (1, 'Widget', 'Hardware', 9.99), (2, 'Gadget', 'Electronics', 29.99)`)
 }
 
 // TestMetabaseQueries tests queries commonly issued by Metabase
@@ -135,7 +135,7 @@ func TestMetabaseQueries(t *testing.T) {
 				t.Errorf("Query failed: %v", err)
 				return
 			}
-			rows.Close()
+			_ = rows.Close()
 		})
 	}
 }
@@ -181,7 +181,7 @@ func TestGrafanaQueries(t *testing.T) {
 				t.Errorf("Query failed: %v", err)
 				return
 			}
-			rows.Close()
+			_ = rows.Close()
 		})
 	}
 }
@@ -227,7 +227,7 @@ func TestSupersetQueries(t *testing.T) {
 				t.Errorf("Query failed: %v", err)
 				return
 			}
-			rows.Close()
+			_ = rows.Close()
 		})
 	}
 }
@@ -283,7 +283,7 @@ func TestTableauQueries(t *testing.T) {
 				t.Errorf("Query failed: %v", err)
 				return
 			}
-			rows.Close()
+			_ = rows.Close()
 		})
 	}
 }
@@ -347,7 +347,7 @@ func TestDBeaverQueries(t *testing.T) {
 				t.Errorf("Query failed: %v", err)
 				return
 			}
-			rows.Close()
+			_ = rows.Close()
 		})
 	}
 }
@@ -448,7 +448,7 @@ func TestAirbyteQueries(t *testing.T) {
 				t.Errorf("Query failed: %v", err)
 				return
 			}
-			rows.Close()
+			_ = rows.Close()
 		})
 	}
 }
@@ -516,13 +516,13 @@ func TestPreparedStatements(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		rows, err := stmt.Query(1)
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		if !rows.Next() {
 			t.Error("Expected 1 row")
@@ -534,13 +534,13 @@ func TestPreparedStatements(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		rows, err := stmt.Query("Alice", true)
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		if !rows.Next() {
 			t.Error("Expected 1 row")
@@ -552,7 +552,7 @@ func TestPreparedStatements(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		_, err = stmt.Exec(999, "PreparedUser", "prepared@test.com", true)
 		if err != nil {
@@ -560,7 +560,7 @@ func TestPreparedStatements(t *testing.T) {
 		}
 
 		// Cleanup
-		testDB.Exec("DELETE FROM users WHERE id = 999")
+		_, _ = testDB.Exec("DELETE FROM users WHERE id = 999")
 	})
 }
 
@@ -574,7 +574,7 @@ func TestTransactions(t *testing.T) {
 
 		_, err = tx.Exec("INSERT INTO users (id, name, email, active) VALUES (1000, 'TxUser', 'tx@test.com', true)")
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			t.Fatalf("Insert failed: %v", err)
 		}
 
@@ -585,13 +585,15 @@ func TestTransactions(t *testing.T) {
 
 		// Verify
 		var count int
-		testDB.QueryRow("SELECT COUNT(*) FROM users WHERE id = 1000").Scan(&count)
+		if err := testDB.QueryRow("SELECT COUNT(*) FROM users WHERE id = 1000").Scan(&count); err != nil {
+			t.Errorf("Scan failed: %v", err)
+		}
 		if count != 1 {
 			t.Errorf("Expected 1 row after commit, got %d", count)
 		}
 
 		// Cleanup
-		testDB.Exec("DELETE FROM users WHERE id = 1000")
+		_, _ = testDB.Exec("DELETE FROM users WHERE id = 1000")
 	})
 
 	t.Run("rollback", func(t *testing.T) {
@@ -602,7 +604,7 @@ func TestTransactions(t *testing.T) {
 
 		_, err = tx.Exec("INSERT INTO users (id, name, email, active) VALUES (1001, 'RollbackUser', 'rb@test.com', true)")
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			t.Fatalf("Insert failed: %v", err)
 		}
 
@@ -613,7 +615,9 @@ func TestTransactions(t *testing.T) {
 
 		// Verify rollback worked
 		var count int
-		testDB.QueryRow("SELECT COUNT(*) FROM users WHERE id = 1001").Scan(&count)
+		if err := testDB.QueryRow("SELECT COUNT(*) FROM users WHERE id = 1001").Scan(&count); err != nil {
+			t.Errorf("Scan failed: %v", err)
+		}
 		if count != 0 {
 			t.Errorf("Expected 0 rows after rollback, got %d", count)
 		}

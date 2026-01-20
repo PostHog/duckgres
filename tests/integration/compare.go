@@ -73,7 +73,7 @@ func ExecuteQuery(db *sql.DB, query string) (*QueryResult, error) {
 	if err != nil {
 		return &QueryResult{Error: err}, nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	columns, err := rows.Columns()
 	if err != nil {

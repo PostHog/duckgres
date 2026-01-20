@@ -140,12 +140,16 @@ func (c *clientConn) serve() error {
 			if c.server.cfg.DuckLake.MetadataStore != "" {
 				// Must switch away from ducklake before detaching - DuckDB doesn't allow
 				// detaching the default database
-				c.db.Exec("USE memory")
+				if _, err := c.db.Exec("USE memory"); err != nil {
+					log.Printf("Warning: failed to switch to memory for user %q: %v", c.username, err)
+				}
 				if _, err := c.db.Exec("DETACH ducklake"); err != nil {
 					log.Printf("Warning: failed to detach DuckLake for user %q: %v", c.username, err)
 				}
 			}
-			c.db.Close()
+			if err := c.db.Close(); err != nil {
+				log.Printf("Warning: failed to close db for user %q: %v", c.username, err)
+			}
 		}
 	}()
 
@@ -156,7 +160,9 @@ func (c *clientConn) serve() error {
 	if err := writeReadyForQuery(c.writer, c.txStatus); err != nil {
 		return err
 	}
-	c.writer.Flush()
+	if err := c.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush writer: %w", err)
+	}
 
 	// Main message loop
 	return c.messageLoop()
@@ -220,7 +226,9 @@ func (c *clientConn) handleStartup() error {
 	if err := writeAuthCleartextPassword(c.writer); err != nil {
 		return err
 	}
-	c.writer.Flush()
+	if err := c.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush writer: %w", err)
+	}
 
 	// Read password response
 	msgType, body, err := readMessage(c.reader)
@@ -272,18 +280,22 @@ func (c *clientConn) sendInitialParams() {
 	}
 
 	for name, value := range params {
-		writeParameterStatus(c.writer, name, value)
+		if err := writeParameterStatus(c.writer, name, value); err != nil {
+			log.Printf("Warning: failed to write parameter %s: %v", name, err)
+		}
 	}
 
 	// Send backend key data
-	writeBackendKeyData(c.writer, c.pid, 0)
+	if err := writeBackendKeyData(c.writer, c.pid, 0); err != nil {
+		log.Printf("Warning: failed to write backend key data: %v", err)
+	}
 }
 
 func (c *clientConn) messageLoop() error {
 	for {
 		// Set read deadline if idle timeout is configured
 		if c.server.cfg.IdleTimeout > 0 {
-			c.conn.SetReadDeadline(time.Now().Add(c.server.cfg.IdleTimeout))
+			_ = c.conn.SetReadDeadline(time.Now().Add(c.server.cfg.IdleTimeout))
 		}
 
 		msgType, body, err := readMessage(c.reader)
@@ -326,14 +338,14 @@ func (c *clientConn) messageLoop() error {
 			if err := writeReadyForQuery(c.writer, c.txStatus); err != nil {
 				return err
 			}
-			c.writer.Flush()
+			_ = c.writer.Flush()
 
 		case msgClose:
 			// Extended query protocol - Close
 			c.handleClose(body)
 
 		case msgFlush:
-			c.writer.Flush()
+			_ = c.writer.Flush()
 
 		case msgTerminate:
 			return nil
@@ -351,9 +363,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Treat empty queries or queries with just semicolons as empty
 	// PostgreSQL returns EmptyQueryResponse for queries like "" or ";" or ";;;"
 	if query == "" || isEmptyQuery(query) {
-		writeEmptyQueryResponse(c.writer)
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeEmptyQueryResponse(c.writer)
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -365,34 +377,34 @@ func (c *clientConn) handleQuery(body []byte) error {
 	if err != nil {
 		// Parse error - send error to client
 		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
 	// Handle transform-detected errors (e.g., unrecognized config parameter)
 	if result.Error != nil {
 		c.sendError("ERROR", "42704", result.Error.Error())
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
 	// Handle ignored SET parameters
 	if result.IsIgnoredSet {
 		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, query)
-		writeCommandComplete(c.writer, "SET")
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeCommandComplete(c.writer, "SET")
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
 	// Handle no-op commands (CREATE INDEX, VACUUM, etc.)
 	if result.IsNoOp {
 		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, query)
-		writeCommandComplete(c.writer, result.NoOpTag)
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeCommandComplete(c.writer, result.NoOpTag)
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -426,9 +438,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 		// while DuckDB throws an error. Match PostgreSQL behavior.
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
-			writeCommandComplete(c.writer, "BEGIN")
-			writeReadyForQuery(c.writer, c.txStatus)
-			c.writer.Flush()
+			_ = writeCommandComplete(c.writer, "BEGIN")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
 			return nil
 		}
 
@@ -443,17 +455,17 @@ func (c *clientConn) handleQuery(body []byte) error {
 			if err != nil {
 				c.sendError("ERROR", "42000", err.Error())
 				c.setTxError()
-				writeReadyForQuery(c.writer, c.txStatus)
-				c.writer.Flush()
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
 				return nil
 			}
 		}
 
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
-		writeCommandComplete(c.writer, tag)
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeCommandComplete(c.writer, tag)
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -462,19 +474,19 @@ func (c *clientConn) handleQuery(body []byte) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -482,8 +494,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -514,9 +526,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Send command complete (SELECT doesn't change transaction status)
 	tag := fmt.Sprintf("SELECT %d", rowCount)
-	writeCommandComplete(c.writer, tag)
-	writeReadyForQuery(c.writer, c.txStatus)
-	c.writer.Flush()
+	_ = writeCommandComplete(c.writer, tag)
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
 
 	return nil
 }
@@ -532,9 +544,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 // 4. Stream rows from cursor to client
 func (c *clientConn) executeMultiStatement(statements []string, cleanup []string) error {
 	if len(statements) == 0 {
-		writeEmptyQueryResponse(c.writer)
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeEmptyQueryResponse(c.writer)
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -561,8 +573,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
-			writeReadyForQuery(c.writer, c.txStatus)
-			c.writer.Flush()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
 			return nil
 		}
 	}
@@ -581,11 +593,11 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
-			writeReadyForQuery(c.writer, c.txStatus)
-			c.writer.Flush()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
 			return nil
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		// Execute cleanup while cursor is open (data is materialized in cursor)
 		// DuckDB cursor holds result data even after source tables are dropped
@@ -602,8 +614,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
-			writeReadyForQuery(c.writer, c.txStatus)
-			c.writer.Flush()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
 			return nil
 		}
 
@@ -612,8 +624,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 		// Send completion
 		tag := c.buildCommandTag(cmdType, result)
-		writeCommandComplete(c.writer, tag)
-		writeReadyForQuery(c.writer, c.txStatus)
+		_ = writeCommandComplete(c.writer, tag)
+		_ = writeReadyForQuery(c.writer, c.txStatus)
 		return c.writer.Flush()
 	}
 }
@@ -636,7 +648,7 @@ func (c *clientConn) executeCleanup(cleanup []string) {
 // Unlike executeMultiStatement, this does NOT send ReadyForQuery (that's done by Sync).
 func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup []string, args []interface{}, resultFormats []int16, described bool) {
 	if len(statements) == 0 {
-		writeEmptyQueryResponse(c.writer)
+		_ = writeEmptyQueryResponse(c.writer)
 		return
 	}
 
@@ -683,7 +695,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 			c.sendError("ERROR", "42000", err.Error())
 			return
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		// Execute cleanup while cursor is open (data is materialized in cursor)
 		c.executeCleanup(cleanup)
@@ -707,7 +719,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 		// Send completion (no ReadyForQuery - that's done by Sync)
 		tag := c.buildCommandTag(cmdType, result)
-		writeCommandComplete(c.writer, tag)
+		_ = writeCommandComplete(c.writer, tag)
 	}
 }
 
@@ -772,7 +784,7 @@ func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, 
 
 	// Send completion (no ReadyForQuery - that's done by Sync)
 	tag := fmt.Sprintf("SELECT %d", rowCount)
-	writeCommandComplete(c.writer, tag)
+	_ = writeCommandComplete(c.writer, tag)
 }
 
 // streamRowsToClient sends result rows over the wire protocol.
@@ -783,8 +795,8 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -792,8 +804,8 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -825,15 +837,15 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string) error {
 	if err := rows.Err(); err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
 	// Send completion
 	tag := fmt.Sprintf("%s %d", cmdType, rowCount)
-	writeCommandComplete(c.writer, tag)
-	writeReadyForQuery(c.writer, c.txStatus)
+	_ = writeCommandComplete(c.writer, tag)
+	_ = writeReadyForQuery(c.writer, c.txStatus)
 	return c.writer.Flush()
 }
 
@@ -1137,15 +1149,15 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
 	rowsAffected, _ := result.RowsAffected()
-	writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowsAffected))
-	writeReadyForQuery(c.writer, c.txStatus)
-	c.writer.Flush()
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowsAffected))
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
 	return nil
 }
 
@@ -1155,8 +1167,8 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if len(matches) < 2 {
 		c.sendError("ERROR", "42601", "Invalid COPY TO STDOUT syntax")
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -1182,18 +1194,18 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -1201,7 +1213,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if err := writeCopyOutResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
 	}
-	c.writer.Flush()
+	_ = c.writer.Flush()
 
 	// Send header if CSV with HEADER
 	if copyWithCSVRegex.MatchString(upperQuery) && copyWithHeaderRegex.MatchString(upperQuery) {
@@ -1242,9 +1254,9 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		return err
 	}
 
-	writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-	writeReadyForQuery(c.writer, c.txStatus)
-	c.writer.Flush()
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
 	return nil
 }
 
@@ -1258,8 +1270,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 
@@ -1273,18 +1285,18 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42P01", fmt.Sprintf("relation \"%s\" does not exist", tableName))
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 	cols, _ := testRows.Columns()
-	testRows.Close()
+	_ = testRows.Close()
 
 	// Send CopyInResponse
 	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
 	}
-	c.writer.Flush()
+	_ = c.writer.Flush()
 	log.Printf("[%s] COPY FROM STDIN: sent CopyInResponse, waiting for data...", c.username)
 
 	// Create temp file upfront and stream data directly to it (avoids memory buffering)
@@ -1295,12 +1307,12 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		log.Printf("[%s] COPY FROM STDIN: failed to create temp file: %v", c.username, err)
 		c.sendError("ERROR", "58000", fmt.Sprintf("failed to create temp file: %v", err))
 		c.setTxError()
-		writeReadyForQuery(c.writer, c.txStatus)
-		c.writer.Flush()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
 		return nil
 	}
 	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 
 	// Stream COPY data directly to temp file (no memory buffering)
 	rowCount := 0
@@ -1312,7 +1324,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
 			log.Printf("[%s] COPY FROM STDIN: error reading message: %v", c.username, err)
-			tmpFile.Close()
+			_ = tmpFile.Close()
 			return err
 		}
 
@@ -1321,11 +1333,11 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			n, err := tmpFile.Write(body)
 			if err != nil {
 				log.Printf("[%s] COPY FROM STDIN: failed to write to temp file: %v", c.username, err)
-				tmpFile.Close()
+				_ = tmpFile.Close()
 				c.sendError("ERROR", "58000", fmt.Sprintf("failed to write to temp file: %v", err))
 				c.setTxError()
-				writeReadyForQuery(c.writer, c.txStatus)
-				c.writer.Flush()
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
 				return nil
 			}
 			bytesWritten += int64(n)
@@ -1336,7 +1348,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			}
 
 		case msgCopyDone:
-			tmpFile.Close()
+			_ = tmpFile.Close()
 			dataReceiveElapsed := time.Since(dataReceiveStart)
 			log.Printf("[%s] COPY FROM STDIN: CopyDone received - %d messages, %d bytes in %v",
 				c.username, copyDataMessages, bytesWritten, dataReceiveElapsed)
@@ -1352,8 +1364,8 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 				log.Printf("[%s] COPY FROM STDIN: DuckDB COPY failed: %v", c.username, err)
 				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
 				c.setTxError()
-				writeReadyForQuery(c.writer, c.txStatus)
-				c.writer.Flush()
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
 				return nil
 			}
 
@@ -1365,9 +1377,9 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			log.Printf("[%s] COPY FROM STDIN: completed - %d rows in %v (DuckDB load: %v)",
 				c.username, rowCount, totalElapsed, loadElapsed)
 
-			writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-			writeReadyForQuery(c.writer, c.txStatus)
-			c.writer.Flush()
+			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
 			return nil
 
 		case msgCopyFail:
@@ -1375,15 +1387,15 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			errMsg := string(bytes.TrimRight(body, "\x00"))
 			c.sendError("ERROR", "57014", fmt.Sprintf("COPY failed: %s", errMsg))
 			c.setTxError()
-			writeReadyForQuery(c.writer, c.txStatus)
-			c.writer.Flush()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
 			return nil
 
 		default:
 			c.sendError("ERROR", "08P01", fmt.Sprintf("unexpected message type during COPY: %c", msgType))
 			c.setTxError()
-			writeReadyForQuery(c.writer, c.txStatus)
-			c.writer.Flush()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
 			return nil
 		}
 	}
@@ -1416,7 +1428,7 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 	var buf bytes.Buffer
 
 	// Number of fields
-	binary.Write(&buf, binary.BigEndian, int16(len(cols)))
+	_ = binary.Write(&buf, binary.BigEndian, int16(len(cols)))
 
 	for i, col := range cols {
 		// Column name (null-terminated)
@@ -1424,25 +1436,25 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 		buf.WriteByte(0)
 
 		// Table OID (0 = not from a table)
-		binary.Write(&buf, binary.BigEndian, int32(0))
+		_ = binary.Write(&buf, binary.BigEndian, int32(0))
 
 		// Column attribute number (0 = not from a table)
-		binary.Write(&buf, binary.BigEndian, int16(0))
+		_ = binary.Write(&buf, binary.BigEndian, int16(0))
 
 		// Data type OID - check for pg_catalog column name overrides first,
 		// then fall back to DuckDB type mapping
 		oid := c.mapTypeOIDWithColumnName(col, colTypes[i])
-		binary.Write(&buf, binary.BigEndian, oid)
+		_ = binary.Write(&buf, binary.BigEndian, oid)
 
 		// Data type size - use appropriate size for overridden types
 		typeSize := c.mapTypeSizeWithColumnName(col, colTypes[i])
-		binary.Write(&buf, binary.BigEndian, typeSize)
+		_ = binary.Write(&buf, binary.BigEndian, typeSize)
 
 		// Type modifier (-1 = no modifier)
-		binary.Write(&buf, binary.BigEndian, int32(-1))
+		_ = binary.Write(&buf, binary.BigEndian, int32(-1))
 
 		// Format code (0 = text, 1 = binary)
-		binary.Write(&buf, binary.BigEndian, int16(0))
+		_ = binary.Write(&buf, binary.BigEndian, int16(0))
 	}
 
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
@@ -1480,12 +1492,12 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 	var buf bytes.Buffer
 
 	// Number of columns
-	binary.Write(&buf, binary.BigEndian, int16(len(values)))
+	_ = binary.Write(&buf, binary.BigEndian, int16(len(values)))
 
 	for i, v := range values {
 		if v == nil {
 			// NULL value
-			binary.Write(&buf, binary.BigEndian, int32(-1))
+			_ = binary.Write(&buf, binary.BigEndian, int32(-1))
 			continue
 		}
 
@@ -1506,16 +1518,16 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 			if encoded == nil {
 				// Fallback to text if binary encoding fails
 				str := formatValue(v)
-				binary.Write(&buf, binary.BigEndian, int32(len(str)))
+				_ = binary.Write(&buf, binary.BigEndian, int32(len(str)))
 				buf.WriteString(str)
 			} else {
-				binary.Write(&buf, binary.BigEndian, int32(len(encoded)))
+				_ = binary.Write(&buf, binary.BigEndian, int32(len(encoded)))
 				buf.Write(encoded)
 			}
 		} else {
 			// Text encoding
 			str := formatValue(v)
-			binary.Write(&buf, binary.BigEndian, int32(len(str)))
+			_ = binary.Write(&buf, binary.BigEndian, int32(len(str)))
 			buf.WriteString(str)
 		}
 	}
@@ -1569,12 +1581,12 @@ func formatValue(v interface{}) string {
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
-	writeErrorResponse(c.writer, severity, code, message)
-	c.writer.Flush()
+	_ = writeErrorResponse(c.writer, severity, code, message)
+	_ = c.writer.Flush()
 }
 
 func (c *clientConn) sendNotice(severity, code, message string) {
-	writeNoticeResponse(c.writer, severity, code, message)
+	_ = writeNoticeResponse(c.writer, severity, code, message)
 	// Don't flush here - let the caller decide when to flush
 }
 
@@ -1655,7 +1667,7 @@ func (c *clientConn) handleParse(body []byte) {
 	} else if result.SQL != query {
 		log.Printf("[%s] Prepared statement %q transpiled: %s", c.username, stmtName, result.SQL)
 	}
-	writeParseComplete(c.writer)
+	_ = writeParseComplete(c.writer)
 }
 
 func (c *clientConn) handleBind(body []byte) {
@@ -1755,7 +1767,7 @@ func (c *clientConn) handleBind(body []byte) {
 		described:     ps.described, // Inherit from statement if Describe(S) was called
 	}
 
-	writeBindComplete(c.writer)
+	_ = writeBindComplete(c.writer)
 }
 
 func (c *clientConn) handleDescribe(body []byte) {
@@ -1798,7 +1810,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		returnsResults := queryReturnsResults(ps.query)
 		log.Printf("[%s] Describe statement %q: returnsResults=%v", c.username, name, returnsResults)
 		if !returnsResults {
-			writeNoData(c.writer)
+			_ = writeNoData(c.writer)
 			return
 		}
 
@@ -1821,21 +1833,21 @@ func (c *clientConn) handleDescribe(body []byte) {
 		if err != nil {
 			// Can't describe - send NoData
 			log.Printf("[%s] Describe failed to get columns: %v", c.username, err)
-			writeNoData(c.writer)
+			_ = writeNoData(c.writer)
 			return
 		}
 
 		cols, _ := rows.Columns()
 		colTypes, _ := rows.ColumnTypes()
-		rows.Close()
+		_ = rows.Close()
 
 		if len(cols) == 0 {
-			writeNoData(c.writer)
+			_ = writeNoData(c.writer)
 			return
 		}
 
 		log.Printf("[%s] Describe statement: sending RowDescription with %d columns", c.username, len(cols))
-		c.sendRowDescription(cols, colTypes)
+		_ = c.sendRowDescription(cols, colTypes)
 		ps.described = true
 
 	case 'P':
@@ -1848,7 +1860,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 
 		// For queries that don't return results, send NoData
 		if !queryReturnsResults(p.stmt.query) {
-			writeNoData(c.writer)
+			_ = writeNoData(c.writer)
 			return
 		}
 
@@ -1865,23 +1877,23 @@ func (c *clientConn) handleDescribe(body []byte) {
 		rows, err := c.db.Query(p.stmt.convertedQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
-			writeNoData(c.writer)
+			_ = writeNoData(c.writer)
 			return
 		}
 
 		cols, _ := rows.Columns()
 		colTypes, _ := rows.ColumnTypes()
-		rows.Close()
+		_ = rows.Close()
 
 		if len(cols) == 0 {
-			writeNoData(c.writer)
+			_ = writeNoData(c.writer)
 			return
 		}
 
 		// Only mark as described when we actually send RowDescription.
 		// If we sent NoData above, Execute should still send RowDescription.
 		p.described = true
-		c.sendRowDescription(cols, colTypes)
+		_ = c.sendRowDescription(cols, colTypes)
 
 	default:
 		c.sendError("ERROR", "08P01", "invalid Describe type")
@@ -1930,7 +1942,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
 	trimmedQuery := strings.TrimSpace(p.stmt.query)
 	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
-		writeEmptyQueryResponse(c.writer)
+		_ = writeEmptyQueryResponse(c.writer)
 		return
 	}
 
@@ -1938,7 +1950,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// (determined by transpiler during Parse)
 	if p.stmt.isIgnoredSet {
 		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, p.stmt.query)
-		writeCommandComplete(c.writer, "SET")
+		_ = writeCommandComplete(c.writer, "SET")
 		return
 	}
 
@@ -1946,7 +1958,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// (determined by transpiler during Parse)
 	if p.stmt.isNoOp {
 		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, p.stmt.query)
-		writeCommandComplete(c.writer, p.stmt.noOpTag)
+		_ = writeCommandComplete(c.writer, p.stmt.noOpTag)
 		return
 	}
 
@@ -1963,7 +1975,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		// while DuckDB throws an error. Match PostgreSQL behavior.
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
-			writeCommandComplete(c.writer, "BEGIN")
+			_ = writeCommandComplete(c.writer, "BEGIN")
 			return
 		}
 
@@ -1985,7 +1997,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
-		writeCommandComplete(c.writer, tag)
+		_ = writeCommandComplete(c.writer, tag)
 		return
 	}
 
@@ -1997,7 +2009,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.setTxError()
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -2052,7 +2064,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	tag := fmt.Sprintf("SELECT %d", rowCount)
-	writeCommandComplete(c.writer, tag)
+	_ = writeCommandComplete(c.writer, tag)
 }
 
 func (c *clientConn) handleClose(body []byte) {
@@ -2075,20 +2087,20 @@ func (c *clientConn) handleClose(body []byte) {
 		delete(c.portals, name)
 	}
 
-	writeCloseComplete(c.writer)
+	_ = writeCloseComplete(c.writer)
 }
 
 func (c *clientConn) sendParameterDescription(paramTypes []int32) {
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, int16(len(paramTypes)))
+	_ = binary.Write(&buf, binary.BigEndian, int16(len(paramTypes)))
 	for _, oid := range paramTypes {
 		// If OID is 0, use text type
 		if oid == 0 {
 			oid = 25 // text
 		}
-		binary.Write(&buf, binary.BigEndian, oid)
+		_ = binary.Write(&buf, binary.BigEndian, oid)
 	}
-	writeMessage(c.writer, 't', buf.Bytes())
+	_ = writeMessage(c.writer, 't', buf.Bytes())
 }
 
 // readCString reads a null-terminated string from reader

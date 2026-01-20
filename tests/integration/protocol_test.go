@@ -56,7 +56,7 @@ func TestProtocolSimpleQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		count := 0
 		for rows.Next() {
@@ -75,7 +75,7 @@ func TestProtocolSimpleQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		if rows.Next() {
 			t.Error("Expected no rows")
@@ -99,7 +99,7 @@ func TestProtocolExtendedQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		var result int
 		err = stmt.QueryRow(10, 20).Scan(&result)
@@ -117,7 +117,7 @@ func TestProtocolExtendedQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		var result string
 		err = stmt.QueryRow("hello", "world").Scan(&result)
@@ -134,7 +134,7 @@ func TestProtocolExtendedQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		var name string
 		err = stmt.QueryRow(1).Scan(&name)
@@ -151,7 +151,7 @@ func TestProtocolExtendedQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		for i := 1; i <= 5; i++ {
 			var result int
@@ -172,7 +172,7 @@ func TestProtocolExtendedQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		result, err := stmt.Exec(1, "test")
 		if err != nil {
@@ -200,7 +200,7 @@ func TestProtocolTransactions(t *testing.T) {
 
 		_, err = tx.Exec("INSERT INTO tx_test VALUES (1, 'committed')")
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			t.Fatalf("Insert failed: %v", err)
 		}
 
@@ -231,7 +231,7 @@ func TestProtocolTransactions(t *testing.T) {
 
 		_, err = tx.Exec("INSERT INTO tx_rollback_test VALUES (1)")
 		if err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			t.Fatalf("Insert failed: %v", err)
 		}
 
@@ -241,7 +241,9 @@ func TestProtocolTransactions(t *testing.T) {
 		}
 
 		var count int
-		testHarness.DuckgresDB.QueryRow("SELECT COUNT(*) FROM tx_rollback_test").Scan(&count)
+		if err := testHarness.DuckgresDB.QueryRow("SELECT COUNT(*) FROM tx_rollback_test").Scan(&count); err != nil {
+			t.Errorf("Scan failed: %v", err)
+		}
 		if count != 0 {
 			t.Errorf("Expected 0 rows after rollback, got %d", count)
 		}
@@ -257,7 +259,7 @@ func TestProtocolTransactions(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Begin failed: %v", err)
 		}
-		defer tx.Rollback()
+		defer func() { _ = tx.Rollback() }()
 
 		_, err = tx.Exec("INSERT INTO tx_isolation_test VALUES (1), (2), (3)")
 		if err != nil {
@@ -274,7 +276,7 @@ func TestProtocolTransactions(t *testing.T) {
 			t.Errorf("Expected 3 rows in transaction, got %d", count)
 		}
 
-		tx.Rollback()
+		_ = tx.Rollback()
 		mustExec(t, testHarness.DuckgresDB, "DROP TABLE tx_isolation_test")
 	})
 }
@@ -311,7 +313,7 @@ func TestProtocolErrors(t *testing.T) {
 
 	t.Run("error_recovery", func(t *testing.T) {
 		// After an error, connection should still be usable
-		testHarness.DuckgresDB.Query("SELECT * FROM nonexistent") // This should error
+		_, _ = testHarness.DuckgresDB.Query("SELECT * FROM nonexistent") // This should error
 
 		// But this should work
 		var val int
@@ -418,7 +420,7 @@ func TestProtocolRowDescription(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		columns, err := rows.Columns()
 		if err != nil {
@@ -441,7 +443,7 @@ func TestProtocolRowDescription(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		types, err := rows.ColumnTypes()
 		if err != nil {
@@ -525,7 +527,7 @@ func TestProtocolLargeResults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		count := 0
 		for rows.Next() {
@@ -549,7 +551,7 @@ func TestProtocolLargeResults(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		columns, _ := rows.Columns()
 		if len(columns) != 30 {
