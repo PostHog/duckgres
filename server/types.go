@@ -58,7 +58,7 @@ func mapDuckDBType(typeName string) TypeInfo {
 	case upper == "UTINYINT" || upper == "USMALLINT":
 		return TypeInfo{OID: OidInt4, Size: 4}
 	case upper == "UINTEGER":
-		return TypeInfo{OID: OidInt8, Size: 8}
+		return TypeInfo{OID: OidOid, Size: 4} // PostgreSQL oid type for pg_catalog columns
 	case upper == "UBIGINT":
 		return TypeInfo{OID: OidNumeric, Size: -1}
 	case upper == "REAL" || upper == "FLOAT4" || upper == "FLOAT":

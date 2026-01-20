@@ -333,10 +333,10 @@ func initPgCatalog(db *sql.DB) error {
 	pgTypeSQL := `
 		CREATE OR REPLACE VIEW pg_type AS
 		SELECT
-			oid,
+			oid::UINTEGER AS oid,
 			typname,
-			typnamespace,
-			typowner,
+			typnamespace::UINTEGER AS typnamespace,
+			typowner::UINTEGER AS typowner,
 			-- typlen: -1 for variable length types
 			COALESCE(typlen, -1::SMALLINT) AS typlen,
 			typbyval,
@@ -347,12 +347,12 @@ func initPgCatalog(db *sql.DB) error {
 			-- typdelim: comma is the default delimiter
 			COALESCE(typdelim, ','::VARCHAR) AS typdelim,
 			-- typrelid: 0 for non-composite types
-			COALESCE(typrelid, 0::BIGINT) AS typrelid,
+			COALESCE(typrelid, 0::UINTEGER)::UINTEGER AS typrelid,
 			typsubscript,
 			-- typelem: 0 for non-array types
-			COALESCE(typelem, 0::BIGINT) AS typelem,
+			COALESCE(typelem, 0::UINTEGER)::UINTEGER AS typelem,
 			-- typarray: 0 if no array type exists
-			COALESCE(typarray, 0::BIGINT) AS typarray,
+			COALESCE(typarray, 0::UINTEGER)::UINTEGER AS typarray,
 			typinput,
 			typoutput,
 			typreceive,
@@ -365,13 +365,13 @@ func initPgCatalog(db *sql.DB) error {
 			-- typnotnull: false for base types
 			COALESCE(typnotnull, false) AS typnotnull,
 			-- typbasetype: 0 for base types (not domains)
-			COALESCE(typbasetype, 0::BIGINT) AS typbasetype,
+			COALESCE(typbasetype, 0::UINTEGER)::UINTEGER AS typbasetype,
 			-- typtypmod: -1 means no modifier
 			COALESCE(typtypmod, -1::INTEGER) AS typtypmod,
 			-- typndims: 0 for non-array types
 			COALESCE(typndims, 0::INTEGER) AS typndims,
 			-- typcollation: 0 for types without collation
-			COALESCE(typcollation, 0::BIGINT) AS typcollation,
+			COALESCE(typcollation, 0::UINTEGER)::UINTEGER AS typcollation,
 			typdefaultbin,
 			typdefault,
 			typacl
@@ -386,63 +386,64 @@ func initPgCatalog(db *sql.DB) error {
 	pgAttributeSQL := `
 		CREATE OR REPLACE VIEW pg_attribute AS
 		SELECT
-			a.attrelid,
+			a.attrelid::UINTEGER AS attrelid,
 			a.attname,
 			-- Map DuckDB internal type OIDs to PostgreSQL standard OIDs
+			-- Cast to UINTEGER so wire protocol reports as oid (OID 26) for JDBC compatibility
 			-- Comprehensive mapping to ensure all columns join with pg_type
 			CASE
 				-- Numeric types
-				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::BIGINT
-				WHEN dc.data_type = 'INTEGER' THEN 23::BIGINT
-				WHEN dc.data_type = 'BIGINT' THEN 20::BIGINT
-				WHEN dc.data_type = 'SMALLINT' THEN 21::BIGINT
-				WHEN dc.data_type = 'TINYINT' THEN 21::BIGINT
-				WHEN dc.data_type = 'HUGEINT' THEN 1700::BIGINT
+				WHEN dc.data_type LIKE 'DECIMAL%' OR dc.data_type LIKE 'NUMERIC%' THEN 1700::UINTEGER
+				WHEN dc.data_type = 'INTEGER' THEN 23::UINTEGER
+				WHEN dc.data_type = 'BIGINT' THEN 20::UINTEGER
+				WHEN dc.data_type = 'SMALLINT' THEN 21::UINTEGER
+				WHEN dc.data_type = 'TINYINT' THEN 21::UINTEGER
+				WHEN dc.data_type = 'HUGEINT' THEN 1700::UINTEGER
 				-- Unsigned types (map to larger signed or numeric)
-				WHEN dc.data_type = 'UBIGINT' THEN 1700::BIGINT
-				WHEN dc.data_type = 'UINTEGER' THEN 20::BIGINT
-				WHEN dc.data_type = 'USMALLINT' THEN 23::BIGINT
-				WHEN dc.data_type = 'UTINYINT' THEN 21::BIGINT
+				WHEN dc.data_type = 'UBIGINT' THEN 1700::UINTEGER
+				WHEN dc.data_type = 'UINTEGER' THEN 20::UINTEGER
+				WHEN dc.data_type = 'USMALLINT' THEN 23::UINTEGER
+				WHEN dc.data_type = 'UTINYINT' THEN 21::UINTEGER
 				-- Floating point
-				WHEN dc.data_type = 'FLOAT' OR dc.data_type = 'DOUBLE' THEN 701::BIGINT
-				WHEN dc.data_type = 'REAL' THEN 700::BIGINT
+				WHEN dc.data_type = 'FLOAT' OR dc.data_type = 'DOUBLE' THEN 701::UINTEGER
+				WHEN dc.data_type = 'REAL' THEN 700::UINTEGER
 				-- String types
-				WHEN dc.data_type = 'VARCHAR' THEN 1043::BIGINT
-				WHEN dc.data_type = 'TEXT' THEN 25::BIGINT
-				WHEN dc.data_type = 'CHAR' OR dc.data_type = 'BPCHAR' THEN 1042::BIGINT
+				WHEN dc.data_type = 'VARCHAR' THEN 1043::UINTEGER
+				WHEN dc.data_type = 'TEXT' THEN 25::UINTEGER
+				WHEN dc.data_type = 'CHAR' OR dc.data_type = 'BPCHAR' THEN 1042::UINTEGER
 				-- Boolean
-				WHEN dc.data_type = 'BOOLEAN' THEN 16::BIGINT
+				WHEN dc.data_type = 'BOOLEAN' THEN 16::UINTEGER
 				-- Binary
-				WHEN dc.data_type = 'BLOB' OR dc.data_type = 'BYTEA' THEN 17::BIGINT
+				WHEN dc.data_type = 'BLOB' OR dc.data_type = 'BYTEA' THEN 17::UINTEGER
 				-- Date/Time types
-				WHEN dc.data_type = 'DATE' THEN 1082::BIGINT
-				WHEN dc.data_type = 'TIME' THEN 1083::BIGINT
-				WHEN dc.data_type = 'TIMESTAMP' THEN 1114::BIGINT
-				WHEN dc.data_type LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 1184::BIGINT
-				WHEN dc.data_type LIKE 'TIME WITH TIME ZONE%' THEN 1266::BIGINT
-				WHEN dc.data_type = 'INTERVAL' THEN 1186::BIGINT
+				WHEN dc.data_type = 'DATE' THEN 1082::UINTEGER
+				WHEN dc.data_type = 'TIME' THEN 1083::UINTEGER
+				WHEN dc.data_type = 'TIMESTAMP' THEN 1114::UINTEGER
+				WHEN dc.data_type LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 1184::UINTEGER
+				WHEN dc.data_type LIKE 'TIME WITH TIME ZONE%' THEN 1266::UINTEGER
+				WHEN dc.data_type = 'INTERVAL' THEN 1186::UINTEGER
 				-- UUID
-				WHEN dc.data_type = 'UUID' THEN 2950::BIGINT
+				WHEN dc.data_type = 'UUID' THEN 2950::UINTEGER
 				-- Bit
-				WHEN dc.data_type = 'BIT' THEN 1560::BIGINT
+				WHEN dc.data_type = 'BIT' THEN 1560::UINTEGER
 				-- JSON
-				WHEN dc.data_type = 'JSON' THEN 114::BIGINT
+				WHEN dc.data_type = 'JSON' THEN 114::UINTEGER
 				-- Array types
-				WHEN dc.data_type = 'INTEGER[]' THEN 1007::BIGINT
-				WHEN dc.data_type = 'BIGINT[]' THEN 1016::BIGINT
-				WHEN dc.data_type = 'SMALLINT[]' THEN 1005::BIGINT
-				WHEN dc.data_type = 'VARCHAR[]' THEN 1015::BIGINT
-				WHEN dc.data_type = 'TEXT[]' THEN 1009::BIGINT
-				WHEN dc.data_type = 'BOOLEAN[]' THEN 1000::BIGINT
-				WHEN dc.data_type = 'FLOAT[]' OR dc.data_type = 'DOUBLE[]' THEN 1022::BIGINT
-				WHEN dc.data_type = 'REAL[]' THEN 1021::BIGINT
-				WHEN dc.data_type = 'DATE[]' THEN 1182::BIGINT
-				WHEN dc.data_type = 'TIMESTAMP[]' THEN 1115::BIGINT
-				WHEN dc.data_type LIKE 'NUMERIC%[]' OR dc.data_type LIKE 'DECIMAL%[]' THEN 1231::BIGINT
-				WHEN dc.data_type = 'UUID[]' THEN 2951::BIGINT
-				WHEN dc.data_type = 'INTERVAL[]' THEN 1187::BIGINT
-				WHEN dc.data_type = 'BLOB[]' OR dc.data_type = 'BYTEA[]' THEN 1001::BIGINT
-				ELSE a.atttypid
+				WHEN dc.data_type = 'INTEGER[]' THEN 1007::UINTEGER
+				WHEN dc.data_type = 'BIGINT[]' THEN 1016::UINTEGER
+				WHEN dc.data_type = 'SMALLINT[]' THEN 1005::UINTEGER
+				WHEN dc.data_type = 'VARCHAR[]' THEN 1015::UINTEGER
+				WHEN dc.data_type = 'TEXT[]' THEN 1009::UINTEGER
+				WHEN dc.data_type = 'BOOLEAN[]' THEN 1000::UINTEGER
+				WHEN dc.data_type = 'FLOAT[]' OR dc.data_type = 'DOUBLE[]' THEN 1022::UINTEGER
+				WHEN dc.data_type = 'REAL[]' THEN 1021::UINTEGER
+				WHEN dc.data_type = 'DATE[]' THEN 1182::UINTEGER
+				WHEN dc.data_type = 'TIMESTAMP[]' THEN 1115::UINTEGER
+				WHEN dc.data_type LIKE 'NUMERIC%[]' OR dc.data_type LIKE 'DECIMAL%[]' THEN 1231::UINTEGER
+				WHEN dc.data_type = 'UUID[]' THEN 2951::UINTEGER
+				WHEN dc.data_type = 'INTERVAL[]' THEN 1187::UINTEGER
+				WHEN dc.data_type = 'BLOB[]' OR dc.data_type = 'BYTEA[]' THEN 1001::UINTEGER
+				ELSE a.atttypid::UINTEGER
 			END AS atttypid,
 			a.attstattarget,
 			-- Set correct attlen for each type
@@ -478,8 +479,8 @@ func initPgCatalog(db *sql.DB) error {
 				WHEN dc.data_type LIKE '%[]' THEN -1::INTEGER
 				ELSE a.attlen
 			END AS attlen,
-			a.attnum,
-			a.attndims,
+			a.attnum::SMALLINT AS attnum,
+			a.attndims::SMALLINT AS attndims,
 			a.attcacheoff,
 			-- Fix atttypmod: Convert NUMERIC precision/scale from DuckDB to PostgreSQL format
 			-- DuckDB: precision * 1000 + scale (e.g., 10002 for NUMERIC(10,2))
@@ -500,8 +501,8 @@ func initPgCatalog(db *sql.DB) error {
 			a.attgenerated,
 			a.attisdropped,
 			a.attislocal,
-			a.attinhcount,
-			a.attcollation,
+			a.attinhcount::INTEGER AS attinhcount,
+			a.attcollation::UINTEGER AS attcollation,
 			a.attacl,
 			a.attoptions,
 			a.attfdwoptions,
