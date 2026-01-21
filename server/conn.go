@@ -2149,17 +2149,18 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	// Check if this is a native_duckdb command (prepared via extended protocol)
-	if p.stmt.noOpTag == "NATIVE_DUCKDB_ON" {
+	switch p.stmt.noOpTag {
+	case "NATIVE_DUCKDB_ON":
 		c.nativeDuckDB = true
 		log.Printf("[%s] Native DuckDB mode: on (via prepared statement)", c.username)
 		_ = writeCommandComplete(c.writer, "SET")
 		return
-	} else if p.stmt.noOpTag == "NATIVE_DUCKDB_OFF" {
+	case "NATIVE_DUCKDB_OFF":
 		c.nativeDuckDB = false
 		log.Printf("[%s] Native DuckDB mode: off (via prepared statement)", c.username)
 		_ = writeCommandComplete(c.writer, "SET")
 		return
-	} else if p.stmt.noOpTag == "NATIVE_DUCKDB_SHOW" {
+	case "NATIVE_DUCKDB_SHOW":
 		c.handleNativeDuckDBShowExtended()
 		return
 	}
