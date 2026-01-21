@@ -1476,6 +1476,10 @@ func (c *clientConn) mapTypeSizeWithColumnName(colName string, colType *sql.Colu
 			return 64 // name is 64 bytes
 		case OidChar:
 			return 1 // "char" is 1 byte
+		case OidText:
+			return -1 // text is variable length
+		case OidInt2:
+			return 2 // smallint is 2 bytes
 		}
 	}
 	return getTypeInfo(colType).Size

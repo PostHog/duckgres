@@ -51,13 +51,26 @@ var pgCatalogColumnOIDs = map[string]int32{
 	"usename":            OidName,
 	"current_database()": OidName,
 	"current_database":   OidName,
+	// JDBC metadata query aliases that should be NAME type
+	"TABLE_SCHEM":   OidName,
+	"TABLE_CATALOG": OidName,
+	"table_schem":   OidName,
+	"table_name":    OidName,
 	// "char" type columns (OID 18) - single-byte internal type
-	"typtype":      OidChar,
-	"typcategory":  OidChar,
-	"typalign":     OidChar,
-	"typstorage":   OidChar,
-	"relkind":      OidChar,
+	"typtype":       OidChar,
+	"typcategory":   OidChar,
+	"typalign":      OidChar,
+	"typstorage":    OidChar,
+	"relkind":       OidChar,
 	"relpersistence": OidChar,
+	"attidentity":   OidChar,
+	"attgenerated":  OidChar,
+	// text type columns (OID 25)
+	"table_type":  OidText,
+	"adsrc":       OidText,
+	"description": OidText,
+	// smallint columns (OID 21)
+	"attlen": OidInt2,
 }
 
 // TypeInfo contains PostgreSQL type information
