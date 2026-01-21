@@ -207,6 +207,31 @@ func (t *Transpiler) TranspileMulti(sql string) ([]*Result, error) {
 	return results, nil
 }
 
+// CountParameters parses SQL and counts $N placeholders without applying any transforms.
+// This is used for prepared statements in native DuckDB mode where we skip transpilation
+// but still need to know the parameter count for the extended query protocol.
+func CountParameters(sql string) (int, error) {
+	sql = strings.TrimSpace(sql)
+	if sql == "" {
+		return 0, nil
+	}
+
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return 0, err
+	}
+
+	// Use the PlaceholderTransform just for counting
+	pt := transform.NewPlaceholderTransform()
+	result := &transform.Result{}
+	_, err = pt.Transform(tree, result)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.ParamCount, nil
+}
+
 // ConvertAlterTableToAlterView transforms an ALTER TABLE RENAME statement
 // to ALTER VIEW RENAME. This is used to retry failed ALTER TABLE commands
 // when DuckDB reports that the target is a view, not a table.

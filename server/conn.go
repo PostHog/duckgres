@@ -93,17 +93,18 @@ const (
 )
 
 type clientConn struct {
-	server     *Server
-	conn       net.Conn
-	reader     *bufio.Reader
-	writer     *bufio.Writer
-	username   string
-	database   string
-	db         *sql.DB
-	pid        int32
-	stmts      map[string]*preparedStmt // prepared statements by name
-	portals    map[string]*portal       // portals by name
-	txStatus   byte                     // current transaction status ('I', 'T', or 'E')
+	server       *Server
+	conn         net.Conn
+	reader       *bufio.Reader
+	writer       *bufio.Writer
+	username     string
+	database     string
+	db           *sql.DB
+	pid          int32
+	stmts        map[string]*preparedStmt // prepared statements by name
+	portals      map[string]*portal       // portals by name
+	txStatus     byte                     // current transaction status ('I', 'T', or 'E')
+	nativeDuckDB bool                     // Native DuckDB mode - bypass transpilation when true
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -112,6 +113,135 @@ func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpi
 		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "",
 		ConvertPlaceholders: convertPlaceholders,
 	})
+}
+
+// isNativeDuckDBCommand checks if a query is a SET or SHOW native_duckdb command.
+// Returns (isSet, isShow, value) where:
+// - isSet: true if this is "SET native_duckdb = on/off/true/false"
+// - isShow: true if this is "SHOW native_duckdb"
+// - value: the boolean value for SET commands
+func (c *clientConn) isNativeDuckDBCommand(query string) (isSet bool, isShow bool, value bool) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+
+	// Check for SHOW native_duckdb
+	if upper == "SHOW NATIVE_DUCKDB" || upper == "SHOW NATIVE_DUCKDB;" {
+		return false, true, false
+	}
+
+	// Check for SET native_duckdb = value
+	// Supported formats: SET native_duckdb = on/off/true/false/'on'/'off'
+	if !strings.HasPrefix(upper, "SET NATIVE_DUCKDB") {
+		return false, false, false
+	}
+
+	// Parse the value
+	// Remove SET native_duckdb and any surrounding whitespace
+	rest := strings.TrimSpace(query[len("SET native_duckdb"):])
+	rest = strings.TrimSuffix(rest, ";")
+
+	// Must have = or TO
+	if strings.HasPrefix(strings.ToUpper(rest), "=") {
+		rest = strings.TrimSpace(rest[1:])
+	} else if strings.HasPrefix(strings.ToUpper(rest), " TO ") {
+		rest = strings.TrimSpace(rest[4:])
+	} else if strings.HasPrefix(strings.ToUpper(rest), "TO ") {
+		rest = strings.TrimSpace(rest[3:])
+	} else {
+		return false, false, false
+	}
+
+	// Parse the value - remove quotes if present
+	rest = strings.Trim(rest, "'\"")
+	upperVal := strings.ToUpper(rest)
+
+	switch upperVal {
+	case "ON", "TRUE", "1":
+		return true, false, true
+	case "OFF", "FALSE", "0":
+		return true, false, false
+	default:
+		return false, false, false
+	}
+}
+
+// handleNativeDuckDBSet handles SET native_duckdb = on/off.
+func (c *clientConn) handleNativeDuckDBSet(value bool) {
+	c.nativeDuckDB = value
+	log.Printf("[%s] Native DuckDB mode: %v", c.username, value)
+	_ = writeCommandComplete(c.writer, "SET")
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+}
+
+// handleNativeDuckDBShow handles SHOW native_duckdb (simple query protocol).
+func (c *clientConn) handleNativeDuckDBShow() {
+	// Send RowDescription for a single text column named "native_duckdb"
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.BigEndian, int16(1)) // 1 column
+
+	// Column: native_duckdb
+	buf.WriteString("native_duckdb")
+	buf.WriteByte(0)                                     // null terminator
+	_ = binary.Write(&buf, binary.BigEndian, int32(0))   // table OID
+	_ = binary.Write(&buf, binary.BigEndian, int16(0))   // column number
+	_ = binary.Write(&buf, binary.BigEndian, int32(25))  // text OID
+	_ = binary.Write(&buf, binary.BigEndian, int16(-1))  // type size (variable)
+	_ = binary.Write(&buf, binary.BigEndian, int32(-1))  // type modifier
+	_ = binary.Write(&buf, binary.BigEndian, int16(0))   // format code (text)
+
+	_ = writeMessage(c.writer, msgRowDescription, buf.Bytes())
+
+	// Send DataRow with current value
+	var valueBuf bytes.Buffer
+	_ = binary.Write(&valueBuf, binary.BigEndian, int16(1)) // 1 column
+	valueStr := "off"
+	if c.nativeDuckDB {
+		valueStr = "on"
+	}
+	_ = binary.Write(&valueBuf, binary.BigEndian, int32(len(valueStr)))
+	valueBuf.WriteString(valueStr)
+
+	_ = writeMessage(c.writer, msgDataRow, valueBuf.Bytes())
+
+	// Send CommandComplete and ReadyForQuery
+	_ = writeCommandComplete(c.writer, "SHOW")
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+}
+
+// handleNativeDuckDBShowExtended handles SHOW native_duckdb (extended query protocol).
+// Unlike handleNativeDuckDBShow, this does NOT send ReadyForQuery (that's done by Sync).
+func (c *clientConn) handleNativeDuckDBShowExtended() {
+	// Send RowDescription for a single text column named "native_duckdb"
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.BigEndian, int16(1)) // 1 column
+
+	// Column: native_duckdb
+	buf.WriteString("native_duckdb")
+	buf.WriteByte(0)                                     // null terminator
+	_ = binary.Write(&buf, binary.BigEndian, int32(0))   // table OID
+	_ = binary.Write(&buf, binary.BigEndian, int16(0))   // column number
+	_ = binary.Write(&buf, binary.BigEndian, int32(25))  // text OID
+	_ = binary.Write(&buf, binary.BigEndian, int16(-1))  // type size (variable)
+	_ = binary.Write(&buf, binary.BigEndian, int32(-1))  // type modifier
+	_ = binary.Write(&buf, binary.BigEndian, int16(0))   // format code (text)
+
+	_ = writeMessage(c.writer, msgRowDescription, buf.Bytes())
+
+	// Send DataRow with current value
+	var valueBuf bytes.Buffer
+	_ = binary.Write(&valueBuf, binary.BigEndian, int16(1)) // 1 column
+	valueStr := "off"
+	if c.nativeDuckDB {
+		valueStr = "on"
+	}
+	_ = binary.Write(&valueBuf, binary.BigEndian, int32(len(valueStr)))
+	valueBuf.WriteString(valueStr)
+
+	_ = writeMessage(c.writer, msgDataRow, valueBuf.Bytes())
+
+	// Send CommandComplete (no ReadyForQuery - that's done by Sync)
+	_ = writeCommandComplete(c.writer, "SHOW")
 }
 
 func (c *clientConn) serve() error {
@@ -371,15 +501,33 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	log.Printf("[%s] Query: %s", c.username, query)
 
-	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
-	tr := c.newTranspiler(false)
-	result, err := tr.Transpile(query)
-	if err != nil {
-		// Parse error - send error to client
-		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
-		_ = writeReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
+	// Check for native_duckdb commands BEFORE transpiling
+	// These commands control the transpilation mode itself
+	if isSet, isShow, value := c.isNativeDuckDBCommand(query); isSet {
+		c.handleNativeDuckDBSet(value)
 		return nil
+	} else if isShow {
+		c.handleNativeDuckDBShow()
+		return nil
+	}
+
+	// Skip transpilation if native DuckDB mode is enabled
+	var result *transpiler.Result
+	var err error
+	if c.nativeDuckDB {
+		log.Printf("[%s] Native DuckDB mode: bypassing transpilation", c.username)
+		result = &transpiler.Result{SQL: query}
+	} else {
+		// Transpile PostgreSQL SQL to DuckDB-compatible SQL
+		tr := c.newTranspiler(false)
+		result, err = tr.Transpile(query)
+		if err != nil {
+			// Parse error - send error to client
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
 	}
 
 	// Handle transform-detected errors (e.g., unrecognized config parameter)
@@ -1635,18 +1783,68 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
-	// Transpile PostgreSQL SQL to DuckDB-compatible SQL (with placeholder conversion)
-	tr := c.newTranspiler(true) // Enable placeholder conversion for prepared statements
-	result, err := tr.Transpile(query)
-	if err != nil {
-		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
-		return
-	}
+	// Check for native_duckdb commands - these are handled specially at Execute time
+	// For prepared statements, we need to store them so Bind/Execute can handle them
+	isSet, isShow, setVal := c.isNativeDuckDBCommand(query)
 
-	// Handle transform-detected errors (e.g., unrecognized config parameter)
-	if result.Error != nil {
-		c.sendError("ERROR", "42704", result.Error.Error())
-		return
+	// Skip transpilation if native DuckDB mode is enabled OR this is a native_duckdb command
+	var result *transpiler.Result
+	if c.nativeDuckDB || isSet || isShow {
+		// In native mode, we skip transpilation but still need to count parameters
+		paramCount, err := transpiler.CountParameters(query)
+		if err != nil {
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			return
+		}
+		if c.nativeDuckDB {
+			log.Printf("[%s] Native DuckDB mode: bypassing transpilation for prepared statement", c.username)
+		}
+		result = &transpiler.Result{
+			SQL:        query,
+			ParamCount: paramCount,
+		}
+
+		// Store native_duckdb command info in the prepared statement for Execute
+		if isSet || isShow {
+			// Close existing statement with same name
+			delete(c.stmts, stmtName)
+			c.stmts[stmtName] = &preparedStmt{
+				query:          query,
+				convertedQuery: query,
+				paramTypes:     paramTypes,
+				numParams:      paramCount,
+				isIgnoredSet:   isSet, // Reuse this flag to signal special handling
+			}
+			// Store the SET value in a way Execute can access it
+			// We'll use a special marker in the query itself
+			if isSet {
+				if setVal {
+					c.stmts[stmtName].noOpTag = "NATIVE_DUCKDB_ON"
+				} else {
+					c.stmts[stmtName].noOpTag = "NATIVE_DUCKDB_OFF"
+				}
+			} else if isShow {
+				c.stmts[stmtName].noOpTag = "NATIVE_DUCKDB_SHOW"
+			}
+			log.Printf("[%s] Prepared statement %q (native_duckdb command): %s", c.username, stmtName, query)
+			_ = writeParseComplete(c.writer)
+			return
+		}
+	} else {
+		// Transpile PostgreSQL SQL to DuckDB-compatible SQL (with placeholder conversion)
+		tr := c.newTranspiler(true) // Enable placeholder conversion for prepared statements
+		var err error
+		result, err = tr.Transpile(query)
+		if err != nil {
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			return
+		}
+
+		// Handle transform-detected errors (e.g., unrecognized config parameter)
+		if result.Error != nil {
+			c.sendError("ERROR", "42704", result.Error.Error())
+			return
+		}
 	}
 
 	// Close existing statement with same name
@@ -1947,6 +2145,22 @@ func (c *clientConn) handleExecute(body []byte) {
 	trimmedQuery := strings.TrimSpace(p.stmt.query)
 	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
 		_ = writeEmptyQueryResponse(c.writer)
+		return
+	}
+
+	// Check if this is a native_duckdb command (prepared via extended protocol)
+	if p.stmt.noOpTag == "NATIVE_DUCKDB_ON" {
+		c.nativeDuckDB = true
+		log.Printf("[%s] Native DuckDB mode: on (via prepared statement)", c.username)
+		_ = writeCommandComplete(c.writer, "SET")
+		return
+	} else if p.stmt.noOpTag == "NATIVE_DUCKDB_OFF" {
+		c.nativeDuckDB = false
+		log.Printf("[%s] Native DuckDB mode: off (via prepared statement)", c.username)
+		_ = writeCommandComplete(c.writer, "SET")
+		return
+	} else if p.stmt.noOpTag == "NATIVE_DUCKDB_SHOW" {
+		c.handleNativeDuckDBShowExtended()
 		return
 	}
 

@@ -1421,6 +1421,84 @@ func TestTranspile_WritableCTE_ColumnRefRewriting(t *testing.T) {
 	}
 }
 
+func TestCountParameters(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		expected int
+		wantErr  bool
+	}{
+		{
+			name:     "no parameters",
+			sql:      "SELECT * FROM users",
+			expected: 0,
+		},
+		{
+			name:     "single parameter",
+			sql:      "SELECT * FROM users WHERE id = $1",
+			expected: 1,
+		},
+		{
+			name:     "multiple sequential parameters",
+			sql:      "SELECT * FROM users WHERE id = $1 AND name = $2 AND age = $3",
+			expected: 3,
+		},
+		{
+			name:     "non-sequential parameters",
+			sql:      "SELECT * FROM users WHERE id = $5",
+			expected: 5,
+		},
+		{
+			name:     "mixed parameter numbers",
+			sql:      "SELECT * FROM users WHERE id = $3 OR id = $1",
+			expected: 3,
+		},
+		{
+			name:     "parameters in INSERT",
+			sql:      "INSERT INTO users (name, email) VALUES ($1, $2)",
+			expected: 2,
+		},
+		{
+			name:     "parameters in UPDATE",
+			sql:      "UPDATE users SET name = $1 WHERE id = $2",
+			expected: 2,
+		},
+		{
+			name:     "empty string",
+			sql:      "",
+			expected: 0,
+		},
+		{
+			name:     "whitespace only",
+			sql:      "   ",
+			expected: 0,
+		},
+		{
+			name:    "invalid SQL",
+			sql:     "NOT VALID SQL AT ALL $$$",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			count, err := CountParameters(tt.sql)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("CountParameters(%q) expected error, got nil", tt.sql)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CountParameters(%q) unexpected error: %v", tt.sql, err)
+			}
+			if count != tt.expected {
+				t.Errorf("CountParameters(%q) = %d, want %d", tt.sql, count, tt.expected)
+			}
+		})
+	}
+}
+
 func TestConvertAlterTableToAlterView(t *testing.T) {
 	tests := []struct {
 		name       string
