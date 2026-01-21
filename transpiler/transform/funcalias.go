@@ -67,6 +67,13 @@ func (t *FuncAliasTransform) transformSelectTargets(stmt *pg_query.SelectStmt) b
 		}
 	}
 
+	// Recurse into FROM clause subqueries
+	for _, from := range stmt.FromClause {
+		if t.transformFromClause(from) {
+			changed = true
+		}
+	}
+
 	// Recurse into subqueries (UNION, etc.)
 	if stmt.Larg != nil {
 		if t.transformSelectTargets(stmt.Larg) {
@@ -76,6 +83,36 @@ func (t *FuncAliasTransform) transformSelectTargets(stmt *pg_query.SelectStmt) b
 	if stmt.Rarg != nil {
 		if t.transformSelectTargets(stmt.Rarg) {
 			changed = true
+		}
+	}
+
+	return changed
+}
+
+func (t *FuncAliasTransform) transformFromClause(node *pg_query.Node) bool {
+	if node == nil {
+		return false
+	}
+
+	changed := false
+
+	switch n := node.Node.(type) {
+	case *pg_query.Node_RangeSubselect:
+		if n.RangeSubselect != nil && n.RangeSubselect.Subquery != nil {
+			if selectStmt := n.RangeSubselect.Subquery.GetSelectStmt(); selectStmt != nil {
+				if t.transformSelectTargets(selectStmt) {
+					changed = true
+				}
+			}
+		}
+	case *pg_query.Node_JoinExpr:
+		if n.JoinExpr != nil {
+			if t.transformFromClause(n.JoinExpr.Larg) {
+				changed = true
+			}
+			if t.transformFromClause(n.JoinExpr.Rarg) {
+				changed = true
+			}
 		}
 	}
 

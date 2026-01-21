@@ -306,6 +306,62 @@ func TestTranspile_Version(t *testing.T) {
 	}
 }
 
+func TestTranspile_FuncAlias(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name          string
+		input         string
+		expectedAlias string // can be quoted or unquoted
+	}{
+		{
+			name:          "current_database direct",
+			input:         "SELECT current_database()",
+			expectedAlias: "current_database",
+		},
+		{
+			name:          "current_database in subquery",
+			input:         "SELECT * FROM (SELECT current_database()) c",
+			expectedAlias: "current_database",
+		},
+		{
+			name:          "current_schema direct",
+			input:         "SELECT current_schema()",
+			expectedAlias: "current_schema",
+		},
+		{
+			name:          "current_schema in subquery",
+			input:         "SELECT * FROM (SELECT current_schema()) c",
+			expectedAlias: "current_schema",
+		},
+		{
+			name:          "nested subquery",
+			input:         "SELECT * FROM (SELECT * FROM (SELECT current_database()) a) b",
+			expectedAlias: "current_database",
+		},
+		{
+			name:          "join with subqueries",
+			input:         "SELECT * FROM (SELECT current_database()) a JOIN (SELECT current_schema()) b ON true",
+			expectedAlias: "current_database",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			// Check for alias with or without quotes
+			hasAlias := strings.Contains(result.SQL, "AS "+tt.expectedAlias) ||
+				strings.Contains(result.SQL, "AS \""+tt.expectedAlias+"\"")
+			if !hasAlias {
+				t.Errorf("Expected AS %s (quoted or unquoted) in output, got: %q", tt.expectedAlias, result.SQL)
+			}
+		})
+	}
+}
+
 func TestTranspile_DDL_DuckLakeMode(t *testing.T) {
 	tests := []struct {
 		name     string
