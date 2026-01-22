@@ -133,7 +133,7 @@ func stripSQLComments(query string) string {
 		if i+1 < len(query) && query[i] == '/' && query[i+1] == '*' {
 			i += 2
 			// Skip until end of block comment
-			for i+1 < len(query) && !(query[i] == '*' && query[i+1] == '/') {
+			for i+1 < len(query) && (query[i] != '*' || query[i+1] != '/') {
 				i++
 			}
 			if i+1 < len(query) {
