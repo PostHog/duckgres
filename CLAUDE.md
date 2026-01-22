@@ -21,7 +21,7 @@ PostgreSQL Client → TLS → Duckgres Server → DuckDB (per-user database)
 - **server/catalog.go**: pg_catalog compatibility views and macros initialization
 - **server/types.go**: Type OID mapping between DuckDB and PostgreSQL
 - **server/ratelimit.go**: Rate limiting for brute-force protection
-- **server/tls.go**: Auto-generation of self-signed TLS certificates
+- **server/certs.go**: Auto-generation of self-signed TLS certificates
 - **transpiler/**: AST-based SQL transpiler (PostgreSQL → DuckDB)
   - `transpiler.go`: Main API, transform pipeline orchestration
   - `config.go`: Configuration types (DuckLakeMode, ConvertPlaceholders)
@@ -72,7 +72,7 @@ psql and other clients expect PostgreSQL system catalogs. We provide compatibili
 Supports bulk data transfer:
 - **COPY TO STDOUT**: Streams query results to client
 - **COPY FROM STDIN**: Receives data from client, inserts row by row
-- Supports CSV format with HEADER option
+- Supports CSV format with HEADER, DELIMITER, and NULL options
 
 ## Configuration
 
