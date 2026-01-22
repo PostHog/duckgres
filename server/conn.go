@@ -115,12 +115,46 @@ func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpi
 	})
 }
 
+// stripSQLComments removes SQL comments from a query string.
+// It handles both line comments (-- ...) and block comments (/* ... */).
+func stripSQLComments(query string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(query) {
+		// Check for line comment
+		if i+1 < len(query) && query[i] == '-' && query[i+1] == '-' {
+			// Skip until end of line
+			for i < len(query) && query[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		// Check for block comment
+		if i+1 < len(query) && query[i] == '/' && query[i+1] == '*' {
+			i += 2
+			// Skip until end of block comment
+			for i+1 < len(query) && !(query[i] == '*' && query[i+1] == '/') {
+				i++
+			}
+			if i+1 < len(query) {
+				i += 2 // Skip */
+			}
+			continue
+		}
+		result.WriteByte(query[i])
+		i++
+	}
+	return result.String()
+}
+
 // isNativeDuckDBCommand checks if a query is a SET or SHOW native_duckdb command.
 // Returns (isSet, isShow, value) where:
 // - isSet: true if this is "SET native_duckdb = on/off/true/false"
 // - isShow: true if this is "SHOW native_duckdb"
 // - value: the boolean value for SET commands
 func (c *clientConn) isNativeDuckDBCommand(query string) (isSet bool, isShow bool, value bool) {
+	// Strip comments first - some clients (like Hex) append metadata comments
+	query = stripSQLComments(query)
 	upper := strings.ToUpper(strings.TrimSpace(query))
 
 	// Check for SHOW native_duckdb

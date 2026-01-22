@@ -1490,6 +1490,29 @@ func TestIsNativeDuckDBCommand(t *testing.T) {
 			expectValue:  false,
 		},
 
+		// With trailing comments (like Hex does)
+		{
+			name:       "SET with trailing line comment",
+			query:      "SET native_duckdb = on\n-- Hex query metadata: {\"project_id\": \"123\"}",
+			expectIsSet:  true,
+			expectIsShow: false,
+			expectValue:  true,
+		},
+		{
+			name:       "SET with trailing block comment",
+			query:      "SET native_duckdb = off /* comment */",
+			expectIsSet:  true,
+			expectIsShow: false,
+			expectValue:  false,
+		},
+		{
+			name:       "SHOW with trailing comment",
+			query:      "SHOW native_duckdb -- comment",
+			expectIsSet:  false,
+			expectIsShow: true,
+			expectValue:  false,
+		},
+
 		// Not native_duckdb commands
 		{
 			name:       "SET search_path",
