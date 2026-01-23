@@ -9,7 +9,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"regexp"
@@ -201,7 +201,7 @@ func (c *clientConn) isNativeDuckDBCommand(query string) (isSet bool, isShow boo
 // handleNativeDuckDBSet handles SET native_duckdb = on/off.
 func (c *clientConn) handleNativeDuckDBSet(value bool) {
 	c.nativeDuckDB = value
-	log.Printf("[%s] Native DuckDB mode: %v", c.username, value)
+	slog.Info("Native DuckDB mode changed.", "user", c.username, "enabled", value)
 	_ = writeCommandComplete(c.writer, "SET")
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
@@ -305,14 +305,14 @@ func (c *clientConn) serve() error {
 				// Must switch away from ducklake before detaching - DuckDB doesn't allow
 				// detaching the default database
 				if _, err := c.db.Exec("USE memory"); err != nil {
-					log.Printf("Warning: failed to switch to memory for user %q: %v", c.username, err)
+					slog.Warn("Failed to switch to memory.", "user", c.username, "error", err)
 				}
 				if _, err := c.db.Exec("DETACH ducklake"); err != nil {
-					log.Printf("Warning: failed to detach DuckLake for user %q: %v", c.username, err)
+					slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err)
 				}
 			}
 			if err := c.db.Close(); err != nil {
-				log.Printf("Warning: failed to close db for user %q: %v", c.username, err)
+				slog.Warn("Failed to close database.", "user", c.username, "error", err)
 			}
 		}
 	}()
@@ -360,7 +360,7 @@ func (c *clientConn) handleStartup() error {
 			c.writer = bufio.NewWriter(tlsConn)
 			tlsUpgraded = true
 
-			log.Printf("TLS connection established from %s", c.conn.RemoteAddr())
+			slog.Info("TLS connection established.", "remote_addr", c.conn.RemoteAddr())
 			continue
 		}
 
@@ -414,7 +414,7 @@ func (c *clientConn) handleStartup() error {
 		// Record failed authentication attempt
 		banned := c.server.rateLimiter.RecordFailedAuth(c.conn.RemoteAddr())
 		if banned {
-			log.Printf("IP %s banned after too many failed auth attempts", c.conn.RemoteAddr())
+			slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", c.conn.RemoteAddr())
 		}
 		c.sendError("FATAL", "28P01", "password authentication failed")
 		return fmt.Errorf("authentication failed for user %q", c.username)
@@ -428,7 +428,7 @@ func (c *clientConn) handleStartup() error {
 		return err
 	}
 
-	log.Printf("User %q authenticated from %s", c.username, c.conn.RemoteAddr())
+	slog.Info("User authenticated.", "user", c.username, "remote_addr", c.conn.RemoteAddr())
 	return nil
 }
 
@@ -445,13 +445,13 @@ func (c *clientConn) sendInitialParams() {
 
 	for name, value := range params {
 		if err := writeParameterStatus(c.writer, name, value); err != nil {
-			log.Printf("Warning: failed to write parameter %s: %v", name, err)
+			slog.Warn("Failed to write parameter.", "param", name, "error", err)
 		}
 	}
 
 	// Send backend key data
 	if err := writeBackendKeyData(c.writer, c.pid, 0); err != nil {
-		log.Printf("Warning: failed to write backend key data: %v", err)
+		slog.Warn("Failed to write backend key data.", "error", err)
 	}
 }
 
@@ -469,7 +469,7 @@ func (c *clientConn) messageLoop() error {
 			}
 			// Check if this is a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("[%s] Connection idle timeout, closing", c.username)
+				slog.Info("Connection idle timeout, closing.", "user", c.username)
 				return nil
 			}
 			return err
@@ -478,7 +478,7 @@ func (c *clientConn) messageLoop() error {
 		switch msgType {
 		case msgQuery:
 			if err := c.handleQuery(body); err != nil {
-				log.Printf("Query error: %v", err)
+				slog.Error("Query error.", "error", err)
 			}
 
 		case msgParse:
@@ -515,7 +515,7 @@ func (c *clientConn) messageLoop() error {
 			return nil
 
 		default:
-			log.Printf("Unknown message type: %c", msgType)
+			slog.Warn("Unknown message type.", "type", string(msgType))
 		}
 	}
 }
@@ -533,7 +533,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
-	log.Printf("[%s] Query: %s", c.username, query)
+	slog.Debug("Query received.", "user", c.username, "query", query)
 
 	// Check for native_duckdb commands BEFORE transpiling
 	// These commands control the transpilation mode itself
@@ -549,7 +549,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	var result *transpiler.Result
 	var err error
 	if c.nativeDuckDB {
-		log.Printf("[%s] Native DuckDB mode: bypassing transpilation", c.username)
+		slog.Debug("Native DuckDB mode: bypassing transpilation.", "user", c.username)
 		result = &transpiler.Result{SQL: query}
 	} else {
 		// Transpile PostgreSQL SQL to DuckDB-compatible SQL
@@ -574,7 +574,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle ignored SET parameters
 	if result.IsIgnoredSet {
-		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, query)
+		slog.Debug("Ignoring PostgreSQL-specific SET.", "user", c.username, "query", query)
 		_ = writeCommandComplete(c.writer, "SET")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
@@ -583,7 +583,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle no-op commands (CREATE INDEX, VACUUM, etc.)
 	if result.IsNoOp {
-		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, query)
+		slog.Debug("No-op command (DuckLake limitation).", "user", c.username, "query", query)
 		_ = writeCommandComplete(c.writer, result.NoOpTag)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
@@ -592,7 +592,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle multi-statement results (writable CTE rewrites)
 	if len(result.Statements) > 0 {
-		log.Printf("[%s] Multi-statement query (%d statements, %d cleanup)", c.username, len(result.Statements), len(result.CleanupStatements))
+		slog.Debug("Multi-statement query.", "user", c.username, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
 		return c.executeMultiStatement(result.Statements, result.CleanupStatements)
 	}
 
@@ -602,7 +602,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Log the transpiled query if it differs from the original
 	if query != originalQuery {
-		log.Printf("[%s] Executed: %s", c.username, query)
+		slog.Debug("Query transpiled.", "user", c.username, "executed", query)
 	}
 
 	// Determine command type for proper response
@@ -747,10 +747,10 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	// Execute setup statements (all but last)
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
-		log.Printf("[%s] Multi-stmt setup [%d/%d]: %s", c.username, i+1, len(statements)-1, stmt)
+		slog.Debug("Multi-stmt setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		_, err := c.db.Exec(stmt)
 		if err != nil {
-			log.Printf("[%s] Multi-stmt setup error: %v", c.username, err)
+			slog.Error("Multi-stmt setup error.", "user", c.username, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -765,13 +765,13 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	finalStmt := statements[len(statements)-1]
 	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
 	cmdType := c.getCommandType(upperFinal)
-	log.Printf("[%s] Multi-stmt final: %s (cmdType=%s)", c.username, finalStmt, cmdType)
+	slog.Debug("Multi-stmt final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
 
 	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
 		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.db.Query(finalStmt)
 		if err != nil {
-			log.Printf("[%s] Multi-stmt final query error: %v", c.username, err)
+			slog.Error("Multi-stmt final query error.", "user", c.username, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -792,7 +792,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		// DML (INSERT/UPDATE/DELETE): execute then cleanup
 		result, err := c.db.Exec(finalStmt)
 		if err != nil {
-			log.Printf("[%s] Multi-stmt final exec error: %v", c.username, err)
+			slog.Error("Multi-stmt final exec error.", "user", c.username, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -816,11 +816,11 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 // This is used to clean up temp tables after a multi-statement query.
 func (c *clientConn) executeCleanup(cleanup []string) {
 	for _, stmt := range cleanup {
-		log.Printf("[%s] Multi-stmt cleanup: %s", c.username, stmt)
+		slog.Debug("Multi-stmt cleanup.", "user", c.username, "stmt", stmt)
 		_, err := c.db.Exec(stmt)
 		if err != nil {
 			// Log but don't fail - cleanup is best effort
-			log.Printf("[%s] Multi-stmt cleanup error (ignored): %v", c.username, err)
+			slog.Warn("Multi-stmt cleanup error (ignored).", "user", c.username, "error", err)
 		}
 	}
 }
@@ -849,10 +849,10 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	// Execute setup statements (all but last)
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
-		log.Printf("[%s] Multi-stmt-ext setup [%d/%d]: %s", c.username, i+1, len(statements)-1, stmt)
+		slog.Debug("Multi-stmt-ext setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		_, err := c.db.Exec(stmt, args...)
 		if err != nil {
-			log.Printf("[%s] Multi-stmt-ext setup error: %v", c.username, err)
+			slog.Error("Multi-stmt-ext setup error.", "user", c.username, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -865,13 +865,13 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	finalStmt := statements[len(statements)-1]
 	upperFinal := strings.ToUpper(strings.TrimSpace(finalStmt))
 	cmdType := c.getCommandType(upperFinal)
-	log.Printf("[%s] Multi-stmt-ext final: %s (cmdType=%s)", c.username, finalStmt, cmdType)
+	slog.Debug("Multi-stmt-ext final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
 
 	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
 		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.db.Query(finalStmt, args...)
 		if err != nil {
-			log.Printf("[%s] Multi-stmt-ext final query error: %v", c.username, err)
+			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -889,7 +889,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		// DML (INSERT/UPDATE/DELETE): execute then cleanup
 		result, err := c.db.Exec(finalStmt, args...)
 		if err != nil {
-			log.Printf("[%s] Multi-stmt-ext final exec error: %v", c.username, err)
+			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -1445,7 +1445,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 // handleCopyIn handles COPY ... FROM STDIN
 func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	copyStartTime := time.Now()
-	log.Printf("[%s] COPY FROM STDIN: starting", c.username)
+	slog.Debug("COPY FROM STDIN starting.", "user", c.username)
 
 	// Parse COPY options using the helper function
 	opts, err := ParseCopyFromOptions(query)
@@ -1459,7 +1459,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 	tableName := opts.TableName
 	columnList := opts.ColumnList
-	log.Printf("[%s] COPY FROM STDIN: table=%s columns=%s", c.username, tableName, columnList)
+	slog.Debug("COPY FROM STDIN parsed.", "user", c.username, "table", tableName, "columns", columnList)
 
 	// Get column count for the table
 	colQuery := fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
@@ -1479,14 +1479,14 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return err
 	}
 	_ = c.writer.Flush()
-	log.Printf("[%s] COPY FROM STDIN: sent CopyInResponse, waiting for data...", c.username)
+	slog.Debug("COPY FROM STDIN sent CopyInResponse, waiting for data.", "user", c.username)
 
 	// Create temp file upfront and stream data directly to it (avoids memory buffering)
 	// This approach leverages DuckDB's highly optimized CSV parser which handles
 	// type conversions automatically and can load millions of rows in seconds.
 	tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
 	if err != nil {
-		log.Printf("[%s] COPY FROM STDIN: failed to create temp file: %v", c.username, err)
+		slog.Error("COPY FROM STDIN failed to create temp file.", "user", c.username, "error", err)
 		c.sendError("ERROR", "58000", fmt.Sprintf("failed to create temp file: %v", err))
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1505,7 +1505,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	for {
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
-			log.Printf("[%s] COPY FROM STDIN: error reading message: %v", c.username, err)
+			slog.Error("COPY FROM STDIN error reading message.", "user", c.username, "error", err)
 			_ = tmpFile.Close()
 			return err
 		}
@@ -1514,7 +1514,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		case msgCopyData:
 			n, err := tmpFile.Write(body)
 			if err != nil {
-				log.Printf("[%s] COPY FROM STDIN: failed to write to temp file: %v", c.username, err)
+				slog.Error("COPY FROM STDIN failed to write to temp file.", "user", c.username, "error", err)
 				_ = tmpFile.Close()
 				c.sendError("ERROR", "58000", fmt.Sprintf("failed to write to temp file: %v", err))
 				c.setTxError()
@@ -1525,25 +1525,23 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			bytesWritten += int64(n)
 			copyDataMessages++
 			if copyDataMessages%10000 == 0 {
-				log.Printf("[%s] COPY FROM STDIN: received %d CopyData messages, %d bytes written",
-					c.username, copyDataMessages, bytesWritten)
+				slog.Debug("COPY FROM STDIN progress.", "user", c.username, "messages", copyDataMessages, "bytes", bytesWritten)
 			}
 
 		case msgCopyDone:
 			_ = tmpFile.Close()
 			dataReceiveElapsed := time.Since(dataReceiveStart)
-			log.Printf("[%s] COPY FROM STDIN: CopyDone received - %d messages, %d bytes in %v",
-				c.username, copyDataMessages, bytesWritten, dataReceiveElapsed)
+			slog.Debug("COPY FROM STDIN CopyDone received.", "user", c.username, "messages", copyDataMessages, "bytes", bytesWritten, "duration", dataReceiveElapsed)
 
 			// Build DuckDB COPY FROM statement using the helper function
 			copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, tmpPath, opts)
 
-			log.Printf("[%s] COPY FROM STDIN: executing native DuckDB COPY: %s", c.username, copySQL)
+			slog.Debug("COPY FROM STDIN executing native DuckDB COPY.", "user", c.username, "sql", copySQL)
 			loadStart := time.Now()
 
 			result, err := c.db.Exec(copySQL)
 			if err != nil {
-				log.Printf("[%s] COPY FROM STDIN: DuckDB COPY failed: %v", c.username, err)
+				slog.Error("COPY FROM STDIN DuckDB COPY failed.", "user", c.username, "error", err)
 				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
 				c.setTxError()
 				_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1556,8 +1554,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 			totalElapsed := time.Since(copyStartTime)
 			loadElapsed := time.Since(loadStart)
-			log.Printf("[%s] COPY FROM STDIN: completed - %d rows in %v (DuckDB load: %v)",
-				c.username, rowCount, totalElapsed, loadElapsed)
+			slog.Info("COPY FROM STDIN completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
 
 			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
 			_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1831,7 +1828,7 @@ func (c *clientConn) handleParse(body []byte) {
 			return
 		}
 		if c.nativeDuckDB {
-			log.Printf("[%s] Native DuckDB mode: bypassing transpilation for prepared statement", c.username)
+			slog.Debug("Native DuckDB mode: bypassing transpilation for prepared statement.", "user", c.username)
 		}
 		result = &transpiler.Result{
 			SQL:        query,
@@ -1860,7 +1857,7 @@ func (c *clientConn) handleParse(body []byte) {
 			} else if isShow {
 				c.stmts[stmtName].noOpTag = "NATIVE_DUCKDB_SHOW"
 			}
-			log.Printf("[%s] Prepared statement %q (native_duckdb command): %s", c.username, stmtName, query)
+			slog.Debug("Prepared statement (native_duckdb command).", "user", c.username, "name", stmtName, "query", query)
 			_ = writeParseComplete(c.writer)
 			return
 		}
@@ -1896,12 +1893,11 @@ func (c *clientConn) handleParse(body []byte) {
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}
 
-	log.Printf("[%s] Prepared statement %q: %s", c.username, stmtName, query)
+	slog.Debug("Prepared statement.", "user", c.username, "name", stmtName, "query", query)
 	if len(result.Statements) > 0 {
-		log.Printf("[%s] Prepared statement %q multi-statement: %d statements, %d cleanup",
-			c.username, stmtName, len(result.Statements), len(result.CleanupStatements))
+		slog.Debug("Prepared statement multi-statement.", "user", c.username, "name", stmtName, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
 	} else if result.SQL != query {
-		log.Printf("[%s] Prepared statement %q transpiled: %s", c.username, stmtName, result.SQL)
+		slog.Debug("Prepared statement transpiled.", "user", c.username, "name", stmtName, "transpiled", result.SQL)
 	}
 	_ = writeParseComplete(c.writer)
 }
@@ -2027,7 +2023,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 			c.sendError("ERROR", "26000", fmt.Sprintf("prepared statement %q does not exist", name))
 			return
 		}
-		log.Printf("[%s] Describe statement %q: %s", c.username, name, ps.query)
+		slog.Debug("Describe statement.", "user", c.username, "name", name, "query", ps.query)
 
 		// Send parameter description based on the number of $N placeholders we found
 		// If the client didn't send explicit types, create them
@@ -2044,7 +2040,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// For queries that return results, we need to send RowDescription
 		// For other queries, send NoData
 		returnsResults := queryReturnsResults(ps.query)
-		log.Printf("[%s] Describe statement %q: returnsResults=%v", c.username, name, returnsResults)
+		slog.Debug("Describe statement returns results check.", "user", c.username, "name", name, "returns_results", returnsResults)
 		if !returnsResults {
 			_ = writeNoData(c.writer)
 			return
@@ -2068,7 +2064,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		rows, err := c.db.Query(describeQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
-			log.Printf("[%s] Describe failed to get columns: %v", c.username, err)
+			slog.Debug("Describe failed to get columns.", "user", c.username, "error", err)
 			_ = writeNoData(c.writer)
 			return
 		}
@@ -2082,7 +2078,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		log.Printf("[%s] Describe statement: sending RowDescription with %d columns", c.username, len(cols))
+		slog.Debug("Describe statement sending RowDescription.", "user", c.username, "columns", len(cols))
 		_ = c.sendRowDescription(cols, colTypes)
 		ps.described = true
 
@@ -2173,7 +2169,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	cmdType := c.getCommandType(upperQuery)
 	returnsResults := queryReturnsResults(p.stmt.query)
 
-	log.Printf("[%s] Execute %q with %d params: %s", c.username, portalName, len(args), p.stmt.query)
+	slog.Debug("Execute portal.", "user", c.username, "portal", portalName, "params", len(args), "query", p.stmt.query)
 
 	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
 	trimmedQuery := strings.TrimSpace(p.stmt.query)
@@ -2186,12 +2182,12 @@ func (c *clientConn) handleExecute(body []byte) {
 	switch p.stmt.noOpTag {
 	case "NATIVE_DUCKDB_ON":
 		c.nativeDuckDB = true
-		log.Printf("[%s] Native DuckDB mode: on (via prepared statement)", c.username)
+		slog.Info("Native DuckDB mode enabled via prepared statement.", "user", c.username)
 		_ = writeCommandComplete(c.writer, "SET")
 		return
 	case "NATIVE_DUCKDB_OFF":
 		c.nativeDuckDB = false
-		log.Printf("[%s] Native DuckDB mode: off (via prepared statement)", c.username)
+		slog.Info("Native DuckDB mode disabled via prepared statement.", "user", c.username)
 		_ = writeCommandComplete(c.writer, "SET")
 		return
 	case "NATIVE_DUCKDB_SHOW":
@@ -2202,7 +2198,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Check if this is a PostgreSQL-specific SET command that should be ignored
 	// (determined by transpiler during Parse)
 	if p.stmt.isIgnoredSet {
-		log.Printf("[%s] Ignoring PostgreSQL-specific SET: %s", c.username, p.stmt.query)
+		slog.Debug("Ignoring PostgreSQL-specific SET.", "user", c.username, "query", p.stmt.query)
 		_ = writeCommandComplete(c.writer, "SET")
 		return
 	}
@@ -2210,15 +2206,14 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Handle no-op commands (CREATE INDEX, VACUUM, etc.) - DuckLake doesn't support these
 	// (determined by transpiler during Parse)
 	if p.stmt.isNoOp {
-		log.Printf("[%s] No-op command (DuckLake limitation): %s", c.username, p.stmt.query)
+		slog.Debug("No-op command (DuckLake limitation).", "user", c.username, "query", p.stmt.query)
 		_ = writeCommandComplete(c.writer, p.stmt.noOpTag)
 		return
 	}
 
 	// Handle multi-statement results (e.g., writable CTE rewrites)
 	if len(p.stmt.statements) > 0 {
-		log.Printf("[%s] Execute multi-statement (%d statements, %d cleanup)",
-			c.username, len(p.stmt.statements), len(p.stmt.cleanupStatements))
+		slog.Debug("Execute multi-statement.", "user", c.username, "statements", len(p.stmt.statements), "cleanup", len(p.stmt.cleanupStatements))
 		c.executeMultiStatementExtended(p.stmt.statements, p.stmt.cleanupStatements, args, p.resultFormats, p.described)
 		return
 	}
@@ -2242,7 +2237,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				}
 			}
 			if err != nil {
-				log.Printf("[%s] Execute error: %v", c.username, err)
+				slog.Error("Execute error.", "user", c.username, "error", err)
 				c.sendError("ERROR", "42000", err.Error())
 				c.setTxError()
 				return
@@ -2257,7 +2252,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Result-returning query: use Query with converted query
 	rows, err := c.db.Query(p.stmt.convertedQuery, args...)
 	if err != nil {
-		log.Printf("[%s] Query error: %v", c.username, err)
+		slog.Error("Query error.", "user", c.username, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -2266,7 +2261,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		log.Printf("[%s] Columns error: %v", c.username, err)
+		slog.Error("Columns error.", "user", c.username, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
