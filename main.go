@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -128,9 +128,10 @@ func main() {
 	if *configFile != "" {
 		fileCfg, err := loadConfigFile(*configFile)
 		if err != nil {
-			log.Fatalf("Failed to load config file: %v", err)
+			slog.Error("Failed to load config file: " + err.Error())
+			os.Exit(1)
 		}
-		log.Printf("Loaded configuration from %s", *configFile)
+		slog.Info("Loaded configuration from " + *configFile)
 
 		// Apply config file values
 		if fileCfg.Host != "" {
@@ -163,14 +164,14 @@ func main() {
 			if d, err := time.ParseDuration(fileCfg.RateLimit.FailedAttemptWindow); err == nil {
 				cfg.RateLimit.FailedAttemptWindow = d
 			} else {
-				log.Printf("Warning: invalid failed_attempt_window duration: %v", err)
+				slog.Warn("Invalid failed_attempt_window duration: " + err.Error())
 			}
 		}
 		if fileCfg.RateLimit.BanDuration != "" {
 			if d, err := time.ParseDuration(fileCfg.RateLimit.BanDuration); err == nil {
 				cfg.RateLimit.BanDuration = d
 			} else {
-				log.Printf("Warning: invalid ban_duration duration: %v", err)
+				slog.Warn("Invalid ban_duration duration: " + err.Error())
 			}
 		}
 
@@ -284,18 +285,21 @@ func main() {
 
 	// Create data directory if it doesn't exist
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
-		log.Fatalf("Failed to create data directory: %v", err)
+		slog.Error("Failed to create data directory: " + err.Error())
+		os.Exit(1)
 	}
 
 	// Auto-generate self-signed certificates if they don't exist
 	if err := server.EnsureCertificates(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
-		log.Fatalf("Failed to ensure TLS certificates: %v", err)
+		slog.Error("Failed to ensure TLS certificates: " + err.Error())
+		os.Exit(1)
 	}
-	log.Printf("Using TLS certificates: %s, %s", cfg.TLSCertFile, cfg.TLSKeyFile)
+	slog.Info("Using TLS certificates", "cert_file", cfg.TLSCertFile, "key_file", cfg.TLSKeyFile)
 
 	srv, err := server.New(cfg)
 	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
+		slog.Error("Failed to create server: " + err.Error())
+		os.Exit(1)
 	}
 
 	// Handle graceful shutdown
@@ -304,13 +308,14 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Println("Shutting down...")
+		slog.Info("Shutting down...")
 		_ = srv.Close()
 		os.Exit(0)
 	}()
 
-	log.Printf("Starting Duckgres server on %s:%d (TLS required)", cfg.Host, cfg.Port)
+	slog.Info("Starting Duckgres server (TLS required)", "host", cfg.Host, "port", cfg.Port)
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("Server error: %v", err)
+		slog.Error("Server error: " + err.Error())
+		os.Exit(1)
 	}
 }
