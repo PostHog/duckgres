@@ -3,7 +3,7 @@ package server
 import (
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 )
 
 // initPgCatalog creates PostgreSQL compatibility functions and views in DuckDB
@@ -24,7 +24,7 @@ func initPgCatalog(db *sql.DB) error {
 		) AS t(oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datacl)
 	`
 	if _, err := db.Exec(pgDatabaseSQL); err != nil {
-		log.Printf("Warning: failed to create pg_database view: %v", err)
+		slog.Warn("Failed to create pg_database view.", "error", err)
 	}
 
 	// Create pg_class wrapper that adds missing columns psql expects
@@ -82,7 +82,7 @@ func initPgCatalog(db *sql.DB) error {
 		)
 	`
 	if _, err := db.Exec(pgClassSQL); err != nil {
-		log.Printf("Warning: failed to create pg_class_full view: %v", err)
+		slog.Warn("Failed to create pg_class_full view.", "error", err)
 	}
 
 	// Create pg_collation view (DuckDB doesn't have this)
@@ -102,7 +102,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgCollationSQL); err != nil {
-		log.Printf("Warning: failed to create pg_collation view: %v", err)
+		slog.Warn("Failed to create pg_collation view.", "error", err)
 	}
 
 	// Create pg_policy view for row-level security (empty, DuckDB doesn't support RLS)
@@ -120,7 +120,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgPolicySQL); err != nil {
-		log.Printf("Warning: failed to create pg_policy view: %v", err)
+		slog.Warn("Failed to create pg_policy view.", "error", err)
 	}
 
 	// Create pg_roles view (minimal for psql compatibility)
@@ -142,7 +142,7 @@ func initPgCatalog(db *sql.DB) error {
 			ARRAY[]::VARCHAR[] AS rolconfig
 	`
 	if _, err := db.Exec(pgRolesSQL); err != nil {
-		log.Printf("Warning: failed to create pg_roles view: %v", err)
+		slog.Warn("Failed to create pg_roles view.", "error", err)
 	}
 
 	// Create pg_statistic_ext view (extended statistics, empty)
@@ -160,7 +160,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgStatisticExtSQL); err != nil {
-		log.Printf("Warning: failed to create pg_statistic_ext view: %v", err)
+		slog.Warn("Failed to create pg_statistic_ext view.", "error", err)
 	}
 
 	// Create pg_publication_tables view (logical replication, empty)
@@ -173,7 +173,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgPublicationTablesSQL); err != nil {
-		log.Printf("Warning: failed to create pg_publication_tables view: %v", err)
+		slog.Warn("Failed to create pg_publication_tables view.", "error", err)
 	}
 
 	// Create pg_rules view (empty, DuckDB doesn't have rules)
@@ -187,7 +187,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgRulesSQL); err != nil {
-		log.Printf("Warning: failed to create pg_rules view: %v", err)
+		slog.Warn("Failed to create pg_rules view.", "error", err)
 	}
 
 	// Create pg_publication view (logical replication, empty)
@@ -206,7 +206,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgPublicationSQL); err != nil {
-		log.Printf("Warning: failed to create pg_publication view: %v", err)
+		slog.Warn("Failed to create pg_publication view.", "error", err)
 	}
 
 	// Create pg_publication_rel view (publication-relation mapping, empty)
@@ -219,7 +219,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgPublicationRelSQL); err != nil {
-		log.Printf("Warning: failed to create pg_publication_rel view: %v", err)
+		slog.Warn("Failed to create pg_publication_rel view.", "error", err)
 	}
 
 	// Create pg_inherits view (table inheritance, empty - DuckDB doesn't support inheritance)
@@ -233,7 +233,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgInheritsSQL); err != nil {
-		log.Printf("Warning: failed to create pg_inherits view: %v", err)
+		slog.Warn("Failed to create pg_inherits view.", "error", err)
 	}
 
 	// Create pg_matviews view (materialized views, empty - DuckDB doesn't support matviews)
@@ -250,7 +250,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgMatviewsSQL); err != nil {
-		log.Printf("Warning: failed to create pg_matviews view: %v", err)
+		slog.Warn("Failed to create pg_matviews view.", "error", err)
 	}
 
 	// Create pg_stat_statements view (query statistics, empty - pg_stat_statements extension not supported)
@@ -284,7 +284,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgStatStatementsSQL); err != nil {
-		log.Printf("Warning: failed to create pg_stat_statements view: %v", err)
+		slog.Warn("Failed to create pg_stat_statements view.", "error", err)
 	}
 
 	// Create pg_partitioned_table view (partitioning, empty - DuckDB doesn't support table partitioning)
@@ -302,7 +302,7 @@ func initPgCatalog(db *sql.DB) error {
 		WHERE false
 	`
 	if _, err := db.Exec(pgPartitionedTableSQL); err != nil {
-		log.Printf("Warning: failed to create pg_partitioned_table view: %v", err)
+		slog.Warn("Failed to create pg_partitioned_table view.", "error", err)
 	}
 
 	// Create pg_stat_user_tables view (table statistics)
@@ -340,7 +340,7 @@ func initPgCatalog(db *sql.DB) error {
 		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
 	`
 	if _, err := db.Exec(pgStatUserTablesSQL); err != nil {
-		log.Printf("Warning: failed to create pg_stat_user_tables view: %v", err)
+		slog.Warn("Failed to create pg_stat_user_tables view.", "error", err)
 	}
 
 	// Create pg_namespace wrapper that maps 'main' to 'public' for PostgreSQL compatibility
@@ -357,7 +357,7 @@ func initPgCatalog(db *sql.DB) error {
 		FROM pg_catalog.pg_namespace
 	`
 	if _, err := db.Exec(pgNamespaceSQL); err != nil {
-		log.Printf("Warning: failed to create pg_namespace view: %v", err)
+		slog.Warn("Failed to create pg_namespace view.", "error", err)
 	}
 
 	// Create pg_type wrapper that fixes NULL values for JDBC compatibility
@@ -411,7 +411,7 @@ func initPgCatalog(db *sql.DB) error {
 		FROM pg_catalog.pg_type
 	`
 	if _, err := db.Exec(pgTypeSQL); err != nil {
-		log.Printf("Warning: failed to create pg_type view: %v", err)
+		slog.Warn("Failed to create pg_type view.", "error", err)
 	}
 
 	// Create pg_attribute wrapper that maps DuckDB internal type OIDs to PostgreSQL OIDs
@@ -546,7 +546,7 @@ func initPgCatalog(db *sql.DB) error {
 		LEFT JOIN duckdb_columns() dc ON dc.table_oid = a.attrelid AND dc.column_name = a.attname
 	`
 	if _, err := db.Exec(pgAttributeSQL); err != nil {
-		log.Printf("Warning: failed to create pg_attribute view: %v", err)
+		slog.Warn("Failed to create pg_attribute view.", "error", err)
 	}
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
@@ -874,7 +874,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			FROM %s.columns
 		`
 		if _, err := db.Exec(fmt.Sprintf(columnsViewSimpleSQL, infoSchemaPrefix)); err != nil {
-			log.Printf("Warning: failed to create information_schema_columns_compat view: %v", err)
+			slog.Warn("Failed to create information_schema_columns_compat view.", "error", err)
 		}
 	}
 
@@ -914,7 +914,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		AND t.table_name NOT LIKE 'pragma_%%'
 	`
 	if _, err := db.Exec(fmt.Sprintf(tablesViewSQL, infoSchemaPrefix)); err != nil {
-		log.Printf("Warning: failed to create information_schema_tables_compat view: %v", err)
+		slog.Warn("Failed to create information_schema_tables_compat view.", "error", err)
 	}
 
 	// Create information_schema.schemata wrapper view
@@ -946,7 +946,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			NULL, NULL, NULL, NULL
 	`
 	if _, err := db.Exec(fmt.Sprintf(schemataViewSQL, infoSchemaPrefix)); err != nil {
-		log.Printf("Warning: failed to create information_schema_schemata_compat view: %v", err)
+		slog.Warn("Failed to create information_schema_schemata_compat view.", "error", err)
 	}
 
 	// Create information_schema.views wrapper view
@@ -981,7 +981,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		AND v.table_name NOT LIKE 'pragma_%%'
 	`
 	if _, err := db.Exec(fmt.Sprintf(viewsViewSQL, infoSchemaPrefix)); err != nil {
-		log.Printf("Warning: failed to create information_schema_views_compat view: %v", err)
+		slog.Warn("Failed to create information_schema_views_compat view.", "error", err)
 	}
 
 	return nil
