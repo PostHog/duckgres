@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"regexp"
 	"sync"
@@ -131,9 +131,8 @@ func New(cfg Config) (*Server, error) {
 		duckLakeSem: make(chan struct{}, 1),
 	}
 
-	log.Printf("TLS enabled with certificate: %s", cfg.TLSCertFile)
-	log.Printf("Rate limiting enabled: max %d failed attempts in %v, ban duration %v",
-		cfg.RateLimit.MaxFailedAttempts, cfg.RateLimit.FailedAttemptWindow, cfg.RateLimit.BanDuration)
+	slog.Info("TLS enabled.", "cert_file", cfg.TLSCertFile)
+	slog.Info("Rate limiting enabled.", "max_failed_attempts", cfg.RateLimit.MaxFailedAttempts, "window", cfg.RateLimit.FailedAttemptWindow, "ban_duration", cfg.RateLimit.BanDuration)
 	return s, nil
 }
 
@@ -154,7 +153,7 @@ func (s *Server) ListenAndServe() error {
 			if closed {
 				return nil
 			}
-			log.Printf("Accept error: %v", err)
+			slog.Error("Accept error.", "error", err)
 			continue
 		}
 
@@ -185,7 +184,7 @@ func (s *Server) Close() error {
 	// Check if there are active connections
 	activeConns := atomic.LoadInt64(&s.activeConns)
 	if activeConns > 0 {
-		log.Printf("Waiting for %d active connection(s) to finish...", activeConns)
+		slog.Info("Waiting for active connections to finish.", "count", activeConns)
 	}
 
 	// Wait for connections with timeout
@@ -197,13 +196,13 @@ func (s *Server) Close() error {
 
 	select {
 	case <-done:
-		log.Println("All connections closed gracefully")
+		slog.Info("All connections closed gracefully.")
 	case <-time.After(s.cfg.ShutdownTimeout):
-		log.Printf("Shutdown timeout (%v) exceeded, force closing remaining connections", s.cfg.ShutdownTimeout)
+		slog.Warn("Shutdown timeout exceeded, force closing remaining connections.", "timeout", s.cfg.ShutdownTimeout)
 	}
 
 	// Database connections are now closed by each clientConn when it terminates
-	log.Println("Shutdown complete")
+	slog.Info("Shutdown complete.")
 	return nil
 }
 
@@ -221,7 +220,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Check if there are active connections
 	activeConns := atomic.LoadInt64(&s.activeConns)
 	if activeConns > 0 {
-		log.Printf("Waiting for %d active connection(s) to finish...", activeConns)
+		slog.Info("Waiting for active connections to finish.", "count", activeConns)
 	}
 
 	// Wait for connections with context
@@ -233,13 +232,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
-		log.Println("All connections closed gracefully")
+		slog.Info("All connections closed gracefully.")
 	case <-ctx.Done():
-		log.Printf("Shutdown context cancelled, force closing remaining connections")
+		slog.Warn("Shutdown context cancelled, force closing remaining connections.")
 	}
 
 	// Database connections are now closed by each clientConn when it terminates
-	log.Println("Shutdown complete")
+	slog.Info("Shutdown complete.")
 	return nil
 }
 
@@ -269,14 +268,14 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 
 	// Load configured extensions
 	if err := s.loadExtensions(db); err != nil {
-		log.Printf("Warning: failed to load some extensions for user %q: %v", username, err)
+		slog.Warn("Failed to load some extensions.", "user", username, "error", err)
 	}
 
 	// Initialize pg_catalog schema for PostgreSQL compatibility
 	// Must be done BEFORE attaching DuckLake so macros are created in memory.main,
 	// not in the DuckLake catalog (which doesn't support macro storage).
 	if err := initPgCatalog(db); err != nil {
-		log.Printf("Warning: failed to initialize pg_catalog for user %q: %v", username, err)
+		slog.Warn("Failed to initialize pg_catalog.", "user", username, "error", err)
 		// Continue anyway - basic queries will still work
 	}
 
@@ -290,21 +289,21 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 		}
 		// DuckLake not configured, this warning is just informational
-		log.Printf("Warning: failed to attach DuckLake for user %q: %v", username, err)
+		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
 	} else if s.cfg.DuckLake.MetadataStore != "" {
 		duckLakeMode = true
 
 		// Recreate pg_class_full to source from DuckLake metadata instead of DuckDB's pg_catalog.
 		// This ensures consistent PostgreSQL-compatible OIDs across all pg_class queries.
 		if err := recreatePgClassForDuckLake(db); err != nil {
-			log.Printf("Warning: failed to recreate pg_class_full for DuckLake: %v", err)
+			slog.Warn("Failed to recreate pg_class_full for DuckLake.", "error", err)
 			// Non-fatal: continue with DuckDB-based pg_class_full
 		}
 
 		// Recreate pg_namespace to source from DuckLake metadata.
 		// This ensures OIDs match pg_class_full for JOINs (e.g., Metabase table discovery).
 		if err := recreatePgNamespaceForDuckLake(db); err != nil {
-			log.Printf("Warning: failed to recreate pg_namespace for DuckLake: %v", err)
+			slog.Warn("Failed to recreate pg_namespace for DuckLake.", "error", err)
 			// Non-fatal: continue with DuckDB-based pg_namespace
 		}
 	}
@@ -313,7 +312,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	// Must be done AFTER attaching DuckLake (so views can reference ducklake.information_schema)
 	// but BEFORE setting DuckLake as default (so views are created in memory.main, not ducklake.main)
 	if err := initInformationSchema(db, duckLakeMode); err != nil {
-		log.Printf("Warning: failed to initialize information_schema for user %q: %v", username, err)
+		slog.Warn("Failed to initialize information_schema.", "user", username, "error", err)
 		// Continue anyway - basic queries will still work
 	}
 
@@ -338,19 +337,19 @@ func (s *Server) loadExtensions(db *sql.DB) error {
 	for _, ext := range s.cfg.Extensions {
 		// First install the extension (downloads if needed)
 		if _, err := db.Exec("INSTALL " + ext); err != nil {
-			log.Printf("Warning: failed to install extension %q: %v", ext, err)
+			slog.Warn("Failed to install extension.", "extension", ext, "error", err)
 			lastErr = err
 			continue
 		}
 
 		// Then load it into the current session
 		if _, err := db.Exec("LOAD " + ext); err != nil {
-			log.Printf("Warning: failed to load extension %q: %v", ext, err)
+			slog.Warn("Failed to load extension.", "extension", ext, "error", err)
 			lastErr = err
 			continue
 		}
 
-		log.Printf("Loaded extension: %s", ext)
+		slog.Info("Loaded extension.", "extension", ext)
 	}
 
 	return lastErr
@@ -408,25 +407,24 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	if s.cfg.DuckLake.ObjectStore != "" {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
 			s.cfg.DuckLake.MetadataStore, s.cfg.DuckLake.ObjectStore)
-		log.Printf("Attaching DuckLake catalog with object store: metadata=%s, data=%s",
-			redactConnectionString(s.cfg.DuckLake.MetadataStore), s.cfg.DuckLake.ObjectStore)
+		slog.Info("Attaching DuckLake catalog with object store.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore), "data", s.cfg.DuckLake.ObjectStore)
 	} else {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", s.cfg.DuckLake.MetadataStore)
-		log.Printf("Attaching DuckLake catalog: %s", redactConnectionString(s.cfg.DuckLake.MetadataStore))
+		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore))
 	}
 
 	if _, err := db.Exec(attachStmt); err != nil {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
 
-	log.Printf("Attached DuckLake catalog successfully")
+	slog.Info("Attached DuckLake catalog successfully.")
 
 	// Set DuckLake max retry count to handle concurrent connections
 	// DuckLake uses optimistic concurrency - when multiple connections commit
 	// simultaneously, they may conflict on snapshot IDs. Default of 10 is too low
 	// for tools like Fivetran that open many concurrent connections.
 	if _, err := db.Exec("SET ducklake_max_retry_count = 100"); err != nil {
-		log.Printf("Warning: failed to set ducklake_max_retry_count: %v", err)
+		slog.Warn("Failed to set ducklake_max_retry_count.", "error", err)
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
 
@@ -439,7 +437,7 @@ func setDuckLakeDefault(db *sql.DB) error {
 	if _, err := db.Exec("USE ducklake"); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
 	}
-	log.Printf("Set DuckLake as default catalog")
+	slog.Info("Set DuckLake as default catalog.")
 	return nil
 }
 
@@ -473,18 +471,18 @@ func (s *Server) createS3Secret(db *sql.DB) error {
 	if provider == "credential_chain" {
 		// Use AWS SDK credential chain
 		secretStmt = s.buildCredentialChainSecret()
-		log.Printf("Creating S3 secret with credential_chain provider")
+		slog.Info("Creating S3 secret with credential_chain provider.")
 	} else {
 		// Use explicit credentials (config provider)
 		secretStmt = s.buildConfigSecret()
-		log.Printf("Creating S3 secret with config provider for endpoint: %s", s.cfg.DuckLake.S3Endpoint)
+		slog.Info("Creating S3 secret with config provider.", "endpoint", s.cfg.DuckLake.S3Endpoint)
 	}
 
 	if _, err := db.Exec(secretStmt); err != nil {
 		return err
 	}
 
-	log.Printf("Created S3 secret successfully")
+	slog.Info("Created S3 secret successfully.")
 	return nil
 }
 
@@ -586,14 +584,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Check rate limiting before doing anything
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {
 		// Send PostgreSQL error and close
-		log.Printf("Connection from %s rejected: %s", remoteAddr, msg)
+		slog.Warn("Connection rejected.", "remote_addr", remoteAddr, "reason", msg)
 		_ = conn.Close()
 		return
 	}
 
 	// Register this connection
 	if !s.rateLimiter.RegisterConnection(remoteAddr) {
-		log.Printf("Connection from %s rejected: rate limit exceeded", remoteAddr)
+		slog.Warn("Connection rejected: rate limit exceeded.", "remote_addr", remoteAddr)
 		_ = conn.Close()
 		return
 	}
@@ -610,6 +608,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 
 	if err := c.serve(); err != nil {
-		log.Printf("Connection error: %v", err)
+		slog.Error("Connection error.", "error", err)
 	}
 }
