@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
@@ -80,7 +81,7 @@ func generateSelfSignedCert(certFile, keyFile string) error {
 	}
 	defer func() {
 		if err := certOut.Close(); err != nil {
-			fmt.Printf("failed to close cert file: %v\n", err)
+			slog.Warn("Failed to close cert file.", "error", err)
 		}
 	}()
 
@@ -95,7 +96,7 @@ func generateSelfSignedCert(certFile, keyFile string) error {
 	}
 	defer func() {
 		if err := keyOut.Close(); err != nil {
-			fmt.Printf("failed to close key file: %v\n", err)
+			slog.Warn("Failed to close key file.", "error", err)
 		}
 	}()
 
