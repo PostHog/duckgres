@@ -437,7 +437,7 @@ func setDuckLakeDefault(db *sql.DB) error {
 	if _, err := db.Exec("USE ducklake"); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
 	}
-	slog.Debug("Set DuckLake as default catalog.")
+	slog.Info("Set DuckLake as default catalog.")
 	return nil
 }
 
