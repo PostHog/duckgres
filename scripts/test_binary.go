@@ -4,7 +4,8 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 
 	_ "github.com/lib/pq"
 )
@@ -15,11 +16,12 @@ func main() {
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		log.Fatalf("Failed to open db: %v", err)
+		slog.Error("Failed to open database.", "error", err)
+		os.Exit(1)
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
-			log.Printf("failed to close db: %v", err)
+			slog.Warn("Failed to close database.", "error", err)
 		}
 	}()
 
@@ -27,7 +29,7 @@ func main() {
 	fmt.Println("=== Creating test table ===")
 	_, err = db.Exec(`DROP TABLE IF EXISTS binary_test`)
 	if err != nil {
-		log.Printf("Drop table warning: %v", err)
+		slog.Warn("Drop table warning.", "error", err)
 	}
 
 	_, err = db.Exec(`
@@ -39,7 +41,8 @@ func main() {
 		)
 	`)
 	if err != nil {
-		log.Fatalf("Create table failed: %v", err)
+		slog.Error("Create table failed.", "error", err)
+		os.Exit(1)
 	}
 	fmt.Println("Table created successfully")
 
@@ -52,7 +55,8 @@ func main() {
 		(3, 'Gizmo', 9.99, true)
 	`)
 	if err != nil {
-		log.Fatalf("Insert failed: %v", err)
+		slog.Error("Insert failed.", "error", err)
+		os.Exit(1)
 	}
 	fmt.Println("Data inserted successfully")
 
@@ -60,11 +64,12 @@ func main() {
 	fmt.Println("\n=== Querying with prepared statement ===")
 	rows, err := db.Query("SELECT id, name, price, active FROM binary_test WHERE id > $1", 0)
 	if err != nil {
-		log.Fatalf("Query failed: %v", err)
+		slog.Error("Query failed.", "error", err)
+		os.Exit(1)
 	}
 	defer func() {
 		if err := rows.Close(); err != nil {
-			log.Printf("failed to close rows: %v", err)
+			slog.Warn("Failed to close rows.", "error", err)
 		}
 	}()
 
@@ -74,7 +79,8 @@ func main() {
 		var price float64
 		var active bool
 		if err := rows.Scan(&id, &name, &price, &active); err != nil {
-			log.Fatalf("Scan failed: %v", err)
+			slog.Error("Scan failed.", "error", err)
+			os.Exit(1)
 		}
 		fmt.Printf("  id=%d, name=%s, price=%.2f, active=%v\n", id, name, price, active)
 	}
@@ -84,7 +90,8 @@ func main() {
 	var intVal int
 	err = db.QueryRow("SELECT 12345").Scan(&intVal)
 	if err != nil {
-		log.Fatalf("Integer query failed: %v", err)
+		slog.Error("Integer query failed.", "error", err)
+		os.Exit(1)
 	}
 	fmt.Printf("  Integer: %d (expected 12345)\n", intVal)
 
@@ -93,7 +100,8 @@ func main() {
 	var floatVal float64
 	err = db.QueryRow("SELECT 3.14159").Scan(&floatVal)
 	if err != nil {
-		log.Fatalf("Float query failed: %v", err)
+		slog.Error("Float query failed.", "error", err)
+		os.Exit(1)
 	}
 	fmt.Printf("  Float: %f (expected 3.14159)\n", floatVal)
 
@@ -102,7 +110,8 @@ func main() {
 	var boolVal bool
 	err = db.QueryRow("SELECT true").Scan(&boolVal)
 	if err != nil {
-		log.Fatalf("Boolean query failed: %v", err)
+		slog.Error("Boolean query failed.", "error", err)
+		os.Exit(1)
 	}
 	fmt.Printf("  Boolean: %v (expected true)\n", boolVal)
 
