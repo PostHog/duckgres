@@ -170,18 +170,16 @@ func (c *clientConn) isNativeDuckDBCommand(query string) (isSet bool, isShow boo
 		return false, false, false
 	}
 
-	// Parse the value
-	// Remove SET native_duckdb and any surrounding whitespace
-	rest := strings.TrimSpace(query[len("SET native_duckdb"):])
-	rest = strings.TrimSuffix(rest, ";")
+	// Parse the value by finding = or TO in the original query.
+	// We can't use a fixed offset because the identifier may be quoted.
+	rest := strings.TrimSuffix(query, ";")
+	upperRest := strings.ToUpper(rest)
 
-	// Must have = or TO
-	if strings.HasPrefix(strings.ToUpper(rest), "=") {
-		rest = strings.TrimSpace(rest[1:])
-	} else if strings.HasPrefix(strings.ToUpper(rest), " TO ") {
-		rest = strings.TrimSpace(rest[4:])
-	} else if strings.HasPrefix(strings.ToUpper(rest), "TO ") {
-		rest = strings.TrimSpace(rest[3:])
+	// Find the value after = or TO
+	if idx := strings.Index(upperRest, "="); idx != -1 {
+		rest = strings.TrimSpace(rest[idx+1:])
+	} else if idx := strings.Index(upperRest, " TO "); idx != -1 {
+		rest = strings.TrimSpace(rest[idx+4:])
 	} else {
 		return false, false, false
 	}

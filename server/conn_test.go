@@ -1458,6 +1458,43 @@ func TestIsNativeDuckDBCommand(t *testing.T) {
 			expectValue:  false,
 		},
 
+		// Quoted identifier
+		{
+			name:         `SET "native_duckdb" = on`,
+			query:        `SET "native_duckdb" = on`,
+			expectIsSet:  true,
+			expectIsShow: false,
+			expectValue:  true,
+		},
+		{
+			name:         `set "native_duckdb" to 1`,
+			query:        `set "native_duckdb" to 1`,
+			expectIsSet:  true,
+			expectIsShow: false,
+			expectValue:  true,
+		},
+		{
+			name:         `SET "native_duckdb" = off;`,
+			query:        `SET "native_duckdb" = off;`,
+			expectIsSet:  true,
+			expectIsShow: false,
+			expectValue:  false,
+		},
+		{
+			name:         `SHOW "native_duckdb"`,
+			query:        `SHOW "native_duckdb"`,
+			expectIsSet:  false,
+			expectIsShow: true,
+			expectValue:  false,
+		},
+		{
+			name:         `SHOW "native_duckdb";`,
+			query:        `SHOW "native_duckdb";`,
+			expectIsSet:  false,
+			expectIsShow: true,
+			expectValue:  false,
+		},
+
 		// With trailing semicolon
 		{
 			name:       "SET native_duckdb = on;",
