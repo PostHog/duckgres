@@ -13,15 +13,33 @@ func initPgCatalog(db *sql.DB) error {
 	// We put it in main schema and rewrite queries to use it
 	// Include template databases for PostgreSQL compatibility
 	// Note: We use 'testdb' as the user database name to match the test PostgreSQL container
+	// Full PostgreSQL 16 compatible columns:
+	//   datlocprovider: 'c' = libc (traditional), 'i' = icu (added in PostgreSQL 15)
+	//   daticulocale: ICU locale name (NULL for libc provider)
+	//   daticurules: ICU collation rules (NULL, added in PostgreSQL 16)
+	//   datcollversion: collation version (NULL)
 	pgDatabaseSQL := `
 		CREATE OR REPLACE VIEW pg_database AS
-		SELECT * FROM (
-			VALUES
-				(1::INTEGER, 'postgres', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL),
-				(2::INTEGER, 'template0', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', true, false, -1::INTEGER, NULL),
-				(3::INTEGER, 'template1', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', true, true, -1::INTEGER, NULL),
-				(4::INTEGER, 'testdb', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL)
-		) AS t(oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datacl)
+		SELECT
+			oid, datname, datdba, encoding, datlocprovider, datistemplate, datallowconn,
+			datconnlimit, datfrozenxid, datminmxid, dattablespace, datcollate, datctype,
+			daticulocale, daticurules, datcollversion, datacl
+		FROM (
+			SELECT 1::INTEGER as oid, 'postgres' as datname, 10::INTEGER as datdba, 6::INTEGER as encoding,
+				'c' as datlocprovider, false as datistemplate, true as datallowconn, -1::INTEGER as datconnlimit,
+				0::INTEGER as datfrozenxid, 0::INTEGER as datminmxid, 1663::INTEGER as dattablespace,
+				'en_US.UTF-8' as datcollate, 'en_US.UTF-8' as datctype,
+				NULL as daticulocale, NULL as daticurules, NULL as datcollversion, NULL as datacl
+			UNION ALL
+			SELECT 2, 'template0', 10, 6, 'c', true, false, -1, 0, 0, 1663,
+				'en_US.UTF-8', 'en_US.UTF-8', NULL, NULL, NULL, NULL
+			UNION ALL
+			SELECT 3, 'template1', 10, 6, 'c', true, true, -1, 0, 0, 1663,
+				'en_US.UTF-8', 'en_US.UTF-8', NULL, NULL, NULL, NULL
+			UNION ALL
+			SELECT 4, 'testdb', 10, 6, 'c', false, true, -1, 0, 0, 1663,
+				'en_US.UTF-8', 'en_US.UTF-8', NULL, NULL, NULL, NULL
+		)
 	`
 	if _, err := db.Exec(pgDatabaseSQL); err != nil {
 		slog.Warn("Failed to create pg_database view.", "error", err)
