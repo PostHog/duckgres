@@ -207,6 +207,59 @@ func TestTranspile_InformationSchema_DuckLakeMode(t *testing.T) {
 	}
 }
 
+func TestTranspile_PgCatalog_DuckLakeMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			name:     "pg_catalog.pg_class -> memory.main.pg_class_full",
+			input:    "SELECT * FROM pg_catalog.pg_class",
+			contains: "memory.main.pg_class_full",
+		},
+		{
+			name:     "pg_catalog.pg_matviews -> memory.main.pg_matviews",
+			input:    "SELECT * FROM pg_catalog.pg_matviews",
+			contains: "memory.main.pg_matviews",
+		},
+		{
+			name:     "unqualified pg_matviews -> memory.main.pg_matviews",
+			input:    "SELECT matviewname FROM pg_matviews WHERE schemaname = 'public'",
+			contains: "memory.main.pg_matviews",
+		},
+		{
+			name:     "unqualified pg_class -> memory.main.pg_class_full",
+			input:    "SELECT * FROM pg_class",
+			contains: "memory.main.pg_class_full",
+		},
+		{
+			name:     "pg_catalog.pg_database -> memory.main.pg_database",
+			input:    "SELECT * FROM pg_catalog.pg_database",
+			contains: "memory.main.pg_database",
+		},
+		{
+			name:     "pg_catalog.pg_namespace -> memory.main.pg_namespace",
+			input:    "SELECT * FROM pg_catalog.pg_namespace",
+			contains: "memory.main.pg_namespace",
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+		})
+	}
+}
+
 func TestTranspile_TypeCast(t *testing.T) {
 	tests := []struct {
 		name     string
