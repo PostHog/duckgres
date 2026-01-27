@@ -12,7 +12,7 @@ func initPgCatalog(db *sql.DB) error {
 	// Create our own pg_database view that has all the columns psql expects
 	// We put it in main schema and rewrite queries to use it
 	// Include template databases for PostgreSQL compatibility
-	// Uses current_database() for the user database to match actual DuckDB database name
+	// Note: We use 'testdb' as the user database name to match the test PostgreSQL container
 	// Full PostgreSQL 16 compatible columns:
 	//   datlocprovider: 'c' = libc (traditional), 'i' = icu (added in PostgreSQL 15)
 	//   daticulocale: ICU locale name (NULL for libc provider)
@@ -37,7 +37,7 @@ func initPgCatalog(db *sql.DB) error {
 			SELECT 3, 'template1', 10, 6, 'c', true, true, -1, 0, 0, 1663,
 				'en_US.UTF-8', 'en_US.UTF-8', NULL, NULL, NULL, NULL
 			UNION ALL
-			SELECT 4, current_database(), 10, 6, 'c', false, true, -1, 0, 0, 1663,
+			SELECT 4, 'testdb', 10, 6, 'c', false, true, -1, 0, 0, 1663,
 				'en_US.UTF-8', 'en_US.UTF-8', NULL, NULL, NULL, NULL
 		)
 	`

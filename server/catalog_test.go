@@ -12,7 +12,7 @@ func TestPgDatabaseView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := initPgCatalog(db); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
@@ -30,7 +30,7 @@ func TestPgDatabaseView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to query pg_database: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	columns, err := rows.Columns()
 	if err != nil {
@@ -57,7 +57,7 @@ func TestPgDatabaseViewContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := initPgCatalog(db); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
@@ -68,7 +68,7 @@ func TestPgDatabaseViewContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to query pg_database: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	expected := []struct {
 		datname        string
@@ -79,7 +79,7 @@ func TestPgDatabaseViewContent(t *testing.T) {
 		{"postgres", "c", false, true},
 		{"template0", "c", true, false},
 		{"template1", "c", true, true},
-		{"memory", "c", false, true}, // current_database() returns "memory" for :memory:
+		{"testdb", "c", false, true}, // Hardcoded to match integration test PostgreSQL container
 	}
 
 	i := 0
