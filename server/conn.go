@@ -635,6 +635,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 				}
 			}
 			if err != nil {
+				slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
 				c.sendError("ERROR", "42000", err.Error())
 				c.setTxError()
 				_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -654,6 +655,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Execute SELECT query
 	rows, err := c.db.Query(query)
 	if err != nil {
+		slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -750,7 +752,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		slog.Debug("Multi-stmt setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		_, err := c.db.Exec(stmt)
 		if err != nil {
-			slog.Error("Multi-stmt setup error.", "user", c.username, "error", err)
+			slog.Error("Multi-stmt setup error.", "user", c.username, "query", stmt, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -771,7 +773,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.db.Query(finalStmt)
 		if err != nil {
-			slog.Error("Multi-stmt final query error.", "user", c.username, "error", err)
+			slog.Error("Multi-stmt final query error.", "user", c.username, "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -786,13 +788,13 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		c.executeCleanup(cleanup)
 
 		// Now stream results from cursor
-		return c.streamRowsToClient(rows, cmdType)
+		return c.streamRowsToClient(rows, cmdType, finalStmt)
 
 	} else {
 		// DML (INSERT/UPDATE/DELETE): execute then cleanup
 		result, err := c.db.Exec(finalStmt)
 		if err != nil {
-			slog.Error("Multi-stmt final exec error.", "user", c.username, "error", err)
+			slog.Error("Multi-stmt final exec error.", "user", c.username, "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -852,7 +854,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		slog.Debug("Multi-stmt-ext setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		_, err := c.db.Exec(stmt, args...)
 		if err != nil {
-			slog.Error("Multi-stmt-ext setup error.", "user", c.username, "error", err)
+			slog.Error("Multi-stmt-ext setup error.", "user", c.username, "query", stmt, "error", err)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -871,7 +873,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.db.Query(finalStmt, args...)
 		if err != nil {
-			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "error", err)
+			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -883,13 +885,13 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		c.executeCleanup(cleanup)
 
 		// Stream results from cursor (extended protocol version)
-		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described)
+		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalStmt)
 
 	} else {
 		// DML (INSERT/UPDATE/DELETE): execute then cleanup
 		result, err := c.db.Exec(finalStmt, args...)
 		if err != nil {
-			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "error", err)
+			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "query", finalStmt, "error", err)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -908,10 +910,11 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 // streamRowsToClientExtended sends result rows for the extended query protocol.
 // Unlike streamRowsToClient, this does NOT send ReadyForQuery, and supports
 // binary result formats and the described flag.
-func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, resultFormats []int16, described bool) {
+func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, resultFormats []int16, described bool, query string) {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
+		slog.Error("Failed to get column info.", "user", c.username, "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -919,6 +922,7 @@ func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, 
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
+		slog.Error("Failed to get column types.", "user", c.username, "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -947,6 +951,7 @@ func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, 
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
+			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			return
@@ -959,6 +964,7 @@ func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, 
 	}
 
 	if err := rows.Err(); err != nil {
+		slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -971,10 +977,11 @@ func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, 
 
 // streamRowsToClient sends result rows over the wire protocol.
 // The rows cursor must already be obtained before calling this function.
-func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string) error {
+func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string, query string) error {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
+		slog.Error("Failed to get column info.", "user", c.username, "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -984,6 +991,7 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string) error {
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
+		slog.Error("Failed to get column types.", "user", c.username, "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1006,6 +1014,7 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string) error {
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
+			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
 			break
 		}
@@ -1017,6 +1026,7 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string) error {
 	}
 
 	if err := rows.Err(); err != nil {
+		slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1374,6 +1384,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	// Execute the query
 	rows, err := c.db.Query(selectQuery)
 	if err != nil {
+		slog.Error("COPY TO query failed.", "user", c.username, "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1384,6 +1395,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
+		slog.Error("COPY TO failed to get columns.", "user", c.username, "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1465,6 +1477,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	colQuery := fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
 	testRows, err := c.db.Query(colQuery)
 	if err != nil {
+		slog.Error("COPY FROM table check failed.", "user", c.username, "table", tableName, "error", err)
 		c.sendError("ERROR", "42P01", fmt.Sprintf("relation \"%s\" does not exist", tableName))
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -2237,7 +2250,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				}
 			}
 			if err != nil {
-				slog.Error("Execute error.", "user", c.username, "error", err)
+				slog.Error("Query execution failed.", "user", c.username, "query", p.stmt.convertedQuery, "original_query", p.stmt.query, "error", err)
 				c.sendError("ERROR", "42000", err.Error())
 				c.setTxError()
 				return
@@ -2252,7 +2265,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Result-returning query: use Query with converted query
 	rows, err := c.db.Query(p.stmt.convertedQuery, args...)
 	if err != nil {
-		slog.Error("Query error.", "user", c.username, "error", err)
+		slog.Error("Query execution failed.", "user", c.username, "query", p.stmt.convertedQuery, "original_query", p.stmt.query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
