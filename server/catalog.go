@@ -13,15 +13,16 @@ func initPgCatalog(db *sql.DB) error {
 	// We put it in main schema and rewrite queries to use it
 	// Include template databases for PostgreSQL compatibility
 	// Note: We use 'testdb' as the user database name to match the test PostgreSQL container
+	// datlocprovider: 'c' = libc (traditional), 'i' = icu (added in PostgreSQL 15)
 	pgDatabaseSQL := `
 		CREATE OR REPLACE VIEW pg_database AS
 		SELECT * FROM (
 			VALUES
-				(1::INTEGER, 'postgres', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL),
-				(2::INTEGER, 'template0', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', true, false, -1::INTEGER, NULL),
-				(3::INTEGER, 'template1', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', true, true, -1::INTEGER, NULL),
-				(4::INTEGER, 'testdb', 10::INTEGER, 6::INTEGER, 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL)
-		) AS t(oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datacl)
+				(1::INTEGER, 'postgres', 10::INTEGER, 6::INTEGER, 'c', 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL),
+				(2::INTEGER, 'template0', 10::INTEGER, 6::INTEGER, 'c', 'en_US.UTF-8', 'en_US.UTF-8', true, false, -1::INTEGER, NULL),
+				(3::INTEGER, 'template1', 10::INTEGER, 6::INTEGER, 'c', 'en_US.UTF-8', 'en_US.UTF-8', true, true, -1::INTEGER, NULL),
+				(4::INTEGER, 'testdb', 10::INTEGER, 6::INTEGER, 'c', 'en_US.UTF-8', 'en_US.UTF-8', false, true, -1::INTEGER, NULL)
+		) AS t(oid, datname, datdba, encoding, datlocprovider, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datacl)
 	`
 	if _, err := db.Exec(pgDatabaseSQL); err != nil {
 		slog.Warn("Failed to create pg_database view.", "error", err)
