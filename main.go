@@ -79,6 +79,11 @@ func env(key, defaultVal string) string {
 	return defaultVal
 }
 
+func initMetrics(ctx context.Context, usePrometheus bool) (*sdkmetric.MeterProvider, error) {
+    // setup exporter based on flag
+    // return provider
+}
+
 func main() {
 	// Define CLI flags with environment variable fallbacks
 	configFile := flag.String("config", env("DUCKGRES_CONFIG", ""), "Path to YAML config file (env: DUCKGRES_CONFIG)")
@@ -282,6 +287,10 @@ func main() {
 	if *keyFile != "" {
 		cfg.TLSKeyFile = *keyFile
 	}
+
+	provider, err := initMetrics(ctx, cfg.UsePrometheus)
+    defer provider.Shutdown(ctx)
+    otel.SetMeterProvider(provider)
 
 	// Create data directory if it doesn't exist
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
