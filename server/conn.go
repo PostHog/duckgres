@@ -156,6 +156,8 @@ func (c *clientConn) isNativeDuckDBCommand(query string) (isSet bool, isShow boo
 	// Strip comments first - some clients (like Hex) append metadata comments
 	query = stripSQLComments(query)
 	upper := strings.ToUpper(strings.TrimSpace(query))
+	// Strip quotes around the `native_duckdb` identifier, if present.
+	upper = strings.ReplaceAll(upper, `"NATIVE_DUCKDB"`, "NATIVE_DUCKDB")
 
 	// Check for SHOW native_duckdb
 	if upper == "SHOW NATIVE_DUCKDB" || upper == "SHOW NATIVE_DUCKDB;" {
