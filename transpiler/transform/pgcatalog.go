@@ -128,22 +128,19 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 				// e.g., pg_catalog.pg_class, memory.pg_catalog.pg_class, ducklake.pg_catalog.pg_class
 				if newName, ok := t.ViewMappings[relname]; ok {
 					n.RangeVar.Relname = newName
-					if t.DuckLakeMode {
-						// In DuckLake mode, our views are in memory.main
-						n.RangeVar.Catalogname = "memory"
-						n.RangeVar.Schemaname = "main"
-					} else {
-						n.RangeVar.Catalogname = ""
-						n.RangeVar.Schemaname = ""
-					}
+					// Views are in memory.main schema - always use explicit catalog
+					// This ensures views work regardless of default catalog (DuckLake or not)
+					n.RangeVar.Catalogname = "memory"
+					n.RangeVar.Schemaname = "main"
 				} else {
 					n.RangeVar.Catalogname = ""
 					n.RangeVar.Schemaname = ""
 				}
 				*changed = true
-			} else if t.DuckLakeMode && n.RangeVar.Schemaname == "" && n.RangeVar.Catalogname == "" {
-				// Handle unqualified pg_catalog view names in DuckLake mode
+			} else if n.RangeVar.Schemaname == "" && n.RangeVar.Catalogname == "" {
+				// Handle unqualified pg_catalog view names
 				// e.g., "SELECT * FROM pg_matviews" -> "SELECT * FROM memory.main.pg_matviews"
+				// Always qualify to ensure views are found regardless of default catalog
 				if newName, ok := t.ViewMappings[relname]; ok {
 					n.RangeVar.Relname = newName
 					n.RangeVar.Catalogname = "memory"

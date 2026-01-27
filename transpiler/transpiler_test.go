@@ -47,15 +47,15 @@ func TestTranspile_PgCatalog(t *testing.T) {
 		excludes string
 	}{
 		{
-			name:     "pg_catalog.pg_class -> pg_class_full",
+			name:     "pg_catalog.pg_class -> memory.main.pg_class_full",
 			input:    "SELECT * FROM pg_catalog.pg_class",
-			contains: "pg_class_full",
+			contains: "memory.main.pg_class_full",
 			excludes: "pg_catalog",
 		},
 		{
-			name:     "pg_catalog.pg_database -> pg_database",
+			name:     "pg_catalog.pg_database -> memory.main.pg_database",
 			input:    "SELECT * FROM pg_catalog.pg_database",
-			contains: "pg_database",
+			contains: "memory.main.pg_database",
 			excludes: "pg_catalog",
 		},
 		{
