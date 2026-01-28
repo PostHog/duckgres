@@ -6,6 +6,30 @@
 
 A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any PostgreSQL client (psql, pgAdmin, lib/pq, psycopg2, etc.) and get DuckDB's analytical query performance.
 
+## Table of Contents
+
+- [Features](#features)
+- [Metrics](#metrics)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+  - [YAML Configuration](#yaml-configuration)
+  - [Environment Variables](#environment-variables)
+  - [CLI Flags](#cli-flags)
+- [DuckDB Extensions](#duckdb-extensions)
+- [DuckLake Integration](#ducklake-integration)
+  - [Quick Start with Docker](#quick-start-with-docker)
+  - [Object Storage Configuration](#object-storage-configuration)
+  - [Seeding Sample Data](#seeding-sample-data)
+- [COPY Protocol](#copy-protocol)
+- [Graceful Shutdown](#graceful-shutdown)
+- [Rate Limiting](#rate-limiting)
+- [Usage Examples](#usage-examples)
+- [Architecture](#architecture)
+- [Supported Features](#supported-features)
+- [Limitations](#limitations)
+- [Dependencies](#dependencies)
+- [License](#license)
+
 ## Features
 
 - **PostgreSQL Wire Protocol**: Full compatibility with PostgreSQL clients
