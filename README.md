@@ -23,7 +23,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 ## Metrics
 
-Duckgres exposes Prometheus metrics on `:9090/metrics`.
+Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is currently fixed at 9090 and cannot be changed via configuration.
 
 | Metric | Type | Description |
 |--------|------|-------------|
