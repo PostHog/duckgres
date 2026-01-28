@@ -25,6 +25,12 @@ var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently open client connections",
 })
 
+var queryDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "duckgres_query_duration_seconds",
+	Help:    "Query execution duration in seconds",
+	Buckets: prometheus.DefBuckets,
+})
+
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
 }

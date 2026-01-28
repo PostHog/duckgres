@@ -533,6 +533,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
+	start := time.Now()
+	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
 
 	// Check for native_duckdb commands BEFORE transpiling
@@ -2169,6 +2171,8 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", portalName))
 		return
 	}
+	start := time.Now()
+	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 
 	// Convert parameter values to interface{}, handling binary format
 	args, err := p.decodeParams()
