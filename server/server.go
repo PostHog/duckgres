@@ -58,8 +58,12 @@ type DuckLakeConfig struct {
 
 	// ObjectStore is the S3-compatible storage path for DuckLake data files
 	// Format: "s3://bucket/path/" for S3/MinIO
-	// If not specified, data is stored alongside the metadata
+	// If not specified, uses DataPath for local storage
 	ObjectStore string
+
+	// DataPath is the local file system path for DuckLake data files
+	// Used when ObjectStore is not set (for local/non-S3 storage)
+	DataPath string
 
 	// S3 credential provider: "config" (explicit credentials) or "credential_chain" (AWS SDK chain)
 	// Default: "config" if S3AccessKey is set, otherwise "credential_chain"
@@ -400,14 +404,18 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	}
 
 	// Build the ATTACH statement
-	// Format without object store: ATTACH 'ducklake:<metadata_connection>' AS ducklake
-	// Format with object store: ATTACH 'ducklake:<metadata_connection>' AS ducklake (DATA_PATH '<s3_path>')
+	// Format without data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake
+	// Format with data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake (DATA_PATH '<path>')
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
 	var attachStmt string
-	if s.cfg.DuckLake.ObjectStore != "" {
+	dataPath := s.cfg.DuckLake.ObjectStore
+	if dataPath == "" {
+		dataPath = s.cfg.DuckLake.DataPath
+	}
+	if dataPath != "" {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
-			s.cfg.DuckLake.MetadataStore, s.cfg.DuckLake.ObjectStore)
-		slog.Info("Attaching DuckLake catalog with object store.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore), "data", s.cfg.DuckLake.ObjectStore)
+			s.cfg.DuckLake.MetadataStore, dataPath)
+		slog.Info("Attaching DuckLake catalog with data path.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore), "data", dataPath)
 	} else {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", s.cfg.DuckLake.MetadataStore)
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore))

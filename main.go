@@ -41,6 +41,7 @@ type RateLimitFileConfig struct {
 type DuckLakeFileConfig struct {
 	MetadataStore string `yaml:"metadata_store"` // e.g., "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
 	ObjectStore   string `yaml:"object_store"`   // e.g., "s3://bucket/path/" for S3/MinIO storage
+	DataPath      string `yaml:"data_path"`      // Local file path for data storage (alternative to object_store)
 
 	// S3 credential provider: "config" (explicit) or "credential_chain" (AWS SDK)
 	S3Provider string `yaml:"s3_provider"`
@@ -186,6 +187,9 @@ func main() {
 		}
 		if fileCfg.DuckLake.ObjectStore != "" {
 			cfg.DuckLake.ObjectStore = fileCfg.DuckLake.ObjectStore
+		}
+		if fileCfg.DuckLake.DataPath != "" {
+			cfg.DuckLake.DataPath = fileCfg.DuckLake.DataPath
 		}
 		if fileCfg.DuckLake.S3Provider != "" {
 			cfg.DuckLake.S3Provider = fileCfg.DuckLake.S3Provider
