@@ -63,6 +63,9 @@ func New(cfg Config) *Transpiler {
 	// 11. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
 	t.transforms = append(t.transforms, transform.NewOnConflictTransformWithConfig(cfg.DuckLakeMode))
 
+	// 12. Locking clause removal (FOR UPDATE, FOR SHARE, etc.) - DuckDB doesn't support these
+	t.transforms = append(t.transforms, transform.NewLockingTransform())
+
 	// DDL transforms only when DuckLake mode is enabled
 	if cfg.DuckLakeMode {
 		t.transforms = append(t.transforms, transform.NewDDLTransform())
