@@ -13,10 +13,17 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // redactConnectionString removes sensitive information (passwords) from connection strings for logging
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s]+)`)
+
+var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_connections_open",
+	Help: "Number of currently open client connections",
+})
 
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
@@ -579,7 +586,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	// Track active connections
 	atomic.AddInt64(&s.activeConns, 1)
-	defer atomic.AddInt64(&s.activeConns, -1)
+	connectionsGauge.Inc()
+	defer func() {
+		atomic.AddInt64(&s.activeConns, -1)
+		connectionsGauge.Dec()
+	}()
 
 	// Check rate limiting before doing anything
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {

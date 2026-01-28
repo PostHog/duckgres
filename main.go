@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
 )
 
@@ -79,9 +81,15 @@ func env(key, defaultVal string) string {
 	return defaultVal
 }
 
-func initMetrics(ctx context.Context, usePrometheus bool) (*sdkmetric.MeterProvider, error) {
-    // setup exporter based on flag
-    // return provider
+// initMetrics starts the Prometheus metrics HTTP server on :9090/metrics
+func initMetrics() {
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		slog.Info("Starting metrics server", "addr", ":9090")
+		if err := http.ListenAndServe(":9090", nil); err != nil {
+			slog.Error("Metrics server error", "error", err)
+		}
+	}()
 }
 
 func main() {
@@ -288,9 +296,7 @@ func main() {
 		cfg.TLSKeyFile = *keyFile
 	}
 
-	provider, err := initMetrics(ctx, cfg.UsePrometheus)
-    defer provider.Shutdown(ctx)
-    otel.SetMeterProvider(provider)
+	initMetrics()
 
 	// Create data directory if it doesn't exist
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
