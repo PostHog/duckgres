@@ -346,6 +346,7 @@ func TestOnConflictTransform_PreservesTableName(t *testing.T) {
 			mergeStmt := tree.Stmts[0].Stmt.GetMergeStmt()
 			if mergeStmt == nil {
 				t.Fatal("Expected MERGE statement")
+				return
 			}
 
 			if mergeStmt.Relation.Relname != tt.tableName {
@@ -374,6 +375,7 @@ func TestOnConflictTransform_MergeWhenClauses(t *testing.T) {
 		mergeStmt := tree.Stmts[0].Stmt.GetMergeStmt()
 		if mergeStmt == nil {
 			t.Fatal("Expected MERGE statement")
+			return
 		}
 
 		// Should have 2 WHEN clauses: MATCHED (UPDATE) and NOT MATCHED (INSERT)
@@ -416,6 +418,7 @@ func TestOnConflictTransform_MergeWhenClauses(t *testing.T) {
 		mergeStmt := tree.Stmts[0].Stmt.GetMergeStmt()
 		if mergeStmt == nil {
 			t.Fatal("Expected MERGE statement")
+			return
 		}
 
 		// Should have only 1 WHEN clause: NOT MATCHED (INSERT)
