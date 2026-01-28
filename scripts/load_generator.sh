@@ -11,11 +11,20 @@ PID=$!
 trap "kill $PID 2>/dev/null; exit" INT TERM
 
 # Wait for server
+server_ready=0
 for i in {1..10}; do
-    curl -s "http://localhost:9090/metrics" >/dev/null 2>&1 && break
+    if curl -s "http://localhost:9090/metrics" >/dev/null 2>&1; then
+        server_ready=1
+        break
+    fi
     sleep 1
 done
 
+if [ "$server_ready" -ne 1 ]; then
+    echo "Error: server did not start within timeout. Exiting." >&2
+    kill "$PID" 2>/dev/null
+    exit 1
+fi
 echo "Running queries every 2 seconds. Ctrl-C to stop."
 while true; do
     PGPASSWORD=postgres psql "host=127.0.0.1 port=$PORT user=postgres sslmode=require" -c "SELECT 1" >/dev/null 2>&1
