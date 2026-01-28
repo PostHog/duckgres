@@ -456,4 +456,4 @@ GROUP BY name;
 
 ## License
 
-[MIT](LICENSE)
+MIT
