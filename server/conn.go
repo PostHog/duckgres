@@ -1779,7 +1779,14 @@ func formatValue(v interface{}) string {
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
-	if severity == "ERROR" || severity == "FATAL" {
+	// Class 28 = "Invalid Authorization Specification" (auth failures).
+	// All current FATAL errors use class 28, so this covers both auth
+	// failures and connection rejections (no SSL, no user, wrong password).
+	// NOTE: If one adds a FATAL error with a non-28 code, be sure to add
+	// a metric for it here.
+	if strings.HasPrefix(code, "28") {
+		authFailuresCounter.Inc()
+	} else if severity == "ERROR" {
 		queryErrorsCounter.Inc()
 	}
 	_ = writeErrorResponse(c.writer, severity, code, message)

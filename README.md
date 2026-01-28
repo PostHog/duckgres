@@ -30,6 +30,7 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_connections_open` | Gauge | Number of currently open client connections |
 | `duckgres_query_duration_seconds` | Histogram | Query execution duration (includes `_count`, `_sum`, `_bucket`) |
 | `duckgres_query_errors_total` | Counter | Total number of failed queries |
+| `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
 
 ### Testing Metrics
 

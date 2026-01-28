@@ -36,6 +36,11 @@ var queryErrorsCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Total number of failed queries",
 })
 
+var authFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_auth_failures_total",
+	Help: "Total number of authentication failures",
+})
+
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
 }
