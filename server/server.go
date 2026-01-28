@@ -41,6 +41,16 @@ var authFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Total number of authentication failures",
 })
 
+var rateLimitRejectsCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_rate_limit_rejects_total",
+	Help: "Total number of connections rejected due to rate limiting",
+})
+
+var rateLimitedIPsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_rate_limited_ips",
+	Help: "Number of currently rate-limited IP addresses",
+})
+
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
 }
@@ -604,6 +614,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {
 		// Send PostgreSQL error and close
 		slog.Warn("Connection rejected.", "remote_addr", remoteAddr, "reason", msg)
+		rateLimitRejectsCounter.Inc()
 		_ = conn.Close()
 		return
 	}
@@ -611,6 +622,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Register this connection
 	if !s.rateLimiter.RegisterConnection(remoteAddr) {
 		slog.Warn("Connection rejected: rate limit exceeded.", "remote_addr", remoteAddr)
+		rateLimitRejectsCounter.Inc()
 		_ = conn.Close()
 		return
 	}

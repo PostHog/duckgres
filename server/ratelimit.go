@@ -165,7 +165,12 @@ func (rl *RateLimiter) RecordFailedAuth(addr net.Addr) bool {
 
 	// Ban if exceeded threshold
 	if recentAttempts >= rl.config.MaxFailedAttempts {
+		// Decrement if replacing an expired ban that cleanup hasn't cleared yet
+		if !record.bannedUntil.IsZero() && now.After(record.bannedUntil) {
+			rateLimitedIPsGauge.Dec()
+		}
 		record.bannedUntil = now.Add(rl.config.BanDuration)
+		rateLimitedIPsGauge.Inc()
 		return true
 	}
 
@@ -184,6 +189,9 @@ func (rl *RateLimiter) RecordSuccessfulAuth(addr net.Addr) {
 
 	if record, ok := rl.records[ip]; ok {
 		record.failedAttempts = nil
+		if !record.bannedUntil.IsZero() {
+			rateLimitedIPsGauge.Dec()
+		}
 		record.bannedUntil = time.Time{}
 	}
 }
@@ -247,6 +255,7 @@ func (rl *RateLimiter) cleanup() {
 		// Clear expired bans
 		if !record.bannedUntil.IsZero() && now.After(record.bannedUntil) {
 			record.bannedUntil = time.Time{}
+			rateLimitedIPsGauge.Dec()
 		}
 
 		// Remove record if it's empty and has no active connections
