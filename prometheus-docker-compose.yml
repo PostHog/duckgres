@@ -1,0 +1,23 @@
+# Prometheus setup for local development and testing.
+#
+# Usage:
+#   1. Start duckgres: ./duckgres --port 5432
+#   2. Start prometheus: docker compose -f prometheus-docker-compose.yml up
+#   3. Open http://localhost:9091 to view metrics
+#
+# Available metrics:
+#   - duckgres_connections_open: current number of open connections
+#   - duckgres_query_duration_seconds: histogram of query latencies
+#   - duckgres_query_errors_total: counter of failed queries
+#
+# Note: Uses port 9091 for Prometheus UI to avoid conflict with duckgres metrics on 9090.
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
