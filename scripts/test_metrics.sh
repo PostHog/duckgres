@@ -27,6 +27,15 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=$PORT user=postgres sslmode=requir
 # Check metrics
 QUERY_COUNT=$(curl -s "http://localhost:$METRICS_PORT/metrics" | grep 'duckgres_query_duration_seconds_count' | awk '{print $2}')
 
+if [ -z "$QUERY_COUNT" ]; then
+    echo "FAIL: could not find 'duckgres_query_duration_seconds_count' metric in metrics output"
+    exit 1
+fi
+
+if ! [[ "$QUERY_COUNT" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: query count '$QUERY_COUNT' is not a valid integer metric value"
+    exit 1
+fi
 if [ "$QUERY_COUNT" -ge 2 ]; then
     echo "PASS: query count is $QUERY_COUNT (expected >= 2)"
 else
