@@ -1779,7 +1779,7 @@ func formatValue(v interface{}) string {
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
-	if severity == "ERROR" {
+	if severity == "ERROR" || severity == "FATAL" {
 		queryErrorsCounter.Inc()
 	}
 	_ = writeErrorResponse(c.writer, severity, code, message)
