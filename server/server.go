@@ -31,6 +31,11 @@ var queryDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
 	Buckets: prometheus.DefBuckets,
 })
 
+var queryErrorsCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_errors_total",
+	Help: "Total number of failed queries",
+})
+
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
 }

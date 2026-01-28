@@ -1779,6 +1779,9 @@ func formatValue(v interface{}) string {
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
+	if severity == "ERROR" {
+		queryErrorsCounter.Inc()
+	}
 	_ = writeErrorResponse(c.writer, severity, code, message)
 	_ = c.writer.Flush()
 }
