@@ -2181,6 +2181,14 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", portalName))
 		return
 	}
+
+	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
+	trimmedQuery := strings.TrimSpace(p.stmt.query)
+	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
+		_ = writeEmptyQueryResponse(c.writer)
+		return
+	}
+
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 
@@ -2197,13 +2205,6 @@ func (c *clientConn) handleExecute(body []byte) {
 	returnsResults := queryReturnsResults(p.stmt.query)
 
 	slog.Debug("Execute portal.", "user", c.username, "portal", portalName, "params", len(args), "query", p.stmt.query)
-
-	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
-	trimmedQuery := strings.TrimSpace(p.stmt.query)
-	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
-		_ = writeEmptyQueryResponse(c.writer)
-		return
-	}
 
 	// Check if this is a native_duckdb command (prepared via extended protocol)
 	switch p.stmt.noOpTag {
