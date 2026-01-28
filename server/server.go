@@ -600,14 +600,6 @@ func (s *Server) buildCredentialChainSecret() string {
 func (s *Server) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 
-	// Track active connections
-	atomic.AddInt64(&s.activeConns, 1)
-	connectionsGauge.Inc()
-	defer func() {
-		atomic.AddInt64(&s.activeConns, -1)
-		connectionsGauge.Dec()
-	}()
-
 	// Check rate limiting before doing anything
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {
 		// Send PostgreSQL error and close
@@ -622,6 +614,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+
+	// Track active connections (only after rate limiting passes)
+	atomic.AddInt64(&s.activeConns, 1)
+	connectionsGauge.Inc()
+	defer func() {
+		atomic.AddInt64(&s.activeConns, -1)
+		connectionsGauge.Dec()
+	}()
 
 	// Ensure we unregister when done
 	defer func() {
