@@ -19,5 +19,10 @@ services:
       - "9091:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    # On Linux, host.docker.internal is not defined by default; this mapping
+    # ensures the container can reach services on the host. If running with
+    # `docker run` instead of compose, you may need:
+    #   --add-host=host.docker.internal:host-gateway
+    # or use an alternative like: network_mode: "host".
     extra_hosts:
       - "host.docker.internal:host-gateway"
