@@ -457,7 +457,7 @@ func TestFallbackMixedSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DESCRIBE failed: %v", err)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		// 3. Another standard PostgreSQL query
 		_, err = db.Exec("SELECT * FROM users LIMIT 1")
@@ -470,7 +470,7 @@ func TestFallbackMixedSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("FROM-first query failed: %v", err)
 		}
-		rows.Close()
+		_ = rows.Close()
 
 		// 5. PostgreSQL-style type cast
 		var result string
@@ -487,6 +487,6 @@ func TestFallbackMixedSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SUMMARIZE failed: %v", err)
 		}
-		rows.Close()
+		_ = rows.Close()
 	})
 }
