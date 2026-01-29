@@ -291,7 +291,17 @@ func (c *clientConn) validateWithDuckDB(query string) error {
 	// Use EXPLAIN to validate the query without executing it
 	// DuckDB's EXPLAIN will fail if the query is syntactically invalid
 	_, err := c.db.Exec("EXPLAIN " + query)
-	return err
+	if err != nil {
+		// Strip "EXPLAIN " from error messages to avoid confusing users,
+		// but only if the original query didn't start with EXPLAIN
+		errMsg := err.Error()
+		upperQuery := strings.ToUpper(strings.TrimSpace(stripLeadingComments(query)))
+		if !strings.HasPrefix(upperQuery, "EXPLAIN") {
+			errMsg = strings.Replace(errMsg, "EXPLAIN ", "", 1)
+		}
+		return fmt.Errorf("%s", errMsg)
+	}
+	return nil
 }
 
 // isDuckDBUtilityCommand checks if a query is a DuckDB utility command
