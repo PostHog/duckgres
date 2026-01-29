@@ -1221,6 +1221,14 @@ func queryReturnsResults(query string) bool {
 	if strings.HasPrefix(upper, "DESCRIBE") {
 		return true
 	}
+	// SUMMARIZE returns results (DuckDB-specific)
+	if strings.HasPrefix(upper, "SUMMARIZE") {
+		return true
+	}
+	// FROM-first syntax returns results (DuckDB-specific)
+	if strings.HasPrefix(upper, "FROM") {
+		return true
+	}
 	return false
 }
 
