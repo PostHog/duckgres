@@ -204,7 +204,7 @@ func TestFallbackPreparedStatement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to execute DESCRIBE: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		// Just verify we got some results
 		if !rows.Next() {
@@ -219,7 +219,7 @@ func TestFallbackPreparedStatement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to execute pragma_table_info: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		if !rows.Next() {
 			t.Error("Expected at least one row from pragma_table_info")
@@ -235,7 +235,7 @@ func TestFallbackPreparedStatement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to execute FROM-first query: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 		// Query executed successfully, that's the main test
 	})
 }
