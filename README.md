@@ -25,6 +25,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - [Rate Limiting](#rate-limiting)
 - [Usage Examples](#usage-examples)
 - [Architecture](#architecture)
+- [Two-Tier Query Processing](#two-tier-query-processing)
 - [Supported Features](#supported-features)
 - [Limitations](#limitations)
 - [Dependencies](#dependencies)
@@ -33,6 +34,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 ## Features
 
 - **PostgreSQL Wire Protocol**: Full compatibility with PostgreSQL clients
+- **Two-Tier Query Processing**: Transparently handles both PostgreSQL and DuckDB-specific syntax
 - **TLS Encryption**: Required TLS connections with auto-generated self-signed certificates
 - **Per-User Databases**: Each authenticated user gets their own isolated DuckDB database file
 - **Password Authentication**: Cleartext password authentication over TLS
@@ -423,6 +425,52 @@ GROUP BY name;
 │  + DuckLake     │
 └─────────────────┘
 ```
+
+## Two-Tier Query Processing
+
+Duckgres uses a two-tier approach to handle both PostgreSQL and DuckDB-specific SQL syntax transparently:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Incoming Query                           │
+└─────────────────────────────┬───────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  Tier 1: PostgreSQL Parser                      │
+│                   (pg_query_go / libpg_query)                   │
+└──────────────┬─────────────────────────────────┬────────────────┘
+               │                                 │
+          Parse OK                          Parse Failed
+               │                                 │
+               ▼                                 ▼
+┌──────────────────────────┐    ┌─────────────────────────────────┐
+│   Transpile PG → DuckDB  │    │   Tier 2: DuckDB Validation     │
+│   (type mappings, etc.)  │    │   (EXPLAIN or direct execute)   │
+└──────────────┬───────────┘    └──────────────┬──────────────────┘
+               │                               │
+               ▼                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Execute on DuckDB                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### How It Works
+
+1. **Tier 1 (PostgreSQL Parser)**: All queries first pass through the PostgreSQL parser. Valid PostgreSQL syntax is transpiled to DuckDB-compatible SQL (handling differences in types, functions, and system catalogs).
+
+2. **Tier 2 (DuckDB Fallback)**: If PostgreSQL parsing fails, the query is validated directly against DuckDB using `EXPLAIN`. If valid, it executes natively. This enables DuckDB-specific syntax that isn't valid PostgreSQL.
+
+### Supported DuckDB-Specific Syntax
+
+The following DuckDB features work transparently through the fallback mechanism: `FROM`-first queries, `SELECT * EXCLUDE/REPLACE`, `DESCRIBE`, `SUMMARIZE`, `QUALIFY` clause, lambda functions, positional joins, `ASOF` joins, struct operations, `COLUMNS` expression, and `SAMPLE`.
+
+### Utility Commands
+
+DuckDB utility commands that don't support `EXPLAIN` validation are passed through directly: `ATTACH`, `DETACH`, `USE`, `INSTALL`, `LOAD`, `CREATE/DROP SECRET`, `SET`, `RESET`, `PRAGMA`, `CHECKPOINT`, `EXPORT/IMPORT DATABASE`, and `CALL`.
+
+### Prepared Statements
+
+Two-tier processing works with prepared statements (extended query protocol). Parameter placeholders (`$1`, `$2`, etc.) are counted using regex when PostgreSQL parsing fails, ensuring correct parameter binding for DuckDB-specific queries.
 
 ## Supported Features
 
