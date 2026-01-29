@@ -164,65 +164,6 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 	}, nil
 }
 
-// TranspileMulti handles SQL strings that may contain multiple statements.
-// Returns a slice of Results, one for each statement.
-func (t *Transpiler) TranspileMulti(sql string) ([]*Result, error) {
-	sql = strings.TrimSpace(sql)
-	if sql == "" {
-		return []*Result{{SQL: sql}}, nil
-	}
-
-	// Split by semicolons (simple approach - pg_query handles this better)
-	tree, err := pg_query.Parse(sql)
-	if err != nil {
-		// PostgreSQL parsing failed - signal that we should try native DuckDB execution
-		// Count parameters using regex since we can't use the AST
-		return []*Result{{SQL: sql, FallbackToNative: true, ParamCount: countParametersRegex(sql)}}, nil
-	}
-
-	results := make([]*Result, 0, len(tree.Stmts))
-
-	for i := range tree.Stmts {
-		// Create a new tree with just this statement
-		singleTree := &pg_query.ParseResult{
-			Stmts: []*pg_query.RawStmt{tree.Stmts[i]},
-		}
-
-		transformResult := &transform.Result{}
-
-		// Apply all transforms
-		for _, tr := range t.transforms {
-			_, err := tr.Transform(singleTree, transformResult)
-			if err != nil {
-				return nil, err
-			}
-
-			if transformResult.IsNoOp || transformResult.IsIgnoredSet {
-				break
-			}
-		}
-
-		result := &Result{
-			ParamCount:   transformResult.ParamCount,
-			IsNoOp:       transformResult.IsNoOp,
-			NoOpTag:      transformResult.NoOpTag,
-			IsIgnoredSet: transformResult.IsIgnoredSet,
-		}
-
-		if !transformResult.IsNoOp && !transformResult.IsIgnoredSet {
-			deparsed, err := pg_query.Deparse(singleTree)
-			if err != nil {
-				return nil, err
-			}
-			result.SQL = deparsed
-		}
-
-		results = append(results, result)
-	}
-
-	return results, nil
-}
-
 // CountParameters parses SQL and counts $N placeholders without applying any transforms.
 // This is used for prepared statements in native DuckDB mode where we skip transpilation
 // but still need to know the parameter count for the extended query protocol.

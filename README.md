@@ -464,14 +464,6 @@ Duckgres uses a two-tier approach to handle both PostgreSQL and DuckDB-specific 
 
 The following DuckDB features work transparently through the fallback mechanism: `FROM`-first queries, `SELECT * EXCLUDE/REPLACE`, `DESCRIBE`, `SUMMARIZE`, `QUALIFY` clause, lambda functions, positional joins, `ASOF` joins, struct operations, `COLUMNS` expression, and `SAMPLE`.
 
-### Utility Commands
-
-DuckDB utility commands that don't support `EXPLAIN` validation are passed through directly: `ATTACH`, `DETACH`, `USE`, `INSTALL`, `LOAD`, `CREATE/DROP SECRET`, `SET`, `RESET`, `PRAGMA`, `CHECKPOINT`, `EXPORT/IMPORT DATABASE`, and `CALL`.
-
-### Prepared Statements
-
-Two-tier processing works with prepared statements (extended query protocol). Parameter placeholders (`$1`, `$2`, etc.) are counted using regex when PostgreSQL parsing fails, ensuring correct parameter binding for DuckDB-specific queries.
-
 ## Supported Features
 
 ### SQL Commands

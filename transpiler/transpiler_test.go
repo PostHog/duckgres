@@ -1730,57 +1730,6 @@ func TestTranspile_FallbackToNative(t *testing.T) {
 	}
 }
 
-func TestTranspileMulti_FallbackToNative(t *testing.T) {
-	// Test that TranspileMulti also handles FallbackToNative correctly
-	tr := New(DefaultConfig())
-
-	tests := []struct {
-		name         string
-		input        string
-		wantFallback bool
-		wantCount    int // expected number of results
-	}{
-		{
-			name:         "valid PostgreSQL multi-statement - no fallback",
-			input:        "SELECT 1; SELECT 2",
-			wantFallback: false,
-			wantCount:    2,
-		},
-		{
-			name:         "DuckDB-specific syntax - fallback",
-			input:        "DESCRIBE SELECT * FROM users",
-			wantFallback: true,
-			wantCount:    1,
-		},
-		{
-			name:         "DuckDB PRAGMA - fallback",
-			input:        "PRAGMA table_info('users')",
-			wantFallback: true,
-			wantCount:    1,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			results, err := tr.TranspileMulti(tt.input)
-			if err != nil {
-				t.Fatalf("TranspileMulti(%q) error: %v", tt.input, err)
-			}
-
-			if len(results) != tt.wantCount {
-				t.Errorf("TranspileMulti(%q) returned %d results, want %d",
-					tt.input, len(results), tt.wantCount)
-			}
-
-			// Check first result for fallback flag
-			if len(results) > 0 && results[0].FallbackToNative != tt.wantFallback {
-				t.Errorf("TranspileMulti(%q) FallbackToNative = %v, want %v",
-					tt.input, results[0].FallbackToNative, tt.wantFallback)
-			}
-		})
-	}
-}
-
 func TestConvertAlterTableToAlterView(t *testing.T) {
 	tests := []struct {
 		name       string
