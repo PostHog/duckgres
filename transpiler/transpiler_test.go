@@ -1859,3 +1859,62 @@ func TestConvertAlterTableToAlterView(t *testing.T) {
 		})
 	}
 }
+
+func TestTranspile_FallbackParamCount(t *testing.T) {
+	// Test that when pg_query fails to parse DuckDB-specific syntax,
+	// the transpiler still correctly counts $N parameter placeholders
+	// using regex-based counting.
+	tests := []struct {
+		name       string
+		input      string
+		paramCount int
+	}{
+		{
+			name:       "DuckDB FROM-first with parameter",
+			input:      "FROM users SELECT name WHERE id = $1",
+			paramCount: 1,
+		},
+		{
+			name:       "DuckDB SELECT EXCLUDE with parameter",
+			input:      "SELECT * EXCLUDE (email) FROM users WHERE id = $1",
+			paramCount: 1,
+		},
+		{
+			name:       "DuckDB DESCRIBE with no params",
+			input:      "DESCRIBE SELECT 1 AS num",
+			paramCount: 0,
+		},
+		{
+			name:       "DuckDB QUALIFY with multiple params",
+			input:      "SELECT id, name FROM users WHERE status = $1 QUALIFY row_number() OVER (ORDER BY id) <= $2",
+			paramCount: 2,
+		},
+		{
+			name:       "DuckDB list_filter with param",
+			input:      "SELECT list_filter([1, 2, 3, 4, 5], x -> x > $1) AS filtered",
+			paramCount: 1,
+		},
+		{
+			name:       "Out of order params",
+			input:      "FROM users SELECT $3, $1, $2",
+			paramCount: 3,
+		},
+	}
+
+	tr := New(Config{ConvertPlaceholders: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !result.FallbackToNative {
+				t.Errorf("Transpile(%q) should set FallbackToNative=true for DuckDB-specific syntax", tt.input)
+			}
+			if result.ParamCount != tt.paramCount {
+				t.Errorf("Transpile(%q) ParamCount = %d, want %d", tt.input, result.ParamCount, tt.paramCount)
+			}
+		})
+	}
+}

@@ -288,6 +288,12 @@ func (c *clientConn) validateWithDuckDB(query string) error {
 		return nil
 	}
 
+	// Skip EXPLAIN validation for queries with parameter placeholders ($1, $2, etc.)
+	// EXPLAIN cannot handle unbound parameters - we'll let DuckDB validate at execution time
+	if hasParameterPlaceholders(query) {
+		return nil
+	}
+
 	// Use EXPLAIN to validate the query without executing it
 	// DuckDB's EXPLAIN will fail if the query is syntactically invalid
 	_, err := c.db.Exec("EXPLAIN " + query)
@@ -302,6 +308,14 @@ func (c *clientConn) validateWithDuckDB(query string) error {
 		return fmt.Errorf("%s", errMsg)
 	}
 	return nil
+}
+
+// paramPlaceholderRegex matches PostgreSQL-style $N parameter placeholders
+var paramPlaceholderRegex = regexp.MustCompile(`\$\d+`)
+
+// hasParameterPlaceholders returns true if the query contains $N placeholders
+func hasParameterPlaceholders(query string) bool {
+	return paramPlaceholderRegex.MatchString(query)
 }
 
 // isDuckDBUtilityCommand checks if a query is a DuckDB utility command

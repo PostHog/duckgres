@@ -1,11 +1,16 @@
 package transpiler
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/transpiler/transform"
 )
+
+// paramRegex matches PostgreSQL-style $N parameter placeholders
+var paramRegex = regexp.MustCompile(`\$(\d+)`)
 
 // Transpiler converts PostgreSQL SQL to DuckDB-compatible SQL
 type Transpiler struct {
@@ -91,9 +96,11 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 	tree, err := pg_query.Parse(sql)
 	if err != nil {
 		// PostgreSQL parsing failed - signal that we should try native DuckDB execution
+		// Count parameters using regex since we can't use the AST
 		return &Result{
 			SQL:              sql,
 			FallbackToNative: true,
+			ParamCount:       countParametersRegex(sql),
 		}, nil
 	}
 
@@ -169,7 +176,8 @@ func (t *Transpiler) TranspileMulti(sql string) ([]*Result, error) {
 	tree, err := pg_query.Parse(sql)
 	if err != nil {
 		// PostgreSQL parsing failed - signal that we should try native DuckDB execution
-		return []*Result{{SQL: sql, FallbackToNative: true}}, nil
+		// Count parameters using regex since we can't use the AST
+		return []*Result{{SQL: sql, FallbackToNative: true, ParamCount: countParametersRegex(sql)}}, nil
 	}
 
 	results := make([]*Result, 0, len(tree.Stmts))
@@ -238,6 +246,26 @@ func CountParameters(sql string) (int, error) {
 	}
 
 	return result.ParamCount, nil
+}
+
+// countParametersRegex counts $N parameter placeholders using regex.
+// This is a fallback for when pg_query can't parse the SQL (e.g., DuckDB-specific syntax).
+// It finds the highest $N placeholder number, which represents the parameter count.
+func countParametersRegex(sql string) int {
+	matches := paramRegex.FindAllStringSubmatch(sql, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+
+	maxParam := 0
+	for _, match := range matches {
+		if len(match) > 1 {
+			if n, err := strconv.Atoi(match[1]); err == nil && n > maxParam {
+				maxParam = n
+			}
+		}
+	}
+	return maxParam
 }
 
 // ConvertAlterTableToAlterView transforms an ALTER TABLE RENAME statement

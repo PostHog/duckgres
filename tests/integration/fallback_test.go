@@ -238,6 +238,28 @@ func TestFallbackPreparedStatement(t *testing.T) {
 		defer func() { _ = rows.Close() }()
 		// Query executed successfully, that's the main test
 	})
+
+	t.Run("from_first_with_parameter", func(t *testing.T) {
+		skipIfKnown(t)
+		// Test FROM-first syntax WITH a parameter - this demonstrates the issue
+		// where ParamCount=0 for fallback queries
+		rows, err := db.Query("FROM users SELECT name WHERE id = $1", 1)
+		if err != nil {
+			t.Fatalf("Failed to execute FROM-first query with parameter: %v", err)
+		}
+		defer func() { _ = rows.Close() }()
+		// Query executed successfully
+	})
+
+	t.Run("select_exclude_with_parameter", func(t *testing.T) {
+		skipIfKnown(t)
+		// DuckDB EXCLUDE syntax with parameter
+		rows, err := db.Query("SELECT * EXCLUDE (email) FROM users WHERE id = $1", 1)
+		if err != nil {
+			t.Fatalf("Failed to execute SELECT EXCLUDE with parameter: %v", err)
+		}
+		defer func() { _ = rows.Close() }()
+	})
 }
 
 // TestFallbackUtilityCommands tests DuckDB utility commands that don't support EXPLAIN
