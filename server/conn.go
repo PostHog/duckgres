@@ -322,16 +322,17 @@ func hasParameterPlaceholders(query string) bool {
 // that doesn't support EXPLAIN validation. These commands are passed
 // through directly to DuckDB without pre-validation.
 func isDuckDBUtilityCommand(query string) bool {
-	// Strip leading comments and get the first word (case-insensitive)
+	// Strip leading comments and get the first keyword (case-insensitive)
 	upper := strings.ToUpper(stripLeadingComments(query))
 
 	// List of DuckDB utility commands that don't support EXPLAIN
+	// All prefixes should NOT have trailing spaces - we check word boundaries separately
 	utilityPrefixes := []string{
 		"ATTACH",
 		"DETACH",
-		"USE ",
+		"USE",
 		"INSTALL",
-		"LOAD ",
+		"LOAD",
 		"UNLOAD",
 		"CREATE SECRET",
 		"DROP SECRET",
@@ -345,18 +346,32 @@ func isDuckDBUtilityCommand(query string) bool {
 		"FORCE CHECKPOINT",
 		"EXPORT DATABASE",
 		"IMPORT DATABASE",
-		"CALL ",
-		"SET ",   // DuckDB SET syntax
-		"RESET ", // DuckDB RESET syntax
+		"CALL",
+		"SET",
+		"RESET",
 	}
 
 	for _, prefix := range utilityPrefixes {
-		if strings.HasPrefix(upper, prefix) {
+		if hasCommandPrefix(upper, prefix) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// hasCommandPrefix checks if query starts with the given command prefix,
+// ensuring it's followed by a word boundary (space, newline, semicolon, or end of string).
+func hasCommandPrefix(query, prefix string) bool {
+	if !strings.HasPrefix(query, prefix) {
+		return false
+	}
+	// Check that prefix is followed by a word boundary
+	if len(query) == len(prefix) {
+		return true // Exact match
+	}
+	next := query[len(prefix)]
+	return next == ' ' || next == '\t' || next == '\n' || next == '\r' || next == ';'
 }
 
 func (c *clientConn) serve() error {
