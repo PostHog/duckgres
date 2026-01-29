@@ -346,11 +346,8 @@ func isDuckDBUtilityCommand(query string) bool {
 		"EXPORT DATABASE",
 		"IMPORT DATABASE",
 		"CALL ",
-		"SET ",       // DuckDB SET syntax
-		"RESET ",     // DuckDB RESET syntax
-		"DESCRIBE ",  // DESCRIBE is a utility but actually supports EXPLAIN in some cases
-		"SUMMARIZE ", // SUMMARIZE doesn't support EXPLAIN
-		"FROM ",      // FROM-first syntax - let it through
+		"SET ",   // DuckDB SET syntax
+		"RESET ", // DuckDB RESET syntax
 	}
 
 	for _, prefix := range utilityPrefixes {
