@@ -90,7 +90,11 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 	// Parse the SQL into an AST
 	tree, err := pg_query.Parse(sql)
 	if err != nil {
-		return nil, err
+		// PostgreSQL parsing failed - signal that we should try native DuckDB execution
+		return &Result{
+			SQL:              sql,
+			FallbackToNative: true,
+		}, nil
 	}
 
 	// Create transform result to collect metadata from transforms
@@ -164,7 +168,8 @@ func (t *Transpiler) TranspileMulti(sql string) ([]*Result, error) {
 	// Split by semicolons (simple approach - pg_query handles this better)
 	tree, err := pg_query.Parse(sql)
 	if err != nil {
-		return nil, err
+		// PostgreSQL parsing failed - signal that we should try native DuckDB execution
+		return []*Result{{SQL: sql, FallbackToNative: true}}, nil
 	}
 
 	results := make([]*Result, 0, len(tree.Stmts))

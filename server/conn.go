@@ -278,6 +278,66 @@ func (c *clientConn) handleNativeDuckDBShowExtended() {
 	_ = writeCommandComplete(c.writer, "SHOW")
 }
 
+// validateWithDuckDB checks if a query is valid DuckDB syntax.
+// This is used when PostgreSQL parsing fails to determine if the query should
+// be executed natively by DuckDB.
+func (c *clientConn) validateWithDuckDB(query string) error {
+	// Check if this is a utility command that doesn't support EXPLAIN
+	// For these, we skip validation and let DuckDB handle them directly
+	if isDuckDBUtilityCommand(query) {
+		return nil
+	}
+
+	// Use EXPLAIN to validate the query without executing it
+	// DuckDB's EXPLAIN will fail if the query is syntactically invalid
+	_, err := c.db.Exec("EXPLAIN " + query)
+	return err
+}
+
+// isDuckDBUtilityCommand checks if a query is a DuckDB utility command
+// that doesn't support EXPLAIN validation. These commands are passed
+// through directly to DuckDB without pre-validation.
+func isDuckDBUtilityCommand(query string) bool {
+	// Strip leading comments and get the first word (case-insensitive)
+	upper := strings.ToUpper(stripLeadingComments(query))
+
+	// List of DuckDB utility commands that don't support EXPLAIN
+	utilityPrefixes := []string{
+		"ATTACH",
+		"DETACH",
+		"USE ",
+		"INSTALL",
+		"LOAD ",
+		"UNLOAD",
+		"CREATE SECRET",
+		"DROP SECRET",
+		"CREATE PERSISTENT SECRET",
+		"CREATE TEMPORARY SECRET",
+		"CREATE OR REPLACE SECRET",
+		"CREATE OR REPLACE PERSISTENT SECRET",
+		"CREATE OR REPLACE TEMPORARY SECRET",
+		"PRAGMA",
+		"CHECKPOINT",
+		"FORCE CHECKPOINT",
+		"EXPORT DATABASE",
+		"IMPORT DATABASE",
+		"CALL ",
+		"SET ",       // DuckDB SET syntax
+		"RESET ",     // DuckDB RESET syntax
+		"DESCRIBE ",  // DESCRIBE is a utility but actually supports EXPLAIN in some cases
+		"SUMMARIZE ", // SUMMARIZE doesn't support EXPLAIN
+		"FROM ",      // FROM-first syntax - let it through
+	}
+
+	for _, prefix := range utilityPrefixes {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (c *clientConn) serve() error {
 	c.reader = bufio.NewReader(c.conn)
 	c.writer = bufio.NewWriter(c.conn)
@@ -558,12 +618,24 @@ func (c *clientConn) handleQuery(body []byte) error {
 		tr := c.newTranspiler(false)
 		result, err = tr.Transpile(query)
 		if err != nil {
-			// Parse error - send error to client
+			// Transform error - send error to client
 			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
 		}
+	}
+
+	// Handle fallback to native DuckDB: PostgreSQL parsing failed, try DuckDB directly
+	if result.FallbackToNative {
+		if err := c.validateWithDuckDB(query); err != nil {
+			// Neither PostgreSQL nor DuckDB can parse this query
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+		slog.Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "user", c.username, "query", query)
 	}
 
 	// Handle transform-detected errors (e.g., unrecognized config parameter)
@@ -1900,6 +1972,16 @@ func (c *clientConn) handleParse(body []byte) {
 		if result.Error != nil {
 			c.sendError("ERROR", "42704", result.Error.Error())
 			return
+		}
+
+		// Handle fallback to native DuckDB: PostgreSQL parsing failed, try DuckDB directly
+		if result.FallbackToNative {
+			if err := c.validateWithDuckDB(query); err != nil {
+				// Neither PostgreSQL nor DuckDB can parse this query
+				c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+				return
+			}
+			slog.Debug("Fallback to native DuckDB: query not valid PostgreSQL but valid DuckDB.", "user", c.username, "query", query)
 		}
 	}
 

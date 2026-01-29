@@ -52,4 +52,9 @@ type Result struct {
 	// Error is set when a transform detects an error that should be returned to the client
 	// (e.g., unrecognized configuration parameter in SHOW command)
 	Error error
+
+	// FallbackToNative indicates that PostgreSQL parsing failed but the query
+	// should be attempted directly against DuckDB. This allows DuckDB-specific
+	// syntax to work without explicitly enabling native_duckdb mode.
+	FallbackToNative bool
 }
