@@ -74,7 +74,17 @@ func readStartupMessage(r io.Reader) (map[string]string, error) {
 	}
 
 	// Check for cancel request (80877102)
+	// Format: 4 bytes length, 4 bytes request code, 4 bytes pid, 4 bytes secret key
 	if protocolVersion == 80877102 {
+		if len(remaining) >= 12 {
+			cancelPid := binary.BigEndian.Uint32(remaining[4:8])
+			cancelSecretKey := binary.BigEndian.Uint32(remaining[8:12])
+			return map[string]string{
+				"__cancel_request":    "true",
+				"__cancel_pid":        fmt.Sprintf("%d", cancelPid),
+				"__cancel_secret_key": fmt.Sprintf("%d", cancelSecretKey),
+			}, nil
+		}
 		return map[string]string{"__cancel_request": "true"}, nil
 	}
 

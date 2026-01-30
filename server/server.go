@@ -51,6 +51,17 @@ var rateLimitedIPsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently rate-limited IP addresses",
 })
 
+var queryCancellationsCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_cancellations_total",
+	Help: "Total number of queries cancelled via cancel request",
+})
+
+// BackendKey uniquely identifies a backend connection for cancel requests
+type BackendKey struct {
+	Pid       int32
+	SecretKey int32
+}
+
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
 }
@@ -131,6 +142,10 @@ type Server struct {
 	// duckLakeSem serializes DuckLake attachment to avoid write-write conflicts.
 	// Using a channel instead of mutex allows for timeout on acquisition.
 	duckLakeSem chan struct{}
+
+	// Query cancellation tracking
+	activeQueries   map[BackendKey]context.CancelFunc
+	activeQueriesMu sync.RWMutex
 }
 
 func New(cfg Config) (*Server, error) {
@@ -160,8 +175,9 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:         cfg,
-		rateLimiter: NewRateLimiter(cfg.RateLimit),
+		cfg:           cfg,
+		rateLimiter:   NewRateLimiter(cfg.RateLimit),
+		activeQueries: make(map[BackendKey]context.CancelFunc),
 		tlsConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		},
@@ -282,6 +298,38 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // ActiveConnections returns the number of active connections
 func (s *Server) ActiveConnections() int64 {
 	return atomic.LoadInt64(&s.activeConns)
+}
+
+// RegisterQuery registers a cancel function for a backend key.
+// This allows the query to be cancelled via a cancel request from another connection.
+func (s *Server) RegisterQuery(key BackendKey, cancel context.CancelFunc) {
+	s.activeQueriesMu.Lock()
+	s.activeQueries[key] = cancel
+	s.activeQueriesMu.Unlock()
+}
+
+// UnregisterQuery removes the cancel function for a backend key.
+// This should be called when a query completes (successfully or with error).
+func (s *Server) UnregisterQuery(key BackendKey) {
+	s.activeQueriesMu.Lock()
+	delete(s.activeQueries, key)
+	s.activeQueriesMu.Unlock()
+}
+
+// CancelQuery cancels a running query by its backend key.
+// Returns true if a query was found and cancelled, false otherwise.
+func (s *Server) CancelQuery(key BackendKey) bool {
+	s.activeQueriesMu.RLock()
+	cancel, ok := s.activeQueries[key]
+	s.activeQueriesMu.RUnlock()
+
+	if ok && cancel != nil {
+		cancel()
+		queryCancellationsCounter.Inc()
+		slog.Info("Query cancelled via cancel request.", "pid", key.Pid, "secret_key", key.SecretKey)
+		return true
+	}
+	return false
 }
 
 // createDBConnection creates a DuckDB connection for a client session.

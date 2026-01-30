@@ -3,6 +3,8 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
@@ -10,9 +12,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,17 +97,18 @@ const (
 )
 
 type clientConn struct {
-	server       *Server
-	conn         net.Conn
-	reader       *bufio.Reader
-	writer       *bufio.Writer
-	username string
-	database string
-	db       *sql.DB
-	pid      int32
-	stmts    map[string]*preparedStmt // prepared statements by name
-	portals  map[string]*portal       // portals by name
-	txStatus byte                     // current transaction status ('I', 'T', or 'E')
+	server    *Server
+	conn      net.Conn
+	reader    *bufio.Reader
+	writer    *bufio.Writer
+	username  string
+	database  string
+	db        *sql.DB
+	pid       int32
+	secretKey int32                    // unique key for cancel requests
+	stmts     map[string]*preparedStmt // prepared statements by name
+	portals   map[string]*portal       // portals by name
+	txStatus  byte                     // current transaction status ('I', 'T', or 'E')
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -112,6 +117,43 @@ func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpi
 		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "",
 		ConvertPlaceholders: convertPlaceholders,
 	})
+}
+
+// generateSecretKey generates a cryptographically random secret key for cancel requests.
+func generateSecretKey() int32 {
+	n, err := rand.Int(rand.Reader, big.NewInt(1<<31))
+	if err != nil {
+		// Fallback to time-based key if crypto/rand fails
+		return int32(time.Now().UnixNano() & 0x7FFFFFFF)
+	}
+	return int32(n.Int64())
+}
+
+// backendKey returns the backend key for this connection, used for cancel requests.
+func (c *clientConn) backendKey() BackendKey {
+	return BackendKey{Pid: c.pid, SecretKey: c.secretKey}
+}
+
+// queryContext returns a cancellable context for query execution.
+// The cancel function is registered with the server so it can be invoked
+// via a cancel request from another connection.
+// The caller must call the returned cleanup function when the query completes.
+func (c *clientConn) queryContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	key := c.backendKey()
+	c.server.RegisterQuery(key, cancel)
+
+	cleanup := func() {
+		c.server.UnregisterQuery(key)
+		cancel()
+	}
+
+	return ctx, cleanup
+}
+
+// isQueryCancelled checks if an error is due to query cancellation
+func isQueryCancelled(err error) bool {
+	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
 }
 
 // validateWithDuckDB checks if a query is valid DuckDB syntax.
@@ -214,6 +256,7 @@ func (c *clientConn) serve() error {
 	c.reader = bufio.NewReader(c.conn)
 	c.writer = bufio.NewWriter(c.conn)
 	c.pid = int32(os.Getpid())
+	c.secretKey = generateSecretKey()
 	c.stmts = make(map[string]*preparedStmt)
 	c.portals = make(map[string]*portal)
 	c.txStatus = txStatusIdle
@@ -298,6 +341,15 @@ func (c *clientConn) handleStartup() error {
 
 		// Handle cancel request
 		if params["__cancel_request"] == "true" {
+			// Extract pid and secret key from the cancel request
+			if pidStr, ok := params["__cancel_pid"]; ok {
+				if secretKeyStr, ok := params["__cancel_secret_key"]; ok {
+					pid, _ := strconv.ParseInt(pidStr, 10, 32)
+					secretKey, _ := strconv.ParseInt(secretKeyStr, 10, 32)
+					key := BackendKey{Pid: int32(pid), SecretKey: int32(secretKey)}
+					c.server.CancelQuery(key)
+				}
+			}
 			return nil
 		}
 
@@ -381,8 +433,8 @@ func (c *clientConn) sendInitialParams() {
 		}
 	}
 
-	// Send backend key data
-	if err := writeBackendKeyData(c.writer, c.pid, 0); err != nil {
+	// Send backend key data (pid and secret key for cancel requests)
+	if err := writeBackendKeyData(c.writer, c.pid, c.secretKey); err != nil {
 		slog.Warn("Failed to write backend key data.", "error", err)
 	}
 }
@@ -554,17 +606,24 @@ func (c *clientConn) handleQuery(body []byte) error {
 			return nil
 		}
 
-		result, err := c.db.Exec(query)
+		ctx, cleanup := c.queryContext()
+		defer cleanup()
+
+		result, err := c.db.ExecContext(ctx, query)
 		if err != nil {
 			// Retry ALTER TABLE as ALTER VIEW if target is a view
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
-					result, err = c.db.Exec(alteredQuery)
+					result, err = c.db.ExecContext(ctx, alteredQuery)
 				}
 			}
 			if err != nil {
-				slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
-				c.sendError("ERROR", "42000", err.Error())
+				if isQueryCancelled(err) {
+					c.sendError("ERROR", "57014", "canceling statement due to user request")
+				} else {
+					slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+					c.sendError("ERROR", "42000", err.Error())
+				}
 				c.setTxError()
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
@@ -581,10 +640,17 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	// Execute SELECT query
-	rows, err := c.db.Query(query)
+	ctx, cleanup := c.queryContext()
+	defer cleanup()
+
+	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
-		slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+		}
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
