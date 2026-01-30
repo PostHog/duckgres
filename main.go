@@ -23,6 +23,7 @@ type FileConfig struct {
 	DataDir    string              `yaml:"data_dir"`
 	TLS        TLSConfig           `yaml:"tls"`
 	Users      map[string]string   `yaml:"users"`
+	AuthMethod string              `yaml:"auth_method"` // "cleartext" (default) or "md5"
 	RateLimit  RateLimitFileConfig `yaml:"rate_limit"`
 	Extensions []string            `yaml:"extensions"`
 	DuckLake   DuckLakeFileConfig  `yaml:"ducklake"`
@@ -109,12 +110,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG    Path to YAML config file\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST      Host to bind to (default: 0.0.0.0)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT      Port to listen on (default: 5432)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR  Directory for DuckDB files (default: ./data)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT      TLS certificate file (default: ./certs/server.crt)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY       TLS private key file (default: ./certs/server.key)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG       Path to YAML config file\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST         Host to bind to (default: 0.0.0.0)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT         Port to listen on (default: 5432)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR     Directory for DuckDB files (default: ./data)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT         TLS certificate file (default: ./certs/server.crt)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY          TLS private key file (default: ./certs/server.key)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_AUTH_METHOD  Auth method: cleartext (default) or md5\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
 
@@ -165,6 +167,9 @@ func main() {
 		}
 		if len(fileCfg.Users) > 0 {
 			cfg.Users = fileCfg.Users
+		}
+		if fileCfg.AuthMethod != "" {
+			cfg.AuthMethod = server.AuthMethod(fileCfg.AuthMethod)
 		}
 
 		// Apply rate limit config
@@ -248,6 +253,9 @@ func main() {
 	}
 	if v := os.Getenv("DUCKGRES_KEY"); v != "" {
 		cfg.TLSKeyFile = v
+	}
+	if v := os.Getenv("DUCKGRES_AUTH_METHOD"); v != "" {
+		cfg.AuthMethod = server.AuthMethod(v)
 	}
 	if v := os.Getenv("DUCKGRES_DUCKLAKE_METADATA_STORE"); v != "" {
 		cfg.DuckLake.MetadataStore = v

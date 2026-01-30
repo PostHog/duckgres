@@ -3,10 +3,13 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
+	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
 	"encoding/csv"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -482,9 +485,29 @@ func (c *clientConn) handleStartup() error {
 		break
 	}
 
-	// Request password
-	if err := writeAuthCleartextPassword(c.writer); err != nil {
-		return err
+	// Get the expected password for this user
+	expectedPassword, userExists := c.server.cfg.Users[c.username]
+
+	// Determine auth method (default to cleartext for backwards compatibility)
+	authMethod := c.server.cfg.AuthMethod
+	if authMethod == "" {
+		authMethod = AuthCleartext
+	}
+
+	var salt [4]byte
+	if authMethod == AuthMD5 {
+		// Generate random salt for MD5 auth
+		if _, err := rand.Read(salt[:]); err != nil {
+			return fmt.Errorf("failed to generate salt: %w", err)
+		}
+		if err := writeAuthMD5Password(c.writer, salt); err != nil {
+			return err
+		}
+	} else {
+		// Request cleartext password
+		if err := writeAuthCleartextPassword(c.writer); err != nil {
+			return err
+		}
 	}
 	if err := c.writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush writer: %w", err)
@@ -504,9 +527,17 @@ func (c *clientConn) handleStartup() error {
 	// Password is null-terminated
 	password := string(bytes.TrimRight(body, "\x00"))
 
-	// Validate password
-	expectedPassword, ok := c.server.cfg.Users[c.username]
-	if !ok || expectedPassword != password {
+	// Validate password based on auth method
+	var authValid bool
+	if !userExists {
+		authValid = false
+	} else if authMethod == AuthMD5 {
+		authValid = verifyMD5Password(password, expectedPassword, c.username, salt)
+	} else {
+		authValid = password == expectedPassword
+	}
+
+	if !authValid {
 		// Record failed authentication attempt
 		banned := c.server.rateLimiter.RecordFailedAuth(c.conn.RemoteAddr())
 		if banned {
@@ -526,6 +557,26 @@ func (c *clientConn) handleStartup() error {
 
 	slog.Info("User authenticated.", "user", c.username, "remote_addr", c.conn.RemoteAddr())
 	return nil
+}
+
+// verifyMD5Password verifies an MD5-hashed password response.
+// The client computes: "md5" + md5(md5(password + username) + salt)
+// where salt is the 4-byte random salt sent by the server.
+func verifyMD5Password(clientResponse, password, username string, salt [4]byte) bool {
+	// Client response should start with "md5" followed by 32 hex chars
+	if len(clientResponse) != 35 || clientResponse[:3] != "md5" {
+		return false
+	}
+
+	// Compute expected hash: md5(md5(password + username) + salt)
+	inner := md5.Sum([]byte(password + username))
+	innerHex := hex.EncodeToString(inner[:])
+
+	outer := md5.Sum(append([]byte(innerHex), salt[:]...))
+	outerHex := hex.EncodeToString(outer[:])
+
+	expected := "md5" + outerHex
+	return clientResponse == expected
 }
 
 func (c *clientConn) sendInitialParams() {
