@@ -55,11 +55,25 @@ func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
 }
 
+// AuthMethod represents the authentication method to use
+type AuthMethod string
+
+const (
+	// AuthCleartext uses cleartext password (default, protected by TLS)
+	AuthCleartext AuthMethod = "cleartext"
+	// AuthMD5 uses MD5 hashed password (PostgreSQL standard)
+	AuthMD5 AuthMethod = "md5"
+)
+
 type Config struct {
 	Host    string
 	Port    int
 	DataDir string
 	Users   map[string]string // username -> password
+
+	// AuthMethod specifies the authentication method.
+	// Supported values: "cleartext" (default), "md5".
+	AuthMethod AuthMethod
 
 	// TLS configuration (required)
 	TLSCertFile string // Path to TLS certificate file
