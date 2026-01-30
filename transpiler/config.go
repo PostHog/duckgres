@@ -54,7 +54,7 @@ type Result struct {
 	Error error
 
 	// FallbackToNative indicates that PostgreSQL parsing failed but the query
-	// should be attempted directly against DuckDB. This allows DuckDB-specific
-	// syntax to work without explicitly enabling native_duckdb mode.
+	// should be attempted directly against DuckDB. This enables two-tier query
+	// processing where DuckDB-specific syntax works automatically.
 	FallbackToNative bool
 }
