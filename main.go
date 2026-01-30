@@ -18,14 +18,15 @@ import (
 
 // FileConfig represents the YAML configuration file structure
 type FileConfig struct {
-	Host       string              `yaml:"host"`
-	Port       int                 `yaml:"port"`
-	DataDir    string              `yaml:"data_dir"`
-	TLS        TLSConfig           `yaml:"tls"`
-	Users      map[string]string   `yaml:"users"`
-	RateLimit  RateLimitFileConfig `yaml:"rate_limit"`
-	Extensions []string            `yaml:"extensions"`
-	DuckLake   DuckLakeFileConfig  `yaml:"ducklake"`
+	Host         string              `yaml:"host"`
+	Port         int                 `yaml:"port"`
+	DataDir      string              `yaml:"data_dir"`
+	TLS          TLSConfig           `yaml:"tls"`
+	Users        map[string]string   `yaml:"users"`
+	RateLimit    RateLimitFileConfig `yaml:"rate_limit"`
+	Extensions   []string            `yaml:"extensions"`
+	DuckLake     DuckLakeFileConfig  `yaml:"ducklake"`
+	QueryTimeout string              `yaml:"query_timeout"` // e.g., "30s", "5m"
 }
 
 type TLSConfig struct {
@@ -109,12 +110,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG    Path to YAML config file\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST      Host to bind to (default: 0.0.0.0)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT      Port to listen on (default: 5432)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR  Directory for DuckDB files (default: ./data)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT      TLS certificate file (default: ./certs/server.crt)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY       TLS private key file (default: ./certs/server.key)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG        Path to YAML config file\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST          Host to bind to (default: 0.0.0.0)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT          Port to listen on (default: 5432)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR      Directory for DuckDB files (default: ./data)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT          TLS certificate file (default: ./certs/server.crt)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY           TLS private key file (default: ./certs/server.key)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_QUERY_TIMEOUT Maximum query execution time (e.g., 30s, 5m)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
 
@@ -192,6 +194,15 @@ func main() {
 		// Apply extensions config
 		if len(fileCfg.Extensions) > 0 {
 			cfg.Extensions = fileCfg.Extensions
+		}
+
+		// Apply query timeout config
+		if fileCfg.QueryTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.QueryTimeout); err == nil {
+				cfg.QueryTimeout = d
+			} else {
+				slog.Warn("Invalid query_timeout duration: " + err.Error())
+			}
 		}
 
 		// Apply DuckLake config
@@ -281,6 +292,13 @@ func main() {
 	}
 	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
+	}
+	if v := os.Getenv("DUCKGRES_QUERY_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.QueryTimeout = d
+		} else {
+			slog.Warn("Invalid DUCKGRES_QUERY_TIMEOUT: " + err.Error())
+		}
 	}
 
 	// Apply CLI flags (highest priority)

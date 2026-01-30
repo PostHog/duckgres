@@ -51,6 +51,11 @@ var rateLimitedIPsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently rate-limited IP addresses",
 })
 
+var queryTimeoutsCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_timeouts_total",
+	Help: "Total number of queries that timed out",
+})
+
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
 }
@@ -81,6 +86,11 @@ type Config struct {
 	// This prevents accumulation of zombie connections from clients that disconnect
 	// uncleanly. Default: 10 minutes. Set to 0 to disable.
 	IdleTimeout time.Duration
+
+	// QueryTimeout is the maximum time a query can run before being cancelled.
+	// This prevents runaway queries from blocking connections forever.
+	// Default: 0 (no timeout). Common values: 30s, 1m, 5m.
+	QueryTimeout time.Duration
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
