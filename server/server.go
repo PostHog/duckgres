@@ -51,6 +51,11 @@ var rateLimitedIPsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently rate-limited IP addresses",
 })
 
+var connectionLimitRejectsCounter = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_connection_limit_rejects_total",
+	Help: "Total number of connections rejected due to max_connections limit",
+})
+
 func redactConnectionString(connStr string) string {
 	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
 }
@@ -81,6 +86,11 @@ type Config struct {
 	// This prevents accumulation of zombie connections from clients that disconnect
 	// uncleanly. Default: 10 minutes. Set to 0 to disable.
 	IdleTimeout time.Duration
+
+	// MaxConnections is the maximum number of concurrent client connections.
+	// New connections are rejected when this limit is reached.
+	// Default: 0 (unlimited).
+	MaxConnections int
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -170,6 +180,9 @@ func New(cfg Config) (*Server, error) {
 
 	slog.Info("TLS enabled.", "cert_file", cfg.TLSCertFile)
 	slog.Info("Rate limiting enabled.", "max_failed_attempts", cfg.RateLimit.MaxFailedAttempts, "window", cfg.RateLimit.FailedAttemptWindow, "ban_duration", cfg.RateLimit.BanDuration)
+	if cfg.MaxConnections > 0 {
+		slog.Info("Connection limit enabled.", "max_connections", cfg.MaxConnections)
+	}
 	return s, nil
 }
 
@@ -617,6 +630,17 @@ func (s *Server) buildCredentialChainSecret() string {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
+
+	// Check global connection limit
+	if s.cfg.MaxConnections > 0 {
+		currentConns := atomic.LoadInt64(&s.activeConns)
+		if currentConns >= int64(s.cfg.MaxConnections) {
+			slog.Warn("Connection rejected: max connections reached.", "remote_addr", remoteAddr, "current", currentConns, "max", s.cfg.MaxConnections)
+			connectionLimitRejectsCounter.Inc()
+			_ = conn.Close()
+			return
+		}
+	}
 
 	// Check rate limiting before doing anything
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {

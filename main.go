@@ -18,14 +18,15 @@ import (
 
 // FileConfig represents the YAML configuration file structure
 type FileConfig struct {
-	Host       string              `yaml:"host"`
-	Port       int                 `yaml:"port"`
-	DataDir    string              `yaml:"data_dir"`
-	TLS        TLSConfig           `yaml:"tls"`
-	Users      map[string]string   `yaml:"users"`
-	RateLimit  RateLimitFileConfig `yaml:"rate_limit"`
-	Extensions []string            `yaml:"extensions"`
-	DuckLake   DuckLakeFileConfig  `yaml:"ducklake"`
+	Host           string              `yaml:"host"`
+	Port           int                 `yaml:"port"`
+	DataDir        string              `yaml:"data_dir"`
+	TLS            TLSConfig           `yaml:"tls"`
+	Users          map[string]string   `yaml:"users"`
+	RateLimit      RateLimitFileConfig `yaml:"rate_limit"`
+	Extensions     []string            `yaml:"extensions"`
+	DuckLake       DuckLakeFileConfig  `yaml:"ducklake"`
+	MaxConnections int                 `yaml:"max_connections"` // Maximum concurrent connections (0 = unlimited)
 }
 
 type TLSConfig struct {
@@ -109,12 +110,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG    Path to YAML config file\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST      Host to bind to (default: 0.0.0.0)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT      Port to listen on (default: 5432)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR  Directory for DuckDB files (default: ./data)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT      TLS certificate file (default: ./certs/server.crt)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY       TLS private key file (default: ./certs/server.key)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG           Path to YAML config file\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST             Host to bind to (default: 0.0.0.0)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT             Port to listen on (default: 5432)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR         Directory for DuckDB files (default: ./data)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT             TLS certificate file (default: ./certs/server.crt)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY              TLS private key file (default: ./certs/server.key)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_CONNECTIONS  Maximum concurrent connections (default: 0, unlimited)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
 
@@ -229,6 +231,11 @@ func main() {
 		if fileCfg.DuckLake.S3Profile != "" {
 			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
 		}
+
+		// Apply connection limit config
+		if fileCfg.MaxConnections > 0 {
+			cfg.MaxConnections = fileCfg.MaxConnections
+		}
 	}
 
 	// Apply environment variables (override config file)
@@ -281,6 +288,11 @@ func main() {
 	}
 	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
+	}
+	if v := os.Getenv("DUCKGRES_MAX_CONNECTIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.MaxConnections = n
+		}
 	}
 
 	// Apply CLI flags (highest priority)
