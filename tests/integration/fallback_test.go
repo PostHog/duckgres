@@ -428,9 +428,9 @@ func TestFallbackUtilityWithComments(t *testing.T) {
 		}
 
 		// Switch back and detach
-		_, err = db.Exec("/* back to ducklake */ USE ducklake")
+		_, err = db.Exec("/* back to main */ USE main")
 		if err != nil {
-			t.Fatalf("USE ducklake failed: %v", err)
+			t.Fatalf("USE main failed: %v", err)
 		}
 
 		_, err = db.Exec("/* cleanup */ DETACH comment_attach_test")

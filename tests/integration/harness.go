@@ -222,8 +222,8 @@ func (h *TestHarness) connectDuckgres() error {
 }
 
 // loadFixtures loads the test schema and data into Duckgres
-// In DuckLake mode, tables are automatically created in ducklake.main
-// because the server runs "USE ducklake" to set the default catalog
+// In DuckLake mode, tables are automatically created in main.main
+// because the server runs "USE main" to set the default catalog
 func (h *TestHarness) loadFixtures() error {
 	// In DuckLake mode, drop existing tables first since metadata persists
 	if h.useDuckLake {

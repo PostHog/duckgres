@@ -693,16 +693,16 @@ func initPgCatalog(db *sql.DB) error {
 
 // initInformationSchema creates the column metadata table and information_schema wrapper views.
 // This enables accurate type information (VARCHAR lengths, NUMERIC precision) in information_schema.
-// Views are created in memory.main (before USE ducklake) and query from unqualified information_schema,
+// Views are created in memory.main (before USE main) and query from unqualified information_schema,
 // which resolves to the default catalog's information_schema at query time.
 func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	// Use just "information_schema" without catalog prefix
-	// Views are created in memory.main (before USE ducklake) and query from information_schema
+	// Views are created in memory.main (before USE main) and query from information_schema
 	// which resolves to the current default catalog's information_schema at query time
 	infoSchemaPrefix := "information_schema"
 
 	// Create metadata table to store column type information that DuckDB doesn't preserve
-	// Table is created in main schema (which is memory.main before USE ducklake)
+	// Table is created in main schema (which is memory.main before USE main)
 	metadataTableSQL := `
 		CREATE TABLE IF NOT EXISTS main.__duckgres_column_metadata (
 			table_schema VARCHAR NOT NULL,
@@ -722,7 +722,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	// Transforms DuckDB type names to PostgreSQL-compatible names
 	// Maps: VARCHAR->text, BOOLEAN->boolean, INTEGER->integer, BIGINT->bigint,
 	//       TIMESTAMP->timestamp without time zone, DECIMAL->numeric, etc.
-	// Views are created in main schema (which is memory.main before USE ducklake)
+	// Views are created in main schema (which is memory.main before USE main)
 	columnsViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 		SELECT
@@ -1007,13 +1007,13 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 
 // recreatePgClassForDuckLake recreates pg_class_full to source from DuckDB's native
 // system functions (duckdb_tables, duckdb_views, etc.) filtered to only include
-// objects from the 'ducklake' catalog (user tables/views).
-// This excludes internal DuckLake metadata tables from '__ducklake_metadata_ducklake'.
+// objects from the 'main' catalog (DuckLake user tables/views).
+// This excludes internal DuckLake metadata tables from '__ducklake_metadata_main'.
 // Must be called AFTER DuckLake is attached.
 func recreatePgClassForDuckLake(db *sql.DB) error {
 	pgClassSQL := `
 		CREATE OR REPLACE VIEW pg_class_full AS
-		-- Tables from ducklake catalog
+		-- Tables from main catalog (DuckLake)
 		SELECT
 			table_oid AS oid,
 			table_name AS relname,
@@ -1052,7 +1052,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			NULL AS reloptions,
 			NULL AS relpartbound
 		FROM duckdb_tables()
-		WHERE database_name = 'ducklake'
+		WHERE database_name = 'main'
 		  AND table_name NOT IN (
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
@@ -1063,7 +1063,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
-		-- Views from ducklake catalog
+		-- Views from main catalog (DuckLake)
 		SELECT
 			view_oid AS oid,
 			view_name AS relname,
@@ -1102,7 +1102,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			NULL AS reloptions,
 			NULL AS relpartbound
 		FROM duckdb_views()
-		WHERE database_name = 'ducklake'
+		WHERE database_name = 'main'
 		  AND view_name NOT IN (
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
@@ -1113,7 +1113,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
-		-- Sequences from ducklake catalog
+		-- Sequences from main catalog (DuckLake)
 		SELECT
 			sequence_oid AS oid,
 			sequence_name AS relname,
@@ -1152,9 +1152,9 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			NULL AS reloptions,
 			NULL AS relpartbound
 		FROM duckdb_sequences()
-		WHERE database_name = 'ducklake'
+		WHERE database_name = 'main'
 		UNION ALL
-		-- Indexes from ducklake catalog
+		-- Indexes from main catalog (DuckLake)
 		SELECT
 			index_oid AS oid,
 			index_name AS relname,
@@ -1193,7 +1193,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 			NULL AS reloptions,
 			NULL AS relpartbound
 		FROM duckdb_indexes()
-		WHERE database_name = 'ducklake'
+		WHERE database_name = 'main'
 	`
 	_, err := db.Exec(pgClassSQL)
 	return err
@@ -1212,7 +1212,7 @@ func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 			CASE WHEN schema_name = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
 			NULL AS nspacl
 		FROM duckdb_tables()
-		WHERE database_name = 'ducklake'
+		WHERE database_name = 'main'
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err

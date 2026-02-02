@@ -461,7 +461,7 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 
 	// Check if DuckLake catalog is already attached
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'main'").Scan(&count)
 	if err == nil && count > 0 {
 		// Already attached
 		return nil
@@ -485,8 +485,8 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	}
 
 	// Build the ATTACH statement
-	// Format without data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake
-	// Format with data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake (DATA_PATH '<path>')
+	// Format without data path: ATTACH 'ducklake:<metadata_connection>' AS main
+	// Format with data path: ATTACH 'ducklake:<metadata_connection>' AS main (DATA_PATH '<path>')
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
 	var attachStmt string
 	dataPath := s.cfg.DuckLake.ObjectStore
@@ -494,11 +494,11 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 		dataPath = s.cfg.DuckLake.DataPath
 	}
 	if dataPath != "" {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
+		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS main (DATA_PATH '%s')",
 			s.cfg.DuckLake.MetadataStore, dataPath)
 		slog.Info("Attaching DuckLake catalog with data path.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore), "data", dataPath)
 	} else {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", s.cfg.DuckLake.MetadataStore)
+		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS main", s.cfg.DuckLake.MetadataStore)
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore))
 	}
 
@@ -523,7 +523,7 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 // setDuckLakeDefault sets the DuckLake catalog as the default so all queries use it.
 // This should be called AFTER creating per-connection views in memory.main.
 func setDuckLakeDefault(db *sql.DB) error {
-	if _, err := db.Exec("USE ducklake"); err != nil {
+	if _, err := db.Exec("USE main"); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
 	}
 	slog.Info("Set DuckLake as default catalog.")

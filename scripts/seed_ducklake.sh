@@ -106,9 +106,9 @@ fi
 echo "Connected successfully!"
 echo ""
 
-# Check if DuckLake catalog is attached
+# Check if DuckLake catalog is attached (mounted as 'main')
 echo "Checking DuckLake catalog..."
-if ! run_sql "SHOW ALL TABLES" 2>&1 | grep -q "ducklake"; then
+if ! run_sql "SHOW ALL TABLES" 2>&1 | grep -q "__ducklake_metadata"; then
     echo "ERROR: DuckLake catalog is not attached."
     echo ""
     echo "Make sure duckgres.yaml has DuckLake configured with:"
@@ -123,13 +123,13 @@ echo ""
 # Clean existing tables if requested
 if [ "$CLEAN" = true ]; then
     echo "Cleaning existing tables..."
-    run_sql "DROP TABLE IF EXISTS ducklake.main.order_items" || true
-    run_sql "DROP TABLE IF EXISTS ducklake.main.orders" || true
-    run_sql "DROP TABLE IF EXISTS ducklake.main.products" || true
-    run_sql "DROP TABLE IF EXISTS ducklake.main.customers" || true
-    run_sql "DROP TABLE IF EXISTS ducklake.main.categories" || true
-    run_sql "DROP TABLE IF EXISTS ducklake.main.events" || true
-    run_sql "DROP TABLE IF EXISTS ducklake.main.page_views" || true
+    run_sql "DROP TABLE IF EXISTS main.main.order_items" || true
+    run_sql "DROP TABLE IF EXISTS main.main.orders" || true
+    run_sql "DROP TABLE IF EXISTS main.main.products" || true
+    run_sql "DROP TABLE IF EXISTS main.main.customers" || true
+    run_sql "DROP TABLE IF EXISTS main.main.categories" || true
+    run_sql "DROP TABLE IF EXISTS main.main.events" || true
+    run_sql "DROP TABLE IF EXISTS main.main.page_views" || true
     echo "Done!"
     echo ""
 fi
@@ -139,9 +139,9 @@ echo "(Data will be stored as Parquet files in MinIO)"
 echo ""
 
 # Create categories table
-echo "Creating ducklake.main.categories..."
+echo "Creating main.main.categories..."
 run_sql_script <<'EOF'
-CREATE TABLE IF NOT EXISTS ducklake.main.categories (
+CREATE TABLE IF NOT EXISTS main.main.categories (
     id INTEGER,
     name VARCHAR,
     description VARCHAR,
@@ -150,9 +150,9 @@ CREATE TABLE IF NOT EXISTS ducklake.main.categories (
 EOF
 
 # Create products table
-echo "Creating ducklake.main.products..."
+echo "Creating main.main.products..."
 run_sql_script <<'EOF'
-CREATE TABLE IF NOT EXISTS ducklake.main.products (
+CREATE TABLE IF NOT EXISTS main.main.products (
     id INTEGER,
     name VARCHAR,
     description VARCHAR,
@@ -167,9 +167,9 @@ CREATE TABLE IF NOT EXISTS ducklake.main.products (
 EOF
 
 # Create customers table
-echo "Creating ducklake.main.customers..."
+echo "Creating main.main.customers..."
 run_sql_script <<'EOF'
-CREATE TABLE IF NOT EXISTS ducklake.main.customers (
+CREATE TABLE IF NOT EXISTS main.main.customers (
     id INTEGER,
     email VARCHAR,
     first_name VARCHAR,
@@ -184,9 +184,9 @@ CREATE TABLE IF NOT EXISTS ducklake.main.customers (
 EOF
 
 # Create orders table
-echo "Creating ducklake.main.orders..."
+echo "Creating main.main.orders..."
 run_sql_script <<'EOF'
-CREATE TABLE IF NOT EXISTS ducklake.main.orders (
+CREATE TABLE IF NOT EXISTS main.main.orders (
     id INTEGER,
     customer_id INTEGER,
     order_date TIMESTAMP,
@@ -198,9 +198,9 @@ CREATE TABLE IF NOT EXISTS ducklake.main.orders (
 EOF
 
 # Create order_items table
-echo "Creating ducklake.main.order_items..."
+echo "Creating main.main.order_items..."
 run_sql_script <<'EOF'
-CREATE TABLE IF NOT EXISTS ducklake.main.order_items (
+CREATE TABLE IF NOT EXISTS main.main.order_items (
     id INTEGER,
     order_id INTEGER,
     product_id INTEGER,
@@ -211,9 +211,9 @@ CREATE TABLE IF NOT EXISTS ducklake.main.order_items (
 EOF
 
 # Create events table (analytics-style)
-echo "Creating ducklake.main.events..."
+echo "Creating main.main.events..."
 run_sql_script <<'EOF'
-CREATE TABLE IF NOT EXISTS ducklake.main.events (
+CREATE TABLE IF NOT EXISTS main.main.events (
     id INTEGER,
     event_name VARCHAR,
     distinct_id VARCHAR,
@@ -225,9 +225,9 @@ CREATE TABLE IF NOT EXISTS ducklake.main.events (
 EOF
 
 # Create page_views table
-echo "Creating ducklake.main.page_views..."
+echo "Creating main.main.page_views..."
 run_sql_script <<'EOF'
-CREATE TABLE IF NOT EXISTS ducklake.main.page_views (
+CREATE TABLE IF NOT EXISTS main.main.page_views (
     id INTEGER,
     visitor_id VARCHAR,
     page_path VARCHAR,
@@ -246,7 +246,7 @@ echo ""
 # Seed categories
 echo "Inserting categories..."
 run_sql_script <<'EOF'
-INSERT INTO ducklake.main.categories (id, name, description, created_at) VALUES
+INSERT INTO main.main.categories (id, name, description, created_at) VALUES
     (1, 'Electronics', 'Electronic devices and accessories', '2024-01-01 00:00:00'),
     (2, 'Clothing', 'Apparel and fashion items', '2024-01-01 00:00:00'),
     (3, 'Books', 'Physical and digital books', '2024-01-01 00:00:00'),
@@ -257,7 +257,7 @@ EOF
 # Seed products
 echo "Inserting products..."
 run_sql_script <<'EOF'
-INSERT INTO ducklake.main.products (id, name, description, category_id, price, stock_quantity, sku, is_active, created_at, updated_at) VALUES
+INSERT INTO main.main.products (id, name, description, category_id, price, stock_quantity, sku, is_active, created_at, updated_at) VALUES
     (1, 'Wireless Mouse', 'Ergonomic wireless mouse with USB receiver', 1, 29.99, 150, 'ELEC-001', true, '2024-01-01 00:00:00', '2024-01-01 00:00:00'),
     (2, 'Mechanical Keyboard', 'RGB mechanical keyboard with Cherry MX switches', 1, 149.99, 75, 'ELEC-002', true, '2024-01-01 00:00:00', '2024-01-01 00:00:00'),
     (3, 'USB-C Hub', '7-in-1 USB-C hub with HDMI and SD card reader', 1, 59.99, 200, 'ELEC-003', true, '2024-01-01 00:00:00', '2024-01-01 00:00:00'),
@@ -278,7 +278,7 @@ EOF
 # Seed customers
 echo "Inserting customers..."
 run_sql_script <<'EOF'
-INSERT INTO ducklake.main.customers (id, email, first_name, last_name, company, phone, country, city, created_at, last_login) VALUES
+INSERT INTO main.main.customers (id, email, first_name, last_name, company, phone, country, city, created_at, last_login) VALUES
     (1, 'alice@example.com', 'Alice', 'Johnson', 'Tech Corp', '+1-555-0101', 'USA', 'San Francisco', '2024-01-01 00:00:00', '2024-01-20 10:00:00'),
     (2, 'bob@example.com', 'Bob', 'Smith', 'Data Inc', '+1-555-0102', 'USA', 'New York', '2024-01-02 00:00:00', '2024-01-24 12:30:00'),
     (3, 'carol@example.com', 'Carol', 'Williams', 'Analytics Ltd', '+44-20-7123-4567', 'UK', 'London', '2024-01-03 00:00:00', '2024-01-17 09:15:00'),
@@ -294,7 +294,7 @@ EOF
 # Seed orders
 echo "Inserting orders..."
 run_sql_script <<'EOF'
-INSERT INTO ducklake.main.orders (id, customer_id, order_date, status, total_amount, shipping_address, notes) VALUES
+INSERT INTO main.main.orders (id, customer_id, order_date, status, total_amount, shipping_address, notes) VALUES
     (1, 1, '2024-01-15 10:30:00', 'completed', 179.98, '123 Tech Street, San Francisco, CA 94102', NULL),
     (2, 2, '2024-01-16 14:45:00', 'completed', 449.99, '456 Data Ave, New York, NY 10001', NULL),
     (3, 3, '2024-01-17 09:15:00', 'shipped', 94.98, '789 Analytics Rd, London, UK', 'Express shipping'),
@@ -312,7 +312,7 @@ EOF
 # Seed order items
 echo "Inserting order items..."
 run_sql_script <<'EOF'
-INSERT INTO ducklake.main.order_items (id, order_id, product_id, quantity, unit_price, discount_percent) VALUES
+INSERT INTO main.main.order_items (id, order_id, product_id, quantity, unit_price, discount_percent) VALUES
     (1, 1, 1, 1, 29.99, 0),
     (2, 1, 2, 1, 149.99, 0),
     (3, 2, 4, 1, 449.99, 0),
@@ -338,7 +338,7 @@ EOF
 # Seed events (analytics data)
 echo "Inserting events..."
 run_sql_script <<'EOF'
-INSERT INTO ducklake.main.events (id, event_name, distinct_id, properties, event_timestamp, session_id, page_url) VALUES
+INSERT INTO main.main.events (id, event_name, distinct_id, properties, event_timestamp, session_id, page_url) VALUES
     (1, 'page_view', 'user_001', '{"page": "/home", "referrer": "google.com"}', '2024-01-20 10:00:00', 'sess_abc123', 'https://example.com/home'),
     (2, 'button_click', 'user_001', '{"button": "signup", "variant": "blue"}', '2024-01-20 10:01:30', 'sess_abc123', 'https://example.com/home'),
     (3, 'signup', 'user_001', '{"method": "email", "plan": "free"}', '2024-01-20 10:05:00', 'sess_abc123', 'https://example.com/signup'),
@@ -359,7 +359,7 @@ EOF
 # Seed page_views
 echo "Inserting page views..."
 run_sql_script <<'EOF'
-INSERT INTO ducklake.main.page_views (id, visitor_id, page_path, referrer, user_agent, duration_seconds, view_timestamp) VALUES
+INSERT INTO main.main.page_views (id, visitor_id, page_path, referrer, user_agent, duration_seconds, view_timestamp) VALUES
     (1, 'v_001', '/', 'https://google.com', 'Mozilla/5.0 Chrome/120.0', 45, '2024-01-20 08:00:00'),
     (2, 'v_001', '/products', NULL, 'Mozilla/5.0 Chrome/120.0', 120, '2024-01-20 08:01:00'),
     (3, 'v_001', '/products/electronics', NULL, 'Mozilla/5.0 Chrome/120.0', 90, '2024-01-20 08:03:00'),
@@ -383,27 +383,27 @@ echo "=== Verifying Data ==="
 echo ""
 echo "Table row counts in DuckLake catalog:"
 echo "--------------------------------------"
-run_sql "SELECT 'categories' as table_name, COUNT(*) as rows FROM ducklake.main.categories"
-run_sql "SELECT 'products' as table_name, COUNT(*) as rows FROM ducklake.main.products"
-run_sql "SELECT 'customers' as table_name, COUNT(*) as rows FROM ducklake.main.customers"
-run_sql "SELECT 'orders' as table_name, COUNT(*) as rows FROM ducklake.main.orders"
-run_sql "SELECT 'order_items' as table_name, COUNT(*) as rows FROM ducklake.main.order_items"
-run_sql "SELECT 'events' as table_name, COUNT(*) as rows FROM ducklake.main.events"
-run_sql "SELECT 'page_views' as table_name, COUNT(*) as rows FROM ducklake.main.page_views"
+run_sql "SELECT 'categories' as table_name, COUNT(*) as rows FROM main.main.categories"
+run_sql "SELECT 'products' as table_name, COUNT(*) as rows FROM main.main.products"
+run_sql "SELECT 'customers' as table_name, COUNT(*) as rows FROM main.main.customers"
+run_sql "SELECT 'orders' as table_name, COUNT(*) as rows FROM main.main.orders"
+run_sql "SELECT 'order_items' as table_name, COUNT(*) as rows FROM main.main.order_items"
+run_sql "SELECT 'events' as table_name, COUNT(*) as rows FROM main.main.events"
+run_sql "SELECT 'page_views' as table_name, COUNT(*) as rows FROM main.main.page_views"
 
 echo ""
 echo "=== Sample Queries ==="
 echo ""
 echo "Top 5 products by price:"
-run_sql "SELECT name, price FROM ducklake.main.products ORDER BY price DESC LIMIT 5"
+run_sql "SELECT name, price FROM main.main.products ORDER BY price DESC LIMIT 5"
 
 echo ""
 echo "Orders by status:"
-run_sql "SELECT status, COUNT(*) as count FROM ducklake.main.orders GROUP BY status ORDER BY count DESC"
+run_sql "SELECT status, COUNT(*) as count FROM main.main.orders GROUP BY status ORDER BY count DESC"
 
 echo ""
 echo "Event types:"
-run_sql "SELECT event_name, COUNT(*) as count FROM ducklake.main.events GROUP BY event_name ORDER BY count DESC"
+run_sql "SELECT event_name, COUNT(*) as count FROM main.main.events GROUP BY event_name ORDER BY count DESC"
 
 echo ""
 echo "=== Seed Complete! ==="
@@ -417,9 +417,9 @@ echo "  Username: minioadmin"
 echo "  Password: minioadmin"
 echo ""
 echo "Sample queries to try:"
-echo "  SELECT * FROM ducklake.main.products LIMIT 5;"
-echo "  SELECT * FROM ducklake.main.orders WHERE status = 'completed';"
+echo "  SELECT * FROM main.main.products LIMIT 5;"
+echo "  SELECT * FROM main.main.orders WHERE status = 'completed';"
 echo "  SELECT c.first_name, c.last_name, COUNT(o.id) as order_count"
-echo "    FROM ducklake.main.customers c"
-echo "    JOIN ducklake.main.orders o ON c.id = o.customer_id"
+echo "    FROM main.main.customers c"
+echo "    JOIN main.main.orders o ON c.id = o.customer_id"
 echo "    GROUP BY c.first_name, c.last_name;"
