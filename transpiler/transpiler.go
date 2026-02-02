@@ -39,6 +39,9 @@ func New(cfg Config) *Transpiler {
 	// 3. information_schema mappings to compat views
 	t.transforms = append(t.transforms, transform.NewInformationSchemaTransformWithConfig(cfg.DuckLakeMode))
 
+	// 3.1 Map PostgreSQL "public" schema to DuckDB "main"
+	t.transforms = append(t.transforms, transform.NewPublicSchemaTransform())
+
 	// 4. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, transform.NewTypeMappingTransform())
 

@@ -260,6 +260,51 @@ func TestTranspile_PgCatalog_DuckLakeMode(t *testing.T) {
 	}
 }
 
+func TestTranspile_PublicSchema(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "public table ref -> main",
+			input:    "SELECT id, name, created_at FROM public.airflow_test",
+			contains: "main.airflow_test",
+			excludes: "public.airflow_test",
+		},
+		{
+			name:     "public insert target -> main",
+			input:    "INSERT INTO public.airflow_test (id) VALUES (1)",
+			contains: "main.airflow_test",
+			excludes: "public.airflow_test",
+		},
+		{
+			name:     "public DDL target -> main",
+			input:    "CREATE TABLE public.new_table (id INT)",
+			contains: "main.new_table",
+			excludes: "public.new_table",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
 func TestTranspile_TypeCast(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -276,8 +321,8 @@ func TestTranspile_TypeCast(t *testing.T) {
 		{
 			name:     "regclass cast from unqualified oid - fallback to varchar (avoids shadowing)",
 			input:    "SELECT oid::pg_catalog.regclass FROM pg_class",
-			contains: "varchar",                // Should fallback, NOT produce subquery
-			excludes: "select relname from",    // Must NOT produce shadowing subquery
+			contains: "varchar",             // Should fallback, NOT produce subquery
+			excludes: "select relname from", // Must NOT produce shadowing subquery
 		},
 		{
 			name:     "regclass cast from string literal",
@@ -1153,9 +1198,9 @@ func TestTranspile_ExpandArray(t *testing.T) {
 			name:  "_pg_expandarray with field access .n",
 			input: "SELECT (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ FROM pg_index i",
 			contains: []string{
-				"_pg_exp_1.n",                                     // field access replaced
-				"unnest(i.indkey)",                                // LATERAL join added
-				"generate_subscripts(i.indkey, 1)",                // index generation added
+				"_pg_exp_1.n",                      // field access replaced
+				"unnest(i.indkey)",                 // LATERAL join added
+				"generate_subscripts(i.indkey, 1)", // index generation added
 			},
 			excludes: []string{
 				"_pg_expandarray", // original function removed
