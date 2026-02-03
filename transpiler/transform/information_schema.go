@@ -208,6 +208,20 @@ func (t *InformationSchemaTransform) walkAndTransform(node *pg_query.Node, chang
 				t.walkAndTransform(item, changed)
 			}
 		}
+
+	case *pg_query.Node_ColumnRef:
+		// Rewrite qualified column references to match renamed tables
+		if n.ColumnRef != nil && len(n.ColumnRef.Fields) >= 2 {
+			if first := n.ColumnRef.Fields[0]; first != nil {
+				if str := first.GetString_(); str != nil {
+					tableName := strings.ToLower(str.Sval)
+					if newName, ok := t.ViewMappings[tableName]; ok {
+						str.Sval = newName
+						*changed = true
+					}
+				}
+			}
+		}
 	}
 }
 

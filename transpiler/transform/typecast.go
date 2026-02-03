@@ -18,6 +18,7 @@ type TypeCastTransform struct {
 func NewTypeCastTransform() *TypeCastTransform {
 	return &TypeCastTransform{
 		TypeMappings: map[string]string{
+			// PostgreSQL reg* types -> varchar
 			"regtype":       "varchar",
 			"regnamespace":  "varchar",
 			"regproc":       "varchar",
@@ -26,8 +27,27 @@ func NewTypeCastTransform() *TypeCastTransform {
 			"regprocedure":  "varchar",
 			"regconfig":     "varchar",
 			"regdictionary": "varchar",
-			"text":          "varchar",
 			// Note: regclass is handled specially - converted to subquery lookup
+
+			// String types
+			"text": "varchar",
+			"name": "varchar", // PostgreSQL internal name type
+
+			// JSON types
+			"json":  "json",
+			"jsonb": "json",
+
+			// Types that just need pg_catalog prefix stripped
+			"decimal":  "decimal",
+			"boolean":  "boolean",
+			"date":     "date",
+			"uuid":     "uuid",
+			"bit":      "bit",
+
+			// Types that need conversion
+			"xml":    "varchar",
+			"varbit": "varchar",
+			"oid":    "integer",
 		},
 	}
 }
