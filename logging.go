@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
+	"time"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
@@ -110,7 +112,12 @@ func initLogging() func() {
 
 	slog.Info("PostHog logging enabled.", "host", host)
 
+	var once sync.Once
 	return func() {
-		_ = provider.Shutdown(context.Background())
+		once.Do(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = provider.Shutdown(ctx)
+		})
 	}
 }
