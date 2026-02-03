@@ -1994,6 +1994,116 @@ func TestTranspile_TypeCast_JsonType(t *testing.T) {
 	}
 }
 
+func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
+	// Test SQL standard syntax functions (COERCE_SQL_SYNTAX functions)
+	// These use special syntax like EXTRACT(year FROM date) instead of regular function calls.
+	// The pg_query deparser only outputs SQL syntax when BOTH:
+	// 1. funcformat = COERCE_SQL_SYNTAX
+	// 2. function has pg_catalog prefix
+	//
+	// For functions that map to the same name (extract→extract), we preserve the prefix
+	// so SQL syntax is preserved. For renamed functions (btrim→trim), we strip the prefix
+	// so it outputs as a regular function call.
+	tests := []struct {
+		name     string
+		input    string
+		contains []string // all must be present
+		excludes []string // none must be present
+	}{
+		// Same-name mappings - should preserve SQL syntax
+		{
+			name:     "EXTRACT preserves SQL syntax with FROM keyword",
+			input:    "SELECT EXTRACT(year FROM DATE '2020-01-01')",
+			contains: []string{"extract", " from "}, // SQL syntax uses FROM keyword
+			excludes: []string{`"extract"(`},        // should NOT be quoted function call format
+		},
+		{
+			name:     "SUBSTRING preserves SQL syntax with FROM FOR keywords",
+			input:    "SELECT SUBSTRING('hello' FROM 2 FOR 3)",
+			contains: []string{"substring", " from ", " for "}, // SQL syntax uses FROM...FOR
+			excludes: []string{`"substring"(`},                 // should NOT be quoted function call
+		},
+		{
+			name:     "EXTRACT with different field",
+			input:    "SELECT EXTRACT(month FROM timestamp '2020-06-15 10:30:00')",
+			contains: []string{"extract", " from "},
+			excludes: []string{`"extract"(`},
+		},
+
+		// Unmapped SQL syntax functions - should pass through unchanged
+		{
+			name:     "POSITION preserves SQL syntax with IN keyword",
+			input:    "SELECT POSITION('a' IN 'abc')",
+			contains: []string{"position", " in "},
+			excludes: []string{`"position"(`},
+		},
+		{
+			name:     "OVERLAY preserves SQL syntax with PLACING FROM FOR keywords",
+			input:    "SELECT OVERLAY('hello' PLACING 'XX' FROM 2 FOR 3)",
+			contains: []string{"overlay", " placing ", " from "},
+			excludes: []string{`"overlay"(`},
+		},
+
+		// Renamed SQL syntax functions - btrim->trim strips prefix, uses function call
+		{
+			name:     "TRIM BOTH (btrim->trim) uses function call",
+			input:    "SELECT TRIM(BOTH ' ' FROM '  hello  ')",
+			contains: []string{"trim"},
+			excludes: []string{"pg_catalog"}, // prefix should be stripped since name changes
+		},
+
+		// Same-name SQL syntax functions - ltrim/rtrim map to themselves, SQL syntax preserved
+		{
+			name:     "TRIM LEADING preserves SQL syntax",
+			input:    "SELECT TRIM(LEADING ' ' FROM '  hello  ')",
+			contains: []string{"trim", "leading"}, // SQL syntax preserved
+			excludes: []string{`"ltrim"(`},
+		},
+		{
+			name:     "TRIM TRAILING preserves SQL syntax",
+			input:    "SELECT TRIM(TRAILING ' ' FROM '  hello  ')",
+			contains: []string{"trim", "trailing"}, // SQL syntax preserved
+			excludes: []string{`"rtrim"(`},
+		},
+
+		// Complex expressions with SQL syntax functions
+		{
+			name:     "EXTRACT in expression preserves SQL syntax",
+			input:    "SELECT EXTRACT(year FROM created_at) + 1 FROM events",
+			contains: []string{"extract", " from created_at"}, // SQL syntax uses FROM keyword
+			excludes: []string{`"extract"(`},
+		},
+		{
+			name:     "Multiple SQL syntax functions",
+			input:    "SELECT EXTRACT(year FROM d), SUBSTRING(s FROM 1 FOR 5) FROM t",
+			contains: []string{"extract", "substring", " from d"},
+			excludes: []string{`"extract"(`, `"substring"(`},
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			lowerSQL := strings.ToLower(result.SQL)
+			for _, c := range tt.contains {
+				if !strings.Contains(lowerSQL, strings.ToLower(c)) {
+					t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, c)
+				}
+			}
+			for _, e := range tt.excludes {
+				if strings.Contains(lowerSQL, strings.ToLower(e)) {
+					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, e)
+				}
+			}
+		})
+	}
+}
+
 func TestTranspile_FallbackParamCount(t *testing.T) {
 	// Test that when pg_query fails to parse DuckDB-specific syntax,
 	// the transpiler still correctly counts $N parameter placeholders
