@@ -47,6 +47,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_inherits":           "pg_inherits",
 			"pg_matviews":           "pg_matviews",
 			"pg_stat_user_tables":   "pg_stat_user_tables",
+			"pg_statio_user_tables": "pg_statio_user_tables",
 			"pg_stat_statements":    "pg_stat_statements",
 			"pg_partitioned_table":  "pg_partitioned_table",
 			"pg_type":               "pg_type",

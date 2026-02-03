@@ -93,7 +93,7 @@ func initPgCatalog(db *sql.DB) error {
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
 			'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
@@ -330,7 +330,7 @@ func initPgCatalog(db *sql.DB) error {
 		CREATE OR REPLACE VIEW pg_stat_user_tables AS
 		SELECT
 			c.oid AS relid,
-			n.nspname AS schemaname,
+			CASE WHEN n.nspname = 'main' THEN 'public' ELSE n.nspname END AS schemaname,
 			c.relname AS relname,
 			0::BIGINT AS seq_scan,
 			0::BIGINT AS seq_tup_read,
@@ -359,6 +359,31 @@ func initPgCatalog(db *sql.DB) error {
 	`
 	if _, err := db.Exec(pgStatUserTablesSQL); err != nil {
 		slog.Warn("Failed to create pg_stat_user_tables view.", "error", err)
+	}
+
+	// Create pg_statio_user_tables view (table I/O statistics)
+	// DuckDB doesn't track PostgreSQL-style buffer cache hit/read stats, so return 0s.
+	pgStatioUserTablesSQL := `
+		CREATE OR REPLACE VIEW pg_statio_user_tables AS
+		SELECT
+			c.oid AS relid,
+			CASE WHEN n.nspname = 'main' THEN 'public' ELSE n.nspname END AS schemaname,
+			c.relname AS relname,
+			0::BIGINT AS heap_blks_read,
+			0::BIGINT AS heap_blks_hit,
+			0::BIGINT AS idx_blks_read,
+			0::BIGINT AS idx_blks_hit,
+			0::BIGINT AS toast_blks_read,
+			0::BIGINT AS toast_blks_hit,
+			0::BIGINT AS tidx_blks_read,
+			0::BIGINT AS tidx_blks_hit
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+		WHERE c.relkind IN ('r', 'p')
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+	`
+	if _, err := db.Exec(pgStatioUserTablesSQL); err != nil {
+		slog.Warn("Failed to create pg_statio_user_tables view.", "error", err)
 	}
 
 	// Create pg_namespace wrapper that maps 'main' to 'public' for PostgreSQL compatibility
@@ -922,7 +947,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
-			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table', 'pg_attribute',
+			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -989,7 +1014,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
-			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table', 'pg_attribute',
+			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -1054,13 +1079,13 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 		FROM duckdb_tables()
 		WHERE database_name = 'ducklake'
 		  AND table_name NOT IN (
-			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
-			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
-			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-			'pg_attribute',
-			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', '__duckgres_column_metadata'
+				'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
+				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
+				'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
+				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+				'pg_attribute',
+				'information_schema_columns_compat', 'information_schema_tables_compat',
+				'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
 		-- Views from ducklake catalog
@@ -1104,13 +1129,13 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 		FROM duckdb_views()
 		WHERE database_name = 'ducklake'
 		  AND view_name NOT IN (
-			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
-			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
-			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-			'pg_attribute',
-			'information_schema_columns_compat', 'information_schema_tables_compat',
-			'information_schema_schemata_compat', '__duckgres_column_metadata'
+				'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
+				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
+				'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
+				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
+				'pg_attribute',
+				'information_schema_columns_compat', 'information_schema_tables_compat',
+				'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
 		UNION ALL
 		-- Sequences from ducklake catalog
