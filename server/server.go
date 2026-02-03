@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"regexp"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -349,6 +350,16 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
+	}
+
+	// Set DuckDB threads to 4x the number of CPUs for better parallelism
+	numCPU := runtime.NumCPU()
+	threads := numCPU * 4
+	if _, err := db.Exec(fmt.Sprintf("SET threads = %d", threads)); err != nil {
+		slog.Warn("Failed to set DuckDB threads.", "threads", threads, "error", err)
+		// Continue anyway - DuckDB will use its default
+	} else {
+		slog.Debug("Set DuckDB threads.", "threads", threads, "cpus", numCPU)
 	}
 
 	// Load configured extensions
