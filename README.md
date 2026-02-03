@@ -15,6 +15,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
   - [YAML Configuration](#yaml-configuration)
   - [Environment Variables](#environment-variables)
   - [CLI Flags](#cli-flags)
+  - [PostHog Logging](#posthog-logging)
 - [DuckDB Extensions](#duckdb-extensions)
 - [DuckLake Integration](#ducklake-integration)
   - [Quick Start with Docker](#quick-start-with-docker)
@@ -147,6 +148,28 @@ Run with config file:
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
+| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
+| `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
+| `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` in PostHog logs (e.g., `duckgres-acme`); only used when `POSTHOG_API_KEY` is set | - |
+
+### PostHog Logging
+
+Duckgres can optionally export structured logs to [PostHog Logs](https://posthog.com/docs/logs) via the OpenTelemetry Protocol (OTLP). Logs are always written to stderr regardless of this setting.
+
+To enable, set your PostHog project API key:
+
+```bash
+export POSTHOG_API_KEY=phc_your_project_api_key
+./duckgres
+```
+
+For EU Cloud or self-hosted PostHog instances, override the ingest host:
+
+```bash
+export POSTHOG_API_KEY=phc_your_project_api_key
+export POSTHOG_HOST=eu.i.posthog.com
+./duckgres
+```
 
 ### CLI Flags
 

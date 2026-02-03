@@ -120,6 +120,15 @@ func main() {
 
 	flag.Parse()
 
+	loggingShutdown := initLogging()
+	defer loggingShutdown()
+
+	fatal := func(msg string) {
+		slog.Error(msg)
+		loggingShutdown()
+		os.Exit(1)
+	}
+
 	if *showHelp {
 		flag.Usage()
 		os.Exit(0)
@@ -304,21 +313,18 @@ func main() {
 
 	// Create data directory if it doesn't exist
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
-		slog.Error("Failed to create data directory: " + err.Error())
-		os.Exit(1)
+		fatal("Failed to create data directory: " + err.Error())
 	}
 
 	// Auto-generate self-signed certificates if they don't exist
 	if err := server.EnsureCertificates(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
-		slog.Error("Failed to ensure TLS certificates: " + err.Error())
-		os.Exit(1)
+		fatal("Failed to ensure TLS certificates: " + err.Error())
 	}
 	slog.Info("Using TLS certificates", "cert_file", cfg.TLSCertFile, "key_file", cfg.TLSKeyFile)
 
 	srv, err := server.New(cfg)
 	if err != nil {
-		slog.Error("Failed to create server: " + err.Error())
-		os.Exit(1)
+		fatal("Failed to create server: " + err.Error())
 	}
 
 	// Handle graceful shutdown
@@ -329,12 +335,12 @@ func main() {
 		<-sigChan
 		slog.Info("Shutting down...")
 		_ = srv.Close()
+		loggingShutdown()
 		os.Exit(0)
 	}()
 
 	slog.Info("Starting Duckgres server (TLS required)", "host", cfg.Host, "port", cfg.Port)
 	if err := srv.ListenAndServe(); err != nil {
-		slog.Error("Server error: " + err.Error())
-		os.Exit(1)
+		fatal("Server error: " + err.Error())
 	}
 }
