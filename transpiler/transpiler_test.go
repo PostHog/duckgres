@@ -1933,6 +1933,112 @@ func TestTranspile_TypeCast_JsonType(t *testing.T) {
 	}
 }
 
+func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
+	// Test SQL standard syntax functions (COERCE_SQL_SYNTAX functions)
+	// These use special syntax like EXTRACT(year FROM date) instead of regular function calls.
+	// The pg_query deparser only outputs SQL syntax when BOTH:
+	// 1. funcformat = COERCE_SQL_SYNTAX
+	// 2. function has pg_catalog prefix
+	//
+	// For functions that map to the same name (extract→extract), we preserve the prefix
+	// so SQL syntax is preserved. For renamed functions (btrim→trim), we strip the prefix
+	// so it outputs as a regular function call.
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		// Same-name mappings - should preserve SQL syntax
+		{
+			name:     "EXTRACT preserves SQL syntax",
+			input:    "SELECT EXTRACT(year FROM DATE '2020-01-01')",
+			contains: "extract",
+			excludes: "",
+		},
+		{
+			name:     "SUBSTRING preserves SQL syntax",
+			input:    "SELECT SUBSTRING('hello' FROM 2 FOR 3)",
+			contains: "SUBSTRING",
+			excludes: "",
+		},
+		{
+			name:     "EXTRACT with different field",
+			input:    "SELECT EXTRACT(month FROM timestamp '2020-06-15 10:30:00')",
+			contains: "extract",
+			excludes: "",
+		},
+
+		// Unmapped SQL syntax functions - should pass through unchanged
+		{
+			name:     "POSITION preserves SQL syntax",
+			input:    "SELECT POSITION('a' IN 'abc')",
+			contains: "POSITION",
+			excludes: "",
+		},
+		{
+			name:     "OVERLAY preserves SQL syntax",
+			input:    "SELECT OVERLAY('hello' PLACING 'XX' FROM 2 FOR 3)",
+			contains: "OVERLAY",
+			excludes: "",
+		},
+
+		// Renamed SQL syntax functions - btrim->trim strips prefix, uses function call
+		{
+			name:     "TRIM BOTH (btrim->trim) uses function call",
+			input:    "SELECT TRIM(BOTH ' ' FROM '  hello  ')",
+			contains: "trim",
+			excludes: "pg_catalog", // prefix should be stripped since name changes
+		},
+
+		// Same-name SQL syntax functions - ltrim/rtrim map to themselves, SQL syntax preserved
+		{
+			name:     "TRIM LEADING preserves SQL syntax",
+			input:    "SELECT TRIM(LEADING ' ' FROM '  hello  ')",
+			contains: "TRIM", // SQL syntax preserved (LEADING)
+			excludes: "",
+		},
+		{
+			name:     "TRIM TRAILING preserves SQL syntax",
+			input:    "SELECT TRIM(TRAILING ' ' FROM '  hello  ')",
+			contains: "TRIM", // SQL syntax preserved (TRAILING)
+			excludes: "",
+		},
+
+		// Complex expressions with SQL syntax functions
+		{
+			name:     "EXTRACT in expression",
+			input:    "SELECT EXTRACT(year FROM created_at) + 1 FROM events",
+			contains: "extract",
+			excludes: "",
+		},
+		{
+			name:     "Multiple SQL syntax functions",
+			input:    "SELECT EXTRACT(year FROM d), SUBSTRING(s FROM 1 FOR 5) FROM t",
+			contains: "extract",
+			excludes: "",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			lowerSQL := strings.ToLower(result.SQL)
+			if tt.contains != "" && !strings.Contains(lowerSQL, strings.ToLower(tt.contains)) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(lowerSQL, strings.ToLower(tt.excludes)) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
 func TestTranspile_FallbackParamCount(t *testing.T) {
 	// Test that when pg_query fails to parse DuckDB-specific syntax,
 	// the transpiler still correctly counts $N parameter placeholders
