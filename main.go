@@ -120,6 +120,9 @@ func main() {
 
 	flag.Parse()
 
+	loggingShutdown := initLogging()
+	defer loggingShutdown()
+
 	if *showHelp {
 		flag.Usage()
 		os.Exit(0)
