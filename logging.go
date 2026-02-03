@@ -84,7 +84,7 @@ func initLogging() func() {
 		}),
 	)
 	if err != nil {
-		slog.Error("Failed to create PostHog log exporter, continuing with stderr only.", "error", err)
+		fmt.Fprintf(os.Stderr, "Failed to create PostHog log exporter, continuing with stderr only: %v\n", err)
 		return func() {}
 	}
 
