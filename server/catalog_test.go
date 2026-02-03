@@ -114,3 +114,48 @@ func TestPgDatabaseViewContent(t *testing.T) {
 		t.Errorf("Expected %d rows, got %d", len(expected), i)
 	}
 }
+
+func TestPgStatioUserTablesViewColumns(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := initPgCatalog(db); err != nil {
+		t.Fatalf("Failed to init pg_catalog: %v", err)
+	}
+
+	expectedColumns := []string{
+		"relid", "schemaname", "relname",
+		"heap_blks_read", "heap_blks_hit",
+		"idx_blks_read", "idx_blks_hit",
+		"toast_blks_read", "toast_blks_hit",
+		"tidx_blks_read", "tidx_blks_hit",
+	}
+
+	rows, err := db.Query("SELECT * FROM pg_statio_user_tables LIMIT 1")
+	if err != nil {
+		t.Fatalf("Failed to query pg_statio_user_tables: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("Failed to get columns: %v", err)
+	}
+
+	if len(columns) != len(expectedColumns) {
+		t.Errorf("Expected %d columns, got %d", len(expectedColumns), len(columns))
+	}
+
+	for i, expected := range expectedColumns {
+		if i >= len(columns) {
+			t.Errorf("Missing column %d: %s", i, expected)
+			continue
+		}
+		if columns[i] != expected {
+			t.Errorf("Column %d: expected %q, got %q", i, expected, columns[i])
+		}
+	}
+}

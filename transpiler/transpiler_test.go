@@ -59,6 +59,12 @@ func TestTranspile_PgCatalog(t *testing.T) {
 			excludes: "pg_catalog",
 		},
 		{
+			name:     "pg_catalog.pg_statio_user_tables -> memory.main.pg_statio_user_tables",
+			input:    "SELECT * FROM pg_catalog.pg_statio_user_tables",
+			contains: "memory.main.pg_statio_user_tables",
+			excludes: "pg_catalog",
+		},
+		{
 			name:     "pg_catalog function prefix stripped",
 			input:    "SELECT pg_catalog.pg_get_userbyid(1)",
 			contains: "pg_get_userbyid",
@@ -242,6 +248,16 @@ func TestTranspile_PgCatalog_DuckLakeMode(t *testing.T) {
 			name:     "pg_catalog.pg_namespace -> memory.main.pg_namespace",
 			input:    "SELECT * FROM pg_catalog.pg_namespace",
 			contains: "memory.main.pg_namespace",
+		},
+		{
+			name:     "pg_catalog.pg_statio_user_tables -> memory.main.pg_statio_user_tables",
+			input:    "SELECT * FROM pg_catalog.pg_statio_user_tables",
+			contains: "memory.main.pg_statio_user_tables",
+		},
+		{
+			name:     "unqualified pg_statio_user_tables -> memory.main.pg_statio_user_tables",
+			input:    "SELECT * FROM pg_statio_user_tables",
+			contains: "memory.main.pg_statio_user_tables",
 		},
 	}
 
@@ -1603,11 +1619,11 @@ func TestTranspile_FallbackToNative(t *testing.T) {
 	tr := New(DefaultConfig())
 
 	tests := []struct {
-		name             string
-		input            string
-		wantFallback     bool
-		wantSQL          string // expected SQL in result (original for fallback)
-		wantErrNil       bool   // whether err should be nil
+		name         string
+		input        string
+		wantFallback bool
+		wantSQL      string // expected SQL in result (original for fallback)
+		wantErrNil   bool   // whether err should be nil
 	}{
 		{
 			name:         "valid PostgreSQL - no fallback",
