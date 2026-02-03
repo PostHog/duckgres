@@ -27,6 +27,8 @@ func NewTypeCastTransform() *TypeCastTransform {
 			"regconfig":     "varchar",
 			"regdictionary": "varchar",
 			"text":          "varchar",
+			"json":          "json",
+			"jsonb":         "json",
 			// Note: regclass is handled specially - converted to subquery lookup
 		},
 	}
