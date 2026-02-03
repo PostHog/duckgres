@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 
@@ -15,6 +16,7 @@ type multiHandler struct {
 	handlers []slog.Handler
 }
 
+// Enabled returns true if any underlying handler is enabled for the given level.
 func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	for _, h := range m.handlers {
 		if h.Enabled(ctx, level) {
@@ -24,6 +26,7 @@ func (m *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return false
 }
 
+// Handle dispatches the log record to each underlying handler that is enabled for the record's level.
 func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
 	for _, h := range m.handlers {
 		if h.Enabled(ctx, r.Level) {
@@ -33,6 +36,7 @@ func (m *multiHandler) Handle(ctx context.Context, r slog.Record) error {
 	return nil
 }
 
+// WithAttrs returns a new multiHandler with the given attributes applied to all underlying handlers.
 func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	handlers := make([]slog.Handler, len(m.handlers))
 	for i, h := range m.handlers {
@@ -41,6 +45,7 @@ func (m *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &multiHandler{handlers: handlers}
 }
 
+// WithGroup returns a new multiHandler with the given group name applied to all underlying handlers.
 func (m *multiHandler) WithGroup(name string) slog.Handler {
 	handlers := make([]slog.Handler, len(m.handlers))
 	for i, h := range m.handlers {
@@ -55,8 +60,10 @@ func (m *multiHandler) WithGroup(name string) slog.Handler {
 func initLogging() func() {
 	apiKey := os.Getenv("POSTHOG_API_KEY")
 	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
 		return func() {}
 	}
+	fmt.Fprintln(os.Stderr, "PostHog logging enabled, configuring OTLP exporter...")
 
 	host := os.Getenv("POSTHOG_HOST")
 	if host == "" {
