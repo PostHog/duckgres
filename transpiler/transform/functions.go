@@ -188,8 +188,14 @@ func (t *FunctionTransform) transformFuncCall(fc *pg_query.FuncCall) bool {
 			str.Sval = newName
 		}
 
-		// Remove schema prefix if present
-		if len(fc.Funcname) > 1 {
+		// Remove schema prefix if present, BUT preserve pg_catalog for functions
+		// using SQL syntax (COERCE_SQL_SYNTAX) like EXTRACT(field FROM source)
+		// because the deparser only outputs the special syntax with the prefix.
+		// However, only preserve the prefix when the function name stays the same.
+		// If we rename the function (like btrim -> trim), the deparser won't recognize
+		// it as SQL syntax anymore, so we must strip the prefix.
+		preservePrefix := fc.Funcformat == pg_query.CoercionForm_COERCE_SQL_SYNTAX && funcName == newName
+		if len(fc.Funcname) > 1 && !preservePrefix {
 			if first := fc.Funcname[0].GetString_(); first != nil {
 				schema := strings.ToLower(first.Sval)
 				if schema == "pg_catalog" || schema == "public" {
