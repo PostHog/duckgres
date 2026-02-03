@@ -150,6 +150,7 @@ Run with config file:
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
+| `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` in PostHog logs (e.g., `duckgres-acme`); only used when `POSTHOG_API_KEY` is set | - |
 
 ### PostHog Logging
 

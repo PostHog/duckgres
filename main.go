@@ -332,6 +332,7 @@ func main() {
 		<-sigChan
 		slog.Info("Shutting down...")
 		_ = srv.Close()
+		loggingShutdown()
 		os.Exit(0)
 	}()
 
