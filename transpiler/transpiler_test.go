@@ -2052,3 +2052,99 @@ func TestTranspile_FallbackParamCount(t *testing.T) {
 		})
 	}
 }
+
+func TestTranspile_RegexOperators(t *testing.T) {
+	// Test regex operator transformation from PostgreSQL to DuckDB
+	// PostgreSQL: text ~ pattern -> DuckDB: regexp_matches(text, pattern)
+	// PostgreSQL: text ~* pattern -> DuckDB: regexp_matches(text, pattern, 'i')
+	// PostgreSQL: text !~ pattern -> DuckDB: NOT regexp_matches(text, pattern)
+	// PostgreSQL: text !~* pattern -> DuckDB: NOT regexp_matches(text, pattern, 'i')
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "case-sensitive regex match",
+			input:    "SELECT * FROM users WHERE name ~ '^A'",
+			contains: "regexp_matches",
+			excludes: " ~ ",
+		},
+		{
+			name:     "case-insensitive regex match",
+			input:    "SELECT * FROM users WHERE name ~* '^a'",
+			contains: "regexp_matches",
+			excludes: " ~* ",
+		},
+		{
+			name:     "case-sensitive regex NOT match",
+			input:    "SELECT * FROM users WHERE name !~ '^A'",
+			contains: "NOT regexp_matches",
+			excludes: " !~ ",
+		},
+		{
+			name:     "case-insensitive regex NOT match",
+			input:    "SELECT * FROM users WHERE name !~* '^a'",
+			contains: "NOT regexp_matches",
+			excludes: " !~* ",
+		},
+		{
+			name:     "case-insensitive includes 'i' flag",
+			input:    "SELECT * FROM users WHERE name ~* 'pattern'",
+			contains: "'i'",
+		},
+		{
+			name:     "regex in SELECT expression",
+			input:    "SELECT name ~ 'test' AS matches FROM users",
+			contains: "regexp_matches",
+		},
+		{
+			name:     "regex in JOIN condition",
+			input:    "SELECT * FROM users u JOIN emails e ON e.email ~ u.pattern",
+			contains: "regexp_matches",
+		},
+		{
+			name:     "regex with column references",
+			input:    "SELECT * FROM patterns WHERE subject ~ regex_pattern",
+			contains: "regexp_matches(subject, regex_pattern)",
+		},
+		{
+			name:     "regex in CASE expression",
+			input:    "SELECT CASE WHEN name ~ '^A' THEN 'A' ELSE 'Other' END FROM users",
+			contains: "regexp_matches(name, '^A')",
+		},
+		{
+			name:     "regex combined with AND",
+			input:    "SELECT * FROM users WHERE name ~ '^A' AND active = true",
+			contains: "regexp_matches",
+		},
+		{
+			name:     "regex combined with OR",
+			input:    "SELECT * FROM users WHERE name ~ '^A' OR name ~ '^B'",
+			contains: "regexp_matches",
+		},
+		{
+			name:     "regex in CTE",
+			input:    "WITH filtered AS (SELECT * FROM users WHERE name ~ '^A') SELECT * FROM filtered",
+			contains: "regexp_matches",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, want to contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
