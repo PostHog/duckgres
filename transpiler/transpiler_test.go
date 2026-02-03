@@ -1946,77 +1946,77 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
-		contains string
-		excludes string
+		contains []string // all must be present
+		excludes []string // none must be present
 	}{
 		// Same-name mappings - should preserve SQL syntax
 		{
-			name:     "EXTRACT preserves SQL syntax",
+			name:     "EXTRACT preserves SQL syntax with FROM keyword",
 			input:    "SELECT EXTRACT(year FROM DATE '2020-01-01')",
-			contains: "extract",
-			excludes: "",
+			contains: []string{"extract", " from "}, // SQL syntax uses FROM keyword
+			excludes: []string{`"extract"(`},        // should NOT be quoted function call format
 		},
 		{
-			name:     "SUBSTRING preserves SQL syntax",
+			name:     "SUBSTRING preserves SQL syntax with FROM FOR keywords",
 			input:    "SELECT SUBSTRING('hello' FROM 2 FOR 3)",
-			contains: "SUBSTRING",
-			excludes: "",
+			contains: []string{"substring", " from ", " for "}, // SQL syntax uses FROM...FOR
+			excludes: []string{`"substring"(`},                 // should NOT be quoted function call
 		},
 		{
 			name:     "EXTRACT with different field",
 			input:    "SELECT EXTRACT(month FROM timestamp '2020-06-15 10:30:00')",
-			contains: "extract",
-			excludes: "",
+			contains: []string{"extract", " from "},
+			excludes: []string{`"extract"(`},
 		},
 
 		// Unmapped SQL syntax functions - should pass through unchanged
 		{
-			name:     "POSITION preserves SQL syntax",
+			name:     "POSITION preserves SQL syntax with IN keyword",
 			input:    "SELECT POSITION('a' IN 'abc')",
-			contains: "POSITION",
-			excludes: "",
+			contains: []string{"position", " in "},
+			excludes: []string{`"position"(`},
 		},
 		{
-			name:     "OVERLAY preserves SQL syntax",
+			name:     "OVERLAY preserves SQL syntax with PLACING FROM FOR keywords",
 			input:    "SELECT OVERLAY('hello' PLACING 'XX' FROM 2 FOR 3)",
-			contains: "OVERLAY",
-			excludes: "",
+			contains: []string{"overlay", " placing ", " from "},
+			excludes: []string{`"overlay"(`},
 		},
 
 		// Renamed SQL syntax functions - btrim->trim strips prefix, uses function call
 		{
 			name:     "TRIM BOTH (btrim->trim) uses function call",
 			input:    "SELECT TRIM(BOTH ' ' FROM '  hello  ')",
-			contains: "trim",
-			excludes: "pg_catalog", // prefix should be stripped since name changes
+			contains: []string{"trim"},
+			excludes: []string{"pg_catalog"}, // prefix should be stripped since name changes
 		},
 
 		// Same-name SQL syntax functions - ltrim/rtrim map to themselves, SQL syntax preserved
 		{
 			name:     "TRIM LEADING preserves SQL syntax",
 			input:    "SELECT TRIM(LEADING ' ' FROM '  hello  ')",
-			contains: "TRIM", // SQL syntax preserved (LEADING)
-			excludes: "",
+			contains: []string{"trim", "leading"}, // SQL syntax preserved
+			excludes: []string{`"ltrim"(`},
 		},
 		{
 			name:     "TRIM TRAILING preserves SQL syntax",
 			input:    "SELECT TRIM(TRAILING ' ' FROM '  hello  ')",
-			contains: "TRIM", // SQL syntax preserved (TRAILING)
-			excludes: "",
+			contains: []string{"trim", "trailing"}, // SQL syntax preserved
+			excludes: []string{`"rtrim"(`},
 		},
 
 		// Complex expressions with SQL syntax functions
 		{
-			name:     "EXTRACT in expression",
+			name:     "EXTRACT in expression preserves SQL syntax",
 			input:    "SELECT EXTRACT(year FROM created_at) + 1 FROM events",
-			contains: "extract",
-			excludes: "",
+			contains: []string{"extract", " from created_at"}, // SQL syntax uses FROM keyword
+			excludes: []string{`"extract"(`},
 		},
 		{
 			name:     "Multiple SQL syntax functions",
 			input:    "SELECT EXTRACT(year FROM d), SUBSTRING(s FROM 1 FOR 5) FROM t",
-			contains: "extract",
-			excludes: "",
+			contains: []string{"extract", "substring", " from d"},
+			excludes: []string{`"extract"(`, `"substring"(`},
 		},
 	}
 
@@ -2029,11 +2029,15 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
 			}
 			lowerSQL := strings.ToLower(result.SQL)
-			if tt.contains != "" && !strings.Contains(lowerSQL, strings.ToLower(tt.contains)) {
-				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			for _, c := range tt.contains {
+				if !strings.Contains(lowerSQL, strings.ToLower(c)) {
+					t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, c)
+				}
 			}
-			if tt.excludes != "" && strings.Contains(lowerSQL, strings.ToLower(tt.excludes)) {
-				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			for _, e := range tt.excludes {
+				if strings.Contains(lowerSQL, strings.ToLower(e)) {
+					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, e)
+				}
 			}
 		})
 	}
