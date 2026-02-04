@@ -1,3 +1,5 @@
+name: duckgres-integration
+
 services:
   # PostgreSQL for comparison testing (existing)
   postgres:
