@@ -866,8 +866,12 @@ func (s *Server) handleCancelRequestIsolated(params map[string]string) {
 	}
 
 	var pid, secretKey int64
-	fmt.Sscanf(pidStr, "%d", &pid)
-	fmt.Sscanf(secretKeyStr, "%d", &secretKey)
+	if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
+		return
+	}
+	if _, err := fmt.Sscanf(secretKeyStr, "%d", &secretKey); err != nil {
+		return
+	}
 
 	key := BackendKey{Pid: int32(pid), SecretKey: int32(secretKey)}
 	s.CancelQueryBySignal(key)
