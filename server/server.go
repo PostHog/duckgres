@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"sync"
@@ -360,6 +361,16 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 		// Continue anyway - DuckDB will use its default
 	} else {
 		slog.Debug("Set DuckDB threads.", "threads", threads, "cpus", numCPU)
+	}
+
+	// Set temp directory to a subdirectory under DataDir to ensure DuckDB has a
+	// writable location for intermediate results. This prevents "Read-only file system"
+	// errors in containerized or restricted environments.
+	tempDir := filepath.Join(s.cfg.DataDir, "tmp")
+	if _, err := db.Exec(fmt.Sprintf("SET temp_directory = '%s'", tempDir)); err != nil {
+		slog.Warn("Failed to set DuckDB temp_directory.", "temp_directory", tempDir, "error", err)
+	} else {
+		slog.Debug("Set DuckDB temp_directory.", "temp_directory", tempDir)
 	}
 
 	// Load configured extensions
