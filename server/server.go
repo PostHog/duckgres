@@ -93,7 +93,7 @@ type Config struct {
 
 	// IdleTimeout is the maximum time a connection can be idle before being closed.
 	// This prevents accumulation of zombie connections from clients that disconnect
-	// uncleanly. Default: 10 minutes. Set to 0 to disable.
+	// uncleanly. Default: 24 hours. Set to 0 to disable.
 	IdleTimeout time.Duration
 
 	// ProcessIsolation enables spawning each client connection in a separate OS process.
@@ -186,9 +186,9 @@ func New(cfg Config) (*Server, error) {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
-	// Use default idle timeout if not specified (10 minutes)
+	// Use default idle timeout if not specified (24 hours)
 	if cfg.IdleTimeout == 0 {
-		cfg.IdleTimeout = 10 * time.Minute
+		cfg.IdleTimeout = 24 * time.Hour
 	}
 
 	s := &Server{
@@ -209,6 +209,11 @@ func New(cfg Config) (*Server, error) {
 
 	slog.Info("TLS enabled.", "cert_file", cfg.TLSCertFile)
 	slog.Info("Rate limiting enabled.", "max_failed_attempts", cfg.RateLimit.MaxFailedAttempts, "window", cfg.RateLimit.FailedAttemptWindow, "ban_duration", cfg.RateLimit.BanDuration)
+	if cfg.IdleTimeout > 0 {
+		slog.Info("Idle timeout enabled.", "timeout", cfg.IdleTimeout)
+	} else {
+		slog.Info("Idle timeout disabled.")
+	}
 	return s, nil
 }
 
