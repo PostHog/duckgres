@@ -275,6 +275,15 @@ func (c *clientConn) serve() error {
 	c.db = db
 	defer func() {
 		if c.db != nil {
+			// If we're in a transaction, explicitly rollback before closing.
+			// This prevents DuckDB from trying to rollback during Close() which can
+			// throw a C++ exception if the connection is already broken (e.g., SSL
+			// connection closed unexpectedly), causing the entire process to abort.
+			// We ignore the error since the connection may already be broken.
+			if c.txStatus == txStatusTransaction || c.txStatus == txStatusError {
+				_, _ = c.db.Exec("ROLLBACK")
+			}
+
 			// Detach DuckLake to release the RDS metadata connection
 			if c.server.cfg.DuckLake.MetadataStore != "" {
 				// Must switch away from ducklake before detaching - DuckDB doesn't allow
