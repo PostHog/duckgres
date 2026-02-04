@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -93,6 +94,12 @@ type Config struct {
 	// This prevents accumulation of zombie connections from clients that disconnect
 	// uncleanly. Default: 10 minutes. Set to 0 to disable.
 	IdleTimeout time.Duration
+
+	// ProcessIsolation enables spawning each client connection in a separate OS process.
+	// This prevents DuckDB C++ crashes from taking down the entire server.
+	// When enabled, rate limiting and cancel requests are handled by the parent process,
+	// while TLS, authentication, and query execution happen in child processes.
+	ProcessIsolation bool
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -144,9 +151,17 @@ type Server struct {
 	// Using a channel instead of mutex allows for timeout on acquisition.
 	duckLakeSem chan struct{}
 
-	// Query cancellation tracking
+	// Query cancellation tracking (used in non-isolated mode)
 	activeQueries   map[BackendKey]context.CancelFunc
 	activeQueriesMu sync.RWMutex
+
+	// Child process tracking (used when ProcessIsolation is enabled)
+	childTracker *ChildTracker
+
+	// External query cancel channel (used in child worker processes)
+	// When this channel is closed, all active queries should be cancelled.
+	// This is used to propagate SIGUSR1 from signal handler to query execution.
+	externalCancelCh <-chan struct{}
 }
 
 func New(cfg Config) (*Server, error) {
@@ -183,6 +198,12 @@ func New(cfg Config) (*Server, error) {
 			Certificates: []tls.Certificate{cert},
 		},
 		duckLakeSem: make(chan struct{}, 1),
+	}
+
+	// Initialize child tracker if process isolation is enabled
+	if cfg.ProcessIsolation {
+		s.childTracker = NewChildTracker()
+		slog.Info("Process isolation enabled. Each connection will spawn a child process.")
 	}
 
 	slog.Info("TLS enabled.", "cert_file", cfg.TLSCertFile)
@@ -241,10 +262,23 @@ func (s *Server) Close() error {
 		slog.Info("Waiting for active connections to finish.", "count", activeConns)
 	}
 
+	// If process isolation is enabled, signal children to terminate
+	if s.cfg.ProcessIsolation && s.childTracker != nil {
+		childCount := s.childTracker.Count()
+		if childCount > 0 {
+			slog.Info("Signaling child processes to terminate.", "count", childCount)
+			s.childTracker.SignalAll(syscall.SIGTERM)
+		}
+	}
+
 	// Wait for connections with timeout
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
+		// Also wait for child processes if isolation is enabled
+		if s.cfg.ProcessIsolation && s.childTracker != nil {
+			<-s.childTracker.WaitAll()
+		}
 		close(done)
 	}()
 
@@ -253,6 +287,10 @@ func (s *Server) Close() error {
 		slog.Info("All connections closed gracefully.")
 	case <-time.After(s.cfg.ShutdownTimeout):
 		slog.Warn("Shutdown timeout exceeded, force closing remaining connections.", "timeout", s.cfg.ShutdownTimeout)
+		// Force kill remaining children
+		if s.cfg.ProcessIsolation && s.childTracker != nil {
+			s.childTracker.SignalAll(syscall.SIGKILL)
+		}
 	}
 
 	// Database connections are now closed by each clientConn when it terminates
@@ -277,10 +315,23 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		slog.Info("Waiting for active connections to finish.", "count", activeConns)
 	}
 
+	// If process isolation is enabled, signal children to terminate
+	if s.cfg.ProcessIsolation && s.childTracker != nil {
+		childCount := s.childTracker.Count()
+		if childCount > 0 {
+			slog.Info("Signaling child processes to terminate.", "count", childCount)
+			s.childTracker.SignalAll(syscall.SIGTERM)
+		}
+	}
+
 	// Wait for connections with context
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
+		// Also wait for child processes if isolation is enabled
+		if s.cfg.ProcessIsolation && s.childTracker != nil {
+			<-s.childTracker.WaitAll()
+		}
 		close(done)
 	}()
 
@@ -289,6 +340,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		slog.Info("All connections closed gracefully.")
 	case <-ctx.Done():
 		slog.Warn("Shutdown context cancelled, force closing remaining connections.")
+		// Force kill remaining children
+		if s.cfg.ProcessIsolation && s.childTracker != nil {
+			s.childTracker.SignalAll(syscall.SIGKILL)
+		}
 	}
 
 	// Database connections are now closed by each clientConn when it terminates
@@ -694,6 +749,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
+	// Process isolation mode: handle SSL request and cancel in parent, spawn child for rest
+	if s.cfg.ProcessIsolation {
+		s.handleConnectionIsolated(conn, remoteAddr)
+		return
+	}
+
+	// Non-isolated mode: handle everything in the current goroutine
+	s.handleConnectionInProcess(conn, remoteAddr)
+}
+
+// handleConnectionInProcess handles a connection in the current process (non-isolated mode).
+func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 	// Track active connections (only after rate limiting passes)
 	atomic.AddInt64(&s.activeConns, 1)
 	connectionsGauge.Inc()
@@ -716,4 +783,92 @@ func (s *Server) handleConnection(conn net.Conn) {
 	if err := c.serve(); err != nil {
 		slog.Error("Connection error.", "error", err)
 	}
+}
+
+// handleConnectionIsolated handles a connection with process isolation.
+// The parent handles SSL request and cancel requests, then spawns a child process
+// for TLS handshake, authentication, and query execution.
+func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
+	// IMPORTANT: Use the raw connection (not a buffered reader) for reading the
+	// SSL request message. This ensures we don't accidentally buffer data that
+	// should be read by the child process after FD passing.
+	// The SSL request is a single, small message and the client waits for 'S'
+	// before sending the TLS ClientHello, so unbuffered reads are safe here.
+	params, err := readStartupMessage(conn)
+	if err != nil {
+		slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
+		s.rateLimiter.UnregisterConnection(remoteAddr)
+		_ = conn.Close()
+		return
+	}
+
+	// Handle cancel request in parent (no child spawn needed)
+	if params["__cancel_request"] == "true" {
+		s.handleCancelRequestIsolated(params)
+		s.rateLimiter.UnregisterConnection(remoteAddr)
+		_ = conn.Close()
+		return
+	}
+
+	// Handle SSL request: send 'S' then spawn child for TLS handshake
+	if params["__ssl_request"] == "true" {
+		// Send 'S' to indicate we support SSL
+		if _, err := conn.Write([]byte("S")); err != nil {
+			slog.Error("Failed to send SSL response.", "remote_addr", remoteAddr, "error", err)
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+
+		// After sending 'S', the client will do TLS handshake and then send the real startup message.
+		// We spawn a child process to handle TLS and everything after.
+		// Track active connections
+		atomic.AddInt64(&s.activeConns, 1)
+		connectionsGauge.Inc()
+
+		// Spawn child process - it will do TLS handshake and read the startup message
+		child, err := s.spawnChildForTLS(conn)
+		if err != nil {
+			slog.Error("Failed to spawn child process.", "remote_addr", remoteAddr, "error", err)
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			atomic.AddInt64(&s.activeConns, -1)
+			connectionsGauge.Dec()
+			_ = conn.Close()
+			return
+		}
+
+		// Register child in tracker
+		s.childTracker.Add(child)
+
+		// Monitor child in background (handles cleanup when child exits)
+		go func() {
+			s.monitorChild(child)
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			atomic.AddInt64(&s.activeConns, -1)
+			connectionsGauge.Dec()
+		}()
+	} else {
+		// No SSL request - reject connection (TLS is required)
+		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
+		s.rateLimiter.UnregisterConnection(remoteAddr)
+		_ = conn.Close()
+		return
+	}
+}
+
+// handleCancelRequestIsolated handles a cancel request in process isolation mode.
+func (s *Server) handleCancelRequestIsolated(params map[string]string) {
+	pidStr := params["__cancel_pid"]
+	secretKeyStr := params["__cancel_secret_key"]
+
+	if pidStr == "" || secretKeyStr == "" {
+		return
+	}
+
+	var pid, secretKey int64
+	fmt.Sscanf(pidStr, "%d", &pid)
+	fmt.Sscanf(secretKeyStr, "%d", &secretKey)
+
+	key := BackendKey{Pid: int32(pid), SecretKey: int32(secretKey)}
+	s.CancelQueryBySignal(key)
 }

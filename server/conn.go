@@ -138,10 +138,26 @@ func (c *clientConn) backendKey() BackendKey {
 // The cancel function is registered with the server so it can be invoked
 // via a cancel request from another connection.
 // The caller must call the returned cleanup function when the query completes.
+//
+// In child worker processes, the context is also cancelled when the server's
+// externalCancelCh is closed (triggered by SIGUSR1 signal).
 func (c *clientConn) queryContext() (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
+
+	// If there's an external cancel channel (child worker mode), set up a goroutine
+	// to cancel the context when the channel is closed
+	if c.server.externalCancelCh != nil {
+		go func() {
+			select {
+			case <-c.server.externalCancelCh:
+				cancel()
+			case <-ctx.Done():
+				// Context already cancelled, nothing to do
+			}
+		}()
+	}
 
 	cleanup := func() {
 		c.server.UnregisterQuery(key)
