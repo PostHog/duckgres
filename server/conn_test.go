@@ -1000,6 +1000,8 @@ func TestParseCopyFromOptions(t *testing.T) {
 		delimiter  string
 		hasHeader  bool
 		nullString string
+		quote      string
+		escape     string
 	}{
 		{
 			name:       "simple COPY FROM STDIN",
@@ -1009,6 +1011,8 @@ func TestParseCopyFromOptions(t *testing.T) {
 			delimiter:  "\t",
 			hasHeader:  false,
 			nullString: "\\N",
+			quote:      "",
+			escape:     "",
 		},
 		{
 			name:       "COPY with schema",
@@ -1018,6 +1022,8 @@ func TestParseCopyFromOptions(t *testing.T) {
 			delimiter:  "\t",
 			hasHeader:  false,
 			nullString: "\\N",
+			quote:      "",
+			escape:     "",
 		},
 		{
 			name:       "COPY with columns",
@@ -1027,6 +1033,8 @@ func TestParseCopyFromOptions(t *testing.T) {
 			delimiter:  "\t",
 			hasHeader:  false,
 			nullString: "\\N",
+			quote:      "",
+			escape:     "",
 		},
 		{
 			name:       "COPY CSV",
@@ -1036,6 +1044,8 @@ func TestParseCopyFromOptions(t *testing.T) {
 			delimiter:  ",",
 			hasHeader:  false,
 			nullString: "\\N",
+			quote:      `"`,
+			escape:     "",
 		},
 		{
 			name:       "COPY CSV HEADER",
@@ -1045,6 +1055,8 @@ func TestParseCopyFromOptions(t *testing.T) {
 			delimiter:  ",",
 			hasHeader:  true,
 			nullString: "\\N",
+			quote:      `"`,
+			escape:     "",
 		},
 		{
 			name:       "COPY WITH FORMAT CSV HEADER",
@@ -1054,6 +1066,8 @@ func TestParseCopyFromOptions(t *testing.T) {
 			delimiter:  ",",
 			hasHeader:  true,
 			nullString: "\\N",
+			quote:      `"`,
+			escape:     "",
 		},
 		{
 			name:       "COPY with custom NULL",
@@ -1063,6 +1077,8 @@ func TestParseCopyFromOptions(t *testing.T) {
 			delimiter:  "\t",
 			hasHeader:  false,
 			nullString: "NA",
+			quote:      "",
+			escape:     "",
 		},
 		{
 			name:       "COPY CSV with all options",
@@ -1072,6 +1088,30 @@ func TestParseCopyFromOptions(t *testing.T) {
 			delimiter:  ",",
 			hasHeader:  true,
 			nullString: "",
+			quote:      `"`,
+			escape:     "",
+		},
+		{
+			name:       "COPY CSV with custom QUOTE",
+			query:      `COPY users FROM STDIN CSV QUOTE "'"`,
+			tableName:  "users",
+			columnList: "",
+			delimiter:  ",",
+			hasHeader:  false,
+			nullString: "\\N",
+			quote:      `'`,
+			escape:     "",
+		},
+		{
+			name:       "COPY CSV with custom ESCAPE",
+			query:      `COPY users FROM STDIN CSV ESCAPE "\"`,
+			tableName:  "users",
+			columnList: "",
+			delimiter:  ",",
+			hasHeader:  false,
+			nullString: "\\N",
+			quote:      `"`,
+			escape:     `\`,
 		},
 		{
 			name:    "invalid query - not COPY FROM STDIN",
@@ -1111,6 +1151,12 @@ func TestParseCopyFromOptions(t *testing.T) {
 			}
 			if opts.NullString != tt.nullString {
 				t.Errorf("NullString = %q, want %q", opts.NullString, tt.nullString)
+			}
+			if opts.Quote != tt.quote {
+				t.Errorf("Quote = %q, want %q", opts.Quote, tt.quote)
+			}
+			if opts.Escape != tt.escape {
+				t.Errorf("Escape = %q, want %q", opts.Escape, tt.escape)
 			}
 		})
 	}
@@ -1239,8 +1285,9 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				Delimiter:  ",",
 				HasHeader:  true,
 				NullString: "\\N",
+				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, HEADER, NULL '\\N')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, HEADER, NULL '\\N', QUOTE '\"')",
 		},
 		{
 			name:       "with column list",
@@ -1251,8 +1298,9 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				Delimiter:  ",",
 				HasHeader:  false,
 				NullString: "\\N",
+				Quote:      `"`,
 			},
-			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, NULL '\\N')",
+			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, NULL '\\N', QUOTE '\"')",
 		},
 		{
 			name:       "custom NULL string",
@@ -1263,8 +1311,9 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				Delimiter:  ",",
 				HasHeader:  false,
 				NullString: "NA",
+				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, NULL 'NA')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, NULL 'NA', QUOTE '\"')",
 		},
 		{
 			name:       "empty NULL string",
@@ -1275,8 +1324,9 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				Delimiter:  ",",
 				HasHeader:  true,
 				NullString: "",
+				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, HEADER, NULL '')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, HEADER, NULL '', QUOTE '\"')",
 		},
 		{
 			name:       "schema qualified table",
@@ -1287,8 +1337,23 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				Delimiter:  "\t",
 				HasHeader:  true,
 				NullString: "\\N",
+				Quote:      `"`,
 			},
-			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, HEADER, NULL '\\N', DELIMITER '\t')",
+			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, HEADER, NULL '\\N', DELIMITER '\t', QUOTE '\"')",
+		},
+		{
+			name:       "CSV with custom escape character",
+			tableName:  "users",
+			columnList: "",
+			filePath:   "/tmp/data.csv",
+			opts: &CopyFromOptions{
+				Delimiter:  ",",
+				HasHeader:  true,
+				NullString: "\\N",
+				Quote:      `"`,
+				Escape:     `\`,
+			},
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, HEADER, NULL '\\N', QUOTE '\"', ESCAPE '\\')",
 		},
 	}
 

@@ -1325,6 +1325,8 @@ var (
 	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
 	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)
 	copyNullRegex       = regexp.MustCompile(`(?i)\bNULL\s+'([^']*)'`)
+	copyQuoteRegex      = regexp.MustCompile(`(?i)\bQUOTE\s+['"](.)['"]\s*`)
+	copyEscapeRegex     = regexp.MustCompile(`(?i)\bESCAPE\s+['"](.)['"]\s*`)
 )
 
 // CopyFromOptions contains parsed options from a COPY FROM STDIN command
@@ -1334,6 +1336,8 @@ type CopyFromOptions struct {
 	Delimiter  string
 	HasHeader  bool
 	NullString string
+	Quote      string // Quote character (default " for CSV)
+	Escape     string // Escape character (default same as Quote)
 }
 
 // ParseCopyFromOptions extracts options from a COPY FROM STDIN command
@@ -1369,6 +1373,18 @@ func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
 	// Parse NULL string option
 	if m := copyNullRegex.FindStringSubmatch(query); len(m) > 1 {
 		opts.NullString = m[1]
+	}
+
+	// Parse QUOTE option (default " for CSV)
+	if m := copyQuoteRegex.FindStringSubmatch(query); len(m) > 1 {
+		opts.Quote = m[1]
+	} else if copyWithCSVRegex.MatchString(upperQuery) {
+		opts.Quote = `"` // Default quote character for CSV
+	}
+
+	// Parse ESCAPE option (default same as QUOTE)
+	if m := copyEscapeRegex.FindStringSubmatch(query); len(m) > 1 {
+		opts.Escape = m[1]
 	}
 
 	return opts, nil
@@ -1413,7 +1429,7 @@ func ParseCopyToOptions(query string) (*CopyToOptions, error) {
 
 // BuildDuckDBCopyFromSQL generates a DuckDB COPY FROM statement
 func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFromOptions) string {
-	// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',')
+	// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',', QUOTE '"')
 	copyOptions := []string{"FORMAT CSV"}
 	if opts.HasHeader {
 		copyOptions = append(copyOptions, "HEADER")
@@ -1422,6 +1438,14 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 	copyOptions = append(copyOptions, fmt.Sprintf("NULL '%s'", opts.NullString))
 	if opts.Delimiter != "," {
 		copyOptions = append(copyOptions, fmt.Sprintf("DELIMITER '%s'", opts.Delimiter))
+	}
+	// Always specify QUOTE for CSV to ensure proper quote handling
+	if opts.Quote != "" {
+		copyOptions = append(copyOptions, fmt.Sprintf("QUOTE '%s'", opts.Quote))
+	}
+	// Specify ESCAPE if different from default (same as QUOTE)
+	if opts.Escape != "" {
+		copyOptions = append(copyOptions, fmt.Sprintf("ESCAPE '%s'", opts.Escape))
 	}
 
 	return fmt.Sprintf("COPY %s %s FROM '%s' (%s)",
