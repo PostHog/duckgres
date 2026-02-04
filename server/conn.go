@@ -138,10 +138,26 @@ func (c *clientConn) backendKey() BackendKey {
 // The cancel function is registered with the server so it can be invoked
 // via a cancel request from another connection.
 // The caller must call the returned cleanup function when the query completes.
+//
+// In child worker processes, the context is also cancelled when the server's
+// externalCancelCh is closed (triggered by SIGUSR1 signal).
 func (c *clientConn) queryContext() (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
+
+	// If there's an external cancel channel (child worker mode), set up a goroutine
+	// to cancel the context when the channel is closed
+	if c.server.externalCancelCh != nil {
+		go func() {
+			select {
+			case <-c.server.externalCancelCh:
+				cancel()
+			case <-ctx.Done():
+				// Context already cancelled, nothing to do
+			}
+		}()
+	}
 
 	cleanup := func() {
 		c.server.UnregisterQuery(key)
@@ -154,6 +170,105 @@ func (c *clientConn) queryContext() (context.Context, func()) {
 // isQueryCancelled checks if an error is due to query cancellation
 func isQueryCancelled(err error) bool {
 	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
+}
+
+// isConnectionBroken checks if an error indicates a broken connection
+// (e.g., SSL connection closed, network error)
+func isConnectionBroken(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := strings.ToLower(err.Error())
+	return strings.Contains(errMsg, "ssl connection has been closed") ||
+		strings.Contains(errMsg, "connection refused") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "connection reset") ||
+		strings.Contains(errMsg, "network is unreachable") ||
+		strings.Contains(errMsg, "no route to host") ||
+		strings.Contains(errMsg, "i/o timeout") ||
+		strings.Contains(errMsg, "use of closed network connection")
+}
+
+// safeCleanupDB safely closes the database connection, handling the case where
+// the underlying connection (e.g., DuckLake's SSL connection to RDS) may be broken.
+//
+// This mitigates crashes from DuckDB throwing C++ exceptions during cleanup by:
+// 1. Detecting broken connections early via a health check query
+// 2. Explicitly rolling back transactions before Close() to avoid DuckDB's internal ROLLBACK
+// 3. Skipping SQL cleanup operations when the connection is known to be broken
+//
+// Note: If the connection breaks between our health check and Close(), DuckDB may still
+// throw a C++ exception. This is a best-effort mitigation, not a complete fix.
+func (c *clientConn) safeCleanupDB() {
+	cleanupTimeout := 5 * time.Second
+	connHealthy := true
+
+	// Check connection health. For DuckLake, we need to actually run a query that
+	// touches the metadata connection, not just ping the local DuckDB connection.
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	if c.server.cfg.DuckLake.MetadataStore != "" {
+		// Query DuckLake metadata to verify the RDS connection is still alive
+		_, err := c.db.ExecContext(ctx, "SELECT 1 FROM ducklake.information_schema.schemata LIMIT 1")
+		if err != nil {
+			slog.Warn("DuckLake connection unhealthy during cleanup, skipping SQL cleanup.",
+				"user", c.username, "error", err)
+			connHealthy = false
+		}
+	} else {
+		if err := c.db.PingContext(ctx); err != nil {
+			slog.Warn("Database connection unhealthy during cleanup, skipping SQL cleanup.",
+				"user", c.username, "error", err)
+			connHealthy = false
+		}
+	}
+	cancel()
+
+	// If we're in a transaction, explicitly ROLLBACK before closing.
+	// This prevents DuckDB from trying to ROLLBACK internally during Close(),
+	// which can throw exceptions if the connection is in a bad state.
+	if connHealthy && (c.txStatus == txStatusTransaction || c.txStatus == txStatusError) {
+		ctx2, cancel2 := context.WithTimeout(context.Background(), cleanupTimeout)
+		_, err := c.db.ExecContext(ctx2, "ROLLBACK")
+		cancel2()
+		if err != nil {
+			slog.Warn("Failed to rollback transaction during cleanup.",
+				"user", c.username, "error", err)
+			if isConnectionBroken(err) {
+				connHealthy = false
+			}
+		}
+	}
+
+	// Detach DuckLake to release the RDS metadata connection (only if connection is healthy)
+	if connHealthy && c.server.cfg.DuckLake.MetadataStore != "" {
+		// Must switch away from ducklake before detaching - DuckDB doesn't allow
+		// detaching the default database
+		ctx3, cancel3 := context.WithTimeout(context.Background(), cleanupTimeout)
+		_, err := c.db.ExecContext(ctx3, "USE memory")
+		cancel3()
+		if err != nil {
+			slog.Warn("Failed to switch to memory.", "user", c.username, "error", err)
+			if isConnectionBroken(err) {
+				connHealthy = false
+			}
+		}
+
+		if connHealthy {
+			ctx4, cancel4 := context.WithTimeout(context.Background(), cleanupTimeout)
+			_, err := c.db.ExecContext(ctx4, "DETACH ducklake")
+			cancel4()
+			if err != nil {
+				slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err)
+			}
+		}
+	}
+
+	// Always attempt to close the database connection.
+	// If the connection is broken, this may still throw, but we've done our best
+	// to clean up the transaction state first.
+	if err := c.db.Close(); err != nil {
+		slog.Warn("Failed to close database.", "user", c.username, "error", err)
+	}
 }
 
 // validateWithDuckDB checks if a query is valid DuckDB syntax.
@@ -275,20 +390,7 @@ func (c *clientConn) serve() error {
 	c.db = db
 	defer func() {
 		if c.db != nil {
-			// Detach DuckLake to release the RDS metadata connection
-			if c.server.cfg.DuckLake.MetadataStore != "" {
-				// Must switch away from ducklake before detaching - DuckDB doesn't allow
-				// detaching the default database
-				if _, err := c.db.Exec("USE memory"); err != nil {
-					slog.Warn("Failed to switch to memory.", "user", c.username, "error", err)
-				}
-				if _, err := c.db.Exec("DETACH ducklake"); err != nil {
-					slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err)
-				}
-			}
-			if err := c.db.Close(); err != nil {
-				slog.Warn("Failed to close database.", "user", c.username, "error", err)
-			}
+			c.safeCleanupDB()
 		}
 	}()
 

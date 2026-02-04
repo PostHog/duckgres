@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/csv"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -403,6 +404,84 @@ func TestNestedBeginDetection(t *testing.T) {
 	// The warning is sent but the transaction continues
 	if c.txStatus != txStatusTransaction {
 		t.Errorf("txStatus should still be %c after nested BEGIN detection, got %c", txStatusTransaction, c.txStatus)
+	}
+}
+
+func TestIsConnectionBroken(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "SSL connection closed",
+			err:      fmt.Errorf("SSL connection has been closed unexpectedly"),
+			expected: true,
+		},
+		{
+			name:     "connection refused",
+			err:      fmt.Errorf("dial tcp: connection refused"),
+			expected: true,
+		},
+		{
+			name:     "broken pipe",
+			err:      fmt.Errorf("write: broken pipe"),
+			expected: true,
+		},
+		{
+			name:     "connection reset",
+			err:      fmt.Errorf("read: connection reset by peer"),
+			expected: true,
+		},
+		{
+			name:     "network unreachable",
+			err:      fmt.Errorf("network is unreachable"),
+			expected: true,
+		},
+		{
+			name:     "no route to host",
+			err:      fmt.Errorf("no route to host"),
+			expected: true,
+		},
+		{
+			name:     "regular query error",
+			err:      fmt.Errorf("table does not exist"),
+			expected: false,
+		},
+		{
+			name:     "syntax error",
+			err:      fmt.Errorf("Parser Error: syntax error"),
+			expected: false,
+		},
+		{
+			name:     "DuckLake SSL error from logs",
+			err:      fmt.Errorf(`Failed to execute query "ROLLBACK": SSL connection has been closed unexpectedly`),
+			expected: true,
+		},
+		{
+			name:     "i/o timeout",
+			err:      fmt.Errorf("read tcp: i/o timeout"),
+			expected: true,
+		},
+		{
+			name:     "use of closed network connection",
+			err:      fmt.Errorf("use of closed network connection"),
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isConnectionBroken(tt.err)
+			if result != tt.expected {
+				t.Errorf("isConnectionBroken(%v) = %v, want %v", tt.err, result, tt.expected)
+			}
+		})
 	}
 }
 
