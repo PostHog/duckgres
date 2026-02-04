@@ -64,7 +64,7 @@ ducklake:
 
 # Connection idle timeout (optional)
 # Connections with no activity for this duration will be closed.
-# Default: 24h (24 hours). Set to "0" to disable.
+# Default: 24h (24 hours). Set to "-1" to disable.
 # idle_timeout: "24h"
 
 # Rate limiting configuration (optional - these are the defaults)

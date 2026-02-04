@@ -93,7 +93,7 @@ type Config struct {
 
 	// IdleTimeout is the maximum time a connection can be idle before being closed.
 	// This prevents accumulation of zombie connections from clients that disconnect
-	// uncleanly. Default: 24 hours. Set to 0 to disable.
+	// uncleanly. Default: 24 hours. Set to a negative value (e.g., -1) to disable.
 	IdleTimeout time.Duration
 
 	// ProcessIsolation enables spawning each client connection in a separate OS process.
@@ -187,8 +187,11 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	// Use default idle timeout if not specified (24 hours)
+	// Negative value means explicitly disabled (set to 0)
 	if cfg.IdleTimeout == 0 {
 		cfg.IdleTimeout = 24 * time.Hour
+	} else if cfg.IdleTimeout < 0 {
+		cfg.IdleTimeout = 0
 	}
 
 	s := &Server{

@@ -27,7 +27,7 @@ type FileConfig struct {
 	Extensions       []string            `yaml:"extensions"`
 	DuckLake         DuckLakeFileConfig  `yaml:"ducklake"`
 	ProcessIsolation bool                `yaml:"process_isolation"` // Enable process isolation per connection
-	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "10m", "1h", "0" to disable
+	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
 }
 
 type TLSConfig struct {
@@ -113,7 +113,7 @@ func main() {
 	certFile := flag.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
 	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
-	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '0' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
+	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	showHelp := flag.Bool("help", false, "Show help message")
 
 	flag.Usage = func() {
@@ -129,7 +129,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, 0 to disable)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
 
