@@ -1170,21 +1170,38 @@ func TestTranspile_DropCascade_NonDuckLakeMode(t *testing.T) {
 }
 
 func TestTranspile_JSONOperators(t *testing.T) {
-	// DuckDB supports -> and ->> operators
+	// JSON operators -> and ->> are converted to function calls to avoid
+	// DuckDB operator precedence issues where "a AND b -> 'key'" is parsed
+	// as "(a AND b) -> 'key'" instead of "a AND (b -> 'key')"
 	tests := []struct {
 		name     string
 		input    string
-		contains string
+		expected string
 	}{
 		{
-			name:     "JSON arrow operator",
+			name:     "JSON arrow operator converts to json_extract",
 			input:    "SELECT data->'key' FROM t",
-			contains: "->",
+			expected: "SELECT json_extract(data, 'key') FROM t",
 		},
 		{
-			name:     "JSON double arrow operator",
+			name:     "JSON double arrow operator converts to json_extract_string",
 			input:    "SELECT data->>'key' FROM t",
-			contains: "->>",
+			expected: "SELECT json_extract_string(data, 'key') FROM t",
+		},
+		{
+			name:     "JSON operator in WHERE with AND",
+			input:    "SELECT * FROM t WHERE id > 0 AND data->>'key' IS NULL",
+			expected: "SELECT * FROM t WHERE id > 0 AND json_extract_string(data, 'key') IS NULL",
+		},
+		{
+			name:     "Chained JSON operators",
+			input:    "SELECT data->'a'->'b' FROM t",
+			expected: "SELECT json_extract(json_extract(data, 'a'), 'b') FROM t",
+		},
+		{
+			name:     "JSON operator with complex WHERE",
+			input:    "SELECT * FROM t WHERE x = 1 AND data->>'key' = 'val' AND y = 2",
+			expected: "SELECT * FROM t WHERE x = 1 AND json_extract_string(data, 'key') = 'val' AND y = 2",
 		},
 	}
 
@@ -1196,8 +1213,8 @@ func TestTranspile_JSONOperators(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
 			}
-			if !strings.Contains(result.SQL, tt.contains) {
-				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			if result.SQL != tt.expected {
+				t.Errorf("Transpile(%q)\n  got:  %q\n  want: %q", tt.input, result.SQL, tt.expected)
 			}
 		})
 	}

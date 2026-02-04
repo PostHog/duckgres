@@ -229,11 +229,18 @@ func (t *OperatorTransform) transformExpression(node *pg_query.Node) *pg_query.N
 		return nil
 	}
 
-	// Check if this is a regex operator A_Expr
+	// Check if this is an operator A_Expr that needs transformation
 	if aexpr := node.GetAExpr(); aexpr != nil {
 		opName := t.getOperatorName(aexpr)
 
 		switch opName {
+		// JSON operators - convert to function calls to avoid DuckDB precedence issues
+		// DuckDB parses "a AND b -> 'key'" as "(a AND b) -> 'key'" instead of "a AND (b -> 'key')"
+		case "->":
+			return t.createJsonExtractFuncCall(aexpr.Lexpr, aexpr.Rexpr, false)
+		case "->>":
+			return t.createJsonExtractFuncCall(aexpr.Lexpr, aexpr.Rexpr, true)
+		// Regex operators
 		case "~":
 			return t.createRegexFuncCall(aexpr.Lexpr, aexpr.Rexpr, false, false)
 		case "~*":
@@ -410,6 +417,32 @@ func (t *OperatorTransform) getOperatorName(aexpr *pg_query.A_Expr) string {
 	return ""
 }
 
+// createJsonExtractFuncCall creates a json_extract or json_extract_string function call node.
+// This converts -> and ->> operators to explicit function calls to avoid DuckDB's
+// operator precedence issues where "a AND b -> 'key'" is parsed as "(a AND b) -> 'key'".
+func (t *OperatorTransform) createJsonExtractFuncCall(left, right *pg_query.Node, asText bool) *pg_query.Node {
+	// First, recursively transform the left operand (for chained JSON access like a->'b'->'c')
+	if newLeft := t.transformExpression(left); newLeft != nil {
+		left = newLeft
+	}
+
+	funcName := "json_extract"
+	if asText {
+		funcName = "json_extract_string"
+	}
+
+	return &pg_query.Node{
+		Node: &pg_query.Node_FuncCall{
+			FuncCall: &pg_query.FuncCall{
+				Funcname: []*pg_query.Node{
+					{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: funcName}}},
+				},
+				Args: []*pg_query.Node{left, right},
+			},
+		},
+	}
+}
+
 // createRegexFuncCall creates a regexp_matches function call node
 // For negated operators, wraps in NOT
 func (t *OperatorTransform) createRegexFuncCall(left, right *pg_query.Node, caseInsensitive, negated bool) *pg_query.Node {
@@ -460,8 +493,8 @@ func (t *OperatorTransform) createRegexFuncCall(left, right *pg_query.Node, case
 //
 // JSON Operators (PostgreSQL -> DuckDB):
 //
-//	-> : Same (extract JSON object field)
-//	->> : Same (extract JSON object field as text)
+//	-> : json_extract() - converted to function call to avoid precedence issues
+//	->> : json_extract_string() - converted to function call to avoid precedence issues
 //	#> : Not directly supported (use json_extract with path)
 //	#>> : Not directly supported (use json_extract_string with path)
 //	@> : json_contains() or manual check
