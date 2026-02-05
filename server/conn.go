@@ -1430,22 +1430,26 @@ func ParseCopyToOptions(query string) (*CopyToOptions, error) {
 // BuildDuckDBCopyFromSQL generates a DuckDB COPY FROM statement
 func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFromOptions) string {
 	// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',', QUOTE '"')
+	// AUTO_DETECT FALSE disables sniffer to prevent it from overriding our settings
 	// STRICT_MODE FALSE allows reading rows that don't strictly comply with CSV standard
-	copyOptions := []string{"FORMAT CSV", "STRICT_MODE FALSE"}
+	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE"}
 	if opts.HasHeader {
 		copyOptions = append(copyOptions, "HEADER")
 	}
 	// Always specify NULL string - DuckDB doesn't recognize \N by default
 	copyOptions = append(copyOptions, fmt.Sprintf("NULL '%s'", opts.NullString))
-	if opts.Delimiter != "," {
-		copyOptions = append(copyOptions, fmt.Sprintf("DELIMITER '%s'", opts.Delimiter))
-	}
+	// Always specify DELIMITER explicitly (required when AUTO_DETECT is FALSE)
+	copyOptions = append(copyOptions, fmt.Sprintf("DELIMITER '%s'", opts.Delimiter))
 	// Always specify QUOTE for CSV to ensure proper quote handling
 	if opts.Quote != "" {
 		copyOptions = append(copyOptions, fmt.Sprintf("QUOTE '%s'", opts.Quote))
-	}
-	// Specify ESCAPE if different from default (same as QUOTE)
-	if opts.Escape != "" {
+		// Set ESCAPE to match QUOTE for RFC 4180 compliance (doubled quotes = escaped quote)
+		escape := opts.Escape
+		if escape == "" {
+			escape = opts.Quote
+		}
+		copyOptions = append(copyOptions, fmt.Sprintf("ESCAPE '%s'", escape))
+	} else if opts.Escape != "" {
 		copyOptions = append(copyOptions, fmt.Sprintf("ESCAPE '%s'", opts.Escape))
 	}
 
