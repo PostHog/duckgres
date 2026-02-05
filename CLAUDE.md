@@ -100,61 +100,6 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=35437 user=postgres sslmode=requir
 \l           # List databases
 ```
 
-## Running with DuckLake
-
-To test duckgres with DuckLake (S3-backed storage with PostgreSQL metadata):
-
-### 1. Start dependencies (PostgreSQL + MinIO)
-```bash
-docker-compose up -d
-```
-
-This starts:
-- PostgreSQL on port 5433 (metadata store)
-- MinIO on port 9000 (S3-compatible object storage)
-- Creates `ducklake` bucket automatically
-
-### 2. Create local test config
-Create `duckgres_local_test.yaml`:
-```yaml
-host: "0.0.0.0"
-port: 35437
-data_dir: "./data"
-
-users:
-  postgres: "postgres"
-
-extensions:
-  - ducklake
-
-ducklake:
-  metadata_store: "postgres:host=localhost port=5433 user=ducklake password=ducklake dbname=ducklake"
-  object_store: "s3://ducklake/data/"
-  s3_provider: "config"
-  s3_endpoint: "localhost:9000"
-  s3_access_key: "minioadmin"
-  s3_secret_key: "minioadmin"
-  s3_region: "us-east-1"
-  s3_use_ssl: false
-  s3_url_style: "path"
-```
-
-### 3. Build and run
-```bash
-go build -o duckgres . && ./duckgres --config duckgres_local_test.yaml
-```
-
-### 4. Connect and test
-```bash
-PGPASSWORD=postgres psql "host=127.0.0.1 port=35437 user=postgres sslmode=require"
-```
-
-### Cleanup
-```bash
-pkill -f duckgres
-docker-compose down
-```
-
 ## Common Development Tasks
 
 ### Adding a new pg_catalog view
