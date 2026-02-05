@@ -1430,7 +1430,8 @@ func ParseCopyToOptions(query string) (*CopyToOptions, error) {
 // BuildDuckDBCopyFromSQL generates a DuckDB COPY FROM statement
 func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFromOptions) string {
 	// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',', QUOTE '"')
-	copyOptions := []string{"FORMAT CSV"}
+	// STRICT_MODE FALSE allows reading rows that don't strictly comply with CSV standard
+	copyOptions := []string{"FORMAT CSV", "STRICT_MODE FALSE"}
 	if opts.HasHeader {
 		copyOptions = append(copyOptions, "HEADER")
 	}
