@@ -684,14 +684,7 @@ func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 	}
 
 	// Determine provider: use credential_chain if explicitly set or if no access key provided
-	provider := dlCfg.S3Provider
-	if provider == "" {
-		if dlCfg.S3AccessKey != "" {
-			provider = "config"
-		} else {
-			provider = "credential_chain"
-		}
-	}
+	provider := s3ProviderForConfig(dlCfg)
 
 	var secretStmt string
 
@@ -799,6 +792,76 @@ func buildCredentialChainSecret(dlCfg DuckLakeConfig) string {
 
 	secret += "\n\t\t)"
 	return secret
+}
+
+// credentialRefreshInterval is how often to refresh S3 credentials for long-lived connections.
+// EC2 instance role credentials typically expire after 6 hours. Refreshing every 5 minutes
+// ensures fresh credentials are always available without excessive IMDS calls.
+const credentialRefreshInterval = 5 * time.Minute
+
+// s3ProviderForConfig returns the effective S3 provider for the given DuckLake config.
+func s3ProviderForConfig(dlCfg DuckLakeConfig) string {
+	provider := dlCfg.S3Provider
+	if provider == "" {
+		if dlCfg.S3AccessKey != "" {
+			provider = "config"
+		} else {
+			provider = "credential_chain"
+		}
+	}
+	return provider
+}
+
+// needsCredentialRefresh returns true if the DuckLake config uses temporary credentials
+// that need periodic refresh (credential_chain provider with an S3 object store).
+func needsCredentialRefresh(dlCfg DuckLakeConfig) bool {
+	if dlCfg.ObjectStore == "" {
+		return false
+	}
+	return s3ProviderForConfig(dlCfg) == "credential_chain"
+}
+
+// StartCredentialRefresh starts a background goroutine that periodically refreshes
+// S3 credentials for long-lived DuckDB connections using the credential_chain provider.
+// This prevents credential expiration when running on EC2 with IAM instance roles,
+// STS assume-role, or other temporary credential sources.
+//
+// Note: Because each DuckDB connection uses MaxOpenConns(1), the refresh db.Exec will
+// block behind any running query. This means credentials are refreshed between queries,
+// not during them. A query that runs longer than the credential TTL (~6h for instance
+// roles) could still fail if DuckDB makes S3 requests with the stale cached credentials.
+//
+// Returns a stop function that cancels the refresh goroutine. The caller must call
+// the stop function when the connection is closed to prevent goroutine leaks.
+// If credential refresh is not needed (static credentials, no S3, etc.), returns a no-op.
+func StartCredentialRefresh(db *sql.DB, dlCfg DuckLakeConfig) func() {
+	if !needsCredentialRefresh(dlCfg) {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(credentialRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				secretStmt := buildCredentialChainSecret(dlCfg)
+				if _, err := db.Exec(secretStmt); err != nil {
+					slog.Warn("Failed to refresh S3 credentials.", "error", err)
+				} else {
+					slog.Debug("Refreshed S3 credentials.")
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+	}
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
