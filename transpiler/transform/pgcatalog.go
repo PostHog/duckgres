@@ -421,6 +421,14 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 		if n.SortBy != nil {
 			t.walkAndTransform(n.SortBy.Node, changed)
 		}
+
+	case *pg_query.Node_ViewStmt:
+		if n.ViewStmt != nil {
+			if n.ViewStmt.View != nil {
+				t.walkAndTransform(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: n.ViewStmt.View}}, changed)
+			}
+			t.walkAndTransform(n.ViewStmt.Query, changed)
+		}
 	}
 }
 
