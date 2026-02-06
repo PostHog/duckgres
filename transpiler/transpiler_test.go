@@ -2275,3 +2275,72 @@ func TestTranspile_RegexOperators(t *testing.T) {
 		})
 	}
 }
+
+func TestTranspile_SimilarTo(t *testing.T) {
+	// Test SIMILAR TO pattern matching
+	// PostgreSQL converts SIMILAR TO to use similar_to_escape() and regex matching
+	// We provide a similar_to_escape macro that converts SQL patterns to regex
+	tests := []struct {
+		name     string
+		input    string
+		contains []string
+		excludes []string
+	}{
+		{
+			name:     "SIMILAR TO converts to similar_to_escape and regexp_matches",
+			input:    "SELECT 'hello' SIMILAR TO 'h%'",
+			contains: []string{"similar_to_escape", "regexp_matches"},
+			excludes: []string{"SIMILAR TO"},
+		},
+		{
+			name:     "NOT SIMILAR TO includes NOT",
+			input:    "SELECT 'hello' NOT SIMILAR TO 'x%'",
+			contains: []string{"NOT", "similar_to_escape", "regexp_matches"},
+			excludes: []string{"SIMILAR TO"},
+		},
+		{
+			name:     "SIMILAR TO in WHERE clause",
+			input:    "SELECT * FROM users WHERE name SIMILAR TO '%smith%'",
+			contains: []string{"similar_to_escape", "regexp_matches"},
+		},
+		{
+			name:     "SIMILAR TO with underscore pattern",
+			input:    "SELECT 'ab' SIMILAR TO 'a_'",
+			contains: []string{"similar_to_escape", "regexp_matches"},
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			for _, c := range tt.contains {
+				if !strings.Contains(result.SQL, c) {
+					t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, c)
+				}
+			}
+			for _, e := range tt.excludes {
+				if strings.Contains(result.SQL, e) {
+					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, e)
+				}
+			}
+		})
+	}
+}
+
+func TestTranspile_SimilarTo_DuckLakeMode(t *testing.T) {
+	// Test that similar_to_escape gets memory.main prefix in DuckLake mode
+	tr := New(Config{DuckLakeMode: true})
+
+	result, err := tr.Transpile("SELECT 'hello' SIMILAR TO 'h%'")
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+	if !strings.Contains(result.SQL, "memory.main.similar_to_escape") {
+		t.Errorf("In DuckLake mode, similar_to_escape should have memory.main prefix, got: %q", result.SQL)
+	}
+}

@@ -74,6 +74,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_table_privilege":             true,
 			"array_to_string":                 true,
 			"version":                         true,
+			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -89,6 +90,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
 			"version":                         true, // PostgreSQL-compatible version string for SQLAlchemy
 			"format_type":                     true, // Custom format_type with full PostgreSQL typemod support
+			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
 		},
 	}
 }

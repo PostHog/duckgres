@@ -701,6 +701,12 @@ func initPgCatalog(db *sql.DB) error {
 			END`,
 		// pg_is_in_recovery - check if in recovery mode
 		`CREATE OR REPLACE MACRO pg_is_in_recovery() AS false`,
+		// similar_to_escape - convert SIMILAR TO pattern to regex pattern
+		// PostgreSQL SIMILAR TO uses SQL patterns (% for any, _ for single char)
+		// This converts them to regex patterns (.* for any, . for single char)
+		// and anchors the pattern with ^ and $
+		`CREATE OR REPLACE MACRO similar_to_escape(pattern) AS
+			'^' || replace(replace(pattern, '%', '.*'), '_', '.') || '$'`,
 		// version - return PostgreSQL-compatible version string
 		// Fivetran and other tools check this to determine compatibility
 		`CREATE OR REPLACE MACRO version() AS 'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'`,
