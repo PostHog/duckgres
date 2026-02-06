@@ -425,9 +425,9 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string) 
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
 	}
 
-	// Set DuckDB threads to 4x the number of CPUs for better parallelism
+	// Set DuckDB threads to 2x the number of CPUs for parallelism
 	numCPU := runtime.NumCPU()
-	threads := numCPU * 4
+	threads := numCPU * 2
 	if _, err := db.Exec(fmt.Sprintf("SET threads = %d", threads)); err != nil {
 		slog.Warn("Failed to set DuckDB threads.", "threads", threads, "error", err)
 		// Continue anyway - DuckDB will use its default
