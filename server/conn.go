@@ -382,6 +382,7 @@ func (c *clientConn) serve() error {
 	}
 
 	// Create a DuckDB connection for this client session (unless pre-created by caller)
+	var stopRefresh func()
 	if c.db == nil {
 		db, err := c.server.createDBConnection(c.username)
 		if err != nil {
@@ -393,12 +394,18 @@ func (c *clientConn) serve() error {
 		// Start background credential refresh for long-lived connections.
 		// Only needed when we create the DB here; the control plane manages
 		// refresh for pre-created connections via DBPool.
-		stopRefresh := StartCredentialRefresh(c.db, c.server.cfg.DuckLake)
-		defer stopRefresh()
+		stopRefresh = StartCredentialRefresh(c.db, c.server.cfg.DuckLake)
 	}
+	// Defers run LIFO: first stop the credential refresh goroutine (so it won't
+	// call db.Exec on a closed DB), then clean up the database connection.
 	defer func() {
 		if c.db != nil {
 			c.safeCleanupDB()
+		}
+	}()
+	defer func() {
+		if stopRefresh != nil {
+			stopRefresh()
 		}
 	}()
 
