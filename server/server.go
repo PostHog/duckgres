@@ -826,6 +826,11 @@ func needsCredentialRefresh(dlCfg DuckLakeConfig) bool {
 // This prevents credential expiration when running on EC2 with IAM instance roles,
 // STS assume-role, or other temporary credential sources.
 //
+// Note: Because each DuckDB connection uses MaxOpenConns(1), the refresh db.Exec will
+// block behind any running query. This means credentials are refreshed between queries,
+// not during them. A query that runs longer than the credential TTL (~6h for instance
+// roles) could still fail if DuckDB makes S3 requests with the stale cached credentials.
+//
 // Returns a stop function that cancels the refresh goroutine. The caller must call
 // the stop function when the connection is closed to prevent goroutine leaks.
 // If credential refresh is not needed (static credentials, no S3, etc.), returns a no-op.

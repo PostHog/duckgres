@@ -105,7 +105,7 @@ func TestStartCredentialRefresh_StopsCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Install httpfs extension so CREATE SECRET works
 	if _, err := db.Exec("INSTALL httpfs"); err != nil {
