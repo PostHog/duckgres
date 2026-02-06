@@ -115,6 +115,7 @@ func main() {
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
 	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
+	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	showHelp := flag.Bool("help", false, "Show help message")
 
 	// Control plane flags
@@ -371,6 +372,15 @@ func main() {
 			fatal("Worker mode requires --grpc-socket and --fd-socket flags")
 		}
 		controlplane.RunWorker(*grpcSocket, *fdSocket)
+		return
+	}
+
+	// Handle REPL mode (interactive SQL shell, no TLS/metrics/server needed)
+	if *repl {
+		if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+			fatal("Failed to create data directory: " + err.Error())
+		}
+		server.RunShell(cfg)
 		return
 	}
 
