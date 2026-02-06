@@ -2498,6 +2498,298 @@ func TestTranspile_RangeFunction(t *testing.T) {
 	}
 }
 
+func TestTranspile_CtidToRowid(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "SELECT ctid -> rowid",
+			input:    "SELECT ctid FROM users",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "qualified table.ctid -> table.rowid",
+			input:    "SELECT u.ctid FROM users u",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "ctid in WHERE clause",
+			input:    "SELECT * FROM users WHERE ctid = '(0,1)'",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "ctid in DELETE",
+			input:    "DELETE FROM users WHERE ctid = '(0,1)'",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "ctid case insensitive",
+			input:    "SELECT CTID FROM users",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "no false positive on ctid-like column name",
+			input:    "SELECT acid FROM users",
+			contains: "acid",
+		},
+		{
+			name:     "ctid in subquery",
+			input:    "SELECT * FROM (SELECT ctid, name FROM users) sub",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_CatalogStrip(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "3-part name strips catalog",
+			input:    "SELECT * FROM duckgres.main.users",
+			contains: "main.users",
+			excludes: "duckgres.main.users",
+		},
+		{
+			name:     "3-part name with different catalog",
+			input:    "SELECT * FROM mydb.main.orders",
+			contains: "main.orders",
+			excludes: "mydb.main.orders",
+		},
+		{
+			name:     "memory catalog is preserved",
+			input:    "SELECT * FROM memory.main.pg_class_full",
+			contains: "memory.main.pg_class_full",
+		},
+		{
+			name:     "2-part name unchanged",
+			input:    "SELECT * FROM main.users",
+			contains: "main.users",
+		},
+		{
+			name:     "unqualified name unchanged",
+			input:    "SELECT * FROM users",
+			contains: "users",
+		},
+		{
+			name:     "catalog strip in INSERT",
+			input:    "INSERT INTO duckgres.main.users (id) VALUES (1)",
+			contains: "main.users",
+			excludes: "duckgres.main.users",
+		},
+		{
+			name:     "catalog strip in UPDATE",
+			input:    "UPDATE duckgres.main.users SET name = 'test'",
+			contains: "main.users",
+			excludes: "duckgres.main.users",
+		},
+		{
+			name:     "catalog strip in DELETE",
+			input:    "DELETE FROM duckgres.main.users WHERE id = 1",
+			contains: "main.users",
+			excludes: "duckgres.main.users",
+		},
+		{
+			name:     "catalog strip in JOIN",
+			input:    "SELECT * FROM duckgres.main.users u JOIN duckgres.main.orders o ON u.id = o.user_id",
+			excludes: "duckgres.",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_PgCatalogStubViews(t *testing.T) {
+	// Test that new stub views (pg_constraint, pg_enum, pg_indexes) are mapped correctly
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "pg_catalog.pg_constraint -> memory.main.pg_constraint",
+			input:    "SELECT * FROM pg_catalog.pg_constraint",
+			contains: "memory.main.pg_constraint",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "pg_catalog.pg_enum -> memory.main.pg_enum",
+			input:    "SELECT * FROM pg_catalog.pg_enum",
+			contains: "memory.main.pg_enum",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "pg_catalog.pg_indexes -> memory.main.pg_indexes",
+			input:    "SELECT * FROM pg_catalog.pg_indexes",
+			contains: "memory.main.pg_indexes",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "unqualified pg_constraint -> memory.main.pg_constraint",
+			input:    "SELECT conname FROM pg_constraint WHERE contype = 'p'",
+			contains: "memory.main.pg_constraint",
+		},
+		{
+			name:     "unqualified pg_enum -> memory.main.pg_enum",
+			input:    "SELECT enumlabel FROM pg_enum",
+			contains: "memory.main.pg_enum",
+		},
+		{
+			name:     "unqualified pg_indexes -> memory.main.pg_indexes",
+			input:    "SELECT indexname FROM pg_indexes WHERE tablename = 'users'",
+			contains: "memory.main.pg_indexes",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_CtidWithCatalogStrip(t *testing.T) {
+	// Test that ctid→rowid and catalog stripping work together,
+	// which is the real-world scenario when DuckDB's postgres extension reads data
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "ctid SELECT with catalog-qualified table",
+			input:    "SELECT ctid FROM duckgres.main.users",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "ctid and catalog combined do not have duckgres prefix",
+			input:    "SELECT ctid, name FROM duckgres.main.users WHERE id > 0",
+			excludes: "duckgres.",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_ViewStmtWalking(t *testing.T) {
+	// Test that CREATE VIEW ... AS SELECT has its inner query transformed
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "CREATE VIEW with pg_catalog reference",
+			input:    "CREATE VIEW myview AS SELECT * FROM pg_catalog.pg_class",
+			contains: "memory.main.pg_class_full",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "CREATE VIEW with public schema",
+			input:    "CREATE VIEW myview AS SELECT * FROM public.users",
+			contains: "main.users",
+			excludes: "public.users",
+		},
+		{
+			name:     "CREATE OR REPLACE VIEW with ctid",
+			input:    "CREATE OR REPLACE VIEW myview AS SELECT ctid, name FROM users",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
 func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 	// Test that custom macros get memory.main. prefix in DuckLake mode
 	// These macros are created in memory.main and need explicit qualification
