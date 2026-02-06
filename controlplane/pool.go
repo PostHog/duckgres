@@ -185,6 +185,28 @@ func (p *WorkerPool) ConnectExistingWorker(id int, grpcSocket, fdSocket string) 
 		done:       make(chan struct{}),
 	}
 
+	// Monitor the handed-over worker via gRPC health checks.
+	// Unlike SpawnWorker where we can cmd.Wait(), we don't own this process,
+	// so we detect exit by polling health. This ensures done is closed for
+	// ShutdownAll and RollingUpdate which wait on <-w.done.
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, err := client.Health(ctx, &pb.HealthRequest{})
+			cancel()
+			if err != nil {
+				slog.Info("Handed-over worker unreachable, marking as done.", "id", id, "error", err)
+				close(worker.done)
+				p.mu.Lock()
+				delete(p.workers, id)
+				p.mu.Unlock()
+				return
+			}
+		}
+	}()
+
 	p.mu.Lock()
 	p.workers[id] = worker
 	p.mu.Unlock()

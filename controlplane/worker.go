@@ -53,10 +53,11 @@ type Worker struct {
 }
 
 type workerSession struct {
-	pid       int32
-	secretKey int32
-	cancel    context.CancelFunc
+	pid        int32
+	secretKey  int32
+	cancel     context.CancelFunc
 	remoteAddr string
+	minServer  *server.Server // per-session server for query cancellation
 }
 
 // RunWorker is the entry point for a worker process.
@@ -430,6 +431,14 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 	minServer := &server.Server{}
 	server.InitMinimalServer(minServer, w.cfg, queryCancelCh)
 
+	// Store minServer in session so CancelQuery can cancel individual queries
+	// rather than tearing down the entire session.
+	w.sessionsMu.Lock()
+	if s, ok := w.sessions[pid]; ok {
+		s.minServer = minServer
+	}
+	w.sessionsMu.Unlock()
+
 	cc := server.NewClientConn(minServer, tlsConn, reader, writer, username, database, db, pid, secretKey)
 
 	// Send initial params and ready for query
@@ -468,9 +477,16 @@ func (w *Worker) CancelQuery(_ context.Context, req *pb.CancelQueryRequest) (*pb
 
 	for _, s := range w.sessions {
 		if s.pid == req.BackendPid && s.secretKey == req.SecretKey {
-			s.cancel()
-			slog.Info("Query cancelled via gRPC.", "pid", req.BackendPid)
-			return &pb.CancelQueryResponse{Cancelled: true}, nil
+			// Cancel the active query via the per-session server's activeQueries map,
+			// matching standalone mode behavior. This cancels only the in-flight query
+			// while keeping the connection alive (instead of tearing down the session).
+			key := server.BackendKey{Pid: req.BackendPid, SecretKey: req.SecretKey}
+			if s.minServer != nil && s.minServer.CancelQuery(key) {
+				slog.Info("Query cancelled via gRPC.", "pid", req.BackendPid)
+				return &pb.CancelQueryResponse{Cancelled: true}, nil
+			}
+			// No active query registered yet (session still initializing)
+			return &pb.CancelQueryResponse{Cancelled: false}, nil
 		}
 	}
 	return &pb.CancelQueryResponse{Cancelled: false}, nil
