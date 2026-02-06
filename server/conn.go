@@ -1547,6 +1547,7 @@ type CopyFromOptions struct {
 	NullString string
 	Quote      string // Quote character (default " for CSV)
 	Escape     string // Escape character (default same as Quote)
+	IsBinary   bool   // True if FORMAT binary
 }
 
 // ParseCopyFromOptions extracts options from a COPY FROM STDIN command
@@ -1567,6 +1568,12 @@ func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
 	// Extract column list if present
 	if len(matches) > 2 && matches[2] != "" {
 		opts.ColumnList = fmt.Sprintf("(%s)", matches[2])
+	}
+
+	// Detect binary format
+	if copyBinaryRegex.MatchString(upperQuery) {
+		opts.IsBinary = true
+		return opts, nil
 	}
 
 	// Parse delimiter
@@ -1932,7 +1939,7 @@ func (c *clientConn) handleCopyOutBinary(rows *sql.Rows, cols []string) error {
 // handleCopyIn handles COPY ... FROM STDIN
 func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	copyStartTime := time.Now()
-	slog.Debug("COPY FROM STDIN starting.", "user", c.username)
+	slog.Debug("COPY FROM STDIN starting.", "user", c.username, "query", query)
 
 	// Parse COPY options using the helper function
 	opts, err := ParseCopyFromOptions(query)
@@ -1946,10 +1953,17 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 	tableName := opts.TableName
 	columnList := opts.ColumnList
-	slog.Debug("COPY FROM STDIN parsed.", "user", c.username, "table", tableName, "columns", columnList)
+	slog.Debug("COPY FROM STDIN parsed.", "user", c.username, "table", tableName, "columns", columnList, "binary", opts.IsBinary)
 
-	// Get column count for the table
-	colQuery := fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
+	// Get column info. If a column list is specified, query only those columns
+	// in the specified order to match the binary data field order.
+	var colQuery string
+	if columnList != "" {
+		// columnList is "(col1, col2, ...)" — use it in SELECT to get types in COPY order
+		colQuery = fmt.Sprintf("SELECT %s FROM %s LIMIT 0", columnList[1:len(columnList)-1], tableName)
+	} else {
+		colQuery = fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
+	}
 	testRows, err := c.db.Query(colQuery)
 	if err != nil {
 		slog.Error("COPY FROM table check failed.", "user", c.username, "table", tableName, "error", err)
@@ -1960,7 +1974,13 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return nil
 	}
 	cols, _ := testRows.Columns()
+	colTypes, _ := testRows.ColumnTypes()
 	_ = testRows.Close()
+
+	// Branch to binary handler if binary format
+	if opts.IsBinary {
+		return c.handleCopyInBinary(opts, cols, colTypes)
+	}
 
 	// Send CopyInResponse
 	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
@@ -2065,6 +2085,225 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			_ = c.writer.Flush()
 			return nil
 		}
+	}
+}
+
+// handleCopyInBinary handles COPY ... FROM STDIN with binary format.
+// It parses the PostgreSQL binary COPY format, decodes each field, and INSERTs rows.
+func (c *clientConn) handleCopyInBinary(opts *CopyFromOptions, cols []string, colTypes []*sql.ColumnType) error {
+	copyStartTime := time.Now()
+
+	// Get type OIDs for decoding
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
+	// Send CopyInResponse (binary format)
+	if err := writeCopyInResponse(c.writer, int16(len(cols)), false); err != nil {
+		return err
+	}
+	_ = c.writer.Flush()
+	slog.Debug("COPY FROM STDIN binary: sent CopyInResponse.", "user", c.username)
+
+	// Collect all CopyData messages into a buffer
+	var buf bytes.Buffer
+	for {
+		msgType, body, err := readMessage(c.reader)
+		if err != nil {
+			slog.Error("COPY FROM STDIN binary: error reading message.", "user", c.username, "error", err)
+			return err
+		}
+
+		switch msgType {
+		case msgCopyData:
+			buf.Write(body)
+
+		case msgCopyDone:
+			// Parse binary data and insert rows
+			data := buf.Bytes()
+			rowCount, err := c.parseBinaryCopyAndInsert(data, opts.TableName, opts.ColumnList, cols, typeOIDs)
+			if err != nil {
+				slog.Error("COPY FROM STDIN binary: parse/insert failed.", "user", c.username, "error", err)
+				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
+				c.setTxError()
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
+				return nil
+			}
+
+			elapsed := time.Since(copyStartTime)
+			slog.Info("COPY FROM STDIN binary completed.", "user", c.username, "rows", rowCount, "bytes", buf.Len(), "duration", elapsed)
+
+			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		case msgCopyFail:
+			errMsg := string(bytes.TrimRight(body, "\x00"))
+			c.sendError("ERROR", "57014", fmt.Sprintf("COPY failed: %s", errMsg))
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		default:
+			c.sendError("ERROR", "08P01", fmt.Sprintf("unexpected message type during COPY: %c", msgType))
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+	}
+}
+
+// parseBinaryCopyAndInsert parses PostgreSQL binary COPY format data and INSERTs rows.
+func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList string, cols []string, typeOIDs []int32) (int, error) {
+	offset := 0
+
+	// Validate and skip header (19+ bytes)
+	// Signature: "PGCOPY\n\377\r\n\0" (11 bytes)
+	if len(data) < 19 {
+		return 0, fmt.Errorf("binary COPY data too short for header")
+	}
+	expectedSig := []byte{'P', 'G', 'C', 'O', 'P', 'Y', '\n', 0xFF, '\r', '\n', 0x00}
+	if !bytes.Equal(data[:11], expectedSig) {
+		return 0, fmt.Errorf("invalid binary COPY signature")
+	}
+	offset = 11
+
+	// Flags (4 bytes) and extension area length (4 bytes)
+	// flags := binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+	extLen := binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+	offset += int(extLen) // skip extension area
+
+	// Build INSERT statement: INSERT INTO table (col1, col2, ...) VALUES ($1, $2, ...)
+	numCols := len(cols)
+	placeholders := make([]string, numCols)
+	for i := range placeholders {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+
+	colNames := columnList
+	if colNames == "" {
+		quotedCols := make([]string, numCols)
+		for i, col := range cols {
+			quotedCols[i] = fmt.Sprintf(`"%s"`, col)
+		}
+		colNames = "(" + strings.Join(quotedCols, ", ") + ")"
+	}
+
+	insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES (%s)",
+		tableName, colNames, strings.Join(placeholders, ", "))
+
+	// Parse tuples and insert
+	rowCount := 0
+	for offset < len(data) {
+		if offset+2 > len(data) {
+			return rowCount, fmt.Errorf("truncated binary COPY data at tuple header")
+		}
+
+		fieldCount := int16(binary.BigEndian.Uint16(data[offset:]))
+		offset += 2
+
+		// Trailer: field count of -1
+		if fieldCount == -1 {
+			break
+		}
+
+		if int(fieldCount) != numCols {
+			return rowCount, fmt.Errorf("binary COPY field count mismatch: got %d, expected %d", fieldCount, numCols)
+		}
+
+		values := make([]interface{}, numCols)
+		for i := 0; i < numCols; i++ {
+			if offset+4 > len(data) {
+				return rowCount, fmt.Errorf("truncated binary COPY data at field %d length", i)
+			}
+
+			fieldLen := int32(binary.BigEndian.Uint32(data[offset:]))
+			offset += 4
+
+			if fieldLen == -1 {
+				values[i] = nil
+			} else {
+				if offset+int(fieldLen) > len(data) {
+					return rowCount, fmt.Errorf("truncated binary COPY data at field %d data", i)
+				}
+				fieldData := data[offset : offset+int(fieldLen)]
+				offset += int(fieldLen)
+
+				decoded, err := decodeBinaryCopy(fieldData, typeOIDs[i])
+				if err != nil {
+					return rowCount, fmt.Errorf("failed to decode field %d (OID %d, %d bytes): %v", i, typeOIDs[i], fieldLen, err)
+				}
+				values[i] = decoded
+			}
+		}
+
+		if _, err := c.db.Exec(insertSQL, values...); err != nil {
+			return rowCount, fmt.Errorf("INSERT failed at row %d: %v", rowCount+1, err)
+		}
+		rowCount++
+	}
+
+	return rowCount, nil
+}
+
+// decodeBinaryCopy decodes a binary COPY field, using field length to resolve type ambiguity.
+// DuckDB's postgres extension may send different integer widths than what the table OID suggests.
+func decodeBinaryCopy(data []byte, oid int32) (interface{}, error) {
+	if data == nil {
+		return nil, nil
+	}
+
+	// Zero-length fields: return empty string for text types, nil for others
+	if len(data) == 0 {
+		switch oid {
+		case OidText, OidVarchar, OidBpchar, OidName, OidJSON, OidJSONB:
+			return "", nil
+		default:
+			return nil, nil
+		}
+	}
+
+	switch oid {
+	case OidBool:
+		return decodeBool(data)
+	case OidInt2, OidInt4, OidInt8:
+		// Use field length to determine actual integer width
+		switch len(data) {
+		case 2:
+			return decodeInt2(data)
+		case 4:
+			return decodeInt4(data)
+		case 8:
+			return decodeInt8(data)
+		default:
+			return string(data), nil
+		}
+	case OidFloat4:
+		if len(data) == 8 {
+			return decodeFloat8(data)
+		}
+		return decodeFloat4(data)
+	case OidFloat8:
+		if len(data) == 4 {
+			return decodeFloat4(data)
+		}
+		return decodeFloat8(data)
+	case OidDate:
+		return decodeDate(data)
+	case OidTimestamp, OidTimestamptz:
+		return decodeTimestamp(data)
+	case OidBytea:
+		return data, nil
+	default:
+		// For text, varchar, and unknown types, return as string
+		return string(data), nil
 	}
 }
 
