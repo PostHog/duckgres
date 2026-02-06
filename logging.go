@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,12 +59,34 @@ func (m *multiHandler) WithGroup(name string) slog.Handler {
 	return &multiHandler{handlers: handlers}
 }
 
+// newPostHogExporter creates an OTLP log exporter for a single PostHog API key.
+// Returns nil if the exporter cannot be created.
+func newPostHogExporter(ctx context.Context, host, apiKey string) *otlploghttp.Exporter {
+	exporter, err := otlploghttp.New(ctx,
+		otlploghttp.WithEndpoint(host),
+		otlploghttp.WithURLPath("/i/v1/logs"),
+		otlploghttp.WithHeaders(map[string]string{
+			"Authorization": "Bearer " + apiKey,
+		}),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create PostHog log exporter for key %s…: %v\n", apiKey[:min(8, len(apiKey))], err)
+		return nil
+	}
+	return exporter
+}
+
 // initLogging configures slog to send logs to PostHog via OTLP when
-// POSTHOG_API_KEY is set. Logs always go to stderr; PostHog is additive.
-// Returns a shutdown function that flushes the OTLP batch processor.
+// POSTHOG_API_KEY is set. Additional PostHog projects can be targeted by
+// setting ADDITIONAL_POSTHOG_API_KEYS to a comma-separated list of API keys.
+// Logs always go to stderr; PostHog is additive.
+// Returns a shutdown function that flushes all OTLP batch processors.
 func initLogging() func() {
 	apiKey := os.Getenv("POSTHOG_API_KEY")
 	if apiKey == "" {
+		if os.Getenv("ADDITIONAL_POSTHOG_API_KEYS") != "" {
+			fmt.Fprintln(os.Stderr, "ADDITIONAL_POSTHOG_API_KEYS is set but POSTHOG_API_KEY is not; ignoring additional keys")
+		}
 		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
 		return func() {}
 	}
@@ -76,16 +99,39 @@ func initLogging() func() {
 
 	ctx := context.Background()
 
-	exporter, err := otlploghttp.New(ctx,
-		otlploghttp.WithEndpoint(host),
-		otlploghttp.WithURLPath("/i/v1/logs"),
-		otlploghttp.WithHeaders(map[string]string{
-			"Authorization": "Bearer " + apiKey,
-		}),
-	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create PostHog log exporter, continuing with stderr only: %v\n", err)
+	// Collect all API keys: primary + additional.
+	apiKeys := []string{apiKey}
+	if additional := os.Getenv("ADDITIONAL_POSTHOG_API_KEYS"); additional != "" {
+		seen := map[string]bool{apiKey: true}
+		for _, raw := range strings.Split(additional, ",") {
+			k := strings.TrimSpace(raw)
+			if k == "" {
+				continue
+			}
+			if seen[k] {
+				fmt.Fprintf(os.Stderr, "Ignoring duplicate PostHog API key %s…\n", k[:min(8, len(k))])
+				continue
+			}
+			seen[k] = true
+			apiKeys = append(apiKeys, k)
+		}
+	}
+
+	// The primary exporter must succeed; additional ones are best-effort.
+	primaryExp := newPostHogExporter(ctx, host, apiKey)
+	if primaryExp == nil {
+		fmt.Fprintln(os.Stderr, "Primary PostHog exporter failed to initialize, continuing with stderr only")
 		return func() {}
+	}
+	processors := []sdklog.LoggerProviderOption{
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(primaryExp)),
+	}
+	for _, k := range apiKeys[1:] {
+		exp := newPostHogExporter(ctx, host, k)
+		if exp == nil {
+			continue
+		}
+		processors = append(processors, sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)))
 	}
 
 	serviceName := "duckgres"
@@ -98,10 +144,8 @@ func initLogging() func() {
 		semconv.ServiceName(serviceName),
 	)
 
-	provider := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
-		sdklog.WithResource(res),
-	)
+	opts := append(processors, sdklog.WithResource(res))
+	provider := sdklog.NewLoggerProvider(opts...)
 
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
 	textHandler := slog.NewTextHandler(os.Stderr, nil)
@@ -110,7 +154,7 @@ func initLogging() func() {
 		handlers: []slog.Handler{textHandler, otelHandler},
 	}))
 
-	slog.Info("PostHog logging enabled.", "host", host)
+	slog.Info("PostHog logging enabled.", "host", host, "exporters", len(processors))
 
 	var once sync.Once
 	return func() {
