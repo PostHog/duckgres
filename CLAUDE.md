@@ -8,24 +8,39 @@ Duckgres is a PostgreSQL wire protocol server backed by DuckDB. It allows any Po
 
 ## Architecture
 
+Duckgres supports three run modes: `standalone` (default), `control-plane`, and `worker`.
+
 ```
-PostgreSQL Client → TLS → Duckgres Server → DuckDB (per-user database)
+Standalone:    PostgreSQL Client → TLS → Duckgres Server → DuckDB (per-user database)
+Control Plane: PostgreSQL Client → TLS → Control Plane → (FD pass) → Worker → DuckDB
 ```
 
 ### Key Components
 
-- **main.go**: Entry point, configuration loading (CLI flags, env vars, YAML)
-- **server/server.go**: Server struct, connection handling, graceful shutdown
+- **main.go**: Entry point, configuration loading (CLI flags, env vars, YAML), mode routing
+- **server/server.go**: Server struct, connection handling, graceful shutdown, `CreateDBConnection()` (standalone function)
 - **server/conn.go**: Client connection handling, query execution, COPY protocol
 - **server/protocol.go**: PostgreSQL wire protocol message encoding/decoding
+- **server/exports.go**: Exported wrappers for protocol functions (used by control plane workers)
 - **server/catalog.go**: pg_catalog compatibility views and macros initialization
 - **server/types.go**: Type OID mapping between DuckDB and PostgreSQL
 - **server/ratelimit.go**: Rate limiting for brute-force protection
 - **server/certs.go**: Auto-generation of self-signed TLS certificates
+- **server/parent.go**: Child process spawning for ProcessIsolation mode
+- **server/worker.go**: Per-connection child worker (ProcessIsolation mode)
 - **transpiler/**: AST-based SQL transpiler (PostgreSQL → DuckDB)
   - `transpiler.go`: Main API, transform pipeline orchestration
   - `config.go`: Configuration types (DuckLakeMode, ConvertPlaceholders)
   - `transform/`: Individual transform implementations
+- **controlplane/**: Multi-process control plane architecture
+  - `proto/worker.proto`: gRPC service definition (Configure, AcceptConnection, CancelQuery, Drain, Health, Shutdown)
+  - `proto/*.pb.go`: Generated gRPC/protobuf code
+  - `fdpass/fdpass.go`: Unix socket FD passing via SCM_RIGHTS
+  - `worker.go`: Long-lived worker process (gRPC server, FD receiver, session handler)
+  - `dbpool.go`: Per-session DuckDB database pool management
+  - `control.go`: Control plane main loop (TCP listener, rate limiting, connection routing)
+  - `pool.go`: Worker pool management (spawn, health check, least-connections routing, rolling update)
+  - `handover.go`: Graceful deployment (listener FD transfer between control planes)
 
 ## PostgreSQL Wire Protocol
 
@@ -74,10 +89,24 @@ Supports bulk data transfer:
 - **COPY FROM STDIN**: Receives data from client, inserts row by row
 - Supports CSV format with HEADER, DELIMITER, and NULL options
 
+## Run Modes
+
+- **standalone** (default): Single process, handles everything. Current behavior unchanged.
+- **control-plane**: Multi-process. Accepts TCP connections, passes FDs to worker pool via Unix sockets.
+- **worker**: Long-lived child process spawned by control plane. Handles TLS, auth, query execution via gRPC + FD passing.
+
+Key CLI flags for control plane mode:
+- `--mode control-plane|worker|standalone`
+- `--worker-count N` (default 4)
+- `--socket-dir /path` (Unix sockets for gRPC + FD passing)
+- `--handover-socket /path` (graceful deployment between control planes)
+- `--grpc-socket /path` (worker, set by control plane at spawn)
+- `--fd-socket /path` (worker, set by control plane at spawn)
+
 ## Configuration
 
 Three-tier configuration (highest to lowest priority):
-1. CLI flags (`--port`, `--config`, etc.)
+1. CLI flags (`--port`, `--config`, `--mode`, etc.)
 2. Environment variables (`DUCKGRES_PORT`, etc.)
 3. YAML config file
 4. Built-in defaults

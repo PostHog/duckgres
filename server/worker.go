@@ -358,13 +358,6 @@ type workerServer struct {
 }
 
 // createDBConnection creates a DuckDB connection for the child worker.
-// This is a copy of Server.createDBConnection adapted for the worker context.
 func (w *workerServer) createDBConnection(username string) (*sql.DB, error) {
-	// Import sql package - we'll use the Server's method through embedding
-	// For now, create a temporary Server instance to reuse the logic
-	tempServer := &Server{
-		cfg:         w.cfg,
-		duckLakeSem: make(chan struct{}, 1),
-	}
-	return tempServer.createDBConnection(username)
+	return CreateDBConnection(w.cfg, make(chan struct{}, 1), username)
 }
