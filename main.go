@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"syscall"
@@ -116,6 +117,7 @@ func main() {
 	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
+	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showHelp := flag.Bool("help", false, "Show help message")
 
 	// Control plane flags
@@ -371,6 +373,33 @@ func main() {
 		} else {
 			slog.Warn("Invalid --idle-timeout duration: " + err.Error())
 		}
+	}
+
+	// Handle --psql: launch psql connected to the local Duckgres server
+	if *psql {
+		// Pick the first user from the config
+		var user, password string
+		for u, p := range cfg.Users {
+			user, password = u, p
+			break
+		}
+
+		connectHost := "127.0.0.1"
+		psqlArgs := []string{
+			"psql",
+			fmt.Sprintf("host=%s port=%d user=%s sslmode=require", connectHost, cfg.Port, user),
+		}
+
+		psqlPath, err := exec.LookPath("psql")
+		if err != nil {
+			fatal("psql not found in PATH")
+		}
+
+		env := append(os.Environ(), "PGPASSWORD="+password)
+		if err := syscall.Exec(psqlPath, psqlArgs, env); err != nil {
+			fatal("Failed to exec psql: " + err.Error())
+		}
+		return
 	}
 
 	// Handle worker mode early (before metrics, certs, etc.)
