@@ -83,6 +83,18 @@ func TestFallbackToNativeDuckDB(t *testing.T) {
 			Query:        "SELECT list_filter([1, 2, 3, 4, 5], x -> x > 2) AS filtered",
 			DuckgresOnly: true,
 		},
+		// EXPLAIN with DuckDB-specific FROM-first syntax (regression: was producing EXPLAIN EXPLAIN)
+		{
+			Name:         "explain_from_first",
+			Query:        "EXPLAIN FROM users SELECT name",
+			DuckgresOnly: true,
+		},
+		// EXPLAIN ANALYZE with DuckDB-specific syntax
+		{
+			Name:         "explain_analyze_from_first",
+			Query:        "EXPLAIN ANALYZE FROM users SELECT name",
+			DuckgresOnly: true,
+		},
 	}
 	runQueryTests(t, tests)
 }

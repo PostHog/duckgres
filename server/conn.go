@@ -281,6 +281,12 @@ func (c *clientConn) validateWithDuckDB(query string) error {
 		return nil
 	}
 
+	// Skip validation for queries that already start with EXPLAIN to avoid EXPLAIN EXPLAIN
+	upperQuery := strings.ToUpper(strings.TrimSpace(stripLeadingComments(query)))
+	if strings.HasPrefix(upperQuery, "EXPLAIN") {
+		return nil
+	}
+
 	// Skip EXPLAIN validation for queries with parameter placeholders ($1, $2, etc.)
 	// EXPLAIN cannot handle unbound parameters - we'll let DuckDB validate at execution time
 	if hasParameterPlaceholders(query) {
@@ -291,13 +297,8 @@ func (c *clientConn) validateWithDuckDB(query string) error {
 	// DuckDB's EXPLAIN will fail if the query is syntactically invalid
 	_, err := c.db.Exec("EXPLAIN " + query)
 	if err != nil {
-		// Strip "EXPLAIN " from error messages to avoid confusing users,
-		// but only if the original query didn't start with EXPLAIN
-		errMsg := err.Error()
-		upperQuery := strings.ToUpper(strings.TrimSpace(stripLeadingComments(query)))
-		if !strings.HasPrefix(upperQuery, "EXPLAIN") {
-			errMsg = strings.Replace(errMsg, "EXPLAIN ", "", 1)
-		}
+		// Strip "EXPLAIN " from error messages to avoid confusing users
+		errMsg := strings.Replace(err.Error(), "EXPLAIN ", "", 1)
 		return fmt.Errorf("%s", errMsg)
 	}
 	return nil
