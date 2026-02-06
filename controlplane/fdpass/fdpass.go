@@ -77,15 +77,15 @@ func SocketPair() (*net.UnixConn, *net.UnixConn, error) {
 
 	sender, err := fdToUnixConn(fds[0], "sender")
 	if err != nil {
-		syscall.Close(fds[0])
-		syscall.Close(fds[1])
+		_ = syscall.Close(fds[0])
+		_ = syscall.Close(fds[1])
 		return nil, nil, err
 	}
 
 	receiver, err := fdToUnixConn(fds[1], "receiver")
 	if err != nil {
-		sender.Close()
-		syscall.Close(fds[1])
+		_ = sender.Close()
+		_ = syscall.Close(fds[1])
 		return nil, nil, err
 	}
 
@@ -97,7 +97,7 @@ func fdToUnixConn(fd int, name string) (*net.UnixConn, error) {
 	if f == nil {
 		return nil, fmt.Errorf("invalid fd %d", fd)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fc, err := net.FileConn(f)
 	if err != nil {
@@ -106,7 +106,7 @@ func fdToUnixConn(fd int, name string) (*net.UnixConn, error) {
 
 	uc, ok := fc.(*net.UnixConn)
 	if !ok {
-		fc.Close()
+		_ = fc.Close()
 		return nil, fmt.Errorf("not a UnixConn")
 	}
 	return uc, nil

@@ -31,7 +31,7 @@ func (cp *ControlPlane) startHandoverListener() {
 	}
 
 	// Clean up old socket
-	os.Remove(cp.cfg.HandoverSocket)
+	_ = os.Remove(cp.cfg.HandoverSocket)
 
 	ln, err := net.Listen("unix", cp.cfg.HandoverSocket)
 	if err != nil {
@@ -42,8 +42,8 @@ func (cp *ControlPlane) startHandoverListener() {
 	slog.Info("Handover listener started.", "socket", cp.cfg.HandoverSocket)
 
 	go func() {
-		defer ln.Close()
-		defer os.Remove(cp.cfg.HandoverSocket)
+		defer func() { _ = ln.Close() }()
+		defer func() { _ = os.Remove(cp.cfg.HandoverSocket) }()
 
 		for {
 			conn, err := ln.Accept()
@@ -67,8 +67,8 @@ func (cp *ControlPlane) startHandoverListener() {
 
 // handleHandoverRequest processes an incoming handover request from a new control plane.
 func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.Listener) {
-	defer conn.Close()
-	defer handoverLn.Close()
+	defer func() { _ = conn.Close() }()
+	defer func() { _ = handoverLn.Close() }()
 
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
@@ -119,7 +119,7 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 		slog.Error("Failed to get listener FD.", "error", err)
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
@@ -171,7 +171,7 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, []handoverWorker,
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect handover socket: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
@@ -201,7 +201,7 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, []handoverWorker,
 	if err != nil {
 		return nil, nil, fmt.Errorf("receive listener FD: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Reconstruct listener from FD
 	ln, err := net.FileListener(file)
@@ -211,13 +211,13 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, []handoverWorker,
 
 	tcpLn, ok := ln.(*net.TCPListener)
 	if !ok {
-		ln.Close()
+		_ = ln.Close()
 		return nil, nil, fmt.Errorf("not a TCP listener")
 	}
 
 	// Send handover complete
 	if err := encoder.Encode(handoverMsg{Type: "handover_complete"}); err != nil {
-		tcpLn.Close()
+		_ = tcpLn.Close()
 		return nil, nil, fmt.Errorf("send handover complete: %w", err)
 	}
 

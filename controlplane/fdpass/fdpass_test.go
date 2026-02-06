@@ -12,15 +12,15 @@ func TestSendRecvFD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SocketPair: %v", err)
 	}
-	defer sender.Close()
-	defer receiver.Close()
+	defer func() { _ = sender.Close() }()
+	defer func() { _ = receiver.Close() }()
 
 	// Create a temp file to pass
 	tmp, err := os.CreateTemp("", "fdpass-test-*")
 	if err != nil {
 		t.Fatalf("CreateTemp: %v", err)
 	}
-	defer os.Remove(tmp.Name())
+	defer func() { _ = os.Remove(tmp.Name()) }()
 
 	// Write some data
 	msg := "hello from fd passing"
@@ -35,14 +35,14 @@ func TestSendRecvFD(t *testing.T) {
 	if err := SendFile(sender, tmp); err != nil {
 		t.Fatalf("SendFile: %v", err)
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	// Receive the FD
 	received, err := RecvFile(receiver, "received")
 	if err != nil {
 		t.Fatalf("RecvFile: %v", err)
 	}
-	defer received.Close()
+	defer func() { _ = received.Close() }()
 
 	// Read data from received FD to verify it works
 	if _, err := received.Seek(0, 0); err != nil {
@@ -64,15 +64,15 @@ func TestSendRecvTCPConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SocketPair: %v", err)
 	}
-	defer sender.Close()
-	defer receiver.Close()
+	defer func() { _ = sender.Close() }()
+	defer func() { _ = receiver.Close() }()
 
 	// Create a TCP listener
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Connect a TCP client
 	clientConn, err := net.Dial("tcp", ln.Addr().String())
@@ -92,13 +92,13 @@ func TestSendRecvTCPConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("File: %v", err)
 	}
-	serverConn.Close() // Close the original; file has a dup'd FD
+	_ = serverConn.Close() // Close the original; file has a dup'd FD
 
 	// Send the TCP FD
 	if err := SendFile(sender, file); err != nil {
 		t.Fatalf("SendFile: %v", err)
 	}
-	file.Close()
+	_ = file.Close()
 
 	// Receive the TCP FD in the "worker"
 	recvFile, err := RecvFile(receiver, "tcp-conn")
@@ -111,8 +111,8 @@ func TestSendRecvTCPConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FileConn: %v", err)
 	}
-	recvFile.Close()
-	defer fc.Close()
+	_ = recvFile.Close()
+	defer func() { _ = fc.Close() }()
 
 	// Write from the reconstructed connection, read from client
 	msg := "hello via fd passing"
@@ -129,5 +129,5 @@ func TestSendRecvTCPConn(t *testing.T) {
 		t.Errorf("got %q, want %q", string(buf[:n]), msg)
 	}
 
-	clientConn.Close()
+	_ = clientConn.Close()
 }

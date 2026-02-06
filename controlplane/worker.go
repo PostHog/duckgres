@@ -45,8 +45,7 @@ type Worker struct {
 	sessionsWg sync.WaitGroup
 
 	// Cancellation
-	activeQueries   map[server.BackendKey]context.CancelFunc
-	activeQueriesMu sync.RWMutex
+	activeQueries map[server.BackendKey]context.CancelFunc
 
 	// FD passing - stores the most recently received FD
 	pendingFD int
@@ -97,7 +96,7 @@ func (w *Worker) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen gRPC socket: %w", err)
 	}
-	defer os.Remove(w.grpcSocketPath)
+	defer func() { _ = os.Remove(w.grpcSocketPath) }()
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterWorkerControlServer(grpcServer, w)
@@ -113,7 +112,7 @@ func (w *Worker) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen FD socket: %w", err)
 	}
-	defer os.Remove(w.fdSocketPath)
+	defer func() { _ = os.Remove(w.fdSocketPath) }()
 
 	// Accept FD connections in a goroutine
 	go w.fdReceiverLoop(fdLn)
@@ -173,13 +172,13 @@ func (w *Worker) fdReceiverLoop(ln net.Listener) {
 		uc, ok := conn.(*net.UnixConn)
 		if !ok {
 			slog.Error("FD socket: not a UnixConn")
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 
 		// Receive the FD
 		fd, err := fdpass.RecvFD(uc)
-		uc.Close()
+		_ = uc.Close()
 		if err != nil {
 			slog.Error("Failed to receive FD.", "error", err)
 			continue
@@ -274,14 +273,14 @@ func (w *Worker) AcceptConnection(_ context.Context, req *pb.AcceptConnectionReq
 		return &pb.AcceptConnectionResponse{Ok: false, Error: "invalid FD"}, nil
 	}
 	fc, err := net.FileConn(file)
-	file.Close()
+	_ = file.Close()
 	if err != nil {
 		return &pb.AcceptConnectionResponse{Ok: false, Error: fmt.Sprintf("FileConn: %v", err)}, nil
 	}
 
 	tcpConn, ok := fc.(*net.TCPConn)
 	if !ok {
-		fc.Close()
+		_ = fc.Close()
 		return &pb.AcceptConnectionResponse{Ok: false, Error: "not TCP"}, nil
 	}
 
@@ -312,17 +311,17 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 	tlsConn := tls.Server(tcpConn, w.tlsConfig)
 	if err := tlsConn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		slog.Error("Failed to set TLS deadline.", "error", err)
-		tcpConn.Close()
+		_ = tcpConn.Close()
 		return
 	}
 	if err := tlsConn.Handshake(); err != nil {
 		slog.Error("TLS handshake failed.", "error", err, "remote_addr", remoteAddr)
-		tcpConn.Close()
+		_ = tcpConn.Close()
 		return
 	}
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
 		slog.Error("Failed to clear TLS deadline.", "error", err)
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 
@@ -333,7 +332,7 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 	params, err := server.ReadStartupMessage(reader)
 	if err != nil {
 		slog.Error("Failed to read startup message.", "error", err, "remote_addr", remoteAddr)
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 
@@ -343,7 +342,7 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 	if username == "" {
 		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no user specified")
 		_ = writer.Flush()
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 
@@ -352,31 +351,31 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 	if !ok {
 		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 
 	if err := server.WriteAuthCleartextPassword(writer); err != nil {
 		slog.Error("Failed to request password.", "error", err)
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 	if err := writer.Flush(); err != nil {
 		slog.Error("Failed to flush.", "error", err)
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 
 	msgType, body, err := server.ReadMessage(reader)
 	if err != nil {
 		slog.Error("Failed to read password.", "error", err)
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 	if msgType != 'p' {
 		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
 		_ = writer.Flush()
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 
@@ -384,13 +383,13 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 	if password != expectedPassword {
 		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 
 	if err := server.WriteAuthOK(writer); err != nil {
 		slog.Error("Failed to send auth OK.", "error", err)
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 
@@ -402,7 +401,7 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 		slog.Error("Failed to create session DB.", "error", err)
 		_ = server.WriteErrorResponse(writer, "FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
 		_ = writer.Flush()
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		return
 	}
 	defer w.dbPool.CloseSession(pid)
@@ -467,7 +466,7 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 		}
 	case <-sessionCtx.Done():
 		slog.Info("Session cancelled.", "user", username, "pid", pid)
-		tlsConn.Close()
+		_ = tlsConn.Close()
 	}
 }
 

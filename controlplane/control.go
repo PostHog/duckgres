@@ -331,7 +331,7 @@ func (cp *ControlPlane) shutdown() {
 	}
 
 	slog.Info("Draining workers...")
-	cp.pool.DrainAll(30 * time.Second)
+	_ = cp.pool.DrainAll(30 * time.Second)
 
 	slog.Info("Shutting down workers...")
 	cp.pool.ShutdownAll(30 * time.Second)

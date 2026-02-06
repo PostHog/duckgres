@@ -504,12 +504,6 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string) 
 	return db, nil
 }
 
-// loadExtensions installs and loads configured DuckDB extensions.
-// This is a thin wrapper around LoadExtensions using the server's config.
-func (s *Server) loadExtensions(db *sql.DB) error {
-	return LoadExtensions(db, s.cfg.Extensions)
-}
-
 // LoadExtensions installs and loads DuckDB extensions.
 // This is a standalone function so it can be reused by control plane workers.
 func LoadExtensions(db *sql.DB, extensions []string) error {
@@ -537,12 +531,6 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 	}
 
 	return lastErr
-}
-
-// attachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
-// This is a thin wrapper around AttachDuckLake using the server's config.
-func (s *Server) attachDuckLake(db *sql.DB) error {
-	return AttachDuckLake(db, s.cfg.DuckLake, s.duckLakeSem)
 }
 
 // AttachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).

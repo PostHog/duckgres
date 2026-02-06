@@ -38,9 +38,6 @@ type WorkerPool struct {
 	workers   map[int]*ManagedWorker
 	socketDir string
 	cfg       server.Config
-
-	// Round-robin counter for simple load balancing
-	nextWorker int
 }
 
 // NewWorkerPool creates a new worker pool.
@@ -58,8 +55,8 @@ func (p *WorkerPool) SpawnWorker(id int) error {
 	fdSocket := filepath.Join(p.socketDir, fmt.Sprintf("worker-%d-fd.sock", id))
 
 	// Clean up old sockets
-	os.Remove(grpcSocket)
-	os.Remove(fdSocket)
+	_ = os.Remove(grpcSocket)
+	_ = os.Remove(fdSocket)
 
 	// Spawn child process
 	cmd := exec.Command(os.Args[0],
@@ -102,12 +99,12 @@ func (p *WorkerPool) SpawnWorker(id int) error {
 	resp, err := client.Configure(ctx, configReq)
 	cancel()
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		_ = cmd.Process.Kill()
 		return fmt.Errorf("configure worker %d: %w", id, err)
 	}
 	if !resp.Ok {
-		conn.Close()
+		_ = conn.Close()
 		_ = cmd.Process.Kill()
 		return fmt.Errorf("configure worker %d: %s", id, resp.Error)
 	}
@@ -167,11 +164,11 @@ func (p *WorkerPool) ConnectExistingWorker(id int, grpcSocket, fdSocket string) 
 	health, err := client.Health(ctx, &pb.HealthRequest{})
 	cancel()
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("health check worker %d: %w", id, err)
 	}
 	if !health.Healthy {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("worker %d is not healthy", id)
 	}
 
@@ -237,15 +234,15 @@ func (p *WorkerPool) RouteConnection(tcpFile *os.File, remoteAddr string, secret
 
 	uc, ok := fdConn.(*net.UnixConn)
 	if !ok {
-		fdConn.Close()
+		_ = fdConn.Close()
 		return 0, fmt.Errorf("FD conn not UnixConn")
 	}
 
 	if err := fdpass.SendFile(uc, tcpFile); err != nil {
-		uc.Close()
+		_ = uc.Close()
 		return 0, fmt.Errorf("send FD to worker %d: %w", worker.ID, err)
 	}
-	uc.Close()
+	_ = uc.Close()
 
 	// Tell worker to accept the connection via gRPC
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -470,7 +467,7 @@ func (p *WorkerPool) RollingUpdate(ctx context.Context) error {
 			}
 		}
 
-		old.GRPCConn.Close()
+		_ = old.GRPCConn.Close()
 
 		// Spawn replacement
 		if err := p.SpawnWorker(id); err != nil {
@@ -520,7 +517,7 @@ func waitForSocket(path string, timeout time.Duration) error {
 			// Try to connect
 			conn, err := net.DialTimeout("unix", path, time.Second)
 			if err == nil {
-				conn.Close()
+				_ = conn.Close()
 				return nil
 			}
 		}
