@@ -24,7 +24,7 @@ func RunShell(cfg Config) {
 		slog.Error("Failed to create database connection.", "error", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	stopRefresh := StartCredentialRefresh(db, cfg.DuckLake)
 	defer stopRefresh()
@@ -135,7 +135,7 @@ func executeShellQuery(ctx context.Context, db *sql.DB, query string) {
 		fmt.Fprintf(os.Stderr, "ERROR: %s\n", err)
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
