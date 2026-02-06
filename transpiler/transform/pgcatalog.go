@@ -74,6 +74,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_table_privilege":             true,
 			"array_to_string":                 true,
 			"version":                         true,
+			"unnest":                          true, // DuckDB has unnest, just strip pg_catalog prefix
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -89,6 +90,12 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
 			"version":                         true, // PostgreSQL-compatible version string for SQLAlchemy
 			"format_type":                     true, // Custom format_type with full PostgreSQL typemod support
+			"pg_get_expr":                     true, // Our version that accepts 2 or 3 args
+			"pg_get_indexdef":                 true, // Returns empty string
+			"pg_get_constraintdef":            true, // Returns empty string
+			"obj_description":                 true, // Returns NULL
+			"col_description":                 true, // Returns NULL
+			"pg_get_partkeydef":               true, // Returns empty string
 		},
 	}
 }
@@ -302,6 +309,19 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 			t.walkAndTransform(n.SubLink.Testexpr, changed)
 		}
 
+	case *pg_query.Node_RangeFunction:
+		// Function in FROM clause like: FROM unnest(...)
+		if n.RangeFunction != nil {
+			for _, funcList := range n.RangeFunction.Functions {
+				// Each function is wrapped in a List
+				if list := funcList.GetList(); list != nil {
+					for _, item := range list.Items {
+						t.walkAndTransform(item, changed)
+					}
+				}
+			}
+		}
+
 	case *pg_query.Node_BoolExpr:
 		if n.BoolExpr != nil {
 			for _, arg := range n.BoolExpr.Args {
@@ -366,7 +386,7 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 		}
 
 	case *pg_query.Node_CollateClause:
-		// COLLATE pg_catalog."default" -> remove
+		// COLLATE pg_catalog."default" -> remove the entire COLLATE clause
 		if n.CollateClause != nil {
 			// Check if it's pg_catalog.default collation
 			if len(n.CollateClause.Collname) >= 2 {
@@ -374,15 +394,27 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 					if str := first.GetString_(); str != nil && strings.EqualFold(str.Sval, "pg_catalog") {
 						if second := n.CollateClause.Collname[1]; second != nil {
 							if collStr := second.GetString_(); collStr != nil && strings.EqualFold(collStr.Sval, "default") {
-								// Clear the collation - this will be handled by the parent
-								n.CollateClause.Collname = nil
-								*changed = true
+								// Replace the CollateClause node with its Arg
+								// This removes "COLLATE pg_catalog.default" entirely
+								if n.CollateClause.Arg != nil {
+									node.Node = n.CollateClause.Arg.Node
+									*changed = true
+									// Continue walking from the replaced node
+									t.walkAndTransform(node, changed)
+									return
+								}
 							}
 						}
 					}
 				}
 			}
 			t.walkAndTransform(n.CollateClause.Arg, changed)
+		}
+
+	case *pg_query.Node_SortBy:
+		// ORDER BY clause items
+		if n.SortBy != nil {
+			t.walkAndTransform(n.SortBy.Node, changed)
 		}
 	}
 }

@@ -254,6 +254,12 @@ func (t *TypeCastTransform) walkAndTransform(node *pg_query.Node, changed *bool)
 		if n.DeleteStmt != nil {
 			t.walkAndTransform(n.DeleteStmt.WhereClause, changed)
 		}
+
+	case *pg_query.Node_SortBy:
+		// ORDER BY clause items
+		if n.SortBy != nil {
+			t.walkAndTransform(n.SortBy.Node, changed)
+		}
 	}
 }
 
