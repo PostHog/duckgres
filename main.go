@@ -172,7 +172,14 @@ func main() {
 		Extensions: []string{"ducklake"},
 	}
 
-	// Load config file if specified
+	// Auto-detect duckgres.yaml if no config file was explicitly specified
+	if *configFile == "" {
+		if _, err := os.Stat("duckgres.yaml"); err == nil {
+			*configFile = "duckgres.yaml"
+		}
+	}
+
+	// Load config file if specified (or auto-detected)
 	if *configFile != "" {
 		fileCfg, err := loadConfigFile(*configFile)
 		if err != nil {
