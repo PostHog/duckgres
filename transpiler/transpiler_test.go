@@ -887,6 +887,24 @@ func TestTranspile_TypeMappings(t *testing.T) {
 			contains: "text",
 			excludes: "tsvector",
 		},
+		{
+			name:     "pg_catalog.json prefix stripped",
+			input:    "CREATE TABLE t (data pg_catalog.json)",
+			contains: "json",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "pg_catalog.int4 prefix stripped and mapped",
+			input:    "CREATE TABLE t (id pg_catalog.int4)",
+			contains: "integer",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "pg_catalog.varchar prefix stripped",
+			input:    "CREATE TABLE t (name pg_catalog.varchar)",
+			contains: "varchar",
+			excludes: "pg_catalog",
+		},
 	}
 
 	tr := New(DefaultConfig())
@@ -2545,6 +2563,18 @@ func TestTranspile_CtidToRowid(t *testing.T) {
 			input:    "SELECT * FROM (SELECT ctid, name FROM users) sub",
 			contains: "rowid",
 			excludes: "ctid",
+		},
+		{
+			name:     "ctid BETWEEN ::tid replaced with TRUE",
+			input:    "SELECT * FROM users WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid",
+			contains: "true",
+			excludes: "tid",
+		},
+		{
+			name:     "ctid BETWEEN with other conditions preserved",
+			input:    "SELECT * FROM users WHERE id > 0 AND ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid",
+			contains: "true",
+			excludes: "tid",
 		},
 	}
 
