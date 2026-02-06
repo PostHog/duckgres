@@ -25,7 +25,7 @@ users:
 # Default: ducklake (loaded even without config file)
 extensions:
   - ducklake
-  - "cache_httpfs FROM community"  # Caches S3/HTTP requests locally for faster queries
+  # - "cache_httpfs FROM community"  # Caches S3/HTTP requests locally (requires internet)
   # - parquet
 
 # DuckLake configuration (optional)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -453,7 +454,10 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string) 
 	// cache_httpfs wraps httpfs with a local disk cache, avoiding repeated S3/HTTP downloads.
 	if hasCacheHTTPFS(cfg.Extensions) {
 		cacheDir := filepath.Join(cfg.DataDir, "cache")
-		if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_cache_directory = '%s'", cacheDir)); err != nil {
+		if err := os.MkdirAll(cacheDir, 0750); err != nil {
+			slog.Warn("Failed to create cache_httpfs cache directory.", "cache_directory", cacheDir, "error", err)
+		} else if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_cache_directory = '%s'", cacheDir)); err != nil {
+			// NOTE: cache directory path comes from trusted server config (DataDir), not user input.
 			slog.Warn("Failed to set cache_httpfs cache directory.", "cache_directory", cacheDir, "error", err)
 		} else {
 			slog.Debug("Set cache_httpfs cache directory.", "cache_directory", cacheDir)
@@ -516,10 +520,22 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string) 
 	return db, nil
 }
 
+// parseExtensionName splits an extension string into its name and install command.
+// For "cache_httpfs FROM community", returns ("cache_httpfs", "cache_httpfs FROM community").
+// For "ducklake", returns ("ducklake", "ducklake").
+func parseExtensionName(ext string) (name, installCmd string) {
+	if idx := strings.Index(strings.ToUpper(ext), " FROM "); idx != -1 {
+		return strings.TrimSpace(ext[:idx]), ext
+	}
+	return ext, ext
+}
+
 // LoadExtensions installs and loads DuckDB extensions.
 // This is a standalone function so it can be reused by control plane workers.
 // Extension strings can include a source, e.g. "cache_httpfs FROM community".
 // INSTALL uses the full string; LOAD uses just the extension name.
+//
+// NOTE: Extension names come from trusted server config, not user input.
 func LoadExtensions(db *sql.DB, extensions []string) error {
 	if len(extensions) == 0 {
 		return nil
@@ -527,28 +543,23 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 
 	var lastErr error
 	for _, ext := range extensions {
-		// Parse "name FROM source" -> installCmd=full string, loadName=name
-		// Parse "name" -> installCmd=name, loadName=name
-		loadName := ext
-		if idx := strings.Index(strings.ToUpper(ext), " FROM "); idx != -1 {
-			loadName = strings.TrimSpace(ext[:idx])
-		}
+		name, installCmd := parseExtensionName(ext)
 
 		// First install the extension (downloads if needed)
-		if _, err := db.Exec("INSTALL " + ext); err != nil {
-			slog.Warn("Failed to install extension.", "extension", ext, "error", err)
+		if _, err := db.Exec("INSTALL " + installCmd); err != nil {
+			slog.Warn("Failed to install extension.", "extension", installCmd, "error", err)
 			lastErr = err
 			continue
 		}
 
 		// Then load it into the current session
-		if _, err := db.Exec("LOAD " + loadName); err != nil {
-			slog.Warn("Failed to load extension.", "extension", loadName, "error", err)
+		if _, err := db.Exec("LOAD " + name); err != nil {
+			slog.Warn("Failed to load extension.", "extension", name, "error", err)
 			lastErr = err
 			continue
 		}
 
-		slog.Info("Loaded extension.", "extension", loadName)
+		slog.Info("Loaded extension.", "extension", name)
 	}
 
 	return lastErr
@@ -557,10 +568,7 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 // hasCacheHTTPFS checks if cache_httpfs is in the extensions list.
 func hasCacheHTTPFS(extensions []string) bool {
 	for _, ext := range extensions {
-		name := ext
-		if idx := strings.Index(strings.ToUpper(ext), " FROM "); idx != -1 {
-			name = strings.TrimSpace(ext[:idx])
-		}
+		name, _ := parseExtensionName(ext)
 		if name == "cache_httpfs" {
 			return true
 		}
