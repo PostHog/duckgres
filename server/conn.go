@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/transpiler"
 )
 
@@ -623,6 +624,14 @@ func (c *clientConn) handleQuery(body []byte) error {
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
 
+	// Check for multi-statement query (PostgreSQL simple query protocol supports
+	// multiple semicolon-separated statements in a single Q message).
+	// Each statement gets its own results, with a single ReadyForQuery at the end.
+	tree, parseErr := pg_query.Parse(query)
+	if parseErr == nil && len(tree.Stmts) > 1 {
+		return c.handleMultiStatementQuery(tree)
+	}
+
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
 	tr := c.newTranspiler(false)
 	result, err := tr.Transpile(query)
@@ -811,6 +820,190 @@ func (c *clientConn) handleQuery(body []byte) error {
 	_ = c.writer.Flush()
 
 	return nil
+}
+
+// handleMultiStatementQuery processes multiple semicolon-separated statements
+// from a single Q (simple query) message. Per the PostgreSQL wire protocol,
+// each statement gets its own RowDescription/DataRow/CommandComplete messages,
+// with a single ReadyForQuery at the end. If any statement fails, remaining
+// statements are skipped.
+func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error {
+	slog.Debug("Multi-statement simple query.", "user", c.username, "count", len(tree.Stmts))
+
+	for _, stmt := range tree.Stmts {
+		// Deparse individual statement back to SQL
+		singleTree := &pg_query.ParseResult{
+			Stmts: []*pg_query.RawStmt{stmt},
+		}
+		singleSQL, err := pg_query.Deparse(singleTree)
+		if err != nil {
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			break
+		}
+
+		errSent, fatalErr := c.executeSingleStatement(singleSQL)
+		if fatalErr != nil {
+			return fatalErr
+		}
+		if errSent {
+			break // Stop processing remaining statements on error
+		}
+	}
+
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// executeSingleStatement transpiles and executes a single SQL statement,
+// sending results to the client. Does NOT send ReadyForQuery (the caller
+// is responsible for that). Returns (true, nil) if an error was sent to the
+// client (so the caller can stop processing a batch), or (false, err) for
+// fatal connection errors.
+func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
+	// Transpile
+	tr := c.newTranspiler(false)
+	result, err := tr.Transpile(query)
+	if err != nil {
+		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		return true, nil
+	}
+
+	if result.FallbackToNative {
+		if err := c.validateWithDuckDB(query); err != nil {
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			return true, nil
+		}
+		slog.Debug("Fallback to native DuckDB.", "user", c.username, "query", query)
+	}
+
+	if result.Error != nil {
+		c.sendError("ERROR", "42704", result.Error.Error())
+		return true, nil
+	}
+
+	if result.IsIgnoredSet {
+		_ = writeCommandComplete(c.writer, "SET")
+		return false, nil
+	}
+
+	if result.IsNoOp {
+		_ = writeCommandComplete(c.writer, result.NoOpTag)
+		return false, nil
+	}
+
+	// Multi-statement rewrites (writable CTEs) not supported inside batches
+	if len(result.Statements) > 0 {
+		c.sendError("ERROR", "0A000", "writable CTEs not supported in multi-statement queries")
+		return true, nil
+	}
+
+	executedQuery := result.SQL
+	if executedQuery != query {
+		slog.Debug("Query transpiled.", "user", c.username, "executed", executedQuery)
+	}
+
+	upperQuery := strings.ToUpper(executedQuery)
+	cmdType := c.getCommandType(upperQuery)
+
+	// COPY not supported inside batches
+	if cmdType == "COPY" {
+		c.sendError("ERROR", "0A000", "COPY not supported in multi-statement queries")
+		return true, nil
+	}
+
+	if cmdType != "SELECT" {
+		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+			_ = writeCommandComplete(c.writer, "BEGIN")
+			return false, nil
+		}
+
+		ctx, cleanup := c.queryContext()
+		defer cleanup()
+
+		execResult, err := c.db.ExecContext(ctx, executedQuery)
+		if err != nil {
+			if isAlterTableNotTableError(err) {
+				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
+					execResult, err = c.db.ExecContext(ctx, alteredQuery)
+				}
+			}
+			if err != nil {
+				if isQueryCancelled(err) {
+					c.sendError("ERROR", "57014", "canceling statement due to user request")
+				} else {
+					slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
+					c.sendError("ERROR", "42000", err.Error())
+				}
+				c.setTxError()
+				return true, nil
+			}
+		}
+
+		c.updateTxStatus(cmdType)
+		tag := c.buildCommandTag(cmdType, execResult)
+		_ = writeCommandComplete(c.writer, tag)
+		return false, nil
+	}
+
+	// SELECT
+	ctx, cleanup := c.queryContext()
+	defer cleanup()
+
+	rows, err := c.db.QueryContext(ctx, executedQuery)
+	if err != nil {
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+		}
+		c.setTxError()
+		return true, nil
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		return true, nil
+	}
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		return true, nil
+	}
+
+	if err := c.sendRowDescription(cols, colTypes); err != nil {
+		return false, err
+	}
+
+	rowCount := 0
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			return true, nil
+		}
+
+		if err := c.sendDataRow(values); err != nil {
+			return false, err
+		}
+		rowCount++
+	}
+
+	tag := fmt.Sprintf("SELECT %d", rowCount)
+	_ = writeCommandComplete(c.writer, tag)
+	return false, nil
 }
 
 // executeMultiStatement handles execution of multi-statement query rewrites.
@@ -1321,6 +1514,7 @@ func (c *clientConn) buildCommandTag(cmdType string, result sql.Result) string {
 var (
 	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
 	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s*(?:\(([^)]+)\)\s*)?FROM\s+STDIN`)
+	copyBinaryRegex     = regexp.MustCompile(`(?i)\bFORMAT\s+(?:"?binary"?|BINARY)\b`)
 	copyWithCSVRegex    = regexp.MustCompile(`(?i)\bCSV\b`)
 	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
 	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)
@@ -1497,14 +1691,6 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		return nil
 	}
 
-	// Parse options
-	delimiter := "\t"
-	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
-		delimiter = m[1]
-	} else if copyWithCSVRegex.MatchString(upperQuery) {
-		delimiter = ","
-	}
-
 	// The source can be a table name or a query in parentheses
 	source := strings.TrimSpace(matches[1])
 	var selectQuery string
@@ -1512,6 +1698,14 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		selectQuery = source[1 : len(source)-1]
 	} else {
 		selectQuery = fmt.Sprintf("SELECT * FROM %s", source)
+	}
+
+	// Transpile the inner SELECT to handle schema mappings (e.g., public -> main)
+	// The outer COPY statement may not have been transpiled if pg_query can't parse
+	// the full COPY syntax (e.g., FORMAT "binary").
+	tr := c.newTranspiler(false)
+	if result, err := tr.Transpile(selectQuery); err == nil && !result.FallbackToNative {
+		selectQuery = result.SQL
 	}
 
 	// Execute the query
@@ -1536,7 +1730,21 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		return nil
 	}
 
-	// Send CopyOutResponse
+	isBinary := copyBinaryRegex.MatchString(query)
+
+	if isBinary {
+		return c.handleCopyOutBinary(rows, cols)
+	}
+
+	// Parse text/CSV options
+	delimiter := "\t"
+	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
+		delimiter = m[1]
+	} else if copyWithCSVRegex.MatchString(upperQuery) {
+		delimiter = ","
+	}
+
+	// Send CopyOutResponse (text format)
 	if err := writeCopyOutResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
 	}
@@ -1574,6 +1782,125 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 			return err
 		}
 		rowCount++
+	}
+
+	// Send CopyDone
+	if err := writeCopyDone(c.writer); err != nil {
+		return err
+	}
+
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// handleCopyOutBinary handles COPY ... TO STDOUT (FORMAT binary)
+// Implements PostgreSQL's binary COPY format: header, binary-encoded tuples, trailer.
+// Sends one CopyData message per tuple, with header prepended to the first tuple
+// and trailer appended to the last, matching how clients like DuckDB's postgres
+// extension consume binary COPY streams via PQgetCopyData.
+func (c *clientConn) handleCopyOutBinary(rows *sql.Rows, cols []string) error {
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	// Get type OIDs for each column
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
+	// Send CopyOutResponse (binary format)
+	if err := writeCopyOutResponse(c.writer, int16(len(cols)), false); err != nil {
+		return err
+	}
+	_ = c.writer.Flush()
+
+	// Binary COPY header (19 bytes)
+	binaryHeader := []byte{
+		'P', 'G', 'C', 'O', 'P', 'Y', '\n', 0xFF, '\r', '\n', 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
+
+	// encodeTuple encodes a single tuple in PostgreSQL binary COPY format
+	encodeTuple := func(values []interface{}) []byte {
+		var buf bytes.Buffer
+		_ = binary.Write(&buf, binary.BigEndian, int16(len(values)))
+		for i, v := range values {
+			if v == nil {
+				_ = binary.Write(&buf, binary.BigEndian, int32(-1))
+			} else {
+				data := encodeBinary(v, typeOIDs[i])
+				if data == nil {
+					_ = binary.Write(&buf, binary.BigEndian, int32(-1))
+				} else {
+					_ = binary.Write(&buf, binary.BigEndian, int32(len(data)))
+					buf.Write(data)
+				}
+			}
+		}
+		return buf.Bytes()
+	}
+
+	// Send each tuple as its own CopyData message.
+	// The header is prepended to the first tuple's message.
+	rowCount := 0
+	firstRow := true
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+
+		tupleBytes := encodeTuple(values)
+
+		if firstRow {
+			// First CopyData message: header + tuple
+			msg := make([]byte, 0, len(binaryHeader)+len(tupleBytes))
+			msg = append(msg, binaryHeader...)
+			msg = append(msg, tupleBytes...)
+			if err := writeCopyData(c.writer, msg); err != nil {
+				return err
+			}
+			firstRow = false
+		} else {
+			if err := writeCopyData(c.writer, tupleBytes); err != nil {
+				return err
+			}
+		}
+		rowCount++
+	}
+
+	// If no rows, still need to send header + trailer
+	if firstRow {
+		// No rows at all: send header + trailer in one message
+		msg := make([]byte, 0, len(binaryHeader)+2)
+		msg = append(msg, binaryHeader...)
+		msg = append(msg, 0xFF, 0xFF) // trailer: -1 as int16
+		if err := writeCopyData(c.writer, msg); err != nil {
+			return err
+		}
+	} else {
+		// Send trailer as its own CopyData message
+		if err := writeCopyData(c.writer, []byte{0xFF, 0xFF}); err != nil {
+			return err
+		}
 	}
 
 	// Send CopyDone

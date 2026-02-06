@@ -52,6 +52,9 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_partitioned_table":  "pg_partitioned_table",
 			"pg_type":               "pg_type",
 			"pg_attribute":          "pg_attribute",
+			"pg_constraint":         "pg_constraint",
+			"pg_enum":               "pg_enum",
+			"pg_indexes":            "pg_indexes",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
