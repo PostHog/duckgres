@@ -398,8 +398,15 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 }
 
 // createDBConnection creates a DuckDB connection for a client session.
-// Uses in-memory database as an anchor for DuckLake attachment (actual data lives in RDS/S3).
+// This is a thin wrapper around CreateDBConnection using the server's config.
 func (s *Server) createDBConnection(username string) (*sql.DB, error) {
+	return CreateDBConnection(s.cfg, s.duckLakeSem, username)
+}
+
+// CreateDBConnection creates a DuckDB connection for a client session.
+// Uses in-memory database as an anchor for DuckLake attachment (actual data lives in RDS/S3).
+// This is a standalone function so it can be reused by both the server and control plane workers.
+func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string) (*sql.DB, error) {
 	// Create new in-memory connection (DuckLake provides actual storage)
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
@@ -429,7 +436,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	// Set temp directory to a subdirectory under DataDir to ensure DuckDB has a
 	// writable location for intermediate results. This prevents "Read-only file system"
 	// errors in containerized or restricted environments.
-	tempDir := filepath.Join(s.cfg.DataDir, "tmp")
+	tempDir := filepath.Join(cfg.DataDir, "tmp")
 	if _, err := db.Exec(fmt.Sprintf("SET temp_directory = '%s'", tempDir)); err != nil {
 		slog.Warn("Failed to set DuckDB temp_directory.", "temp_directory", tempDir, "error", err)
 	} else {
@@ -437,7 +444,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	}
 
 	// Load configured extensions
-	if err := s.loadExtensions(db); err != nil {
+	if err := LoadExtensions(db, cfg.Extensions); err != nil {
 		slog.Warn("Failed to load some extensions.", "user", username, "error", err)
 	}
 
@@ -451,16 +458,16 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 
 	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
-	if err := s.attachDuckLake(db); err != nil {
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
-		if s.cfg.DuckLake.MetadataStore != "" {
+		if cfg.DuckLake.MetadataStore != "" {
 			_ = db.Close()
 			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 		}
 		// DuckLake not configured, this warning is just informational
 		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
-	} else if s.cfg.DuckLake.MetadataStore != "" {
+	} else if cfg.DuckLake.MetadataStore != "" {
 		duckLakeMode = true
 
 		// Recreate pg_class_full to source from DuckLake metadata instead of DuckDB's pg_catalog.
@@ -497,14 +504,15 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	return db, nil
 }
 
-// loadExtensions installs and loads configured DuckDB extensions
-func (s *Server) loadExtensions(db *sql.DB) error {
-	if len(s.cfg.Extensions) == 0 {
+// LoadExtensions installs and loads DuckDB extensions.
+// This is a standalone function so it can be reused by control plane workers.
+func LoadExtensions(db *sql.DB, extensions []string) error {
+	if len(extensions) == 0 {
 		return nil
 	}
 
 	var lastErr error
-	for _, ext := range s.cfg.Extensions {
+	for _, ext := range extensions {
 		// First install the extension (downloads if needed)
 		if _, err := db.Exec("INSTALL " + ext); err != nil {
 			slog.Warn("Failed to install extension.", "extension", ext, "error", err)
@@ -525,10 +533,11 @@ func (s *Server) loadExtensions(db *sql.DB) error {
 	return lastErr
 }
 
-// attachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
+// AttachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
 // Call setDuckLakeDefault after creating per-connection views in memory.main.
-func (s *Server) attachDuckLake(db *sql.DB) error {
-	if s.cfg.DuckLake.MetadataStore == "" {
+// This is a standalone function so it can be reused by control plane workers.
+func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
+	if dlCfg.MetadataStore == "" {
 		return nil // DuckLake not configured
 	}
 
@@ -538,8 +547,8 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	// Use a 30-second timeout to prevent connections from hanging indefinitely
 	// if attachment is slow (e.g., network latency to metadata store).
 	select {
-	case s.duckLakeSem <- struct{}{}:
-		defer func() { <-s.duckLakeSem }()
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
 	case <-time.After(30 * time.Second):
 		return fmt.Errorf("timeout waiting for DuckLake attachment lock")
 	}
@@ -555,15 +564,15 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	// Create S3 secret if using object store
 	// - With explicit credentials (S3AccessKey set) or custom endpoint
 	// - With credential_chain provider (for AWS S3)
-	if s.cfg.DuckLake.ObjectStore != "" {
-		needsSecret := s.cfg.DuckLake.S3Endpoint != "" ||
-			s.cfg.DuckLake.S3AccessKey != "" ||
-			s.cfg.DuckLake.S3Provider == "credential_chain" ||
-			s.cfg.DuckLake.S3Chain != "" ||
-			s.cfg.DuckLake.S3Profile != ""
+	if dlCfg.ObjectStore != "" {
+		needsSecret := dlCfg.S3Endpoint != "" ||
+			dlCfg.S3AccessKey != "" ||
+			dlCfg.S3Provider == "credential_chain" ||
+			dlCfg.S3Chain != "" ||
+			dlCfg.S3Profile != ""
 
 		if needsSecret {
-			if err := s.createS3Secret(db); err != nil {
+			if err := createS3Secret(db, dlCfg); err != nil {
 				return fmt.Errorf("failed to create S3 secret: %w", err)
 			}
 		}
@@ -574,17 +583,17 @@ func (s *Server) attachDuckLake(db *sql.DB) error {
 	// Format with data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake (DATA_PATH '<path>')
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
 	var attachStmt string
-	dataPath := s.cfg.DuckLake.ObjectStore
+	dataPath := dlCfg.ObjectStore
 	if dataPath == "" {
-		dataPath = s.cfg.DuckLake.DataPath
+		dataPath = dlCfg.DataPath
 	}
 	if dataPath != "" {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
-			s.cfg.DuckLake.MetadataStore, dataPath)
-		slog.Info("Attaching DuckLake catalog with data path.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore), "data", dataPath)
+			dlCfg.MetadataStore, dataPath)
+		slog.Info("Attaching DuckLake catalog with data path.", "metadata", redactConnectionString(dlCfg.MetadataStore), "data", dataPath)
 	} else {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", s.cfg.DuckLake.MetadataStore)
-		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(s.cfg.DuckLake.MetadataStore))
+		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", dlCfg.MetadataStore)
+		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
 	if _, err := db.Exec(attachStmt); err != nil {
@@ -615,14 +624,15 @@ func setDuckLakeDefault(db *sql.DB) error {
 	return nil
 }
 
-// createS3Secret creates a DuckDB secret for S3/MinIO access
+// createS3Secret creates a DuckDB secret for S3/MinIO access.
+// This is a standalone function so it can be reused by control plane workers.
 // Supports two providers:
 //   - "config": explicit credentials (for MinIO or when you have access keys)
 //   - "credential_chain": AWS SDK credential chain (env vars, config files, instance metadata, etc.)
 //
 // Note: Caller must hold duckLakeSem to avoid race conditions.
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
-func (s *Server) createS3Secret(db *sql.DB) error {
+func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 	// Check if secret already exists to avoid unnecessary creation
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'ducklake_s3'").Scan(&count)
@@ -631,9 +641,9 @@ func (s *Server) createS3Secret(db *sql.DB) error {
 	}
 
 	// Determine provider: use credential_chain if explicitly set or if no access key provided
-	provider := s.cfg.DuckLake.S3Provider
+	provider := dlCfg.S3Provider
 	if provider == "" {
-		if s.cfg.DuckLake.S3AccessKey != "" {
+		if dlCfg.S3AccessKey != "" {
 			provider = "config"
 		} else {
 			provider = "credential_chain"
@@ -644,12 +654,12 @@ func (s *Server) createS3Secret(db *sql.DB) error {
 
 	if provider == "credential_chain" {
 		// Use AWS SDK credential chain
-		secretStmt = s.buildCredentialChainSecret()
+		secretStmt = buildCredentialChainSecret(dlCfg)
 		slog.Info("Creating S3 secret with credential_chain provider.")
 	} else {
 		// Use explicit credentials (config provider)
-		secretStmt = s.buildConfigSecret()
-		slog.Info("Creating S3 secret with config provider.", "endpoint", s.cfg.DuckLake.S3Endpoint)
+		secretStmt = buildConfigSecret(dlCfg)
+		slog.Info("Creating S3 secret with config provider.", "endpoint", dlCfg.S3Endpoint)
 	}
 
 	if _, err := db.Exec(secretStmt); err != nil {
@@ -661,19 +671,19 @@ func (s *Server) createS3Secret(db *sql.DB) error {
 }
 
 // buildConfigSecret builds a CREATE SECRET statement with explicit credentials
-func (s *Server) buildConfigSecret() string {
-	region := s.cfg.DuckLake.S3Region
+func buildConfigSecret(dlCfg DuckLakeConfig) string {
+	region := dlCfg.S3Region
 	if region == "" {
 		region = "us-east-1"
 	}
 
-	urlStyle := s.cfg.DuckLake.S3URLStyle
+	urlStyle := dlCfg.S3URLStyle
 	if urlStyle == "" {
 		urlStyle = "path" // Default to path style for MinIO compatibility
 	}
 
 	useSSL := "false"
-	if s.cfg.DuckLake.S3UseSSL {
+	if dlCfg.S3UseSSL {
 		useSSL = "true"
 	}
 
@@ -687,16 +697,16 @@ func (s *Server) buildConfigSecret() string {
 			REGION '%s',
 			URL_STYLE '%s',
 			USE_SSL %s`,
-		s.cfg.DuckLake.S3AccessKey,
-		s.cfg.DuckLake.S3SecretKey,
+		dlCfg.S3AccessKey,
+		dlCfg.S3SecretKey,
 		region,
 		urlStyle,
 		useSSL,
 	)
 
 	// Add endpoint if specified (for MinIO or custom S3-compatible storage)
-	if s.cfg.DuckLake.S3Endpoint != "" {
-		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", s.cfg.DuckLake.S3Endpoint)
+	if dlCfg.S3Endpoint != "" {
+		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
 	}
 
 	secret += "\n\t\t)"
@@ -704,7 +714,7 @@ func (s *Server) buildConfigSecret() string {
 }
 
 // buildCredentialChainSecret builds a CREATE SECRET statement using AWS SDK credential chain
-func (s *Server) buildCredentialChainSecret() string {
+func buildCredentialChainSecret(dlCfg DuckLakeConfig) string {
 	// Start with base credential_chain secret
 	secret := `
 		CREATE OR REPLACE SECRET ducklake_s3 (
@@ -712,33 +722,33 @@ func (s *Server) buildCredentialChainSecret() string {
 			PROVIDER credential_chain`
 
 	// Add chain if specified (e.g., "env;config" to check specific sources)
-	if s.cfg.DuckLake.S3Chain != "" {
-		secret += fmt.Sprintf(",\n\t\t\tCHAIN '%s'", s.cfg.DuckLake.S3Chain)
+	if dlCfg.S3Chain != "" {
+		secret += fmt.Sprintf(",\n\t\t\tCHAIN '%s'", dlCfg.S3Chain)
 	}
 
 	// Add profile if specified (for config chain)
-	if s.cfg.DuckLake.S3Profile != "" {
-		secret += fmt.Sprintf(",\n\t\t\tPROFILE '%s'", s.cfg.DuckLake.S3Profile)
+	if dlCfg.S3Profile != "" {
+		secret += fmt.Sprintf(",\n\t\t\tPROFILE '%s'", dlCfg.S3Profile)
 	}
 
 	// Add region override if specified
-	if s.cfg.DuckLake.S3Region != "" {
-		secret += fmt.Sprintf(",\n\t\t\tREGION '%s'", s.cfg.DuckLake.S3Region)
+	if dlCfg.S3Region != "" {
+		secret += fmt.Sprintf(",\n\t\t\tREGION '%s'", dlCfg.S3Region)
 	}
 
 	// Add endpoint if specified (for custom S3-compatible storage)
-	if s.cfg.DuckLake.S3Endpoint != "" {
-		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", s.cfg.DuckLake.S3Endpoint)
+	if dlCfg.S3Endpoint != "" {
+		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
 
 		// Also set URL style and SSL for custom endpoints
-		urlStyle := s.cfg.DuckLake.S3URLStyle
+		urlStyle := dlCfg.S3URLStyle
 		if urlStyle == "" {
 			urlStyle = "path"
 		}
 		secret += fmt.Sprintf(",\n\t\t\tURL_STYLE '%s'", urlStyle)
 
 		useSSL := "false"
-		if s.cfg.DuckLake.S3UseSSL {
+		if dlCfg.S3UseSSL {
 			useSSL = "true"
 		}
 		secret += fmt.Sprintf(",\n\t\t\tUSE_SSL %s", useSSL)

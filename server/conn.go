@@ -381,13 +381,15 @@ func (c *clientConn) serve() error {
 		return fmt.Errorf("startup failed: %w", err)
 	}
 
-	// Create a DuckDB connection for this client session
-	db, err := c.server.createDBConnection(c.username)
-	if err != nil {
-		c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
-		return err
+	// Create a DuckDB connection for this client session (unless pre-created by caller)
+	if c.db == nil {
+		db, err := c.server.createDBConnection(c.username)
+		if err != nil {
+			c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
+			return err
+		}
+		c.db = db
 	}
-	c.db = db
 	defer func() {
 		if c.db != nil {
 			c.safeCleanupDB()

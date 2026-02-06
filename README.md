@@ -26,6 +26,8 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - [Rate Limiting](#rate-limiting)
 - [Usage Examples](#usage-examples)
 - [Architecture](#architecture)
+  - [Standalone Mode](#standalone-mode)
+  - [Control Plane Mode](#control-plane-mode)
 - [Two-Tier Query Processing](#two-tier-query-processing)
 - [Supported Features](#supported-features)
 - [Limitations](#limitations)
@@ -45,6 +47,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - **DuckLake Integration**: Auto-attach DuckLake catalogs for lakehouse workflows
 - **Rate Limiting**: Built-in protection against brute-force attacks
 - **Graceful Shutdown**: Waits for in-flight queries before exiting
+- **Control Plane Mode**: Multi-process architecture with long-lived workers, zero-downtime deployments, and rolling updates
 - **Flexible Configuration**: YAML config files, environment variables, and CLI flags
 - **Prometheus Metrics**: Built-in metrics endpoint for monitoring
 
@@ -177,12 +180,16 @@ export POSTHOG_HOST=eu.i.posthog.com
 ./duckgres --help
 
 Options:
-  -config string    Path to YAML config file
-  -host string      Host to bind to
-  -port int         Port to listen on
-  -data-dir string  Directory for DuckDB files
-  -cert string      TLS certificate file
-  -key string       TLS private key file
+  -config string           Path to YAML config file
+  -host string             Host to bind to
+  -port int                Port to listen on
+  -data-dir string         Directory for DuckDB files
+  -cert string             TLS certificate file
+  -key string              TLS private key file
+  -mode string             Run mode: standalone (default), control-plane, or worker
+  -worker-count int        Number of worker processes (control-plane mode, default 4)
+  -socket-dir string       Unix socket directory (control-plane mode)
+  -handover-socket string  Handover socket for graceful deployment (control-plane mode)
 ```
 
 ## DuckDB Extensions
@@ -428,6 +435,12 @@ GROUP BY name;
 
 ## Architecture
 
+Duckgres supports two run modes: **standalone** (single process, default) and **control-plane** (multi-process with worker pool).
+
+### Standalone Mode
+
+The default mode runs everything in a single process:
+
 ```
 ┌─────────────────┐
 │  PostgreSQL     │
@@ -447,6 +460,64 @@ GROUP BY name;
 │  + Extensions   │
 │  + DuckLake     │
 └─────────────────┘
+```
+
+### Control Plane Mode
+
+For production deployments, control-plane mode splits the server into a **control plane** (connection management, routing) and a pool of long-lived **worker processes** (query execution). This enables zero-downtime deployments and cross-session DuckDB cache reuse.
+
+```
+                    CONTROL PLANE (duckgres --mode control-plane)
+                    ┌──────────────────────────────────────────┐
+  PG Client ──TLS──>│ TCP Listener                             │
+                    │ Rate Limiting                             │
+                    │ Connection Router (least-connections)     │
+                    │   │ FD pass via Unix socket (SCM_RIGHTS)  │
+                    │   ▼                                      │
+                    │ gRPC Client ─────────────────────────+    │
+                    └──────────────────────────────────────────┘
+                                                           │
+                                                    gRPC (UDS)
+                                                           │
+                    WORKER POOL                            ▼
+                    ┌──────────────────────────────────────────┐
+                    │ Worker 1 (duckgres --mode worker)        │
+                    │   gRPC Server (Configure, Health, Drain) │
+                    │   FD Receiver (Unix socket)              │
+                    │   Shared DuckDB instance (long-lived)    │
+                    │   ├── Session 1 (goroutine)              │
+                    │   ├── Session 2 (goroutine)              │
+                    │   └── Session N ...                      │
+                    ├──────────────────────────────────────────┤
+                    │ Worker 2 ...                             │
+                    └──────────────────────────────────────────┘
+```
+
+Start in control-plane mode:
+
+```bash
+# Start with 4 workers (default)
+./duckgres --mode control-plane --port 5432 --worker-count 4
+
+# Connect with psql (identical to standalone mode)
+PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"
+```
+
+**Zero-downtime deployment** using the handover protocol:
+
+```bash
+# Start the first control plane with a handover socket
+./duckgres --mode control-plane --port 5432 --handover-socket /var/run/duckgres/handover.sock
+
+# Deploy a new version - it takes over the listener and workers without dropping connections
+./duckgres-v2 --mode control-plane --port 5432 --handover-socket /var/run/duckgres/handover.sock
+```
+
+**Rolling worker updates** via signal:
+
+```bash
+# Replace workers one at a time (drains sessions before replacing each worker)
+kill -USR2 <control-plane-pid>
 ```
 
 ## Two-Tier Query Processing
@@ -509,9 +580,9 @@ The following DuckDB features work transparently through the fallback mechanism:
 
 ## Limitations
 
-- **Single Process**: Each user's database is opened in the same process
-- **No Replication**: Single-node only
-- **Limited System Catalog**: Some `pg_*` system tables are not available
+- **Single Node**: No built-in replication or clustering
+- **Limited System Catalog**: Some `pg_*` system tables are stubs (return empty)
+- **Type OID Mapping**: Incomplete (some types show as "unknown")
 
 ## Dependencies
 

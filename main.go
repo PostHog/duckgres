@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
@@ -115,6 +116,14 @@ func main() {
 	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	showHelp := flag.Bool("help", false, "Show help message")
+
+	// Control plane flags
+	mode := flag.String("mode", "standalone", "Run mode: standalone (default), control-plane, or worker")
+	workerCount := flag.Int("worker-count", 4, "Number of worker processes (control-plane mode)")
+	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
+	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
+	grpcSocket := flag.String("grpc-socket", "", "gRPC socket path (worker mode, set by control-plane)")
+	fdSocket := flag.String("fd-socket", "", "FD passing socket path (worker mode, set by control-plane)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Duckgres - PostgreSQL wire protocol server for DuckDB\n\n")
@@ -356,6 +365,15 @@ func main() {
 		}
 	}
 
+	// Handle worker mode early (before metrics, certs, etc.)
+	if *mode == "worker" {
+		if *grpcSocket == "" || *fdSocket == "" {
+			fatal("Worker mode requires --grpc-socket and --fd-socket flags")
+		}
+		controlplane.RunWorker(*grpcSocket, *fdSocket)
+		return
+	}
+
 	initMetrics()
 
 	// Create data directory if it doesn't exist
@@ -369,6 +387,19 @@ func main() {
 	}
 	slog.Info("Using TLS certificates", "cert_file", cfg.TLSCertFile, "key_file", cfg.TLSKeyFile)
 
+	// Handle control-plane mode
+	if *mode == "control-plane" {
+		cpCfg := controlplane.ControlPlaneConfig{
+			Config:         cfg,
+			WorkerCount:    *workerCount,
+			SocketDir:      *socketDir,
+			HandoverSocket: *handoverSocket,
+		}
+		controlplane.RunControlPlane(cpCfg)
+		return
+	}
+
+	// Standalone mode (default)
 	srv, err := server.New(cfg)
 	if err != nil {
 		fatal("Failed to create server: " + err.Error())
