@@ -17,8 +17,9 @@ type DBPool struct {
 	cfg         server.Config
 	duckLakeSem chan struct{}
 
-	mu       sync.Mutex
-	sessions map[int32]*sql.DB // keyed by session backend PID
+	mu          sync.Mutex
+	sessions    map[int32]*sql.DB // keyed by session backend PID
+	stopRefresh map[int32]func()  // credential refresh stop functions
 }
 
 // NewDBPool creates a new database pool with the given server configuration.
@@ -27,6 +28,7 @@ func NewDBPool(cfg server.Config) *DBPool {
 		cfg:         cfg,
 		duckLakeSem: make(chan struct{}, 1),
 		sessions:    make(map[int32]*sql.DB),
+		stopRefresh: make(map[int32]func()),
 	}
 }
 
@@ -38,8 +40,11 @@ func (p *DBPool) CreateSession(pid int32, username string) (*sql.DB, error) {
 		return nil, fmt.Errorf("create session db: %w", err)
 	}
 
+	stop := server.StartCredentialRefresh(db, p.cfg.DuckLake)
+
 	p.mu.Lock()
 	p.sessions[pid] = db
+	p.stopRefresh[pid] = stop
 	p.mu.Unlock()
 
 	slog.Debug("Created session database.", "pid", pid, "user", username)
@@ -50,10 +55,16 @@ func (p *DBPool) CreateSession(pid int32, username string) (*sql.DB, error) {
 func (p *DBPool) CloseSession(pid int32) {
 	p.mu.Lock()
 	db, ok := p.sessions[pid]
+	stop := p.stopRefresh[pid]
 	if ok {
 		delete(p.sessions, pid)
+		delete(p.stopRefresh, pid)
 	}
 	p.mu.Unlock()
+
+	if stop != nil {
+		stop()
+	}
 
 	if ok && db != nil {
 		if err := db.Close(); err != nil {
@@ -73,11 +84,22 @@ func (p *DBPool) ActiveSessions() int {
 func (p *DBPool) CloseAll(timeout time.Duration) {
 	p.mu.Lock()
 	sessions := make(map[int32]*sql.DB, len(p.sessions))
+	stops := make(map[int32]func(), len(p.stopRefresh))
 	for k, v := range p.sessions {
 		sessions[k] = v
 	}
+	for k, v := range p.stopRefresh {
+		stops[k] = v
+	}
 	p.sessions = make(map[int32]*sql.DB)
+	p.stopRefresh = make(map[int32]func())
 	p.mu.Unlock()
+
+	for _, stop := range stops {
+		if stop != nil {
+			stop()
+		}
+	}
 
 	for pid, db := range sessions {
 		if err := db.Close(); err != nil {

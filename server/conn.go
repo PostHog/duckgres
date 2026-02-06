@@ -389,6 +389,12 @@ func (c *clientConn) serve() error {
 			return err
 		}
 		c.db = db
+
+		// Start background credential refresh for long-lived connections.
+		// Only needed when we create the DB here; the control plane manages
+		// refresh for pre-created connections via DBPool.
+		stopRefresh := StartCredentialRefresh(c.db, c.server.cfg.DuckLake)
+		defer stopRefresh()
 	}
 	defer func() {
 		if c.db != nil {
