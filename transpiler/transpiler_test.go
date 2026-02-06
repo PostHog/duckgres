@@ -2332,6 +2332,59 @@ func TestTranspile_SimilarTo(t *testing.T) {
 	}
 }
 
+func TestTranspile_CollatePgCatalogDefault(t *testing.T) {
+	// Test that COLLATE pg_catalog.default is completely removed from queries
+	// This is used by psql's \d command and was causing "COLLATE )" syntax errors
+	// because only the collation name was being stripped, not the entire COLLATE clause
+	tests := []struct {
+		name     string
+		input    string
+		excludes []string
+	}{
+		{
+			name:     "COLLATE pg_catalog.default in WHERE clause",
+			input:    "SELECT * FROM t WHERE name COLLATE pg_catalog.default = 'test'",
+			excludes: []string{"COLLATE", "pg_catalog.default"},
+		},
+		{
+			name:     "COLLATE pg_catalog.default with regex operator",
+			input:    "SELECT * FROM pg_class WHERE relname ~ '^users$' COLLATE pg_catalog.default",
+			excludes: []string{"COLLATE", "pg_catalog.default"},
+		},
+		{
+			name:     "COLLATE pg_catalog.\"default\" with quoted default",
+			input:    `SELECT * FROM t WHERE name COLLATE pg_catalog."default" = 'test'`,
+			excludes: []string{"COLLATE"},
+		},
+		{
+			name:     "multiple COLLATE clauses",
+			input:    "SELECT a COLLATE pg_catalog.default, b COLLATE pg_catalog.default FROM t",
+			excludes: []string{"COLLATE"},
+		},
+		{
+			name:     "COLLATE in ORDER BY",
+			input:    "SELECT * FROM t ORDER BY name COLLATE pg_catalog.default",
+			excludes: []string{"COLLATE"},
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			for _, e := range tt.excludes {
+				if strings.Contains(result.SQL, e) {
+					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, e)
+				}
+			}
+		})
+	}
+}
+
 func TestTranspile_SimilarTo_DuckLakeMode(t *testing.T) {
 	// Test that similar_to_escape gets memory.main prefix in DuckLake mode
 	tr := New(Config{DuckLakeMode: true})
@@ -2342,5 +2395,160 @@ func TestTranspile_SimilarTo_DuckLakeMode(t *testing.T) {
 	}
 	if !strings.Contains(result.SQL, "memory.main.similar_to_escape") {
 		t.Errorf("In DuckLake mode, similar_to_escape should have memory.main prefix, got: %q", result.SQL)
+	}
+}
+
+func TestTranspile_OrderByTransforms(t *testing.T) {
+	// Test that ORDER BY clause expressions are properly transformed
+	// This was broken because Node_SortBy wasn't being walked
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "pg_catalog function in ORDER BY",
+			input:    "SELECT * FROM pg_class ORDER BY pg_catalog.pg_get_expr(relpartbound, oid)",
+			contains: "pg_get_expr",
+			excludes: "pg_catalog.pg_get_expr",
+		},
+		{
+			name:     "regclass cast in ORDER BY",
+			input:    "SELECT * FROM pg_class ORDER BY oid::pg_catalog.regclass",
+			contains: "varchar",
+			excludes: "regclass",
+		},
+		{
+			name:     "type cast in ORDER BY",
+			input:    "SELECT * FROM t ORDER BY data::pg_catalog.text",
+			contains: "varchar",
+			excludes: "pg_catalog.text",
+		},
+		{
+			name:     "multiple expressions in ORDER BY",
+			input:    "SELECT * FROM pg_class ORDER BY oid::pg_catalog.regclass, pg_catalog.pg_table_is_visible(oid)",
+			contains: "pg_table_is_visible",
+			excludes: "pg_catalog.pg_table_is_visible",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_RangeFunction(t *testing.T) {
+	// Test that functions in FROM clause (RangeFunction) are properly transformed
+	// This is used by queries like "SELECT * FROM unnest(array)"
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "pg_catalog.unnest in FROM clause",
+			input:    "SELECT x FROM pg_catalog.unnest(ARRAY[1,2,3]) AS x",
+			contains: "unnest",
+			excludes: "pg_catalog.unnest",
+		},
+		{
+			name:     "unnest in subquery FROM clause",
+			input:    "SELECT * FROM (SELECT x FROM pg_catalog.unnest(arr) AS x) sub",
+			contains: "unnest",
+			excludes: "pg_catalog.unnest",
+		},
+		{
+			name:     "multiple functions in FROM clause",
+			input:    "SELECT x FROM pg_catalog.unnest(ARRAY[1,2,3]) AS x, pg_catalog.unnest(ARRAY[4,5,6]) AS y",
+			contains: "unnest",
+			excludes: "pg_catalog.unnest",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
+	// Test that custom macros get memory.main. prefix in DuckLake mode
+	// These macros are created in memory.main and need explicit qualification
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			name:     "pg_get_expr gets memory.main prefix",
+			input:    "SELECT pg_catalog.pg_get_expr(adbin, adrelid) FROM pg_attrdef",
+			contains: "memory.main.pg_get_expr",
+		},
+		{
+			name:     "pg_get_indexdef gets memory.main prefix",
+			input:    "SELECT pg_catalog.pg_get_indexdef(indexrelid) FROM pg_index",
+			contains: "memory.main.pg_get_indexdef",
+		},
+		{
+			name:     "pg_get_constraintdef gets memory.main prefix",
+			input:    "SELECT pg_catalog.pg_get_constraintdef(oid) FROM pg_constraint",
+			contains: "memory.main.pg_get_constraintdef",
+		},
+		{
+			name:     "obj_description gets memory.main prefix",
+			input:    "SELECT pg_catalog.obj_description(oid, 'pg_class') FROM pg_class",
+			contains: "memory.main.obj_description",
+		},
+		{
+			name:     "col_description gets memory.main prefix",
+			input:    "SELECT pg_catalog.col_description(attrelid, attnum) FROM pg_attribute",
+			contains: "memory.main.col_description",
+		},
+		{
+			name:     "format_type gets memory.main prefix",
+			input:    "SELECT pg_catalog.format_type(atttypid, atttypmod) FROM pg_attribute",
+			contains: "memory.main.format_type",
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+		})
 	}
 }
