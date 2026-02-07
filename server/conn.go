@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,6 +23,10 @@ import (
 
 	"github.com/posthog/duckgres/transpiler"
 )
+
+// errCancelHandled is returned by handleStartup when a cancel request was
+// processed. This signals serve() to exit without creating a DB connection.
+var errCancelHandled = errors.New("cancel request handled")
 
 type preparedStmt struct {
 	query             string
@@ -200,6 +205,17 @@ func isConnectionBroken(err error) bool {
 // Note: If the connection breaks between our health check and Close(), DuckDB may still
 // throw a C++ exception. This is a best-effort mitigation, not a complete fix.
 func (c *clientConn) safeCleanupDB() {
+	// Recover from Go-level panics during database cleanup (e.g., nil pointer
+	// dereference if connection state is inconsistent after cancellation).
+	// Note: DuckDB C++ crashes (SIGABRT/SIGSEGV) are fatal signals that cannot be
+	// caught by recover() — process isolation mode is needed to survive those.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Recovered from panic during database cleanup.",
+				"user", c.username, "panic", r)
+		}
+	}()
+
 	cleanupTimeout := 5 * time.Second
 	connHealthy := true
 
@@ -379,6 +395,9 @@ func (c *clientConn) serve() error {
 
 	// Handle startup
 	if err := c.handleStartup(); err != nil {
+		if errors.Is(err, errCancelHandled) {
+			return nil // Cancel request was processed, exit cleanly
+		}
 		return fmt.Errorf("startup failed: %w", err)
 	}
 
@@ -468,7 +487,7 @@ func (c *clientConn) handleStartup() error {
 					c.server.CancelQuery(key)
 				}
 			}
-			return nil
+			return errCancelHandled
 		}
 
 		// Reject non-TLS connections
@@ -580,6 +599,10 @@ func (c *clientConn) messageLoop() error {
 		switch msgType {
 		case msgQuery:
 			if err := c.handleQuery(body); err != nil {
+				if isConnectionBroken(err) {
+					slog.Info("Client connection lost during query.", "user", c.username, "error", err)
+					return nil
+				}
 				slog.Error("Query error.", "error", err)
 			}
 
@@ -811,13 +834,30 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 		if err := rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
-			break
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
 		}
 
 		if err := c.sendDataRow(values); err != nil {
 			return err
 		}
 		rowCount++
+	}
+
+	// Check for errors during row iteration (e.g., context cancellation from Ctrl+C)
+	if err := rows.Err(); err != nil {
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			slog.Error("Row iteration error.", "user", c.username, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+		}
+		c.setTxError()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
 	}
 
 	// Send command complete (SELECT doesn't change transaction status)
@@ -1076,8 +1116,12 @@ func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, 
 	}
 
 	if err := rows.Err(); err != nil {
-		slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+		}
 		c.setTxError()
 		return
 	}
@@ -1128,7 +1172,10 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string, query st
 		if err := rows.Scan(valuePtrs...); err != nil {
 			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
-			break
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
 		}
 
 		if err := c.sendDataRow(values); err != nil {
@@ -1138,8 +1185,12 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string, query st
 	}
 
 	if err := rows.Err(); err != nil {
-		slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+		}
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
