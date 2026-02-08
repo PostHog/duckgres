@@ -62,8 +62,15 @@ func (m *multiHandler) WithGroup(name string) slog.Handler {
 // POSTHOG_API_KEY is set. Logs always go to stderr; PostHog is additive.
 // Returns a shutdown function that flushes the OTLP batch processor.
 func initLogging() func() {
+	// Allow setting log level via environment variable (default: info)
+	logLevel := slog.LevelInfo
+	if lvl := os.Getenv("DUCKGRES_LOG_LEVEL"); lvl == "debug" {
+		logLevel = slog.LevelDebug
+	}
+
 	apiKey := os.Getenv("POSTHOG_API_KEY")
 	if apiKey == "" {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
 		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
 		return func() {}
 	}
@@ -104,7 +111,7 @@ func initLogging() func() {
 	)
 
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
-	textHandler := slog.NewTextHandler(os.Stderr, nil)
+	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
 
 	slog.SetDefault(slog.New(&multiHandler{
 		handlers: []slog.Handler{textHandler, otelHandler},

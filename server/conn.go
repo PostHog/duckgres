@@ -1538,6 +1538,22 @@ var (
 	copyEscapeRegex     = regexp.MustCompile(`(?i)\bESCAPE\s+['"](.)['"]\s*`)
 )
 
+// stripPublicSchema maps PostgreSQL's "public" schema to DuckDB's default schema
+// in COPY table names. Handles both quoted ("public"."table") and unquoted (public.table) forms.
+// This mirrors the transpiler's PublicSchemaTransform but operates on raw table name strings
+// since COPY commands bypass the SQL transpiler (pg_query can't parse COPY ... FORMAT BINARY).
+func stripPublicSchema(tableName string) string {
+	// Quoted form: "public"."tablename" → "tablename"
+	if strings.HasPrefix(tableName, `"public".`) {
+		return tableName[len(`"public".`):]
+	}
+	// Unquoted form: public.tablename → tablename
+	if strings.HasPrefix(strings.ToLower(tableName), "public.") {
+		return tableName[len("public."):]
+	}
+	return tableName
+}
+
 // CopyFromOptions contains parsed options from a COPY FROM STDIN command
 type CopyFromOptions struct {
 	TableName  string
@@ -1560,7 +1576,7 @@ func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
 	}
 
 	opts := &CopyFromOptions{
-		TableName:  matches[1],
+		TableName:  stripPublicSchema(matches[1]),
 		Delimiter:  "\t", // Default PostgreSQL text format delimiter
 		NullString: "\\N", // Default PostgreSQL null representation
 	}
