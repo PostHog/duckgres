@@ -1296,8 +1296,9 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 }
 
 // recreatePgNamespaceForDuckLake recreates pg_namespace to source from DuckDB's native
-// duckdb_tables() function to get schema OIDs that are consistent with pg_class_full.
-// We derive namespaces from duckdb_tables() because duckdb_schemas() doesn't have schema_oid.
+// duckdb_tables() and duckdb_views() functions to get schema OIDs that are consistent
+// with pg_class_full. We derive namespaces from both tables and views because
+// duckdb_schemas() doesn't have schema_oid, and some schemas may only contain views.
 // Must be called AFTER DuckLake is attached.
 func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 	pgNamespaceSQL := `
@@ -1307,8 +1308,11 @@ func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 			CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname,
 			CASE WHEN schema_name = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
 			NULL AS nspacl
-		FROM duckdb_tables()
-		WHERE database_name = 'ducklake'
+		FROM (
+			SELECT schema_oid, schema_name FROM duckdb_tables() WHERE database_name = 'ducklake'
+			UNION
+			SELECT schema_oid, schema_name FROM duckdb_views() WHERE database_name = 'ducklake'
+		)
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err

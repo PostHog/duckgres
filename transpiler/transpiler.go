@@ -254,3 +254,39 @@ func ConvertAlterTableToAlterView(sql string) (string, bool) {
 	}
 	return result, true
 }
+
+// ConvertDropTableToDropView transforms a DROP TABLE [IF EXISTS] statement
+// to DROP VIEW [IF EXISTS]. This is used to retry failed DROP TABLE commands
+// when DuckDB reports that the target is a view, not a table.
+// Returns the transformed SQL and true if successful, or the original SQL
+// and false if the input is not a DROP TABLE statement.
+func ConvertDropTableToDropView(sql string) (string, bool) {
+	tree, err := pg_query.Parse(sql)
+	if err != nil || len(tree.Stmts) == 0 {
+		return sql, false
+	}
+
+	stmt := tree.Stmts[0].Stmt
+	if stmt == nil {
+		return sql, false
+	}
+
+	dropStmt, ok := stmt.Node.(*pg_query.Node_DropStmt)
+	if !ok || dropStmt.DropStmt == nil {
+		return sql, false
+	}
+
+	// Only transform if it's a DROP TABLE
+	if dropStmt.DropStmt.RemoveType != pg_query.ObjectType_OBJECT_TABLE {
+		return sql, false
+	}
+
+	// Change to DROP VIEW
+	dropStmt.DropStmt.RemoveType = pg_query.ObjectType_OBJECT_VIEW
+
+	result, err := pg_query.Deparse(tree)
+	if err != nil {
+		return sql, false
+	}
+	return result, true
+}

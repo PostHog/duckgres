@@ -1905,6 +1905,82 @@ func TestConvertAlterTableToAlterView(t *testing.T) {
 	}
 }
 
+func TestConvertDropTableToDropView(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantOK     bool
+		wantChange bool
+	}{
+		{
+			name:       "DROP TABLE IF EXISTS to DROP VIEW IF EXISTS",
+			input:      `DROP TABLE IF EXISTS "my_schema"."my_view"`,
+			wantOK:     true,
+			wantChange: true,
+		},
+		{
+			name:       "simple DROP TABLE to DROP VIEW",
+			input:      `DROP TABLE myview`,
+			wantOK:     true,
+			wantChange: true,
+		},
+		{
+			name:       "DROP VIEW unchanged",
+			input:      `DROP VIEW IF EXISTS myview`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "SELECT statement unchanged",
+			input:      `SELECT * FROM users`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "ALTER TABLE unchanged",
+			input:      `ALTER TABLE users ADD COLUMN email TEXT`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "empty string",
+			input:      ``,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "invalid SQL",
+			input:      `NOT VALID SQL AT ALL`,
+			wantOK:     false,
+			wantChange: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, ok := ConvertDropTableToDropView(tt.input)
+			if ok != tt.wantOK {
+				t.Errorf("ConvertDropTableToDropView(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if tt.wantChange {
+				if result == tt.input {
+					t.Errorf("ConvertDropTableToDropView(%q) should change the SQL", tt.input)
+				}
+				if !strings.Contains(strings.ToUpper(result), "DROP VIEW") {
+					t.Errorf("ConvertDropTableToDropView(%q) = %q, should contain DROP VIEW", tt.input, result)
+				}
+				if strings.Contains(strings.ToUpper(result), "DROP TABLE") {
+					t.Errorf("ConvertDropTableToDropView(%q) = %q, should not contain DROP TABLE", tt.input, result)
+				}
+			} else {
+				if result != tt.input {
+					t.Errorf("ConvertDropTableToDropView(%q) = %q, should return original", tt.input, result)
+				}
+			}
+		})
+	}
+}
+
 func TestTranspile_PgCatalog_ColumnRefRewrite(t *testing.T) {
 	// Bug: When pg_class is rewritten to pg_class_full, column references like
 	// pg_class.oid should also be rewritten to pg_class_full.oid

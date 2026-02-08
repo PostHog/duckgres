@@ -639,6 +639,17 @@ func (c *clientConn) handleQuery(body []byte) error {
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
 
+	// Route COPY TO STDOUT / COPY FROM STDIN directly to handleCopy()
+	// before transpilation, because:
+	// 1. The inner SELECT may contain DuckDB-specific syntax (QUALIFY, ASOF, struct literals)
+	//    that pg_query can't parse
+	// 2. handleCopyOut() already extracts and transpiles the inner SELECT separately
+	// 3. validateWithDuckDB() can't EXPLAIN COPY with FORMAT "binary"
+	upperQueryEarly := strings.ToUpper(query)
+	if copyToStdoutRegex.MatchString(upperQueryEarly) || copyFromStdinRegex.MatchString(upperQueryEarly) {
+		return c.handleCopy(query, upperQueryEarly)
+	}
+
 	// Check for multi-statement query (PostgreSQL simple query protocol supports
 	// multiple semicolon-separated statements in a single Q message).
 	// Each statement gets its own results, with a single ReadyForQuery at the end.
@@ -740,6 +751,12 @@ func (c *clientConn) handleQuery(body []byte) error {
 			// Retry ALTER TABLE as ALTER VIEW if target is a view
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
+					result, err = c.db.ExecContext(ctx, alteredQuery)
+				}
+			}
+			// Retry DROP TABLE as DROP VIEW if target is a view
+			if isDropTableOnViewError(err) {
+				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
 					result, err = c.db.ExecContext(ctx, alteredQuery)
 				}
 			}
@@ -941,6 +958,11 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		if err != nil {
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
+					execResult, err = c.db.ExecContext(ctx, alteredQuery)
+				}
+			}
+			if isDropTableOnViewError(err) {
+				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
 					execResult, err = c.db.ExecContext(ctx, alteredQuery)
 				}
 			}
@@ -2935,6 +2957,12 @@ func (c *clientConn) handleExecute(body []byte) {
 					result, err = c.db.Exec(alteredQuery, args...)
 				}
 			}
+			// Retry DROP TABLE as DROP VIEW if target is a view
+			if isDropTableOnViewError(err) {
+				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(p.stmt.convertedQuery); ok {
+					result, err = c.db.Exec(alteredQuery, args...)
+				}
+			}
 			if err != nil {
 				slog.Error("Query execution failed.", "user", c.username, "query", p.stmt.convertedQuery, "original_query", p.stmt.query, "error", err)
 				c.sendError("ERROR", "42000", err.Error())
@@ -3073,4 +3101,13 @@ func isAlterTableNotTableError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "cannot use alter table") &&
 		strings.Contains(msg, "not a table")
+}
+
+// isDropTableOnViewError checks if the error indicates that a DROP TABLE
+// was attempted on a view. DuckDB returns:
+// "Catalog Error: Existing object X is of type View, trying to drop type Table"
+func isDropTableOnViewError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "is of type View") &&
+		strings.Contains(msg, "trying to drop type Table")
 }
