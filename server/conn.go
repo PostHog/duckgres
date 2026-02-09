@@ -2240,7 +2240,7 @@ func (c *clientConn) appendWithDuckDBAppender(tableName string, rows [][]interfa
 	if err != nil {
 		return 0, fmt.Errorf("failed to get DB connection: %w", err)
 	}
-	defer sqlConn.Close()
+	defer sqlConn.Close() //nolint:errcheck
 
 	var rowCount int
 	err = sqlConn.Raw(func(driverConn interface{}) error {
@@ -2269,7 +2269,7 @@ func (c *clientConn) appendWithDuckDBAppender(tableName string, rows [][]interfa
 				driverVals[j] = v
 			}
 			if appErr = appender.AppendRow(driverVals...); appErr != nil {
-				appender.Close()
+				_ = appender.Close()
 				return fmt.Errorf("AppendRow failed at row %d: %w", i+1, appErr)
 			}
 		}

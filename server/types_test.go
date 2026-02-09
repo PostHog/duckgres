@@ -998,8 +998,8 @@ func TestParseNumericTypmod(t *testing.T) {
 	}{
 		{"DECIMAL(10,2)", int32((10<<16)|2) + 4},
 		{"DECIMAL(18,4)", int32((18<<16)|4) + 4},
-		{"DECIMAL(38,0)", int32((38<<16)|0) + 4},
-		{"DECIMAL(1,0)", int32((1<<16)|0) + 4},
+		{"DECIMAL(38,0)", int32(38<<16) + 4},
+		{"DECIMAL(1,0)", int32(1<<16) + 4},
 		{"numeric(5,3)", int32((5<<16)|3) + 4},
 		// No precision/scale → -1
 		{"DECIMAL", -1},
