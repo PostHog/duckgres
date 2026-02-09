@@ -2027,7 +2027,7 @@ func (c *clientConn) handleCopyOutBinary(rows *sql.Rows, cols []string) error {
 
 		if firstRow {
 			// First CopyData message: header + tuple
-			msg := make([]byte, 0, len(binaryHeader)+len(tupleBytes))
+			msg := make([]byte, 0, int64(len(binaryHeader))+int64(len(tupleBytes)))
 			msg = append(msg, binaryHeader...)
 			msg = append(msg, tupleBytes...)
 			if err := writeCopyData(c.writer, msg); err != nil {
