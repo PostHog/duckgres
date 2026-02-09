@@ -592,6 +592,71 @@ func initPgCatalog(db *sql.DB) error {
 		slog.Warn("Failed to create pg_attribute view.", "error", err)
 	}
 
+	// Create pg_constraint stub view for clients that query constraint metadata
+	// (e.g., DuckDB's postgres extension, JDBC drivers)
+	// Returns no rows since DuckDB doesn't have PostgreSQL-style constraints
+	pgConstraintSQL := `
+		CREATE OR REPLACE VIEW pg_constraint AS
+		SELECT
+			NULL::BIGINT AS oid,
+			NULL::VARCHAR AS conname,
+			NULL::BIGINT AS connamespace,
+			NULL::VARCHAR AS contype,
+			NULL::BOOLEAN AS condeferrable,
+			NULL::BOOLEAN AS condeferred,
+			NULL::BOOLEAN AS convalidated,
+			NULL::BIGINT AS conrelid,
+			NULL::BIGINT AS contypid,
+			NULL::BIGINT AS conindid,
+			NULL::BIGINT AS conparentid,
+			NULL::BIGINT AS confrelid,
+			NULL::VARCHAR AS confupdtype,
+			NULL::VARCHAR AS confdeltype,
+			NULL::VARCHAR AS confmatchtype,
+			NULL::BOOLEAN AS conislocal,
+			NULL::INTEGER AS coninhcount,
+			NULL::BOOLEAN AS connoinherit,
+			NULL::INTEGER[] AS conkey,
+			NULL::INTEGER[] AS confkey,
+			NULL::VARCHAR AS conbin,
+			NULL::VARCHAR AS consrc
+		WHERE false
+	`
+	if _, err := db.Exec(pgConstraintSQL); err != nil {
+		slog.Warn("Failed to create pg_constraint view.", "error", err)
+	}
+
+	// Create pg_enum stub view for clients that query enum type metadata
+	// Returns no rows since DuckDB doesn't have PostgreSQL-style enums
+	pgEnumSQL := `
+		CREATE OR REPLACE VIEW pg_enum AS
+		SELECT
+			NULL::BIGINT AS oid,
+			NULL::BIGINT AS enumtypid,
+			NULL::FLOAT AS enumsortorder,
+			NULL::VARCHAR AS enumlabel
+		WHERE false
+	`
+	if _, err := db.Exec(pgEnumSQL); err != nil {
+		slog.Warn("Failed to create pg_enum view.", "error", err)
+	}
+
+	// Create pg_indexes stub view for clients that query index metadata
+	// Returns no rows since DuckDB doesn't expose indexes in PostgreSQL format
+	pgIndexesSQL := `
+		CREATE OR REPLACE VIEW pg_indexes AS
+		SELECT
+			NULL::VARCHAR AS schemaname,
+			NULL::VARCHAR AS tablename,
+			NULL::VARCHAR AS indexname,
+			NULL::VARCHAR AS tablespace,
+			NULL::VARCHAR AS indexdef
+		WHERE false
+	`
+	if _, err := db.Exec(pgIndexesSQL); err != nil {
+		slog.Warn("Failed to create pg_indexes view.", "error", err)
+	}
+
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
 	//
@@ -1231,8 +1296,9 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 }
 
 // recreatePgNamespaceForDuckLake recreates pg_namespace to source from DuckDB's native
-// duckdb_tables() function to get schema OIDs that are consistent with pg_class_full.
-// We derive namespaces from duckdb_tables() because duckdb_schemas() doesn't have schema_oid.
+// duckdb_tables() and duckdb_views() functions to get schema OIDs that are consistent
+// with pg_class_full. We derive namespaces from both tables and views because
+// duckdb_schemas() doesn't have schema_oid, and some schemas may only contain views.
 // Must be called AFTER DuckLake is attached.
 func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 	pgNamespaceSQL := `
@@ -1242,8 +1308,11 @@ func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 			CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname,
 			CASE WHEN schema_name = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
 			NULL AS nspacl
-		FROM duckdb_tables()
-		WHERE database_name = 'ducklake'
+		FROM (
+			SELECT schema_oid, schema_name FROM duckdb_tables() WHERE database_name = 'ducklake'
+			UNION
+			SELECT schema_oid, schema_name FROM duckdb_views() WHERE database_name = 'ducklake'
+		)
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err

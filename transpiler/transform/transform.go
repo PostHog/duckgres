@@ -224,6 +224,13 @@ func walkNode(node *pg_query.Node, fn func(*pg_query.Node) bool) bool {
 		// GRANT/REVOKE - no-op
 	case *pg_query.Node_CommentStmt:
 		// COMMENT - no-op
+	case *pg_query.Node_ViewStmt:
+		if n.ViewStmt != nil {
+			if n.ViewStmt.View != nil {
+				walkNode(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: n.ViewStmt.View}}, fn)
+			}
+			walkNode(n.ViewStmt.Query, fn)
+		}
 	case *pg_query.Node_AlterTableStmt:
 		if n.AlterTableStmt != nil {
 			for _, cmd := range n.AlterTableStmt.Cmds {

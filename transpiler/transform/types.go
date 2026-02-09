@@ -162,5 +162,17 @@ func (t *TypeMappingTransform) transformTypeName(typeName *pg_query.TypeName) bo
 		return true
 	}
 
+	// Even without a type mapping, strip pg_catalog schema prefix.
+	// PostgreSQL parser qualifies built-in types as pg_catalog.typename
+	// (e.g., pg_catalog.json) but DuckDB rejects the pg_catalog prefix.
+	if len(typeName.Names) > 1 {
+		if first := typeName.Names[0].GetString_(); first != nil {
+			if strings.ToLower(first.Sval) == "pg_catalog" {
+				typeName.Names = typeName.Names[1:]
+				return true
+			}
+		}
+	}
+
 	return false
 }

@@ -52,6 +52,9 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_partitioned_table":  "pg_partitioned_table",
 			"pg_type":               "pg_type",
 			"pg_attribute":          "pg_attribute",
+			"pg_constraint":         "pg_constraint",
+			"pg_enum":               "pg_enum",
+			"pg_indexes":            "pg_indexes",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
@@ -417,6 +420,14 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 		// ORDER BY clause items
 		if n.SortBy != nil {
 			t.walkAndTransform(n.SortBy.Node, changed)
+		}
+
+	case *pg_query.Node_ViewStmt:
+		if n.ViewStmt != nil {
+			if n.ViewStmt.View != nil {
+				t.walkAndTransform(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: n.ViewStmt.View}}, changed)
+			}
+			t.walkAndTransform(n.ViewStmt.Query, changed)
 		}
 	}
 }
