@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"math/big"
 	"testing"
@@ -1253,5 +1254,84 @@ func TestDecodeTimestampAncient(t *testing.T) {
 				t.Errorf("round-trip: got %v, want %v", decoded, tt.input)
 			}
 		})
+	}
+}
+
+// TestEncodeJSON verifies that encodeJSON re-serializes Go native values back
+// to valid JSON text. The Go DuckDB driver's getJSON() deserializes JSON via
+// json.Unmarshal (e.g., JSON string "hello" becomes Go string hello without
+// quotes). Without re-serialization, bare strings like hello are sent on the
+// wire and CAST(x AS JSON) fails because hello is not valid JSON.
+func TestEncodeJSON(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    interface{} // Go native value (as returned by DuckDB driver's getJSON)
+		expected string      // Expected JSON text on the wire
+	}{
+		{"string", "hello", `"hello"`},
+		{"empty string", "", `""`},
+		{"string with quotes", `say "hi"`, `"say \"hi\""`},
+		{"integer", float64(42), "42"},
+		{"float", float64(3.14), "3.14"},
+		{"boolean true", true, "true"},
+		{"boolean false", false, "false"},
+		{"null", nil, "null"},
+		{"object", map[string]interface{}{"name": "Alice", "age": float64(30)}, ""},  // checked separately
+		{"array", []interface{}{float64(1), float64(2), float64(3)}, "[1,2,3]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := encodeJSON(tt.input)
+			if result == nil {
+				t.Fatal("encodeJSON returned nil")
+			}
+			got := string(result)
+
+			if tt.name == "object" {
+				// Object key order is non-deterministic; verify it's valid JSON with expected keys
+				var parsed map[string]interface{}
+				if err := json.Unmarshal(result, &parsed); err != nil {
+					t.Fatalf("encodeJSON produced invalid JSON: %s", got)
+				}
+				if parsed["name"] != "Alice" || parsed["age"] != float64(30) {
+					t.Errorf("encodeJSON object content wrong: %s", got)
+				}
+				return
+			}
+
+			if got != tt.expected {
+				t.Errorf("encodeJSON(%v) = %s, want %s", tt.input, got, tt.expected)
+			}
+
+			// Verify the output is valid JSON (the whole point of this function)
+			var v interface{}
+			if err := json.Unmarshal(result, &v); err != nil {
+				t.Errorf("encodeJSON(%v) produced invalid JSON %q: %v", tt.input, got, err)
+			}
+		})
+	}
+}
+
+// TestEncodeBinaryJSON verifies that encodeBinary routes JSON/JSONB OIDs
+// through encodeJSON rather than the default text encoder.
+func TestEncodeBinaryJSON(t *testing.T) {
+	// Simulate what the Go DuckDB driver returns for JSON string "hello":
+	// json.Unmarshal('"hello"') produces Go string "hello" (no quotes)
+	goValue := "hello"
+
+	for _, oid := range []int32{OidJSON, OidJSONB} {
+		result := encodeBinary(goValue, oid)
+		got := string(result)
+		if got != `"hello"` {
+			t.Errorf("encodeBinary(%q, OID %d) = %s, want %s", goValue, oid, got, `"hello"`)
+		}
+	}
+
+	// Non-JSON OID should NOT add quotes (plain text encoding)
+	result := encodeBinary("hello", OidVarchar)
+	got := string(result)
+	if got != "hello" {
+		t.Errorf("encodeBinary(%q, OidVarchar) = %s, want %s", "hello", got, "hello")
 	}
 }
