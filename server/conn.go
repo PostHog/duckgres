@@ -638,6 +638,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
+	fmt.Fprintf(os.Stderr, "handleQuery: %s\n", query)
 
 	// Route COPY TO STDOUT / COPY FROM STDIN directly to handleCopy()
 	// before transpilation, because:
@@ -1929,6 +1930,10 @@ func (c *clientConn) handleCopyOutBinary(rows *sql.Rows, cols []string) error {
 		}
 
 		tupleBytes := encodeTuple(values)
+		fmt.Fprintf(os.Stderr, "handleCopyOutBinary: tuple bytes (%d bytes): %X\n", len(tupleBytes), tupleBytes)
+		for i, v := range values {
+			fmt.Fprintf(os.Stderr, "  col[%d] type=%T oid=%d\n", i, v, typeOIDs[i])
+		}
 
 		if firstRow {
 			// First CopyData message: header + tuple
@@ -2333,6 +2338,8 @@ func decodeBinaryCopy(data []byte, oid int32) (interface{}, error) {
 			return decodeFloat4(data)
 		}
 		return decodeFloat8(data)
+	case OidNumeric:
+		return decodeNumeric(data)
 	case OidDate:
 		return decodeDate(data)
 	case OidTimestamp, OidTimestamptz:
@@ -2394,8 +2401,9 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 		typeSize := c.mapTypeSizeWithColumnName(col, colTypes[i])
 		_ = binary.Write(&buf, binary.BigEndian, typeSize)
 
-		// Type modifier (-1 = no modifier)
-		_ = binary.Write(&buf, binary.BigEndian, int32(-1))
+		// Type modifier (e.g. precision/scale for NUMERIC, -1 = no modifier)
+		typmod := getTypeInfo(colTypes[i]).Typmod
+		_ = binary.Write(&buf, binary.BigEndian, typmod)
 
 		// Format code (0 = text, 1 = binary)
 		_ = binary.Write(&buf, binary.BigEndian, int16(0))
@@ -2572,6 +2580,7 @@ func (c *clientConn) handleParse(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid Parse message")
 		return
 	}
+	fmt.Fprintf(os.Stderr, "handleParse: stmt=%q query=%s\n", stmtName, query)
 
 	// Read number of parameter types
 	var numParamTypes int16

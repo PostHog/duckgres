@@ -5,8 +5,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/big"
+	"os"
 	"strings"
 	"time"
+
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // PostgreSQL type OIDs
@@ -75,8 +79,9 @@ var pgCatalogColumnOIDs = map[string]int32{
 
 // TypeInfo contains PostgreSQL type information
 type TypeInfo struct {
-	OID  int32
-	Size int16 // -1 for variable length
+	OID    int32
+	Size   int16 // -1 for variable length
+	Typmod int32 // -1 = no modifier; for NUMERIC: ((precision << 16) | scale) + 4
 }
 
 // mapDuckDBType maps a DuckDB type name to PostgreSQL type info
@@ -107,7 +112,7 @@ func mapDuckDBType(typeName string) TypeInfo {
 	case upper == "DOUBLE" || upper == "FLOAT8":
 		return TypeInfo{OID: OidFloat8, Size: 8}
 	case strings.HasPrefix(upper, "DECIMAL") || strings.HasPrefix(upper, "NUMERIC"):
-		return TypeInfo{OID: OidNumeric, Size: -1}
+		return TypeInfo{OID: OidNumeric, Size: -1, Typmod: parseNumericTypmod(typeName)}
 	case upper == "VARCHAR" || strings.HasPrefix(upper, "VARCHAR("):
 		return TypeInfo{OID: OidVarchar, Size: -1}
 	case upper == "TEXT" || upper == "STRING":
@@ -139,6 +144,35 @@ func getTypeInfo(colType *sql.ColumnType) TypeInfo {
 	return mapDuckDBType(colType.DatabaseTypeName())
 }
 
+// parseNumericTypmod parses precision and scale from a type name like "DECIMAL(10,2)"
+// and encodes them as a PostgreSQL typmod: ((precision << 16) | scale) + 4.
+// Returns -1 if precision/scale cannot be extracted.
+func parseNumericTypmod(typeName string) int32 {
+	lparen := strings.IndexByte(typeName, '(')
+	rparen := strings.IndexByte(typeName, ')')
+	if lparen < 0 || rparen < 0 || rparen <= lparen {
+		return -1
+	}
+	inner := typeName[lparen+1 : rparen]
+	parts := strings.SplitN(inner, ",", 2)
+	if len(parts) != 2 {
+		return -1
+	}
+	precision := strings.TrimSpace(parts[0])
+	scale := strings.TrimSpace(parts[1])
+	var p, s int
+	if _, err := fmt.Sscanf(precision, "%d", &p); err != nil {
+		return -1
+	}
+	if _, err := fmt.Sscanf(scale, "%d", &s); err != nil {
+		return -1
+	}
+	if p <= 0 || s < 0 || p > 38 {
+		return -1
+	}
+	return int32((p << 16) | s) + 4
+}
+
 // encodeBinary encodes a value in PostgreSQL binary format
 // Returns the encoded bytes, or nil if the value should be sent as NULL
 func encodeBinary(v interface{}, oid int32) []byte {
@@ -159,6 +193,8 @@ func encodeBinary(v interface{}, oid int32) []byte {
 		return encodeFloat4(v)
 	case OidFloat8:
 		return encodeFloat8(v)
+	case OidNumeric:
+		return encodeNumeric(v)
 	case OidDate:
 		return encodeDate(v)
 	case OidTimestamp, OidTimestamptz:
@@ -393,6 +429,110 @@ func encodeBytea(v interface{}) []byte {
 	}
 }
 
+// encodeNumeric encodes a value in PostgreSQL binary numeric format.
+//
+// PostgreSQL binary numeric layout:
+//
+//	int16 ndigits  - number of base-10000 digit groups
+//	int16 weight   - weight of first digit (number of groups before decimal point - 1)
+//	int16 sign     - 0x0000 = positive, 0x4000 = negative
+//	int16 dscale   - number of digits after decimal point (display scale)
+//	int16[] digits - base-10000 digit groups
+func encodeNumeric(v interface{}) []byte {
+	dec, ok := v.(duckdb.Decimal)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "encodeNumeric: NOT duckdb.Decimal, type=%T value=%v\n", v, v)
+		// Fallback: try to format as text and let the caller handle it
+		return encodeText(v)
+	}
+	fmt.Fprintf(os.Stderr, "encodeNumeric: duckdb.Decimal width=%d scale=%d value=%s\n", dec.Width, dec.Scale, dec.Value.String())
+
+	val := new(big.Int).Set(dec.Value)
+	dscale := int16(dec.Scale)
+
+	// Handle sign
+	var sign int16
+	if val.Sign() < 0 {
+		sign = 0x4000 // NUMERIC_NEG
+		val.Neg(val)
+	}
+
+	// Handle zero
+	if val.Sign() == 0 {
+		buf := make([]byte, 8)
+		// ndigits=0, weight=0, sign=0, dscale=dscale
+		binary.BigEndian.PutUint16(buf[6:], uint16(dscale))
+		return buf
+	}
+
+	// Convert unscaled value to base-10000 digits aligned to the decimal point.
+	// The unscaled value represents: val * 10^(-scale)
+	// PostgreSQL numeric uses base-10000 groups where each group covers 4 decimal digits.
+	// We need to pad the unscaled value so the fractional part fills complete groups.
+	fracGroups := (int(dscale) + 3) / 4 // ceiling division
+	padding := fracGroups*4 - int(dscale)
+	if padding > 0 {
+		pow := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(padding)), nil)
+		val.Mul(val, pow)
+	}
+
+	base := big.NewInt(10000)
+	var allDigits []int16
+
+	// Extract base-10000 digits (least significant first)
+	tmp := new(big.Int).Set(val)
+	for tmp.Sign() > 0 {
+		mod := new(big.Int)
+		tmp.DivMod(tmp, base, mod)
+		allDigits = append(allDigits, int16(mod.Int64()))
+	}
+
+	// Reverse to most-significant first
+	for i, j := 0, len(allDigits)-1; i < j; i, j = i+1, j-1 {
+		allDigits[i], allDigits[j] = allDigits[j], allDigits[i]
+	}
+
+	// The last fracGroups entries are the fractional part
+	totalGroups := len(allDigits)
+	intGroups := totalGroups - fracGroups
+	if intGroups < 0 {
+		// Need to pad with leading zero groups
+		pad := make([]int16, -intGroups)
+		allDigits = append(pad, allDigits...)
+		intGroups = 0
+		totalGroups = len(allDigits)
+	}
+
+	// Weight = number of integer groups - 1
+	weight := int16(intGroups - 1)
+
+	// Strip trailing zero groups (PostgreSQL weight handles implicit zeros)
+	ndigits := totalGroups
+	for ndigits > 0 && allDigits[ndigits-1] == 0 {
+		ndigits--
+	}
+
+	// Strip leading zero groups (and adjust weight)
+	startIdx := 0
+	for startIdx < ndigits && allDigits[startIdx] == 0 {
+		startIdx++
+		weight--
+	}
+	digits := allDigits[startIdx:ndigits]
+	nd := int16(len(digits))
+
+	// Build binary buffer: 8 byte header + 2 bytes per digit
+	buf := make([]byte, 8+2*int(nd))
+	binary.BigEndian.PutUint16(buf[0:], uint16(nd))
+	binary.BigEndian.PutUint16(buf[2:], uint16(weight))
+	binary.BigEndian.PutUint16(buf[4:], uint16(sign))
+	binary.BigEndian.PutUint16(buf[6:], uint16(dscale))
+	for i, d := range digits {
+		binary.BigEndian.PutUint16(buf[8+2*i:], uint16(d))
+	}
+	return buf
+}
+
 func encodeText(v interface{}) []byte {
 	str := formatValue(v)
 	return []byte(str)
@@ -419,6 +559,8 @@ func decodeBinary(data []byte, oid int32) (interface{}, error) {
 		return decodeFloat4(data)
 	case OidFloat8:
 		return decodeFloat8(data)
+	case OidNumeric:
+		return decodeNumeric(data)
 	case OidDate:
 		return decodeDate(data)
 	case OidTimestamp, OidTimestamptz:
@@ -493,4 +635,88 @@ func decodeTimestamp(data []byte) (time.Time, error) {
 	micros := int64(binary.BigEndian.Uint64(data))
 	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 	return pgEpoch.Add(time.Duration(micros) * time.Microsecond), nil
+}
+
+// decodeNumeric decodes PostgreSQL binary numeric format into a string.
+func decodeNumeric(data []byte) (string, error) {
+	if len(data) < 8 {
+		return "", fmt.Errorf("insufficient data for numeric: got %d bytes, need at least 8", len(data))
+	}
+
+	ndigits := int(binary.BigEndian.Uint16(data[0:]))
+	weight := int16(binary.BigEndian.Uint16(data[2:]))
+	sign := binary.BigEndian.Uint16(data[4:])
+	dscale := int(binary.BigEndian.Uint16(data[6:]))
+
+	if len(data) < 8+2*ndigits {
+		return "", fmt.Errorf("insufficient data for numeric digits: got %d bytes, need %d", len(data), 8+2*ndigits)
+	}
+
+	// Special values
+	if sign == 0xC000 {
+		return "NaN", nil
+	}
+
+	// Read base-10000 digits
+	digits := make([]int16, ndigits)
+	for i := 0; i < ndigits; i++ {
+		digits[i] = int16(binary.BigEndian.Uint16(data[8+2*i:]))
+	}
+
+	// Reconstruct the unscaled value
+	val := new(big.Int)
+	base := big.NewInt(10000)
+	for _, d := range digits {
+		val.Mul(val, base)
+		val.Add(val, big.NewInt(int64(d)))
+	}
+
+	// The digits represent: sum(digits[i] * 10000^(weight-i))
+	// After reading all ndigits groups, we have val * 10000^(weight - ndigits + 1)
+	// We need to convert to a fixed-point number with dscale decimal places.
+	// Exponent in terms of decimal digits: 4 * (weight - ndigits + 1)
+	exp := 4 * (int(weight) - ndigits + 1)
+
+	// We want the value as: val * 10^exp, displayed with dscale decimal places.
+	// Shift so we have dscale fractional digits: multiply by 10^(dscale + exp)
+	shift := dscale + exp
+	if shift > 0 {
+		factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(shift)), nil)
+		val.Mul(val, factor)
+	} else if shift < 0 {
+		factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-shift)), nil)
+		val.Div(val, factor)
+	}
+
+	// Now val is the unscaled integer with dscale implied decimal places
+	negative := sign == 0x4000
+	if negative {
+		val.Neg(val)
+	}
+
+	// Format as decimal string
+	str := val.String()
+	if dscale == 0 {
+		return str, nil
+	}
+
+	isNeg := false
+	if len(str) > 0 && str[0] == '-' {
+		isNeg = true
+		str = str[1:]
+	}
+
+	// Pad with leading zeros if needed
+	for len(str) <= dscale {
+		str = "0" + str
+	}
+
+	intPart := str[:len(str)-dscale]
+	fracPart := str[len(str)-dscale:]
+
+	result := intPart + "." + fracPart
+	if isNeg {
+		result = "-" + result
+	}
+	return result, nil
 }

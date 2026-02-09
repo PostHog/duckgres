@@ -3,8 +3,11 @@ package server
 import (
 	"encoding/binary"
 	"math"
+	"math/big"
 	"testing"
 	"time"
+
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 func TestMapDuckDBType(t *testing.T) {
@@ -795,5 +798,233 @@ func TestDecodeBinary(t *testing.T) {
 				t.Errorf("decodeBinary(%v, %d) = %v (%T), want %v (%T)", tt.data, tt.oid, result, result, tt.expected, tt.expected)
 			}
 		})
+	}
+}
+
+func TestEncodeNumeric(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          duckdb.Decimal
+		expectNdigits  uint16
+		expectWeight   int16
+		expectSign     uint16
+		expectDscale   uint16
+		expectDigits   []uint16
+	}{
+		{
+			name:          "99.99",
+			input:         duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(9999)},
+			expectNdigits: 2,
+			expectWeight:  0,
+			expectSign:    0x0000, // NUMERIC_POS
+			expectDscale:  2,
+			expectDigits:  []uint16{99, 9900},
+		},
+		{
+			name:          "-50.25",
+			input:         duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(-5025)},
+			expectNdigits: 2,
+			expectWeight:  0,
+			expectSign:    0x4000, // NUMERIC_NEG
+			expectDscale:  2,
+			expectDigits:  []uint16{50, 2500},
+		},
+		{
+			name:          "0.00",
+			input:         duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(0)},
+			expectNdigits: 0,
+			expectWeight:  0,
+			expectSign:    0x0000,
+			expectDscale:  2,
+			expectDigits:  nil,
+		},
+		{
+			name:          "12.3456",
+			input:         duckdb.Decimal{Width: 8, Scale: 4, Value: big.NewInt(123456)},
+			expectNdigits: 2,
+			expectWeight:  0,
+			expectSign:    0x0000,
+			expectDscale:  4,
+			expectDigits:  []uint16{12, 3456},
+		},
+		{
+			name:          "0.0001",
+			input:         duckdb.Decimal{Width: 8, Scale: 4, Value: big.NewInt(1)},
+			expectNdigits: 1,
+			expectWeight:  -1,
+			expectSign:    0x0000,
+			expectDscale:  4,
+			expectDigits:  []uint16{1},
+		},
+		{
+			name:          "9999.9999",
+			input:         duckdb.Decimal{Width: 8, Scale: 4, Value: big.NewInt(99999999)},
+			expectNdigits: 2,
+			expectWeight:  0,
+			expectSign:    0x0000,
+			expectDscale:  4,
+			expectDigits:  []uint16{9999, 9999},
+		},
+		{
+			name:          "10000.00",
+			input:         duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(1000000)},
+			expectNdigits: 1,
+			expectWeight:  1,
+			expectSign:    0x0000,
+			expectDscale:  2,
+			expectDigits:  []uint16{1},
+		},
+		{
+			name:          "1.00",
+			input:         duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(100)},
+			expectNdigits: 1,
+			expectWeight:  0,
+			expectSign:    0x0000,
+			expectDscale:  2,
+			expectDigits:  []uint16{1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := encodeNumeric(tt.input)
+			if result == nil {
+				t.Fatalf("encodeNumeric(%s) returned nil", tt.name)
+			}
+			if len(result) < 8 {
+				t.Fatalf("encodeNumeric(%s) returned %d bytes, need at least 8", tt.name, len(result))
+			}
+
+			ndigits := binary.BigEndian.Uint16(result[0:2])
+			weight := int16(binary.BigEndian.Uint16(result[2:4]))
+			sign := binary.BigEndian.Uint16(result[4:6])
+			dscale := binary.BigEndian.Uint16(result[6:8])
+
+			if ndigits != tt.expectNdigits {
+				t.Errorf("ndigits = %d, want %d", ndigits, tt.expectNdigits)
+			}
+			if weight != tt.expectWeight {
+				t.Errorf("weight = %d, want %d", weight, tt.expectWeight)
+			}
+			if sign != tt.expectSign {
+				t.Errorf("sign = 0x%04X, want 0x%04X", sign, tt.expectSign)
+			}
+			if dscale != tt.expectDscale {
+				t.Errorf("dscale = %d, want %d", dscale, tt.expectDscale)
+			}
+
+			expectedLen := 8 + 2*int(tt.expectNdigits)
+			if len(result) != expectedLen {
+				t.Errorf("result length = %d, want %d", len(result), expectedLen)
+			}
+
+			for i, expected := range tt.expectDigits {
+				if 8+2*i+2 > len(result) {
+					t.Errorf("digit %d: result too short", i)
+					break
+				}
+				got := binary.BigEndian.Uint16(result[8+2*i:])
+				if got != expected {
+					t.Errorf("digit[%d] = %d, want %d", i, got, expected)
+				}
+			}
+		})
+	}
+
+	// Test non-Decimal fallback to text encoding
+	t.Run("non-decimal fallback", func(t *testing.T) {
+		result := encodeNumeric("123.45")
+		expected := []byte("123.45")
+		if len(result) != len(expected) {
+			t.Errorf("non-decimal fallback: length = %d, want %d", len(result), len(expected))
+		}
+	})
+}
+
+func TestDecodeNumeric(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    duckdb.Decimal // will encode then decode
+		expected string
+	}{
+		{"99.99", duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(9999)}, "99.99"},
+		{"-50.25", duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(-5025)}, "-50.25"},
+		{"0.00", duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(0)}, "0.00"},
+		{"12.3456", duckdb.Decimal{Width: 8, Scale: 4, Value: big.NewInt(123456)}, "12.3456"},
+		{"0.0001", duckdb.Decimal{Width: 8, Scale: 4, Value: big.NewInt(1)}, "0.0001"},
+		{"9999.9999", duckdb.Decimal{Width: 8, Scale: 4, Value: big.NewInt(99999999)}, "9999.9999"},
+		{"10000.00", duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(1000000)}, "10000.00"},
+		{"1.00", duckdb.Decimal{Width: 10, Scale: 2, Value: big.NewInt(100)}, "1.00"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := encodeNumeric(tt.input)
+			decoded, err := decodeNumeric(encoded)
+			if err != nil {
+				t.Fatalf("decodeNumeric failed: %v", err)
+			}
+			if decoded != tt.expected {
+				t.Errorf("decodeNumeric(encodeNumeric(%s)) = %q, want %q", tt.name, decoded, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDecodeNumericRaw(t *testing.T) {
+	// Test decoding a manually constructed binary numeric: 99.99
+	// ndigits=2, weight=0, sign=0x0000, dscale=2, digits=[99, 9900]
+	data := make([]byte, 12)
+	binary.BigEndian.PutUint16(data[0:], 2)      // ndigits
+	binary.BigEndian.PutUint16(data[2:], 0)       // weight
+	binary.BigEndian.PutUint16(data[4:], 0x0000)  // sign (positive)
+	binary.BigEndian.PutUint16(data[6:], 2)       // dscale
+	binary.BigEndian.PutUint16(data[8:], 99)      // digit[0]
+	binary.BigEndian.PutUint16(data[10:], 9900)   // digit[1]
+
+	result, err := decodeNumeric(data)
+	if err != nil {
+		t.Fatalf("decodeNumeric failed: %v", err)
+	}
+	if result != "99.99" {
+		t.Errorf("decodeNumeric = %q, want %q", result, "99.99")
+	}
+}
+
+func TestParseNumericTypmod(t *testing.T) {
+	tests := []struct {
+		typeName string
+		want     int32
+	}{
+		{"DECIMAL(10,2)", int32((10<<16)|2) + 4},
+		{"DECIMAL(18,4)", int32((18<<16)|4) + 4},
+		{"DECIMAL(38,0)", int32((38<<16)|0) + 4},
+		{"DECIMAL(1,0)", int32((1<<16)|0) + 4},
+		{"numeric(5,3)", int32((5<<16)|3) + 4},
+		// No precision/scale → -1
+		{"DECIMAL", -1},
+		{"NUMERIC", -1},
+		// Invalid
+		{"DECIMAL()", -1},
+		{"DECIMAL(10)", -1},
+		{"DECIMAL(0,2)", -1},
+		{"DECIMAL(39,2)", -1},
+		{"VARCHAR(10)", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.typeName, func(t *testing.T) {
+			got := parseNumericTypmod(tt.typeName)
+			if got != tt.want {
+				t.Errorf("parseNumericTypmod(%q) = %d, want %d", tt.typeName, got, tt.want)
+			}
+		})
+	}
+
+	// Verify round-trip with postgres_scanner's decoding formula
+	typmod := parseNumericTypmod("DECIMAL(10,2)")
+	width := ((typmod - 4) >> 16) & 0xffff
+	scale := typmod - 4 - (width << 16)
+	if width != 10 || scale != 2 {
+		t.Errorf("round-trip: width=%d scale=%d, want 10, 2", width, scale)
 	}
 }
