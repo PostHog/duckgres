@@ -852,6 +852,12 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return err
 	}
 
+	// Extract type OIDs for JSON-aware text formatting
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
 	// Send rows
 	rowCount := 0
 	for rows.Next() {
@@ -869,7 +875,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 			return nil
 		}
 
-		if err := c.sendDataRow(values); err != nil {
+		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
 			return err
 		}
 		rowCount++
@@ -1063,6 +1069,12 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return false, err
 	}
 
+	// Extract type OIDs for JSON-aware text formatting
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
 	rowCount := 0
 	for rows.Next() {
 		values := make([]interface{}, len(cols))
@@ -1076,7 +1088,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			return true, nil
 		}
 
-		if err := c.sendDataRow(values); err != nil {
+		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
 			return false, err
 		}
 		rowCount++
@@ -1378,6 +1390,12 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string, query st
 		return err
 	}
 
+	// Extract type OIDs for JSON-aware text formatting
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
 	// Stream DataRows
 	rowCount := 0
 	for rows.Next() {
@@ -1396,7 +1414,7 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string, query st
 			return nil
 		}
 
-		if err := c.sendDataRow(values); err != nil {
+		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
 			return err
 		}
 		rowCount++
@@ -1851,6 +1869,20 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		return c.handleCopyOutBinary(rows, cols)
 	}
 
+	// Get column types for JSON-aware formatting
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
 	// Parse text/CSV options
 	delimiter := "\t"
 	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
@@ -1889,8 +1921,12 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 		// Format row as tab/comma separated values
 		var rowData []string
-		for _, v := range values {
-			rowData = append(rowData, c.formatCopyValue(v))
+		for i, v := range values {
+			if typeOIDs[i] == OidJSON || typeOIDs[i] == OidJSONB {
+				rowData = append(rowData, string(encodeJSON(v)))
+			} else {
+				rowData = append(rowData, c.formatCopyValue(v))
+			}
 		}
 		line := strings.Join(rowData, delimiter) + "\n"
 		if err := writeCopyData(c.writer, []byte(line)); err != nil {
@@ -1991,7 +2027,7 @@ func (c *clientConn) handleCopyOutBinary(rows *sql.Rows, cols []string) error {
 
 		if firstRow {
 			// First CopyData message: header + tuple
-			msg := make([]byte, 0, len(binaryHeader)+len(tupleBytes))
+			msg := make([]byte, 0, int64(len(binaryHeader))+int64(len(tupleBytes)))
 			msg = append(msg, binaryHeader...)
 			msg = append(msg, tupleBytes...)
 			if err := writeCopyData(c.writer, msg); err != nil {
@@ -2630,10 +2666,6 @@ func (c *clientConn) mapTypeSizeWithColumnName(colName string, colType *sql.Colu
 	return getTypeInfo(colType).Size
 }
 
-func (c *clientConn) sendDataRow(values []interface{}) error {
-	return c.sendDataRowWithFormats(values, nil, nil)
-}
-
 // sendDataRowWithFormats sends a data row with optional binary encoding
 // formatCodes: per-column format codes (0=text, 1=binary), or nil for all text
 // typeOIDs: per-column type OIDs for binary encoding, or nil
@@ -2674,8 +2706,13 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 				buf.Write(encoded)
 			}
 		} else {
-			// Text encoding
-			str := formatValue(v)
+			// Text encoding — use JSON re-serialization for JSON columns
+			var str string
+			if typeOIDs != nil && i < len(typeOIDs) && (typeOIDs[i] == OidJSON || typeOIDs[i] == OidJSONB) {
+				str = string(encodeJSON(v))
+			} else {
+				str = formatValue(v)
+			}
 			_ = binary.Write(&buf, binary.BigEndian, int32(len(str)))
 			buf.WriteString(str)
 		}

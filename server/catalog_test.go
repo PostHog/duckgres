@@ -159,3 +159,113 @@ func TestPgStatioUserTablesViewColumns(t *testing.T) {
 		}
 	}
 }
+
+// TestPgTypeHasComplexTypeOIDs verifies that the pg_type view includes
+// synthetic entries for PostgreSQL OIDs used by pg_attribute. Without these,
+// JOIN pg_attribute ON atttypid = pg_type.oid silently drops columns with
+// complex types (JSON, arrays, structs), making tables appear to have fewer
+// columns than they actually do.
+func TestPgTypeHasComplexTypeOIDs(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := initPgCatalog(db); err != nil {
+		t.Fatalf("Failed to init pg_catalog: %v", err)
+	}
+
+	// These OIDs are assigned by the pg_attribute view for complex types.
+	// Each must have a matching row in pg_type or the JOIN drops the column.
+	required := []struct {
+		oid  int
+		name string
+	}{
+		{114, "json"},
+		{3802, "jsonb"},
+		{25, "text"},
+		{1042, "bpchar"},
+		{2249, "record"},
+		// Array types
+		{1000, "_bool"},
+		{1007, "_int4"},
+		{1015, "_varchar"},
+		{1016, "_int8"},
+		{1022, "_float8"},
+	}
+
+	for _, r := range required {
+		var count int
+		err := db.QueryRow("SELECT count(*) FROM pg_type WHERE oid = ?", r.oid).Scan(&count)
+		if err != nil {
+			t.Errorf("Failed to query pg_type for OID %d (%s): %v", r.oid, r.name, err)
+			continue
+		}
+		if count == 0 {
+			t.Errorf("pg_type missing OID %d (%s) — columns with this type will be invisible", r.oid, r.name)
+		}
+	}
+}
+
+// TestPgAttributeJoinPgTypeComplexColumns verifies end-to-end that creating a
+// table with JSON and array columns produces rows in the pg_attribute JOIN
+// pg_type result. This is the exact query postgres_scanner uses to read table
+// schemas — if it returns fewer columns than the table has, the bug is present.
+func TestPgAttributeJoinPgTypeComplexColumns(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Load json extension for JSON type support
+	if _, err := db.Exec("SET autoinstall_known_extensions=1; SET autoload_known_extensions=1"); err != nil {
+		t.Fatalf("Failed to set extension settings: %v", err)
+	}
+
+	if err := initPgCatalog(db); err != nil {
+		t.Fatalf("Failed to init pg_catalog: %v", err)
+	}
+
+	// Create a table with complex types
+	if _, err := db.Exec("CREATE TABLE test_complex(id INTEGER, data JSON, tags VARCHAR[], name VARCHAR)"); err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	// This is the query postgres_scanner uses to discover columns (simplified).
+	// The JOIN on pg_type is what caused columns to be silently dropped.
+	query := `
+		SELECT attname, pg_type.typname
+		FROM pg_class
+		JOIN pg_namespace ON relnamespace = pg_namespace.oid
+		JOIN pg_attribute ON pg_class.oid = pg_attribute.attrelid
+		JOIN pg_type ON atttypid = pg_type.oid
+		WHERE attnum > 0 AND relname = 'test_complex'
+		ORDER BY attnum
+	`
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatalf("Failed to query pg_attribute JOIN pg_type: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var columns []string
+	for rows.Next() {
+		var attname, typname string
+		if err := rows.Scan(&attname, &typname); err != nil {
+			t.Fatalf("Failed to scan: %v", err)
+		}
+		columns = append(columns, attname)
+	}
+
+	expected := []string{"id", "data", "tags", "name"}
+	if len(columns) != len(expected) {
+		t.Fatalf("pg_attribute JOIN pg_type returned %d columns %v, want %d %v", len(columns), columns, len(expected), expected)
+	}
+	for i, col := range columns {
+		if col != expected[i] {
+			t.Errorf("column %d: got %q, want %q", i, col, expected[i])
+		}
+	}
+}

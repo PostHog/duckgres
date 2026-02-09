@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
@@ -287,6 +288,11 @@ func encodeBinary(v interface{}, oid int32) []byte {
 		return encodeUUID(v)
 	case OidBytea:
 		return encodeBytea(v)
+	case OidJSON, OidJSONB:
+		// The Go DuckDB driver deserializes JSON columns into native Go types
+		// (e.g., JSON string "hello" → Go string hello, without quotes).
+		// Re-serialize to JSON text before sending on the wire.
+		return encodeJSON(v)
 	default:
 		// For text, varchar, and other types, encode as text bytes
 		return encodeText(v)
@@ -826,6 +832,19 @@ func encodeArray(v interface{}, elementOID int32) []byte {
 func encodeText(v interface{}) []byte {
 	str := formatValue(v)
 	return []byte(str)
+}
+
+// encodeJSON re-serializes a Go value to JSON bytes.
+// The Go DuckDB driver deserializes JSON columns into native Go types
+// (json.Unmarshal: string→string without quotes, object→map, array→slice, etc.).
+// We must reverse this to produce valid JSON text for the wire protocol.
+func encodeJSON(v interface{}) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// Fallback: encode as text (best effort)
+		return encodeText(v)
+	}
+	return b
 }
 
 // decodeBinary decodes binary-format parameter bytes based on type OID.
