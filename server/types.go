@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
@@ -35,8 +36,27 @@ const (
 	OidInterval    int32 = 1186
 	OidNumeric     int32 = 1700
 	OidUUID        int32 = 2950
+	OidTimetz      int32 = 1266
 	OidJSON        int32 = 114
 	OidJSONB       int32 = 3802
+
+	// Array OIDs
+	OidBoolArray        int32 = 1000
+	OidInt2Array        int32 = 1005
+	OidInt4Array        int32 = 1007
+	OidTextArray        int32 = 1009
+	OidVarcharArray     int32 = 1015
+	OidInt8Array        int32 = 1016
+	OidFloat4Array      int32 = 1021
+	OidFloat8Array      int32 = 1022
+	OidTimestampArray   int32 = 1115
+	OidDateArray        int32 = 1182
+	OidTimeArray        int32 = 1183
+	OidTimestamptzArray int32 = 1185
+	OidIntervalArray    int32 = 1187
+	OidNumericArray     int32 = 1231
+	OidTimetzArray      int32 = 1270
+	OidUUIDArray        int32 = 2951
 )
 
 // pgCatalogColumnOIDs maps pg_catalog column names to their correct PostgreSQL type OIDs.
@@ -77,6 +97,46 @@ var pgCatalogColumnOIDs = map[string]int32{
 	"attlen": OidInt2,
 }
 
+// arrayElementOIDs maps array OID → element OID (for binary encoding)
+var arrayElementOIDs = map[int32]int32{
+	OidBoolArray:        OidBool,
+	OidInt2Array:        OidInt2,
+	OidInt4Array:        OidInt4,
+	OidInt8Array:        OidInt8,
+	OidFloat4Array:      OidFloat4,
+	OidFloat8Array:      OidFloat8,
+	OidTextArray:        OidText,
+	OidVarcharArray:     OidVarchar,
+	OidDateArray:        OidDate,
+	OidTimeArray:        OidTime,
+	OidTimetzArray:      OidTimetz,
+	OidTimestampArray:   OidTimestamp,
+	OidTimestamptzArray: OidTimestamptz,
+	OidIntervalArray:    OidInterval,
+	OidNumericArray:     OidNumeric,
+	OidUUIDArray:        OidUUID,
+}
+
+// elementToArrayOID maps scalar element OID → array OID
+var elementToArrayOID = map[int32]int32{
+	OidBool:        OidBoolArray,
+	OidInt2:        OidInt2Array,
+	OidInt4:        OidInt4Array,
+	OidInt8:        OidInt8Array,
+	OidFloat4:      OidFloat4Array,
+	OidFloat8:      OidFloat8Array,
+	OidText:        OidTextArray,
+	OidVarchar:     OidVarcharArray,
+	OidDate:        OidDateArray,
+	OidTime:        OidTimeArray,
+	OidTimetz:      OidTimetzArray,
+	OidTimestamp:    OidTimestampArray,
+	OidTimestamptz: OidTimestamptzArray,
+	OidInterval:    OidIntervalArray,
+	OidNumeric:     OidNumericArray,
+	OidUUID:        OidUUIDArray,
+}
+
 // TypeInfo contains PostgreSQL type information
 type TypeInfo struct {
 	OID    int32
@@ -87,6 +147,17 @@ type TypeInfo struct {
 // mapDuckDBType maps a DuckDB type name to PostgreSQL type info
 func mapDuckDBType(typeName string) TypeInfo {
 	upper := strings.ToUpper(typeName)
+
+	// Detect array types: DuckDB Go driver reports LIST columns as "INTEGER[]", "VARCHAR[]", etc.
+	if strings.HasSuffix(upper, "[]") {
+		elementTypeName := typeName[:len(typeName)-2] // preserve original case for DECIMAL parsing
+		elemInfo := mapDuckDBType(elementTypeName)
+		if arrayOID, ok := elementToArrayOID[elemInfo.OID]; ok {
+			return TypeInfo{OID: arrayOID, Size: -1, Typmod: elemInfo.Typmod}
+		}
+		// Unknown element type — fall through to text
+		return TypeInfo{OID: OidText, Size: -1}
+	}
 
 	switch {
 	case upper == "BOOLEAN" || upper == "BOOL":
@@ -123,6 +194,8 @@ func mapDuckDBType(typeName string) TypeInfo {
 		return TypeInfo{OID: OidDate, Size: 4}
 	case upper == "TIME":
 		return TypeInfo{OID: OidTime, Size: 8}
+	case upper == "TIME WITH TIME ZONE" || upper == "TIMETZ":
+		return TypeInfo{OID: OidTimetz, Size: 12}
 	case upper == "TIMESTAMP":
 		return TypeInfo{OID: OidTimestamp, Size: 8}
 	case upper == "TIMESTAMP WITH TIME ZONE" || upper == "TIMESTAMPTZ":
@@ -178,6 +251,11 @@ func parseNumericTypmod(typeName string) int32 {
 func encodeBinary(v interface{}, oid int32) []byte {
 	if v == nil {
 		return nil
+	}
+
+	// Check if this is an array OID
+	if elemOID, ok := arrayElementOIDs[oid]; ok {
+		return encodeArray(v, elemOID)
 	}
 
 	switch oid {
@@ -682,6 +760,58 @@ func encodeNumeric(v interface{}) []byte {
 		binary.BigEndian.PutUint16(buf[8+2*i:], uint16(d))
 	}
 	return buf
+}
+
+// encodeArray encodes a []any slice in PostgreSQL binary ARRAY format.
+// PostgreSQL binary array format:
+//
+//	int32 ndim       - number of dimensions (1 for flat arrays)
+//	int32 has_null   - 1 if any element is NULL
+//	int32 element_oid - OID of the element type
+//	int32 dim_len    - length of the dimension
+//	int32 dim_lbound - lower bound (always 1)
+//	For each element:
+//	  int32 len      - byte length of element, or -1 for NULL
+//	  bytes data     - element data (absent for NULL)
+func encodeArray(v interface{}, elementOID int32) []byte {
+	slice, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+
+	// Check for NULLs
+	hasNull := int32(0)
+	for _, elem := range slice {
+		if elem == nil {
+			hasNull = 1
+			break
+		}
+	}
+
+	var buf bytes.Buffer
+	// Header
+	_ = binary.Write(&buf, binary.BigEndian, int32(1))          // ndim = 1
+	_ = binary.Write(&buf, binary.BigEndian, hasNull)           // has_null flag
+	_ = binary.Write(&buf, binary.BigEndian, elementOID)        // element OID
+	_ = binary.Write(&buf, binary.BigEndian, int32(len(slice))) // dimension length
+	_ = binary.Write(&buf, binary.BigEndian, int32(1))          // lower bound = 1
+
+	// Elements
+	for _, elem := range slice {
+		if elem == nil {
+			_ = binary.Write(&buf, binary.BigEndian, int32(-1))
+		} else {
+			data := encodeBinary(elem, elementOID)
+			if data == nil {
+				_ = binary.Write(&buf, binary.BigEndian, int32(-1))
+			} else {
+				_ = binary.Write(&buf, binary.BigEndian, int32(len(data)))
+				buf.Write(data)
+			}
+		}
+	}
+
+	return buf.Bytes()
 }
 
 func encodeText(v interface{}) []byte {

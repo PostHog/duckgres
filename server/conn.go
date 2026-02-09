@@ -2371,7 +2371,14 @@ func (c *clientConn) formatCopyValue(v interface{}) string {
 	if v == nil {
 		return "\\N"
 	}
-	return fmt.Sprintf("%v", v)
+	switch val := v.(type) {
+	case []any:
+		return formatArrayValue(val)
+	case map[string]any:
+		return formatMapValue(val)
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }
 
 // parseCopyLine parses a line of COPY input
@@ -2544,10 +2551,79 @@ func formatValue(v interface{}) string {
 			return val.Format("2006-01-02 15:04:05.999999")
 		}
 		return val.Format("2006-01-02 15:04:05")
+	case []any:
+		// PostgreSQL array text format: {1,2,3}
+		return formatArrayValue(val)
+	case map[string]any:
+		// STRUCT text format: {"key1": val1, "key2": val2}
+		return formatMapValue(val)
 	default:
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+// formatArrayValue formats a []any slice as PostgreSQL text array: {1,2,3}
+func formatArrayValue(arr []any) string {
+	var buf strings.Builder
+	buf.WriteByte('{')
+	for i, elem := range arr {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if elem == nil {
+			buf.WriteString("NULL")
+		} else {
+			s := formatValue(elem)
+			// Quote strings that contain special characters
+			if needsArrayQuoting(s) {
+				buf.WriteByte('"')
+				// Escape backslashes and double quotes
+				for _, c := range s {
+					if c == '"' || c == '\\' {
+						buf.WriteByte('\\')
+					}
+					buf.WriteRune(c)
+				}
+				buf.WriteByte('"')
+			} else {
+				buf.WriteString(s)
+			}
+		}
+	}
+	buf.WriteByte('}')
+	return buf.String()
+}
+
+// needsArrayQuoting returns true if a string value needs quoting inside a PostgreSQL array literal
+func needsArrayQuoting(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, c := range s {
+		if c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || c == ' ' {
+			return true
+		}
+	}
+	return false
+}
+
+// formatMapValue formats a map[string]any as a key-value text representation
+func formatMapValue(m map[string]any) string {
+	var buf strings.Builder
+	buf.WriteByte('{')
+	first := true
+	for k, v := range m {
+		if !first {
+			buf.WriteString(", ")
+		}
+		first = false
+		buf.WriteString(k)
+		buf.WriteString("=")
+		buf.WriteString(formatValue(v))
+	}
+	buf.WriteByte('}')
+	return buf.String()
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
