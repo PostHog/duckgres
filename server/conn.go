@@ -2666,10 +2666,6 @@ func (c *clientConn) mapTypeSizeWithColumnName(colName string, colType *sql.Colu
 	return getTypeInfo(colType).Size
 }
 
-func (c *clientConn) sendDataRow(values []interface{}) error {
-	return c.sendDataRowWithFormats(values, nil, nil)
-}
-
 // sendDataRowWithFormats sends a data row with optional binary encoding
 // formatCodes: per-column format codes (0=text, 1=binary), or nil for all text
 // typeOIDs: per-column type OIDs for binary encoding, or nil
