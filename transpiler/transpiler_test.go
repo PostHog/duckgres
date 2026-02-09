@@ -2350,6 +2350,16 @@ func TestTranspile_RegexOperators(t *testing.T) {
 			input:    "WITH filtered AS (SELECT * FROM users WHERE name ~ '^A') SELECT * FROM filtered",
 			contains: "regexp_matches",
 		},
+		{
+			name:     "unary bitwise NOT is not converted to regex",
+			input:    "SELECT id, ~id AS bnot FROM users",
+			excludes: "regexp_matches",
+		},
+		{
+			name:     "unary bitwise NOT in WHERE clause",
+			input:    "SELECT * FROM users WHERE ~id = -2",
+			excludes: "regexp_matches",
+		},
 	}
 
 	tr := New(DefaultConfig())

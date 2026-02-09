@@ -240,9 +240,14 @@ func (t *OperatorTransform) transformExpression(node *pg_query.Node) *pg_query.N
 			return t.createJsonExtractFuncCall(aexpr.Lexpr, aexpr.Rexpr, false)
 		case "->>":
 			return t.createJsonExtractFuncCall(aexpr.Lexpr, aexpr.Rexpr, true)
-		// Regex operators
+		// Regex operators — only match binary ~ (both operands present).
+		// Unary ~ (bitwise NOT, e.g. ~id) has Lexpr=nil and must be left as-is;
+		// DuckDB supports ~ as bitwise NOT natively. Passing nil into
+		// createRegexFuncCall would create a nil AST node that crashes pg_query.Deparse.
 		case "~":
-			return t.createRegexFuncCall(aexpr.Lexpr, aexpr.Rexpr, false, false)
+			if aexpr.Lexpr != nil {
+				return t.createRegexFuncCall(aexpr.Lexpr, aexpr.Rexpr, false, false)
+			}
 		case "~*":
 			return t.createRegexFuncCall(aexpr.Lexpr, aexpr.Rexpr, true, false)
 		case "!~":
