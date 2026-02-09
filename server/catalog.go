@@ -404,8 +404,11 @@ func initPgCatalog(db *sql.DB) error {
 	}
 
 	// Create pg_type wrapper that fixes NULL values for JDBC compatibility
-	// DuckDB's pg_catalog.pg_type has NULL for many columns that JDBC clients
-	// expect to have proper defaults.
+	// and adds PostgreSQL OIDs that are missing from DuckDB's pg_catalog.pg_type.
+	// The pg_attribute view maps DuckDB types to PostgreSQL OIDs (e.g., JSON→114,
+	// VARCHAR[]→1015), but DuckDB's pg_type only has entries for basic types.
+	// Without these synthetic entries, JOIN pg_type ON atttypid=oid silently drops
+	// columns with complex types (JSON, arrays, structs).
 	pgTypeSQL := `
 		CREATE OR REPLACE VIEW pg_type AS
 		SELECT
@@ -452,6 +455,67 @@ func initPgCatalog(db *sql.DB) error {
 			typdefault,
 			typacl
 		FROM pg_catalog.pg_type
+		UNION ALL
+		-- Synthetic entries for PostgreSQL OIDs used by pg_attribute but missing from
+		-- DuckDB's pg_type. These ensure JOIN pg_type ON atttypid=oid doesn't drop columns.
+		SELECT
+			v.oid::UINTEGER AS oid,
+			v.typname,
+			11::UINTEGER AS typnamespace,
+			0::UINTEGER AS typowner,
+			v.typlen::SMALLINT AS typlen,
+			false AS typbyval,
+			v.typtype,
+			v.typcategory,
+			false AS typispreferred,
+			true AS typisdefined,
+			v.typdelim AS typdelim,
+			0::UINTEGER AS typrelid,
+			NULL AS typsubscript,
+			v.typelem::UINTEGER AS typelem,
+			0::UINTEGER AS typarray,
+			NULL AS typinput,
+			NULL AS typoutput,
+			NULL AS typreceive,
+			NULL AS typsend,
+			NULL AS typmodin,
+			NULL AS typmodout,
+			NULL AS typanalyze,
+			'i' AS typalign,
+			'x' AS typstorage,
+			false AS typnotnull,
+			0::UINTEGER AS typbasetype,
+			-1::INTEGER AS typtypmod,
+			0::INTEGER AS typndims,
+			0::UINTEGER AS typcollation,
+			NULL AS typdefaultbin,
+			NULL AS typdefault,
+			NULL AS typacl
+		FROM (VALUES
+			-- Base types missing from DuckDB's pg_type
+			(25,   'text',       -1, 'b', 'S', ',', 0),
+			(114,  'json',       -1, 'b', 'U', ',', 0),
+			(3802, 'jsonb',      -1, 'b', 'U', ',', 0),
+			(1042, 'bpchar',     -1, 'b', 'S', ',', 0),
+			(2249, 'record',     -1, 'p', 'P', ',', 0),
+			-- Array types (typelem points to the element base type OID)
+			(1000, '_bool',      -1, 'b', 'A', ',', 16),
+			(1001, '_bytea',     -1, 'b', 'A', ',', 17),
+			(1005, '_int2',      -1, 'b', 'A', ',', 21),
+			(1007, '_int4',      -1, 'b', 'A', ',', 23),
+			(1009, '_text',      -1, 'b', 'A', ',', 25),
+			(1015, '_varchar',   -1, 'b', 'A', ',', 1043),
+			(1016, '_int8',      -1, 'b', 'A', ',', 20),
+			(1021, '_float4',    -1, 'b', 'A', ',', 700),
+			(1022, '_float8',    -1, 'b', 'A', ',', 701),
+			(1115, '_timestamp', -1, 'b', 'A', ',', 1114),
+			(1182, '_date',      -1, 'b', 'A', ',', 1082),
+			(1187, '_interval',  -1, 'b', 'A', ',', 1186),
+			(1231, '_numeric',   -1, 'b', 'A', ',', 1700),
+			(2951, '_uuid',      -1, 'b', 'A', ',', 2950)
+		) AS v(oid, typname, typlen, typtype, typcategory, typdelim, typelem)
+		-- Only include synthetic entries that don't already exist in pg_catalog.pg_type
+		WHERE v.oid NOT IN (SELECT COALESCE(t.oid, 0) FROM pg_catalog.pg_type t)
 	`
 	if _, err := db.Exec(pgTypeSQL); err != nil {
 		slog.Warn("Failed to create pg_type view.", "error", err)
@@ -521,6 +585,8 @@ func initPgCatalog(db *sql.DB) error {
 				WHEN dc.data_type = 'UUID[]' THEN 2951::UINTEGER
 				WHEN dc.data_type = 'INTERVAL[]' THEN 1187::UINTEGER
 				WHEN dc.data_type = 'BLOB[]' OR dc.data_type = 'BYTEA[]' THEN 1001::UINTEGER
+				-- Composite/struct types → PostgreSQL record pseudo-type
+				WHEN dc.data_type LIKE 'STRUCT%' THEN 2249::UINTEGER
 				ELSE a.atttypid::UINTEGER
 			END AS atttypid,
 			a.attstattarget,
@@ -555,6 +621,8 @@ func initPgCatalog(db *sql.DB) error {
 				WHEN dc.data_type = 'CHAR' OR dc.data_type = 'BPCHAR' THEN -1::INTEGER
 				-- All array types are variable length
 				WHEN dc.data_type LIKE '%[]' THEN -1::INTEGER
+				-- Struct/composite types are variable length
+				WHEN dc.data_type LIKE 'STRUCT%' THEN -1::INTEGER
 				ELSE a.attlen
 			END AS attlen,
 			a.attnum::SMALLINT AS attnum,
