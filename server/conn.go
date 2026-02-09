@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/transpiler"
 )
@@ -2207,7 +2209,133 @@ func (c *clientConn) handleCopyInBinary(opts *CopyFromOptions, cols []string, co
 	}
 }
 
-// parseBinaryCopyAndInsert parses PostgreSQL binary COPY format data and INSERTs rows.
+// splitQualifiedName splits a possibly-quoted SQL name like "schema"."table" into parts.
+func splitQualifiedName(name string) []string {
+	var parts []string
+	var current strings.Builder
+	inQuotes := false
+	for i := 0; i < len(name); i++ {
+		if name[i] == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if name[i] == '.' && !inQuotes {
+			parts = append(parts, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteByte(name[i])
+	}
+	parts = append(parts, current.String())
+	return parts
+}
+
+// appendWithDuckDBAppender uses the DuckDB Appender API for fast bulk inserts.
+// Only works for full-column inserts (no column subset).
+func (c *clientConn) appendWithDuckDBAppender(tableName string, rows [][]interface{}) (int, error) {
+	parts := splitQualifiedName(tableName)
+
+	ctx := context.Background()
+	sqlConn, err := c.db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get DB connection: %w", err)
+	}
+	defer sqlConn.Close()
+
+	var rowCount int
+	err = sqlConn.Raw(func(driverConn interface{}) error {
+		dc, ok := driverConn.(driver.Conn)
+		if !ok {
+			return fmt.Errorf("underlying connection does not implement driver.Conn")
+		}
+
+		var appender *duckdb.Appender
+		var appErr error
+		switch len(parts) {
+		case 1:
+			appender, appErr = duckdb.NewAppenderFromConn(dc, "", parts[0])
+		case 2:
+			appender, appErr = duckdb.NewAppenderFromConn(dc, parts[0], parts[1])
+		default:
+			appender, appErr = duckdb.NewAppender(dc, parts[0], parts[1], parts[2])
+		}
+		if appErr != nil {
+			return fmt.Errorf("failed to create Appender: %w", appErr)
+		}
+
+		for i, row := range rows {
+			driverVals := make([]driver.Value, len(row))
+			for j, v := range row {
+				driverVals[j] = v
+			}
+			if appErr = appender.AppendRow(driverVals...); appErr != nil {
+				appender.Close()
+				return fmt.Errorf("AppendRow failed at row %d: %w", i+1, appErr)
+			}
+		}
+
+		if appErr = appender.Close(); appErr != nil {
+			return fmt.Errorf("Appender.Close failed: %w", appErr)
+		}
+
+		rowCount = len(rows)
+		return nil
+	})
+
+	return rowCount, err
+}
+
+// batchInsertRows inserts rows using batched multi-row INSERT statements.
+// Used as fallback when Appender can't be used (column subsets, unsupported types).
+func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string, rows [][]interface{}) (int, error) {
+	const batchSize = 1000
+	numCols := len(cols)
+
+	colNames := columnList
+	if colNames == "" {
+		quotedCols := make([]string, numCols)
+		for i, col := range cols {
+			quotedCols[i] = fmt.Sprintf(`"%s"`, col)
+		}
+		colNames = "(" + strings.Join(quotedCols, ", ") + ")"
+	}
+
+	rowCount := 0
+	for start := 0; start < len(rows); start += batchSize {
+		end := start + batchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		batch := rows[start:end]
+
+		var valueClauses []string
+		var args []interface{}
+		paramIdx := 1
+		for _, row := range batch {
+			placeholders := make([]string, numCols)
+			for j := range row {
+				placeholders[j] = fmt.Sprintf("$%d", paramIdx)
+				args = append(args, row[j])
+				paramIdx++
+			}
+			valueClauses = append(valueClauses, "("+strings.Join(placeholders, ", ")+")")
+		}
+
+		insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES %s",
+			tableName, colNames, strings.Join(valueClauses, ", "))
+
+		if _, err := c.db.Exec(insertSQL, args...); err != nil {
+			return rowCount, fmt.Errorf("batch INSERT failed at rows %d-%d: %v", start+1, start+len(batch), err)
+		}
+		rowCount += len(batch)
+	}
+
+	return rowCount, nil
+}
+
+// parseBinaryCopyAndInsert parses PostgreSQL binary COPY format data and inserts rows.
+// Uses the DuckDB Appender API for full-column inserts (fast path), falling back to
+// batched multi-row INSERT for column subsets or unsupported types.
 func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList string, cols []string, typeOIDs []int32) (int, error) {
 	offset := 0
 
@@ -2223,36 +2351,18 @@ func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList
 	offset = 11
 
 	// Flags (4 bytes) and extension area length (4 bytes)
-	// flags := binary.BigEndian.Uint32(data[offset:])
 	offset += 4
 	extLen := binary.BigEndian.Uint32(data[offset:])
 	offset += 4
 	offset += int(extLen) // skip extension area
 
-	// Build INSERT statement: INSERT INTO table (col1, col2, ...) VALUES ($1, $2, ...)
 	numCols := len(cols)
-	placeholders := make([]string, numCols)
-	for i := range placeholders {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-	}
 
-	colNames := columnList
-	if colNames == "" {
-		quotedCols := make([]string, numCols)
-		for i, col := range cols {
-			quotedCols[i] = fmt.Sprintf(`"%s"`, col)
-		}
-		colNames = "(" + strings.Join(quotedCols, ", ") + ")"
-	}
-
-	insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES (%s)",
-		tableName, colNames, strings.Join(placeholders, ", "))
-
-	// Parse tuples and insert
-	rowCount := 0
+	// Parse all rows from binary data first
+	var rows [][]interface{}
 	for offset < len(data) {
 		if offset+2 > len(data) {
-			return rowCount, fmt.Errorf("truncated binary COPY data at tuple header")
+			return len(rows), fmt.Errorf("truncated binary COPY data at tuple header")
 		}
 
 		fieldCount := int16(binary.BigEndian.Uint16(data[offset:]))
@@ -2264,13 +2374,13 @@ func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList
 		}
 
 		if int(fieldCount) != numCols {
-			return rowCount, fmt.Errorf("binary COPY field count mismatch: got %d, expected %d", fieldCount, numCols)
+			return len(rows), fmt.Errorf("binary COPY field count mismatch: got %d, expected %d", fieldCount, numCols)
 		}
 
 		values := make([]interface{}, numCols)
 		for i := 0; i < numCols; i++ {
 			if offset+4 > len(data) {
-				return rowCount, fmt.Errorf("truncated binary COPY data at field %d length", i)
+				return len(rows), fmt.Errorf("truncated binary COPY data at field %d length", i)
 			}
 
 			fieldLen := int32(binary.BigEndian.Uint32(data[offset:]))
@@ -2280,26 +2390,36 @@ func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList
 				values[i] = nil
 			} else {
 				if offset+int(fieldLen) > len(data) {
-					return rowCount, fmt.Errorf("truncated binary COPY data at field %d data", i)
+					return len(rows), fmt.Errorf("truncated binary COPY data at field %d data", i)
 				}
 				fieldData := data[offset : offset+int(fieldLen)]
 				offset += int(fieldLen)
 
 				decoded, err := decodeBinaryCopy(fieldData, typeOIDs[i])
 				if err != nil {
-					return rowCount, fmt.Errorf("failed to decode field %d (OID %d, %d bytes): %v", i, typeOIDs[i], fieldLen, err)
+					return len(rows), fmt.Errorf("failed to decode field %d (OID %d, %d bytes): %v", i, typeOIDs[i], fieldLen, err)
 				}
 				values[i] = decoded
 			}
 		}
-
-		if _, err := c.db.Exec(insertSQL, values...); err != nil {
-			return rowCount, fmt.Errorf("INSERT failed at row %d: %v", rowCount+1, err)
-		}
-		rowCount++
+		rows = append(rows, values)
 	}
 
-	return rowCount, nil
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	// Fast path: use Appender for full-column inserts (no column subset)
+	if columnList == "" {
+		count, err := c.appendWithDuckDBAppender(tableName, rows)
+		if err == nil {
+			return count, nil
+		}
+		slog.Warn("Appender failed, falling back to batched INSERT.", "table", tableName, "error", err)
+	}
+
+	// Fallback: batched multi-row INSERT
+	return c.batchInsertRows(tableName, columnList, cols, rows)
 }
 
 // decodeBinaryCopy decodes a binary COPY field, using field length to resolve type ambiguity.

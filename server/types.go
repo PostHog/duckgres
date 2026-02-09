@@ -171,7 +171,9 @@ func mapDuckDBType(typeName string) TypeInfo {
 	case upper == "BIGINT" || upper == "INT8":
 		return TypeInfo{OID: OidInt8, Size: 8}
 	case upper == "HUGEINT" || upper == "INT128":
-		return TypeInfo{OID: OidNumeric, Size: -1} // No direct equivalent
+		// Map to NUMERIC(38,0) so postgres_scanner reads it as DECIMAL(38,0) → INT128,
+		// matching the HUGEINT physical type. Typmod = ((38 << 16) | 0) + 4 = 2490372.
+		return TypeInfo{OID: OidNumeric, Size: -1, Typmod: 2490372}
 	case upper == "UTINYINT" || upper == "USMALLINT":
 		return TypeInfo{OID: OidInt4, Size: 4}
 	case upper == "UINTEGER":
@@ -670,14 +672,21 @@ func decodeInterval(data []byte) (string, error) {
 //	int16 dscale   - number of digits after decimal point (display scale)
 //	int16[] digits - base-10000 digit groups
 func encodeNumeric(v interface{}) []byte {
-	dec, ok := v.(duckdb.Decimal)
-	if !ok {
+	var val *big.Int
+	var dscale int16
+
+	switch x := v.(type) {
+	case duckdb.Decimal:
+		val = new(big.Int).Set(x.Value)
+		dscale = int16(x.Scale)
+	case *big.Int:
+		// HUGEINT comes from the Go driver as *big.Int (scale 0)
+		val = new(big.Int).Set(x)
+		dscale = 0
+	default:
 		// Fallback: try to format as text and let the caller handle it
 		return encodeText(v)
 	}
-
-	val := new(big.Int).Set(dec.Value)
-	dscale := int16(dec.Scale)
 
 	// Handle sign
 	var sign int16
