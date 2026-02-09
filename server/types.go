@@ -3,10 +3,10 @@ package server
 import (
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
-	"os"
 	"strings"
 	"time"
 
@@ -199,6 +199,12 @@ func encodeBinary(v interface{}, oid int32) []byte {
 		return encodeDate(v)
 	case OidTimestamp, OidTimestamptz:
 		return encodeTimestamp(v)
+	case OidTime:
+		return encodeTime(v)
+	case OidInterval:
+		return encodeInterval(v)
+	case OidUUID:
+		return encodeUUID(v)
 	case OidBytea:
 		return encodeBytea(v)
 	default:
@@ -429,6 +435,153 @@ func encodeBytea(v interface{}) []byte {
 	}
 }
 
+// encodeUUID encodes a UUID value as 16 raw bytes (PostgreSQL binary UUID format).
+// DuckDB Go driver returns UUID as []byte (16 bytes).
+func encodeUUID(v interface{}) []byte {
+	switch val := v.(type) {
+	case []byte:
+		if len(val) == 16 {
+			return val
+		}
+		return nil
+	case string:
+		s := strings.ReplaceAll(val, "-", "")
+		if len(s) != 32 {
+			return nil
+		}
+		data, err := hex.DecodeString(s)
+		if err != nil {
+			return nil
+		}
+		return data
+	default:
+		// Try Stringer interface (e.g., duckdb.UUID)
+		if stringer, ok := v.(fmt.Stringer); ok {
+			return encodeUUID(stringer.String())
+		}
+		return nil
+	}
+}
+
+// decodeUUID decodes 16 raw bytes into a UUID string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+func decodeUUID(data []byte) (string, error) {
+	if len(data) != 16 {
+		return "", fmt.Errorf("invalid UUID binary data: got %d bytes, need 16", len(data))
+	}
+	s := hex.EncodeToString(data)
+	return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32], nil
+}
+
+// encodeTime encodes a TIME value as int64 microseconds since midnight (PostgreSQL binary format).
+// DuckDB Go driver returns TIME as time.Time with date fixed to 0001-01-01.
+func encodeTime(v interface{}) []byte {
+	buf := make([]byte, 8)
+	var micros int64
+
+	switch val := v.(type) {
+	case time.Time:
+		micros = int64(val.Hour())*3600000000 + int64(val.Minute())*60000000 +
+			int64(val.Second())*1000000 + int64(val.Nanosecond())/1000
+	case string:
+		t, err := time.Parse("15:04:05", val)
+		if err != nil {
+			t, err = time.Parse("15:04:05.000000", val)
+			if err != nil {
+				return nil
+			}
+		}
+		micros = int64(t.Hour())*3600000000 + int64(t.Minute())*60000000 +
+			int64(t.Second())*1000000 + int64(t.Nanosecond())/1000
+	default:
+		return nil
+	}
+
+	binary.BigEndian.PutUint64(buf, uint64(micros))
+	return buf
+}
+
+// decodeTime decodes int64 microseconds since midnight into a time string.
+func decodeTime(data []byte) (string, error) {
+	if len(data) < 8 {
+		return "", fmt.Errorf("insufficient data for time: got %d bytes, need 8", len(data))
+	}
+	micros := int64(binary.BigEndian.Uint64(data))
+	hours := micros / 3600000000
+	micros %= 3600000000
+	minutes := micros / 60000000
+	micros %= 60000000
+	seconds := micros / 1000000
+	micros %= 1000000
+	if micros > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d.%06d", hours, minutes, seconds, micros), nil
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds), nil
+}
+
+// encodeInterval encodes an INTERVAL value in PostgreSQL binary format:
+// int64 microseconds + int32 days + int32 months = 16 bytes.
+func encodeInterval(v interface{}) []byte {
+	buf := make([]byte, 16)
+	switch val := v.(type) {
+	case duckdb.Interval:
+		binary.BigEndian.PutUint64(buf[0:8], uint64(val.Micros))
+		binary.BigEndian.PutUint32(buf[8:12], uint32(val.Days))
+		binary.BigEndian.PutUint32(buf[12:16], uint32(val.Months))
+	default:
+		_ = val
+		return nil
+	}
+	return buf
+}
+
+// decodeInterval decodes PostgreSQL binary INTERVAL (16 bytes) into an interval string.
+func decodeInterval(data []byte) (string, error) {
+	if len(data) < 16 {
+		return "", fmt.Errorf("insufficient data for interval: got %d bytes, need 16", len(data))
+	}
+	micros := int64(binary.BigEndian.Uint64(data[0:8]))
+	days := int32(binary.BigEndian.Uint32(data[8:12]))
+	months := int32(binary.BigEndian.Uint32(data[12:16]))
+
+	var parts []string
+	if months != 0 {
+		years := months / 12
+		remMonths := months % 12
+		if years != 0 {
+			parts = append(parts, fmt.Sprintf("%d year", years))
+		}
+		if remMonths != 0 {
+			parts = append(parts, fmt.Sprintf("%d month", remMonths))
+		}
+	}
+	if days != 0 {
+		parts = append(parts, fmt.Sprintf("%d day", days))
+	}
+	if micros != 0 || len(parts) == 0 {
+		neg := micros < 0
+		if neg {
+			micros = -micros
+		}
+		h := micros / 3600000000
+		micros %= 3600000000
+		m := micros / 60000000
+		micros %= 60000000
+		s := micros / 1000000
+		remainMicros := micros % 1000000
+		var timePart string
+		if remainMicros > 0 {
+			timePart = fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, remainMicros)
+		} else {
+			timePart = fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+		}
+		if neg {
+			timePart = "-" + timePart
+		}
+		parts = append(parts, timePart)
+	}
+	return strings.Join(parts, " "), nil
+}
+
 // encodeNumeric encodes a value in PostgreSQL binary numeric format.
 //
 // PostgreSQL binary numeric layout:
@@ -441,11 +594,9 @@ func encodeBytea(v interface{}) []byte {
 func encodeNumeric(v interface{}) []byte {
 	dec, ok := v.(duckdb.Decimal)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "encodeNumeric: NOT duckdb.Decimal, type=%T value=%v\n", v, v)
 		// Fallback: try to format as text and let the caller handle it
 		return encodeText(v)
 	}
-	fmt.Fprintf(os.Stderr, "encodeNumeric: duckdb.Decimal width=%d scale=%d value=%s\n", dec.Width, dec.Scale, dec.Value.String())
 
 	val := new(big.Int).Set(dec.Value)
 	dscale := int16(dec.Scale)
@@ -565,6 +716,12 @@ func decodeBinary(data []byte, oid int32) (interface{}, error) {
 		return decodeDate(data)
 	case OidTimestamp, OidTimestamptz:
 		return decodeTimestamp(data)
+	case OidTime:
+		return decodeTime(data)
+	case OidInterval:
+		return decodeInterval(data)
+	case OidUUID:
+		return decodeUUID(data)
 	case OidBytea:
 		return data, nil // raw bytes
 	default:
@@ -633,8 +790,16 @@ func decodeTimestamp(data []byte) (time.Time, error) {
 	}
 	// Microseconds since PostgreSQL epoch (2000-01-01)
 	micros := int64(binary.BigEndian.Uint64(data))
-	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-	return pgEpoch.Add(time.Duration(micros) * time.Microsecond), nil
+	// Use time.Unix to avoid time.Duration overflow for dates far from epoch.
+	// time.Duration is int64 nanoseconds, which overflows at ~292 years.
+	const pgEpochUnix int64 = 946684800 // 2000-01-01 00:00:00 UTC in Unix seconds
+	secs := micros / 1_000_000
+	remainMicros := micros % 1_000_000
+	if remainMicros < 0 {
+		secs--
+		remainMicros += 1_000_000
+	}
+	return time.Unix(pgEpochUnix+secs, remainMicros*1000).UTC(), nil
 }
 
 // decodeNumeric decodes PostgreSQL binary numeric format into a string.

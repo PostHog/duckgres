@@ -2063,6 +2063,12 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 		switch msgType {
 		case msgCopyData:
+			// Skip the PostgreSQL text COPY end-of-data marker (\.\n).
+			// Some clients send this as a CopyData message before CopyDone.
+			if (len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
+				(len(body) == 2 && body[0] == '\\' && body[1] == '.') {
+				continue
+			}
 			n, err := tmpFile.Write(body)
 			if err != nil {
 				slog.Error("COPY FROM STDIN failed to write to temp file.", "user", c.username, "error", err)
@@ -2303,11 +2309,13 @@ func decodeBinaryCopy(data []byte, oid int32) (interface{}, error) {
 		return nil, nil
 	}
 
-	// Zero-length fields: return empty string for text types, nil for others
+	// Zero-length fields: return empty string for text types, empty bytes for bytea, nil for others
 	if len(data) == 0 {
 		switch oid {
 		case OidText, OidVarchar, OidBpchar, OidName, OidJSON, OidJSONB:
 			return "", nil
+		case OidBytea:
+			return []byte{}, nil
 		default:
 			return nil, nil
 		}
@@ -2344,6 +2352,12 @@ func decodeBinaryCopy(data []byte, oid int32) (interface{}, error) {
 		return decodeDate(data)
 	case OidTimestamp, OidTimestamptz:
 		return decodeTimestamp(data)
+	case OidTime:
+		return decodeTime(data)
+	case OidInterval:
+		return decodeInterval(data)
+	case OidUUID:
+		return decodeUUID(data)
 	case OidBytea:
 		return data, nil
 	default:

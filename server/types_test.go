@@ -1028,3 +1028,230 @@ func TestParseNumericTypmod(t *testing.T) {
 		t.Errorf("round-trip: width=%d scale=%d, want 10, 2", width, scale)
 	}
 }
+
+func TestEncodeDecodeUUID(t *testing.T) {
+	// Test encoding from []byte (DuckDB scan type)
+	rawBytes := []byte{0xa0, 0xee, 0xbc, 0x99, 0x9c, 0x0b, 0x4e, 0xf8, 0xbb, 0x6d, 0x6b, 0xb9, 0xbd, 0x38, 0x0a, 0x11}
+	encoded := encodeUUID(rawBytes)
+	if len(encoded) != 16 {
+		t.Fatalf("encodeUUID([]byte) length = %d, want 16", len(encoded))
+	}
+	for i, b := range rawBytes {
+		if encoded[i] != b {
+			t.Errorf("encodeUUID([]byte)[%d] = %02x, want %02x", i, encoded[i], b)
+		}
+	}
+
+	// Test encoding from string
+	encoded2 := encodeUUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+	if len(encoded2) != 16 {
+		t.Fatalf("encodeUUID(string) length = %d, want 16", len(encoded2))
+	}
+	for i, b := range rawBytes {
+		if encoded2[i] != b {
+			t.Errorf("encodeUUID(string)[%d] = %02x, want %02x", i, encoded2[i], b)
+		}
+	}
+
+	// Test decode round-trip
+	decoded, err := decodeUUID(encoded)
+	if err != nil {
+		t.Fatalf("decodeUUID error: %v", err)
+	}
+	if decoded != "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" {
+		t.Errorf("decodeUUID = %q, want %q", decoded, "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+	}
+
+	// Test invalid lengths
+	if _, err := decodeUUID([]byte{1, 2, 3}); err == nil {
+		t.Error("decodeUUID(3 bytes) should error")
+	}
+	if result := encodeUUID([]byte{1, 2, 3}); result != nil {
+		t.Error("encodeUUID(3 bytes) should return nil")
+	}
+	if result := encodeUUID("not-a-uuid"); result != nil {
+		t.Error("encodeUUID(invalid string) should return nil")
+	}
+	if result := encodeUUID(12345); result != nil {
+		t.Error("encodeUUID(int) should return nil")
+	}
+}
+
+func TestEncodeDecodeTime(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        interface{}
+		expectMicros int64
+		expectStr    string
+	}{
+		{
+			"midnight",
+			time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+			0,
+			"00:00:00",
+		},
+		{
+			"10:30:00",
+			time.Date(1, 1, 1, 10, 30, 0, 0, time.UTC),
+			10*3600000000 + 30*60000000,
+			"10:30:00",
+		},
+		{
+			"23:59:59",
+			time.Date(1, 1, 1, 23, 59, 59, 0, time.UTC),
+			23*3600000000 + 59*60000000 + 59*1000000,
+			"23:59:59",
+		},
+		{
+			"12:00:00.500000",
+			time.Date(1, 1, 1, 12, 0, 0, 500000000, time.UTC), // 500ms = 500000µs
+			12*3600000000 + 500000,
+			"12:00:00.500000",
+		},
+		{
+			"string 10:30:00",
+			"10:30:00",
+			10*3600000000 + 30*60000000,
+			"10:30:00",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := encodeTime(tt.input)
+			if encoded == nil {
+				t.Fatalf("encodeTime(%v) returned nil", tt.input)
+			}
+			if len(encoded) != 8 {
+				t.Fatalf("encodeTime(%v) length = %d, want 8", tt.input, len(encoded))
+			}
+			gotMicros := int64(binary.BigEndian.Uint64(encoded))
+			if gotMicros != tt.expectMicros {
+				t.Errorf("encodeTime(%v) = %d micros, want %d", tt.input, gotMicros, tt.expectMicros)
+			}
+
+			decoded, err := decodeTime(encoded)
+			if err != nil {
+				t.Fatalf("decodeTime error: %v", err)
+			}
+			if decoded != tt.expectStr {
+				t.Errorf("decodeTime = %q, want %q", decoded, tt.expectStr)
+			}
+		})
+	}
+
+	// Test invalid
+	if result := encodeTime(12345); result != nil {
+		t.Error("encodeTime(int) should return nil")
+	}
+	if _, err := decodeTime([]byte{1, 2}); err == nil {
+		t.Error("decodeTime(2 bytes) should error")
+	}
+}
+
+func TestEncodeDecodeInterval(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     duckdb.Interval
+		expectStr string
+	}{
+		{
+			"1 day",
+			duckdb.Interval{Days: 1, Months: 0, Micros: 0},
+			"1 day",
+		},
+		{
+			"1 month",
+			duckdb.Interval{Days: 0, Months: 1, Micros: 0},
+			"1 month",
+		},
+		{
+			"1 year 2 months 3 days",
+			duckdb.Interval{Days: 3, Months: 14, Micros: 0},
+			"1 year 2 month 3 day",
+		},
+		{
+			"1 hour",
+			duckdb.Interval{Days: 0, Months: 0, Micros: 3600000000},
+			"01:00:00",
+		},
+		{
+			"complex",
+			duckdb.Interval{Days: 5, Months: 3, Micros: 7200000000 + 1800000000}, // 2h30m
+			"3 month 5 day 02:30:00",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := encodeInterval(tt.input)
+			if encoded == nil {
+				t.Fatalf("encodeInterval(%v) returned nil", tt.input)
+			}
+			if len(encoded) != 16 {
+				t.Fatalf("encodeInterval(%v) length = %d, want 16", tt.input, len(encoded))
+			}
+
+			// Verify binary layout
+			gotMicros := int64(binary.BigEndian.Uint64(encoded[0:8]))
+			gotDays := int32(binary.BigEndian.Uint32(encoded[8:12]))
+			gotMonths := int32(binary.BigEndian.Uint32(encoded[12:16]))
+			if gotMicros != tt.input.Micros {
+				t.Errorf("micros = %d, want %d", gotMicros, tt.input.Micros)
+			}
+			if gotDays != tt.input.Days {
+				t.Errorf("days = %d, want %d", gotDays, tt.input.Days)
+			}
+			if gotMonths != tt.input.Months {
+				t.Errorf("months = %d, want %d", gotMonths, tt.input.Months)
+			}
+
+			decoded, err := decodeInterval(encoded)
+			if err != nil {
+				t.Fatalf("decodeInterval error: %v", err)
+			}
+			if decoded != tt.expectStr {
+				t.Errorf("decodeInterval = %q, want %q", decoded, tt.expectStr)
+			}
+		})
+	}
+
+	// Test invalid
+	if result := encodeInterval("not an interval"); result != nil {
+		t.Error("encodeInterval(string) should return nil")
+	}
+	if _, err := decodeInterval([]byte{1, 2}); err == nil {
+		t.Error("decodeInterval(2 bytes) should error")
+	}
+}
+
+func TestDecodeTimestampAncient(t *testing.T) {
+	// Bug 8: timestamps before ~1700 were corrupted due to time.Duration overflow.
+	// This test verifies the fix works for ancient dates.
+	tests := []struct {
+		name     string
+		input    time.Time
+	}{
+		{"2024-01-15", time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)},
+		{"1970-01-01", time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"1000-06-15", time.Date(1000, 6, 15, 12, 0, 0, 0, time.UTC)},
+		{"0100-01-01", time.Date(100, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"0001-01-01", time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := encodeTimestamp(tt.input)
+			if encoded == nil {
+				t.Fatalf("encodeTimestamp(%v) returned nil", tt.input)
+			}
+			decoded, err := decodeTimestamp(encoded)
+			if err != nil {
+				t.Fatalf("decodeTimestamp error: %v", err)
+			}
+			if !decoded.Equal(tt.input) {
+				t.Errorf("round-trip: got %v, want %v", decoded, tt.input)
+			}
+		})
+	}
+}
