@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -30,14 +32,15 @@ type Worker struct {
 	grpcSocketPath string
 	fdSocketPath   string
 
-	mu          sync.RWMutex
-	cfg         server.Config
-	configured  bool
-	draining    bool
-	tlsConfig   *tls.Config
-	dbPool      *DBPool
-	startTime   time.Time
+	mu           sync.RWMutex
+	cfg          server.Config
+	configured   bool
+	draining     bool
+	tlsConfig    *tls.Config
+	dbPool       *DBPool
+	startTime    time.Time
 	totalQueries atomic.Int64
+	flightConns  atomic.Int64
 
 	// Session tracking
 	sessions   map[int32]*workerSession
@@ -47,8 +50,8 @@ type Worker struct {
 	// Cancellation
 	activeQueries map[server.BackendKey]context.CancelFunc
 
-	// FD passing - stores the most recently received FD
-	pendingFD int
+	// FD passing queue for incoming sockets from the control plane.
+	fdQueue chan int
 }
 
 type workerSession struct {
@@ -68,7 +71,7 @@ func RunWorker(grpcSocket, fdSocket string) {
 		startTime:      time.Now(),
 		sessions:       make(map[int32]*workerSession),
 		activeQueries:  make(map[server.BackendKey]context.CancelFunc),
-		pendingFD:      -1,
+		fdQueue:        make(chan int, 1024),
 	}
 
 	// Set up signal handling
@@ -152,7 +155,14 @@ func (w *Worker) run(ctx context.Context) error {
 		w.dbPool.CloseAll(5 * time.Second)
 	}
 
-	return nil
+	for {
+		select {
+		case fd := <-w.fdQueue:
+			_ = syscall.Close(fd)
+		default:
+			return nil
+		}
+	}
 }
 
 // fdReceiverLoop accepts connections on the FD socket and reads file descriptors from them.
@@ -184,10 +194,14 @@ func (w *Worker) fdReceiverLoop(ln net.Listener) {
 			continue
 		}
 
-		// Store the FD for the next AcceptConnection RPC to pick up
-		w.mu.Lock()
-		w.pendingFD = fd
-		w.mu.Unlock()
+		// Queue the FD for the next AcceptConnection RPC to pick up.
+		select {
+		case w.fdQueue <- fd:
+		default:
+			// Backpressure safety: do not leak descriptors under overload.
+			_ = syscall.Close(fd)
+			slog.Warn("FD queue full, dropping incoming connection FD.")
+		}
 	}
 }
 
@@ -197,6 +211,12 @@ func (w *Worker) Configure(_ context.Context, req *pb.ConfigureRequest) (*pb.Con
 
 	if w.configured {
 		return &pb.ConfigureResponse{Ok: false, Error: "already configured"}, nil
+	}
+	if err := validateTLSFiles(req.TlsCertFile, req.TlsKeyFile); err != nil {
+		return &pb.ConfigureResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := validateUsers(req.Users); err != nil {
+		return &pb.ConfigureResponse{Ok: false, Error: err.Error()}, nil
 	}
 
 	// Build server config from proto
@@ -227,14 +247,12 @@ func (w *Worker) Configure(_ context.Context, req *pb.ConfigureRequest) (*pb.Con
 	}
 
 	// Load TLS
-	if w.cfg.TLSCertFile != "" && w.cfg.TLSKeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(w.cfg.TLSCertFile, w.cfg.TLSKeyFile)
-		if err != nil {
-			return &pb.ConfigureResponse{Ok: false, Error: fmt.Sprintf("load TLS: %v", err)}, nil
-		}
-		w.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-		}
+	cert, err := tls.LoadX509KeyPair(w.cfg.TLSCertFile, w.cfg.TLSKeyFile)
+	if err != nil {
+		return &pb.ConfigureResponse{Ok: false, Error: fmt.Sprintf("load TLS: %v", err)}, nil
+	}
+	w.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
 	}
 
 	// Create DB pool with the worker's start time as serverStartTime.
@@ -261,14 +279,12 @@ func (w *Worker) AcceptConnection(_ context.Context, req *pb.AcceptConnectionReq
 	}
 	w.mu.RUnlock()
 
-	// Get the pending FD
-	w.mu.Lock()
-	fd := w.pendingFD
-	w.pendingFD = -1
-	w.mu.Unlock()
-
-	if fd < 0 {
-		return &pb.AcceptConnectionResponse{Ok: false, Error: "no pending FD"}, nil
+	// Wait briefly for the FD receiver loop to enqueue the socket.
+	var fd int
+	select {
+	case fd = <-w.fdQueue:
+	case <-time.After(2 * time.Second):
+		return &pb.AcceptConnectionResponse{Ok: false, Error: "timed out waiting for pending FD"}, nil
 	}
 
 	// Create a net.Conn from the FD
@@ -286,6 +302,14 @@ func (w *Worker) AcceptConnection(_ context.Context, req *pb.AcceptConnectionReq
 	if !ok {
 		_ = fc.Close()
 		return &pb.AcceptConnectionResponse{Ok: false, Error: "not TCP"}, nil
+	}
+
+	if strings.HasPrefix(req.RemoteAddr, "flight://") {
+		remoteAddr := strings.TrimPrefix(req.RemoteAddr, "flight://")
+		sessionPid := w.nextSessionPID()
+		w.sessionsWg.Add(1)
+		go w.handleFlightConnection(tcpConn, remoteAddr, sessionPid)
+		return &pb.AcceptConnectionResponse{Ok: true, BackendPid: sessionPid}, nil
 	}
 
 	// Use a unique session counter within this worker
@@ -474,6 +498,27 @@ func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, sec
 	}
 }
 
+func (w *Worker) handleFlightConnection(tcpConn *net.TCPConn, remoteAddr string, pid int32) {
+	defer w.sessionsWg.Done()
+	w.flightConns.Add(1)
+	defer w.flightConns.Add(-1)
+
+	slog.Info("Flight session starting.", "pid", pid, "remote_addr", remoteAddr)
+	defer func() {
+		_ = tcpConn.Close()
+	}()
+
+	sessionServer := NewFlightSessionServer(w, pid, remoteAddr)
+	defer sessionServer.Close()
+
+	ln := NewSingleConnListener(tcpConn)
+	defer func() { _ = ln.Close() }()
+
+	if err := sessionServer.Serve(ln, w.tlsConfig); err != nil && !errors.Is(err, net.ErrClosed) {
+		slog.Error("Flight session server error.", "pid", pid, "error", err)
+	}
+}
+
 func (w *Worker) CancelQuery(_ context.Context, req *pb.CancelQueryRequest) (*pb.CancelQueryResponse, error) {
 	w.sessionsMu.RLock()
 	defer w.sessionsMu.RUnlock()
@@ -533,7 +578,7 @@ func (w *Worker) Health(_ context.Context, _ *pb.HealthRequest) (*pb.HealthRespo
 
 	return &pb.HealthResponse{
 		Healthy:           w.configured && !draining,
-		ActiveConnections: active,
+		ActiveConnections: active + int32(w.flightConns.Load()),
 		UptimeNs:          int64(time.Since(w.startTime)),
 		TotalQueries:      w.totalQueries.Load(),
 		Draining:          draining,

@@ -5,6 +5,10 @@
 host: "0.0.0.0"
 port: 5432
 
+# Flight SQL listener (control-plane mode)
+flight:
+  port: 8815
+
 # Directory for DuckDB database files (one per user)
 data_dir: "./data"
 

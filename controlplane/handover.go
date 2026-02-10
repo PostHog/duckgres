@@ -13,8 +13,9 @@ import (
 
 // Handover protocol messages
 type handoverMsg struct {
-	Type    string           `json:"type"`
-	Workers []handoverWorker `json:"workers,omitempty"`
+	Type              string           `json:"type"`
+	Workers           []handoverWorker `json:"workers,omitempty"`
+	HasFlightListener bool             `json:"has_flight_listener,omitempty"`
 }
 
 type handoverWorker struct {
@@ -24,7 +25,7 @@ type handoverWorker struct {
 }
 
 // startHandoverListener starts listening for handover requests from a new control plane.
-// When a new CP connects, the old CP will transfer its TCP listener FD and worker info.
+// When a new CP connects, the old CP will transfer both listener FDs and worker info.
 func (cp *ControlPlane) startHandoverListener() {
 	if cp.cfg.HandoverSocket == "" {
 		return
@@ -100,17 +101,18 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 
 	// Send ack with worker info
 	if err := encoder.Encode(handoverMsg{
-		Type:    "handover_ack",
-		Workers: handoverWorkers,
+		Type:              "handover_ack",
+		Workers:           handoverWorkers,
+		HasFlightListener: cp.flightLn != nil,
 	}); err != nil {
 		slog.Error("Failed to send handover ack.", "error", err)
 		return
 	}
 
-	// Pass TCP listener FD via SCM_RIGHTS
-	tcpLn, ok := cp.listener.(*net.TCPListener)
+	// Pass PG listener FD via SCM_RIGHTS
+	tcpLn, ok := cp.pgListener.(*net.TCPListener)
 	if !ok {
-		slog.Error("Listener is not TCP, cannot handover.")
+		slog.Error("PG listener is not TCP, cannot handover.")
 		return
 	}
 
@@ -128,11 +130,32 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	}
 
 	if err := fdpass.SendFile(uc, file); err != nil {
-		slog.Error("Failed to send listener FD.", "error", err)
+		slog.Error("Failed to send PG listener FD.", "error", err)
 		return
 	}
+	slog.Info("PG listener FD sent to new control plane.")
 
-	slog.Info("Listener FD sent to new control plane.")
+	// Pass Flight listener FD via SCM_RIGHTS when present.
+	if cp.flightLn != nil {
+		flightTCP, ok := cp.flightLn.(*net.TCPListener)
+		if !ok {
+			slog.Error("Flight listener is not TCP, cannot handover.")
+			return
+		}
+
+		flightFile, err := flightTCP.File()
+		if err != nil {
+			slog.Error("Failed to get Flight listener FD.", "error", err)
+			return
+		}
+		defer func() { _ = flightFile.Close() }()
+
+		if err := fdpass.SendFile(uc, flightFile); err != nil {
+			slog.Error("Failed to send Flight listener FD.", "error", err)
+			return
+		}
+		slog.Info("Flight listener FD sent to new control plane.")
+	}
 
 	// Wait for handover_complete
 	var complete handoverMsg
@@ -146,16 +169,19 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 		return
 	}
 
-	slog.Info("Handover complete. Old control plane stopping accept loop...")
+	slog.Info("Handover complete. Waiting briefly before stopping old listeners...")
+
+	// Keep listeners alive briefly so the new control plane can enter accept loops.
+	time.Sleep(2 * time.Second)
 
 	// Stop accepting new connections
 	cp.closeMu.Lock()
 	cp.closed = true
 	cp.closeMu.Unlock()
-	_ = cp.listener.Close()
-
-	// Brief wait for in-flight FD passes to complete
-	time.Sleep(2 * time.Second)
+	_ = cp.pgListener.Close()
+	if cp.flightLn != nil {
+		_ = cp.flightLn.Close()
+	}
 
 	// Wait for wg to drain
 	cp.wg.Wait()
@@ -165,11 +191,11 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 }
 
 // receiveHandover connects to an existing control plane's handover socket,
-// receives the TCP listener FD and worker info, and takes over.
-func receiveHandover(handoverSocket string) (*net.TCPListener, []handoverWorker, error) {
+// receives listener FDs and worker info, and takes over.
+func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener, []handoverWorker, error) {
 	conn, err := net.Dial("unix", handoverSocket)
 	if err != nil {
-		return nil, nil, fmt.Errorf("connect handover socket: %w", err)
+		return nil, nil, nil, fmt.Errorf("connect handover socket: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -178,51 +204,79 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, []handoverWorker,
 
 	// Send handover request
 	if err := encoder.Encode(handoverMsg{Type: "handover_request"}); err != nil {
-		return nil, nil, fmt.Errorf("send handover request: %w", err)
+		return nil, nil, nil, fmt.Errorf("send handover request: %w", err)
 	}
 
 	// Read ack with worker info
 	var ack handoverMsg
 	if err := decoder.Decode(&ack); err != nil {
-		return nil, nil, fmt.Errorf("read handover ack: %w", err)
+		return nil, nil, nil, fmt.Errorf("read handover ack: %w", err)
 	}
 
 	if ack.Type != "handover_ack" {
-		return nil, nil, fmt.Errorf("unexpected handover message: %s", ack.Type)
+		return nil, nil, nil, fmt.Errorf("unexpected handover message: %s", ack.Type)
 	}
 
 	// Receive listener FD
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
-		return nil, nil, fmt.Errorf("handover connection is not Unix")
+		return nil, nil, nil, fmt.Errorf("handover connection is not Unix")
 	}
 
-	file, err := fdpass.RecvFile(uc, "tcp-listener")
+	file, err := fdpass.RecvFile(uc, "pg-listener")
 	if err != nil {
-		return nil, nil, fmt.Errorf("receive listener FD: %w", err)
+		return nil, nil, nil, fmt.Errorf("receive PG listener FD: %w", err)
 	}
 	defer func() { _ = file.Close() }()
 
 	// Reconstruct listener from FD
 	ln, err := net.FileListener(file)
 	if err != nil {
-		return nil, nil, fmt.Errorf("FileListener: %w", err)
+		return nil, nil, nil, fmt.Errorf("FileListener PG: %w", err)
 	}
 
 	tcpLn, ok := ln.(*net.TCPListener)
 	if !ok {
 		_ = ln.Close()
-		return nil, nil, fmt.Errorf("not a TCP listener")
+		return nil, nil, nil, fmt.Errorf("PG listener is not TCP")
+	}
+
+	var flightTCP *net.TCPListener
+	if ack.HasFlightListener {
+		flightFile, err := fdpass.RecvFile(uc, "flight-listener")
+		if err != nil {
+			_ = tcpLn.Close()
+			return nil, nil, nil, fmt.Errorf("receive Flight listener FD: %w", err)
+		}
+		defer func() { _ = flightFile.Close() }()
+
+		flightLn, err := net.FileListener(flightFile)
+		if err != nil {
+			_ = tcpLn.Close()
+			return nil, nil, nil, fmt.Errorf("FileListener Flight: %w", err)
+		}
+
+		var ok bool
+		flightTCP, ok = flightLn.(*net.TCPListener)
+		if !ok {
+			_ = flightLn.Close()
+			_ = tcpLn.Close()
+			return nil, nil, nil, fmt.Errorf("flight listener is not TCP")
+		}
 	}
 
 	// Send handover complete
 	if err := encoder.Encode(handoverMsg{Type: "handover_complete"}); err != nil {
 		_ = tcpLn.Close()
-		return nil, nil, fmt.Errorf("send handover complete: %w", err)
+		if flightTCP != nil {
+			_ = flightTCP.Close()
+		}
+		return nil, nil, nil, fmt.Errorf("send handover complete: %w", err)
 	}
 
-	slog.Info("Handover received: got listener and worker info.",
+	slog.Info("Handover received: got listeners and worker info.",
+		"has_flight_listener", ack.HasFlightListener,
 		"workers", len(ack.Workers))
 
-	return tcpLn, ack.Workers, nil
+	return tcpLn, flightTCP, ack.Workers, nil
 }

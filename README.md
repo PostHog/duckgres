@@ -48,6 +48,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - **Rate Limiting**: Built-in protection against brute-force attacks
 - **Graceful Shutdown**: Waits for in-flight queries before exiting
 - **Control Plane Mode**: Multi-process architecture with long-lived workers, zero-downtime deployments, and rolling updates
+- **Flight SQL Ingress (Control Plane)**: Stable Flight SQL endpoint with TLS + username/password auth
 - **Flexible Configuration**: YAML config files, environment variables, and CLI flags
 - **Prometheus Metrics**: Built-in metrics endpoint for monitoring
 
@@ -127,6 +128,8 @@ Create a `duckgres.yaml` file (see `duckgres.example.yaml` for a complete exampl
 ```yaml
 host: "0.0.0.0"
 port: 5432
+flight:
+  port: 8815
 data_dir: "./data"
 
 tls:
@@ -164,6 +167,7 @@ Run with config file:
 | `DUCKGRES_CONFIG` | Path to YAML config file | - |
 | `DUCKGRES_HOST` | Host to bind to | `0.0.0.0` |
 | `DUCKGRES_PORT` | Port to listen on | `5432` |
+| `DUCKGRES_FLIGHT_PORT` | Flight SQL port (control-plane mode) | `8815` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
@@ -208,6 +212,7 @@ Options:
   -worker-count int        Number of worker processes (control-plane mode, default 4)
   -socket-dir string       Unix socket directory (control-plane mode)
   -handover-socket string  Handover socket for graceful deployment (control-plane mode)
+  -flight-port int         Flight SQL port to listen on (control-plane mode, default 8815)
 ```
 
 ## DuckDB Extensions
@@ -487,7 +492,8 @@ For production deployments, control-plane mode splits the server into a **contro
 ```
                     CONTROL PLANE (duckgres --mode control-plane)
                     ┌──────────────────────────────────────────┐
-  PG Client ──TLS──>│ TCP Listener                             │
+  PG Client ──TLS──>│ PG TCP Listener                          │
+Flight SQL Client ─>│ Flight TCP Listener                      │
                     │ Rate Limiting                             │
                     │ Connection Router (least-connections)     │
                     │   │ FD pass via Unix socket (SCM_RIGHTS)  │
@@ -515,10 +521,13 @@ Start in control-plane mode:
 
 ```bash
 # Start with 4 workers (default)
-./duckgres --mode control-plane --port 5432 --worker-count 4
+./duckgres --mode control-plane --port 5432 --flight-port 8815 --worker-count 4
 
 # Connect with psql (identical to standalone mode)
 PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"
+
+# Connect with Flight SQL client using Basic auth over TLS
+# endpoint: grpc+tls://localhost:8815
 ```
 
 **Zero-downtime deployment** using the handover protocol:
