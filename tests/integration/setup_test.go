@@ -225,6 +225,12 @@ var knownFailures = map[string]string{
 	"prepare_with_types": "DuckDB: prepared statement types differ",
 	"pg_typeof":          "DuckDB: pg_typeof differs",
 	"pg_typeof_text":     "DuckDB: pg_typeof differs",
+
+	// Savepoint tests - DuckDB does not support SAVEPOINT syntax
+	"basic_savepoint":      "DuckDB: SAVEPOINT not supported",
+	"nested_savepoints":    "DuckDB: SAVEPOINT not supported",
+	"release_savepoint":    "DuckDB: SAVEPOINT not supported",
+	"savepoint_with_error": "DuckDB: SAVEPOINT not supported",
 }
 
 // skipIfKnown checks if the current test is in the known failures list

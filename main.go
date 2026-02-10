@@ -149,7 +149,7 @@ func main() {
 	// Handle -v shorthand before flag.Parse (Go's flag package doesn't support short aliases)
 	for _, arg := range os.Args[1:] {
 		if arg == "-v" {
-			fmt.Printf("duckgres version %s (commit: %s, built: %s)\n", version, commit, date)
+			fmt.Println(versionString())
 			os.Exit(0)
 		}
 	}
@@ -157,7 +157,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("duckgres version %s (commit: %s, built: %s)\n", version, commit, date)
+		fmt.Println(versionString())
 		os.Exit(0)
 	}
 
