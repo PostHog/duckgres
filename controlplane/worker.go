@@ -146,6 +146,11 @@ func (w *Worker) run(ctx context.Context) error {
 		slog.Info("All sessions drained.")
 	case <-time.After(30 * time.Second):
 		slog.Warn("Drain timeout, force closing sessions.")
+		w.sessionsMu.RLock()
+		for _, s := range w.sessions {
+			s.cancel()
+		}
+		w.sessionsMu.RUnlock()
 	}
 
 	grpcServer.GracefulStop()
@@ -324,10 +329,13 @@ func (w *Worker) AcceptConnection(_ context.Context, req *pb.AcceptConnectionReq
 var sessionCounter atomic.Int32
 
 func (w *Worker) nextSessionPID() int32 {
-	// Use worker PID * 1000 + counter to create unique pseudo-PIDs
-	base := int32(os.Getpid())
+	// Combine worker PID (mod 2000) with monotonic counter for unique session PIDs.
+	// PID prefix ensures uniqueness across workers (each is a separate process with
+	// its own sessionCounter). Supports 1M sessions per worker before wrapping.
+	// Max value: 1999*1_000_000 + 999_999 = 1,999,999,999 (fits int32).
+	base := int32(os.Getpid() % 2000)
 	counter := sessionCounter.Add(1)
-	return base*1000 + counter%1000
+	return base*1_000_000 + counter%1_000_000
 }
 
 func (w *Worker) handleSession(tcpConn *net.TCPConn, remoteAddr string, pid, secretKey int32) {

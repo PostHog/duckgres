@@ -30,6 +30,7 @@ type ManagedWorker struct {
 	Client     pb.WorkerControlClient
 	StartTime  time.Time
 	done       chan struct{} // closed when process exits
+	routeMu    sync.Mutex   // serializes FD send + AcceptConnection to prevent FD swaps
 }
 
 // WorkerPool manages a pool of long-lived worker processes.
@@ -230,7 +231,14 @@ func (p *WorkerPool) routeConnection(tcpFile *os.File, remoteAddr string, secret
 		return 0, err
 	}
 
-	// Connect to worker's FD socket and send the FD
+	// Serialize FD send + AcceptConnection per worker. Without this, concurrent
+	// routeConnection calls to the same worker can interleave: goroutine A sends
+	// FD-A, goroutine B sends FD-B, then B's AcceptConnection dequeues FD-A
+	// (wrong client). The lock ensures each FD is paired with its gRPC call.
+	worker.routeMu.Lock()
+	defer worker.routeMu.Unlock()
+
+	// Connect to worker's FD socket and send the FD.
 	// Note: we do NOT call waitForSocket here — it probe-connects then closes,
 	// which triggers an EOF in the worker's fdReceiverLoop. The FD socket is
 	// guaranteed to be ready after SpawnWorker/ConnectExistingWorker completes.
@@ -385,7 +393,7 @@ func (p *WorkerPool) ShutdownAll(timeout time.Duration) {
 		case <-w.done:
 		case <-deadline:
 			slog.Warn("Worker shutdown timeout, killing.", "id", w.ID, "pid", w.PID)
-			if w.Cmd.Process != nil {
+			if w.Cmd != nil && w.Cmd.Process != nil {
 				_ = w.Cmd.Process.Kill()
 			}
 		}
@@ -474,7 +482,7 @@ func (p *WorkerPool) RollingUpdate(ctx context.Context) error {
 		select {
 		case <-old.done:
 		case <-time.After(30 * time.Second):
-			if old.Cmd.Process != nil {
+			if old.Cmd != nil && old.Cmd.Process != nil {
 				_ = old.Cmd.Process.Kill()
 			}
 		}
