@@ -2611,8 +2611,13 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 	_ = binary.Write(&buf, binary.BigEndian, int16(len(cols)))
 
 	for i, col := range cols {
+		// Strip internal "memory.main." prefix from column names.
+		// In DuckLake mode the transpiler qualifies our custom macros with
+		// memory.main. so DuckDB can find them, but clients shouldn't see that.
+		displayCol := strings.TrimPrefix(col, "memory.main.")
+
 		// Column name (null-terminated)
-		buf.WriteString(col)
+		buf.WriteString(displayCol)
 		buf.WriteByte(0)
 
 		// Table OID (0 = not from a table)
@@ -2763,6 +2768,9 @@ func formatValue(v interface{}) string {
 	case []any:
 		// PostgreSQL array text format: {1,2,3}
 		return formatArrayValue(val)
+	case duckdb.Interval:
+		// PostgreSQL interval text format: "1 year 2 mons 3 days 04:05:06.123456"
+		return formatInterval(val)
 	case map[string]any:
 		// STRUCT text format: {"key1": val1, "key2": val2}
 		return formatMapValue(val)
@@ -2770,6 +2778,61 @@ func formatValue(v interface{}) string {
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+// formatInterval formats a duckdb.Interval as a PostgreSQL-compatible interval string.
+// Examples: "00:13:08.917797", "1 day 02:30:00", "1 year 2 mons 3 days 04:05:06".
+func formatInterval(iv duckdb.Interval) string {
+	var parts []string
+	if iv.Months != 0 {
+		years := iv.Months / 12
+		remMonths := iv.Months % 12
+		if years != 0 {
+			if years == 1 || years == -1 {
+				parts = append(parts, fmt.Sprintf("%d year", years))
+			} else {
+				parts = append(parts, fmt.Sprintf("%d years", years))
+			}
+		}
+		if remMonths != 0 {
+			if remMonths == 1 || remMonths == -1 {
+				parts = append(parts, fmt.Sprintf("%d mon", remMonths))
+			} else {
+				parts = append(parts, fmt.Sprintf("%d mons", remMonths))
+			}
+		}
+	}
+	if iv.Days != 0 {
+		if iv.Days == 1 || iv.Days == -1 {
+			parts = append(parts, fmt.Sprintf("%d day", iv.Days))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d days", iv.Days))
+		}
+	}
+	if iv.Micros != 0 || len(parts) == 0 {
+		micros := iv.Micros
+		neg := micros < 0
+		if neg {
+			micros = -micros
+		}
+		h := micros / 3600000000
+		micros %= 3600000000
+		m := micros / 60000000
+		micros %= 60000000
+		s := micros / 1000000
+		rem := micros % 1000000
+		var timePart string
+		if rem > 0 {
+			timePart = fmt.Sprintf("%02d:%02d:%02d.%06d", h, m, s, rem)
+		} else {
+			timePart = fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+		}
+		if neg {
+			timePart = "-" + timePart
+		}
+		parts = append(parts, timePart)
+	}
+	return strings.Join(parts, " ")
 }
 
 // formatArrayValue formats a []any slice as PostgreSQL text array: {1,2,3}
