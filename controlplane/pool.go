@@ -230,12 +230,10 @@ func (p *WorkerPool) routeConnection(tcpFile *os.File, remoteAddr string, secret
 		return 0, err
 	}
 
-	// Wait for FD socket to be available
-	if err := waitForSocket(worker.FDSocket, 5*time.Second); err != nil {
-		return 0, fmt.Errorf("worker %d FD socket not ready: %w", worker.ID, err)
-	}
-
 	// Connect to worker's FD socket and send the FD
+	// Note: we do NOT call waitForSocket here — it probe-connects then closes,
+	// which triggers an EOF in the worker's fdReceiverLoop. The FD socket is
+	// guaranteed to be ready after SpawnWorker/ConnectExistingWorker completes.
 	fdConn, err := net.Dial("unix", worker.FDSocket)
 	if err != nil {
 		return 0, fmt.Errorf("connect FD socket for worker %d: %w", worker.ID, err)
