@@ -972,6 +972,39 @@ func TestDecodeNumeric(t *testing.T) {
 	}
 }
 
+func TestUBIGINTTypmod(t *testing.T) {
+	// UBIGINT should map to NUMERIC(20,0) with proper typmod
+	info := mapDuckDBType("UBIGINT")
+	if info.OID != OidNumeric {
+		t.Errorf("UBIGINT OID = %d, want %d (OidNumeric)", info.OID, OidNumeric)
+	}
+	expectedTypmod := int32(((20 << 16) | 0) + 4)
+	if info.Typmod != expectedTypmod {
+		t.Errorf("UBIGINT Typmod = %d, want %d (DECIMAL(20,0))", info.Typmod, expectedTypmod)
+	}
+}
+
+func TestEncodeDecodeUBIGINTMax(t *testing.T) {
+	// Max UBIGINT = 2^64 - 1 = 18446744073709551615 (20 digits)
+	// DuckDB Go driver returns UBIGINT as duckdb.Decimal with scale 0
+	maxUBIGINT := new(big.Int)
+	maxUBIGINT.SetString("18446744073709551615", 10)
+	dec := duckdb.Decimal{Width: 20, Scale: 0, Value: maxUBIGINT}
+
+	encoded := encodeNumeric(dec)
+	if encoded == nil {
+		t.Fatal("encodeNumeric returned nil for max UBIGINT")
+	}
+
+	decoded, err := decodeNumeric(encoded)
+	if err != nil {
+		t.Fatalf("decodeNumeric failed: %v", err)
+	}
+	if decoded != "18446744073709551615" {
+		t.Errorf("roundtrip max UBIGINT = %q, want %q", decoded, "18446744073709551615")
+	}
+}
+
 func TestDecodeNumericRaw(t *testing.T) {
 	// Test decoding a manually constructed binary numeric: 99.99
 	// ndigits=2, weight=0, sign=0x0000, dscale=2, digits=[99, 9900]

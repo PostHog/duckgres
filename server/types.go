@@ -180,7 +180,11 @@ func mapDuckDBType(typeName string) TypeInfo {
 	case upper == "UINTEGER":
 		return TypeInfo{OID: OidOid, Size: 4} // PostgreSQL oid type for pg_catalog columns
 	case upper == "UBIGINT":
-		return TypeInfo{OID: OidNumeric, Size: -1}
+		// Map to NUMERIC(20,0) so postgres_scanner reads it as DECIMAL(20,0) → INT128.
+		// UBIGINT max (2^64-1 = 18446744073709551615) is 20 digits.
+		// Without typmod, the extension can't determine buffer size and fails with
+		// "out of buffer in ReadInteger". Typmod = ((20 << 16) | 0) + 4 = 1310724.
+		return TypeInfo{OID: OidNumeric, Size: -1, Typmod: 1310724}
 	case upper == "REAL" || upper == "FLOAT4" || upper == "FLOAT":
 		return TypeInfo{OID: OidFloat4, Size: 4}
 	case upper == "DOUBLE" || upper == "FLOAT8":
