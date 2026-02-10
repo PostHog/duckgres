@@ -8,9 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/server"
@@ -157,6 +155,12 @@ func main() {
 
 	flag.Parse()
 
+	// Track explicitly-set CLI flags so precedence is consistent.
+	cliSet := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		cliSet[f.Name] = true
+	})
+
 	loggingShutdown := initLogging()
 	defer loggingShutdown()
 
@@ -171,19 +175,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Start with defaults
-	cfg := server.Config{
-		Host:        "0.0.0.0",
-		Port:        5432,
-		DataDir:     "./data",
-		TLSCertFile: "./certs/server.crt",
-		TLSKeyFile:  "./certs/server.key",
-		Users: map[string]string{
-			"postgres": "postgres",
-		},
-		Extensions: []string{"ducklake"},
-	}
-
 	// Auto-detect duckgres.yaml if no config file was explicitly specified
 	if *configFile == "" {
 		if _, err := os.Stat("duckgres.yaml"); err == nil {
@@ -191,213 +182,35 @@ func main() {
 		}
 	}
 
+	var fileCfg *FileConfig
 	// Load config file if specified (or auto-detected)
 	if *configFile != "" {
-		fileCfg, err := loadConfigFile(*configFile)
+		loadedCfg, err := loadConfigFile(*configFile)
 		if err != nil {
 			slog.Error("Failed to load config file: " + err.Error())
 			os.Exit(1)
 		}
 		slog.Info("Loaded configuration from " + *configFile)
-
-		// Apply config file values
-		if fileCfg.Host != "" {
-			cfg.Host = fileCfg.Host
-		}
-		if fileCfg.Port != 0 {
-			cfg.Port = fileCfg.Port
-		}
-		if fileCfg.Flight.Host != "" {
-			*flightHost = fileCfg.Flight.Host
-		}
-		if fileCfg.Flight.Port != 0 {
-			*flightPort = fileCfg.Flight.Port
-		}
-		if fileCfg.DataDir != "" {
-			cfg.DataDir = fileCfg.DataDir
-		}
-		if fileCfg.TLS.Cert != "" {
-			cfg.TLSCertFile = fileCfg.TLS.Cert
-		}
-		if fileCfg.TLS.Key != "" {
-			cfg.TLSKeyFile = fileCfg.TLS.Key
-		}
-		if len(fileCfg.Users) > 0 {
-			cfg.Users = fileCfg.Users
-		}
-
-		// Apply rate limit config
-		if fileCfg.RateLimit.MaxFailedAttempts > 0 {
-			cfg.RateLimit.MaxFailedAttempts = fileCfg.RateLimit.MaxFailedAttempts
-		}
-		if fileCfg.RateLimit.MaxConnectionsPerIP > 0 {
-			cfg.RateLimit.MaxConnectionsPerIP = fileCfg.RateLimit.MaxConnectionsPerIP
-		}
-		if fileCfg.RateLimit.FailedAttemptWindow != "" {
-			if d, err := time.ParseDuration(fileCfg.RateLimit.FailedAttemptWindow); err == nil {
-				cfg.RateLimit.FailedAttemptWindow = d
-			} else {
-				slog.Warn("Invalid failed_attempt_window duration: " + err.Error())
-			}
-		}
-		if fileCfg.RateLimit.BanDuration != "" {
-			if d, err := time.ParseDuration(fileCfg.RateLimit.BanDuration); err == nil {
-				cfg.RateLimit.BanDuration = d
-			} else {
-				slog.Warn("Invalid ban_duration duration: " + err.Error())
-			}
-		}
-
-		// Apply extensions config
-		if len(fileCfg.Extensions) > 0 {
-			cfg.Extensions = fileCfg.Extensions
-		}
-
-		// Apply DuckLake config
-		if fileCfg.DuckLake.MetadataStore != "" {
-			cfg.DuckLake.MetadataStore = fileCfg.DuckLake.MetadataStore
-		}
-		if fileCfg.DuckLake.ObjectStore != "" {
-			cfg.DuckLake.ObjectStore = fileCfg.DuckLake.ObjectStore
-		}
-		if fileCfg.DuckLake.DataPath != "" {
-			cfg.DuckLake.DataPath = fileCfg.DuckLake.DataPath
-		}
-		if fileCfg.DuckLake.S3Provider != "" {
-			cfg.DuckLake.S3Provider = fileCfg.DuckLake.S3Provider
-		}
-		if fileCfg.DuckLake.S3Endpoint != "" {
-			cfg.DuckLake.S3Endpoint = fileCfg.DuckLake.S3Endpoint
-		}
-		if fileCfg.DuckLake.S3AccessKey != "" {
-			cfg.DuckLake.S3AccessKey = fileCfg.DuckLake.S3AccessKey
-		}
-		if fileCfg.DuckLake.S3SecretKey != "" {
-			cfg.DuckLake.S3SecretKey = fileCfg.DuckLake.S3SecretKey
-		}
-		if fileCfg.DuckLake.S3Region != "" {
-			cfg.DuckLake.S3Region = fileCfg.DuckLake.S3Region
-		}
-		cfg.DuckLake.S3UseSSL = fileCfg.DuckLake.S3UseSSL
-		if fileCfg.DuckLake.S3URLStyle != "" {
-			cfg.DuckLake.S3URLStyle = fileCfg.DuckLake.S3URLStyle
-		}
-		if fileCfg.DuckLake.S3Chain != "" {
-			cfg.DuckLake.S3Chain = fileCfg.DuckLake.S3Chain
-		}
-		if fileCfg.DuckLake.S3Profile != "" {
-			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
-		}
-
-		// Apply process isolation config
-		cfg.ProcessIsolation = fileCfg.ProcessIsolation
-
-		// Apply idle timeout config
-		if fileCfg.IdleTimeout != "" {
-			if d, err := time.ParseDuration(fileCfg.IdleTimeout); err == nil {
-				cfg.IdleTimeout = d
-			} else {
-				slog.Warn("Invalid idle_timeout duration: " + err.Error())
-			}
-		}
+		fileCfg = loadedCfg
 	}
 
-	// Apply environment variables (override config file)
-	if v := os.Getenv("DUCKGRES_HOST"); v != "" {
-		cfg.Host = v
-	}
-	if v := os.Getenv("DUCKGRES_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			cfg.Port = p
-		}
-	}
-	if v := os.Getenv("DUCKGRES_DATA_DIR"); v != "" {
-		cfg.DataDir = v
-	}
-	if v := os.Getenv("DUCKGRES_CERT"); v != "" {
-		cfg.TLSCertFile = v
-	}
-	if v := os.Getenv("DUCKGRES_KEY"); v != "" {
-		cfg.TLSKeyFile = v
-	}
-	if v := os.Getenv("DUCKGRES_FLIGHT_HOST"); v != "" {
-		*flightHost = v
-	}
-	if v := os.Getenv("DUCKGRES_FLIGHT_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			*flightPort = p
-		}
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_METADATA_STORE"); v != "" {
-		cfg.DuckLake.MetadataStore = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_OBJECT_STORE"); v != "" {
-		cfg.DuckLake.ObjectStore = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROVIDER"); v != "" {
-		cfg.DuckLake.S3Provider = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_ENDPOINT"); v != "" {
-		cfg.DuckLake.S3Endpoint = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_ACCESS_KEY"); v != "" {
-		cfg.DuckLake.S3AccessKey = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_SECRET_KEY"); v != "" {
-		cfg.DuckLake.S3SecretKey = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_REGION"); v != "" {
-		cfg.DuckLake.S3Region = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_USE_SSL"); v == "true" || v == "1" {
-		cfg.DuckLake.S3UseSSL = true
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_URL_STYLE"); v != "" {
-		cfg.DuckLake.S3URLStyle = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_CHAIN"); v != "" {
-		cfg.DuckLake.S3Chain = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
-		cfg.DuckLake.S3Profile = v
-	}
-	if v := os.Getenv("DUCKGRES_PROCESS_ISOLATION"); v == "true" || v == "1" {
-		cfg.ProcessIsolation = true
-	}
-	if v := os.Getenv("DUCKGRES_IDLE_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.IdleTimeout = d
-		} else {
-			slog.Warn("Invalid DUCKGRES_IDLE_TIMEOUT duration: " + err.Error())
-		}
-	}
-
-	// Apply CLI flags (highest priority)
-	if *host != "" {
-		cfg.Host = *host
-	}
-	if *port != 0 {
-		cfg.Port = *port
-	}
-	if *dataDir != "" {
-		cfg.DataDir = *dataDir
-	}
-	if *certFile != "" {
-		cfg.TLSCertFile = *certFile
-	}
-	if *keyFile != "" {
-		cfg.TLSKeyFile = *keyFile
-	}
-	if *processIsolation {
-		cfg.ProcessIsolation = true
-	}
-	if *idleTimeout != "" {
-		if d, err := time.ParseDuration(*idleTimeout); err == nil {
-			cfg.IdleTimeout = d
-		} else {
-			slog.Warn("Invalid --idle-timeout duration: " + err.Error())
-		}
-	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:              cliSet,
+		Host:             *host,
+		Port:             *port,
+		DataDir:          *dataDir,
+		CertFile:         *certFile,
+		KeyFile:          *keyFile,
+		ProcessIsolation: *processIsolation,
+		IdleTimeout:      *idleTimeout,
+		FlightHost:       *flightHost,
+		FlightPort:       *flightPort,
+	}, os.Getenv, func(msg string) {
+		slog.Warn(msg)
+	})
+	cfg := resolved.Server
+	flightCfgHost := resolved.FlightHost
+	flightCfgPort := resolved.FlightPort
 
 	// Handle --psql: launch psql connected to the local Duckgres server
 	if *psql {
@@ -459,14 +272,7 @@ func main() {
 
 	// Handle control-plane mode
 	if *mode == "control-plane" {
-		effectiveFlightHost := *flightHost
-		if effectiveFlightHost == "" {
-			effectiveFlightHost = cfg.Host
-		}
-		effectiveFlightPort := *flightPort
-		if effectiveFlightPort == 0 {
-			effectiveFlightPort = 8815
-		}
+		effectiveFlightHost, effectiveFlightPort := effectiveFlightConfig(cfg, flightCfgHost, flightCfgPort)
 
 		cpCfg := controlplane.ControlPlaneConfig{
 			Config:         cfg,
