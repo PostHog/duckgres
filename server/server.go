@@ -621,6 +621,18 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 		}
 	}
 
+	// Warn if metadata store appears to connect via pgbouncer.
+	// pgbouncer's connection lifecycle management (idle timeout, server_lifetime, etc.)
+	// can kill connections that DuckLake's internal metadata database depends on,
+	// causing cascading failures during long queries.
+	if strings.Contains(dlCfg.MetadataStore, " port=6432") ||
+		strings.Contains(dlCfg.MetadataStore, ":6432/") ||
+		strings.HasSuffix(dlCfg.MetadataStore, ":6432") {
+		slog.Warn("DuckLake metadata store appears to connect via pgbouncer (port 6432). " +
+			"This can cause connection drops during long queries. " +
+			"Consider connecting directly to PostgreSQL instead.")
+	}
+
 	// Build the ATTACH statement
 	// Format without data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake
 	// Format with data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake (DATA_PATH '<path>')
@@ -908,6 +920,15 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 	defer func() {
 		s.rateLimiter.UnregisterConnection(remoteAddr)
 		_ = conn.Close()
+	}()
+
+	// Recover from Go-level panics (e.g., from DuckDB CGO boundary).
+	// This won't catch C++ fatal signals (SIGABRT/SIGSEGV) — process isolation handles those.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Recovered from panic in connection handler.",
+				"remote_addr", remoteAddr, "panic", r)
+		}
 	}()
 
 	c := &clientConn{
