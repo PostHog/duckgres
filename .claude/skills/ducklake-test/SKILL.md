@@ -1,7 +1,6 @@
 ---
 name: ducklake-test
 description: Start duckgres with DuckLake (S3-backed storage with PostgreSQL metadata) for local testing. Use when testing duckgres against DuckLake or reproducing Fivetran sync issues.
-disable-model-invocation: true
 ---
 
 Start duckgres with DuckLake configuration:

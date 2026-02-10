@@ -280,6 +280,7 @@ func TestTranspile_PublicSchema(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
+		expected string
 		contains string
 		excludes string
 	}{
@@ -301,6 +302,16 @@ func TestTranspile_PublicSchema(t *testing.T) {
 			contains: "main.new_table",
 			excludes: "public.new_table",
 		},
+		{
+			name:     "3-part catalog.public.table unchanged",
+			input:    "SELECT * FROM postgres.public.users",
+			expected: "SELECT * FROM postgres.public.users",
+		},
+		{
+			name:     "3-part catalog.public.table in INSERT unchanged",
+			input:    "INSERT INTO mydb.public.events (id) VALUES (1)",
+			expected: "INSERT INTO mydb.public.events (id) VALUES (1)",
+		},
 	}
 
 	tr := New(DefaultConfig())
@@ -310,6 +321,11 @@ func TestTranspile_PublicSchema(t *testing.T) {
 			result, err := tr.Transpile(tt.input)
 			if err != nil {
 				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.expected != "" {
+				if result.SQL != tt.expected {
+					t.Errorf("Transpile(%q) = %q, expected %q", tt.input, result.SQL, tt.expected)
+				}
 			}
 			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
 				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
@@ -887,6 +903,24 @@ func TestTranspile_TypeMappings(t *testing.T) {
 			contains: "text",
 			excludes: "tsvector",
 		},
+		{
+			name:     "pg_catalog.json prefix stripped",
+			input:    "CREATE TABLE t (data pg_catalog.json)",
+			contains: "json",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "pg_catalog.int4 prefix stripped and mapped",
+			input:    "CREATE TABLE t (id pg_catalog.int4)",
+			contains: "integer",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "pg_catalog.varchar prefix stripped",
+			input:    "CREATE TABLE t (name pg_catalog.varchar)",
+			contains: "varchar",
+			excludes: "pg_catalog",
+		},
 	}
 
 	tr := New(DefaultConfig())
@@ -944,6 +978,12 @@ func TestTranspile_FunctionMappings(t *testing.T) {
 			input:    "SELECT json_build_object('a', 1, 'b', 2)",
 			contains: "json_object",
 			excludes: "json_build_object",
+		},
+		{
+			name:     "json_object strips pg_catalog prefix",
+			input:    "SELECT JSON_OBJECT('id', id, 'name', name) FROM test",
+			contains: "json_object",
+			excludes: "pg_catalog",
 		},
 	}
 
@@ -1887,6 +1927,82 @@ func TestConvertAlterTableToAlterView(t *testing.T) {
 	}
 }
 
+func TestConvertDropTableToDropView(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantOK     bool
+		wantChange bool
+	}{
+		{
+			name:       "DROP TABLE IF EXISTS to DROP VIEW IF EXISTS",
+			input:      `DROP TABLE IF EXISTS "my_schema"."my_view"`,
+			wantOK:     true,
+			wantChange: true,
+		},
+		{
+			name:       "simple DROP TABLE to DROP VIEW",
+			input:      `DROP TABLE myview`,
+			wantOK:     true,
+			wantChange: true,
+		},
+		{
+			name:       "DROP VIEW unchanged",
+			input:      `DROP VIEW IF EXISTS myview`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "SELECT statement unchanged",
+			input:      `SELECT * FROM users`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "ALTER TABLE unchanged",
+			input:      `ALTER TABLE users ADD COLUMN email TEXT`,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "empty string",
+			input:      ``,
+			wantOK:     false,
+			wantChange: false,
+		},
+		{
+			name:       "invalid SQL",
+			input:      `NOT VALID SQL AT ALL`,
+			wantOK:     false,
+			wantChange: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, ok := ConvertDropTableToDropView(tt.input)
+			if ok != tt.wantOK {
+				t.Errorf("ConvertDropTableToDropView(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if tt.wantChange {
+				if result == tt.input {
+					t.Errorf("ConvertDropTableToDropView(%q) should change the SQL", tt.input)
+				}
+				if !strings.Contains(strings.ToUpper(result), "DROP VIEW") {
+					t.Errorf("ConvertDropTableToDropView(%q) = %q, should contain DROP VIEW", tt.input, result)
+				}
+				if strings.Contains(strings.ToUpper(result), "DROP TABLE") {
+					t.Errorf("ConvertDropTableToDropView(%q) = %q, should not contain DROP TABLE", tt.input, result)
+				}
+			} else {
+				if result != tt.input {
+					t.Errorf("ConvertDropTableToDropView(%q) = %q, should return original", tt.input, result)
+				}
+			}
+		})
+	}
+}
+
 func TestTranspile_PgCatalog_ColumnRefRewrite(t *testing.T) {
 	// Bug: When pg_class is rewritten to pg_class_full, column references like
 	// pg_class.oid should also be rewritten to pg_class_full.oid
@@ -2256,6 +2372,16 @@ func TestTranspile_RegexOperators(t *testing.T) {
 			input:    "WITH filtered AS (SELECT * FROM users WHERE name ~ '^A') SELECT * FROM filtered",
 			contains: "regexp_matches",
 		},
+		{
+			name:     "unary bitwise NOT is not converted to regex",
+			input:    "SELECT id, ~id AS bnot FROM users",
+			excludes: "regexp_matches",
+		},
+		{
+			name:     "unary bitwise NOT in WHERE clause",
+			input:    "SELECT * FROM users WHERE ~id = -2",
+			excludes: "regexp_matches",
+		},
 	}
 
 	tr := New(DefaultConfig())
@@ -2477,6 +2603,193 @@ func TestTranspile_RangeFunction(t *testing.T) {
 			input:    "SELECT x FROM pg_catalog.unnest(ARRAY[1,2,3]) AS x, pg_catalog.unnest(ARRAY[4,5,6]) AS y",
 			contains: "unnest",
 			excludes: "pg_catalog.unnest",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_CtidToRowid(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "SELECT ctid -> rowid",
+			input:    "SELECT ctid FROM users",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "qualified table.ctid -> table.rowid",
+			input:    "SELECT u.ctid FROM users u",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "ctid in WHERE clause",
+			input:    "SELECT * FROM users WHERE ctid = '(0,1)'",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "ctid in DELETE",
+			input:    "DELETE FROM users WHERE ctid = '(0,1)'",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "ctid case insensitive",
+			input:    "SELECT CTID FROM users",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "no false positive on ctid-like column name",
+			input:    "SELECT acid FROM users",
+			contains: "acid",
+		},
+		{
+			name:     "ctid in subquery",
+			input:    "SELECT * FROM (SELECT ctid, name FROM users) sub",
+			contains: "rowid",
+			excludes: "ctid",
+		},
+		{
+			name:     "ctid BETWEEN ::tid replaced with TRUE",
+			input:    "SELECT * FROM users WHERE ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid",
+			contains: "true",
+			excludes: "tid",
+		},
+		{
+			name:     "ctid BETWEEN with other conditions preserved",
+			input:    "SELECT * FROM users WHERE id > 0 AND ctid BETWEEN '(0,0)'::tid AND '(4294967295,0)'::tid",
+			contains: "true",
+			excludes: "tid",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_PgCatalogStubViews(t *testing.T) {
+	// Test that new stub views (pg_constraint, pg_enum, pg_indexes) are mapped correctly
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "pg_catalog.pg_constraint -> memory.main.pg_constraint",
+			input:    "SELECT * FROM pg_catalog.pg_constraint",
+			contains: "memory.main.pg_constraint",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "pg_catalog.pg_enum -> memory.main.pg_enum",
+			input:    "SELECT * FROM pg_catalog.pg_enum",
+			contains: "memory.main.pg_enum",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "pg_catalog.pg_indexes -> memory.main.pg_indexes",
+			input:    "SELECT * FROM pg_catalog.pg_indexes",
+			contains: "memory.main.pg_indexes",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "unqualified pg_constraint -> memory.main.pg_constraint",
+			input:    "SELECT conname FROM pg_constraint WHERE contype = 'p'",
+			contains: "memory.main.pg_constraint",
+		},
+		{
+			name:     "unqualified pg_enum -> memory.main.pg_enum",
+			input:    "SELECT enumlabel FROM pg_enum",
+			contains: "memory.main.pg_enum",
+		},
+		{
+			name:     "unqualified pg_indexes -> memory.main.pg_indexes",
+			input:    "SELECT indexname FROM pg_indexes WHERE tablename = 'users'",
+			contains: "memory.main.pg_indexes",
+		},
+	}
+
+	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_ViewStmtWalking(t *testing.T) {
+	// Test that CREATE VIEW ... AS SELECT has its inner query transformed
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "CREATE VIEW with pg_catalog reference",
+			input:    "CREATE VIEW myview AS SELECT * FROM pg_catalog.pg_class",
+			contains: "memory.main.pg_class_full",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "CREATE VIEW with public schema",
+			input:    "CREATE VIEW myview AS SELECT * FROM public.users",
+			contains: "main.users",
+			excludes: "public.users",
+		},
+		{
+			name:     "CREATE OR REPLACE VIEW with ctid",
+			input:    "CREATE OR REPLACE VIEW myview AS SELECT ctid, name FROM users",
+			contains: "rowid",
+			excludes: "ctid",
 		},
 	}
 

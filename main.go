@@ -121,6 +121,7 @@ func main() {
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
+	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
 
 	// Control plane flags
@@ -133,7 +134,7 @@ func main() {
 	fdSocket := flag.String("fd-socket", "", "FD passing socket path (worker mode, set by control-plane)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Duckgres - PostgreSQL wire protocol server for DuckDB\n\n")
+		fmt.Fprintf(os.Stderr, "Duckgres %s - PostgreSQL wire protocol server for DuckDB\n\n", version)
 		fmt.Fprintf(os.Stderr, "Usage: duckgres [options]\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
@@ -150,7 +151,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
 
+	// Handle -v shorthand before flag.Parse (Go's flag package doesn't support short aliases)
+	for _, arg := range os.Args[1:] {
+		if arg == "-v" {
+			fmt.Println(versionString())
+			os.Exit(0)
+		}
+	}
+
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionString())
+		os.Exit(0)
+	}
 
 	// Track explicitly-set CLI flags so precedence is consistent.
 	cliSet := make(map[string]bool)
@@ -298,7 +312,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	slog.Info("Starting Duckgres server (TLS required)", "host", cfg.Host, "port", cfg.Port)
+	slog.Info("Starting Duckgres server (TLS required)", "version", version, "host", cfg.Host, "port", cfg.Port)
 	if err := srv.ListenAndServe(); err != nil {
 		fatal("Server error: " + err.Error())
 	}

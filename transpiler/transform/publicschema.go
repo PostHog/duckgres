@@ -31,8 +31,9 @@ func (t *PublicSchemaTransform) Transform(tree *pg_query.ParseResult, _ *Result)
 			return true
 		}
 
-		// Only rewrite schema-qualified references like public.table.
-		// If a catalog/database is provided, leave it alone.
+		// Only rewrite 2-part names like public.table → main.table.
+		// Fully qualified 3-part names (catalog.public.table) are left as-is
+		// for DuckDB to resolve against the named catalog.
 		if rv.Catalogname == "" && strings.EqualFold(rv.Schemaname, "public") {
 			rv.Schemaname = "main"
 			changed = true

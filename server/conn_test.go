@@ -1,9 +1,11 @@
 package server
 
 import (
+	"encoding/binary"
 	"encoding/csv"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"testing"
 )
@@ -1015,9 +1017,20 @@ func TestParseCopyFromOptions(t *testing.T) {
 			escape:     "",
 		},
 		{
-			name:       "COPY with schema",
+			name:       "COPY with public schema stripped",
 			query:      "COPY public.users FROM STDIN",
-			tableName:  "public.users",
+			tableName:  "users",
+			columnList: "",
+			delimiter:  "\t",
+			hasHeader:  false,
+			nullString: "\\N",
+			quote:      "",
+			escape:     "",
+		},
+		{
+			name:       "COPY with quoted public schema stripped",
+			query:      `COPY "public"."users" FROM STDIN`,
+			tableName:  `"users"`,
 			columnList: "",
 			delimiter:  "\t",
 			hasHeader:  false,
@@ -1513,6 +1526,314 @@ func TestPreparedStmtMultiStatement(t *testing.T) {
 	hasMultiStatement := len(stmt.statements) > 0
 	if !hasMultiStatement {
 		t.Error("expected hasMultiStatement to be true")
+	}
+}
+
+func TestCopyBinaryRegex(t *testing.T) {
+	tests := []struct {
+		name        string
+		query       string
+		shouldMatch bool
+	}{
+		{
+			name:        "FORMAT binary unquoted",
+			query:       "COPY users TO STDOUT (FORMAT binary)",
+			shouldMatch: true,
+		},
+		{
+			name:        "FORMAT BINARY uppercase",
+			query:       "COPY users TO STDOUT (FORMAT BINARY)",
+			shouldMatch: true,
+		},
+		{
+			name:        `FORMAT "binary" quoted`,
+			query:       `COPY users TO STDOUT (FORMAT "binary")`,
+			shouldMatch: true,
+		},
+		{
+			name:        "FORMAT csv should not match",
+			query:       "COPY users TO STDOUT (FORMAT csv)",
+			shouldMatch: false,
+		},
+		{
+			name:        "no FORMAT clause",
+			query:       "COPY users TO STDOUT",
+			shouldMatch: false,
+		},
+		{
+			name:        "FORMAT binary in FROM STDIN",
+			query:       "COPY users FROM STDIN (FORMAT binary)",
+			shouldMatch: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matched := copyBinaryRegex.MatchString(tt.query)
+			if matched != tt.shouldMatch {
+				t.Errorf("copyBinaryRegex.Match(%q) = %v, want %v", tt.query, matched, tt.shouldMatch)
+			}
+		})
+	}
+}
+
+func TestParseCopyFromOptions_Binary(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantErr    bool
+		isBinary   bool
+		tableName  string
+		columnList string
+	}{
+		{
+			name:      "COPY with FORMAT binary",
+			query:     "COPY users FROM STDIN (FORMAT binary)",
+			isBinary:  true,
+			tableName: "users",
+		},
+		{
+			name:       "COPY with columns and FORMAT binary",
+			query:      "COPY users (id, name) FROM STDIN (FORMAT binary)",
+			isBinary:   true,
+			tableName:  "users",
+			columnList: "(id, name)",
+		},
+		{
+			name:      "COPY CSV is not binary",
+			query:     "COPY users FROM STDIN CSV",
+			isBinary:  false,
+			tableName: "users",
+		},
+		{
+			name:      "COPY text format is not binary",
+			query:     "COPY users FROM STDIN",
+			isBinary:  false,
+			tableName: "users",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts, err := ParseCopyFromOptions(tt.query)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseCopyFromOptions(%q) error: %v", tt.query, err)
+			}
+			if opts.IsBinary != tt.isBinary {
+				t.Errorf("IsBinary = %v, want %v", opts.IsBinary, tt.isBinary)
+			}
+			if opts.TableName != tt.tableName {
+				t.Errorf("TableName = %q, want %q", opts.TableName, tt.tableName)
+			}
+			if tt.columnList != "" && opts.ColumnList != tt.columnList {
+				t.Errorf("ColumnList = %q, want %q", opts.ColumnList, tt.columnList)
+			}
+		})
+	}
+}
+
+func TestDecodeBinaryCopy(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		oid      int32
+		expected interface{}
+		wantErr  bool
+	}{
+		{
+			name:     "nil data returns nil",
+			data:     nil,
+			oid:      OidText,
+			expected: nil,
+		},
+		{
+			name:     "empty data text type returns empty string",
+			data:     []byte{},
+			oid:      OidText,
+			expected: "",
+		},
+		{
+			name:     "empty data varchar returns empty string",
+			data:     []byte{},
+			oid:      OidVarchar,
+			expected: "",
+		},
+		{
+			name:     "empty data json returns empty string",
+			data:     []byte{},
+			oid:      OidJSON,
+			expected: "",
+		},
+		{
+			name:     "empty data int returns nil",
+			data:     []byte{},
+			oid:      OidInt4,
+			expected: nil,
+		},
+		{
+			name:     "bool true",
+			data:     []byte{1},
+			oid:      OidBool,
+			expected: true,
+		},
+		{
+			name:     "bool false",
+			data:     []byte{0},
+			oid:      OidBool,
+			expected: false,
+		},
+		{
+			name:     "int2 value 42",
+			data:     []byte{0, 42},
+			oid:      OidInt2,
+			expected: int16(42),
+		},
+		{
+			name:     "int4 value 1000",
+			data:     []byte{0, 0, 3, 232},
+			oid:      OidInt4,
+			expected: int32(1000),
+		},
+		{
+			name:     "int8 value 1000000",
+			data:     []byte{0, 0, 0, 0, 0, 15, 66, 64},
+			oid:      OidInt8,
+			expected: int64(1000000),
+		},
+		{
+			name:     "int OID with 2-byte data uses int2 decode",
+			data:     []byte{0, 7},
+			oid:      OidInt4,
+			expected: int16(7),
+		},
+		{
+			name:     "int OID with 8-byte data uses int8 decode",
+			data:     []byte{0, 0, 0, 0, 0, 0, 0, 1},
+			oid:      OidInt4,
+			expected: int64(1),
+		},
+		{
+			name:     "text data",
+			data:     []byte("hello world"),
+			oid:      OidText,
+			expected: "hello world",
+		},
+		{
+			name:     "varchar data",
+			data:     []byte("test"),
+			oid:      OidVarchar,
+			expected: "test",
+		},
+		{
+			name:     "bytea data",
+			data:     []byte{0xDE, 0xAD, 0xBE, 0xEF},
+			oid:      OidBytea,
+			expected: []byte{0xDE, 0xAD, 0xBE, 0xEF},
+		},
+		{
+			name:     "OidOid (UINTEGER) decodes as int4",
+			data:     []byte{0, 0, 0, 42},
+			oid:      OidOid,
+			expected: int32(42),
+		},
+		{
+			name:     "unknown OID returns string",
+			data:     []byte("some_data"),
+			oid:      99999,
+			expected: "some_data",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decodeBinaryCopy(tt.data, tt.oid)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeBinaryCopy() error: %v", err)
+			}
+			// Compare with type-specific checks
+			switch expected := tt.expected.(type) {
+			case nil:
+				if result != nil {
+					t.Errorf("got %v (%T), want nil", result, result)
+				}
+			case bool:
+				if v, ok := result.(bool); !ok || v != expected {
+					t.Errorf("got %v (%T), want %v", result, result, expected)
+				}
+			case int16:
+				if v, ok := result.(int16); !ok || v != expected {
+					t.Errorf("got %v (%T), want %v", result, result, expected)
+				}
+			case int32:
+				if v, ok := result.(int32); !ok || v != expected {
+					t.Errorf("got %v (%T), want %v", result, result, expected)
+				}
+			case int64:
+				if v, ok := result.(int64); !ok || v != expected {
+					t.Errorf("got %v (%T), want %v", result, result, expected)
+				}
+			case string:
+				if v, ok := result.(string); !ok || v != expected {
+					t.Errorf("got %v (%T), want %q", result, result, expected)
+				}
+			case []byte:
+				if v, ok := result.([]byte); !ok {
+					t.Errorf("got %v (%T), want []byte", result, result)
+				} else {
+					for i := range expected {
+						if i >= len(v) || v[i] != expected[i] {
+							t.Errorf("byte mismatch at index %d", i)
+							break
+						}
+					}
+				}
+			default:
+				t.Errorf("unhandled type in test: %T", expected)
+			}
+		})
+	}
+}
+
+func TestDecodeBinaryCopy_FloatWidthMismatch(t *testing.T) {
+	// DuckDB's postgres extension may send float data with mismatched width
+	// e.g., float4 OID but 8-byte data, or float8 OID but 4-byte data
+
+	// float4 OID with 8-byte data should decode as float8
+	float8Data := make([]byte, 8)
+	bits := math.Float64bits(3.14)
+	binary.BigEndian.PutUint64(float8Data, bits)
+
+	result, err := decodeBinaryCopy(float8Data, OidFloat4)
+	if err != nil {
+		t.Fatalf("decodeBinaryCopy(float8 data, OidFloat4) error: %v", err)
+	}
+	if v, ok := result.(float64); !ok || math.Abs(v-3.14) > 0.001 {
+		t.Errorf("got %v (%T), want ~3.14", result, result)
+	}
+
+	// float8 OID with 4-byte data should decode as float4
+	float4Data := make([]byte, 4)
+	bits32 := math.Float32bits(2.5)
+	binary.BigEndian.PutUint32(float4Data, bits32)
+
+	result, err = decodeBinaryCopy(float4Data, OidFloat8)
+	if err != nil {
+		t.Fatalf("decodeBinaryCopy(float4 data, OidFloat8) error: %v", err)
+	}
+	if v, ok := result.(float32); !ok || math.Abs(float64(v)-2.5) > 0.001 {
+		t.Errorf("got %v (%T), want ~2.5", result, result)
 	}
 }
 

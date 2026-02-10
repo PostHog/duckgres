@@ -4,11 +4,14 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 // initPgCatalog creates PostgreSQL compatibility functions and views in DuckDB
-// DuckDB already has a pg_catalog schema with basic views, so we just add missing functions
-func initPgCatalog(db *sql.DB) error {
+// DuckDB already has a pg_catalog schema with basic views, so we just add missing functions.
+// serverStartTime is the top-level server start time; processStartTime is this process's start time.
+// In standalone mode these are the same; in process isolation mode they differ.
+func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time) error {
 	// Create our own pg_database view that has all the columns psql expects
 	// We put it in main schema and rewrite queries to use it
 	// Include template databases for PostgreSQL compatibility
@@ -404,8 +407,11 @@ func initPgCatalog(db *sql.DB) error {
 	}
 
 	// Create pg_type wrapper that fixes NULL values for JDBC compatibility
-	// DuckDB's pg_catalog.pg_type has NULL for many columns that JDBC clients
-	// expect to have proper defaults.
+	// and adds PostgreSQL OIDs that are missing from DuckDB's pg_catalog.pg_type.
+	// The pg_attribute view maps DuckDB types to PostgreSQL OIDs (e.g., JSON→114,
+	// VARCHAR[]→1015), but DuckDB's pg_type only has entries for basic types.
+	// Without these synthetic entries, JOIN pg_type ON atttypid=oid silently drops
+	// columns with complex types (JSON, arrays, structs).
 	pgTypeSQL := `
 		CREATE OR REPLACE VIEW pg_type AS
 		SELECT
@@ -452,6 +458,67 @@ func initPgCatalog(db *sql.DB) error {
 			typdefault,
 			typacl
 		FROM pg_catalog.pg_type
+		UNION ALL
+		-- Synthetic entries for PostgreSQL OIDs used by pg_attribute but missing from
+		-- DuckDB's pg_type. These ensure JOIN pg_type ON atttypid=oid doesn't drop columns.
+		SELECT
+			v.oid::UINTEGER AS oid,
+			v.typname,
+			11::UINTEGER AS typnamespace,
+			0::UINTEGER AS typowner,
+			v.typlen::SMALLINT AS typlen,
+			false AS typbyval,
+			v.typtype,
+			v.typcategory,
+			false AS typispreferred,
+			true AS typisdefined,
+			v.typdelim AS typdelim,
+			0::UINTEGER AS typrelid,
+			NULL AS typsubscript,
+			v.typelem::UINTEGER AS typelem,
+			0::UINTEGER AS typarray,
+			NULL AS typinput,
+			NULL AS typoutput,
+			NULL AS typreceive,
+			NULL AS typsend,
+			NULL AS typmodin,
+			NULL AS typmodout,
+			NULL AS typanalyze,
+			'i' AS typalign,
+			'x' AS typstorage,
+			false AS typnotnull,
+			0::UINTEGER AS typbasetype,
+			-1::INTEGER AS typtypmod,
+			0::INTEGER AS typndims,
+			0::UINTEGER AS typcollation,
+			NULL AS typdefaultbin,
+			NULL AS typdefault,
+			NULL AS typacl
+		FROM (VALUES
+			-- Base types missing from DuckDB's pg_type
+			(25,   'text',       -1, 'b', 'S', ',', 0),
+			(114,  'json',       -1, 'b', 'U', ',', 0),
+			(3802, 'jsonb',      -1, 'b', 'U', ',', 0),
+			(1042, 'bpchar',     -1, 'b', 'S', ',', 0),
+			(2249, 'record',     -1, 'p', 'P', ',', 0),
+			-- Array types (typelem points to the element base type OID)
+			(1000, '_bool',      -1, 'b', 'A', ',', 16),
+			(1001, '_bytea',     -1, 'b', 'A', ',', 17),
+			(1005, '_int2',      -1, 'b', 'A', ',', 21),
+			(1007, '_int4',      -1, 'b', 'A', ',', 23),
+			(1009, '_text',      -1, 'b', 'A', ',', 25),
+			(1015, '_varchar',   -1, 'b', 'A', ',', 1043),
+			(1016, '_int8',      -1, 'b', 'A', ',', 20),
+			(1021, '_float4',    -1, 'b', 'A', ',', 700),
+			(1022, '_float8',    -1, 'b', 'A', ',', 701),
+			(1115, '_timestamp', -1, 'b', 'A', ',', 1114),
+			(1182, '_date',      -1, 'b', 'A', ',', 1082),
+			(1187, '_interval',  -1, 'b', 'A', ',', 1186),
+			(1231, '_numeric',   -1, 'b', 'A', ',', 1700),
+			(2951, '_uuid',      -1, 'b', 'A', ',', 2950)
+		) AS v(oid, typname, typlen, typtype, typcategory, typdelim, typelem)
+		-- Only include synthetic entries that don't already exist in pg_catalog.pg_type
+		WHERE v.oid NOT IN (SELECT COALESCE(t.oid, 0) FROM pg_catalog.pg_type t)
 	`
 	if _, err := db.Exec(pgTypeSQL); err != nil {
 		slog.Warn("Failed to create pg_type view.", "error", err)
@@ -521,6 +588,8 @@ func initPgCatalog(db *sql.DB) error {
 				WHEN dc.data_type = 'UUID[]' THEN 2951::UINTEGER
 				WHEN dc.data_type = 'INTERVAL[]' THEN 1187::UINTEGER
 				WHEN dc.data_type = 'BLOB[]' OR dc.data_type = 'BYTEA[]' THEN 1001::UINTEGER
+				-- Composite/struct types → PostgreSQL record pseudo-type
+				WHEN dc.data_type LIKE 'STRUCT%' THEN 2249::UINTEGER
 				ELSE a.atttypid::UINTEGER
 			END AS atttypid,
 			a.attstattarget,
@@ -555,6 +624,8 @@ func initPgCatalog(db *sql.DB) error {
 				WHEN dc.data_type = 'CHAR' OR dc.data_type = 'BPCHAR' THEN -1::INTEGER
 				-- All array types are variable length
 				WHEN dc.data_type LIKE '%[]' THEN -1::INTEGER
+				-- Struct/composite types are variable length
+				WHEN dc.data_type LIKE 'STRUCT%' THEN -1::INTEGER
 				ELSE a.attlen
 			END AS attlen,
 			a.attnum::SMALLINT AS attnum,
@@ -590,6 +661,71 @@ func initPgCatalog(db *sql.DB) error {
 	`
 	if _, err := db.Exec(pgAttributeSQL); err != nil {
 		slog.Warn("Failed to create pg_attribute view.", "error", err)
+	}
+
+	// Create pg_constraint stub view for clients that query constraint metadata
+	// (e.g., DuckDB's postgres extension, JDBC drivers)
+	// Returns no rows since DuckDB doesn't have PostgreSQL-style constraints
+	pgConstraintSQL := `
+		CREATE OR REPLACE VIEW pg_constraint AS
+		SELECT
+			NULL::BIGINT AS oid,
+			NULL::VARCHAR AS conname,
+			NULL::BIGINT AS connamespace,
+			NULL::VARCHAR AS contype,
+			NULL::BOOLEAN AS condeferrable,
+			NULL::BOOLEAN AS condeferred,
+			NULL::BOOLEAN AS convalidated,
+			NULL::BIGINT AS conrelid,
+			NULL::BIGINT AS contypid,
+			NULL::BIGINT AS conindid,
+			NULL::BIGINT AS conparentid,
+			NULL::BIGINT AS confrelid,
+			NULL::VARCHAR AS confupdtype,
+			NULL::VARCHAR AS confdeltype,
+			NULL::VARCHAR AS confmatchtype,
+			NULL::BOOLEAN AS conislocal,
+			NULL::INTEGER AS coninhcount,
+			NULL::BOOLEAN AS connoinherit,
+			NULL::INTEGER[] AS conkey,
+			NULL::INTEGER[] AS confkey,
+			NULL::VARCHAR AS conbin,
+			NULL::VARCHAR AS consrc
+		WHERE false
+	`
+	if _, err := db.Exec(pgConstraintSQL); err != nil {
+		slog.Warn("Failed to create pg_constraint view.", "error", err)
+	}
+
+	// Create pg_enum stub view for clients that query enum type metadata
+	// Returns no rows since DuckDB doesn't have PostgreSQL-style enums
+	pgEnumSQL := `
+		CREATE OR REPLACE VIEW pg_enum AS
+		SELECT
+			NULL::BIGINT AS oid,
+			NULL::BIGINT AS enumtypid,
+			NULL::FLOAT AS enumsortorder,
+			NULL::VARCHAR AS enumlabel
+		WHERE false
+	`
+	if _, err := db.Exec(pgEnumSQL); err != nil {
+		slog.Warn("Failed to create pg_enum view.", "error", err)
+	}
+
+	// Create pg_indexes stub view for clients that query index metadata
+	// Returns no rows since DuckDB doesn't expose indexes in PostgreSQL format
+	pgIndexesSQL := `
+		CREATE OR REPLACE VIEW pg_indexes AS
+		SELECT
+			NULL::VARCHAR AS schemaname,
+			NULL::VARCHAR AS tablename,
+			NULL::VARCHAR AS indexname,
+			NULL::VARCHAR AS tablespace,
+			NULL::VARCHAR AS indexdef
+		WHERE false
+	`
+	if _, err := db.Exec(pgIndexesSQL); err != nil {
+		slog.Warn("Failed to create pg_indexes view.", "error", err)
 	}
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
@@ -710,6 +846,17 @@ func initPgCatalog(db *sql.DB) error {
 		// version - return PostgreSQL-compatible version string
 		// Fivetran and other tools check this to determine compatibility
 		`CREATE OR REPLACE MACRO version() AS 'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'`,
+		// uptime - returns server uptime as an INTERVAL
+		// Bakes the server start timestamp into the macro; now() evaluates at query time.
+		// In standalone mode this equals process_uptime(). In process isolation mode
+		// this shows the parent server's lifetime.
+		fmt.Sprintf(`CREATE OR REPLACE MACRO uptime() AS (now() - TIMESTAMP '%s')`,
+			serverStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
+		// process_uptime - returns current process uptime as an INTERVAL
+		// In standalone mode this equals uptime(). In process isolation mode
+		// this shows the child process lifetime (≈ connection duration).
+		fmt.Sprintf(`CREATE OR REPLACE MACRO process_uptime() AS (now() - TIMESTAMP '%s')`,
+			processStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
 	}
 
 	for _, f := range functions {
@@ -1231,8 +1378,9 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 }
 
 // recreatePgNamespaceForDuckLake recreates pg_namespace to source from DuckDB's native
-// duckdb_tables() function to get schema OIDs that are consistent with pg_class_full.
-// We derive namespaces from duckdb_tables() because duckdb_schemas() doesn't have schema_oid.
+// duckdb_tables() and duckdb_views() functions to get schema OIDs that are consistent
+// with pg_class_full. We derive namespaces from both tables and views because
+// duckdb_schemas() doesn't have schema_oid, and some schemas may only contain views.
 // Must be called AFTER DuckLake is attached.
 func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 	pgNamespaceSQL := `
@@ -1242,8 +1390,11 @@ func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 			CASE WHEN schema_name = 'main' THEN 'public' ELSE schema_name END AS nspname,
 			CASE WHEN schema_name = 'main' THEN 6171::BIGINT ELSE 10::BIGINT END AS nspowner,
 			NULL AS nspacl
-		FROM duckdb_tables()
-		WHERE database_name = 'ducklake'
+		FROM (
+			SELECT schema_oid, schema_name FROM duckdb_tables() WHERE database_name = 'ducklake'
+			UNION
+			SELECT schema_oid, schema_name FROM duckdb_views() WHERE database_name = 'ducklake'
+		)
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/binary"
 	"encoding/csv"
 	"errors"
@@ -21,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	duckdb "github.com/duckdb/duckdb-go/v2"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/transpiler"
 )
 
@@ -661,6 +664,26 @@ func (c *clientConn) handleQuery(body []byte) error {
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
+	fmt.Fprintf(os.Stderr, "handleQuery: %s\n", query)
+
+	// Route COPY TO STDOUT / COPY FROM STDIN directly to handleCopy()
+	// before transpilation, because:
+	// 1. The inner SELECT may contain DuckDB-specific syntax (QUALIFY, ASOF, struct literals)
+	//    that pg_query can't parse
+	// 2. handleCopyOut() already extracts and transpiles the inner SELECT separately
+	// 3. validateWithDuckDB() can't EXPLAIN COPY with FORMAT "binary"
+	upperQueryEarly := strings.ToUpper(query)
+	if copyToStdoutRegex.MatchString(upperQueryEarly) || copyFromStdinRegex.MatchString(upperQueryEarly) {
+		return c.handleCopy(query, upperQueryEarly)
+	}
+
+	// Check for multi-statement query (PostgreSQL simple query protocol supports
+	// multiple semicolon-separated statements in a single Q message).
+	// Each statement gets its own results, with a single ReadyForQuery at the end.
+	tree, parseErr := pg_query.Parse(query)
+	if parseErr == nil && len(tree.Stmts) > 1 {
+		return c.handleMultiStatementQuery(tree)
+	}
 
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
 	tr := c.newTranspiler(false)
@@ -758,6 +781,12 @@ func (c *clientConn) handleQuery(body []byte) error {
 					result, err = c.db.ExecContext(ctx, alteredQuery)
 				}
 			}
+			// Retry DROP TABLE as DROP VIEW if target is a view
+			if isDropTableOnViewError(err) {
+				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
+					result, err = c.db.ExecContext(ctx, alteredQuery)
+				}
+			}
 			if err != nil {
 				if isQueryCancelled(err) {
 					c.sendError("ERROR", "57014", "canceling statement due to user request")
@@ -823,6 +852,12 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return err
 	}
 
+	// Extract type OIDs for JSON-aware text formatting
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
 	// Send rows
 	rowCount := 0
 	for rows.Next() {
@@ -840,7 +875,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 			return nil
 		}
 
-		if err := c.sendDataRow(values); err != nil {
+		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
 			return err
 		}
 		rowCount++
@@ -867,6 +902,201 @@ func (c *clientConn) handleQuery(body []byte) error {
 	_ = c.writer.Flush()
 
 	return nil
+}
+
+// handleMultiStatementQuery processes multiple semicolon-separated statements
+// from a single Q (simple query) message. Per the PostgreSQL wire protocol,
+// each statement gets its own RowDescription/DataRow/CommandComplete messages,
+// with a single ReadyForQuery at the end. If any statement fails, remaining
+// statements are skipped.
+func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error {
+	slog.Debug("Multi-statement simple query.", "user", c.username, "count", len(tree.Stmts))
+
+	for _, stmt := range tree.Stmts {
+		// Deparse individual statement back to SQL
+		singleTree := &pg_query.ParseResult{
+			Stmts: []*pg_query.RawStmt{stmt},
+		}
+		singleSQL, err := pg_query.Deparse(singleTree)
+		if err != nil {
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			break
+		}
+
+		errSent, fatalErr := c.executeSingleStatement(singleSQL)
+		if fatalErr != nil {
+			return fatalErr
+		}
+		if errSent {
+			break // Stop processing remaining statements on error
+		}
+	}
+
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// executeSingleStatement transpiles and executes a single SQL statement,
+// sending results to the client. Does NOT send ReadyForQuery (the caller
+// is responsible for that). Returns (true, nil) if an error was sent to the
+// client (so the caller can stop processing a batch), or (false, err) for
+// fatal connection errors.
+func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
+	// Transpile
+	tr := c.newTranspiler(false)
+	result, err := tr.Transpile(query)
+	if err != nil {
+		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		return true, nil
+	}
+
+	if result.FallbackToNative {
+		if err := c.validateWithDuckDB(query); err != nil {
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+			return true, nil
+		}
+		slog.Debug("Fallback to native DuckDB.", "user", c.username, "query", query)
+	}
+
+	if result.Error != nil {
+		c.sendError("ERROR", "42704", result.Error.Error())
+		return true, nil
+	}
+
+	if result.IsIgnoredSet {
+		_ = writeCommandComplete(c.writer, "SET")
+		return false, nil
+	}
+
+	if result.IsNoOp {
+		_ = writeCommandComplete(c.writer, result.NoOpTag)
+		return false, nil
+	}
+
+	// Multi-statement rewrites (writable CTEs) not supported inside batches
+	if len(result.Statements) > 0 {
+		c.sendError("ERROR", "0A000", "writable CTEs not supported in multi-statement queries")
+		return true, nil
+	}
+
+	executedQuery := result.SQL
+	if executedQuery != query {
+		slog.Debug("Query transpiled.", "user", c.username, "executed", executedQuery)
+	}
+
+	upperQuery := strings.ToUpper(executedQuery)
+	cmdType := c.getCommandType(upperQuery)
+
+	// COPY not supported inside batches
+	if cmdType == "COPY" {
+		c.sendError("ERROR", "0A000", "COPY not supported in multi-statement queries")
+		return true, nil
+	}
+
+	if cmdType != "SELECT" {
+		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+			_ = writeCommandComplete(c.writer, "BEGIN")
+			return false, nil
+		}
+
+		ctx, cleanup := c.queryContext()
+		defer cleanup()
+
+		execResult, err := c.db.ExecContext(ctx, executedQuery)
+		if err != nil {
+			if isAlterTableNotTableError(err) {
+				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
+					execResult, err = c.db.ExecContext(ctx, alteredQuery)
+				}
+			}
+			if isDropTableOnViewError(err) {
+				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
+					execResult, err = c.db.ExecContext(ctx, alteredQuery)
+				}
+			}
+			if err != nil {
+				if isQueryCancelled(err) {
+					c.sendError("ERROR", "57014", "canceling statement due to user request")
+				} else {
+					slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
+					c.sendError("ERROR", "42000", err.Error())
+				}
+				c.setTxError()
+				return true, nil
+			}
+		}
+
+		c.updateTxStatus(cmdType)
+		tag := c.buildCommandTag(cmdType, execResult)
+		_ = writeCommandComplete(c.writer, tag)
+		return false, nil
+	}
+
+	// SELECT
+	ctx, cleanup := c.queryContext()
+	defer cleanup()
+
+	rows, err := c.db.QueryContext(ctx, executedQuery)
+	if err != nil {
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+		}
+		c.setTxError()
+		return true, nil
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		return true, nil
+	}
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		return true, nil
+	}
+
+	if err := c.sendRowDescription(cols, colTypes); err != nil {
+		return false, err
+	}
+
+	// Extract type OIDs for JSON-aware text formatting
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
+	rowCount := 0
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			return true, nil
+		}
+
+		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
+			return false, err
+		}
+		rowCount++
+	}
+
+	tag := fmt.Sprintf("SELECT %d", rowCount)
+	_ = writeCommandComplete(c.writer, tag)
+	return false, nil
 }
 
 // executeMultiStatement handles execution of multi-statement query rewrites.
@@ -1160,6 +1390,12 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string, query st
 		return err
 	}
 
+	// Extract type OIDs for JSON-aware text formatting
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
 	// Stream DataRows
 	rowCount := 0
 	for rows.Next() {
@@ -1178,7 +1414,7 @@ func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string, query st
 			return nil
 		}
 
-		if err := c.sendDataRow(values); err != nil {
+		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
 			return err
 		}
 		rowCount++
@@ -1388,6 +1624,7 @@ func (c *clientConn) buildCommandTag(cmdType string, result sql.Result) string {
 var (
 	copyToStdoutRegex   = regexp.MustCompile(`(?i)COPY\s+(.+?)\s+TO\s+STDOUT`)
 	copyFromStdinRegex  = regexp.MustCompile(`(?i)COPY\s+(\S+)\s*(?:\(([^)]+)\)\s*)?FROM\s+STDIN`)
+	copyBinaryRegex     = regexp.MustCompile(`(?i)\bFORMAT\s+(?:"?binary"?|BINARY)\b`)
 	copyWithCSVRegex    = regexp.MustCompile(`(?i)\bCSV\b`)
 	copyWithHeaderRegex = regexp.MustCompile(`(?i)\bHEADER\b`)
 	copyDelimiterRegex  = regexp.MustCompile(`(?i)\bDELIMITER\s+['"](.)['"]\b`)
@@ -1395,6 +1632,22 @@ var (
 	copyQuoteRegex      = regexp.MustCompile(`(?i)\bQUOTE\s+['"](.)['"]\s*`)
 	copyEscapeRegex     = regexp.MustCompile(`(?i)\bESCAPE\s+['"](.)['"]\s*`)
 )
+
+// stripPublicSchema maps PostgreSQL's "public" schema to DuckDB's default schema
+// in COPY table names. Handles both quoted ("public"."table") and unquoted (public.table) forms.
+// This mirrors the transpiler's PublicSchemaTransform but operates on raw table name strings
+// since COPY commands bypass the SQL transpiler (pg_query can't parse COPY ... FORMAT BINARY).
+func stripPublicSchema(tableName string) string {
+	// Quoted form: "public"."tablename" → "tablename"
+	if strings.HasPrefix(tableName, `"public".`) {
+		return tableName[len(`"public".`):]
+	}
+	// Unquoted form: public.tablename → tablename
+	if strings.HasPrefix(strings.ToLower(tableName), "public.") {
+		return tableName[len("public."):]
+	}
+	return tableName
+}
 
 // CopyFromOptions contains parsed options from a COPY FROM STDIN command
 type CopyFromOptions struct {
@@ -1405,6 +1658,7 @@ type CopyFromOptions struct {
 	NullString string
 	Quote      string // Quote character (default " for CSV)
 	Escape     string // Escape character (default same as Quote)
+	IsBinary   bool   // True if FORMAT binary
 }
 
 // ParseCopyFromOptions extracts options from a COPY FROM STDIN command
@@ -1417,7 +1671,7 @@ func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
 	}
 
 	opts := &CopyFromOptions{
-		TableName:  matches[1],
+		TableName:  stripPublicSchema(matches[1]),
 		Delimiter:  "\t", // Default PostgreSQL text format delimiter
 		NullString: "\\N", // Default PostgreSQL null representation
 	}
@@ -1425,6 +1679,12 @@ func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
 	// Extract column list if present
 	if len(matches) > 2 && matches[2] != "" {
 		opts.ColumnList = fmt.Sprintf("(%s)", matches[2])
+	}
+
+	// Detect binary format
+	if copyBinaryRegex.MatchString(upperQuery) {
+		opts.IsBinary = true
+		return opts, nil
 	}
 
 	// Parse delimiter
@@ -1564,14 +1824,6 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		return nil
 	}
 
-	// Parse options
-	delimiter := "\t"
-	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
-		delimiter = m[1]
-	} else if copyWithCSVRegex.MatchString(upperQuery) {
-		delimiter = ","
-	}
-
 	// The source can be a table name or a query in parentheses
 	source := strings.TrimSpace(matches[1])
 	var selectQuery string
@@ -1579,6 +1831,14 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		selectQuery = source[1 : len(source)-1]
 	} else {
 		selectQuery = fmt.Sprintf("SELECT * FROM %s", source)
+	}
+
+	// Transpile the inner SELECT to handle schema mappings (e.g., public -> main)
+	// The outer COPY statement may not have been transpiled if pg_query can't parse
+	// the full COPY syntax (e.g., FORMAT "binary").
+	tr := c.newTranspiler(false)
+	if result, err := tr.Transpile(selectQuery); err == nil && !result.FallbackToNative {
+		selectQuery = result.SQL
 	}
 
 	// Execute the query
@@ -1603,7 +1863,35 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		return nil
 	}
 
-	// Send CopyOutResponse
+	isBinary := copyBinaryRegex.MatchString(query)
+
+	if isBinary {
+		return c.handleCopyOutBinary(rows, cols)
+	}
+
+	// Get column types for JSON-aware formatting
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
+	// Parse text/CSV options
+	delimiter := "\t"
+	if m := copyDelimiterRegex.FindStringSubmatch(query); len(m) > 1 {
+		delimiter = m[1]
+	} else if copyWithCSVRegex.MatchString(upperQuery) {
+		delimiter = ","
+	}
+
+	// Send CopyOutResponse (text format)
 	if err := writeCopyOutResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
 	}
@@ -1633,8 +1921,12 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 		// Format row as tab/comma separated values
 		var rowData []string
-		for _, v := range values {
-			rowData = append(rowData, c.formatCopyValue(v))
+		for i, v := range values {
+			if typeOIDs[i] == OidJSON || typeOIDs[i] == OidJSONB {
+				rowData = append(rowData, string(encodeJSON(v)))
+			} else {
+				rowData = append(rowData, c.formatCopyValue(v))
+			}
 		}
 		line := strings.Join(rowData, delimiter) + "\n"
 		if err := writeCopyData(c.writer, []byte(line)); err != nil {
@@ -1654,10 +1946,133 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	return nil
 }
 
+// handleCopyOutBinary handles COPY ... TO STDOUT (FORMAT binary)
+// Implements PostgreSQL's binary COPY format: header, binary-encoded tuples, trailer.
+// Sends one CopyData message per tuple, with header prepended to the first tuple
+// and trailer appended to the last, matching how clients like DuckDB's postgres
+// extension consume binary COPY streams via PQgetCopyData.
+func (c *clientConn) handleCopyOutBinary(rows *sql.Rows, cols []string) error {
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	// Get type OIDs for each column
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
+	// Send CopyOutResponse (binary format)
+	if err := writeCopyOutResponse(c.writer, int16(len(cols)), false); err != nil {
+		return err
+	}
+	_ = c.writer.Flush()
+
+	// Binary COPY header (19 bytes)
+	binaryHeader := []byte{
+		'P', 'G', 'C', 'O', 'P', 'Y', '\n', 0xFF, '\r', '\n', 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	}
+
+	// encodeTuple encodes a single tuple in PostgreSQL binary COPY format
+	encodeTuple := func(values []interface{}) []byte {
+		var buf bytes.Buffer
+		_ = binary.Write(&buf, binary.BigEndian, int16(len(values)))
+		for i, v := range values {
+			if v == nil {
+				_ = binary.Write(&buf, binary.BigEndian, int32(-1))
+			} else {
+				data := encodeBinary(v, typeOIDs[i])
+				if data == nil {
+					_ = binary.Write(&buf, binary.BigEndian, int32(-1))
+				} else {
+					_ = binary.Write(&buf, binary.BigEndian, int32(len(data)))
+					buf.Write(data)
+				}
+			}
+		}
+		return buf.Bytes()
+	}
+
+	// Send each tuple as its own CopyData message.
+	// The header is prepended to the first tuple's message.
+	rowCount := 0
+	firstRow := true
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+
+		tupleBytes := encodeTuple(values)
+		fmt.Fprintf(os.Stderr, "handleCopyOutBinary: tuple bytes (%d bytes): %X\n", len(tupleBytes), tupleBytes)
+		for i, v := range values {
+			fmt.Fprintf(os.Stderr, "  col[%d] type=%T oid=%d\n", i, v, typeOIDs[i])
+		}
+
+		if firstRow {
+			// First CopyData message: header + tuple
+			msg := make([]byte, 0, int64(len(binaryHeader))+int64(len(tupleBytes)))
+			msg = append(msg, binaryHeader...)
+			msg = append(msg, tupleBytes...)
+			if err := writeCopyData(c.writer, msg); err != nil {
+				return err
+			}
+			firstRow = false
+		} else {
+			if err := writeCopyData(c.writer, tupleBytes); err != nil {
+				return err
+			}
+		}
+		rowCount++
+	}
+
+	// If no rows, still need to send header + trailer
+	if firstRow {
+		// No rows at all: send header + trailer in one message
+		msg := make([]byte, 0, len(binaryHeader)+2)
+		msg = append(msg, binaryHeader...)
+		msg = append(msg, 0xFF, 0xFF) // trailer: -1 as int16
+		if err := writeCopyData(c.writer, msg); err != nil {
+			return err
+		}
+	} else {
+		// Send trailer as its own CopyData message
+		if err := writeCopyData(c.writer, []byte{0xFF, 0xFF}); err != nil {
+			return err
+		}
+	}
+
+	// Send CopyDone
+	if err := writeCopyDone(c.writer); err != nil {
+		return err
+	}
+
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
 // handleCopyIn handles COPY ... FROM STDIN
 func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	copyStartTime := time.Now()
-	slog.Debug("COPY FROM STDIN starting.", "user", c.username)
+	slog.Debug("COPY FROM STDIN starting.", "user", c.username, "query", query)
 
 	// Parse COPY options using the helper function
 	opts, err := ParseCopyFromOptions(query)
@@ -1671,10 +2086,17 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 	tableName := opts.TableName
 	columnList := opts.ColumnList
-	slog.Debug("COPY FROM STDIN parsed.", "user", c.username, "table", tableName, "columns", columnList)
+	slog.Debug("COPY FROM STDIN parsed.", "user", c.username, "table", tableName, "columns", columnList, "binary", opts.IsBinary)
 
-	// Get column count for the table
-	colQuery := fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
+	// Get column info. If a column list is specified, query only those columns
+	// in the specified order to match the binary data field order.
+	var colQuery string
+	if columnList != "" {
+		// columnList is "(col1, col2, ...)" — use it in SELECT to get types in COPY order
+		colQuery = fmt.Sprintf("SELECT %s FROM %s LIMIT 0", columnList[1:len(columnList)-1], tableName)
+	} else {
+		colQuery = fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
+	}
 	testRows, err := c.db.Query(colQuery)
 	if err != nil {
 		slog.Error("COPY FROM table check failed.", "user", c.username, "table", tableName, "error", err)
@@ -1685,7 +2107,13 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return nil
 	}
 	cols, _ := testRows.Columns()
+	colTypes, _ := testRows.ColumnTypes()
 	_ = testRows.Close()
+
+	// Branch to binary handler if binary format
+	if opts.IsBinary {
+		return c.handleCopyInBinary(opts, cols, colTypes)
+	}
 
 	// Send CopyInResponse
 	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
@@ -1725,6 +2153,12 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 		switch msgType {
 		case msgCopyData:
+			// Skip the PostgreSQL text COPY end-of-data marker (\.\n).
+			// Some clients send this as a CopyData message before CopyDone.
+			if (len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
+				(len(body) == 2 && body[0] == '\\' && body[1] == '.') {
+				continue
+			}
 			n, err := tmpFile.Write(body)
 			if err != nil {
 				slog.Error("COPY FROM STDIN failed to write to temp file.", "user", c.username, "error", err)
@@ -1793,12 +2227,366 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	}
 }
 
+// handleCopyInBinary handles COPY ... FROM STDIN with binary format.
+// It parses the PostgreSQL binary COPY format, decodes each field, and INSERTs rows.
+func (c *clientConn) handleCopyInBinary(opts *CopyFromOptions, cols []string, colTypes []*sql.ColumnType) error {
+	copyStartTime := time.Now()
+
+	// Get type OIDs for decoding
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
+	// Send CopyInResponse (binary format)
+	if err := writeCopyInResponse(c.writer, int16(len(cols)), false); err != nil {
+		return err
+	}
+	_ = c.writer.Flush()
+	slog.Debug("COPY FROM STDIN binary: sent CopyInResponse.", "user", c.username)
+
+	// Collect all CopyData messages into a buffer
+	var buf bytes.Buffer
+	for {
+		msgType, body, err := readMessage(c.reader)
+		if err != nil {
+			slog.Error("COPY FROM STDIN binary: error reading message.", "user", c.username, "error", err)
+			return err
+		}
+
+		switch msgType {
+		case msgCopyData:
+			buf.Write(body)
+
+		case msgCopyDone:
+			// Parse binary data and insert rows
+			data := buf.Bytes()
+			rowCount, err := c.parseBinaryCopyAndInsert(data, opts.TableName, opts.ColumnList, cols, typeOIDs)
+			if err != nil {
+				slog.Error("COPY FROM STDIN binary: parse/insert failed.", "user", c.username, "error", err)
+				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
+				c.setTxError()
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
+				return nil
+			}
+
+			elapsed := time.Since(copyStartTime)
+			slog.Info("COPY FROM STDIN binary completed.", "user", c.username, "rows", rowCount, "bytes", buf.Len(), "duration", elapsed)
+
+			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		case msgCopyFail:
+			errMsg := string(bytes.TrimRight(body, "\x00"))
+			c.sendError("ERROR", "57014", fmt.Sprintf("COPY failed: %s", errMsg))
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		default:
+			c.sendError("ERROR", "08P01", fmt.Sprintf("unexpected message type during COPY: %c", msgType))
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+	}
+}
+
+// splitQualifiedName splits a possibly-quoted SQL name like "schema"."table" into parts.
+func splitQualifiedName(name string) []string {
+	var parts []string
+	var current strings.Builder
+	inQuotes := false
+	for i := 0; i < len(name); i++ {
+		if name[i] == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+		if name[i] == '.' && !inQuotes {
+			parts = append(parts, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteByte(name[i])
+	}
+	parts = append(parts, current.String())
+	return parts
+}
+
+// appendWithDuckDBAppender uses the DuckDB Appender API for fast bulk inserts.
+// Only works for full-column inserts (no column subset).
+func (c *clientConn) appendWithDuckDBAppender(tableName string, rows [][]interface{}) (int, error) {
+	parts := splitQualifiedName(tableName)
+
+	ctx := context.Background()
+	sqlConn, err := c.db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get DB connection: %w", err)
+	}
+	defer sqlConn.Close() //nolint:errcheck
+
+	var rowCount int
+	err = sqlConn.Raw(func(driverConn interface{}) error {
+		dc, ok := driverConn.(driver.Conn)
+		if !ok {
+			return fmt.Errorf("underlying connection does not implement driver.Conn")
+		}
+
+		var appender *duckdb.Appender
+		var appErr error
+		switch len(parts) {
+		case 1:
+			appender, appErr = duckdb.NewAppenderFromConn(dc, "", parts[0])
+		case 2:
+			appender, appErr = duckdb.NewAppenderFromConn(dc, parts[0], parts[1])
+		default:
+			appender, appErr = duckdb.NewAppender(dc, parts[0], parts[1], parts[2])
+		}
+		if appErr != nil {
+			return fmt.Errorf("failed to create Appender: %w", appErr)
+		}
+
+		for i, row := range rows {
+			driverVals := make([]driver.Value, len(row))
+			for j, v := range row {
+				driverVals[j] = v
+			}
+			if appErr = appender.AppendRow(driverVals...); appErr != nil {
+				_ = appender.Close()
+				return fmt.Errorf("AppendRow failed at row %d: %w", i+1, appErr)
+			}
+		}
+
+		if appErr = appender.Close(); appErr != nil {
+			return fmt.Errorf("Appender.Close failed: %w", appErr)
+		}
+
+		rowCount = len(rows)
+		return nil
+	})
+
+	return rowCount, err
+}
+
+// batchInsertRows inserts rows using batched multi-row INSERT statements.
+// Used as fallback when Appender can't be used (column subsets, unsupported types).
+func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string, rows [][]interface{}) (int, error) {
+	const batchSize = 1000
+	numCols := len(cols)
+
+	colNames := columnList
+	if colNames == "" {
+		quotedCols := make([]string, numCols)
+		for i, col := range cols {
+			quotedCols[i] = fmt.Sprintf(`"%s"`, col)
+		}
+		colNames = "(" + strings.Join(quotedCols, ", ") + ")"
+	}
+
+	rowCount := 0
+	for start := 0; start < len(rows); start += batchSize {
+		end := start + batchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		batch := rows[start:end]
+
+		var valueClauses []string
+		var args []interface{}
+		paramIdx := 1
+		for _, row := range batch {
+			placeholders := make([]string, numCols)
+			for j := range row {
+				placeholders[j] = fmt.Sprintf("$%d", paramIdx)
+				args = append(args, row[j])
+				paramIdx++
+			}
+			valueClauses = append(valueClauses, "("+strings.Join(placeholders, ", ")+")")
+		}
+
+		insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES %s",
+			tableName, colNames, strings.Join(valueClauses, ", "))
+
+		if _, err := c.db.Exec(insertSQL, args...); err != nil {
+			return rowCount, fmt.Errorf("batch INSERT failed at rows %d-%d: %v", start+1, start+len(batch), err)
+		}
+		rowCount += len(batch)
+	}
+
+	return rowCount, nil
+}
+
+// parseBinaryCopyAndInsert parses PostgreSQL binary COPY format data and inserts rows.
+// Uses the DuckDB Appender API for full-column inserts (fast path), falling back to
+// batched multi-row INSERT for column subsets or unsupported types.
+func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList string, cols []string, typeOIDs []int32) (int, error) {
+	offset := 0
+
+	// Validate and skip header (19+ bytes)
+	// Signature: "PGCOPY\n\377\r\n\0" (11 bytes)
+	if len(data) < 19 {
+		return 0, fmt.Errorf("binary COPY data too short for header")
+	}
+	expectedSig := []byte{'P', 'G', 'C', 'O', 'P', 'Y', '\n', 0xFF, '\r', '\n', 0x00}
+	if !bytes.Equal(data[:11], expectedSig) {
+		return 0, fmt.Errorf("invalid binary COPY signature")
+	}
+	offset = 11
+
+	// Flags (4 bytes) and extension area length (4 bytes)
+	offset += 4
+	extLen := binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+	offset += int(extLen) // skip extension area
+
+	numCols := len(cols)
+
+	// Parse all rows from binary data first
+	var rows [][]interface{}
+	for offset < len(data) {
+		if offset+2 > len(data) {
+			return len(rows), fmt.Errorf("truncated binary COPY data at tuple header")
+		}
+
+		fieldCount := int16(binary.BigEndian.Uint16(data[offset:]))
+		offset += 2
+
+		// Trailer: field count of -1
+		if fieldCount == -1 {
+			break
+		}
+
+		if int(fieldCount) != numCols {
+			return len(rows), fmt.Errorf("binary COPY field count mismatch: got %d, expected %d", fieldCount, numCols)
+		}
+
+		values := make([]interface{}, numCols)
+		for i := 0; i < numCols; i++ {
+			if offset+4 > len(data) {
+				return len(rows), fmt.Errorf("truncated binary COPY data at field %d length", i)
+			}
+
+			fieldLen := int32(binary.BigEndian.Uint32(data[offset:]))
+			offset += 4
+
+			if fieldLen == -1 {
+				values[i] = nil
+			} else {
+				if offset+int(fieldLen) > len(data) {
+					return len(rows), fmt.Errorf("truncated binary COPY data at field %d data", i)
+				}
+				fieldData := data[offset : offset+int(fieldLen)]
+				offset += int(fieldLen)
+
+				decoded, err := decodeBinaryCopy(fieldData, typeOIDs[i])
+				if err != nil {
+					return len(rows), fmt.Errorf("failed to decode field %d (OID %d, %d bytes): %v", i, typeOIDs[i], fieldLen, err)
+				}
+				values[i] = decoded
+			}
+		}
+		rows = append(rows, values)
+	}
+
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	// Fast path: use Appender for full-column inserts (no column subset)
+	if columnList == "" {
+		count, err := c.appendWithDuckDBAppender(tableName, rows)
+		if err == nil {
+			return count, nil
+		}
+		slog.Warn("Appender failed, falling back to batched INSERT.", "table", tableName, "error", err)
+	}
+
+	// Fallback: batched multi-row INSERT
+	return c.batchInsertRows(tableName, columnList, cols, rows)
+}
+
+// decodeBinaryCopy decodes a binary COPY field, using field length to resolve type ambiguity.
+// DuckDB's postgres extension may send different integer widths than what the table OID suggests.
+func decodeBinaryCopy(data []byte, oid int32) (interface{}, error) {
+	if data == nil {
+		return nil, nil
+	}
+
+	// Zero-length fields: return empty string for text types, empty bytes for bytea, nil for others
+	if len(data) == 0 {
+		switch oid {
+		case OidText, OidVarchar, OidBpchar, OidName, OidJSON, OidJSONB:
+			return "", nil
+		case OidBytea:
+			return []byte{}, nil
+		default:
+			return nil, nil
+		}
+	}
+
+	switch oid {
+	case OidBool:
+		return decodeBool(data)
+	case OidInt2, OidInt4, OidInt8, OidOid:
+		// Use field length to determine actual integer width
+		switch len(data) {
+		case 2:
+			return decodeInt2(data)
+		case 4:
+			return decodeInt4(data)
+		case 8:
+			return decodeInt8(data)
+		default:
+			return string(data), nil
+		}
+	case OidFloat4:
+		if len(data) == 8 {
+			return decodeFloat8(data)
+		}
+		return decodeFloat4(data)
+	case OidFloat8:
+		if len(data) == 4 {
+			return decodeFloat4(data)
+		}
+		return decodeFloat8(data)
+	case OidNumeric:
+		return decodeNumeric(data)
+	case OidDate:
+		return decodeDate(data)
+	case OidTimestamp, OidTimestamptz:
+		return decodeTimestamp(data)
+	case OidTime:
+		return decodeTime(data)
+	case OidInterval:
+		return decodeInterval(data)
+	case OidUUID:
+		return decodeUUID(data)
+	case OidBytea:
+		return data, nil
+	default:
+		// For text, varchar, and unknown types, return as string
+		return string(data), nil
+	}
+}
+
 // formatCopyValue formats a value for COPY output
 func (c *clientConn) formatCopyValue(v interface{}) string {
 	if v == nil {
 		return "\\N"
 	}
-	return fmt.Sprintf("%v", v)
+	switch val := v.(type) {
+	case []any:
+		return formatArrayValue(val)
+	case map[string]any:
+		return formatMapValue(val)
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }
 
 // parseCopyLine parses a line of COPY input
@@ -1842,8 +2630,9 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 		typeSize := c.mapTypeSizeWithColumnName(col, colTypes[i])
 		_ = binary.Write(&buf, binary.BigEndian, typeSize)
 
-		// Type modifier (-1 = no modifier)
-		_ = binary.Write(&buf, binary.BigEndian, int32(-1))
+		// Type modifier (e.g. precision/scale for NUMERIC, -1 = no modifier)
+		typmod := getTypeInfo(colTypes[i]).Typmod
+		_ = binary.Write(&buf, binary.BigEndian, typmod)
 
 		// Format code (0 = text, 1 = binary)
 		_ = binary.Write(&buf, binary.BigEndian, int16(0))
@@ -1875,10 +2664,6 @@ func (c *clientConn) mapTypeSizeWithColumnName(colName string, colType *sql.Colu
 		}
 	}
 	return getTypeInfo(colType).Size
-}
-
-func (c *clientConn) sendDataRow(values []interface{}) error {
-	return c.sendDataRowWithFormats(values, nil, nil)
 }
 
 // sendDataRowWithFormats sends a data row with optional binary encoding
@@ -1921,8 +2706,13 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 				buf.Write(encoded)
 			}
 		} else {
-			// Text encoding
-			str := formatValue(v)
+			// Text encoding — use JSON re-serialization for JSON columns
+			var str string
+			if typeOIDs != nil && i < len(typeOIDs) && (typeOIDs[i] == OidJSON || typeOIDs[i] == OidJSONB) {
+				str = string(encodeJSON(v))
+			} else {
+				str = formatValue(v)
+			}
 			_ = binary.Write(&buf, binary.BigEndian, int32(len(str)))
 			buf.WriteString(str)
 		}
@@ -1970,10 +2760,79 @@ func formatValue(v interface{}) string {
 			return val.Format("2006-01-02 15:04:05.999999")
 		}
 		return val.Format("2006-01-02 15:04:05")
+	case []any:
+		// PostgreSQL array text format: {1,2,3}
+		return formatArrayValue(val)
+	case map[string]any:
+		// STRUCT text format: {"key1": val1, "key2": val2}
+		return formatMapValue(val)
 	default:
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+// formatArrayValue formats a []any slice as PostgreSQL text array: {1,2,3}
+func formatArrayValue(arr []any) string {
+	var buf strings.Builder
+	buf.WriteByte('{')
+	for i, elem := range arr {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if elem == nil {
+			buf.WriteString("NULL")
+		} else {
+			s := formatValue(elem)
+			// Quote strings that contain special characters
+			if needsArrayQuoting(s) {
+				buf.WriteByte('"')
+				// Escape backslashes and double quotes
+				for _, c := range s {
+					if c == '"' || c == '\\' {
+						buf.WriteByte('\\')
+					}
+					buf.WriteRune(c)
+				}
+				buf.WriteByte('"')
+			} else {
+				buf.WriteString(s)
+			}
+		}
+	}
+	buf.WriteByte('}')
+	return buf.String()
+}
+
+// needsArrayQuoting returns true if a string value needs quoting inside a PostgreSQL array literal
+func needsArrayQuoting(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, c := range s {
+		if c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || c == ' ' {
+			return true
+		}
+	}
+	return false
+}
+
+// formatMapValue formats a map[string]any as a key-value text representation
+func formatMapValue(m map[string]any) string {
+	var buf strings.Builder
+	buf.WriteByte('{')
+	first := true
+	for k, v := range m {
+		if !first {
+			buf.WriteString(", ")
+		}
+		first = false
+		buf.WriteString(k)
+		buf.WriteString("=")
+		buf.WriteString(formatValue(v))
+	}
+	buf.WriteByte('}')
+	return buf.String()
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
@@ -2020,6 +2879,7 @@ func (c *clientConn) handleParse(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid Parse message")
 		return
 	}
+	fmt.Fprintf(os.Stderr, "handleParse: stmt=%q query=%s\n", stmtName, query)
 
 	// Read number of parameter types
 	var numParamTypes int16
@@ -2405,6 +3265,12 @@ func (c *clientConn) handleExecute(body []byte) {
 					result, err = c.db.Exec(alteredQuery, args...)
 				}
 			}
+			// Retry DROP TABLE as DROP VIEW if target is a view
+			if isDropTableOnViewError(err) {
+				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(p.stmt.convertedQuery); ok {
+					result, err = c.db.Exec(alteredQuery, args...)
+				}
+			}
 			if err != nil {
 				slog.Error("Query execution failed.", "user", c.username, "query", p.stmt.convertedQuery, "original_query", p.stmt.query, "error", err)
 				c.sendError("ERROR", "42000", err.Error())
@@ -2543,4 +3409,13 @@ func isAlterTableNotTableError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "cannot use alter table") &&
 		strings.Contains(msg, "not a table")
+}
+
+// isDropTableOnViewError checks if the error indicates that a DROP TABLE
+// was attempted on a view. DuckDB returns:
+// "Catalog Error: Existing object X is of type View, trying to drop type Table"
+func isDropTableOnViewError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "is of type View") &&
+		strings.Contains(msg, "trying to drop type Table")
 }

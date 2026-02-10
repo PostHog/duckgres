@@ -97,13 +97,20 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 
 		case *pg_query.Node_AlterTableStmt:
 			if n.AlterTableStmt != nil {
-				// Check for unsupported ALTER TABLE commands (constraints, NOT NULL, DEFAULT, etc.)
 				for _, cmd := range n.AlterTableStmt.Cmds {
 					if alterCmd := cmd.GetAlterTableCmd(); alterCmd != nil {
+						// Check for unsupported ALTER TABLE commands (constraints, NOT NULL, DEFAULT, etc.)
 						if t.isUnsupportedAlterCommand(alterCmd) {
 							result.IsNoOp = true
 							result.NoOpTag = "ALTER TABLE"
 							return true, nil
+						}
+						// Make ADD COLUMN idempotent by adding IF NOT EXISTS.
+						// DuckLake reuses physical tables across sqlmesh snapshots, so
+						// columns may already exist when sqlmesh issues ALTER TABLE ADD COLUMN.
+						if alterCmd.Subtype == pg_query.AlterTableType_AT_AddColumn && !alterCmd.MissingOk {
+							alterCmd.MissingOk = true
+							changed = true
 						}
 					}
 				}

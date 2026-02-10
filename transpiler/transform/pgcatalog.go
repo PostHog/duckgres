@@ -52,6 +52,9 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_partitioned_table":  "pg_partitioned_table",
 			"pg_type":               "pg_type",
 			"pg_attribute":          "pg_attribute",
+			"pg_constraint":         "pg_constraint",
+			"pg_enum":               "pg_enum",
+			"pg_indexes":            "pg_indexes",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
@@ -76,6 +79,9 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"version":                         true,
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
 			"unnest":                          true, // DuckDB has unnest, just strip pg_catalog prefix
+			"json_object":                     true, // DuckDB native function, just strip pg_catalog prefix
+			"uptime":                          true, // Server uptime as INTERVAL
+			"process_uptime":                  true, // Current process uptime as INTERVAL
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -98,6 +104,8 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"obj_description":                 true, // Returns NULL
 			"col_description":                 true, // Returns NULL
 			"pg_get_partkeydef":               true, // Returns empty string
+			"uptime":                          true, // Server uptime as INTERVAL
+			"process_uptime":                  true, // Current process uptime as INTERVAL
 		},
 	}
 }
@@ -417,6 +425,14 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 		// ORDER BY clause items
 		if n.SortBy != nil {
 			t.walkAndTransform(n.SortBy.Node, changed)
+		}
+
+	case *pg_query.Node_ViewStmt:
+		if n.ViewStmt != nil {
+			if n.ViewStmt.View != nil {
+				t.walkAndTransform(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: n.ViewStmt.View}}, changed)
+			}
+			t.walkAndTransform(n.ViewStmt.Query, changed)
 		}
 	}
 }

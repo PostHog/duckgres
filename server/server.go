@@ -22,6 +22,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+// processStartTime is captured at process init, used to distinguish server vs child process uptime.
+var processStartTime = time.Now()
+
 // redactConnectionString removes sensitive information (passwords) from connection strings for logging
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s]+)`)
 
@@ -402,13 +405,15 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 // createDBConnection creates a DuckDB connection for a client session.
 // This is a thin wrapper around CreateDBConnection using the server's config.
 func (s *Server) createDBConnection(username string) (*sql.DB, error) {
-	return CreateDBConnection(s.cfg, s.duckLakeSem, username)
+	return CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime)
 }
 
 // CreateDBConnection creates a DuckDB connection for a client session.
 // Uses in-memory database as an anchor for DuckLake attachment (actual data lives in RDS/S3).
 // This is a standalone function so it can be reused by both the server and control plane workers.
-func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string) (*sql.DB, error) {
+// serverStartTime is the time the top-level server process started (may differ from processStartTime
+// in process isolation mode where each child has its own processStartTime).
+func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time) (*sql.DB, error) {
 	// Create new in-memory connection (DuckLake provides actual storage)
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
@@ -467,7 +472,7 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string) 
 	// Initialize pg_catalog schema for PostgreSQL compatibility
 	// Must be done BEFORE attaching DuckLake so macros are created in memory.main,
 	// not in the DuckLake catalog (which doesn't support macro storage).
-	if err := initPgCatalog(db); err != nil {
+	if err := initPgCatalog(db, serverStartTime, processStartTime); err != nil {
 		slog.Warn("Failed to initialize pg_catalog.", "user", username, "error", err)
 		// Continue anyway - basic queries will still work
 	}
@@ -619,6 +624,18 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 				return fmt.Errorf("failed to create S3 secret: %w", err)
 			}
 		}
+	}
+
+	// Warn if metadata store appears to connect via pgbouncer.
+	// pgbouncer's connection lifecycle management (idle timeout, server_lifetime, etc.)
+	// can kill connections that DuckLake's internal metadata database depends on,
+	// causing cascading failures during long queries.
+	if strings.Contains(dlCfg.MetadataStore, " port=6432") ||
+		strings.Contains(dlCfg.MetadataStore, ":6432/") ||
+		strings.HasSuffix(dlCfg.MetadataStore, ":6432") {
+		slog.Warn("DuckLake metadata store appears to connect via pgbouncer (port 6432). " +
+			"This can cause connection drops during long queries. " +
+			"Consider connecting directly to PostgreSQL instead.")
 	}
 
 	// Build the ATTACH statement
@@ -908,6 +925,15 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 	defer func() {
 		s.rateLimiter.UnregisterConnection(remoteAddr)
 		_ = conn.Close()
+	}()
+
+	// Recover from Go-level panics (e.g., from DuckDB CGO boundary).
+	// This won't catch C++ fatal signals (SIGABRT/SIGSEGV) — process isolation handles those.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Recovered from panic in connection handler.",
+				"remote_addr", remoteAddr, "panic", r)
+		}
 	}()
 
 	c := &clientConn{

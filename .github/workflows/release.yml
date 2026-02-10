@@ -36,7 +36,8 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          go build -o duckgres-${{ matrix.goos }}-${{ matrix.goarch }} .
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          go build -ldflags "-X main.version=build-${SHORT_SHA} -X main.commit=${{ github.sha }} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
