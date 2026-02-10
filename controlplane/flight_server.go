@@ -61,15 +61,21 @@ func NewFlightSessionServer(worker *Worker, pid int32, remoteAddr string) *Fligh
 		txnOwner:   make(map[string]string),
 	}
 
-	s.BaseServer.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerName, "duckgres")
-	s.BaseServer.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerVersion, "1.0.0")
-	s.BaseServer.RegisterSqlInfo(flightsql.SqlInfoTransactionsSupported, true)
+	if err := s.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerName, "duckgres"); err != nil {
+		panic(fmt.Sprintf("register sql info server name: %v", err))
+	}
+	if err := s.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerVersion, "1.0.0"); err != nil {
+		panic(fmt.Sprintf("register sql info server version: %v", err))
+	}
+	if err := s.RegisterSqlInfo(flightsql.SqlInfoTransactionsSupported, true); err != nil {
+		panic(fmt.Sprintf("register sql info transactions supported: %v", err))
+	}
 
 	return s
 }
 
 func (s *FlightSessionServer) Serve(listener net.Listener, tlsConfig *tls.Config) error {
-	s.flightSrv = flight.NewFlightServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
+	s.flightSrv = flight.NewServerWithMiddleware(nil, grpc.Creds(credentials.NewTLS(tlsConfig)))
 	s.flightSrv.RegisterFlightService(flightsql.NewFlightServer(s))
 	s.flightSrv.InitListener(listener)
 	return s.flightSrv.Serve()
@@ -244,7 +250,9 @@ func (s *FlightSessionServer) DoGetStatement(ctx context.Context, ticket flights
 			ch <- flight.StreamChunk{Err: err}
 			return
 		}
-		defer rows.Close()
+		defer func() {
+			_ = rows.Close()
+		}()
 
 		s.worker.totalQueries.Add(1)
 		for {
@@ -437,9 +445,8 @@ func (s *FlightSessionServer) DoGetPreparedStatement(ctx context.Context,
 		return nil, nil, err
 	}
 
-	handleID := string(cmd.GetPreparedStatementHandle())
 	s.mu.RLock()
-	handle, ok := s.queries[handleID]
+	handle, ok := s.queries[string(cmd.GetPreparedStatementHandle())]
 	s.mu.RUnlock()
 	if !ok {
 		return nil, nil, status.Error(codes.NotFound, "prepared statement not found")
@@ -468,7 +475,9 @@ func (s *FlightSessionServer) DoGetPreparedStatement(ctx context.Context,
 			ch <- flight.StreamChunk{Err: err}
 			return
 		}
-		defer rows.Close()
+		defer func() {
+			_ = rows.Close()
+		}()
 
 		s.worker.totalQueries.Add(1)
 		for {
@@ -542,7 +551,9 @@ func (s *FlightSessionServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 			ch <- flight.StreamChunk{Err: qerr}
 			return
 		}
-		defer rows.Close()
+		defer func() {
+			_ = rows.Close()
+		}()
 
 		builder := array.NewRecordBuilder(s.alloc, schema)
 		defer builder.Release()
@@ -571,7 +582,7 @@ func (s *FlightSessionServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 			ch <- flight.StreamChunk{Err: rowErr}
 			return
 		}
-		ch <- flight.StreamChunk{Data: builder.NewRecord()}
+		ch <- flight.StreamChunk{Data: builder.NewRecordBatch()}
 	}()
 
 	return schema, ch, nil
@@ -654,7 +665,9 @@ func (s *FlightSessionServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			ch <- flight.StreamChunk{Err: qerr}
 			return
 		}
-		defer rows.Close()
+		defer func() {
+			_ = rows.Close()
+		}()
 
 		type tableInfo struct {
 			catalog   sql.NullString
@@ -709,7 +722,7 @@ func (s *FlightSessionServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			}
 		}
 
-		ch <- flight.StreamChunk{Data: builder.NewRecord()}
+		ch <- flight.StreamChunk{Data: builder.NewRecordBatch()}
 	}()
 
 	return schema, ch, nil
@@ -758,7 +771,9 @@ func (s *FlightSessionServer) getQuerySchema(ctx context.Context, db *sql.DB, qu
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
@@ -772,7 +787,7 @@ func (s *FlightSessionServer) getQuerySchema(ctx context.Context, db *sql.DB, qu
 	return arrow.NewSchema(fields, nil), nil
 }
 
-func (s *FlightSessionServer) rowsToRecord(rows *sql.Rows, schema *arrow.Schema, batchSize int) (arrow.Record, error) {
+func (s *FlightSessionServer) rowsToRecord(rows *sql.Rows, schema *arrow.Schema, batchSize int) (arrow.RecordBatch, error) {
 	builder := array.NewRecordBuilder(s.alloc, schema)
 	defer builder.Release()
 
@@ -801,7 +816,7 @@ func (s *FlightSessionServer) rowsToRecord(rows *sql.Rows, schema *arrow.Schema,
 	if count == 0 {
 		return nil, nil
 	}
-	return builder.NewRecord(), nil
+	return builder.NewRecordBatch(), nil
 }
 
 func duckDBTypeToArrow(dbType string) arrow.DataType {

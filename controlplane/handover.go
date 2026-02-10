@@ -261,7 +261,7 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener,
 		if !ok {
 			_ = flightLn.Close()
 			_ = tcpLn.Close()
-			return nil, nil, nil, fmt.Errorf("Flight listener is not TCP")
+			return nil, nil, nil, fmt.Errorf("flight listener is not TCP")
 		}
 	}
 
