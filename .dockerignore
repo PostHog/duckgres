@@ -1,0 +1,7 @@
+.git
+data/
+certs/
+*.db
+*.duckdb
+.idea/
+.vscode/
