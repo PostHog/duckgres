@@ -420,7 +420,6 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		// Edge case test tables
 		"error_recovery_tx",
 		"error_then_tx",
-		"constraint_recovery",
 		"prepare_ddl_test",
 		"stmt_across_tx",
 		"savepoint_basic",
@@ -435,13 +434,19 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		"explain_insert_test",
 		"explain_a",
 		"explain_b",
-		"empty_ops",
 		"empty_update",
 		"empty_delete",
 		"empty_agg",
 		"join_populated",
 		"join_empty",
 		"multi_stmt_test",
+		"concurrent_write_0",
+		"concurrent_write_1",
+		"concurrent_write_2",
+		"concurrent_write_3",
+		"concurrent_write_4",
+		"concurrent_ddl_test",
+		"concurrent_dml_test",
 	}
 
 	for _, t := range tables {

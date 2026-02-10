@@ -86,20 +86,54 @@ func TestConcurrentConnections(t *testing.T) {
 		conn2 := openDuckgresConn(t)
 		defer func() { _ = conn2.Close() }()
 
-		// conn1 does DDL
+		// Set up tables before the concurrent phase
 		mustExec(t, conn1, "CREATE TABLE concurrent_ddl_test (id INTEGER, name TEXT)")
-		mustExec(t, conn1, "INSERT INTO concurrent_ddl_test VALUES (1, 'one')")
-
-		// conn2 runs DML on its own table simultaneously
 		mustExec(t, conn2, "CREATE TABLE concurrent_dml_test (id INTEGER)")
-		mustExec(t, conn2, "INSERT INTO concurrent_dml_test VALUES (42)")
 
-		var val int
-		if err := conn2.QueryRow("SELECT id FROM concurrent_dml_test").Scan(&val); err != nil {
-			t.Fatalf("conn2 query failed: %v", err)
-		}
-		if val != 42 {
-			t.Errorf("Expected 42, got %d", val)
+		// Run DDL and DML concurrently on separate connections
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			// conn1: multiple inserts + ALTER TABLE
+			if _, err := conn1.Exec("INSERT INTO concurrent_ddl_test VALUES (1, 'one')"); err != nil {
+				errs <- fmt.Errorf("conn1 insert: %w", err)
+				return
+			}
+			if _, err := conn1.Exec("ALTER TABLE concurrent_ddl_test ADD COLUMN extra TEXT"); err != nil {
+				errs <- fmt.Errorf("conn1 alter: %w", err)
+				return
+			}
+			if _, err := conn1.Exec("INSERT INTO concurrent_ddl_test (id, name, extra) VALUES (2, 'two', 'added')"); err != nil {
+				errs <- fmt.Errorf("conn1 insert after alter: %w", err)
+				return
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			// conn2: inserts + reads
+			for j := 1; j <= 5; j++ {
+				if _, err := conn2.Exec(fmt.Sprintf("INSERT INTO concurrent_dml_test VALUES (%d)", j)); err != nil {
+					errs <- fmt.Errorf("conn2 insert %d: %w", j, err)
+					return
+				}
+			}
+			var count int
+			if err := conn2.QueryRow("SELECT COUNT(*) FROM concurrent_dml_test").Scan(&count); err != nil {
+				errs <- fmt.Errorf("conn2 count: %w", err)
+				return
+			}
+			if count != 5 {
+				errs <- fmt.Errorf("conn2: expected 5 rows, got %d", count)
+			}
+		}()
+
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Error(err)
 		}
 
 		_, _ = conn1.Exec("DROP TABLE concurrent_ddl_test")
@@ -133,6 +167,9 @@ func TestConcurrentConnections(t *testing.T) {
 }
 
 // TestErrorRecovery tests that sessions remain usable after various error states.
+// Note: basic single-error recovery is covered by TestProtocolErrors/error_recovery.
+// These tests cover more complex scenarios: errors inside transactions and
+// error-then-transaction sequences.
 func TestErrorRecovery(t *testing.T) {
 	t.Run("error_in_transaction_then_rollback", func(t *testing.T) {
 		conn := openDuckgresConn(t)
@@ -148,7 +185,7 @@ func TestErrorRecovery(t *testing.T) {
 		_, _ = tx.Exec("INSERT INTO nonexistent_table VALUES (1)") // error
 		_ = tx.Rollback()
 
-		// Connection should still work
+		// Connection should still work after error-in-tx + rollback
 		mustExec(t, conn, "INSERT INTO error_recovery_tx VALUES (1)")
 		var count int
 		if err := conn.QueryRow("SELECT COUNT(*) FROM error_recovery_tx").Scan(&count); err != nil {
@@ -161,33 +198,14 @@ func TestErrorRecovery(t *testing.T) {
 		mustExec(t, conn, "DROP TABLE error_recovery_tx")
 	})
 
-	t.Run("multiple_errors_same_connection", func(t *testing.T) {
-		conn := openDuckgresConn(t)
-		defer func() { _ = conn.Close() }()
-
-		// Fire several errors in sequence
-		_, _ = conn.Exec("SELECT * FROM table_does_not_exist_1")
-		_, _ = conn.Exec("SELECT * FROM table_does_not_exist_2")
-		_, _ = conn.Exec("SELEC bad syntax")
-
-		// Connection should still work
-		var val int
-		if err := conn.QueryRow("SELECT 42").Scan(&val); err != nil {
-			t.Fatalf("Query after errors failed: %v", err)
-		}
-		if val != 42 {
-			t.Errorf("Expected 42, got %d", val)
-		}
-	})
-
 	t.Run("error_then_successful_transaction", func(t *testing.T) {
 		conn := openDuckgresConn(t)
 		defer func() { _ = conn.Close() }()
 
-		// Cause an error
+		// Cause an error outside of a transaction
 		_, _ = conn.Exec("SELECT * FROM nonexistent_recovery_table")
 
-		// Now do a successful transaction
+		// Now do a full successful transaction (BEGIN, INSERT, COMMIT)
 		mustExec(t, conn, "CREATE TABLE error_then_tx (id INTEGER)")
 		tx, err := conn.Begin()
 		if err != nil {
@@ -211,59 +229,18 @@ func TestErrorRecovery(t *testing.T) {
 
 		mustExec(t, conn, "DROP TABLE error_then_tx")
 	})
-
-	t.Run("division_by_zero_recovery", func(t *testing.T) {
-		conn := openDuckgresConn(t)
-		defer func() { _ = conn.Close() }()
-
-		_, err := conn.Exec("SELECT 1/0")
-		if err == nil {
-			t.Log("DuckDB may not error on division by zero (returns NULL or Inf)")
-		}
-
-		// Connection should still work
-		var val int
-		if err := conn.QueryRow("SELECT 1").Scan(&val); err != nil {
-			t.Fatalf("Query after division error failed: %v", err)
-		}
-		if val != 1 {
-			t.Errorf("Expected 1, got %d", val)
-		}
-	})
-
-	t.Run("constraint_violation_recovery", func(t *testing.T) {
-		conn := openDuckgresConn(t)
-		defer func() { _ = conn.Close() }()
-
-		mustExec(t, conn, "CREATE TABLE constraint_recovery (id INTEGER PRIMARY KEY, val TEXT)")
-		mustExec(t, conn, "INSERT INTO constraint_recovery VALUES (1, 'first')")
-
-		// Violate PK constraint
-		_, err := conn.Exec("INSERT INTO constraint_recovery VALUES (1, 'duplicate')")
-		if err == nil {
-			t.Log("No constraint error — DuckDB may not enforce PK in all modes")
-		}
-
-		// Connection should still work
-		var count int
-		if err := conn.QueryRow("SELECT COUNT(*) FROM constraint_recovery").Scan(&count); err != nil {
-			t.Fatalf("Query after constraint violation failed: %v", err)
-		}
-		if count < 1 {
-			t.Errorf("Expected at least 1 row, got %d", count)
-		}
-
-		mustExec(t, conn, "DROP TABLE constraint_recovery")
-	})
 }
 
 // TestPreparedStatementEdgeCases tests advanced prepared statement scenarios.
+// Note: basic prepare/execute/reuse is covered by TestProtocolExtendedQuery.
+// These tests cover scenarios ORMs depend on: high parameter counts, error
+// resilience, multiple active statements, NULL params, and cross-tx usage.
 func TestPreparedStatementEdgeCases(t *testing.T) {
 	t.Run("many_parameters", func(t *testing.T) {
 		conn := openDuckgresConn(t)
 		defer func() { _ = conn.Close() }()
 
-		// Build query with 20 parameters
+		// Build query with 20 parameters — tests PlaceholderTransform at scale
 		var placeholders []string
 		var args []interface{}
 		for i := 1; i <= 20; i++ {
@@ -304,7 +281,7 @@ func TestPreparedStatementEdgeCases(t *testing.T) {
 		// Cause an error (string where int expected)
 		_ = stmt.QueryRow("not_a_number").Scan(&val)
 
-		// Should still work after error
+		// Same prepared statement should still work after error
 		if err := stmt.QueryRow(10).Scan(&val); err != nil {
 			t.Fatalf("Reuse after error failed: %v", err)
 		}
@@ -329,6 +306,7 @@ func TestPreparedStatementEdgeCases(t *testing.T) {
 		}
 		defer func() { _ = stmt2.Close() }()
 
+		// Interleave execution of both statements
 		var val1, val2 int
 		if err := stmt1.QueryRow(5).Scan(&val1); err != nil {
 			t.Fatalf("stmt1 query failed: %v", err)
@@ -348,13 +326,27 @@ func TestPreparedStatementEdgeCases(t *testing.T) {
 		conn := openDuckgresConn(t)
 		defer func() { _ = conn.Close() }()
 
-		// Preparing DDL may succeed or fail depending on server — both are acceptable
-		_, err := conn.Exec("CREATE TABLE prepare_ddl_test (id INTEGER)")
+		// Actually prepare a DDL statement — some drivers/servers reject this,
+		// others allow it. Either outcome is acceptable.
+		stmt, err := conn.Prepare("CREATE TABLE prepare_ddl_test (id INTEGER)")
 		if err != nil {
-			t.Fatalf("DDL exec failed: %v", err)
+			t.Logf("Prepare DDL returned error (acceptable): %v", err)
+			// Connection should still be usable
+			var val int
+			if err := conn.QueryRow("SELECT 1").Scan(&val); err != nil {
+				t.Fatalf("Connection broken after failed prepare: %v", err)
+			}
+			return
+		}
+		defer func() { _ = stmt.Close() }()
+
+		_, err = stmt.Exec()
+		if err != nil {
+			t.Logf("Exec prepared DDL returned error (acceptable): %v", err)
+			return
 		}
 
-		// Verify table exists
+		// Verify table was created
 		var count int
 		if err := conn.QueryRow("SELECT COUNT(*) FROM prepare_ddl_test").Scan(&count); err != nil {
 			t.Fatalf("Query failed: %v", err)
@@ -404,7 +396,7 @@ func TestPreparedStatementEdgeCases(t *testing.T) {
 			t.Fatalf("Commit tx1 failed: %v", err)
 		}
 
-		// Use in second transaction
+		// Use same prepared statement in second transaction
 		tx2, err := conn.Begin()
 		if err != nil {
 			t.Fatalf("Begin tx2 failed: %v", err)
@@ -429,7 +421,9 @@ func TestPreparedStatementEdgeCases(t *testing.T) {
 	})
 }
 
-// TestSavepoints tests nested transaction control.
+// TestSavepoints tests nested transaction control used by ORMs (Django, Rails).
+// Currently skipped because DuckDB does not support SAVEPOINT syntax.
+// These tests will activate automatically if/when support is added.
 func TestSavepoints(t *testing.T) {
 	t.Run("basic_savepoint", func(t *testing.T) {
 		skipIfKnown(t)
@@ -845,26 +839,10 @@ func TestExplain(t *testing.T) {
 }
 
 // TestEmptyTableOperations tests operations on tables with no rows.
+// Note: basic empty SELECT is covered by TestProtocolSimpleQuery/empty_result.
+// These tests cover UPDATE/DELETE returning 0 rows affected, aggregate NULL
+// behavior, and JOINs where one side is empty.
 func TestEmptyTableOperations(t *testing.T) {
-	t.Run("select_empty", func(t *testing.T) {
-		conn := openDuckgresConn(t)
-		defer func() { _ = conn.Close() }()
-
-		mustExec(t, conn, "CREATE TABLE empty_ops (id INTEGER, val TEXT, num DOUBLE)")
-
-		rows, err := conn.Query("SELECT * FROM empty_ops")
-		if err != nil {
-			t.Fatalf("SELECT from empty table failed: %v", err)
-		}
-		defer func() { _ = rows.Close() }()
-
-		if rows.Next() {
-			t.Error("Expected no rows from empty table")
-		}
-
-		mustExec(t, conn, "DROP TABLE empty_ops")
-	})
-
 	t.Run("update_empty", func(t *testing.T) {
 		conn := openDuckgresConn(t)
 		defer func() { _ = conn.Close() }()
@@ -955,7 +933,9 @@ func TestEmptyTableOperations(t *testing.T) {
 	})
 }
 
-// TestMultiStatementBehavior tests handling of multi-statement query strings.
+// TestMultiStatementBehavior tests that a single query string containing multiple
+// semicolon-separated statements is handled correctly. This is distinct from
+// TestProtocolMultipleStatements which sends separate query calls sequentially.
 func TestMultiStatementBehavior(t *testing.T) {
 	t.Run("two_selects", func(t *testing.T) {
 		conn := openDuckgresConn(t)
@@ -1069,32 +1049,6 @@ func TestConnectionParameters(t *testing.T) {
 		}
 		if val != 1 {
 			t.Errorf("Expected 1, got %d", val)
-		}
-	})
-
-	t.Run("multiple_reconnects", func(t *testing.T) {
-		connStr := fmt.Sprintf(
-			"host=127.0.0.1 port=%d user=testuser password=testpass dbname=test sslmode=require",
-			testHarness.dgPort,
-		)
-
-		for i := range 5 {
-			db, err := sql.Open("postgres", connStr)
-			if err != nil {
-				t.Fatalf("Reconnect %d: open failed: %v", i, err)
-			}
-			db.SetMaxOpenConns(1)
-			db.SetMaxIdleConns(1)
-
-			var val int
-			if err := db.QueryRow("SELECT 1").Scan(&val); err != nil {
-				_ = db.Close()
-				t.Fatalf("Reconnect %d: query failed: %v", i, err)
-			}
-			if val != 1 {
-				t.Errorf("Reconnect %d: expected 1, got %d", i, val)
-			}
-			_ = db.Close()
 		}
 	})
 }
