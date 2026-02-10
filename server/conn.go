@@ -2532,7 +2532,7 @@ func decodeBinaryCopy(data []byte, oid int32) (interface{}, error) {
 	switch oid {
 	case OidBool:
 		return decodeBool(data)
-	case OidInt2, OidInt4, OidInt8:
+	case OidInt2, OidInt4, OidInt8, OidOid:
 		// Use field length to determine actual integer width
 		switch len(data) {
 		case 2:

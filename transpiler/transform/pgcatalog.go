@@ -79,6 +79,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"version":                         true,
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
 			"unnest":                          true, // DuckDB has unnest, just strip pg_catalog prefix
+			"json_object":                     true, // DuckDB native function, just strip pg_catalog prefix
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.

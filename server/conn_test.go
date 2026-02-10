@@ -1737,6 +1737,12 @@ func TestDecodeBinaryCopy(t *testing.T) {
 			expected: []byte{0xDE, 0xAD, 0xBE, 0xEF},
 		},
 		{
+			name:     "OidOid (UINTEGER) decodes as int4",
+			data:     []byte{0, 0, 0, 42},
+			oid:      OidOid,
+			expected: int32(42),
+		},
+		{
 			name:     "unknown OID returns string",
 			data:     []byte("some_data"),
 			oid:      99999,
