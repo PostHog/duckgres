@@ -112,7 +112,6 @@ Create a `duckgres.yaml` file (see `duckgres.example.yaml` for a complete exampl
 host: "0.0.0.0"
 port: 5432
 flight:
-  host: "0.0.0.0"
   port: 8815
 data_dir: "./data"
 
@@ -151,7 +150,6 @@ Run with config file:
 | `DUCKGRES_CONFIG` | Path to YAML config file | - |
 | `DUCKGRES_HOST` | Host to bind to | `0.0.0.0` |
 | `DUCKGRES_PORT` | Port to listen on | `5432` |
-| `DUCKGRES_FLIGHT_HOST` | Flight SQL host (control-plane mode) | `DUCKGRES_HOST` |
 | `DUCKGRES_FLIGHT_PORT` | Flight SQL port (control-plane mode) | `8815` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
@@ -197,7 +195,6 @@ Options:
   -worker-count int        Number of worker processes (control-plane mode, default 4)
   -socket-dir string       Unix socket directory (control-plane mode)
   -handover-socket string  Handover socket for graceful deployment (control-plane mode)
-  -flight-host string      Flight SQL host to bind to (control-plane mode)
   -flight-port int         Flight SQL port to listen on (control-plane mode, default 8815)
 ```
 

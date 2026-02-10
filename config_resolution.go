@@ -17,13 +17,11 @@ type configCLIInputs struct {
 	KeyFile          string
 	ProcessIsolation bool
 	IdleTimeout      string
-	FlightHost       string
 	FlightPort       int
 }
 
 type resolvedConfig struct {
 	Server     server.Config
-	FlightHost string
 	FlightPort int
 }
 
@@ -53,7 +51,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	cfg := defaultServerConfig()
-	flightHost := ""
 	flightPort := 0
 
 	if fileCfg != nil {
@@ -62,9 +59,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.Port != 0 {
 			cfg.Port = fileCfg.Port
-		}
-		if fileCfg.Flight.Host != "" {
-			flightHost = fileCfg.Flight.Host
 		}
 		if fileCfg.Flight.Port != 0 {
 			flightPort = fileCfg.Flight.Port
@@ -169,9 +163,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_KEY"); v != "" {
 		cfg.TLSKeyFile = v
 	}
-	if v := getenv("DUCKGRES_FLIGHT_HOST"); v != "" {
-		flightHost = v
-	}
 	if v := getenv("DUCKGRES_FLIGHT_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			flightPort = p
@@ -256,26 +247,19 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid --idle-timeout duration: " + err.Error())
 		}
 	}
-	if cli.Set["flight-host"] {
-		flightHost = cli.FlightHost
-	}
 	if cli.Set["flight-port"] {
 		flightPort = cli.FlightPort
 	}
 
 	return resolvedConfig{
 		Server:     cfg,
-		FlightHost: flightHost,
 		FlightPort: flightPort,
 	}
 }
 
-func effectiveFlightConfig(cfg server.Config, flightHost string, flightPort int) (string, int) {
-	if flightHost == "" {
-		flightHost = cfg.Host
-	}
+func effectiveFlightConfig(_ server.Config, flightPort int) int {
 	if flightPort == 0 {
 		flightPort = 8815
 	}
-	return flightHost, flightPort
+	return flightPort
 }

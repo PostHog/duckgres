@@ -25,7 +25,6 @@ type ControlPlaneConfig struct {
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
 	MaxConnsPerWorker   int
-	FlightHost          string
 	FlightPort          int
 }
 
@@ -54,9 +53,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if cfg.HealthCheckInterval == 0 {
 		cfg.HealthCheckInterval = 5 * time.Second
 	}
-	if cfg.FlightHost == "" {
-		cfg.FlightHost = cfg.Host
-	}
 	if cfg.FlightPort == 0 {
 		cfg.FlightPort = 8815
 	}
@@ -64,9 +60,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		slog.Error("Invalid flight port.", "flight_port", cfg.FlightPort)
 		os.Exit(1)
 	}
-	if cfg.FlightHost == cfg.Host && cfg.FlightPort == cfg.Port {
-		slog.Error("Flight listener cannot share host+port with PG listener.",
-			"host", cfg.Host, "port", cfg.Port)
+	if cfg.FlightPort == cfg.Port {
+		slog.Error("Flight listener cannot share port with PG listener on the same host.",
+			"host", cfg.Host, "port", cfg.Port, "flight_port", cfg.FlightPort)
 		os.Exit(1)
 	}
 
@@ -140,7 +136,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 		cp.pgListener = ln
 
-		flightAddr := fmt.Sprintf("%s:%d", cfg.FlightHost, cfg.FlightPort)
+		flightAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.FlightPort)
 		flightLn, err := net.Listen("tcp", flightAddr)
 		if err != nil {
 			_ = cp.pgListener.Close()

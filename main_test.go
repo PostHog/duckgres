@@ -17,7 +17,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		Host: "file-host",
 		Port: 5000,
 		Flight: FlightFileConfig{
-			Host: "file-flight-host",
 			Port: 7777,
 		},
 		DataDir: "/tmp/file-data",
@@ -35,7 +34,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		"DUCKGRES_DATA_DIR":          "/tmp/env-data",
 		"DUCKGRES_CERT":              "/tmp/env.crt",
 		"DUCKGRES_KEY":               "/tmp/env.key",
-		"DUCKGRES_FLIGHT_HOST":       "env-flight-host",
 		"DUCKGRES_FLIGHT_PORT":       "8888",
 		"DUCKGRES_PROCESS_ISOLATION": "true",
 		"DUCKGRES_IDLE_TIMEOUT":      "2h",
@@ -50,7 +48,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 			"key":               true,
 			"process-isolation": true,
 			"idle-timeout":      true,
-			"flight-host":       true,
 			"flight-port":       true,
 		},
 		Host:             "cli-host",
@@ -60,7 +57,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		KeyFile:          "/tmp/cli.key",
 		ProcessIsolation: false,
 		IdleTimeout:      "3h",
-		FlightHost:       "cli-flight-host",
 		FlightPort:       9999,
 	}, envFromMap(env), nil)
 
@@ -85,9 +81,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	if resolved.Server.IdleTimeout != 3*time.Hour {
 		t.Fatalf("idle timeout precedence mismatch: got %s", resolved.Server.IdleTimeout)
 	}
-	if resolved.FlightHost != "cli-flight-host" {
-		t.Fatalf("flight host precedence mismatch: got %q", resolved.FlightHost)
-	}
 	if resolved.FlightPort != 9999 {
 		t.Fatalf("flight port precedence mismatch: got %d", resolved.FlightPort)
 	}
@@ -98,7 +91,6 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 		Host: "file-host",
 		Port: 5000,
 		Flight: FlightFileConfig{
-			Host: "file-flight-host",
 			Port: 7777,
 		},
 	}
@@ -106,7 +98,6 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_HOST":        "env-host",
 		"DUCKGRES_PORT":        "6000",
-		"DUCKGRES_FLIGHT_HOST": "env-flight-host",
 		"DUCKGRES_FLIGHT_PORT": "8888",
 	}
 
@@ -117,9 +108,6 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	}
 	if resolved.Server.Port != 6000 {
 		t.Fatalf("expected env port, got %d", resolved.Server.Port)
-	}
-	if resolved.FlightHost != "env-flight-host" {
-		t.Fatalf("expected env flight host, got %q", resolved.FlightHost)
 	}
 	if resolved.FlightPort != 8888 {
 		t.Fatalf("expected env flight port, got %d", resolved.FlightPort)
@@ -185,12 +173,7 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 
 func TestEffectiveFlightConfigDefaults(t *testing.T) {
 	cfg := defaultServerConfig()
-	cfg.Host = "resolved-host"
-
-	host, port := effectiveFlightConfig(cfg, "", 0)
-	if host != "resolved-host" {
-		t.Fatalf("expected default flight host from server host, got %q", host)
-	}
+	port := effectiveFlightConfig(cfg, 0)
 	if port != 8815 {
 		t.Fatalf("expected default flight port 8815, got %d", port)
 	}
