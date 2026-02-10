@@ -25,6 +25,8 @@ type ControlPlaneConfig struct {
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
 	MaxConnsPerWorker   int
+	FlightHost          string
+	FlightPort          int
 }
 
 // ControlPlane manages the TCP listener and worker pool.
@@ -32,7 +34,8 @@ type ControlPlane struct {
 	cfg         ControlPlaneConfig
 	pool        *WorkerPool
 	rateLimiter *server.RateLimiter
-	listener    net.Listener
+	pgListener  net.Listener
+	flightLn    net.Listener
 	activeConns int64
 	closed      bool
 	closeMu     sync.Mutex
@@ -50,6 +53,27 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 	if cfg.HealthCheckInterval == 0 {
 		cfg.HealthCheckInterval = 5 * time.Second
+	}
+	if cfg.FlightHost == "" {
+		cfg.FlightHost = cfg.Host
+	}
+	if cfg.FlightPort == 0 {
+		cfg.FlightPort = 8815
+	}
+	if cfg.FlightPort < 1 || cfg.FlightPort > 65535 {
+		slog.Error("Invalid flight port.", "flight_port", cfg.FlightPort)
+		os.Exit(1)
+	}
+	if cfg.FlightHost == cfg.Host && cfg.FlightPort == cfg.Port {
+		slog.Error("Flight listener cannot share host+port with PG listener.",
+			"host", cfg.Host, "port", cfg.Port)
+		os.Exit(1)
+	}
+
+	// Enforce secure defaults for control-plane mode.
+	if err := validateControlPlaneSecurity(cfg); err != nil {
+		slog.Error("Invalid control-plane security configuration.", "error", err)
+		os.Exit(1)
 	}
 
 	// Create socket directory
@@ -78,11 +102,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if cfg.HandoverSocket != "" {
 		if _, err := os.Stat(cfg.HandoverSocket); err == nil {
 			slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
-			tcpLn, existingWorkers, err := receiveHandover(cfg.HandoverSocket)
+			pgLn, flightLn, existingWorkers, err := receiveHandover(cfg.HandoverSocket)
 			if err != nil {
 				slog.Warn("Handover failed, starting fresh.", "error", err)
 			} else {
-				cp.listener = tcpLn
+				cp.pgListener = pgLn
+				cp.flightLn = flightLn
 				handoverDone = true
 
 				// Connect to existing workers instead of spawning new ones
@@ -113,7 +138,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			slog.Error("Failed to listen.", "addr", addr, "error", err)
 			os.Exit(1)
 		}
-		cp.listener = ln
+		cp.pgListener = ln
+
+		flightAddr := fmt.Sprintf("%s:%d", cfg.FlightHost, cfg.FlightPort)
+		flightLn, err := net.Listen("tcp", flightAddr)
+		if err != nil {
+			_ = cp.pgListener.Close()
+			slog.Error("Failed to listen for Flight.", "addr", flightAddr, "error", err)
+			os.Exit(1)
+		}
+		cp.flightLn = flightLn
 	}
 
 	// Start health check loop
@@ -122,7 +156,10 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Start handover listener for future deployments
 	cp.startHandoverListener()
 
-	slog.Info("Control plane listening.", "addr", cp.listener.Addr().String(), "workers", cfg.WorkerCount)
+	slog.Info("Control plane listening.",
+		"pg_addr", cp.pgListener.Addr().String(),
+		"flight_addr", cp.flightLn.Addr().String(),
+		"workers", cfg.WorkerCount)
 
 	// Handle signals
 	go func() {
@@ -143,7 +180,8 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}()
 
-	// Accept loop
+	// Accept loops
+	go cp.acceptFlightLoop()
 	cp.acceptLoop()
 }
 
@@ -160,7 +198,7 @@ func makeShutdownCtx(_ <-chan os.Signal) context.Context {
 
 func (cp *ControlPlane) acceptLoop() {
 	for {
-		conn, err := cp.listener.Accept()
+		conn, err := cp.pgListener.Accept()
 		if err != nil {
 			cp.closeMu.Lock()
 			closed := cp.closed
@@ -267,6 +305,76 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 }
 
+func (cp *ControlPlane) acceptFlightLoop() {
+	for {
+		conn, err := cp.flightLn.Accept()
+		if err != nil {
+			cp.closeMu.Lock()
+			closed := cp.closed
+			cp.closeMu.Unlock()
+			if closed {
+				return
+			}
+			slog.Error("Flight accept error.", "error", err)
+			continue
+		}
+
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+
+		cp.wg.Add(1)
+		go func() {
+			defer cp.wg.Done()
+			cp.handleFlightConnection(conn)
+		}()
+	}
+}
+
+func (cp *ControlPlane) handleFlightConnection(conn net.Conn) {
+	remoteAddr := conn.RemoteAddr()
+
+	if msg := cp.rateLimiter.CheckConnection(remoteAddr); msg != "" {
+		slog.Warn("Flight connection rejected.", "remote_addr", remoteAddr, "reason", msg)
+		_ = conn.Close()
+		return
+	}
+	if !cp.rateLimiter.RegisterConnection(remoteAddr) {
+		slog.Warn("Flight connection rejected: rate limit.", "remote_addr", remoteAddr)
+		_ = conn.Close()
+		return
+	}
+	defer cp.rateLimiter.UnregisterConnection(remoteAddr)
+
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		slog.Error("Flight connection is not TCP.", "remote_addr", remoteAddr)
+		_ = conn.Close()
+		return
+	}
+
+	file, err := tcpConn.File()
+	if err != nil {
+		slog.Error("Failed to get Flight connection FD.", "remote_addr", remoteAddr, "error", err)
+		_ = conn.Close()
+		return
+	}
+
+	_ = conn.Close()
+	defer func() { _ = file.Close() }()
+
+	atomic.AddInt64(&cp.activeConns, 1)
+	defer atomic.AddInt64(&cp.activeConns, -1)
+
+	backendPid, err := cp.pool.RouteFlightConnection(file, remoteAddr.String())
+	if err != nil {
+		slog.Error("Failed to route Flight connection.", "remote_addr", remoteAddr, "error", err)
+		return
+	}
+	slog.Debug("Flight connection routed.", "remote_addr", remoteAddr, "backend_pid", backendPid)
+}
+
 // startupResult holds the parsed initial startup message.
 type startupResult struct {
 	sslRequest      bool
@@ -326,8 +434,11 @@ func (cp *ControlPlane) shutdown() {
 	cp.closed = true
 	cp.closeMu.Unlock()
 
-	if cp.listener != nil {
-		_ = cp.listener.Close()
+	if cp.pgListener != nil {
+		_ = cp.pgListener.Close()
+	}
+	if cp.flightLn != nil {
+		_ = cp.flightLn.Close()
 	}
 
 	slog.Info("Draining workers...")

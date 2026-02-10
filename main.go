@@ -22,6 +22,7 @@ import (
 type FileConfig struct {
 	Host             string              `yaml:"host"`
 	Port             int                 `yaml:"port"`
+	Flight           FlightFileConfig    `yaml:"flight"`
 	DataDir          string              `yaml:"data_dir"`
 	TLS              TLSConfig           `yaml:"tls"`
 	Users            map[string]string   `yaml:"users"`
@@ -30,6 +31,11 @@ type FileConfig struct {
 	DuckLake         DuckLakeFileConfig  `yaml:"ducklake"`
 	ProcessIsolation bool                `yaml:"process_isolation"` // Enable process isolation per connection
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
+}
+
+type FlightFileConfig struct {
+	Host string `yaml:"host"`
+	Port int    `yaml:"port"`
 }
 
 type TLSConfig struct {
@@ -125,6 +131,8 @@ func main() {
 	workerCount := flag.Int("worker-count", 4, "Number of worker processes (control-plane mode)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
+	flightHost := flag.String("flight-host", "", "Flight SQL host to bind to (control-plane mode, env: DUCKGRES_FLIGHT_HOST)")
+	flightPort := flag.Int("flight-port", 0, "Flight SQL port to listen on (control-plane mode, env: DUCKGRES_FLIGHT_PORT)")
 	grpcSocket := flag.String("grpc-socket", "", "gRPC socket path (worker mode, set by control-plane)")
 	fdSocket := flag.String("fd-socket", "", "FD passing socket path (worker mode, set by control-plane)")
 
@@ -140,6 +148,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_HOST        Flight SQL host (control-plane mode, default: DUCKGRES_HOST)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_PORT        Flight SQL port (control-plane mode, default: 8815)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
@@ -196,6 +206,12 @@ func main() {
 		}
 		if fileCfg.Port != 0 {
 			cfg.Port = fileCfg.Port
+		}
+		if fileCfg.Flight.Host != "" {
+			*flightHost = fileCfg.Flight.Host
+		}
+		if fileCfg.Flight.Port != 0 {
+			*flightPort = fileCfg.Flight.Port
 		}
 		if fileCfg.DataDir != "" {
 			cfg.DataDir = fileCfg.DataDir
@@ -303,6 +319,14 @@ func main() {
 	}
 	if v := os.Getenv("DUCKGRES_KEY"); v != "" {
 		cfg.TLSKeyFile = v
+	}
+	if v := os.Getenv("DUCKGRES_FLIGHT_HOST"); v != "" {
+		*flightHost = v
+	}
+	if v := os.Getenv("DUCKGRES_FLIGHT_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			*flightPort = p
+		}
 	}
 	if v := os.Getenv("DUCKGRES_DUCKLAKE_METADATA_STORE"); v != "" {
 		cfg.DuckLake.MetadataStore = v
@@ -435,11 +459,22 @@ func main() {
 
 	// Handle control-plane mode
 	if *mode == "control-plane" {
+		effectiveFlightHost := *flightHost
+		if effectiveFlightHost == "" {
+			effectiveFlightHost = cfg.Host
+		}
+		effectiveFlightPort := *flightPort
+		if effectiveFlightPort == 0 {
+			effectiveFlightPort = 8815
+		}
+
 		cpCfg := controlplane.ControlPlaneConfig{
 			Config:         cfg,
 			WorkerCount:    *workerCount,
 			SocketDir:      *socketDir,
 			HandoverSocket: *handoverSocket,
+			FlightHost:     effectiveFlightHost,
+			FlightPort:     effectiveFlightPort,
 		}
 		controlplane.RunControlPlane(cpCfg)
 		return
