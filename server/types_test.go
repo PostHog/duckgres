@@ -978,7 +978,7 @@ func TestUBIGINTTypmod(t *testing.T) {
 	if info.OID != OidNumeric {
 		t.Errorf("UBIGINT OID = %d, want %d (OidNumeric)", info.OID, OidNumeric)
 	}
-	expectedTypmod := int32(((20 << 16) | 0) + 4)
+	expectedTypmod := int32((20 << 16) + 4)
 	if info.Typmod != expectedTypmod {
 		t.Errorf("UBIGINT Typmod = %d, want %d (DECIMAL(20,0))", info.Typmod, expectedTypmod)
 	}
