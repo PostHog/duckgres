@@ -14,8 +14,9 @@ import (
 // The database is opened once and shared across all sessions. Each session
 // gets its own *sql.DB with MaxOpenConns=1 for transaction isolation.
 type DBPool struct {
-	cfg         server.Config
-	duckLakeSem chan struct{}
+	cfg             server.Config
+	duckLakeSem     chan struct{}
+	serverStartTime time.Time
 
 	mu          sync.Mutex
 	sessions    map[int32]*sql.DB // keyed by session backend PID
@@ -23,19 +24,22 @@ type DBPool struct {
 }
 
 // NewDBPool creates a new database pool with the given server configuration.
-func NewDBPool(cfg server.Config) *DBPool {
+// serverStartTime is the time the top-level server (control plane) started,
+// used to compute uptime() in SQL.
+func NewDBPool(cfg server.Config, serverStartTime time.Time) *DBPool {
 	return &DBPool{
-		cfg:         cfg,
-		duckLakeSem: make(chan struct{}, 1),
-		sessions:    make(map[int32]*sql.DB),
-		stopRefresh: make(map[int32]func()),
+		cfg:             cfg,
+		serverStartTime: serverStartTime,
+		duckLakeSem:     make(chan struct{}, 1),
+		sessions:        make(map[int32]*sql.DB),
+		stopRefresh:     make(map[int32]func()),
 	}
 }
 
 // CreateSession creates a new DuckDB connection for a client session.
 // The connection is registered by its backend PID for tracking.
 func (p *DBPool) CreateSession(pid int32, username string) (*sql.DB, error) {
-	db, err := server.CreateDBConnection(p.cfg, p.duckLakeSem, username)
+	db, err := server.CreateDBConnection(p.cfg, p.duckLakeSem, username, p.serverStartTime)
 	if err != nil {
 		return nil, fmt.Errorf("create session db: %w", err)
 	}

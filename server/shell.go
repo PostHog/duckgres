@@ -19,7 +19,7 @@ import (
 func RunShell(cfg Config) {
 	sem := make(chan struct{}, 1)
 
-	db, err := CreateDBConnection(cfg, sem, "shell")
+	db, err := CreateDBConnection(cfg, sem, "shell", processStartTime)
 	if err != nil {
 		slog.Error("Failed to create database connection.", "error", err)
 		os.Exit(1)

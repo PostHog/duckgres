@@ -4,11 +4,14 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 // initPgCatalog creates PostgreSQL compatibility functions and views in DuckDB
-// DuckDB already has a pg_catalog schema with basic views, so we just add missing functions
-func initPgCatalog(db *sql.DB) error {
+// DuckDB already has a pg_catalog schema with basic views, so we just add missing functions.
+// serverStartTime is the top-level server start time; processStartTime is this process's start time.
+// In standalone mode these are the same; in process isolation mode they differ.
+func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time) error {
 	// Create our own pg_database view that has all the columns psql expects
 	// We put it in main schema and rewrite queries to use it
 	// Include template databases for PostgreSQL compatibility
@@ -843,6 +846,17 @@ func initPgCatalog(db *sql.DB) error {
 		// version - return PostgreSQL-compatible version string
 		// Fivetran and other tools check this to determine compatibility
 		`CREATE OR REPLACE MACRO version() AS 'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'`,
+		// uptime - returns server uptime as an INTERVAL
+		// Bakes the server start timestamp into the macro; now() evaluates at query time.
+		// In standalone mode this equals process_uptime(). In process isolation mode
+		// this shows the parent server's lifetime.
+		fmt.Sprintf(`CREATE OR REPLACE MACRO uptime() AS (now() - TIMESTAMP '%s')`,
+			serverStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
+		// process_uptime - returns current process uptime as an INTERVAL
+		// In standalone mode this equals uptime(). In process isolation mode
+		// this shows the child process lifetime (≈ connection duration).
+		fmt.Sprintf(`CREATE OR REPLACE MACRO process_uptime() AS (now() - TIMESTAMP '%s')`,
+			processStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
 	}
 
 	for _, f := range functions {
