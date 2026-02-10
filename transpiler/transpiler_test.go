@@ -280,6 +280,7 @@ func TestTranspile_PublicSchema(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
+		expected string
 		contains string
 		excludes string
 	}{
@@ -301,6 +302,16 @@ func TestTranspile_PublicSchema(t *testing.T) {
 			contains: "main.new_table",
 			excludes: "public.new_table",
 		},
+		{
+			name:     "3-part catalog.public.table -> catalog.main.table",
+			input:    "SELECT * FROM postgres.public.users",
+			expected: "SELECT * FROM postgres.main.users",
+		},
+		{
+			name:     "3-part catalog.public.table in INSERT",
+			input:    "INSERT INTO mydb.public.events (id) VALUES (1)",
+			expected: "INSERT INTO mydb.main.events (id) VALUES (1)",
+		},
 	}
 
 	tr := New(DefaultConfig())
@@ -310,6 +321,11 @@ func TestTranspile_PublicSchema(t *testing.T) {
 			result, err := tr.Transpile(tt.input)
 			if err != nil {
 				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.expected != "" {
+				if result.SQL != tt.expected {
+					t.Errorf("Transpile(%q) = %q, expected %q", tt.input, result.SQL, tt.expected)
+				}
 			}
 			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
 				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
@@ -2688,83 +2704,6 @@ func TestTranspile_CtidToRowid(t *testing.T) {
 	}
 }
 
-func TestTranspile_CatalogStrip(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		contains string
-		excludes string
-	}{
-		{
-			name:     "3-part name strips catalog",
-			input:    "SELECT * FROM duckgres.main.users",
-			contains: "main.users",
-			excludes: "duckgres.main.users",
-		},
-		{
-			name:     "3-part name with different catalog",
-			input:    "SELECT * FROM mydb.main.orders",
-			contains: "main.orders",
-			excludes: "mydb.main.orders",
-		},
-		{
-			name:     "memory catalog is preserved",
-			input:    "SELECT * FROM memory.main.pg_class_full",
-			contains: "memory.main.pg_class_full",
-		},
-		{
-			name:     "2-part name unchanged",
-			input:    "SELECT * FROM main.users",
-			contains: "main.users",
-		},
-		{
-			name:     "unqualified name unchanged",
-			input:    "SELECT * FROM users",
-			contains: "users",
-		},
-		{
-			name:     "catalog strip in INSERT",
-			input:    "INSERT INTO duckgres.main.users (id) VALUES (1)",
-			contains: "main.users",
-			excludes: "duckgres.main.users",
-		},
-		{
-			name:     "catalog strip in UPDATE",
-			input:    "UPDATE duckgres.main.users SET name = 'test'",
-			contains: "main.users",
-			excludes: "duckgres.main.users",
-		},
-		{
-			name:     "catalog strip in DELETE",
-			input:    "DELETE FROM duckgres.main.users WHERE id = 1",
-			contains: "main.users",
-			excludes: "duckgres.main.users",
-		},
-		{
-			name:     "catalog strip in JOIN",
-			input:    "SELECT * FROM duckgres.main.users u JOIN duckgres.main.orders o ON u.id = o.user_id",
-			excludes: "duckgres.",
-		},
-	}
-
-	tr := New(DefaultConfig())
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := tr.Transpile(tt.input)
-			if err != nil {
-				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
-			}
-			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
-				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
-			}
-			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
-				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
-			}
-		})
-	}
-}
-
 func TestTranspile_PgCatalogStubViews(t *testing.T) {
 	// Test that new stub views (pg_constraint, pg_enum, pg_indexes) are mapped correctly
 	tests := []struct {
@@ -2805,46 +2744,6 @@ func TestTranspile_PgCatalogStubViews(t *testing.T) {
 			name:     "unqualified pg_indexes -> memory.main.pg_indexes",
 			input:    "SELECT indexname FROM pg_indexes WHERE tablename = 'users'",
 			contains: "memory.main.pg_indexes",
-		},
-	}
-
-	tr := New(DefaultConfig())
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := tr.Transpile(tt.input)
-			if err != nil {
-				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
-			}
-			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
-				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
-			}
-			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
-				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
-			}
-		})
-	}
-}
-
-func TestTranspile_CtidWithCatalogStrip(t *testing.T) {
-	// Test that ctid→rowid and catalog stripping work together,
-	// which is the real-world scenario when DuckDB's postgres extension reads data
-	tests := []struct {
-		name     string
-		input    string
-		contains string
-		excludes string
-	}{
-		{
-			name:     "ctid SELECT with catalog-qualified table",
-			input:    "SELECT ctid FROM duckgres.main.users",
-			contains: "rowid",
-			excludes: "ctid",
-		},
-		{
-			name:     "ctid and catalog combined do not have duckgres prefix",
-			input:    "SELECT ctid, name FROM duckgres.main.users WHERE id > 0",
-			excludes: "duckgres.",
 		},
 	}
 

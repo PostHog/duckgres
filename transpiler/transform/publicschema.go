@@ -31,9 +31,8 @@ func (t *PublicSchemaTransform) Transform(tree *pg_query.ParseResult, _ *Result)
 			return true
 		}
 
-		// Only rewrite schema-qualified references like public.table.
-		// If a catalog/database is provided, leave it alone.
-		if rv.Catalogname == "" && strings.EqualFold(rv.Schemaname, "public") {
+		// Rewrite public → main regardless of whether a catalog is present.
+		if strings.EqualFold(rv.Schemaname, "public") {
 			rv.Schemaname = "main"
 			changed = true
 		}
