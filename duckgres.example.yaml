@@ -36,6 +36,9 @@ ducklake:
   # Examples:
   #   - "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
   #   - "postgres:host=ducklake.example.com user=ducklake password=secret dbname=ducklake"
+  # WARNING: Do not use pgbouncer (port 6432) for the metadata store connection.
+  # pgbouncer's connection lifecycle management can kill connections that DuckLake
+  # depends on, causing cascading failures. Connect directly to PostgreSQL instead.
   # metadata_store: "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
 
   # S3-compatible object storage for data files (optional)
@@ -61,6 +64,12 @@ ducklake:
   # s3_chain: "env;config"             # Which sources to check (env, config, sts, sso, instance, process)
   # s3_profile: "my-profile"           # AWS profile name (for config chain)
   # s3_region: "us-west-2"             # Override auto-detected region
+
+# Process isolation (default: true)
+# Each client connection spawns a separate OS process, so a DuckDB crash
+# (e.g., from a failed DuckLake metadata connection) only kills that session,
+# not the entire server. Set to false only for debugging or low-resource environments.
+process_isolation: true
 
 # Connection idle timeout (optional)
 # Connections with no activity for this duration will be closed.

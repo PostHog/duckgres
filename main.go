@@ -28,7 +28,7 @@ type FileConfig struct {
 	RateLimit        RateLimitFileConfig `yaml:"rate_limit"`
 	Extensions       []string            `yaml:"extensions"`
 	DuckLake         DuckLakeFileConfig  `yaml:"ducklake"`
-	ProcessIsolation bool                `yaml:"process_isolation"` // Enable process isolation per connection
+	ProcessIsolation *bool               `yaml:"process_isolation"` // Enable process isolation per connection
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
 }
 
@@ -114,7 +114,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	certFile := flag.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
-	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
+	processIsolation := flag.Bool("process-isolation", true, "Enable process isolation per connection")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
@@ -140,7 +140,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable/disable process isolation (true/false, default: true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -171,7 +171,8 @@ func main() {
 		Users: map[string]string{
 			"postgres": "postgres",
 		},
-		Extensions: []string{"ducklake"},
+		Extensions:       []string{"ducklake"},
+		ProcessIsolation: true,
 	}
 
 	// Auto-detect duckgres.yaml if no config file was explicitly specified
@@ -273,8 +274,10 @@ func main() {
 			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
 		}
 
-		// Apply process isolation config
-		cfg.ProcessIsolation = fileCfg.ProcessIsolation
+		// Apply process isolation config (only when explicitly set in YAML)
+		if fileCfg.ProcessIsolation != nil {
+			cfg.ProcessIsolation = *fileCfg.ProcessIsolation
+		}
 
 		// Apply idle timeout config
 		if fileCfg.IdleTimeout != "" {
@@ -337,8 +340,8 @@ func main() {
 	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
 	}
-	if v := os.Getenv("DUCKGRES_PROCESS_ISOLATION"); v == "true" || v == "1" {
-		cfg.ProcessIsolation = true
+	if v := os.Getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {
+		cfg.ProcessIsolation = (v == "true" || v == "1")
 	}
 	if v := os.Getenv("DUCKGRES_IDLE_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -364,9 +367,11 @@ func main() {
 	if *keyFile != "" {
 		cfg.TLSKeyFile = *keyFile
 	}
-	if *processIsolation {
-		cfg.ProcessIsolation = true
-	}
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "process-isolation" {
+			cfg.ProcessIsolation = *processIsolation
+		}
+	})
 	if *idleTimeout != "" {
 		if d, err := time.ParseDuration(*idleTimeout); err == nil {
 			cfg.IdleTimeout = d
