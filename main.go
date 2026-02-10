@@ -421,6 +421,13 @@ func main() {
 		return
 	}
 
+	// Process isolation is incompatible with control-plane/worker mode — those modes
+	// already provide process-level isolation via the worker pool. Disable it and warn.
+	if *mode != "standalone" && cfg.ProcessIsolation {
+		cfg.ProcessIsolation = false
+		slog.Info("Process isolation disabled (not applicable in " + *mode + " mode)")
+	}
+
 	// Handle worker mode early (before metrics, certs, etc.)
 	if *mode == "worker" {
 		if *grpcSocket == "" || *fdSocket == "" {
