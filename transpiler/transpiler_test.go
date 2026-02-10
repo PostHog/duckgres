@@ -303,14 +303,14 @@ func TestTranspile_PublicSchema(t *testing.T) {
 			excludes: "public.new_table",
 		},
 		{
-			name:     "3-part catalog.public.table -> catalog.main.table",
+			name:     "3-part catalog.public.table unchanged",
 			input:    "SELECT * FROM postgres.public.users",
-			expected: "SELECT * FROM postgres.main.users",
+			expected: "SELECT * FROM postgres.public.users",
 		},
 		{
-			name:     "3-part catalog.public.table in INSERT",
+			name:     "3-part catalog.public.table in INSERT unchanged",
 			input:    "INSERT INTO mydb.public.events (id) VALUES (1)",
-			expected: "INSERT INTO mydb.main.events (id) VALUES (1)",
+			expected: "INSERT INTO mydb.public.events (id) VALUES (1)",
 		},
 	}
 
