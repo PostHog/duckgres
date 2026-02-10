@@ -8,9 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/server"
@@ -22,14 +20,19 @@ import (
 type FileConfig struct {
 	Host             string              `yaml:"host"`
 	Port             int                 `yaml:"port"`
+	Flight           FlightFileConfig    `yaml:"flight"`
 	DataDir          string              `yaml:"data_dir"`
 	TLS              TLSConfig           `yaml:"tls"`
 	Users            map[string]string   `yaml:"users"`
 	RateLimit        RateLimitFileConfig `yaml:"rate_limit"`
 	Extensions       []string            `yaml:"extensions"`
 	DuckLake         DuckLakeFileConfig  `yaml:"ducklake"`
-	ProcessIsolation *bool               `yaml:"process_isolation"` // Enable process isolation per connection
+	ProcessIsolation bool                `yaml:"process_isolation"` // Enable process isolation per connection
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
+}
+
+type FlightFileConfig struct {
+	Port int    `yaml:"port"`
 }
 
 type TLSConfig struct {
@@ -114,7 +117,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	certFile := flag.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
-	processIsolation := flag.Bool("process-isolation", true, "Enable process isolation per connection")
+	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
@@ -126,6 +129,7 @@ func main() {
 	workerCount := flag.Int("worker-count", 4, "Number of worker processes (control-plane mode)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
+	flightPort := flag.Int("flight-port", 0, "Flight SQL port to listen on (control-plane mode, env: DUCKGRES_FLIGHT_PORT)")
 	grpcSocket := flag.String("grpc-socket", "", "gRPC socket path (worker mode, set by control-plane)")
 	fdSocket := flag.String("fd-socket", "", "FD passing socket path (worker mode, set by control-plane)")
 
@@ -141,7 +145,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable/disable process isolation (true/false, default: true)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_PORT        Flight SQL port (control-plane mode, default: 8815)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -161,6 +166,12 @@ func main() {
 		os.Exit(0)
 	}
 
+	// Track explicitly-set CLI flags so precedence is consistent.
+	cliSet := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		cliSet[f.Name] = true
+	})
+
 	loggingShutdown := initLogging()
 	defer loggingShutdown()
 
@@ -175,20 +186,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Start with defaults
-	cfg := server.Config{
-		Host:        "0.0.0.0",
-		Port:        5432,
-		DataDir:     "./data",
-		TLSCertFile: "./certs/server.crt",
-		TLSKeyFile:  "./certs/server.key",
-		Users: map[string]string{
-			"postgres": "postgres",
-		},
-		Extensions:       []string{"ducklake"},
-		ProcessIsolation: true,
-	}
-
 	// Auto-detect duckgres.yaml if no config file was explicitly specified
 	if *configFile == "" {
 		if _, err := os.Stat("duckgres.yaml"); err == nil {
@@ -196,203 +193,33 @@ func main() {
 		}
 	}
 
+	var fileCfg *FileConfig
 	// Load config file if specified (or auto-detected)
 	if *configFile != "" {
-		fileCfg, err := loadConfigFile(*configFile)
+		loadedCfg, err := loadConfigFile(*configFile)
 		if err != nil {
 			slog.Error("Failed to load config file: " + err.Error())
 			os.Exit(1)
 		}
 		slog.Info("Loaded configuration from " + *configFile)
-
-		// Apply config file values
-		if fileCfg.Host != "" {
-			cfg.Host = fileCfg.Host
-		}
-		if fileCfg.Port != 0 {
-			cfg.Port = fileCfg.Port
-		}
-		if fileCfg.DataDir != "" {
-			cfg.DataDir = fileCfg.DataDir
-		}
-		if fileCfg.TLS.Cert != "" {
-			cfg.TLSCertFile = fileCfg.TLS.Cert
-		}
-		if fileCfg.TLS.Key != "" {
-			cfg.TLSKeyFile = fileCfg.TLS.Key
-		}
-		if len(fileCfg.Users) > 0 {
-			cfg.Users = fileCfg.Users
-		}
-
-		// Apply rate limit config
-		if fileCfg.RateLimit.MaxFailedAttempts > 0 {
-			cfg.RateLimit.MaxFailedAttempts = fileCfg.RateLimit.MaxFailedAttempts
-		}
-		if fileCfg.RateLimit.MaxConnectionsPerIP > 0 {
-			cfg.RateLimit.MaxConnectionsPerIP = fileCfg.RateLimit.MaxConnectionsPerIP
-		}
-		if fileCfg.RateLimit.FailedAttemptWindow != "" {
-			if d, err := time.ParseDuration(fileCfg.RateLimit.FailedAttemptWindow); err == nil {
-				cfg.RateLimit.FailedAttemptWindow = d
-			} else {
-				slog.Warn("Invalid failed_attempt_window duration: " + err.Error())
-			}
-		}
-		if fileCfg.RateLimit.BanDuration != "" {
-			if d, err := time.ParseDuration(fileCfg.RateLimit.BanDuration); err == nil {
-				cfg.RateLimit.BanDuration = d
-			} else {
-				slog.Warn("Invalid ban_duration duration: " + err.Error())
-			}
-		}
-
-		// Apply extensions config
-		if len(fileCfg.Extensions) > 0 {
-			cfg.Extensions = fileCfg.Extensions
-		}
-
-		// Apply DuckLake config
-		if fileCfg.DuckLake.MetadataStore != "" {
-			cfg.DuckLake.MetadataStore = fileCfg.DuckLake.MetadataStore
-		}
-		if fileCfg.DuckLake.ObjectStore != "" {
-			cfg.DuckLake.ObjectStore = fileCfg.DuckLake.ObjectStore
-		}
-		if fileCfg.DuckLake.DataPath != "" {
-			cfg.DuckLake.DataPath = fileCfg.DuckLake.DataPath
-		}
-		if fileCfg.DuckLake.S3Provider != "" {
-			cfg.DuckLake.S3Provider = fileCfg.DuckLake.S3Provider
-		}
-		if fileCfg.DuckLake.S3Endpoint != "" {
-			cfg.DuckLake.S3Endpoint = fileCfg.DuckLake.S3Endpoint
-		}
-		if fileCfg.DuckLake.S3AccessKey != "" {
-			cfg.DuckLake.S3AccessKey = fileCfg.DuckLake.S3AccessKey
-		}
-		if fileCfg.DuckLake.S3SecretKey != "" {
-			cfg.DuckLake.S3SecretKey = fileCfg.DuckLake.S3SecretKey
-		}
-		if fileCfg.DuckLake.S3Region != "" {
-			cfg.DuckLake.S3Region = fileCfg.DuckLake.S3Region
-		}
-		cfg.DuckLake.S3UseSSL = fileCfg.DuckLake.S3UseSSL
-		if fileCfg.DuckLake.S3URLStyle != "" {
-			cfg.DuckLake.S3URLStyle = fileCfg.DuckLake.S3URLStyle
-		}
-		if fileCfg.DuckLake.S3Chain != "" {
-			cfg.DuckLake.S3Chain = fileCfg.DuckLake.S3Chain
-		}
-		if fileCfg.DuckLake.S3Profile != "" {
-			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
-		}
-
-		// Apply process isolation config (only when explicitly set in YAML)
-		if fileCfg.ProcessIsolation != nil {
-			cfg.ProcessIsolation = *fileCfg.ProcessIsolation
-		}
-
-		// Apply idle timeout config
-		if fileCfg.IdleTimeout != "" {
-			if d, err := time.ParseDuration(fileCfg.IdleTimeout); err == nil {
-				cfg.IdleTimeout = d
-			} else {
-				slog.Warn("Invalid idle_timeout duration: " + err.Error())
-			}
-		}
+		fileCfg = loadedCfg
 	}
 
-	// Apply environment variables (override config file)
-	if v := os.Getenv("DUCKGRES_HOST"); v != "" {
-		cfg.Host = v
-	}
-	if v := os.Getenv("DUCKGRES_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			cfg.Port = p
-		}
-	}
-	if v := os.Getenv("DUCKGRES_DATA_DIR"); v != "" {
-		cfg.DataDir = v
-	}
-	if v := os.Getenv("DUCKGRES_CERT"); v != "" {
-		cfg.TLSCertFile = v
-	}
-	if v := os.Getenv("DUCKGRES_KEY"); v != "" {
-		cfg.TLSKeyFile = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_METADATA_STORE"); v != "" {
-		cfg.DuckLake.MetadataStore = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_OBJECT_STORE"); v != "" {
-		cfg.DuckLake.ObjectStore = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROVIDER"); v != "" {
-		cfg.DuckLake.S3Provider = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_ENDPOINT"); v != "" {
-		cfg.DuckLake.S3Endpoint = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_ACCESS_KEY"); v != "" {
-		cfg.DuckLake.S3AccessKey = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_SECRET_KEY"); v != "" {
-		cfg.DuckLake.S3SecretKey = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_REGION"); v != "" {
-		cfg.DuckLake.S3Region = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_USE_SSL"); v == "true" || v == "1" {
-		cfg.DuckLake.S3UseSSL = true
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_URL_STYLE"); v != "" {
-		cfg.DuckLake.S3URLStyle = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_CHAIN"); v != "" {
-		cfg.DuckLake.S3Chain = v
-	}
-	if v := os.Getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
-		cfg.DuckLake.S3Profile = v
-	}
-	if v := os.Getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {
-		cfg.ProcessIsolation = (v == "true" || v == "1")
-	}
-	if v := os.Getenv("DUCKGRES_IDLE_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.IdleTimeout = d
-		} else {
-			slog.Warn("Invalid DUCKGRES_IDLE_TIMEOUT duration: " + err.Error())
-		}
-	}
-
-	// Apply CLI flags (highest priority)
-	if *host != "" {
-		cfg.Host = *host
-	}
-	if *port != 0 {
-		cfg.Port = *port
-	}
-	if *dataDir != "" {
-		cfg.DataDir = *dataDir
-	}
-	if *certFile != "" {
-		cfg.TLSCertFile = *certFile
-	}
-	if *keyFile != "" {
-		cfg.TLSKeyFile = *keyFile
-	}
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "process-isolation" {
-			cfg.ProcessIsolation = *processIsolation
-		}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:              cliSet,
+		Host:             *host,
+		Port:             *port,
+		DataDir:          *dataDir,
+		CertFile:         *certFile,
+		KeyFile:          *keyFile,
+		ProcessIsolation: *processIsolation,
+		IdleTimeout:      *idleTimeout,
+		FlightPort:       *flightPort,
+	}, os.Getenv, func(msg string) {
+		slog.Warn(msg)
 	})
-	if *idleTimeout != "" {
-		if d, err := time.ParseDuration(*idleTimeout); err == nil {
-			cfg.IdleTimeout = d
-		} else {
-			slog.Warn("Invalid --idle-timeout duration: " + err.Error())
-		}
-	}
+	cfg := resolved.Server
+	flightCfgPort := resolved.FlightPort
 
 	// Handle --psql: launch psql connected to the local Duckgres server
 	if *psql {
@@ -454,11 +281,14 @@ func main() {
 
 	// Handle control-plane mode
 	if *mode == "control-plane" {
+		effectiveFlightPort := effectiveFlightConfig(cfg, flightCfgPort)
+
 		cpCfg := controlplane.ControlPlaneConfig{
 			Config:         cfg,
 			WorkerCount:    *workerCount,
 			SocketDir:      *socketDir,
 			HandoverSocket: *handoverSocket,
+			FlightPort:     effectiveFlightPort,
 		}
 		controlplane.RunControlPlane(cpCfg)
 		return

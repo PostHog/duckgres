@@ -216,6 +216,15 @@ func (p *WorkerPool) ConnectExistingWorker(id int, grpcSocket, fdSocket string) 
 // RouteConnection sends a TCP file descriptor to a worker for handling.
 // It selects the least-loaded worker based on health checks.
 func (p *WorkerPool) RouteConnection(tcpFile *os.File, remoteAddr string, secretKey int32) (int32, error) {
+	return p.routeConnection(tcpFile, remoteAddr, secretKey, false)
+}
+
+// RouteFlightConnection sends a Flight connection FD to a worker.
+func (p *WorkerPool) RouteFlightConnection(tcpFile *os.File, remoteAddr string) (int32, error) {
+	return p.routeConnection(tcpFile, remoteAddr, 0, true)
+}
+
+func (p *WorkerPool) routeConnection(tcpFile *os.File, remoteAddr string, secretKey int32, isFlight bool) (int32, error) {
 	worker, err := p.selectWorker()
 	if err != nil {
 		return 0, err
@@ -244,10 +253,15 @@ func (p *WorkerPool) RouteConnection(tcpFile *os.File, remoteAddr string, secret
 	}
 	_ = uc.Close()
 
+	controlRemoteAddr := remoteAddr
+	if isFlight {
+		controlRemoteAddr = "flight://" + remoteAddr
+	}
+
 	// Tell worker to accept the connection via gRPC
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	resp, err := worker.Client.AcceptConnection(ctx, &pb.AcceptConnectionRequest{
-		RemoteAddr:       remoteAddr,
+		RemoteAddr:       controlRemoteAddr,
 		BackendSecretKey: secretKey,
 	})
 	cancel()
