@@ -237,8 +237,12 @@ func (w *Worker) Configure(_ context.Context, req *pb.ConfigureRequest) (*pb.Con
 		}
 	}
 
-	// Create DB pool
-	w.dbPool = NewDBPool(w.cfg)
+	// Create DB pool with the worker's start time as serverStartTime.
+	// In control plane mode, workers are spawned at startup so w.startTime ≈
+	// control plane start time. Both uptime() and process_uptime() will show
+	// the same value (worker lifetime) since this is a single long-lived process.
+	// The two functions diverge only in process isolation mode.
+	w.dbPool = NewDBPool(w.cfg, w.startTime)
 
 	w.configured = true
 	slog.Info("Worker configured.", "data_dir", w.cfg.DataDir, "ducklake", w.cfg.DuckLake.MetadataStore != "")

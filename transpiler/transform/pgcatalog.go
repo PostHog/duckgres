@@ -80,6 +80,8 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
 			"unnest":                          true, // DuckDB has unnest, just strip pg_catalog prefix
 			"json_object":                     true, // DuckDB native function, just strip pg_catalog prefix
+			"uptime":                          true, // Server uptime as INTERVAL
+			"process_uptime":                  true, // Current process uptime as INTERVAL
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -102,6 +104,8 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"obj_description":                 true, // Returns NULL
 			"col_description":                 true, // Returns NULL
 			"pg_get_partkeydef":               true, // Returns empty string
+			"uptime":                          true, // Server uptime as INTERVAL
+			"process_uptime":                  true, // Current process uptime as INTERVAL
 		},
 	}
 }

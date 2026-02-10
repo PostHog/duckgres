@@ -2,7 +2,9 @@ package server
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -14,7 +16,7 @@ func TestPgDatabaseView(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := initPgCatalog(db); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -59,7 +61,7 @@ func TestPgDatabaseViewContent(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := initPgCatalog(db); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -122,7 +124,7 @@ func TestPgStatioUserTablesViewColumns(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := initPgCatalog(db); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -172,7 +174,7 @@ func TestPgTypeHasComplexTypeOIDs(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := initPgCatalog(db); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -224,7 +226,7 @@ func TestPgAttributeJoinPgTypeComplexColumns(t *testing.T) {
 		t.Fatalf("Failed to set extension settings: %v", err)
 	}
 
-	if err := initPgCatalog(db); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -266,6 +268,30 @@ func TestPgAttributeJoinPgTypeComplexColumns(t *testing.T) {
 	for i, col := range columns {
 		if col != expected[i] {
 			t.Errorf("column %d: got %q, want %q", i, col, expected[i])
+		}
+	}
+}
+
+func TestUptimeMacros(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	start := time.Now()
+	if err := initPgCatalog(db, start, start); err != nil {
+		t.Fatalf("Failed to init pg_catalog: %v", err)
+	}
+
+	// Verify both macros return INTERVAL type
+	for _, fn := range []string{"uptime", "process_uptime"} {
+		var typeName string
+		if err := db.QueryRow(fmt.Sprintf("SELECT pg_typeof(%s())", fn)).Scan(&typeName); err != nil {
+			t.Fatalf("%s() query failed: %v", fn, err)
+		}
+		if typeName != "interval" {
+			t.Errorf("%s() returned type %q, want interval", fn, typeName)
 		}
 	}
 }
