@@ -6,7 +6,8 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=1 go build -o duckgres .
+ARG VERSION=dev
+RUN CGO_ENABLED=1 go build -ldflags "-X main.version=${VERSION} -X main.commit=$(git rev-parse HEAD 2>/dev/null || echo unknown) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 
 FROM debian:bookworm-slim
 
