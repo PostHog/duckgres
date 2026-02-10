@@ -86,6 +86,23 @@ go build -o duckgres .
 
 The server starts on port 5432 by default with TLS enabled. Database files are stored in `./data/`. Self-signed certificates are auto-generated in `./certs/` if not present.
 
+### Docker
+
+```bash
+docker build -t duckgres .
+docker run --rm -p 5432:5432 -p 9090:9090 duckgres
+```
+
+Mount a config file and persist data:
+
+```bash
+docker run --rm \
+  -p 5432:5432 -p 9090:9090 \
+  -v ./duckgres.yaml:/app/duckgres.yaml \
+  -v ./data:/app/data \
+  duckgres
+```
+
 ### Connect
 
 ```bash
