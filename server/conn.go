@@ -2628,11 +2628,11 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 
 		// Data type OID - check for pg_catalog column name overrides first,
 		// then fall back to DuckDB type mapping
-		oid := c.mapTypeOIDWithColumnName(col, colTypes[i])
+		oid := c.mapTypeOIDWithColumnName(displayCol, colTypes[i])
 		_ = binary.Write(&buf, binary.BigEndian, oid)
 
 		// Data type size - use appropriate size for overridden types
-		typeSize := c.mapTypeSizeWithColumnName(col, colTypes[i])
+		typeSize := c.mapTypeSizeWithColumnName(displayCol, colTypes[i])
 		_ = binary.Write(&buf, binary.BigEndian, typeSize)
 
 		// Type modifier (e.g. precision/scale for NUMERIC, -1 = no modifier)
