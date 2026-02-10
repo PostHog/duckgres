@@ -77,9 +77,6 @@ func New(cfg Config) *Transpiler {
 	// 13. ctid → rowid mapping (PostgreSQL system column to DuckDB equivalent)
 	t.transforms = append(t.transforms, transform.NewCtidTransform())
 
-	// 14. Strip catalog qualifiers (duckgres is single-catalog)
-	t.transforms = append(t.transforms, transform.NewCatalogStripTransform())
-
 	// DDL transforms only when DuckLake mode is enabled
 	if cfg.DuckLakeMode {
 		t.transforms = append(t.transforms, transform.NewDDLTransform())
