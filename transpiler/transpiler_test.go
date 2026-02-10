@@ -963,6 +963,12 @@ func TestTranspile_FunctionMappings(t *testing.T) {
 			contains: "json_object",
 			excludes: "json_build_object",
 		},
+		{
+			name:     "json_object strips pg_catalog prefix",
+			input:    "SELECT JSON_OBJECT('id', id, 'name', name) FROM test",
+			contains: "json_object",
+			excludes: "pg_catalog",
+		},
 	}
 
 	tr := New(DefaultConfig())
