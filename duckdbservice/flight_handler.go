@@ -1,15 +1,10 @@
-package controlplane
+package duckdbservice
 
 import (
 	"context"
-	"crypto/tls"
 	"database/sql"
-	"encoding/base64"
 	"fmt"
-	"net"
 	"strings"
-	"sync"
-	"sync/atomic"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -17,178 +12,41 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/posthog/duckgres/duckdbservice"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
-type FlightSessionServer struct {
+// FlightSQLHandler implements Arrow Flight SQL for multiple sessions.
+// Sessions are identified by the "x-duckgres-session" gRPC metadata header.
+type FlightSQLHandler struct {
 	flightsql.BaseServer
-
-	worker     *Worker
-	pid        int32
-	remoteAddr string
-
+	pool  *SessionPool
 	alloc memory.Allocator
-
-	mu       sync.RWMutex
-	db       *sql.DB
-	username string
-	queries  map[string]*flightQueryHandle
-	txns     map[string]*sql.Tx
-	txnOwner map[string]string
-	handleID atomic.Uint64
-
-	flightSrv flight.Server
 }
 
-type flightQueryHandle struct {
-	query  string
-	schema *arrow.Schema
-	txnID  string
-}
-
-func NewFlightSessionServer(worker *Worker, pid int32, remoteAddr string) *FlightSessionServer {
-	s := &FlightSessionServer{
-		worker:     worker,
-		pid:        pid,
-		remoteAddr: remoteAddr,
-		alloc:      memory.DefaultAllocator,
-		queries:    make(map[string]*flightQueryHandle),
-		txns:       make(map[string]*sql.Tx),
-		txnOwner:   make(map[string]string),
-	}
-
-	if err := s.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerName, "duckgres"); err != nil {
-		panic(fmt.Sprintf("register sql info server name: %v", err))
-	}
-	if err := s.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerVersion, "1.0.0"); err != nil {
-		panic(fmt.Sprintf("register sql info server version: %v", err))
-	}
-	if err := s.RegisterSqlInfo(flightsql.SqlInfoTransactionsSupported, true); err != nil {
-		panic(fmt.Sprintf("register sql info transactions supported: %v", err))
-	}
-
-	return s
-}
-
-func (s *FlightSessionServer) Serve(listener net.Listener, tlsConfig *tls.Config) error {
-	s.flightSrv = flight.NewServerWithMiddleware(nil, grpc.Creds(credentials.NewTLS(tlsConfig)))
-	s.flightSrv.RegisterFlightService(flightsql.NewFlightServer(s))
-	s.flightSrv.InitListener(listener)
-	return s.flightSrv.Serve()
-}
-
-func (s *FlightSessionServer) Close() {
-	if s.flightSrv != nil {
-		s.flightSrv.Shutdown()
-	}
-
-	s.mu.Lock()
-	for id, tx := range s.txns {
-		_ = tx.Rollback()
-		delete(s.txns, id)
-		delete(s.txnOwner, id)
-	}
-	s.db = nil
-	s.mu.Unlock()
-
-	s.worker.dbPool.CloseSession(s.pid)
-}
-
-func (s *FlightSessionServer) authAndDB(ctx context.Context) (string, *sql.DB, error) {
-	username, password, err := extractBasicCredentials(ctx)
-	if err != nil {
-		return "", nil, err
-	}
-
-	s.worker.mu.RLock()
-	expected, ok := s.worker.cfg.Users[username]
-	s.worker.mu.RUnlock()
-	if !ok || expected != password {
-		return "", nil, status.Error(codes.Unauthenticated, "invalid username or password")
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.username != "" && s.username != username {
-		return "", nil, status.Error(codes.PermissionDenied, "single Flight connection cannot switch users")
-	}
-
-	if s.db == nil {
-		db, err := s.worker.dbPool.CreateSession(s.pid, username)
-		if err != nil {
-			return "", nil, status.Errorf(codes.Internal, "open database: %v", err)
-		}
-		s.db = db
-		s.username = username
-	}
-
-	return username, s.db, nil
-}
-
-func extractBasicCredentials(ctx context.Context) (string, string, error) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return "", "", status.Error(codes.Unauthenticated, "missing metadata")
-	}
-
-	authHeaders := md.Get("authorization")
-	if len(authHeaders) == 0 {
-		return "", "", status.Error(codes.Unauthenticated, "missing authorization header")
-	}
-
-	auth := authHeaders[0]
-	parts := strings.SplitN(auth, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Basic") {
-		return "", "", status.Error(codes.Unauthenticated, "expected Basic authorization")
-	}
-
-	raw, err := base64.StdEncoding.DecodeString(parts[1])
-	if err != nil {
-		return "", "", status.Error(codes.Unauthenticated, "invalid basic auth encoding")
-	}
-
-	creds := string(raw)
-	sep := strings.IndexByte(creds, ':')
-	if sep <= 0 {
-		return "", "", status.Error(codes.Unauthenticated, "invalid basic auth payload")
-	}
-
-	username := creds[:sep]
-	password := creds[sep+1:]
-	if username == "" || password == "" {
-		return "", "", status.Error(codes.Unauthenticated, "invalid basic auth credentials")
-	}
-	return username, password, nil
-}
-
-func (s *FlightSessionServer) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery,
+func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery,
 	desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	_, db, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 
 	query := cmd.GetQuery()
-	tx, txnKey, err := s.getOpenTxn(cmd.GetTransactionId())
+	tx, txnKey, err := session.getOpenTxn(cmd.GetTransactionId())
 	if err != nil {
 		return nil, err
 	}
 
-	schema, err := s.getQuerySchema(ctx, db, query, tx)
+	schema, err := getQuerySchema(ctx, session.DB, query, tx, h.alloc)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
 
-	handleID := fmt.Sprintf("query-%d", s.handleID.Add(1))
-	s.mu.Lock()
-	s.queries[handleID] = &flightQueryHandle{query: query, schema: schema, txnID: txnKey}
-	s.mu.Unlock()
+	handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
+	session.mu.Lock()
+	session.queries[handleID] = &QueryHandle{Query: query, TxnID: txnKey}
+	session.mu.Unlock()
 
 	ticketBytes, err := flightsql.CreateStatementQueryTicket([]byte(handleID))
 	if err != nil {
@@ -196,7 +54,7 @@ func (s *FlightSessionServer) GetFlightInfoStatement(ctx context.Context, cmd fl
 	}
 
 	return &flight.FlightInfo{
-		Schema:           flight.SerializeSchema(schema, s.alloc),
+		Schema:           flight.SerializeSchema(schema, h.alloc),
 		FlightDescriptor: desc,
 		Endpoint: []*flight.FlightEndpoint{{
 			Ticket: &flight.Ticket{Ticket: ticketBytes},
@@ -206,46 +64,52 @@ func (s *FlightSessionServer) GetFlightInfoStatement(ctx context.Context, cmd fl
 	}, nil
 }
 
-func (s *FlightSessionServer) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema,
+func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema,
 	<-chan flight.StreamChunk, error) {
-	_, db, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 
 	handleID := string(ticket.GetStatementHandle())
 
-	s.mu.RLock()
-	handle, ok := s.queries[handleID]
-	s.mu.RUnlock()
+	session.mu.RLock()
+	handle, ok := session.queries[handleID]
+	session.mu.RUnlock()
 	if !ok {
 		return nil, nil, status.Error(codes.NotFound, "query handle not found")
 	}
 
 	var tx *sql.Tx
-	if handle.txnID != "" {
-		s.mu.RLock()
-		tx = s.txns[handle.txnID]
-		s.mu.RUnlock()
+	if handle.TxnID != "" {
+		session.mu.RLock()
+		tx = session.txns[handle.TxnID]
+		session.mu.RUnlock()
 		if tx == nil {
 			return nil, nil, status.Error(codes.NotFound, "transaction not found")
 		}
+	}
+
+	schema, err := getQuerySchema(ctx, session.DB, handle.Query, tx, h.alloc)
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "failed to get query schema: %v", err)
 	}
 
 	ch := make(chan flight.StreamChunk, 10)
 	go func() {
 		defer close(ch)
 		defer func() {
-			s.mu.Lock()
-			delete(s.queries, handleID)
-			s.mu.Unlock()
+			session.mu.Lock()
+			delete(session.queries, handleID)
+			session.mu.Unlock()
 		}()
 
 		var rows *sql.Rows
 		if tx != nil {
-			rows, err = tx.QueryContext(ctx, handle.query)
+			rows, err = tx.QueryContext(ctx, handle.Query)
 		} else {
-			rows, err = db.QueryContext(ctx, handle.query)
+			rows, err = session.DB.QueryContext(ctx, handle.Query)
 		}
 		if err != nil {
 			ch <- flight.StreamChunk{Err: err}
@@ -255,9 +119,8 @@ func (s *FlightSessionServer) DoGetStatement(ctx context.Context, ticket flights
 			_ = rows.Close()
 		}()
 
-		s.worker.totalQueries.Add(1)
 		for {
-			record, recErr := s.rowsToRecord(rows, handle.schema, 1024)
+			record, recErr := RowsToRecord(h.alloc, rows, schema, 1024)
 			if recErr != nil {
 				ch <- flight.StreamChunk{Err: recErr}
 				return
@@ -269,17 +132,18 @@ func (s *FlightSessionServer) DoGetStatement(ctx context.Context, ticket flights
 		}
 	}()
 
-	return handle.schema, ch, nil
+	return schema, ch, nil
 }
 
-func (s *FlightSessionServer) DoPutCommandStatementUpdate(ctx context.Context,
+func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	cmd flightsql.StatementUpdate) (int64, error) {
-	_, db, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return 0, err
+		return 0, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 
-	tx, _, err := s.getOpenTxn(cmd.GetTransactionId())
+	tx, _, err := session.getOpenTxn(cmd.GetTransactionId())
 	if err != nil {
 		return 0, err
 	}
@@ -289,12 +153,11 @@ func (s *FlightSessionServer) DoPutCommandStatementUpdate(ctx context.Context,
 	if tx != nil {
 		result, err = tx.ExecContext(ctx, query)
 	} else {
-		result, err = db.ExecContext(ctx, query)
+		result, err = session.DB.ExecContext(ctx, query)
 	}
 	if err != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
 	}
-	s.worker.totalQueries.Add(1)
 
 	affected, err := result.RowsAffected()
 	if err != nil {
@@ -303,33 +166,35 @@ func (s *FlightSessionServer) DoPutCommandStatementUpdate(ctx context.Context,
 	return affected, nil
 }
 
-func (s *FlightSessionServer) BeginTransaction(ctx context.Context,
+func (h *FlightSQLHandler) BeginTransaction(ctx context.Context,
 	req flightsql.ActionBeginTransactionRequest) ([]byte, error) {
-	username, db, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 	_ = req
 
-	tx, err := db.BeginTx(context.Background(), nil)
+	tx, err := session.DB.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to begin transaction: %v", err)
 	}
 
-	txnKey := fmt.Sprintf("txn-%d", s.handleID.Add(1))
-	s.mu.Lock()
-	s.txns[txnKey] = tx
-	s.txnOwner[txnKey] = username
-	s.mu.Unlock()
+	txnKey := fmt.Sprintf("txn-%d", session.handleCounter.Add(1))
+	session.mu.Lock()
+	session.txns[txnKey] = tx
+	session.txnOwner[txnKey] = session.Username
+	session.mu.Unlock()
 
 	return []byte(txnKey), nil
 }
 
-func (s *FlightSessionServer) EndTransaction(ctx context.Context,
+func (h *FlightSQLHandler) EndTransaction(ctx context.Context,
 	req flightsql.ActionEndTransactionRequest) error {
-	username, _, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return err
+		return status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 
 	txnKey := string(req.GetTransactionId())
@@ -337,21 +202,16 @@ func (s *FlightSessionServer) EndTransaction(ctx context.Context,
 		return status.Error(codes.InvalidArgument, "missing transaction id")
 	}
 
-	s.mu.Lock()
-	tx, ok := s.txns[txnKey]
-	owner := s.txnOwner[txnKey]
+	session.mu.Lock()
+	tx, ok := session.txns[txnKey]
 	if ok {
-		delete(s.txns, txnKey)
-		delete(s.txnOwner, txnKey)
+		delete(session.txns, txnKey)
+		delete(session.txnOwner, txnKey)
 	}
-	s.mu.Unlock()
+	session.mu.Unlock()
 
 	if !ok || tx == nil {
 		return status.Error(codes.NotFound, "transaction not found")
-	}
-	if owner != username {
-		_ = tx.Rollback()
-		return status.Error(codes.PermissionDenied, "transaction does not belong to authenticated user")
 	}
 
 	switch req.GetAction() {
@@ -371,27 +231,28 @@ func (s *FlightSessionServer) EndTransaction(ctx context.Context,
 	}
 }
 
-func (s *FlightSessionServer) CreatePreparedStatement(ctx context.Context,
+func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 	req flightsql.ActionCreatePreparedStatementRequest) (flightsql.ActionCreatePreparedStatementResult, error) {
-	_, db, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
+	if err != nil {
+		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.Unauthenticated, "%v", err)
+	}
+
+	tx, txnKey, err := session.getOpenTxn(req.GetTransactionId())
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
 
-	tx, txnKey, err := s.getOpenTxn(req.GetTransactionId())
-	if err != nil {
-		return flightsql.ActionCreatePreparedStatementResult{}, err
-	}
-
-	schema, err := s.getQuerySchema(ctx, db, req.GetQuery(), tx)
+	schema, err := getQuerySchema(ctx, session.DB, req.GetQuery(), tx, h.alloc)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.InvalidArgument, "failed to prepare: %v", err)
 	}
 
-	handleID := fmt.Sprintf("prep-%d", s.handleID.Add(1))
-	s.mu.Lock()
-	s.queries[handleID] = &flightQueryHandle{query: req.GetQuery(), schema: schema, txnID: txnKey}
-	s.mu.Unlock()
+	handleID := fmt.Sprintf("prep-%d", session.handleCounter.Add(1))
+	session.mu.Lock()
+	session.queries[handleID] = &QueryHandle{Query: req.GetQuery(), TxnID: txnKey}
+	session.mu.Unlock()
 
 	return flightsql.ActionCreatePreparedStatementResult{
 		Handle:        []byte(handleID),
@@ -399,37 +260,49 @@ func (s *FlightSessionServer) CreatePreparedStatement(ctx context.Context,
 	}, nil
 }
 
-func (s *FlightSessionServer) ClosePreparedStatement(ctx context.Context,
+func (h *FlightSQLHandler) ClosePreparedStatement(ctx context.Context,
 	req flightsql.ActionClosePreparedStatementRequest) error {
-	_, _, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return err
+		return status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 
 	handleID := string(req.GetPreparedStatementHandle())
-	s.mu.Lock()
-	delete(s.queries, handleID)
-	s.mu.Unlock()
+	session.mu.Lock()
+	delete(session.queries, handleID)
+	session.mu.Unlock()
 	return nil
 }
 
-func (s *FlightSessionServer) GetFlightInfoPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery,
+func (h *FlightSQLHandler) GetFlightInfoPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery,
 	desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	_, _, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 
 	handleID := string(cmd.GetPreparedStatementHandle())
-	s.mu.RLock()
-	handle, ok := s.queries[handleID]
-	s.mu.RUnlock()
+	session.mu.RLock()
+	handle, ok := session.queries[handleID]
+	session.mu.RUnlock()
 	if !ok {
 		return nil, status.Error(codes.NotFound, "prepared statement not found")
 	}
 
+	tx, _, err := session.getOpenTxn([]byte(handle.TxnID))
+	if err != nil {
+		return nil, err
+	}
+
+	schema, err := getQuerySchema(ctx, session.DB, handle.Query, tx, h.alloc)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get schema: %v", err)
+	}
+
 	return &flight.FlightInfo{
-		Schema:           flight.SerializeSchema(handle.schema, s.alloc),
+		Schema:           flight.SerializeSchema(schema, h.alloc),
 		FlightDescriptor: desc,
 		Endpoint: []*flight.FlightEndpoint{{
 			Ticket: &flight.Ticket{Ticket: []byte(handleID)},
@@ -439,28 +312,34 @@ func (s *FlightSessionServer) GetFlightInfoPreparedStatement(ctx context.Context
 	}, nil
 }
 
-func (s *FlightSessionServer) DoGetPreparedStatement(ctx context.Context,
+func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 	cmd flightsql.PreparedStatementQuery) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	_, db, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 
-	s.mu.RLock()
-	handle, ok := s.queries[string(cmd.GetPreparedStatementHandle())]
-	s.mu.RUnlock()
+	session.mu.RLock()
+	handle, ok := session.queries[string(cmd.GetPreparedStatementHandle())]
+	session.mu.RUnlock()
 	if !ok {
 		return nil, nil, status.Error(codes.NotFound, "prepared statement not found")
 	}
 
 	var tx *sql.Tx
-	if handle.txnID != "" {
-		s.mu.RLock()
-		tx = s.txns[handle.txnID]
-		s.mu.RUnlock()
+	if handle.TxnID != "" {
+		session.mu.RLock()
+		tx = session.txns[handle.TxnID]
+		session.mu.RUnlock()
 		if tx == nil {
 			return nil, nil, status.Error(codes.NotFound, "transaction not found")
 		}
+	}
+
+	schema, err := getQuerySchema(ctx, session.DB, handle.Query, tx, h.alloc)
+	if err != nil {
+		return nil, nil, status.Errorf(codes.Internal, "failed to get query schema: %v", err)
 	}
 
 	ch := make(chan flight.StreamChunk, 10)
@@ -468,9 +347,9 @@ func (s *FlightSessionServer) DoGetPreparedStatement(ctx context.Context,
 		defer close(ch)
 		var rows *sql.Rows
 		if tx != nil {
-			rows, err = tx.QueryContext(ctx, handle.query)
+			rows, err = tx.QueryContext(ctx, handle.Query)
 		} else {
-			rows, err = db.QueryContext(ctx, handle.query)
+			rows, err = session.DB.QueryContext(ctx, handle.Query)
 		}
 		if err != nil {
 			ch <- flight.StreamChunk{Err: err}
@@ -480,9 +359,8 @@ func (s *FlightSessionServer) DoGetPreparedStatement(ctx context.Context,
 			_ = rows.Close()
 		}()
 
-		s.worker.totalQueries.Add(1)
 		for {
-			record, recErr := s.rowsToRecord(rows, handle.schema, 1024)
+			record, recErr := RowsToRecord(h.alloc, rows, schema, 1024)
 			if recErr != nil {
 				ch <- flight.StreamChunk{Err: recErr}
 				return
@@ -494,19 +372,19 @@ func (s *FlightSessionServer) DoGetPreparedStatement(ctx context.Context,
 		}
 	}()
 
-	return handle.schema, ch, nil
+	return schema, ch, nil
 }
 
-func (s *FlightSessionServer) GetFlightInfoSchemas(ctx context.Context, cmd flightsql.GetDBSchemas,
+func (h *FlightSQLHandler) GetFlightInfoSchemas(ctx context.Context, cmd flightsql.GetDBSchemas,
 	desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	_, _, err := s.authAndDB(ctx)
+
+	_, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
-	_ = cmd
 
 	return &flight.FlightInfo{
-		Schema:           flight.SerializeSchema(schema_ref.DBSchemas, s.alloc),
+		Schema:           flight.SerializeSchema(schema_ref.DBSchemas, h.alloc),
 		FlightDescriptor: desc,
 		Endpoint: []*flight.FlightEndpoint{{
 			Ticket: &flight.Ticket{Ticket: desc.Cmd},
@@ -516,13 +394,13 @@ func (s *FlightSessionServer) GetFlightInfoSchemas(ctx context.Context, cmd flig
 	}, nil
 }
 
-func (s *FlightSessionServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.GetDBSchemas) (*arrow.Schema,
+func (h *FlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd flightsql.GetDBSchemas) (*arrow.Schema,
 	<-chan flight.StreamChunk, error) {
-	username, db, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
-	activeTx := s.getActiveTxnForUser(username)
 
 	schema := schema_ref.DBSchemas
 	query := "SELECT catalog_name, schema_name AS db_schema_name FROM information_schema.schemata WHERE 1=1"
@@ -538,6 +416,8 @@ func (s *FlightSessionServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 	}
 	query += " ORDER BY catalog_name, db_schema_name"
 
+	activeTx := session.getActiveTxn()
+
 	ch := make(chan flight.StreamChunk, 1)
 	go func() {
 		defer close(ch)
@@ -546,7 +426,7 @@ func (s *FlightSessionServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 		if activeTx != nil {
 			rows, qerr = activeTx.QueryContext(ctx, query, args...)
 		} else {
-			rows, qerr = db.QueryContext(ctx, query, args...)
+			rows, qerr = session.DB.QueryContext(ctx, query, args...)
 		}
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
@@ -556,7 +436,7 @@ func (s *FlightSessionServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 			_ = rows.Close()
 		}()
 
-		builder := array.NewRecordBuilder(s.alloc, schema)
+		builder := array.NewRecordBuilder(h.alloc, schema)
 		defer builder.Release()
 		catalogBuilder := builder.Field(0).(*array.StringBuilder)
 		schemaBuilder := builder.Field(1).(*array.StringBuilder)
@@ -589,11 +469,12 @@ func (s *FlightSessionServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 	return schema, ch, nil
 }
 
-func (s *FlightSessionServer) GetFlightInfoTables(ctx context.Context, cmd flightsql.GetTables,
+func (h *FlightSQLHandler) GetFlightInfoTables(ctx context.Context, cmd flightsql.GetTables,
 	desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	_, _, err := s.authAndDB(ctx)
+
+	_, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
 
 	schema := schema_ref.Tables
@@ -602,7 +483,7 @@ func (s *FlightSessionServer) GetFlightInfoTables(ctx context.Context, cmd fligh
 	}
 
 	return &flight.FlightInfo{
-		Schema:           flight.SerializeSchema(schema, s.alloc),
+		Schema:           flight.SerializeSchema(schema, h.alloc),
 		FlightDescriptor: desc,
 		Endpoint: []*flight.FlightEndpoint{{
 			Ticket: &flight.Ticket{Ticket: desc.Cmd},
@@ -612,13 +493,13 @@ func (s *FlightSessionServer) GetFlightInfoTables(ctx context.Context, cmd fligh
 	}, nil
 }
 
-func (s *FlightSessionServer) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema,
+func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema,
 	<-chan flight.StreamChunk, error) {
-	username, db, err := s.authAndDB(ctx)
+
+	session, err := h.sessionFromContext(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, status.Errorf(codes.Unauthenticated, "%v", err)
 	}
-	activeTx := s.getActiveTxnForUser(username)
 
 	schema := schema_ref.Tables
 	includeSchema := cmd.GetIncludeSchema()
@@ -652,6 +533,8 @@ func (s *FlightSessionServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	}
 	query += " ORDER BY table_catalog, table_schema, table_name"
 
+	activeTx := session.getActiveTxn()
+
 	ch := make(chan flight.StreamChunk, 1)
 	go func() {
 		defer close(ch)
@@ -660,7 +543,7 @@ func (s *FlightSessionServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 		if activeTx != nil {
 			rows, qerr = activeTx.QueryContext(ctx, query, args...)
 		} else {
-			rows, qerr = db.QueryContext(ctx, query, args...)
+			rows, qerr = session.DB.QueryContext(ctx, query, args...)
 		}
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
@@ -690,7 +573,7 @@ func (s *FlightSessionServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			return
 		}
 
-		builder := array.NewRecordBuilder(s.alloc, schema)
+		builder := array.NewRecordBuilder(h.alloc, schema)
 		defer builder.Release()
 
 		var schemaBuilder *array.BinaryBuilder
@@ -713,13 +596,13 @@ func (s *FlightSessionServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			builder.Field(3).(*array.StringBuilder).Append(t.tableType)
 
 			if includeSchema {
-				qualified := qualifyTableName(t.catalog, t.schema, t.name)
-				tableSchema, schemaErr := s.getQuerySchema(ctx, db, "SELECT * FROM "+qualified, activeTx)
+				qualified := QualifyTableName(t.catalog, t.schema, t.name)
+				tableSchema, schemaErr := getQuerySchema(ctx, session.DB, "SELECT * FROM "+qualified, activeTx, h.alloc)
 				if schemaErr != nil {
 					ch <- flight.StreamChunk{Err: schemaErr}
 					return
 				}
-				schemaBuilder.Append(flight.SerializeSchema(tableSchema, s.alloc))
+				schemaBuilder.Append(flight.SerializeSchema(tableSchema, h.alloc))
 			}
 		}
 
@@ -729,7 +612,9 @@ func (s *FlightSessionServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	return schema, ch, nil
 }
 
-func (s *FlightSessionServer) getOpenTxn(transactionID []byte) (*sql.Tx, string, error) {
+// Session helpers
+
+func (s *Session) getOpenTxn(transactionID []byte) (*sql.Tx, string, error) {
 	if len(transactionID) == 0 {
 		return nil, "", nil
 	}
@@ -743,24 +628,19 @@ func (s *FlightSessionServer) getOpenTxn(transactionID []byte) (*sql.Tx, string,
 	return tx, txnKey, nil
 }
 
-func (s *FlightSessionServer) getActiveTxnForUser(username string) *sql.Tx {
-	if username == "" {
-		return nil
-	}
+func (s *Session) getActiveTxn() *sql.Tx {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for txnKey, owner := range s.txnOwner {
-		if owner != username {
-			continue
-		}
-		if tx, ok := s.txns[txnKey]; ok && tx != nil {
+	for _, tx := range s.txns {
+		if tx != nil {
 			return tx
 		}
 	}
 	return nil
 }
 
-func (s *FlightSessionServer) getQuerySchema(ctx context.Context, db *sql.DB, query string, tx *sql.Tx) (*arrow.Schema, error) {
+// getQuerySchema executes a query with LIMIT 0 to discover the result schema.
+func getQuerySchema(ctx context.Context, db *sql.DB, query string, tx *sql.Tx, alloc memory.Allocator) (*arrow.Schema, error) {
 	queryWithLimit := query + " LIMIT 0"
 	var rows *sql.Rows
 	var err error
@@ -783,19 +663,7 @@ func (s *FlightSessionServer) getQuerySchema(ctx context.Context, db *sql.DB, qu
 
 	fields := make([]arrow.Field, len(colTypes))
 	for i, ct := range colTypes {
-		fields[i] = arrow.Field{Name: ct.Name(), Type: duckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
+		fields[i] = arrow.Field{Name: ct.Name(), Type: DuckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
 	}
 	return arrow.NewSchema(fields, nil), nil
-}
-
-func (s *FlightSessionServer) rowsToRecord(rows *sql.Rows, schema *arrow.Schema, batchSize int) (arrow.RecordBatch, error) {
-	return duckdbservice.RowsToRecord(s.alloc, rows, schema, batchSize)
-}
-
-func duckDBTypeToArrow(dbType string) arrow.DataType {
-	return duckdbservice.DuckDBTypeToArrow(dbType)
-}
-
-func qualifyTableName(catalog, schema sql.NullString, table string) string {
-	return duckdbservice.QualifyTableName(catalog, schema, table)
 }
