@@ -97,8 +97,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Try handover from existing control plane if handover socket exists
 	handoverDone := false
-	if cfg.HandoverSocket != "" {
-		if _, err := os.Stat(cfg.HandoverSocket); err == nil {
+	if cfg.HandoverSocket == "" {
+		slog.Info("No handover socket configured, starting fresh.")
+	} else {
+		if _, err := os.Stat(cfg.HandoverSocket); err != nil {
+			slog.Info("Handover socket not found, starting fresh.", "socket", cfg.HandoverSocket, "error", err)
+		} else {
 			slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
 			pgLn, flightLn, existingWorkers, err := receiveHandover(cfg.HandoverSocket)
 			if err != nil {
@@ -121,15 +125,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 
 	if !handoverDone {
-		// Spawn new workers
-		for i := 0; i < cfg.WorkerCount; i++ {
-			if err := cp.pool.SpawnWorker(i); err != nil {
-				slog.Error("Failed to spawn worker.", "id", i, "error", err)
-				os.Exit(1)
-			}
-		}
-
-		// Start TCP listener
+		// Bind TCP listeners FIRST, before spawning workers. If the port is
+		// already in use (e.g. old CP still running after a failed handover),
+		// we exit immediately without touching worker sockets.
 		addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
@@ -146,6 +144,14 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			os.Exit(1)
 		}
 		cp.flightLn = flightLn
+
+		// Spawn workers only after listeners are bound.
+		for i := 0; i < cfg.WorkerCount; i++ {
+			if err := cp.pool.SpawnWorker(i); err != nil {
+				slog.Error("Failed to spawn worker.", "id", i, "error", err)
+				os.Exit(1)
+			}
+		}
 	}
 
 	// Start health check loop
@@ -156,10 +162,30 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Notify systemd we're ready.
 	if handoverDone {
-		// New process after handover: claim PID and signal ready.
-		if err := sdNotify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); err != nil {
-			slog.Warn("sd_notify MAINPID+READY failed.", "error", err)
-		}
+		// Delay MAINPID+READY until the old CP exits and we get reparented
+		// to PID 1 (systemd). If we send MAINPID while still a child of the
+		// old CP, systemd warns "Supervising process which is not our child"
+		// and can't detect crashes for auto-restart.
+		go func() {
+			ppid := os.Getppid()
+			if ppid != 1 {
+				reparented := false
+				for i := 0; i < 100; i++ { // 10s max
+					time.Sleep(100 * time.Millisecond)
+					if os.Getppid() != ppid {
+						reparented = true
+						break
+					}
+				}
+				if !reparented {
+					slog.Warn("Timed out waiting for old CP to exit, sending MAINPID anyway.", "old_ppid", ppid)
+				}
+			}
+			if err := sdNotify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); err != nil {
+				slog.Warn("sd_notify MAINPID+READY failed.", "error", err)
+			}
+			slog.Info("Notified systemd of new main PID.", "pid", os.Getpid())
+		}()
 	} else {
 		if err := sdNotify("READY=1"); err != nil {
 			slog.Warn("sd_notify READY failed.", "error", err)
@@ -171,12 +197,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"flight_addr", cp.flightLn.Addr().String(),
 		"workers", cfg.WorkerCount)
 
-	// After handover, replace adopted workers with freshly spawned ones.
+	// After handover, replace adopted workers with fresh ones. Old workers
+	// stay alive serving existing sessions until all clients disconnect.
 	if handoverDone {
 		go func() {
-			slog.Info("Post-handover: starting rolling update to replace adopted workers.")
-			if err := cp.pool.RollingUpdate(makeShutdownCtx(sigChan)); err != nil {
-				slog.Error("Post-handover rolling update failed.", "error", err)
+			slog.Info("Post-handover: starting graceful replace of adopted workers.")
+			if err := cp.pool.GracefulReplace(makeShutdownCtx(sigChan)); err != nil {
+				slog.Error("Post-handover graceful replace failed.", "error", err)
 			}
 		}()
 	}
