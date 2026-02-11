@@ -3,12 +3,18 @@ package duckdbservice
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"math/big"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 // RowsToRecord converts sql.Rows into an Arrow RecordBatch of up to batchSize rows.
@@ -47,33 +53,133 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 
 // DuckDBTypeToArrow maps a DuckDB type name to an Arrow DataType.
 func DuckDBTypeToArrow(dbType string) arrow.DataType {
-	dbType = strings.ToUpper(dbType)
-	switch {
-	case strings.Contains(dbType, "INT64"), strings.Contains(dbType, "BIGINT"):
-		return arrow.PrimitiveTypes.Int64
-	case strings.Contains(dbType, "INT32"), strings.Contains(dbType, "INTEGER"):
-		return arrow.PrimitiveTypes.Int32
-	case strings.Contains(dbType, "INT16"), strings.Contains(dbType, "SMALLINT"):
-		return arrow.PrimitiveTypes.Int16
-	case strings.Contains(dbType, "INT8"), strings.Contains(dbType, "TINYINT"):
-		return arrow.PrimitiveTypes.Int8
-	case strings.Contains(dbType, "DOUBLE"), strings.Contains(dbType, "FLOAT8"):
-		return arrow.PrimitiveTypes.Float64
-	case strings.Contains(dbType, "FLOAT"), strings.Contains(dbType, "REAL"):
-		return arrow.PrimitiveTypes.Float32
-	case strings.Contains(dbType, "BOOL"):
-		return arrow.FixedWidthTypes.Boolean
-	case strings.Contains(dbType, "VARCHAR"), strings.Contains(dbType, "TEXT"), strings.Contains(dbType, "STRING"):
-		return arrow.BinaryTypes.String
-	case strings.Contains(dbType, "BLOB"):
-		return arrow.BinaryTypes.Binary
-	case strings.Contains(dbType, "DATE"):
-		return arrow.FixedWidthTypes.Date32
-	case strings.Contains(dbType, "TIMESTAMP"):
-		return arrow.FixedWidthTypes.Timestamp_us
-	default:
+	upper := strings.ToUpper(strings.TrimSpace(dbType))
+
+	// LIST: "INTEGER[]", "VARCHAR[]", etc.
+	if strings.HasSuffix(upper, "[]") {
+		return arrow.ListOf(DuckDBTypeToArrow(dbType[:len(dbType)-2]))
+	}
+
+	// DECIMAL(p,s) / NUMERIC(p,s)
+	if strings.HasPrefix(upper, "DECIMAL(") || strings.HasPrefix(upper, "NUMERIC(") {
+		p, s := parseDecimalParams(dbType)
+		return &arrow.Decimal128Type{Precision: int32(p), Scale: int32(s)}
+	}
+
+	// STRUCT(...) and MAP(...) — Phase 2
+	if strings.HasPrefix(upper, "STRUCT(") {
 		return arrow.BinaryTypes.String
 	}
+	if strings.HasPrefix(upper, "MAP(") {
+		return arrow.BinaryTypes.String
+	}
+
+	switch upper {
+	// Signed integers
+	case "TINYINT":
+		return arrow.PrimitiveTypes.Int8
+	case "SMALLINT":
+		return arrow.PrimitiveTypes.Int16
+	case "INTEGER", "INT":
+		return arrow.PrimitiveTypes.Int32
+	case "BIGINT":
+		return arrow.PrimitiveTypes.Int64
+
+	// Unsigned integers
+	case "UTINYINT":
+		return arrow.PrimitiveTypes.Uint8
+	case "USMALLINT":
+		return arrow.PrimitiveTypes.Uint16
+	case "UINTEGER":
+		return arrow.PrimitiveTypes.Uint32
+	case "UBIGINT":
+		return arrow.PrimitiveTypes.Uint64
+
+	// Big integers as Decimal128
+	case "HUGEINT":
+		return &arrow.Decimal128Type{Precision: 38, Scale: 0}
+	case "UHUGEINT":
+		return &arrow.Decimal128Type{Precision: 38, Scale: 0}
+
+	// Floats
+	case "FLOAT", "REAL":
+		return arrow.PrimitiveTypes.Float32
+	case "DOUBLE":
+		return arrow.PrimitiveTypes.Float64
+
+	// Boolean
+	case "BOOLEAN", "BOOL":
+		return arrow.FixedWidthTypes.Boolean
+
+	// Strings
+	case "VARCHAR", "TEXT", "STRING":
+		return arrow.BinaryTypes.String
+	case "BLOB", "BYTEA":
+		return arrow.BinaryTypes.Binary
+
+	// Date
+	case "DATE":
+		return arrow.FixedWidthTypes.Date32
+
+	// Time
+	case "TIME":
+		return arrow.FixedWidthTypes.Time64us
+	case "TIMETZ":
+		return arrow.FixedWidthTypes.Time64us
+
+	// Timestamps (no timezone → empty TimeZone string)
+	case "TIMESTAMP":
+		return &arrow.TimestampType{Unit: arrow.Microsecond}
+	case "TIMESTAMP_S":
+		return &arrow.TimestampType{Unit: arrow.Second}
+	case "TIMESTAMP_MS":
+		return &arrow.TimestampType{Unit: arrow.Millisecond}
+	case "TIMESTAMP_NS":
+		return &arrow.TimestampType{Unit: arrow.Nanosecond}
+	case "TIMESTAMPTZ":
+		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
+
+	// Interval
+	case "INTERVAL":
+		return arrow.FixedWidthTypes.MonthDayNanoInterval
+
+	// UUID as string (DuckDB's Arrow reader maps FixedSizeBinary(16) to BLOB, not UUID)
+	case "UUID":
+		return arrow.BinaryTypes.String
+
+	// JSON/ENUM/BIT as string
+	case "JSON", "BIT":
+		return arrow.BinaryTypes.String
+
+	// Bare DECIMAL without params
+	case "DECIMAL", "NUMERIC":
+		return &arrow.Decimal128Type{Precision: 18, Scale: 3}
+
+	default:
+		// VARCHAR(N), ENUM(...), etc.
+		if strings.HasPrefix(upper, "VARCHAR(") || strings.HasPrefix(upper, "ENUM(") {
+			return arrow.BinaryTypes.String
+		}
+		return arrow.BinaryTypes.String
+	}
+}
+
+// parseDecimalParams extracts precision and scale from a type name like "DECIMAL(18,2)".
+func parseDecimalParams(typeName string) (precision, scale int) {
+	lparen := strings.IndexByte(typeName, '(')
+	rparen := strings.LastIndexByte(typeName, ')')
+	if lparen < 0 || rparen <= lparen {
+		return 18, 3
+	}
+	parts := strings.SplitN(typeName[lparen+1:rparen], ",", 2)
+	if len(parts) == 2 {
+		n1, _ := fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &precision)
+		n2, _ := fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &scale)
+		if n1 == 1 && n2 == 1 {
+			return
+		}
+	}
+	return 18, 3
 }
 
 // AppendValue appends a value to an Arrow array builder with type coercion.
@@ -124,6 +230,40 @@ func AppendValue(builder array.Builder, val interface{}) {
 		default:
 			b.AppendNull()
 		}
+	case *array.Uint8Builder:
+		switch v := val.(type) {
+		case uint8:
+			b.Append(v)
+		case uint16:
+			b.Append(uint8(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Uint16Builder:
+		switch v := val.(type) {
+		case uint16:
+			b.Append(v)
+		case uint32:
+			b.Append(uint16(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Uint32Builder:
+		switch v := val.(type) {
+		case uint32:
+			b.Append(v)
+		case uint64:
+			b.Append(uint32(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Uint64Builder:
+		switch v := val.(type) {
+		case uint64:
+			b.Append(v)
+		default:
+			b.AppendNull()
+		}
 	case *array.Float64Builder:
 		switch v := val.(type) {
 		case float64:
@@ -148,12 +288,94 @@ func AppendValue(builder array.Builder, val interface{}) {
 		} else {
 			b.AppendNull()
 		}
+	case *array.Date32Builder:
+		switch v := val.(type) {
+		case time.Time:
+			// Floor division to handle pre-epoch dates correctly.
+			// Go's integer division truncates toward zero, but Date32
+			// needs days since epoch rounded toward negative infinity.
+			unix := v.Unix()
+			days := unix / 86400
+			if unix%86400 < 0 {
+				days--
+			}
+			b.Append(arrow.Date32(days))
+		default:
+			b.AppendNull()
+		}
+	case *array.TimestampBuilder:
+		switch v := val.(type) {
+		case time.Time:
+			b.AppendTime(v)
+		default:
+			b.AppendNull()
+		}
+	case *array.Time64Builder:
+		switch v := val.(type) {
+		case time.Time:
+			micros := int64(v.Hour())*3600000000 + int64(v.Minute())*60000000 +
+				int64(v.Second())*1000000 + int64(v.Nanosecond())/1000
+			b.Append(arrow.Time64(micros))
+		default:
+			b.AppendNull()
+		}
+	case *array.MonthDayNanoIntervalBuilder:
+		switch v := val.(type) {
+		case duckdb.Interval:
+			b.Append(arrow.MonthDayNanoInterval{
+				Months:      v.Months,
+				Days:        v.Days,
+				Nanoseconds: v.Micros * 1000,
+			})
+		default:
+			b.AppendNull()
+		}
+	case *array.Decimal128Builder:
+		switch v := val.(type) {
+		case duckdb.Decimal:
+			b.Append(decimal128.FromBigInt(v.Value))
+		case *big.Int:
+			b.Append(decimal128.FromBigInt(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.FixedSizeBinaryBuilder:
+		switch v := val.(type) {
+		case duckdb.UUID:
+			b.Append(v[:])
+		case []byte:
+			b.Append(v)
+		default:
+			b.AppendNull()
+		}
+	case *array.ListBuilder:
+		switch v := val.(type) {
+		case []any:
+			b.Append(true)
+			vb := b.ValueBuilder()
+			for _, elem := range v {
+				AppendValue(vb, elem)
+			}
+		default:
+			b.AppendNull()
+		}
 	case *array.StringBuilder:
 		switch v := val.(type) {
 		case string:
 			b.Append(v)
+		case duckdb.UUID:
+			b.Append(v.String())
 		case []byte:
-			b.Append(string(v))
+			// TODO: This heuristic (16 bytes + invalid UTF-8 → UUID) is coupled to
+			// DuckDBTypeToArrow("UUID") returning String. If UUID mapping changes,
+			// update this branch accordingly. The Go driver returns []byte (not
+			// duckdb.UUID) when scanning UUID columns into interface{}.
+			if len(v) == 16 && !utf8.Valid(v) {
+				s := hex.EncodeToString(v)
+				b.Append(s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32])
+			} else {
+				b.Append(string(v))
+			}
 		default:
 			b.Append(fmt.Sprintf("%v", v))
 		}
