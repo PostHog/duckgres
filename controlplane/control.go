@@ -40,6 +40,7 @@ type ControlPlane struct {
 	closed      bool
 	closeMu     sync.Mutex
 	wg          sync.WaitGroup
+	reloading   atomic.Bool // guards against concurrent selfExec from double SIGUSR1
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -185,6 +186,10 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		for sig := range sigChan {
 			switch sig {
 			case syscall.SIGUSR1:
+				if !cp.reloading.CompareAndSwap(false, true) {
+					slog.Warn("SIGUSR1 ignored, handover already in progress.")
+					break
+				}
 				slog.Info("Received SIGUSR1, starting graceful handover via self-exec.")
 				if err := sdNotify("RELOADING=1"); err != nil {
 					slog.Warn("sd_notify RELOADING failed.", "error", err)
@@ -489,15 +494,30 @@ func (cp *ControlPlane) selfExec() {
 
 	if err := cmd.Start(); err != nil {
 		slog.Error("Self-exec failed.", "error", err)
-		// Cancel the RELOADING state so systemd considers us running again.
-		if notifyErr := sdNotify("READY=1"); notifyErr != nil {
-			slog.Warn("sd_notify READY (after failed self-exec) failed.", "error", notifyErr)
-		}
+		cp.recoverFromFailedReload()
 		return
 	}
 
 	slog.Info("New control plane spawned.", "pid", cmd.Process.Pid)
-	// Don't cmd.Wait() — the handover listener handles the rest.
+
+	// Reap the child in the background to avoid a zombie. The old CP normally
+	// exits via os.Exit(0) in handleHandoverRequest before the child finishes,
+	// but if handover fails the child may exit first and needs to be reaped.
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			slog.Warn("Self-exec'd process exited with error.", "error", err)
+		}
+	}()
 	// Old CP exits via os.Exit(0) in handleHandoverRequest() after handover completes.
-	// If new process crashes before connecting, handover listener times out and old CP continues.
+	// If new process crashes before connecting, handleHandoverRequest times out
+	// and calls recoverFromFailedReload.
+}
+
+// recoverFromFailedReload cancels the RELOADING state, resets the guard flag,
+// and restarts the handover listener so a future SIGUSR1 can retry.
+func (cp *ControlPlane) recoverFromFailedReload() {
+	if err := sdNotify("READY=1"); err != nil {
+		slog.Warn("sd_notify READY (recovery) failed.", "error", err)
+	}
+	cp.reloading.Store(false)
 }
