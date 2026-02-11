@@ -71,6 +71,10 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	defer func() { _ = conn.Close() }()
 	defer func() { _ = handoverLn.Close() }()
 
+	// Deadline prevents the old CP from hanging forever if the new process
+	// crashes mid-protocol before sending handover_complete.
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
 
