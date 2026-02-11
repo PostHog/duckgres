@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/posthog/duckgres/controlplane"
+	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
@@ -125,13 +127,18 @@ func main() {
 	showHelp := flag.Bool("help", false, "Show help message")
 
 	// Control plane flags
-	mode := flag.String("mode", "standalone", "Run mode: standalone (default), control-plane, or worker")
+	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, worker, or duckdb-service")
 	workerCount := flag.Int("worker-count", 4, "Number of worker processes (control-plane mode)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
 	flightPort := flag.Int("flight-port", 0, "Flight SQL port to listen on (control-plane mode, env: DUCKGRES_FLIGHT_PORT)")
 	grpcSocket := flag.String("grpc-socket", "", "gRPC socket path (worker mode, set by control-plane)")
 	fdSocket := flag.String("fd-socket", "", "FD passing socket path (worker mode, set by control-plane)")
+
+	// DuckDB service flags
+	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
+	duckdbToken := flag.String("duckdb-token", "", "Bearer token for DuckDB service auth (duckdb-service mode, env: DUCKGRES_DUCKDB_TOKEN)")
+	duckdbMaxSessions := flag.Int("duckdb-max-sessions", 0, "Max concurrent sessions, 0=unlimited (duckdb-service mode, env: DUCKGRES_DUCKDB_MAX_SESSIONS)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Duckgres %s - PostgreSQL wire protocol server for DuckDB\n\n", version)
@@ -148,6 +155,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_PORT        Flight SQL port (control-plane mode, default: 8815)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
 
@@ -261,6 +271,47 @@ func main() {
 			fatal("Worker mode requires --grpc-socket and --fd-socket flags")
 		}
 		controlplane.RunWorker(*grpcSocket, *fdSocket)
+		return
+	}
+
+	// Handle duckdb-service mode
+	if *mode == "duckdb-service" {
+		listenAddr := *duckdbListen
+		if listenAddr == "" {
+			listenAddr = env("DUCKGRES_DUCKDB_LISTEN", "")
+		}
+		if listenAddr == "" {
+			fatal("duckdb-service mode requires --duckdb-listen flag or DUCKGRES_DUCKDB_LISTEN env var")
+		}
+
+		token := *duckdbToken
+		if token == "" {
+			token = env("DUCKGRES_DUCKDB_TOKEN", "")
+		}
+
+		maxSessions := *duckdbMaxSessions
+		if maxSessions == 0 {
+			if v := env("DUCKGRES_DUCKDB_MAX_SESSIONS", ""); v != "" {
+				if n, err := strconv.Atoi(v); err != nil {
+					slog.Warn("Invalid DUCKGRES_DUCKDB_MAX_SESSIONS", "value", v)
+				} else {
+					maxSessions = n
+				}
+			}
+		}
+
+		if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+			fatal("Failed to create data directory: " + err.Error())
+		}
+
+		initMetrics()
+
+		duckdbservice.Run(duckdbservice.ServiceConfig{
+			ListenAddr:   listenAddr,
+			ServerConfig: cfg,
+			BearerToken:  token,
+			MaxSessions:  maxSessions,
+		})
 		return
 	}
 
