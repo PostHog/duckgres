@@ -184,12 +184,12 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	}
 
 	handoverOK = true
-	slog.Info("Handover complete. Waiting briefly before stopping old listeners...")
 
-	// Keep listeners alive briefly so the new control plane can enter accept loops.
-	time.Sleep(2 * time.Second)
-
-	// Stop accepting new connections
+	// Stop accepting new connections immediately. The new CP has its own
+	// listener FD copy (from SCM_RIGHTS), so closing our copy doesn't
+	// affect the underlying socket — the new CP can still accept on it.
+	// Without this, both CPs race to accept connections and the old CP
+	// may route to draining workers.
 	cp.closeMu.Lock()
 	cp.closed = true
 	cp.closeMu.Unlock()
@@ -198,7 +198,7 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 		_ = cp.flightLn.Close()
 	}
 
-	// Wait for wg to drain
+	// Wait for in-flight connections to finish routing
 	cp.wg.Wait()
 
 	slog.Info("Old control plane exiting after handover.")

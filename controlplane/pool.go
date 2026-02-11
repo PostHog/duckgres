@@ -38,9 +38,11 @@ type ManagedWorker struct {
 type WorkerPool struct {
 	mu            sync.RWMutex
 	workers       map[int]*ManagedWorker
+	retiring      []*ManagedWorker // workers removed from routing but still serving sessions
 	socketDir     string
 	cfg           server.Config
-	rollingUpdate atomic.Bool // suppresses health check spawning during rolling update
+	rollingUpdate atomic.Bool  // suppresses health check spawning during rolling/graceful update
+	nextGen       atomic.Int64 // monotonic generation counter for unique socket paths
 }
 
 // NewWorkerPool creates a new worker pool.
@@ -53,11 +55,15 @@ func NewWorkerPool(socketDir string, cfg server.Config) *WorkerPool {
 }
 
 // SpawnWorker spawns a new worker process and establishes gRPC + FD socket connections.
+// Socket paths include the CP PID and a generation counter to ensure uniqueness
+// across handovers (where a new CP replaces workers that share the same ID).
 func (p *WorkerPool) SpawnWorker(id int) error {
-	grpcSocket := filepath.Join(p.socketDir, fmt.Sprintf("worker-%d-grpc.sock", id))
-	fdSocket := filepath.Join(p.socketDir, fmt.Sprintf("worker-%d-fd.sock", id))
+	gen := p.nextGen.Add(1)
+	tag := fmt.Sprintf("%d-%d-%d", id, os.Getpid(), gen) // unique: workerID-cpPID-gen
+	grpcSocket := filepath.Join(p.socketDir, fmt.Sprintf("w%s-grpc.sock", tag))
+	fdSocket := filepath.Join(p.socketDir, fmt.Sprintf("w%s-fd.sock", tag))
 
-	// Clean up old sockets
+	// Clean up stale sockets (shouldn't exist for unique tag, but safety net)
 	_ = os.Remove(grpcSocket)
 	_ = os.Remove(fdSocket)
 
@@ -134,9 +140,11 @@ func (p *WorkerPool) SpawnWorker(id int) error {
 		}
 		close(worker.done)
 
-		// Remove from pool
+		// Remove from pool only if this worker is still the current one
 		p.mu.Lock()
-		delete(p.workers, id)
+		if p.workers[id] == worker {
+			delete(p.workers, id)
+		}
 		p.mu.Unlock()
 	}()
 
@@ -200,7 +208,9 @@ func (p *WorkerPool) ConnectExistingWorker(id int, grpcSocket, fdSocket string) 
 				slog.Info("Handed-over worker unreachable, marking as done.", "id", id, "error", err)
 				close(worker.done)
 				p.mu.Lock()
-				delete(p.workers, id)
+				if p.workers[id] == worker {
+					delete(p.workers, id)
+				}
 				p.mu.Unlock()
 				return
 			}
@@ -312,14 +322,6 @@ func (p *WorkerPool) selectWorker() (*ManagedWorker, error) {
 	}
 
 	if best == nil {
-		// Fallback to round-robin if health checks fail
-		for _, w := range p.workers {
-			best = w
-			break
-		}
-	}
-
-	if best == nil {
 		return nil, fmt.Errorf("no healthy workers")
 	}
 
@@ -327,11 +329,17 @@ func (p *WorkerPool) selectWorker() (*ManagedWorker, error) {
 }
 
 // CancelQuery forwards a cancel request to the appropriate worker.
+// Also checks retiring workers that are still serving sessions.
 func (p *WorkerPool) CancelQuery(backendPid, secretKey int32) bool {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-
+	all := make([]*ManagedWorker, 0, len(p.workers)+len(p.retiring))
 	for _, w := range p.workers {
+		all = append(all, w)
+	}
+	all = append(all, p.retiring...)
+	p.mu.RUnlock()
+
+	for _, w := range all {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		resp, err := w.Client.CancelQuery(ctx, &pb.CancelQueryRequest{
 			BackendPid: backendPid,
@@ -346,13 +354,14 @@ func (p *WorkerPool) CancelQuery(backendPid, secretKey int32) bool {
 	return false
 }
 
-// DrainAll sends Drain to all workers.
+// DrainAll sends Drain to all workers, including retiring ones.
 func (p *WorkerPool) DrainAll(timeout time.Duration) error {
 	p.mu.RLock()
-	workers := make([]*ManagedWorker, 0, len(p.workers))
+	workers := make([]*ManagedWorker, 0, len(p.workers)+len(p.retiring))
 	for _, w := range p.workers {
 		workers = append(workers, w)
 	}
+	workers = append(workers, p.retiring...)
 	p.mu.RUnlock()
 
 	var wg sync.WaitGroup
@@ -373,13 +382,14 @@ func (p *WorkerPool) DrainAll(timeout time.Duration) error {
 	return nil
 }
 
-// ShutdownAll sends Shutdown to all workers and waits for them to exit.
+// ShutdownAll sends Shutdown to all workers (including retiring) and waits for them to exit.
 func (p *WorkerPool) ShutdownAll(timeout time.Duration) {
 	p.mu.RLock()
-	workers := make([]*ManagedWorker, 0, len(p.workers))
+	workers := make([]*ManagedWorker, 0, len(p.workers)+len(p.retiring))
 	for _, w := range p.workers {
 		workers = append(workers, w)
 	}
+	workers = append(workers, p.retiring...)
 	p.mu.RUnlock()
 
 	for _, w := range workers {
@@ -497,6 +507,9 @@ func (p *WorkerPool) RollingUpdate(ctx context.Context) error {
 		}
 
 		_ = old.GRPCConn.Close()
+		// Clean up old sockets — workers exit via os.Exit(0) which skips defers.
+		_ = os.Remove(old.GRPCSocket)
+		_ = os.Remove(old.FDSocket)
 
 		// Spawn replacement
 		if err := p.SpawnWorker(id); err != nil {
@@ -507,6 +520,148 @@ func (p *WorkerPool) RollingUpdate(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// GracefulReplace replaces workers one at a time but lets old workers keep
+// serving existing sessions until all clients disconnect naturally.
+// Only one rolling/graceful update can run at a time.
+func (p *WorkerPool) GracefulReplace(ctx context.Context) error {
+	if !p.rollingUpdate.CompareAndSwap(false, true) {
+		slog.Warn("Rolling update already in progress, skipping.")
+		return nil
+	}
+	defer p.rollingUpdate.Store(false)
+
+	p.mu.RLock()
+	ids := make([]int, 0, len(p.workers))
+	for id := range p.workers {
+		ids = append(ids, id)
+	}
+	p.mu.RUnlock()
+
+	for _, id := range ids {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		slog.Info("Graceful replace: replacing worker.", "id", id)
+
+		p.mu.Lock()
+		old, exists := p.workers[id]
+		if !exists {
+			p.mu.Unlock()
+			continue
+		}
+		delete(p.workers, id)
+		p.mu.Unlock()
+
+		// Set draining flag on old worker (TimeoutNs=1 returns immediately,
+		// just sets draining=true; 0 would default to 30s wait).
+		drainCtx, drainCancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = old.Client.Drain(drainCtx, &pb.DrainRequest{TimeoutNs: 1})
+		drainCancel()
+
+		// Spawn replacement with same ID
+		if err := p.SpawnWorker(id); err != nil {
+			// Put old worker back if spawn fails
+			p.mu.Lock()
+			if _, replaced := p.workers[id]; !replaced {
+				p.workers[id] = old
+			}
+			p.mu.Unlock()
+			return fmt.Errorf("failed to spawn replacement worker %d: %w", id, err)
+		}
+
+		// Retire the old worker in the background
+		go p.retireWorker(old)
+
+		slog.Info("Graceful replace: worker replaced.", "id", id)
+	}
+
+	return nil
+}
+
+// retireWorker monitors an old worker that has been removed from routing.
+// It waits until all active connections drain naturally, then shuts it down.
+func (p *WorkerPool) retireWorker(w *ManagedWorker) {
+	p.mu.Lock()
+	p.retiring = append(p.retiring, w)
+	p.mu.Unlock()
+
+	defer func() {
+		_ = w.GRPCConn.Close()
+		// Clean up socket files — workers exit via os.Exit(0) which skips defers.
+		_ = os.Remove(w.GRPCSocket)
+		_ = os.Remove(w.FDSocket)
+		p.mu.Lock()
+		for i, rw := range p.retiring {
+			if rw == w {
+				p.retiring = append(p.retiring[:i], p.retiring[i+1:]...)
+				break
+			}
+		}
+		p.mu.Unlock()
+	}()
+
+	const (
+		pollInterval = 5 * time.Second
+		maxRetire    = 24 * time.Hour
+	)
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	deadline := time.After(maxRetire)
+
+	for {
+		select {
+		case <-deadline:
+			slog.Warn("Retiring worker hit 24h safety net, force shutting down.", "id", w.ID, "pid", w.PID)
+			shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, _ = w.Client.Shutdown(shutCtx, &pb.ShutdownRequest{TimeoutNs: int64(30 * time.Second)})
+			shutCancel()
+			select {
+			case <-w.done:
+			case <-time.After(30 * time.Second):
+				if w.Cmd != nil && w.Cmd.Process != nil {
+					_ = w.Cmd.Process.Kill()
+				}
+			}
+			return
+
+		case <-w.done:
+			slog.Info("Retiring worker exited on its own.", "id", w.ID, "pid", w.PID)
+			return
+
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			health, err := w.Client.Health(ctx, &pb.HealthRequest{})
+			cancel()
+
+			if err != nil {
+				slog.Info("Retiring worker unreachable, considering it done.", "id", w.ID, "error", err)
+				return
+			}
+
+			if health.ActiveConnections == 0 {
+				slog.Info("Retiring worker has no active connections, shutting down.", "id", w.ID, "pid", w.PID)
+				shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_, _ = w.Client.Shutdown(shutCtx, &pb.ShutdownRequest{TimeoutNs: int64(30 * time.Second)})
+				shutCancel()
+				select {
+				case <-w.done:
+				case <-time.After(30 * time.Second):
+					if w.Cmd != nil && w.Cmd.Process != nil {
+						_ = w.Cmd.Process.Kill()
+					}
+				}
+				return
+			}
+
+			slog.Debug("Retiring worker still has active connections.", "id", w.ID, "active", health.ActiveConnections)
+		}
+	}
 }
 
 func buildConfigureRequest(cfg server.Config) *pb.ConfigureRequest {

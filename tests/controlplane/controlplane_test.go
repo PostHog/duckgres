@@ -105,10 +105,6 @@ type cpHarness struct {
 	socketDir  string
 	configFile string
 	logBuf     *syncBuffer
-
-	// Track new CP PIDs spawned via handover for cleanup
-	newCPPids []int
-	mu        sync.Mutex
 }
 
 type cpOpts struct {
@@ -183,6 +179,9 @@ users:
 		"HOME=" + os.Getenv("HOME"),
 		"PATH=" + os.Getenv("PATH"),
 	}
+	// Put CP in its own process group so cleanup can kill the entire tree
+	// (CP + selfExec'd new CPs + all workers) with a single signal.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("Failed to start control plane: %v", err)
@@ -209,7 +208,7 @@ users:
 
 func (h *cpHarness) openConn(t *testing.T) *sql.DB {
 	t.Helper()
-	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require", h.port)
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require connect_timeout=10", h.port)
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		t.Fatalf("Failed to open connection: %v", err)
@@ -269,45 +268,43 @@ func (h *cpHarness) parseNewCPPid() (int, error) {
 func (h *cpHarness) cleanup(t *testing.T) {
 	t.Helper()
 
-	// Kill the original CP
-	if h.cmd.Process != nil {
-		_ = h.cmd.Process.Signal(syscall.SIGTERM)
-		done := make(chan struct{})
-		go func() {
-			_ = h.cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			_ = h.cmd.Process.Kill()
-			_ = h.cmd.Wait()
-		}
+	if h.cmd.Process == nil {
+		return
 	}
 
-	// Kill any new CPs spawned via handover
-	h.mu.Lock()
-	pids := append([]int{}, h.newCPPids...)
-	h.mu.Unlock()
+	// The CP was started with Setpgid: true, so it and all descendants
+	// (selfExec'd new CPs, all workers) share a process group. Killing
+	// the group ensures no orphan workers survive to hold pipe FDs open
+	// (which would block cmd.Wait() forever).
+	pgid := h.cmd.Process.Pid
 
-	for _, pid := range pids {
-		// Check if still alive
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			continue
-		}
-		_ = proc.Signal(syscall.SIGTERM)
-		// Give it a moment to exit
-		time.Sleep(500 * time.Millisecond)
-		_ = proc.Signal(syscall.SIGKILL)
+	// Try graceful shutdown first
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+
+	done := make(chan struct{})
+	go func() {
+		_ = h.cmd.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return
+	case <-time.After(5 * time.Second):
+	}
+
+	// Force kill entire process group
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		// Safety net: don't block forever even if Wait() is stuck.
+		// This shouldn't happen since SIGKILL to the group kills all
+		// pipe holders, but guard against edge cases.
 	}
 }
 
-func (h *cpHarness) trackNewCPPid(pid int) {
-	h.mu.Lock()
-	h.newCPPids = append(h.newCPPids, pid)
-	h.mu.Unlock()
-}
 
 // doHandover sends SIGUSR1, waits for the new CP to take over, and tracks
 // the new PID for cleanup. Returns the new CP's PID.
@@ -332,8 +329,6 @@ func (h *cpHarness) doHandover(t *testing.T) int {
 	if err != nil {
 		t.Fatalf("Failed to parse new CP PID: %v\nLogs:\n%s", err, h.logBuf.String())
 	}
-	h.trackNewCPPid(newPid)
-
 	return newPid
 }
 
@@ -407,8 +402,15 @@ func TestHandoverPreservesActiveQuery(t *testing.T) {
 		t.Fatal("Long-running query timed out")
 	}
 
-	// The same connection should still work after the query completes
-	// (though it may fail after rolling update drains the old worker)
+	// The same connection should still work after the query completes —
+	// graceful replace keeps old workers alive until clients disconnect.
+	var postHandover int
+	if err := db.QueryRow("SELECT 42").Scan(&postHandover); err != nil {
+		t.Fatalf("Post-handover query on same connection failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if postHandover != 42 {
+		t.Fatalf("Expected 42, got %d", postHandover)
+	}
 }
 
 func TestHandoverNewConnections(t *testing.T) {
@@ -425,9 +427,9 @@ func TestHandoverNewConnections(t *testing.T) {
 	// Trigger handover
 	h.doHandover(t)
 
-	// Wait for the new CP's rolling update to complete so workers are fully ready
-	if err := h.waitForLogCount("Rolling update: worker replaced.", 2, 120*time.Second); err != nil {
-		t.Logf("Warning: rolling update may not have completed: %v", err)
+	// Wait for the new CP's graceful replace to complete so new workers are ready
+	if err := h.waitForLogCount("Graceful replace: worker replaced.", 2, 120*time.Second); err != nil {
+		t.Logf("Warning: graceful replace may not have completed: %v", err)
 	}
 
 	// New connections must work after handover settles
@@ -458,7 +460,7 @@ func TestHandoverNewConnectionsDuringTransition(t *testing.T) {
 
 	// While handover is in progress, try connecting repeatedly.
 	// Some connections may fail during transition, but at least some should succeed.
-	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require", h.port)
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require connect_timeout=10", h.port)
 	var successes, failures int
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -487,10 +489,6 @@ func TestHandoverNewConnectionsDuringTransition(t *testing.T) {
 		t.Fatalf("No connections succeeded during handover transition.\nLogs:\n%s", h.logBuf.String())
 	}
 
-	// Parse the new CP PID for cleanup
-	if newPid, err := h.parseNewCPPid(); err == nil {
-		h.trackNewCPPid(newPid)
-	}
 }
 
 func TestRollingUpdatePreservesActiveQuery(t *testing.T) {
@@ -556,7 +554,7 @@ func TestRollingUpdatePreservesActiveQuery(t *testing.T) {
 func TestHandoverConcurrentConnections(t *testing.T) {
 	h := startControlPlane(t, defaultOpts())
 
-	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require", h.port)
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require connect_timeout=10", h.port)
 	const numConns = 8
 	dbs := make([]*sql.DB, numConns)
 	for i := range dbs {
@@ -606,7 +604,7 @@ func TestHandoverConcurrentConnections(t *testing.T) {
 	// Wait for all query goroutines to finish
 	wg.Wait()
 
-	// Close all connections so post-handover rolling update drain completes quickly
+	// Close all connections so retiring workers can detect 0 active connections
 	for _, db := range dbs {
 		_ = db.Close()
 	}
@@ -615,10 +613,6 @@ func TestHandoverConcurrentConnections(t *testing.T) {
 	if err := h.waitForLog("Handover complete, took over listener and workers.", 60*time.Second); err != nil {
 		t.Fatalf("Handover did not complete.\nLogs:\n%s", h.logBuf.String())
 	}
-	if newPid, err := h.parseNewCPPid(); err == nil {
-		h.trackNewCPPid(newPid)
-	}
-
 	// Count errors from the concurrent queries
 	var errCount int
 	for _, err := range errors {
@@ -628,14 +622,13 @@ func TestHandoverConcurrentConnections(t *testing.T) {
 		}
 	}
 
-	// Active queries on old workers should complete. Some connections may
-	// break when the old worker is drained during the post-handover rolling
-	// update, but the majority should succeed.
-	if errCount > numConns/2 {
-		t.Fatalf("Too many errors: %d/%d connections failed.\nLogs:\n%s",
+	// With graceful replace, old workers stay alive until clients disconnect,
+	// so all active queries should complete without error.
+	if errCount > 0 {
+		t.Fatalf("%d/%d connections failed (expected 0 with graceful replace).\nLogs:\n%s",
 			errCount, numConns, h.logBuf.String())
 	}
-	t.Logf("Concurrent handover: %d/%d connections completed without error", numConns-errCount, numConns)
+	t.Logf("Concurrent handover: all %d connections completed without error", numConns)
 }
 
 func TestDoubleUSR1Ignored(t *testing.T) {
@@ -654,31 +647,28 @@ func TestDoubleUSR1Ignored(t *testing.T) {
 		t.Fatalf("Failed to send first SIGUSR1: %v", err)
 	}
 
-	// Immediately send second SIGUSR1
+	// Immediately send second SIGUSR1. The old CP may exit before
+	// this signal is delivered (listener closes immediately after
+	// handover), so don't fail if the signal can't be sent.
 	time.Sleep(100 * time.Millisecond)
-	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
-		t.Fatalf("Failed to send second SIGUSR1: %v", err)
-	}
-
-	// Check that the duplicate was ignored
-	if err := h.waitForLog("SIGUSR1 ignored, handover already in progress.", 10*time.Second); err != nil {
-		t.Fatalf("Double SIGUSR1 was not ignored.\nLogs:\n%s", h.logBuf.String())
-	}
+	_ = h.sendSignal(syscall.SIGUSR1)
 
 	// Wait for the new CP to confirm it has taken over
 	if err := h.waitForLog("Handover complete, took over listener and workers.", 30*time.Second); err != nil {
 		t.Fatalf("Handover did not complete.\nLogs:\n%s", h.logBuf.String())
 	}
 
-	// Track new CP for cleanup
-	if newPid, err := h.parseNewCPPid(); err == nil {
-		h.trackNewCPPid(newPid)
+	// Verify exactly one handover happened (the second SIGUSR1 was either
+	// ignored by the reloading guard or arrived after the old CP exited).
+	handoverCount := strings.Count(h.logBuf.String(), "Handover complete, took over listener and workers.")
+	if handoverCount != 1 {
+		t.Fatalf("Expected exactly 1 handover, got %d.\nLogs:\n%s", handoverCount, h.logBuf.String())
 	}
 
 	// Service should work after handover completes
-	// Wait for rolling update to finish so new workers are ready
-	if err := h.waitForLogCount("Rolling update: worker replaced.", 2, 120*time.Second); err != nil {
-		t.Logf("Warning: rolling update may not have completed: %v", err)
+	// Wait for graceful replace to finish so new workers are ready
+	if err := h.waitForLogCount("Graceful replace: worker replaced.", 2, 120*time.Second); err != nil {
+		t.Logf("Warning: graceful replace may not have completed: %v", err)
 	}
 
 	db2 := h.openConn(t)
@@ -703,17 +693,17 @@ func TestUSR2DuringRollingUpdate(t *testing.T) {
 		t.Fatalf("Failed to send SIGUSR1: %v", err)
 	}
 
-	// Wait for post-handover rolling update to start
-	if err := h.waitForLog("Post-handover: starting rolling update", 30*time.Second); err != nil {
-		t.Fatalf("Rolling update did not start.\nLogs:\n%s", h.logBuf.String())
+	// Wait for post-handover graceful replace to start
+	if err := h.waitForLog("Post-handover: starting graceful replace", 30*time.Second); err != nil {
+		t.Fatalf("Graceful replace did not start.\nLogs:\n%s", h.logBuf.String())
 	}
 
-	// Track new CP for cleanup and send it SIGUSR2 while rolling update is in progress
+	// Track new CP for cleanup and send it SIGUSR2 while graceful replace is in progress.
+	// GracefulReplace uses the same rollingUpdate flag, so SIGUSR2 is rejected.
 	newPid, err := h.parseNewCPPid()
 	if err != nil {
 		t.Fatalf("Could not get new CP PID: %v", err)
 	}
-	h.trackNewCPPid(newPid)
 	if err := syscall.Kill(newPid, syscall.SIGUSR2); err != nil {
 		t.Fatalf("Failed to send SIGUSR2 to new CP: %v", err)
 	}
@@ -723,9 +713,9 @@ func TestUSR2DuringRollingUpdate(t *testing.T) {
 		t.Fatalf("Concurrent rolling update was not rejected.\nLogs:\n%s", h.logBuf.String())
 	}
 
-	// Wait for the original rolling update to finish
-	if err := h.waitForLogCount("Rolling update: worker replaced.", 2, 120*time.Second); err != nil {
-		t.Logf("Warning: rolling update may not have fully completed: %v", err)
+	// Wait for the graceful replace to finish
+	if err := h.waitForLogCount("Graceful replace: worker replaced.", 2, 120*time.Second); err != nil {
+		t.Logf("Warning: graceful replace may not have fully completed: %v", err)
 	}
 
 	// Service should still work
@@ -749,9 +739,9 @@ func TestHandoverThenNormalOperation(t *testing.T) {
 	// Do a full handover
 	newPid := h.doHandover(t)
 
-	// Wait for rolling update to complete (all workers replaced)
-	if err := h.waitForLogCount("Rolling update: worker replaced.", 2, 120*time.Second); err != nil {
-		t.Fatalf("Post-handover rolling update did not complete.\nLogs:\n%s", h.logBuf.String())
+	// Wait for graceful replace to complete (all workers replaced)
+	if err := h.waitForLogCount("Graceful replace: worker replaced.", 2, 120*time.Second); err != nil {
+		t.Fatalf("Post-handover graceful replace did not complete.\nLogs:\n%s", h.logBuf.String())
 	}
 
 	// Verify new connections work
@@ -769,10 +759,9 @@ func TestHandoverThenNormalOperation(t *testing.T) {
 		t.Fatalf("Failed to send SIGUSR2 to new CP: %v", err)
 	}
 
-	// Wait for the new rolling update to start and complete
-	// The post-handover rolling update already produced 2 "worker replaced" logs.
-	// After SIGUSR2, we expect 2 more (4 total).
-	if err := h.waitForLogCount("Rolling update: worker replaced.", 4, 120*time.Second); err != nil {
+	// Wait for the SIGUSR2 rolling update to complete (2 workers replaced).
+	// These are "Rolling update:" logs (not "Graceful replace:").
+	if err := h.waitForLogCount("Rolling update: worker replaced.", 2, 120*time.Second); err != nil {
 		t.Fatalf("SIGUSR2 rolling update did not complete.\nLogs:\n%s", h.logBuf.String())
 	}
 
@@ -780,6 +769,50 @@ func TestHandoverThenNormalOperation(t *testing.T) {
 	db3 := h.openConn(t)
 	if err := db3.QueryRow("SELECT 99").Scan(&v); err != nil {
 		t.Fatalf("Post-rolling-update query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if v != 99 {
+		t.Fatalf("Expected 99, got %d", v)
+	}
+}
+
+func TestHandoverOldWorkerRetiresOnDisconnect(t *testing.T) {
+	h := startControlPlane(t, defaultOpts())
+
+	// Open a connection and run a query to warm it up
+	db := h.openConn(t)
+	var v int
+	if err := db.QueryRow("SELECT 1").Scan(&v); err != nil {
+		t.Fatalf("Warmup query failed: %v", err)
+	}
+
+	// Trigger handover — old workers become retiring, new workers spawned
+	h.doHandover(t)
+
+	// Wait for graceful replace to finish spawning new workers
+	if err := h.waitForLogCount("Graceful replace: worker replaced.", 2, 120*time.Second); err != nil {
+		t.Fatalf("Graceful replace did not complete.\nLogs:\n%s", h.logBuf.String())
+	}
+
+	// The existing connection should still work on the retiring old worker
+	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
+		t.Fatalf("Query on retiring worker failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if v != 42 {
+		t.Fatalf("Expected 42, got %d", v)
+	}
+
+	// Close the connection — this should cause the retiring worker to have 0 active connections
+	_ = db.Close()
+
+	// The retiring worker should detect 0 connections and shut down
+	if err := h.waitForLog("Retiring worker has no active connections, shutting down.", 30*time.Second); err != nil {
+		t.Fatalf("Old worker did not retire after disconnect.\nLogs:\n%s", h.logBuf.String())
+	}
+
+	// New connections should work on the new workers
+	db2 := h.openConn(t)
+	if err := db2.QueryRow("SELECT 99").Scan(&v); err != nil {
+		t.Fatalf("Post-retirement query failed: %v\nLogs:\n%s", err, h.logBuf.String())
 	}
 	if v != 99 {
 		t.Fatalf("Expected 99, got %d", v)

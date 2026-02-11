@@ -197,12 +197,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"flight_addr", cp.flightLn.Addr().String(),
 		"workers", cfg.WorkerCount)
 
-	// After handover, replace adopted workers with freshly spawned ones.
+	// After handover, replace adopted workers with fresh ones. Old workers
+	// stay alive serving existing sessions until all clients disconnect.
 	if handoverDone {
 		go func() {
-			slog.Info("Post-handover: starting rolling update to replace adopted workers.")
-			if err := cp.pool.RollingUpdate(makeShutdownCtx(sigChan)); err != nil {
-				slog.Error("Post-handover rolling update failed.", "error", err)
+			slog.Info("Post-handover: starting graceful replace of adopted workers.")
+			if err := cp.pool.GracefulReplace(makeShutdownCtx(sigChan)); err != nil {
+				slog.Error("Post-handover graceful replace failed.", "error", err)
 			}
 		}()
 	}
