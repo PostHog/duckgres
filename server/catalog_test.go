@@ -284,7 +284,7 @@ func TestUptimeMacros(t *testing.T) {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
-	// Verify both macros return INTERVAL type
+	// Verify both macros return INTERVAL type and a non-negative value
 	for _, fn := range []string{"uptime", "process_uptime"} {
 		var typeName string
 		if err := db.QueryRow(fmt.Sprintf("SELECT pg_typeof(%s())", fn)).Scan(&typeName); err != nil {
@@ -292,6 +292,16 @@ func TestUptimeMacros(t *testing.T) {
 		}
 		if typeName != "interval" {
 			t.Errorf("%s() returned type %q, want interval", fn, typeName)
+		}
+
+		// Verify the interval is non-negative (catches timezone bugs where
+		// UTC vs local mismatch produces a negative offset like -08:00:00)
+		var isNonNeg bool
+		if err := db.QueryRow(fmt.Sprintf("SELECT %s() >= INTERVAL '0 seconds'", fn)).Scan(&isNonNeg); err != nil {
+			t.Fatalf("%s() >= 0 query failed: %v", fn, err)
+		}
+		if !isNonNeg {
+			t.Errorf("%s() returned a negative interval — possible timezone bug", fn)
 		}
 	}
 }

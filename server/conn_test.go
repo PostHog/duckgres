@@ -8,6 +8,8 @@ import (
 	"math"
 	"strings"
 	"testing"
+
+	duckdb "github.com/duckdb/duckdb-go/v2"
 )
 
 func TestIsEmptyQuery(t *testing.T) {
@@ -1919,6 +1921,54 @@ func TestParseMultiLineCSV(t *testing.T) {
 							i, j, val, tt.expected[i][j])
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestFormatInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval duckdb.Interval
+		want     string
+	}{
+		// Zero
+		{"zero", duckdb.Interval{}, "00:00:00"},
+
+		// Time only
+		{"seconds", duckdb.Interval{Micros: 5_000_000}, "00:00:05"},
+		{"minutes and seconds", duckdb.Interval{Micros: 788_000_000}, "00:13:08"},
+		{"hours minutes seconds", duckdb.Interval{Micros: 3_661_000_000}, "01:01:01"},
+		{"fractional seconds", duckdb.Interval{Micros: 788_917_797}, "00:13:08.917797"},
+		{"exact microseconds", duckdb.Interval{Micros: 1}, "00:00:00.000001"},
+
+		// Days
+		{"one day", duckdb.Interval{Days: 1}, "1 day"},
+		{"multiple days", duckdb.Interval{Days: 5}, "5 days"},
+		{"days and time", duckdb.Interval{Days: 3, Micros: 9_000_000_000}, "3 days 02:30:00"},
+
+		// Months
+		{"one month", duckdb.Interval{Months: 1}, "1 mon"},
+		{"multiple months", duckdb.Interval{Months: 7}, "7 mons"},
+		{"one year", duckdb.Interval{Months: 12}, "1 year"},
+		{"years and months", duckdb.Interval{Months: 14}, "1 year 2 mons"},
+		{"multiple years", duckdb.Interval{Months: 36}, "3 years"},
+
+		// Mixed
+		{"full interval", duckdb.Interval{Months: 14, Days: 3, Micros: 14_706_123_456}, "1 year 2 mons 3 days 04:05:06.123456"},
+
+		// Negative
+		{"negative time", duckdb.Interval{Micros: -3_600_000_000}, "-01:00:00"},
+		{"negative days", duckdb.Interval{Days: -2}, "-2 days"},
+		{"negative months", duckdb.Interval{Months: -1}, "-1 mon"},
+		{"negative years", duckdb.Interval{Months: -14}, "-1 year -2 mons"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatInterval(tt.interval)
+			if got != tt.want {
+				t.Errorf("formatInterval(%+v) = %q, want %q", tt.interval, got, tt.want)
 			}
 		})
 	}
