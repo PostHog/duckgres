@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -35,10 +36,11 @@ type ManagedWorker struct {
 
 // WorkerPool manages a pool of long-lived worker processes.
 type WorkerPool struct {
-	mu        sync.RWMutex
-	workers   map[int]*ManagedWorker
-	socketDir string
-	cfg       server.Config
+	mu            sync.RWMutex
+	workers       map[int]*ManagedWorker
+	socketDir     string
+	cfg           server.Config
+	rollingUpdate atomic.Bool // suppresses health check spawning during rolling update
 }
 
 // NewWorkerPool creates a new worker pool.
@@ -414,7 +416,7 @@ func (p *WorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration
 			currentCount := len(p.workers)
 			p.mu.RUnlock()
 
-			if currentCount < desiredCount {
+			if currentCount < desiredCount && !p.rollingUpdate.Load() {
 				slog.Warn("Worker count below desired, spawning replacements.",
 					"current", currentCount, "desired", desiredCount)
 				for i := 0; i < desiredCount; i++ {
@@ -445,6 +447,9 @@ func (p *WorkerPool) Workers() []*ManagedWorker {
 
 // RollingUpdate replaces workers one at a time with a new binary.
 func (p *WorkerPool) RollingUpdate(ctx context.Context) error {
+	p.rollingUpdate.Store(true)
+	defer p.rollingUpdate.Store(false)
+
 	p.mu.RLock()
 	ids := make([]int, 0, len(p.workers))
 	for id := range p.workers {
