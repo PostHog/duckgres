@@ -68,8 +68,22 @@ func (cp *ControlPlane) startHandoverListener() {
 
 // handleHandoverRequest processes an incoming handover request from a new control plane.
 func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.Listener) {
-	defer func() { _ = conn.Close() }()
-	defer func() { _ = handoverLn.Close() }()
+	handoverOK := false
+	defer func() {
+		_ = conn.Close()
+		_ = handoverLn.Close()
+		if !handoverOK {
+			// Handover failed — recover so the old CP keeps serving and
+			// a future SIGUSR1 can retry.
+			slog.Warn("Handover failed, recovering.")
+			cp.recoverFromFailedReload()
+			cp.startHandoverListener()
+		}
+	}()
+
+	// Deadline prevents the old CP from hanging forever if the new process
+	// crashes mid-protocol before sending handover_complete.
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
@@ -169,6 +183,7 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 		return
 	}
 
+	handoverOK = true
 	slog.Info("Handover complete. Waiting briefly before stopping old listeners...")
 
 	// Keep listeners alive briefly so the new control plane can enter accept loops.

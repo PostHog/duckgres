@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,7 @@ type ControlPlane struct {
 	closed      bool
 	closeMu     sync.Mutex
 	wg          sync.WaitGroup
+	reloading   atomic.Bool // guards against concurrent selfExec from double SIGUSR1
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -91,7 +93,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Set up signal handling
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR2)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1, syscall.SIGUSR2)
 
 	// Try handover from existing control plane if handover socket exists
 	handoverDone := false
@@ -152,15 +154,47 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Start handover listener for future deployments
 	cp.startHandoverListener()
 
+	// Notify systemd we're ready.
+	if handoverDone {
+		// New process after handover: claim PID and signal ready.
+		if err := sdNotify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); err != nil {
+			slog.Warn("sd_notify MAINPID+READY failed.", "error", err)
+		}
+	} else {
+		if err := sdNotify("READY=1"); err != nil {
+			slog.Warn("sd_notify READY failed.", "error", err)
+		}
+	}
+
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
 		"flight_addr", cp.flightLn.Addr().String(),
 		"workers", cfg.WorkerCount)
 
+	// After handover, replace adopted workers with freshly spawned ones.
+	if handoverDone {
+		go func() {
+			slog.Info("Post-handover: starting rolling update to replace adopted workers.")
+			if err := cp.pool.RollingUpdate(makeShutdownCtx(sigChan)); err != nil {
+				slog.Error("Post-handover rolling update failed.", "error", err)
+			}
+		}()
+	}
+
 	// Handle signals
 	go func() {
 		for sig := range sigChan {
 			switch sig {
+			case syscall.SIGUSR1:
+				if !cp.reloading.CompareAndSwap(false, true) {
+					slog.Warn("SIGUSR1 ignored, handover already in progress.")
+					break
+				}
+				slog.Info("Received SIGUSR1, starting graceful handover via self-exec.")
+				if err := sdNotify("RELOADING=1"); err != nil {
+					slog.Warn("sd_notify RELOADING failed.", "error", err)
+				}
+				go cp.selfExec()
 			case syscall.SIGUSR2:
 				slog.Info("Received SIGUSR2, starting rolling update.")
 				go func() {
@@ -447,4 +481,43 @@ func (cp *ControlPlane) shutdown() {
 	cp.wg.Wait()
 
 	slog.Info("Control plane shutdown complete.")
+}
+
+// selfExec spawns a new control plane process from the binary on disk.
+// The new process detects the existing handover socket and initiates the
+// handover protocol to receive listener FDs and worker info.
+func (cp *ControlPlane) selfExec() {
+	cmd := exec.Command(os.Args[0], os.Args[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+
+	if err := cmd.Start(); err != nil {
+		slog.Error("Self-exec failed.", "error", err)
+		cp.recoverFromFailedReload()
+		return
+	}
+
+	slog.Info("New control plane spawned.", "pid", cmd.Process.Pid)
+
+	// Reap the child in the background to avoid a zombie. The old CP normally
+	// exits via os.Exit(0) in handleHandoverRequest before the child finishes,
+	// but if handover fails the child may exit first and needs to be reaped.
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			slog.Warn("Self-exec'd process exited with error.", "error", err)
+		}
+	}()
+	// Old CP exits via os.Exit(0) in handleHandoverRequest() after handover completes.
+	// If new process crashes before connecting, handleHandoverRequest times out
+	// and calls recoverFromFailedReload.
+}
+
+// recoverFromFailedReload cancels the RELOADING state, resets the guard flag,
+// and restarts the handover listener so a future SIGUSR1 can retry.
+func (cp *ControlPlane) recoverFromFailedReload() {
+	if err := sdNotify("READY=1"); err != nil {
+		slog.Warn("sd_notify READY (recovery) failed.", "error", err)
+	}
+	cp.reloading.Store(false)
 }
