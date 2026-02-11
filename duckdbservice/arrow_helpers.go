@@ -66,12 +66,12 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		return &arrow.Decimal128Type{Precision: int32(p), Scale: int32(s)}
 	}
 
-	// STRUCT(...) and MAP(...) — Phase 2
+	// STRUCT(...) and MAP(...)
 	if strings.HasPrefix(upper, "STRUCT(") {
-		return arrow.BinaryTypes.String
+		return parseStructType(dbType)
 	}
 	if strings.HasPrefix(upper, "MAP(") {
-		return arrow.BinaryTypes.String
+		return parseMapType(dbType)
 	}
 
 	switch upper {
@@ -162,6 +162,113 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		}
 		return arrow.BinaryTypes.String
 	}
+}
+
+// splitTopLevelCommas splits s on commas at parenthesis depth 0,
+// respecting double-quoted identifiers (with "" as escape).
+func splitTopLevelCommas(s string) []string {
+	var parts []string
+	depth := 0
+	inQuotes := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch {
+		case ch == '"' && !inQuotes:
+			inQuotes = true
+		case ch == '"' && inQuotes:
+			// Peek ahead for escaped quote ""
+			if i+1 < len(s) && s[i+1] == '"' {
+				i++ // skip the escaped quote
+			} else {
+				inQuotes = false
+			}
+		case ch == '(' && !inQuotes:
+			depth++
+		case ch == ')' && !inQuotes:
+			depth--
+		case ch == ',' && depth == 0 && !inQuotes:
+			parts = append(parts, strings.TrimSpace(s[start:i]))
+			start = i + 1
+		}
+	}
+	parts = append(parts, strings.TrimSpace(s[start:]))
+	return parts
+}
+
+// extractInnerContent returns the content between the first '(' and last ')'.
+func extractInnerContent(dbType string) string {
+	lparen := strings.IndexByte(dbType, '(')
+	rparen := strings.LastIndexByte(dbType, ')')
+	if lparen < 0 || rparen <= lparen {
+		return ""
+	}
+	return dbType[lparen+1 : rparen]
+}
+
+// parseStructFieldDef parses a single struct field definition like `"field_name" TYPE`.
+// It handles double-quote escaping ("" → ").
+func parseStructFieldDef(fieldDef string) (name, typStr string) {
+	s := strings.TrimSpace(fieldDef)
+	if len(s) > 0 && s[0] == '"' {
+		// Quoted identifier: scan past opening ", collect until unescaped closing "
+		var nameBuilder strings.Builder
+		i := 1 // skip opening quote
+		for i < len(s) {
+			if s[i] == '"' {
+				if i+1 < len(s) && s[i+1] == '"' {
+					nameBuilder.WriteByte('"')
+					i += 2
+					continue
+				}
+				// Closing quote
+				i++
+				break
+			}
+			nameBuilder.WriteByte(s[i])
+			i++
+		}
+		name = nameBuilder.String()
+		typStr = strings.TrimSpace(s[i:])
+		return
+	}
+	// Fallback: unquoted name, split on first space
+	idx := strings.IndexByte(s, ' ')
+	if idx < 0 {
+		return s, ""
+	}
+	return s[:idx], strings.TrimSpace(s[idx+1:])
+}
+
+// parseStructType parses a DuckDB STRUCT type string into an Arrow StructType.
+func parseStructType(dbType string) *arrow.StructType {
+	inner := extractInnerContent(dbType)
+	parts := splitTopLevelCommas(inner)
+	fields := make([]arrow.Field, 0, len(parts))
+	for _, part := range parts {
+		name, typ := parseStructFieldDef(part)
+		if name == "" {
+			continue
+		}
+		fields = append(fields, arrow.Field{
+			Name:     name,
+			Type:     DuckDBTypeToArrow(typ),
+			Nullable: true,
+		})
+	}
+	return arrow.StructOf(fields...)
+}
+
+// parseMapType parses a DuckDB MAP type string into an Arrow MapType.
+func parseMapType(dbType string) *arrow.MapType {
+	inner := extractInnerContent(dbType)
+	parts := splitTopLevelCommas(inner)
+	if len(parts) != 2 {
+		return arrow.MapOf(arrow.BinaryTypes.String, arrow.BinaryTypes.String)
+	}
+	keyType := DuckDBTypeToArrow(parts[0])
+	valueType := DuckDBTypeToArrow(parts[1])
+	return arrow.MapOf(keyType, valueType)
 }
 
 // parseDecimalParams extracts precision and scale from a type name like "DECIMAL(18,2)".
@@ -355,6 +462,41 @@ func AppendValue(builder array.Builder, val interface{}) {
 			vb := b.ValueBuilder()
 			for _, elem := range v {
 				AppendValue(vb, elem)
+			}
+		default:
+			b.AppendNull()
+		}
+	case *array.StructBuilder:
+		switch v := val.(type) {
+		case map[string]any:
+			b.Append(true)
+			st := b.Type().(*arrow.StructType)
+			for i := 0; i < st.NumFields(); i++ {
+				fieldVal, ok := v[st.Field(i).Name]
+				if !ok {
+					b.FieldBuilder(i).AppendNull()
+				} else {
+					AppendValue(b.FieldBuilder(i), fieldVal)
+				}
+			}
+		default:
+			b.AppendNull()
+		}
+	case *array.MapBuilder:
+		switch v := val.(type) {
+		case duckdb.Map:
+			b.Append(true)
+			kb, ib := b.KeyBuilder(), b.ItemBuilder()
+			for k, item := range v {
+				AppendValue(kb, k)
+				AppendValue(ib, item)
+			}
+		case map[any]any:
+			b.Append(true)
+			kb, ib := b.KeyBuilder(), b.ItemBuilder()
+			for k, item := range v {
+				AppendValue(kb, k)
+				AppendValue(ib, item)
 			}
 		default:
 			b.AppendNull()

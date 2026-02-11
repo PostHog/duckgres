@@ -94,9 +94,44 @@ func TestDuckDBTypeToArrow(t *testing.T) {
 		{"DOUBLE[]", arrow.ListOf(arrow.PrimitiveTypes.Float64)},
 		{"BOOLEAN[]", arrow.ListOf(arrow.FixedWidthTypes.Boolean)},
 
-		// STRUCT/MAP fall back to string (Phase 2)
-		{"STRUCT(a INTEGER, b VARCHAR)", arrow.BinaryTypes.String},
-		{"MAP(VARCHAR, INTEGER)", arrow.BinaryTypes.String},
+		// STRUCT types (recursive)
+		{`STRUCT("a" INTEGER, "b" VARCHAR)`, arrow.StructOf(
+			arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+			arrow.Field{Name: "b", Type: arrow.BinaryTypes.String, Nullable: true},
+		)},
+
+		// MAP types (recursive)
+		{"MAP(VARCHAR, INTEGER)", arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int32)},
+
+		// Nested: struct containing map
+		{`STRUCT("a" MAP(VARCHAR, INTEGER), "b" BIGINT)`, arrow.StructOf(
+			arrow.Field{Name: "a", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int32), Nullable: true},
+			arrow.Field{Name: "b", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		)},
+
+		// Nested: map containing struct
+		{`MAP(VARCHAR, STRUCT("x" INTEGER))`, arrow.MapOf(
+			arrow.BinaryTypes.String,
+			arrow.StructOf(arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}),
+		)},
+
+		// Deeply nested struct
+		{`STRUCT("a" STRUCT("b" INTEGER))`, arrow.StructOf(
+			arrow.Field{Name: "a", Type: arrow.StructOf(
+				arrow.Field{Name: "b", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+			), Nullable: true},
+		)},
+
+		// LIST inside STRUCT field
+		{`STRUCT("a" INTEGER[], "b" VARCHAR)`, arrow.StructOf(
+			arrow.Field{Name: "a", Type: arrow.ListOf(arrow.PrimitiveTypes.Int32), Nullable: true},
+			arrow.Field{Name: "b", Type: arrow.BinaryTypes.String, Nullable: true},
+		)},
+
+		// LIST of STRUCT
+		{`STRUCT("a" INTEGER)[]`, arrow.ListOf(arrow.StructOf(
+			arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		))},
 
 		// Case insensitivity
 		{"integer", arrow.PrimitiveTypes.Int32},
@@ -410,4 +445,280 @@ func TestAppendValue(t *testing.T) {
 			t.Errorf("value(1) = %q, want %q", arr.Value(1), "42")
 		}
 	})
+
+	t.Run("StructBuilder", func(t *testing.T) {
+		st := arrow.StructOf(
+			arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+			arrow.Field{Name: "b", Type: arrow.BinaryTypes.String, Nullable: true},
+		)
+		schema := arrow.NewSchema([]arrow.Field{
+			{Name: "s", Type: st, Nullable: true},
+		}, nil)
+		rb := array.NewRecordBuilder(alloc, schema)
+		defer rb.Release()
+
+		// Valid struct
+		AppendValue(rb.Field(0), map[string]any{"a": int32(42), "b": "hello"})
+		// Null struct
+		AppendValue(rb.Field(0), nil)
+		// Struct with missing field (b should be null)
+		AppendValue(rb.Field(0), map[string]any{"a": int32(7)})
+
+		rec := rb.NewRecordBatch()
+		defer rec.Release()
+		col := rec.Column(0).(*array.Struct)
+
+		if col.Len() != 3 {
+			t.Fatalf("len = %d, want 3", col.Len())
+		}
+
+		// Check valid struct
+		aCol := col.Field(0).(*array.Int32)
+		bCol := col.Field(1).(*array.String)
+		if aCol.Value(0) != 42 {
+			t.Errorf("row0.a = %d, want 42", aCol.Value(0))
+		}
+		if bCol.Value(0) != "hello" {
+			t.Errorf("row0.b = %q, want %q", bCol.Value(0), "hello")
+		}
+
+		// Check null struct
+		if !col.IsNull(1) {
+			t.Error("row1 should be null")
+		}
+
+		// Check struct with missing field
+		if aCol.Value(2) != 7 {
+			t.Errorf("row2.a = %d, want 7", aCol.Value(2))
+		}
+		if !bCol.IsNull(2) {
+			t.Error("row2.b should be null")
+		}
+	})
+
+	t.Run("MapBuilder", func(t *testing.T) {
+		mt := arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int32)
+		schema := arrow.NewSchema([]arrow.Field{
+			{Name: "m", Type: mt, Nullable: true},
+		}, nil)
+		rb := array.NewRecordBuilder(alloc, schema)
+		defer rb.Release()
+
+		// Valid map (using duckdb.Map)
+		AppendValue(rb.Field(0), duckdb.Map{"x": int32(1), "y": int32(2)})
+		// Null map
+		AppendValue(rb.Field(0), nil)
+		// Empty map
+		AppendValue(rb.Field(0), duckdb.Map{})
+
+		rec := rb.NewRecordBatch()
+		defer rec.Release()
+		col := rec.Column(0).(*array.Map)
+
+		if col.Len() != 3 {
+			t.Fatalf("len = %d, want 3", col.Len())
+		}
+
+		// Valid map: should have 2 entries
+		start, end := col.ValueOffsets(0)
+		if end-start != 2 {
+			t.Errorf("row0 entries = %d, want 2", end-start)
+		}
+
+		// Null map
+		if !col.IsNull(1) {
+			t.Error("row1 should be null")
+		}
+
+		// Empty map: should have 0 entries but not be null
+		start, end = col.ValueOffsets(2)
+		if end-start != 0 {
+			t.Errorf("row2 entries = %d, want 0", end-start)
+		}
+		if col.IsNull(2) {
+			t.Error("row2 should not be null (empty map)")
+		}
+	})
+
+	t.Run("MapBuilder_map_any_any", func(t *testing.T) {
+		mt := arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int32)
+		schema := arrow.NewSchema([]arrow.Field{
+			{Name: "m", Type: mt, Nullable: true},
+		}, nil)
+		rb := array.NewRecordBuilder(alloc, schema)
+		defer rb.Release()
+
+		// map[any]any fallback
+		AppendValue(rb.Field(0), map[any]any{"x": int32(1)})
+
+		rec := rb.NewRecordBatch()
+		defer rec.Release()
+		col := rec.Column(0).(*array.Map)
+
+		if col.Len() != 1 {
+			t.Fatalf("len = %d, want 1", col.Len())
+		}
+		start, end := col.ValueOffsets(0)
+		if end-start != 1 {
+			t.Errorf("row0 entries = %d, want 1", end-start)
+		}
+	})
+
+	t.Run("StructBuilder_nested_map", func(t *testing.T) {
+		// STRUCT("a" MAP(VARCHAR, INTEGER))
+		st := arrow.StructOf(
+			arrow.Field{Name: "a", Type: arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int32), Nullable: true},
+		)
+		schema := arrow.NewSchema([]arrow.Field{
+			{Name: "s", Type: st, Nullable: true},
+		}, nil)
+		rb := array.NewRecordBuilder(alloc, schema)
+		defer rb.Release()
+
+		AppendValue(rb.Field(0), map[string]any{
+			"a": duckdb.Map{"k": int32(99)},
+		})
+
+		rec := rb.NewRecordBatch()
+		defer rec.Release()
+		col := rec.Column(0).(*array.Struct)
+		mapCol := col.Field(0).(*array.Map)
+
+		start, end := mapCol.ValueOffsets(0)
+		if end-start != 1 {
+			t.Errorf("nested map entries = %d, want 1", end-start)
+		}
+	})
+
+	t.Run("MapBuilder_nested_struct", func(t *testing.T) {
+		// MAP(VARCHAR, STRUCT("x" INTEGER))
+		mt := arrow.MapOf(
+			arrow.BinaryTypes.String,
+			arrow.StructOf(arrow.Field{Name: "x", Type: arrow.PrimitiveTypes.Int32, Nullable: true}),
+		)
+		schema := arrow.NewSchema([]arrow.Field{
+			{Name: "m", Type: mt, Nullable: true},
+		}, nil)
+		rb := array.NewRecordBuilder(alloc, schema)
+		defer rb.Release()
+
+		AppendValue(rb.Field(0), duckdb.Map{
+			"key1": map[string]any{"x": int32(10)},
+		})
+
+		rec := rb.NewRecordBatch()
+		defer rec.Release()
+		col := rec.Column(0).(*array.Map)
+
+		start, end := col.ValueOffsets(0)
+		if end-start != 1 {
+			t.Errorf("map entries = %d, want 1", end-start)
+		}
+	})
+}
+
+func TestSplitTopLevelCommas(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "simple fields",
+			input: `"a" INTEGER, "b" VARCHAR`,
+			want:  []string{`"a" INTEGER`, `"b" VARCHAR`},
+		},
+		{
+			name:  "nested parens",
+			input: `"a" MAP(VARCHAR, INTEGER), "b" BIGINT`,
+			want:  []string{`"a" MAP(VARCHAR, INTEGER)`, `"b" BIGINT`},
+		},
+		{
+			name:  "no commas",
+			input: `VARCHAR`,
+			want:  []string{`VARCHAR`},
+		},
+		{
+			name:  "map params",
+			input: `VARCHAR, STRUCT("x" INT)`,
+			want:  []string{`VARCHAR`, `STRUCT("x" INT)`},
+		},
+		{
+			name:  "empty",
+			input: "",
+			want:  []string{""},
+		},
+		{
+			name:  "deeply nested",
+			input: `"a" STRUCT("b" MAP(VARCHAR, INTEGER)), "c" BIGINT`,
+			want:  []string{`"a" STRUCT("b" MAP(VARCHAR, INTEGER))`, `"c" BIGINT`},
+		},
+		{
+			name:  "quoted field with comma in name",
+			input: `"a,b" INTEGER, "c" VARCHAR`,
+			want:  []string{`"a,b" INTEGER`, `"c" VARCHAR`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitTopLevelCommas(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitTopLevelCommas(%q) = %v (len %d), want %v (len %d)",
+					tt.input, got, len(got), tt.want, len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("splitTopLevelCommas(%q)[%d] = %q, want %q",
+						tt.input, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseStructFieldDef(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantName string
+		wantType string
+	}{
+		{
+			name:     "simple field",
+			input:    `"a" INTEGER`,
+			wantName: "a",
+			wantType: "INTEGER",
+		},
+		{
+			name:     "escaped quotes in name",
+			input:    `"a""b" VARCHAR`,
+			wantName: `a"b`,
+			wantType: "VARCHAR",
+		},
+		{
+			name:     "nested type",
+			input:    `"data" MAP(VARCHAR, INTEGER)`,
+			wantName: "data",
+			wantType: "MAP(VARCHAR, INTEGER)",
+		},
+		{
+			name:     "unquoted name fallback",
+			input:    `field_name BIGINT`,
+			wantName: "field_name",
+			wantType: "BIGINT",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotType := parseStructFieldDef(tt.input)
+			if gotName != tt.wantName {
+				t.Errorf("parseStructFieldDef(%q) name = %q, want %q", tt.input, gotName, tt.wantName)
+			}
+			if gotType != tt.wantType {
+				t.Errorf("parseStructFieldDef(%q) type = %q, want %q", tt.input, gotType, tt.wantType)
+			}
+		})
+	}
 }
