@@ -446,8 +446,12 @@ func (p *WorkerPool) Workers() []*ManagedWorker {
 }
 
 // RollingUpdate replaces workers one at a time with a new binary.
+// Only one rolling update can run at a time; concurrent calls return immediately.
 func (p *WorkerPool) RollingUpdate(ctx context.Context) error {
-	p.rollingUpdate.Store(true)
+	if !p.rollingUpdate.CompareAndSwap(false, true) {
+		slog.Warn("Rolling update already in progress, skipping.")
+		return nil
+	}
 	defer p.rollingUpdate.Store(false)
 
 	p.mu.RLock()

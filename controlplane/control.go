@@ -169,11 +169,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		go func() {
 			ppid := os.Getppid()
 			if ppid != 1 {
+				reparented := false
 				for i := 0; i < 100; i++ { // 10s max
 					time.Sleep(100 * time.Millisecond)
 					if os.Getppid() != ppid {
+						reparented = true
 						break
 					}
+				}
+				if !reparented {
+					slog.Warn("Timed out waiting for old CP to exit, sending MAINPID anyway.", "old_ppid", ppid)
 				}
 			}
 			if err := sdNotify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); err != nil {
