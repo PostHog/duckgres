@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	// Build binary
 	binaryPath = filepath.Join(tmpDir, "duckgres")
@@ -142,7 +142,7 @@ func startControlPlane(t *testing.T, opts cpOpts) *cpHarness {
 	if err != nil {
 		t.Fatalf("Failed to create socket dir: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(socketDir) })
+	t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
 
 	// Write YAML config
 	configFile := filepath.Join(tmpDir, "duckgres.yaml")
@@ -216,7 +216,7 @@ func (h *cpHarness) openConn(t *testing.T) *sql.DB {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() { _ = db.Close() })
 	return db
 }
 
@@ -420,7 +420,7 @@ func TestHandoverNewConnections(t *testing.T) {
 	if err := db.QueryRow("SELECT 1").Scan(&v); err != nil {
 		t.Fatalf("Pre-handover query failed: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Trigger handover
 	h.doHandover(t)
@@ -449,7 +449,7 @@ func TestHandoverNewConnectionsDuringTransition(t *testing.T) {
 	if err := db.QueryRow("SELECT 1").Scan(&v); err != nil {
 		t.Fatalf("Pre-handover query failed: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Send SIGUSR1
 	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
@@ -467,7 +467,7 @@ func TestHandoverNewConnectionsDuringTransition(t *testing.T) {
 			failures++
 		} else {
 			err = tmpDB.QueryRow("SELECT 1").Scan(&v)
-			tmpDB.Close()
+			_ = tmpDB.Close()
 			if err == nil {
 				successes++
 			} else {
@@ -538,7 +538,7 @@ func TestRollingUpdatePreservesActiveQuery(t *testing.T) {
 
 	// Close the connection so drain can complete quickly (drain waits for
 	// all sessions to end, not just queries).
-	db.Close()
+	_ = db.Close()
 
 	// Wait for rolling update to finish
 	if err := h.waitForLogCount("Rolling update: worker replaced.", 2, 120*time.Second); err != nil {
@@ -575,7 +575,7 @@ func TestHandoverConcurrentConnections(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		for _, db := range dbs {
-			db.Close()
+			_ = db.Close()
 		}
 	})
 
@@ -608,7 +608,7 @@ func TestHandoverConcurrentConnections(t *testing.T) {
 
 	// Close all connections so post-handover rolling update drain completes quickly
 	for _, db := range dbs {
-		db.Close()
+		_ = db.Close()
 	}
 
 	// Wait for the new CP to confirm it has taken over
@@ -647,7 +647,7 @@ func TestDoubleUSR1Ignored(t *testing.T) {
 	if err := db.QueryRow("SELECT 1").Scan(&v); err != nil {
 		t.Fatalf("Pre-test query failed: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Send first SIGUSR1
 	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
@@ -696,7 +696,7 @@ func TestUSR2DuringRollingUpdate(t *testing.T) {
 	if err := db.QueryRow("SELECT 1").Scan(&v); err != nil {
 		t.Fatalf("Pre-test query failed: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Send SIGUSR1 to start handover (which triggers a post-handover rolling update)
 	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
@@ -744,7 +744,7 @@ func TestHandoverThenNormalOperation(t *testing.T) {
 	if err := db.QueryRow("SELECT 1").Scan(&v); err != nil {
 		t.Fatalf("Pre-handover query failed: %v", err)
 	}
-	db.Close()
+	_ = db.Close()
 
 	// Do a full handover
 	newPid := h.doHandover(t)
@@ -762,7 +762,7 @@ func TestHandoverThenNormalOperation(t *testing.T) {
 	if v != 42 {
 		t.Fatalf("Expected 42, got %d", v)
 	}
-	db2.Close()
+	_ = db2.Close()
 
 	// Send SIGUSR2 to the new CP — a standalone rolling update should also work
 	if err := syscall.Kill(newPid, syscall.SIGUSR2); err != nil {
