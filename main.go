@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/posthog/duckgres/controlplane"
@@ -291,8 +292,10 @@ func main() {
 		maxSessions := *duckdbMaxSessions
 		if maxSessions == 0 {
 			if v := env("DUCKGRES_DUCKDB_MAX_SESSIONS", ""); v != "" {
-				if n, err := fmt.Sscanf(v, "%d", &maxSessions); n != 1 || err != nil {
+				if n, err := strconv.Atoi(v); err != nil {
 					slog.Warn("Invalid DUCKGRES_DUCKDB_MAX_SESSIONS", "value", v)
+				} else {
+					maxSessions = n
 				}
 			}
 		}

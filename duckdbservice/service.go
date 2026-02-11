@@ -1,11 +1,9 @@
 package duckdbservice
 
 import (
-	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,21 +14,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 // DuckDBService is a standalone Arrow Flight SQL service backed by DuckDB.
 type DuckDBService struct {
 	cfg       ServiceConfig
 	pool      *SessionPool
-	startTime time.Time
 	flightSrv flight.Server
 }
 
@@ -39,6 +34,7 @@ type SessionPool struct {
 	mu          sync.RWMutex
 	sessions    map[string]*Session
 	stopRefresh map[string]func()
+	reserved    int // number of session slots reserved but not yet inserted
 	duckLakeSem chan struct{}
 	cfg         server.Config
 	startTime   time.Time
@@ -61,8 +57,9 @@ type Session struct {
 
 // QueryHandle stores a prepared or ad-hoc query for later execution.
 type QueryHandle struct {
-	Query string
-	TxnID string
+	Query  string
+	Schema *arrow.Schema
+	TxnID  string
 }
 
 // NewDuckDBService creates a new DuckDB service with the given config.
@@ -77,9 +74,8 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 	}
 
 	return &DuckDBService{
-		cfg:       cfg,
-		pool:      pool,
-		startTime: time.Now(),
+		cfg:  cfg,
+		pool: pool,
 	}
 }
 
@@ -102,6 +98,13 @@ func Run(cfg ServiceConfig) {
 	if err != nil {
 		slog.Error("Failed to listen", "network", network, "addr", addr, "error", err)
 		os.Exit(1)
+	}
+
+	// Restrict unix socket permissions to owner only
+	if network == "unix" {
+		if err := os.Chmod(addr, 0700); err != nil {
+			slog.Warn("Failed to set unix socket permissions", "error", err)
+		}
 	}
 
 	slog.Info("Starting DuckDB service", "network", network, "addr", addr)
@@ -135,8 +138,15 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 		)
 	}
 
+	// Wrap the flightsql server with custom action handling.
+	// flightsql.NewFlightServer routes standard Flight SQL actions but rejects
+	// custom action types. Our wrapper intercepts custom actions (CreateSession,
+	// DestroySession, HealthCheck) before falling through to the standard router.
+	flightSqlSrv := flightsql.NewFlightServer(handler)
+	customSrv := &customActionServer{FlightServer: flightSqlSrv, handler: handler}
+
 	svc.flightSrv = flight.NewServerWithMiddleware(nil, opts...)
-	svc.flightSrv.RegisterFlightService(flightsql.NewFlightServer(handler))
+	svc.flightSrv.RegisterFlightService(customSrv)
 	svc.flightSrv.InitListener(listener)
 	return svc.flightSrv.Serve()
 }
@@ -151,15 +161,20 @@ func (svc *DuckDBService) Shutdown() {
 
 // CreateSession creates a new DuckDB session for the given username.
 func (p *SessionPool) CreateSession(username string) (*Session, error) {
+	// Reserve a slot under the lock to prevent TOCTOU race on maxSessions.
 	p.mu.Lock()
-	if p.maxSessions > 0 && len(p.sessions) >= p.maxSessions {
+	if p.maxSessions > 0 && len(p.sessions)+p.reserved >= p.maxSessions {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("max sessions reached (%d)", p.maxSessions)
 	}
+	p.reserved++
 	p.mu.Unlock()
 
 	db, err := server.CreateDBConnection(p.cfg, p.duckLakeSem, username, p.startTime)
 	if err != nil {
+		p.mu.Lock()
+		p.reserved--
+		p.mu.Unlock()
 		return nil, fmt.Errorf("create session db: %w", err)
 	}
 
@@ -177,11 +192,12 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	}
 
 	p.mu.Lock()
+	p.reserved--
 	p.sessions[token] = session
 	p.stopRefresh[token] = stop
 	p.mu.Unlock()
 
-	slog.Debug("Created DuckDB session", "session", token, "user", username)
+	slog.Debug("Created DuckDB session", "user", username)
 	return session, nil
 }
 
@@ -205,7 +221,7 @@ func (p *SessionPool) DestroySession(token string) error {
 	p.mu.Unlock()
 
 	if !ok {
-		return fmt.Errorf("session not found: %s", token)
+		return fmt.Errorf("session not found")
 	}
 
 	// Roll back any open transactions
@@ -222,11 +238,11 @@ func (p *SessionPool) DestroySession(token string) error {
 	}
 	if session.DB != nil {
 		if err := session.DB.Close(); err != nil {
-			slog.Warn("Failed to close session database", "session", token, "error", err)
+			slog.Warn("Failed to close session database", "error", err)
 		}
 	}
 
-	slog.Debug("Destroyed DuckDB session", "session", token)
+	slog.Debug("Destroyed DuckDB session", "user", session.Username)
 	return nil
 }
 
@@ -258,7 +274,7 @@ func (p *SessionPool) CloseAll() {
 		}
 	}
 
-	for token, session := range sessions {
+	for _, session := range sessions {
 		session.mu.Lock()
 		for id, tx := range session.txns {
 			_ = tx.Rollback()
@@ -267,9 +283,7 @@ func (p *SessionPool) CloseAll() {
 		session.mu.Unlock()
 
 		if session.DB != nil {
-			if err := session.DB.Close(); err != nil {
-				slog.Warn("Failed to close session database during shutdown", "session", token, "error", err)
-			}
+			_ = session.DB.Close()
 		}
 	}
 }
@@ -282,68 +296,26 @@ func generateSessionToken() string {
 	return hex.EncodeToString(b)
 }
 
-// DoAction handles custom Flight actions for session management.
-func (h *FlightSQLHandler) DoAction(cmd *flight.Action, stream flight.FlightService_DoActionServer) error {
+// customActionServer wraps a flight.FlightServer to add custom DoAction
+// handlers while preserving the standard flightsql routing for all other
+// methods and standard Flight SQL action types.
+type customActionServer struct {
+	flight.FlightServer
+	handler *FlightSQLHandler
+}
+
+func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightService_DoActionServer) error {
 	switch cmd.Type {
 	case "CreateSession":
-		return h.doCreateSession(cmd.Body, stream)
+		return s.handler.doCreateSession(cmd.Body, stream)
 	case "DestroySession":
-		return h.doDestroySession(cmd.Body, stream)
+		return s.handler.doDestroySession(cmd.Body, stream)
 	case "HealthCheck":
-		return h.doHealthCheck(stream)
+		return s.handler.doHealthCheck(stream)
 	default:
-		return status.Errorf(codes.Unimplemented, "unknown action type: %s", cmd.Type)
+		// Fall through to standard flightsql action router (BeginTransaction, etc.)
+		return s.FlightServer.DoAction(cmd, stream)
 	}
-}
-
-func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightService_DoActionServer) error {
-	var req struct {
-		Username string `json:"username"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return fmt.Errorf("invalid CreateSession request: %w", err)
-	}
-	if req.Username == "" {
-		return fmt.Errorf("username is required")
-	}
-
-	session, err := h.pool.CreateSession(req.Username)
-	if err != nil {
-		return fmt.Errorf("create session: %w", err)
-	}
-
-	resp, _ := json.Marshal(map[string]string{
-		"session_token": session.ID,
-	})
-	return stream.Send(&flight.Result{Body: resp})
-}
-
-func (h *FlightSQLHandler) doDestroySession(body []byte, stream flight.FlightService_DoActionServer) error {
-	var req struct {
-		SessionToken string `json:"session_token"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return fmt.Errorf("invalid DestroySession request: %w", err)
-	}
-	if req.SessionToken == "" {
-		return fmt.Errorf("session_token is required")
-	}
-
-	if err := h.pool.DestroySession(req.SessionToken); err != nil {
-		return err
-	}
-
-	resp, _ := json.Marshal(map[string]bool{"ok": true})
-	return stream.Send(&flight.Result{Body: resp})
-}
-
-func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionServer) error {
-	resp, _ := json.Marshal(map[string]interface{}{
-		"healthy":   true,
-		"sessions":  h.pool.ActiveSessions(),
-		"uptime_ns": time.Since(h.pool.startTime).Nanoseconds(),
-	})
-	return stream.Send(&flight.Result{Body: resp})
 }
 
 // NewFlightSQLHandler creates a new multi-session Flight SQL handler.
@@ -364,25 +336,4 @@ func NewFlightSQLHandler(pool *SessionPool) *FlightSQLHandler {
 	}
 
 	return h
-}
-
-// sessionFromContext extracts the session from gRPC metadata.
-// The session token is expected in the "x-duckgres-session" header.
-func (h *FlightSQLHandler) sessionFromContext(ctx context.Context) (*Session, error) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return nil, fmt.Errorf("missing metadata")
-	}
-
-	tokens := md.Get("x-duckgres-session")
-	if len(tokens) == 0 {
-		return nil, fmt.Errorf("missing x-duckgres-session header")
-	}
-
-	session, ok := h.pool.GetSession(tokens[0])
-	if !ok {
-		return nil, fmt.Errorf("session not found")
-	}
-
-	return session, nil
 }

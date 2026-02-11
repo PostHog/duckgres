@@ -1,6 +1,7 @@
 package duckdbservice
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -168,6 +169,35 @@ func AppendValue(builder array.Builder, val interface{}) {
 	default:
 		builder.AppendNull()
 	}
+}
+
+// GetQuerySchema executes a query with LIMIT 0 to discover the result schema.
+func GetQuerySchema(ctx context.Context, db *sql.DB, query string, tx *sql.Tx) (*arrow.Schema, error) {
+	queryWithLimit := query + " LIMIT 0"
+	var rows *sql.Rows
+	var err error
+	if tx != nil {
+		rows, err = tx.QueryContext(ctx, queryWithLimit)
+	} else {
+		rows, err = db.QueryContext(ctx, queryWithLimit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+
+	fields := make([]arrow.Field, len(colTypes))
+	for i, ct := range colTypes {
+		fields[i] = arrow.Field{Name: ct.Name(), Type: DuckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
+	}
+	return arrow.NewSchema(fields, nil), nil
 }
 
 // QualifyTableName builds a qualified table name from nullable catalog/schema and table name.

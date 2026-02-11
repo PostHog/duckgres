@@ -2,6 +2,7 @@ package duckdbservice
 
 import (
 	"context"
+	"crypto/subtle"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -57,7 +58,7 @@ func validateBearerToken(ctx context.Context, expectedToken string) error {
 		return status.Error(codes.Unauthenticated, "expected Bearer authorization")
 	}
 
-	if parts[1] != expectedToken {
+	if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expectedToken)) != 1 {
 		return status.Error(codes.Unauthenticated, "invalid bearer token")
 	}
 

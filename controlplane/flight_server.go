@@ -242,13 +242,14 @@ func (s *FlightSessionServer) DoGetStatement(ctx context.Context, ticket flights
 		}()
 
 		var rows *sql.Rows
+		var qerr error
 		if tx != nil {
-			rows, err = tx.QueryContext(ctx, handle.query)
+			rows, qerr = tx.QueryContext(ctx, handle.query)
 		} else {
-			rows, err = db.QueryContext(ctx, handle.query)
+			rows, qerr = db.QueryContext(ctx, handle.query)
 		}
-		if err != nil {
-			ch <- flight.StreamChunk{Err: err}
+		if qerr != nil {
+			ch <- flight.StreamChunk{Err: qerr}
 			return
 		}
 		defer func() {
@@ -467,13 +468,14 @@ func (s *FlightSessionServer) DoGetPreparedStatement(ctx context.Context,
 	go func() {
 		defer close(ch)
 		var rows *sql.Rows
+		var qerr error
 		if tx != nil {
-			rows, err = tx.QueryContext(ctx, handle.query)
+			rows, qerr = tx.QueryContext(ctx, handle.query)
 		} else {
-			rows, err = db.QueryContext(ctx, handle.query)
+			rows, qerr = db.QueryContext(ctx, handle.query)
 		}
-		if err != nil {
-			ch <- flight.StreamChunk{Err: err}
+		if qerr != nil {
+			ch <- flight.StreamChunk{Err: qerr}
 			return
 		}
 		defer func() {
@@ -761,39 +763,11 @@ func (s *FlightSessionServer) getActiveTxnForUser(username string) *sql.Tx {
 }
 
 func (s *FlightSessionServer) getQuerySchema(ctx context.Context, db *sql.DB, query string, tx *sql.Tx) (*arrow.Schema, error) {
-	queryWithLimit := query + " LIMIT 0"
-	var rows *sql.Rows
-	var err error
-	if tx != nil {
-		rows, err = tx.QueryContext(ctx, queryWithLimit)
-	} else {
-		rows, err = db.QueryContext(ctx, queryWithLimit)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = rows.Close()
-	}()
-
-	colTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, err
-	}
-
-	fields := make([]arrow.Field, len(colTypes))
-	for i, ct := range colTypes {
-		fields[i] = arrow.Field{Name: ct.Name(), Type: duckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
-	}
-	return arrow.NewSchema(fields, nil), nil
+	return duckdbservice.GetQuerySchema(ctx, db, query, tx)
 }
 
 func (s *FlightSessionServer) rowsToRecord(rows *sql.Rows, schema *arrow.Schema, batchSize int) (arrow.RecordBatch, error) {
 	return duckdbservice.RowsToRecord(s.alloc, rows, schema, batchSize)
-}
-
-func duckDBTypeToArrow(dbType string) arrow.DataType {
-	return duckdbservice.DuckDBTypeToArrow(dbType)
 }
 
 func qualifyTableName(catalog, schema sql.NullString, table string) string {
