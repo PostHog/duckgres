@@ -565,12 +565,9 @@ func (p *WorkerPool) GracefulReplace(ctx context.Context) error {
 
 		// Spawn replacement with same ID
 		if err := p.SpawnWorker(id); err != nil {
-			// Put old worker back if spawn fails
-			p.mu.Lock()
-			if _, replaced := p.workers[id]; !replaced {
-				p.workers[id] = old
-			}
-			p.mu.Unlock()
+			// Old worker is already drained so it would reject new connections.
+			// Retire it and let the health check loop spawn a fresh replacement.
+			go p.retireWorker(old)
 			return fmt.Errorf("failed to spawn replacement worker %d: %w", id, err)
 		}
 
