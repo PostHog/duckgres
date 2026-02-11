@@ -214,7 +214,6 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener,
 	}
 	defer func() { _ = conn.Close() }()
 
-	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
 
 	// Send handover request
@@ -222,9 +221,11 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener,
 		return nil, nil, nil, fmt.Errorf("send handover request: %w", err)
 	}
 
-	// Read ack with worker info
+	// Read ack with worker info. We must NOT use json.NewDecoder here because
+	// its buffered reads would consume the data byte from the next SCM_RIGHTS
+	// FD send, silently discarding the ancillary file descriptor.
 	var ack handoverMsg
-	if err := decoder.Decode(&ack); err != nil {
+	if err := readJSONLine(conn, &ack); err != nil {
 		return nil, nil, nil, fmt.Errorf("read handover ack: %w", err)
 	}
 
@@ -294,4 +295,26 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener,
 		"workers", len(ack.Workers))
 
 	return tcpLn, flightTCP, ack.Workers, nil
+}
+
+// readJSONLine reads one newline-terminated JSON message from conn without
+// buffering past the newline. This is critical when the same connection also
+// carries SCM_RIGHTS file descriptors — a buffered reader (like json.Decoder)
+// would consume the 1-byte data payload of the next FD send via conn.Read(),
+// which silently discards the accompanying ancillary data (the actual FD).
+func readJSONLine(conn net.Conn, v any) error {
+	var buf []byte
+	one := make([]byte, 1)
+	for {
+		n, err := conn.Read(one)
+		if n > 0 {
+			buf = append(buf, one[0])
+			if one[0] == '\n' {
+				return json.Unmarshal(buf, v)
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
