@@ -31,6 +31,8 @@ type FileConfig struct {
 	DuckLake         DuckLakeFileConfig  `yaml:"ducklake"`
 	ProcessIsolation bool                `yaml:"process_isolation"` // Enable process isolation per connection
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
+	MemoryLimit      string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
+	Threads          int                 `yaml:"threads"`           // DuckDB threads per session
 }
 
 type FlightFileConfig struct {
@@ -121,6 +123,8 @@ func main() {
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
 	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
+	memoryLimit := flag.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
+	threads := flag.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
@@ -155,6 +159,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_PORT        Flight SQL port (control-plane mode, default: 8815)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_THREADS            DuckDB threads per session\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
@@ -225,6 +231,8 @@ func main() {
 		ProcessIsolation: *processIsolation,
 		IdleTimeout:      *idleTimeout,
 		FlightPort:       *flightPort,
+		MemoryLimit:      *memoryLimit,
+		Threads:          *threads,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})
