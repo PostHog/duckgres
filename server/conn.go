@@ -1557,6 +1557,17 @@ func stripLeadingComments(query string) string {
 	}
 }
 
+// describeSupportsLimit returns true if the (uppercased) query supports a LIMIT clause.
+// SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL etc. do not.
+func describeSupportsLimit(upper string) bool {
+	s := strings.TrimSpace(upper)
+	return strings.HasPrefix(s, "SELECT") ||
+		strings.HasPrefix(s, "WITH") ||
+		strings.HasPrefix(s, "VALUES") ||
+		strings.HasPrefix(s, "TABLE") ||
+		strings.HasPrefix(s, "FROM") // DuckDB FROM-first syntax
+}
+
 // queryReturnsResults checks if a SQL query returns a result set.
 // This is used to determine whether to send RowDescription or NoData.
 func queryReturnsResults(query string) bool {
@@ -3254,8 +3265,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// The cleanest approach is to add a "WHERE false" or "LIMIT 0" clause
 		// to get column info without actually running the query
 		describeQuery := strings.TrimRight(strings.TrimSpace(ps.convertedQuery), ";")
-		// Try adding LIMIT 0 to avoid needing real parameter values
-		if !strings.Contains(strings.ToUpper(describeQuery), "LIMIT") {
+		// Try adding LIMIT 0 to avoid needing real parameter values.
+		// Only for statements that support LIMIT (SELECT/WITH/VALUES/TABLE/FROM).
+		upperDesc := strings.ToUpper(describeQuery)
+		if !strings.Contains(upperDesc, "LIMIT") && describeSupportsLimit(upperDesc) {
 			describeQuery = describeQuery + " LIMIT 0"
 		}
 
