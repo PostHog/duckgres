@@ -18,6 +18,8 @@ type configCLIInputs struct {
 	ProcessIsolation bool
 	IdleTimeout      string
 	FlightPort       int
+	MemoryLimit      string
+	Threads          int
 }
 
 type resolvedConfig struct {
@@ -144,6 +146,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 				warn("Invalid idle_timeout duration: " + err.Error())
 			}
 		}
+		if fileCfg.MemoryLimit != "" {
+			cfg.MemoryLimit = fileCfg.MemoryLimit
+		}
+		if fileCfg.Threads != 0 {
+			cfg.Threads = fileCfg.Threads
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -221,6 +229,16 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_IDLE_TIMEOUT duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_MEMORY_LIMIT"); v != "" {
+		cfg.MemoryLimit = v
+	}
+	if v := getenv("DUCKGRES_THREADS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Threads = n
+		} else {
+			warn("Invalid DUCKGRES_THREADS: " + err.Error())
+		}
+	}
 
 	if cli.Set["host"] {
 		cfg.Host = cli.Host
@@ -249,6 +267,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["flight-port"] {
 		flightPort = cli.FlightPort
+	}
+	if cli.Set["memory-limit"] {
+		cfg.MemoryLimit = cli.MemoryLimit
+	}
+	if cli.Set["threads"] {
+		cfg.Threads = cli.Threads
 	}
 
 	return resolvedConfig{
