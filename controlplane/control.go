@@ -160,33 +160,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Start handover listener for future deployments
 	cp.startHandoverListener()
 
-	// Notify systemd we're ready.
-	if handoverDone {
-		// Delay MAINPID+READY until the old CP exits and we get reparented
-		// to PID 1 (systemd). If we send MAINPID while still a child of the
-		// old CP, systemd warns "Supervising process which is not our child"
-		// and can't detect crashes for auto-restart.
-		go func() {
-			ppid := os.Getppid()
-			if ppid != 1 {
-				reparented := false
-				for i := 0; i < 100; i++ { // 10s max
-					time.Sleep(100 * time.Millisecond)
-					if os.Getppid() != ppid {
-						reparented = true
-						break
-					}
-				}
-				if !reparented {
-					slog.Warn("Timed out waiting for old CP to exit, sending MAINPID anyway.", "old_ppid", ppid)
-				}
-			}
-			if err := sdNotify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); err != nil {
-				slog.Warn("sd_notify MAINPID+READY failed.", "error", err)
-			}
-			slog.Info("Notified systemd of new main PID.", "pid", os.Getpid())
-		}()
-	} else {
+	// Notify systemd we're ready (fresh start only).
+	// After handover, sd_notify(MAINPID+READY) is sent synchronously in
+	// receiveHandover() before handover_complete, so the old CP can't exit
+	// before systemd knows our PID.
+	if !handoverDone {
 		if err := sdNotify("READY=1"); err != nil {
 			slog.Warn("sd_notify READY failed.", "error", err)
 		}
