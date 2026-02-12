@@ -74,6 +74,7 @@ jobs:
         with:
           tag_name: build-${{ steps.sha.outputs.short }}
           name: Build ${{ steps.sha.outputs.short }}
+          prerelease: true
           body: |
             Automated build from commit ${{ github.sha }}
           files: |
@@ -96,15 +97,12 @@ jobs:
         with:
           tag_name: latest
           name: Latest Build
+          prerelease: true
           body: |
             Latest build from commit ${{ github.sha }}
 
-            For a stable URL, use:
-            ```
-            https://github.com/PostHog/duckgres/releases/latest/download/duckgres-linux-amd64
-            https://github.com/PostHog/duckgres/releases/latest/download/duckgres-linux-arm64
-            https://github.com/PostHog/duckgres/releases/latest/download/checksums.txt
-            ```
+            This is a **pre-release** (canary). It auto-deploys to the canary duckling.
+            To promote to customer ducklings: edit this release and uncheck "pre-release".
           files: |
             artifacts/duckgres-linux-amd64/duckgres-linux-amd64
             artifacts/duckgres-linux-arm64/duckgres-linux-arm64
