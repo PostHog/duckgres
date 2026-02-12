@@ -636,6 +636,8 @@ func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
 		{"trailing semicolon", "SELECT 1 AS n;"},
 		{"trailing semicolon with spaces", "SELECT 1 AS n ; "},
 		{"CTE with semicolon", "WITH cte AS (SELECT 42 AS val) SELECT * FROM cte;"},
+		{"query with existing LIMIT", "SELECT 1 AS n LIMIT 1"},
+		{"query with existing LIMIT and semicolon", "SELECT 1 AS n LIMIT 1;"},
 	}
 
 	for _, tt := range tests {

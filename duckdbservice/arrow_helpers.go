@@ -542,7 +542,10 @@ func AppendValue(builder array.Builder, val interface{}) {
 // GetQuerySchema executes a query with LIMIT 0 to discover the result schema.
 func GetQuerySchema(ctx context.Context, db *sql.DB, query string, tx *sql.Tx) (*arrow.Schema, error) {
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
-	queryWithLimit := q + " LIMIT 0"
+	queryWithLimit := q
+	if !strings.Contains(strings.ToUpper(q), "LIMIT") {
+		queryWithLimit = q + " LIMIT 0"
+	}
 	var rows *sql.Rows
 	var err error
 	if tx != nil {
