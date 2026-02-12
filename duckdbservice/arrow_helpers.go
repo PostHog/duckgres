@@ -543,7 +543,10 @@ func AppendValue(builder array.Builder, val interface{}) {
 func GetQuerySchema(ctx context.Context, db *sql.DB, query string, tx *sql.Tx) (*arrow.Schema, error) {
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
 	queryWithLimit := q
-	if !strings.Contains(strings.ToUpper(q), "LIMIT") {
+	upper := strings.ToUpper(q)
+	// Only append LIMIT 0 for SELECT/WITH/VALUES/TABLE statements.
+	// SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL etc. don't support LIMIT.
+	if !strings.Contains(upper, "LIMIT") && supportsLimit(upper) {
 		queryWithLimit = q + " LIMIT 0"
 	}
 	var rows *sql.Rows
@@ -570,6 +573,19 @@ func GetQuerySchema(ctx context.Context, db *sql.DB, query string, tx *sql.Tx) (
 		fields[i] = arrow.Field{Name: ct.Name(), Type: DuckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
 	}
 	return arrow.NewSchema(fields, nil), nil
+}
+
+// supportsLimit returns true if the (uppercased) query is a statement type
+// that accepts a LIMIT clause. Statements like SHOW, DESCRIBE, EXPLAIN,
+// PRAGMA, and CALL do not support LIMIT.
+func supportsLimit(upper string) bool {
+	// Strip leading whitespace (already trimmed, but defensive)
+	s := strings.TrimSpace(upper)
+	return strings.HasPrefix(s, "SELECT") ||
+		strings.HasPrefix(s, "WITH") ||
+		strings.HasPrefix(s, "VALUES") ||
+		strings.HasPrefix(s, "TABLE") ||
+		strings.HasPrefix(s, "FROM") // DuckDB FROM-first syntax
 }
 
 // QualifyTableName builds a qualified table name from nullable catalog/schema and table name.
