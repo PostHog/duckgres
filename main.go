@@ -22,7 +22,6 @@ import (
 type FileConfig struct {
 	Host             string              `yaml:"host"`
 	Port             int                 `yaml:"port"`
-	Flight           FlightFileConfig    `yaml:"flight"`
 	DataDir          string              `yaml:"data_dir"`
 	TLS              TLSConfig           `yaml:"tls"`
 	Users            map[string]string   `yaml:"users"`
@@ -33,10 +32,6 @@ type FileConfig struct {
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
 	MemoryLimit      string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
 	Threads          int                 `yaml:"threads"`           // DuckDB threads per session
-}
-
-type FlightFileConfig struct {
-	Port int    `yaml:"port"`
 }
 
 type TLSConfig struct {
@@ -131,13 +126,10 @@ func main() {
 	showHelp := flag.Bool("help", false, "Show help message")
 
 	// Control plane flags
-	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, worker, or duckdb-service")
+	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
 	workerCount := flag.Int("worker-count", 4, "Number of worker processes (control-plane mode)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
-	flightPort := flag.Int("flight-port", 0, "Flight SQL port to listen on (control-plane mode, env: DUCKGRES_FLIGHT_PORT)")
-	grpcSocket := flag.String("grpc-socket", "", "gRPC socket path (worker mode, set by control-plane)")
-	fdSocket := flag.String("fd-socket", "", "FD passing socket path (worker mode, set by control-plane)")
 
 	// DuckDB service flags
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
@@ -156,7 +148,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_PORT        Flight SQL port (control-plane mode, default: 8815)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
@@ -230,14 +221,12 @@ func main() {
 		KeyFile:          *keyFile,
 		ProcessIsolation: *processIsolation,
 		IdleTimeout:      *idleTimeout,
-		FlightPort:       *flightPort,
 		MemoryLimit:      *memoryLimit,
 		Threads:          *threads,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})
 	cfg := resolved.Server
-	flightCfgPort := resolved.FlightPort
 
 	// Handle --psql: launch psql connected to the local Duckgres server
 	if *psql {
@@ -271,15 +260,6 @@ func main() {
 	if *mode != "standalone" && cfg.ProcessIsolation {
 		cfg.ProcessIsolation = false
 		slog.Info("Process isolation disabled (not applicable in " + *mode + " mode)")
-	}
-
-	// Handle worker mode early (before metrics, certs, etc.)
-	if *mode == "worker" {
-		if *grpcSocket == "" || *fdSocket == "" {
-			fatal("Worker mode requires --grpc-socket and --fd-socket flags")
-		}
-		controlplane.RunWorker(*grpcSocket, *fdSocket)
-		return
 	}
 
 	// Handle duckdb-service mode
@@ -347,14 +327,12 @@ func main() {
 
 	// Handle control-plane mode
 	if *mode == "control-plane" {
-		effectiveFlightPort := effectiveFlightConfig(cfg, flightCfgPort)
-
 		cpCfg := controlplane.ControlPlaneConfig{
 			Config:         cfg,
 			WorkerCount:    *workerCount,
 			SocketDir:      *socketDir,
+			ConfigPath:     *configFile,
 			HandoverSocket: *handoverSocket,
-			FlightPort:     effectiveFlightPort,
 		}
 		controlplane.RunControlPlane(cpCfg)
 		return

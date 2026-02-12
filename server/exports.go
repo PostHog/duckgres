@@ -3,7 +3,6 @@ package server
 import (
 	"bufio"
 	"context"
-	"database/sql"
 	"io"
 	"net"
 )
@@ -47,7 +46,7 @@ func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
 // the control plane worker. The returned value is opaque (*clientConn) but
 // can be used with SendInitialParams and RunMessageLoop.
 func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio.Writer,
-	username, database string, db *sql.DB, pid, secretKey int32) *clientConn {
+	username, database string, executor QueryExecutor, pid, secretKey int32) *clientConn {
 
 	return &clientConn{
 		server:    s,
@@ -56,7 +55,7 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 		writer:    writer,
 		username:  username,
 		database:  database,
-		db:        db,
+		executor:  executor,
 		pid:       pid,
 		secretKey: secretKey,
 		stmts:     make(map[string]*preparedStmt),

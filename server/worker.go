@@ -296,7 +296,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		writer:    writer,
 		username:  username,
 		database:  database,
-		db:        db,
+		executor:  NewLocalExecutor(db),
 		pid:       pid,
 		secretKey: cfg.BackendSecretKey,
 		stmts:     make(map[string]*preparedStmt),
@@ -315,7 +315,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 
 	// Ensure cleanup on exit
 	defer func() {
-		if clientConn.db != nil {
+		if clientConn.executor != nil {
 			clientConn.safeCleanupDB()
 		}
 	}()

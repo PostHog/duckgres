@@ -14,11 +14,8 @@ func envFromMap(values map[string]string) func(string) string {
 
 func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	fileCfg := &FileConfig{
-		Host: "file-host",
-		Port: 5000,
-		Flight: FlightFileConfig{
-			Port: 7777,
-		},
+		Host:    "file-host",
+		Port:    5000,
 		DataDir: "/tmp/file-data",
 		TLS: TLSConfig{
 			Cert: "/tmp/file.crt",
@@ -34,7 +31,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		"DUCKGRES_DATA_DIR":          "/tmp/env-data",
 		"DUCKGRES_CERT":              "/tmp/env.crt",
 		"DUCKGRES_KEY":               "/tmp/env.key",
-		"DUCKGRES_FLIGHT_PORT":       "8888",
 		"DUCKGRES_PROCESS_ISOLATION": "true",
 		"DUCKGRES_IDLE_TIMEOUT":      "2h",
 	}
@@ -48,7 +44,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 			"key":               true,
 			"process-isolation": true,
 			"idle-timeout":      true,
-			"flight-port":       true,
 		},
 		Host:             "cli-host",
 		Port:             7000,
@@ -57,7 +52,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		KeyFile:          "/tmp/cli.key",
 		ProcessIsolation: false,
 		IdleTimeout:      "3h",
-		FlightPort:       9999,
 	}, envFromMap(env), nil)
 
 	if resolved.Server.Host != "cli-host" {
@@ -81,24 +75,17 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	if resolved.Server.IdleTimeout != 3*time.Hour {
 		t.Fatalf("idle timeout precedence mismatch: got %s", resolved.Server.IdleTimeout)
 	}
-	if resolved.FlightPort != 9999 {
-		t.Fatalf("flight port precedence mismatch: got %d", resolved.FlightPort)
-	}
 }
 
 func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	fileCfg := &FileConfig{
 		Host: "file-host",
 		Port: 5000,
-		Flight: FlightFileConfig{
-			Port: 7777,
-		},
 	}
 
 	env := map[string]string{
-		"DUCKGRES_HOST":        "env-host",
-		"DUCKGRES_PORT":        "6000",
-		"DUCKGRES_FLIGHT_PORT": "8888",
+		"DUCKGRES_HOST": "env-host",
+		"DUCKGRES_PORT": "6000",
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
@@ -109,16 +96,10 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	if resolved.Server.Port != 6000 {
 		t.Fatalf("expected env port, got %d", resolved.Server.Port)
 	}
-	if resolved.FlightPort != 8888 {
-		t.Fatalf("expected env flight port, got %d", resolved.FlightPort)
-	}
 }
 
 func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	fileCfg := &FileConfig{
-		Flight: FlightFileConfig{
-			Port: 7777,
-		},
 		ProcessIsolation: true,
 		IdleTimeout:      "45m",
 		DuckLake: DuckLakeFileConfig{
@@ -127,7 +108,6 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	}
 
 	env := map[string]string{
-		"DUCKGRES_FLIGHT_PORT":         "bad-port",
 		"DUCKGRES_PROCESS_ISOLATION":   "not-a-bool",
 		"DUCKGRES_DUCKLAKE_S3_USE_SSL": "not-a-bool",
 		"DUCKGRES_IDLE_TIMEOUT":        "bad-duration",
@@ -138,9 +118,6 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 		warns = append(warns, msg)
 	})
 
-	if resolved.FlightPort != 7777 {
-		t.Fatalf("invalid env flight port should not override valid file value, got %d", resolved.FlightPort)
-	}
 	if !resolved.Server.ProcessIsolation {
 		t.Fatalf("invalid env process isolation should not override valid file value")
 	}
@@ -152,7 +129,6 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	}
 
 	wantWarnings := []string{
-		"Invalid DUCKGRES_FLIGHT_PORT",
 		"Invalid DUCKGRES_PROCESS_ISOLATION",
 		"Invalid DUCKGRES_DUCKLAKE_S3_USE_SSL",
 		"Invalid DUCKGRES_IDLE_TIMEOUT duration",
@@ -264,13 +240,5 @@ func TestResolveEffectiveConfigInvalidMemoryLimit(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected warning about invalid memory_limit format, warnings: %v", warns)
-	}
-}
-
-func TestEffectiveFlightConfigDefaults(t *testing.T) {
-	cfg := defaultServerConfig()
-	port := effectiveFlightConfig(cfg, 0)
-	if port != 8815 {
-		t.Fatalf("expected default flight port 8815, got %d", port)
 	}
 }

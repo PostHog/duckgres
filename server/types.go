@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -219,8 +218,8 @@ func mapDuckDBType(typeName string) TypeInfo {
 	}
 }
 
-// getTypeInfo extracts type info from a sql.ColumnType
-func getTypeInfo(colType *sql.ColumnType) TypeInfo {
+// getTypeInfo extracts type info from a ColumnTyper (e.g. *sql.ColumnType).
+func getTypeInfo(colType ColumnTyper) TypeInfo {
 	return mapDuckDBType(colType.DatabaseTypeName())
 }
 
@@ -617,6 +616,11 @@ func encodeInterval(v interface{}) []byte {
 		binary.BigEndian.PutUint64(buf[0:8], uint64(val.Micros))
 		binary.BigEndian.PutUint32(buf[8:12], uint32(val.Days))
 		binary.BigEndian.PutUint32(buf[12:16], uint32(val.Months))
+	case intervalValue:
+		// Arrow Flight returns intervalValue instead of duckdb.Interval
+		binary.BigEndian.PutUint64(buf[0:8], uint64(val.Micros))
+		binary.BigEndian.PutUint32(buf[8:12], uint32(val.Days))
+		binary.BigEndian.PutUint32(buf[12:16], uint32(val.Months))
 	default:
 		_ = val
 		return nil
@@ -693,6 +697,26 @@ func encodeNumeric(v interface{}) []byte {
 		// HUGEINT comes from the Go driver as *big.Int (scale 0)
 		val = new(big.Int).Set(x)
 		dscale = 0
+	case string:
+		// Arrow Flight returns decimals with non-zero scale as strings like "123.45".
+		// Parse the string back into unscaled big.Int + scale.
+		s := x
+		neg := false
+		if len(s) > 0 && s[0] == '-' {
+			neg = true
+			s = s[1:]
+		}
+		if dotIdx := strings.Index(s, "."); dotIdx >= 0 {
+			dscale = int16(len(s) - dotIdx - 1)
+			s = s[:dotIdx] + s[dotIdx+1:]
+		}
+		val = new(big.Int)
+		if _, ok := val.SetString(s, 10); !ok {
+			return encodeText(v)
+		}
+		if neg {
+			val.Neg(val)
+		}
 	default:
 		// Fallback: try to format as text and let the caller handle it
 		return encodeText(v)
