@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strings"
@@ -191,12 +192,16 @@ func (r *FlightRowSet) Next() bool {
 		r.currentBatch = nil
 	}
 
-	// Read next batch
-	if r.reader.Next() {
+	// Read next batch, skipping empty batches
+	for r.reader.Next() {
 		r.currentBatch = r.reader.Record()
 		r.currentBatch.Retain()
 		r.batchRow = 0
-		return r.currentBatch.NumRows() > 0
+		if r.currentBatch.NumRows() > 0 {
+			return true
+		}
+		r.currentBatch.Release()
+		r.currentBatch = nil
 	}
 
 	r.done = true
@@ -485,8 +490,7 @@ func formatArgValue(v any) string {
 		escaped := strings.ReplaceAll(val, "'", "''")
 		return "'" + escaped + "'"
 	case []byte:
-		escaped := strings.ReplaceAll(string(val), "'", "''")
-		return "'" + escaped + "'"
+		return "decode('" + hex.EncodeToString(val) + "', 'hex')"
 	case bool:
 		if val {
 			return "TRUE"

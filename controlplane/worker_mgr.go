@@ -284,8 +284,11 @@ func (p *FlightWorkerPool) ReplaceWorker(id int) error {
 	return p.SpawnWorker(id)
 }
 
+// WorkerCrashHandler is called when a worker crash is detected, before respawning.
+type WorkerCrashHandler func(workerID int)
+
 // HealthCheckLoop periodically checks worker health and respawns dead workers.
-func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, expectedCount int) {
+func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, expectedCount int, onCrash ...WorkerCrashHandler) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -307,6 +310,9 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 					return
 				case <-w.done:
 					slog.Warn("Worker crashed, respawning.", "id", w.ID, "error", w.exitErr)
+					for _, h := range onCrash {
+						h(w.ID)
+					}
 					if err := p.ReplaceWorker(w.ID); err != nil {
 						slog.Error("Failed to respawn worker.", "id", w.ID, "error", err)
 					}

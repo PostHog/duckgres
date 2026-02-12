@@ -150,8 +150,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
-	// Start health check loop
-	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, cfg.WorkerCount)
+	// Start health check loop with crash notification
+	onCrash := func(workerID int) {
+		cp.sessions.OnWorkerCrash(workerID, func(pid int32) {
+			// Sessions on the crashed worker will see gRPC errors on
+			// their next query. OnWorkerCrash cleans up session state
+			// so SelectWorker load balancing stays accurate.
+			slog.Warn("Session orphaned by worker crash.", "pid", pid, "worker", workerID)
+		})
+	}
+	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, cfg.WorkerCount, onCrash)
 
 	// Start handover listener for future deployments
 	cp.startHandoverListener()
@@ -297,9 +305,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = tlsConn.Close()
 		return
 	}
+	defer tlsConn.Close()
+
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
 		slog.Error("Failed to clear TLS deadline.", "remote_addr", remoteAddr, "error", err)
-		_ = tlsConn.Close()
 		return
 	}
 
@@ -310,7 +319,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	startupParams, err := server.ReadStartupMessage(reader)
 	if err != nil {
 		slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
-		_ = tlsConn.Close()
 		return
 	}
 
@@ -320,7 +328,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	if username == "" {
 		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no user specified")
 		_ = writer.Flush()
-		_ = tlsConn.Close()
 		return
 	}
 
@@ -330,19 +337,16 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		slog.Warn("Unknown user.", "user", username, "remote_addr", remoteAddr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
-		_ = tlsConn.Close()
 		return
 	}
 
 	// Request password
 	if err := server.WriteAuthCleartextPassword(writer); err != nil {
 		slog.Error("Failed to request password.", "remote_addr", remoteAddr, "error", err)
-		_ = tlsConn.Close()
 		return
 	}
 	if err := writer.Flush(); err != nil {
 		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err)
-		_ = tlsConn.Close()
 		return
 	}
 
@@ -350,14 +354,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	msgType, body, err := server.ReadMessage(reader)
 	if err != nil {
 		slog.Error("Failed to read password message.", "remote_addr", remoteAddr, "error", err)
-		_ = tlsConn.Close()
 		return
 	}
 
 	if msgType != 'p' {
 		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
 		_ = writer.Flush()
-		_ = tlsConn.Close()
 		return
 	}
 
@@ -367,14 +369,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		cp.rateLimiter.RecordFailedAuth(remoteAddr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
-		_ = tlsConn.Close()
 		return
 	}
 
 	// Send auth OK
 	if err := server.WriteAuthOK(writer); err != nil {
 		slog.Error("Failed to send auth OK.", "remote_addr", remoteAddr, "error", err)
-		_ = tlsConn.Close()
 		return
 	}
 
@@ -388,7 +388,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
 		_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
 		_ = writer.Flush()
-		_ = tlsConn.Close()
 		return
 	}
 	defer cp.sessions.DestroySession(pid)
