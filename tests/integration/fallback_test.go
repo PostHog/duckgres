@@ -417,11 +417,22 @@ func TestFallbackUtilityWithComments(t *testing.T) {
 	t.Run("attach_with_comment", func(t *testing.T) {
 		skipIfKnown(t)
 
+		// Save current database so we can restore it (may be "memory" or "ducklake")
+		var originalDb string
+		if err := db.QueryRow("SELECT current_database()").Scan(&originalDb); err != nil {
+			t.Fatalf("Get current database failed: %v", err)
+		}
+
 		// ATTACH with block comment
 		_, err := db.Exec("/* attach test db */ ATTACH ':memory:' AS comment_attach_test")
 		if err != nil {
 			t.Fatalf("ATTACH with comment failed: %v", err)
 		}
+		defer func() {
+			// Always restore original database and detach, even on failure
+			_, _ = db.Exec("USE " + originalDb)
+			_, _ = db.Exec("DETACH comment_attach_test")
+		}()
 
 		// USE with line comment
 		_, err = db.Exec("-- switch db\nUSE comment_attach_test")
@@ -439,10 +450,10 @@ func TestFallbackUtilityWithComments(t *testing.T) {
 			t.Errorf("Expected 'comment_attach_test', got %q", currentDb)
 		}
 
-		// Switch back and detach
-		_, err = db.Exec("/* back to ducklake */ USE ducklake")
+		// Switch back and detach (defer handles cleanup on failure too)
+		_, err = db.Exec("/* back to original */ USE " + originalDb)
 		if err != nil {
-			t.Fatalf("USE ducklake failed: %v", err)
+			t.Fatalf("USE %s failed: %v", originalDb, err)
 		}
 
 		_, err = db.Exec("/* cleanup */ DETACH comment_attach_test")

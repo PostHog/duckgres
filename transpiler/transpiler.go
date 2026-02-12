@@ -155,6 +155,9 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 		_ = changed // We track changes but don't need to act on it currently
 	}
 
+	// DuckDB compatibility fixups on the AST before deparsing
+	fixupAST(tree)
+
 	// Deparse the modified AST back to SQL
 	deparsed, err := pg_query.Deparse(tree)
 	if err != nil {
@@ -213,6 +216,23 @@ func countParametersRegex(sql string) int {
 		}
 	}
 	return maxParam
+}
+
+// fixupAST applies DuckDB compatibility fixups to the parsed AST before deparsing.
+// These are simple, unconditional cleanups that prevent PostgreSQL-specific syntax
+// from reaching DuckDB (e.g., USING btree on CREATE INDEX).
+func fixupAST(tree *pg_query.ParseResult) {
+	for _, stmt := range tree.Stmts {
+		if stmt.Stmt == nil {
+			continue
+		}
+		if idx, ok := stmt.Stmt.Node.(*pg_query.Node_IndexStmt); ok && idx.IndexStmt != nil {
+			// DuckDB does not support USING <method> on CREATE INDEX.
+			// PostgreSQL's parser sets AccessMethod to "btree" by default,
+			// causing the deparser to emit "USING btree". Clear it.
+			idx.IndexStmt.AccessMethod = ""
+		}
+	}
 }
 
 // ConvertAlterTableToAlterView transforms an ALTER TABLE RENAME statement
