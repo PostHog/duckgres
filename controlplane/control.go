@@ -305,7 +305,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = tlsConn.Close()
 		return
 	}
-	defer tlsConn.Close()
+	defer func() { _ = tlsConn.Close() }()
 
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
 		slog.Error("Failed to clear TLS deadline.", "remote_addr", remoteAddr, "error", err)

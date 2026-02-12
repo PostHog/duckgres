@@ -233,18 +233,6 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
 }
 
-// waitForLogCount waits until the given substring appears at least `count` times.
-func (h *cpHarness) waitForLogCount(substr string, count int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if strings.Count(h.logBuf.String(), substr) >= count {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return fmt.Errorf("log %q appeared %d times (want %d) after %v",
-		substr, strings.Count(h.logBuf.String(), substr), count, timeout)
-}
 
 var newCPPidRe = regexp.MustCompile(`New control plane spawned\.\s.*pid=(\d+)`)
 
