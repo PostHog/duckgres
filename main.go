@@ -33,6 +33,7 @@ type FileConfig struct {
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
 	MemoryLimit      string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
 	Threads          int                 `yaml:"threads"`           // DuckDB threads per session
+	PassthroughUsers []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
 }
 
 type FlightFileConfig struct {

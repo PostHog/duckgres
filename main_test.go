@@ -267,6 +267,29 @@ func TestResolveEffectiveConfigInvalidMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigPassthroughUsers(t *testing.T) {
+	fileCfg := &FileConfig{
+		PassthroughUsers: []string{"alice", "bob"},
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+
+	if len(resolved.Server.PassthroughUsers) != 2 {
+		t.Fatalf("expected 2 passthrough users, got %d", len(resolved.Server.PassthroughUsers))
+	}
+	if !resolved.Server.PassthroughUsers["alice"] {
+		t.Fatalf("expected alice to be a passthrough user")
+	}
+	if !resolved.Server.PassthroughUsers["bob"] {
+		t.Fatalf("expected bob to be a passthrough user")
+	}
+
+	// Empty list should not set the map
+	resolved = resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.PassthroughUsers != nil {
+		t.Fatalf("expected nil passthrough users for empty config, got %v", resolved.Server.PassthroughUsers)
+	}
+}
+
 func TestEffectiveFlightConfigDefaults(t *testing.T) {
 	cfg := defaultServerConfig()
 	port := effectiveFlightConfig(cfg, 0)

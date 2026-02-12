@@ -1973,3 +1973,27 @@ func TestFormatInterval(t *testing.T) {
 		})
 	}
 }
+
+func TestCountDollarParams(t *testing.T) {
+	tests := []struct {
+		query    string
+		expected int
+	}{
+		{"SELECT 1", 0},
+		{"SELECT $1", 1},
+		{"SELECT $1, $2", 2},
+		{"SELECT $2, $1", 2},
+		{"SELECT $10", 10},
+		{"INSERT INTO t VALUES ($1, $2, $3)", 3},
+		{"SELECT * FROM t WHERE id = $1 AND name = $3", 3},
+		{"", 0},
+		{"SELECT '$1'", 1}, // simplified: doesn't parse string literals
+	}
+
+	for _, tt := range tests {
+		got := countDollarParams(tt.query)
+		if got != tt.expected {
+			t.Errorf("countDollarParams(%q) = %d, want %d", tt.query, got, tt.expected)
+		}
+	}
+}
