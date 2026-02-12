@@ -161,6 +161,7 @@ func (s *Server) spawnChildForTLS(conn net.Conn) (*ChildProcess, error) {
 		Users:            s.cfg.Users, // Pass all users - child will look up after getting username
 		BackendSecretKey: backendSecretKey,
 		ServerStartTime:  processStartTime.UnixNano(),
+		ServerVersion:    processVersion,
 	}
 
 	configJSON, err := json.Marshal(childCfg)

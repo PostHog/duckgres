@@ -101,6 +101,9 @@ func initMetrics() {
 }
 
 func main() {
+	// Set version on server package so catalog macros can expose it
+	server.SetProcessVersion(version)
+
 	// Check if we're running as a child worker process
 	if os.Getenv("DUCKGRES_CHILD_MODE") == "1" {
 		// Use the same logging setup as parent for consistent log format
