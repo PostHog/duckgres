@@ -22,7 +22,6 @@ import (
 type FileConfig struct {
 	Host             string              `yaml:"host"`
 	Port             int                 `yaml:"port"`
-	Flight           FlightFileConfig    `yaml:"flight"`
 	DataDir          string              `yaml:"data_dir"`
 	TLS              TLSConfig           `yaml:"tls"`
 	Users            map[string]string   `yaml:"users"`
@@ -33,10 +32,6 @@ type FileConfig struct {
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
 	MemoryLimit      string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
 	Threads          int                 `yaml:"threads"`           // DuckDB threads per session
-}
-
-type FlightFileConfig struct {
-	Port int    `yaml:"port"`
 }
 
 type TLSConfig struct {

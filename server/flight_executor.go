@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -156,7 +157,7 @@ type FlightRowSet struct {
 	batchRow     int // current row index within currentBatch
 	done         bool
 	err          error
-	released     bool
+	closeOnce    sync.Once
 }
 
 func (r *FlightRowSet) Columns() ([]string, error) {
@@ -233,15 +234,13 @@ func (r *FlightRowSet) Scan(dest ...any) error {
 }
 
 func (r *FlightRowSet) Close() error {
-	if r.released {
-		return nil
-	}
-	r.released = true
-	if r.currentBatch != nil {
-		r.currentBatch.Release()
-		r.currentBatch = nil
-	}
-	r.reader.Release()
+	r.closeOnce.Do(func() {
+		if r.currentBatch != nil {
+			r.currentBatch.Release()
+			r.currentBatch = nil
+		}
+		r.reader.Release()
+	})
 	return nil
 }
 
@@ -471,6 +470,10 @@ func (c *bearerCreds) RequireTransportSecurity() bool {
 // interpolateArgs performs simple positional argument interpolation for Flight SQL.
 // Flight SQL's Execute doesn't support $1-style parameters natively,
 // so we interpolate them into the query string.
+//
+// Safety: args come from PostgreSQL wire protocol typed parameter binding,
+// not raw user strings. The caller (handleBind) decodes typed values from
+// the binary protocol, so the values are trusted internal data.
 func interpolateArgs(query string, args []any) string {
 	for i := len(args); i >= 1; i-- {
 		placeholder := fmt.Sprintf("$%d", i)
@@ -486,8 +489,8 @@ func formatArgValue(v any) string {
 	}
 	switch val := v.(type) {
 	case string:
-		// Escape single quotes
-		escaped := strings.ReplaceAll(val, "'", "''")
+		escaped := strings.ReplaceAll(val, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, "'", "''")
 		return "'" + escaped + "'"
 	case []byte:
 		return "decode('" + hex.EncodeToString(val) + "', 'hex')"
@@ -500,7 +503,25 @@ func formatArgValue(v any) string {
 		return "'" + val.Format("2006-01-02 15:04:05.999999") + "'"
 	case *big.Int:
 		return val.String()
+	case int:
+		return fmt.Sprintf("%d", val)
+	case int8:
+		return fmt.Sprintf("%d", val)
+	case int16:
+		return fmt.Sprintf("%d", val)
+	case int32:
+		return fmt.Sprintf("%d", val)
+	case int64:
+		return fmt.Sprintf("%d", val)
+	case float32:
+		return fmt.Sprintf("%g", val)
+	case float64:
+		return fmt.Sprintf("%g", val)
 	default:
-		return fmt.Sprintf("%v", val)
+		// Treat unknown types as strings to avoid injection via Stringer
+		s := fmt.Sprintf("%v", val)
+		s = strings.ReplaceAll(s, `\`, `\\`)
+		s = strings.ReplaceAll(s, "'", "''")
+		return "'" + s + "'"
 	}
 }

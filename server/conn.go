@@ -663,7 +663,6 @@ func (c *clientConn) handleQuery(body []byte) error {
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
-	fmt.Fprintf(os.Stderr, "handleQuery: %s\n", query)
 
 	// Route COPY TO STDOUT / COPY FROM STDIN directly to handleCopy()
 	// before transpilation, because:
@@ -2019,10 +2018,6 @@ func (c *clientConn) handleCopyOutBinary(rows RowSet, cols []string) error {
 		}
 
 		tupleBytes := encodeTuple(values)
-		fmt.Fprintf(os.Stderr, "handleCopyOutBinary: tuple bytes (%d bytes): %X\n", len(tupleBytes), tupleBytes)
-		for i, v := range values {
-			fmt.Fprintf(os.Stderr, "  col[%d] type=%T oid=%d\n", i, v, typeOIDs[i])
-		}
 
 		if firstRow {
 			// First CopyData message: header + tuple
@@ -2944,8 +2939,6 @@ func (c *clientConn) handleParse(body []byte) {
 		c.sendError("ERROR", "08P01", "invalid Parse message")
 		return
 	}
-	fmt.Fprintf(os.Stderr, "handleParse: stmt=%q query=%s\n", stmtName, query)
-
 	// Read number of parameter types
 	var numParamTypes int16
 	if err := binary.Read(reader, binary.BigEndian, &numParamTypes); err != nil {
