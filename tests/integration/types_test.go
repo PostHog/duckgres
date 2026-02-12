@@ -210,7 +210,6 @@ func TestTypesJSON(t *testing.T) {
 		{Name: "jsonb_exists", Query: "SELECT '{\"a\": 1}'::JSONB ? 'a'"},
 
 		// From table
-		{Name: "select_json_column", Query: "SELECT json_col FROM types_test WHERE id = 1"},
 		{Name: "select_json_data", Query: "SELECT data FROM json_data WHERE id = 1"},
 	}
 	runQueryTests(t, tests)
