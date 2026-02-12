@@ -171,6 +171,102 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigMemoryLimitAndThreads(t *testing.T) {
+	// Test YAML → env → CLI precedence for memory_limit and threads
+
+	// YAML only
+	fileCfg := &FileConfig{
+		MemoryLimit: "2GB",
+		Threads:     2,
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.MemoryLimit != "2GB" {
+		t.Fatalf("expected memory_limit from file, got %q", resolved.Server.MemoryLimit)
+	}
+	if resolved.Server.Threads != 2 {
+		t.Fatalf("expected threads from file, got %d", resolved.Server.Threads)
+	}
+
+	// Env overrides file
+	env := map[string]string{
+		"DUCKGRES_MEMORY_LIMIT": "8GB",
+		"DUCKGRES_THREADS":      "8",
+	}
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.MemoryLimit != "8GB" {
+		t.Fatalf("expected memory_limit from env, got %q", resolved.Server.MemoryLimit)
+	}
+	if resolved.Server.Threads != 8 {
+		t.Fatalf("expected threads from env, got %d", resolved.Server.Threads)
+	}
+
+	// CLI overrides env
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:         map[string]bool{"memory-limit": true, "threads": true},
+		MemoryLimit: "16GB",
+		Threads:     16,
+	}, envFromMap(env), nil)
+	if resolved.Server.MemoryLimit != "16GB" {
+		t.Fatalf("expected memory_limit from CLI, got %q", resolved.Server.MemoryLimit)
+	}
+	if resolved.Server.Threads != 16 {
+		t.Fatalf("expected threads from CLI, got %d", resolved.Server.Threads)
+	}
+}
+
+func TestResolveEffectiveConfigInvalidThreadsEnv(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_THREADS": "not-a-number",
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.Threads != 0 {
+		t.Fatalf("expected default threads, got %d", resolved.Server.Threads)
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "Invalid DUCKGRES_THREADS") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about invalid DUCKGRES_THREADS, warnings: %v", warns)
+	}
+}
+
+func TestResolveEffectiveConfigInvalidMemoryLimit(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_MEMORY_LIMIT": "lots-of-memory",
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	// Invalid format should be cleared (falls back to auto-detection)
+	if resolved.Server.MemoryLimit != "" {
+		t.Fatalf("expected empty memory_limit after invalid input, got %q", resolved.Server.MemoryLimit)
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "Invalid memory_limit format") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about invalid memory_limit format, warnings: %v", warns)
+	}
+}
+
 func TestEffectiveFlightConfigDefaults(t *testing.T) {
 	cfg := defaultServerConfig()
 	port := effectiveFlightConfig(cfg, 0)

@@ -69,6 +69,11 @@ ducklake:
   # s3_profile: "my-profile"           # AWS profile name (for config chain)
   # s3_region: "us-west-2"             # Override auto-detected region
 
+# DuckDB resource limits per session
+# Auto-detected from system memory if not set.
+# memory_limit: "4GB"
+# threads: 4
+
 # Process isolation (default: true)
 # Each client connection spawns a separate OS process, so a DuckDB crash
 # (e.g., from a failed DuckLake metadata connection) only kills that session,
