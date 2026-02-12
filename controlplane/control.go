@@ -1,7 +1,10 @@
 package controlplane
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -23,19 +26,23 @@ type ControlPlaneConfig struct {
 
 	WorkerCount         int
 	SocketDir           string
+	ConfigPath          string // Path to config file, passed to workers
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
-	MaxConnsPerWorker   int
-	FlightPort          int
 }
 
-// ControlPlane manages the TCP listener and worker pool.
+// ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
+// The control plane owns client connections end-to-end: TLS, authentication,
+// PostgreSQL wire protocol, and SQL transpilation all happen here. Workers are
+// thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
 	cfg         ControlPlaneConfig
-	pool        *WorkerPool
+	pool        *FlightWorkerPool
+	sessions    *SessionManager
+	srv         *server.Server // Minimal server for cancel request routing
 	rateLimiter *server.RateLimiter
+	tlsConfig   *tls.Config
 	pgListener  net.Listener
-	flightLn    net.Listener
 	activeConns int64
 	closed      bool
 	closeMu     sync.Mutex
@@ -55,18 +62,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if cfg.HealthCheckInterval == 0 {
 		cfg.HealthCheckInterval = 5 * time.Second
 	}
-	if cfg.FlightPort == 0 {
-		cfg.FlightPort = 8815
-	}
-	if cfg.FlightPort < 1 || cfg.FlightPort > 65535 {
-		slog.Error("Invalid flight port.", "flight_port", cfg.FlightPort)
-		os.Exit(1)
-	}
-	if cfg.FlightPort == cfg.Port {
-		slog.Error("Flight listener cannot share port with PG listener on the same host.",
-			"host", cfg.Host, "port", cfg.Port, "flight_port", cfg.FlightPort)
-		os.Exit(1)
-	}
 
 	// Enforce secure defaults for control-plane mode.
 	if err := validateControlPlaneSecurity(cfg); err != nil {
@@ -80,20 +75,38 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
+	// Load TLS certificates
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+	if err != nil {
+		slog.Error("Failed to load TLS certificates.", "error", err)
+		os.Exit(1)
+	}
+
 	// Use default rate limit config if not specified
 	if cfg.RateLimit.MaxFailedAttempts == 0 {
 		cfg.RateLimit = server.DefaultRateLimitConfig()
 	}
 
+	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath)
+
+	// Create a minimal server for cancel request routing
+	srv := &server.Server{}
+	server.InitMinimalServer(srv, cfg.Config, nil)
+
 	cp := &ControlPlane{
 		cfg:         cfg,
-		pool:        NewWorkerPool(cfg.SocketDir, cfg.Config),
+		pool:        pool,
+		sessions:    NewSessionManager(pool),
+		srv:         srv,
 		rateLimiter: server.NewRateLimiter(cfg.RateLimit),
+		tlsConfig: &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		},
 	}
 
 	// Set up signal handling
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1, syscall.SIGUSR2)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1)
 
 	// Try handover from existing control plane if handover socket exists
 	handoverDone := false
@@ -104,28 +117,19 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			slog.Info("Handover socket not found, starting fresh.", "socket", cfg.HandoverSocket, "error", err)
 		} else {
 			slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
-			pgLn, flightLn, existingWorkers, err := receiveHandover(cfg.HandoverSocket)
+			pgLn, err := receiveHandover(cfg.HandoverSocket)
 			if err != nil {
 				slog.Warn("Handover failed, starting fresh.", "error", err)
 			} else {
 				cp.pgListener = pgLn
-				cp.flightLn = flightLn
 				handoverDone = true
-
-				// Connect to existing workers instead of spawning new ones
-				for _, w := range existingWorkers {
-					if err := cp.pool.ConnectExistingWorker(w.ID, w.GRPCSocket, w.FDSocket); err != nil {
-						slog.Error("Failed to connect to handed-over worker.", "id", w.ID, "error", err)
-					}
-				}
-				slog.Info("Handover complete, took over listener and workers.",
-					"workers", len(existingWorkers))
+				slog.Info("Handover complete, took over PG listener.")
 			}
 		}
 	}
 
 	if !handoverDone {
-		// Bind TCP listeners FIRST, before spawning workers. If the port is
+		// Bind TCP listener FIRST, before spawning workers. If the port is
 		// already in use (e.g. old CP still running after a failed handover),
 		// we exit immediately without touching worker sockets.
 		addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
@@ -135,27 +139,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			os.Exit(1)
 		}
 		cp.pgListener = ln
+	}
 
-		flightAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.FlightPort)
-		flightLn, err := net.Listen("tcp", flightAddr)
-		if err != nil {
-			_ = cp.pgListener.Close()
-			slog.Error("Failed to listen for Flight.", "addr", flightAddr, "error", err)
-			os.Exit(1)
-		}
-		cp.flightLn = flightLn
-
-		// Spawn workers only after listeners are bound.
-		for i := 0; i < cfg.WorkerCount; i++ {
-			if err := cp.pool.SpawnWorker(i); err != nil {
-				slog.Error("Failed to spawn worker.", "id", i, "error", err)
-				os.Exit(1)
-			}
-		}
+	// Spawn workers (always fresh, even after handover)
+	if err := cp.pool.SpawnAll(cfg.WorkerCount); err != nil {
+		slog.Error("Failed to spawn workers.", "error", err)
+		os.Exit(1)
 	}
 
 	// Start health check loop
-	go cp.pool.HealthCheckLoop(makeShutdownCtx(sigChan), cfg.HealthCheckInterval, cfg.WorkerCount)
+	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, cfg.WorkerCount)
 
 	// Start handover listener for future deployments
 	cp.startHandoverListener()
@@ -172,19 +165,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
-		"flight_addr", cp.flightLn.Addr().String(),
 		"workers", cfg.WorkerCount)
-
-	// After handover, replace adopted workers with fresh ones. Old workers
-	// stay alive serving existing sessions until all clients disconnect.
-	if handoverDone {
-		go func() {
-			slog.Info("Post-handover: starting graceful replace of adopted workers.")
-			if err := cp.pool.GracefulReplace(makeShutdownCtx(sigChan)); err != nil {
-				slog.Error("Post-handover graceful replace failed.", "error", err)
-			}
-		}()
-	}
 
 	// Handle signals
 	go func() {
@@ -200,13 +181,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 					slog.Warn("sd_notify RELOADING failed.", "error", err)
 				}
 				go cp.selfExec()
-			case syscall.SIGUSR2:
-				slog.Info("Received SIGUSR2, starting rolling update.")
-				go func() {
-					if err := cp.pool.RollingUpdate(makeShutdownCtx(sigChan)); err != nil {
-						slog.Error("Rolling update failed.", "error", err)
-					}
-				}()
 			case syscall.SIGTERM, syscall.SIGINT:
 				slog.Info("Received shutdown signal.", "signal", sig)
 				cp.shutdown()
@@ -215,12 +189,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}()
 
-	// Accept loops
-	go cp.acceptFlightLoop()
+	// Accept loop (blocks)
 	cp.acceptLoop()
 }
 
-func makeShutdownCtx(_ <-chan os.Signal) context.Context {
+func makeShutdownCtx() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -286,128 +259,159 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Handle cancel request
 	if params.cancelRequest {
-		cp.pool.CancelQuery(params.cancelPid, params.cancelSecretKey)
+		key := server.BackendKey{Pid: params.cancelPid, SecretKey: params.cancelSecretKey}
+		cp.srv.CancelQuery(key)
 		_ = conn.Close()
 		return
 	}
 
-	// Handle SSL request
-	if params.sslRequest {
-		// Send 'S' to indicate SSL support
-		if _, err := conn.Write([]byte("S")); err != nil {
-			slog.Error("Failed to send SSL response.", "remote_addr", remoteAddr, "error", err)
-			_ = conn.Close()
-			return
-		}
-
-		// Get TCP file descriptor to pass to worker
-		tcpConn, ok := conn.(*net.TCPConn)
-		if !ok {
-			slog.Error("Not a TCP connection.", "remote_addr", remoteAddr)
-			_ = conn.Close()
-			return
-		}
-
-		file, err := tcpConn.File()
-		if err != nil {
-			slog.Error("Failed to get FD.", "remote_addr", remoteAddr, "error", err)
-			_ = conn.Close()
-			return
-		}
-
-		// Close the original connection (file has a dup'd FD)
-		_ = conn.Close()
-
-		// Generate a secret key for this connection
-		secretKey := server.GenerateSecretKey()
-
-		atomic.AddInt64(&cp.activeConns, 1)
-		defer atomic.AddInt64(&cp.activeConns, -1)
-
-		// Route to a worker
-		backendPid, err := cp.pool.RouteConnection(file, remoteAddr.String(), secretKey)
-		_ = file.Close()
-		if err != nil {
-			slog.Error("Failed to route connection.", "remote_addr", remoteAddr, "error", err)
-			return
-		}
-
-		slog.Debug("Connection routed.", "remote_addr", remoteAddr, "backend_pid", backendPid)
-	} else {
-		// No SSL - reject
+	// Require SSL
+	if !params.sslRequest {
 		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
 		_ = conn.Close()
-	}
-}
-
-func (cp *ControlPlane) acceptFlightLoop() {
-	for {
-		conn, err := cp.flightLn.Accept()
-		if err != nil {
-			cp.closeMu.Lock()
-			closed := cp.closed
-			cp.closeMu.Unlock()
-			if closed {
-				return
-			}
-			slog.Error("Flight accept error.", "error", err)
-			continue
-		}
-
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			_ = tcpConn.SetKeepAlive(true)
-			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		}
-
-		cp.wg.Add(1)
-		go func() {
-			defer cp.wg.Done()
-			cp.handleFlightConnection(conn)
-		}()
-	}
-}
-
-func (cp *ControlPlane) handleFlightConnection(conn net.Conn) {
-	remoteAddr := conn.RemoteAddr()
-
-	if msg := cp.rateLimiter.CheckConnection(remoteAddr); msg != "" {
-		slog.Warn("Flight connection rejected.", "remote_addr", remoteAddr, "reason", msg)
-		_ = conn.Close()
-		return
-	}
-	if !cp.rateLimiter.RegisterConnection(remoteAddr) {
-		slog.Warn("Flight connection rejected: rate limit.", "remote_addr", remoteAddr)
-		_ = conn.Close()
-		return
-	}
-	defer cp.rateLimiter.UnregisterConnection(remoteAddr)
-
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		slog.Error("Flight connection is not TCP.", "remote_addr", remoteAddr)
-		_ = conn.Close()
 		return
 	}
 
-	file, err := tcpConn.File()
-	if err != nil {
-		slog.Error("Failed to get Flight connection FD.", "remote_addr", remoteAddr, "error", err)
+	// Send 'S' to indicate SSL support
+	if _, err := conn.Write([]byte("S")); err != nil {
+		slog.Error("Failed to send SSL response.", "remote_addr", remoteAddr, "error", err)
 		_ = conn.Close()
 		return
 	}
-
-	_ = conn.Close()
-	defer func() { _ = file.Close() }()
 
 	atomic.AddInt64(&cp.activeConns, 1)
 	defer atomic.AddInt64(&cp.activeConns, -1)
 
-	backendPid, err := cp.pool.RouteFlightConnection(file, remoteAddr.String())
-	if err != nil {
-		slog.Error("Failed to route Flight connection.", "remote_addr", remoteAddr, "error", err)
+	// TLS handshake
+	tlsConn := tls.Server(conn, cp.tlsConfig)
+	if err := tlsConn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		slog.Error("Failed to set TLS deadline.", "remote_addr", remoteAddr, "error", err)
+		_ = conn.Close()
 		return
 	}
-	slog.Debug("Flight connection routed.", "remote_addr", remoteAddr, "backend_pid", backendPid)
+	if err := tlsConn.Handshake(); err != nil {
+		slog.Error("TLS handshake failed.", "remote_addr", remoteAddr, "error", err)
+		_ = tlsConn.Close()
+		return
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		slog.Error("Failed to clear TLS deadline.", "remote_addr", remoteAddr, "error", err)
+		_ = tlsConn.Close()
+		return
+	}
+
+	reader := bufio.NewReader(tlsConn)
+	writer := bufio.NewWriter(tlsConn)
+
+	// Read startup message (user/database)
+	startupParams, err := server.ReadStartupMessage(reader)
+	if err != nil {
+		slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
+		_ = tlsConn.Close()
+		return
+	}
+
+	username := startupParams["user"]
+	database := startupParams["database"]
+
+	if username == "" {
+		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no user specified")
+		_ = writer.Flush()
+		_ = tlsConn.Close()
+		return
+	}
+
+	// Look up expected password for this user
+	expectedPassword, ok := cp.cfg.Users[username]
+	if !ok {
+		slog.Warn("Unknown user.", "user", username, "remote_addr", remoteAddr)
+		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+		_ = writer.Flush()
+		_ = tlsConn.Close()
+		return
+	}
+
+	// Request password
+	if err := server.WriteAuthCleartextPassword(writer); err != nil {
+		slog.Error("Failed to request password.", "remote_addr", remoteAddr, "error", err)
+		_ = tlsConn.Close()
+		return
+	}
+	if err := writer.Flush(); err != nil {
+		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err)
+		_ = tlsConn.Close()
+		return
+	}
+
+	// Read password response
+	msgType, body, err := server.ReadMessage(reader)
+	if err != nil {
+		slog.Error("Failed to read password message.", "remote_addr", remoteAddr, "error", err)
+		_ = tlsConn.Close()
+		return
+	}
+
+	if msgType != 'p' {
+		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
+		_ = writer.Flush()
+		_ = tlsConn.Close()
+		return
+	}
+
+	password := string(bytes.TrimRight(body, "\x00"))
+	if password != expectedPassword {
+		slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
+		cp.rateLimiter.RecordFailedAuth(remoteAddr)
+		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+		_ = writer.Flush()
+		_ = tlsConn.Close()
+		return
+	}
+
+	// Send auth OK
+	if err := server.WriteAuthOK(writer); err != nil {
+		slog.Error("Failed to send auth OK.", "remote_addr", remoteAddr, "error", err)
+		_ = tlsConn.Close()
+		return
+	}
+
+	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
+
+	// Create session on a worker
+	ctx := context.Background()
+	pid, executor, err := cp.sessions.CreateSession(ctx, username)
+	if err != nil {
+		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
+		_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
+		_ = writer.Flush()
+		_ = tlsConn.Close()
+		return
+	}
+	defer cp.sessions.DestroySession(pid)
+
+	secretKey := server.GenerateSecretKey()
+
+	// Create clientConn with FlightExecutor
+	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, database, executor, pid, secretKey)
+
+	// Send initial parameters and ReadyForQuery
+	server.SendInitialParams(cc)
+	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
+		slog.Error("Failed to send ReadyForQuery.", "remote_addr", remoteAddr, "error", err)
+		return
+	}
+	if err := writer.Flush(); err != nil {
+		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err)
+		return
+	}
+
+	// Run message loop
+	if err := server.RunMessageLoop(cc); err != nil {
+		slog.Error("Message loop error.", "user", username, "remote_addr", remoteAddr, "error", err)
+		return
+	}
+
+	slog.Info("Client disconnected.", "user", username, "remote_addr", remoteAddr)
 }
 
 // startupResult holds the parsed initial startup message.
@@ -472,25 +476,20 @@ func (cp *ControlPlane) shutdown() {
 	if cp.pgListener != nil {
 		_ = cp.pgListener.Close()
 	}
-	if cp.flightLn != nil {
-		_ = cp.flightLn.Close()
-	}
 
-	slog.Info("Draining workers...")
-	_ = cp.pool.DrainAll(30 * time.Second)
+	// Wait for in-flight connections to finish
+	slog.Info("Waiting for connections to drain...")
+	cp.wg.Wait()
 
 	slog.Info("Shutting down workers...")
-	cp.pool.ShutdownAll(30 * time.Second)
-
-	// Wait for in-flight accept loop goroutines
-	cp.wg.Wait()
+	cp.pool.ShutdownAll()
 
 	slog.Info("Control plane shutdown complete.")
 }
 
 // selfExec spawns a new control plane process from the binary on disk.
 // The new process detects the existing handover socket and initiates the
-// handover protocol to receive listener FDs and worker info.
+// handover protocol to receive listener FDs.
 func (cp *ControlPlane) selfExec() {
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
 	cmd.Stdout = os.Stdout
@@ -513,9 +512,6 @@ func (cp *ControlPlane) selfExec() {
 			slog.Warn("Self-exec'd process exited with error.", "error", err)
 		}
 	}()
-	// Old CP exits via os.Exit(0) in handleHandoverRequest() after handover completes.
-	// If new process crashes before connecting, handleHandoverRequest times out
-	// and calls recoverFromFailedReload.
 }
 
 // recoverFromFailedReload cancels the RELOADING state, resets the guard flag,

@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"database/sql"
 	"database/sql/driver"
 	"encoding/binary"
 	"encoding/csv"
@@ -111,7 +110,7 @@ type clientConn struct {
 	writer    *bufio.Writer
 	username  string
 	database  string
-	db        *sql.DB
+	executor  QueryExecutor
 	pid       int32
 	secretKey int32                    // unique key for cancel requests
 	stmts     map[string]*preparedStmt // prepared statements by name
@@ -227,14 +226,14 @@ func (c *clientConn) safeCleanupDB() {
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	if c.server.cfg.DuckLake.MetadataStore != "" {
 		// Query DuckLake metadata to verify the RDS connection is still alive
-		_, err := c.db.ExecContext(ctx, "SELECT 1 FROM ducklake.information_schema.schemata LIMIT 1")
+		_, err := c.executor.ExecContext(ctx, "SELECT 1 FROM ducklake.information_schema.schemata LIMIT 1")
 		if err != nil {
 			slog.Warn("DuckLake connection unhealthy during cleanup, skipping SQL cleanup.",
 				"user", c.username, "error", err)
 			connHealthy = false
 		}
 	} else {
-		if err := c.db.PingContext(ctx); err != nil {
+		if err := c.executor.PingContext(ctx); err != nil {
 			slog.Warn("Database connection unhealthy during cleanup, skipping SQL cleanup.",
 				"user", c.username, "error", err)
 			connHealthy = false
@@ -247,7 +246,7 @@ func (c *clientConn) safeCleanupDB() {
 	// which can throw exceptions if the connection is in a bad state.
 	if connHealthy && (c.txStatus == txStatusTransaction || c.txStatus == txStatusError) {
 		ctx2, cancel2 := context.WithTimeout(context.Background(), cleanupTimeout)
-		_, err := c.db.ExecContext(ctx2, "ROLLBACK")
+		_, err := c.executor.ExecContext(ctx2, "ROLLBACK")
 		cancel2()
 		if err != nil {
 			slog.Warn("Failed to rollback transaction during cleanup.",
@@ -263,7 +262,7 @@ func (c *clientConn) safeCleanupDB() {
 		// Must switch away from ducklake before detaching - DuckDB doesn't allow
 		// detaching the default database
 		ctx3, cancel3 := context.WithTimeout(context.Background(), cleanupTimeout)
-		_, err := c.db.ExecContext(ctx3, "USE memory")
+		_, err := c.executor.ExecContext(ctx3, "USE memory")
 		cancel3()
 		if err != nil {
 			slog.Warn("Failed to switch to memory.", "user", c.username, "error", err)
@@ -274,7 +273,7 @@ func (c *clientConn) safeCleanupDB() {
 
 		if connHealthy {
 			ctx4, cancel4 := context.WithTimeout(context.Background(), cleanupTimeout)
-			_, err := c.db.ExecContext(ctx4, "DETACH ducklake")
+			_, err := c.executor.ExecContext(ctx4, "DETACH ducklake")
 			cancel4()
 			if err != nil {
 				slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err)
@@ -285,7 +284,7 @@ func (c *clientConn) safeCleanupDB() {
 	// Always attempt to close the database connection.
 	// If the connection is broken, this may still throw, but we've done our best
 	// to clean up the transaction state first.
-	if err := c.db.Close(); err != nil {
+	if err := c.executor.Close(); err != nil {
 		slog.Warn("Failed to close database.", "user", c.username, "error", err)
 	}
 }
@@ -314,7 +313,7 @@ func (c *clientConn) validateWithDuckDB(query string) error {
 
 	// Use EXPLAIN to validate the query without executing it
 	// DuckDB's EXPLAIN will fail if the query is syntactically invalid
-	_, err := c.db.Exec("EXPLAIN " + query)
+	_, err := c.executor.Exec("EXPLAIN " + query)
 	if err != nil {
 		// Strip "EXPLAIN " from error messages to avoid confusing users
 		errMsg := strings.Replace(err.Error(), "EXPLAIN ", "", 1)
@@ -406,23 +405,23 @@ func (c *clientConn) serve() error {
 
 	// Create a DuckDB connection for this client session (unless pre-created by caller)
 	var stopRefresh func()
-	if c.db == nil {
+	if c.executor == nil {
 		db, err := c.server.createDBConnection(c.username)
 		if err != nil {
 			c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
 			return err
 		}
-		c.db = db
+		c.executor = NewLocalExecutor(db)
 
 		// Start background credential refresh for long-lived connections.
 		// Only needed when we create the DB here; the control plane manages
 		// refresh for pre-created connections via DBPool.
-		stopRefresh = StartCredentialRefresh(c.db, c.server.cfg.DuckLake)
+		stopRefresh = StartCredentialRefresh(db, c.server.cfg.DuckLake)
 	}
 	// Defers run LIFO: first stop the credential refresh goroutine (so it won't
 	// call db.Exec on a closed DB), then clean up the database connection.
 	defer func() {
-		if c.db != nil {
+		if c.executor != nil {
 			c.safeCleanupDB()
 		}
 	}()
@@ -773,18 +772,18 @@ func (c *clientConn) handleQuery(body []byte) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		result, err := c.db.ExecContext(ctx, query)
+		result, err := c.executor.ExecContext(ctx, query)
 		if err != nil {
 			// Retry ALTER TABLE as ALTER VIEW if target is a view
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
-					result, err = c.db.ExecContext(ctx, alteredQuery)
+					result, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
 			}
 			// Retry DROP TABLE as DROP VIEW if target is a view
 			if isDropTableOnViewError(err) {
 				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
-					result, err = c.db.ExecContext(ctx, alteredQuery)
+					result, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
 			}
 			if err != nil {
@@ -813,7 +812,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	rows, err := c.db.QueryContext(ctx, query)
+	rows, err := c.executor.QueryContext(ctx, query)
 	if err != nil {
 		if isQueryCancelled(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
@@ -1004,16 +1003,16 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		execResult, err := c.db.ExecContext(ctx, executedQuery)
+		execResult, err := c.executor.ExecContext(ctx, executedQuery)
 		if err != nil {
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
-					execResult, err = c.db.ExecContext(ctx, alteredQuery)
+					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
 			}
 			if isDropTableOnViewError(err) {
 				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
-					execResult, err = c.db.ExecContext(ctx, alteredQuery)
+					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
 			}
 			if err != nil {
@@ -1038,7 +1037,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	rows, err := c.db.QueryContext(ctx, executedQuery)
+	rows, err := c.executor.QueryContext(ctx, executedQuery)
 	if err != nil {
 		if isQueryCancelled(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
@@ -1132,7 +1131,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
 		slog.Debug("Multi-stmt setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
-		_, err := c.db.Exec(stmt)
+		_, err := c.executor.Exec(stmt)
 		if err != nil {
 			slog.Error("Multi-stmt setup error.", "user", c.username, "query", stmt, "error", err)
 			c.setTxError()
@@ -1153,7 +1152,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
 		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
-		rows, err := c.db.Query(finalStmt)
+		rows, err := c.executor.Query(finalStmt)
 		if err != nil {
 			slog.Error("Multi-stmt final query error.", "user", c.username, "query", finalStmt, "error", err)
 			c.setTxError()
@@ -1174,7 +1173,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 	} else {
 		// DML (INSERT/UPDATE/DELETE): execute then cleanup
-		result, err := c.db.Exec(finalStmt)
+		result, err := c.executor.Exec(finalStmt)
 		if err != nil {
 			slog.Error("Multi-stmt final exec error.", "user", c.username, "query", finalStmt, "error", err)
 			c.setTxError()
@@ -1201,7 +1200,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 func (c *clientConn) executeCleanup(cleanup []string) {
 	for _, stmt := range cleanup {
 		slog.Debug("Multi-stmt cleanup.", "user", c.username, "stmt", stmt)
-		_, err := c.db.Exec(stmt)
+		_, err := c.executor.Exec(stmt)
 		if err != nil {
 			// Log but don't fail - cleanup is best effort
 			slog.Warn("Multi-stmt cleanup error (ignored).", "user", c.username, "error", err)
@@ -1234,7 +1233,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
 		slog.Debug("Multi-stmt-ext setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
-		_, err := c.db.Exec(stmt, args...)
+		_, err := c.executor.Exec(stmt, args...)
 		if err != nil {
 			slog.Error("Multi-stmt-ext setup error.", "user", c.username, "query", stmt, "error", err)
 			c.setTxError()
@@ -1253,7 +1252,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
 		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
-		rows, err := c.db.Query(finalStmt, args...)
+		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
 			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "query", finalStmt, "error", err)
 			c.setTxError()
@@ -1271,7 +1270,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	} else {
 		// DML (INSERT/UPDATE/DELETE): execute then cleanup
-		result, err := c.db.Exec(finalStmt, args...)
+		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
 			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "query", finalStmt, "error", err)
 			c.setTxError()
@@ -1292,7 +1291,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 // streamRowsToClientExtended sends result rows for the extended query protocol.
 // Unlike streamRowsToClient, this does NOT send ReadyForQuery, and supports
 // binary result formats and the described flag.
-func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, resultFormats []int16, described bool, query string) {
+func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, resultFormats []int16, described bool, query string) {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
@@ -1363,7 +1362,7 @@ func (c *clientConn) streamRowsToClientExtended(rows *sql.Rows, cmdType string, 
 
 // streamRowsToClient sends result rows over the wire protocol.
 // The rows cursor must already be obtained before calling this function.
-func (c *clientConn) streamRowsToClient(rows *sql.Rows, cmdType string, query string) error {
+func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query string) error {
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
@@ -1604,7 +1603,7 @@ func (c *clientConn) setTxError() {
 	}
 }
 
-func (c *clientConn) buildCommandTag(cmdType string, result sql.Result) string {
+func (c *clientConn) buildCommandTag(cmdType string, result ExecResult) string {
 	switch cmdType {
 	case "INSERT":
 		rowsAffected, _ := result.RowsAffected()
@@ -1797,7 +1796,7 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	}
 
 	// For other COPY commands (e.g., COPY TO file), pass through to DuckDB
-	result, err := c.db.Exec(query)
+	result, err := c.executor.Exec(query)
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
@@ -1842,7 +1841,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	}
 
 	// Execute the query
-	rows, err := c.db.Query(selectQuery)
+	rows, err := c.executor.Query(selectQuery)
 	if err != nil {
 		slog.Error("COPY TO query failed.", "user", c.username, "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
@@ -1951,7 +1950,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 // Sends one CopyData message per tuple, with header prepended to the first tuple
 // and trailer appended to the last, matching how clients like DuckDB's postgres
 // extension consume binary COPY streams via PQgetCopyData.
-func (c *clientConn) handleCopyOutBinary(rows *sql.Rows, cols []string) error {
+func (c *clientConn) handleCopyOutBinary(rows RowSet, cols []string) error {
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
@@ -2097,7 +2096,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	} else {
 		colQuery = fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName)
 	}
-	testRows, err := c.db.Query(colQuery)
+	testRows, err := c.executor.Query(colQuery)
 	if err != nil {
 		slog.Error("COPY FROM table check failed.", "user", c.username, "table", tableName, "error", err)
 		c.sendError("ERROR", "42P01", fmt.Sprintf("relation \"%s\" does not exist", tableName))
@@ -2186,7 +2185,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			slog.Debug("COPY FROM STDIN executing native DuckDB COPY.", "user", c.username, "sql", copySQL)
 			loadStart := time.Now()
 
-			result, err := c.db.Exec(copySQL)
+			result, err := c.executor.Exec(copySQL)
 			if err != nil {
 				slog.Error("COPY FROM STDIN DuckDB COPY failed.", "user", c.username, "error", err)
 				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
@@ -2229,7 +2228,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 // handleCopyInBinary handles COPY ... FROM STDIN with binary format.
 // It parses the PostgreSQL binary COPY format, decodes each field, and INSERTs rows.
-func (c *clientConn) handleCopyInBinary(opts *CopyFromOptions, cols []string, colTypes []*sql.ColumnType) error {
+func (c *clientConn) handleCopyInBinary(opts *CopyFromOptions, cols []string, colTypes []ColumnTyper) error {
 	copyStartTime := time.Now()
 
 	// Get type OIDs for decoding
@@ -2324,7 +2323,7 @@ func (c *clientConn) appendWithDuckDBAppender(tableName string, rows [][]interfa
 	parts := splitQualifiedName(tableName)
 
 	ctx := context.Background()
-	sqlConn, err := c.db.Conn(ctx)
+	sqlConn, err := c.executor.ConnContext(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get DB connection: %w", err)
 	}
@@ -2412,7 +2411,7 @@ func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string
 		insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES %s",
 			tableName, colNames, strings.Join(valueClauses, ", "))
 
-		if _, err := c.db.Exec(insertSQL, args...); err != nil {
+		if _, err := c.executor.Exec(insertSQL, args...); err != nil {
 			return rowCount, fmt.Errorf("batch INSERT failed at rows %d-%d: %v", start+1, start+len(batch), err)
 		}
 		rowCount += len(batch)
@@ -2604,7 +2603,7 @@ func (c *clientConn) parseCopyLine(line, delimiter string) []string {
 	return fields
 }
 
-func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnType) error {
+func (c *clientConn) sendRowDescription(cols []string, colTypes []ColumnTyper) error {
 	var buf bytes.Buffer
 
 	// Number of fields
@@ -2646,7 +2645,7 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []*sql.ColumnTyp
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
 }
 
-func (c *clientConn) mapTypeOIDWithColumnName(colName string, colType *sql.ColumnType) int32 {
+func (c *clientConn) mapTypeOIDWithColumnName(colName string, colType ColumnTyper) int32 {
 	// Check if this column name has a specific pg_catalog type override
 	if oid, ok := pgCatalogColumnOIDs[colName]; ok {
 		return oid
@@ -2654,7 +2653,7 @@ func (c *clientConn) mapTypeOIDWithColumnName(colName string, colType *sql.Colum
 	return getTypeInfo(colType).OID
 }
 
-func (c *clientConn) mapTypeSizeWithColumnName(colName string, colType *sql.ColumnType) int16 {
+func (c *clientConn) mapTypeSizeWithColumnName(colName string, colType ColumnTyper) int16 {
 	// Return appropriate sizes for overridden types
 	if oid, ok := pgCatalogColumnOIDs[colName]; ok {
 		switch oid {
@@ -3167,7 +3166,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 			args[i] = nil
 		}
 
-		rows, err := c.db.Query(describeQuery, args...)
+		rows, err := c.executor.Query(describeQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
 			slog.Debug("Describe failed to get columns.", "user", c.username, "error", err)
@@ -3212,7 +3211,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 
 		// Try to get column info
-		rows, err := c.db.Query(p.stmt.convertedQuery, args...)
+		rows, err := c.executor.Query(p.stmt.convertedQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
 			_ = writeNoData(c.writer)
@@ -3320,18 +3319,18 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 
 		// Non-result-returning query: use Exec with converted query
-		result, err := c.db.Exec(p.stmt.convertedQuery, args...)
+		result, err := c.executor.Exec(p.stmt.convertedQuery, args...)
 		if err != nil {
 			// Retry ALTER TABLE as ALTER VIEW if target is a view
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(p.stmt.convertedQuery); ok {
-					result, err = c.db.Exec(alteredQuery, args...)
+					result, err = c.executor.Exec(alteredQuery, args...)
 				}
 			}
 			// Retry DROP TABLE as DROP VIEW if target is a view
 			if isDropTableOnViewError(err) {
 				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(p.stmt.convertedQuery); ok {
-					result, err = c.db.Exec(alteredQuery, args...)
+					result, err = c.executor.Exec(alteredQuery, args...)
 				}
 			}
 			if err != nil {
@@ -3348,7 +3347,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	// Result-returning query: use Query with converted query
-	rows, err := c.db.Query(p.stmt.convertedQuery, args...)
+	rows, err := c.executor.Query(p.stmt.convertedQuery, args...)
 	if err != nil {
 		slog.Error("Query execution failed.", "user", c.username, "query", p.stmt.convertedQuery, "original_query", p.stmt.query, "error", err)
 		c.sendError("ERROR", "42000", err.Error())

@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -219,8 +218,8 @@ func mapDuckDBType(typeName string) TypeInfo {
 	}
 }
 
-// getTypeInfo extracts type info from a sql.ColumnType
-func getTypeInfo(colType *sql.ColumnType) TypeInfo {
+// getTypeInfo extracts type info from a ColumnTyper (e.g. *sql.ColumnType).
+func getTypeInfo(colType ColumnTyper) TypeInfo {
 	return mapDuckDBType(colType.DatabaseTypeName())
 }
 

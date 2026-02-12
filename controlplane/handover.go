@@ -6,26 +6,17 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"syscall"
 	"time"
-
-	"github.com/posthog/duckgres/controlplane/fdpass"
 )
 
 // Handover protocol messages
 type handoverMsg struct {
-	Type              string           `json:"type"`
-	Workers           []handoverWorker `json:"workers,omitempty"`
-	HasFlightListener bool             `json:"has_flight_listener,omitempty"`
-}
-
-type handoverWorker struct {
-	ID         int    `json:"id"`
-	GRPCSocket string `json:"grpc_socket"`
-	FDSocket   string `json:"fd_socket"`
+	Type string `json:"type"`
 }
 
 // startHandoverListener starts listening for handover requests from a new control plane.
-// When a new CP connects, the old CP will transfer both listener FDs and worker info.
+// When a new CP connects, the old CP will transfer the PG listener FD.
 func (cp *ControlPlane) startHandoverListener() {
 	if cp.cfg.HandoverSocket == "" {
 		return
@@ -102,23 +93,8 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 
 	slog.Info("Received handover request, preparing transfer...")
 
-	// Build worker list
-	workers := cp.pool.Workers()
-	handoverWorkers := make([]handoverWorker, 0, len(workers))
-	for _, w := range workers {
-		handoverWorkers = append(handoverWorkers, handoverWorker{
-			ID:         w.ID,
-			GRPCSocket: w.GRPCSocket,
-			FDSocket:   w.FDSocket,
-		})
-	}
-
-	// Send ack with worker info
-	if err := encoder.Encode(handoverMsg{
-		Type:              "handover_ack",
-		Workers:           handoverWorkers,
-		HasFlightListener: cp.flightLn != nil,
-	}); err != nil {
+	// Send ack
+	if err := encoder.Encode(handoverMsg{Type: "handover_ack"}); err != nil {
 		slog.Error("Failed to send handover ack.", "error", err)
 		return
 	}
@@ -143,33 +119,11 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 		return
 	}
 
-	if err := fdpass.SendFile(uc, file); err != nil {
+	if err := sendFD(uc, file); err != nil {
 		slog.Error("Failed to send PG listener FD.", "error", err)
 		return
 	}
 	slog.Info("PG listener FD sent to new control plane.")
-
-	// Pass Flight listener FD via SCM_RIGHTS when present.
-	if cp.flightLn != nil {
-		flightTCP, ok := cp.flightLn.(*net.TCPListener)
-		if !ok {
-			slog.Error("Flight listener is not TCP, cannot handover.")
-			return
-		}
-
-		flightFile, err := flightTCP.File()
-		if err != nil {
-			slog.Error("Failed to get Flight listener FD.", "error", err)
-			return
-		}
-		defer func() { _ = flightFile.Close() }()
-
-		if err := fdpass.SendFile(uc, flightFile); err != nil {
-			slog.Error("Failed to send Flight listener FD.", "error", err)
-			return
-		}
-		slog.Info("Flight listener FD sent to new control plane.")
-	}
 
 	// Wait for handover_complete
 	var complete handoverMsg
@@ -188,29 +142,27 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	// Stop accepting new connections immediately. The new CP has its own
 	// listener FD copy (from SCM_RIGHTS), so closing our copy doesn't
 	// affect the underlying socket — the new CP can still accept on it.
-	// Without this, both CPs race to accept connections and the old CP
-	// may route to draining workers.
 	cp.closeMu.Lock()
 	cp.closed = true
 	cp.closeMu.Unlock()
 	_ = cp.pgListener.Close()
-	if cp.flightLn != nil {
-		_ = cp.flightLn.Close()
-	}
 
-	// Wait for in-flight connections to finish routing
+	// Wait for in-flight connections to finish
 	cp.wg.Wait()
+
+	// Shut down workers now that all connections are done
+	cp.pool.ShutdownAll()
 
 	slog.Info("Old control plane exiting after handover.")
 	os.Exit(0)
 }
 
 // receiveHandover connects to an existing control plane's handover socket,
-// receives listener FDs and worker info, and takes over.
-func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener, []handoverWorker, error) {
+// receives the PG listener FD, and takes over.
+func receiveHandover(handoverSocket string) (*net.TCPListener, error) {
 	conn, err := net.Dial("unix", handoverSocket)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("connect handover socket: %w", err)
+		return nil, fmt.Errorf("connect handover socket: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -218,67 +170,43 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener,
 
 	// Send handover request
 	if err := encoder.Encode(handoverMsg{Type: "handover_request"}); err != nil {
-		return nil, nil, nil, fmt.Errorf("send handover request: %w", err)
+		return nil, fmt.Errorf("send handover request: %w", err)
 	}
 
-	// Read ack with worker info. We must NOT use json.NewDecoder here because
+	// Read ack. We must NOT use json.NewDecoder here because
 	// its buffered reads would consume the data byte from the next SCM_RIGHTS
 	// FD send, silently discarding the ancillary file descriptor.
 	var ack handoverMsg
 	if err := readJSONLine(conn, &ack); err != nil {
-		return nil, nil, nil, fmt.Errorf("read handover ack: %w", err)
+		return nil, fmt.Errorf("read handover ack: %w", err)
 	}
 
 	if ack.Type != "handover_ack" {
-		return nil, nil, nil, fmt.Errorf("unexpected handover message: %s", ack.Type)
+		return nil, fmt.Errorf("unexpected handover message: %s", ack.Type)
 	}
 
-	// Receive listener FD
+	// Receive PG listener FD
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("handover connection is not Unix")
+		return nil, fmt.Errorf("handover connection is not Unix")
 	}
 
-	file, err := fdpass.RecvFile(uc, "pg-listener")
+	file, err := recvFD(uc)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("receive PG listener FD: %w", err)
+		return nil, fmt.Errorf("receive PG listener FD: %w", err)
 	}
 	defer func() { _ = file.Close() }()
 
 	// Reconstruct listener from FD
 	ln, err := net.FileListener(file)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("FileListener PG: %w", err)
+		return nil, fmt.Errorf("FileListener PG: %w", err)
 	}
 
 	tcpLn, ok := ln.(*net.TCPListener)
 	if !ok {
 		_ = ln.Close()
-		return nil, nil, nil, fmt.Errorf("PG listener is not TCP")
-	}
-
-	var flightTCP *net.TCPListener
-	if ack.HasFlightListener {
-		flightFile, err := fdpass.RecvFile(uc, "flight-listener")
-		if err != nil {
-			_ = tcpLn.Close()
-			return nil, nil, nil, fmt.Errorf("receive Flight listener FD: %w", err)
-		}
-		defer func() { _ = flightFile.Close() }()
-
-		flightLn, err := net.FileListener(flightFile)
-		if err != nil {
-			_ = tcpLn.Close()
-			return nil, nil, nil, fmt.Errorf("FileListener Flight: %w", err)
-		}
-
-		var ok bool
-		flightTCP, ok = flightLn.(*net.TCPListener)
-		if !ok {
-			_ = flightLn.Close()
-			_ = tcpLn.Close()
-			return nil, nil, nil, fmt.Errorf("flight listener is not TCP")
-		}
+		return nil, fmt.Errorf("PG listener is not TCP")
 	}
 
 	// Notify systemd of our PID BEFORE telling the old CP we're done.
@@ -291,17 +219,42 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener,
 	// Send handover complete
 	if err := encoder.Encode(handoverMsg{Type: "handover_complete"}); err != nil {
 		_ = tcpLn.Close()
-		if flightTCP != nil {
-			_ = flightTCP.Close()
-		}
-		return nil, nil, nil, fmt.Errorf("send handover complete: %w", err)
+		return nil, fmt.Errorf("send handover complete: %w", err)
 	}
 
-	slog.Info("Handover received: got listeners and worker info.",
-		"has_flight_listener", ack.HasFlightListener,
-		"workers", len(ack.Workers))
+	slog.Info("Handover received: got PG listener.")
+	return tcpLn, nil
+}
 
-	return tcpLn, flightTCP, ack.Workers, nil
+// sendFD sends a file descriptor over a Unix socket using SCM_RIGHTS.
+func sendFD(uc *net.UnixConn, file *os.File) error {
+	rights := syscall.UnixRights(int(file.Fd()))
+	_, _, err := uc.WriteMsgUnix([]byte{0}, rights, nil)
+	return err
+}
+
+// recvFD receives a file descriptor from a Unix socket using SCM_RIGHTS.
+func recvFD(uc *net.UnixConn) (*os.File, error) {
+	buf := make([]byte, 1)
+	oob := make([]byte, 64)
+	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
+	if err != nil {
+		return nil, err
+	}
+	scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return nil, fmt.Errorf("parse control message: %w", err)
+	}
+	for _, scm := range scms {
+		fds, err := syscall.ParseUnixRights(&scm)
+		if err != nil {
+			continue
+		}
+		if len(fds) > 0 {
+			return os.NewFile(uintptr(fds[0]), "received-fd"), nil
+		}
+	}
+	return nil, fmt.Errorf("no file descriptor received")
 }
 
 // readJSONLine reads one newline-terminated JSON message from conn without
