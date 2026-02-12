@@ -281,6 +281,13 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, *net.TCPListener,
 		}
 	}
 
+	// Notify systemd of our PID BEFORE telling the old CP we're done.
+	// The old CP exits on handover_complete, so systemd must know our PID
+	// first — otherwise it sees the old MAINPID die and kills the cgroup.
+	if err := sdNotify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); err != nil {
+		slog.Warn("sd_notify MAINPID+READY failed.", "error", err)
+	}
+
 	// Send handover complete
 	if err := encoder.Encode(handoverMsg{Type: "handover_complete"}); err != nil {
 		_ = tcpLn.Close()
