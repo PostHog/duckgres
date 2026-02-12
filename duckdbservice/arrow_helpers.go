@@ -125,6 +125,10 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 	case "TIME":
 		return arrow.FixedWidthTypes.Time64us
 	case "TIMETZ":
+		// The Go driver converts TIMETZ to UTC (see duckdb-go getTimeTZ),
+		// discarding the original timezone offset before we see the value.
+		// Time64us preserves the UTC time-of-day correctly; the offset is
+		// irrecoverably lost at the driver level.
 		return arrow.FixedWidthTypes.Time64us
 
 	// Timestamps (no timezone → empty TimeZone string)
