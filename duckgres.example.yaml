@@ -19,6 +19,11 @@ users:
   alice: "alice123"
   bob: "bob123"
 
+# Passthrough users bypass all PostgreSQL compatibility (no transpiler, no pg_catalog).
+# Queries are sent directly to DuckDB. Users listed here must also exist in 'users' above.
+# passthrough_users:
+#   - alice
+
 # DuckDB extensions to load on database initialization
 # Extensions are installed (downloaded if needed) and loaded automatically
 # Common extensions: httpfs, parquet, json, sqlite, postgres, mysql, excel
