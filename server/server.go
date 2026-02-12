@@ -25,6 +25,15 @@ import (
 // processStartTime is captured at process init, used to distinguish server vs child process uptime.
 var processStartTime = time.Now()
 
+// processVersion is set from main() via SetProcessVersion. Defaults to "dev".
+var processVersion = "dev"
+
+// SetProcessVersion sets the version string for this process. Called from main().
+func SetProcessVersion(v string) { processVersion = v }
+
+// ProcessVersion returns the version string for this process.
+func ProcessVersion() string { return processVersion }
+
 // redactConnectionString removes sensitive information (passwords) from connection strings for logging
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s]+)`)
 
@@ -417,7 +426,7 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 // createDBConnection creates a DuckDB connection for a client session.
 // This is a thin wrapper around CreateDBConnection using the server's config.
 func (s *Server) createDBConnection(username string) (*sql.DB, error) {
-	return CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime)
+	return CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
 }
 
 // openBaseDB creates and configures a bare DuckDB in-memory connection with
@@ -498,7 +507,8 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 // This is a standalone function so it can be reused by both the server and control plane workers.
 // serverStartTime is the time the top-level server process started (may differ from processStartTime
 // in process isolation mode where each child has its own processStartTime).
-func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time) (*sql.DB, error) {
+// serverVersion is the version of the top-level server/control-plane process.
+func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time, serverVersion string) (*sql.DB, error) {
 	db, err := openBaseDB(cfg, username)
 	if err != nil {
 		return nil, err
@@ -507,7 +517,7 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 	// Initialize pg_catalog schema for PostgreSQL compatibility
 	// Must be done BEFORE attaching DuckLake so macros are created in memory.main,
 	// not in the DuckLake catalog (which doesn't support macro storage).
-	if err := initPgCatalog(db, serverStartTime, processStartTime); err != nil {
+	if err := initPgCatalog(db, serverStartTime, processStartTime, serverVersion, processVersion); err != nil {
 		slog.Warn("Failed to initialize pg_catalog.", "user", username, "error", err)
 		// Continue anyway - basic queries will still work
 	}

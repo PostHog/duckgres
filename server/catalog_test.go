@@ -16,7 +16,7 @@ func TestPgDatabaseView(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime, "dev", "dev"); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -61,7 +61,7 @@ func TestPgDatabaseViewContent(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime, "dev", "dev"); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestPgStatioUserTablesViewColumns(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime, "dev", "dev"); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -174,7 +174,7 @@ func TestPgTypeHasComplexTypeOIDs(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime, "dev", "dev"); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -226,7 +226,7 @@ func TestPgAttributeJoinPgTypeComplexColumns(t *testing.T) {
 		t.Fatalf("Failed to set extension settings: %v", err)
 	}
 
-	if err := initPgCatalog(db, processStartTime, processStartTime); err != nil {
+	if err := initPgCatalog(db, processStartTime, processStartTime, "dev", "dev"); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
@@ -280,12 +280,12 @@ func TestUptimeMacros(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	start := time.Now()
-	if err := initPgCatalog(db, start, start); err != nil {
+	if err := initPgCatalog(db, start, start, "dev", "dev"); err != nil {
 		t.Fatalf("Failed to init pg_catalog: %v", err)
 	}
 
 	// Verify both macros return INTERVAL type and a non-negative value
-	for _, fn := range []string{"uptime", "process_uptime"} {
+	for _, fn := range []string{"uptime", "worker_uptime"} {
 		var typeName string
 		if err := db.QueryRow(fmt.Sprintf("SELECT pg_typeof(%s())", fn)).Scan(&typeName); err != nil {
 			t.Fatalf("%s() query failed: %v", fn, err)
