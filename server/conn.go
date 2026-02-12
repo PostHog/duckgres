@@ -3253,10 +3253,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// For SELECT, we need to describe the result columns
 		// The cleanest approach is to add a "WHERE false" or "LIMIT 0" clause
 		// to get column info without actually running the query
-		describeQuery := ps.convertedQuery
+		describeQuery := strings.TrimRight(strings.TrimSpace(ps.convertedQuery), ";")
 		// Try adding LIMIT 0 to avoid needing real parameter values
-		if !strings.Contains(strings.ToUpper(ps.convertedQuery), "LIMIT") {
-			describeQuery = ps.convertedQuery + " LIMIT 0"
+		if !strings.Contains(strings.ToUpper(describeQuery), "LIMIT") {
+			describeQuery = describeQuery + " LIMIT 0"
 		}
 
 		// Use NULL for all parameters
