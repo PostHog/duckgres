@@ -2770,6 +2770,9 @@ func formatValue(v interface{}) string {
 	case duckdb.Interval:
 		// PostgreSQL interval text format: "1 year 2 mons 3 days 04:05:06.123456"
 		return formatInterval(val)
+	case intervalValue:
+		// Arrow Flight returns intervalValue instead of duckdb.Interval
+		return formatInterval(duckdb.Interval{Months: val.Months, Days: val.Days, Micros: val.Micros})
 	case map[string]any:
 		// STRUCT text format: {"key1": val1, "key2": val2}
 		return formatMapValue(val)

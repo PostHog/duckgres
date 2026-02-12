@@ -147,10 +147,21 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	cp.closeMu.Unlock()
 	_ = cp.pgListener.Close()
 
-	// Wait for in-flight connections to finish
-	cp.wg.Wait()
+	// Wait for in-flight connections to finish (with timeout)
+	drainDone := make(chan struct{})
+	go func() {
+		cp.wg.Wait()
+		close(drainDone)
+	}()
 
-	// Shut down workers now that all connections are done
+	select {
+	case <-drainDone:
+		slog.Info("All connections drained after handover.")
+	case <-time.After(5 * time.Minute):
+		slog.Warn("Handover drain timeout after 5 minutes, forcing exit.")
+	}
+
+	// Shut down workers
 	cp.pool.ShutdownAll()
 
 	slog.Info("Old control plane exiting after handover.")

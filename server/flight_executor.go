@@ -24,6 +24,7 @@ type FlightExecutor struct {
 	client       *flightsql.Client
 	sessionToken string
 	alloc        memory.Allocator
+	ownsClient   bool // if true, Close() closes the client
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -47,7 +48,20 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 		client:       client,
 		sessionToken: sessionToken,
 		alloc:        memory.DefaultAllocator,
+		ownsClient:   true,
 	}, nil
+}
+
+// NewFlightExecutorFromClient creates a FlightExecutor that shares an existing
+// Flight SQL client. The client is NOT closed when this executor is closed.
+// This avoids creating a new gRPC connection per session.
+func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) *FlightExecutor {
+	return &FlightExecutor{
+		client:       client,
+		sessionToken: sessionToken,
+		alloc:        memory.DefaultAllocator,
+		ownsClient:   false,
+	}
 }
 
 // withSession adds the session token to the gRPC context.
@@ -125,7 +139,10 @@ func (e *FlightExecutor) PingContext(ctx context.Context) error {
 }
 
 func (e *FlightExecutor) Close() error {
-	return e.client.Close()
+	if e.ownsClient {
+		return e.client.Close()
+	}
+	return nil
 }
 
 // FlightRowSet wraps an Arrow Flight RecordBatch reader to implement RowSet.

@@ -29,13 +29,20 @@ type ManagedWorker struct {
 	exitErr    error
 }
 
+// SessionCounter provides session counts per worker for load balancing.
+type SessionCounter interface {
+	SessionCountForWorker(workerID int) int
+}
+
 // FlightWorkerPool manages a pool of duckdb-service worker processes.
 type FlightWorkerPool struct {
-	mu        sync.RWMutex
-	workers   map[int]*ManagedWorker
-	socketDir string
-	configPath string
-	binaryPath string
+	mu             sync.RWMutex
+	workers        map[int]*ManagedWorker
+	socketDir      string
+	configPath     string
+	binaryPath     string
+	sessionCounter SessionCounter // set after SessionManager is created
+	shuttingDown   bool
 }
 
 // NewFlightWorkerPool creates a new worker pool.
@@ -168,6 +175,12 @@ func doHealthCheck(ctx context.Context, client *flightsql.Client) error {
 	return fmt.Errorf("worker not healthy")
 }
 
+// SetSessionCounter sets the session counter for load balancing.
+// Must be called before accepting connections.
+func (p *FlightWorkerPool) SetSessionCounter(sc SessionCounter) {
+	p.sessionCounter = sc
+}
+
 // SelectWorker returns the worker with the fewest active sessions.
 func (p *FlightWorkerPool) SelectWorker() (*ManagedWorker, error) {
 	p.mu.RLock()
@@ -177,17 +190,21 @@ func (p *FlightWorkerPool) SelectWorker() (*ManagedWorker, error) {
 		return nil, fmt.Errorf("no workers available")
 	}
 
-	// For now, simple round-robin selection based on worker ID.
-	// Session counting will be added when session manager tracks per-worker counts.
 	var best *ManagedWorker
+	bestCount := int(^uint(0) >> 1) // max int
 	for _, w := range p.workers {
 		select {
 		case <-w.done:
 			continue // skip dead workers
 		default:
 		}
-		if best == nil || w.ID < best.ID {
+		count := 0
+		if p.sessionCounter != nil {
+			count = p.sessionCounter.SessionCountForWorker(w.ID)
+		}
+		if best == nil || count < bestCount || (count == bestCount && w.ID < best.ID) {
 			best = w
+			bestCount = count
 		}
 	}
 
@@ -218,6 +235,7 @@ func (p *FlightWorkerPool) SpawnAll(count int) error {
 // ShutdownAll stops all workers gracefully.
 func (p *FlightWorkerPool) ShutdownAll() {
 	p.mu.Lock()
+	p.shuttingDown = true
 	workers := make([]*ManagedWorker, 0, len(p.workers))
 	for _, w := range p.workers {
 		workers = append(workers, w)
@@ -250,6 +268,10 @@ func (p *FlightWorkerPool) ShutdownAll() {
 // ReplaceWorker replaces a dead worker with a new one.
 func (p *FlightWorkerPool) ReplaceWorker(id int) error {
 	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return fmt.Errorf("pool is shutting down")
+	}
 	old, exists := p.workers[id]
 	if exists {
 		if old.client != nil {
@@ -281,6 +303,8 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 
 			for _, w := range workers {
 				select {
+				case <-ctx.Done():
+					return
 				case <-w.done:
 					slog.Warn("Worker crashed, respawning.", "id", w.ID, "error", w.exitErr)
 					if err := p.ReplaceWorker(w.ID); err != nil {
@@ -298,12 +322,16 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 
 			// Ensure we have the expected number of workers
 			p.mu.RLock()
-			currentCount := len(p.workers)
+			shutting := p.shuttingDown
 			p.mu.RUnlock()
-			for i := currentCount; i < expectedCount; i++ {
-				slog.Info("Spawning missing worker.", "id", i)
-				if err := p.SpawnWorker(i); err != nil {
-					slog.Error("Failed to spawn missing worker.", "id", i, "error", err)
+			if !shutting {
+				for i := 0; i < expectedCount; i++ {
+					if _, ok := p.Worker(i); !ok {
+						slog.Info("Spawning missing worker.", "id", i)
+						if err := p.SpawnWorker(i); err != nil {
+							slog.Error("Failed to spawn missing worker.", "id", i, "error", err)
+						}
+					}
 				}
 			}
 		}

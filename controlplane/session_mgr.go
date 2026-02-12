@@ -53,14 +53,8 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
 	}
 
-	// Create FlightExecutor for this session
-	addr := "unix://" + worker.socketPath
-	executor, err := server.NewFlightExecutor(addr, worker.bearerToken, sessionToken)
-	if err != nil {
-		// Best effort: destroy the session we just created
-		_ = worker.DestroySession(ctx, sessionToken)
-		return 0, nil, fmt.Errorf("create flight executor: %w", err)
-	}
+	// Create FlightExecutor sharing the worker's existing gRPC connection
+	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
 
 	pid := sm.nextPID.Add(1)
 

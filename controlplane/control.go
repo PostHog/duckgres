@@ -93,10 +93,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)
 
+	sessions := NewSessionManager(pool)
+	pool.SetSessionCounter(sessions)
+
 	cp := &ControlPlane{
 		cfg:         cfg,
 		pool:        pool,
-		sessions:    NewSessionManager(pool),
+		sessions:    sessions,
 		srv:         srv,
 		rateLimiter: server.NewRateLimiter(cfg.RateLimit),
 		tlsConfig: &tls.Config{
@@ -375,6 +378,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
+	cp.rateLimiter.RecordSuccessfulAuth(remoteAddr)
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
 	// Create session on a worker
