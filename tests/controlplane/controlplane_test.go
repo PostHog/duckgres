@@ -107,20 +107,16 @@ type cpHarness struct {
 }
 
 type cpOpts struct {
-	workerCount    int
 	handoverSocket string
 }
 
 func defaultOpts() cpOpts {
-	return cpOpts{workerCount: 2}
+	return cpOpts{}
 }
 
 func startControlPlane(t *testing.T, opts cpOpts) *cpHarness {
 	t.Helper()
 
-	if opts.workerCount == 0 {
-		opts.workerCount = 2
-	}
 
 	port := freePort(t)
 
@@ -163,7 +159,6 @@ users:
 	args := []string{
 		"--config", configFile,
 		"--mode", "control-plane",
-		"--worker-count", strconv.Itoa(opts.workerCount),
 		"--socket-dir", socketDir,
 		"--handover-socket", handoverSocket,
 	}

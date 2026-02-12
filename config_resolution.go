@@ -19,6 +19,9 @@ type configCLIInputs struct {
 	IdleTimeout      string
 	MemoryLimit      string
 	Threads          int
+	MemoryBudget     string
+	MaxWorkers       int
+	MinWorkers       int
 }
 
 type resolvedConfig struct {
@@ -146,6 +149,15 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.Threads != 0 {
 			cfg.Threads = fileCfg.Threads
 		}
+		if fileCfg.MemoryBudget != "" {
+			cfg.MemoryBudget = fileCfg.MemoryBudget
+		}
+		if fileCfg.MaxWorkers != 0 {
+			cfg.MaxWorkers = fileCfg.MaxWorkers
+		}
+		if fileCfg.MinWorkers != 0 {
+			cfg.MinWorkers = fileCfg.MinWorkers
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -226,6 +238,23 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_THREADS: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_MEMORY_BUDGET"); v != "" {
+		cfg.MemoryBudget = v
+	}
+	if v := getenv("DUCKGRES_MIN_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MinWorkers = n
+		} else {
+			warn("Invalid DUCKGRES_MIN_WORKERS: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_MAX_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MaxWorkers = n
+		} else {
+			warn("Invalid DUCKGRES_MAX_WORKERS: " + err.Error())
+		}
+	}
 
 	if cli.Set["host"] {
 		cfg.Host = cli.Host
@@ -258,11 +287,26 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["threads"] {
 		cfg.Threads = cli.Threads
 	}
+	if cli.Set["memory-budget"] {
+		cfg.MemoryBudget = cli.MemoryBudget
+	}
+	if cli.Set["min-workers"] {
+		cfg.MinWorkers = cli.MinWorkers
+	}
+	if cli.Set["max-workers"] {
+		cfg.MaxWorkers = cli.MaxWorkers
+	}
 
 	// Validate memory_limit format if explicitly set
 	if cfg.MemoryLimit != "" && !server.ValidateMemoryLimit(cfg.MemoryLimit) {
 		warn("Invalid memory_limit format: " + cfg.MemoryLimit + " (expected e.g. '4GB', '512MB')")
 		cfg.MemoryLimit = "" // fall back to auto-detection
+	}
+
+	// Validate memory_budget format if explicitly set
+	if cfg.MemoryBudget != "" && !server.ValidateMemoryLimit(cfg.MemoryBudget) {
+		warn("Invalid memory_budget format: " + cfg.MemoryBudget + " (expected e.g. '24GB', '512MB')")
+		cfg.MemoryBudget = "" // fall back to auto-detection
 	}
 
 	return resolvedConfig{

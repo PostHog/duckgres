@@ -24,7 +24,6 @@ import (
 type ControlPlaneConfig struct {
 	server.Config
 
-	WorkerCount         int
 	SocketDir           string
 	ConfigPath          string // Path to config file, passed to workers
 	HandoverSocket      string
@@ -53,9 +52,6 @@ type ControlPlane struct {
 // RunControlPlane is the entry point for the control plane process.
 func RunControlPlane(cfg ControlPlaneConfig) {
 	// Apply defaults
-	if cfg.WorkerCount == 0 {
-		cfg.WorkerCount = 4
-	}
 	if cfg.SocketDir == "" {
 		cfg.SocketDir = "/var/run/duckgres"
 	}
@@ -87,13 +83,18 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.RateLimit = server.DefaultRateLimitConfig()
 	}
 
-	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath)
+	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, cfg.MaxWorkers)
 
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)
 
-	sessions := NewSessionManager(pool)
+	// Initialize memory rebalancer
+	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
+	rebalancer := NewMemoryRebalancer(memBudget, 0, nil) // sessions set below
+
+	sessions := NewSessionManager(pool, rebalancer)
+	rebalancer.sessions = sessions // wire up the circular dependency
 	pool.SetSessionCounter(sessions)
 
 	cp := &ControlPlane{
@@ -144,10 +145,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.pgListener = ln
 	}
 
-	// Spawn workers (always fresh, even after handover)
-	if err := cp.pool.SpawnAll(cfg.WorkerCount); err != nil {
-		slog.Error("Failed to spawn workers.", "error", err)
-		os.Exit(1)
+	// Pre-warm workers if min_workers is set
+	if cfg.MinWorkers > 0 {
+		if err := cp.pool.SpawnMinWorkers(cfg.MinWorkers); err != nil {
+			slog.Error("Failed to spawn min workers.", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	// Start health check loop with crash notification
@@ -155,11 +158,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.sessions.OnWorkerCrash(workerID, func(pid int32) {
 			// Sessions on the crashed worker will see gRPC errors on
 			// their next query. OnWorkerCrash cleans up session state
-			// so SelectWorker load balancing stays accurate.
+			// so load balancing stays accurate.
 			slog.Warn("Session orphaned by worker crash.", "pid", pid, "worker", workerID)
 		})
 	}
-	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, cfg.WorkerCount, onCrash)
+	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash)
 
 	// Start handover listener for future deployments
 	cp.startHandoverListener()
@@ -176,7 +179,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
-		"workers", cfg.WorkerCount)
+		"min_workers", cfg.MinWorkers,
+		"max_workers", cfg.MaxWorkers,
+		"memory_budget", formatBytes(rebalancer.memoryBudget))
 
 	// Handle signals
 	go func() {

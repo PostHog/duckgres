@@ -18,7 +18,7 @@ func TestAutoMemoryLimit(t *testing.T) {
 
 	// On Linux (CI and production), we should detect system memory
 	if runtime.GOOS == "linux" {
-		totalBytes := totalSystemMemoryBytes()
+		totalBytes := readSystemMemoryBytes()
 		if totalBytes == 0 {
 			t.Fatal("totalSystemMemoryBytes returned 0 on Linux")
 		}
@@ -62,7 +62,7 @@ func TestTotalSystemMemoryBytes(t *testing.T) {
 		t.Skip("Only runs on Linux")
 	}
 
-	total := totalSystemMemoryBytes()
+	total := readSystemMemoryBytes()
 	if total == 0 {
 		t.Fatal("Expected non-zero memory on Linux")
 	}

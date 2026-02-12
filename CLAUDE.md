@@ -102,7 +102,9 @@ Supports bulk data transfer:
 
 Key CLI flags for control plane mode:
 - `--mode control-plane|duckdb-service|standalone`
-- `--worker-count N` (default 4)
+- `--min-workers N` (default 0, pre-warm workers at startup)
+- `--max-workers N` (default 0 = unlimited)
+- `--memory-budget SIZE` (e.g., "24GB", default: 75% system RAM)
 - `--socket-dir /path` (Unix sockets for Flight SQL workers)
 - `--handover-socket /path` (graceful deployment between control planes)
 

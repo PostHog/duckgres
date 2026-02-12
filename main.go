@@ -32,6 +32,9 @@ type FileConfig struct {
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
 	MemoryLimit      string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
 	Threads          int                 `yaml:"threads"`           // DuckDB threads per session
+	MemoryBudget     string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
+	MaxWorkers       int                 `yaml:"max_workers"`       // Max worker processes (control-plane mode)
+	MinWorkers       int                 `yaml:"min_workers"`       // Pre-warm worker count (control-plane mode)
 }
 
 type TLSConfig struct {
@@ -120,6 +123,7 @@ func main() {
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	memoryLimit := flag.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
 	threads := flag.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
+	memoryBudget := flag.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
@@ -127,7 +131,8 @@ func main() {
 
 	// Control plane flags
 	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
-	workerCount := flag.Int("worker-count", 4, "Number of worker processes (control-plane mode)")
+	minWorkers := flag.Int("min-workers", 0, "Pre-warm worker count at startup (control-plane mode) (env: DUCKGRES_MIN_WORKERS)")
+	maxWorkers := flag.Int("max-workers", 0, "Max worker processes, 0=unlimited (control-plane mode) (env: DUCKGRES_MAX_WORKERS)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
 
@@ -152,6 +157,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_THREADS            DuckDB threads per session\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_BUDGET      Total memory for all DuckDB sessions (e.g., 24GB)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MIN_WORKERS        Pre-warm worker count (control-plane mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_WORKERS        Max worker processes (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
@@ -223,6 +231,9 @@ func main() {
 		IdleTimeout:      *idleTimeout,
 		MemoryLimit:      *memoryLimit,
 		Threads:          *threads,
+		MemoryBudget:     *memoryBudget,
+		MinWorkers:       *minWorkers,
+		MaxWorkers:       *maxWorkers,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})
@@ -329,7 +340,6 @@ func main() {
 	if *mode == "control-plane" {
 		cpCfg := controlplane.ControlPlaneConfig{
 			Config:         cfg,
-			WorkerCount:    *workerCount,
 			SocketDir:      *socketDir,
 			ConfigPath:     *configFile,
 			HandoverSocket: *handoverSocket,
