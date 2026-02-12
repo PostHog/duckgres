@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -863,11 +864,11 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			processStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
 		// control_plane_version - returns the top-level server/control-plane version
 		// In standalone mode this equals worker_version().
-		fmt.Sprintf(`CREATE OR REPLACE MACRO control_plane_version() AS '%s'`, serverVersion),
+		fmt.Sprintf(`CREATE OR REPLACE MACRO control_plane_version() AS '%s'`, strings.ReplaceAll(serverVersion, "'", "''")),
 		// worker_version - returns the current worker process version
 		// In standalone mode this equals control_plane_version(). During rolling updates
 		// these may differ if the control plane has been upgraded but workers haven't yet.
-		fmt.Sprintf(`CREATE OR REPLACE MACRO worker_version() AS '%s'`, processVersion),
+		fmt.Sprintf(`CREATE OR REPLACE MACRO worker_version() AS '%s'`, strings.ReplaceAll(processVersion, "'", "''")),
 	}
 
 	for _, f := range functions {
