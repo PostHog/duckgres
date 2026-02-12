@@ -626,7 +626,7 @@ func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open DuckDB: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	tests := []struct {
 		name  string
