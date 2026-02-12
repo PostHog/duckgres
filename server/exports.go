@@ -49,18 +49,19 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 	username, database string, executor QueryExecutor, pid, secretKey int32) *clientConn {
 
 	return &clientConn{
-		server:    s,
-		conn:      conn,
-		reader:    reader,
-		writer:    writer,
-		username:  username,
-		database:  database,
-		executor:  executor,
-		pid:       pid,
-		secretKey: secretKey,
-		stmts:     make(map[string]*preparedStmt),
-		portals:   make(map[string]*portal),
-		txStatus:  txStatusIdle,
+		server:      s,
+		conn:        conn,
+		reader:      reader,
+		writer:      writer,
+		username:    username,
+		database:    database,
+		executor:    executor,
+		pid:         pid,
+		secretKey:   secretKey,
+		passthrough: s.cfg.PassthroughUsers[username],
+		stmts:       make(map[string]*preparedStmt),
+		portals:     make(map[string]*portal),
+		txStatus:    txStatusIdle,
 	}
 }
 
