@@ -275,6 +275,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		cfg.Threads = cli.Threads
 	}
 
+	// Validate memory_limit format if explicitly set
+	if cfg.MemoryLimit != "" && !server.ValidateMemoryLimit(cfg.MemoryLimit) {
+		warn("Invalid memory_limit format: " + cfg.MemoryLimit + " (expected e.g. '4GB', '512MB')")
+		cfg.MemoryLimit = "" // fall back to auto-detection
+	}
+
 	return resolvedConfig{
 		Server:     cfg,
 		FlightPort: flightPort,

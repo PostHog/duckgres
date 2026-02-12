@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 )
 
 // totalSystemMemoryBytes reads total physical memory from /proc/meminfo on Linux.
@@ -30,29 +32,48 @@ func totalSystemMemoryBytes() uint64 {
 	return 0
 }
 
+var (
+	autoMemoryLimitOnce  sync.Once
+	autoMemoryLimitValue string
+)
+
 // autoMemoryLimit computes a DuckDB memory_limit based on system memory.
 // Formula: totalMem * 0.75 / 4, with a floor of 256MB.
 // The /4 accounts for typical concurrency (multiple sessions sharing RAM).
 // Returns "4GB" as a safe default if system memory cannot be detected.
+// The result is computed once and cached since system memory doesn't change.
 func autoMemoryLimit() string {
-	totalBytes := totalSystemMemoryBytes()
-	if totalBytes == 0 {
-		return "4GB"
-	}
+	autoMemoryLimitOnce.Do(func() {
+		totalBytes := totalSystemMemoryBytes()
+		if totalBytes == 0 {
+			autoMemoryLimitValue = "4GB"
+			return
+		}
 
-	const mb = 1024 * 1024
-	const gb = 1024 * mb
+		const mb = 1024 * 1024
+		const gb = 1024 * mb
 
-	limitBytes := totalBytes * 3 / 4 / 4 // 75% / 4 sessions
-	if limitBytes < 256*mb {
-		limitBytes = 256 * mb
-	}
+		limitBytes := totalBytes * 3 / 4 / 4 // 75% / 4 sessions
+		if limitBytes < 256*mb {
+			limitBytes = 256 * mb
+		}
 
-	// Format as human-readable: use GB if >= 1GB, else MB
-	if limitBytes >= gb {
-		limitGB := limitBytes / gb
-		return fmt.Sprintf("%dGB", limitGB)
-	}
-	limitMB := limitBytes / mb
-	return fmt.Sprintf("%dMB", limitMB)
+		// Format as human-readable: use GB if >= 1GB, else MB
+		if limitBytes >= gb {
+			limitGB := limitBytes / gb
+			autoMemoryLimitValue = fmt.Sprintf("%dGB", limitGB)
+		} else {
+			limitMB := limitBytes / mb
+			autoMemoryLimitValue = fmt.Sprintf("%dMB", limitMB)
+		}
+	})
+	return autoMemoryLimitValue
+}
+
+// validMemoryLimit matches DuckDB memory limit values like "4GB", "512MB", "1TB".
+var validMemoryLimit = regexp.MustCompile(`(?i)^\d+\s*(KB|MB|GB|TB)$`)
+
+// ValidateMemoryLimit checks that a memory_limit string is a valid DuckDB size value.
+func ValidateMemoryLimit(v string) bool {
+	return validMemoryLimit.MatchString(v)
 }

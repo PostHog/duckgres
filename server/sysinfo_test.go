@@ -2,11 +2,15 @@ package server
 
 import (
 	"runtime"
+	"sync"
 	"testing"
 )
 
 func TestAutoMemoryLimit(t *testing.T) {
-	// autoMemoryLimit should return a non-empty string
+	// Reset cached value so test is independent
+	autoMemoryLimitOnce = sync.Once{}
+	autoMemoryLimitValue = ""
+
 	result := autoMemoryLimit()
 	if result == "" {
 		t.Fatal("autoMemoryLimit returned empty string")
@@ -23,6 +27,10 @@ func TestAutoMemoryLimit(t *testing.T) {
 }
 
 func TestAutoMemoryLimitFormat(t *testing.T) {
+	// Reset cached value so test is independent
+	autoMemoryLimitOnce = sync.Once{}
+	autoMemoryLimitValue = ""
+
 	result := autoMemoryLimit()
 	// Should end with GB or MB
 	validSuffix := false
@@ -34,6 +42,18 @@ func TestAutoMemoryLimitFormat(t *testing.T) {
 	}
 	if !validSuffix {
 		t.Fatalf("autoMemoryLimit returned %q, expected suffix GB or MB", result)
+	}
+}
+
+func TestAutoMemoryLimitCached(t *testing.T) {
+	// Reset and call twice — should return same value
+	autoMemoryLimitOnce = sync.Once{}
+	autoMemoryLimitValue = ""
+
+	first := autoMemoryLimit()
+	second := autoMemoryLimit()
+	if first != second {
+		t.Fatalf("autoMemoryLimit not stable: %q vs %q", first, second)
 	}
 }
 
@@ -52,4 +72,20 @@ func TestTotalSystemMemoryBytes(t *testing.T) {
 		t.Fatalf("Suspiciously low memory: %d bytes", total)
 	}
 	t.Logf("System memory: %d bytes (%.1f GB)", total, float64(total)/(1024*1024*1024))
+}
+
+func TestValidateMemoryLimit(t *testing.T) {
+	valid := []string{"4GB", "512MB", "1TB", "256kb", "100 MB", "2 gb"}
+	for _, v := range valid {
+		if !ValidateMemoryLimit(v) {
+			t.Errorf("expected %q to be valid", v)
+		}
+	}
+
+	invalid := []string{"", "4", "GB", "lots", "4GB; DROP TABLE", "4'GB"}
+	for _, v := range invalid {
+		if ValidateMemoryLimit(v) {
+			t.Errorf("expected %q to be invalid", v)
+		}
+	}
 }

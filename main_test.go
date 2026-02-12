@@ -240,6 +240,33 @@ func TestResolveEffectiveConfigInvalidThreadsEnv(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigInvalidMemoryLimit(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_MEMORY_LIMIT": "lots-of-memory",
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	// Invalid format should be cleared (falls back to auto-detection)
+	if resolved.Server.MemoryLimit != "" {
+		t.Fatalf("expected empty memory_limit after invalid input, got %q", resolved.Server.MemoryLimit)
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "Invalid memory_limit format") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about invalid memory_limit format, warnings: %v", warns)
+	}
+}
+
 func TestEffectiveFlightConfigDefaults(t *testing.T) {
 	cfg := defaultServerConfig()
 	port := effectiveFlightConfig(cfg, 0)
