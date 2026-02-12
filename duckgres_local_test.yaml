@@ -1,0 +1,17 @@
+host: "0.0.0.0"
+port: 35437
+data_dir: "./data"
+users:
+  postgres: "postgres"
+extensions:
+  - ducklake
+ducklake:
+  metadata_store: "postgres:host=localhost port=5433 user=ducklake password=ducklake dbname=ducklake"
+  object_store: "s3://ducklake/data/"
+  s3_provider: "config"
+  s3_endpoint: "localhost:9000"
+  s3_access_key: "minioadmin"
+  s3_secret_key: "minioadmin"
+  s3_region: "us-east-1"
+  s3_use_ssl: false
+  s3_url_style: "path"

@@ -932,12 +932,30 @@ func TestEncodeNumeric(t *testing.T) {
 		})
 	}
 
-	// Test non-Decimal fallback to text encoding
-	t.Run("non-decimal fallback", func(t *testing.T) {
+	// Test string decimal encoding (used by Arrow Flight mode)
+	t.Run("string decimal", func(t *testing.T) {
 		result := encodeNumeric("123.45")
-		expected := []byte("123.45")
+		if result == nil {
+			t.Fatal("encodeNumeric(\"123.45\") returned nil")
+		}
+		if len(result) < 8 {
+			t.Fatalf("encodeNumeric(\"123.45\") returned %d bytes, need at least 8", len(result))
+		}
+		decoded, err := decodeNumeric(result)
+		if err != nil {
+			t.Fatalf("decodeNumeric failed: %v", err)
+		}
+		if decoded != "123.45" {
+			t.Errorf("decodeNumeric(encodeNumeric(\"123.45\")) = %q, want %q", decoded, "123.45")
+		}
+	})
+
+	// Test non-numeric string fallback to text encoding
+	t.Run("non-numeric string fallback", func(t *testing.T) {
+		result := encodeNumeric("not_a_number")
+		expected := []byte("not_a_number")
 		if len(result) != len(expected) {
-			t.Errorf("non-decimal fallback: length = %d, want %d", len(result), len(expected))
+			t.Errorf("non-numeric string fallback: length = %d, want %d", len(result), len(expected))
 		}
 	})
 }

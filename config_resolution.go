@@ -17,14 +17,12 @@ type configCLIInputs struct {
 	KeyFile          string
 	ProcessIsolation bool
 	IdleTimeout      string
-	FlightPort       int
 	MemoryLimit      string
 	Threads          int
 }
 
 type resolvedConfig struct {
-	Server     server.Config
-	FlightPort int
+	Server server.Config
 }
 
 func defaultServerConfig() server.Config {
@@ -53,7 +51,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	cfg := defaultServerConfig()
-	flightPort := 0
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -61,9 +58,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.Port != 0 {
 			cfg.Port = fileCfg.Port
-		}
-		if fileCfg.Flight.Port != 0 {
-			flightPort = fileCfg.Flight.Port
 		}
 		if fileCfg.DataDir != "" {
 			cfg.DataDir = fileCfg.DataDir
@@ -177,13 +171,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_KEY"); v != "" {
 		cfg.TLSKeyFile = v
 	}
-	if v := getenv("DUCKGRES_FLIGHT_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			flightPort = p
-		} else {
-			warn("Invalid DUCKGRES_FLIGHT_PORT: " + err.Error())
-		}
-	}
 	if v := getenv("DUCKGRES_DUCKLAKE_METADATA_STORE"); v != "" {
 		cfg.DuckLake.MetadataStore = v
 	}
@@ -271,9 +258,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid --idle-timeout duration: " + err.Error())
 		}
 	}
-	if cli.Set["flight-port"] {
-		flightPort = cli.FlightPort
-	}
 	if cli.Set["memory-limit"] {
 		cfg.MemoryLimit = cli.MemoryLimit
 	}
@@ -288,14 +272,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	return resolvedConfig{
-		Server:     cfg,
-		FlightPort: flightPort,
+		Server: cfg,
 	}
-}
-
-func effectiveFlightConfig(_ server.Config, flightPort int) int {
-	if flightPort == 0 {
-		flightPort = 8815
-	}
-	return flightPort
 }

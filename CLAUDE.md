@@ -8,11 +8,11 @@ Duckgres is a PostgreSQL wire protocol server backed by DuckDB. It allows any Po
 
 ## Architecture
 
-Duckgres supports three run modes: `standalone` (default), `control-plane`, and `worker`.
+Duckgres supports three run modes: `standalone` (default), `control-plane`, and `duckdb-service`.
 
 ```
 Standalone:    PostgreSQL Client → TLS → Duckgres Server → DuckDB (per-user database)
-Control Plane: PostgreSQL Client → TLS → Control Plane → (FD pass) → Worker → DuckDB
+Control Plane: PostgreSQL Client → TLS/Auth/PG Protocol → Control Plane → Flight SQL (UDS) → Worker (DuckDB)
 ```
 
 ### Key Components
@@ -26,6 +26,7 @@ Control Plane: PostgreSQL Client → TLS → Control Plane → (FD pass) → Wor
 - **server/types.go**: Type OID mapping between DuckDB and PostgreSQL
 - **server/ratelimit.go**: Rate limiting for brute-force protection
 - **server/certs.go**: Auto-generation of self-signed TLS certificates
+- **server/sysinfo.go**: System memory detection and auto memory limit computation
 - **server/parent.go**: Child process spawning for ProcessIsolation mode
 - **server/worker.go**: Per-connection child worker (ProcessIsolation mode)
 - **transpiler/**: AST-based SQL transpiler (PostgreSQL → DuckDB)
@@ -33,14 +34,18 @@ Control Plane: PostgreSQL Client → TLS → Control Plane → (FD pass) → Wor
   - `config.go`: Configuration types (DuckLakeMode, ConvertPlaceholders)
   - `transform/`: Individual transform implementations
 - **controlplane/**: Multi-process control plane architecture
-  - `proto/worker.proto`: gRPC service definition (Configure, AcceptConnection, CancelQuery, Drain, Health, Shutdown)
-  - `proto/*.pb.go`: Generated gRPC/protobuf code
-  - `fdpass/fdpass.go`: Unix socket FD passing via SCM_RIGHTS
-  - `worker.go`: Long-lived worker process (gRPC server, FD receiver, session handler)
-  - `dbpool.go`: Per-session DuckDB database pool management
-  - `control.go`: Control plane main loop (TCP listener, rate limiting, connection routing)
-  - `pool.go`: Worker pool management (spawn, health check, least-connections routing, rolling update)
+  - `control.go`: Control plane main loop (TCP listener, TLS, auth, PG protocol, SQL transpilation, connection routing)
+  - `worker_mgr.go`: Flight SQL worker pool management (spawn, health check, least-connections routing, rolling update)
+  - `session_mgr.go`: Session lifecycle management (maps PG connections to Flight SQL sessions on workers)
   - `handover.go`: Graceful deployment (listener FD transfer between control planes)
+  - `sdnotify.go`: systemd sd_notify integration
+  - `validation.go`: Configuration validation
+- **duckdbservice/**: Standalone DuckDB Arrow Flight SQL service (used as worker in control-plane mode)
+  - `service.go`: Flight SQL server lifecycle, gRPC setup
+  - `flight_handler.go`: Arrow Flight SQL handler (DoPut, DoGet, GetFlightInfo, session management)
+  - `arrow_helpers.go`: Arrow/DuckDB type mapping and conversion
+  - `auth.go`: Bearer token authentication middleware
+  - `config.go`: Service configuration (listen addr, bearer token, max sessions)
 
 ## PostgreSQL Wire Protocol
 
@@ -91,17 +96,20 @@ Supports bulk data transfer:
 
 ## Run Modes
 
-- **standalone** (default): Single process, handles everything. Current behavior unchanged.
-- **control-plane**: Multi-process. Accepts TCP connections, passes FDs to worker pool via Unix sockets.
-- **worker**: Long-lived child process spawned by control plane. Handles TLS, auth, query execution via gRPC + FD passing.
+- **standalone** (default): Single process, handles everything including TLS, auth, PG protocol, and DuckDB execution.
+- **control-plane**: Multi-process. The control plane owns client connections end-to-end (TLS, auth, PG wire protocol, SQL transpilation) and routes queries to a pool of Flight SQL worker processes over Unix sockets.
+- **duckdb-service**: Thin DuckDB execution engine exposed via Arrow Flight SQL. Spawned automatically by the control plane as worker processes, or run standalone for testing.
 
 Key CLI flags for control plane mode:
-- `--mode control-plane|worker|standalone`
+- `--mode control-plane|duckdb-service|standalone`
 - `--worker-count N` (default 4)
-- `--socket-dir /path` (Unix sockets for gRPC + FD passing)
+- `--socket-dir /path` (Unix sockets for Flight SQL workers)
 - `--handover-socket /path` (graceful deployment between control planes)
-- `--grpc-socket /path` (worker, set by control plane at spawn)
-- `--fd-socket /path` (worker, set by control plane at spawn)
+
+Key CLI flags for duckdb-service mode:
+- `--duckdb-listen` (listen address, e.g., `unix:///var/run/duckgres/duckdb.sock` or `:8816`)
+- `--duckdb-token` (bearer token for authentication)
+- `--duckdb-max-sessions` (max concurrent sessions, 0=unlimited)
 
 ## Configuration
 
@@ -158,7 +166,6 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=35437 user=postgres sslmode=requir
 
 ## Known Limitations
 
-- Single process (all users share one process)
 - No replication
 - Some pg_catalog tables are stubs (return empty)
 - Type OID mapping is incomplete (some types show as "unknown")
