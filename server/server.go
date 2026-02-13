@@ -587,11 +587,14 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 // or information_schema initialization. DuckLake is still attached if configured
 // so passthrough users can access the same data. This is used for passthrough users
 // who send DuckDB-native SQL and don't need the PostgreSQL compatibility layer.
-func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, username string) (*sql.DB, error) {
+func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time, serverVersion string) (*sql.DB, error) {
 	db, err := openBaseDB(cfg, username)
 	if err != nil {
 		return nil, err
 	}
+
+	// Utility macros (uptime, version) are useful for all connections.
+	initUtilityMacros(db, serverStartTime, processStartTime, serverVersion, processVersion)
 
 	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {

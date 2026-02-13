@@ -175,7 +175,7 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 		err error
 	)
 	if p.cfg.PassthroughUsers[username] {
-		db, err = server.CreatePassthroughDBConnection(p.cfg, p.duckLakeSem, username)
+		db, err = server.CreatePassthroughDBConnection(p.cfg, p.duckLakeSem, username, p.startTime, server.ProcessVersion())
 	} else {
 		db, err = server.CreateDBConnection(p.cfg, p.duckLakeSem, username, p.startTime, server.ProcessVersion())
 	}

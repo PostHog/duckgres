@@ -305,3 +305,42 @@ func TestUptimeMacros(t *testing.T) {
 		}
 	}
 }
+
+func TestUtilityMacrosWithoutPgCatalog(t *testing.T) {
+	// Verify that initUtilityMacros works independently of initPgCatalog,
+	// so passthrough users get uptime/version macros.
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	start := time.Now()
+	initUtilityMacros(db, start, start, "test-v1.0", "test-v1.0")
+
+	for _, fn := range []string{"uptime", "worker_uptime"} {
+		var typeName string
+		if err := db.QueryRow(fmt.Sprintf("SELECT pg_typeof(%s())", fn)).Scan(&typeName); err != nil {
+			t.Fatalf("%s() query failed: %v", fn, err)
+		}
+		if typeName != "interval" {
+			t.Errorf("%s() returned type %q, want interval", fn, typeName)
+		}
+	}
+
+	for _, tc := range []struct {
+		fn   string
+		want string
+	}{
+		{"control_plane_version", "test-v1.0"},
+		{"worker_version", "test-v1.0"},
+	} {
+		var val string
+		if err := db.QueryRow(fmt.Sprintf("SELECT %s()", tc.fn)).Scan(&val); err != nil {
+			t.Fatalf("%s() query failed: %v", tc.fn, err)
+		}
+		if val != tc.want {
+			t.Errorf("%s() = %q, want %q", tc.fn, val, tc.want)
+		}
+	}
+}
