@@ -42,24 +42,20 @@ func NewSessionManager(pool *FlightWorkerPool, rebalancer *MemoryRebalancer) *Se
 	return sm
 }
 
-// CreateSession spawns a dedicated worker, creates a session on it, and rebalances
-// memory/thread limits across all active sessions.
+// CreateSession acquires a worker (reusing an idle one or spawning a new one),
+// creates a session on it, and rebalances memory/thread limits across all active sessions.
 func (sm *SessionManager) CreateSession(ctx context.Context, username string) (int32, *server.FlightExecutor, error) {
-	// Check max_workers cap
-	if err := sm.pool.CheckMaxWorkers(); err != nil {
-		return 0, nil, err
-	}
-
-	// Spawn a dedicated worker for this connection
-	worker, err := sm.pool.SpawnWorkerForSession()
+	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
+	// Max-workers check is atomic inside AcquireWorker to prevent TOCTOU races.
+	worker, err := sm.pool.AcquireWorker()
 	if err != nil {
-		return 0, nil, fmt.Errorf("spawn worker: %w", err)
+		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
 
 	sessionToken, err := worker.CreateSession(ctx, username)
 	if err != nil {
-		// Clean up the worker we just spawned
-		sm.pool.RetireWorker(worker.ID)
+		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker)
+		sm.pool.RetireWorkerIfNoSessions(worker.ID)
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
 	}
 
@@ -84,7 +80,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 
 	// Rebalance memory/threads across all sessions (including this new one)
 	if sm.rebalancer != nil {
-		sm.rebalancer.Rebalance(ctx)
+		sm.rebalancer.RequestRebalance()
 	}
 
 	return pid, executor, nil
@@ -131,9 +127,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 
 	// Rebalance remaining sessions
 	if sm.rebalancer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		sm.rebalancer.Rebalance(ctx)
-		cancel()
+		sm.rebalancer.RequestRebalance()
 	}
 }
 
@@ -163,6 +157,11 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	sm.mu.Lock()
 	delete(sm.byWorker, workerID)
 	sm.mu.Unlock()
+
+	// Rebalance remaining sessions after crash cleanup
+	if sm.rebalancer != nil {
+		sm.rebalancer.RequestRebalance()
+	}
 }
 
 // SessionCount returns the number of active sessions.

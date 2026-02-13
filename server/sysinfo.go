@@ -93,30 +93,33 @@ func ValidateMemoryLimit(v string) bool {
 	return validMemoryLimit.MatchString(v)
 }
 
-// ParseMemoryBytes parses a DuckDB memory size string (e.g., "4GB", "512MB") into bytes.
-// Returns 0 if the string is empty or invalid.
+// ParseMemoryBytes parses a DuckDB memory size string (e.g., "4GB", "512MB", "1.5GB") into bytes.
+// Supports both integer and fractional values. Returns 0 if the string is empty or invalid.
 func ParseMemoryBytes(s string) uint64 {
 	if s == "" {
 		return 0
 	}
-	s = strings.TrimSpace(s)
+	s = strings.TrimSpace(strings.ToUpper(s))
 
-	var value uint64
+	var value float64
 	var unit string
-	if _, err := fmt.Sscanf(strings.ToUpper(s), "%d%s", &value, &unit); err != nil {
+	if _, err := fmt.Sscanf(s, "%f%s", &value, &unit); err != nil || value < 0 {
 		return 0
 	}
 
+	var multiplier float64
 	switch unit {
 	case "KB":
-		return value * 1024
+		multiplier = 1024
 	case "MB":
-		return value * 1024 * 1024
+		multiplier = 1024 * 1024
 	case "GB":
-		return value * 1024 * 1024 * 1024
+		multiplier = 1024 * 1024 * 1024
 	case "TB":
-		return value * 1024 * 1024 * 1024 * 1024
+		multiplier = 1024 * 1024 * 1024 * 1024
 	default:
 		return 0
 	}
+
+	return uint64(value * multiplier)
 }

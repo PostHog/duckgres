@@ -83,18 +83,37 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.RateLimit = server.DefaultRateLimitConfig()
 	}
 
-	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, cfg.MaxWorkers)
+	// Initialize memory rebalancer first to compute dynamic max-workers cap
+	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
+	rebalancer := NewMemoryRebalancer(memBudget, 0, nil) // sessions wired below
+
+	// If max_workers is not set, derive it from the memory budget to prevent
+	// overcommit: budget / 256MB floor = max sessions before every session
+	// is pinned to the minimum allocation.
+	maxWorkers := cfg.MaxWorkers
+	if maxWorkers == 0 {
+		maxWorkers = rebalancer.MaxSessionsForBudget()
+		slog.Info("Derived max_workers from memory budget.",
+			"max_workers", maxWorkers,
+			"memory_budget", formatBytes(rebalancer.memoryBudget))
+	}
+
+	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
 
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)
 
-	// Initialize memory rebalancer
-	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
-	rebalancer := NewMemoryRebalancer(memBudget, 0, nil) // sessions set below
-
 	sessions := NewSessionManager(pool, rebalancer)
-	rebalancer.sessions = sessions // wire up the circular dependency
+
+	// Wire the circular dependency: rebalancer needs sessions to iterate,
+	// sessions needs rebalancer to trigger rebalance on create/destroy.
+	// This is safe because Rebalance is only called from CreateSession/DestroySession,
+	// and no sessions exist yet at this point.
+	//
+	// Lock ordering invariant: rebalancer.mu → sm.mu(RLock). Never acquire
+	// rebalancer.mu while holding sm.mu to avoid deadlock.
+	rebalancer.SetSessionLister(sessions)
 	pool.SetSessionCounter(sessions)
 
 	cp := &ControlPlane{

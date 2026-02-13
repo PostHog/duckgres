@@ -247,14 +247,37 @@ func (p *FlightWorkerPool) SpawnMinWorkers(count int) error {
 	return p.SpawnAll(count)
 }
 
-// SpawnWorkerForSession spawns a new dedicated worker and returns it.
-// Uses auto-incrementing IDs to avoid collisions.
-func (p *FlightWorkerPool) SpawnWorkerForSession() (*ManagedWorker, error) {
+// AcquireWorker returns a worker for a new session. It first tries to claim an
+// idle pre-warmed worker (one with no active sessions). If none are available,
+// it spawns a new one. The max-workers check is performed atomically under the
+// write lock to prevent TOCTOU races from concurrent connections.
+func (p *FlightWorkerPool) AcquireWorker() (*ManagedWorker, error) {
 	p.mu.Lock()
 	if p.shuttingDown {
 		p.mu.Unlock()
 		return nil, fmt.Errorf("pool is shutting down")
 	}
+
+	// Check max-workers cap atomically under the write lock
+	if p.maxWorkers > 0 && len(p.workers) >= p.maxWorkers {
+		// Even at the cap, we may have idle pre-warmed workers to reuse.
+		// Only fail if all existing workers are busy.
+		idle := p.findIdleWorkerLocked()
+		if idle != nil {
+			p.mu.Unlock()
+			return idle, nil
+		}
+		p.mu.Unlock()
+		return nil, fmt.Errorf("max workers reached (%d)", p.maxWorkers)
+	}
+
+	// Try to claim an idle pre-warmed worker before spawning a new one
+	idle := p.findIdleWorkerLocked()
+	if idle != nil {
+		p.mu.Unlock()
+		return idle, nil
+	}
+
 	id := p.nextWorkerID
 	p.nextWorkerID++
 	p.mu.Unlock()
@@ -270,22 +293,25 @@ func (p *FlightWorkerPool) SpawnWorkerForSession() (*ManagedWorker, error) {
 	return w, nil
 }
 
-// CheckMaxWorkers returns an error if the max worker limit has been reached.
-func (p *FlightWorkerPool) CheckMaxWorkers() error {
-	if p.maxWorkers <= 0 {
-		return nil // unlimited
-	}
-	p.mu.RLock()
-	count := len(p.workers)
-	p.mu.RUnlock()
-	if count >= p.maxWorkers {
-		return fmt.Errorf("max workers reached (%d)", p.maxWorkers)
+// findIdleWorkerLocked returns a live worker with no active sessions, or nil.
+// Caller must hold p.mu (read or write lock).
+func (p *FlightWorkerPool) findIdleWorkerLocked() *ManagedWorker {
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue // dead
+		default:
+		}
+		if p.sessionCounter != nil && p.sessionCounter.SessionCountForWorker(w.ID) == 0 {
+			return w
+		}
 	}
 	return nil
 }
 
 // RetireWorker stops a worker process and cleans up its resources.
-// Sends SIGTERM, waits up to 10s, then SIGKILL.
+// Sends SIGTERM, waits up to 3s, then SIGKILL. Runs asynchronously
+// to avoid blocking the calling goroutine (e.g., connection handler).
 func (p *FlightWorkerPool) RetireWorker(id int) {
 	p.mu.Lock()
 	w, ok := p.workers[id]
@@ -296,7 +322,23 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 	delete(p.workers, id)
 	p.mu.Unlock()
 
-	slog.Info("Retiring worker.", "id", id)
+	// Run the actual process cleanup asynchronously so DestroySession
+	// doesn't block the connection handler goroutine for up to 3s+.
+	go retireWorkerProcess(w)
+}
+
+// RetireWorkerIfNoSessions retires a worker only if it has no active sessions.
+// Used to clean up on session creation failure without retiring pre-warmed workers.
+func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) {
+	if p.sessionCounter != nil && p.sessionCounter.SessionCountForWorker(id) > 0 {
+		return
+	}
+	p.RetireWorker(id)
+}
+
+// retireWorkerProcess handles the actual process shutdown and socket cleanup.
+func retireWorkerProcess(w *ManagedWorker) {
+	slog.Info("Retiring worker.", "id", w.ID)
 
 	// Close the gRPC client first
 	if w.client != nil {
@@ -308,11 +350,12 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 		_ = w.cmd.Process.Signal(os.Interrupt)
 	}
 
-	// Wait up to 10s for graceful exit
+	// Wait up to 3s for graceful exit. The worker just had its session
+	// destroyed and should exit almost immediately.
 	select {
 	case <-w.done:
-	case <-time.After(10 * time.Second):
-		slog.Warn("Worker did not exit in time, killing.", "id", id)
+	case <-time.After(3 * time.Second):
+		slog.Warn("Worker did not exit in time, killing.", "id", w.ID)
 		if w.cmd.Process != nil {
 			_ = w.cmd.Process.Kill()
 		}
