@@ -574,3 +574,116 @@ func TestDoubleUSR1Ignored(t *testing.T) {
 		t.Fatalf("Post-handover query failed: %v\nLogs:\n%s", err, h.logBuf.String())
 	}
 }
+
+// TestHandoverChildCrashRecovery verifies that when the self-exec'd child
+// process dies before connecting to the handover socket, the old control
+// plane recovers from the RELOADING state and continues serving.
+//
+// This is a regression test for a bug where selfExec()'s cmd.Wait goroutine
+// didn't trigger recovery, leaving the old CP stuck in "reloading" state
+// and causing systemd to log "Reload operation timed out" indefinitely.
+func TestHandoverChildCrashRecovery(t *testing.T) {
+	h := startControlPlane(t, defaultOpts())
+
+	// Verify initial connectivity
+	db := h.openConn(t)
+	var v int
+	if err := db.QueryRow("SELECT 1").Scan(&v); err != nil {
+		t.Fatalf("Pre-test query failed: %v", err)
+	}
+	_ = db.Close()
+
+	// Save the original config, then corrupt it so the self-exec'd child
+	// fails during startup (before reaching the handover socket).
+	// The old CP already loaded its config, so this doesn't affect it.
+	origConfig, err := os.ReadFile(h.configFile)
+	if err != nil {
+		t.Fatalf("Failed to read config file: %v", err)
+	}
+	if err := os.WriteFile(h.configFile, []byte("invalid yaml: ["), 0644); err != nil {
+		t.Fatalf("Failed to corrupt config: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.WriteFile(h.configFile, origConfig, 0644)
+	})
+
+	// Send SIGUSR1 — the child will fail to parse config and exit
+	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
+		t.Fatalf("Failed to send SIGUSR1: %v", err)
+	}
+
+	// The old CP must detect the child failure and recover
+	if err := h.waitForLog("Child process exited before completing handover, recovering.", 15*time.Second); err != nil {
+		t.Fatalf("Recovery did not happen.\nLogs:\n%s", h.logBuf.String())
+	}
+
+	// The old CP should still accept connections after recovery
+	db2 := h.openConn(t)
+	if err := db2.QueryRow("SELECT 42").Scan(&v); err != nil {
+		t.Fatalf("Post-recovery query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if v != 42 {
+		t.Fatalf("Expected 42, got %d", v)
+	}
+}
+
+// TestHandoverChildCrashThenRetry verifies that after recovering from a
+// failed handover (child crash), a subsequent SIGUSR1 successfully completes
+// a full handover. This ensures the handover listener is properly restarted.
+func TestHandoverChildCrashThenRetry(t *testing.T) {
+	h := startControlPlane(t, defaultOpts())
+
+	// Verify initial connectivity
+	db := h.openConn(t)
+	var v int
+	if err := db.QueryRow("SELECT 1").Scan(&v); err != nil {
+		t.Fatalf("Pre-test query failed: %v", err)
+	}
+	_ = db.Close()
+
+	// Save original config, then corrupt it to make the first reload fail
+	origConfig, err := os.ReadFile(h.configFile)
+	if err != nil {
+		t.Fatalf("Failed to read config file: %v", err)
+	}
+	if err := os.WriteFile(h.configFile, []byte("invalid yaml: ["), 0644); err != nil {
+		t.Fatalf("Failed to corrupt config: %v", err)
+	}
+
+	// First SIGUSR1 — child crashes, old CP recovers
+	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
+		t.Fatalf("Failed to send first SIGUSR1: %v", err)
+	}
+	if err := h.waitForLog("Child process exited before completing handover, recovering.", 15*time.Second); err != nil {
+		t.Fatalf("First recovery did not happen.\nLogs:\n%s", h.logBuf.String())
+	}
+
+	// Verify old CP still works
+	db2 := h.openConn(t)
+	if err := db2.QueryRow("SELECT 1").Scan(&v); err != nil {
+		t.Fatalf("Post-recovery query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	_ = db2.Close()
+
+	// Restore valid config
+	if err := os.WriteFile(h.configFile, origConfig, 0644); err != nil {
+		t.Fatalf("Failed to restore config: %v", err)
+	}
+
+	// Second SIGUSR1 — this time the handover should succeed
+	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
+		t.Fatalf("Failed to send second SIGUSR1: %v", err)
+	}
+	if err := h.waitForLog("Handover complete, took over PG listener.", 30*time.Second); err != nil {
+		t.Fatalf("Second handover did not complete.\nLogs:\n%s", h.logBuf.String())
+	}
+
+	// New CP should serve connections
+	db3 := h.openConn(t)
+	if err := db3.QueryRow("SELECT 42").Scan(&v); err != nil {
+		t.Fatalf("Post-handover query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if v != 42 {
+		t.Fatalf("Expected 42, got %d", v)
+	}
+}
