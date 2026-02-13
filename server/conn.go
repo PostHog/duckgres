@@ -705,6 +705,23 @@ func (c *clientConn) handleQuery(body []byte) error {
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
 
+	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
+	// or transpilation. DuckDB doesn't support these natively, so cursor
+	// emulation is needed for all users including passthrough.
+	{
+		tree, parseErr := pg_query.Parse(query)
+		if parseErr == nil && len(tree.Stmts) == 1 {
+			switch s := tree.Stmts[0].Stmt.Node.(type) {
+			case *pg_query.Node_DeclareCursorStmt:
+				return c.handleDeclareCursor(s.DeclareCursorStmt)
+			case *pg_query.Node_FetchStmt:
+				return c.handleFetchCursor(s.FetchStmt)
+			case *pg_query.Node_ClosePortalStmt:
+				return c.handleCloseCursor(s.ClosePortalStmt)
+			}
+		}
+	}
+
 	// Passthrough mode: skip all transpilation, send query directly to DuckDB
 	if c.passthrough {
 		upperQuery := strings.ToUpper(query)
@@ -730,19 +747,6 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// multiple semicolon-separated statements in a single Q message).
 	// Each statement gets its own results, with a single ReadyForQuery at the end.
 	tree, parseErr := pg_query.Parse(query)
-
-	// Check for cursor operations (DECLARE, FETCH, CLOSE) before transpilation
-	if parseErr == nil && len(tree.Stmts) == 1 {
-		switch s := tree.Stmts[0].Stmt.Node.(type) {
-		case *pg_query.Node_DeclareCursorStmt:
-			return c.handleDeclareCursor(s.DeclareCursorStmt)
-		case *pg_query.Node_FetchStmt:
-			return c.handleFetchCursor(s.FetchStmt)
-		case *pg_query.Node_ClosePortalStmt:
-			return c.handleCloseCursor(s.ClosePortalStmt)
-		}
-	}
-
 	if parseErr == nil && len(tree.Stmts) > 1 {
 		return c.handleMultiStatementQuery(tree)
 	}
@@ -1055,15 +1059,18 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				c.sendError("ERROR", "42601", "could not deparse cursor query")
 				return true, nil
 			}
-			tr := c.newTranspiler(false)
-			result, err := tr.Transpile(innerSQL)
-			if err != nil {
-				c.sendError("ERROR", "42601", fmt.Sprintf("syntax error in cursor query: %v", err))
-				return true, nil
-			}
-			transpiledSQL := result.SQL
-			if result.FallbackToNative {
-				transpiledSQL = innerSQL
+			transpiledSQL := innerSQL
+			if !c.passthrough {
+				tr := c.newTranspiler(false)
+				result, err := tr.Transpile(innerSQL)
+				if err != nil {
+					c.sendError("ERROR", "42601", fmt.Sprintf("syntax error in cursor query: %v", err))
+					return true, nil
+				}
+				transpiledSQL = result.SQL
+				if result.FallbackToNative {
+					transpiledSQL = innerSQL
+				}
 			}
 			c.closeCursor(s.DeclareCursorStmt.Portalname)
 			c.cursors[s.DeclareCursorStmt.Portalname] = &cursorState{query: transpiledSQL}
@@ -1092,6 +1099,10 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				}
 			}
 			howMany := s.FetchStmt.HowMany
+			if howMany < 0 {
+				c.sendError("ERROR", "0A000", "cursor can only scan forward")
+				return true, nil
+			}
 			if s.FetchStmt.Ismove {
 				moveCount := int64(0)
 				for moveCount < howMany && cursor.rows.Next() {
@@ -3203,29 +3214,16 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
-	// Passthrough mode: skip transpilation, store query directly
-	if c.passthrough {
-		// Count $N parameters with a simple regex (pg_query.Parse may fail on DuckDB-native SQL)
-		paramCount := countDollarParams(query)
-		delete(c.stmts, stmtName)
-		c.stmts[stmtName] = &preparedStmt{
-			query:          query,
-			convertedQuery: query, // No transpilation
-			paramTypes:     paramTypes,
-			numParams:      paramCount,
-		}
-		_ = writeParseComplete(c.writer)
-		return
-	}
-
-	// Detect cursor operations before transpilation
+	// Detect cursor operations before passthrough or transpilation.
+	// DuckDB doesn't support DECLARE/FETCH/CLOSE natively, so cursor
+	// emulation is needed for all users including passthrough.
 	cursorTree, cursorParseErr := pg_query.Parse(query)
 	if cursorParseErr == nil && len(cursorTree.Stmts) == 1 {
 		switch s := cursorTree.Stmts[0].Stmt.Node.(type) {
 		case *pg_query.Node_DeclareCursorStmt:
 			innerSQL := deparseInnerQuery(s.DeclareCursorStmt.Query)
 			transpiledSQL := innerSQL
-			if innerSQL != "" {
+			if !c.passthrough && innerSQL != "" {
 				tr := c.newTranspiler(true)
 				innerResult, innerErr := tr.Transpile(innerSQL)
 				if innerErr == nil && !innerResult.FallbackToNative {
@@ -3244,7 +3242,7 @@ func (c *clientConn) handleParse(body []byte) {
 			return
 
 		case *pg_query.Node_FetchStmt:
-			if !isFetchForwardOnly(s.FetchStmt.Direction) {
+			if !isFetchForwardOnly(s.FetchStmt.Direction) || s.FetchStmt.HowMany < 0 {
 				c.sendError("ERROR", "0A000", "cursor can only scan forward")
 				return
 			}
@@ -3270,6 +3268,21 @@ func (c *clientConn) handleParse(body []byte) {
 			_ = writeParseComplete(c.writer)
 			return
 		}
+	}
+
+	// Passthrough mode: skip transpilation, store query directly
+	if c.passthrough {
+		// Count $N parameters with a simple regex (pg_query.Parse may fail on DuckDB-native SQL)
+		paramCount := countDollarParams(query)
+		delete(c.stmts, stmtName)
+		c.stmts[stmtName] = &preparedStmt{
+			query:          query,
+			convertedQuery: query, // No transpilation
+			paramTypes:     paramTypes,
+			numParams:      paramCount,
+		}
+		_ = writeParseComplete(c.writer)
+		return
 	}
 
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL (with placeholder conversion)
@@ -3525,6 +3538,22 @@ func (c *clientConn) handleDescribe(body []byte) {
 		p, ok := c.portals[name]
 		if !ok {
 			c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", name))
+			return
+		}
+
+		// Handle cursor operations in portal Describe
+		switch p.stmt.cursorOp {
+		case cursorOpDeclare, cursorOpClose:
+			_ = writeNoData(c.writer)
+			return
+		case cursorOpFetch:
+			cols, colTypes, err := c.getCursorSchema(p.stmt.cursorName)
+			if err != nil || len(cols) == 0 {
+				_ = writeNoData(c.writer)
+				return
+			}
+			p.described = true
+			_ = c.sendRowDescription(cols, colTypes)
 			return
 		}
 
@@ -3918,19 +3947,21 @@ func (c *clientConn) handleDeclareCursor(stmt *pg_query.DeclareCursorStmt) error
 		return nil
 	}
 
-	// Transpile the inner SELECT query
-	tr := c.newTranspiler(false)
-	result, err := tr.Transpile(innerSQL)
-	if err != nil {
-		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error in cursor query: %v", err))
-		_ = writeReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
-		return nil
-	}
-
-	transpiledSQL := result.SQL
-	if result.FallbackToNative {
-		transpiledSQL = innerSQL
+	// Transpile the inner SELECT query (skip for passthrough users)
+	transpiledSQL := innerSQL
+	if !c.passthrough {
+		tr := c.newTranspiler(false)
+		result, err := tr.Transpile(innerSQL)
+		if err != nil {
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error in cursor query: %v", err))
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+		transpiledSQL = result.SQL
+		if result.FallbackToNative {
+			transpiledSQL = innerSQL
+		}
 	}
 
 	// Close existing cursor with same name (PostgreSQL behavior)
@@ -3980,6 +4011,12 @@ func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
 
 	// Determine how many rows to fetch (pg_query sets HowMany=MaxInt64 for FETCH ALL)
 	howMany := stmt.HowMany
+	if howMany < 0 {
+		c.sendError("ERROR", "0A000", "cursor can only scan forward")
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
 
 	// MOVE: advance position without returning rows
 	if stmt.Ismove {
