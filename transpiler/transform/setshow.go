@@ -56,8 +56,9 @@ func NewSetShowTransform() *SetShowTransform {
 			// Encoding (DuckDB is always UTF-8)
 			"client_encoding": true,
 
-			// Role settings
-			"role": true,
+			// Role/authorization settings
+			"role":                  true,
+			"session_authorization": true,
 
 			// PostgreSQL-specific features
 			"row_security":             true,

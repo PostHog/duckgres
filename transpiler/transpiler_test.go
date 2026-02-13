@@ -677,14 +677,32 @@ func TestTranspile_SetShow(t *testing.T) {
 		}
 	})
 
-	// Test SET ROLE NONE is ignored
-	t.Run("SET ROLE NONE ignored", func(t *testing.T) {
-		result, err := tr.Transpile("SET ROLE NONE")
+	// Test SET ROLE is ignored
+	t.Run("SET ROLE ignored", func(t *testing.T) {
+		tests := []string{
+			"SET ROLE NONE",
+			"SET ROLE postgres",
+			"RESET ROLE",
+		}
+		for _, query := range tests {
+			result, err := tr.Transpile(query)
+			if err != nil {
+				t.Errorf("Transpile(%q) error: %v", query, err)
+			}
+			if !result.IsIgnoredSet {
+				t.Errorf("Transpile(%q) should be marked as ignored", query)
+			}
+		}
+	})
+
+	// Test SET SESSION AUTHORIZATION is ignored
+	t.Run("SET SESSION AUTHORIZATION ignored", func(t *testing.T) {
+		result, err := tr.Transpile("SET SESSION AUTHORIZATION DEFAULT")
 		if err != nil {
 			t.Fatalf("Transpile error: %v", err)
 		}
 		if !result.IsIgnoredSet {
-			t.Error("SET ROLE NONE should be marked as ignored")
+			t.Error("SET SESSION AUTHORIZATION DEFAULT should be marked as ignored")
 		}
 	})
 
