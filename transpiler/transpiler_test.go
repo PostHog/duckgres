@@ -677,6 +677,17 @@ func TestTranspile_SetShow(t *testing.T) {
 		}
 	})
 
+	// Test SET ROLE NONE is ignored
+	t.Run("SET ROLE NONE ignored", func(t *testing.T) {
+		result, err := tr.Transpile("SET ROLE NONE")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if !result.IsIgnoredSet {
+			t.Error("SET ROLE NONE should be marked as ignored")
+		}
+	})
+
 	// Test various SET SESSION CHARACTERISTICS variations
 	t.Run("SET SESSION CHARACTERISTICS variations", func(t *testing.T) {
 		tests := []string{
