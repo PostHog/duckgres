@@ -85,34 +85,26 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.RateLimit = server.DefaultRateLimitConfig()
 	}
 
-	// Initialize memory rebalancer to compute dynamic max-workers cap.
-	// Rebalancing is disabled by default: each session gets a static allocation
-	// (budget/max_workers). Enable with --memory-rebalance to dynamically
-	// redistribute memory on every connect/disconnect.
+	// Initialize memory rebalancer. Every session gets the full memory budget
+	// (75% of system RAM by default). DuckDB spills to disk/swap if needed.
 	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
 	maxWorkers := cfg.MaxWorkers
 
-	// We need a temporary rebalancer to compute MaxSessionsForBudget before
-	// we know the final maxWorkers value. Create with enabled=false initially.
-	tempRebalancer := NewMemoryRebalancer(memBudget, 0, nil, false, 0)
+	// Use a temporary rebalancer to auto-detect the budget and derive
+	// a default max_workers if not explicitly set.
+	tempRebalancer := NewMemoryRebalancer(memBudget, 0, nil, false)
 	memBudget = tempRebalancer.memoryBudget // capture auto-detected value
 
-	// If max_workers is not set, derive it from the memory budget to prevent
-	// overcommit: budget / 256MB floor = max sessions before every session
-	// is pinned to the minimum allocation.
+	// If max_workers is not set, derive a reasonable concurrency cap from
+	// the memory budget (budget / 256MB).
 	if maxWorkers == 0 {
-		maxWorkers = tempRebalancer.MaxSessionsForBudget()
+		maxWorkers = tempRebalancer.DefaultMaxWorkers()
 		slog.Info("Derived max_workers from memory budget.",
 			"max_workers", maxWorkers,
 			"memory_budget", formatBytes(memBudget))
-	} else if maxWorkers > tempRebalancer.MaxSessionsForBudget() {
-		slog.Warn("max_workers exceeds memory budget capacity; sessions may overcommit memory.",
-			"max_workers", maxWorkers,
-			"budget_capacity", tempRebalancer.MaxSessionsForBudget())
 	}
 
-	// Now create the real rebalancer with the final maxWorkers value
-	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance, maxWorkers)
+	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance)
 
 	// Validate min_workers <= max_workers
 	minWorkers := cfg.MinWorkers

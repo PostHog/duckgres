@@ -53,8 +53,9 @@ var (
 )
 
 // autoMemoryLimit computes a DuckDB memory_limit based on system memory.
-// Formula: totalMem * 0.75 / 4, with a floor of 256MB.
-// The /4 accounts for typical concurrency (multiple sessions sharing RAM).
+// Formula: totalMem * 0.75, with a floor of 256MB.
+// Every session gets the full budget — DuckDB will spill to disk/swap if
+// aggregate usage exceeds physical RAM.
 // Returns "4GB" as a safe default if system memory cannot be detected.
 // The result is computed once and cached since system memory doesn't change.
 func autoMemoryLimit() string {
@@ -68,7 +69,7 @@ func autoMemoryLimit() string {
 		const mb = 1024 * 1024
 		const gb = 1024 * mb
 
-		limitBytes := totalBytes * 3 / 4 / 4 // 75% / 4 sessions
+		limitBytes := totalBytes * 3 / 4 // 75% of system RAM
 		if limitBytes < 256*mb {
 			limitBytes = 256 * mb
 		}

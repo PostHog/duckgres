@@ -74,16 +74,14 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 	sm.mu.Lock()
 	sm.sessions[pid] = session
 	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
-	totalSessions := len(sm.sessions)
 	sm.mu.Unlock()
 
 	slog.Debug("Session created.", "pid", pid, "worker", worker.ID, "user", username)
 
-	// Set initial memory/thread limits on this session synchronously so it
-	// never runs with unlimited resources (debounced rebalance would be too late).
-	// Then trigger an async rebalance to adjust all other sessions.
+	// Set memory/thread limits on this session synchronously so it never
+	// runs with unlimited resources.
 	if sm.rebalancer != nil {
-		sm.rebalancer.SetInitialLimits(ctx, session, totalSessions)
+		sm.rebalancer.SetInitialLimits(ctx, session)
 		sm.rebalancer.RequestRebalance()
 	}
 
