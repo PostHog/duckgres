@@ -48,6 +48,7 @@ type ControlPlane struct {
 	closeMu     sync.Mutex
 	wg          sync.WaitGroup
 	reloading   atomic.Bool // guards against concurrent selfExec from double SIGUSR1
+	handoverLn  net.Listener // current handover listener; protected by closeMu
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -507,14 +508,38 @@ func (cp *ControlPlane) selfExec() {
 
 	slog.Info("New control plane spawned.", "pid", cmd.Process.Pid)
 
-	// Reap the child in the background to avoid a zombie. The old CP normally
-	// exits via os.Exit(0) in handleHandoverRequest before the child finishes,
-	// but if handover fails the child may exit first and needs to be reaped.
+	// Reap the child in the background to avoid a zombie. If the child exits
+	// before completing the handover (e.g. config error, crash, killed by
+	// systemd reload timeout), we must recover so the old CP exits the
+	// RELOADING state and the handover listener doesn't block forever.
 	go func() {
-		if err := cmd.Wait(); err != nil {
+		err := cmd.Wait()
+		if err != nil {
 			slog.Warn("Self-exec'd process exited with error.", "error", err)
 		}
+
+		// If we're still in reloading state, the handover never completed.
+		// handleHandoverRequest was either never reached (child died before
+		// connecting) or hasn't run its recovery yet. Recover here.
+		if !cp.reloading.Load() {
+			return
+		}
+		slog.Error("Child process exited before completing handover, recovering.", "error", err)
+		cp.cancelHandoverListener()
+		cp.recoverFromFailedReload()
+		cp.startHandoverListener()
 	}()
+}
+
+// cancelHandoverListener closes the current handover listener, unblocking
+// any goroutine stuck in Accept().
+func (cp *ControlPlane) cancelHandoverListener() {
+	cp.closeMu.Lock()
+	defer cp.closeMu.Unlock()
+	if cp.handoverLn != nil {
+		_ = cp.handoverLn.Close()
+		cp.handoverLn = nil
+	}
 }
 
 // recoverFromFailedReload cancels the RELOADING state, resets the guard flag,

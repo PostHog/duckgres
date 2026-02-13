@@ -31,24 +31,38 @@ func (cp *ControlPlane) startHandoverListener() {
 		return
 	}
 
+	cp.closeMu.Lock()
+	cp.handoverLn = ln
+	cp.closeMu.Unlock()
+
 	slog.Info("Handover listener started.", "socket", cp.cfg.HandoverSocket)
 
 	go func() {
 		defer func() { _ = ln.Close() }()
-		defer func() { _ = os.Remove(cp.cfg.HandoverSocket) }()
 
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				cp.closeMu.Lock()
 				closed := cp.closed
+				superseded := cp.handoverLn != ln
 				cp.closeMu.Unlock()
 				if closed {
+					_ = os.Remove(cp.cfg.HandoverSocket)
+					return
+				}
+				if superseded {
+					// A new listener owns the socket path now; don't remove it.
 					return
 				}
 				slog.Error("Handover accept error.", "error", err)
 				continue
 			}
+
+			// Socket file is no longer needed — the handover request handler
+			// will start a new listener (with a fresh socket) if recovery
+			// is needed, and startHandoverListener always removes stale files.
+			_ = os.Remove(cp.cfg.HandoverSocket)
 
 			// Handle handover in a goroutine (only one at a time is expected)
 			go cp.handleHandoverRequest(conn, ln)
