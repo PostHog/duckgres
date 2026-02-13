@@ -129,6 +129,12 @@ type Config struct {
 	// If empty, defaults to 75% of system RAM.
 	MemoryBudget string
 
+	// MemoryRebalance enables dynamic per-connection memory reallocation in control-plane mode.
+	// When enabled, the memory budget is redistributed across all active sessions on every
+	// connect/disconnect. When disabled (default), each session gets a static allocation
+	// of budget/max_workers at creation time.
+	MemoryRebalance bool
+
 	// MaxWorkers is the maximum number of worker processes in control-plane mode.
 	// 0 means unlimited.
 	MaxWorkers int

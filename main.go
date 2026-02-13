@@ -33,6 +33,7 @@ type FileConfig struct {
 	MemoryLimit      string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
 	Threads          int                 `yaml:"threads"`           // DuckDB threads per session
 	MemoryBudget     string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
+	MemoryRebalance  *bool               `yaml:"memory_rebalance"`  // Enable dynamic per-connection memory reallocation
 	MaxWorkers       int                 `yaml:"max_workers"`       // Max worker processes (control-plane mode)
 	MinWorkers       int                 `yaml:"min_workers"`       // Pre-warm worker count (control-plane mode)
 	PassthroughUsers []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
@@ -128,6 +129,7 @@ func main() {
 	memoryLimit := flag.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
 	threads := flag.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	memoryBudget := flag.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
+	memoryRebalance := flag.Bool("memory-rebalance", false, "Enable dynamic per-connection memory reallocation (control-plane mode) (env: DUCKGRES_MEMORY_REBALANCE)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
@@ -162,6 +164,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_THREADS            DuckDB threads per session\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_BUDGET      Total memory for all DuckDB sessions (e.g., 24GB)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_REBALANCE   Enable dynamic per-connection memory reallocation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MIN_WORKERS        Pre-warm worker count (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_WORKERS        Max worker processes (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
@@ -236,6 +239,7 @@ func main() {
 		MemoryLimit:      *memoryLimit,
 		Threads:          *threads,
 		MemoryBudget:     *memoryBudget,
+		MemoryRebalance:  *memoryRebalance,
 		MinWorkers:       *minWorkers,
 		MaxWorkers:       *maxWorkers,
 	}, os.Getenv, func(msg string) {
