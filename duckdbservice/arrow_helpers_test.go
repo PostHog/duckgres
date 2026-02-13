@@ -1,6 +1,8 @@
 package duckdbservice
 
 import (
+	"context"
+	"database/sql"
 	"math/big"
 	"testing"
 	"time"
@@ -615,6 +617,44 @@ func TestAppendValue(t *testing.T) {
 			t.Errorf("map entries = %d, want 1", end-start)
 		}
 	})
+}
+
+func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
+	// Regression test: queries ending with ";" caused "syntax error at or near LIMIT"
+	// because GetQuerySchema appended " LIMIT 0" after the semicolon, producing "; LIMIT 0".
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("failed to open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"no semicolon", "SELECT 1 AS n"},
+		{"trailing semicolon", "SELECT 1 AS n;"},
+		{"trailing semicolon with spaces", "SELECT 1 AS n ; "},
+		{"CTE with semicolon", "WITH cte AS (SELECT 42 AS val) SELECT * FROM cte;"},
+		{"query with existing LIMIT", "SELECT 1 AS n LIMIT 1"},
+		{"query with existing LIMIT and semicolon", "SELECT 1 AS n LIMIT 1;"},
+		{"SHOW statement", "SHOW TABLES"},
+		{"SHOW with semicolon", "SHOW TABLES;"},
+		{"DESCRIBE statement", "DESCRIBE SELECT 1"},
+		{"FROM-first syntax", "FROM range(3)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schema, err := GetQuerySchema(context.Background(), db, tt.query, nil)
+			if err != nil {
+				t.Fatalf("GetQuerySchema(%q) error: %v", tt.query, err)
+			}
+			if schema.NumFields() == 0 {
+				t.Fatalf("GetQuerySchema(%q) returned 0 fields", tt.query)
+			}
+		})
+	}
 }
 
 func TestSplitTopLevelCommas(t *testing.T) {

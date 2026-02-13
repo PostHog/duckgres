@@ -35,6 +35,7 @@ type FileConfig struct {
 	MemoryBudget     string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
 	MaxWorkers       int                 `yaml:"max_workers"`       // Max worker processes (control-plane mode)
 	MinWorkers       int                 `yaml:"min_workers"`       // Pre-warm worker count (control-plane mode)
+	PassthroughUsers []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
 }
 
 type TLSConfig struct {
@@ -103,6 +104,9 @@ func initMetrics() {
 }
 
 func main() {
+	// Set version on server package so catalog macros can expose it
+	server.SetProcessVersion(version)
+
 	// Check if we're running as a child worker process
 	if os.Getenv("DUCKGRES_CHILD_MODE") == "1" {
 		// Use the same logging setup as parent for consistent log format

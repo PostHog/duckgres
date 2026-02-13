@@ -158,6 +158,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.MinWorkers != 0 {
 			cfg.MinWorkers = fileCfg.MinWorkers
 		}
+		if len(fileCfg.PassthroughUsers) > 0 {
+			cfg.PassthroughUsers = make(map[string]bool, len(fileCfg.PassthroughUsers))
+			for _, u := range fileCfg.PassthroughUsers {
+				cfg.PassthroughUsers[u] = true
+			}
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {

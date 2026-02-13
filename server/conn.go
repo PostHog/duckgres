@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"database/sql"
 	"database/sql/driver"
 	"encoding/binary"
 	"encoding/csv"
@@ -104,18 +105,19 @@ const (
 )
 
 type clientConn struct {
-	server    *Server
-	conn      net.Conn
-	reader    *bufio.Reader
-	writer    *bufio.Writer
-	username  string
-	database  string
-	executor  QueryExecutor
-	pid       int32
-	secretKey int32                    // unique key for cancel requests
-	stmts     map[string]*preparedStmt // prepared statements by name
-	portals   map[string]*portal       // portals by name
-	txStatus  byte                     // current transaction status ('I', 'T', or 'E')
+	server      *Server
+	conn        net.Conn
+	reader      *bufio.Reader
+	writer      *bufio.Writer
+	username    string
+	database    string
+	executor    QueryExecutor
+	pid         int32
+	secretKey   int32                    // unique key for cancel requests
+	stmts       map[string]*preparedStmt // prepared statements by name
+	portals     map[string]*portal       // portals by name
+	txStatus    byte                     // current transaction status ('I', 'T', or 'E')
+	passthrough bool                     // true for passthrough users (skip transpiler + pg_catalog)
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -403,10 +405,22 @@ func (c *clientConn) serve() error {
 		return fmt.Errorf("startup failed: %w", err)
 	}
 
+	// Check if this is a passthrough user (skip transpiler + pg_catalog)
+	c.passthrough = c.server.cfg.PassthroughUsers[c.username]
+	if c.passthrough {
+		slog.Info("Passthrough mode enabled.", "user", c.username)
+	}
+
 	// Create a DuckDB connection for this client session (unless pre-created by caller)
 	var stopRefresh func()
 	if c.executor == nil {
-		db, err := c.server.createDBConnection(c.username)
+		var db *sql.DB
+		var err error
+		if c.passthrough {
+			db, err = CreatePassthroughDBConnection(c.server.cfg, c.server.duckLakeSem, c.username)
+		} else {
+			db, err = c.server.createDBConnection(c.username)
+		}
 		if err != nil {
 			c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
 			return err
@@ -664,6 +678,16 @@ func (c *clientConn) handleQuery(body []byte) error {
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
 
+	// Passthrough mode: skip all transpilation, send query directly to DuckDB
+	if c.passthrough {
+		upperQuery := strings.ToUpper(query)
+		cmdType := c.getCommandType(upperQuery)
+		if cmdType == "COPY" {
+			return c.handleCopy(query, upperQuery)
+		}
+		return c.executeQueryDirect(query, cmdType)
+	}
+
 	// Route COPY TO STDOUT / COPY FROM STDIN directly to handleCopy()
 	// before transpilation, because:
 	// 1. The inner SELECT may contain DuckDB-specific syntax (QUALIFY, ASOF, struct literals)
@@ -808,6 +832,53 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	// Execute SELECT query
+	return c.executeSelectQuery(query)
+}
+
+// executeQueryDirect executes a query directly against DuckDB without any transpilation.
+// Used for passthrough users who send DuckDB-native SQL.
+func (c *clientConn) executeQueryDirect(query, cmdType string) error {
+	if cmdType != "SELECT" {
+		// Handle nested BEGIN
+		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
+			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
+			_ = writeCommandComplete(c.writer, "BEGIN")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+
+		ctx, cleanup := c.queryContext()
+		defer cleanup()
+
+		result, err := c.executor.ExecContext(ctx, query)
+		if err != nil {
+			if isQueryCancelled(err) {
+				c.sendError("ERROR", "57014", "canceling statement due to user request")
+			} else {
+				slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+				c.sendError("ERROR", "42000", err.Error())
+			}
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+
+		c.updateTxStatus(cmdType)
+		tag := c.buildCommandTag(cmdType, result)
+		_ = writeCommandComplete(c.writer, tag)
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	return c.executeSelectQuery(query)
+}
+
+// executeSelectQuery runs a SELECT query against DuckDB and streams results to the client.
+// Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.
+func (c *clientConn) executeSelectQuery(query string) error {
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
@@ -826,7 +897,6 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 	defer func() { _ = rows.Close() }()
 
-	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
@@ -845,18 +915,15 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
-	// Send row description
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
 		return err
 	}
 
-	// Extract type OIDs for JSON-aware text formatting
 	typeOIDs := make([]int32, len(colTypes))
 	for i, ct := range colTypes {
 		typeOIDs[i] = getTypeInfo(ct).OID
 	}
 
-	// Send rows
 	rowCount := 0
 	for rows.Next() {
 		values := make([]interface{}, len(cols))
@@ -879,7 +946,6 @@ func (c *clientConn) handleQuery(body []byte) error {
 		rowCount++
 	}
 
-	// Check for errors during row iteration (e.g., context cancellation from Ctrl+C)
 	if err := rows.Err(); err != nil {
 		if isQueryCancelled(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
@@ -893,12 +959,10 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
-	// Send command complete (SELECT doesn't change transaction status)
 	tag := fmt.Sprintf("SELECT %d", rowCount)
 	_ = writeCommandComplete(c.writer, tag)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
-
 	return nil
 }
 
@@ -1438,6 +1502,27 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 	return c.writer.Flush()
 }
 
+// countDollarParams counts $N-style parameter placeholders in a query string
+// using a manual byte scan. This avoids pg_query.Parse which may fail on
+// DuckDB-native SQL syntax.
+func countDollarParams(query string) int {
+	max := 0
+	for i := 0; i < len(query); i++ {
+		if query[i] == '$' && i+1 < len(query) && query[i+1] >= '1' && query[i+1] <= '9' {
+			n := 0
+			j := i + 1
+			for j < len(query) && query[j] >= '0' && query[j] <= '9' {
+				n = n*10 + int(query[j]-'0')
+				j++
+			}
+			if n > max {
+				max = n
+			}
+		}
+	}
+	return max
+}
+
 // isEmptyQuery checks if a query contains only semicolons and whitespace.
 // PostgreSQL returns EmptyQueryResponse for queries like ";" or ";;;" or "; ; ;"
 func isEmptyQuery(query string) bool {
@@ -1470,6 +1555,17 @@ func stripLeadingComments(query string) string {
 			return query
 		}
 	}
+}
+
+// describeSupportsLimit returns true if the (uppercased) query supports a LIMIT clause.
+// SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL etc. do not.
+func describeSupportsLimit(upper string) bool {
+	s := strings.TrimSpace(upper)
+	return strings.HasPrefix(s, "SELECT") ||
+		strings.HasPrefix(s, "WITH") ||
+		strings.HasPrefix(s, "VALUES") ||
+		strings.HasPrefix(s, "TABLE") ||
+		strings.HasPrefix(s, "FROM") // DuckDB FROM-first syntax
 }
 
 // queryReturnsResults checks if a SQL query returns a result set.
@@ -1834,9 +1930,12 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	// Transpile the inner SELECT to handle schema mappings (e.g., public -> main)
 	// The outer COPY statement may not have been transpiled if pg_query can't parse
 	// the full COPY syntax (e.g., FORMAT "binary").
-	tr := c.newTranspiler(false)
-	if result, err := tr.Transpile(selectQuery); err == nil && !result.FallbackToNative {
-		selectQuery = result.SQL
+	// Skip for passthrough users who send DuckDB-native SQL.
+	if !c.passthrough {
+		tr := c.newTranspiler(false)
+		if result, err := tr.Transpile(selectQuery); err == nil && !result.FallbackToNative {
+			selectQuery = result.SQL
+		}
 	}
 
 	// Execute the query
@@ -2955,6 +3054,21 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
+	// Passthrough mode: skip transpilation, store query directly
+	if c.passthrough {
+		// Count $N parameters with a simple regex (pg_query.Parse may fail on DuckDB-native SQL)
+		paramCount := countDollarParams(query)
+		delete(c.stmts, stmtName)
+		c.stmts[stmtName] = &preparedStmt{
+			query:          query,
+			convertedQuery: query, // No transpilation
+			paramTypes:     paramTypes,
+			numParams:      paramCount,
+		}
+		_ = writeParseComplete(c.writer)
+		return
+	}
+
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL (with placeholder conversion)
 	tr := c.newTranspiler(true) // Enable placeholder conversion for prepared statements
 	result, err := tr.Transpile(query)
@@ -3150,10 +3264,12 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// For SELECT, we need to describe the result columns
 		// The cleanest approach is to add a "WHERE false" or "LIMIT 0" clause
 		// to get column info without actually running the query
-		describeQuery := ps.convertedQuery
-		// Try adding LIMIT 0 to avoid needing real parameter values
-		if !strings.Contains(strings.ToUpper(ps.convertedQuery), "LIMIT") {
-			describeQuery = ps.convertedQuery + " LIMIT 0"
+		describeQuery := strings.TrimRight(strings.TrimSpace(ps.convertedQuery), ";")
+		// Try adding LIMIT 0 to avoid needing real parameter values.
+		// Only for statements that support LIMIT (SELECT/WITH/VALUES/TABLE/FROM).
+		upperDesc := strings.ToUpper(describeQuery)
+		if !strings.Contains(upperDesc, "LIMIT") && describeSupportsLimit(upperDesc) {
+			describeQuery = describeQuery + " LIMIT 0"
 		}
 
 		// Use NULL for all parameters

@@ -53,6 +53,10 @@ type ChildConfig struct {
 	// ServerStartTime is the parent server's start time (Unix nanoseconds).
 	// Used to distinguish server uptime from child process uptime.
 	ServerStartTime int64 `json:"server_start_time"`
+
+	// ServerVersion is the parent server's version string.
+	// Used to distinguish control_plane_version() from worker_version().
+	ServerVersion string `json:"server_version,omitempty"`
 }
 
 // RunChildMode is the entry point for child worker processes.
@@ -276,8 +280,15 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		parentStartTime = time.Unix(0, cfg.ServerStartTime)
 	}
 
+	// Reconstruct parent server version for control_plane_version() macro.
+	// Fall back to this process's version if the field is missing.
+	parentVersion := processVersion
+	if cfg.ServerVersion != "" {
+		parentVersion = cfg.ServerVersion
+	}
+
 	// Create DuckDB connection
-	db, err := CreateDBConnection(serverCfg, make(chan struct{}, 1), username, parentStartTime)
+	db, err := CreateDBConnection(serverCfg, make(chan struct{}, 1), username, parentStartTime, parentVersion)
 	if err != nil {
 		slog.Error("Failed to create database connection", "error", err)
 		_ = writeErrorResponse(writer, "FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))

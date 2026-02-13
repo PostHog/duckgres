@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -11,7 +12,8 @@ import (
 // DuckDB already has a pg_catalog schema with basic views, so we just add missing functions.
 // serverStartTime is the top-level server start time; processStartTime is this process's start time.
 // In standalone mode these are the same; in process isolation mode they differ.
-func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time) error {
+// serverVersion is the top-level server/control-plane version; processVersion is this process's version.
+func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serverVersion, processVersion string) error {
 	// Create our own pg_database view that has all the columns psql expects
 	// We put it in main schema and rewrite queries to use it
 	// Include template databases for PostgreSQL compatibility
@@ -851,15 +853,22 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time) erro
 		// Uses TIMESTAMPTZ with explicit +00 suffix so the timezone is unambiguous —
 		// DuckDB's now() returns TIMESTAMPTZ in UTC, and a bare TIMESTAMP literal
 		// would be interpreted in the session timezone, causing an offset.
-		// In standalone mode this equals process_uptime(). In process isolation mode
+		// In standalone mode this equals worker_uptime(). In process isolation mode
 		// this shows the parent server's lifetime.
 		fmt.Sprintf(`CREATE OR REPLACE MACRO uptime() AS (now() - TIMESTAMPTZ '%s+00')`,
 			serverStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
-		// process_uptime - returns current process uptime as an INTERVAL
+		// worker_uptime - returns current process uptime as an INTERVAL
 		// In standalone mode this equals uptime(). In process isolation mode
 		// this shows the child process lifetime (≈ connection duration).
-		fmt.Sprintf(`CREATE OR REPLACE MACRO process_uptime() AS (now() - TIMESTAMPTZ '%s+00')`,
+		fmt.Sprintf(`CREATE OR REPLACE MACRO worker_uptime() AS (now() - TIMESTAMPTZ '%s+00')`,
 			processStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
+		// control_plane_version - returns the top-level server/control-plane version
+		// In standalone mode this equals worker_version().
+		fmt.Sprintf(`CREATE OR REPLACE MACRO control_plane_version() AS '%s'`, strings.ReplaceAll(serverVersion, "'", "''")),
+		// worker_version - returns the current worker process version
+		// In standalone mode this equals control_plane_version(). During rolling updates
+		// these may differ if the control plane has been upgraded but workers haven't yet.
+		fmt.Sprintf(`CREATE OR REPLACE MACRO worker_version() AS '%s'`, strings.ReplaceAll(processVersion, "'", "''")),
 	}
 
 	for _, f := range functions {

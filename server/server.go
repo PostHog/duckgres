@@ -25,6 +25,15 @@ import (
 // processStartTime is captured at process init, used to distinguish server vs child process uptime.
 var processStartTime = time.Now()
 
+// processVersion is set from main() via SetProcessVersion. Defaults to "dev".
+var processVersion = "dev"
+
+// SetProcessVersion sets the version string for this process. Called from main().
+func SetProcessVersion(v string) { processVersion = v }
+
+// ProcessVersion returns the version string for this process.
+func ProcessVersion() string { return processVersion }
+
 // redactConnectionString removes sensitive information (passwords) from connection strings for logging
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s]+)`)
 
@@ -127,6 +136,10 @@ type Config struct {
 	// MinWorkers is the number of pre-warmed worker processes at startup in control-plane mode.
 	// 0 means no pre-warming (workers spawn on demand).
 	MinWorkers int
+
+	// PassthroughUsers are users that bypass the SQL transpiler and pg_catalog initialization.
+	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
+	PassthroughUsers map[string]bool
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -426,16 +439,13 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 // createDBConnection creates a DuckDB connection for a client session.
 // This is a thin wrapper around CreateDBConnection using the server's config.
 func (s *Server) createDBConnection(username string) (*sql.DB, error) {
-	return CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime)
+	return CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
 }
 
-// CreateDBConnection creates a DuckDB connection for a client session.
-// Uses in-memory database as an anchor for DuckLake attachment (actual data lives in RDS/S3).
-// This is a standalone function so it can be reused by both the server and control plane workers.
-// serverStartTime is the time the top-level server process started (may differ from processStartTime
-// in process isolation mode where each child has its own processStartTime).
-func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time) (*sql.DB, error) {
-	// Create new in-memory connection (DuckLake provides actual storage)
+// openBaseDB creates and configures a bare DuckDB in-memory connection with
+// threads, memory limit, temp directory, extensions, and cache_httpfs settings.
+// This shared setup is used by both regular and passthrough connections.
+func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
@@ -502,10 +512,25 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 		}
 	}
 
+	return db, nil
+}
+
+// CreateDBConnection creates a DuckDB connection for a client session.
+// Uses in-memory database as an anchor for DuckLake attachment (actual data lives in RDS/S3).
+// This is a standalone function so it can be reused by both the server and control plane workers.
+// serverStartTime is the time the top-level server process started (may differ from processStartTime
+// in process isolation mode where each child has its own processStartTime).
+// serverVersion is the version of the top-level server/control-plane process.
+func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time, serverVersion string) (*sql.DB, error) {
+	db, err := openBaseDB(cfg, username)
+	if err != nil {
+		return nil, err
+	}
+
 	// Initialize pg_catalog schema for PostgreSQL compatibility
 	// Must be done BEFORE attaching DuckLake so macros are created in memory.main,
 	// not in the DuckLake catalog (which doesn't support macro storage).
-	if err := initPgCatalog(db, serverStartTime, processStartTime); err != nil {
+	if err := initPgCatalog(db, serverStartTime, processStartTime, serverVersion, processVersion); err != nil {
 		slog.Warn("Failed to initialize pg_catalog.", "user", username, "error", err)
 		// Continue anyway - basic queries will still work
 	}
@@ -549,6 +574,33 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 
 	// Now set DuckLake as the default catalog so all user queries use it
 	if duckLakeMode {
+		if err := setDuckLakeDefault(db); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
+		}
+	}
+
+	return db, nil
+}
+
+// CreatePassthroughDBConnection creates a DuckDB connection without pg_catalog
+// or information_schema initialization. DuckLake is still attached if configured
+// so passthrough users can access the same data. This is used for passthrough users
+// who send DuckDB-native SQL and don't need the PostgreSQL compatibility layer.
+func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, username string) (*sql.DB, error) {
+	db, err := openBaseDB(cfg, username)
+	if err != nil {
+		return nil, err
+	}
+
+	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
+		if cfg.DuckLake.MetadataStore != "" {
+			_ = db.Close()
+			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+		}
+		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
+	} else if cfg.DuckLake.MetadataStore != "" {
 		if err := setDuckLakeDefault(db); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)

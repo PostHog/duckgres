@@ -172,6 +172,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}
 
+
 	// Start health check loop with crash notification
 	onCrash := func(workerID int) {
 		cp.sessions.OnWorkerCrash(workerID, func(pid int32) {
