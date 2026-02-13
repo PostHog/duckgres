@@ -13,33 +13,19 @@ func (m *mockSessionLister) AllSessions() []*ManagedSession {
 	return m.sessions
 }
 
-func TestPerSessionMemoryLimit(t *testing.T) {
-	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, true, 0) // 24GB, 8 threads
+func TestMemoryLimit(t *testing.T) {
+	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, true) // 24GB, 8 threads
 	t.Cleanup(r.Stop)
 
-	tests := []struct {
-		sessions int
-		want     string
-	}{
-		{1, "24576MB"},
-		{2, "12288MB"},
-		{3, "8192MB"},
-		{4, "6144MB"},
-		{8, "3072MB"},
-		{24, "1024MB"},
-		{100, "256MB"}, // floor
-	}
-
-	for _, tt := range tests {
-		got := r.PerSessionMemoryLimit(tt.sessions)
-		if got != tt.want {
-			t.Errorf("PerSessionMemoryLimit(%d) = %q, want %q", tt.sessions, got, tt.want)
-		}
+	// Every session gets the full budget
+	got := r.MemoryLimit()
+	if got != "24576MB" {
+		t.Errorf("MemoryLimit() = %q, want %q", got, "24576MB")
 	}
 }
 
 func TestPerSessionThreads(t *testing.T) {
-	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, true, 0)
+	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, true)
 	t.Cleanup(r.Stop)
 
 	// Threads are not subdivided — every session gets the full budget
@@ -49,23 +35,13 @@ func TestPerSessionThreads(t *testing.T) {
 	}
 }
 
-func TestPerSessionMemoryFloor(t *testing.T) {
-	// 512MB budget with 100 sessions = 5MB per session, but floor is 256MB
-	r := NewMemoryRebalancer(512*1024*1024, 4, &mockSessionLister{}, true, 0)
+func TestMemoryLimitFloor(t *testing.T) {
+	// Budget below 256MB floor should be clamped up
+	r := NewMemoryRebalancer(128*1024*1024, 4, &mockSessionLister{}, true)
 	t.Cleanup(r.Stop)
-	got := r.PerSessionMemoryLimit(100)
+	got := r.MemoryLimit()
 	if got != "256MB" {
 		t.Errorf("expected floor of 256MB, got %q", got)
-	}
-}
-
-func TestPerSessionMemoryLimitZeroSessions(t *testing.T) {
-	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, true, 0)
-	t.Cleanup(r.Stop)
-	// Zero sessions should not panic, returns full budget
-	got := r.PerSessionMemoryLimit(0)
-	if got != "24576MB" {
-		t.Errorf("expected 24576MB for 0 sessions, got %q", got)
 	}
 }
 
@@ -90,7 +66,7 @@ func TestFormatBytes(t *testing.T) {
 
 func TestNewMemoryRebalancerDefaults(t *testing.T) {
 	// With 0 budget, should auto-detect (or fallback)
-	r := NewMemoryRebalancer(0, 0, &mockSessionLister{}, true, 0)
+	r := NewMemoryRebalancer(0, 0, &mockSessionLister{}, true)
 	t.Cleanup(r.Stop)
 	if r.memoryBudget == 0 {
 		t.Error("expected non-zero memory budget")
@@ -100,26 +76,26 @@ func TestNewMemoryRebalancerDefaults(t *testing.T) {
 	}
 }
 
-func TestMaxSessionsForBudget(t *testing.T) {
-	// 4GB budget / 256MB floor = 16 max sessions
-	r := NewMemoryRebalancer(4*1024*1024*1024, 8, &mockSessionLister{}, true, 0)
+func TestDefaultMaxWorkers(t *testing.T) {
+	// 4GB budget / 256MB = 16
+	r := NewMemoryRebalancer(4*1024*1024*1024, 8, &mockSessionLister{}, true)
 	t.Cleanup(r.Stop)
-	got := r.MaxSessionsForBudget()
+	got := r.DefaultMaxWorkers()
 	if got != 16 {
-		t.Errorf("MaxSessionsForBudget() = %d, want 16", got)
+		t.Errorf("DefaultMaxWorkers() = %d, want 16", got)
 	}
 
-	// 24GB budget / 256MB floor = 96 max sessions
-	r2 := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, true, 0)
+	// 24GB budget / 256MB = 96
+	r2 := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, true)
 	t.Cleanup(r2.Stop)
-	got2 := r2.MaxSessionsForBudget()
+	got2 := r2.DefaultMaxWorkers()
 	if got2 != 96 {
-		t.Errorf("MaxSessionsForBudget() = %d, want 96", got2)
+		t.Errorf("DefaultMaxWorkers() = %d, want 96", got2)
 	}
 }
 
 func TestDisabledRebalancerRequestIsNoop(t *testing.T) {
-	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, false, 10)
+	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, false)
 	t.Cleanup(r.Stop)
 
 	// RequestRebalance should be a no-op (no debounce goroutine running)
@@ -134,17 +110,14 @@ func TestDisabledRebalancerRequestIsNoop(t *testing.T) {
 	}
 }
 
-func TestDisabledRebalancerStaticAllocation(t *testing.T) {
-	// 24GB budget, 10 max_workers → static allocation = 24GB/10 = 2457MB per session
-	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, false, 10)
+func TestDisabledRebalancerFullBudget(t *testing.T) {
+	// Even when disabled, every session gets the full budget
+	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, false)
 	t.Cleanup(r.Stop)
 
-	if !r.enabled {
-		// Verify the static allocation math: budget/maxWorkers
-		expected := formatBytes(perSessionMemory(24*1024*1024*1024, 10))
-		if expected != "2457MB" {
-			t.Errorf("expected static allocation of 2457MB, got %q", expected)
-		}
+	got := r.MemoryLimit()
+	if got != "24576MB" {
+		t.Errorf("expected full budget of 24576MB, got %q", got)
 	}
 }
 

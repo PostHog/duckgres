@@ -28,14 +28,14 @@ type SessionLister interface {
 	AllSessions() []*ManagedSession
 }
 
-// MemoryRebalancer dynamically distributes memory budgets across active DuckDB
-// sessions. On every session create/destroy, it recomputes per-session memory
-// limits and sends SET commands to all active sessions. Threads are not
-// subdivided — every session gets the full thread budget.
+// MemoryRebalancer sets memory_limit and threads on DuckDB sessions.
+// Every session gets the full memory budget — DuckDB will spill to disk/swap
+// if aggregate usage exceeds physical RAM. Threads are not subdivided.
 //
-// When enabled is false, dynamic rebalancing is disabled: each new session
-// gets a static allocation (budget/maxWorkers) at creation time but existing
-// sessions are never adjusted on connect/disconnect.
+// When enabled is true, SET commands are re-sent on every session
+// create/destroy (useful if the budget or threads change at runtime).
+// When enabled is false (default), each session gets its limits at creation
+// time and is never adjusted afterward.
 //
 // Lock ordering invariant: r.mu → SessionManager.mu(RLock). Never acquire
 // r.mu while holding SessionManager.mu to avoid deadlock.
@@ -43,11 +43,9 @@ type MemoryRebalancer struct {
 	mu       sync.Mutex
 	sessions SessionLister // mutable: set via SetSessionLister
 
-	// memoryBudget, threadBudget, maxWorkers, and enabled are immutable
-	// after construction.
-	memoryBudget uint64 // total bytes for all sessions
+	// memoryBudget, threadBudget, and enabled are immutable after construction.
+	memoryBudget uint64 // total bytes — each session gets this full amount
 	threadBudget int    // threads per session (not subdivided)
-	maxWorkers   int    // used for static allocation when rebalancing is disabled
 	enabled      bool   // when false, skip dynamic rebalancing
 
 	// Debounce: coalesce rapid rebalance requests
@@ -58,9 +56,9 @@ type MemoryRebalancer struct {
 // NewMemoryRebalancer creates a rebalancer with the given budgets.
 // If memoryBudget is 0, it defaults to 75% of system RAM.
 // If threadBudget is 0, it defaults to runtime.NumCPU().
-// If enabled is false, dynamic rebalancing is disabled: RequestRebalance is
-// a no-op and SetInitialLimits uses a static allocation (budget/maxWorkers).
-func NewMemoryRebalancer(memoryBudget uint64, threadBudget int, sessions SessionLister, enabled bool, maxWorkers int) *MemoryRebalancer {
+// If enabled is false, RequestRebalance is a no-op and sessions only get
+// their limits set once at creation time.
+func NewMemoryRebalancer(memoryBudget uint64, threadBudget int, sessions SessionLister, enabled bool) *MemoryRebalancer {
 	if memoryBudget == 0 {
 		totalMem := server.SystemMemoryBytes()
 		if totalMem > 0 {
@@ -76,7 +74,6 @@ func NewMemoryRebalancer(memoryBudget uint64, threadBudget int, sessions Session
 	r := &MemoryRebalancer{
 		memoryBudget:     memoryBudget,
 		threadBudget:     threadBudget,
-		maxWorkers:       maxWorkers,
 		enabled:          enabled,
 		sessions:         sessions,
 		pendingRebalance: make(chan struct{}, 1),
@@ -161,8 +158,7 @@ func (r *MemoryRebalancer) doRebalance() {
 		return
 	}
 
-	memLimit := perSessionMemory(budget, count)
-	memStr := formatBytes(memLimit)
+	memStr := formatBytes(memoryLimit(budget))
 
 	slog.Info("Rebalancing session resources.",
 		"sessions", count,
@@ -191,13 +187,9 @@ func (r *MemoryRebalancer) doRebalance() {
 	}
 }
 
-// PerSessionMemoryLimit returns the current per-session memory limit string
-// based on the given session count.
-func (r *MemoryRebalancer) PerSessionMemoryLimit(sessionCount int) string {
-	if sessionCount <= 0 {
-		sessionCount = 1
-	}
-	return formatBytes(perSessionMemory(r.memoryBudget, sessionCount))
+// MemoryLimit returns the memory limit string applied to every session.
+func (r *MemoryRebalancer) MemoryLimit() string {
+	return formatBytes(memoryLimit(r.memoryBudget))
 }
 
 // PerSessionThreads returns the thread count for each session.
@@ -206,40 +198,30 @@ func (r *MemoryRebalancer) PerSessionThreads() int {
 	return r.threadBudget
 }
 
-func perSessionMemory(budget uint64, count int) uint64 {
-	limit := budget / uint64(count)
-	if limit < minMemoryPerSession {
-		limit = minMemoryPerSession
+// memoryLimit returns the memory limit for a session: the full budget,
+// with a floor of minMemoryPerSession (256MB).
+func memoryLimit(budget uint64) uint64 {
+	if budget < minMemoryPerSession {
+		return minMemoryPerSession
 	}
-	return limit
+	return budget
 }
 
-// MaxSessionsForBudget returns the maximum number of sessions that can be
-// supported without exceeding the memory budget, given the per-session floor.
-// This can be used to derive a dynamic max-workers cap.
-func (r *MemoryRebalancer) MaxSessionsForBudget() int {
+// DefaultMaxWorkers returns a reasonable default for max_workers based on
+// the memory budget. This is a concurrency cap (budget / 256MB), not a
+// memory-safety guarantee — each session gets the full budget.
+func (r *MemoryRebalancer) DefaultMaxWorkers() int {
 	return int(r.memoryBudget / minMemoryPerSession)
 }
 
 // SetInitialLimits sets memory_limit and threads on a single session synchronously.
 // Called during CreateSession so the new session never runs with unlimited resources.
-// When rebalancing is disabled, uses a static allocation based on budget/maxWorkers.
-func (r *MemoryRebalancer) SetInitialLimits(ctx context.Context, session *ManagedSession, totalSessions int) {
+func (r *MemoryRebalancer) SetInitialLimits(ctx context.Context, session *ManagedSession) {
 	if session == nil || session.Executor == nil {
 		return
 	}
 
-	var memStr string
-	if r.enabled {
-		memStr = r.PerSessionMemoryLimit(totalSessions)
-	} else {
-		// Static allocation: divide budget by maxWorkers (or use full budget if maxWorkers is 0)
-		divisor := r.maxWorkers
-		if divisor <= 0 {
-			divisor = 1
-		}
-		memStr = formatBytes(perSessionMemory(r.memoryBudget, divisor))
-	}
+	memStr := r.MemoryLimit()
 	threads := r.PerSessionThreads()
 
 	setCtx, cancel := context.WithTimeout(ctx, rebalanceTimeout)
