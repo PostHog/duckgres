@@ -79,10 +79,14 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 		_ = handoverLn.Close()
 		if !handoverOK {
 			// Handover failed — recover so the old CP keeps serving and
-			// a future SIGUSR1 can retry.
+			// a future SIGUSR1 can retry. Use the atomic CAS inside
+			// recoverFromFailedReload to avoid racing with the cmd.Wait
+			// goroutine in selfExec (which also attempts recovery when
+			// the child process exits).
 			slog.Warn("Handover failed, recovering.")
-			cp.recoverFromFailedReload()
-			cp.startHandoverListener()
+			if cp.recoverFromFailedReload() {
+				cp.startHandoverListener()
+			}
 		}
 	}()
 

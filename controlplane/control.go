@@ -519,15 +519,14 @@ func (cp *ControlPlane) selfExec() {
 		}
 
 		// If we're still in reloading state, the handover never completed.
-		// handleHandoverRequest was either never reached (child died before
-		// connecting) or hasn't run its recovery yet. Recover here.
-		if !cp.reloading.Load() {
-			return
-		}
+		// handleHandoverRequest may also be trying to recover (child connected
+		// but died mid-protocol), so recoverFromFailedReload uses CAS to
+		// ensure only one goroutine runs the full recovery path.
 		slog.Error("Child process exited before completing handover, recovering.", "error", err)
 		cp.cancelHandoverListener()
-		cp.recoverFromFailedReload()
-		cp.startHandoverListener()
+		if cp.recoverFromFailedReload() {
+			cp.startHandoverListener()
+		}
 	}()
 }
 
@@ -542,11 +541,17 @@ func (cp *ControlPlane) cancelHandoverListener() {
 	}
 }
 
-// recoverFromFailedReload cancels the RELOADING state, resets the guard flag,
-// and restarts the handover listener so a future SIGUSR1 can retry.
-func (cp *ControlPlane) recoverFromFailedReload() {
+// recoverFromFailedReload atomically exits the RELOADING state and notifies
+// systemd that the service is ready again. Returns true if this call won the
+// race (i.e. actually recovered). Callers that need to restart the handover
+// listener should only do so when this returns true, to avoid duplicate
+// listeners.
+func (cp *ControlPlane) recoverFromFailedReload() bool {
+	if !cp.reloading.CompareAndSwap(true, false) {
+		return false // another goroutine already recovered
+	}
 	if err := sdNotify("READY=1"); err != nil {
 		slog.Warn("sd_notify READY (recovery) failed.", "error", err)
 	}
-	cp.reloading.Store(false)
+	return true
 }
