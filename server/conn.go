@@ -417,7 +417,7 @@ func (c *clientConn) serve() error {
 		var db *sql.DB
 		var err error
 		if c.passthrough {
-			db, err = CreatePassthroughDBConnection(c.server.cfg, c.server.duckLakeSem, c.username)
+			db, err = CreatePassthroughDBConnection(c.server.cfg, c.server.duckLakeSem, c.username, processStartTime, processVersion)
 		} else {
 			db, err = c.server.createDBConnection(c.username)
 		}

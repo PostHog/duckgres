@@ -848,6 +848,27 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// version - return PostgreSQL-compatible version string
 		// Fivetran and other tools check this to determine compatibility
 		`CREATE OR REPLACE MACRO version() AS 'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'`,
+	}
+
+	for _, f := range functions {
+		if _, err := db.Exec(f); err != nil {
+			// Log but don't fail - some might already exist or conflict
+			continue
+		}
+	}
+
+	// Utility macros (uptime, version) are also needed by passthrough users,
+	// so they live in a shared function.
+	initUtilityMacros(db, serverStartTime, processStartTime, serverVersion, processVersion)
+
+	return nil
+}
+
+// initUtilityMacros creates duckgres-specific utility macros (uptime, version info).
+// These are not PostgreSQL compatibility macros — they're useful for all connections,
+// including passthrough users who bypass pg_catalog initialization.
+func initUtilityMacros(db *sql.DB, serverStartTime, processStartTime time.Time, serverVersion, processVersion string) {
+	macros := []string{
 		// uptime - returns server uptime as an INTERVAL
 		// Bakes the server start timestamp into the macro; now() evaluates at query time.
 		// Uses TIMESTAMPTZ with explicit +00 suffix so the timezone is unambiguous —
@@ -871,14 +892,11 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		fmt.Sprintf(`CREATE OR REPLACE MACRO worker_version() AS '%s'`, strings.ReplaceAll(processVersion, "'", "''")),
 	}
 
-	for _, f := range functions {
-		if _, err := db.Exec(f); err != nil {
-			// Log but don't fail - some might already exist or conflict
-			continue
+	for _, m := range macros {
+		if _, err := db.Exec(m); err != nil {
+			slog.Warn("Failed to create utility macro", "error", err)
 		}
 	}
-
-	return nil
 }
 
 // initInformationSchema creates the column metadata table and information_schema wrapper views.
