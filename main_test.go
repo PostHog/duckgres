@@ -243,6 +243,121 @@ func TestResolveEffectiveConfigInvalidMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
+	// YAML only
+	fileCfg := &FileConfig{
+		MemoryBudget: "24GB",
+		MinWorkers:   2,
+		MaxWorkers:   10,
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.MemoryBudget != "24GB" {
+		t.Fatalf("expected memory_budget from file, got %q", resolved.Server.MemoryBudget)
+	}
+	if resolved.Server.MinWorkers != 2 {
+		t.Fatalf("expected min_workers from file, got %d", resolved.Server.MinWorkers)
+	}
+	if resolved.Server.MaxWorkers != 10 {
+		t.Fatalf("expected max_workers from file, got %d", resolved.Server.MaxWorkers)
+	}
+
+	// Env overrides file
+	env := map[string]string{
+		"DUCKGRES_MEMORY_BUDGET": "32GB",
+		"DUCKGRES_MIN_WORKERS":   "4",
+		"DUCKGRES_MAX_WORKERS":   "20",
+	}
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.MemoryBudget != "32GB" {
+		t.Fatalf("expected memory_budget from env, got %q", resolved.Server.MemoryBudget)
+	}
+	if resolved.Server.MinWorkers != 4 {
+		t.Fatalf("expected min_workers from env, got %d", resolved.Server.MinWorkers)
+	}
+	if resolved.Server.MaxWorkers != 20 {
+		t.Fatalf("expected max_workers from env, got %d", resolved.Server.MaxWorkers)
+	}
+
+	// CLI overrides env
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:          map[string]bool{"memory-budget": true, "min-workers": true, "max-workers": true},
+		MemoryBudget: "48GB",
+		MinWorkers:   8,
+		MaxWorkers:   50,
+	}, envFromMap(env), nil)
+	if resolved.Server.MemoryBudget != "48GB" {
+		t.Fatalf("expected memory_budget from CLI, got %q", resolved.Server.MemoryBudget)
+	}
+	if resolved.Server.MinWorkers != 8 {
+		t.Fatalf("expected min_workers from CLI, got %d", resolved.Server.MinWorkers)
+	}
+	if resolved.Server.MaxWorkers != 50 {
+		t.Fatalf("expected max_workers from CLI, got %d", resolved.Server.MaxWorkers)
+	}
+}
+
+func TestResolveEffectiveConfigInvalidMemoryBudget(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_MEMORY_BUDGET": "lots-of-memory",
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.MemoryBudget != "" {
+		t.Fatalf("expected empty memory_budget after invalid input, got %q", resolved.Server.MemoryBudget)
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "Invalid memory_budget format") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about invalid memory_budget format, warnings: %v", warns)
+	}
+}
+
+func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_MIN_WORKERS": "not-a-number",
+		"DUCKGRES_MAX_WORKERS": "also-bad",
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.MinWorkers != 0 {
+		t.Fatalf("expected default min_workers, got %d", resolved.Server.MinWorkers)
+	}
+	if resolved.Server.MaxWorkers != 0 {
+		t.Fatalf("expected default max_workers, got %d", resolved.Server.MaxWorkers)
+	}
+
+	wantWarnings := []string{
+		"Invalid DUCKGRES_MIN_WORKERS",
+		"Invalid DUCKGRES_MAX_WORKERS",
+	}
+	for _, w := range wantWarnings {
+		found := false
+		for _, got := range warns {
+			if strings.Contains(got, w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected warning containing %q, warnings: %v", w, warns)
+		}
+	}
+}
+
 func TestResolveEffectiveConfigPassthroughUsers(t *testing.T) {
 	fileCfg := &FileConfig{
 		PassthroughUsers: []string{"alice", "bob"},

@@ -35,24 +35,31 @@ type SessionCounter interface {
 }
 
 // FlightWorkerPool manages a pool of duckdb-service worker processes.
+//
+// Lock ordering invariant: pool.mu → SessionManager.mu(RLock).
+// findIdleWorkerLocked calls SessionCountForWorker while holding pool.mu.
+// Never acquire pool.mu while holding SessionManager.mu to avoid deadlock.
 type FlightWorkerPool struct {
 	mu             sync.RWMutex
 	workers        map[int]*ManagedWorker
+	nextWorkerID   int // auto-incrementing worker ID
 	socketDir      string
 	configPath     string
 	binaryPath     string
 	sessionCounter SessionCounter // set after SessionManager is created
+	maxWorkers     int            // 0 = unlimited
 	shuttingDown   bool
 }
 
 // NewFlightWorkerPool creates a new worker pool.
-func NewFlightWorkerPool(socketDir, configPath string) *FlightWorkerPool {
+func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWorkerPool {
 	binaryPath, _ := os.Executable()
 	return &FlightWorkerPool{
 		workers:    make(map[int]*ManagedWorker),
 		socketDir:  socketDir,
 		configPath: configPath,
 		binaryPath: binaryPath,
+		maxWorkers: maxWorkers,
 	}
 }
 
@@ -181,39 +188,6 @@ func (p *FlightWorkerPool) SetSessionCounter(sc SessionCounter) {
 	p.sessionCounter = sc
 }
 
-// SelectWorker returns the worker with the fewest active sessions.
-func (p *FlightWorkerPool) SelectWorker() (*ManagedWorker, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.workers) == 0 {
-		return nil, fmt.Errorf("no workers available")
-	}
-
-	var best *ManagedWorker
-	bestCount := int(^uint(0) >> 1) // max int
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue // skip dead workers
-		default:
-		}
-		count := 0
-		if p.sessionCounter != nil {
-			count = p.sessionCounter.SessionCountForWorker(w.ID)
-		}
-		if best == nil || count < bestCount || (count == bestCount && w.ID < best.ID) {
-			best = w
-			bestCount = count
-		}
-	}
-
-	if best == nil {
-		return nil, fmt.Errorf("all workers dead")
-	}
-	return best, nil
-}
-
 // Worker returns a worker by ID.
 func (p *FlightWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	p.mu.RLock()
@@ -229,7 +203,138 @@ func (p *FlightWorkerPool) SpawnAll(count int) error {
 			return err
 		}
 	}
+	// Update nextWorkerID past the pre-spawned range
+	p.mu.Lock()
+	if count > p.nextWorkerID {
+		p.nextWorkerID = count
+	}
+	p.mu.Unlock()
 	return nil
+}
+
+// SpawnMinWorkers pre-warms the pool with the given number of workers.
+// This is used at startup for the elastic 1:1 model.
+func (p *FlightWorkerPool) SpawnMinWorkers(count int) error {
+	return p.SpawnAll(count)
+}
+
+// AcquireWorker returns a worker for a new session. It first tries to claim an
+// idle pre-warmed worker (one with no active sessions). If none are available,
+// it spawns a new one. The max-workers check is performed atomically under the
+// write lock to prevent TOCTOU races from concurrent connections.
+func (p *FlightWorkerPool) AcquireWorker() (*ManagedWorker, error) {
+	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool is shutting down")
+	}
+
+	// Check max-workers cap atomically under the write lock
+	if p.maxWorkers > 0 && len(p.workers) >= p.maxWorkers {
+		// Even at the cap, we may have idle pre-warmed workers to reuse.
+		// Only fail if all existing workers are busy.
+		idle := p.findIdleWorkerLocked()
+		if idle != nil {
+			p.mu.Unlock()
+			return idle, nil
+		}
+		p.mu.Unlock()
+		return nil, fmt.Errorf("max workers reached (%d)", p.maxWorkers)
+	}
+
+	// Try to claim an idle pre-warmed worker before spawning a new one
+	idle := p.findIdleWorkerLocked()
+	if idle != nil {
+		p.mu.Unlock()
+		return idle, nil
+	}
+
+	id := p.nextWorkerID
+	p.nextWorkerID++
+	p.mu.Unlock()
+
+	if err := p.SpawnWorker(id); err != nil {
+		return nil, err
+	}
+
+	w, ok := p.Worker(id)
+	if !ok {
+		return nil, fmt.Errorf("worker %d not found after spawn", id)
+	}
+	return w, nil
+}
+
+// findIdleWorkerLocked returns a live worker with no active sessions, or nil.
+// Caller must hold p.mu (read or write lock).
+func (p *FlightWorkerPool) findIdleWorkerLocked() *ManagedWorker {
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue // dead
+		default:
+		}
+		if p.sessionCounter != nil && p.sessionCounter.SessionCountForWorker(w.ID) == 0 {
+			return w
+		}
+	}
+	return nil
+}
+
+// RetireWorker stops a worker process and cleans up its resources.
+// Sends SIGINT, waits up to 3s, then SIGKILL. Runs asynchronously
+// to avoid blocking the calling goroutine (e.g., connection handler).
+func (p *FlightWorkerPool) RetireWorker(id int) {
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.workers, id)
+	p.mu.Unlock()
+
+	// Run the actual process cleanup asynchronously so DestroySession
+	// doesn't block the connection handler goroutine for up to 3s+.
+	go retireWorkerProcess(w)
+}
+
+// RetireWorkerIfNoSessions retires a worker only if it has no active sessions.
+// Used to clean up on session creation failure without retiring pre-warmed workers.
+func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) {
+	if p.sessionCounter != nil && p.sessionCounter.SessionCountForWorker(id) > 0 {
+		return
+	}
+	p.RetireWorker(id)
+}
+
+// retireWorkerProcess handles the actual process shutdown and socket cleanup.
+func retireWorkerProcess(w *ManagedWorker) {
+	slog.Info("Retiring worker.", "id", w.ID)
+
+	// Send SIGINT first so the worker can drain in-flight requests
+	if w.cmd.Process != nil {
+		_ = w.cmd.Process.Signal(os.Interrupt)
+	}
+
+	// Wait up to 3s for graceful exit. The worker just had its session
+	// destroyed and should exit almost immediately.
+	select {
+	case <-w.done:
+	case <-time.After(3 * time.Second):
+		slog.Warn("Worker did not exit in time, killing.", "id", w.ID)
+		if w.cmd.Process != nil {
+			_ = w.cmd.Process.Kill()
+		}
+		<-w.done
+	}
+
+	// Close gRPC client after the process has exited
+	if w.client != nil {
+		_ = w.client.Close()
+	}
+
+	// Clean up socket
+	_ = os.Remove(w.socketPath)
 }
 
 // ShutdownAll stops all workers gracefully.
@@ -265,30 +370,14 @@ func (p *FlightWorkerPool) ShutdownAll() {
 	}
 }
 
-// ReplaceWorker replaces a dead worker with a new one.
-func (p *FlightWorkerPool) ReplaceWorker(id int) error {
-	p.mu.Lock()
-	if p.shuttingDown {
-		p.mu.Unlock()
-		return fmt.Errorf("pool is shutting down")
-	}
-	old, exists := p.workers[id]
-	if exists {
-		if old.client != nil {
-			_ = old.client.Close()
-		}
-		delete(p.workers, id)
-	}
-	p.mu.Unlock()
-
-	return p.SpawnWorker(id)
-}
-
 // WorkerCrashHandler is called when a worker crash is detected, before respawning.
 type WorkerCrashHandler func(workerID int)
 
-// HealthCheckLoop periodically checks worker health and respawns dead workers.
-func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, expectedCount int, onCrash ...WorkerCrashHandler) {
+// HealthCheckLoop periodically checks worker health and handles crashed workers.
+// In the elastic 1:1 model, crashed workers with active sessions trigger crash
+// notification (so sessions see errors), and the dead worker is cleaned up.
+// Workers without sessions are simply retired.
+func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash ...WorkerCrashHandler) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -309,13 +398,26 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 				case <-ctx.Done():
 					return
 				case <-w.done:
-					slog.Warn("Worker crashed, respawning.", "id", w.ID, "error", w.exitErr)
+					// Check if already cleaned up by RetireWorker (intentional shutdown).
+					// If so, skip — this is not a crash.
+					p.mu.Lock()
+					_, stillInPool := p.workers[w.ID]
+					if stillInPool {
+						delete(p.workers, w.ID)
+					}
+					p.mu.Unlock()
+					if !stillInPool {
+						continue
+					}
+					// Worker crashed — notify sessions, clean up
+					slog.Warn("Worker crashed.", "id", w.ID, "error", w.exitErr)
 					for _, h := range onCrash {
 						h(w.ID)
 					}
-					if err := p.ReplaceWorker(w.ID); err != nil {
-						slog.Error("Failed to respawn worker.", "id", w.ID, "error", err)
+					if w.client != nil {
+						_ = w.client.Close()
 					}
+					_ = os.Remove(w.socketPath)
 				default:
 					// Worker is alive, do a health check
 					hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -323,21 +425,6 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						slog.Warn("Worker health check failed.", "id", w.ID, "error", err)
 					}
 					cancel()
-				}
-			}
-
-			// Ensure we have the expected number of workers
-			p.mu.RLock()
-			shutting := p.shuttingDown
-			p.mu.RUnlock()
-			if !shutting {
-				for i := 0; i < expectedCount; i++ {
-					if _, ok := p.Worker(i); !ok {
-						slog.Info("Spawning missing worker.", "id", i)
-						if err := p.SpawnWorker(i); err != nil {
-							slog.Error("Failed to spawn missing worker.", "id", i, "error", err)
-						}
-					}
 				}
 			}
 		}

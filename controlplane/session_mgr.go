@@ -21,35 +21,41 @@ type ManagedSession struct {
 
 // SessionManager tracks all active sessions and their worker assignments.
 type SessionManager struct {
-	mu       sync.RWMutex
-	sessions map[int32]*ManagedSession // PID → session
-	byWorker map[int][]int32           // workerID → PIDs
-	pool     *FlightWorkerPool
+	mu         sync.RWMutex
+	sessions   map[int32]*ManagedSession // PID → session
+	byWorker   map[int][]int32           // workerID → PIDs
+	pool       *FlightWorkerPool
+	rebalancer *MemoryRebalancer
 
 	nextPID atomic.Int32
 }
 
 // NewSessionManager creates a new session manager.
-func NewSessionManager(pool *FlightWorkerPool) *SessionManager {
+func NewSessionManager(pool *FlightWorkerPool, rebalancer *MemoryRebalancer) *SessionManager {
 	sm := &SessionManager{
-		sessions: make(map[int32]*ManagedSession),
-		byWorker: make(map[int][]int32),
-		pool:     pool,
+		sessions:   make(map[int32]*ManagedSession),
+		byWorker:   make(map[int][]int32),
+		pool:       pool,
+		rebalancer: rebalancer,
 	}
 	sm.nextPID.Store(1000) // Start PIDs above typical OS PIDs
 	return sm
 }
 
-// CreateSession creates a new session on the least-loaded worker.
-// Returns the session PID, FlightExecutor, and worker ID.
+// CreateSession acquires a worker (reusing an idle one or spawning a new one),
+// creates a session on it, and rebalances memory/thread limits across all active sessions.
 func (sm *SessionManager) CreateSession(ctx context.Context, username string) (int32, *server.FlightExecutor, error) {
-	worker, err := sm.pool.SelectWorker()
+	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
+	// Max-workers check is atomic inside AcquireWorker to prevent TOCTOU races.
+	worker, err := sm.pool.AcquireWorker()
 	if err != nil {
-		return 0, nil, fmt.Errorf("select worker: %w", err)
+		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
 
 	sessionToken, err := worker.CreateSession(ctx, username)
 	if err != nil {
+		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker)
+		sm.pool.RetireWorkerIfNoSessions(worker.ID)
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
 	}
 
@@ -68,13 +74,24 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 	sm.mu.Lock()
 	sm.sessions[pid] = session
 	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
+	totalSessions := len(sm.sessions)
 	sm.mu.Unlock()
 
 	slog.Debug("Session created.", "pid", pid, "worker", worker.ID, "user", username)
+
+	// Set initial memory/thread limits on this session synchronously so it
+	// never runs with unlimited resources (debounced rebalance would be too late).
+	// Then trigger an async rebalance to adjust all other sessions.
+	if sm.rebalancer != nil {
+		sm.rebalancer.SetInitialLimits(ctx, session, totalSessions)
+		sm.rebalancer.RequestRebalance()
+	}
+
 	return pid, executor, nil
 }
 
-// DestroySession destroys a session and cleans up resources.
+// DestroySession destroys a session, retires its dedicated worker, and rebalances
+// memory/thread limits across remaining sessions.
 func (sm *SessionManager) DestroySession(pid int32) {
 	sm.mu.Lock()
 	session, ok := sm.sessions[pid]
@@ -99,15 +116,28 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		_ = session.Executor.Close()
 	}
 
-	// Destroy session on worker (best effort)
+	// Destroy session on worker (best effort, skip if worker already dead)
 	worker, ok := sm.pool.Worker(session.WorkerID)
 	if ok {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = worker.DestroySession(ctx, session.SessionToken)
-		cancel()
+		select {
+		case <-worker.done:
+			// Worker already dead, skip RPC
+		default:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = worker.DestroySession(ctx, session.SessionToken)
+			cancel()
+		}
 	}
 
+	// Retire the dedicated worker (1:1 model)
+	sm.pool.RetireWorker(session.WorkerID)
+
 	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
+
+	// Rebalance remaining sessions
+	if sm.rebalancer != nil {
+		sm.rebalancer.RequestRebalance()
+	}
 }
 
 // OnWorkerCrash handles a worker crash by sending errors to all affected sessions.
@@ -136,6 +166,11 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	sm.mu.Lock()
 	delete(sm.byWorker, workerID)
 	sm.mu.Unlock()
+
+	// Rebalance remaining sessions after crash cleanup
+	if sm.rebalancer != nil {
+		sm.rebalancer.RequestRebalance()
+	}
 }
 
 // SessionCount returns the number of active sessions.
@@ -151,3 +186,16 @@ func (sm *SessionManager) SessionCountForWorker(workerID int) int {
 	defer sm.mu.RUnlock()
 	return len(sm.byWorker[workerID])
 }
+
+// AllSessions returns a snapshot of all active sessions.
+// The returned slice is safe to iterate without holding the lock.
+func (sm *SessionManager) AllSessions() []*ManagedSession {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	result := make([]*ManagedSession, 0, len(sm.sessions))
+	for _, s := range sm.sessions {
+		result = append(result, s)
+	}
+	return result
+}
+

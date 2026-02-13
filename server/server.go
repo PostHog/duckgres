@@ -124,6 +124,19 @@ type Config struct {
 	// If zero, defaults to runtime.NumCPU().
 	Threads int
 
+	// MemoryBudget is the total memory available for all DuckDB sessions (e.g., "24GB").
+	// Used in control-plane mode for dynamic per-session memory allocation.
+	// If empty, defaults to 75% of system RAM.
+	MemoryBudget string
+
+	// MaxWorkers is the maximum number of worker processes in control-plane mode.
+	// 0 means unlimited.
+	MaxWorkers int
+
+	// MinWorkers is the number of pre-warmed worker processes at startup in control-plane mode.
+	// 0 means no pre-warming (workers spawn on demand).
+	MinWorkers int
+
 	// PassthroughUsers are users that bypass the SQL transpiler and pg_catalog initialization.
 	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
 	PassthroughUsers map[string]bool

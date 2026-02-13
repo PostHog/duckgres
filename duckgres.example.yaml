@@ -70,10 +70,22 @@ ducklake:
   # s3_profile: "my-profile"           # AWS profile name (for config chain)
   # s3_region: "us-west-2"             # Override auto-detected region
 
-# DuckDB resource limits per session
+# DuckDB resource limits per session (standalone mode)
 # Auto-detected from system memory if not set.
 # memory_limit: "4GB"
 # threads: 4
+
+# Dynamic memory allocation (control-plane mode only)
+# Total memory budget shared across all DuckDB sessions.
+# Each session gets budget / active_sessions (floor: 256MB).
+# Default: 75% of system RAM.
+# memory_budget: "24GB"
+
+# Worker process limits (control-plane mode only)
+# min_workers: pre-warm workers at startup for instant connection handling.
+# max_workers: cap on total workers (0 = unlimited).
+# min_workers: 0
+# max_workers: 0
 
 # Process isolation (default: true)
 # Each client connection spawns a separate OS process, so a DuckDB crash

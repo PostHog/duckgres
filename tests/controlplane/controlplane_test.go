@@ -107,20 +107,16 @@ type cpHarness struct {
 }
 
 type cpOpts struct {
-	workerCount    int
 	handoverSocket string
 }
 
 func defaultOpts() cpOpts {
-	return cpOpts{workerCount: 2}
+	return cpOpts{}
 }
 
 func startControlPlane(t *testing.T, opts cpOpts) *cpHarness {
 	t.Helper()
 
-	if opts.workerCount == 0 {
-		opts.workerCount = 2
-	}
 
 	port := freePort(t)
 
@@ -163,7 +159,6 @@ users:
 	args := []string{
 		"--config", configFile,
 		"--mode", "control-plane",
-		"--worker-count", strconv.Itoa(opts.workerCount),
 		"--socket-dir", socketDir,
 		"--handover-socket", handoverSocket,
 	}
@@ -617,6 +612,12 @@ func TestHandoverChildCrashRecovery(t *testing.T) {
 		t.Fatalf("Recovery did not happen.\nLogs:\n%s", h.logBuf.String())
 	}
 
+	// Restore valid config so the old CP can spawn new workers on demand
+	// (elastic 1:1 model spawns a worker per connection).
+	if err := os.WriteFile(h.configFile, origConfig, 0644); err != nil {
+		t.Fatalf("Failed to restore config: %v", err)
+	}
+
 	// The old CP should still accept connections after recovery
 	db2 := h.openConn(t)
 	if err := db2.QueryRow("SELECT 42").Scan(&v); err != nil {
@@ -658,17 +659,18 @@ func TestHandoverChildCrashThenRetry(t *testing.T) {
 		t.Fatalf("First recovery did not happen.\nLogs:\n%s", h.logBuf.String())
 	}
 
+	// Restore valid config so the old CP can spawn new workers on demand
+	// (elastic 1:1 model spawns a worker per connection).
+	if err := os.WriteFile(h.configFile, origConfig, 0644); err != nil {
+		t.Fatalf("Failed to restore config: %v", err)
+	}
+
 	// Verify old CP still works
 	db2 := h.openConn(t)
 	if err := db2.QueryRow("SELECT 1").Scan(&v); err != nil {
 		t.Fatalf("Post-recovery query failed: %v\nLogs:\n%s", err, h.logBuf.String())
 	}
 	_ = db2.Close()
-
-	// Restore valid config
-	if err := os.WriteFile(h.configFile, origConfig, 0644); err != nil {
-		t.Fatalf("Failed to restore config: %v", err)
-	}
 
 	// Second SIGUSR1 — this time the handover should succeed
 	if err := h.sendSignal(syscall.SIGUSR1); err != nil {

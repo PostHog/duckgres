@@ -24,7 +24,6 @@ import (
 type ControlPlaneConfig struct {
 	server.Config
 
-	WorkerCount         int
 	SocketDir           string
 	ConfigPath          string // Path to config file, passed to workers
 	HandoverSocket      string
@@ -39,6 +38,7 @@ type ControlPlane struct {
 	cfg         ControlPlaneConfig
 	pool        *FlightWorkerPool
 	sessions    *SessionManager
+	rebalancer  *MemoryRebalancer
 	srv         *server.Server // Minimal server for cancel request routing
 	rateLimiter *server.RateLimiter
 	tlsConfig   *tls.Config
@@ -54,9 +54,6 @@ type ControlPlane struct {
 // RunControlPlane is the entry point for the control plane process.
 func RunControlPlane(cfg ControlPlaneConfig) {
 	// Apply defaults
-	if cfg.WorkerCount == 0 {
-		cfg.WorkerCount = 4
-	}
 	if cfg.SocketDir == "" {
 		cfg.SocketDir = "/var/run/duckgres"
 	}
@@ -88,19 +85,56 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.RateLimit = server.DefaultRateLimitConfig()
 	}
 
-	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath)
+	// Initialize memory rebalancer first to compute dynamic max-workers cap
+	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
+	rebalancer := NewMemoryRebalancer(memBudget, 0, nil) // sessions wired below
+
+	// If max_workers is not set, derive it from the memory budget to prevent
+	// overcommit: budget / 256MB floor = max sessions before every session
+	// is pinned to the minimum allocation.
+	maxWorkers := cfg.MaxWorkers
+	if maxWorkers == 0 {
+		maxWorkers = rebalancer.MaxSessionsForBudget()
+		slog.Info("Derived max_workers from memory budget.",
+			"max_workers", maxWorkers,
+			"memory_budget", formatBytes(rebalancer.memoryBudget))
+	} else if maxWorkers > rebalancer.MaxSessionsForBudget() {
+		slog.Warn("max_workers exceeds memory budget capacity; sessions may overcommit memory.",
+			"max_workers", maxWorkers,
+			"budget_capacity", rebalancer.MaxSessionsForBudget())
+	}
+
+	// Validate min_workers <= max_workers
+	minWorkers := cfg.MinWorkers
+	if minWorkers > maxWorkers {
+		slog.Warn("min_workers exceeds max_workers; capping to max_workers.",
+			"min_workers", minWorkers, "max_workers", maxWorkers)
+		minWorkers = maxWorkers
+	}
+
+	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
 
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)
 
-	sessions := NewSessionManager(pool)
+	sessions := NewSessionManager(pool, rebalancer)
+
+	// Wire the circular dependency: rebalancer needs sessions to iterate,
+	// sessions needs rebalancer to trigger rebalance on create/destroy.
+	// This is safe because Rebalance is only called from CreateSession/DestroySession,
+	// and no sessions exist yet at this point.
+	//
+	// Lock ordering invariant: rebalancer.mu → sm.mu(RLock). Never acquire
+	// rebalancer.mu while holding sm.mu to avoid deadlock.
+	rebalancer.SetSessionLister(sessions)
 	pool.SetSessionCounter(sessions)
 
 	cp := &ControlPlane{
 		cfg:         cfg,
 		pool:        pool,
 		sessions:    sessions,
+		rebalancer:  rebalancer,
 		srv:         srv,
 		rateLimiter: server.NewRateLimiter(cfg.RateLimit),
 		tlsConfig: &tls.Config{
@@ -145,10 +179,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.pgListener = ln
 	}
 
-	// Spawn workers (always fresh, even after handover)
-	if err := cp.pool.SpawnAll(cfg.WorkerCount); err != nil {
-		slog.Error("Failed to spawn workers.", "error", err)
-		os.Exit(1)
+	// Pre-warm workers if min_workers is set
+	if minWorkers > 0 {
+		if err := cp.pool.SpawnMinWorkers(minWorkers); err != nil {
+			slog.Error("Failed to spawn min workers.", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	// Start health check loop with crash notification
@@ -156,11 +192,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.sessions.OnWorkerCrash(workerID, func(pid int32) {
 			// Sessions on the crashed worker will see gRPC errors on
 			// their next query. OnWorkerCrash cleans up session state
-			// so SelectWorker load balancing stays accurate.
+			// so load balancing stays accurate.
 			slog.Warn("Session orphaned by worker crash.", "pid", pid, "worker", workerID)
 		})
 	}
-	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, cfg.WorkerCount, onCrash)
+	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash)
 
 	// Start handover listener for future deployments
 	cp.startHandoverListener()
@@ -177,7 +213,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
-		"workers", cfg.WorkerCount)
+		"min_workers", minWorkers,
+		"max_workers", maxWorkers,
+		"memory_budget", formatBytes(rebalancer.memoryBudget))
 
 	// Handle signals
 	go func() {
@@ -487,6 +525,10 @@ func (cp *ControlPlane) shutdown() {
 
 	slog.Info("Shutting down workers...")
 	cp.pool.ShutdownAll()
+
+	if cp.rebalancer != nil {
+		cp.rebalancer.Stop()
+	}
 
 	slog.Info("Control plane shutdown complete.")
 }
