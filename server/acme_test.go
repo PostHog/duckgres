@@ -15,7 +15,7 @@ func TestNewACMEManagerCreatesCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewACMEManager failed: %v", err)
 	}
-	defer mgr.Close()
+	defer func() { _ = mgr.Close() }()
 
 	// Verify cache directory was created
 	info, err := os.Stat(cacheDir)
@@ -36,7 +36,7 @@ func TestNewACMEManagerDefaultCacheDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewACMEManager failed: %v", err)
 	}
-	defer mgr.Close()
+	defer func() { _ = mgr.Close() }()
 
 	if mgr.cacheDir != defaultDir {
 		t.Fatalf("expected cache dir %q, got %q", defaultDir, mgr.cacheDir)
@@ -51,7 +51,7 @@ func TestACMEManagerTLSConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewACMEManager failed: %v", err)
 	}
-	defer mgr.Close()
+	defer func() { _ = mgr.Close() }()
 
 	tlsCfg := mgr.TLSConfig()
 	if tlsCfg == nil {
