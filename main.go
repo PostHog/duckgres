@@ -152,6 +152,7 @@ func main() {
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
 	acmeEmail := flag.String("acme-email", "", "Contact email for Let's Encrypt notifications (env: DUCKGRES_ACME_EMAIL)")
+	acmeCacheDir := flag.String("acme-cache-dir", "", "Directory for ACME certificate cache (env: DUCKGRES_ACME_CACHE_DIR)")
 
 	// DuckDB service flags
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
@@ -258,6 +259,7 @@ func main() {
 		MaxWorkers:       *maxWorkers,
 		ACMEDomain:       *acmeDomain,
 		ACMEEmail:        *acmeEmail,
+		ACMECacheDir:     *acmeCacheDir,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})

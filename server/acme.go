@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -17,9 +18,9 @@ import (
 type ACMEManager struct {
 	manager  *autocert.Manager
 	httpSrv  *http.Server
-	httpLn   net.Listener
 	domain   string
 	cacheDir string
+	closeOnce sync.Once
 }
 
 // NewACMEManager creates a new ACME manager for the given domain.
@@ -45,14 +46,16 @@ func NewACMEManager(domain, email, cacheDir, httpAddr string) (*ACMEManager, err
 		Email:      email,
 	}
 
-	// Start HTTP listener for ACME HTTP-01 challenges
+	// Start HTTP listener for ACME HTTP-01 challenges.
+	// Use mgr.HTTPHandler with a 404 fallback instead of nil to avoid
+	// creating an open HTTP-to-HTTPS redirector on port 80.
 	ln, err := net.Listen("tcp", httpAddr)
 	if err != nil {
 		return nil, err
 	}
 
 	httpSrv := &http.Server{
-		Handler:           mgr.HTTPHandler(nil),
+		Handler:           mgr.HTTPHandler(http.NotFoundHandler()),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -67,7 +70,6 @@ func NewACMEManager(domain, email, cacheDir, httpAddr string) (*ACMEManager, err
 	return &ACMEManager{
 		manager:  mgr,
 		httpSrv:  httpSrv,
-		httpLn:   ln,
 		domain:   domain,
 		cacheDir: cacheDir,
 	}, nil
@@ -78,12 +80,18 @@ func NewACMEManager(domain, email, cacheDir, httpAddr string) (*ACMEManager, err
 func (a *ACMEManager) TLSConfig() *tls.Config {
 	return &tls.Config{
 		GetCertificate: a.manager.GetCertificate,
+		MinVersion:     tls.VersionTLS12,
 	}
 }
 
 // Close gracefully shuts down the HTTP challenge listener.
+// Safe to call multiple times.
 func (a *ACMEManager) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return a.httpSrv.Shutdown(ctx)
+	var err error
+	a.closeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err = a.httpSrv.Shutdown(ctx)
+	})
+	return err
 }

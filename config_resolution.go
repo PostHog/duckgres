@@ -25,6 +25,7 @@ type configCLIInputs struct {
 	MinWorkers       int
 	ACMEDomain       string
 	ACMEEmail        string
+	ACMECacheDir     string
 }
 
 type resolvedConfig struct {
@@ -342,6 +343,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["acme-email"] {
 		cfg.ACMEEmail = cli.ACMEEmail
+	}
+	if cli.Set["acme-cache-dir"] {
+		cfg.ACMECacheDir = cli.ACMECacheDir
 	}
 
 	// Validate memory_limit format if explicitly set

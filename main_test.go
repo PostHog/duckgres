@@ -422,15 +422,19 @@ func TestResolveEffectiveConfigACME(t *testing.T) {
 
 	// CLI overrides env
 	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
-		Set:        map[string]bool{"acme-domain": true, "acme-email": true},
-		ACMEDomain: "cli.us.duckgres.com",
-		ACMEEmail:  "cli@posthog.com",
+		Set:          map[string]bool{"acme-domain": true, "acme-email": true, "acme-cache-dir": true},
+		ACMEDomain:   "cli.us.duckgres.com",
+		ACMEEmail:    "cli@posthog.com",
+		ACMECacheDir: "/cli/acme-cache",
 	}, envFromMap(env), nil)
 	if resolved.Server.ACMEDomain != "cli.us.duckgres.com" {
 		t.Fatalf("expected ACME domain from CLI, got %q", resolved.Server.ACMEDomain)
 	}
 	if resolved.Server.ACMEEmail != "cli@posthog.com" {
 		t.Fatalf("expected ACME email from CLI, got %q", resolved.Server.ACMEEmail)
+	}
+	if resolved.Server.ACMECacheDir != "/cli/acme-cache" {
+		t.Fatalf("expected ACME cache dir from CLI, got %q", resolved.Server.ACMECacheDir)
 	}
 }
 

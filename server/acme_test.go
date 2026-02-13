@@ -28,20 +28,19 @@ func TestNewACMEManagerCreatesCache(t *testing.T) {
 }
 
 func TestNewACMEManagerDefaultCacheDir(t *testing.T) {
-	// Use port 0 to get a random available port
-	mgr, err := NewACMEManager("test.example.com", "test@example.com", "", "127.0.0.1:0")
+	// Override default cache dir to use a temp directory
+	tmpDir := t.TempDir()
+	defaultDir := filepath.Join(tmpDir, "default-acme-cache")
+
+	mgr, err := NewACMEManager("test.example.com", "test@example.com", defaultDir, "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("NewACMEManager failed: %v", err)
 	}
 	defer mgr.Close()
 
-	// Default cache dir should be used
-	if mgr.cacheDir != "./certs/acme" {
-		t.Fatalf("expected default cache dir './certs/acme', got %q", mgr.cacheDir)
+	if mgr.cacheDir != defaultDir {
+		t.Fatalf("expected cache dir %q, got %q", defaultDir, mgr.cacheDir)
 	}
-
-	// Clean up default cache dir
-	os.RemoveAll("./certs/acme")
 }
 
 func TestACMEManagerTLSConfig(t *testing.T) {
@@ -61,6 +60,9 @@ func TestACMEManagerTLSConfig(t *testing.T) {
 	if tlsCfg.GetCertificate == nil {
 		t.Fatal("TLSConfig.GetCertificate is nil")
 	}
+	if tlsCfg.MinVersion != 0x0303 { // tls.VersionTLS12
+		t.Fatalf("expected MinVersion TLS 1.2 (0x0303), got 0x%04x", tlsCfg.MinVersion)
+	}
 }
 
 func TestACMEManagerClose(t *testing.T) {
@@ -75,5 +77,10 @@ func TestACMEManagerClose(t *testing.T) {
 	// Close should not error
 	if err := mgr.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Double close should be safe (sync.Once)
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("second Close failed: %v", err)
 	}
 }
