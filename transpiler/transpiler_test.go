@@ -2962,6 +2962,9 @@ func TestClassify_NeedsTransform(t *testing.T) {
 		{"SIMILAR TO", "SELECT 'hello' SIMILAR TO 'h%'", FlagOperators | FlagPgCatalog},
 		{"COLLATE", "SELECT * FROM t ORDER BY name COLLATE pg_catalog.default", FlagOperators | FlagPgCatalog},
 		{"SET with comment prefix", "/* ETL */ SET statement_timeout = 5000", FlagSetShow},
+		{"SET with line comment prefix", "-- setup\nSET statement_timeout = 5000", FlagSetShow},
+		{"SHOW after multiple comments", "-- first\n-- second\nSHOW server_version", FlagSetShow},
+		{"SET after mixed comments", "/* block */\n-- line\nSET search_path = 'main'", FlagSetShow},
 	}
 
 	for _, tt := range tests {

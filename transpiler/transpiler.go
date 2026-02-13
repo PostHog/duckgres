@@ -33,8 +33,9 @@ const (
 	FlagCtid                                     // ctid -> rowid mapping
 	FlagDDL                                      // DDL constraint stripping
 	FlagPlaceholder                              // $1/$2 placeholder conversion
+	flagSentinel                                 // must be last — used to derive FlagAll
 
-	FlagAll TransformFlags = (1 << 17) - 1 // All flags set
+	FlagAll TransformFlags = flagSentinel - 1 // All flags set
 )
 
 // Classification is the result of pre-parse query classification.
@@ -131,6 +132,12 @@ func New(cfg Config) *Transpiler {
 //   - Tier 0: No PG-specific patterns detected → return original SQL directly (no parse)
 //   - Tier 1: PG-specific patterns detected → parse and apply only relevant transforms
 //   - Tier 2: Error-driven retry (ALTER TABLE→VIEW, DROP TABLE→VIEW) handled by caller
+//
+// Note: Tier 0 queries never set FallbackToNative (they bypass parsing entirely).
+// DuckDB-native syntax (DESCRIBE, PIVOT, etc.) is returned as-is, which is correct
+// since conn.go sends the SQL to DuckDB either way. The only difference is that
+// conn.go won't call validateWithDuckDB() for Tier 0 queries, but that validation
+// is a courtesy for better error messages, not a correctness requirement.
 func (t *Transpiler) Transpile(sql string) (*Result, error) {
 	sql = strings.TrimSpace(sql)
 	if sql == "" {
@@ -330,7 +337,11 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagFuncAlias
 	}
 
-	// Operators: JSON arrows and regex
+	// Operators: JSON arrows and regex.
+	// Note: "~" is aggressive — it matches column names and string literals too.
+	// This is acceptable: false positive just runs the operator transform (cheap),
+	// while a false negative would break PostgreSQL regex queries that DuckDB
+	// handles via regexp_matches rewrite.
 	if containsAny(upper, "->", "~") {
 		flags |= FlagOperators
 	}
@@ -348,7 +359,9 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagLocking
 	}
 
-	// ctid system column
+	// ctid system column.
+	// Substring match may false-positive on names like "DOCTID" — acceptable
+	// since the ctid transform only rewrites actual ctid column references in the AST.
 	if strings.Contains(upper, "CTID") {
 		flags |= FlagCtid
 	}
@@ -363,7 +376,10 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagOnConflict
 	}
 
-	// DDL patterns (DuckLake mode only)
+	// DDL patterns (DuckLake mode only).
+	// "UNIQUE" and "REFERENCES" may false-positive in non-DDL contexts (e.g.,
+	// SELECT ... WHERE col = 'UNIQUE'), but the DDL transform only acts on
+	// CREATE TABLE / ALTER TABLE AST nodes, so false positives are harmless.
 	if cfg.DuckLakeMode {
 		if containsAny(upper, "CREATE INDEX", "DROP INDEX", "VACUUM", "GRANT ", "REVOKE ",
 			"PRIMARY KEY", "UNIQUE", "REFERENCES", "SERIAL", "BIGSERIAL",
@@ -372,7 +388,10 @@ func Classify(sql string, cfg Config) Classification {
 		}
 	}
 
-	// Writable CTEs: WITH ... (INSERT|UPDATE|DELETE)
+	// Writable CTEs: WITH ... (INSERT|UPDATE|DELETE).
+	// This can false-positive on read-only queries containing these keywords
+	// (e.g., WHERE action = 'UPDATE'), but the writable CTE transform checks
+	// the actual AST and is a no-op for non-writable CTEs.
 	if strings.Contains(upper, "WITH ") {
 		if containsAny(upper, "INSERT ", "UPDATE ", "DELETE ") {
 			flags |= FlagWritableCTE
@@ -408,18 +427,30 @@ func containsAny(s string, substrs ...string) bool {
 }
 
 // hasAnyPrefix returns true if s starts with any of the given prefixes.
-// The check is performed after trimming leading whitespace and comment blocks.
+// The check is performed after trimming leading whitespace, line comments (-- ...),
+// and block comments (/* ... */).
 func hasAnyPrefix(s string, prefixes ...string) bool {
-	// Skip leading whitespace (already uppercased)
 	trimmed := strings.TrimLeft(s, " \t\n\r")
 
-	// Skip block comments /* ... */
-	for strings.HasPrefix(trimmed, "/*") {
-		end := strings.Index(trimmed, "*/")
-		if end < 0 {
+	// Skip leading comments (line comments and block comments)
+	for {
+		if strings.HasPrefix(trimmed, "--") {
+			// Line comment: skip to end of line
+			nl := strings.IndexByte(trimmed, '\n')
+			if nl < 0 {
+				return false // entire string is a comment
+			}
+			trimmed = strings.TrimLeft(trimmed[nl+1:], " \t\n\r")
+		} else if strings.HasPrefix(trimmed, "/*") {
+			// Block comment: skip to closing */
+			end := strings.Index(trimmed, "*/")
+			if end < 0 {
+				return false // unclosed block comment
+			}
+			trimmed = strings.TrimLeft(trimmed[end+2:], " \t\n\r")
+		} else {
 			break
 		}
-		trimmed = strings.TrimLeft(trimmed[end+2:], " \t\n\r")
 	}
 
 	for _, prefix := range prefixes {
