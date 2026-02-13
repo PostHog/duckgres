@@ -20,6 +20,10 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// MaxGRPCMessageSize is the max gRPC message size for Flight SQL communication.
+// DuckDB query results can easily exceed the default 4MB limit.
+const MaxGRPCMessageSize = 1 << 30 // 1GB
+
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.
 type FlightExecutor struct {
@@ -36,6 +40,10 @@ type FlightExecutor struct {
 func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor, error) {
 	var dialOpts []grpc.DialOption
 	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(MaxGRPCMessageSize),
+		grpc.MaxCallSendMsgSize(MaxGRPCMessageSize),
+	))
 
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&bearerCreds{token: bearerToken}))

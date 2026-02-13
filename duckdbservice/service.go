@@ -131,6 +131,10 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 	handler := NewFlightSQLHandler(svc.pool)
 
 	var opts []grpc.ServerOption
+	opts = append(opts,
+		grpc.MaxRecvMsgSize(server.MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(server.MaxGRPCMessageSize),
+	)
 	if svc.cfg.BearerToken != "" {
 		opts = append(opts,
 			grpc.ChainUnaryInterceptor(BearerTokenUnaryInterceptor(svc.cfg.BearerToken)),
