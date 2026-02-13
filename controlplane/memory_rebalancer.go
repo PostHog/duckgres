@@ -28,9 +28,10 @@ type SessionLister interface {
 	AllSessions() []*ManagedSession
 }
 
-// MemoryRebalancer dynamically distributes memory and thread budgets across
-// active DuckDB sessions. On every session create/destroy, it recomputes
-// per-session limits and sends SET commands to all active sessions.
+// MemoryRebalancer dynamically distributes memory budgets across active DuckDB
+// sessions. On every session create/destroy, it recomputes per-session memory
+// limits and sends SET commands to all active sessions. Threads are not
+// subdivided — every session gets the full thread budget.
 //
 // Lock ordering invariant: r.mu → SessionManager.mu(RLock). Never acquire
 // r.mu while holding SessionManager.mu to avoid deadlock.
@@ -42,7 +43,7 @@ type MemoryRebalancer struct {
 	// They are read without holding mu by PerSessionMemoryLimit,
 	// PerSessionThreads, and MaxSessionsForBudget.
 	memoryBudget uint64 // total bytes for all sessions
-	threadBudget int    // total threads for all sessions
+	threadBudget int    // threads per session (not subdivided)
 
 	// Debounce: coalesce rapid rebalance requests
 	pendingRebalance chan struct{} // buffered(1), signals rebalance needed
@@ -146,15 +147,13 @@ func (r *MemoryRebalancer) doRebalance() {
 	}
 
 	memLimit := perSessionMemory(budget, count)
-	threads := perSessionThreads(threadBudget, count)
 	memStr := formatBytes(memLimit)
 
 	slog.Info("Rebalancing session resources.",
 		"sessions", count,
 		"memory_per_session", memStr,
-		"threads_per_session", threads,
-		"memory_budget", formatBytes(budget),
-		"thread_budget", threadBudget)
+		"threads", threadBudget,
+		"memory_budget", formatBytes(budget))
 
 	// Send SET commands without holding the rebalancer lock
 	ctx := context.Background()
@@ -169,7 +168,7 @@ func (r *MemoryRebalancer) doRebalance() {
 			slog.Warn("Failed to set memory_limit on session.", "pid", s.PID, "error", err)
 		}
 
-		if _, err := s.Executor.ExecContext(sessCtx, fmt.Sprintf("SET threads = %d", threads)); err != nil {
+		if _, err := s.Executor.ExecContext(sessCtx, fmt.Sprintf("SET threads = %d", threadBudget)); err != nil {
 			slog.Warn("Failed to set threads on session.", "pid", s.PID, "error", err)
 		}
 
@@ -186,13 +185,10 @@ func (r *MemoryRebalancer) PerSessionMemoryLimit(sessionCount int) string {
 	return formatBytes(perSessionMemory(r.memoryBudget, sessionCount))
 }
 
-// PerSessionThreads returns the current per-session thread count
-// based on the given session count.
-func (r *MemoryRebalancer) PerSessionThreads(sessionCount int) int {
-	if sessionCount <= 0 {
-		sessionCount = 1
-	}
-	return perSessionThreads(r.threadBudget, sessionCount)
+// PerSessionThreads returns the thread count for each session.
+// Threads are not subdivided — every session gets the full budget.
+func (r *MemoryRebalancer) PerSessionThreads() int {
+	return r.threadBudget
 }
 
 func perSessionMemory(budget uint64, count int) uint64 {
@@ -201,14 +197,6 @@ func perSessionMemory(budget uint64, count int) uint64 {
 		limit = minMemoryPerSession
 	}
 	return limit
-}
-
-func perSessionThreads(budget int, count int) int {
-	threads := budget / count
-	if threads < 1 {
-		threads = 1
-	}
-	return threads
 }
 
 // MaxSessionsForBudget returns the maximum number of sessions that can be
@@ -226,7 +214,7 @@ func (r *MemoryRebalancer) SetInitialLimits(ctx context.Context, session *Manage
 	}
 
 	memStr := r.PerSessionMemoryLimit(totalSessions)
-	threads := r.PerSessionThreads(totalSessions)
+	threads := r.PerSessionThreads()
 
 	setCtx, cancel := context.WithTimeout(ctx, rebalanceTimeout)
 	defer cancel()
