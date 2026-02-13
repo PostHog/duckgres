@@ -581,10 +581,6 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 		{"ALTER TABLE DROP NOT NULL", "ALTER TABLE users ALTER COLUMN name DROP NOT NULL", "ALTER TABLE"},
 		{"ALTER TABLE SET DEFAULT", "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'active'", "ALTER TABLE"},
 		{"ALTER TABLE DROP DEFAULT", "ALTER TABLE users ALTER COLUMN status DROP DEFAULT", "ALTER TABLE"},
-		{"REINDEX", "REINDEX TABLE users", "REINDEX"},
-		{"CLUSTER", "CLUSTER users USING idx_name", "CLUSTER"},
-		{"COMMENT ON", "COMMENT ON TABLE users IS 'User accounts'", "COMMENT"},
-		{"REFRESH MATERIALIZED VIEW", "REFRESH MATERIALIZED VIEW my_view", "REFRESH MATERIALIZED VIEW"},
 	}
 
 	tr := New(Config{DuckLakeMode: true})
@@ -1705,16 +1701,14 @@ func TestCountParameters(t *testing.T) {
 
 func TestTranspile_FallbackToNative(t *testing.T) {
 	// Test that FallbackToNative is set correctly when PostgreSQL parsing fails
-	// during Tier 1 (query has PG patterns but is invalid PG syntax).
-	// DuckDB-specific queries with no PG patterns go through Tier 0 (Direct)
-	// and return original SQL without FallbackToNative (no parse needed).
+	// but the query might be valid DuckDB syntax
 	tr := New(DefaultConfig())
 
 	tests := []struct {
 		name         string
 		input        string
 		wantFallback bool
-		wantSQL      string // expected SQL in result (original for direct/fallback)
+		wantSQL      string // expected SQL in result (original for fallback)
 		wantErrNil   bool   // whether err should be nil
 	}{
 		{
@@ -1735,92 +1729,108 @@ func TestTranspile_FallbackToNative(t *testing.T) {
 			wantFallback: false,
 			wantErrNil:   true,
 		},
-		// DuckDB-specific syntax: no PG patterns → Tier 0 Direct → original SQL returned.
-		// These used to trigger FallbackToNative (pg_query.Parse failed), but now the
-		// classifier returns Direct and the query goes to DuckDB without parsing at all.
+		// Note: COPY syntax is valid PostgreSQL, so it doesn't trigger fallback
+		// even if the FORMAT PARQUET is DuckDB-specific
 		{
-			name:       "DuckDB DESCRIBE statement - direct",
-			input:      "DESCRIBE SELECT * FROM users",
-			wantSQL:    "DESCRIBE SELECT * FROM users",
-			wantErrNil: true,
+			name:         "DuckDB DESCRIBE statement - fallback",
+			input:        "DESCRIBE SELECT * FROM users",
+			wantFallback: true,
+			wantSQL:      "DESCRIBE SELECT * FROM users",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB SUMMARIZE statement - direct",
-			input:      "SUMMARIZE SELECT * FROM users",
-			wantSQL:    "SUMMARIZE SELECT * FROM users",
-			wantErrNil: true,
+			name:         "DuckDB SUMMARIZE statement - fallback",
+			input:        "SUMMARIZE SELECT * FROM users",
+			wantFallback: true,
+			wantSQL:      "SUMMARIZE SELECT * FROM users",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB PIVOT syntax - direct",
-			input:      "PIVOT cities ON year USING sum(population)",
-			wantSQL:    "PIVOT cities ON year USING sum(population)",
-			wantErrNil: true,
+			name:         "DuckDB PIVOT syntax - fallback",
+			input:        "PIVOT cities ON year USING sum(population)",
+			wantFallback: true,
+			wantSQL:      "PIVOT cities ON year USING sum(population)",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB UNPIVOT syntax - direct",
-			input:      "UNPIVOT monthly_sales ON jan, feb, mar INTO NAME month VALUE sales",
-			wantSQL:    "UNPIVOT monthly_sales ON jan, feb, mar INTO NAME month VALUE sales",
-			wantErrNil: true,
+			name:         "DuckDB UNPIVOT syntax - fallback",
+			input:        "UNPIVOT monthly_sales ON jan, feb, mar INTO NAME month VALUE sales",
+			wantFallback: true,
+			wantSQL:      "UNPIVOT monthly_sales ON jan, feb, mar INTO NAME month VALUE sales",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB FROM-first syntax - direct",
-			input:      "FROM users SELECT name, email",
-			wantSQL:    "FROM users SELECT name, email",
-			wantErrNil: true,
+			name:         "DuckDB FROM-first syntax - fallback",
+			input:        "FROM users SELECT name, email",
+			wantFallback: true,
+			wantSQL:      "FROM users SELECT name, email",
+			wantErrNil:   true,
+		},
+		// Note: read_parquet() and read_csv() are valid PostgreSQL syntax
+		// (just function calls), so they don't trigger fallback.
+		// They only fail at execution time if the function doesn't exist.
+		{
+			name:         "DuckDB INSTALL extension - fallback",
+			input:        "INSTALL httpfs",
+			wantFallback: true,
+			wantSQL:      "INSTALL httpfs",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB INSTALL extension - direct",
-			input:      "INSTALL httpfs",
-			wantSQL:    "INSTALL httpfs",
-			wantErrNil: true,
+			name:         "DuckDB LOAD extension - fallback",
+			input:        "LOAD httpfs",
+			wantFallback: true,
+			wantSQL:      "LOAD httpfs",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB LOAD extension - direct",
-			input:      "LOAD httpfs",
-			wantSQL:    "LOAD httpfs",
-			wantErrNil: true,
+			name:         "DuckDB ATTACH database - fallback",
+			input:        "ATTACH 'my.db' AS mydb",
+			wantFallback: true,
+			wantSQL:      "ATTACH 'my.db' AS mydb",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB ATTACH database - direct",
-			input:      "ATTACH 'my.db' AS mydb",
-			wantSQL:    "ATTACH 'my.db' AS mydb",
-			wantErrNil: true,
+			name:         "DuckDB USE database - fallback",
+			input:        "USE mydb",
+			wantFallback: true,
+			wantSQL:      "USE mydb",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB USE database - direct",
-			input:      "USE mydb",
-			wantSQL:    "USE mydb",
-			wantErrNil: true,
+			name:         "DuckDB PRAGMA statement - fallback",
+			input:        "PRAGMA database_list",
+			wantFallback: true,
+			wantSQL:      "PRAGMA database_list",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB PRAGMA statement - direct",
-			input:      "PRAGMA database_list",
-			wantSQL:    "PRAGMA database_list",
-			wantErrNil: true,
+			name:         "DuckDB CREATE MACRO - fallback",
+			input:        "CREATE MACRO add(a, b) AS a + b",
+			wantFallback: true,
+			wantSQL:      "CREATE MACRO add(a, b) AS a + b",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB CREATE MACRO - direct",
-			input:      "CREATE MACRO add(a, b) AS a + b",
-			wantSQL:    "CREATE MACRO add(a, b) AS a + b",
-			wantErrNil: true,
+			name:         "DuckDB SELECT with EXCLUDE - fallback",
+			input:        "SELECT * EXCLUDE (password) FROM users",
+			wantFallback: true,
+			wantSQL:      "SELECT * EXCLUDE (password) FROM users",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB SELECT with EXCLUDE - direct",
-			input:      "SELECT * EXCLUDE (password) FROM users",
-			wantSQL:    "SELECT * EXCLUDE (password) FROM users",
-			wantErrNil: true,
+			name:         "DuckDB SELECT with REPLACE - fallback",
+			input:        "SELECT * REPLACE (upper(name) AS name) FROM users",
+			wantFallback: true,
+			wantSQL:      "SELECT * REPLACE (upper(name) AS name) FROM users",
+			wantErrNil:   true,
 		},
 		{
-			name:       "DuckDB SELECT with REPLACE - direct",
-			input:      "SELECT * REPLACE (upper(name) AS name) FROM users",
-			wantSQL:    "SELECT * REPLACE (upper(name) AS name) FROM users",
-			wantErrNil: true,
-		},
-		{
-			name:       "DuckDB QUALIFY clause - direct",
-			input:      "SELECT * FROM sales QUALIFY row_number() OVER (PARTITION BY region) = 1",
-			wantSQL:    "SELECT * FROM sales QUALIFY row_number() OVER (PARTITION BY region) = 1",
-			wantErrNil: true,
+			name:         "DuckDB QUALIFY clause - fallback",
+			input:        "SELECT * FROM sales QUALIFY row_number() OVER (PARTITION BY region) = 1",
+			wantFallback: true,
+			wantSQL:      "SELECT * FROM sales QUALIFY row_number() OVER (PARTITION BY region) = 1",
+			wantErrNil:   true,
 		},
 		{
 			name:         "valid PostgreSQL CTE - no fallback",
@@ -1858,8 +1868,8 @@ func TestTranspile_FallbackToNative(t *testing.T) {
 					tt.input, result.FallbackToNative, tt.wantFallback)
 			}
 
-			// For direct/fallback cases, SQL should be the original query
-			if tt.wantSQL != "" && result.SQL != tt.wantSQL {
+			// For fallback cases, SQL should be the original query
+			if tt.wantFallback && tt.wantSQL != "" && result.SQL != tt.wantSQL {
 				t.Errorf("Transpile(%q) SQL = %q, want %q",
 					tt.input, result.SQL, tt.wantSQL)
 			}
@@ -2257,51 +2267,43 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 }
 
 func TestTranspile_FallbackParamCount(t *testing.T) {
-	// Test that DuckDB-specific syntax with ConvertPlaceholders=true still correctly
-	// counts $N parameter placeholders.
-	// Queries with $ go through Tier 1 (FlagPlaceholder) → pg_query fails → FallbackToNative
-	// Queries without $ go through Tier 0 (Direct) → param count via regex (returns 0)
+	// Test that when pg_query fails to parse DuckDB-specific syntax,
+	// the transpiler still correctly counts $N parameter placeholders
+	// using regex-based counting.
 	tests := []struct {
-		name           string
-		input          string
-		paramCount     int
-		wantFallback   bool // true for Tier 1 (has $), false for Tier 0 (no $)
+		name       string
+		input      string
+		paramCount int
 	}{
 		{
-			name:         "DuckDB FROM-first with parameter",
-			input:        "FROM users SELECT name WHERE id = $1",
-			paramCount:   1,
-			wantFallback: true,
+			name:       "DuckDB FROM-first with parameter",
+			input:      "FROM users SELECT name WHERE id = $1",
+			paramCount: 1,
 		},
 		{
-			name:         "DuckDB SELECT EXCLUDE with parameter",
-			input:        "SELECT * EXCLUDE (email) FROM users WHERE id = $1",
-			paramCount:   1,
-			wantFallback: true,
+			name:       "DuckDB SELECT EXCLUDE with parameter",
+			input:      "SELECT * EXCLUDE (email) FROM users WHERE id = $1",
+			paramCount: 1,
 		},
 		{
-			name:         "DuckDB DESCRIBE with no params - Tier 0 Direct",
-			input:        "DESCRIBE SELECT 1 AS num",
-			paramCount:   0,
-			wantFallback: false, // No $ → no FlagPlaceholder → Tier 0 Direct
+			name:       "DuckDB DESCRIBE with no params",
+			input:      "DESCRIBE SELECT 1 AS num",
+			paramCount: 0,
 		},
 		{
-			name:         "DuckDB QUALIFY with multiple params",
-			input:        "SELECT id, name FROM users WHERE status = $1 QUALIFY row_number() OVER (ORDER BY id) <= $2",
-			paramCount:   2,
-			wantFallback: true,
+			name:       "DuckDB QUALIFY with multiple params",
+			input:      "SELECT id, name FROM users WHERE status = $1 QUALIFY row_number() OVER (ORDER BY id) <= $2",
+			paramCount: 2,
 		},
 		{
-			name:         "DuckDB list_filter with param",
-			input:        "SELECT list_filter([1, 2, 3, 4, 5], x -> x > $1) AS filtered",
-			paramCount:   1,
-			wantFallback: true,
+			name:       "DuckDB list_filter with param",
+			input:      "SELECT list_filter([1, 2, 3, 4, 5], x -> x > $1) AS filtered",
+			paramCount: 1,
 		},
 		{
-			name:         "Out of order params",
-			input:        "FROM users SELECT $3, $1, $2",
-			paramCount:   3,
-			wantFallback: true,
+			name:       "Out of order params",
+			input:      "FROM users SELECT $3, $1, $2",
+			paramCount: 3,
 		},
 	}
 
@@ -2313,8 +2315,8 @@ func TestTranspile_FallbackParamCount(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
 			}
-			if result.FallbackToNative != tt.wantFallback {
-				t.Errorf("Transpile(%q) FallbackToNative = %v, want %v", tt.input, result.FallbackToNative, tt.wantFallback)
+			if !result.FallbackToNative {
+				t.Errorf("Transpile(%q) should set FallbackToNative=true for DuckDB-specific syntax", tt.input)
 			}
 			if result.ParamCount != tt.paramCount {
 				t.Errorf("Transpile(%q) ParamCount = %d, want %d", tt.input, result.ParamCount, tt.paramCount)
@@ -2890,252 +2892,5 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
 			}
 		})
-	}
-}
-
-// --- Three-Tier Intercept Tests ---
-
-func TestClassify_Direct(t *testing.T) {
-	// Plain queries with no PostgreSQL-specific patterns should be classified as Direct
-	cfg := DefaultConfig()
-
-	tests := []struct {
-		name  string
-		input string
-	}{
-		{"simple select", "SELECT 1"},
-		{"select from table", "SELECT * FROM users"},
-		{"select with where", "SELECT * FROM users WHERE id = 1"},
-		{"insert", "INSERT INTO users (name) VALUES ('test')"},
-		{"update", "UPDATE users SET name = 'test' WHERE id = 1"},
-		{"delete", "DELETE FROM users WHERE id = 1"},
-		{"create table", "CREATE TABLE users (id INTEGER, name VARCHAR)"},
-		{"drop table", "DROP TABLE users"},
-		{"create schema", "CREATE SCHEMA test"},
-		{"CTE read-only", "WITH active AS (SELECT * FROM users WHERE active) SELECT * FROM active"},
-		{"subquery", "SELECT * FROM (SELECT id, name FROM users) AS u"},
-		{"JOIN", "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id"},
-		{"UNION", "SELECT name FROM users UNION SELECT name FROM admins"},
-		{"comment prefix", "/* sync_id:abc123 */ SELECT * FROM users"},
-		{"DuckDB DESCRIBE", "DESCRIBE SELECT * FROM users"},
-		{"DuckDB PRAGMA", "PRAGMA database_list"},
-		{"DuckDB FROM-first", "FROM users SELECT name"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cls := Classify(tt.input, cfg)
-			if !cls.Direct {
-				t.Errorf("Classify(%q) = {Direct: false, Flags: %d}, want Direct", tt.input, cls.Flags)
-			}
-		})
-	}
-}
-
-func TestClassify_NeedsTransform(t *testing.T) {
-	// Queries with PostgreSQL-specific patterns should return correct flags
-	cfg := DefaultConfig()
-
-	tests := []struct {
-		name      string
-		input     string
-		wantFlags TransformFlags // flags that MUST be set (may have more)
-	}{
-		{"SET command", "SET application_name = 'test'", FlagSetShow},
-		{"SHOW command", "SHOW server_version", FlagSetShow},
-		{"RESET command", "RESET ALL", FlagSetShow},
-		{"BEGIN", "BEGIN", FlagSetShow},
-		{"pg_catalog table", "SELECT * FROM pg_catalog.pg_class", FlagPgCatalog},
-		{"pg_class unqualified", "SELECT * FROM pg_class", FlagPgCatalog},
-		{"information_schema", "SELECT * FROM information_schema.columns", FlagInfoSchema},
-		{"public schema", "SELECT * FROM public.users", FlagPublicSchema},
-		{"version()", "SELECT version()", FlagVersion | FlagPgCatalog},
-		{"JSONB type", "CREATE TABLE t (data JSONB)", FlagTypeMapping | FlagPgCatalog},
-		{"BYTEA type", "CREATE TABLE t (data BYTEA)", FlagTypeMapping | FlagPgCatalog},
-		{"::regtype cast", "SELECT typname::regtype FROM pg_type", FlagTypeCast | FlagPgCatalog},
-		{"::regclass cast", "SELECT 'users'::regclass", FlagTypeCast | FlagPgCatalog},
-		{"array_agg function", "SELECT array_agg(x) FROM t", FlagFunctions | FlagPgCatalog},
-		{"current_database", "SELECT current_database()", FlagFuncAlias | FlagPgCatalog},
-		{"JSON arrow", "SELECT data->>'name' FROM t", FlagOperators | FlagPgCatalog},
-		{"regex operator", "SELECT * FROM t WHERE name ~ '^A'", FlagOperators | FlagPgCatalog},
-		{"FOR UPDATE", "SELECT * FROM t FOR UPDATE", FlagLocking},
-		{"ctid", "SELECT ctid FROM t", FlagCtid},
-		{"_pg_expandarray", "SELECT (_pg_expandarray(arr)).n FROM t", FlagExpandArray},
-		{"ON CONFLICT", "INSERT INTO t (id) VALUES (1) ON CONFLICT DO NOTHING", FlagOnConflict},
-		{"placeholder $1", "SELECT * FROM users WHERE id = $1", FlagPlaceholder},
-		{"SIMILAR TO", "SELECT 'hello' SIMILAR TO 'h%'", FlagOperators | FlagPgCatalog},
-		{"COLLATE", "SELECT * FROM t ORDER BY name COLLATE pg_catalog.default", FlagOperators | FlagPgCatalog},
-		{"SET with comment prefix", "/* ETL */ SET statement_timeout = 5000", FlagSetShow},
-		{"SET with line comment prefix", "-- setup\nSET statement_timeout = 5000", FlagSetShow},
-		{"SHOW after multiple comments", "-- first\n-- second\nSHOW server_version", FlagSetShow},
-		{"SET after mixed comments", "/* block */\n-- line\nSET search_path = 'main'", FlagSetShow},
-	}
-
-	for _, tt := range tests {
-		cfgToUse := cfg
-		// Enable ConvertPlaceholders for placeholder test
-		if tt.wantFlags&FlagPlaceholder != 0 {
-			cfgToUse = Config{ConvertPlaceholders: true}
-		}
-
-		t.Run(tt.name, func(t *testing.T) {
-			cls := Classify(tt.input, cfgToUse)
-			if cls.Direct {
-				t.Errorf("Classify(%q) = Direct, want flags containing %d", tt.input, tt.wantFlags)
-				return
-			}
-			if cls.Flags&tt.wantFlags != tt.wantFlags {
-				t.Errorf("Classify(%q) flags = %d, want flags to contain %d (missing: %d)",
-					tt.input, cls.Flags, tt.wantFlags, tt.wantFlags&^cls.Flags)
-			}
-		})
-	}
-}
-
-func TestClassify_DuckLakeMode(t *testing.T) {
-	cfg := Config{DuckLakeMode: true}
-
-	tests := []struct {
-		name      string
-		input     string
-		wantFlags TransformFlags
-	}{
-		{"CREATE INDEX is DDL", "CREATE INDEX idx ON users (name)", FlagDDL},
-		{"PRIMARY KEY is DDL", "CREATE TABLE t (id INT PRIMARY KEY)", FlagDDL},
-		{"SERIAL is DDL", "CREATE TABLE t (id SERIAL)", FlagDDL},
-		{"ALTER TABLE is DDL", "ALTER TABLE users ADD CONSTRAINT pk PRIMARY KEY (id)", FlagDDL},
-		{"VACUUM is DDL", "VACUUM users", FlagDDL},
-		{"CASCADE is DDL", "DROP TABLE users CASCADE", FlagDDL},
-		{"REINDEX is DDL", "REINDEX TABLE users", FlagDDL},
-		{"CLUSTER is DDL", "CLUSTER users USING idx_name", FlagDDL},
-		{"COMMENT ON is DDL", "COMMENT ON TABLE users IS 'desc'", FlagDDL},
-		{"REFRESH is DDL", "REFRESH MATERIALIZED VIEW my_view", FlagDDL},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cls := Classify(tt.input, cfg)
-			if cls.Direct {
-				t.Errorf("Classify(%q, DuckLake) = Direct, want flags containing %d", tt.input, tt.wantFlags)
-				return
-			}
-			if cls.Flags&tt.wantFlags != tt.wantFlags {
-				t.Errorf("Classify(%q, DuckLake) flags = %d, want flags to contain %d",
-					tt.input, cls.Flags, tt.wantFlags)
-			}
-		})
-	}
-
-	// Same queries should be Direct in non-DuckLake mode (except ones with other PG patterns)
-	nonDLCfg := DefaultConfig()
-	t.Run("CREATE INDEX direct in non-DuckLake", func(t *testing.T) {
-		cls := Classify("CREATE INDEX idx ON users (name)", nonDLCfg)
-		if !cls.Direct {
-			t.Errorf("CREATE INDEX should be Direct in non-DuckLake mode, got flags %d", cls.Flags)
-		}
-	})
-}
-
-func TestTier0MatchesTier1(t *testing.T) {
-	// Verify that queries classified as Direct produce the same result
-	// as running through the full pipeline via TranspileAll.
-	// This ensures the classifier doesn't miss any needed transforms.
-	tr := New(DefaultConfig())
-
-	directQueries := []string{
-		"SELECT 1",
-		"SELECT * FROM users",
-		"SELECT * FROM users WHERE id = 1",
-		"INSERT INTO users (name) VALUES ('test')",
-		"UPDATE users SET name = 'test' WHERE id = 1",
-		"DELETE FROM users WHERE id = 1",
-		"CREATE TABLE users (id INTEGER, name VARCHAR)",
-		"DROP TABLE users",
-		"SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id",
-		"SELECT name FROM users UNION SELECT name FROM admins",
-		"WITH cte AS (SELECT 1 AS id) SELECT * FROM cte",
-	}
-
-	for _, sql := range directQueries {
-		t.Run(sql, func(t *testing.T) {
-			// Verify it's classified as Direct
-			cls := Classify(sql, DefaultConfig())
-			if !cls.Direct {
-				t.Fatalf("Expected Direct classification for %q, got flags %d", sql, cls.Flags)
-			}
-
-			// Get Tier 0 result (Direct)
-			tier0Result, err := tr.Transpile(sql)
-			if err != nil {
-				t.Fatalf("Transpile(%q) error: %v", sql, err)
-			}
-
-			// Get full pipeline result
-			tier1Result, err := tr.TranspileAll(sql)
-			if err != nil {
-				t.Fatalf("TranspileAll(%q) error: %v", sql, err)
-			}
-
-			// Both should produce equivalent results
-			// Tier 0 returns original SQL; Tier 1 does parse+deparse which may normalize
-			// So we just check that both are non-empty and have the same metadata
-			if tier0Result.SQL == "" {
-				t.Error("Tier 0 returned empty SQL")
-			}
-			if tier1Result.SQL == "" {
-				t.Error("Tier 1 returned empty SQL")
-			}
-			if tier0Result.IsNoOp != tier1Result.IsNoOp {
-				t.Errorf("IsNoOp mismatch: Tier 0 = %v, Tier 1 = %v", tier0Result.IsNoOp, tier1Result.IsNoOp)
-			}
-			if tier0Result.IsIgnoredSet != tier1Result.IsIgnoredSet {
-				t.Errorf("IsIgnoredSet mismatch: Tier 0 = %v, Tier 1 = %v", tier0Result.IsIgnoredSet, tier1Result.IsIgnoredSet)
-			}
-			if tier0Result.FallbackToNative != tier1Result.FallbackToNative {
-				t.Errorf("FallbackToNative mismatch: Tier 0 = %v, Tier 1 = %v", tier0Result.FallbackToNative, tier1Result.FallbackToNative)
-			}
-		})
-	}
-}
-
-func BenchmarkTranspile_Direct(b *testing.B) {
-	// Tier 0: No PG patterns → skip parse entirely
-	tr := New(DefaultConfig())
-	query := "SELECT * FROM users WHERE id = 1"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = tr.Transpile(query)
-	}
-}
-
-func BenchmarkTranspile_OldAllTransforms(b *testing.B) {
-	// Full pipeline (TranspileAll) for comparison with Tier 0
-	tr := New(DefaultConfig())
-	query := "SELECT * FROM users WHERE id = 1"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = tr.TranspileAll(query)
-	}
-}
-
-func BenchmarkClassify(b *testing.B) {
-	cfg := DefaultConfig()
-	query := "SELECT * FROM users WHERE id = 1"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		Classify(query, cfg)
-	}
-}
-
-func BenchmarkClassify_PgCatalog(b *testing.B) {
-	cfg := DefaultConfig()
-	query := "SELECT * FROM pg_catalog.pg_class WHERE relkind = 'r'"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		Classify(query, cfg)
 	}
 }
