@@ -42,22 +42,10 @@ func TestPerSessionThreads(t *testing.T) {
 	r := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{})
 	t.Cleanup(r.Stop)
 
-	tests := []struct {
-		sessions int
-		want     int
-	}{
-		{1, 8},
-		{2, 4},
-		{4, 2},
-		{8, 1},
-		{16, 1}, // floor
-	}
-
-	for _, tt := range tests {
-		got := r.PerSessionThreads(tt.sessions)
-		if got != tt.want {
-			t.Errorf("PerSessionThreads(%d) = %d, want %d", tt.sessions, got, tt.want)
-		}
+	// Threads are not subdivided — every session gets the full budget
+	got := r.PerSessionThreads()
+	if got != 8 {
+		t.Errorf("PerSessionThreads() = %d, want 8", got)
 	}
 }
 
