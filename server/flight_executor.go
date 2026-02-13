@@ -36,6 +36,10 @@ type FlightExecutor struct {
 func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor, error) {
 	var dialOpts []grpc.DialOption
 	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(256*1024*1024),
+		grpc.MaxCallSendMsgSize(256*1024*1024),
+	))
 
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&bearerCreds{token: bearerToken}))
