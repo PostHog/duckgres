@@ -89,9 +89,14 @@ type Config struct {
 	DataDir string
 	Users   map[string]string // username -> password
 
-	// TLS configuration (required)
+	// TLS configuration (required unless ACME is configured)
 	TLSCertFile string // Path to TLS certificate file
 	TLSKeyFile  string // Path to TLS private key file
+
+	// ACME/Let's Encrypt configuration (alternative to static TLS cert/key)
+	ACMEDomain   string // Domain for ACME certificate (e.g., "decisive-mongoose-wine.us.duckgres.com")
+	ACMEEmail    string // Contact email for Let's Encrypt notifications
+	ACMECacheDir string // Directory for cached certificates (default: "./certs/acme")
 
 	// Rate limiting configuration
 	RateLimit RateLimitConfig
@@ -208,19 +213,12 @@ type Server struct {
 	// When this channel is closed, all active queries should be cancelled.
 	// This is used to propagate SIGUSR1 from signal handler to query execution.
 	externalCancelCh <-chan struct{}
+
+	// ACME manager for Let's Encrypt certificates (nil when using static certs)
+	acmeManager *ACMEManager
 }
 
 func New(cfg Config) (*Server, error) {
-	// TLS is required
-	if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
-		return nil, fmt.Errorf("TLS certificate and key are required")
-	}
-
-	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
-	}
-
 	// Use default rate limit config if not specified
 	if cfg.RateLimit.MaxFailedAttempts == 0 {
 		cfg.RateLimit = DefaultRateLimitConfig()
@@ -243,10 +241,31 @@ func New(cfg Config) (*Server, error) {
 		cfg:           cfg,
 		rateLimiter:   NewRateLimiter(cfg.RateLimit),
 		activeQueries: make(map[BackendKey]context.CancelFunc),
-		tlsConfig: &tls.Config{
+		duckLakeSem:   make(chan struct{}, 1),
+	}
+
+	// Configure TLS: ACME (Let's Encrypt) or static certificate files
+	if cfg.ACMEDomain != "" {
+		mgr, err := NewACMEManager(cfg.ACMEDomain, cfg.ACMEEmail, cfg.ACMECacheDir, ":80")
+		if err != nil {
+			return nil, fmt.Errorf("failed to start ACME manager: %w", err)
+		}
+		s.acmeManager = mgr
+		s.tlsConfig = mgr.TLSConfig()
+		slog.Info("TLS enabled via ACME/Let's Encrypt.", "domain", cfg.ACMEDomain)
+	} else {
+		// Static certificate files
+		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
+			return nil, fmt.Errorf("TLS certificate and key are required (or configure --acme-domain)")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
+		}
+		s.tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
-		},
-		duckLakeSem: make(chan struct{}, 1),
+		}
+		slog.Info("TLS enabled.", "cert_file", cfg.TLSCertFile)
 	}
 
 	// Initialize child tracker if process isolation is enabled
@@ -255,7 +274,6 @@ func New(cfg Config) (*Server, error) {
 		slog.Info("Process isolation enabled. Each connection will spawn a child process.")
 	}
 
-	slog.Info("TLS enabled.", "cert_file", cfg.TLSCertFile)
 	slog.Info("Rate limiting enabled.", "max_failed_attempts", cfg.RateLimit.MaxFailedAttempts, "window", cfg.RateLimit.FailedAttemptWindow, "ban_duration", cfg.RateLimit.BanDuration)
 	if cfg.IdleTimeout > 0 {
 		slog.Info("Idle timeout enabled.", "timeout", cfg.IdleTimeout)
@@ -347,6 +365,13 @@ func (s *Server) Close() error {
 		}
 	}
 
+	// Shut down ACME HTTP challenge listener if active
+	if s.acmeManager != nil {
+		if err := s.acmeManager.Close(); err != nil {
+			slog.Warn("ACME manager shutdown error.", "error", err)
+		}
+	}
+
 	// Database connections are now closed by each clientConn when it terminates
 	slog.Info("Shutdown complete.")
 	return nil
@@ -397,6 +422,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		// Force kill remaining children
 		if s.cfg.ProcessIsolation && s.childTracker != nil {
 			s.childTracker.SignalAll(syscall.SIGKILL)
+		}
+	}
+
+	// Shut down ACME HTTP challenge listener if active
+	if s.acmeManager != nil {
+		if err := s.acmeManager.Close(); err != nil {
+			slog.Warn("ACME manager shutdown error.", "error", err)
 		}
 	}
 

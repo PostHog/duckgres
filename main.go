@@ -40,8 +40,15 @@ type FileConfig struct {
 }
 
 type TLSConfig struct {
-	Cert string `yaml:"cert"`
-	Key  string `yaml:"key"`
+	Cert string     `yaml:"cert"`
+	Key  string     `yaml:"key"`
+	ACME ACMEConfig `yaml:"acme"`
+}
+
+type ACMEConfig struct {
+	Domain   string `yaml:"domain"`
+	Email    string `yaml:"email"`
+	CacheDir string `yaml:"cache_dir"`
 }
 
 type RateLimitFileConfig struct {
@@ -142,6 +149,10 @@ func main() {
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
 
+	// ACME/Let's Encrypt flags
+	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
+	acmeEmail := flag.String("acme-email", "", "Contact email for Let's Encrypt notifications (env: DUCKGRES_ACME_EMAIL)")
+
 	// DuckDB service flags
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
 	duckdbToken := flag.String("duckdb-token", "", "Bearer token for DuckDB service auth (duckdb-service mode, env: DUCKGRES_DUCKDB_TOKEN)")
@@ -167,6 +178,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_REBALANCE   Enable dynamic per-connection memory reallocation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MIN_WORKERS        Pre-warm worker count (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_WORKERS        Max worker processes (control-plane mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DOMAIN        Domain for ACME/Let's Encrypt certificate\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_EMAIL         Contact email for Let's Encrypt notifications\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_CACHE_DIR     Directory for ACME certificate cache\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
@@ -242,6 +256,8 @@ func main() {
 		MemoryRebalance:  *memoryRebalance,
 		MinWorkers:       *minWorkers,
 		MaxWorkers:       *maxWorkers,
+		ACMEDomain:       *acmeDomain,
+		ACMEEmail:        *acmeEmail,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})
@@ -341,11 +357,15 @@ func main() {
 		fatal("Failed to create data directory: " + err.Error())
 	}
 
-	// Auto-generate self-signed certificates if they don't exist
-	if err := server.EnsureCertificates(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
-		fatal("Failed to ensure TLS certificates: " + err.Error())
+	// Auto-generate self-signed certificates if they don't exist (skip when ACME is configured)
+	if cfg.ACMEDomain == "" {
+		if err := server.EnsureCertificates(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+			fatal("Failed to ensure TLS certificates: " + err.Error())
+		}
+		slog.Info("Using TLS certificates", "cert_file", cfg.TLSCertFile, "key_file", cfg.TLSKeyFile)
+	} else {
+		slog.Info("ACME/Let's Encrypt mode enabled", "domain", cfg.ACMEDomain)
 	}
-	slog.Info("Using TLS certificates", "cert_file", cfg.TLSCertFile, "key_file", cfg.TLSKeyFile)
 
 	// Handle control-plane mode
 	if *mode == "control-plane" {
