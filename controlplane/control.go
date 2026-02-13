@@ -48,6 +48,7 @@ type ControlPlane struct {
 	closeMu     sync.Mutex
 	wg          sync.WaitGroup
 	reloading   atomic.Bool // guards against concurrent selfExec from double SIGUSR1
+	handoverLn  net.Listener // current handover listener; protected by closeMu
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -538,21 +539,54 @@ func (cp *ControlPlane) selfExec() {
 
 	slog.Info("New control plane spawned.", "pid", cmd.Process.Pid)
 
-	// Reap the child in the background to avoid a zombie. The old CP normally
-	// exits via os.Exit(0) in handleHandoverRequest before the child finishes,
-	// but if handover fails the child may exit first and needs to be reaped.
+	// Reap the child in the background to avoid a zombie. If the child exits
+	// before completing the handover (e.g. config error, crash, killed by
+	// systemd reload timeout), we must recover so the old CP exits the
+	// RELOADING state and the handover listener doesn't block forever.
 	go func() {
-		if err := cmd.Wait(); err != nil {
+		err := cmd.Wait()
+		if err != nil {
 			slog.Warn("Self-exec'd process exited with error.", "error", err)
+		}
+
+		// If we're still in reloading state, the handover never completed.
+		// handleHandoverRequest may also be trying to recover (child connected
+		// but died mid-protocol), so recoverFromFailedReload uses CAS to
+		// ensure only one goroutine runs the full recovery path.
+		//
+		// cancelHandoverListener must be inside the CAS winner branch —
+		// otherwise it could close a listener that handleHandoverRequest's
+		// recovery already created.
+		if cp.recoverFromFailedReload() {
+			slog.Warn("Child process exited before completing handover, recovering.", "error", err)
+			cp.cancelHandoverListener()
+			cp.startHandoverListener()
 		}
 	}()
 }
 
-// recoverFromFailedReload cancels the RELOADING state, resets the guard flag,
-// and restarts the handover listener so a future SIGUSR1 can retry.
-func (cp *ControlPlane) recoverFromFailedReload() {
+// cancelHandoverListener closes the current handover listener, unblocking
+// any goroutine stuck in Accept().
+func (cp *ControlPlane) cancelHandoverListener() {
+	cp.closeMu.Lock()
+	defer cp.closeMu.Unlock()
+	if cp.handoverLn != nil {
+		_ = cp.handoverLn.Close()
+		cp.handoverLn = nil
+	}
+}
+
+// recoverFromFailedReload atomically exits the RELOADING state and notifies
+// systemd that the service is ready again. Returns true if this call won the
+// race (i.e. actually recovered). Callers that need to restart the handover
+// listener should only do so when this returns true, to avoid duplicate
+// listeners.
+func (cp *ControlPlane) recoverFromFailedReload() bool {
+	if !cp.reloading.CompareAndSwap(true, false) {
+		return false // another goroutine already recovered
+	}
 	if err := sdNotify("READY=1"); err != nil {
 		slog.Warn("sd_notify READY (recovery) failed.", "error", err)
 	}
-	cp.reloading.Store(false)
+	return true
 }
