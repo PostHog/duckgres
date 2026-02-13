@@ -20,6 +20,7 @@ type configCLIInputs struct {
 	MemoryLimit      string
 	Threads          int
 	MemoryBudget     string
+	MemoryRebalance  bool
 	MaxWorkers       int
 	MinWorkers       int
 }
@@ -152,6 +153,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.MemoryBudget != "" {
 			cfg.MemoryBudget = fileCfg.MemoryBudget
 		}
+		if fileCfg.MemoryRebalance != nil {
+			cfg.MemoryRebalance = *fileCfg.MemoryRebalance
+		}
 		if fileCfg.MaxWorkers != 0 {
 			cfg.MaxWorkers = fileCfg.MaxWorkers
 		}
@@ -247,6 +251,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_MEMORY_BUDGET"); v != "" {
 		cfg.MemoryBudget = v
 	}
+	if v := getenv("DUCKGRES_MEMORY_REBALANCE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.MemoryRebalance = b
+		} else {
+			warn("Invalid DUCKGRES_MEMORY_REBALANCE: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_MIN_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.MinWorkers = n
@@ -295,6 +306,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["memory-budget"] {
 		cfg.MemoryBudget = cli.MemoryBudget
+	}
+	if cli.Set["memory-rebalance"] {
+		cfg.MemoryRebalance = cli.MemoryRebalance
 	}
 	if cli.Set["min-workers"] {
 		cfg.MinWorkers = cli.MinWorkers

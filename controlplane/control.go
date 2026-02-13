@@ -85,24 +85,34 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.RateLimit = server.DefaultRateLimitConfig()
 	}
 
-	// Initialize memory rebalancer first to compute dynamic max-workers cap
+	// Initialize memory rebalancer to compute dynamic max-workers cap.
+	// Rebalancing is disabled by default: each session gets a static allocation
+	// (budget/max_workers). Enable with --memory-rebalance to dynamically
+	// redistribute memory on every connect/disconnect.
 	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
-	rebalancer := NewMemoryRebalancer(memBudget, 0, nil) // sessions wired below
+	maxWorkers := cfg.MaxWorkers
+
+	// We need a temporary rebalancer to compute MaxSessionsForBudget before
+	// we know the final maxWorkers value. Create with enabled=false initially.
+	tempRebalancer := NewMemoryRebalancer(memBudget, 0, nil, false, 0)
+	memBudget = tempRebalancer.memoryBudget // capture auto-detected value
 
 	// If max_workers is not set, derive it from the memory budget to prevent
 	// overcommit: budget / 256MB floor = max sessions before every session
 	// is pinned to the minimum allocation.
-	maxWorkers := cfg.MaxWorkers
 	if maxWorkers == 0 {
-		maxWorkers = rebalancer.MaxSessionsForBudget()
+		maxWorkers = tempRebalancer.MaxSessionsForBudget()
 		slog.Info("Derived max_workers from memory budget.",
 			"max_workers", maxWorkers,
-			"memory_budget", formatBytes(rebalancer.memoryBudget))
-	} else if maxWorkers > rebalancer.MaxSessionsForBudget() {
+			"memory_budget", formatBytes(memBudget))
+	} else if maxWorkers > tempRebalancer.MaxSessionsForBudget() {
 		slog.Warn("max_workers exceeds memory budget capacity; sessions may overcommit memory.",
 			"max_workers", maxWorkers,
-			"budget_capacity", rebalancer.MaxSessionsForBudget())
+			"budget_capacity", tempRebalancer.MaxSessionsForBudget())
 	}
+
+	// Now create the real rebalancer with the final maxWorkers value
+	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance, maxWorkers)
 
 	// Validate min_workers <= max_workers
 	minWorkers := cfg.MinWorkers
@@ -215,7 +225,8 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"pg_addr", cp.pgListener.Addr().String(),
 		"min_workers", minWorkers,
 		"max_workers", maxWorkers,
-		"memory_budget", formatBytes(rebalancer.memoryBudget))
+		"memory_budget", formatBytes(rebalancer.memoryBudget),
+		"memory_rebalance", cfg.MemoryRebalance)
 
 	// Handle signals
 	go func() {

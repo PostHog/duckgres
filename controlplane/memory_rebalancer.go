@@ -33,17 +33,22 @@ type SessionLister interface {
 // limits and sends SET commands to all active sessions. Threads are not
 // subdivided — every session gets the full thread budget.
 //
+// When enabled is false, dynamic rebalancing is disabled: each new session
+// gets a static allocation (budget/maxWorkers) at creation time but existing
+// sessions are never adjusted on connect/disconnect.
+//
 // Lock ordering invariant: r.mu → SessionManager.mu(RLock). Never acquire
 // r.mu while holding SessionManager.mu to avoid deadlock.
 type MemoryRebalancer struct {
 	mu       sync.Mutex
 	sessions SessionLister // mutable: set via SetSessionLister
 
-	// memoryBudget and threadBudget are immutable after construction.
-	// They are read without holding mu by PerSessionMemoryLimit,
-	// PerSessionThreads, and MaxSessionsForBudget.
+	// memoryBudget, threadBudget, maxWorkers, and enabled are immutable
+	// after construction.
 	memoryBudget uint64 // total bytes for all sessions
 	threadBudget int    // threads per session (not subdivided)
+	maxWorkers   int    // used for static allocation when rebalancing is disabled
+	enabled      bool   // when false, skip dynamic rebalancing
 
 	// Debounce: coalesce rapid rebalance requests
 	pendingRebalance chan struct{} // buffered(1), signals rebalance needed
@@ -53,7 +58,9 @@ type MemoryRebalancer struct {
 // NewMemoryRebalancer creates a rebalancer with the given budgets.
 // If memoryBudget is 0, it defaults to 75% of system RAM.
 // If threadBudget is 0, it defaults to runtime.NumCPU().
-func NewMemoryRebalancer(memoryBudget uint64, threadBudget int, sessions SessionLister) *MemoryRebalancer {
+// If enabled is false, dynamic rebalancing is disabled: RequestRebalance is
+// a no-op and SetInitialLimits uses a static allocation (budget/maxWorkers).
+func NewMemoryRebalancer(memoryBudget uint64, threadBudget int, sessions SessionLister, enabled bool, maxWorkers int) *MemoryRebalancer {
 	if memoryBudget == 0 {
 		totalMem := server.SystemMemoryBytes()
 		if totalMem > 0 {
@@ -69,13 +76,17 @@ func NewMemoryRebalancer(memoryBudget uint64, threadBudget int, sessions Session
 	r := &MemoryRebalancer{
 		memoryBudget:     memoryBudget,
 		threadBudget:     threadBudget,
+		maxWorkers:       maxWorkers,
+		enabled:          enabled,
 		sessions:         sessions,
 		pendingRebalance: make(chan struct{}, 1),
 		stopDebounce:     make(chan struct{}),
 	}
 
-	// Start background debounce goroutine
-	go r.debounceLoop()
+	// Only start background debounce goroutine when rebalancing is enabled
+	if enabled {
+		go r.debounceLoop()
+	}
 
 	return r
 }
@@ -95,7 +106,11 @@ func (r *MemoryRebalancer) Stop() {
 
 // RequestRebalance signals that a rebalance is needed. Multiple rapid calls
 // are coalesced — the actual rebalance runs at most once per debounce interval.
+// When rebalancing is disabled, this is a no-op.
 func (r *MemoryRebalancer) RequestRebalance() {
+	if !r.enabled {
+		return
+	}
 	// Non-blocking send to buffered(1) channel — if a rebalance is already
 	// pending, this is a no-op (the pending rebalance will pick up new state).
 	select {
@@ -208,12 +223,23 @@ func (r *MemoryRebalancer) MaxSessionsForBudget() int {
 
 // SetInitialLimits sets memory_limit and threads on a single session synchronously.
 // Called during CreateSession so the new session never runs with unlimited resources.
+// When rebalancing is disabled, uses a static allocation based on budget/maxWorkers.
 func (r *MemoryRebalancer) SetInitialLimits(ctx context.Context, session *ManagedSession, totalSessions int) {
 	if session == nil || session.Executor == nil {
 		return
 	}
 
-	memStr := r.PerSessionMemoryLimit(totalSessions)
+	var memStr string
+	if r.enabled {
+		memStr = r.PerSessionMemoryLimit(totalSessions)
+	} else {
+		// Static allocation: divide budget by maxWorkers (or use full budget if maxWorkers is 0)
+		divisor := r.maxWorkers
+		if divisor <= 0 {
+			divisor = 1
+		}
+		memStr = formatBytes(perSessionMemory(r.memoryBudget, divisor))
+	}
 	threads := r.PerSessionThreads()
 
 	setCtx, cancel := context.WithTimeout(ctx, rebalanceTimeout)
