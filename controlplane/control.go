@@ -98,6 +98,18 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		slog.Info("Derived max_workers from memory budget.",
 			"max_workers", maxWorkers,
 			"memory_budget", formatBytes(rebalancer.memoryBudget))
+	} else if maxWorkers > rebalancer.MaxSessionsForBudget() {
+		slog.Warn("max_workers exceeds memory budget capacity; sessions may overcommit memory.",
+			"max_workers", maxWorkers,
+			"budget_capacity", rebalancer.MaxSessionsForBudget())
+	}
+
+	// Validate min_workers <= max_workers
+	minWorkers := cfg.MinWorkers
+	if minWorkers > maxWorkers {
+		slog.Warn("min_workers exceeds max_workers; capping to max_workers.",
+			"min_workers", minWorkers, "max_workers", maxWorkers)
+		minWorkers = maxWorkers
 	}
 
 	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
@@ -168,13 +180,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 
 	// Pre-warm workers if min_workers is set
-	if cfg.MinWorkers > 0 {
-		if err := cp.pool.SpawnMinWorkers(cfg.MinWorkers); err != nil {
+	if minWorkers > 0 {
+		if err := cp.pool.SpawnMinWorkers(minWorkers); err != nil {
 			slog.Error("Failed to spawn min workers.", "error", err)
 			os.Exit(1)
 		}
 	}
-
 
 	// Start health check loop with crash notification
 	onCrash := func(workerID int) {
@@ -202,7 +213,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
-		"min_workers", cfg.MinWorkers,
+		"min_workers", minWorkers,
 		"max_workers", maxWorkers,
 		"memory_budget", formatBytes(rebalancer.memoryBudget))
 

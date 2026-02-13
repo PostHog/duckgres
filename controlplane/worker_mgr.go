@@ -35,6 +35,10 @@ type SessionCounter interface {
 }
 
 // FlightWorkerPool manages a pool of duckdb-service worker processes.
+//
+// Lock ordering invariant: pool.mu → SessionManager.mu(RLock).
+// findIdleWorkerLocked calls SessionCountForWorker while holding pool.mu.
+// Never acquire pool.mu while holding SessionManager.mu to avoid deadlock.
 type FlightWorkerPool struct {
 	mu             sync.RWMutex
 	workers        map[int]*ManagedWorker
@@ -277,7 +281,7 @@ func (p *FlightWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 }
 
 // RetireWorker stops a worker process and cleans up its resources.
-// Sends SIGTERM, waits up to 3s, then SIGKILL. Runs asynchronously
+// Sends SIGINT, waits up to 3s, then SIGKILL. Runs asynchronously
 // to avoid blocking the calling goroutine (e.g., connection handler).
 func (p *FlightWorkerPool) RetireWorker(id int) {
 	p.mu.Lock()
@@ -307,7 +311,7 @@ func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) {
 func retireWorkerProcess(w *ManagedWorker) {
 	slog.Info("Retiring worker.", "id", w.ID)
 
-	// Send SIGTERM first so the worker can drain in-flight requests
+	// Send SIGINT first so the worker can drain in-flight requests
 	if w.cmd.Process != nil {
 		_ = w.cmd.Process.Signal(os.Interrupt)
 	}
@@ -332,14 +336,6 @@ func retireWorkerProcess(w *ManagedWorker) {
 	// Clean up socket
 	_ = os.Remove(w.socketPath)
 }
-
-// WorkerCount returns the number of active workers.
-func (p *FlightWorkerPool) WorkerCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.workers)
-}
-
 
 // ShutdownAll stops all workers gracefully.
 func (p *FlightWorkerPool) ShutdownAll() {

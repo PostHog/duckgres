@@ -94,7 +94,7 @@ func ValidateMemoryLimit(v string) bool {
 }
 
 // ParseMemoryBytes parses a DuckDB memory size string (e.g., "4GB", "512MB", "1.5GB") into bytes.
-// Supports both integer and fractional values. Returns 0 if the string is empty or invalid.
+// Supports both integer and fractional values. Returns 0 if the string is empty, invalid, or "0GB".
 func ParseMemoryBytes(s string) uint64 {
 	if s == "" {
 		return 0

@@ -35,10 +35,14 @@ type SessionLister interface {
 // Lock ordering invariant: r.mu → SessionManager.mu(RLock). Never acquire
 // r.mu while holding SessionManager.mu to avoid deadlock.
 type MemoryRebalancer struct {
-	mu           sync.Mutex
+	mu       sync.Mutex
+	sessions SessionLister // mutable: set via SetSessionLister
+
+	// memoryBudget and threadBudget are immutable after construction.
+	// They are read without holding mu by PerSessionMemoryLimit,
+	// PerSessionThreads, and MaxSessionsForBudget.
 	memoryBudget uint64 // total bytes for all sessions
 	threadBudget int    // total threads for all sessions
-	sessions     SessionLister
 
 	// Debounce: coalesce rapid rebalance requests
 	pendingRebalance chan struct{} // buffered(1), signals rebalance needed
@@ -106,8 +110,13 @@ func (r *MemoryRebalancer) debounceLoop() {
 		case <-r.stopDebounce:
 			return
 		case <-r.pendingRebalance:
-			// Wait briefly to coalesce rapid connect/disconnect bursts
-			time.Sleep(rebalanceDebounce)
+			// Wait briefly to coalesce rapid connect/disconnect bursts,
+			// but respect shutdown signals during the debounce window.
+			select {
+			case <-r.stopDebounce:
+				return
+			case <-time.After(rebalanceDebounce):
+			}
 			// Drain any additional signals that arrived during the debounce
 			select {
 			case <-r.pendingRebalance:

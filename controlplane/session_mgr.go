@@ -116,12 +116,17 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		_ = session.Executor.Close()
 	}
 
-	// Destroy session on worker (best effort)
+	// Destroy session on worker (best effort, skip if worker already dead)
 	worker, ok := sm.pool.Worker(session.WorkerID)
 	if ok {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = worker.DestroySession(ctx, session.SessionToken)
-		cancel()
+		select {
+		case <-worker.done:
+			// Worker already dead, skip RPC
+		default:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = worker.DestroySession(ctx, session.SessionToken)
+			cancel()
+		}
 	}
 
 	// Retire the dedicated worker (1:1 model)
