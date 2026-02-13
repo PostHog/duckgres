@@ -132,8 +132,8 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 
 	var opts []grpc.ServerOption
 	opts = append(opts,
-		grpc.MaxRecvMsgSize(1024*1024*1024),
-		grpc.MaxSendMsgSize(1024*1024*1024),
+		grpc.MaxRecvMsgSize(server.MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(server.MaxGRPCMessageSize),
 	)
 	if svc.cfg.BearerToken != "" {
 		opts = append(opts,
