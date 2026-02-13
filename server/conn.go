@@ -31,6 +31,26 @@ import (
 // processed. This signals serve() to exit without creating a DB connection.
 var errCancelHandled = errors.New("cancel request handled")
 
+// cursorOp identifies cursor-related statement types detected during Parse.
+type cursorOp int
+
+const (
+	cursorOpNone    cursorOp = iota
+	cursorOpDeclare          // DECLARE cursor_name CURSOR FOR ...
+	cursorOpFetch            // FETCH [count] FROM cursor_name
+	cursorOpClose            // CLOSE cursor_name / CLOSE ALL
+)
+
+// cursorState holds the state of an emulated server-side cursor.
+type cursorState struct {
+	query    string        // Inner SELECT query (transpiled)
+	rows     RowSet        // Open result set (nil until first FETCH)
+	cols     []string      // Column names (cached after first FETCH)
+	colTypes []ColumnTyper // Column types (cached after first FETCH)
+	typeOIDs []int32       // PG type OIDs (cached after first FETCH)
+	cleanup  func()        // Query context cleanup
+}
+
 type preparedStmt struct {
 	query             string
 	convertedQuery    string
@@ -42,6 +62,10 @@ type preparedStmt struct {
 	described         bool     // True if Describe(S) was called on this statement
 	statements        []string // Multi-statement rewrite (e.g., writable CTE)
 	cleanupStatements []string // Cleanup statements for multi-statement (DROP temp tables, COMMIT)
+	cursorOp          cursorOp // Cursor operation type (for Extended Query)
+	cursorName        string   // Cursor name
+	cursorQuery       string   // Transpiled inner SELECT (for DECLARE)
+	fetchCount        int64    // FETCH row count
 }
 
 type portal struct {
@@ -118,6 +142,7 @@ type clientConn struct {
 	portals     map[string]*portal       // portals by name
 	txStatus    byte                     // current transaction status ('I', 'T', or 'E')
 	passthrough bool                     // true for passthrough users (skip transpiler + pg_catalog)
+	cursors     map[string]*cursorState  // server-side cursor emulation
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -395,6 +420,7 @@ func (c *clientConn) serve() error {
 	c.secretKey = generateSecretKey()
 	c.stmts = make(map[string]*preparedStmt)
 	c.portals = make(map[string]*portal)
+	c.cursors = make(map[string]*cursorState)
 	c.txStatus = txStatusIdle
 
 	// Handle startup
@@ -432,13 +458,14 @@ func (c *clientConn) serve() error {
 		// refresh for pre-created connections via DBPool.
 		stopRefresh = StartCredentialRefresh(db, c.server.cfg.DuckLake)
 	}
-	// Defers run LIFO: first stop the credential refresh goroutine (so it won't
-	// call db.Exec on a closed DB), then clean up the database connection.
+	// Defers run LIFO: close cursors first (they hold open RowSets), then stop
+	// credential refresh, then clean up the database connection.
 	defer func() {
 		if c.executor != nil {
 			c.safeCleanupDB()
 		}
 	}()
+	defer c.closeAllCursors()
 	defer func() {
 		if stopRefresh != nil {
 			stopRefresh()
@@ -677,6 +704,23 @@ func (c *clientConn) handleQuery(body []byte) error {
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
+
+	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
+	// or transpilation. DuckDB doesn't support these natively, so cursor
+	// emulation is needed for all users including passthrough.
+	{
+		tree, parseErr := pg_query.Parse(query)
+		if parseErr == nil && len(tree.Stmts) == 1 {
+			switch s := tree.Stmts[0].Stmt.Node.(type) {
+			case *pg_query.Node_DeclareCursorStmt:
+				return c.handleDeclareCursor(s.DeclareCursorStmt)
+			case *pg_query.Node_FetchStmt:
+				return c.handleFetchCursor(s.FetchStmt)
+			case *pg_query.Node_ClosePortalStmt:
+				return c.handleCloseCursor(s.ClosePortalStmt)
+			}
+		}
+	}
 
 	// Passthrough mode: skip all transpilation, send query directly to DuckDB
 	if c.passthrough {
@@ -1005,6 +1049,121 @@ func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error
 // client (so the caller can stop processing a batch), or (false, err) for
 // fatal connection errors.
 func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
+	// Check for cursor operations before transpilation
+	tree, parseErr := pg_query.Parse(query)
+	if parseErr == nil && len(tree.Stmts) == 1 {
+		switch s := tree.Stmts[0].Stmt.Node.(type) {
+		case *pg_query.Node_DeclareCursorStmt:
+			innerSQL := deparseInnerQuery(s.DeclareCursorStmt.Query)
+			if innerSQL == "" {
+				c.sendError("ERROR", "42601", "could not deparse cursor query")
+				return true, nil
+			}
+			transpiledSQL := innerSQL
+			if !c.passthrough {
+				tr := c.newTranspiler(false)
+				result, err := tr.Transpile(innerSQL)
+				if err != nil {
+					c.sendError("ERROR", "42601", fmt.Sprintf("syntax error in cursor query: %v", err))
+					return true, nil
+				}
+				transpiledSQL = result.SQL
+				if result.FallbackToNative {
+					transpiledSQL = innerSQL
+				}
+			}
+			c.closeCursor(s.DeclareCursorStmt.Portalname)
+			c.cursors[s.DeclareCursorStmt.Portalname] = &cursorState{query: transpiledSQL}
+			_ = writeCommandComplete(c.writer, "DECLARE CURSOR")
+			return false, nil
+
+		case *pg_query.Node_FetchStmt:
+			if !isFetchForwardOnly(s.FetchStmt.Direction) {
+				c.sendError("ERROR", "0A000", "cursor can only scan forward")
+				return true, nil
+			}
+			cursor, ok := c.cursors[s.FetchStmt.Portalname]
+			if !ok {
+				c.sendError("ERROR", "34000", fmt.Sprintf("cursor %q does not exist", s.FetchStmt.Portalname))
+				return true, nil
+			}
+			if cursor.rows == nil {
+				if err := c.openCursor(cursor); err != nil {
+					if isQueryCancelled(err) {
+						c.sendError("ERROR", "57014", "canceling statement due to user request")
+					} else {
+						c.sendError("ERROR", "42000", err.Error())
+					}
+					c.setTxError()
+					return true, nil
+				}
+			}
+			howMany := s.FetchStmt.HowMany
+			if howMany < 0 {
+				c.sendError("ERROR", "0A000", "cursor can only scan forward")
+				return true, nil
+			}
+			if s.FetchStmt.Ismove {
+				moveCount := int64(0)
+				for moveCount < howMany && cursor.rows.Next() {
+					values := make([]interface{}, len(cursor.cols))
+					valuePtrs := make([]interface{}, len(cursor.cols))
+					for i := range values {
+						valuePtrs[i] = &values[i]
+					}
+					_ = cursor.rows.Scan(valuePtrs...)
+					moveCount++
+				}
+				_ = writeCommandComplete(c.writer, fmt.Sprintf("MOVE %d", moveCount))
+				return false, nil
+			}
+			if err := c.sendRowDescription(cursor.cols, cursor.colTypes); err != nil {
+				return false, err
+			}
+			rowCount := int64(0)
+			for rowCount < howMany && cursor.rows.Next() {
+				values := make([]interface{}, len(cursor.cols))
+				valuePtrs := make([]interface{}, len(cursor.cols))
+				for i := range values {
+					valuePtrs[i] = &values[i]
+				}
+				if err := cursor.rows.Scan(valuePtrs...); err != nil {
+					c.sendError("ERROR", "42000", err.Error())
+					c.setTxError()
+					return true, nil
+				}
+				if err := c.sendDataRowWithFormats(values, nil, cursor.typeOIDs); err != nil {
+					return false, err
+				}
+				rowCount++
+			}
+			if err := cursor.rows.Err(); err != nil {
+				if isQueryCancelled(err) {
+					c.sendError("ERROR", "57014", "canceling statement due to user request")
+				} else {
+					c.sendError("ERROR", "42000", err.Error())
+				}
+				c.setTxError()
+				return true, nil
+			}
+			_ = writeCommandComplete(c.writer, fmt.Sprintf("FETCH %d", rowCount))
+			return false, nil
+
+		case *pg_query.Node_ClosePortalStmt:
+			if s.ClosePortalStmt.Portalname == "" {
+				c.closeAllCursors()
+			} else {
+				if _, ok := c.cursors[s.ClosePortalStmt.Portalname]; !ok {
+					c.sendError("ERROR", "34000", fmt.Sprintf("cursor %q does not exist", s.ClosePortalStmt.Portalname))
+					return true, nil
+				}
+				c.closeCursor(s.ClosePortalStmt.Portalname)
+			}
+			_ = writeCommandComplete(c.writer, "CLOSE CURSOR")
+			return false, nil
+		}
+	}
+
 	// Transpile
 	tr := c.newTranspiler(false)
 	result, err := tr.Transpile(query)
@@ -1686,6 +1845,7 @@ func (c *clientConn) updateTxStatus(cmdType string) {
 		c.txStatus = txStatusTransaction
 	case "COMMIT", "ROLLBACK":
 		c.txStatus = txStatusIdle
+		c.closeAllCursors()
 	}
 	// For other commands, keep the current status
 }
@@ -3054,6 +3214,62 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
+	// Detect cursor operations before passthrough or transpilation.
+	// DuckDB doesn't support DECLARE/FETCH/CLOSE natively, so cursor
+	// emulation is needed for all users including passthrough.
+	cursorTree, cursorParseErr := pg_query.Parse(query)
+	if cursorParseErr == nil && len(cursorTree.Stmts) == 1 {
+		switch s := cursorTree.Stmts[0].Stmt.Node.(type) {
+		case *pg_query.Node_DeclareCursorStmt:
+			innerSQL := deparseInnerQuery(s.DeclareCursorStmt.Query)
+			transpiledSQL := innerSQL
+			if !c.passthrough && innerSQL != "" {
+				tr := c.newTranspiler(true)
+				innerResult, innerErr := tr.Transpile(innerSQL)
+				if innerErr == nil && !innerResult.FallbackToNative {
+					transpiledSQL = innerResult.SQL
+				}
+			}
+			delete(c.stmts, stmtName)
+			c.stmts[stmtName] = &preparedStmt{
+				query:          query,
+				convertedQuery: query,
+				cursorOp:       cursorOpDeclare,
+				cursorName:     s.DeclareCursorStmt.Portalname,
+				cursorQuery:    transpiledSQL,
+			}
+			_ = writeParseComplete(c.writer)
+			return
+
+		case *pg_query.Node_FetchStmt:
+			if !isFetchForwardOnly(s.FetchStmt.Direction) || s.FetchStmt.HowMany < 0 {
+				c.sendError("ERROR", "0A000", "cursor can only scan forward")
+				return
+			}
+			delete(c.stmts, stmtName)
+			c.stmts[stmtName] = &preparedStmt{
+				query:          query,
+				convertedQuery: query,
+				cursorOp:       cursorOpFetch,
+				cursorName:     s.FetchStmt.Portalname,
+				fetchCount:     s.FetchStmt.HowMany,
+			}
+			_ = writeParseComplete(c.writer)
+			return
+
+		case *pg_query.Node_ClosePortalStmt:
+			delete(c.stmts, stmtName)
+			c.stmts[stmtName] = &preparedStmt{
+				query:          query,
+				convertedQuery: query,
+				cursorOp:       cursorOpClose,
+				cursorName:     s.ClosePortalStmt.Portalname,
+			}
+			_ = writeParseComplete(c.writer)
+			return
+		}
+	}
+
 	// Passthrough mode: skip transpilation, store query directly
 	if c.passthrough {
 		// Count $N parameters with a simple regex (pg_query.Parse may fail on DuckDB-native SQL)
@@ -3252,6 +3468,24 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 		c.sendParameterDescription(paramTypes)
 
+		// Handle cursor operations in Describe
+		switch ps.cursorOp {
+		case cursorOpDeclare, cursorOpClose:
+			// DECLARE and CLOSE don't return rows
+			_ = writeNoData(c.writer)
+			return
+		case cursorOpFetch:
+			// FETCH returns rows — look up cursor to get schema
+			cols, colTypes, err := c.getCursorSchema(ps.cursorName)
+			if err != nil || len(cols) == 0 {
+				_ = writeNoData(c.writer)
+				return
+			}
+			_ = c.sendRowDescription(cols, colTypes)
+			ps.described = true
+			return
+		}
+
 		// For queries that return results, we need to send RowDescription
 		// For other queries, send NoData
 		returnsResults := queryReturnsResults(ps.query)
@@ -3304,6 +3538,22 @@ func (c *clientConn) handleDescribe(body []byte) {
 		p, ok := c.portals[name]
 		if !ok {
 			c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", name))
+			return
+		}
+
+		// Handle cursor operations in portal Describe
+		switch p.stmt.cursorOp {
+		case cursorOpDeclare, cursorOpClose:
+			_ = writeNoData(c.writer)
+			return
+		case cursorOpFetch:
+			cols, colTypes, err := c.getCursorSchema(p.stmt.cursorName)
+			if err != nil || len(cols) == 0 {
+				_ = writeNoData(c.writer)
+				return
+			}
+			p.described = true
+			_ = c.sendRowDescription(cols, colTypes)
 			return
 		}
 
@@ -3371,6 +3621,19 @@ func (c *clientConn) handleExecute(body []byte) {
 	p, ok := c.portals[portalName]
 	if !ok {
 		c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", portalName))
+		return
+	}
+
+	// Handle cursor operations before normal execution
+	switch p.stmt.cursorOp {
+	case cursorOpDeclare:
+		c.handleDeclareCursorExtended(p)
+		return
+	case cursorOpFetch:
+		c.handleFetchCursorExtended(p)
+		return
+	case cursorOpClose:
+		c.handleCloseCursorExtended(p)
 		return
 	}
 
@@ -3574,6 +3837,363 @@ func readCString(r *bytes.Reader) (string, error) {
 		buf.WriteByte(b)
 	}
 	return buf.String(), nil
+}
+
+// --- Server-side cursor emulation ---
+
+// deparseInnerQuery deparses a pg_query Node back to SQL text.
+func deparseInnerQuery(node *pg_query.Node) string {
+	tree := &pg_query.ParseResult{
+		Stmts: []*pg_query.RawStmt{{Stmt: node}},
+	}
+	sql, err := pg_query.Deparse(tree)
+	if err != nil {
+		return ""
+	}
+	return sql
+}
+
+// openCursor executes the cursor's stored query and caches the result set metadata.
+func (c *clientConn) openCursor(cursor *cursorState) error {
+	ctx, cleanup := c.queryContext()
+	cursor.cleanup = cleanup
+
+	rows, err := c.executor.QueryContext(ctx, cursor.query)
+	if err != nil {
+		cleanup()
+		cursor.cleanup = nil
+		return err
+	}
+	cursor.rows = rows
+
+	cols, err := rows.Columns()
+	if err != nil {
+		_ = rows.Close()
+		cursor.rows = nil
+		cleanup()
+		cursor.cleanup = nil
+		return err
+	}
+	cursor.cols = cols
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		_ = rows.Close()
+		cursor.rows = nil
+		cleanup()
+		cursor.cleanup = nil
+		return err
+	}
+	cursor.colTypes = colTypes
+
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+	cursor.typeOIDs = typeOIDs
+	return nil
+}
+
+// closeCursor closes a specific cursor and cleans up its resources.
+func (c *clientConn) closeCursor(name string) {
+	cursor, ok := c.cursors[name]
+	if !ok {
+		return
+	}
+	if cursor.rows != nil {
+		_ = cursor.rows.Close()
+	}
+	if cursor.cleanup != nil {
+		cursor.cleanup()
+	}
+	delete(c.cursors, name)
+}
+
+// closeAllCursors closes all open cursors on this connection.
+func (c *clientConn) closeAllCursors() {
+	for name := range c.cursors {
+		c.closeCursor(name)
+	}
+}
+
+// getCursorSchema opens the cursor if needed to retrieve column metadata,
+// then returns the schema information. Used by handleDescribe for FETCH statements.
+func (c *clientConn) getCursorSchema(cursorName string) ([]string, []ColumnTyper, error) {
+	cursor, ok := c.cursors[cursorName]
+	if !ok {
+		return nil, nil, fmt.Errorf("cursor %q does not exist", cursorName)
+	}
+	if cursor.rows == nil {
+		if err := c.openCursor(cursor); err != nil {
+			return nil, nil, err
+		}
+	}
+	return cursor.cols, cursor.colTypes, nil
+}
+
+// isFetchForwardOnly returns true if the FetchStmt direction is forward-compatible.
+func isFetchForwardOnly(dir pg_query.FetchDirection) bool {
+	return dir == pg_query.FetchDirection_FETCH_DIRECTION_UNDEFINED ||
+		dir == pg_query.FetchDirection_FETCH_FORWARD
+}
+
+// handleDeclareCursor handles DECLARE cursor in the Simple Query protocol.
+func (c *clientConn) handleDeclareCursor(stmt *pg_query.DeclareCursorStmt) error {
+	innerSQL := deparseInnerQuery(stmt.Query)
+	if innerSQL == "" {
+		c.sendError("ERROR", "42601", "could not deparse cursor query")
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	// Transpile the inner SELECT query (skip for passthrough users)
+	transpiledSQL := innerSQL
+	if !c.passthrough {
+		tr := c.newTranspiler(false)
+		result, err := tr.Transpile(innerSQL)
+		if err != nil {
+			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error in cursor query: %v", err))
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+		transpiledSQL = result.SQL
+		if result.FallbackToNative {
+			transpiledSQL = innerSQL
+		}
+	}
+
+	// Close existing cursor with same name (PostgreSQL behavior)
+	c.closeCursor(stmt.Portalname)
+
+	c.cursors[stmt.Portalname] = &cursorState{query: transpiledSQL}
+	slog.Debug("Cursor declared.", "user", c.username, "cursor", stmt.Portalname, "query", transpiledSQL)
+
+	_ = writeCommandComplete(c.writer, "DECLARE CURSOR")
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// handleFetchCursor handles FETCH in the Simple Query protocol.
+func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
+	// Validate direction
+	if !isFetchForwardOnly(stmt.Direction) {
+		c.sendError("ERROR", "0A000", "cursor can only scan forward")
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	cursor, ok := c.cursors[stmt.Portalname]
+	if !ok {
+		c.sendError("ERROR", "34000", fmt.Sprintf("cursor %q does not exist", stmt.Portalname))
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	// Open cursor on first FETCH
+	if cursor.rows == nil {
+		if err := c.openCursor(cursor); err != nil {
+			if isQueryCancelled(err) {
+				c.sendError("ERROR", "57014", "canceling statement due to user request")
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+	}
+
+	// Determine how many rows to fetch (pg_query sets HowMany=MaxInt64 for FETCH ALL)
+	howMany := stmt.HowMany
+	if howMany < 0 {
+		c.sendError("ERROR", "0A000", "cursor can only scan forward")
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	// MOVE: advance position without returning rows
+	if stmt.Ismove {
+		moveCount := int64(0)
+		for moveCount < howMany && cursor.rows.Next() {
+			// Read the row to advance position, but don't send it
+			values := make([]interface{}, len(cursor.cols))
+			valuePtrs := make([]interface{}, len(cursor.cols))
+			for i := range values {
+				valuePtrs[i] = &values[i]
+			}
+			_ = cursor.rows.Scan(valuePtrs...)
+			moveCount++
+		}
+		_ = writeCommandComplete(c.writer, fmt.Sprintf("MOVE %d", moveCount))
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	// Send RowDescription
+	if err := c.sendRowDescription(cursor.cols, cursor.colTypes); err != nil {
+		return err
+	}
+
+	// Stream rows
+	rowCount := int64(0)
+	for rowCount < howMany && cursor.rows.Next() {
+		values := make([]interface{}, len(cursor.cols))
+		valuePtrs := make([]interface{}, len(cursor.cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := cursor.rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			c.setTxError()
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+
+		if err := c.sendDataRowWithFormats(values, nil, cursor.typeOIDs); err != nil {
+			return err
+		}
+		rowCount++
+	}
+
+	if err := cursor.rows.Err(); err != nil {
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			c.sendError("ERROR", "42000", err.Error())
+		}
+		c.setTxError()
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("FETCH %d", rowCount))
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// handleCloseCursor handles CLOSE in the Simple Query protocol.
+func (c *clientConn) handleCloseCursor(stmt *pg_query.ClosePortalStmt) error {
+	if stmt.Portalname == "" {
+		// CLOSE ALL
+		c.closeAllCursors()
+	} else {
+		if _, ok := c.cursors[stmt.Portalname]; !ok {
+			c.sendError("ERROR", "34000", fmt.Sprintf("cursor %q does not exist", stmt.Portalname))
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+		c.closeCursor(stmt.Portalname)
+	}
+
+	slog.Debug("Cursor closed.", "user", c.username, "cursor", stmt.Portalname)
+	_ = writeCommandComplete(c.writer, "CLOSE CURSOR")
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// handleDeclareCursorExtended handles DECLARE cursor in the Extended Query protocol.
+func (c *clientConn) handleDeclareCursorExtended(p *portal) {
+	// Close existing cursor with same name
+	c.closeCursor(p.stmt.cursorName)
+
+	c.cursors[p.stmt.cursorName] = &cursorState{query: p.stmt.cursorQuery}
+	slog.Debug("Cursor declared (extended).", "user", c.username, "cursor", p.stmt.cursorName, "query", p.stmt.cursorQuery)
+
+	_ = writeCommandComplete(c.writer, "DECLARE CURSOR")
+}
+
+// handleFetchCursorExtended handles FETCH in the Extended Query protocol.
+func (c *clientConn) handleFetchCursorExtended(p *portal) {
+	cursor, ok := c.cursors[p.stmt.cursorName]
+	if !ok {
+		c.sendError("ERROR", "34000", fmt.Sprintf("cursor %q does not exist", p.stmt.cursorName))
+		return
+	}
+
+	// Open cursor on first FETCH
+	if cursor.rows == nil {
+		if err := c.openCursor(cursor); err != nil {
+			if isQueryCancelled(err) {
+				c.sendError("ERROR", "57014", "canceling statement due to user request")
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
+			c.setTxError()
+			return
+		}
+	}
+
+	howMany := p.stmt.fetchCount
+
+	// Send RowDescription if Describe wasn't already called
+	if !p.described && len(cursor.cols) > 0 {
+		if err := c.sendRowDescription(cursor.cols, cursor.colTypes); err != nil {
+			return
+		}
+	}
+
+	// Stream rows
+	rowCount := int64(0)
+	for rowCount < howMany && cursor.rows.Next() {
+		values := make([]interface{}, len(cursor.cols))
+		valuePtrs := make([]interface{}, len(cursor.cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := cursor.rows.Scan(valuePtrs...); err != nil {
+			c.sendError("ERROR", "42000", err.Error())
+			c.setTxError()
+			return
+		}
+
+		if err := c.sendDataRowWithFormats(values, p.resultFormats, cursor.typeOIDs); err != nil {
+			return
+		}
+		rowCount++
+	}
+
+	if err := cursor.rows.Err(); err != nil {
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			c.sendError("ERROR", "42000", err.Error())
+		}
+		c.setTxError()
+		return
+	}
+
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("FETCH %d", rowCount))
+}
+
+// handleCloseCursorExtended handles CLOSE cursor in the Extended Query protocol.
+func (c *clientConn) handleCloseCursorExtended(p *portal) {
+	if p.stmt.cursorName == "" {
+		c.closeAllCursors()
+	} else {
+		if _, ok := c.cursors[p.stmt.cursorName]; !ok {
+			c.sendError("ERROR", "34000", fmt.Sprintf("cursor %q does not exist", p.stmt.cursorName))
+			return
+		}
+		c.closeCursor(p.stmt.cursorName)
+	}
+
+	slog.Debug("Cursor closed (extended).", "user", c.username, "cursor", p.stmt.cursorName)
+	_ = writeCommandComplete(c.writer, "CLOSE CURSOR")
 }
 
 // isAlterTableNotTableError checks if the error indicates that an ALTER TABLE

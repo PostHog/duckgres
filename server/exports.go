@@ -61,6 +61,7 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 		passthrough: s.cfg.PassthroughUsers[username],
 		stmts:       make(map[string]*preparedStmt),
 		portals:     make(map[string]*portal),
+		cursors:     make(map[string]*cursorState),
 		txStatus:    txStatusIdle,
 	}
 }
