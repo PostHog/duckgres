@@ -83,6 +83,11 @@ func (r *MemoryRebalancer) SetSessionLister(sl SessionLister) {
 	r.sessions = sl
 }
 
+// Stop stops the background debounce goroutine. Must be called on shutdown.
+func (r *MemoryRebalancer) Stop() {
+	close(r.stopDebounce)
+}
+
 // RequestRebalance signals that a rebalance is needed. Multiple rapid calls
 // are coalesced — the actual rebalance runs at most once per debounce interval.
 func (r *MemoryRebalancer) RequestRebalance() {
@@ -202,6 +207,27 @@ func perSessionThreads(budget int, count int) int {
 // This can be used to derive a dynamic max-workers cap.
 func (r *MemoryRebalancer) MaxSessionsForBudget() int {
 	return int(r.memoryBudget / minMemoryPerSession)
+}
+
+// SetInitialLimits sets memory_limit and threads on a single session synchronously.
+// Called during CreateSession so the new session never runs with unlimited resources.
+func (r *MemoryRebalancer) SetInitialLimits(ctx context.Context, session *ManagedSession, totalSessions int) {
+	if session == nil || session.Executor == nil {
+		return
+	}
+
+	memStr := r.PerSessionMemoryLimit(totalSessions)
+	threads := r.PerSessionThreads(totalSessions)
+
+	setCtx, cancel := context.WithTimeout(ctx, rebalanceTimeout)
+	defer cancel()
+
+	if _, err := session.Executor.ExecContext(setCtx, fmt.Sprintf("SET memory_limit = '%s'", memStr)); err != nil {
+		slog.Warn("Failed to set initial memory_limit.", "pid", session.PID, "error", err)
+	}
+	if _, err := session.Executor.ExecContext(setCtx, fmt.Sprintf("SET threads = %d", threads)); err != nil {
+		slog.Warn("Failed to set initial threads.", "pid", session.PID, "error", err)
+	}
 }
 
 // formatBytes formats a byte count as a human-readable DuckDB size string.

@@ -1,33 +1,8 @@
 package controlplane
 
 import (
-	"context"
-	"fmt"
-	"sync"
 	"testing"
 )
-
-// mockExecutor records SET commands sent to it.
-type mockExecutor struct {
-	mu       sync.Mutex
-	commands []string
-	failNext bool
-}
-
-func (m *mockExecutor) ExecContext(_ context.Context, query string, _ ...any) (interface{ RowsAffected() (int64, error) }, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failNext {
-		m.failNext = false
-		return nil, fmt.Errorf("mock error")
-	}
-	m.commands = append(m.commands, query)
-	return &mockResult{}, nil
-}
-
-type mockResult struct{}
-
-func (r *mockResult) RowsAffected() (int64, error) { return 0, nil }
 
 // mockSessionLister returns a fixed list of sessions.
 type mockSessionLister struct {

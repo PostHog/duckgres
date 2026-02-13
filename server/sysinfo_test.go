@@ -110,7 +110,7 @@ func TestParseMemoryBytes(t *testing.T) {
 }
 
 func TestValidateMemoryLimit(t *testing.T) {
-	valid := []string{"4GB", "512MB", "1TB", "256kb", "100 MB", "2 gb"}
+	valid := []string{"4GB", "512MB", "1TB", "256kb", "100 MB", "2 gb", "1.5GB", "0.5MB", "2.75TB"}
 	for _, v := range valid {
 		if !ValidateMemoryLimit(v) {
 			t.Errorf("expected %q to be valid", v)

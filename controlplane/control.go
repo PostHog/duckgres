@@ -38,6 +38,7 @@ type ControlPlane struct {
 	cfg         ControlPlaneConfig
 	pool        *FlightWorkerPool
 	sessions    *SessionManager
+	rebalancer  *MemoryRebalancer
 	srv         *server.Server // Minimal server for cancel request routing
 	rateLimiter *server.RateLimiter
 	tlsConfig   *tls.Config
@@ -120,6 +121,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg:         cfg,
 		pool:        pool,
 		sessions:    sessions,
+		rebalancer:  rebalancer,
 		srv:         srv,
 		rateLimiter: server.NewRateLimiter(cfg.RateLimit),
 		tlsConfig: &tls.Config{
@@ -200,7 +202,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
 		"min_workers", cfg.MinWorkers,
-		"max_workers", cfg.MaxWorkers,
+		"max_workers", maxWorkers,
 		"memory_budget", formatBytes(rebalancer.memoryBudget))
 
 	// Handle signals
@@ -511,6 +513,10 @@ func (cp *ControlPlane) shutdown() {
 
 	slog.Info("Shutting down workers...")
 	cp.pool.ShutdownAll()
+
+	if cp.rebalancer != nil {
+		cp.rebalancer.Stop()
+	}
 
 	slog.Info("Control plane shutdown complete.")
 }

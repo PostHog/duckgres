@@ -85,8 +85,8 @@ func autoMemoryLimit() string {
 	return autoMemoryLimitValue
 }
 
-// validMemoryLimit matches DuckDB memory limit values like "4GB", "512MB", "1TB".
-var validMemoryLimit = regexp.MustCompile(`(?i)^\d+\s*(KB|MB|GB|TB)$`)
+// validMemoryLimit matches DuckDB memory limit values like "4GB", "512MB", "1.5GB", "1TB".
+var validMemoryLimit = regexp.MustCompile(`(?i)^\d+(\.\d+)?\s*(KB|MB|GB|TB)$`)
 
 // ValidateMemoryLimit checks that a memory_limit string is a valid DuckDB size value.
 func ValidateMemoryLimit(v string) bool {

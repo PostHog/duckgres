@@ -184,39 +184,6 @@ func (p *FlightWorkerPool) SetSessionCounter(sc SessionCounter) {
 	p.sessionCounter = sc
 }
 
-// SelectWorker returns the worker with the fewest active sessions.
-func (p *FlightWorkerPool) SelectWorker() (*ManagedWorker, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.workers) == 0 {
-		return nil, fmt.Errorf("no workers available")
-	}
-
-	var best *ManagedWorker
-	bestCount := int(^uint(0) >> 1) // max int
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue // skip dead workers
-		default:
-		}
-		count := 0
-		if p.sessionCounter != nil {
-			count = p.sessionCounter.SessionCountForWorker(w.ID)
-		}
-		if best == nil || count < bestCount || (count == bestCount && w.ID < best.ID) {
-			best = w
-			bestCount = count
-		}
-	}
-
-	if best == nil {
-		return nil, fmt.Errorf("all workers dead")
-	}
-	return best, nil
-}
-
 // Worker returns a worker by ID.
 func (p *FlightWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	p.mu.RLock()
@@ -340,12 +307,7 @@ func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) {
 func retireWorkerProcess(w *ManagedWorker) {
 	slog.Info("Retiring worker.", "id", w.ID)
 
-	// Close the gRPC client first
-	if w.client != nil {
-		_ = w.client.Close()
-	}
-
-	// Send SIGTERM
+	// Send SIGTERM first so the worker can drain in-flight requests
 	if w.cmd.Process != nil {
 		_ = w.cmd.Process.Signal(os.Interrupt)
 	}
@@ -360,6 +322,11 @@ func retireWorkerProcess(w *ManagedWorker) {
 			_ = w.cmd.Process.Kill()
 		}
 		<-w.done
+	}
+
+	// Close gRPC client after the process has exited
+	if w.client != nil {
+		_ = w.client.Close()
 	}
 
 	// Clean up socket
@@ -405,25 +372,6 @@ func (p *FlightWorkerPool) ShutdownAll() {
 			_ = w.client.Close()
 		}
 	}
-}
-
-// ReplaceWorker replaces a dead worker with a new one.
-func (p *FlightWorkerPool) ReplaceWorker(id int) error {
-	p.mu.Lock()
-	if p.shuttingDown {
-		p.mu.Unlock()
-		return fmt.Errorf("pool is shutting down")
-	}
-	old, exists := p.workers[id]
-	if exists {
-		if old.client != nil {
-			_ = old.client.Close()
-		}
-		delete(p.workers, id)
-	}
-	p.mu.Unlock()
-
-	return p.SpawnWorker(id)
 }
 
 // WorkerCrashHandler is called when a worker crash is detected, before respawning.

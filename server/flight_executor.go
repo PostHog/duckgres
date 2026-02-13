@@ -195,7 +195,7 @@ func (r *FlightRowSet) Next() bool {
 
 	// Read next batch, skipping empty batches
 	for r.reader.Next() {
-		r.currentBatch = r.reader.Record()
+		r.currentBatch = r.reader.RecordBatch()
 		r.currentBatch.Retain()
 		r.batchRow = 0
 		if r.currentBatch.NumRows() > 0 {
