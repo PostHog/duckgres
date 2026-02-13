@@ -398,15 +398,22 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 				case <-ctx.Done():
 					return
 				case <-w.done:
+					// Check if already cleaned up by RetireWorker (intentional shutdown).
+					// If so, skip — this is not a crash.
+					p.mu.Lock()
+					_, stillInPool := p.workers[w.ID]
+					if stillInPool {
+						delete(p.workers, w.ID)
+					}
+					p.mu.Unlock()
+					if !stillInPool {
+						continue
+					}
 					// Worker crashed — notify sessions, clean up
 					slog.Warn("Worker crashed.", "id", w.ID, "error", w.exitErr)
 					for _, h := range onCrash {
 						h(w.ID)
 					}
-					// Remove from pool and clean up socket
-					p.mu.Lock()
-					delete(p.workers, w.ID)
-					p.mu.Unlock()
 					if w.client != nil {
 						_ = w.client.Close()
 					}
