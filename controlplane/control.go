@@ -522,9 +522,13 @@ func (cp *ControlPlane) selfExec() {
 		// handleHandoverRequest may also be trying to recover (child connected
 		// but died mid-protocol), so recoverFromFailedReload uses CAS to
 		// ensure only one goroutine runs the full recovery path.
-		slog.Error("Child process exited before completing handover, recovering.", "error", err)
-		cp.cancelHandoverListener()
+		//
+		// cancelHandoverListener must be inside the CAS winner branch —
+		// otherwise it could close a listener that handleHandoverRequest's
+		// recovery already created.
 		if cp.recoverFromFailedReload() {
+			slog.Warn("Child process exited before completing handover, recovering.", "error", err)
+			cp.cancelHandoverListener()
 			cp.startHandoverListener()
 		}
 	}()
