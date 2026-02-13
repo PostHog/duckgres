@@ -581,6 +581,10 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 		{"ALTER TABLE DROP NOT NULL", "ALTER TABLE users ALTER COLUMN name DROP NOT NULL", "ALTER TABLE"},
 		{"ALTER TABLE SET DEFAULT", "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'active'", "ALTER TABLE"},
 		{"ALTER TABLE DROP DEFAULT", "ALTER TABLE users ALTER COLUMN status DROP DEFAULT", "ALTER TABLE"},
+		{"REINDEX", "REINDEX TABLE users", "REINDEX"},
+		{"CLUSTER", "CLUSTER users USING idx_name", "CLUSTER"},
+		{"COMMENT ON", "COMMENT ON TABLE users IS 'User accounts'", "COMMENT"},
+		{"REFRESH MATERIALIZED VIEW", "REFRESH MATERIALIZED VIEW my_view", "REFRESH MATERIALIZED VIEW"},
 	}
 
 	tr := New(Config{DuckLakeMode: true})
@@ -3002,6 +3006,10 @@ func TestClassify_DuckLakeMode(t *testing.T) {
 		{"ALTER TABLE is DDL", "ALTER TABLE users ADD CONSTRAINT pk PRIMARY KEY (id)", FlagDDL},
 		{"VACUUM is DDL", "VACUUM users", FlagDDL},
 		{"CASCADE is DDL", "DROP TABLE users CASCADE", FlagDDL},
+		{"REINDEX is DDL", "REINDEX TABLE users", FlagDDL},
+		{"CLUSTER is DDL", "CLUSTER users USING idx_name", FlagDDL},
+		{"COMMENT ON is DDL", "COMMENT ON TABLE users IS 'desc'", FlagDDL},
+		{"REFRESH is DDL", "REFRESH MATERIALIZED VIEW my_view", FlagDDL},
 	}
 
 	for _, tt := range tests {

@@ -383,7 +383,8 @@ func Classify(sql string, cfg Config) Classification {
 	if cfg.DuckLakeMode {
 		if containsAny(upper, "CREATE INDEX", "DROP INDEX", "VACUUM", "GRANT ", "REVOKE ",
 			"PRIMARY KEY", "UNIQUE", "REFERENCES", "SERIAL", "BIGSERIAL",
-			"DEFAULT NOW()", "FOREIGN KEY", "ALTER TABLE", "CASCADE") {
+			"DEFAULT NOW()", "FOREIGN KEY", "ALTER TABLE", "CASCADE",
+			"REINDEX", "CLUSTER", "COMMENT ON", "REFRESH ") {
 			flags |= FlagDDL
 		}
 	}
