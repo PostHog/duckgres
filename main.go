@@ -245,11 +245,14 @@ func main() {
 
 	// Handle --psql: launch psql connected to the local Duckgres server
 	if *psql {
-		// Pick the first user from the config
+		// Pick a non-passthrough user so psql gets full pg_catalog compatibility.
+		// Falls back to any user if all are passthrough.
 		var user, password string
 		for u, p := range cfg.Users {
 			user, password = u, p
-			break
+			if !cfg.PassthroughUsers[u] {
+				break
+			}
 		}
 
 		connectHost := "127.0.0.1"
