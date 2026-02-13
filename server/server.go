@@ -510,7 +510,7 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		cacheDir := filepath.Join(cfg.DataDir, "cache")
 		if err := os.MkdirAll(cacheDir, 0750); err != nil {
 			slog.Warn("Failed to create cache_httpfs cache directory.", "cache_directory", cacheDir, "error", err)
-		} else if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_cache_directory = '%s'", cacheDir)); err != nil {
+		} else if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_cache_directory = '%s/'", cacheDir)); err != nil {
 			// NOTE: cache directory path comes from trusted server config (DataDir), not user input.
 			slog.Warn("Failed to set cache_httpfs cache directory.", "cache_directory", cacheDir, "error", err)
 		} else {
