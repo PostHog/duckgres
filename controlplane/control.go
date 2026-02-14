@@ -566,7 +566,22 @@ func (cp *ControlPlane) shutdown() {
 // selfExec spawns a new control plane process from the binary on disk.
 // The new process detects the existing handover socket and initiates the
 // handover protocol to receive listener FDs.
+//
+// Under systemd (Type=notify), the child must be reparented to PID 1 for
+// systemd to properly track it via waitpid(). We achieve this via
+// double-fork using setsid --fork: the intermediate exits immediately and
+// the grandchild (new CP) is reparented to PID 1. Without this, systemd
+// logs "Supervising process X which is not our child" and may not detect
+// crashes for Restart=always.
+//
+// Outside systemd (tests, manual runs), we use direct spawn so the old CP
+// can track the child's exit via cmd.Wait() for faster crash recovery.
 func (cp *ControlPlane) selfExec() {
+	if os.Getenv("NOTIFY_SOCKET") != "" {
+		cp.selfExecDetached()
+		return
+	}
+
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -600,6 +615,41 @@ func (cp *ControlPlane) selfExec() {
 		// recovery already created.
 		if cp.recoverFromFailedReload() {
 			slog.Warn("Child process exited before completing handover, recovering.", "error", err)
+			cp.cancelHandoverListener()
+			cp.startHandoverListener()
+		}
+	}()
+}
+
+// selfExecDetached spawns the new CP via setsid --fork so it is reparented
+// to PID 1 (systemd). Because we cannot track the detached grandchild's
+// exit directly, we use a timeout for crash recovery instead of cmd.Wait().
+func (cp *ControlPlane) selfExecDetached() {
+	args := append([]string{"--fork", os.Args[0]}, os.Args[1:]...)
+	cmd := exec.Command("setsid", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+
+	// cmd.Run() returns almost immediately: setsid --fork double-forks and
+	// the intermediate exits right away. The grandchild (new CP) continues.
+	if err := cmd.Run(); err != nil {
+		slog.Error("Self-exec (detached) failed.", "error", err)
+		cp.recoverFromFailedReload()
+		return
+	}
+
+	slog.Info("New control plane spawned (detached).")
+
+	// Recovery timeout: if no handover connection is received within 30s,
+	// the new CP likely crashed during startup. The handover protocol
+	// already has a 30s per-connection deadline (handleHandoverRequest),
+	// but that only fires after Accept — this timeout covers the case
+	// where the new CP never connects at all.
+	go func() {
+		time.Sleep(30 * time.Second)
+		if cp.recoverFromFailedReload() {
+			slog.Warn("Handover timeout: new CP did not connect within 30s, recovering.")
 			cp.cancelHandoverListener()
 			cp.startHandoverListener()
 		}

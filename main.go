@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
@@ -100,13 +101,21 @@ func env(key, defaultVal string) string {
 	return defaultVal
 }
 
-// initMetrics starts the Prometheus metrics HTTP server on :9090/metrics
+// initMetrics starts the Prometheus metrics HTTP server on :9090/metrics.
+// During zero-downtime handover the old process still holds :9090 until it
+// drains and exits, so we retry until the port becomes available.
 func initMetrics() {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		slog.Info("Starting metrics server", "addr", ":9090")
-		if err := http.ListenAndServe(":9090", nil); err != nil {
-			slog.Error("Metrics server error", "error", err)
+		for {
+			slog.Info("Starting metrics server", "addr", ":9090")
+			if err := http.ListenAndServe(":9090", mux); err != nil {
+				slog.Warn("Metrics server error, retrying in 1s.", "error", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			return
 		}
 	}()
 }
