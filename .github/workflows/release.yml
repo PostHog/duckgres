@@ -69,14 +69,31 @@ jobs:
             sed 's|duckgres-linux-\([^/]*\)/||g' > checksums.txt
           cat checksums.txt
 
+      - name: Check if build release already exists
+        id: check-existing
+        run: |
+          TAG="build-${{ steps.sha.outputs.short }}"
+          if gh release view "$TAG" &>/dev/null; then
+            echo "Release $TAG already exists — skipping to avoid overwriting a promoted release"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create Release
+        if: steps.check-existing.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ steps.sha.outputs.short }}
           name: Build ${{ steps.sha.outputs.short }}
           prerelease: true
+          make_latest: false
           body: |
             Automated build from commit ${{ github.sha }}
+
+            To promote this build to customer ducklings: edit this release and uncheck "pre-release".
           files: |
             artifacts/duckgres-linux-amd64/duckgres-linux-amd64
             artifacts/duckgres-linux-arm64/duckgres-linux-arm64
@@ -98,11 +115,12 @@ jobs:
           tag_name: latest
           name: Latest Build
           prerelease: true
+          make_latest: false
           body: |
             Latest build from commit ${{ github.sha }}
 
-            This is a **pre-release** (canary). It auto-deploys to the canary duckling.
-            To promote to customer ducklings: edit this release and uncheck "pre-release".
+            This is a **pre-release** (canary). It auto-deploys to dev and canary ducklings.
+            To promote a build to customer ducklings: find the specific `build-*` release and uncheck "pre-release".
           files: |
             artifacts/duckgres-linux-amd64/duckgres-linux-amd64
             artifacts/duckgres-linux-arm64/duckgres-linux-arm64
