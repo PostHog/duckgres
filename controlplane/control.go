@@ -280,7 +280,12 @@ func (cp *ControlPlane) acceptLoop() {
 			closed := cp.closed
 			cp.closeMu.Unlock()
 			if closed {
-				return
+				// Block here instead of returning. Returning would cause
+				// RunControlPlane() → main() to exit, killing all in-flight
+				// connection goroutines before the drain completes.
+				// The handover handler or shutdown handler will call os.Exit(0)
+				// after draining connections.
+				select {}
 			}
 			slog.Error("Accept error.", "error", err)
 			continue
