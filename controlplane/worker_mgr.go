@@ -163,6 +163,7 @@ func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flig
 }
 
 // doHealthCheck performs a HealthCheck action on the worker.
+// The server sends exactly one Result message with {"healthy": true, ...}.
 func doHealthCheck(ctx context.Context, client *flightsql.Client) error {
 	// Use the underlying flight client for custom actions.
 	// flightsql.Client.Client is a flight.Client interface which embeds
@@ -327,7 +328,11 @@ func retireWorkerProcess(w *ManagedWorker) {
 	}
 
 	if alreadyDead {
-		slog.Warn("Retiring worker that already exited unexpectedly.", "id", w.ID, "error", w.exitErr)
+		exitCode := -1
+		if w.cmd.ProcessState != nil {
+			exitCode = w.cmd.ProcessState.ExitCode()
+		}
+		slog.Warn("Retiring worker that already exited unexpectedly.", "id", w.ID, "exit_code", exitCode, "error", w.exitErr)
 	} else {
 		slog.Info("Retiring worker.", "id", w.ID)
 
@@ -475,6 +480,8 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 								for _, h := range onCrash {
 									h(w.ID)
 								}
+								// Skip SIGINT (unlike retireWorkerProcess) since the worker
+								// has already proven unresponsive. Go straight to SIGKILL.
 								go func() {
 									if w.cmd.Process != nil {
 										_ = w.cmd.Process.Kill()
