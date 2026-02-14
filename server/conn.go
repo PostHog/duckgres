@@ -35,10 +35,11 @@ var errCancelHandled = errors.New("cancel request handled")
 type cursorOp int
 
 const (
-	cursorOpNone    cursorOp = iota
-	cursorOpDeclare          // DECLARE cursor_name CURSOR FOR ...
-	cursorOpFetch            // FETCH [count] FROM cursor_name
-	cursorOpClose            // CLOSE cursor_name / CLOSE ALL
+	cursorOpNone           cursorOp = iota
+	cursorOpDeclare                 // DECLARE cursor_name CURSOR FOR ...
+	cursorOpFetch                   // FETCH [count] FROM cursor_name
+	cursorOpClose                   // CLOSE cursor_name / CLOSE ALL
+	cursorOpPgCursorsQuery          // SELECT ... FROM pg_cursors WHERE name = ...
 )
 
 // cursorState holds the state of an emulated server-side cursor.
@@ -722,6 +723,12 @@ func (c *clientConn) handleQuery(body []byte) error {
 		}
 	}
 
+	// Intercept pg_cursors queries (e.g. psycopg's "SELECT 1 FROM pg_cursors WHERE name = ...").
+	// DuckDB doesn't have this system view; return synthetic results from cursor emulation state.
+	if cursorName, _, ok := matchPgCursorsQuery(query); ok {
+		return c.handlePgCursorsQuery(cursorName)
+	}
+
 	// Passthrough mode: skip all transpilation, send query directly to DuckDB
 	if c.passthrough {
 		upperQuery := strings.ToUpper(query)
@@ -1162,6 +1169,19 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			_ = writeCommandComplete(c.writer, "CLOSE CURSOR")
 			return false, nil
 		}
+	}
+
+	// Intercept pg_cursors queries
+	if cursorName, _, ok := matchPgCursorsQuery(query); ok {
+		_, exists := c.cursors[cursorName]
+		_ = c.sendPgCursorsRowDescription()
+		rowCount := 0
+		if exists {
+			_ = c.sendDataRowWithFormats([]interface{}{int64(1)}, nil, []int32{23})
+			rowCount = 1
+		}
+		_ = writeCommandComplete(c.writer, fmt.Sprintf("SELECT %d", rowCount))
+		return false, nil
 	}
 
 	// Transpile
@@ -3270,6 +3290,25 @@ func (c *clientConn) handleParse(body []byte) {
 		}
 	}
 
+	// Intercept pg_cursors queries (e.g. psycopg's "SELECT 1 FROM pg_cursors WHERE name = $1").
+	// DuckDB doesn't have this system view; return synthetic results from cursor emulation state.
+	if cursorName, parameterized, ok := matchPgCursorsQuery(query); ok {
+		delete(c.stmts, stmtName)
+		ps := &preparedStmt{
+			query:          query,
+			convertedQuery: query,
+			cursorOp:       cursorOpPgCursorsQuery,
+			cursorName:     cursorName,
+		}
+		if parameterized {
+			ps.numParams = 1
+			ps.paramTypes = []int32{25} // text OID
+		}
+		c.stmts[stmtName] = ps
+		_ = writeParseComplete(c.writer)
+		return
+	}
+
 	// Passthrough mode: skip transpilation, store query directly
 	if c.passthrough {
 		// Count $N parameters with a simple regex (pg_query.Parse may fail on DuckDB-native SQL)
@@ -3484,6 +3523,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 			_ = c.sendRowDescription(cols, colTypes)
 			ps.described = true
 			return
+		case cursorOpPgCursorsQuery:
+			_ = c.sendPgCursorsRowDescription()
+			ps.described = true
+			return
 		}
 
 		// For queries that return results, we need to send RowDescription
@@ -3554,6 +3597,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 			}
 			p.described = true
 			_ = c.sendRowDescription(cols, colTypes)
+			return
+		case cursorOpPgCursorsQuery:
+			_ = c.sendPgCursorsRowDescription()
+			p.described = true
 			return
 		}
 
@@ -3634,6 +3681,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	case cursorOpClose:
 		c.handleCloseCursorExtended(p)
+		return
+	case cursorOpPgCursorsQuery:
+		c.handlePgCursorsQueryExtended(p)
 		return
 	}
 
@@ -3935,6 +3985,96 @@ func (c *clientConn) getCursorSchema(cursorName string) ([]string, []ColumnTyper
 func isFetchForwardOnly(dir pg_query.FetchDirection) bool {
 	return dir == pg_query.FetchDirection_FETCH_DIRECTION_UNDEFINED ||
 		dir == pg_query.FetchDirection_FETCH_FORWARD
+}
+
+// pgCursorsLiteralRegex matches pg_cursors queries with a literal name value:
+//   SELECT 1 FROM pg_cursors WHERE name = 'cursor_name'
+//   SELECT 1 FROM pg_catalog.pg_cursors WHERE name = 'cursor_name'
+var pgCursorsLiteralRegex = regexp.MustCompile(
+	`(?i)^\s*SELECT\s+.+\s+FROM\s+(?:pg_catalog\s*\.\s*)?pg_cursors\s+WHERE\s+name\s*=\s*'([^']*)'`,
+)
+
+// pgCursorsParamRegex matches pg_cursors queries with a parameterized name:
+//   SELECT 1 FROM pg_cursors WHERE name = $1
+var pgCursorsParamRegex = regexp.MustCompile(
+	`(?i)^\s*SELECT\s+.+\s+FROM\s+(?:pg_catalog\s*\.\s*)?pg_cursors\s+WHERE\s+name\s*=\s*\$1\s*$`,
+)
+
+// matchPgCursorsQuery checks if a query is a pg_cursors lookup and extracts the cursor name.
+// Returns the cursor name and true for literal queries, empty string and true for parameterized queries.
+func matchPgCursorsQuery(query string) (cursorName string, parameterized bool, ok bool) {
+	if !strings.Contains(query, "pg_cursors") {
+		return "", false, false
+	}
+	if m := pgCursorsLiteralRegex.FindStringSubmatch(query); m != nil {
+		return m[1], false, true
+	}
+	if pgCursorsParamRegex.MatchString(query) {
+		return "", true, true
+	}
+	return "", false, false
+}
+
+// handlePgCursorsQuery handles SELECT FROM pg_cursors in the Simple Query protocol.
+// Returns a single row with value "1" if the cursor exists, or zero rows if not.
+func (c *clientConn) handlePgCursorsQuery(cursorName string) error {
+	_, exists := c.cursors[cursorName]
+
+	// Send RowDescription: single int4 column named "?column?"
+	if err := c.sendPgCursorsRowDescription(); err != nil {
+		return err
+	}
+
+	rowCount := 0
+	if exists {
+		if err := c.sendDataRowWithFormats([]interface{}{int64(1)}, nil, []int32{23}); err != nil {
+			return err
+		}
+		rowCount = 1
+	}
+
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("SELECT %d", rowCount))
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// handlePgCursorsQueryExtended handles SELECT FROM pg_cursors in the Extended Query protocol.
+func (c *clientConn) handlePgCursorsQueryExtended(p *portal) {
+	// Resolve cursor name: either from literal in query or from bind parameter
+	cursorName := p.stmt.cursorName
+	if cursorName == "" && len(p.paramValues) > 0 && p.paramValues[0] != nil {
+		cursorName = string(p.paramValues[0])
+	}
+
+	_, exists := c.cursors[cursorName]
+
+	if !p.stmt.described {
+		_ = c.sendPgCursorsRowDescription()
+	}
+
+	rowCount := 0
+	if exists {
+		_ = c.sendDataRowWithFormats([]interface{}{int64(1)}, p.resultFormats, []int32{23})
+		rowCount = 1
+	}
+
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("SELECT %d", rowCount))
+}
+
+// sendPgCursorsRowDescription sends a RowDescription for a pg_cursors query result (single int4 column).
+func (c *clientConn) sendPgCursorsRowDescription() error {
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.BigEndian, int16(1)) // 1 column
+	buf.WriteString("?column?")
+	buf.WriteByte(0)
+	_ = binary.Write(&buf, binary.BigEndian, int32(0))  // table OID
+	_ = binary.Write(&buf, binary.BigEndian, int16(0))  // column attr
+	_ = binary.Write(&buf, binary.BigEndian, int32(23)) // int4 OID
+	_ = binary.Write(&buf, binary.BigEndian, int16(4))  // type size
+	_ = binary.Write(&buf, binary.BigEndian, int32(-1)) // typmod
+	_ = binary.Write(&buf, binary.BigEndian, int16(0))  // text format
+	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
 }
 
 // handleDeclareCursor handles DECLARE cursor in the Simple Query protocol.
