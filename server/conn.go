@@ -3580,6 +3580,19 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// Describe portal
 		p, ok := c.portals[name]
 		if !ok {
+			// In PostgreSQL, DECLARE CURSOR creates a named cursor that is also
+			// accessible as a portal. psycopg3's ServerCursor sends Describe Portal
+			// with the cursor name after DECLARE. Check c.cursors as fallback.
+			if _, cursorOk := c.cursors[name]; cursorOk {
+				cols, colTypes, err := c.getCursorSchema(name)
+				if err != nil {
+					slog.Debug("Describe cursor-as-portal failed to open.", "user", c.username, "cursor", name, "error", err)
+					_ = writeNoData(c.writer)
+					return
+				}
+				_ = c.sendRowDescription(cols, colTypes)
+				return
+			}
 			c.sendError("ERROR", "34000", fmt.Sprintf("portal %q does not exist", name))
 			return
 		}
