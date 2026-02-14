@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 func TestIsEmptyQuery(t *testing.T) {
@@ -1969,6 +1970,258 @@ func TestFormatInterval(t *testing.T) {
 			got := formatInterval(tt.interval)
 			if got != tt.want {
 				t.Errorf("formatInterval(%+v) = %q, want %q", tt.interval, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchPgCursorsQuery(t *testing.T) {
+	tests := []struct {
+		name           string
+		query          string
+		wantName       string
+		wantParam      bool
+		wantOK         bool
+	}{
+		// Literal cursor name queries
+		{
+			name:      "basic pg_cursors query",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = 'test_cursor'",
+			wantName:  "test_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "pg_catalog prefix",
+			query:     "SELECT 1 FROM pg_catalog.pg_cursors WHERE name = 'test_cursor'",
+			wantName:  "test_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "psycopg3 style cursor name with dots",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = 'posthog_2_data_imports_team_2.users'",
+			wantName:  "posthog_2_data_imports_team_2.users",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "leading whitespace",
+			query:     "  SELECT 1 FROM pg_cursors WHERE name = 'my_cursor'",
+			wantName:  "my_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "leading newline",
+			query:     "\nSELECT 1 FROM pg_cursors WHERE name = 'my_cursor'\n",
+			wantName:  "my_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "case insensitive",
+			query:     "select 1 from pg_cursors where name = 'test'",
+			wantName:  "test",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "trailing semicolon",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = 'test_cursor';",
+			wantName:  "test_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "pg_catalog with spaces around dot",
+			query:     "SELECT 1 FROM pg_catalog . pg_cursors WHERE name = 'test'",
+			wantName:  "test",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "empty cursor name",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = ''",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    true,
+		},
+
+		// Parameterized queries ($1)
+		{
+			name:      "parameterized query",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = $1",
+			wantName:  "",
+			wantParam: true,
+			wantOK:    true,
+		},
+		{
+			name:      "parameterized with pg_catalog",
+			query:     "SELECT 1 FROM pg_catalog.pg_cursors WHERE name = $1",
+			wantName:  "",
+			wantParam: true,
+			wantOK:    true,
+		},
+
+		// Non-matching queries
+		{
+			name:      "regular SELECT",
+			query:     "SELECT * FROM users",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    false,
+		},
+		{
+			name:      "pg_cursors in different context",
+			query:     "SELECT * FROM pg_cursors",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    false,
+		},
+		{
+			name:      "pg_cursors without WHERE name",
+			query:     "SELECT count(*) FROM pg_cursors WHERE is_holdable = true",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    false,
+		},
+		{
+			name:      "empty query",
+			query:     "",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, param, ok := matchPgCursorsQuery(tt.query)
+			if ok != tt.wantOK {
+				t.Errorf("matchPgCursorsQuery(%q) ok = %v, want %v", tt.query, ok, tt.wantOK)
+			}
+			if name != tt.wantName {
+				t.Errorf("matchPgCursorsQuery(%q) name = %q, want %q", tt.query, name, tt.wantName)
+			}
+			if param != tt.wantParam {
+				t.Errorf("matchPgCursorsQuery(%q) parameterized = %v, want %v", tt.query, param, tt.wantParam)
+			}
+		})
+	}
+}
+
+func TestCursorCloseAllCursors(t *testing.T) {
+	c := &clientConn{
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+			"cur2": {query: "SELECT 2"},
+			"cur3": {query: "SELECT 3"},
+		},
+	}
+
+	if len(c.cursors) != 3 {
+		t.Fatalf("expected 3 cursors, got %d", len(c.cursors))
+	}
+
+	c.closeAllCursors()
+
+	if len(c.cursors) != 0 {
+		t.Errorf("after closeAllCursors, expected 0 cursors, got %d", len(c.cursors))
+	}
+}
+
+func TestCursorCloseSingle(t *testing.T) {
+	c := &clientConn{
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+			"cur2": {query: "SELECT 2"},
+		},
+	}
+
+	c.closeCursor("cur1")
+
+	if len(c.cursors) != 1 {
+		t.Errorf("expected 1 cursor remaining, got %d", len(c.cursors))
+	}
+	if _, ok := c.cursors["cur2"]; !ok {
+		t.Error("expected cur2 to still exist")
+	}
+	if _, ok := c.cursors["cur1"]; ok {
+		t.Error("expected cur1 to be removed")
+	}
+}
+
+func TestCursorCloseNonexistent(t *testing.T) {
+	c := &clientConn{
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+		},
+	}
+
+	// Should not panic
+	c.closeCursor("nonexistent")
+
+	if len(c.cursors) != 1 {
+		t.Errorf("expected 1 cursor, got %d", len(c.cursors))
+	}
+}
+
+func TestTransactionCommitClosesAllCursors(t *testing.T) {
+	c := &clientConn{
+		txStatus: txStatusTransaction,
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+			"cur2": {query: "SELECT 2"},
+		},
+	}
+
+	c.updateTxStatus("COMMIT")
+
+	if c.txStatus != txStatusIdle {
+		t.Errorf("txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+	if len(c.cursors) != 0 {
+		t.Errorf("expected 0 cursors after COMMIT, got %d", len(c.cursors))
+	}
+}
+
+func TestTransactionRollbackClosesAllCursors(t *testing.T) {
+	c := &clientConn{
+		txStatus: txStatusTransaction,
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+		},
+	}
+
+	c.updateTxStatus("ROLLBACK")
+
+	if c.txStatus != txStatusIdle {
+		t.Errorf("txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+	if len(c.cursors) != 0 {
+		t.Errorf("expected 0 cursors after ROLLBACK, got %d", len(c.cursors))
+	}
+}
+
+func TestIsFetchForwardOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		dir  pg_query.FetchDirection
+		want bool
+	}{
+		{"undefined (default)", pg_query.FetchDirection_FETCH_DIRECTION_UNDEFINED, true},
+		{"forward", pg_query.FetchDirection_FETCH_FORWARD, true},
+		{"backward", pg_query.FetchDirection_FETCH_BACKWARD, false},
+		{"absolute", pg_query.FetchDirection_FETCH_ABSOLUTE, false},
+		{"relative", pg_query.FetchDirection_FETCH_RELATIVE, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isFetchForwardOnly(tt.dir)
+			if got != tt.want {
+				t.Errorf("isFetchForwardOnly(%v) = %v, want %v", tt.dir, got, tt.want)
 			}
 		})
 	}
