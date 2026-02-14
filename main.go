@@ -341,7 +341,9 @@ func main() {
 			fatal("Failed to create data directory: " + err.Error())
 		}
 
-		initMetrics()
+		// No initMetrics() here — in control-plane mode, workers are spawned
+		// with --mode duckdb-service and would all fight over :9090. The
+		// control plane process owns the metrics endpoint.
 
 		duckdbservice.Run(duckdbservice.ServiceConfig{
 			ListenAddr:   listenAddr,
