@@ -49,6 +49,7 @@ type ControlPlane struct {
 	wg          sync.WaitGroup
 	reloading   atomic.Bool // guards against concurrent selfExec from double SIGUSR1
 	handoverLn  net.Listener // current handover listener; protected by closeMu
+	acmeManager *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -73,11 +74,26 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
-	// Load TLS certificates
-	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-	if err != nil {
-		slog.Error("Failed to load TLS certificates.", "error", err)
-		os.Exit(1)
+	// Configure TLS: ACME (Let's Encrypt) or static certificate files
+	var tlsCfg *tls.Config
+	var acmeMgr *server.ACMEManager
+	if cfg.ACMEDomain != "" {
+		mgr, err := server.NewACMEManager(cfg.ACMEDomain, cfg.ACMEEmail, cfg.ACMECacheDir, ":80")
+		if err != nil {
+			slog.Error("Failed to start ACME manager.", "error", err)
+			os.Exit(1)
+		}
+		acmeMgr = mgr
+		tlsCfg = mgr.TLSConfig()
+	} else {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			slog.Error("Failed to load TLS certificates.", "error", err)
+			os.Exit(1)
+		}
+		tlsCfg = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
 	}
 
 	// Use default rate limit config if not specified
@@ -139,9 +155,8 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		rebalancer:  rebalancer,
 		srv:         srv,
 		rateLimiter: server.NewRateLimiter(cfg.RateLimit),
-		tlsConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-		},
+		tlsConfig:   tlsCfg,
+		acmeManager: acmeMgr,
 	}
 
 	// Set up signal handling
@@ -531,6 +546,13 @@ func (cp *ControlPlane) shutdown() {
 
 	if cp.rebalancer != nil {
 		cp.rebalancer.Stop()
+	}
+
+	// Shut down ACME HTTP challenge listener if active
+	if cp.acmeManager != nil {
+		if err := cp.acmeManager.Close(); err != nil {
+			slog.Warn("ACME manager shutdown error.", "error", err)
+		}
 	}
 
 	slog.Info("Control plane shutdown complete.")

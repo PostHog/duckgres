@@ -23,6 +23,9 @@ type configCLIInputs struct {
 	MemoryRebalance  bool
 	MaxWorkers       int
 	MinWorkers       int
+	ACMEDomain       string
+	ACMEEmail        string
+	ACMECacheDir     string
 }
 
 type resolvedConfig struct {
@@ -168,6 +171,16 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 				cfg.PassthroughUsers[u] = true
 			}
 		}
+
+		if fileCfg.TLS.ACME.Domain != "" {
+			cfg.ACMEDomain = fileCfg.TLS.ACME.Domain
+		}
+		if fileCfg.TLS.ACME.Email != "" {
+			cfg.ACMEEmail = fileCfg.TLS.ACME.Email
+		}
+		if fileCfg.TLS.ACME.CacheDir != "" {
+			cfg.ACMECacheDir = fileCfg.TLS.ACME.CacheDir
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -272,6 +285,15 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_MAX_WORKERS: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_ACME_DOMAIN"); v != "" {
+		cfg.ACMEDomain = v
+	}
+	if v := getenv("DUCKGRES_ACME_EMAIL"); v != "" {
+		cfg.ACMEEmail = v
+	}
+	if v := getenv("DUCKGRES_ACME_CACHE_DIR"); v != "" {
+		cfg.ACMECacheDir = v
+	}
 
 	if cli.Set["host"] {
 		cfg.Host = cli.Host
@@ -315,6 +337,15 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["max-workers"] {
 		cfg.MaxWorkers = cli.MaxWorkers
+	}
+	if cli.Set["acme-domain"] {
+		cfg.ACMEDomain = cli.ACMEDomain
+	}
+	if cli.Set["acme-email"] {
+		cfg.ACMEEmail = cli.ACMEEmail
+	}
+	if cli.Set["acme-cache-dir"] {
+		cfg.ACMECacheDir = cli.ACMECacheDir
 	}
 
 	// Validate memory_limit format if explicitly set

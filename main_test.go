@@ -380,3 +380,75 @@ func TestResolveEffectiveConfigPassthroughUsers(t *testing.T) {
 		t.Fatalf("expected nil passthrough users for empty config, got %v", resolved.Server.PassthroughUsers)
 	}
 }
+
+func TestResolveEffectiveConfigACME(t *testing.T) {
+	// Test YAML config
+	fileCfg := &FileConfig{
+		TLS: TLSConfig{
+			ACME: ACMEConfig{
+				Domain:   "test.us.duckgres.com",
+				Email:    "infra@posthog.com",
+				CacheDir: "/var/lib/duckgres/acme",
+			},
+		},
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.ACMEDomain != "test.us.duckgres.com" {
+		t.Fatalf("expected ACME domain from file, got %q", resolved.Server.ACMEDomain)
+	}
+	if resolved.Server.ACMEEmail != "infra@posthog.com" {
+		t.Fatalf("expected ACME email from file, got %q", resolved.Server.ACMEEmail)
+	}
+	if resolved.Server.ACMECacheDir != "/var/lib/duckgres/acme" {
+		t.Fatalf("expected ACME cache dir from file, got %q", resolved.Server.ACMECacheDir)
+	}
+
+	// Env overrides file
+	env := map[string]string{
+		"DUCKGRES_ACME_DOMAIN":    "env.us.duckgres.com",
+		"DUCKGRES_ACME_EMAIL":     "ops@posthog.com",
+		"DUCKGRES_ACME_CACHE_DIR": "/tmp/acme-cache",
+	}
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.ACMEDomain != "env.us.duckgres.com" {
+		t.Fatalf("expected ACME domain from env, got %q", resolved.Server.ACMEDomain)
+	}
+	if resolved.Server.ACMEEmail != "ops@posthog.com" {
+		t.Fatalf("expected ACME email from env, got %q", resolved.Server.ACMEEmail)
+	}
+	if resolved.Server.ACMECacheDir != "/tmp/acme-cache" {
+		t.Fatalf("expected ACME cache dir from env, got %q", resolved.Server.ACMECacheDir)
+	}
+
+	// CLI overrides env
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:          map[string]bool{"acme-domain": true, "acme-email": true, "acme-cache-dir": true},
+		ACMEDomain:   "cli.us.duckgres.com",
+		ACMEEmail:    "cli@posthog.com",
+		ACMECacheDir: "/cli/acme-cache",
+	}, envFromMap(env), nil)
+	if resolved.Server.ACMEDomain != "cli.us.duckgres.com" {
+		t.Fatalf("expected ACME domain from CLI, got %q", resolved.Server.ACMEDomain)
+	}
+	if resolved.Server.ACMEEmail != "cli@posthog.com" {
+		t.Fatalf("expected ACME email from CLI, got %q", resolved.Server.ACMEEmail)
+	}
+	if resolved.Server.ACMECacheDir != "/cli/acme-cache" {
+		t.Fatalf("expected ACME cache dir from CLI, got %q", resolved.Server.ACMECacheDir)
+	}
+}
+
+func TestResolveEffectiveConfigACMEEnvOnly(t *testing.T) {
+	// No file config, just env vars
+	env := map[string]string{
+		"DUCKGRES_ACME_DOMAIN": "envonly.us.duckgres.com",
+		"DUCKGRES_ACME_EMAIL":  "test@example.com",
+	}
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.ACMEDomain != "envonly.us.duckgres.com" {
+		t.Fatalf("expected ACME domain from env, got %q", resolved.Server.ACMEDomain)
+	}
+	if resolved.Server.ACMEEmail != "test@example.com" {
+		t.Fatalf("expected ACME email from env, got %q", resolved.Server.ACMEEmail)
+	}
+}
