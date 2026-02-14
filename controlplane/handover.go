@@ -157,6 +157,10 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 
 	handoverOK = true
 
+	// Clear reloading flag so the timeout-based recovery in selfExecDetached
+	// doesn't fire during a long drain.
+	cp.reloading.Store(false)
+
 	// Stop accepting new connections immediately. The new CP has its own
 	// listener FD copy (from SCM_RIGHTS), so closing our copy doesn't
 	// affect the underlying socket — the new CP can still accept on it.
