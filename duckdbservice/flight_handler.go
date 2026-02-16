@@ -618,8 +618,16 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 			ch <- flight.StreamChunk{Err: qerr}
 			return
 		}
+		rowsOpen := true
+		closeRows := func() error {
+			if !rowsOpen {
+				return nil
+			}
+			rowsOpen = false
+			return rows.Close()
+		}
 		defer func() {
-			_ = rows.Close()
+			_ = closeRows()
 		}()
 
 		type tableInfo struct {
@@ -639,6 +647,12 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 		}
 		if rowErr := rows.Err(); rowErr != nil {
 			ch <- flight.StreamChunk{Err: rowErr}
+			return
+		}
+		// Close the metadata cursor before issuing schema probe queries on the
+		// same DB/transaction.
+		if closeErr := closeRows(); closeErr != nil {
+			ch <- flight.StreamChunk{Err: closeErr}
 			return
 		}
 

@@ -581,8 +581,16 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 	ch := make(chan flight.StreamChunk, 1)
 	go func() {
 		defer close(ch)
+		rowsOpen := true
+		closeRows := func() error {
+			if !rowsOpen {
+				return nil
+			}
+			rowsOpen = false
+			return rows.Close()
+		}
 		defer func() {
-			_ = rows.Close()
+			_ = closeRows()
 		}()
 
 		if !includeSchema {
@@ -625,6 +633,12 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 			})
 		}
 		if err := rows.Err(); err != nil {
+			ch <- flight.StreamChunk{Err: err}
+			return
+		}
+		// Release the session query lock before schema lookups, which execute
+		// nested queries through the same session.
+		if err := closeRows(); err != nil {
 			ch <- flight.StreamChunk{Err: err}
 			return
 		}
