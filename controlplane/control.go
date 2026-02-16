@@ -69,9 +69,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
-	// Create socket directory
+	// Create socket directory and verify it is writable. Under
+	// ProtectSystem=strict, the ReadWritePaths bind mount may be missing
+	// if the process was started outside systemd's normal lifecycle.
 	if err := os.MkdirAll(cfg.SocketDir, 0755); err != nil {
 		slog.Error("Failed to create socket directory.", "error", err)
+		os.Exit(1)
+	}
+	if err := checkSocketDirWritable(cfg.SocketDir); err != nil {
+		slog.Error("Socket directory is not writable. Workers will not be able to create Unix sockets.", "dir", cfg.SocketDir, "error", err)
 		os.Exit(1)
 	}
 
@@ -185,7 +191,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			slog.Info("Handover socket not found, starting fresh.", "socket", cfg.HandoverSocket, "error", err)
 		} else {
 			slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
-			pgLn, err := receiveHandover(cfg.HandoverSocket)
+			pgLn, err := receiveHandover(cfg.HandoverSocket, cfg.SocketDir)
 			if err != nil {
 				slog.Warn("Handover failed, starting fresh.", "error", err)
 			} else {
