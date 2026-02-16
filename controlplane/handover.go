@@ -13,6 +13,7 @@ import (
 // Handover protocol messages
 type handoverMsg struct {
 	Type string `json:"type"`
+	PID  int    `json:"pid,omitempty"`
 }
 
 // startHandoverListener starts listening for handover requests from a new control plane.
@@ -157,6 +158,16 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 
 	handoverOK = true
 
+	// Belt and suspenders: also send MAINPID from the old CP (which is the
+	// currently trusted main PID). This eliminates the race where systemd
+	// sees our PID die before processing the new CP's sd_notify MAINPID.
+	// When we send it, systemd updates the tracked PID before we exit.
+	if complete.PID > 0 {
+		if err := sdNotify(fmt.Sprintf("MAINPID=%d", complete.PID)); err != nil {
+			slog.Warn("sd_notify MAINPID (from old CP) failed.", "error", err)
+		}
+	}
+
 	// Clear reloading flag so the timeout-based recovery in selfExecDetached
 	// doesn't fire during a long drain.
 	cp.reloading.Store(false)
@@ -186,13 +197,27 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	// Shut down workers
 	cp.pool.ShutdownAll()
 
+	// Give systemd time to process the MAINPID notification before we exit.
+	// Without this delay there is a small window where systemd could see our
+	// PID die before it has updated the tracked main PID, causing it to
+	// briefly consider the service failed and tear down the RuntimeDirectory
+	// bind mount inside the ProtectSystem=strict mount namespace.
+	// Only sleep when running under systemd — no point delaying in tests or
+	// manual runs where there is no NOTIFY_SOCKET.
+	if os.Getenv("NOTIFY_SOCKET") != "" {
+		time.Sleep(2 * time.Second)
+	}
+
 	slog.Info("Old control plane exiting after handover.")
 	os.Exit(0)
 }
 
 // receiveHandover connects to an existing control plane's handover socket,
-// receives the PG listener FD, and takes over.
-func receiveHandover(handoverSocket string) (*net.TCPListener, error) {
+// receives the PG listener FD, and takes over. socketDir is validated for
+// writability before completing the handover — if the ProtectSystem=strict
+// mount namespace has lost its ReadWritePaths, the handover is aborted so the
+// old CP can recover and keep serving.
+func receiveHandover(handoverSocket, socketDir string) (*net.TCPListener, error) {
 	conn, err := net.Dial("unix", handoverSocket)
 	if err != nil {
 		return nil, fmt.Errorf("connect handover socket: %w", err)
@@ -242,6 +267,16 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, error) {
 		return nil, fmt.Errorf("PG listener is not TCP")
 	}
 
+	// Verify socket directory is writable before committing to the handover.
+	// Under ProtectSystem=strict, a previous handover race can leave the
+	// RuntimeDirectory bind mount in a read-only state. Detect this BEFORE
+	// notifying systemd or sending handover_complete — aborting here lets
+	// the old CP recover seamlessly and keep serving.
+	if err := checkSocketDirWritable(socketDir); err != nil {
+		_ = tcpLn.Close()
+		return nil, fmt.Errorf("socket dir not writable, aborting handover: %w", err)
+	}
+
 	// Notify systemd of our PID BEFORE telling the old CP we're done.
 	// The old CP exits on handover_complete, so systemd must know our PID
 	// first — otherwise it sees the old MAINPID die and kills the cgroup.
@@ -249,8 +284,9 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, error) {
 		slog.Warn("sd_notify MAINPID+READY failed.", "error", err)
 	}
 
-	// Send handover complete
-	if err := encoder.Encode(handoverMsg{Type: "handover_complete"}); err != nil {
+	// Send handover complete (include our PID so the old CP can also send
+	// MAINPID to systemd as the currently trusted main process).
+	if err := encoder.Encode(handoverMsg{Type: "handover_complete", PID: os.Getpid()}); err != nil {
 		_ = tcpLn.Close()
 		return nil, fmt.Errorf("send handover complete: %w", err)
 	}
@@ -288,6 +324,21 @@ func recvFD(uc *net.UnixConn) (*os.File, error) {
 		}
 	}
 	return nil, fmt.Errorf("no file descriptor received")
+}
+
+// checkSocketDirWritable verifies that the socket directory is writable by
+// creating and removing a temporary file. This catches cases where
+// ProtectSystem=strict's ReadWritePaths bind mount has been lost (e.g., after
+// a handover race with systemd's RuntimeDirectory cleanup).
+func checkSocketDirWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".writable-check-*")
+	if err != nil {
+		return fmt.Errorf("cannot write to socket directory %s: %w", dir, err)
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return nil
 }
 
 // readJSONLine reads one newline-terminated JSON message from conn without
