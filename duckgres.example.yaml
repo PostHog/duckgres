@@ -5,6 +5,10 @@
 host: "0.0.0.0"
 port: 5432
 
+# Control-plane Arrow Flight SQL ingress (optional)
+# 0 or omitted disables Flight ingress.
+# flight_port: 8815
+
 # Directory for DuckDB database files (one per user)
 data_dir: "./data"
 

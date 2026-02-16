@@ -38,6 +38,7 @@ type ControlPlane struct {
 	cfg         ControlPlaneConfig
 	pool        *FlightWorkerPool
 	sessions    *SessionManager
+	flight      *FlightIngress
 	rebalancer  *MemoryRebalancer
 	srv         *server.Server // Minimal server for cancel request routing
 	rateLimiter *server.RateLimiter
@@ -47,8 +48,8 @@ type ControlPlane struct {
 	closed      bool
 	closeMu     sync.Mutex
 	wg          sync.WaitGroup
-	reloading   atomic.Bool // guards against concurrent selfExec from double SIGUSR1
-	handoverLn  net.Listener // current handover listener; protected by closeMu
+	reloading   atomic.Bool         // guards against concurrent selfExec from double SIGUSR1
+	handoverLn  net.Listener        // current handover listener; protected by closeMu
 	acmeManager *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
 }
 
@@ -159,6 +160,18 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		acmeManager: acmeMgr,
 	}
 
+	// Optional Flight ingress (disabled when flight_port is 0).
+	// It is intentionally started after pre-warm to avoid concurrent worker
+	// creation races between pre-warm and first external Flight requests.
+	if cfg.FlightPort > 0 {
+		flightIngress, err := NewFlightIngress(cfg.Host, cfg.FlightPort, tlsCfg, cfg.Users, sessions)
+		if err != nil {
+			slog.Error("Failed to initialize Flight ingress.", "error", err)
+			os.Exit(1)
+		}
+		cp.flight = flightIngress
+	}
+
 	// Set up signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1)
@@ -204,6 +217,10 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}
 
+	if cp.flight != nil {
+		cp.flight.Start()
+	}
+
 	// Start health check loop with crash notification
 	onCrash := func(workerID int) {
 		cp.sessions.OnWorkerCrash(workerID, func(pid int32) {
@@ -230,6 +247,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
+		"flight_addr", cp.flightAddr(),
 		"min_workers", minWorkers,
 		"max_workers", maxWorkers,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
@@ -245,6 +263,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 					break
 				}
 				slog.Info("Received SIGUSR1, starting graceful handover via self-exec.")
+				// Flight listener is not part of the handover FD transfer; stop it
+				// before spawning the replacement process so the new CP can bind.
+				if cp.flight != nil {
+					cp.flight.Shutdown()
+					cp.flight = nil
+				}
 				if err := sdNotify("RELOADING=1"); err != nil {
 					slog.Warn("sd_notify RELOADING failed.", "error", err)
 				}
@@ -541,6 +565,10 @@ func (cp *ControlPlane) shutdown() {
 	if cp.pgListener != nil {
 		_ = cp.pgListener.Close()
 	}
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
+	}
 
 	// Wait for in-flight connections to finish
 	slog.Info("Waiting for connections to drain...")
@@ -590,6 +618,7 @@ func (cp *ControlPlane) selfExec() {
 	if err := cmd.Start(); err != nil {
 		slog.Error("Self-exec failed.", "error", err)
 		cp.recoverFromFailedReload()
+		cp.recoverFlightIngressAfterFailedReload()
 		return
 	}
 
@@ -617,6 +646,7 @@ func (cp *ControlPlane) selfExec() {
 			slog.Warn("Child process exited before completing handover, recovering.", "error", err)
 			cp.cancelHandoverListener()
 			cp.startHandoverListener()
+			cp.recoverFlightIngressAfterFailedReload()
 		}
 	}()
 }
@@ -636,6 +666,7 @@ func (cp *ControlPlane) selfExecDetached() {
 	if err := cmd.Run(); err != nil {
 		slog.Error("Self-exec (detached) failed.", "error", err)
 		cp.recoverFromFailedReload()
+		cp.recoverFlightIngressAfterFailedReload()
 		return
 	}
 
@@ -652,6 +683,7 @@ func (cp *ControlPlane) selfExecDetached() {
 			slog.Warn("Handover timeout: new CP did not connect within 30s, recovering.")
 			cp.cancelHandoverListener()
 			cp.startHandoverListener()
+			cp.recoverFlightIngressAfterFailedReload()
 		}
 	}()
 }
@@ -680,4 +712,32 @@ func (cp *ControlPlane) recoverFromFailedReload() bool {
 		slog.Warn("sd_notify READY (recovery) failed.", "error", err)
 	}
 	return true
+}
+
+func (cp *ControlPlane) recoverFlightIngressAfterFailedReload() {
+	if cp.cfg.FlightPort <= 0 {
+		return
+	}
+
+	cp.closeMu.Lock()
+	defer cp.closeMu.Unlock()
+	if cp.closed || cp.flight != nil {
+		return
+	}
+
+	flightIngress, err := NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions)
+	if err != nil {
+		slog.Error("Failed to recover Flight ingress after reload failure.", "error", err)
+		return
+	}
+	cp.flight = flightIngress
+	cp.flight.Start()
+	slog.Info("Recovered Flight ingress after reload failure.", "flight_addr", cp.flight.Addr())
+}
+
+func (cp *ControlPlane) flightAddr() string {
+	if cp.flight == nil {
+		return "disabled"
+	}
+	return cp.flight.Addr()
 }

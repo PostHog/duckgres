@@ -127,6 +127,7 @@ Create a `duckgres.yaml` file (see `duckgres.example.yaml` for a complete exampl
 ```yaml
 host: "0.0.0.0"
 port: 5432
+flight_port: 8815
 data_dir: "./data"
 
 tls:
@@ -164,6 +165,7 @@ Run with config file:
 | `DUCKGRES_CONFIG` | Path to YAML config file | - |
 | `DUCKGRES_HOST` | Host to bind to | `0.0.0.0` |
 | `DUCKGRES_PORT` | Port to listen on | `5432` |
+| `DUCKGRES_FLIGHT_PORT` | Control-plane Flight SQL ingress port (`0` disables) | `0` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
@@ -205,6 +207,7 @@ Options:
   -config string           Path to YAML config file
   -host string             Host to bind to
   -port int                Port to listen on
+  -flight-port int         Control-plane Arrow Flight SQL ingress port, 0=disabled
   -data-dir string         Directory for DuckDB files
   -cert string             TLS certificate file
   -key string              TLS private key file
@@ -492,12 +495,13 @@ The default mode runs everything in a single process:
 
 ### Control Plane Mode
 
-For production deployments, control-plane mode splits the server into a **control plane** and a pool of long-lived **worker processes**. The control plane owns client connections end-to-end (TLS, authentication, PostgreSQL wire protocol, SQL transpilation), while workers are thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets. This enables zero-downtime deployments and cross-session DuckDB cache reuse.
+For production deployments, control-plane mode splits the server into a **control plane** and a pool of long-lived **worker processes**. The control plane owns client connections end-to-end (TLS, authentication, PostgreSQL wire protocol, SQL transpilation), while workers are thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets. Optional control-plane Flight ingress (`flight_port`) also exposes Arrow Flight SQL directly with HTTP Basic auth (`Authorization: Basic ...`), compatible with Duckhog clients.
 
 ```
                     CONTROL PLANE (duckgres --mode control-plane)
                     ┌──────────────────────────────────────────────┐
   PG Client ──TLS──>│ PG TCP Listener                              │
+ Flight SQL Client ─>│ Flight SQL TCP Listener (Basic Auth)         │
                     │ TLS Termination + Password Auth              │
                     │ PostgreSQL Wire Protocol                     │
                     │ SQL Transpilation (PG → DuckDB)              │
@@ -529,11 +533,17 @@ Start in control-plane mode:
 # Start in control-plane mode (workers spawn on demand, 1 per connection)
 ./duckgres --mode control-plane --port 5432
 
+# Enable Flight SQL ingress for Duckhog-compatible clients
+./duckgres --mode control-plane --port 5432 --flight-port 8815
+
 # Pre-warm 2 workers and cap at 10
 ./duckgres --mode control-plane --port 5432 --min-workers 2 --max-workers 10
 
 # Connect with psql (identical to standalone mode)
 PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"
+
+# Flight SQL clients use Basic auth headers (user/password)
+# Example endpoint: grpc+tls://localhost:8815
 ```
 
 **Zero-downtime deployment** using the handover protocol:
