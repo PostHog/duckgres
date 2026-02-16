@@ -995,7 +995,7 @@ func getQuerySchema(ctx context.Context, session *flightClientSession, query str
 	return arrow.NewSchema(fields, nil), nil
 }
 
-func rowSetToRecord(alloc memory.Allocator, rows server.RowSet, schema *arrow.Schema, batchSize int) (arrow.Record, error) {
+func rowSetToRecord(alloc memory.Allocator, rows server.RowSet, schema *arrow.Schema, batchSize int) (arrow.RecordBatch, error) {
 	builder := array.NewRecordBuilder(alloc, schema)
 	defer builder.Release()
 
