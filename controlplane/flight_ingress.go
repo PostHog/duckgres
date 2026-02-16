@@ -2,12 +2,10 @@ package controlplane
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -177,7 +175,7 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 		return nil, status.Error(codes.Unauthenticated, "invalid credentials")
 	}
 
-	sessionKey := flightAuthSessionKey(ctx, username, password)
+	sessionKey := flightAuthSessionKey(ctx, username)
 	s, err := h.sessions.GetOrCreate(ctx, sessionKey, username)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "create session: %v", err)
@@ -945,13 +943,12 @@ func parseBasicCredentials(authHeader string) (username, password string, err er
 	return username, password, nil
 }
 
-func flightAuthSessionKey(ctx context.Context, username, password string) string {
+func flightAuthSessionKey(ctx context.Context, username string) string {
 	clientID := "unknown"
 	if p, ok := peer.FromContext(ctx); ok && p != nil && p.Addr != nil {
 		clientID = p.Addr.String()
 	}
-	sum := sha256.Sum256([]byte(username + "\x00" + password))
-	return clientID + "|" + hex.EncodeToString(sum[:])
+	return clientID + "|" + username
 }
 
 func getQuerySchema(ctx context.Context, session *flightClientSession, query string) (*arrow.Schema, error) {
