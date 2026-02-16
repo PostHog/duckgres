@@ -14,9 +14,10 @@ func envFromMap(values map[string]string) func(string) string {
 
 func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	fileCfg := &FileConfig{
-		Host:    "file-host",
-		Port:    5000,
-		DataDir: "/tmp/file-data",
+		Host:       "file-host",
+		Port:       5000,
+		FlightPort: 5001,
+		DataDir:    "/tmp/file-data",
 		TLS: TLSConfig{
 			Cert: "/tmp/file.crt",
 			Key:  "/tmp/file.key",
@@ -28,6 +29,7 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_HOST":              "env-host",
 		"DUCKGRES_PORT":              "6000",
+		"DUCKGRES_FLIGHT_PORT":       "6001",
 		"DUCKGRES_DATA_DIR":          "/tmp/env-data",
 		"DUCKGRES_CERT":              "/tmp/env.crt",
 		"DUCKGRES_KEY":               "/tmp/env.key",
@@ -39,6 +41,7 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		Set: map[string]bool{
 			"host":              true,
 			"port":              true,
+			"flight-port":       true,
 			"data-dir":          true,
 			"cert":              true,
 			"key":               true,
@@ -47,6 +50,7 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		},
 		Host:             "cli-host",
 		Port:             7000,
+		FlightPort:       7001,
 		DataDir:          "/tmp/cli-data",
 		CertFile:         "/tmp/cli.crt",
 		KeyFile:          "/tmp/cli.key",
@@ -59,6 +63,9 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	}
 	if resolved.Server.Port != 7000 {
 		t.Fatalf("port precedence mismatch: got %d", resolved.Server.Port)
+	}
+	if resolved.Server.FlightPort != 7001 {
+		t.Fatalf("flight port precedence mismatch: got %d", resolved.Server.FlightPort)
 	}
 	if resolved.Server.DataDir != "/tmp/cli-data" {
 		t.Fatalf("data dir precedence mismatch: got %q", resolved.Server.DataDir)
@@ -79,13 +86,15 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 
 func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	fileCfg := &FileConfig{
-		Host: "file-host",
-		Port: 5000,
+		Host:       "file-host",
+		Port:       5000,
+		FlightPort: 5001,
 	}
 
 	env := map[string]string{
-		"DUCKGRES_HOST": "env-host",
-		"DUCKGRES_PORT": "6000",
+		"DUCKGRES_HOST":        "env-host",
+		"DUCKGRES_PORT":        "6000",
+		"DUCKGRES_FLIGHT_PORT": "6001",
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
@@ -95,6 +104,9 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	}
 	if resolved.Server.Port != 6000 {
 		t.Fatalf("expected env port, got %d", resolved.Server.Port)
+	}
+	if resolved.Server.FlightPort != 6001 {
+		t.Fatalf("expected env flight port, got %d", resolved.Server.FlightPort)
 	}
 }
 
@@ -355,6 +367,35 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 		if !found {
 			t.Fatalf("expected warning containing %q, warnings: %v", w, warns)
 		}
+	}
+}
+
+func TestResolveEffectiveConfigInvalidFlightPortEnv(t *testing.T) {
+	fileCfg := &FileConfig{
+		FlightPort: 8815,
+	}
+	env := map[string]string{
+		"DUCKGRES_FLIGHT_PORT": "not-a-number",
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.FlightPort != 8815 {
+		t.Fatalf("invalid env flight port should not override valid file value, got %d", resolved.Server.FlightPort)
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "Invalid DUCKGRES_FLIGHT_PORT") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about invalid DUCKGRES_FLIGHT_PORT, warnings: %v", warns)
 	}
 }
 

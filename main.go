@@ -23,6 +23,7 @@ import (
 type FileConfig struct {
 	Host             string              `yaml:"host"`
 	Port             int                 `yaml:"port"`
+	FlightPort       int                 `yaml:"flight_port"` // Control-plane Flight SQL ingress port (0 disables)
 	DataDir          string              `yaml:"data_dir"`
 	TLS              TLSConfig           `yaml:"tls"`
 	Users            map[string]string   `yaml:"users"`
@@ -137,6 +138,7 @@ func main() {
 	configFile := flag.String("config", env("DUCKGRES_CONFIG", ""), "Path to YAML config file (env: DUCKGRES_CONFIG)")
 	host := flag.String("host", "", "Host to bind to (env: DUCKGRES_HOST)")
 	port := flag.Int("port", 0, "Port to listen on (env: DUCKGRES_PORT)")
+	flightPort := flag.Int("flight-port", 0, "Control-plane Arrow Flight SQL ingress port, 0=disabled (env: DUCKGRES_FLIGHT_PORT)")
 	dataDir := flag.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	certFile := flag.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
@@ -177,6 +179,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG             Path to YAML config file\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST               Host to bind to (default: 0.0.0.0)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT               Port to listen on (default: 5432)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_PORT        Control-plane Arrow Flight SQL ingress port (default: disabled)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
@@ -255,6 +258,7 @@ func main() {
 		Set:              cliSet,
 		Host:             *host,
 		Port:             *port,
+		FlightPort:       *flightPort,
 		DataDir:          *dataDir,
 		CertFile:         *certFile,
 		KeyFile:          *keyFile,

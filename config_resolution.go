@@ -12,6 +12,7 @@ type configCLIInputs struct {
 
 	Host             string
 	Port             int
+	FlightPort       int
 	DataDir          string
 	CertFile         string
 	KeyFile          string
@@ -36,6 +37,7 @@ func defaultServerConfig() server.Config {
 	return server.Config{
 		Host:        "0.0.0.0",
 		Port:        5432,
+		FlightPort:  0,
 		DataDir:     "./data",
 		TLSCertFile: "./certs/server.crt",
 		TLSKeyFile:  "./certs/server.key",
@@ -65,6 +67,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.Port != 0 {
 			cfg.Port = fileCfg.Port
+		}
+		if fileCfg.FlightPort != 0 {
+			cfg.FlightPort = fileCfg.FlightPort
 		}
 		if fileCfg.DataDir != "" {
 			cfg.DataDir = fileCfg.DataDir
@@ -191,6 +196,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			cfg.Port = p
 		}
 	}
+	if v := getenv("DUCKGRES_FLIGHT_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.FlightPort = p
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_PORT: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_DATA_DIR"); v != "" {
 		cfg.DataDir = v
 	}
@@ -300,6 +312,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["port"] {
 		cfg.Port = cli.Port
+	}
+	if cli.Set["flight-port"] {
+		cfg.FlightPort = cli.FlightPort
 	}
 	if cli.Set["data-dir"] {
 		cfg.DataDir = cli.DataDir

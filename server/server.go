@@ -84,10 +84,13 @@ func redactConnectionString(connStr string) string {
 }
 
 type Config struct {
-	Host    string
-	Port    int
-	DataDir string
-	Users   map[string]string // username -> password
+	Host string
+	Port int
+	// FlightPort enables Arrow Flight SQL ingress on the control plane.
+	// 0 disables Flight ingress.
+	FlightPort int
+	DataDir    string
+	Users      map[string]string // username -> password
 
 	// TLS configuration (required unless ACME is configured)
 	TLSCertFile string // Path to TLS certificate file
