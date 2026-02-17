@@ -162,25 +162,29 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 		return nil, status.Error(codes.Unauthenticated, "missing authorization header")
 	}
 
+	// Hash the raw authorization header to use as a cache key for the session.
+	// This allows us to skip redundant Basic Auth decoding and credential lookups
+	// for active sessions.
+	sessionAuthToken := sha256.Sum256([]byte(authHeaders[0]))
+
 	username, password, err := parseBasicCredentials(authHeaders[0])
 	if err != nil {
 		return nil, status.Error(codes.Unauthenticated, err.Error())
 	}
 
-	authHash := sha256.Sum256([]byte(username + ":" + password))
 	sessionKey := flightAuthSessionKey(ctx, username)
 
-	// Try to get existing session and verify hash quickly
+	// Try to get existing session and verify authToken quickly
 	h.sessions.mu.RLock()
 	s, ok := h.sessions.sessions[sessionKey]
 	h.sessions.mu.RUnlock()
 
-	if ok && subtle.ConstantTimeCompare(s.authHash[:], authHash[:]) == 1 {
+	if ok && subtle.ConstantTimeCompare(s.sessionAuthToken[:], sessionAuthToken[:]) == 1 {
 		s.touch()
 		return s, nil
 	}
 
-	// Session not found or hash mismatch, perform full validation
+	// Session not found or authToken mismatch, perform full validation
 	expected, userFound := h.users[username]
 	if !userFound {
 		expected = "__invalid__"
@@ -190,7 +194,7 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 		return nil, status.Error(codes.Unauthenticated, "invalid credentials")
 	}
 
-	s, err = h.sessions.GetOrCreate(ctx, sessionKey, username, authHash)
+	s, err = h.sessions.GetOrCreate(ctx, sessionKey, username, sessionAuthToken)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "create session: %v", err)
 	}
@@ -695,10 +699,10 @@ type flightQueryHandle struct {
 }
 
 type flightClientSession struct {
-	pid      int32
-	username string
-	executor *server.FlightExecutor
-	authHash [32]byte // sha256 of the credentials used to create/last verify the session
+	pid              int32
+	username         string
+	executor         *server.FlightExecutor
+	sessionAuthToken [32]byte // sha256 of the authorization header
 
 	lastUsed atomic.Int64
 	counter  atomic.Uint64
@@ -710,14 +714,14 @@ type flightClientSession struct {
 	queries map[string]*flightQueryHandle
 }
 
-func newFlightClientSession(pid int32, username string, executor *server.FlightExecutor, authHash [32]byte) *flightClientSession {
+func newFlightClientSession(pid int32, username string, executor *server.FlightExecutor, sessionAuthToken [32]byte) *flightClientSession {
 	s := &flightClientSession{
-		pid:      pid,
-		username: username,
-		executor: executor,
-		authHash: authHash,
-		txns:     make(map[string]struct{}),
-		queries:  make(map[string]*flightQueryHandle),
+		pid:              pid,
+		username:         username,
+		executor:         executor,
+		sessionAuthToken: sessionAuthToken,
+		txns:             make(map[string]struct{}),
+		queries:          make(map[string]*flightQueryHandle),
 	}
 	s.touch()
 	return s
@@ -848,36 +852,36 @@ func newFlightAuthSessionStore(sm *SessionManager, idleTTL, reapInterval time.Du
 	return s
 }
 
-func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username string, authHash [32]byte) (*flightClientSession, error) {
+func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username string, sessionAuthToken [32]byte) (*flightClientSession, error) {
 	s.mu.RLock()
 	existing, ok := s.sessions[key]
 	s.mu.RUnlock()
 	if ok {
 		// Verify if the credentials still match the cached session.
 		// This handles the case where a user password changes at runtime.
-		if subtle.ConstantTimeCompare(existing.authHash[:], authHash[:]) == 1 {
+		if subtle.ConstantTimeCompare(existing.sessionAuthToken[:], sessionAuthToken[:]) == 1 {
 			existing.touch()
 			return existing, nil
 		}
-		// Hash mismatch: fall through to create a new session (the old one will be reaped or replaced)
+		// Token mismatch: fall through to create a new session (the old one will be reaped or replaced)
 	}
 
 	pid, executor, err := s.sm.CreateSession(ctx, username)
 	if err != nil {
 		return nil, err
 	}
-	created := newFlightClientSession(pid, username, executor, authHash)
+	created := newFlightClientSession(pid, username, executor, sessionAuthToken)
 
 	s.mu.Lock()
 	if existing, ok := s.sessions[key]; ok {
-		// Double check hash under lock
-		if subtle.ConstantTimeCompare(existing.authHash[:], authHash[:]) == 1 {
+		// Double check token under lock
+		if subtle.ConstantTimeCompare(existing.sessionAuthToken[:], sessionAuthToken[:]) == 1 {
 			s.mu.Unlock()
 			s.sm.DestroySession(pid)
 			existing.touch()
 			return existing, nil
 		}
-		// Hash changed while we were creating the session, replace it
+		// Credentials changed while we were creating the session, replace it
 		s.sm.DestroySession(existing.pid)
 	}
 	s.sessions[key] = created
