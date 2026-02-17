@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +28,11 @@ func flightAuthContext(username, password string) context.Context {
 	return metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Basic "+token))
 }
 
+func basicAuthHeader(username, password string) string {
+	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	return "Basic " + token
+}
+
 func newFlightClient(t *testing.T, port int) *flightsql.Client {
 	t.Helper()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -44,14 +50,7 @@ func newFlightClient(t *testing.T, port int) *flightsql.Client {
 	return client
 }
 
-func requireGetTablesIncludeSchema(t *testing.T, flightPort int) error {
-	client := newFlightClient(t, flightPort)
-	defer func() {
-		_ = client.Close()
-	}()
-	ctx, cancel := context.WithTimeout(flightAuthContext("testuser", "testpass"), 20*time.Second)
-	defer cancel()
-
+func requireGetTablesIncludeSchema(t *testing.T, client *flightsql.Client, ctx context.Context) error {
 	info, err := client.GetTables(ctx, &flightsql.GetTablesOpts{IncludeSchema: true})
 	if err != nil {
 		return fmt.Errorf("GetTables(include_schema=true) failed: %w", err)
@@ -76,7 +75,7 @@ func requireGetTablesIncludeSchema(t *testing.T, flightPort int) error {
 		}
 
 		for reader.Next() {
-			record := reader.Record()
+			record := reader.RecordBatch()
 			names, ok := record.Column(2).(*array.String)
 			if !ok {
 				reader.Release()
@@ -135,8 +134,34 @@ func TestFlightIngressIncludeSchemaLowWorkerRegression(t *testing.T) {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+			client := newFlightClient(t, h.flightPort)
+			defer func() { _ = client.Close() }()
+
+			bootstrapCtx, bootstrapCancel := context.WithTimeout(flightAuthContext("testuser", "testpass"), 20*time.Second)
+			var respHeader metadata.MD
+			_, bootstrapErr := client.GetTables(bootstrapCtx, &flightsql.GetTablesOpts{}, grpc.Header(&respHeader))
+			bootstrapCancel()
+			if bootstrapErr != nil {
+				errCh <- fmt.Errorf("worker %d bootstrap failed: %w", workerID, bootstrapErr)
+				return
+			}
+			sessionTokens := respHeader.Get("x-duckgres-session")
+			if len(sessionTokens) == 0 || strings.TrimSpace(sessionTokens[0]) == "" {
+				errCh <- fmt.Errorf("worker %d bootstrap missing x-duckgres-session header", workerID)
+				return
+			}
+			authHeader := basicAuthHeader("testuser", "testpass")
+			token := strings.TrimSpace(sessionTokens[0])
+
 			for i := 0; i < iterationsPerGoroutine; i++ {
-				if err := requireGetTablesIncludeSchema(t, h.flightPort); err != nil {
+				iterBaseCtx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(
+					"authorization", authHeader,
+					"x-duckgres-session", token,
+				))
+				iterCtx, iterCancel := context.WithTimeout(iterBaseCtx, 20*time.Second)
+				err := requireGetTablesIncludeSchema(t, client, iterCtx)
+				iterCancel()
+				if err != nil {
 					errCh <- fmt.Errorf("worker %d iteration %d failed: %w", workerID, i, err)
 					return
 				}
@@ -149,5 +174,50 @@ func TestFlightIngressIncludeSchemaLowWorkerRegression(t *testing.T) {
 
 	for err := range errCh {
 		t.Fatalf("flight include_schema regression: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+}
+
+func TestFlightIngressServerIssuedSessionTokenRequiresBasicAuth(t *testing.T) {
+	h := startControlPlane(t, cpOpts{
+		flightPort: freePort(t),
+		maxWorkers: 1,
+	})
+
+	client1 := newFlightClient(t, h.flightPort)
+	defer func() { _ = client1.Close() }()
+
+	var respHeader metadata.MD
+	ctx1, cancel1 := context.WithTimeout(flightAuthContext("testuser", "testpass"), 20*time.Second)
+	defer cancel1()
+
+	if _, err := client1.GetTables(ctx1, &flightsql.GetTablesOpts{}, grpc.Header(&respHeader)); err != nil {
+		t.Fatalf("bootstrap GetTables with basic auth failed: %v", err)
+	}
+
+	sessionTokens := respHeader.Get("x-duckgres-session")
+	if len(sessionTokens) == 0 || strings.TrimSpace(sessionTokens[0]) == "" {
+		t.Fatalf("expected server-issued x-duckgres-session header, got %v", respHeader)
+	}
+
+	client2 := newFlightClient(t, h.flightPort)
+	defer func() { _ = client2.Close() }()
+
+	tokenCtx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("x-duckgres-session", sessionTokens[0]))
+	ctx2, cancel2 := context.WithTimeout(tokenCtx, 20*time.Second)
+	defer cancel2()
+
+	if _, err := client2.GetTables(ctx2, &flightsql.GetTablesOpts{}); err == nil {
+		t.Fatalf("expected token-only GetTables to fail without basic auth")
+	}
+
+	tokenAndAuthCtx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(
+		"x-duckgres-session", sessionTokens[0],
+		"authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("testuser:testpass")),
+	))
+	ctx3, cancel3 := context.WithTimeout(tokenAndAuthCtx, 20*time.Second)
+	defer cancel3()
+
+	if _, err := client2.GetTables(ctx3, &flightsql.GetTablesOpts{}); err != nil {
+		t.Fatalf("token+basic GetTables failed: %v", err)
 	}
 }

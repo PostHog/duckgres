@@ -101,8 +101,13 @@ type Config struct {
 	// FlightHandleIdleTTL controls stale prepared/query handle cleanup inside a
 	// Flight auth session.
 	FlightHandleIdleTTL time.Duration
-	DataDir             string
-	Users               map[string]string // username -> password
+
+	// FlightSessionTokenTTL controls the absolute lifetime of issued
+	// x-duckgres-session tokens. Expired tokens are rejected and require
+	// a fresh bootstrap request.
+	FlightSessionTokenTTL time.Duration
+	DataDir               string
+	Users                 map[string]string // username -> password
 
 	// TLS configuration (required unless ACME is configured)
 	TLSCertFile string // Path to TLS certificate file

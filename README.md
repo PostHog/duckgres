@@ -135,6 +135,7 @@ flight_port: 8815
 flight_session_idle_ttl: "10m"
 flight_session_reap_interval: "1m"
 flight_handle_idle_ttl: "15m"
+flight_session_token_ttl: "1h"
 data_dir: "./data"
 
 tls:
@@ -176,6 +177,7 @@ Run with config file:
 | `DUCKGRES_FLIGHT_SESSION_IDLE_TTL` | Flight auth session idle TTL | `10m` |
 | `DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL` | Flight auth session reap interval | `1m` |
 | `DUCKGRES_FLIGHT_HANDLE_IDLE_TTL` | Flight prepared/query handle idle TTL | `15m` |
+| `DUCKGRES_FLIGHT_SESSION_TOKEN_TTL` | Flight issued session token absolute TTL | `1h` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
@@ -221,6 +223,7 @@ Options:
   -flight-session-idle-ttl string      Flight auth session idle TTL (e.g., '10m')
   -flight-session-reap-interval string Flight auth session reap interval (e.g., '1m')
   -flight-handle-idle-ttl string       Flight prepared/query handle idle TTL (e.g., '15m')
+  -flight-session-token-ttl string     Flight issued session token absolute TTL (e.g., '1h')
   -data-dir string         Directory for DuckDB files
   -cert string             TLS certificate file
   -key string              TLS private key file

@@ -16,6 +16,7 @@ type configCLIInputs struct {
 	FlightSessionIdleTTL      string
 	FlightSessionReapInterval string
 	FlightHandleIdleTTL       string
+	FlightSessionTokenTTL     string
 	DataDir                   string
 	CertFile                  string
 	KeyFile                   string
@@ -44,6 +45,7 @@ func defaultServerConfig() server.Config {
 		FlightSessionIdleTTL:      10 * time.Minute,
 		FlightSessionReapInterval: 1 * time.Minute,
 		FlightHandleIdleTTL:       15 * time.Minute,
+		FlightSessionTokenTTL:     1 * time.Hour,
 		DataDir:                   "./data",
 		TLSCertFile:               "./certs/server.crt",
 		TLSKeyFile:                "./certs/server.key",
@@ -96,6 +98,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 				cfg.FlightHandleIdleTTL = d
 			} else {
 				warn("Invalid flight_handle_idle_ttl duration: " + err.Error())
+			}
+		}
+		if fileCfg.FlightSessionTokenTTL != "" {
+			if d, err := time.ParseDuration(fileCfg.FlightSessionTokenTTL); err == nil {
+				cfg.FlightSessionTokenTTL = d
+			} else {
+				warn("Invalid flight_session_token_ttl duration: " + err.Error())
 			}
 		}
 		if fileCfg.DataDir != "" {
@@ -251,6 +260,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_FLIGHT_HANDLE_IDLE_TTL duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_FLIGHT_SESSION_TOKEN_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FlightSessionTokenTTL = d
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_SESSION_TOKEN_TTL duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_DATA_DIR"); v != "" {
 		cfg.DataDir = v
 	}
@@ -383,6 +399,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			cfg.FlightHandleIdleTTL = d
 		} else {
 			warn("Invalid --flight-handle-idle-ttl duration: " + err.Error())
+		}
+	}
+	if cli.Set["flight-session-token-ttl"] {
+		if d, err := time.ParseDuration(cli.FlightSessionTokenTTL); err == nil {
+			cfg.FlightSessionTokenTTL = d
+		} else {
+			warn("Invalid --flight-session-token-ttl duration: " + err.Error())
 		}
 	}
 	if cli.Set["data-dir"] {

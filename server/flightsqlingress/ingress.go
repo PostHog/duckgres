@@ -2,10 +2,12 @@ package flightsqlingress
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -30,11 +32,12 @@ import (
 )
 
 const (
-	flightBatchSize                = 1024
-	defaultFlightSessionIdleTTL    = 10 * time.Minute
-	defaultFlightSessionReapTick   = 1 * time.Minute
-	defaultFlightHandleIdleTTL     = 15 * time.Minute
-	defaultFlightClientIDHeaderKey = "x-duckgres-client-id"
+	flightBatchSize               = 1024
+	defaultFlightSessionIdleTTL   = 10 * time.Minute
+	defaultFlightSessionReapTick  = 1 * time.Minute
+	defaultFlightHandleIdleTTL    = 15 * time.Minute
+	defaultFlightSessionTokenTTL  = 1 * time.Hour
+	defaultFlightSessionHeaderKey = "x-duckgres-session"
 )
 
 const (
@@ -50,6 +53,7 @@ type Config struct {
 	SessionIdleTTL  time.Duration
 	SessionReapTick time.Duration
 	HandleIdleTTL   time.Duration
+	SessionTokenTTL time.Duration
 }
 
 type SessionProvider interface {
@@ -109,8 +113,11 @@ func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[st
 	if cfg.HandleIdleTTL <= 0 {
 		cfg.HandleIdleTTL = defaultFlightHandleIdleTTL
 	}
+	if cfg.SessionTokenTTL <= 0 {
+		cfg.SessionTokenTTL = defaultFlightSessionTokenTTL
+	}
 
-	store := newFlightAuthSessionStore(provider, cfg.SessionIdleTTL, cfg.SessionReapTick, cfg.HandleIdleTTL, opts)
+	store := newFlightAuthSessionStore(provider, cfg.SessionIdleTTL, cfg.SessionReapTick, cfg.HandleIdleTTL, cfg.SessionTokenTTL, opts)
 	handler, err := NewControlPlaneFlightSQLHandler(store, users)
 	if err != nil {
 		_ = ln.Close()
@@ -202,14 +209,49 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 		return nil, status.Error(codes.Unauthenticated, "missing metadata")
 	}
 
+	if h.sessions == nil {
+		return nil, status.Error(codes.Unavailable, "session store is not configured")
+	}
+
+	username, err := h.authenticateBasicCredentials(md)
+	if err != nil {
+		return nil, err
+	}
+
+	if sessionToken := incomingSessionToken(md); sessionToken != "" {
+		s, ok := h.sessions.GetByToken(sessionToken)
+		if !ok {
+			return nil, status.Error(codes.Unauthenticated, "session not found")
+		}
+
+		if username != s.username {
+			return nil, status.Error(codes.PermissionDenied, "session token does not match authenticated user")
+		}
+
+		setSessionTokenMetadata(ctx, sessionToken)
+		s.touch()
+		return s, nil
+	}
+
+	s, err := h.sessions.Create(ctx, username)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "create bootstrap session: %v", err)
+	}
+
+	setSessionTokenMetadata(ctx, s.token)
+	s.touch()
+	return s, nil
+}
+
+func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(md metadata.MD) (string, error) {
 	authHeaders := md.Get("authorization")
 	if len(authHeaders) == 0 {
-		return nil, status.Error(codes.Unauthenticated, "missing authorization header")
+		return "", status.Error(codes.Unauthenticated, "missing authorization header")
 	}
 
 	username, password, err := parseBasicCredentials(authHeaders[0])
 	if err != nil {
-		return nil, status.Error(codes.Unauthenticated, err.Error())
+		return "", status.Error(codes.Unauthenticated, err.Error())
 	}
 
 	expected, userFound := h.users[username]
@@ -218,16 +260,26 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 	}
 	passMatch := subtle.ConstantTimeCompare([]byte(password), []byte(expected)) == 1
 	if !userFound || !passMatch {
-		return nil, status.Error(codes.Unauthenticated, "invalid credentials")
+		return "", status.Error(codes.Unauthenticated, "invalid credentials")
 	}
+	return username, nil
+}
 
-	sessionKey := flightAuthSessionKey(ctx, username)
-	s, err := h.sessions.GetOrCreate(ctx, sessionKey, username)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "create session: %v", err)
+func incomingSessionToken(md metadata.MD) string {
+	values := md.Get(defaultFlightSessionHeaderKey)
+	if len(values) == 0 {
+		return ""
 	}
-	s.touch()
-	return s, nil
+	return strings.TrimSpace(values[0])
+}
+
+func setSessionTokenMetadata(ctx context.Context, sessionToken string) {
+	if sessionToken == "" {
+		return
+	}
+	md := metadata.Pairs(defaultFlightSessionHeaderKey, sessionToken)
+	_ = grpc.SetHeader(ctx, md)
+	_ = grpc.SetTrailer(ctx, md)
 }
 
 func (h *ControlPlaneFlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
@@ -334,9 +386,13 @@ func (h *ControlPlaneFlightSQLHandler) DoPutCommandStatementUpdate(ctx context.C
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
 	}
 
+	return rowsAffectedOrError(res)
+}
+
+func rowsAffectedOrError(res server.ExecResult) (int64, error) {
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return 0, nil
+		return 0, status.Errorf(codes.Internal, "failed to fetch affected row count: %v", err)
 	}
 	return affected, nil
 }
@@ -789,12 +845,15 @@ type flightQueryHandle struct {
 
 type flightClientSession struct {
 	pid      int32
+	token    string
 	username string
 	executor *server.FlightExecutor
 
 	lastUsed atomic.Int64
-	counter  atomic.Uint64
-	streams  atomic.Int32
+	// tokenIssuedAt stores when this token was issued; used for absolute token TTL.
+	tokenIssuedAt atomic.Int64
+	counter       atomic.Uint64
+	streams       atomic.Int32
 
 	opMu sync.Mutex
 
@@ -942,6 +1001,7 @@ type flightAuthSessionStore struct {
 	idleTTL       time.Duration
 	reapInterval  time.Duration
 	handleIdleTTL time.Duration
+	tokenTTL      time.Duration
 	hooks         Hooks
 	isMaxWorkerFn func(error) bool
 
@@ -949,7 +1009,8 @@ type flightAuthSessionStore struct {
 	destroySessionFn func(int32)
 
 	mu       sync.RWMutex
-	sessions map[string]*flightClientSession
+	sessions map[string]*flightClientSession // session token -> session
+	byKey    map[string]string               // auth bootstrap key -> session token
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -968,7 +1029,7 @@ func (r *lockedRowSet) Close() error {
 	return err
 }
 
-func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, handleIdleTTL time.Duration, opts Options) *flightAuthSessionStore {
+func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, handleIdleTTL, tokenTTL time.Duration, opts Options) *flightAuthSessionStore {
 	createFn := func(context.Context, string) (int32, *server.FlightExecutor, error) {
 		return 0, nil, fmt.Errorf("session provider is not configured")
 	}
@@ -987,16 +1048,26 @@ func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, 
 		idleTTL:          idleTTL,
 		reapInterval:     reapInterval,
 		handleIdleTTL:    handleIdleTTL,
+		tokenTTL:         tokenTTL,
 		hooks:            opts.Hooks,
 		isMaxWorkerFn:    isMaxWorkerFn,
 		createSessionFn:  createFn,
 		destroySessionFn: destroyFn,
 		sessions:         make(map[string]*flightClientSession),
+		byKey:            make(map[string]string),
 		stopCh:           make(chan struct{}),
 		doneCh:           make(chan struct{}),
 	}
 	go s.reapLoop()
 	return s
+}
+
+func (s *flightAuthSessionStore) Create(ctx context.Context, username string) (*flightClientSession, error) {
+	bootstrapNonce, err := generateSessionIdentityToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate bootstrap nonce: %w", err)
+	}
+	return s.GetOrCreate(ctx, "bootstrap|"+username+"|"+bootstrapNonce, username)
 }
 
 func (s *flightAuthSessionStore) notifySessionCountChanged(count int) {
@@ -1021,7 +1092,7 @@ func (s *flightAuthSessionStore) notifyMaxWorkerRetry(outcome string) {
 }
 
 func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username string) (*flightClientSession, error) {
-	existing, ok := s.getExisting(key)
+	existing, ok := s.getExistingByKey(key)
 	if ok {
 		existing.touch()
 		return existing, nil
@@ -1051,16 +1122,38 @@ func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username 
 	if err != nil {
 		return nil, err
 	}
+
+	token, tokenErr := generateSessionIdentityToken()
+	if tokenErr != nil {
+		s.destroySessionFn(pid)
+		return nil, fmt.Errorf("generate session identity token: %w", tokenErr)
+	}
 	created := newFlightClientSession(pid, username, executor)
+	created.token = token
 
 	s.mu.Lock()
-	if existing, ok := s.sessions[key]; ok {
+	s.ensureMapsLocked()
+	if existing, ok := s.getExistingByKeyLocked(key); ok {
 		s.mu.Unlock()
 		s.destroySessionFn(pid)
 		existing.touch()
 		return existing, nil
 	}
-	s.sessions[key] = created
+	for {
+		if _, exists := s.sessions[created.token]; !exists {
+			break
+		}
+		token, tokenErr = generateSessionIdentityToken()
+		if tokenErr != nil {
+			s.mu.Unlock()
+			s.destroySessionFn(pid)
+			return nil, fmt.Errorf("generate session identity token: %w", tokenErr)
+		}
+		created.token = token
+	}
+	s.sessions[created.token] = created
+	created.tokenIssuedAt.Store(time.Now().UnixNano())
+	s.byKey[key] = created.token
 	sessionCount := len(s.sessions)
 	s.mu.Unlock()
 	s.notifySessionCountChanged(sessionCount)
@@ -1068,11 +1161,77 @@ func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username 
 	return created, nil
 }
 
-func (s *flightAuthSessionStore) getExisting(key string) (*flightClientSession, bool) {
+func (s *flightAuthSessionStore) GetByToken(token string) (*flightClientSession, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return nil, false
+	}
+
+	var (
+		session          *flightClientSession
+		ok               bool
+		expiredSession   *flightClientSession
+		postExpireCount  int
+		tokenIssuedAtRaw int64
+	)
+
+	s.mu.Lock()
+	s.ensureMapsLocked()
+	session, ok = s.sessions[token]
+	if !ok {
+		s.mu.Unlock()
+		return nil, false
+	}
+
+	tokenIssuedAtRaw = session.tokenIssuedAt.Load()
+	if s.tokenTTL > 0 && tokenIssuedAtRaw > 0 {
+		tokenAge := time.Since(time.Unix(0, tokenIssuedAtRaw))
+		if tokenAge >= s.tokenTTL {
+			delete(s.sessions, token)
+			s.removeByKeyForTokenLocked(token)
+			expiredSession = session
+			postExpireCount = len(s.sessions)
+			destroyFn := s.destroySessionFn
+			s.mu.Unlock()
+
+			if destroyFn != nil {
+				destroyFn(expiredSession.pid)
+			}
+			s.notifySessionCountChanged(postExpireCount)
+			return nil, false
+		}
+	}
+	s.mu.Unlock()
+	return session, true
+}
+
+func (s *flightAuthSessionStore) getExistingByKey(key string) (*flightClientSession, bool) {
 	s.mu.RLock()
-	existing, ok := s.sessions[key]
+	existing, ok := s.getExistingByKeyLocked(key)
 	s.mu.RUnlock()
 	return existing, ok
+}
+
+func (s *flightAuthSessionStore) getExistingByKeyLocked(key string) (*flightClientSession, bool) {
+	token, ok := s.byKey[key]
+	if !ok {
+		return nil, false
+	}
+	existing, ok := s.sessions[token]
+	if !ok {
+		delete(s.byKey, key)
+		return nil, false
+	}
+	return existing, true
+}
+
+func (s *flightAuthSessionStore) ensureMapsLocked() {
+	if s.sessions == nil {
+		s.sessions = make(map[string]*flightClientSession)
+	}
+	if s.byKey == nil {
+		s.byKey = make(map[string]string)
+	}
 }
 
 func (s *flightAuthSessionStore) waitForExisting(ctx context.Context, key string, timeout time.Duration) (*flightClientSession, bool) {
@@ -1081,7 +1240,7 @@ func (s *flightAuthSessionStore) waitForExisting(ctx context.Context, key string
 	defer ticker.Stop()
 
 	for time.Now().Before(deadline) {
-		if existing, ok := s.getExisting(key); ok {
+		if existing, ok := s.getExistingByKey(key); ok {
 			return existing, true
 		}
 		select {
@@ -1090,7 +1249,7 @@ func (s *flightAuthSessionStore) waitForExisting(ctx context.Context, key string
 		case <-ticker.C:
 		}
 	}
-	return s.getExisting(key)
+	return s.getExistingByKey(key)
 }
 
 func (s *flightAuthSessionStore) Close() {
@@ -1099,11 +1258,13 @@ func (s *flightAuthSessionStore) Close() {
 		<-s.doneCh
 
 		s.mu.Lock()
+		s.ensureMapsLocked()
 		sessions := make([]*flightClientSession, 0, len(s.sessions))
 		for _, cs := range s.sessions {
 			sessions = append(sessions, cs)
 		}
 		s.sessions = make(map[string]*flightClientSession)
+		s.byKey = make(map[string]string)
 		s.mu.Unlock()
 		s.notifySessionCountChanged(0)
 
@@ -1122,7 +1283,8 @@ func (s *flightAuthSessionStore) reapIdle(now time.Time, trigger string) int {
 	sessionCount := 0
 
 	s.mu.Lock()
-	for key, cs := range s.sessions {
+	s.ensureMapsLocked()
+	for token, cs := range s.sessions {
 		cs.reapStaleHandles(now, s.handleIdleTTL)
 
 		last := time.Unix(0, cs.lastUsed.Load())
@@ -1138,7 +1300,8 @@ func (s *flightAuthSessionStore) reapIdle(now time.Time, trigger string) int {
 		if cs.queryCount() > 0 {
 			continue
 		}
-		delete(s.sessions, key)
+		delete(s.sessions, token)
+		s.removeByKeyForTokenLocked(token)
 		stale = append(stale, cs)
 	}
 	sessionCount = len(s.sessions)
@@ -1153,6 +1316,14 @@ func (s *flightAuthSessionStore) reapIdle(now time.Time, trigger string) int {
 		s.notifySessionsReaped(trigger, reaped)
 	}
 	return reaped
+}
+
+func (s *flightAuthSessionStore) removeByKeyForTokenLocked(token string) {
+	for key, mappedToken := range s.byKey {
+		if mappedToken == token {
+			delete(s.byKey, key)
+		}
+	}
 }
 
 func (s *flightAuthSessionStore) reapLoop() {
@@ -1201,24 +1372,24 @@ func parseBasicCredentials(authHeader string) (username, password string, err er
 }
 
 func flightAuthSessionKey(ctx context.Context, username string) string {
-	clientID := ""
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if values := md.Get(defaultFlightClientIDHeaderKey); len(values) > 0 {
-			clientID = strings.TrimSpace(values[0])
-		}
-	}
-	if clientID == "" {
-		clientID = "unknown"
-		if p, ok := peer.FromContext(ctx); ok && p != nil && p.Addr != nil {
-			host, _, err := net.SplitHostPort(p.Addr.String())
-			if err == nil && host != "" {
-				clientID = host
-			} else {
-				clientID = p.Addr.String()
-			}
+	clientID := "unknown"
+	if p, ok := peer.FromContext(ctx); ok && p != nil && p.Addr != nil {
+		host, _, err := net.SplitHostPort(p.Addr.String())
+		if err == nil && host != "" {
+			clientID = host
+		} else {
+			clientID = p.Addr.String()
 		}
 	}
 	return username + "|" + clientID
+}
+
+func generateSessionIdentityToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func getQuerySchema(ctx context.Context, session *flightClientSession, query string) (*arrow.Schema, error) {
