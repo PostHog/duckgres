@@ -43,17 +43,14 @@ const (
 const (
 	ReapTriggerPeriodic = "periodic"
 	ReapTriggerForced   = "forced"
-
-	MaxWorkersRetryAttempted = "attempted"
-	MaxWorkersRetrySucceeded = "succeeded"
-	MaxWorkersRetryFailed    = "failed"
 )
 
 type Config struct {
-	SessionIdleTTL  time.Duration
-	SessionReapTick time.Duration
-	HandleIdleTTL   time.Duration
-	SessionTokenTTL time.Duration
+	SessionIdleTTL     time.Duration
+	SessionReapTick    time.Duration
+	HandleIdleTTL      time.Duration
+	SessionTokenTTL    time.Duration
+	WorkerQueueTimeout time.Duration // applied to CreateSession calls; 0 = use request context as-is
 }
 
 type SessionProvider interface {
@@ -64,12 +61,10 @@ type SessionProvider interface {
 type Hooks struct {
 	OnSessionCountChanged func(int)
 	OnSessionsReaped      func(trigger string, count int)
-	OnMaxWorkersRetry     func(outcome string)
 }
 
 type Options struct {
-	IsMaxWorkersError func(error) bool
-	Hooks             Hooks
+	Hooks Hooks
 }
 
 // FlightIngress serves Arrow Flight SQL on the control plane with Basic auth.
@@ -117,7 +112,7 @@ func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[st
 		cfg.SessionTokenTTL = defaultFlightSessionTokenTTL
 	}
 
-	store := newFlightAuthSessionStore(provider, cfg.SessionIdleTTL, cfg.SessionReapTick, cfg.HandleIdleTTL, cfg.SessionTokenTTL, opts)
+	store := newFlightAuthSessionStore(provider, cfg.SessionIdleTTL, cfg.SessionReapTick, cfg.HandleIdleTTL, cfg.SessionTokenTTL, cfg.WorkerQueueTimeout, opts)
 	handler, err := NewControlPlaneFlightSQLHandler(store, users)
 	if err != nil {
 		_ = ln.Close()
@@ -997,13 +992,13 @@ func (s *flightClientSession) reapStaleHandles(now time.Time, ttl time.Duration)
 }
 
 type flightAuthSessionStore struct {
-	provider      SessionProvider
-	idleTTL       time.Duration
-	reapInterval  time.Duration
-	handleIdleTTL time.Duration
-	tokenTTL      time.Duration
-	hooks         Hooks
-	isMaxWorkerFn func(error) bool
+	provider           SessionProvider
+	idleTTL            time.Duration
+	reapInterval       time.Duration
+	handleIdleTTL      time.Duration
+	tokenTTL           time.Duration
+	workerQueueTimeout time.Duration
+	hooks              Hooks
 
 	createSessionFn  func(context.Context, string) (int32, *server.FlightExecutor, error)
 	destroySessionFn func(int32)
@@ -1029,7 +1024,7 @@ func (r *lockedRowSet) Close() error {
 	return err
 }
 
-func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, handleIdleTTL, tokenTTL time.Duration, opts Options) *flightAuthSessionStore {
+func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, handleIdleTTL, tokenTTL, workerQueueTimeout time.Duration, opts Options) *flightAuthSessionStore {
 	createFn := func(context.Context, string) (int32, *server.FlightExecutor, error) {
 		return 0, nil, fmt.Errorf("session provider is not configured")
 	}
@@ -1038,31 +1033,34 @@ func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, 
 		createFn = provider.CreateSession
 		destroyFn = provider.DestroySession
 	}
-	isMaxWorkerFn := opts.IsMaxWorkersError
-	if isMaxWorkerFn == nil {
-		isMaxWorkerFn = func(error) bool { return false }
-	}
 
 	s := &flightAuthSessionStore{
-		provider:         provider,
-		idleTTL:          idleTTL,
-		reapInterval:     reapInterval,
-		handleIdleTTL:    handleIdleTTL,
-		tokenTTL:         tokenTTL,
-		hooks:            opts.Hooks,
-		isMaxWorkerFn:    isMaxWorkerFn,
-		createSessionFn:  createFn,
-		destroySessionFn: destroyFn,
-		sessions:         make(map[string]*flightClientSession),
-		byKey:            make(map[string]string),
-		stopCh:           make(chan struct{}),
-		doneCh:           make(chan struct{}),
+		provider:           provider,
+		idleTTL:            idleTTL,
+		reapInterval:       reapInterval,
+		handleIdleTTL:      handleIdleTTL,
+		tokenTTL:           tokenTTL,
+		workerQueueTimeout: workerQueueTimeout,
+		hooks:              opts.Hooks,
+		createSessionFn:    createFn,
+		destroySessionFn:   destroyFn,
+		sessions:           make(map[string]*flightClientSession),
+		byKey:              make(map[string]string),
+		stopCh:             make(chan struct{}),
+		doneCh:             make(chan struct{}),
 	}
 	go s.reapLoop()
 	return s
 }
 
 func (s *flightAuthSessionStore) Create(ctx context.Context, username string) (*flightClientSession, error) {
+	// Apply worker queue timeout so Flight SQL clients don't queue indefinitely.
+	if s.workerQueueTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.workerQueueTimeout)
+		defer cancel()
+	}
+
 	bootstrapNonce, err := generateSessionIdentityToken()
 	if err != nil {
 		return nil, fmt.Errorf("generate bootstrap nonce: %w", err)
@@ -1085,12 +1083,6 @@ func (s *flightAuthSessionStore) notifySessionsReaped(trigger string, count int)
 	}
 }
 
-func (s *flightAuthSessionStore) notifyMaxWorkerRetry(outcome string) {
-	if s.hooks.OnMaxWorkersRetry != nil {
-		s.hooks.OnMaxWorkersRetry(outcome)
-	}
-}
-
 func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username string) (*flightClientSession, error) {
 	existing, ok := s.getExistingByKey(key)
 	if ok {
@@ -1099,26 +1091,6 @@ func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username 
 	}
 
 	pid, executor, err := s.createSessionFn(ctx, username)
-	if err != nil && s.isMaxWorkerFn(err) {
-		s.notifyMaxWorkerRetry(MaxWorkersRetryAttempted)
-		reaped := s.reapIdle(time.Now(), ReapTriggerForced)
-		if reaped > 0 {
-			slog.Info("Flight auth session store forced idle reap before retry.", "reaped_sessions", reaped)
-		}
-		pid, executor, err = s.createSessionFn(ctx, username)
-		if err != nil {
-			if s.isMaxWorkerFn(err) {
-				if existing, ok := s.waitForExisting(ctx, key, 5*time.Second); ok {
-					existing.touch()
-					s.notifyMaxWorkerRetry(MaxWorkersRetrySucceeded)
-					return existing, nil
-				}
-			}
-			s.notifyMaxWorkerRetry(MaxWorkersRetryFailed)
-		} else {
-			s.notifyMaxWorkerRetry(MaxWorkersRetrySucceeded)
-		}
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -1248,24 +1220,6 @@ func (s *flightAuthSessionStore) ensureMapsLocked() {
 	if s.byKey == nil {
 		s.byKey = make(map[string]string)
 	}
-}
-
-func (s *flightAuthSessionStore) waitForExisting(ctx context.Context, key string, timeout time.Duration) (*flightClientSession, bool) {
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for time.Now().Before(deadline) {
-		if existing, ok := s.getExistingByKey(key); ok {
-			return existing, true
-		}
-		select {
-		case <-ctx.Done():
-			return nil, false
-		case <-ticker.C:
-		}
-	}
-	return s.getExistingByKey(key)
 }
 
 func (s *flightAuthSessionStore) Close() {

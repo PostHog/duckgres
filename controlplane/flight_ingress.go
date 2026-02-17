@@ -2,7 +2,6 @@ package controlplane
 
 import (
 	"crypto/tls"
-	"errors"
 
 	"github.com/posthog/duckgres/server/flightsqlingress"
 )
@@ -14,13 +13,9 @@ type FlightIngress = flightsqlingress.FlightIngress
 // NewFlightIngress creates a control-plane Flight SQL ingress listener.
 func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[string]string, sm *SessionManager, cfg FlightIngressConfig) (*FlightIngress, error) {
 	return flightsqlingress.NewFlightIngress(host, port, tlsConfig, users, sm, cfg, flightsqlingress.Options{
-		IsMaxWorkersError: func(err error) bool {
-			return errors.Is(err, ErrMaxWorkersReached)
-		},
 		Hooks: flightsqlingress.Hooks{
 			OnSessionCountChanged: observeFlightAuthSessions,
 			OnSessionsReaped:      observeFlightSessionsReaped,
-			OnMaxWorkersRetry:     observeFlightMaxWorkersRetry,
 		},
 	})
 }

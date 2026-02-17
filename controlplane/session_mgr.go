@@ -48,16 +48,21 @@ func NewSessionManager(pool *FlightWorkerPool, rebalancer *MemoryRebalancer) *Se
 // creates a session on it, and rebalances memory/thread limits across all active sessions.
 func (sm *SessionManager) CreateSession(ctx context.Context, username string) (int32, *server.FlightExecutor, error) {
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
-	// Max-workers check is atomic inside AcquireWorker to prevent TOCTOU races.
-	worker, err := sm.pool.AcquireWorker()
+	// When max-workers is set, this blocks until a slot is available.
+	worker, err := sm.pool.AcquireWorker(ctx)
 	if err != nil {
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
 
 	sessionToken, err := worker.CreateSession(ctx, username)
 	if err != nil {
-		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker)
-		sm.pool.RetireWorkerIfNoSessions(worker.ID)
+		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker
+		// that has sessions from other concurrent requests).
+		if !sm.pool.RetireWorkerIfNoSessions(worker.ID) {
+			// Worker wasn't retired (it has other sessions), but we still hold
+			// a semaphore slot for our failed request. Release it.
+			sm.pool.releaseWorkerSem()
+		}
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
 	}
 
