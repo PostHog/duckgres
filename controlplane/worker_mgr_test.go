@@ -232,18 +232,6 @@ func TestHealthCheckLoopDetectsCrashedWorker(t *testing.T) {
 	}
 }
 
-// mockSessionCounter implements SessionCounter for tests.
-type mockSessionCounter struct {
-	counts map[int]int
-}
-
-func (m *mockSessionCounter) SessionCountForWorker(workerID int) int {
-	if m.counts == nil {
-		return 0
-	}
-	return m.counts[workerID]
-}
-
 // makeFakeWorker creates a ManagedWorker with a started process that stays alive.
 // Returns the worker and a cancel function to kill it.
 func makeFakeWorker(t *testing.T, id int) (*ManagedWorker, func()) {
@@ -382,7 +370,102 @@ func TestAcquireWorkerShutdownUnblocksWaiters(t *testing.T) {
 	}
 }
 
-func TestCrashReleasesSemaphoreSlot(t *testing.T) {
+func TestRetireWorkerIfNoSessions_ReleasesClaimOnFailure(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+
+	// Manually inject a worker with 1 active session (as if AcquireWorker just returned it)
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 1
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.workerSem <- struct{}{} // Claim slot
+	pool.mu.Unlock()
+
+	// Calling RetireWorkerIfNoSessions should release the claim and kill the worker.
+	if !pool.RetireWorkerIfNoSessions(1) {
+		t.Fatal("expected RetireWorkerIfNoSessions to return true")
+	}
+
+	// Verify semaphore is freed: we should be able to push a token.
+	select {
+	case pool.workerSem <- struct{}{}:
+		// success
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("semaphore slot was leaked")
+	}
+
+	// Verify worker is gone
+	if _, ok := pool.Worker(1); ok {
+		t.Fatal("worker should have been retired")
+	}
+}
+
+func TestAcquireWorker_AtomicClaimRace(t *testing.T) {
+	// Tests that two concurrent acquisitions don't pick the same idle worker.
+	const n = 5
+	pool := NewFlightWorkerPool(t.TempDir(), "", 10)
+
+	// Pre-warm with n idle workers
+	for i := 1; i <= n; i++ {
+		w, cleanup := makeFakeWorker(t, i)
+		defer cleanup()
+		pool.mu.Lock()
+		pool.workers[i] = w
+		pool.mu.Unlock()
+	}
+
+	// Simultaneous acquisitions
+	results := make(chan *ManagedWorker, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			w, _ := pool.AcquireWorker(context.Background())
+			results <- w
+		}()
+	}
+
+	workers := make(map[int]bool)
+	for i := 0; i < n; i++ {
+		w := <-results
+		if w == nil {
+			t.Fatal("failed to acquire worker")
+		}
+		if workers[w.ID] {
+			t.Errorf("worker %d was assigned multiple times!", w.ID)
+		}
+		workers[w.ID] = true
+	}
+}
+
+func TestRetireWorker_ReleasesAllSessions(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+
+	// Inject a worker with 2 sessions
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 2
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.workerSem <- struct{}{}
+	pool.workerSem <- struct{}{}
+	pool.mu.Unlock()
+
+	// Retire it
+	pool.RetireWorker(1)
+
+	// Verify 2 slots released: should be able to push 5 tokens (capacity)
+	for i := 0; i < 5; i++ {
+		select {
+		case pool.workerSem <- struct{}{}:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("semaphore slot %d was leaked", i)
+		}
+	}
+}
+
+func TestCrashReleasesSemaphoreSlots(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
 
 	// Create a worker that exits immediately (simulates crash).

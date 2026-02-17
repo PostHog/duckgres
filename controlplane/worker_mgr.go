@@ -315,13 +315,15 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 		return
 	}
 	delete(p.workers, id)
-	w.activeSessions--
+	sessions := w.activeSessions
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
 
-	// Release semaphore slot so a queued waiter can proceed.
-	p.releaseWorkerSem()
+	// Release semaphore slots so queued waiters can proceed.
+	for i := 0; i < sessions; i++ {
+		p.releaseWorkerSem()
+	}
 
 	// Run the actual process cleanup asynchronously so DestroySession
 	// doesn't block the connection handler goroutine for up to 3s+.
@@ -332,15 +334,30 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 // Used to clean up on session creation failure without retiring pre-warmed workers.
 // Returns true if the worker was retired (and its semaphore slot released).
 func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) bool {
-	p.mu.RLock()
+	p.mu.Lock()
 	w, ok := p.workers[id]
-	if !ok || w.activeSessions > 0 {
-		p.mu.RUnlock()
+	if !ok {
+		p.mu.Unlock()
 		return false
 	}
-	p.mu.RUnlock()
-	p.RetireWorker(id)
-	return true
+
+	// Decrement the acquisition claim we just made.
+	if w.activeSessions > 0 {
+		w.activeSessions--
+		p.releaseWorkerSem()
+	}
+
+	// If it has NO other active sessions, kill it to be safe (it might be broken).
+	if w.activeSessions == 0 {
+		delete(p.workers, id)
+		workerCount := len(p.workers)
+		p.mu.Unlock()
+		observeControlPlaneWorkers(workerCount)
+		go retireWorkerProcess(w)
+		return true
+	}
+	p.mu.Unlock()
+	return false
 }
 
 // retireWorkerProcess handles the actual process shutdown and socket cleanup.
