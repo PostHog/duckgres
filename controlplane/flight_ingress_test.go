@@ -150,13 +150,50 @@ func TestFlightAuthSessionStoreRetriesAfterForcedReapOnMaxWorkers(t *testing.T) 
 	}
 }
 
-func TestFlightAuthSessionStoreReapIgnoresStaleHandlesWithoutStreams(t *testing.T) {
+func TestFlightAuthSessionStoreReapKeepsSessionWithFreshHandle(t *testing.T) {
 	cs := newFlightClientSession(1234, "postgres", nil)
 	cs.lastUsed.Store(time.Now().Add(-1 * time.Hour).UnixNano())
 	cs.addQuery("prep-1", &flightQueryHandle{
 		Query:    "SELECT 1",
-		LastUsed: time.Now().Add(-1 * time.Hour),
+		LastUsed: time.Now(),
 	})
+
+	destroyed := make([]int32, 0, 1)
+	store := &flightAuthSessionStore{
+		idleTTL:       time.Minute,
+		reapInterval:  time.Hour,
+		handleIdleTTL: time.Minute,
+		sessions: map[string]*flightClientSession{
+			"session": cs,
+		},
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+			return 0, nil, fmt.Errorf("not used")
+		},
+		destroySessionFn: func(pid int32) {
+			destroyed = append(destroyed, pid)
+		},
+	}
+
+	reaped := store.ReapIdleNow()
+	if reaped != 0 {
+		t.Fatalf("expected no reaped sessions while handle is fresh, got %d", reaped)
+	}
+	if len(destroyed) != 0 {
+		t.Fatalf("expected no destroyed sessions, got %v", destroyed)
+	}
+}
+
+func TestFlightAuthSessionStoreReapStaleHandleAllowsSessionReap(t *testing.T) {
+	cs := newFlightClientSession(1234, "postgres", nil)
+	cs.lastUsed.Store(time.Now().Add(-1 * time.Hour).UnixNano())
+	cs.addQuery("prep-1", &flightQueryHandle{
+		Query: "SELECT 1",
+	})
+	cs.mu.Lock()
+	cs.queries["prep-1"].LastUsed = time.Now().Add(-1 * time.Hour)
+	cs.mu.Unlock()
 
 	destroyed := make([]int32, 0, 1)
 	store := &flightAuthSessionStore{

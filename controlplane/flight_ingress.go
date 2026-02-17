@@ -909,6 +909,12 @@ func (s *flightClientSession) activeStreamCount() int {
 	return int(s.streams.Load())
 }
 
+func (s *flightClientSession) queryCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.queries)
+}
+
 func (s *flightClientSession) reapStaleHandles(now time.Time, ttl time.Duration) {
 	if ttl <= 0 {
 		return
@@ -1063,6 +1069,9 @@ func (s *flightAuthSessionStore) reapIdle(now time.Time) int {
 			continue
 		}
 		if cs.activeStreamCount() > 0 {
+			continue
+		}
+		if cs.queryCount() > 0 {
 			continue
 		}
 		delete(s.sessions, key)
