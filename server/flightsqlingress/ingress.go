@@ -3,7 +3,6 @@ package flightsqlingress
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
@@ -70,6 +69,7 @@ type Hooks struct {
 type Options struct {
 	IsMaxWorkersError func(error) bool
 	Hooks             Hooks
+	RateLimiter       *server.RateLimiter
 }
 
 // FlightIngress serves Arrow Flight SQL on the control plane with Basic auth.
@@ -123,6 +123,7 @@ func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[st
 		_ = ln.Close()
 		return nil, err
 	}
+	handler.rateLimiter = opts.RateLimiter
 
 	grpcOpts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(server.MaxGRPCMessageSize),
@@ -180,9 +181,10 @@ func (fi *FlightIngress) Shutdown() {
 // ControlPlaneFlightSQLHandler implements Flight SQL over control-plane sessions.
 type ControlPlaneFlightSQLHandler struct {
 	flightsql.BaseServer
-	users    map[string]string
-	sessions *flightAuthSessionStore
-	alloc    memory.Allocator
+	users       map[string]string
+	sessions    *flightAuthSessionStore
+	rateLimiter *server.RateLimiter
+	alloc       memory.Allocator
 }
 
 func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, users map[string]string) (*ControlPlaneFlightSQLHandler, error) {
@@ -204,8 +206,21 @@ func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, users map
 }
 
 func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (*flightClientSession, error) {
+	var remoteAddr net.Addr
+	if p, ok := peer.FromContext(ctx); ok && p != nil {
+		remoteAddr = p.Addr
+	}
+
+	releaseRateLimit, rejectReason := server.BeginRateLimitedAuthAttempt(h.rateLimiter, remoteAddr)
+	defer releaseRateLimit()
+	if rejectReason != "" {
+		slog.Warn("Flight auth rejected by rate limit policy.", "remote_addr", remoteAddr, "reason", rejectReason)
+		return nil, status.Error(codes.ResourceExhausted, "authentication rate limit exceeded")
+	}
+
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
+		server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
 		return nil, status.Error(codes.Unauthenticated, "missing metadata")
 	}
 
@@ -213,7 +228,7 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 		return nil, status.Error(codes.Unavailable, "session store is not configured")
 	}
 
-	username, err := h.authenticateBasicCredentials(md)
+	username, err := h.authenticateBasicCredentials(md, remoteAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -243,25 +258,27 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 	return s, nil
 }
 
-func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(md metadata.MD) (string, error) {
+func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(md metadata.MD, remoteAddr net.Addr) (string, error) {
 	authHeaders := md.Get("authorization")
 	if len(authHeaders) == 0 {
+		server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
 		return "", status.Error(codes.Unauthenticated, "missing authorization header")
 	}
 
 	username, password, err := parseBasicCredentials(authHeaders[0])
 	if err != nil {
+		server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
 		return "", status.Error(codes.Unauthenticated, err.Error())
 	}
 
-	expected, userFound := h.users[username]
-	if !userFound {
-		expected = "__invalid__"
-	}
-	passMatch := subtle.ConstantTimeCompare([]byte(password), []byte(expected)) == 1
-	if !userFound || !passMatch {
+	if !server.ValidateUserPassword(h.users, username, password) {
+		banned := server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
+		if banned {
+			slog.Warn("Flight client IP banned after auth failures.", "remote_addr", remoteAddr)
+		}
 		return "", status.Error(codes.Unauthenticated, "invalid credentials")
 	}
+	server.RecordSuccessfulAuthAttempt(h.rateLimiter, remoteAddr)
 	return username, nil
 }
 
