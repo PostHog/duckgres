@@ -569,6 +569,8 @@ PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require
 ./duckgres-v2 --mode control-plane --port 5432 --handover-socket /var/run/duckgres/handover.sock
 ```
 
+When running under **systemd** with `RuntimeDirectory`, ensure `RuntimeDirectoryPreserve=yes` is set in your unit file. This prevents systemd from cleaning up or remounting the socket directory as read-only when the old process exits during a handover. A template is provided in `scripts/duckgres.service`.
+
 **Rolling worker updates** via signal:
 
 ```bash
