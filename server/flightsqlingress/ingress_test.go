@@ -13,8 +13,12 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 var errTestMaxWorkersReached = errors.New("max workers reached")
@@ -26,6 +30,57 @@ type testExecResult struct {
 
 func (r testExecResult) RowsAffected() (int64, error) {
 	return r.affected, r.err
+}
+
+func metricCounterValue(t *testing.T, metricName string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_COUNTER {
+			t.Fatalf("metric %q is not a counter", metricName)
+		}
+		var total float64
+		for _, metric := range fam.GetMetric() {
+			total += metric.GetCounter().GetValue()
+		}
+		return total
+	}
+	t.Fatalf("metric %q not found", metricName)
+	return 0
+}
+
+func authContextForPeer(addr net.Addr, username, password string) context.Context {
+	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+	base := peer.NewContext(context.Background(), &peer.Peer{Addr: addr})
+	return metadata.NewIncomingContext(base, metadata.Pairs("authorization", "Basic "+token))
+}
+
+func testFlightHandlerWithStoreAndRateLimiter(t *testing.T, users map[string]string, rateLimiter *server.RateLimiter) *ControlPlaneFlightSQLHandler {
+	t.Helper()
+	store := &flightAuthSessionStore{
+		idleTTL:       time.Minute,
+		reapInterval:  time.Hour,
+		handleIdleTTL: time.Minute,
+		sessions:      make(map[string]*flightClientSession),
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
+		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+			return 1234, nil, nil
+		},
+		destroySessionFn: func(int32) {},
+	}
+	h, err := NewControlPlaneFlightSQLHandler(store, users)
+	if err != nil {
+		t.Fatalf("NewControlPlaneFlightSQLHandler returned error: %v", err)
+	}
+	h.rateLimiter = rateLimiter
+	return h
 }
 
 func TestParseBasicCredentials(t *testing.T) {
@@ -117,10 +172,12 @@ func TestFlightAuthSessionKeyDoesNotTrustMetadataClientOverride(t *testing.T) {
 	}
 }
 
-func TestSessionFromContextRejectsServerIssuedSessionTokenWithoutBasicAuth(t *testing.T) {
+func TestSessionFromContextAcceptsServerIssuedSessionTokenWithoutBasicAuth(t *testing.T) {
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
 	store := &flightAuthSessionStore{
 		sessions: map[string]*flightClientSession{
-			"issued-token": newFlightClientSession(1234, "postgres", nil),
+			"issued-token": s,
 		},
 	}
 
@@ -130,8 +187,15 @@ func TestSessionFromContextRejectsServerIssuedSessionTokenWithoutBasicAuth(t *te
 	}
 
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "issued-token"))
-	if _, err := h.sessionFromContext(ctx); err == nil {
-		t.Fatalf("expected token-only auth to be rejected")
+	got, err := h.sessionFromContext(ctx)
+	if err != nil {
+		t.Fatalf("expected token-only auth to succeed, got %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected non-nil session")
+	}
+	if got != s {
+		t.Fatalf("expected existing token session to be reused")
 	}
 }
 
@@ -195,6 +259,44 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithBasicAuth(t *testi
 	}
 	if got.username != "postgres" {
 		t.Fatalf("expected postgres session, got %q", got.username)
+	}
+}
+
+func TestSessionFromContextTokenPathDoesNotClearRateLimiterFailures(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.47"), Port: 30004}
+	rateLimiter := server.NewRateLimiter(server.RateLimitConfig{
+		MaxFailedAttempts:   2,
+		FailedAttemptWindow: time.Minute,
+		BanDuration:         time.Hour,
+		MaxConnectionsPerIP: 100,
+	})
+	rateLimiter.RecordFailedAuth(addr)
+
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			"issued-token": s,
+		},
+	}
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+	h.rateLimiter = rateLimiter
+
+	base := peer.NewContext(context.Background(), &peer.Peer{Addr: addr})
+	ctx := metadata.NewIncomingContext(base, metadata.Pairs("x-duckgres-session", "issued-token"))
+	if _, err := h.sessionFromContext(ctx); err != nil {
+		t.Fatalf("token-only auth failed: %v", err)
+	}
+
+	_, err = h.sessionFromContext(authContextForPeer(addr, "postgres", "wrong"))
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated error for bad password, got %v", err)
+	}
+	if !rateLimiter.IsBanned(addr) {
+		t.Fatalf("expected prior failure + new failure to ban; token-only path should not clear failures")
 	}
 }
 
@@ -364,6 +466,79 @@ func TestNewControlPlaneFlightSQLHandlerReturnsError(t *testing.T) {
 	}
 	if h == nil {
 		t.Fatalf("expected non-nil handler")
+	}
+}
+
+func TestSessionFromContextInvalidCredentialsIncrementsAuthFailureMetric(t *testing.T) {
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, nil)
+	ctx := authContextForPeer(&net.TCPAddr{IP: net.ParseIP("203.0.113.44"), Port: 30001}, "postgres", "wrong")
+
+	before := metricCounterValue(t, "duckgres_auth_failures_total")
+	_, err := h.sessionFromContext(ctx)
+	after := metricCounterValue(t, "duckgres_auth_failures_total")
+
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated error, got %v", err)
+	}
+	if after-before != 1 {
+		t.Fatalf("expected duckgres_auth_failures_total delta 1, got %.0f", after-before)
+	}
+}
+
+func TestSessionFromContextRateLimitedRejectsAndIncrementsMetric(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.45"), Port: 30002}
+	rateLimiter := server.NewRateLimiter(server.RateLimitConfig{
+		MaxFailedAttempts:   1,
+		FailedAttemptWindow: time.Minute,
+		BanDuration:         time.Hour,
+		MaxConnectionsPerIP: 100,
+	})
+	rateLimiter.RecordFailedAuth(addr)
+
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, rateLimiter)
+	ctx := authContextForPeer(addr, "postgres", "postgres")
+
+	before := metricCounterValue(t, "duckgres_rate_limit_rejects_total")
+	_, err := h.sessionFromContext(ctx)
+	after := metricCounterValue(t, "duckgres_rate_limit_rejects_total")
+
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected resource exhausted error, got %v", err)
+	}
+	if after-before != 1 {
+		t.Fatalf("expected duckgres_rate_limit_rejects_total delta 1, got %.0f", after-before)
+	}
+}
+
+func TestSessionFromContextFailedAndSuccessfulAuthUpdateRateLimiter(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.46"), Port: 30003}
+	rateLimiter := server.NewRateLimiter(server.RateLimitConfig{
+		MaxFailedAttempts:   2,
+		FailedAttemptWindow: time.Minute,
+		BanDuration:         time.Hour,
+		MaxConnectionsPerIP: 100,
+	})
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, rateLimiter)
+
+	_, err := h.sessionFromContext(authContextForPeer(addr, "postgres", "wrong"))
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated error for bad password, got %v", err)
+	}
+
+	s, err := h.sessionFromContext(authContextForPeer(addr, "postgres", "postgres"))
+	if err != nil {
+		t.Fatalf("expected successful auth, got %v", err)
+	}
+	if s == nil {
+		t.Fatalf("expected non-nil session")
+	}
+
+	_, err = h.sessionFromContext(authContextForPeer(addr, "postgres", "wrong"))
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated error for bad password, got %v", err)
+	}
+	if rateLimiter.IsBanned(addr) {
+		t.Fatalf("expected successful auth to clear prior failures before next bad password")
 	}
 }
 

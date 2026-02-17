@@ -170,7 +170,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// It is intentionally started after pre-warm to avoid concurrent worker
 	// creation races between pre-warm and first external Flight requests.
 	if cfg.FlightPort > 0 {
-		flightIngress, err := NewFlightIngress(cfg.Host, cfg.FlightPort, tlsCfg, cfg.Users, sessions, FlightIngressConfig{
+		flightIngress, err := NewFlightIngress(cfg.Host, cfg.FlightPort, tlsCfg, cfg.Users, sessions, cp.rateLimiter, FlightIngressConfig{
 			SessionIdleTTL:  cfg.FlightSessionIdleTTL,
 			SessionReapTick: cfg.FlightSessionReapInterval,
 			HandleIdleTTL:   cfg.FlightHandleIdleTTL,
@@ -343,19 +343,13 @@ func (cp *ControlPlane) acceptLoop() {
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 
-	// Rate limiting
-	if msg := cp.rateLimiter.CheckConnection(remoteAddr); msg != "" {
+	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
+	if msg != "" {
 		slog.Warn("Connection rejected.", "remote_addr", remoteAddr, "reason", msg)
 		_ = conn.Close()
 		return
 	}
-
-	if !cp.rateLimiter.RegisterConnection(remoteAddr) {
-		slog.Warn("Connection rejected: rate limit.", "remote_addr", remoteAddr)
-		_ = conn.Close()
-		return
-	}
-	defer cp.rateLimiter.UnregisterConnection(remoteAddr)
+	defer releaseRateLimit()
 
 	// Read startup message to determine SSL vs cancel
 	params, err := readStartupFromRaw(conn)
@@ -376,6 +370,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Require SSL
 	if !params.sslRequest {
 		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
+		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 		_ = conn.Close()
 		return
 	}
@@ -423,16 +418,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	database := startupParams["database"]
 
 	if username == "" {
+		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no user specified")
-		_ = writer.Flush()
-		return
-	}
-
-	// Look up expected password for this user
-	expectedPassword, ok := cp.cfg.Users[username]
-	if !ok {
-		slog.Warn("Unknown user.", "user", username, "remote_addr", remoteAddr)
-		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
 		return
 	}
@@ -455,15 +442,19 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 
 	if msgType != 'p' {
+		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
 		_ = writer.Flush()
 		return
 	}
 
 	password := string(bytes.TrimRight(body, "\x00"))
-	if password != expectedPassword {
+	if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
 		slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
-		cp.rateLimiter.RecordFailedAuth(remoteAddr)
+		banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
+		if banned {
+			slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
+		}
 		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
 		return
@@ -475,7 +466,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
-	cp.rateLimiter.RecordSuccessfulAuth(remoteAddr)
+	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
 	// Create session on a worker
@@ -740,7 +731,7 @@ func (cp *ControlPlane) recoverFlightIngressAfterFailedReload() {
 		return
 	}
 
-	flightIngress, err := NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions, FlightIngressConfig{
+	flightIngress, err := NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions, cp.rateLimiter, FlightIngressConfig{
 		SessionIdleTTL:  cp.cfg.FlightSessionIdleTTL,
 		SessionReapTick: cp.cfg.FlightSessionReapInterval,
 		HandleIdleTTL:   cp.cfg.FlightHandleIdleTTL,
