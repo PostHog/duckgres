@@ -505,7 +505,7 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set DuckDB threads
 	threads := cfg.Threads
 	if threads == 0 {
-		threads = runtime.NumCPU()
+		threads = runtime.NumCPU() * 2
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET threads = %d", threads)); err != nil {
 		slog.Warn("Failed to set DuckDB threads.", "threads", threads, "error", err)
