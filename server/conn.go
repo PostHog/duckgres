@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/binary"
 	"encoding/csv"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -551,8 +553,12 @@ func (c *clientConn) handleStartup() error {
 		break
 	}
 
-	// Request password
-	if err := writeAuthCleartextPassword(c.writer); err != nil {
+	// Request password (MD5)
+	var salt [4]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return fmt.Errorf("failed to generate salt: %w", err)
+	}
+	if err := writeAuthMD5Password(c.writer, salt); err != nil {
 		return err
 	}
 	if err := c.writer.Flush(); err != nil {
@@ -570,12 +576,36 @@ func (c *clientConn) handleStartup() error {
 		return fmt.Errorf("expected password message, got %c", msgType)
 	}
 
-	// Password is null-terminated
-	password := string(bytes.TrimRight(body, "\x00"))
+	// Password response for MD5 is "md5" + 32-char hex string
+	response := string(bytes.TrimRight(body, "\x00"))
 
 	// Validate password
 	expectedPassword, ok := c.server.cfg.Users[c.username]
-	if !ok || expectedPassword != password {
+	authValid := false
+
+	if ok {
+		if !strings.HasPrefix(response, "md5") || len(response) != 35 {
+			// Fallback: check if it's cleartext (some old clients might not support MD5 if we don't handle Negotiation)
+			// But since we specifically requested MD5, they should send MD5.
+			authValid = (expectedPassword == response)
+		} else {
+			// Compute expected MD5: hex(md5(hex(md5(password + username)) + salt))
+			// 1. md5(password + username)
+			h1 := md5.New()
+			h1.Write([]byte(expectedPassword + c.username))
+			s1 := hex.EncodeToString(h1.Sum(nil))
+
+			// 2. md5(s1 + salt)
+			h2 := md5.New()
+			h2.Write([]byte(s1))
+			h2.Write(salt[:])
+			expectedResponse := "md5" + hex.EncodeToString(h2.Sum(nil))
+
+			authValid = (response == expectedResponse)
+		}
+	}
+
+	if !authValid {
 		// Record failed authentication attempt
 		banned := c.server.rateLimiter.RecordFailedAuth(c.conn.RemoteAddr())
 		if banned {
