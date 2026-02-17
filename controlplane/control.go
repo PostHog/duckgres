@@ -174,6 +174,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			SessionIdleTTL:  cfg.FlightSessionIdleTTL,
 			SessionReapTick: cfg.FlightSessionReapInterval,
 			HandleIdleTTL:   cfg.FlightHandleIdleTTL,
+			SessionTokenTTL: cfg.FlightSessionTokenTTL,
 		})
 		if err != nil {
 			slog.Error("Failed to initialize Flight ingress.", "error", err)

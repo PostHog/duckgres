@@ -375,12 +375,14 @@ func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
 		FlightSessionIdleTTL:      "7m",
 		FlightSessionReapInterval: "45s",
 		FlightHandleIdleTTL:       "3m",
+		FlightSessionTokenTTL:     "2h",
 	}
 
 	env := map[string]string{
 		"DUCKGRES_FLIGHT_SESSION_IDLE_TTL":      "9m",
 		"DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL": "30s",
 		"DUCKGRES_FLIGHT_HANDLE_IDLE_TTL":       "4m",
+		"DUCKGRES_FLIGHT_SESSION_TOKEN_TTL":     "90m",
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
@@ -388,10 +390,12 @@ func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
 			"flight-session-idle-ttl":      true,
 			"flight-session-reap-interval": true,
 			"flight-handle-idle-ttl":       true,
+			"flight-session-token-ttl":     true,
 		},
 		FlightSessionIdleTTL:      "11m",
 		FlightSessionReapInterval: "15s",
 		FlightHandleIdleTTL:       "5m",
+		FlightSessionTokenTTL:     "75m",
 	}, envFromMap(env), nil)
 
 	if resolved.Server.FlightSessionIdleTTL != 11*time.Minute {
@@ -403,6 +407,9 @@ func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
 	if resolved.Server.FlightHandleIdleTTL != 5*time.Minute {
 		t.Fatalf("expected CLI flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
 	}
+	if resolved.Server.FlightSessionTokenTTL != 75*time.Minute {
+		t.Fatalf("expected CLI flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
+	}
 }
 
 func TestResolveEffectiveConfigFlightIngressDurationsFromFile(t *testing.T) {
@@ -410,6 +417,7 @@ func TestResolveEffectiveConfigFlightIngressDurationsFromFile(t *testing.T) {
 		FlightSessionIdleTTL:      "7m",
 		FlightSessionReapInterval: "45s",
 		FlightHandleIdleTTL:       "3m",
+		FlightSessionTokenTTL:     "2h",
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
@@ -423,6 +431,9 @@ func TestResolveEffectiveConfigFlightIngressDurationsFromFile(t *testing.T) {
 	if resolved.Server.FlightHandleIdleTTL != 3*time.Minute {
 		t.Fatalf("expected file flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
 	}
+	if resolved.Server.FlightSessionTokenTTL != 2*time.Hour {
+		t.Fatalf("expected file flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
+	}
 }
 
 func TestResolveEffectiveConfigFlightIngressDurationsFromEnv(t *testing.T) {
@@ -430,6 +441,7 @@ func TestResolveEffectiveConfigFlightIngressDurationsFromEnv(t *testing.T) {
 		"DUCKGRES_FLIGHT_SESSION_IDLE_TTL":      "9m",
 		"DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL": "30s",
 		"DUCKGRES_FLIGHT_HANDLE_IDLE_TTL":       "4m",
+		"DUCKGRES_FLIGHT_SESSION_TOKEN_TTL":     "30m",
 	}
 
 	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
@@ -442,6 +454,9 @@ func TestResolveEffectiveConfigFlightIngressDurationsFromEnv(t *testing.T) {
 	}
 	if resolved.Server.FlightHandleIdleTTL != 4*time.Minute {
 		t.Fatalf("expected env flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
+	}
+	if resolved.Server.FlightSessionTokenTTL != 30*time.Minute {
+		t.Fatalf("expected env flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
 	}
 }
 

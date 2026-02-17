@@ -27,6 +27,7 @@ type FileConfig struct {
 	FlightSessionIdleTTL      string              `yaml:"flight_session_idle_ttl"`      // e.g., "10m"
 	FlightSessionReapInterval string              `yaml:"flight_session_reap_interval"` // e.g., "1m"
 	FlightHandleIdleTTL       string              `yaml:"flight_handle_idle_ttl"`       // e.g., "15m"
+	FlightSessionTokenTTL     string              `yaml:"flight_session_token_ttl"`     // e.g., "1h"
 	DataDir                   string              `yaml:"data_dir"`
 	TLS                       TLSConfig           `yaml:"tls"`
 	Users                     map[string]string   `yaml:"users"`
@@ -145,6 +146,7 @@ func main() {
 	flightSessionIdleTTL := flag.String("flight-session-idle-ttl", "", "Flight auth session idle TTL (e.g., '10m') (env: DUCKGRES_FLIGHT_SESSION_IDLE_TTL)")
 	flightSessionReapInterval := flag.String("flight-session-reap-interval", "", "Flight auth session reap interval (e.g., '1m') (env: DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL)")
 	flightHandleIdleTTL := flag.String("flight-handle-idle-ttl", "", "Flight prepared/query handle idle TTL (e.g., '15m') (env: DUCKGRES_FLIGHT_HANDLE_IDLE_TTL)")
+	flightSessionTokenTTL := flag.String("flight-session-token-ttl", "", "Flight issued session token absolute TTL (e.g., '1h') (env: DUCKGRES_FLIGHT_SESSION_TOKEN_TTL)")
 	dataDir := flag.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	certFile := flag.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
@@ -189,6 +191,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_IDLE_TTL      Flight auth session idle TTL (default: 10m)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL Flight auth session reap interval (default: 1m)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_HANDLE_IDLE_TTL       Flight prepared/query handle idle TTL (default: 15m)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_TOKEN_TTL     Flight issued session token absolute TTL (default: 1h)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
@@ -271,6 +274,7 @@ func main() {
 		FlightSessionIdleTTL:      *flightSessionIdleTTL,
 		FlightSessionReapInterval: *flightSessionReapInterval,
 		FlightHandleIdleTTL:       *flightHandleIdleTTL,
+		FlightSessionTokenTTL:     *flightSessionTokenTTL,
 		DataDir:                   *dataDir,
 		CertFile:                  *certFile,
 		KeyFile:                   *keyFile,

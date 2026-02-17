@@ -19,6 +19,15 @@ import (
 
 var errTestMaxWorkersReached = errors.New("max workers reached")
 
+type testExecResult struct {
+	affected int64
+	err      error
+}
+
+func (r testExecResult) RowsAffected() (int64, error) {
+	return r.affected, r.err
+}
+
 func TestParseBasicCredentials(t *testing.T) {
 	token := base64.StdEncoding.EncodeToString([]byte("postgres:postgres"))
 	user, pass, err := parseBasicCredentials("Basic " + token)
@@ -57,6 +66,23 @@ func TestSupportsLimit(t *testing.T) {
 	}
 }
 
+func TestRowsAffectedOrErrorPropagatesRowsAffectedError(t *testing.T) {
+	_, err := rowsAffectedOrError(testExecResult{err: errors.New("not available")})
+	if err == nil {
+		t.Fatalf("expected rowsAffectedOrError to return an error")
+	}
+}
+
+func TestRowsAffectedOrErrorReturnsAffectedCount(t *testing.T) {
+	affected, err := rowsAffectedOrError(testExecResult{affected: 42})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if affected != 42 {
+		t.Fatalf("expected affected=42, got %d", affected)
+	}
+}
+
 func TestFlightAuthSessionKeyStableAcrossPeerPorts(t *testing.T) {
 	ctx1 := peer.NewContext(context.Background(), &peer.Peer{
 		Addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 40000},
@@ -76,18 +102,246 @@ func TestFlightAuthSessionKeyStableAcrossPeerPorts(t *testing.T) {
 	}
 }
 
-func TestFlightAuthSessionKeyMetadataClientOverride(t *testing.T) {
+func TestFlightAuthSessionKeyDoesNotTrustMetadataClientOverride(t *testing.T) {
 	base := peer.NewContext(context.Background(), &peer.Peer{
 		Addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 45555},
 	})
 	ctx := metadata.NewIncomingContext(base, metadata.Pairs("x-duckgres-client-id", "worker-a"))
 
 	key := flightAuthSessionKey(ctx, "postgres")
-	if !strings.Contains(key, "worker-a") {
-		t.Fatalf("expected session key to include metadata client id, got %q", key)
+	if strings.Contains(key, "worker-a") {
+		t.Fatalf("session key should ignore untrusted metadata client id: %q", key)
 	}
 	if strings.Contains(key, "45555") {
-		t.Fatalf("session key should ignore peer source port when client id is provided: %q", key)
+		t.Fatalf("session key should not include peer source port: %q", key)
+	}
+}
+
+func TestSessionFromContextRejectsServerIssuedSessionTokenWithoutBasicAuth(t *testing.T) {
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			"issued-token": newFlightClientSession(1234, "postgres", nil),
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "issued-token"))
+	if _, err := h.sessionFromContext(ctx); err == nil {
+		t.Fatalf("expected token-only auth to be rejected")
+	}
+}
+
+func TestSessionFromContextRejectsUnknownSessionTokenEvenWithBasicAuth(t *testing.T) {
+	store := &flightAuthSessionStore{
+		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+			return 9876, nil, nil
+		},
+		destroySessionFn: func(int32) {},
+		sessions:         make(map[string]*flightClientSession),
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	token := base64.StdEncoding.EncodeToString([]byte("postgres:postgres"))
+	ctx := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs(
+			"x-duckgres-session", "missing-token",
+			"authorization", "Basic "+token,
+		),
+	)
+
+	if _, err := h.sessionFromContext(ctx); err == nil {
+		t.Fatalf("expected unknown session token to be rejected")
+	}
+}
+
+func TestSessionFromContextAcceptsServerIssuedSessionTokenWithBasicAuth(t *testing.T) {
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			"issued-token": s,
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	token := base64.StdEncoding.EncodeToString([]byte("postgres:postgres"))
+	ctx := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs(
+			"x-duckgres-session", "issued-token",
+			"authorization", "Basic "+token,
+		),
+	)
+
+	got, err := h.sessionFromContext(ctx)
+	if err != nil {
+		t.Fatalf("expected token+basic auth to succeed, got error: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected non-nil session")
+	}
+	if got.username != "postgres" {
+		t.Fatalf("expected postgres session, got %q", got.username)
+	}
+}
+
+func TestSessionFromContextWithoutTokenCreatesDistinctSessions(t *testing.T) {
+	var createCalls atomic.Int32
+	store := &flightAuthSessionStore{
+		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+			return createCalls.Add(1), nil, nil
+		},
+		destroySessionFn: func(int32) {},
+		sessions:         make(map[string]*flightClientSession),
+		byKey:            make(map[string]string),
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	token := base64.StdEncoding.EncodeToString([]byte("postgres:postgres"))
+	base := peer.NewContext(context.Background(), &peer.Peer{
+		Addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 45555},
+	})
+	ctx := metadata.NewIncomingContext(base, metadata.Pairs("authorization", "Basic "+token))
+
+	s1, err := h.sessionFromContext(ctx)
+	if err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+	s2, err := h.sessionFromContext(ctx)
+	if err != nil {
+		t.Fatalf("second call failed: %v", err)
+	}
+
+	if s1 == nil || s2 == nil {
+		t.Fatalf("expected non-nil sessions")
+	}
+	if s1 == s2 {
+		t.Fatalf("expected distinct sessions without session token")
+	}
+	if createCalls.Load() != 2 {
+		t.Fatalf("expected two independent session creations, got %d", createCalls.Load())
+	}
+}
+
+func TestFlightAuthSessionStoreGetExistingByKeyConcurrentStaleEntry(t *testing.T) {
+	store := &flightAuthSessionStore{
+		sessions: make(map[string]*flightClientSession),
+		byKey: map[string]string{
+			"stale-key": "missing-token",
+		},
+	}
+
+	const workers = 24
+	const iterations = 1000
+
+	start := make(chan struct{})
+	errCh := make(chan string, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < iterations; j++ {
+				if _, ok := store.getExistingByKey("stale-key"); ok {
+					select {
+					case errCh <- "expected stale key lookup to miss":
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	if msg, ok := <-errCh; ok {
+		t.Fatalf("%s", msg)
+	}
+
+	store.mu.RLock()
+	_, stillPresent := store.byKey["stale-key"]
+	store.mu.RUnlock()
+	if stillPresent {
+		t.Fatalf("expected stale key mapping to be pruned")
+	}
+}
+
+func TestSessionFromContextRejectsExpiredSessionToken(t *testing.T) {
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
+	s.tokenIssuedAt.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+
+	store := &flightAuthSessionStore{
+		tokenTTL: time.Hour,
+		sessions: map[string]*flightClientSession{
+			"issued-token": s,
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	token := base64.StdEncoding.EncodeToString([]byte("postgres:postgres"))
+	ctx := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs(
+			"x-duckgres-session", "issued-token",
+			"authorization", "Basic "+token,
+		),
+	)
+
+	if _, err := h.sessionFromContext(ctx); err == nil {
+		t.Fatalf("expected expired session token to be rejected")
+	}
+}
+
+func TestSessionFromContextRejectsTokenUserMismatch(t *testing.T) {
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			"issued-token": newFlightClientSession(1234, "postgres", nil),
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{
+		"postgres": "postgres",
+		"alice":    "alice",
+	})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	token := base64.StdEncoding.EncodeToString([]byte("alice:alice"))
+	ctx := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs(
+			"x-duckgres-session", "issued-token",
+			"authorization", "Basic "+token,
+		),
+	)
+
+	if _, err := h.sessionFromContext(ctx); err == nil {
+		t.Fatalf("expected token/user mismatch to be rejected")
 	}
 }
 

@@ -8,6 +8,10 @@ port: 5432
 # Control-plane Arrow Flight SQL ingress (optional)
 # 0 or omitted disables Flight ingress.
 # flight_port: 8815
+# flight_session_idle_ttl: "10m"
+# flight_session_reap_interval: "1m"
+# flight_handle_idle_ttl: "15m"
+# flight_session_token_ttl: "1h"
 
 # Directory for DuckDB database files (one per user)
 data_dir: "./data"
