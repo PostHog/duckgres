@@ -211,13 +211,6 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 		remoteAddr = p.Addr
 	}
 
-	releaseRateLimit, rejectReason := server.BeginRateLimitedAuthAttempt(h.rateLimiter, remoteAddr)
-	defer releaseRateLimit()
-	if rejectReason != "" {
-		slog.Warn("Flight auth rejected by rate limit policy.", "remote_addr", remoteAddr, "reason", rejectReason)
-		return nil, status.Error(codes.ResourceExhausted, "authentication rate limit exceeded")
-	}
-
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
@@ -228,24 +221,42 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 		return nil, status.Error(codes.Unavailable, "session store is not configured")
 	}
 
-	username, err := h.authenticateBasicCredentials(md, remoteAddr)
-	if err != nil {
-		return nil, err
-	}
-
 	if sessionToken := incomingSessionToken(md); sessionToken != "" {
 		s, ok := h.sessions.GetByToken(sessionToken)
 		if !ok {
+			server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
 			return nil, status.Error(codes.Unauthenticated, "session not found")
 		}
 
-		if username != s.username {
-			return nil, status.Error(codes.PermissionDenied, "session token does not match authenticated user")
+		// When Basic auth is included alongside a bearer session token, enforce
+		// principal consistency. Token-only auth is allowed after bootstrap.
+		if hasAuthorizationHeader(md) {
+			username, err := h.authenticateBasicCredentials(md, remoteAddr)
+			if err != nil {
+				return nil, err
+			}
+			if username != s.username {
+				server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
+				return nil, status.Error(codes.PermissionDenied, "session token does not match authenticated user")
+			}
 		}
 
 		setSessionTokenMetadata(ctx, sessionToken)
 		s.touch()
 		return s, nil
+	}
+
+	// Bootstrap requires Basic auth and is subject to auth rate limiting.
+	releaseRateLimit, rejectReason := server.BeginRateLimitedAuthAttempt(h.rateLimiter, remoteAddr)
+	defer releaseRateLimit()
+	if rejectReason != "" {
+		slog.Warn("Flight auth rejected by rate limit policy.", "remote_addr", remoteAddr, "reason", rejectReason)
+		return nil, status.Error(codes.ResourceExhausted, "authentication rate limit exceeded")
+	}
+
+	username, err := h.authenticateBasicCredentials(md, remoteAddr)
+	if err != nil {
+		return nil, err
 	}
 
 	s, err := h.sessions.Create(ctx, username)
@@ -256,6 +267,10 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 	setSessionTokenMetadata(ctx, s.token)
 	s.touch()
 	return s, nil
+}
+
+func hasAuthorizationHeader(md metadata.MD) bool {
+	return len(md.Get("authorization")) > 0
 }
 
 func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(md metadata.MD, remoteAddr net.Addr) (string, error) {

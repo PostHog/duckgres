@@ -28,11 +28,6 @@ func flightAuthContext(username, password string) context.Context {
 	return metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Basic "+token))
 }
 
-func basicAuthHeader(username, password string) string {
-	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-	return "Basic " + token
-}
-
 func newFlightClient(t *testing.T, port int) *flightsql.Client {
 	t.Helper()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -150,12 +145,10 @@ func TestFlightIngressIncludeSchemaLowWorkerRegression(t *testing.T) {
 				errCh <- fmt.Errorf("worker %d bootstrap missing x-duckgres-session header", workerID)
 				return
 			}
-			authHeader := basicAuthHeader("testuser", "testpass")
 			token := strings.TrimSpace(sessionTokens[0])
 
 			for i := 0; i < iterationsPerGoroutine; i++ {
 				iterBaseCtx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(
-					"authorization", authHeader,
 					"x-duckgres-session", token,
 				))
 				iterCtx, iterCancel := context.WithTimeout(iterBaseCtx, 20*time.Second)
@@ -177,7 +170,7 @@ func TestFlightIngressIncludeSchemaLowWorkerRegression(t *testing.T) {
 	}
 }
 
-func TestFlightIngressServerIssuedSessionTokenRequiresBasicAuth(t *testing.T) {
+func TestFlightIngressServerIssuedSessionTokenAllowsTokenOnlyAuth(t *testing.T) {
 	h := startControlPlane(t, cpOpts{
 		flightPort: freePort(t),
 		maxWorkers: 1,
@@ -206,8 +199,8 @@ func TestFlightIngressServerIssuedSessionTokenRequiresBasicAuth(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(tokenCtx, 20*time.Second)
 	defer cancel2()
 
-	if _, err := client2.GetTables(ctx2, &flightsql.GetTablesOpts{}); err == nil {
-		t.Fatalf("expected token-only GetTables to fail without basic auth")
+	if _, err := client2.GetTables(ctx2, &flightsql.GetTablesOpts{}); err != nil {
+		t.Fatalf("expected token-only GetTables to succeed, got %v", err)
 	}
 
 	tokenAndAuthCtx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(

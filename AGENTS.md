@@ -9,3 +9,4 @@
 - When creating new branch from origin/main, do not track origin/main. 
 - Always run lint before committing.
 - Parallelize using subagents when possible.
+- Prefer correctness, maintanability, robustness over shortcut implementations

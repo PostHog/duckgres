@@ -172,10 +172,12 @@ func TestFlightAuthSessionKeyDoesNotTrustMetadataClientOverride(t *testing.T) {
 	}
 }
 
-func TestSessionFromContextRejectsServerIssuedSessionTokenWithoutBasicAuth(t *testing.T) {
+func TestSessionFromContextAcceptsServerIssuedSessionTokenWithoutBasicAuth(t *testing.T) {
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
 	store := &flightAuthSessionStore{
 		sessions: map[string]*flightClientSession{
-			"issued-token": newFlightClientSession(1234, "postgres", nil),
+			"issued-token": s,
 		},
 	}
 
@@ -185,8 +187,15 @@ func TestSessionFromContextRejectsServerIssuedSessionTokenWithoutBasicAuth(t *te
 	}
 
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "issued-token"))
-	if _, err := h.sessionFromContext(ctx); err == nil {
-		t.Fatalf("expected token-only auth to be rejected")
+	got, err := h.sessionFromContext(ctx)
+	if err != nil {
+		t.Fatalf("expected token-only auth to succeed, got %v", err)
+	}
+	if got == nil {
+		t.Fatalf("expected non-nil session")
+	}
+	if got != s {
+		t.Fatalf("expected existing token session to be reused")
 	}
 }
 
@@ -250,6 +259,44 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithBasicAuth(t *testi
 	}
 	if got.username != "postgres" {
 		t.Fatalf("expected postgres session, got %q", got.username)
+	}
+}
+
+func TestSessionFromContextTokenPathDoesNotClearRateLimiterFailures(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.47"), Port: 30004}
+	rateLimiter := server.NewRateLimiter(server.RateLimitConfig{
+		MaxFailedAttempts:   2,
+		FailedAttemptWindow: time.Minute,
+		BanDuration:         time.Hour,
+		MaxConnectionsPerIP: 100,
+	})
+	rateLimiter.RecordFailedAuth(addr)
+
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			"issued-token": s,
+		},
+	}
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+	h.rateLimiter = rateLimiter
+
+	base := peer.NewContext(context.Background(), &peer.Peer{Addr: addr})
+	ctx := metadata.NewIncomingContext(base, metadata.Pairs("x-duckgres-session", "issued-token"))
+	if _, err := h.sessionFromContext(ctx); err != nil {
+		t.Fatalf("token-only auth failed: %v", err)
+	}
+
+	_, err = h.sessionFromContext(authContextForPeer(addr, "postgres", "wrong"))
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated error for bad password, got %v", err)
+	}
+	if !rateLimiter.IsBanned(addr) {
+		t.Fatalf("expected prior failure + new failure to ban; token-only path should not clear failures")
 	}
 }
 
