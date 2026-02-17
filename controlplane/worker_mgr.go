@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,15 +20,17 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+var ErrMaxWorkersReached = errors.New("max workers reached")
+
 // ManagedWorker represents a duckdb-service worker process.
 type ManagedWorker struct {
-	ID         int
-	cmd        *exec.Cmd
-	socketPath string
+	ID          int
+	cmd         *exec.Cmd
+	socketPath  string
 	bearerToken string
-	client     *flightsql.Client
-	done       chan struct{} // closed when process exits
-	exitErr    error
+	client      *flightsql.Client
+	done        chan struct{} // closed when process exits
+	exitErr     error
 }
 
 // SessionCounter provides session counts per worker for load balancing.
@@ -247,7 +250,7 @@ func (p *FlightWorkerPool) AcquireWorker() (*ManagedWorker, error) {
 			return idle, nil
 		}
 		p.mu.Unlock()
-		return nil, fmt.Errorf("max workers reached (%d)", p.maxWorkers)
+		return nil, fmt.Errorf("%w (%d)", ErrMaxWorkersReached, p.maxWorkers)
 	}
 
 	// Try to claim an idle pre-warmed worker before spawning a new one

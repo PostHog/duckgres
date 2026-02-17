@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -31,10 +32,18 @@ import (
 )
 
 const (
-	flightBatchSize       = 1024
-	flightSessionIdleTTL  = 10 * time.Minute
-	flightSessionReapTick = 1 * time.Minute
+	flightBatchSize                = 1024
+	defaultFlightSessionIdleTTL    = 10 * time.Minute
+	defaultFlightSessionReapTick   = 1 * time.Minute
+	defaultFlightHandleIdleTTL     = 15 * time.Minute
+	defaultFlightClientIDHeaderKey = "x-duckgres-client-id"
 )
+
+type FlightIngressConfig struct {
+	SessionIdleTTL  time.Duration
+	SessionReapTick time.Duration
+	HandleIdleTTL   time.Duration
+}
 
 // FlightIngress serves Arrow Flight SQL on the control plane with Basic auth.
 // It reuses control-plane worker sessions via SessionManager.
@@ -49,7 +58,7 @@ type FlightIngress struct {
 }
 
 // NewFlightIngress creates a control-plane Flight SQL ingress listener.
-func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[string]string, sm *SessionManager) (*FlightIngress, error) {
+func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[string]string, sm *SessionManager, cfg FlightIngressConfig) (*FlightIngress, error) {
 	if port <= 0 {
 		return nil, fmt.Errorf("invalid flight port: %d", port)
 	}
@@ -69,8 +78,22 @@ func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[st
 		return nil, fmt.Errorf("flight listen %s: %w", addr, err)
 	}
 
-	store := newFlightAuthSessionStore(sm, flightSessionIdleTTL, flightSessionReapTick)
-	handler := NewControlPlaneFlightSQLHandler(store, users)
+	if cfg.SessionIdleTTL <= 0 {
+		cfg.SessionIdleTTL = defaultFlightSessionIdleTTL
+	}
+	if cfg.SessionReapTick <= 0 {
+		cfg.SessionReapTick = defaultFlightSessionReapTick
+	}
+	if cfg.HandleIdleTTL <= 0 {
+		cfg.HandleIdleTTL = defaultFlightHandleIdleTTL
+	}
+
+	store := newFlightAuthSessionStore(sm, cfg.SessionIdleTTL, cfg.SessionReapTick, cfg.HandleIdleTTL)
+	handler, err := NewControlPlaneFlightSQLHandler(store, users)
+	if err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
 
 	opts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(server.MaxGRPCMessageSize),
@@ -133,22 +156,22 @@ type ControlPlaneFlightSQLHandler struct {
 	alloc    memory.Allocator
 }
 
-func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, users map[string]string) *ControlPlaneFlightSQLHandler {
+func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, users map[string]string) (*ControlPlaneFlightSQLHandler, error) {
 	h := &ControlPlaneFlightSQLHandler{
 		users:    users,
 		sessions: sessions,
 		alloc:    memory.DefaultAllocator,
 	}
 	if err := h.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerName, "duckgres-control-plane"); err != nil {
-		panic(fmt.Sprintf("register sql info server name: %v", err))
+		return nil, fmt.Errorf("register sql info server name: %w", err)
 	}
 	if err := h.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerVersion, "1.0.0"); err != nil {
-		panic(fmt.Sprintf("register sql info server version: %v", err))
+		return nil, fmt.Errorf("register sql info server version: %w", err)
 	}
 	if err := h.RegisterSqlInfo(flightsql.SqlInfoTransactionsSupported, true); err != nil {
-		panic(fmt.Sprintf("register sql info transactions supported: %v", err))
+		return nil, fmt.Errorf("register sql info transactions supported: %w", err)
 	}
-	return h
+	return h, nil
 }
 
 func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (*flightClientSession, error) {
@@ -263,9 +286,11 @@ func (h *ControlPlaneFlightSQLHandler) DoGetStatement(ctx context.Context, ticke
 	}
 
 	ch := make(chan flight.StreamChunk, 10)
+	s.beginStream()
 	go func() {
 		defer close(ch)
 		defer func() {
+			s.endStream()
 			_ = rows.Close()
 			s.deleteQuery(handleID)
 		}()
@@ -273,13 +298,16 @@ func (h *ControlPlaneFlightSQLHandler) DoGetStatement(ctx context.Context, ticke
 		for {
 			record, recErr := rowSetToRecord(h.alloc, rows, handle.Schema, flightBatchSize)
 			if recErr != nil {
-				ch <- flight.StreamChunk{Err: recErr}
+				_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: recErr})
 				return
 			}
 			if record == nil {
 				return
 			}
-			ch <- flight.StreamChunk{Data: record}
+			if !sendStreamChunk(ctx, ch, flight.StreamChunk{Data: record}) {
+				record.Release()
+				return
+			}
 		}
 	}()
 
@@ -446,22 +474,27 @@ func (h *ControlPlaneFlightSQLHandler) DoGetPreparedStatement(ctx context.Contex
 	}
 
 	ch := make(chan flight.StreamChunk, 10)
+	s.beginStream()
 	go func() {
 		defer close(ch)
 		defer func() {
+			s.endStream()
 			_ = rows.Close()
 		}()
 
 		for {
 			record, recErr := rowSetToRecord(h.alloc, rows, handle.Schema, flightBatchSize)
 			if recErr != nil {
-				ch <- flight.StreamChunk{Err: recErr}
+				_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: recErr})
 				return
 			}
 			if record == nil {
 				return
 			}
-			ch <- flight.StreamChunk{Data: record}
+			if !sendStreamChunk(ctx, ch, flight.StreamChunk{Data: record}) {
+				record.Release()
+				return
+			}
 		}
 	}()
 
@@ -510,22 +543,27 @@ func (h *ControlPlaneFlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd f
 	}
 
 	ch := make(chan flight.StreamChunk, 1)
+	s.beginStream()
 	go func() {
 		defer close(ch)
 		defer func() {
+			s.endStream()
 			_ = rows.Close()
 		}()
 
 		for {
 			record, recErr := rowSetToRecord(h.alloc, rows, schema, flightBatchSize)
 			if recErr != nil {
-				ch <- flight.StreamChunk{Err: recErr}
+				_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: recErr})
 				return
 			}
 			if record == nil {
 				return
 			}
-			ch <- flight.StreamChunk{Data: record}
+			if !sendStreamChunk(ctx, ch, flight.StreamChunk{Data: record}) {
+				record.Release()
+				return
+			}
 		}
 	}()
 
@@ -595,8 +633,10 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 	}
 
 	ch := make(chan flight.StreamChunk, 1)
+	s.beginStream()
 	go func() {
 		defer close(ch)
+		defer s.endStream()
 		rowsOpen := true
 		closeRows := func() error {
 			if !rowsOpen {
@@ -613,13 +653,15 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 			for {
 				record, recErr := rowSetToRecord(h.alloc, rows, schema, flightBatchSize)
 				if recErr != nil {
-					ch <- flight.StreamChunk{Err: recErr}
+					_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: recErr})
 					return
 				}
 				if record == nil {
 					return
 				}
-				ch <- flight.StreamChunk{Data: record}
+				if !sendStreamChunk(ctx, ch, flight.StreamChunk{Data: record}) {
+					return
+				}
 			}
 		}
 
@@ -637,7 +679,7 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 				ptrs[i] = &values[i]
 			}
 			if err := rows.Scan(ptrs...); err != nil {
-				ch <- flight.StreamChunk{Err: err}
+				_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: err})
 				return
 			}
 
@@ -649,20 +691,46 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 			})
 		}
 		if err := rows.Err(); err != nil {
-			ch <- flight.StreamChunk{Err: err}
+			_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: err})
 			return
 		}
 		// Release the session query lock before schema lookups, which execute
 		// nested queries through the same session.
 		if err := closeRows(); err != nil {
-			ch <- flight.StreamChunk{Err: err}
+			_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: err})
+			return
+		}
+
+		tableSchemas, schemaLoadErr := loadTableSchemas(ctx, s, cmd)
+		if schemaLoadErr != nil {
+			_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: schemaLoadErr})
 			return
 		}
 
 		builder := array.NewRecordBuilder(h.alloc, schema)
-		defer builder.Release()
-
+		defer func() {
+			if builder != nil {
+				builder.Release()
+			}
+		}()
 		schemaBuilder := builder.Field(4).(*array.BinaryBuilder)
+		batchCount := 0
+		flush := func() bool {
+			if batchCount == 0 {
+				return true
+			}
+			record := builder.NewRecordBatch()
+			if !sendStreamChunk(ctx, ch, flight.StreamChunk{Data: record}) {
+				record.Release()
+				return false
+			}
+			builder.Release()
+			builder = array.NewRecordBuilder(h.alloc, schema)
+			schemaBuilder = builder.Field(4).(*array.BinaryBuilder)
+			batchCount = 0
+			return true
+		}
+
 		for _, t := range tables {
 			if t.catalog.Valid {
 				builder.Field(0).(*array.StringBuilder).Append(t.catalog.String)
@@ -677,25 +745,41 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 			builder.Field(2).(*array.StringBuilder).Append(t.name)
 			builder.Field(3).(*array.StringBuilder).Append(t.tableType)
 
-			qualified := duckdbservice.QualifyTableName(t.catalog, t.schema, t.name)
-			tableSchema, schemaErr := getQuerySchema(ctx, s, "SELECT * FROM "+qualified)
-			if schemaErr != nil {
-				ch <- flight.StreamChunk{Err: schemaErr}
-				return
+			key := tableSchemaKey{
+				catalog:    t.catalog.String,
+				hasCatalog: t.catalog.Valid,
+				schema:     t.schema.String,
+				hasSchema:  t.schema.Valid,
+				name:       t.name,
+			}
+			tableSchema := tableSchemas[key]
+			if tableSchema == nil {
+				qualified := duckdbservice.QualifyTableName(t.catalog, t.schema, t.name)
+				var schemaErr error
+				tableSchema, schemaErr = getQuerySchema(ctx, s, "SELECT * FROM "+qualified)
+				if schemaErr != nil {
+					_ = sendStreamChunk(ctx, ch, flight.StreamChunk{Err: schemaErr})
+					return
+				}
 			}
 			schemaBuilder.Append(flight.SerializeSchema(tableSchema, h.alloc))
+			batchCount++
+			if batchCount >= flightBatchSize && !flush() {
+				return
+			}
 		}
 
-		ch <- flight.StreamChunk{Data: builder.NewRecordBatch()}
+		_ = flush()
 	}()
 
 	return schema, ch, nil
 }
 
 type flightQueryHandle struct {
-	Query  string
-	Schema *arrow.Schema
-	TxnID  string
+	Query    string
+	Schema   *arrow.Schema
+	TxnID    string
+	LastUsed time.Time
 }
 
 type flightClientSession struct {
@@ -706,6 +790,7 @@ type flightClientSession struct {
 
 	lastUsed atomic.Int64
 	counter  atomic.Uint64
+	streams  atomic.Int32
 
 	opMu sync.Mutex
 
@@ -770,12 +855,6 @@ func (s *flightClientSession) txnCount() int {
 	return len(s.txns)
 }
 
-func (s *flightClientSession) queryCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.queries)
-}
-
 func (s *flightClientSession) hasTxn(txnKey string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -797,14 +876,18 @@ func (s *flightClientSession) deleteTxn(txnKey string) {
 
 func (s *flightClientSession) addQuery(handleID string, q *flightQueryHandle) {
 	s.mu.Lock()
+	q.LastUsed = time.Now()
 	s.queries[handleID] = q
 	s.mu.Unlock()
 }
 
 func (s *flightClientSession) getQuery(handleID string) (*flightQueryHandle, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	q, ok := s.queries[handleID]
+	if ok {
+		q.LastUsed = time.Now()
+	}
 	return q, ok
 }
 
@@ -814,10 +897,45 @@ func (s *flightClientSession) deleteQuery(handleID string) {
 	s.mu.Unlock()
 }
 
+func (s *flightClientSession) beginStream() {
+	s.streams.Add(1)
+}
+
+func (s *flightClientSession) endStream() {
+	s.streams.Add(-1)
+}
+
+func (s *flightClientSession) activeStreamCount() int {
+	return int(s.streams.Load())
+}
+
+func (s *flightClientSession) reapStaleHandles(now time.Time, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, q := range s.queries {
+		if !q.LastUsed.IsZero() && now.Sub(q.LastUsed) < ttl {
+			continue
+		}
+		if q.TxnID != "" {
+			if _, ok := s.txns[q.TxnID]; ok {
+				continue
+			}
+		}
+		delete(s.queries, id)
+	}
+}
+
 type flightAuthSessionStore struct {
-	sm           *SessionManager
-	idleTTL      time.Duration
-	reapInterval time.Duration
+	sm            *SessionManager
+	idleTTL       time.Duration
+	reapInterval  time.Duration
+	handleIdleTTL time.Duration
+
+	createSessionFn  func(context.Context, string) (int32, *server.FlightExecutor, error)
+	destroySessionFn func(int32)
 
 	mu       sync.RWMutex
 	sessions map[string]*flightClientSession
@@ -839,14 +957,26 @@ func (r *lockedRowSet) Close() error {
 	return err
 }
 
-func newFlightAuthSessionStore(sm *SessionManager, idleTTL, reapInterval time.Duration) *flightAuthSessionStore {
+func newFlightAuthSessionStore(sm *SessionManager, idleTTL, reapInterval, handleIdleTTL time.Duration) *flightAuthSessionStore {
+	createFn := func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		return 0, nil, fmt.Errorf("session manager is not configured")
+	}
+	destroyFn := func(int32) {}
+	if sm != nil {
+		createFn = sm.CreateSession
+		destroyFn = sm.DestroySession
+	}
+
 	s := &flightAuthSessionStore{
-		sm:           sm,
-		idleTTL:      idleTTL,
-		reapInterval: reapInterval,
-		sessions:     make(map[string]*flightClientSession),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
+		sm:               sm,
+		idleTTL:          idleTTL,
+		reapInterval:     reapInterval,
+		handleIdleTTL:    handleIdleTTL,
+		createSessionFn:  createFn,
+		destroySessionFn: destroyFn,
+		sessions:         make(map[string]*flightClientSession),
+		stopCh:           make(chan struct{}),
+		doneCh:           make(chan struct{}),
 	}
 	go s.reapLoop()
 	return s
@@ -866,7 +996,12 @@ func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username 
 		// Token mismatch: fall through to create a new session (the old one will be reaped or replaced)
 	}
 
-	pid, executor, err := s.sm.CreateSession(ctx, username)
+	pid, executor, err := s.createSessionFn(ctx, username)
+	if err != nil && errors.Is(err, ErrMaxWorkersReached) {
+		if reaped := s.ReapIdleNow(); reaped > 0 {
+			pid, executor, err = s.createSessionFn(ctx, username)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -874,15 +1009,15 @@ func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username 
 
 	s.mu.Lock()
 	if existing, ok := s.sessions[key]; ok {
-		// Double check token under lock
+		// Double check token under lock.
 		if subtle.ConstantTimeCompare(existing.sessionAuthToken[:], sessionAuthToken[:]) == 1 {
 			s.mu.Unlock()
-			s.sm.DestroySession(pid)
+			s.destroySessionFn(pid)
 			existing.touch()
 			return existing, nil
 		}
-		// Credentials changed while we were creating the session, replace it
-		s.sm.DestroySession(existing.pid)
+		// Credentials changed while we were creating the session, replace it.
+		s.destroySessionFn(existing.pid)
 	}
 	s.sessions[key] = created
 	s.mu.Unlock()
@@ -904,9 +1039,41 @@ func (s *flightAuthSessionStore) Close() {
 		s.mu.Unlock()
 
 		for _, cs := range sessions {
-			s.sm.DestroySession(cs.pid)
+			s.destroySessionFn(cs.pid)
 		}
 	})
+}
+
+func (s *flightAuthSessionStore) ReapIdleNow() int {
+	return s.reapIdle(time.Now())
+}
+
+func (s *flightAuthSessionStore) reapIdle(now time.Time) int {
+	stale := make([]*flightClientSession, 0)
+
+	s.mu.Lock()
+	for key, cs := range s.sessions {
+		cs.reapStaleHandles(now, s.handleIdleTTL)
+
+		last := time.Unix(0, cs.lastUsed.Load())
+		if now.Sub(last) < s.idleTTL {
+			continue
+		}
+		if cs.txnCount() > 0 {
+			continue
+		}
+		if cs.activeStreamCount() > 0 {
+			continue
+		}
+		delete(s.sessions, key)
+		stale = append(stale, cs)
+	}
+	s.mu.Unlock()
+
+	for _, cs := range stale {
+		s.destroySessionFn(cs.pid)
+	}
+	return len(stale)
 }
 
 func (s *flightAuthSessionStore) reapLoop() {
@@ -919,29 +1086,7 @@ func (s *flightAuthSessionStore) reapLoop() {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
-			now := time.Now()
-			stale := make([]*flightClientSession, 0)
-
-			s.mu.Lock()
-			for key, cs := range s.sessions {
-				last := time.Unix(0, cs.lastUsed.Load())
-				if now.Sub(last) < s.idleTTL {
-					continue
-				}
-				if cs.txnCount() > 0 {
-					continue
-				}
-				if cs.queryCount() > 0 {
-					continue
-				}
-				delete(s.sessions, key)
-				stale = append(stale, cs)
-			}
-			s.mu.Unlock()
-
-			for _, cs := range stale {
-				s.sm.DestroySession(cs.pid)
-			}
+			_ = s.reapIdle(time.Now())
 		}
 	}
 }
@@ -974,16 +1119,32 @@ func parseBasicCredentials(authHeader string) (username, password string, err er
 }
 
 func flightAuthSessionKey(ctx context.Context, username string) string {
-	clientID := "unknown"
-	if p, ok := peer.FromContext(ctx); ok && p != nil && p.Addr != nil {
-		clientID = p.Addr.String()
+	clientID := ""
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if values := md.Get(defaultFlightClientIDHeaderKey); len(values) > 0 {
+			clientID = strings.TrimSpace(values[0])
+		}
 	}
-	return clientID + "|" + username
+	if clientID == "" {
+		clientID = "unknown"
+		if p, ok := peer.FromContext(ctx); ok && p != nil && p.Addr != nil {
+			host, _, err := net.SplitHostPort(p.Addr.String())
+			if err == nil && host != "" {
+				clientID = host
+			} else {
+				clientID = p.Addr.String()
+			}
+		}
+	}
+	return username + "|" + clientID
 }
 
 func getQuerySchema(ctx context.Context, session *flightClientSession, query string) (*arrow.Schema, error) {
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
 	upper := strings.ToUpper(q)
+	if !supportsReadOnlySchemaInference(upper) {
+		return nil, fmt.Errorf("schema inference only supports read-only query statements")
+	}
 	queryWithLimit := q
 	if !strings.Contains(upper, "LIMIT") && supportsLimit(upper) {
 		queryWithLimit = q + " LIMIT 0"
@@ -1020,6 +1181,92 @@ func getQuerySchema(ctx context.Context, session *flightClientSession, query str
 	}
 
 	return arrow.NewSchema(fields, nil), nil
+}
+
+func supportsReadOnlySchemaInference(upper string) bool {
+	return supportsLimit(upper)
+}
+
+func sendStreamChunk(ctx context.Context, ch chan<- flight.StreamChunk, chunk flight.StreamChunk) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case ch <- chunk:
+		return true
+	}
+}
+
+type tableSchemaKey struct {
+	catalog    string
+	hasCatalog bool
+	schema     string
+	hasSchema  bool
+	name       string
+}
+
+func loadTableSchemas(ctx context.Context, s *flightClientSession, cmd flightsql.GetTables) (map[tableSchemaKey]*arrow.Schema, error) {
+	query := "SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable " +
+		"FROM information_schema.columns WHERE 1=1"
+	args := make([]any, 0, 3)
+	if catalog := cmd.GetCatalog(); catalog != nil && *catalog != "" {
+		args = append(args, *catalog)
+		query += fmt.Sprintf(" AND table_catalog = $%d", len(args))
+	}
+	if pattern := cmd.GetDBSchemaFilterPattern(); pattern != nil && *pattern != "" {
+		args = append(args, *pattern)
+		query += fmt.Sprintf(" AND table_schema LIKE $%d", len(args))
+	}
+	if pattern := cmd.GetTableNameFilterPattern(); pattern != nil && *pattern != "" {
+		args = append(args, *pattern)
+		query += fmt.Sprintf(" AND table_name LIKE $%d", len(args))
+	}
+	query += " ORDER BY table_catalog, table_schema, table_name, ordinal_position"
+
+	rows, err := s.query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	fieldsByTable := make(map[tableSchemaKey][]arrow.Field)
+	for rows.Next() {
+		values := make([]any, 6)
+		ptrs := make([]any, 6)
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+
+		catalog := toNullString(values[0])
+		schema := toNullString(values[1])
+		key := tableSchemaKey{
+			catalog:    catalog.String,
+			hasCatalog: catalog.Valid,
+			schema:     schema.String,
+			hasSchema:  schema.Valid,
+			name:       toString(values[2]),
+		}
+
+		nullable := strings.EqualFold(toString(values[5]), "YES")
+		fieldsByTable[key] = append(fieldsByTable[key], arrow.Field{
+			Name:     toString(values[3]),
+			Type:     duckdbservice.DuckDBTypeToArrow(toString(values[4])),
+			Nullable: nullable,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	schemas := make(map[tableSchemaKey]*arrow.Schema, len(fieldsByTable))
+	for key, fields := range fieldsByTable {
+		schemas[key] = arrow.NewSchema(fields, nil)
+	}
+	return schemas, nil
 }
 
 func rowSetToRecord(alloc memory.Allocator, rows server.RowSet, schema *arrow.Schema, batchSize int) (arrow.RecordBatch, error) {

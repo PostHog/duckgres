@@ -170,7 +170,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// It is intentionally started after pre-warm to avoid concurrent worker
 	// creation races between pre-warm and first external Flight requests.
 	if cfg.FlightPort > 0 {
-		flightIngress, err := NewFlightIngress(cfg.Host, cfg.FlightPort, tlsCfg, cfg.Users, sessions)
+		flightIngress, err := NewFlightIngress(cfg.Host, cfg.FlightPort, tlsCfg, cfg.Users, sessions, FlightIngressConfig{
+			SessionIdleTTL:  cfg.FlightSessionIdleTTL,
+			SessionReapTick: cfg.FlightSessionReapInterval,
+			HandleIdleTTL:   cfg.FlightHandleIdleTTL,
+		})
 		if err != nil {
 			slog.Error("Failed to initialize Flight ingress.", "error", err)
 			os.Exit(1)
@@ -731,7 +735,11 @@ func (cp *ControlPlane) recoverFlightIngressAfterFailedReload() {
 		return
 	}
 
-	flightIngress, err := NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions)
+	flightIngress, err := NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions, FlightIngressConfig{
+		SessionIdleTTL:  cp.cfg.FlightSessionIdleTTL,
+		SessionReapTick: cp.cfg.FlightSessionReapInterval,
+		HandleIdleTTL:   cp.cfg.FlightHandleIdleTTL,
+	})
 	if err != nil {
 		slog.Error("Failed to recover Flight ingress after reload failure.", "error", err)
 		return

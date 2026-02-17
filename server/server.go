@@ -89,8 +89,20 @@ type Config struct {
 	// FlightPort enables Arrow Flight SQL ingress on the control plane.
 	// 0 disables Flight ingress.
 	FlightPort int
-	DataDir    string
-	Users      map[string]string // username -> password
+
+	// FlightSessionIdleTTL controls how long an idle Flight auth session is kept
+	// before being reaped.
+	FlightSessionIdleTTL time.Duration
+
+	// FlightSessionReapInterval controls how frequently idle Flight auth sessions
+	// are scanned and reaped.
+	FlightSessionReapInterval time.Duration
+
+	// FlightHandleIdleTTL controls stale prepared/query handle cleanup inside a
+	// Flight auth session.
+	FlightHandleIdleTTL time.Duration
+	DataDir             string
+	Users               map[string]string // username -> password
 
 	// TLS configuration (required unless ACME is configured)
 	TLSCertFile string // Path to TLS certificate file

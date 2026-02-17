@@ -370,6 +370,41 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
+	fileCfg := &FileConfig{
+		FlightSessionIdleTTL:      "7m",
+		FlightSessionReapInterval: "45s",
+		FlightHandleIdleTTL:       "3m",
+	}
+
+	env := map[string]string{
+		"DUCKGRES_FLIGHT_SESSION_IDLE_TTL":      "9m",
+		"DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL": "30s",
+		"DUCKGRES_FLIGHT_HANDLE_IDLE_TTL":       "4m",
+	}
+
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set: map[string]bool{
+			"flight-session-idle-ttl":      true,
+			"flight-session-reap-interval": true,
+			"flight-handle-idle-ttl":       true,
+		},
+		FlightSessionIdleTTL:      "11m",
+		FlightSessionReapInterval: "15s",
+		FlightHandleIdleTTL:       "5m",
+	}, envFromMap(env), nil)
+
+	if resolved.Server.FlightSessionIdleTTL != 11*time.Minute {
+		t.Fatalf("expected CLI flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
+	}
+	if resolved.Server.FlightSessionReapInterval != 15*time.Second {
+		t.Fatalf("expected CLI flight_session_reap_interval, got %s", resolved.Server.FlightSessionReapInterval)
+	}
+	if resolved.Server.FlightHandleIdleTTL != 5*time.Minute {
+		t.Fatalf("expected CLI flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
+	}
+}
+
 func TestResolveEffectiveConfigInvalidFlightPortEnv(t *testing.T) {
 	fileCfg := &FileConfig{
 		FlightPort: 8815,
