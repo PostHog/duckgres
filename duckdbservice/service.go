@@ -39,6 +39,12 @@ type SessionPool struct {
 	cfg         server.Config
 	startTime   time.Time
 	maxSessions int
+	stopCh      chan struct{}
+}
+
+type trackedTx struct {
+	tx       *sql.Tx
+	lastUsed atomic.Int64 // unix nano
 }
 
 // Session represents a single DuckDB session.
@@ -47,10 +53,11 @@ type Session struct {
 	DB        *sql.DB
 	Username  string
 	CreatedAt time.Time
+	lastUsed  atomic.Int64 // unix nano
 
 	mu            sync.RWMutex
 	queries       map[string]*QueryHandle
-	txns          map[string]*sql.Tx
+	txns          map[string]*trackedTx
 	txnOwner      map[string]string
 	handleCounter atomic.Uint64
 }
@@ -71,11 +78,52 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		cfg:         cfg.ServerConfig,
 		startTime:   time.Now(),
 		maxSessions: cfg.MaxSessions,
+		stopCh:      make(chan struct{}),
 	}
+	go pool.reapLoop()
 
 	return &DuckDBService{
 		cfg:  cfg,
 		pool: pool,
+	}
+}
+
+const (
+	txnIdleTimeout = 10 * time.Minute
+	reapInterval   = 1 * time.Minute
+)
+
+func (p *SessionPool) reapLoop() {
+	ticker := time.NewTicker(reapInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.mu.RLock()
+			sessions := make([]*Session, 0, len(p.sessions))
+			for _, s := range p.sessions {
+				sessions = append(sessions, s)
+			}
+			p.mu.RUnlock()
+
+			now := time.Now()
+			for _, s := range sessions {
+				s.mu.Lock()
+				for id, ttx := range s.txns {
+					last := time.Unix(0, ttx.lastUsed.Load())
+					if now.Sub(last) > txnIdleTimeout {
+						slog.Warn("Rolling back idle transaction.", "user", s.Username, "txn", id)
+						_ = ttx.tx.Rollback()
+						delete(s.txns, id)
+						delete(s.txnOwner, id)
+					}
+				}
+				s.mu.Unlock()
+			}
+		case <-p.stopCh:
+			return
+		}
 	}
 }
 
@@ -199,9 +247,10 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 		Username:  username,
 		CreatedAt: time.Now(),
 		queries:   make(map[string]*QueryHandle),
-		txns:      make(map[string]*sql.Tx),
+		txns:      make(map[string]*trackedTx),
 		txnOwner:  make(map[string]string),
 	}
+	session.lastUsed.Store(time.Now().UnixNano())
 
 	p.mu.Lock()
 	p.reserved--
@@ -238,8 +287,8 @@ func (p *SessionPool) DestroySession(token string) error {
 
 	// Roll back any open transactions
 	session.mu.Lock()
-	for id, tx := range session.txns {
-		_ = tx.Rollback()
+	for id, ttx := range session.txns {
+		_ = ttx.tx.Rollback()
 		delete(session.txns, id)
 		delete(session.txnOwner, id)
 	}
@@ -267,6 +316,7 @@ func (p *SessionPool) ActiveSessions() int {
 
 // CloseAll closes all sessions.
 func (p *SessionPool) CloseAll() {
+	close(p.stopCh)
 	p.mu.Lock()
 	sessions := make(map[string]*Session, len(p.sessions))
 	stops := make(map[string]func(), len(p.stopRefresh))
@@ -288,8 +338,8 @@ func (p *SessionPool) CloseAll() {
 
 	for _, session := range sessions {
 		session.mu.Lock()
-		for id, tx := range session.txns {
-			_ = tx.Rollback()
+		for id, ttx := range session.txns {
+			_ = ttx.tx.Rollback()
 			delete(session.txns, id)
 		}
 		session.mu.Unlock()
