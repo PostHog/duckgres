@@ -1,7 +1,6 @@
 package server
 
 import (
-	"crypto/sha256"
 	"crypto/subtle"
 	"net"
 )
@@ -59,8 +58,32 @@ func ValidateUserPassword(users map[string]string, username, password string) bo
 		expectedPassword = invalidPasswordSentinel
 	}
 
-	givenHash := sha256.Sum256([]byte(password))
-	expectedHash := sha256.Sum256([]byte(expectedPassword))
-	passwordMatches := subtle.ConstantTimeCompare(givenHash[:], expectedHash[:]) == 1
+	passwordMatches := constantTimeStringEqual(password, expectedPassword)
 	return userFound && passwordMatches
+}
+
+func constantTimeStringEqual(a, b string) bool {
+	ab := []byte(a)
+	bb := []byte(b)
+
+	maxLen := len(ab)
+	if len(bb) > maxLen {
+		maxLen = len(bb)
+	}
+
+	var diff byte
+	for i := 0; i < maxLen; i++ {
+		var av byte
+		var bv byte
+		if i < len(ab) {
+			av = ab[i]
+		}
+		if i < len(bb) {
+			bv = bb[i]
+		}
+		diff |= av ^ bv
+	}
+
+	lengthsEqual := subtle.ConstantTimeEq(int32(len(ab)), int32(len(bb))) == 1
+	return lengthsEqual && diff == 0
 }
