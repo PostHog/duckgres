@@ -112,3 +112,5 @@ rate_limit:
   ban_duration: "15m"
   # Max concurrent connections from a single IP (0 = unlimited)
   max_connections_per_ip: 100
+  # Max total concurrent connections (0 = unlimited, default: CPUs * 2)
+  # max_connections: 16

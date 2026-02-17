@@ -61,6 +61,7 @@ type RateLimitFileConfig struct {
 	FailedAttemptWindow string `yaml:"failed_attempt_window"` // e.g., "5m"
 	BanDuration         string `yaml:"ban_duration"`          // e.g., "15m"
 	MaxConnectionsPerIP int    `yaml:"max_connections_per_ip"`
+	MaxConnections      int    `yaml:"max_connections"`
 }
 
 type DuckLakeFileConfig struct {
@@ -159,6 +160,9 @@ func main() {
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
 
+	// Rate limiting flags
+	maxConnections := flag.Int("max-connections", 0, "Max concurrent connections, 0=unlimited (env: DUCKGRES_MAX_CONNECTIONS)")
+
 	// Control plane flags
 	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
 	minWorkers := flag.Int("min-workers", 0, "Pre-warm worker count at startup (control-plane mode) (env: DUCKGRES_MIN_WORKERS)")
@@ -203,6 +207,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DOMAIN        Domain for ACME/Let's Encrypt certificate\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_EMAIL         Contact email for Let's Encrypt notifications\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_CACHE_DIR     Directory for ACME certificate cache\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_CONNECTIONS    Max concurrent connections (default: CPUs * 2)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
@@ -285,6 +290,7 @@ func main() {
 		ACMEDomain:                *acmeDomain,
 		ACMEEmail:                 *acmeEmail,
 		ACMECacheDir:              *acmeCacheDir,
+		MaxConnections:            *maxConnections,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})

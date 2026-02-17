@@ -207,11 +207,10 @@ func memoryLimit(budget uint64) uint64 {
 	return budget
 }
 
-// DefaultMaxWorkers returns a reasonable default for max_workers based on
-// the memory budget. This is a concurrency cap (budget / 256MB), not a
-// memory-safety guarantee — each session gets the full budget.
+// DefaultMaxWorkers returns a reasonable default for max_workers.
+// Defaults to number of CPUs * 2.
 func (r *MemoryRebalancer) DefaultMaxWorkers() int {
-	return int(r.memoryBudget / minMemoryPerSession)
+	return runtime.NumCPU() * 2
 }
 
 // SetInitialLimits sets memory_limit and threads on a single session synchronously.

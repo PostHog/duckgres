@@ -2,6 +2,7 @@ package server
 
 import (
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -316,6 +317,47 @@ func TestRateLimiter_UnlimitedConnections(t *testing.T) {
 	}
 }
 
+func TestRateLimiter_GlobalConnectionLimit(t *testing.T) {
+	cfg := RateLimitConfig{
+		MaxFailedAttempts:   5,
+		FailedAttemptWindow: 1 * time.Minute,
+		BanDuration:         5 * time.Minute,
+		MaxConnectionsPerIP: 100,
+		MaxConnections:      2,
+	}
+	rl := NewRateLimiter(cfg)
+
+	addr1 := mockAddr{"tcp", "192.168.1.1:5432"}
+	addr2 := mockAddr{"tcp", "192.168.1.2:5432"}
+	addr3 := mockAddr{"tcp", "192.168.1.3:5432"}
+
+	// Register 2 connections (at limit)
+	if !rl.RegisterConnection(addr1) {
+		t.Fatal("RegisterConnection(addr1) should succeed")
+	}
+	if !rl.RegisterConnection(addr2) {
+		t.Fatal("RegisterConnection(addr2) should succeed")
+	}
+
+	t.Run("exceeds global limit", func(t *testing.T) {
+		if rl.RegisterConnection(addr3) {
+			t.Error("RegisterConnection(addr3) should fail when at global limit")
+		}
+
+		msg := rl.CheckConnection(addr3)
+		if msg != "too many concurrent connections" {
+			t.Errorf("unexpected error message: %s", msg)
+		}
+	})
+
+	t.Run("allows connection after unregister", func(t *testing.T) {
+		rl.UnregisterConnection(addr1)
+		if !rl.RegisterConnection(addr3) {
+			t.Error("RegisterConnection(addr3) should succeed after unregistering addr1")
+		}
+	})
+}
+
 func TestDefaultRateLimitConfig(t *testing.T) {
 	cfg := DefaultRateLimitConfig()
 
@@ -330,5 +372,8 @@ func TestDefaultRateLimitConfig(t *testing.T) {
 	}
 	if cfg.MaxConnectionsPerIP != 100 {
 		t.Errorf("MaxConnectionsPerIP = %d, want 100", cfg.MaxConnectionsPerIP)
+	}
+	if cfg.MaxConnections != runtime.NumCPU()*2 {
+		t.Errorf("MaxConnections = %d, want %d", cfg.MaxConnections, runtime.NumCPU()*2)
 	}
 }
