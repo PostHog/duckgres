@@ -416,6 +416,7 @@ func TestCrashReleasesSemaphoreSlot(t *testing.T) {
 	defer cancel()
 
 	go pool.HealthCheckLoop(ctx, 50*time.Millisecond, func(workerID int) {
+		pool.releaseWorkerSem()
 		select {
 		case crashCh <- workerID:
 		default:

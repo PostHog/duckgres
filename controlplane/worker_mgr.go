@@ -507,7 +507,6 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 							_ = w.client.Close()
 						}
 						_ = os.Remove(w.socketPath)
-						p.releaseWorkerSem()
 					default:
 						// Worker is alive, do a health check.
 						// Recover nil-pointer panics: w.client.Close() (from a
@@ -560,7 +559,6 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 										_ = w.client.Close()
 									}
 									_ = os.Remove(w.socketPath)
-									p.releaseWorkerSem()
 								}
 							}
 						} else {

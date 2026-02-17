@@ -183,6 +183,7 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			if session.connCloser != nil {
 				_ = session.connCloser.Close()
 			}
+			sm.pool.releaseWorkerSem()
 		}
 		sm.mu.Unlock()
 	}
