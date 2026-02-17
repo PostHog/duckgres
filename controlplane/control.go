@@ -474,6 +474,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 
 	// Compute expected MD5: hex(md5(hex(md5(password + username)) + salt))
+	// This algorithm is strictly defined by the PostgreSQL wire protocol
+	// for the MD5 authentication method.
 	// 1. md5(password + username)
 	h1 := md5.New()
 	h1.Write([]byte(expectedPassword + username))
