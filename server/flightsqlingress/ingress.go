@@ -1209,6 +1209,9 @@ func (s *flightAuthSessionStore) getExistingByKey(key string) (*flightClientSess
 	s.mu.RLock()
 	existing, ok := s.getExistingByKeyLocked(key)
 	s.mu.RUnlock()
+	if !ok {
+		s.pruneStaleByKey(key)
+	}
 	return existing, ok
 }
 
@@ -1218,11 +1221,24 @@ func (s *flightAuthSessionStore) getExistingByKeyLocked(key string) (*flightClie
 		return nil, false
 	}
 	existing, ok := s.sessions[token]
+	return existing, ok
+}
+
+// pruneStaleByKey removes a bootstrap key only if it still points to a missing
+// session token. This method must hold an exclusive lock because it mutates maps.
+func (s *flightAuthSessionStore) pruneStaleByKey(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureMapsLocked()
+
+	token, ok := s.byKey[key]
 	if !ok {
-		delete(s.byKey, key)
-		return nil, false
+		return
 	}
-	return existing, true
+	if _, exists := s.sessions[token]; exists {
+		return
+	}
+	delete(s.byKey, key)
 }
 
 func (s *flightAuthSessionStore) ensureMapsLocked() {

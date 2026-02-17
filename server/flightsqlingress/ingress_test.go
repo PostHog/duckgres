@@ -240,6 +240,42 @@ func TestSessionFromContextWithoutTokenCreatesDistinctSessions(t *testing.T) {
 	}
 }
 
+func TestFlightAuthSessionStoreGetExistingByKeyConcurrentStaleEntry(t *testing.T) {
+	store := &flightAuthSessionStore{
+		sessions: make(map[string]*flightClientSession),
+		byKey: map[string]string{
+			"stale-key": "missing-token",
+		},
+	}
+
+	const workers = 24
+	const iterations = 1000
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < iterations; j++ {
+				if _, ok := store.getExistingByKey("stale-key"); ok {
+					t.Fatalf("expected stale key lookup to miss")
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	store.mu.RLock()
+	_, stillPresent := store.byKey["stale-key"]
+	store.mu.RUnlock()
+	if stillPresent {
+		t.Fatalf("expected stale key mapping to be pruned")
+	}
+}
+
 func TestSessionFromContextRejectsExpiredSessionToken(t *testing.T) {
 	s := newFlightClientSession(1234, "postgres", nil)
 	s.token = "issued-token"
