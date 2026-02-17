@@ -138,12 +138,22 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	}
 }
 
-// OnWorkerCrash handles a worker crash by sending errors to all affected sessions.
+// OnWorkerCrash handles a worker crash by marking all affected executors as
+// dead and notifying sessions. Executors are marked dead BEFORE the shared
+// gRPC client is closed to prevent nil-pointer panics from concurrent RPCs.
 // errorFn is called for each affected session to send an error to the client.
 func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	sm.mu.Lock()
 	pids := make([]int32, len(sm.byWorker[workerID]))
 	copy(pids, sm.byWorker[workerID])
+
+	// Mark all executors as dead first (under lock) so any concurrent RPC
+	// sees the dead flag before the gRPC client is closed.
+	for _, pid := range pids {
+		if s, ok := sm.sessions[pid]; ok && s.Executor != nil {
+			s.Executor.MarkDead()
+		}
+	}
 	sm.mu.Unlock()
 
 	slog.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids))

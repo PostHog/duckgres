@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -24,6 +26,9 @@ import (
 // DuckDB query results can easily exceed the default 4MB limit.
 const MaxGRPCMessageSize = 1 << 30 // 1GB
 
+// ErrWorkerDead is returned when the backing worker process has crashed.
+var ErrWorkerDead = errors.New("flight worker is dead")
+
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.
 type FlightExecutor struct {
@@ -31,6 +36,10 @@ type FlightExecutor struct {
 	sessionToken string
 	alloc        memory.Allocator
 	ownsClient   bool // if true, Close() closes the client
+
+	// dead is set to true when the backing worker crashes. Once set, all
+	// RPC methods return ErrWorkerDead without touching the gRPC client.
+	dead atomic.Bool
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -74,12 +83,32 @@ func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) 
 	}
 }
 
+// MarkDead marks this executor's backing worker as dead. All subsequent RPC
+// calls will return ErrWorkerDead without touching the (possibly closed) gRPC client.
+func (e *FlightExecutor) MarkDead() {
+	e.dead.Store(true)
+}
+
 // withSession adds the session token to the gRPC context.
 func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, "x-duckgres-session", e.sessionToken)
 }
 
-func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ...any) (RowSet, error) {
+// recoverClientPanic converts a nil-pointer panic from a closed Flight SQL
+// client into an error. The arrow-go Close() method nils out the embedded
+// FlightServiceClient, so any concurrent RPC on the shared client panics.
+func recoverClientPanic(err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("flight client panic (worker likely crashed): %v", r)
+	}
+}
+
+func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ...any) (rs RowSet, err error) {
+	if e.dead.Load() {
+		return nil, ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+
 	if len(args) > 0 {
 		query = interpolateArgs(query, args)
 	}
@@ -112,7 +141,12 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 	}, nil
 }
 
-func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...any) (ExecResult, error) {
+func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...any) (result ExecResult, err error) {
+	if e.dead.Load() {
+		return nil, ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+
 	if len(args) > 0 {
 		query = interpolateArgs(query, args)
 	}
