@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ type ManagedSession struct {
 	WorkerID     int
 	SessionToken string
 	Executor     *server.FlightExecutor
+	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
 }
 
 // SessionManager tracks all active sessions and their worker assignments.
@@ -167,6 +169,12 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			if session.Executor != nil {
 				_ = session.Executor.Close()
 			}
+			// Close the TCP connection to unblock the message loop's read.
+			// This causes the session goroutine to exit instead of looping
+			// with ErrWorkerDead on every query.
+			if session.connCloser != nil {
+				_ = session.connCloser.Close()
+			}
 		}
 		sm.mu.Unlock()
 	}
@@ -178,6 +186,17 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	// Rebalance remaining sessions after crash cleanup
 	if sm.rebalancer != nil {
 		sm.rebalancer.RequestRebalance()
+	}
+}
+
+// SetConnCloser registers the client's TCP connection so it can be closed
+// when the backing worker crashes. This unblocks the message loop's read,
+// causing it to exit cleanly instead of looping on ErrWorkerDead.
+func (sm *SessionManager) SetConnCloser(pid int32, closer io.Closer) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if s, ok := sm.sessions[pid]; ok {
+		s.connCloser = closer
 	}
 }
 

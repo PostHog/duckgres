@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,6 +90,11 @@ func (e *FlightExecutor) MarkDead() {
 	e.dead.Store(true)
 }
 
+// IsDead reports whether this executor has been marked dead.
+func (e *FlightExecutor) IsDead() bool {
+	return e.dead.Load()
+}
+
 // withSession adds the session token to the gRPC context.
 func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, "x-duckgres-session", e.sessionToken)
@@ -97,9 +103,15 @@ func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
 // recoverClientPanic converts a nil-pointer panic from a closed Flight SQL
 // client into an error. The arrow-go Close() method nils out the embedded
 // FlightServiceClient, so any concurrent RPC on the shared client panics.
+// Only nil-pointer dereferences are recovered; other panics are re-raised
+// to preserve stack traces for unrelated programmer errors.
 func recoverClientPanic(err *error) {
 	if r := recover(); r != nil {
-		*err = fmt.Errorf("flight client panic (worker likely crashed): %v", r)
+		if re, ok := r.(runtime.Error); ok && strings.Contains(re.Error(), "nil pointer") {
+			*err = fmt.Errorf("flight client panic (worker likely crashed): %v", r)
+			return
+		}
+		panic(r)
 	}
 }
 
