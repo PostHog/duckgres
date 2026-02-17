@@ -28,7 +28,7 @@ type ControlPlaneConfig struct {
 	ConfigPath          string // Path to config file, passed to workers
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
-	WorkerQueueTimeout  time.Duration // How long to wait for an available worker slot (default: 30s)
+	WorkerQueueTimeout  time.Duration // How long to wait for an available worker slot (default: 5m)
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -752,6 +752,7 @@ func (cp *ControlPlane) recoverFlightIngressAfterFailedReload() {
 		SessionIdleTTL:     cp.cfg.FlightSessionIdleTTL,
 		SessionReapTick:    cp.cfg.FlightSessionReapInterval,
 		HandleIdleTTL:      cp.cfg.FlightHandleIdleTTL,
+		SessionTokenTTL:    cp.cfg.FlightSessionTokenTTL,
 		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
 	})
 	if err != nil {
