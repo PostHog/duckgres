@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"strings"
@@ -12,7 +13,7 @@ func TestFlightExecutorMarkDead_QueryContext(t *testing.T) {
 	e := &FlightExecutor{} // client is nil — would panic if accessed
 	e.MarkDead()
 
-	_, err := e.QueryContext(nil, "SELECT 1")
+	_, err := e.QueryContext(context.Background(), "SELECT 1")
 	if !errors.Is(err, ErrWorkerDead) {
 		t.Fatalf("expected ErrWorkerDead, got %v", err)
 	}
@@ -22,7 +23,7 @@ func TestFlightExecutorMarkDead_ExecContext(t *testing.T) {
 	e := &FlightExecutor{}
 	e.MarkDead()
 
-	_, err := e.ExecContext(nil, "SET x = 1")
+	_, err := e.ExecContext(context.Background(), "SET x = 1")
 	if !errors.Is(err, ErrWorkerDead) {
 		t.Fatalf("expected ErrWorkerDead, got %v", err)
 	}
@@ -33,7 +34,7 @@ func TestFlightExecutorMarkDeadIdempotent(t *testing.T) {
 	e.MarkDead()
 	e.MarkDead() // should not panic
 
-	_, err := e.QueryContext(nil, "SELECT 1")
+	_, err := e.QueryContext(context.Background(), "SELECT 1")
 	if !errors.Is(err, ErrWorkerDead) {
 		t.Fatalf("expected ErrWorkerDead after double MarkDead, got %v", err)
 	}
@@ -109,7 +110,7 @@ func TestFlightExecutorNilClient_QueryContextRecovers(t *testing.T) {
 		client: nil, // simulates closed client
 	}
 
-	_, err := e.QueryContext(nil, "SELECT 1")
+	_, err := e.QueryContext(context.Background(), "SELECT 1")
 	if err == nil {
 		t.Fatal("expected error from nil client")
 	}
@@ -123,7 +124,7 @@ func TestFlightExecutorNilClient_ExecContextRecovers(t *testing.T) {
 		client: nil,
 	}
 
-	_, err := e.ExecContext(nil, "SET x = 1")
+	_, err := e.ExecContext(context.Background(), "SET x = 1")
 	if err == nil {
 		t.Fatal("expected error from nil client")
 	}

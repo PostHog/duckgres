@@ -171,7 +171,10 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			}
 			// Close the TCP connection to unblock the message loop's read.
 			// This causes the session goroutine to exit instead of looping
-			// with ErrWorkerDead on every query.
+			// with ErrWorkerDead on every query. The deferred close in
+			// handleConnection will also call Close() on the same conn;
+			// that's harmless (net.Conn.Close on a closed socket returns
+			// an error which is discarded).
 			if session.connCloser != nil {
 				_ = session.connCloser.Close()
 			}

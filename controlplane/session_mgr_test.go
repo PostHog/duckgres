@@ -211,3 +211,43 @@ func TestRecoverWorkerPanic_RuntimeErrorRePanics(t *testing.T) {
 
 	t.Fatal("should not reach here")
 }
+
+func TestDestroySessionAfterOnWorkerCrash(t *testing.T) {
+	// Verify that DestroySession is a safe no-op when OnWorkerCrash already
+	// cleaned up the session. This is the exact production sequence:
+	// OnWorkerCrash runs from the health check, then the deferred
+	// DestroySession runs when handleConnection returns.
+	pool := &FlightWorkerPool{
+		workers: make(map[int]*ManagedWorker),
+	}
+	sm := NewSessionManager(pool, nil)
+
+	conn := &mockCloser{}
+	executor := &server.FlightExecutor{}
+	pid := int32(1010)
+
+	sm.mu.Lock()
+	sm.sessions[pid] = &ManagedSession{
+		PID:        pid,
+		WorkerID:   9,
+		Executor:   executor,
+		connCloser: conn,
+	}
+	sm.byWorker[9] = []int32{pid}
+	sm.mu.Unlock()
+
+	// Simulate crash cleanup
+	sm.OnWorkerCrash(9, func(pid int32) {})
+
+	if sm.SessionCount() != 0 {
+		t.Fatal("expected 0 sessions after OnWorkerCrash")
+	}
+
+	// Now DestroySession runs (from deferred call in handleConnection).
+	// Should be a no-op — no panic, no double-close of worker resources.
+	sm.DestroySession(pid)
+
+	if sm.SessionCount() != 0 {
+		t.Fatal("expected 0 sessions after DestroySession")
+	}
+}

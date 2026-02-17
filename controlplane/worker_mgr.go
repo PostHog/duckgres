@@ -484,10 +484,18 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						}
 						_ = os.Remove(w.socketPath)
 					default:
-						// Worker is alive, do a health check
-						hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-						err := doHealthCheck(hctx, w.client)
-						cancel()
+						// Worker is alive, do a health check.
+						// Recover nil-pointer panics: w.client.Close() (from a
+						// concurrent crash/retire) nils out FlightServiceClient,
+						// racing with the DoAction call inside doHealthCheck.
+						var healthErr error
+						func() {
+							defer recoverWorkerPanic(&healthErr)
+							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+							healthErr = doHealthCheck(hctx, w.client)
+							cancel()
+						}()
+						err := healthErr
 
 						if err != nil {
 							mu.Lock()
