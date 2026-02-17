@@ -234,9 +234,22 @@ type Server struct {
 }
 
 func New(cfg Config) (*Server, error) {
-	// Use default rate limit config if not specified
+	// Apply default rate limit config for any unset fields
+	defaults := DefaultRateLimitConfig()
 	if cfg.RateLimit.MaxFailedAttempts == 0 {
-		cfg.RateLimit = DefaultRateLimitConfig()
+		cfg.RateLimit.MaxFailedAttempts = defaults.MaxFailedAttempts
+	}
+	if cfg.RateLimit.FailedAttemptWindow == 0 {
+		cfg.RateLimit.FailedAttemptWindow = defaults.FailedAttemptWindow
+	}
+	if cfg.RateLimit.BanDuration == 0 {
+		cfg.RateLimit.BanDuration = defaults.BanDuration
+	}
+	if cfg.RateLimit.MaxConnectionsPerIP == 0 {
+		cfg.RateLimit.MaxConnectionsPerIP = defaults.MaxConnectionsPerIP
+	}
+	if cfg.RateLimit.MaxConnections == 0 {
+		cfg.RateLimit.MaxConnections = defaults.MaxConnections
 	}
 
 	// Use default shutdown timeout if not specified
