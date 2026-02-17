@@ -101,6 +101,7 @@ func (sb *syncBuffer) String() string {
 type cpHarness struct {
 	cmd        *exec.Cmd
 	port       int
+	flightPort int
 	socketDir  string
 	configFile string
 	logBuf     *syncBuffer
@@ -108,6 +109,8 @@ type cpHarness struct {
 
 type cpOpts struct {
 	handoverSocket string
+	flightPort     int
+	maxWorkers     int
 }
 
 func defaultOpts() cpOpts {
@@ -117,8 +120,8 @@ func defaultOpts() cpOpts {
 func startControlPlane(t *testing.T, opts cpOpts) *cpHarness {
 	t.Helper()
 
-
 	port := freePort(t)
+	flightPort := opts.flightPort
 
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
@@ -145,6 +148,12 @@ tls:
 users:
   testuser: testpass
 `, port, dataDir, certFile, keyFile)
+	if flightPort > 0 {
+		configContent += fmt.Sprintf("flight_port: %d\n", flightPort)
+	}
+	if opts.maxWorkers > 0 {
+		configContent += fmt.Sprintf("max_workers: %d\n", opts.maxWorkers)
+	}
 	if err := os.WriteFile(configFile, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write config: %v", err)
 	}
@@ -182,6 +191,7 @@ users:
 	h := &cpHarness{
 		cmd:        cmd,
 		port:       port,
+		flightPort: flightPort,
 		socketDir:  socketDir,
 		configFile: configFile,
 		logBuf:     logBuf,
@@ -227,7 +237,6 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 	}
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
 }
-
 
 var newCPPidRe = regexp.MustCompile(`New control plane spawned\.\s.*pid=(\d+)`)
 

@@ -63,6 +63,10 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
 | `duckgres_rate_limit_rejects_total` | Counter | Total number of connections rejected due to rate limiting |
 | `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
+| `duckgres_flight_auth_sessions_active` | Gauge | Number of active Flight auth sessions on the control plane |
+| `duckgres_control_plane_workers_active` | Gauge | Number of active control-plane worker processes |
+| `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
+| `duckgres_flight_max_workers_retry_total{outcome}` | Counter | Max-worker retry outcomes for Flight session creation (`outcome=attempted|succeeded|failed`) |
 
 ### Testing Metrics
 

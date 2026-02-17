@@ -58,13 +58,15 @@ type FlightWorkerPool struct {
 // NewFlightWorkerPool creates a new worker pool.
 func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWorkerPool {
 	binaryPath, _ := os.Executable()
-	return &FlightWorkerPool{
+	pool := &FlightWorkerPool{
 		workers:    make(map[int]*ManagedWorker),
 		socketDir:  socketDir,
 		configPath: configPath,
 		binaryPath: binaryPath,
 		maxWorkers: maxWorkers,
 	}
+	observeControlPlaneWorkers(0)
+	return pool
 }
 
 // SpawnWorker starts a new duckdb-service worker process.
@@ -122,7 +124,9 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 
 	p.mu.Lock()
 	p.workers[id] = w
+	workerCount := len(p.workers)
 	p.mu.Unlock()
+	observeControlPlaneWorkers(workerCount)
 
 	slog.Info("Worker spawned.", "id", id, "pid", cmd.Process.Pid, "socket", socketPath)
 	return nil
@@ -302,7 +306,9 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 		return
 	}
 	delete(p.workers, id)
+	workerCount := len(p.workers)
 	p.mu.Unlock()
+	observeControlPlaneWorkers(workerCount)
 
 	// Run the actual process cleanup asynchronously so DestroySession
 	// doesn't block the connection handler goroutine for up to 3s+.
@@ -397,6 +403,11 @@ func (p *FlightWorkerPool) ShutdownAll() {
 			_ = w.client.Close()
 		}
 	}
+
+	p.mu.Lock()
+	p.workers = make(map[int]*ManagedWorker)
+	p.mu.Unlock()
+	observeControlPlaneWorkers(0)
 }
 
 // WorkerCrashHandler is called when a worker crash is detected, before respawning.
@@ -455,7 +466,9 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						if stillInPool {
 							delete(p.workers, w.ID)
 						}
+						workerCount := len(p.workers)
 						p.mu.Unlock()
+						observeControlPlaneWorkers(workerCount)
 						if !stillInPool {
 							return
 						}
@@ -493,7 +506,9 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 								if stillInPool {
 									delete(p.workers, w.ID)
 								}
+								workerCount := len(p.workers)
 								p.mu.Unlock()
+								observeControlPlaneWorkers(workerCount)
 
 								if stillInPool {
 									for _, h := range onCrash {

@@ -1,11 +1,14 @@
-package controlplane
+package flightsqlingress
 
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +16,8 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 )
+
+var errTestMaxWorkersReached = errors.New("max workers reached")
 
 func TestParseBasicCredentials(t *testing.T) {
 	token := base64.StdEncoding.EncodeToString([]byte("postgres:postgres"))
@@ -118,6 +123,7 @@ func TestFlightAuthSessionStoreRetriesAfterForcedReapOnMaxWorkers(t *testing.T) 
 		idleTTL:       time.Minute,
 		reapInterval:  time.Hour,
 		handleIdleTTL: time.Minute,
+		isMaxWorkerFn: func(err error) bool { return errors.Is(err, errTestMaxWorkersReached) },
 		sessions: map[string]*flightClientSession{
 			"stale-session": stale,
 		},
@@ -127,7 +133,7 @@ func TestFlightAuthSessionStoreRetriesAfterForcedReapOnMaxWorkers(t *testing.T) 
 	store.createSessionFn = func(context.Context, string) (int32, *server.FlightExecutor, error) {
 		createCalls++
 		if createCalls == 1 {
-			return 0, nil, fmt.Errorf("acquire worker: %w", ErrMaxWorkersReached)
+			return 0, nil, fmt.Errorf("acquire worker: %w", errTestMaxWorkersReached)
 		}
 		return 9002, nil, nil
 	}
@@ -147,6 +153,144 @@ func TestFlightAuthSessionStoreRetriesAfterForcedReapOnMaxWorkers(t *testing.T) 
 	}
 	if len(destroyed) != 1 || destroyed[0] != 9001 {
 		t.Fatalf("expected stale session to be reaped before retry, got destroyed=%v", destroyed)
+	}
+}
+
+func TestFlightAuthSessionStoreRetryHookEvents(t *testing.T) {
+	outcomes := make([]string, 0, 2)
+	store := &flightAuthSessionStore{
+		idleTTL:       time.Minute,
+		reapInterval:  time.Hour,
+		handleIdleTTL: time.Minute,
+		isMaxWorkerFn: func(err error) bool { return errors.Is(err, errTestMaxWorkersReached) },
+		sessions:      make(map[string]*flightClientSession),
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
+		hooks: Hooks{
+			OnMaxWorkersRetry: func(outcome string) {
+				outcomes = append(outcomes, outcome)
+			},
+		},
+	}
+
+	createCalls := 0
+	store.createSessionFn = func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createCalls++
+		if createCalls == 1 {
+			return 0, nil, fmt.Errorf("acquire worker: %w", errTestMaxWorkersReached)
+		}
+		return 1234, nil, nil
+	}
+	store.destroySessionFn = func(int32) {}
+
+	if _, err := store.GetOrCreate(context.Background(), "k", "postgres"); err != nil {
+		t.Fatalf("expected retry path to succeed, got %v", err)
+	}
+	if len(outcomes) != 2 {
+		t.Fatalf("expected 2 retry outcomes, got %d (%v)", len(outcomes), outcomes)
+	}
+	if outcomes[0] != MaxWorkersRetryAttempted || outcomes[1] != MaxWorkersRetrySucceeded {
+		t.Fatalf("unexpected retry outcomes: %v", outcomes)
+	}
+}
+
+func TestFlightAuthSessionStoreReapHookReceivesTrigger(t *testing.T) {
+	stale := newFlightClientSession(1234, "postgres", nil)
+	stale.lastUsed.Store(time.Now().Add(-1 * time.Hour).UnixNano())
+
+	trigger := ""
+	reapedCount := 0
+	store := &flightAuthSessionStore{
+		idleTTL:       time.Minute,
+		reapInterval:  time.Hour,
+		handleIdleTTL: time.Minute,
+		sessions: map[string]*flightClientSession{
+			"stale": stale,
+		},
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+		hooks: Hooks{
+			OnSessionsReaped: func(t string, count int) {
+				trigger = t
+				reapedCount = count
+			},
+		},
+		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+			return 0, nil, fmt.Errorf("not used")
+		},
+		destroySessionFn: func(int32) {},
+	}
+
+	if got := store.ReapIdleNow(); got != 1 {
+		t.Fatalf("expected one reaped session, got %d", got)
+	}
+	if trigger != ReapTriggerForced {
+		t.Fatalf("expected forced trigger, got %q", trigger)
+	}
+	if reapedCount != 1 {
+		t.Fatalf("expected hook count 1, got %d", reapedCount)
+	}
+}
+
+func TestFlightAuthSessionStoreConcurrentCreateReusesExistingAfterMaxWorkers(t *testing.T) {
+	store := &flightAuthSessionStore{
+		idleTTL:       time.Minute,
+		reapInterval:  time.Hour,
+		handleIdleTTL: time.Minute,
+		isMaxWorkerFn: func(err error) bool { return errors.Is(err, errTestMaxWorkersReached) },
+		sessions:      make(map[string]*flightClientSession),
+		stopCh:        make(chan struct{}),
+		doneCh:        make(chan struct{}),
+	}
+
+	var createCalls atomic.Int32
+	firstCreateStarted := make(chan struct{})
+	releaseFirstCreate := make(chan struct{})
+	store.createSessionFn = func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		callNum := createCalls.Add(1)
+		if callNum == 1 {
+			close(firstCreateStarted)
+			<-releaseFirstCreate
+			return 1001, nil, nil
+		}
+		return 0, nil, fmt.Errorf("acquire worker: %w", errTestMaxWorkersReached)
+	}
+	store.destroySessionFn = func(int32) {}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var s1, s2 *flightClientSession
+	var err1, err2 error
+
+	go func() {
+		defer wg.Done()
+		s1, err1 = store.GetOrCreate(context.Background(), "shared-key", "postgres")
+	}()
+
+	<-firstCreateStarted
+	go func() {
+		defer wg.Done()
+		s2, err2 = store.GetOrCreate(context.Background(), "shared-key", "postgres")
+	}()
+
+	close(releaseFirstCreate)
+	wg.Wait()
+
+	if err1 != nil {
+		t.Fatalf("first GetOrCreate failed: %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("second GetOrCreate failed: %v", err2)
+	}
+	if s1 == nil || s2 == nil {
+		t.Fatalf("expected non-nil sessions, got s1=%v s2=%v", s1, s2)
+	}
+	if s1 != s2 {
+		t.Fatalf("expected both callers to share the same session pointer")
+	}
+	if createCalls.Load() < 1 {
+		t.Fatalf("expected at least 1 create attempt, got %d", createCalls.Load())
 	}
 }
 
