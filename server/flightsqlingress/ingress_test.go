@@ -252,6 +252,7 @@ func TestFlightAuthSessionStoreGetExistingByKeyConcurrentStaleEntry(t *testing.T
 	const iterations = 1000
 
 	start := make(chan struct{})
+	errCh := make(chan string, workers)
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -260,13 +261,21 @@ func TestFlightAuthSessionStoreGetExistingByKeyConcurrentStaleEntry(t *testing.T
 			<-start
 			for j := 0; j < iterations; j++ {
 				if _, ok := store.getExistingByKey("stale-key"); ok {
-					t.Fatalf("expected stale key lookup to miss")
+					select {
+					case errCh <- "expected stale key lookup to miss":
+					default:
+					}
+					return
 				}
 			}
 		}()
 	}
 	close(start)
 	wg.Wait()
+	close(errCh)
+	if msg, ok := <-errCh; ok {
+		t.Fatalf("%s", msg)
+	}
 
 	store.mu.RLock()
 	_, stillPresent := store.byKey["stale-key"]
