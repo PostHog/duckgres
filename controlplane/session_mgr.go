@@ -58,11 +58,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 	if err != nil {
 		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker
 		// that has sessions from other concurrent requests).
-		if !sm.pool.RetireWorkerIfNoSessions(worker.ID) {
-			// Worker wasn't retired (it has other sessions), but we still hold
-			// a semaphore slot for our failed request. Release it.
-			sm.pool.releaseWorkerSem()
-		}
+		sm.pool.RetireWorkerIfNoSessions(worker.ID)
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
 	}
 
@@ -183,7 +179,6 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			if session.connCloser != nil {
 				_ = session.connCloser.Close()
 			}
-			sm.pool.releaseWorkerSem()
 		}
 		sm.mu.Unlock()
 	}

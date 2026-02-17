@@ -271,8 +271,6 @@ func makeFakeWorker(t *testing.T, id int) (*ManagedWorker, func()) {
 
 func TestAcquireWorkerBlocksUntilSlotAvailable(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
-	sc := &mockSessionCounter{counts: map[int]int{0: 1, 1: 1}}
-	pool.SetSessionCounter(sc)
 
 	// Pre-populate 2 busy workers so the pool is at capacity.
 	w0, cleanup0 := makeFakeWorker(t, 0)
@@ -281,6 +279,8 @@ func TestAcquireWorkerBlocksUntilSlotAvailable(t *testing.T) {
 	defer cleanup1()
 
 	pool.mu.Lock()
+	w0.activeSessions = 1
+	w1.activeSessions = 1
 	pool.workers[0] = w0
 	pool.workers[1] = w1
 	pool.nextWorkerID = 2
@@ -384,8 +384,6 @@ func TestAcquireWorkerShutdownUnblocksWaiters(t *testing.T) {
 
 func TestCrashReleasesSemaphoreSlot(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
-	sc := &mockSessionCounter{counts: map[int]int{0: 1}}
-	pool.SetSessionCounter(sc)
 
 	// Create a worker that exits immediately (simulates crash).
 	cmd := exec.Command("true")
@@ -405,6 +403,7 @@ func TestCrashReleasesSemaphoreSlot(t *testing.T) {
 	<-done // wait for it to exit
 
 	pool.mu.Lock()
+	w.activeSessions = 1
 	pool.workers[0] = w
 	pool.nextWorkerID = 1
 	pool.workerSem <- struct{}{} // account for the worker in the semaphore
@@ -416,7 +415,6 @@ func TestCrashReleasesSemaphoreSlot(t *testing.T) {
 	defer cancel()
 
 	go pool.HealthCheckLoop(ctx, 50*time.Millisecond, func(workerID int) {
-		pool.releaseWorkerSem()
 		select {
 		case crashCh <- workerID:
 		default:

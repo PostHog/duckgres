@@ -23,37 +23,27 @@ import (
 
 // ManagedWorker represents a duckdb-service worker process.
 type ManagedWorker struct {
-	ID          int
-	cmd         *exec.Cmd
-	socketPath  string
-	bearerToken string
-	client      *flightsql.Client
-	done        chan struct{} // closed when process exits
-	exitErr     error
+	ID             int
+	cmd            *exec.Cmd
+	socketPath     string
+	bearerToken    string
+	client         *flightsql.Client
+	done           chan struct{} // closed when process exits
+	exitErr        error
+	activeSessions int // Number of sessions currently assigned to this worker
 }
 
-// SessionCounter provides session counts per worker for load balancing.
-type SessionCounter interface {
-	SessionCountForWorker(workerID int) int
-}
-
-// FlightWorkerPool manages a pool of duckdb-service worker processes.
-//
-// Lock ordering invariant: pool.mu → SessionManager.mu(RLock).
-// findIdleWorkerLocked calls SessionCountForWorker while holding pool.mu.
-// Never acquire pool.mu while holding SessionManager.mu to avoid deadlock.
 type FlightWorkerPool struct {
-	mu             sync.RWMutex
-	workers        map[int]*ManagedWorker
-	nextWorkerID   int // auto-incrementing worker ID
-	socketDir      string
-	configPath     string
-	binaryPath     string
-	sessionCounter SessionCounter // set after SessionManager is created
-	maxWorkers     int            // 0 = unlimited
-	shuttingDown   bool
-	workerSem      chan struct{} // buffered to maxWorkers; nil when unlimited
-	shutdownCh     chan struct{} // closed by ShutdownAll to unblock queued waiters
+	mu           sync.RWMutex
+	workers      map[int]*ManagedWorker
+	nextWorkerID int // auto-incrementing worker ID
+	socketDir    string
+	configPath   string
+	binaryPath   string
+	maxWorkers   int           // 0 = unlimited
+	shuttingDown bool
+	workerSem    chan struct{} // buffered to maxWorkers; limits concurrent acquisitions
+	shutdownCh   chan struct{} // closed by ShutdownAll to unblock queued waiters
 }
 
 // NewFlightWorkerPool creates a new worker pool.
@@ -202,12 +192,6 @@ func doHealthCheck(ctx context.Context, client *flightsql.Client) error {
 	return nil
 }
 
-// SetSessionCounter sets the session counter for load balancing.
-// Must be called before accepting connections.
-func (p *FlightWorkerPool) SetSessionCounter(sc SessionCounter) {
-	p.sessionCounter = sc
-}
-
 // Worker returns a worker by ID.
 func (p *FlightWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	p.mu.RLock()
@@ -263,9 +247,11 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 		return nil, fmt.Errorf("pool is shutting down")
 	}
 
-	// Try to claim an idle pre-warmed worker before spawning a new one
+	// Try to claim an idle pre-warmed worker before spawning a new one.
+	// Atomic claim: increment activeSessions while holding the lock.
 	idle := p.findIdleWorkerLocked()
 	if idle != nil {
+		idle.activeSessions++
 		p.mu.Unlock()
 		return idle, nil
 	}
@@ -284,6 +270,11 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 		p.releaseWorkerSem()
 		return nil, fmt.Errorf("worker %d not found after spawn", id)
 	}
+
+	p.mu.Lock()
+	w.activeSessions++
+	p.mu.Unlock()
+
 	return w, nil
 }
 
@@ -306,7 +297,7 @@ func (p *FlightWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 			continue // dead
 		default:
 		}
-		if p.sessionCounter != nil && p.sessionCounter.SessionCountForWorker(w.ID) == 0 {
+		if w.activeSessions == 0 {
 			return w
 		}
 	}
@@ -324,6 +315,7 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 		return
 	}
 	delete(p.workers, id)
+	w.activeSessions--
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
@@ -340,9 +332,13 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 // Used to clean up on session creation failure without retiring pre-warmed workers.
 // Returns true if the worker was retired (and its semaphore slot released).
 func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) bool {
-	if p.sessionCounter != nil && p.sessionCounter.SessionCountForWorker(id) > 0 {
+	p.mu.RLock()
+	w, ok := p.workers[id]
+	if !ok || w.activeSessions > 0 {
+		p.mu.RUnlock()
 		return false
 	}
+	p.mu.RUnlock()
 	p.RetireWorker(id)
 	return true
 }
@@ -507,6 +503,12 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 							_ = w.client.Close()
 						}
 						_ = os.Remove(w.socketPath)
+
+						// Release as many semaphore slots as this worker was using.
+						// In the 1:1 model, this is usually 1.
+						for i := 0; i < w.activeSessions; i++ {
+							p.releaseWorkerSem()
+						}
 					default:
 						// Worker is alive, do a health check.
 						// Recover nil-pointer panics: w.client.Close() (from a
@@ -559,6 +561,10 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 										_ = w.client.Close()
 									}
 									_ = os.Remove(w.socketPath)
+
+									for i := 0; i < w.activeSessions; i++ {
+										p.releaseWorkerSem()
+									}
 								}
 							}
 						} else {

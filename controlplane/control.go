@@ -157,7 +157,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Lock ordering invariant: rebalancer.mu → sm.mu(RLock). Never acquire
 	// rebalancer.mu while holding sm.mu to avoid deadlock.
 	rebalancer.SetSessionLister(sessions)
-	pool.SetSessionCounter(sessions)
 
 	cp := &ControlPlane{
 		cfg:         cfg,
