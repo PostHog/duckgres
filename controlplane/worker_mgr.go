@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -482,10 +484,18 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						}
 						_ = os.Remove(w.socketPath)
 					default:
-						// Worker is alive, do a health check
-						hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-						err := doHealthCheck(hctx, w.client)
-						cancel()
+						// Worker is alive, do a health check.
+						// Recover nil-pointer panics: w.client.Close() (from a
+						// concurrent crash/retire) nils out FlightServiceClient,
+						// racing with the DoAction call inside doHealthCheck.
+						var healthErr error
+						func() {
+							defer recoverWorkerPanic(&healthErr)
+							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+							healthErr = doHealthCheck(hctx, w.client)
+							cancel()
+						}()
+						err := healthErr
 
 						if err != nil {
 							mu.Lock()
@@ -540,8 +550,23 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 	}
 }
 
+// recoverWorkerPanic converts a nil-pointer panic from a closed Flight SQL
+// client into an error. Same race as FlightExecutor: arrow-go Close() nils out
+// FlightServiceClient, and concurrent DoAction calls on the shared client panic.
+func recoverWorkerPanic(err *error) {
+	if r := recover(); r != nil {
+		if re, ok := r.(runtime.Error); ok && strings.Contains(re.Error(), "nil pointer") {
+			*err = fmt.Errorf("worker client panic (worker likely crashed): %v", r)
+			return
+		}
+		panic(r)
+	}
+}
+
 // CreateSession creates a new session on the given worker.
-func (w *ManagedWorker) CreateSession(ctx context.Context, username string) (string, error) {
+func (w *ManagedWorker) CreateSession(ctx context.Context, username string) (token string, err error) {
+	defer recoverWorkerPanic(&err)
+
 	body, _ := json.Marshal(map[string]string{"username": username})
 
 	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
@@ -568,7 +593,9 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username string) (str
 }
 
 // DestroySession destroys a session on the worker.
-func (w *ManagedWorker) DestroySession(ctx context.Context, sessionToken string) error {
+func (w *ManagedWorker) DestroySession(ctx context.Context, sessionToken string) (err error) {
+	defer recoverWorkerPanic(&err)
+
 	body, _ := json.Marshal(map[string]string{"session_token": sessionToken})
 
 	stream, err := w.client.Client.DoAction(ctx, &flight.Action{

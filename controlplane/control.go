@@ -489,6 +489,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	defer cp.sessions.DestroySession(pid)
 
+	// Register the TCP connection so OnWorkerCrash can close it to unblock
+	// the message loop if the backing worker dies.
+	cp.sessions.SetConnCloser(pid, tlsConn)
+
 	secretKey := server.GenerateSecretKey()
 
 	// Create clientConn with FlightExecutor

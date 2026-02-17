@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ type ManagedSession struct {
 	WorkerID     int
 	SessionToken string
 	Executor     *server.FlightExecutor
+	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
 }
 
 // SessionManager tracks all active sessions and their worker assignments.
@@ -138,12 +140,22 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	}
 }
 
-// OnWorkerCrash handles a worker crash by sending errors to all affected sessions.
+// OnWorkerCrash handles a worker crash by marking all affected executors as
+// dead and notifying sessions. Executors are marked dead BEFORE the shared
+// gRPC client is closed to prevent nil-pointer panics from concurrent RPCs.
 // errorFn is called for each affected session to send an error to the client.
 func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	sm.mu.Lock()
 	pids := make([]int32, len(sm.byWorker[workerID]))
 	copy(pids, sm.byWorker[workerID])
+
+	// Mark all executors as dead first (under lock) so any concurrent RPC
+	// sees the dead flag before the gRPC client is closed.
+	for _, pid := range pids {
+		if s, ok := sm.sessions[pid]; ok && s.Executor != nil {
+			s.Executor.MarkDead()
+		}
+	}
 	sm.mu.Unlock()
 
 	slog.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids))
@@ -157,6 +169,15 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			if session.Executor != nil {
 				_ = session.Executor.Close()
 			}
+			// Close the TCP connection to unblock the message loop's read.
+			// This causes the session goroutine to exit instead of looping
+			// with ErrWorkerDead on every query. The deferred close in
+			// handleConnection will also call Close() on the same conn;
+			// that's harmless (net.Conn.Close on a closed socket returns
+			// an error which is discarded).
+			if session.connCloser != nil {
+				_ = session.connCloser.Close()
+			}
 		}
 		sm.mu.Unlock()
 	}
@@ -168,6 +189,17 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	// Rebalance remaining sessions after crash cleanup
 	if sm.rebalancer != nil {
 		sm.rebalancer.RequestRebalance()
+	}
+}
+
+// SetConnCloser registers the client's TCP connection so it can be closed
+// when the backing worker crashes. This unblocks the message loop's read,
+// causing it to exit cleanly instead of looping on ErrWorkerDead.
+func (sm *SessionManager) SetConnCloser(pid int32, closer io.Closer) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if s, ok := sm.sessions[pid]; ok {
+		s.connCloser = closer
 	}
 }
 
