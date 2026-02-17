@@ -39,6 +39,34 @@ func TestTranspile_PassThrough(t *testing.T) {
 	}
 }
 
+func TestCountParametersRegex(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected int
+	}{
+		{"no parameters", "SELECT 1", 0},
+		{"simple parameters", "SELECT $1, $2", 2},
+		{"parameter in string", "SELECT '$1'", 0},
+		{"parameter in ident", "SELECT \"$1\"", 0},
+		{"parameter in line comment", "SELECT $1 -- $2", 1},
+		{"parameter in block comment", "SELECT $1 /* $2 */ $3", 3},
+		{"escaped quote in string", "SELECT '$1''$2'", 0},
+		{"highest parameter number", "SELECT $1, $10, $2", 10},
+		{"multiple occurrences", "SELECT $1, $1, $1", 1},
+		{"duckdb native syntax with parameters", "INSTALL httpfs; SELECT $1", 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := countParametersRegex(tt.input)
+			if actual != tt.expected {
+				t.Errorf("countParametersRegex(%q) = %d, expected %d", tt.input, actual, tt.expected)
+			}
+		})
+	}
+}
+
 func TestTranspile_PgCatalog(t *testing.T) {
 	tests := []struct {
 		name     string
