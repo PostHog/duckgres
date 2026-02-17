@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -105,16 +107,29 @@ func env(key, defaultVal string) string {
 	return defaultVal
 }
 
+var (
+	metricsSrv *http.Server
+	metricsMu  sync.Mutex
+)
+
 // initMetrics starts the Prometheus metrics HTTP server on :9090/metrics.
 // During zero-downtime handover the old process still holds :9090 until it
 // drains and exits, so we retry until the port becomes available.
 func initMetrics() {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+
+	metricsMu.Lock()
+	metricsSrv = &http.Server{
+		Addr:    ":9090",
+		Handler: mux,
+	}
+	metricsMu.Unlock()
+
 	go func() {
 		for {
 			slog.Info("Starting metrics server", "addr", ":9090")
-			if err := http.ListenAndServe(":9090", mux); err != nil {
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Warn("Metrics server error, retrying in 1s.", "error", err)
 				time.Sleep(1 * time.Second)
 				continue
@@ -122,6 +137,20 @@ func initMetrics() {
 			return
 		}
 	}()
+}
+
+// stopMetrics gracefully shuts down the metrics server.
+func stopMetrics() {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+	if metricsSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := metricsSrv.Shutdown(ctx); err != nil {
+			slog.Warn("Failed to shut down metrics server", "error", err)
+		}
+		metricsSrv = nil
+	}
 }
 
 func main() {
@@ -396,13 +425,14 @@ func main() {
 		slog.Info("ACME/Let's Encrypt mode enabled", "domain", cfg.ACMEDomain)
 	}
 
-	// Handle control-plane mode
+		// Handle control-plane mode
 	if *mode == "control-plane" {
 		cpCfg := controlplane.ControlPlaneConfig{
 			Config:         cfg,
 			SocketDir:      *socketDir,
 			ConfigPath:     *configFile,
 			HandoverSocket: *handoverSocket,
+			OnHandover:     stopMetrics,
 		}
 		controlplane.RunControlPlane(cpCfg)
 		return
@@ -421,6 +451,7 @@ func main() {
 	go func() {
 		<-sigChan
 		slog.Info("Shutting down...")
+		stopMetrics()
 		_ = srv.Close()
 		loggingShutdown()
 		os.Exit(0)

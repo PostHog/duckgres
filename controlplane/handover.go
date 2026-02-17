@@ -158,6 +158,11 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 
 	handoverOK = true
 
+	// Stop metrics server early so the new CP can take over the port.
+	if cp.cfg.OnHandover != nil {
+		cp.cfg.OnHandover()
+	}
+
 	// Belt and suspenders: also send MAINPID from the old CP (which is the
 	// currently trusted main PID). This eliminates the race where systemd
 	// sees our PID die before processing the new CP's sd_notify MAINPID.

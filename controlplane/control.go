@@ -28,6 +28,7 @@ type ControlPlaneConfig struct {
 	ConfigPath          string // Path to config file, passed to workers
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
+	OnHandover          func() // Optional hook called when handover completes
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -285,6 +286,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 				go cp.selfExec()
 			case syscall.SIGTERM, syscall.SIGINT:
 				slog.Info("Received shutdown signal.", "signal", sig)
+				if cp.cfg.OnHandover != nil {
+					cp.cfg.OnHandover()
+				}
 				cp.shutdown()
 				os.Exit(0)
 			}
