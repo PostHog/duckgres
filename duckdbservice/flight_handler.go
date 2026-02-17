@@ -44,6 +44,7 @@ func (h *FlightSQLHandler) sessionFromContext(ctx context.Context) (*Session, er
 	if !ok {
 		return nil, status.Error(codes.Unauthenticated, "session not found")
 	}
+	session.lastUsed.Store(time.Now().UnixNano())
 
 	return session, nil
 }
@@ -167,11 +168,13 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 	var tx *sql.Tx
 	if handle.TxnID != "" {
 		session.mu.RLock()
-		tx = session.txns[handle.TxnID]
+		ttx := session.txns[handle.TxnID]
 		session.mu.RUnlock()
-		if tx == nil {
+		if ttx == nil || ttx.tx == nil {
 			return nil, nil, status.Error(codes.NotFound, "transaction not found")
 		}
+		ttx.lastUsed.Store(time.Now().UnixNano())
+		tx = ttx.tx
 	}
 
 	schema := handle.Schema
@@ -262,8 +265,11 @@ func (h *FlightSQLHandler) BeginTransaction(ctx context.Context,
 	}
 
 	txnKey := fmt.Sprintf("txn-%d", session.handleCounter.Add(1))
+	ttx := &trackedTx{tx: tx}
+	ttx.lastUsed.Store(time.Now().UnixNano())
+
 	session.mu.Lock()
-	session.txns[txnKey] = tx
+	session.txns[txnKey] = ttx
 	session.txnOwner[txnKey] = session.Username
 	session.mu.Unlock()
 
@@ -284,30 +290,30 @@ func (h *FlightSQLHandler) EndTransaction(ctx context.Context,
 	}
 
 	session.mu.Lock()
-	tx, ok := session.txns[txnKey]
+	ttx, ok := session.txns[txnKey]
 	if ok {
 		delete(session.txns, txnKey)
 		delete(session.txnOwner, txnKey)
 	}
 	session.mu.Unlock()
 
-	if !ok || tx == nil {
+	if !ok || ttx == nil || ttx.tx == nil {
 		return status.Error(codes.NotFound, "transaction not found")
 	}
 
 	switch req.GetAction() {
 	case flightsql.EndTransactionCommit:
-		if err := tx.Commit(); err != nil {
+		if err := ttx.tx.Commit(); err != nil {
 			return status.Errorf(codes.Internal, "failed to commit transaction: %v", err)
 		}
 		return nil
 	case flightsql.EndTransactionRollback:
-		if err := tx.Rollback(); err != nil {
+		if err := ttx.tx.Rollback(); err != nil {
 			return status.Errorf(codes.Internal, "failed to rollback transaction: %v", err)
 		}
 		return nil
 	default:
-		_ = tx.Rollback()
+		_ = ttx.tx.Rollback()
 		return status.Error(codes.InvalidArgument, "unsupported end transaction action")
 	}
 }
@@ -401,11 +407,13 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 	var tx *sql.Tx
 	if handle.TxnID != "" {
 		session.mu.RLock()
-		tx = session.txns[handle.TxnID]
+		ttx := session.txns[handle.TxnID]
 		session.mu.RUnlock()
-		if tx == nil {
+		if ttx == nil || ttx.tx == nil {
 			return nil, nil, status.Error(codes.NotFound, "transaction not found")
 		}
+		ttx.lastUsed.Store(time.Now().UnixNano())
+		tx = ttx.tx
 	}
 
 	schema := handle.Schema
@@ -703,20 +711,22 @@ func (s *Session) getOpenTxn(transactionID []byte) (*sql.Tx, string, error) {
 	}
 	txnKey := string(transactionID)
 	s.mu.RLock()
-	tx, ok := s.txns[txnKey]
+	ttx, ok := s.txns[txnKey]
 	s.mu.RUnlock()
-	if !ok || tx == nil {
+	if !ok || ttx == nil || ttx.tx == nil {
 		return nil, "", status.Error(codes.NotFound, "transaction not found")
 	}
-	return tx, txnKey, nil
+	ttx.lastUsed.Store(time.Now().UnixNano())
+	return ttx.tx, txnKey, nil
 }
 
 func (s *Session) getActiveTxn() *sql.Tx {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, tx := range s.txns {
-		if tx != nil {
-			return tx
+	for _, ttx := range s.txns {
+		if ttx != nil && ttx.tx != nil {
+			ttx.lastUsed.Store(time.Now().UnixNano())
+			return ttx.tx
 		}
 	}
 	return nil
