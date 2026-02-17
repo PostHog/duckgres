@@ -107,7 +107,7 @@ func TestCheckSocketDirWritable(t *testing.T) {
 		if strings.Contains(err.Error(), "invalid argument") || strings.Contains(err.Error(), "too long") {
 			shortDir, err2 := os.MkdirTemp("/tmp", "dg-test-*")
 			if err2 == nil {
-				defer os.RemoveAll(shortDir)
+				defer func() { _ = os.RemoveAll(shortDir) }()
 				if err3 := checkSocketDirWritable(shortDir); err3 != nil {
 					t.Fatalf("expected short directory %s to be writable: %v", shortDir, err3)
 				}
