@@ -60,7 +60,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.SocketDir = "/var/run/duckgres"
 	}
 	if cfg.HealthCheckInterval == 0 {
-		cfg.HealthCheckInterval = 5 * time.Second
+		cfg.HealthCheckInterval = 2 * time.Second
 	}
 
 	// Enforce secure defaults for control-plane mode.

@@ -414,7 +414,10 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	failures := make(map[int]int) // workerID → consecutive failure count
+	// consecutive failures per workerID.
+	// mu protects access to the failures map across concurrent health check goroutines.
+	var mu sync.Mutex
+	failures := make(map[int]int)
 
 	for {
 		select {
@@ -428,61 +431,73 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 			}
 			p.mu.RUnlock()
 
+			var wg sync.WaitGroup
 			for _, w := range workers {
-				select {
-				case <-ctx.Done():
-					return
-				case <-w.done:
-					delete(failures, w.ID)
-					// Check if already cleaned up by RetireWorker (intentional shutdown).
-					// If so, skip — this is not a crash.
-					p.mu.Lock()
-					_, stillInPool := p.workers[w.ID]
-					if stillInPool {
-						delete(p.workers, w.ID)
-					}
-					p.mu.Unlock()
-					if !stillInPool {
-						continue
-					}
-					// Worker crashed — notify sessions, clean up
-					slog.Warn("Worker crashed.", "id", w.ID, "error", w.exitErr)
-					for _, h := range onCrash {
-						h(w.ID)
-					}
-					if w.client != nil {
-						_ = w.client.Close()
-					}
-					_ = os.Remove(w.socketPath)
-				default:
-					// Worker is alive, do a health check
-					hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-					err := doHealthCheck(hctx, w.client)
-					cancel()
+				wg.Add(1)
+				go func(w *ManagedWorker) {
+					defer wg.Done()
 
-					if err != nil {
-						failures[w.ID]++
-						count := failures[w.ID]
-						slog.Warn("Worker health check failed.", "id", w.ID, "error", err, "consecutive_failures", count)
+					select {
+					case <-ctx.Done():
+						return
+					case <-w.done:
+						mu.Lock()
+						delete(failures, w.ID)
+						mu.Unlock()
 
-						if count >= maxConsecutiveHealthFailures {
-							slog.Error("Worker unresponsive, force-killing.", "id", w.ID, "consecutive_failures", count)
-							delete(failures, w.ID)
+						// Check if already cleaned up by RetireWorker (intentional shutdown).
+						// If so, skip — this is not a crash.
+						p.mu.Lock()
+						_, stillInPool := p.workers[w.ID]
+						if stillInPool {
+							delete(p.workers, w.ID)
+						}
+						p.mu.Unlock()
+						if !stillInPool {
+							return
+						}
+						// Worker crashed — notify sessions, clean up
+						slog.Warn("Worker crashed.", "id", w.ID, "error", w.exitErr)
+						for _, h := range onCrash {
+							h(w.ID)
+						}
+						if w.client != nil {
+							_ = w.client.Close()
+						}
+						_ = os.Remove(w.socketPath)
+					default:
+						// Worker is alive, do a health check
+						hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+						err := doHealthCheck(hctx, w.client)
+						cancel()
 
-							p.mu.Lock()
-							_, stillInPool := p.workers[w.ID]
-							if stillInPool {
-								delete(p.workers, w.ID)
-							}
-							p.mu.Unlock()
+						if err != nil {
+							mu.Lock()
+							failures[w.ID]++
+							count := failures[w.ID]
+							mu.Unlock()
 
-							if stillInPool {
-								for _, h := range onCrash {
-									h(w.ID)
+							slog.Warn("Worker health check failed.", "id", w.ID, "error", err, "consecutive_failures", count)
+
+							if count >= maxConsecutiveHealthFailures {
+								slog.Error("Worker unresponsive, force-killing.", "id", w.ID, "consecutive_failures", count)
+								mu.Lock()
+								delete(failures, w.ID)
+								mu.Unlock()
+
+								p.mu.Lock()
+								_, stillInPool := p.workers[w.ID]
+								if stillInPool {
+									delete(p.workers, w.ID)
 								}
-								// Skip SIGINT (unlike retireWorkerProcess) since the worker
-								// has already proven unresponsive. Go straight to SIGKILL.
-								go func() {
+								p.mu.Unlock()
+
+								if stillInPool {
+									for _, h := range onCrash {
+										h(w.ID)
+									}
+									// Skip SIGINT (unlike retireWorkerProcess) since the worker
+									// has already proven unresponsive. Go straight to SIGKILL.
 									if w.cmd.Process != nil {
 										_ = w.cmd.Process.Kill()
 									}
@@ -492,14 +507,17 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 										_ = w.client.Close()
 									}
 									_ = os.Remove(w.socketPath)
-								}()
+								}
 							}
+						} else {
+							mu.Lock()
+							delete(failures, w.ID)
+							mu.Unlock()
 						}
-					} else {
-						delete(failures, w.ID)
 					}
-				}
+				}(w)
 			}
+			wg.Wait()
 		}
 	}
 }
