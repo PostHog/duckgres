@@ -31,6 +31,7 @@ type configCLIInputs struct {
 	ACMEDomain                string
 	ACMEEmail                 string
 	ACMECacheDir              string
+	MaxConnections            int
 }
 
 type resolvedConfig struct {
@@ -125,6 +126,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.RateLimit.MaxConnectionsPerIP > 0 {
 			cfg.RateLimit.MaxConnectionsPerIP = fileCfg.RateLimit.MaxConnectionsPerIP
+		}
+		if fileCfg.RateLimit.MaxConnections > 0 {
+			cfg.RateLimit.MaxConnections = fileCfg.RateLimit.MaxConnections
 		}
 		if fileCfg.RateLimit.FailedAttemptWindow != "" {
 			if d, err := time.ParseDuration(fileCfg.RateLimit.FailedAttemptWindow); err == nil {
@@ -370,6 +374,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_ACME_CACHE_DIR"); v != "" {
 		cfg.ACMECacheDir = v
 	}
+	if v := getenv("DUCKGRES_MAX_CONNECTIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.RateLimit.MaxConnections = n
+		} else {
+			warn("Invalid DUCKGRES_MAX_CONNECTIONS: " + err.Error())
+		}
+	}
 
 	if cli.Set["host"] {
 		cfg.Host = cli.Host
@@ -453,6 +464,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["acme-cache-dir"] {
 		cfg.ACMECacheDir = cli.ACMECacheDir
+	}
+	if cli.Set["max-connections"] {
+		cfg.RateLimit.MaxConnections = cli.MaxConnections
 	}
 
 	// Validate memory_limit format if explicitly set
