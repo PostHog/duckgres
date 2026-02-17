@@ -42,6 +42,10 @@ message ConfigureRequest {
 
   // Authentication - map of username -> password
   map<string, string> users = 7;
+
+  // DuckDB configuration
+  int32 duckdb_threads = 8;
+  string duckdb_memory_limit = 9;
 }
 
 message DuckLakeConfig {

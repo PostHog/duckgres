@@ -32,9 +32,12 @@ type ConfigureRequest struct {
 	// DuckLake configuration
 	Ducklake *DuckLakeConfig `protobuf:"bytes,6,opt,name=ducklake,proto3" json:"ducklake,omitempty"`
 	// Authentication - map of username -> password
-	Users         map[string]string `protobuf:"bytes,7,rep,name=users,proto3" json:"users,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Users map[string]string `protobuf:"bytes,7,rep,name=users,proto3" json:"users,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// DuckDB configuration
+	DuckdbThreads     int32  `protobuf:"varint,8,opt,name=duckdb_threads,json=duckdbThreads,proto3" json:"duckdb_threads,omitempty"`
+	DuckdbMemoryLimit string `protobuf:"bytes,9,opt,name=duckdb_memory_limit,json=duckdbMemoryLimit,proto3" json:"duckdb_memory_limit,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *ConfigureRequest) Reset() {
@@ -114,6 +117,20 @@ func (x *ConfigureRequest) GetUsers() map[string]string {
 		return x.Users
 	}
 	return nil
+}
+
+func (x *ConfigureRequest) GetDuckdbThreads() int32 {
+	if x != nil {
+		return x.DuckdbThreads
+	}
+	return 0
+}
+
+func (x *ConfigureRequest) GetDuckdbMemoryLimit() string {
+	if x != nil {
+		return x.DuckdbMemoryLimit
+	}
+	return ""
 }
 
 type DuckLakeConfig struct {

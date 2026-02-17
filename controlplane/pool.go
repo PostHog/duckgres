@@ -488,6 +488,8 @@ func buildConfigureRequest(cfg server.Config) *pb.ConfigureRequest {
 		TlsCertFile:   cfg.TLSCertFile,
 		TlsKeyFile:    cfg.TLSKeyFile,
 		Users:         cfg.Users,
+		DuckdbThreads:     int32(cfg.DuckDBThreads),
+		DuckdbMemoryLimit: cfg.DuckDBMemoryLimit,
 	}
 
 	if cfg.DuckLake.MetadataStore != "" {

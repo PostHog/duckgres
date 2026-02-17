@@ -103,6 +103,10 @@ type Config struct {
 	// When enabled, rate limiting and cancel requests are handled by the parent process,
 	// while TLS, authentication, and query execution happen in child processes.
 	ProcessIsolation bool
+
+	// DuckDB configuration
+	DuckDBThreads     int    // Number of threads for DuckDB (default: 2x CPU)
+	DuckDBMemoryLimit string // Memory limit for DuckDB (e.g., "4GB")
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -425,14 +429,26 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string) 
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
 	}
 
-	// Set DuckDB threads to 2x the number of CPUs for parallelism
-	numCPU := runtime.NumCPU()
-	threads := numCPU * 2
+	// Set DuckDB threads
+	threads := cfg.DuckDBThreads
+	if threads <= 0 {
+		// Default to 2x the number of CPUs for parallelism
+		threads = runtime.NumCPU() * 2
+	}
 	if _, err := db.Exec(fmt.Sprintf("SET threads = %d", threads)); err != nil {
 		slog.Warn("Failed to set DuckDB threads.", "threads", threads, "error", err)
 		// Continue anyway - DuckDB will use its default
 	} else {
-		slog.Debug("Set DuckDB threads.", "threads", threads, "cpus", numCPU)
+		slog.Debug("Set DuckDB threads.", "threads", threads)
+	}
+
+	// Set DuckDB memory limit if specified
+	if cfg.DuckDBMemoryLimit != "" {
+		if _, err := db.Exec(fmt.Sprintf("SET memory_limit = '%s'", cfg.DuckDBMemoryLimit)); err != nil {
+			slog.Warn("Failed to set DuckDB memory_limit.", "memory_limit", cfg.DuckDBMemoryLimit, "error", err)
+		} else {
+			slog.Debug("Set DuckDB memory_limit.", "memory_limit", cfg.DuckDBMemoryLimit)
+		}
 	}
 
 	// Set temp directory to a subdirectory under DataDir to ensure DuckDB has a

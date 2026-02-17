@@ -29,6 +29,12 @@ type FileConfig struct {
 	DuckLake         DuckLakeFileConfig  `yaml:"ducklake"`
 	ProcessIsolation bool                `yaml:"process_isolation"` // Enable process isolation per connection
 	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
+	DuckDB           DuckDBFileConfig    `yaml:"duckdb"`
+}
+
+type DuckDBFileConfig struct {
+	Threads     int    `yaml:"threads"`
+	MemoryLimit string `yaml:"memory_limit"`
 }
 
 type TLSConfig struct {
@@ -115,6 +121,8 @@ func main() {
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
 	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
+	duckdbThreads := flag.Int("duckdb-threads", 0, "Number of threads for DuckDB (default: 2x CPU) (env: DUCKGRES_DUCKDB_THREADS)")
+	duckdbMemoryLimit := flag.String("duckdb-memory-limit", "", "Memory limit for DuckDB (e.g., '4GB') (env: DUCKGRES_DUCKDB_MEMORY_LIMIT)")
 	showHelp := flag.Bool("help", false, "Show help message")
 
 	// Control plane flags
@@ -139,6 +147,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_THREADS     Number of threads for DuckDB (default: 2x CPU)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MEMORY_LIMIT Memory limit for DuckDB (e.g., 4GB)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
 
@@ -274,6 +284,14 @@ func main() {
 				slog.Warn("Invalid idle_timeout duration: " + err.Error())
 			}
 		}
+
+		// Apply DuckDB tunables
+		if fileCfg.DuckDB.Threads > 0 {
+			cfg.DuckDBThreads = fileCfg.DuckDB.Threads
+		}
+		if fileCfg.DuckDB.MemoryLimit != "" {
+			cfg.DuckDBMemoryLimit = fileCfg.DuckDB.MemoryLimit
+		}
 	}
 
 	// Apply environment variables (override config file)
@@ -337,6 +355,14 @@ func main() {
 			slog.Warn("Invalid DUCKGRES_IDLE_TIMEOUT duration: " + err.Error())
 		}
 	}
+	if v := os.Getenv("DUCKGRES_DUCKDB_THREADS"); v != "" {
+		if t, err := strconv.Atoi(v); err == nil {
+			cfg.DuckDBThreads = t
+		}
+	}
+	if v := os.Getenv("DUCKGRES_DUCKDB_MEMORY_LIMIT"); v != "" {
+		cfg.DuckDBMemoryLimit = v
+	}
 
 	// Apply CLI flags (highest priority)
 	if *host != "" {
@@ -363,6 +389,12 @@ func main() {
 		} else {
 			slog.Warn("Invalid --idle-timeout duration: " + err.Error())
 		}
+	}
+	if *duckdbThreads > 0 {
+		cfg.DuckDBThreads = *duckdbThreads
+	}
+	if *duckdbMemoryLimit != "" {
+		cfg.DuckDBMemoryLimit = *duckdbMemoryLimit
 	}
 
 	// Handle worker mode early (before metrics, certs, etc.)

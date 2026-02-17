@@ -207,6 +207,9 @@ func (w *Worker) Configure(_ context.Context, req *pb.ConfigureRequest) (*pb.Con
 		TLSCertFile: req.TlsCertFile,
 		TLSKeyFile:  req.TlsKeyFile,
 		Users:       req.Users,
+
+		DuckDBThreads:     int(req.DuckdbThreads),
+		DuckDBMemoryLimit: req.DuckdbMemoryLimit,
 	}
 
 	if req.Ducklake != nil {
