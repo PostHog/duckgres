@@ -10,23 +10,26 @@ import (
 type configCLIInputs struct {
 	Set map[string]bool
 
-	Host             string
-	Port             int
-	FlightPort       int
-	DataDir          string
-	CertFile         string
-	KeyFile          string
-	ProcessIsolation bool
-	IdleTimeout      string
-	MemoryLimit      string
-	Threads          int
-	MemoryBudget     string
-	MemoryRebalance  bool
-	MaxWorkers       int
-	MinWorkers       int
-	ACMEDomain       string
-	ACMEEmail        string
-	ACMECacheDir     string
+	Host                      string
+	Port                      int
+	FlightPort                int
+	FlightSessionIdleTTL      string
+	FlightSessionReapInterval string
+	FlightHandleIdleTTL       string
+	DataDir                   string
+	CertFile                  string
+	KeyFile                   string
+	ProcessIsolation          bool
+	IdleTimeout               string
+	MemoryLimit               string
+	Threads                   int
+	MemoryBudget              string
+	MemoryRebalance           bool
+	MaxWorkers                int
+	MinWorkers                int
+	ACMEDomain                string
+	ACMEEmail                 string
+	ACMECacheDir              string
 }
 
 type resolvedConfig struct {
@@ -35,12 +38,15 @@ type resolvedConfig struct {
 
 func defaultServerConfig() server.Config {
 	return server.Config{
-		Host:        "0.0.0.0",
-		Port:        5432,
-		FlightPort:  0,
-		DataDir:     "./data",
-		TLSCertFile: "./certs/server.crt",
-		TLSKeyFile:  "./certs/server.key",
+		Host:                      "0.0.0.0",
+		Port:                      5432,
+		FlightPort:                0,
+		FlightSessionIdleTTL:      10 * time.Minute,
+		FlightSessionReapInterval: 1 * time.Minute,
+		FlightHandleIdleTTL:       15 * time.Minute,
+		DataDir:                   "./data",
+		TLSCertFile:               "./certs/server.crt",
+		TLSKeyFile:                "./certs/server.key",
 		Users: map[string]string{
 			"postgres": "postgres",
 		},
@@ -70,6 +76,27 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.FlightPort != 0 {
 			cfg.FlightPort = fileCfg.FlightPort
+		}
+		if fileCfg.FlightSessionIdleTTL != "" {
+			if d, err := time.ParseDuration(fileCfg.FlightSessionIdleTTL); err == nil {
+				cfg.FlightSessionIdleTTL = d
+			} else {
+				warn("Invalid flight_session_idle_ttl duration: " + err.Error())
+			}
+		}
+		if fileCfg.FlightSessionReapInterval != "" {
+			if d, err := time.ParseDuration(fileCfg.FlightSessionReapInterval); err == nil {
+				cfg.FlightSessionReapInterval = d
+			} else {
+				warn("Invalid flight_session_reap_interval duration: " + err.Error())
+			}
+		}
+		if fileCfg.FlightHandleIdleTTL != "" {
+			if d, err := time.ParseDuration(fileCfg.FlightHandleIdleTTL); err == nil {
+				cfg.FlightHandleIdleTTL = d
+			} else {
+				warn("Invalid flight_handle_idle_ttl duration: " + err.Error())
+			}
 		}
 		if fileCfg.DataDir != "" {
 			cfg.DataDir = fileCfg.DataDir
@@ -203,6 +230,27 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_FLIGHT_PORT: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_FLIGHT_SESSION_IDLE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FlightSessionIdleTTL = d
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_SESSION_IDLE_TTL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FlightSessionReapInterval = d
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_FLIGHT_HANDLE_IDLE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FlightHandleIdleTTL = d
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_HANDLE_IDLE_TTL duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_DATA_DIR"); v != "" {
 		cfg.DataDir = v
 	}
@@ -315,6 +363,27 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["flight-port"] {
 		cfg.FlightPort = cli.FlightPort
+	}
+	if cli.Set["flight-session-idle-ttl"] {
+		if d, err := time.ParseDuration(cli.FlightSessionIdleTTL); err == nil {
+			cfg.FlightSessionIdleTTL = d
+		} else {
+			warn("Invalid --flight-session-idle-ttl duration: " + err.Error())
+		}
+	}
+	if cli.Set["flight-session-reap-interval"] {
+		if d, err := time.ParseDuration(cli.FlightSessionReapInterval); err == nil {
+			cfg.FlightSessionReapInterval = d
+		} else {
+			warn("Invalid --flight-session-reap-interval duration: " + err.Error())
+		}
+	}
+	if cli.Set["flight-handle-idle-ttl"] {
+		if d, err := time.ParseDuration(cli.FlightHandleIdleTTL); err == nil {
+			cfg.FlightHandleIdleTTL = d
+		} else {
+			warn("Invalid --flight-handle-idle-ttl duration: " + err.Error())
+		}
 	}
 	if cli.Set["data-dir"] {
 		cfg.DataDir = cli.DataDir

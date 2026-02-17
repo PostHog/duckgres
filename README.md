@@ -63,6 +63,10 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
 | `duckgres_rate_limit_rejects_total` | Counter | Total number of connections rejected due to rate limiting |
 | `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
+| `duckgres_flight_auth_sessions_active` | Gauge | Number of active Flight auth sessions on the control plane |
+| `duckgres_control_plane_workers_active` | Gauge | Number of active control-plane worker processes |
+| `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
+| `duckgres_flight_max_workers_retry_total{outcome}` | Counter | Max-worker retry outcomes for Flight session creation (`outcome=attempted|succeeded|failed`) |
 
 ### Testing Metrics
 
@@ -128,6 +132,9 @@ Create a `duckgres.yaml` file (see `duckgres.example.yaml` for a complete exampl
 host: "0.0.0.0"
 port: 5432
 flight_port: 8815
+flight_session_idle_ttl: "10m"
+flight_session_reap_interval: "1m"
+flight_handle_idle_ttl: "15m"
 data_dir: "./data"
 
 tls:
@@ -166,6 +173,9 @@ Run with config file:
 | `DUCKGRES_HOST` | Host to bind to | `0.0.0.0` |
 | `DUCKGRES_PORT` | Port to listen on | `5432` |
 | `DUCKGRES_FLIGHT_PORT` | Control-plane Flight SQL ingress port (`0` disables) | `0` |
+| `DUCKGRES_FLIGHT_SESSION_IDLE_TTL` | Flight auth session idle TTL | `10m` |
+| `DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL` | Flight auth session reap interval | `1m` |
+| `DUCKGRES_FLIGHT_HANDLE_IDLE_TTL` | Flight prepared/query handle idle TTL | `15m` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
@@ -208,6 +218,9 @@ Options:
   -host string             Host to bind to
   -port int                Port to listen on
   -flight-port int         Control-plane Arrow Flight SQL ingress port, 0=disabled
+  -flight-session-idle-ttl string      Flight auth session idle TTL (e.g., '10m')
+  -flight-session-reap-interval string Flight auth session reap interval (e.g., '1m')
+  -flight-handle-idle-ttl string       Flight prepared/query handle idle TTL (e.g., '15m')
   -data-dir string         Directory for DuckDB files
   -cert string             TLS certificate file
   -key string              TLS private key file
