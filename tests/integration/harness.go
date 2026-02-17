@@ -133,6 +133,9 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 			"testuser": "testpass",
 		},
 		Extensions: []string{"ducklake"},
+		RateLimit: server.RateLimitConfig{
+			MaxConnections: 100,
+		},
 	}
 
 	// Configure DuckLake if enabled
