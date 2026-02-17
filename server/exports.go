@@ -26,6 +26,10 @@ func WriteAuthCleartextPassword(w io.Writer) error {
 	return writeAuthCleartextPassword(w)
 }
 
+func WriteAuthMD5Password(w io.Writer, salt [4]byte) error {
+	return writeAuthMD5Password(w, salt)
+}
+
 func WriteReadyForQuery(w io.Writer, txStatus byte) error {
 	return writeReadyForQuery(w, txStatus)
 }

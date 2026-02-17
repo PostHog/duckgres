@@ -186,6 +186,16 @@ func writeAuthCleartextPassword(w io.Writer) error {
 	return writeMessage(w, msgAuth, data)
 }
 
+// writeAuthMD5Password requests MD5 password with a 4-byte salt.
+// NOTE: MD5 is used here specifically for compliance with the PostgreSQL
+// wire protocol's MD5 authentication method.
+func writeAuthMD5Password(w io.Writer, salt [4]byte) error {
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint32(data, authMD5Pwd)
+	copy(data[4:], salt[:])
+	return writeMessage(w, msgAuth, data)
+}
+
 // writeParameterStatus sends a parameter status message
 func writeParameterStatus(w io.Writer, name, value string) error {
 	data := []byte(name)

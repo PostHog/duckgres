@@ -4,14 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -437,9 +441,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Request password
-	if err := server.WriteAuthCleartextPassword(writer); err != nil {
-		slog.Error("Failed to request password.", "remote_addr", remoteAddr, "error", err)
+	// Request password (MD5)
+	var salt [4]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		slog.Error("Failed to generate salt.", "error", err)
+		return
+	}
+	if err := server.WriteAuthMD5Password(writer, salt); err != nil {
+		slog.Error("Failed to request MD5 password.", "remote_addr", remoteAddr, "error", err)
 		return
 	}
 	if err := writer.Flush(); err != nil {
@@ -460,8 +469,30 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
-	password := string(bytes.TrimRight(body, "\x00"))
-	if password != expectedPassword {
+	// Password response for MD5 is "md5" + 32-char hex string
+	response := string(bytes.TrimRight(body, "\x00"))
+	if !strings.HasPrefix(response, "md5") || len(response) != 35 {
+		slog.Warn("Invalid MD5 response format.", "user", username, "remote_addr", remoteAddr)
+		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+		_ = writer.Flush()
+		return
+	}
+
+	// Compute expected MD5: hex(md5(hex(md5(password + username)) + salt))
+	// This algorithm is strictly defined by the PostgreSQL wire protocol
+	// for the MD5 authentication method.
+	// 1. md5(password + username)
+	h1 := md5.New()
+	h1.Write([]byte(expectedPassword + username))
+	s1 := hex.EncodeToString(h1.Sum(nil))
+
+	// 2. md5(s1 + salt)
+	h2 := md5.New()
+	h2.Write([]byte(s1))
+	h2.Write(salt[:])
+	expectedResponse := "md5" + hex.EncodeToString(h2.Sum(nil))
+
+	if response != expectedResponse {
 		slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
 		cp.rateLimiter.RecordFailedAuth(remoteAddr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")

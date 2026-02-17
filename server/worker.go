@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -219,9 +223,14 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		return ExitAuthFailure
 	}
 
-	// Request password
-	if err := writeAuthCleartextPassword(writer); err != nil {
-		slog.Error("Failed to request password", "error", err)
+	// Request password (MD5)
+	var salt [4]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		slog.Error("Failed to generate salt", "error", err)
+		return ExitError
+	}
+	if err := writeAuthMD5Password(writer, salt); err != nil {
+		slog.Error("Failed to request MD5 password", "error", err)
 		return ExitError
 	}
 	if err := writer.Flush(); err != nil {
@@ -243,9 +252,32 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		return ExitError
 	}
 
-	// Password is null-terminated
-	password := string(bytes.TrimRight(body, "\x00"))
-	if password != expectedPassword {
+	// Password response for MD5 is "md5" + 32-char hex string
+	response := string(bytes.TrimRight(body, "\x00"))
+	authValid := false
+
+	if !strings.HasPrefix(response, "md5") || len(response) != 35 {
+		// Fallback: check if it's cleartext
+		authValid = (expectedPassword == response)
+	} else {
+		// Compute expected MD5: hex(md5(hex(md5(password + username)) + salt))
+		// This algorithm is strictly defined by the PostgreSQL wire protocol
+		// for the MD5 authentication method.
+		// 1. md5(password + username)
+		h1 := md5.New()
+		h1.Write([]byte(expectedPassword + username))
+		s1 := hex.EncodeToString(h1.Sum(nil))
+
+		// 2. md5(s1 + salt)
+		h2 := md5.New()
+		h2.Write([]byte(s1))
+		h2.Write(salt[:])
+		expectedResponse := "md5" + hex.EncodeToString(h2.Sum(nil))
+
+		authValid = (response == expectedResponse)
+	}
+
+	if !authValid {
 		slog.Warn("Authentication failed", "user", username, "remote_addr", cfg.RemoteAddr)
 		authFailuresCounter.Inc()
 		_ = writeErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
