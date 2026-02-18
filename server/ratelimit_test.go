@@ -369,8 +369,8 @@ func TestDefaultRateLimitConfig(t *testing.T) {
 	if cfg.BanDuration != 15*time.Minute {
 		t.Errorf("BanDuration = %v, want 15m", cfg.BanDuration)
 	}
-	if cfg.MaxConnectionsPerIP != 100 {
-		t.Errorf("MaxConnectionsPerIP = %d, want 100", cfg.MaxConnectionsPerIP)
+	if cfg.MaxConnectionsPerIP != 500 {
+		t.Errorf("MaxConnectionsPerIP = %d, want 500", cfg.MaxConnectionsPerIP)
 	}
 	if cfg.MaxConnections != 1024 {
 		t.Errorf("MaxConnections = %d, want 1024", cfg.MaxConnections)
