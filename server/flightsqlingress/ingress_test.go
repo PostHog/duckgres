@@ -445,6 +445,122 @@ func TestSessionFromContextRejectsTokenUserMismatch(t *testing.T) {
 	}
 }
 
+func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T) {
+	const bootstrapKey = "bootstrap|postgres|nonce"
+
+	destroyedPIDs := make([]int32, 0, 2)
+	store := &flightAuthSessionStore{
+		idleTTL:       time.Minute,
+		handleIdleTTL: time.Minute,
+		tokenTTL:      time.Hour,
+		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+			return 1234, nil, nil
+		},
+		destroySessionFn: func(pid int32) {
+			destroyedPIDs = append(destroyedPIDs, pid)
+		},
+		sessions: make(map[string]*flightClientSession),
+		byKey:    make(map[string]string),
+	}
+
+	var issued *flightClientSession
+
+	t.Run("issue", func(t *testing.T) {
+		var err error
+		issued, err = store.GetOrCreate(context.Background(), bootstrapKey, "postgres")
+		if err != nil {
+			t.Fatalf("GetOrCreate returned error: %v", err)
+		}
+		if issued == nil {
+			t.Fatalf("expected non-nil issued session")
+		}
+		if strings.TrimSpace(issued.token) == "" {
+			t.Fatalf("expected non-empty issued token")
+		}
+		if issued.tokenIssuedAt.Load() == 0 {
+			t.Fatalf("expected tokenIssuedAt to be set during issuance")
+		}
+		store.mu.RLock()
+		mappedToken := store.byKey[bootstrapKey]
+		store.mu.RUnlock()
+		if mappedToken != issued.token {
+			t.Fatalf("expected bootstrap key to map to issued token")
+		}
+	})
+
+	t.Run("validate", func(t *testing.T) {
+		got, ok := store.GetByToken(issued.token)
+		if !ok {
+			t.Fatalf("expected issued token to validate")
+		}
+		if got != issued {
+			t.Fatalf("expected validated session to match issued session")
+		}
+	})
+
+	t.Run("revoke", func(t *testing.T) {
+		issued.lastUsed.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+
+		if reaped := store.ReapIdleNow(); reaped != 1 {
+			t.Fatalf("expected revoke path to reap one idle session, got %d", reaped)
+		}
+		if _, ok := store.GetByToken(issued.token); ok {
+			t.Fatalf("expected revoked token to fail validation")
+		}
+		store.mu.RLock()
+		_, stillMapped := store.byKey[bootstrapKey]
+		store.mu.RUnlock()
+		if stillMapped {
+			t.Fatalf("expected revoke path to prune bootstrap key mapping")
+		}
+		if len(destroyedPIDs) != 1 || destroyedPIDs[0] != issued.pid {
+			t.Fatalf("expected revoke path to destroy session pid %d, got %v", issued.pid, destroyedPIDs)
+		}
+
+		h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+		if err != nil {
+			t.Fatalf("failed to construct handler: %v", err)
+		}
+		ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", issued.token))
+		if _, err := h.sessionFromContext(ctx); status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("expected revoked token auth to return unauthenticated, got %v", err)
+		}
+	})
+
+	t.Run("expiry", func(t *testing.T) {
+		expiredSession := newFlightClientSession(4321, "postgres", nil)
+		expiredSession.token = "expired-token"
+		expiredSession.tokenIssuedAt.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+
+		expiredDestroyed := make([]int32, 0, 1)
+		expiredStore := &flightAuthSessionStore{
+			tokenTTL: time.Hour,
+			sessions: map[string]*flightClientSession{
+				"expired-token": expiredSession,
+			},
+			byKey: map[string]string{
+				"bootstrap|postgres|expired": "expired-token",
+			},
+			destroySessionFn: func(pid int32) {
+				expiredDestroyed = append(expiredDestroyed, pid)
+			},
+		}
+
+		if _, ok := expiredStore.GetByToken("expired-token"); ok {
+			t.Fatalf("expected expired token validation to fail")
+		}
+		if len(expiredDestroyed) != 1 || expiredDestroyed[0] != expiredSession.pid {
+			t.Fatalf("expected expiry path to destroy session pid %d, got %v", expiredSession.pid, expiredDestroyed)
+		}
+		expiredStore.mu.RLock()
+		_, stillMapped := expiredStore.byKey["bootstrap|postgres|expired"]
+		expiredStore.mu.RUnlock()
+		if stillMapped {
+			t.Fatalf("expected expiry path to prune bootstrap key mapping")
+		}
+	})
+}
+
 func TestSupportsReadOnlySchemaInference(t *testing.T) {
 	if !supportsReadOnlySchemaInference("SELECT * FROM t") {
 		t.Fatalf("SELECT should be schema-inference safe")
