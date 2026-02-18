@@ -28,6 +28,7 @@ type ControlPlaneConfig struct {
 	ConfigPath          string // Path to config file, passed to workers
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
+	WorkerQueueTimeout  time.Duration // How long to wait for an available worker slot (default: 5m)
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -61,6 +62,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 	if cfg.HealthCheckInterval == 0 {
 		cfg.HealthCheckInterval = 2 * time.Second
+	}
+	if cfg.WorkerQueueTimeout == 0 {
+		cfg.WorkerQueueTimeout = 5 * time.Minute
 	}
 
 	// Enforce secure defaults for control-plane mode.
@@ -153,7 +157,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Lock ordering invariant: rebalancer.mu → sm.mu(RLock). Never acquire
 	// rebalancer.mu while holding sm.mu to avoid deadlock.
 	rebalancer.SetSessionLister(sessions)
-	pool.SetSessionCounter(sessions)
 
 	cp := &ControlPlane{
 		cfg:         cfg,
@@ -171,10 +174,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// creation races between pre-warm and first external Flight requests.
 	if cfg.FlightPort > 0 {
 		flightIngress, err := NewFlightIngress(cfg.Host, cfg.FlightPort, tlsCfg, cfg.Users, sessions, cp.rateLimiter, FlightIngressConfig{
-			SessionIdleTTL:  cfg.FlightSessionIdleTTL,
-			SessionReapTick: cfg.FlightSessionReapInterval,
-			HandleIdleTTL:   cfg.FlightHandleIdleTTL,
-			SessionTokenTTL: cfg.FlightSessionTokenTTL,
+			SessionIdleTTL:     cfg.FlightSessionIdleTTL,
+			SessionReapTick:    cfg.FlightSessionReapInterval,
+			HandleIdleTTL:      cfg.FlightHandleIdleTTL,
+			SessionTokenTTL:    cfg.FlightSessionTokenTTL,
+			WorkerQueueTimeout: cfg.WorkerQueueTimeout,
 		})
 		if err != nil {
 			slog.Error("Failed to initialize Flight ingress.", "error", err)
@@ -261,6 +265,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"flight_addr", cp.flightAddr(),
 		"min_workers", minWorkers,
 		"max_workers", maxWorkers,
+		"worker_queue_timeout", cfg.WorkerQueueTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
 		"memory_rebalance", cfg.MemoryRebalance)
 
@@ -469,9 +474,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
-	// Create session on a worker
-	ctx := context.Background()
+	// Create session on a worker. The timeout controls how long we wait in the
+	// worker queue when all slots are occupied.
+	ctx, cancel := context.WithTimeout(context.Background(), cp.cfg.WorkerQueueTimeout)
 	pid, executor, err := cp.sessions.CreateSession(ctx, username)
+	cancel()
 	if err != nil {
 		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
 		_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
@@ -732,9 +739,11 @@ func (cp *ControlPlane) recoverFlightIngressAfterFailedReload() {
 	}
 
 	flightIngress, err := NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions, cp.rateLimiter, FlightIngressConfig{
-		SessionIdleTTL:  cp.cfg.FlightSessionIdleTTL,
-		SessionReapTick: cp.cfg.FlightSessionReapInterval,
-		HandleIdleTTL:   cp.cfg.FlightHandleIdleTTL,
+		SessionIdleTTL:     cp.cfg.FlightSessionIdleTTL,
+		SessionReapTick:    cp.cfg.FlightSessionReapInterval,
+		HandleIdleTTL:      cp.cfg.FlightHandleIdleTTL,
+		SessionTokenTTL:    cp.cfg.FlightSessionTokenTTL,
+		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
 	})
 	if err != nil {
 		slog.Error("Failed to recover Flight ingress after reload failure.", "error", err)

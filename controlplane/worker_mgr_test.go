@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 )
@@ -229,4 +230,300 @@ func TestHealthCheckLoopDetectsCrashedWorker(t *testing.T) {
 	if stillInPool {
 		t.Fatal("crashed worker should have been removed from pool")
 	}
+}
+
+// makeFakeWorker creates a ManagedWorker with a started process that stays alive.
+// Returns the worker and a cancel function to kill it.
+func makeFakeWorker(t *testing.T, id int) (*ManagedWorker, func()) {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start fake worker process: %v", err)
+	}
+	done := make(chan struct{})
+	w := &ManagedWorker{
+		ID:   id,
+		cmd:  cmd,
+		done: done,
+	}
+	go func() {
+		w.exitErr = cmd.Wait()
+		close(done)
+	}()
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		<-done
+	}
+	return w, cleanup
+}
+
+func TestAcquireWorkerBlocksUntilSlotAvailable(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+
+	// Pre-populate 2 busy workers so the pool is at capacity.
+	w0, cleanup0 := makeFakeWorker(t, 0)
+	defer cleanup0()
+	w1, cleanup1 := makeFakeWorker(t, 1)
+	defer cleanup1()
+
+	pool.mu.Lock()
+	w0.activeSessions = 1
+	w1.activeSessions = 1
+	pool.workers[0] = w0
+	pool.workers[1] = w1
+	pool.nextWorkerID = 2
+	// Fill the semaphore to match the 2 active workers.
+	pool.workerSem <- struct{}{}
+	pool.workerSem <- struct{}{}
+	pool.mu.Unlock()
+
+	// AcquireWorker should now block because the semaphore is full.
+	acquired := make(chan struct{})
+	go func() {
+		// This will block until a slot opens.
+		_, _ = pool.AcquireWorker(context.Background())
+		close(acquired)
+	}()
+
+	// Verify it doesn't return immediately.
+	select {
+	case <-acquired:
+		t.Fatal("AcquireWorker should block when pool is at capacity")
+	case <-time.After(100 * time.Millisecond):
+		// expected: still blocked
+	}
+
+	// Retire one worker to free a slot.
+	pool.RetireWorker(0)
+
+	// Now AcquireWorker should unblock (it will try to spawn, which may fail,
+	// but the point is it unblocked from the semaphore).
+	select {
+	case <-acquired:
+		// expected: unblocked
+	case <-time.After(15 * time.Second):
+		t.Fatal("AcquireWorker did not unblock after RetireWorker")
+	}
+}
+
+func TestAcquireWorkerRespectsContextCancellation(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+
+	// Fill the single semaphore slot.
+	pool.workerSem <- struct{}{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := pool.AcquireWorker(ctx)
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("expected context to be done")
+	}
+}
+
+func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0)
+
+	if pool.workerSem != nil {
+		t.Fatal("expected nil workerSem when maxWorkers=0")
+	}
+
+	// AcquireWorker should not block on semaphore (it will fail trying to
+	// spawn a worker with a fake binary, but should get past the semaphore).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := pool.AcquireWorker(ctx)
+	// Will fail to spawn since there's no real binary, but the point is
+	// it didn't block on a nil semaphore.
+	if err == nil {
+		t.Fatal("expected spawn error with non-existent binary")
+	}
+}
+
+func TestAcquireWorkerShutdownUnblocksWaiters(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+
+	// Fill the single semaphore slot.
+	pool.workerSem <- struct{}{}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := pool.AcquireWorker(context.Background())
+		errCh <- err
+	}()
+
+	// Give the goroutine time to block on the semaphore.
+	time.Sleep(50 * time.Millisecond)
+
+	pool.ShutdownAll()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected error after shutdown")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("AcquireWorker did not unblock after ShutdownAll")
+	}
+}
+
+func TestRetireWorkerIfNoSessions_ReleasesClaimOnFailure(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+
+	// Manually inject a worker with 1 active session (as if AcquireWorker just returned it)
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 1
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.workerSem <- struct{}{} // Claim slot
+	pool.mu.Unlock()
+
+	// Calling RetireWorkerIfNoSessions should release the claim and kill the worker.
+	if !pool.RetireWorkerIfNoSessions(1) {
+		t.Fatal("expected RetireWorkerIfNoSessions to return true")
+	}
+
+	// Verify semaphore is freed: we should be able to push a token.
+	select {
+	case pool.workerSem <- struct{}{}:
+		// success
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("semaphore slot was leaked")
+	}
+
+	// Verify worker is gone
+	if _, ok := pool.Worker(1); ok {
+		t.Fatal("worker should have been retired")
+	}
+}
+
+func TestAcquireWorker_AtomicClaimRace(t *testing.T) {
+	// Tests that two concurrent acquisitions don't pick the same idle worker.
+	const n = 5
+	pool := NewFlightWorkerPool(t.TempDir(), "", 10)
+
+	// Pre-warm with n idle workers
+	for i := 1; i <= n; i++ {
+		w, cleanup := makeFakeWorker(t, i)
+		defer cleanup()
+		pool.mu.Lock()
+		pool.workers[i] = w
+		pool.mu.Unlock()
+	}
+
+	// Simultaneous acquisitions
+	results := make(chan *ManagedWorker, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			w, _ := pool.AcquireWorker(context.Background())
+			results <- w
+		}()
+	}
+
+	workers := make(map[int]bool)
+	for i := 0; i < n; i++ {
+		w := <-results
+		if w == nil {
+			t.Fatal("failed to acquire worker")
+		}
+		if workers[w.ID] {
+			t.Errorf("worker %d was assigned multiple times!", w.ID)
+		}
+		workers[w.ID] = true
+	}
+}
+
+func TestRetireWorker_ReleasesAllSessions(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+
+	// Inject a worker with 2 sessions
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 2
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.workerSem <- struct{}{}
+	pool.workerSem <- struct{}{}
+	pool.mu.Unlock()
+
+	// Retire it
+	pool.RetireWorker(1)
+
+	// Verify 2 slots released: should be able to push 5 tokens (capacity)
+	for i := 0; i < 5; i++ {
+		select {
+		case pool.workerSem <- struct{}{}:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("semaphore slot %d was leaked", i)
+		}
+	}
+}
+
+func TestCrashReleasesSemaphoreSlots(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+
+	// Create a worker that exits immediately (simulates crash).
+	cmd := exec.Command("true")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start test process: %v", err)
+	}
+	done := make(chan struct{})
+	w := &ManagedWorker{
+		ID:   0,
+		cmd:  cmd,
+		done: done,
+	}
+	go func() {
+		w.exitErr = cmd.Wait()
+		close(done)
+	}()
+	<-done // wait for it to exit
+
+	pool.mu.Lock()
+	w.activeSessions = 1
+	pool.workers[0] = w
+	pool.nextWorkerID = 1
+	pool.workerSem <- struct{}{} // account for the worker in the semaphore
+	pool.mu.Unlock()
+
+	// Start health check loop which will detect the crash and release the slot.
+	crashCh := make(chan int, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go pool.HealthCheckLoop(ctx, 50*time.Millisecond, func(workerID int) {
+		select {
+		case crashCh <- workerID:
+		default:
+		}
+	})
+
+	// Wait for crash to be detected.
+	select {
+	case <-crashCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for crash detection")
+	}
+
+	// Verify the semaphore slot was released: we should be able to push 2 tokens
+	// (maxWorkers=2) since the crashed worker's slot was freed.
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case pool.workerSem <- struct{}{}:
+			case <-time.After(2 * time.Second):
+				t.Error("semaphore slot not available after crash")
+			}
+		}()
+	}
+	wg.Wait()
 }

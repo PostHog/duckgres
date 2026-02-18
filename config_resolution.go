@@ -28,6 +28,7 @@ type configCLIInputs struct {
 	MemoryRebalance           bool
 	MaxWorkers                int
 	MinWorkers                int
+	WorkerQueueTimeout        string
 	ACMEDomain                string
 	ACMEEmail                 string
 	ACMECacheDir              string
@@ -35,7 +36,8 @@ type configCLIInputs struct {
 }
 
 type resolvedConfig struct {
-	Server server.Config
+	Server             server.Config
+	WorkerQueueTimeout time.Duration
 }
 
 func defaultServerConfig() server.Config {
@@ -69,6 +71,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	cfg := defaultServerConfig()
+	var workerQueueTimeout time.Duration
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -209,6 +212,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.MinWorkers != 0 {
 			cfg.MinWorkers = fileCfg.MinWorkers
+		}
+		if fileCfg.WorkerQueueTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.WorkerQueueTimeout); err == nil {
+				workerQueueTimeout = d
+			} else {
+				warn("Invalid worker_queue_timeout duration: " + err.Error())
+			}
 		}
 		if len(fileCfg.PassthroughUsers) > 0 {
 			cfg.PassthroughUsers = make(map[string]bool, len(fileCfg.PassthroughUsers))
@@ -365,6 +375,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_MAX_WORKERS: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_WORKER_QUEUE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			workerQueueTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_WORKER_QUEUE_TIMEOUT duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_ACME_DOMAIN"); v != "" {
 		cfg.ACMEDomain = v
 	}
@@ -456,6 +473,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["max-workers"] {
 		cfg.MaxWorkers = cli.MaxWorkers
 	}
+	if cli.Set["worker-queue-timeout"] {
+		if d, err := time.ParseDuration(cli.WorkerQueueTimeout); err == nil {
+			workerQueueTimeout = d
+		} else {
+			warn("Invalid --worker-queue-timeout duration: " + err.Error())
+		}
+	}
 	if cli.Set["acme-domain"] {
 		cfg.ACMEDomain = cli.ACMEDomain
 	}
@@ -482,6 +506,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	return resolvedConfig{
-		Server: cfg,
+		Server:             cfg,
+		WorkerQueueTimeout: workerQueueTimeout,
 	}
 }

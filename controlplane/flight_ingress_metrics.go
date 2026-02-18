@@ -18,11 +18,6 @@ var flightSessionsReapedCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Number of Flight auth sessions reaped",
 }, []string{"trigger"})
 
-var flightMaxWorkersRetryCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_flight_max_workers_retry_total",
-	Help: "Number of max-worker retry outcomes when creating Flight auth sessions",
-}, []string{"outcome"})
-
 func observeFlightAuthSessions(count int) {
 	if count < 0 {
 		count = 0
@@ -42,8 +37,4 @@ func observeFlightSessionsReaped(trigger string, count int) {
 		return
 	}
 	flightSessionsReapedCounter.WithLabelValues(trigger).Add(float64(count))
-}
-
-func observeFlightMaxWorkersRetry(outcome string) {
-	flightMaxWorkersRetryCounter.WithLabelValues(outcome).Inc()
 }

@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -22,39 +21,29 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-var ErrMaxWorkersReached = errors.New("max workers reached")
-
 // ManagedWorker represents a duckdb-service worker process.
 type ManagedWorker struct {
-	ID          int
-	cmd         *exec.Cmd
-	socketPath  string
-	bearerToken string
-	client      *flightsql.Client
-	done        chan struct{} // closed when process exits
-	exitErr     error
+	ID             int
+	cmd            *exec.Cmd
+	socketPath     string
+	bearerToken    string
+	client         *flightsql.Client
+	done           chan struct{} // closed when process exits
+	exitErr        error
+	activeSessions int // Number of sessions currently assigned to this worker
 }
 
-// SessionCounter provides session counts per worker for load balancing.
-type SessionCounter interface {
-	SessionCountForWorker(workerID int) int
-}
-
-// FlightWorkerPool manages a pool of duckdb-service worker processes.
-//
-// Lock ordering invariant: pool.mu → SessionManager.mu(RLock).
-// findIdleWorkerLocked calls SessionCountForWorker while holding pool.mu.
-// Never acquire pool.mu while holding SessionManager.mu to avoid deadlock.
 type FlightWorkerPool struct {
-	mu             sync.RWMutex
-	workers        map[int]*ManagedWorker
-	nextWorkerID   int // auto-incrementing worker ID
-	socketDir      string
-	configPath     string
-	binaryPath     string
-	sessionCounter SessionCounter // set after SessionManager is created
-	maxWorkers     int            // 0 = unlimited
-	shuttingDown   bool
+	mu           sync.RWMutex
+	workers      map[int]*ManagedWorker
+	nextWorkerID int // auto-incrementing worker ID
+	socketDir    string
+	configPath   string
+	binaryPath   string
+	maxWorkers   int           // 0 = unlimited
+	shuttingDown bool
+	workerSem    chan struct{} // buffered to maxWorkers; limits concurrent acquisitions
+	shutdownCh   chan struct{} // closed by ShutdownAll to unblock queued waiters
 }
 
 // NewFlightWorkerPool creates a new worker pool.
@@ -66,6 +55,10 @@ func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWo
 		configPath: configPath,
 		binaryPath: binaryPath,
 		maxWorkers: maxWorkers,
+		shutdownCh: make(chan struct{}),
+	}
+	if maxWorkers > 0 {
+		pool.workerSem = make(chan struct{}, maxWorkers)
 	}
 	observeControlPlaneWorkers(0)
 	return pool
@@ -199,12 +192,6 @@ func doHealthCheck(ctx context.Context, client *flightsql.Client) error {
 	return nil
 }
 
-// SetSessionCounter sets the session counter for load balancing.
-// Must be called before accepting connections.
-func (p *FlightWorkerPool) SetSessionCounter(sc SessionCounter) {
-	p.sessionCounter = sc
-}
-
 // Worker returns a worker by ID.
 func (p *FlightWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	p.mu.RLock()
@@ -235,33 +222,36 @@ func (p *FlightWorkerPool) SpawnMinWorkers(count int) error {
 	return p.SpawnAll(count)
 }
 
-// AcquireWorker returns a worker for a new session. It first tries to claim an
-// idle pre-warmed worker (one with no active sessions). If none are available,
-// it spawns a new one. The max-workers check is performed atomically under the
-// write lock to prevent TOCTOU races from concurrent connections.
-func (p *FlightWorkerPool) AcquireWorker() (*ManagedWorker, error) {
+// AcquireWorker returns a worker for a new session. When maxWorkers is set,
+// callers block in FIFO order on the semaphore until a slot is available,
+// the context is cancelled, or the pool shuts down.
+// Once a slot is acquired, it first tries to claim an idle pre-warmed worker
+// (one with no active sessions). If none are available, it spawns a new one.
+func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+	// Block until a semaphore slot is available (FIFO via Go's sudog queue).
+	if p.workerSem != nil {
+		select {
+		case p.workerSem <- struct{}{}:
+			// Got a slot
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timed out waiting for available worker (max_workers=%d): %w", p.maxWorkers, ctx.Err())
+		case <-p.shutdownCh:
+			return nil, fmt.Errorf("pool is shutting down")
+		}
+	}
+
 	p.mu.Lock()
 	if p.shuttingDown {
 		p.mu.Unlock()
+		p.releaseWorkerSem()
 		return nil, fmt.Errorf("pool is shutting down")
 	}
 
-	// Check max-workers cap atomically under the write lock
-	if p.maxWorkers > 0 && len(p.workers) >= p.maxWorkers {
-		// Even at the cap, we may have idle pre-warmed workers to reuse.
-		// Only fail if all existing workers are busy.
-		idle := p.findIdleWorkerLocked()
-		if idle != nil {
-			p.mu.Unlock()
-			return idle, nil
-		}
-		p.mu.Unlock()
-		return nil, fmt.Errorf("%w (%d)", ErrMaxWorkersReached, p.maxWorkers)
-	}
-
-	// Try to claim an idle pre-warmed worker before spawning a new one
+	// Try to claim an idle pre-warmed worker before spawning a new one.
+	// Atomic claim: increment activeSessions while holding the lock.
 	idle := p.findIdleWorkerLocked()
 	if idle != nil {
+		idle.activeSessions++
 		p.mu.Unlock()
 		return idle, nil
 	}
@@ -271,14 +261,31 @@ func (p *FlightWorkerPool) AcquireWorker() (*ManagedWorker, error) {
 	p.mu.Unlock()
 
 	if err := p.SpawnWorker(id); err != nil {
+		p.releaseWorkerSem()
 		return nil, err
 	}
 
 	w, ok := p.Worker(id)
 	if !ok {
+		p.releaseWorkerSem()
 		return nil, fmt.Errorf("worker %d not found after spawn", id)
 	}
+
+	p.mu.Lock()
+	w.activeSessions++
+	p.mu.Unlock()
+
 	return w, nil
+}
+
+// releaseWorkerSem drains one token from the semaphore (non-blocking).
+func (p *FlightWorkerPool) releaseWorkerSem() {
+	if p.workerSem != nil {
+		select {
+		case <-p.workerSem:
+		default:
+		}
+	}
 }
 
 // findIdleWorkerLocked returns a live worker with no active sessions, or nil.
@@ -290,7 +297,7 @@ func (p *FlightWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 			continue // dead
 		default:
 		}
-		if p.sessionCounter != nil && p.sessionCounter.SessionCountForWorker(w.ID) == 0 {
+		if w.activeSessions == 0 {
 			return w
 		}
 	}
@@ -308,9 +315,15 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 		return
 	}
 	delete(p.workers, id)
+	sessions := w.activeSessions
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
+
+	// Release semaphore slots so queued waiters can proceed.
+	for i := 0; i < sessions; i++ {
+		p.releaseWorkerSem()
+	}
 
 	// Run the actual process cleanup asynchronously so DestroySession
 	// doesn't block the connection handler goroutine for up to 3s+.
@@ -319,11 +332,32 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 
 // RetireWorkerIfNoSessions retires a worker only if it has no active sessions.
 // Used to clean up on session creation failure without retiring pre-warmed workers.
-func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) {
-	if p.sessionCounter != nil && p.sessionCounter.SessionCountForWorker(id) > 0 {
-		return
+// Returns true if the worker was retired (and its semaphore slot released).
+func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) bool {
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok {
+		p.mu.Unlock()
+		return false
 	}
-	p.RetireWorker(id)
+
+	// Decrement the acquisition claim we just made.
+	if w.activeSessions > 0 {
+		w.activeSessions--
+		p.releaseWorkerSem()
+	}
+
+	// If it has NO other active sessions, kill it to be safe (it might be broken).
+	if w.activeSessions == 0 {
+		delete(p.workers, id)
+		workerCount := len(p.workers)
+		p.mu.Unlock()
+		observeControlPlaneWorkers(workerCount)
+		go retireWorkerProcess(w)
+		return true
+	}
+	p.mu.Unlock()
+	return false
 }
 
 // retireWorkerProcess handles the actual process shutdown and socket cleanup.
@@ -383,6 +417,9 @@ func (p *FlightWorkerPool) ShutdownAll() {
 		workers = append(workers, w)
 	}
 	p.mu.Unlock()
+
+	// Unblock all goroutines waiting in AcquireWorker's semaphore select.
+	close(p.shutdownCh)
 
 	for _, w := range workers {
 		if w.cmd.Process != nil {
@@ -483,6 +520,12 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 							_ = w.client.Close()
 						}
 						_ = os.Remove(w.socketPath)
+
+						// Release as many semaphore slots as this worker was using.
+						// In the 1:1 model, this is usually 1.
+						for i := 0; i < w.activeSessions; i++ {
+							p.releaseWorkerSem()
+						}
 					default:
 						// Worker is alive, do a health check.
 						// Recover nil-pointer panics: w.client.Close() (from a
@@ -535,6 +578,10 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 										_ = w.client.Close()
 									}
 									_ = os.Remove(w.socketPath)
+
+									for i := 0; i < w.activeSessions; i++ {
+										p.releaseWorkerSem()
+									}
 								}
 							}
 						} else {
