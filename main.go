@@ -43,8 +43,9 @@ type FileConfig struct {
 	MemoryRebalance           *bool               `yaml:"memory_rebalance"`  // Enable dynamic per-connection memory reallocation
 	MaxWorkers                int                 `yaml:"max_workers"`           // Max worker processes (control-plane mode)
 	MinWorkers                int                 `yaml:"min_workers"`           // Pre-warm worker count (control-plane mode)
-	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`  // e.g., "5m"
-	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`   // e.g., "5m"
+	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`        // e.g., "5m"
+	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`         // e.g., "5m"
+	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"`      // e.g., "24h"
 	PassthroughUsers          []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
 }
 
@@ -178,6 +179,7 @@ func main() {
 	maxWorkers := flag.Int("max-workers", 0, "Max worker processes, 0=unlimited (control-plane mode) (env: DUCKGRES_MAX_WORKERS)")
 	workerQueueTimeout := flag.String("worker-queue-timeout", "", "How long to wait for an available worker slot (e.g., '5m') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
 	workerIdleTimeout := flag.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
+	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for connections to drain during handover (default: '24h') (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
 
@@ -217,6 +219,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MIN_WORKERS        Pre-warm worker count (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_WORKERS        Max worker processes (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_WORKER_QUEUE_TIMEOUT  Worker queue timeout (default: 5m)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_HANDOVER_DRAIN_TIMEOUT  Handover drain timeout (default: 24h)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DOMAIN        Domain for ACME/Let's Encrypt certificate\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_EMAIL         Contact email for Let's Encrypt notifications\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_CACHE_DIR     Directory for ACME certificate cache\n")
@@ -303,6 +306,7 @@ func main() {
 		MaxWorkers:                *maxWorkers,
 		WorkerQueueTimeout:        *workerQueueTimeout,
 		WorkerIdleTimeout:         *workerIdleTimeout,
+		HandoverDrainTimeout:      *handoverDrainTimeout,
 		ACMEDomain:                *acmeDomain,
 		ACMEEmail:                 *acmeEmail,
 		ACMECacheDir:              *acmeCacheDir,
@@ -425,9 +429,10 @@ func main() {
 			SocketDir:          *socketDir,
 			ConfigPath:         *configFile,
 			HandoverSocket:     *handoverSocket,
-			WorkerQueueTimeout: resolved.WorkerQueueTimeout,
-			WorkerIdleTimeout:  resolved.WorkerIdleTimeout,
-			MetricsServer:      metricsSrv,
+			WorkerQueueTimeout:   resolved.WorkerQueueTimeout,
+			WorkerIdleTimeout:    resolved.WorkerIdleTimeout,
+			HandoverDrainTimeout: resolved.HandoverDrainTimeout,
+			MetricsServer:        metricsSrv,
 		}
 		controlplane.RunControlPlane(cpCfg)
 		return

@@ -190,8 +190,8 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	select {
 	case <-drainDone:
 		slog.Info("All connections drained after handover.")
-	case <-time.After(5 * time.Minute):
-		slog.Warn("Handover drain timeout after 5 minutes, forcing exit.")
+	case <-time.After(cp.cfg.HandoverDrainTimeout):
+		slog.Warn("Handover drain timeout, forcing exit.", "timeout", cp.cfg.HandoverDrainTimeout)
 	}
 
 	// Shut down workers
