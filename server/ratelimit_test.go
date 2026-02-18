@@ -2,7 +2,6 @@ package server
 
 import (
 	"net"
-	"runtime"
 	"testing"
 	"time"
 )
@@ -373,7 +372,7 @@ func TestDefaultRateLimitConfig(t *testing.T) {
 	if cfg.MaxConnectionsPerIP != 100 {
 		t.Errorf("MaxConnectionsPerIP = %d, want 100", cfg.MaxConnectionsPerIP)
 	}
-	if cfg.MaxConnections != runtime.NumCPU()*2 {
-		t.Errorf("MaxConnections = %d, want %d", cfg.MaxConnections, runtime.NumCPU()*2)
+	if cfg.MaxConnections != 1024 {
+		t.Errorf("MaxConnections = %d, want 1024", cfg.MaxConnections)
 	}
 }

@@ -2,7 +2,6 @@ package server
 
 import (
 	"net"
-	"runtime"
 	"sync"
 	"time"
 )
@@ -28,7 +27,7 @@ func DefaultRateLimitConfig() RateLimitConfig {
 		FailedAttemptWindow: 5 * time.Minute,
 		BanDuration:         15 * time.Minute,
 		MaxConnectionsPerIP: 100,
-		MaxConnections:      runtime.NumCPU() * 2,
+		MaxConnections:      1024,
 	}
 }
 
