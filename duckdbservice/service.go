@@ -166,31 +166,52 @@ func Run(cfg ServiceConfig) {
 		}
 	}()
 
-	network, addr, err := ParseListenAddr(cfg.ListenAddr)
-	if err != nil {
-		slog.Error("Invalid listen address", "error", err)
-		os.Exit(1)
-	}
+	var listener net.Listener
 
-	// Clean up stale unix socket
-	if network == "unix" {
-		_ = os.Remove(addr)
-	}
-
-	listener, err := net.Listen(network, addr)
-	if err != nil {
-		slog.Error("Failed to listen", "network", network, "addr", addr, "error", err)
-		os.Exit(1)
-	}
-
-	// Restrict unix socket permissions to owner only
-	if network == "unix" {
-		if err := os.Chmod(addr, 0700); err != nil {
-			slog.Warn("Failed to set unix socket permissions", "error", err)
+	if cfg.ListenFD > 0 {
+		// Inherited pre-bound listener from the control plane.
+		// The CP creates and binds the Unix socket, then passes the FD via
+		// cmd.ExtraFiles to avoid EROFS under systemd ProtectSystem=strict.
+		file := os.NewFile(uintptr(cfg.ListenFD), "inherited-listener")
+		if file == nil {
+			slog.Error("Invalid inherited listener FD", "fd", cfg.ListenFD)
+			os.Exit(1)
 		}
-	}
+		var err error
+		listener, err = net.FileListener(file)
+		_ = file.Close()
+		if err != nil {
+			slog.Error("Failed to create listener from inherited FD", "fd", cfg.ListenFD, "error", err)
+			os.Exit(1)
+		}
+		slog.Info("Starting DuckDB service (inherited listener)", "addr", listener.Addr().String())
+	} else {
+		network, addr, err := ParseListenAddr(cfg.ListenAddr)
+		if err != nil {
+			slog.Error("Invalid listen address", "error", err)
+			os.Exit(1)
+		}
 
-	slog.Info("Starting DuckDB service", "network", network, "addr", addr)
+		// Clean up stale unix socket
+		if network == "unix" {
+			_ = os.Remove(addr)
+		}
+
+		listener, err = net.Listen(network, addr)
+		if err != nil {
+			slog.Error("Failed to listen", "network", network, "addr", addr, "error", err)
+			os.Exit(1)
+		}
+
+		// Restrict unix socket permissions to owner only
+		if network == "unix" {
+			if err := os.Chmod(addr, 0700); err != nil {
+				slog.Warn("Failed to set unix socket permissions", "error", err)
+			}
+		}
+
+		slog.Info("Starting DuckDB service", "network", network, "addr", addr)
+	}
 
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
