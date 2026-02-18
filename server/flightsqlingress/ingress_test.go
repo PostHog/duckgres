@@ -12,9 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
@@ -24,6 +26,29 @@ import (
 type testExecResult struct {
 	affected int64
 	err      error
+}
+
+type testServerTransportStream struct {
+	header  metadata.MD
+	trailer metadata.MD
+}
+
+func (s *testServerTransportStream) Method() string {
+	return "/duckgres.test/CloseSession"
+}
+
+func (s *testServerTransportStream) SetHeader(md metadata.MD) error {
+	s.header = metadata.Join(s.header, md)
+	return nil
+}
+
+func (s *testServerTransportStream) SendHeader(md metadata.MD) error {
+	return s.SetHeader(md)
+}
+
+func (s *testServerTransportStream) SetTrailer(md metadata.MD) error {
+	s.trailer = metadata.Join(s.trailer, md)
+	return nil
 }
 
 func (r testExecResult) RowsAffected() (int64, error) {
@@ -559,6 +584,166 @@ func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T
 			t.Fatalf("expected expiry path to prune bootstrap key mapping")
 		}
 	})
+}
+
+func TestCloseSessionRevokesTokenAndDestroysWorker(t *testing.T) {
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
+	s.tokenIssuedAt.Store(time.Now().UnixNano())
+
+	var destroyed []int32
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			"issued-token": s,
+		},
+		byKey: map[string]string{
+			"bootstrap|postgres|nonce": "issued-token",
+		},
+		destroySessionFn: func(pid int32) {
+			destroyed = append(destroyed, pid)
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	token := base64.StdEncoding.EncodeToString([]byte("postgres:postgres"))
+	ctx := metadata.NewIncomingContext(
+		context.Background(),
+		metadata.Pairs(
+			"x-duckgres-session", "issued-token",
+			"authorization", "Basic "+token,
+		),
+	)
+
+	res, err := h.CloseSession(ctx, &flight.CloseSessionRequest{})
+	if err != nil {
+		t.Fatalf("CloseSession returned error: %v", err)
+	}
+	if res.GetStatus() != flight.CloseSessionResultClosed {
+		t.Fatalf("expected close status CLOSED, got %s", res.GetStatus())
+	}
+	if len(destroyed) != 1 || destroyed[0] != 1234 {
+		t.Fatalf("expected session pid 1234 to be destroyed, got %v", destroyed)
+	}
+	if _, ok := store.GetByToken("issued-token"); ok {
+		t.Fatalf("expected closed token to be invalid")
+	}
+
+	store.mu.RLock()
+	_, stillMapped := store.byKey["bootstrap|postgres|nonce"]
+	store.mu.RUnlock()
+	if stillMapped {
+		t.Fatalf("expected close path to prune bootstrap key mapping")
+	}
+}
+
+func TestCloseSessionMissingTokenDoesNotBootstrap(t *testing.T) {
+	var createCalls atomic.Int32
+	store := &flightAuthSessionStore{
+		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+			createCalls.Add(1)
+			return 1234, nil, nil
+		},
+		destroySessionFn: func(int32) {},
+		sessions:         make(map[string]*flightClientSession),
+		byKey:            make(map[string]string),
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	ctx := authContextForPeer(&net.TCPAddr{IP: net.ParseIP("203.0.113.50"), Port: 30005}, "postgres", "postgres")
+	_, err = h.CloseSession(ctx, &flight.CloseSessionRequest{})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated for missing session token, got %v", err)
+	}
+	if createCalls.Load() != 0 {
+		t.Fatalf("expected CloseSession to not create bootstrap sessions, got %d create calls", createCalls.Load())
+	}
+}
+
+func TestCloseSessionTokenOnlyRevokesTokenAndDoesNotBootstrap(t *testing.T) {
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
+	s.tokenIssuedAt.Store(time.Now().UnixNano())
+
+	var createCalls atomic.Int32
+	var destroyed []int32
+	store := &flightAuthSessionStore{
+		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+			createCalls.Add(1)
+			return 9876, nil, nil
+		},
+		sessions: map[string]*flightClientSession{
+			"issued-token": s,
+		},
+		byKey: map[string]string{
+			"bootstrap|postgres|nonce": "issued-token",
+		},
+		destroySessionFn: func(pid int32) {
+			destroyed = append(destroyed, pid)
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "issued-token"))
+	res, err := h.CloseSession(ctx, &flight.CloseSessionRequest{})
+	if err != nil {
+		t.Fatalf("CloseSession returned error: %v", err)
+	}
+	if res.GetStatus() != flight.CloseSessionResultClosed {
+		t.Fatalf("expected close status CLOSED, got %s", res.GetStatus())
+	}
+	if createCalls.Load() != 0 {
+		t.Fatalf("expected token-only close to avoid bootstrap session creation, got %d create calls", createCalls.Load())
+	}
+	if len(destroyed) != 1 || destroyed[0] != 1234 {
+		t.Fatalf("expected session pid 1234 to be destroyed, got %v", destroyed)
+	}
+	if _, ok := store.GetByToken("issued-token"); ok {
+		t.Fatalf("expected closed token to be invalid")
+	}
+}
+
+func TestCloseSessionDoesNotReissueSessionTokenMetadata(t *testing.T) {
+	s := newFlightClientSession(1234, "postgres", nil)
+	s.token = "issued-token"
+	s.tokenIssuedAt.Store(time.Now().UnixNano())
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			"issued-token": s,
+		},
+		destroySessionFn: func(int32) {},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	transport := &testServerTransportStream{}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", "issued-token"))
+	ctx = grpc.NewContextWithServerTransportStream(ctx, transport)
+
+	if _, err := h.CloseSession(ctx, &flight.CloseSessionRequest{}); err != nil {
+		t.Fatalf("CloseSession returned error: %v", err)
+	}
+
+	if got := transport.header.Get(defaultFlightSessionHeaderKey); len(got) > 0 {
+		t.Fatalf("expected close-session response header to omit %q, got %v", defaultFlightSessionHeaderKey, got)
+	}
+	if got := transport.trailer.Get(defaultFlightSessionHeaderKey); len(got) > 0 {
+		t.Fatalf("expected close-session response trailer to omit %q, got %v", defaultFlightSessionHeaderKey, got)
+	}
 }
 
 func TestSupportsReadOnlySchemaInference(t *testing.T) {

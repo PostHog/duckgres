@@ -201,6 +201,10 @@ func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, users map
 }
 
 func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (*flightClientSession, error) {
+	return h.sessionFromContextWithTokenMetadata(ctx, true)
+}
+
+func (h *ControlPlaneFlightSQLHandler) sessionFromContextWithTokenMetadata(ctx context.Context, emitTokenMetadata bool) (*flightClientSession, error) {
 	var remoteAddr net.Addr
 	if p, ok := peer.FromContext(ctx); ok && p != nil {
 		remoteAddr = p.Addr
@@ -236,7 +240,9 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContext(ctx context.Context) (
 			}
 		}
 
-		setSessionTokenMetadata(ctx, sessionToken)
+		if emitTokenMetadata {
+			setSessionTokenMetadata(ctx, sessionToken)
+		}
 		s.touch()
 		return s, nil
 	}
@@ -475,6 +481,34 @@ func (h *ControlPlaneFlightSQLHandler) EndTransaction(ctx context.Context, req f
 
 	s.deleteTxn(txnKey)
 	return nil
+}
+
+func (h *ControlPlaneFlightSQLHandler) CloseSession(ctx context.Context, req *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
+	_ = req
+	if h.sessions == nil {
+		return nil, status.Error(codes.Unavailable, "session store is not configured")
+	}
+
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "missing metadata")
+	}
+	sessionToken := incomingSessionToken(md)
+	if sessionToken == "" {
+		return nil, status.Error(codes.Unauthenticated, "missing x-duckgres-session header")
+	}
+
+	// Validate token ownership (and optional Basic-auth principal consistency)
+	// before revoking.
+	if _, err := h.sessionFromContextWithTokenMetadata(ctx, false); err != nil {
+		return nil, err
+	}
+
+	if !h.sessions.CloseByToken(sessionToken) {
+		return nil, status.Error(codes.Unauthenticated, "session not found")
+	}
+
+	return &flight.CloseSessionResult{Status: flight.CloseSessionResultClosed}, nil
 }
 
 func (h *ControlPlaneFlightSQLHandler) CreatePreparedStatement(ctx context.Context, req flightsql.ActionCreatePreparedStatementRequest) (flightsql.ActionCreatePreparedStatementResult, error) {
@@ -1226,6 +1260,39 @@ func (s *flightAuthSessionStore) GetByToken(token string) (*flightClientSession,
 	}
 	s.mu.Unlock()
 	return session, true
+}
+
+func (s *flightAuthSessionStore) CloseByToken(token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+
+	var (
+		session      *flightClientSession
+		sessionCount int
+		destroyFn    func(int32)
+		ok           bool
+	)
+
+	s.mu.Lock()
+	s.ensureMapsLocked()
+	session, ok = s.sessions[token]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	delete(s.sessions, token)
+	s.removeByKeyForTokenLocked(token)
+	sessionCount = len(s.sessions)
+	destroyFn = s.destroySessionFn
+	s.mu.Unlock()
+
+	if destroyFn != nil {
+		destroyFn(session.pid)
+	}
+	s.notifySessionCountChanged(sessionCount)
+	return true
 }
 
 func (s *flightAuthSessionStore) getExistingByKey(key string) (*flightClientSession, bool) {
