@@ -31,9 +31,10 @@ type ControlPlaneConfig struct {
 	ConfigPath          string // Path to config file, passed to workers
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
-	WorkerQueueTimeout  time.Duration // How long to wait for an available worker slot (default: 5m)
-	WorkerIdleTimeout   time.Duration // How long to keep an idle worker alive (default: 5m)
-	MetricsServer       *http.Server  // Optional metrics server to shut down during handover
+	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
+	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
+	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during handover (default: 24h)
+	MetricsServer        *http.Server  // Optional metrics server to shut down during handover
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -73,6 +74,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 	if cfg.WorkerIdleTimeout == 0 {
 		cfg.WorkerIdleTimeout = 5 * time.Minute
+	}
+	if cfg.HandoverDrainTimeout == 0 {
+		cfg.HandoverDrainTimeout = 24 * time.Hour
 	}
 
 	// Enforce secure defaults for control-plane mode.

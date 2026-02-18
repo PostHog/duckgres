@@ -30,6 +30,7 @@ type configCLIInputs struct {
 	MinWorkers                int
 	WorkerQueueTimeout        string
 	WorkerIdleTimeout         string
+	HandoverDrainTimeout      string
 	ACMEDomain                string
 	ACMEEmail                 string
 	ACMECacheDir              string
@@ -37,9 +38,10 @@ type configCLIInputs struct {
 }
 
 type resolvedConfig struct {
-	Server             server.Config
-	WorkerQueueTimeout time.Duration
-	WorkerIdleTimeout  time.Duration
+	Server               server.Config
+	WorkerQueueTimeout   time.Duration
+	WorkerIdleTimeout    time.Duration
+	HandoverDrainTimeout time.Duration
 }
 
 func defaultServerConfig() server.Config {
@@ -75,6 +77,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	cfg := defaultServerConfig()
 	var workerQueueTimeout time.Duration
 	var workerIdleTimeout time.Duration
+	var handoverDrainTimeout time.Duration
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -228,6 +231,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 				workerIdleTimeout = d
 			} else {
 				warn("Invalid worker_idle_timeout duration: " + err.Error())
+			}
+		}
+		if fileCfg.HandoverDrainTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.HandoverDrainTimeout); err == nil {
+				handoverDrainTimeout = d
+			} else {
+				warn("Invalid handover_drain_timeout duration: " + err.Error())
 			}
 		}
 		if len(fileCfg.PassthroughUsers) > 0 {
@@ -399,6 +409,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_WORKER_IDLE_TIMEOUT duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_HANDOVER_DRAIN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			handoverDrainTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_HANDOVER_DRAIN_TIMEOUT duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_ACME_DOMAIN"); v != "" {
 		cfg.ACMEDomain = v
 	}
@@ -504,6 +521,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid --worker-idle-timeout duration: " + err.Error())
 		}
 	}
+	if cli.Set["handover-drain-timeout"] {
+		if d, err := time.ParseDuration(cli.HandoverDrainTimeout); err == nil {
+			handoverDrainTimeout = d
+		} else {
+			warn("Invalid --handover-drain-timeout duration: " + err.Error())
+		}
+	}
 	if cli.Set["acme-domain"] {
 		cfg.ACMEDomain = cli.ACMEDomain
 	}
@@ -530,8 +554,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	return resolvedConfig{
-		Server:             cfg,
-		WorkerQueueTimeout: workerQueueTimeout,
-		WorkerIdleTimeout:  workerIdleTimeout,
+		Server:               cfg,
+		WorkerQueueTimeout:   workerQueueTimeout,
+		WorkerIdleTimeout:    workerIdleTimeout,
+		HandoverDrainTimeout: handoverDrainTimeout,
 	}
 }
