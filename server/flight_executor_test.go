@@ -180,8 +180,8 @@ func TestFlightExecutor_MergedContextCallerCancel(t *testing.T) {
 func TestDisconnectMonitor_DetectsClose(t *testing.T) {
 	// Create a connected pair of net.Conn (using net.Pipe).
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 
 	connCtx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
@@ -200,7 +200,7 @@ func TestDisconnectMonitor_DetectsClose(t *testing.T) {
 	defer stop()
 
 	// Close the client side to simulate client disconnect.
-	client.Close()
+	_ = client.Close()
 
 	// The monitor should detect the disconnect and cancel connCtx.
 	select {
@@ -215,8 +215,8 @@ func TestDisconnectMonitor_StopBeforeDisconnect(t *testing.T) {
 	// Verify that stop() returns promptly and the context is NOT cancelled
 	// when the connection is still alive.
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 
 	connCtx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
@@ -260,8 +260,8 @@ func TestDisconnectMonitor_BufferedDataNotLost(t *testing.T) {
 	// Verify that data arriving during monitoring stays in the bufio.Reader
 	// buffer and can be read after the monitor stops.
 	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
 
 	connCtx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()

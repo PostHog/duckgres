@@ -247,7 +247,7 @@ func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
 	go func() {
 		defer close(stopped)
 		for {
-			c.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			_ = c.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			_, err := c.reader.Peek(1)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -281,11 +281,11 @@ func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
 	return func() {
 		close(done)
 		// Interrupt any in-progress Peek by setting a past deadline.
-		c.conn.SetReadDeadline(time.Now())
+		_ = c.conn.SetReadDeadline(time.Now())
 		<-stopped
 		// Clear the deadline so the message loop's next read uses
 		// the idle timeout (or no deadline).
-		c.conn.SetReadDeadline(time.Time{})
+		_ = c.conn.SetReadDeadline(time.Time{})
 	}
 }
 
