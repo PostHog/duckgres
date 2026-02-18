@@ -185,6 +185,19 @@ func (c *clientConn) backendKey() BackendKey {
 // In child worker processes, the context is also cancelled when the server's
 // externalCancelCh is closed (triggered by SIGUSR1 signal).
 func (c *clientConn) queryContext() (context.Context, func()) {
+	return c.queryContextInner(true)
+}
+
+// queryContextForCursor returns a cancellable context without a disconnect
+// monitor. Cursors are long-lived and span multiple message loop iterations,
+// so the monitor cannot be used — it would race with readMessage on the
+// bufio.Reader between FETCH calls. Disconnect detection still works via
+// c.ctx cancellation when the connection handler exits.
+func (c *clientConn) queryContextForCursor() (context.Context, func()) {
+	return c.queryContextInner(false)
+}
+
+func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(c.ctx)
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
@@ -202,11 +215,15 @@ func (c *clientConn) queryContext() (context.Context, func()) {
 		}()
 	}
 
-	// Start monitoring the client connection for disconnects.
-	stopMonitor := c.startDisconnectMonitor(ctx)
+	var stopMonitor func()
+	if monitor {
+		stopMonitor = c.startDisconnectMonitor(ctx)
+	}
 
 	cleanup := func() {
-		stopMonitor()
+		if stopMonitor != nil {
+			stopMonitor()
+		}
 		c.server.UnregisterQuery(key)
 		cancel()
 	}
@@ -817,6 +834,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	//    that pg_query can't parse
 	// 2. handleCopyOut() already extracts and transpiles the inner SELECT separately
 	// 3. validateWithDuckDB() can't EXPLAIN COPY with FORMAT "binary"
+	//
+	// NOTE: This must stay above queryContext(). handleCopyIn reads from
+	// c.reader directly, which would race with the disconnect monitor.
 	upperQueryEarly := strings.ToUpper(query)
 	if copyToStdoutRegex.MatchString(upperQueryEarly) || copyFromStdinRegex.MatchString(upperQueryEarly) {
 		return c.handleCopy(query, upperQueryEarly)
@@ -3990,7 +4010,7 @@ func deparseInnerQuery(node *pg_query.Node) string {
 
 // openCursor executes the cursor's stored query and caches the result set metadata.
 func (c *clientConn) openCursor(cursor *cursorState) error {
-	ctx, cleanup := c.queryContext()
+	ctx, cleanup := c.queryContextForCursor()
 	cursor.cleanup = cleanup
 
 	rows, err := c.executor.QueryContext(ctx, cursor.query)
