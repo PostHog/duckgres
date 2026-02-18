@@ -137,7 +137,13 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 	// Create a context that is cancelled when either the input context OR
 	// the executor's base context is cancelled.
 	reqCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	success := false
+	defer func() {
+		if !success {
+			cancel()
+		}
+	}()
+
 	if e.ctx != nil {
 		go func() {
 			select {
@@ -170,9 +176,11 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return nil, fmt.Errorf("flight deserialize schema: %w", err)
 	}
 
+	success = true
 	return &FlightRowSet{
 		reader: reader,
 		schema: schema,
+		cancel: cancel,
 	}, nil
 }
 
@@ -252,6 +260,7 @@ type FlightRowSet struct {
 	done         bool
 	err          error
 	closeOnce    sync.Once
+	cancel       context.CancelFunc
 }
 
 func (r *FlightRowSet) Columns() ([]string, error) {
@@ -329,6 +338,9 @@ func (r *FlightRowSet) Scan(dest ...any) error {
 
 func (r *FlightRowSet) Close() error {
 	r.closeOnce.Do(func() {
+		if r.cancel != nil {
+			r.cancel()
+		}
 		if r.currentBatch != nil {
 			r.currentBatch.Release()
 			r.currentBatch = nil
