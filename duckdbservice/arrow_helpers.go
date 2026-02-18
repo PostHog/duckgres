@@ -539,8 +539,12 @@ func AppendValue(builder array.Builder, val interface{}) {
 	}
 }
 
+type contextQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // GetQuerySchema executes a query with LIMIT 0 to discover the result schema.
-func GetQuerySchema(ctx context.Context, db *sql.DB, query string, tx *sql.Tx) (*arrow.Schema, error) {
+func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx contextQueryer) (*arrow.Schema, error) {
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
 	queryWithLimit := q
 	upper := strings.ToUpper(q)

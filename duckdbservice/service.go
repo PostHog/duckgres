@@ -1,6 +1,7 @@
 package duckdbservice
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -40,6 +41,7 @@ type SessionPool struct {
 	startTime   time.Time
 	maxSessions int
 	stopCh      chan struct{}
+	warmupDB    *sql.DB // Keep this open to keep shared cache alive
 }
 
 type trackedTx struct {
@@ -51,6 +53,7 @@ type trackedTx struct {
 type Session struct {
 	ID        string
 	DB        *sql.DB
+	Conn      *sql.Conn // Dedicated connection for this session
 	Username  string
 	CreatedAt time.Time
 	lastUsed  atomic.Int64 // unix nano
@@ -86,6 +89,29 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		cfg:  cfg,
 		pool: pool,
 	}
+}
+
+// Warmup performs one-time initialization of the shared DuckDB instance.
+// This loads extensions and attaches catalogs so that subsequent session
+// creations are nearly instantaneous.
+func (p *SessionPool) Warmup() error {
+	if os.Getenv("DUCKGRES_MODE") != "duckdb-service" {
+		return nil
+	}
+
+	slog.Info("Pre-warming worker DuckDB instance...")
+	// Use a system-level username for warmup
+	db, err := server.CreateDBConnection(p.cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
+	if err != nil {
+		return fmt.Errorf("warmup failed: %w", err)
+	}
+
+	p.mu.Lock()
+	p.warmupDB = db
+	p.mu.Unlock()
+
+	slog.Info("Worker pre-warmed successfully.")
+	return nil
 }
 
 const (
@@ -130,6 +156,15 @@ func (p *SessionPool) reapLoop() {
 // Run starts the DuckDB service, blocking until shutdown.
 func Run(cfg ServiceConfig) {
 	svc := NewDuckDBService(cfg)
+
+	// Pre-warm the DuckDB instance (load extensions, attach DuckLake)
+	// in the background so we don't block the gRPC server from starting.
+	// This ensures that waitForWorker doesn't time out during spawn.
+	go func() {
+		if err := svc.pool.Warmup(); err != nil {
+			slog.Warn("Worker pre-warm failed. Sessions may be slow to initialize.", "error", err)
+		}
+	}()
 
 	network, addr, err := ParseListenAddr(cfg.ListenAddr)
 	if err != nil {
@@ -223,19 +258,45 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	p.mu.Unlock()
 
 	var (
-		db  *sql.DB
-		err error
+		db   *sql.DB
+		conn *sql.Conn
+		err  error
 	)
-	if p.cfg.PassthroughUsers[username] {
-		db, err = server.CreatePassthroughDBConnection(p.cfg, p.duckLakeSem, username, p.startTime, server.ProcessVersion())
-	} else {
-		db, err = server.CreateDBConnection(p.cfg, p.duckLakeSem, username, p.startTime, server.ProcessVersion())
+
+	// Use shared warmupDB if available (highly preferred for performance)
+	p.mu.RLock()
+	db = p.warmupDB
+	p.mu.RUnlock()
+
+	if db == nil {
+		// Fallback: create a new DB connection if warmup failed or wasn't run
+		if p.cfg.PassthroughUsers[username] {
+			db, err = server.CreatePassthroughDBConnection(p.cfg, p.duckLakeSem, username, p.startTime, server.ProcessVersion())
+		} else {
+			db, err = server.CreateDBConnection(p.cfg, p.duckLakeSem, username, p.startTime, server.ProcessVersion())
+		}
+		if err != nil {
+			p.mu.Lock()
+			p.reserved--
+			p.mu.Unlock()
+			return nil, fmt.Errorf("create session db: %w", err)
+		}
 	}
+
+	// Obtain a dedicated connection for this session to ensure isolation
+	// and consistent session settings (search_path, etc.)
+	conn, err = db.Conn(context.Background())
 	if err != nil {
 		p.mu.Lock()
 		p.reserved--
 		p.mu.Unlock()
-		return nil, fmt.Errorf("create session db: %w", err)
+		return nil, fmt.Errorf("failed to obtain connection from pool: %w", err)
+	}
+
+	// Initialize the session connection with username-specific state if needed.
+	// Since the DB is shared, we must set session-local parameters here.
+	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET search_path = '%s,public,ducklake'", username)); err != nil {
+		slog.Warn("Failed to set search_path for session.", "user", username, "error", err)
 	}
 
 	stop := server.StartCredentialRefresh(db, p.cfg.DuckLake)
@@ -244,6 +305,7 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	session := &Session{
 		ID:        token,
 		DB:        db,
+		Conn:      conn,
 		Username:  username,
 		CreatedAt: time.Now(),
 		queries:   make(map[string]*QueryHandle),
@@ -297,7 +359,15 @@ func (p *SessionPool) DestroySession(token string) error {
 	if stop != nil {
 		stop()
 	}
-	if session.DB != nil {
+	if session.Conn != nil {
+		_ = session.Conn.Close()
+	}
+	// Do NOT close session.DB if it is the shared warmupDB
+	p.mu.RLock()
+	isShared := session.DB == p.warmupDB
+	p.mu.RUnlock()
+
+	if session.DB != nil && !isShared {
 		if err := session.DB.Close(); err != nil {
 			slog.Warn("Failed to close session database", "error", err)
 		}
@@ -344,9 +414,16 @@ func (p *SessionPool) CloseAll() {
 		}
 		session.mu.Unlock()
 
-		if session.DB != nil {
+		if session.Conn != nil {
+			_ = session.Conn.Close()
+		}
+		if session.DB != nil && session.DB != p.warmupDB {
 			_ = session.DB.Close()
 		}
+	}
+
+	if p.warmupDB != nil {
+		_ = p.warmupDB.Close()
 	}
 }
 

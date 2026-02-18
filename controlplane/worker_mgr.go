@@ -30,7 +30,8 @@ type ManagedWorker struct {
 	client         *flightsql.Client
 	done           chan struct{} // closed when process exits
 	exitErr        error
-	activeSessions int // Number of sessions currently assigned to this worker
+	activeSessions int       // Number of sessions currently assigned to this worker
+	lastUsed       time.Time // Last time a session was destroyed on this worker
 }
 
 type FlightWorkerPool struct {
@@ -41,6 +42,7 @@ type FlightWorkerPool struct {
 	configPath   string
 	binaryPath   string
 	maxWorkers   int           // 0 = unlimited
+	idleTimeout  time.Duration // how long to keep an idle worker alive
 	shuttingDown bool
 	workerSem    chan struct{} // buffered to maxWorkers; limits concurrent acquisitions
 	shutdownCh   chan struct{} // closed by ShutdownAll to unblock queued waiters
@@ -61,6 +63,7 @@ func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWo
 		pool.workerSem = make(chan struct{}, maxWorkers)
 	}
 	observeControlPlaneWorkers(0)
+	go pool.idleReaper()
 	return pool
 }
 
@@ -200,13 +203,30 @@ func (p *FlightWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	return w, ok
 }
 
-// SpawnAll spawns the specified number of workers.
+// SpawnAll spawns the specified number of workers in parallel.
 func (p *FlightWorkerPool) SpawnAll(count int) error {
+	var wg sync.WaitGroup
+	errs := make(chan error, count)
+
 	for i := 0; i < count; i++ {
-		if err := p.SpawnWorker(i); err != nil {
-			return err
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			if err := p.SpawnWorker(id); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			return err // Return first error encountered
 		}
 	}
+
 	// Update nextWorkerID past the pre-spawned range
 	p.mu.Lock()
 	if count > p.nextWorkerID {
@@ -284,6 +304,57 @@ func (p *FlightWorkerPool) releaseWorkerSem() {
 		select {
 		case <-p.workerSem:
 		default:
+		}
+	}
+}
+
+// ReleaseWorker decrements the active session count for a worker and updates its lastUsed time.
+func (p *FlightWorkerPool) ReleaseWorker(id int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	w, ok := p.workers[id]
+	if ok {
+		if w.activeSessions > 0 {
+			w.activeSessions--
+		}
+		w.lastUsed = time.Now()
+		p.releaseWorkerSem()
+	}
+}
+
+// idleReaper periodically retires workers that have been idle for longer than idleTimeout.
+func (p *FlightWorkerPool) idleReaper() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.shutdownCh:
+			return
+		case <-ticker.C:
+			p.reapIdleWorkers()
+		}
+	}
+}
+
+func (p *FlightWorkerPool) reapIdleWorkers() {
+	p.mu.Lock()
+	var toRetire []*ManagedWorker
+	now := time.Now()
+	for id, w := range p.workers {
+		if w.activeSessions == 0 && !w.lastUsed.IsZero() && now.Sub(w.lastUsed) > p.idleTimeout {
+			toRetire = append(toRetire, w)
+			delete(p.workers, id)
+		}
+	}
+	workerCount := len(p.workers)
+	p.mu.Unlock()
+
+	if len(toRetire) > 0 {
+		slog.Info("Reaping idle workers.", "count", len(toRetire))
+		observeControlPlaneWorkers(workerCount)
+		for _, w := range toRetire {
+			go retireWorkerProcess(w)
 		}
 	}
 }

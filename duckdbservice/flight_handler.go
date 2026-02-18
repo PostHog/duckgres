@@ -122,7 +122,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		return nil, err
 	}
 
-	schema, err := GetQuerySchema(ctx, session.DB, query, tx)
+	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
@@ -193,7 +193,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		if tx != nil {
 			rows, qerr = tx.QueryContext(ctx, handle.Query)
 		} else {
-			rows, qerr = session.DB.QueryContext(ctx, handle.Query)
+			rows, qerr = session.Conn.QueryContext(ctx, handle.Query)
 		}
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
@@ -237,7 +237,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if tx != nil {
 		result, err = tx.ExecContext(ctx, query)
 	} else {
-		result, err = session.DB.ExecContext(ctx, query)
+		result, err = session.Conn.ExecContext(ctx, query)
 	}
 	if err != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
@@ -259,7 +259,7 @@ func (h *FlightSQLHandler) BeginTransaction(ctx context.Context,
 	}
 	_ = req
 
-	tx, err := session.DB.BeginTx(context.Background(), nil)
+	tx, err := session.Conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to begin transaction: %v", err)
 	}
@@ -331,7 +331,7 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
 
-	schema, err := GetQuerySchema(ctx, session.DB, req.GetQuery(), tx)
+	schema, err := GetQuerySchema(ctx, session.Conn, req.GetQuery(), tx)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.InvalidArgument, "failed to prepare: %v", err)
 	}
@@ -426,7 +426,7 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 		if tx != nil {
 			rows, qerr = tx.QueryContext(ctx, handle.Query)
 		} else {
-			rows, qerr = session.DB.QueryContext(ctx, handle.Query)
+			rows, qerr = session.Conn.QueryContext(ctx, handle.Query)
 		}
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
@@ -503,7 +503,7 @@ func (h *FlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd flightsql.Get
 		if activeTx != nil {
 			rows, qerr = activeTx.QueryContext(ctx, query, args...)
 		} else {
-			rows, qerr = session.DB.QueryContext(ctx, query, args...)
+			rows, qerr = session.Conn.QueryContext(ctx, query, args...)
 		}
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
@@ -620,7 +620,7 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 		if activeTx != nil {
 			rows, qerr = activeTx.QueryContext(ctx, query, args...)
 		} else {
-			rows, qerr = session.DB.QueryContext(ctx, query, args...)
+			rows, qerr = session.Conn.QueryContext(ctx, query, args...)
 		}
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
@@ -688,7 +688,7 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 
 			if includeSchema {
 				qualified := QualifyTableName(t.catalog, t.schema, t.name)
-				tableSchema, schemaErr := GetQuerySchema(ctx, session.DB, "SELECT * FROM "+qualified, activeTx)
+				tableSchema, schemaErr := GetQuerySchema(ctx, session.Conn, "SELECT * FROM "+qualified, activeTx)
 				if schemaErr != nil {
 					ch <- flight.StreamChunk{Err: schemaErr}
 					return
