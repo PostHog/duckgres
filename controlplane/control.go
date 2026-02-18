@@ -30,6 +30,7 @@ type ControlPlaneConfig struct {
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
 	WorkerQueueTimeout  time.Duration // How long to wait for an available worker slot (default: 5m)
+	WorkerIdleTimeout   time.Duration // How long to keep an idle worker alive (default: 5m)
 	MetricsServer       *http.Server  // Optional metrics server to shut down during handover
 }
 
@@ -67,6 +68,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 	if cfg.WorkerQueueTimeout == 0 {
 		cfg.WorkerQueueTimeout = 5 * time.Minute
+	}
+	if cfg.WorkerIdleTimeout == 0 {
+		cfg.WorkerIdleTimeout = 5 * time.Minute
 	}
 
 	// Enforce secure defaults for control-plane mode.
@@ -144,6 +148,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 
 	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
+	pool.idleTimeout = cfg.WorkerIdleTimeout
 
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}

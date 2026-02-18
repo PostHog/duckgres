@@ -27,3 +27,6 @@ Thumbs.db
 *.test
 *.out
 coverage.html
+
+.gemini/
+gha-creds-*.json

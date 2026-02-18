@@ -44,6 +44,7 @@ type FileConfig struct {
 	MaxWorkers                int                 `yaml:"max_workers"`           // Max worker processes (control-plane mode)
 	MinWorkers                int                 `yaml:"min_workers"`           // Pre-warm worker count (control-plane mode)
 	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`  // e.g., "5m"
+	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`   // e.g., "5m"
 	PassthroughUsers          []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
 }
 
@@ -176,6 +177,7 @@ func main() {
 	minWorkers := flag.Int("min-workers", 0, "Pre-warm worker count at startup (control-plane mode) (env: DUCKGRES_MIN_WORKERS)")
 	maxWorkers := flag.Int("max-workers", 0, "Max worker processes, 0=unlimited (control-plane mode) (env: DUCKGRES_MAX_WORKERS)")
 	workerQueueTimeout := flag.String("worker-queue-timeout", "", "How long to wait for an available worker slot (e.g., '5m') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
+	workerIdleTimeout := flag.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
 
@@ -300,6 +302,7 @@ func main() {
 		MinWorkers:                *minWorkers,
 		MaxWorkers:                *maxWorkers,
 		WorkerQueueTimeout:        *workerQueueTimeout,
+		WorkerIdleTimeout:         *workerIdleTimeout,
 		ACMEDomain:                *acmeDomain,
 		ACMEEmail:                 *acmeEmail,
 		ACMECacheDir:              *acmeCacheDir,
@@ -423,6 +426,7 @@ func main() {
 			ConfigPath:         *configFile,
 			HandoverSocket:     *handoverSocket,
 			WorkerQueueTimeout: resolved.WorkerQueueTimeout,
+			WorkerIdleTimeout:  resolved.WorkerIdleTimeout,
 			MetricsServer:      metricsSrv,
 		}
 		controlplane.RunControlPlane(cpCfg)

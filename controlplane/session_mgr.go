@@ -130,8 +130,8 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Retire the dedicated worker (1:1 model)
-	sm.pool.RetireWorker(session.WorkerID)
+	// Release the worker for reuse instead of retiring it immediately (pooled model)
+	sm.pool.ReleaseWorker(session.WorkerID)
 
 	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
 

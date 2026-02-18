@@ -598,6 +598,17 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 		return nil, err
 	}
 
+	if err := ConfigureDBConnection(db, cfg, duckLakeSem, username, serverStartTime, serverVersion); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	return db, nil
+}
+
+// ConfigureDBConnection initializes an existing DuckDB connection with pg_catalog,
+// information_schema, and DuckLake catalog attachment.
+func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time, serverVersion string) error {
 	// Initialize pg_catalog schema for PostgreSQL compatibility
 	// Must be done BEFORE attaching DuckLake so macros are created in memory.main,
 	// not in the DuckLake catalog (which doesn't support macro storage).
@@ -612,8 +623,7 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
 		if cfg.DuckLake.MetadataStore != "" {
-			_ = db.Close()
-			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+			return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 		}
 		// DuckLake not configured, this warning is just informational
 		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
@@ -646,12 +656,11 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 	// Now set DuckLake as the default catalog so all user queries use it
 	if duckLakeMode {
 		if err := setDuckLakeDefault(db); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
+			return fmt.Errorf("failed to set DuckLake as default: %w", err)
 		}
 	}
 
-	return db, nil
+	return nil
 }
 
 // CreatePassthroughDBConnection creates a DuckDB connection without pg_catalog
