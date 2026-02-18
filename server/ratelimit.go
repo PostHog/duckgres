@@ -26,7 +26,7 @@ func DefaultRateLimitConfig() RateLimitConfig {
 		MaxFailedAttempts:   5,
 		FailedAttemptWindow: 5 * time.Minute,
 		BanDuration:         15 * time.Minute,
-		MaxConnectionsPerIP: 100,
+		MaxConnectionsPerIP: 500,
 		MaxConnections:      1024,
 	}
 }
