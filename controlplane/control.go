@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -131,12 +132,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	memBudget = tempRebalancer.memoryBudget // capture auto-detected value
 
 	// If max_workers is not set, derive a reasonable concurrency cap from
-	// the memory budget (budget / 256MB).
+	// the memory budget and CPU count.
 	if maxWorkers == 0 {
 		maxWorkers = tempRebalancer.DefaultMaxWorkers()
-		slog.Info("Derived max_workers from memory budget.",
+		slog.Info("Derived max_workers from memory budget and CPU count.",
 			"max_workers", maxWorkers,
-			"memory_budget", formatBytes(memBudget))
+			"memory_budget", formatBytes(memBudget),
+			"num_cpu", runtime.NumCPU())
 	}
 
 	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance)
