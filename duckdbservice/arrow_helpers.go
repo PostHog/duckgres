@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -543,6 +544,14 @@ type contextQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+func isNil(i contextQueryer) bool {
+	if i == nil {
+		return true
+	}
+	v := reflect.ValueOf(i)
+	return v.Kind() == reflect.Ptr && v.IsNil()
+}
+
 // GetQuerySchema executes a query with LIMIT 0 to discover the result schema.
 func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx contextQueryer) (*arrow.Schema, error) {
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
@@ -555,7 +564,7 @@ func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx con
 	}
 	var rows *sql.Rows
 	var err error
-	if tx != nil {
+	if !isNil(tx) {
 		rows, err = tx.QueryContext(ctx, queryWithLimit)
 	} else {
 		rows, err = db.QueryContext(ctx, queryWithLimit)
