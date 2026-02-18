@@ -75,7 +75,10 @@ func SendInitialParams(cc *clientConn) {
 }
 
 // RunMessageLoop runs the main message loop for a client connection.
+// It cancels the connection context when the loop exits, ensuring in-flight
+// query contexts (and any gRPC calls derived from them) are cancelled promptly.
 func RunMessageLoop(cc *clientConn) error {
+	defer cc.cancel()
 	return cc.messageLoop()
 }
 

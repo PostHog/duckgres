@@ -176,6 +176,12 @@ func (c *clientConn) backendKey() BackendKey {
 // via a cancel request from another connection.
 // The caller must call the returned cleanup function when the query completes.
 //
+// A disconnect monitor goroutine runs for the duration of the query. It uses
+// bufio.Reader.Peek to detect client disconnects (TCP FIN/RST) while the
+// query is in-flight, without consuming any bytes from the stream. When a
+// disconnect is detected, the connection context (c.ctx) is cancelled,
+// propagating cancellation to gRPC calls on Flight SQL workers.
+//
 // In child worker processes, the context is also cancelled when the server's
 // externalCancelCh is closed (triggered by SIGUSR1 signal).
 func (c *clientConn) queryContext() (context.Context, func()) {
@@ -196,12 +202,73 @@ func (c *clientConn) queryContext() (context.Context, func()) {
 		}()
 	}
 
+	// Start monitoring the client connection for disconnects.
+	stopMonitor := c.startDisconnectMonitor(ctx)
+
 	cleanup := func() {
+		stopMonitor()
 		c.server.UnregisterQuery(key)
 		cancel()
 	}
 
 	return ctx, cleanup
+}
+
+// startDisconnectMonitor starts a goroutine that polls the client connection
+// for disconnects using bufio.Reader.Peek. During query execution the message
+// loop is blocked on the executor, so nobody else touches the bufio.Reader,
+// making concurrent Peek calls safe. When the client sends a TCP FIN or RST,
+// Peek returns a non-timeout error and the connection context is cancelled.
+//
+// The returned stop function MUST be called when query execution completes.
+// It waits for the monitor goroutine to exit before returning, ensuring the
+// bufio.Reader is not accessed concurrently with the message loop.
+func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
+	stopped := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		for {
+			c.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			_, err := c.reader.Peek(1)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					select {
+					case <-done:
+						return
+					case <-ctx.Done():
+						return
+					default:
+						continue
+					}
+				}
+				// Non-timeout error: client disconnected (EOF, connection reset, etc.)
+				c.cancel()
+				return
+			}
+			// Data available (e.g. pipelined Sync message) — safe in the
+			// bufio.Reader buffer. Keep polling for disconnect.
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			default:
+				continue
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		// Interrupt any in-progress Peek by setting a past deadline.
+		c.conn.SetReadDeadline(time.Now())
+		<-stopped
+		// Clear the deadline so the message loop's next read uses
+		// the idle timeout (or no deadline).
+		c.conn.SetReadDeadline(time.Time{})
+	}
 }
 
 // isQueryCancelled checks if an error is due to query cancellation

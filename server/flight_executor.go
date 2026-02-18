@@ -134,25 +134,13 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		query = interpolateArgs(query, args)
 	}
 
-	// Create a context that is cancelled when either the input context OR
-	// the executor's base context is cancelled.
-	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx, cancel := e.mergedContext(ctx)
 	success := false
 	defer func() {
 		if !success {
 			cancel()
 		}
 	}()
-
-	if e.ctx != nil {
-		go func() {
-			select {
-			case <-e.ctx.Done():
-				cancel()
-			case <-reqCtx.Done():
-			}
-		}()
-	}
 
 	reqCtx = e.withSession(reqCtx)
 
@@ -194,19 +182,8 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 		query = interpolateArgs(query, args)
 	}
 
-	// Create a context that is cancelled when either the input context OR
-	// the executor's base context is cancelled.
-	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx, cancel := e.mergedContext(ctx)
 	defer cancel()
-	if e.ctx != nil {
-		go func() {
-			select {
-			case <-e.ctx.Done():
-				cancel()
-			case <-reqCtx.Done():
-			}
-		}()
-	}
 
 	reqCtx = e.withSession(reqCtx)
 
@@ -237,6 +214,24 @@ func (e *FlightExecutor) PingContext(ctx context.Context) error {
 		return fmt.Errorf("flight ping: %w", err)
 	}
 	return rows.Close()
+}
+
+// mergedContext returns a context that is cancelled when either the caller's
+// context or the executor's base context is done. This ensures gRPC calls are
+// cancelled both when the client disconnects (caller ctx) and when the
+// executor is closed (e.g. worker crash).
+func (e *FlightExecutor) mergedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	merged, cancel := context.WithCancel(ctx)
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-merged.Done():
+			}
+		}()
+	}
+	return merged, cancel
 }
 
 func (e *FlightExecutor) Close() error {
