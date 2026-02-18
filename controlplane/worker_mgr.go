@@ -447,16 +447,31 @@ func (p *FlightWorkerPool) liveWorkerCountLocked() int {
 	return count
 }
 
-// cleanDeadWorkersLocked removes all dead worker entries from the map.
-// Caller must hold p.mu for writing.
+// cleanDeadWorkersLocked removes all dead worker entries from the map and
+// schedules resource cleanup (client, parent listener, socket file) in the
+// background. Caller must hold p.mu for writing.
 func (p *FlightWorkerPool) cleanDeadWorkersLocked() {
 	for id, w := range p.workers {
 		select {
 		case <-w.done:
 			delete(p.workers, id)
+			go cleanupDeadWorker(w)
 		default:
 		}
 	}
+}
+
+// cleanupDeadWorker releases resources for a worker whose process has already
+// exited. Called from cleanDeadWorkersLocked when a dead worker is discovered
+// before the HealthCheckLoop gets to it.
+func cleanupDeadWorker(w *ManagedWorker) {
+	if w.client != nil {
+		_ = w.client.Close()
+	}
+	if w.parentListener != nil {
+		_ = w.parentListener.Close()
+	}
+	_ = os.Remove(w.socketPath)
 }
 
 // RetireWorker stops a worker process and cleans up its resources.
@@ -591,6 +606,10 @@ func (p *FlightWorkerPool) ShutdownAll() {
 		if w.client != nil {
 			_ = w.client.Close()
 		}
+		if w.parentListener != nil {
+			_ = w.parentListener.Close()
+		}
+		_ = os.Remove(w.socketPath)
 	}
 
 	p.mu.Lock()
