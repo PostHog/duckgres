@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,6 +30,7 @@ type ControlPlaneConfig struct {
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
 	WorkerQueueTimeout  time.Duration // How long to wait for an available worker slot (default: 5m)
+	MetricsServer       *http.Server  // Optional metrics server to shut down during handover
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -279,6 +281,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 					break
 				}
 				slog.Info("Received SIGUSR1, starting graceful handover via self-exec.")
+				// Metrics server must be stopped before spawning the replacement
+				// so it can bind to the same port.
+				if cp.cfg.MetricsServer != nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if err := cp.cfg.MetricsServer.Shutdown(ctx); err != nil {
+						slog.Warn("Metrics server shutdown failed.", "error", err)
+					}
+					cancel()
+				}
 				// Flight listener is not part of the handover FD transfer; stop it
 				// before spawning the replacement process so the new CP can bind.
 				if cp.flight != nil {

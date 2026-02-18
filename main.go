@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -109,15 +110,18 @@ func env(key, defaultVal string) string {
 }
 
 // initMetrics starts the Prometheus metrics HTTP server on :9090/metrics.
-// During zero-downtime handover the old process still holds :9090 until it
-// drains and exits, so we retry until the port becomes available.
-func initMetrics() {
+// Returns the http.Server instance so it can be shut down during handover.
+func initMetrics() *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	srv := &http.Server{
+		Addr:    ":9090",
+		Handler: mux,
+	}
 	go func() {
 		for {
-			slog.Info("Starting metrics server", "addr", ":9090")
-			if err := http.ListenAndServe(":9090", mux); err != nil {
+			slog.Info("Starting metrics server", "addr", srv.Addr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Warn("Metrics server error, retrying in 1s.", "error", err)
 				time.Sleep(1 * time.Second)
 				continue
@@ -125,6 +129,7 @@ func initMetrics() {
 			return
 		}
 	}()
+	return srv
 }
 
 func main() {
@@ -393,7 +398,7 @@ func main() {
 		return
 	}
 
-	initMetrics()
+	metricsSrv := initMetrics()
 
 	// Create data directory if it doesn't exist
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
@@ -418,6 +423,7 @@ func main() {
 			ConfigPath:         *configFile,
 			HandoverSocket:     *handoverSocket,
 			WorkerQueueTimeout: resolved.WorkerQueueTimeout,
+			MetricsServer:      metricsSrv,
 		}
 		controlplane.RunControlPlane(cpCfg)
 		return
@@ -436,6 +442,11 @@ func main() {
 	go func() {
 		<-sigChan
 		slog.Info("Shutting down...")
+		if metricsSrv != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = metricsSrv.Shutdown(ctx)
+			cancel()
+		}
 		_ = srv.Close()
 		loggingShutdown()
 		os.Exit(0)
