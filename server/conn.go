@@ -144,6 +144,8 @@ type clientConn struct {
 	txStatus    byte                     // current transaction status ('I', 'T', or 'E')
 	passthrough bool                     // true for passthrough users (skip transpiler + pg_catalog)
 	cursors     map[string]*cursorState  // server-side cursor emulation
+	ctx         context.Context          // connection context, cancelled when connection is closed
+	cancel      context.CancelFunc       // cancels the connection context
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -177,7 +179,7 @@ func (c *clientConn) backendKey() BackendKey {
 // In child worker processes, the context is also cancelled when the server's
 // externalCancelCh is closed (triggered by SIGUSR1 signal).
 func (c *clientConn) queryContext() (context.Context, func()) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(c.ctx)
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
 
@@ -415,6 +417,9 @@ func hasCommandPrefix(query, prefix string) bool {
 }
 
 func (c *clientConn) serve() error {
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	defer c.cancel()
+
 	c.reader = bufio.NewReader(c.conn)
 	c.writer = bufio.NewWriter(c.conn)
 	c.pid = int32(os.Getpid())

@@ -41,6 +41,9 @@ type FlightExecutor struct {
 	// dead is set to true when the backing worker crashes. Once set, all
 	// RPC methods return ErrWorkerDead without touching the gRPC client.
 	dead atomic.Bool
+
+	ctx    context.Context    // base context for all requests
+	cancel context.CancelFunc // cancels the base context
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -64,11 +67,14 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 		return nil, fmt.Errorf("flight sql client: %w", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
 		alloc:        memory.DefaultAllocator,
 		ownsClient:   true,
+		ctx:          ctx,
+		cancel:       cancel,
 	}, nil
 }
 
@@ -76,11 +82,14 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 // Flight SQL client. The client is NOT closed when this executor is closed.
 // This avoids creating a new gRPC connection per session.
 func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) *FlightExecutor {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
 		alloc:        memory.DefaultAllocator,
 		ownsClient:   false,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
@@ -125,9 +134,23 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		query = interpolateArgs(query, args)
 	}
 
-	ctx = e.withSession(ctx)
+	// Create a context that is cancelled when either the input context OR
+	// the executor's base context is cancelled.
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-reqCtx.Done():
+			}
+		}()
+	}
 
-	info, err := e.client.Execute(ctx, query)
+	reqCtx = e.withSession(reqCtx)
+
+	info, err := e.client.Execute(reqCtx, query)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute: %w", err)
 	}
@@ -136,7 +159,7 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return &emptyRowSet{}, nil
 	}
 
-	reader, err := e.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	reader, err := e.client.DoGet(reqCtx, info.Endpoint[0].Ticket)
 	if err != nil {
 		return nil, fmt.Errorf("flight doget: %w", err)
 	}
@@ -163,9 +186,23 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 		query = interpolateArgs(query, args)
 	}
 
-	ctx = e.withSession(ctx)
+	// Create a context that is cancelled when either the input context OR
+	// the executor's base context is cancelled.
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-reqCtx.Done():
+			}
+		}()
+	}
 
-	affected, err := e.client.ExecuteUpdate(ctx, query)
+	reqCtx = e.withSession(reqCtx)
+
+	affected, err := e.client.ExecuteUpdate(reqCtx, query)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute update: %w", err)
 	}
@@ -195,6 +232,9 @@ func (e *FlightExecutor) PingContext(ctx context.Context) error {
 }
 
 func (e *FlightExecutor) Close() error {
+	if e.cancel != nil {
+		e.cancel()
+	}
 	if e.ownsClient {
 		return e.client.Close()
 	}

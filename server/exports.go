@@ -48,6 +48,7 @@ func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
 func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio.Writer,
 	username, database string, executor QueryExecutor, pid, secretKey int32) *clientConn {
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &clientConn{
 		server:      s,
 		conn:        conn,
@@ -63,6 +64,8 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 		portals:     make(map[string]*portal),
 		cursors:     make(map[string]*cursorState),
 		txStatus:    txStatusIdle,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
