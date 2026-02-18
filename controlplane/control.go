@@ -69,8 +69,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if cfg.WorkerQueueTimeout == 0 {
 		cfg.WorkerQueueTimeout = 5 * time.Minute
 	}
+	// WorkerIdleTTL: 0 means "use default" (30s), negative means "disabled".
+	// Config resolution sets -1 for explicit "0" from the user.
 	if cfg.WorkerIdleTTL == 0 {
 		cfg.WorkerIdleTTL = 30 * time.Second
+	} else if cfg.WorkerIdleTTL < 0 {
+		cfg.WorkerIdleTTL = 0 // disabled
 	}
 
 	// Enforce secure defaults for control-plane mode.

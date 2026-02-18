@@ -527,3 +527,196 @@ func TestCrashReleasesSemaphoreSlots(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestReleaseWorker_KeepsWorkerAlive(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2, 30*time.Second)
+
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 1
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.workerSem <- struct{}{} // account for the active session
+	pool.mu.Unlock()
+
+	pool.ReleaseWorker(1)
+
+	// Worker should still be in the pool
+	got, ok := pool.Worker(1)
+	if !ok {
+		t.Fatal("expected worker to remain in pool after ReleaseWorker")
+	}
+	if got.activeSessions != 0 {
+		t.Fatalf("expected 0 active sessions, got %d", got.activeSessions)
+	}
+	if got.idleSince.IsZero() {
+		t.Fatal("expected idleSince to be set")
+	}
+
+	// Semaphore slot should be released
+	select {
+	case pool.workerSem <- struct{}{}:
+		// success — slot was freed
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("semaphore slot was not released by ReleaseWorker")
+	}
+}
+
+func TestReleaseWorker_FallsBackToRetireWhenTTLZero(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2, 0)
+
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 1
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.workerSem <- struct{}{}
+	pool.mu.Unlock()
+
+	pool.ReleaseWorker(1)
+
+	// Worker should be removed (RetireWorker path)
+	if _, ok := pool.Worker(1); ok {
+		t.Fatal("expected worker to be retired when workerIdleTTL=0")
+	}
+}
+
+func TestReleaseWorker_IdleWorkerReusedByAcquire(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5, 30*time.Second)
+
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 1
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.nextWorkerID = 2
+	pool.mu.Unlock()
+
+	// Release the worker back to idle pool
+	pool.ReleaseWorker(1)
+
+	// AcquireWorker should reuse the idle worker instead of spawning a new one
+	got, err := pool.AcquireWorker(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireWorker failed: %v", err)
+	}
+	if got.ID != 1 {
+		t.Fatalf("expected to reuse worker 1, got worker %d", got.ID)
+	}
+	if got.activeSessions != 1 {
+		t.Fatalf("expected 1 active session after acquire, got %d", got.activeSessions)
+	}
+	if !got.idleSince.IsZero() {
+		t.Fatal("expected idleSince to be cleared after acquire")
+	}
+}
+
+func TestRetireIdleWorkers_RetiresExpiredWorkers(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5, 50*time.Millisecond)
+
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.idleSince = time.Now().Add(-100 * time.Millisecond) // expired
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.mu.Unlock()
+
+	pool.retireIdleWorkers()
+
+	// Worker should be removed from pool
+	if _, ok := pool.Worker(1); ok {
+		t.Fatal("expected expired idle worker to be retired")
+	}
+}
+
+func TestRetireIdleWorkers_KeepsNonExpiredWorkers(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5, time.Hour)
+
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.idleSince = time.Now() // just became idle
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.mu.Unlock()
+
+	pool.retireIdleWorkers()
+
+	// Worker should still be in pool (TTL not expired)
+	if _, ok := pool.Worker(1); !ok {
+		t.Fatal("expected non-expired idle worker to remain in pool")
+	}
+}
+
+func TestRetireIdleWorkers_RespectsMinIdleWorkers(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5, 50*time.Millisecond)
+	pool.minIdleWorkers = 2
+
+	// Create 3 expired idle workers
+	var cleanups []func()
+	for i := 1; i <= 3; i++ {
+		w, cleanup := makeFakeWorker(t, i)
+		cleanups = append(cleanups, cleanup)
+		w.idleSince = time.Now().Add(-100 * time.Millisecond)
+		pool.mu.Lock()
+		pool.workers[i] = w
+		pool.mu.Unlock()
+	}
+	defer func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}()
+
+	pool.retireIdleWorkers()
+
+	// Should keep at least 2 idle workers alive
+	pool.mu.RLock()
+	remaining := len(pool.workers)
+	pool.mu.RUnlock()
+	if remaining < 2 {
+		t.Fatalf("expected at least 2 workers to remain (minIdleWorkers=2), got %d", remaining)
+	}
+}
+
+func TestRetireIdleWorkers_SkipsActiveWorkers(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5, 50*time.Millisecond)
+
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 1 // busy worker
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.mu.Unlock()
+
+	pool.retireIdleWorkers()
+
+	// Active worker should not be retired
+	if _, ok := pool.Worker(1); !ok {
+		t.Fatal("expected active worker to remain in pool")
+	}
+}
+
+func TestRetireIdleWorkers_NoopWhenTTLZero(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5, 0)
+
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.idleSince = time.Now().Add(-time.Hour) // very stale
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.mu.Unlock()
+
+	pool.retireIdleWorkers()
+
+	// Worker should remain — TTL is disabled
+	if _, ok := pool.Worker(1); !ok {
+		t.Fatal("expected worker to remain when workerIdleTTL=0")
+	}
+}

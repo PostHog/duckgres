@@ -42,6 +42,7 @@ type FlightWorkerPool struct {
 	configPath     string
 	binaryPath     string
 	maxWorkers     int           // 0 = unlimited
+	minIdleWorkers int           // Keep at least this many idle workers alive (from min_workers)
 	workerIdleTTL  time.Duration // How long to keep idle workers alive for reuse
 	shuttingDown   bool
 	workerSem      chan struct{} // buffered to maxWorkers; limits concurrent acquisitions
@@ -220,8 +221,12 @@ func (p *FlightWorkerPool) SpawnAll(count int) error {
 }
 
 // SpawnMinWorkers pre-warms the pool with the given number of workers.
-// This is used at startup for the elastic 1:1 model.
+// This is used at startup for the elastic 1:1 model. The idle reaper
+// will keep at least this many idle workers alive.
 func (p *FlightWorkerPool) SpawnMinWorkers(count int) error {
+	p.mu.Lock()
+	p.minIdleWorkers = count
+	p.mu.Unlock()
 	return p.SpawnAll(count)
 }
 
@@ -258,7 +263,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 		idle.activeSessions++
 		idle.idleSince = time.Time{} // clear idle marker
 		p.mu.Unlock()
-		slog.Info("Reusing idle worker.", "id", idle.ID)
+		slog.Debug("Reusing idle worker.", "id", idle.ID)
 		return idle, nil
 	}
 
@@ -397,14 +402,30 @@ func (p *FlightWorkerPool) ReleaseWorker(id int) {
 }
 
 // retireIdleWorkers retires workers that have been idle longer than workerIdleTTL.
-// Called from HealthCheckLoop.
+// Called from HealthCheckLoop. Uses a write lock and re-checks activeSessions
+// atomically to avoid racing with AcquireWorker claiming the worker.
+// Keeps at least minIdleWorkers idle workers alive (from min_workers config).
 func (p *FlightWorkerPool) retireIdleWorkers() {
 	if p.workerIdleTTL <= 0 {
 		return
 	}
 
-	p.mu.RLock()
-	var toRetire []int
+	p.mu.Lock()
+
+	// Count current idle workers to respect minIdleWorkers.
+	idleCount := 0
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if w.activeSessions == 0 {
+			idleCount++
+		}
+	}
+
+	var toRetire []*ManagedWorker
 	for _, w := range p.workers {
 		select {
 		case <-w.done:
@@ -412,14 +433,25 @@ func (p *FlightWorkerPool) retireIdleWorkers() {
 		default:
 		}
 		if w.activeSessions == 0 && !w.idleSince.IsZero() && time.Since(w.idleSince) > p.workerIdleTTL {
-			toRetire = append(toRetire, w.ID)
+			if idleCount <= p.minIdleWorkers {
+				break // keep enough idle workers alive
+			}
+			toRetire = append(toRetire, w)
+			delete(p.workers, w.ID)
+			idleCount--
 		}
 	}
-	p.mu.RUnlock()
+	workerCount := len(p.workers)
+	p.mu.Unlock()
 
-	for _, id := range toRetire {
-		slog.Info("Retiring idle worker (TTL expired).", "id", id)
-		p.RetireWorker(id)
+	if len(toRetire) > 0 {
+		observeControlPlaneWorkers(workerCount)
+	}
+
+	for _, w := range toRetire {
+		slog.Info("Retiring idle worker (TTL expired).", "id", w.ID)
+		// No semaphore to release — idle workers already released their slot in ReleaseWorker.
+		go retireWorkerProcess(w)
 	}
 }
 

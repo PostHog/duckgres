@@ -226,6 +226,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.WorkerIdleTTL != "" {
 			if d, err := time.ParseDuration(fileCfg.WorkerIdleTTL); err == nil {
 				workerIdleTTL = d
+				if d == 0 {
+					workerIdleTTL = -1 // sentinel: user explicitly disabled
+				}
 			} else {
 				warn("Invalid worker_idle_ttl duration: " + err.Error())
 			}
@@ -395,6 +398,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_WORKER_IDLE_TTL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			workerIdleTTL = d
+			if d == 0 {
+				workerIdleTTL = -1 // sentinel: user explicitly disabled
+			}
 		} else {
 			warn("Invalid DUCKGRES_WORKER_IDLE_TTL duration: " + err.Error())
 		}
@@ -500,6 +506,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["worker-idle-ttl"] {
 		if d, err := time.ParseDuration(cli.WorkerIdleTTL); err == nil {
 			workerIdleTTL = d
+			if d == 0 {
+				workerIdleTTL = -1 // sentinel: user explicitly disabled
+			}
 		} else {
 			warn("Invalid --worker-idle-ttl duration: " + err.Error())
 		}
