@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -28,6 +29,7 @@ type ManagedWorker struct {
 	socketPath     string
 	bearerToken    string
 	client         *flightsql.Client
+	parentListener net.Listener  // CP-side listener; closed during retire to remove socket file
 	done           chan struct{} // closed when process exits
 	exitErr        error
 	activeSessions int       // Number of sessions currently assigned to this worker
@@ -64,6 +66,10 @@ func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWo
 }
 
 // SpawnWorker starts a new duckdb-service worker process.
+// The control plane pre-binds the Unix socket and passes the listening FD to
+// the worker via cmd.ExtraFiles. This avoids the worker needing filesystem
+// write access to the socket directory, which can fail with EROFS under
+// systemd's ProtectSystem=strict after a handover.
 func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	token := generateToken()
 	socketPath := fmt.Sprintf("%s/worker-%d.sock", p.socketDir, id)
@@ -71,11 +77,28 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	// Clean up stale socket
 	_ = os.Remove(socketPath)
 
-	listenAddr := "unix://" + socketPath
+	// Pre-bind the socket in the control plane process, which has verified
+	// write access to the socket directory. The worker inherits the FD.
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return fmt.Errorf("bind worker socket %s: %w", socketPath, err)
+	}
+
+	// Restrict socket permissions to owner only
+	if err := os.Chmod(socketPath, 0700); err != nil {
+		slog.Warn("Failed to set worker socket permissions.", "error", err)
+	}
+
+	// Get a dup'd FD to pass to the child. ExtraFiles[0] becomes FD 3.
+	file, err := ln.(*net.UnixListener).File()
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("get listener fd for worker %d: %w", id, err)
+	}
 
 	args := []string{
 		"--mode", "duckdb-service",
-		"--duckdb-listen", listenAddr,
+		"--duckdb-listen-fd", "3",
 		"--duckdb-token", token,
 	}
 	if p.configPath != "" {
@@ -83,21 +106,28 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	}
 
 	cmd := exec.Command(p.binaryPath, args...)
+	cmd.ExtraFiles = []*os.File{file}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
 
 	if err := cmd.Start(); err != nil {
+		_ = file.Close()
+		_ = ln.Close()
 		return fmt.Errorf("spawn worker %d: %w", id, err)
 	}
 
+	// Close our copy of the dup'd FD; the child has its own.
+	_ = file.Close()
+
 	done := make(chan struct{})
 	w := &ManagedWorker{
-		ID:          id,
-		cmd:         cmd,
-		socketPath:  socketPath,
-		bearerToken: token,
-		done:        done,
+		ID:             id,
+		cmd:            cmd,
+		socketPath:     socketPath,
+		bearerToken:    token,
+		parentListener: ln,
+		done:           done,
 	}
 
 	// Wait for process exit in background
@@ -106,12 +136,15 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 		close(done)
 	}()
 
-	// Wait for the socket to appear and connect
+	// Wait for the worker's gRPC server to become healthy.
+	// The socket file already exists (we created it above), so waitForWorker
+	// will immediately try connecting and rely on the health check.
 	client, err := waitForWorker(socketPath, token, 10*time.Second)
 	if err != nil {
 		// Kill the process if we can't connect
 		_ = cmd.Process.Kill()
 		<-done
+		_ = ln.Close()
 		return fmt.Errorf("worker %d failed to start: %w", id, err)
 	}
 	w.client = client
@@ -414,16 +447,31 @@ func (p *FlightWorkerPool) liveWorkerCountLocked() int {
 	return count
 }
 
-// cleanDeadWorkersLocked removes all dead worker entries from the map.
-// Caller must hold p.mu for writing.
+// cleanDeadWorkersLocked removes all dead worker entries from the map and
+// schedules resource cleanup (client, parent listener, socket file) in the
+// background. Caller must hold p.mu for writing.
 func (p *FlightWorkerPool) cleanDeadWorkersLocked() {
 	for id, w := range p.workers {
 		select {
 		case <-w.done:
 			delete(p.workers, id)
+			go cleanupDeadWorker(w)
 		default:
 		}
 	}
+}
+
+// cleanupDeadWorker releases resources for a worker whose process has already
+// exited. Called from cleanDeadWorkersLocked when a dead worker is discovered
+// before the HealthCheckLoop gets to it.
+func cleanupDeadWorker(w *ManagedWorker) {
+	if w.client != nil {
+		_ = w.client.Close()
+	}
+	if w.parentListener != nil {
+		_ = w.parentListener.Close()
+	}
+	_ = os.Remove(w.socketPath)
 }
 
 // RetireWorker stops a worker process and cleans up its resources.
@@ -519,7 +567,10 @@ func retireWorkerProcess(w *ManagedWorker) {
 		_ = w.client.Close()
 	}
 
-	// Clean up socket
+	// Close the CP-side listener (removes the socket file) and belt-and-suspenders remove.
+	if w.parentListener != nil {
+		_ = w.parentListener.Close()
+	}
 	_ = os.Remove(w.socketPath)
 }
 
@@ -555,6 +606,10 @@ func (p *FlightWorkerPool) ShutdownAll() {
 		if w.client != nil {
 			_ = w.client.Close()
 		}
+		if w.parentListener != nil {
+			_ = w.parentListener.Close()
+		}
+		_ = os.Remove(w.socketPath)
 	}
 
 	p.mu.Lock()
@@ -633,6 +688,9 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						if w.client != nil {
 							_ = w.client.Close()
 						}
+						if w.parentListener != nil {
+							_ = w.parentListener.Close()
+						}
 						_ = os.Remove(w.socketPath)
 					default:
 						// Worker is alive, do a health check.
@@ -684,6 +742,9 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 									slog.Warn("Force-killed worker exited.", "id", w.ID, "error", w.exitErr)
 									if w.client != nil {
 										_ = w.client.Close()
+									}
+									if w.parentListener != nil {
+										_ = w.parentListener.Close()
 									}
 									_ = os.Remove(w.socketPath)
 								}

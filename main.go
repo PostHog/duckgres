@@ -196,6 +196,7 @@ func main() {
 
 	// DuckDB service flags
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
+	duckdbListenFD := flag.Int("duckdb-listen-fd", 0, "Inherit a pre-bound listener FD instead of creating a new socket (duckdb-service mode, set by control plane)")
 	duckdbToken := flag.String("duckdb-token", "", "Bearer token for DuckDB service auth (duckdb-service mode, env: DUCKGRES_DUCKDB_TOKEN)")
 	duckdbMaxSessions := flag.Int("duckdb-max-sessions", 0, "Max concurrent sessions, 0=unlimited (duckdb-service mode, env: DUCKGRES_DUCKDB_MAX_SESSIONS)")
 
@@ -365,7 +366,7 @@ func main() {
 		if listenAddr == "" {
 			listenAddr = env("DUCKGRES_DUCKDB_LISTEN", "")
 		}
-		if listenAddr == "" {
+		if *duckdbListenFD == 0 && listenAddr == "" {
 			fatal("duckdb-service mode requires --duckdb-listen flag or DUCKGRES_DUCKDB_LISTEN env var")
 		}
 
@@ -395,6 +396,7 @@ func main() {
 
 		duckdbservice.Run(duckdbservice.ServiceConfig{
 			ListenAddr:   listenAddr,
+			ListenFD:     *duckdbListenFD,
 			ServerConfig: cfg,
 			BearerToken:  token,
 			MaxSessions:  maxSessions,
