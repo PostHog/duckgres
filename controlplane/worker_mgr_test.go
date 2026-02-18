@@ -258,7 +258,7 @@ func makeFakeWorker(t *testing.T, id int) (*ManagedWorker, func()) {
 }
 
 func TestAcquireWorkerBlocksUntilSlotAvailable(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2, 0)
 
 	// Pre-populate 2 busy workers so the pool is at capacity.
 	w0, cleanup0 := makeFakeWorker(t, 0)
@@ -307,7 +307,7 @@ func TestAcquireWorkerBlocksUntilSlotAvailable(t *testing.T) {
 }
 
 func TestAcquireWorkerRespectsContextCancellation(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1, 0)
 
 	// Fill the single semaphore slot.
 	pool.workerSem <- struct{}{}
@@ -325,7 +325,7 @@ func TestAcquireWorkerRespectsContextCancellation(t *testing.T) {
 }
 
 func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 0)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 0)
 
 	if pool.workerSem != nil {
 		t.Fatal("expected nil workerSem when maxWorkers=0")
@@ -344,7 +344,7 @@ func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
 }
 
 func TestAcquireWorkerShutdownUnblocksWaiters(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1, 0)
 
 	// Fill the single semaphore slot.
 	pool.workerSem <- struct{}{}
@@ -371,7 +371,7 @@ func TestAcquireWorkerShutdownUnblocksWaiters(t *testing.T) {
 }
 
 func TestRetireWorkerIfNoSessions_ReleasesClaimOnFailure(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1, 0)
 
 	// Manually inject a worker with 1 active session (as if AcquireWorker just returned it)
 	w, cleanup := makeFakeWorker(t, 1)
@@ -405,7 +405,7 @@ func TestRetireWorkerIfNoSessions_ReleasesClaimOnFailure(t *testing.T) {
 func TestAcquireWorker_AtomicClaimRace(t *testing.T) {
 	// Tests that two concurrent acquisitions don't pick the same idle worker.
 	const n = 5
-	pool := NewFlightWorkerPool(t.TempDir(), "", 10)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 10, 0)
 
 	// Pre-warm with n idle workers
 	for i := 1; i <= n; i++ {
@@ -439,7 +439,7 @@ func TestAcquireWorker_AtomicClaimRace(t *testing.T) {
 }
 
 func TestRetireWorker_ReleasesAllSessions(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5, 0)
 
 	// Inject a worker with 2 sessions
 	w, cleanup := makeFakeWorker(t, 1)
@@ -466,7 +466,7 @@ func TestRetireWorker_ReleasesAllSessions(t *testing.T) {
 }
 
 func TestCrashReleasesSemaphoreSlots(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2, 0)
 
 	// Create a worker that exits immediately (simulates crash).
 	cmd := exec.Command("true")

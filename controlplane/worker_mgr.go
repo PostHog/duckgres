@@ -30,32 +30,35 @@ type ManagedWorker struct {
 	client         *flightsql.Client
 	done           chan struct{} // closed when process exits
 	exitErr        error
-	activeSessions int // Number of sessions currently assigned to this worker
+	activeSessions int       // Number of sessions currently assigned to this worker
+	idleSince      time.Time // When this worker became idle (activeSessions dropped to 0)
 }
 
 type FlightWorkerPool struct {
-	mu           sync.RWMutex
-	workers      map[int]*ManagedWorker
-	nextWorkerID int // auto-incrementing worker ID
-	socketDir    string
-	configPath   string
-	binaryPath   string
-	maxWorkers   int           // 0 = unlimited
-	shuttingDown bool
-	workerSem    chan struct{} // buffered to maxWorkers; limits concurrent acquisitions
-	shutdownCh   chan struct{} // closed by ShutdownAll to unblock queued waiters
+	mu             sync.RWMutex
+	workers        map[int]*ManagedWorker
+	nextWorkerID   int // auto-incrementing worker ID
+	socketDir      string
+	configPath     string
+	binaryPath     string
+	maxWorkers     int           // 0 = unlimited
+	workerIdleTTL  time.Duration // How long to keep idle workers alive for reuse
+	shuttingDown   bool
+	workerSem      chan struct{} // buffered to maxWorkers; limits concurrent acquisitions
+	shutdownCh     chan struct{} // closed by ShutdownAll to unblock queued waiters
 }
 
 // NewFlightWorkerPool creates a new worker pool.
-func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWorkerPool {
+func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int, workerIdleTTL time.Duration) *FlightWorkerPool {
 	binaryPath, _ := os.Executable()
 	pool := &FlightWorkerPool{
-		workers:    make(map[int]*ManagedWorker),
-		socketDir:  socketDir,
-		configPath: configPath,
-		binaryPath: binaryPath,
-		maxWorkers: maxWorkers,
-		shutdownCh: make(chan struct{}),
+		workers:       make(map[int]*ManagedWorker),
+		socketDir:     socketDir,
+		configPath:    configPath,
+		binaryPath:    binaryPath,
+		maxWorkers:    maxWorkers,
+		workerIdleTTL: workerIdleTTL,
+		shutdownCh:    make(chan struct{}),
 	}
 	if maxWorkers > 0 {
 		pool.workerSem = make(chan struct{}, maxWorkers)
@@ -247,12 +250,15 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 		return nil, fmt.Errorf("pool is shutting down")
 	}
 
-	// Try to claim an idle pre-warmed worker before spawning a new one.
-	// Atomic claim: increment activeSessions while holding the lock.
+	// Try to claim an idle worker (pre-warmed or released back to the pool)
+	// before spawning a new one. Atomic claim: increment activeSessions
+	// while holding the lock.
 	idle := p.findIdleWorkerLocked()
 	if idle != nil {
 		idle.activeSessions++
+		idle.idleSince = time.Time{} // clear idle marker
 		p.mu.Unlock()
+		slog.Info("Reusing idle worker.", "id", idle.ID)
 		return idle, nil
 	}
 
@@ -358,6 +364,63 @@ func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 	}
 	p.mu.Unlock()
 	return false
+}
+
+// ReleaseWorker returns a worker to the idle pool instead of retiring it.
+// The worker process stays alive so the next connection can reuse it without
+// paying the startup cost (extension loading, DuckLake catalog attach, etc.).
+// If workerIdleTTL is 0, falls back to RetireWorker for backwards compatibility.
+func (p *FlightWorkerPool) ReleaseWorker(id int) {
+	if p.workerIdleTTL <= 0 {
+		p.RetireWorker(id)
+		return
+	}
+
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok {
+		p.mu.Unlock()
+		return
+	}
+
+	if w.activeSessions > 0 {
+		w.activeSessions--
+	}
+	if w.activeSessions == 0 {
+		w.idleSince = time.Now()
+	}
+	p.mu.Unlock()
+
+	p.releaseWorkerSem()
+
+	slog.Debug("Worker released to idle pool.", "id", id)
+}
+
+// retireIdleWorkers retires workers that have been idle longer than workerIdleTTL.
+// Called from HealthCheckLoop.
+func (p *FlightWorkerPool) retireIdleWorkers() {
+	if p.workerIdleTTL <= 0 {
+		return
+	}
+
+	p.mu.RLock()
+	var toRetire []int
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue // dead, handled by health check
+		default:
+		}
+		if w.activeSessions == 0 && !w.idleSince.IsZero() && time.Since(w.idleSince) > p.workerIdleTTL {
+			toRetire = append(toRetire, w.ID)
+		}
+	}
+	p.mu.RUnlock()
+
+	for _, id := range toRetire {
+		slog.Info("Retiring idle worker (TTL expired).", "id", id)
+		p.RetireWorker(id)
+	}
 }
 
 // retireWorkerProcess handles the actual process shutdown and socket cleanup.
@@ -593,6 +656,9 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 				}(w)
 			}
 			wg.Wait()
+
+			// Retire workers that have been idle longer than the TTL
+			p.retireIdleWorkers()
 		}
 	}
 }

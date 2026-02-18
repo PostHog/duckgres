@@ -130,8 +130,10 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Retire the dedicated worker (1:1 model)
-	sm.pool.RetireWorker(session.WorkerID)
+	// Release the worker back to the idle pool for reuse.
+	// The worker process stays alive so the next connection can skip
+	// extension loading and catalog attach.
+	sm.pool.ReleaseWorker(session.WorkerID)
 
 	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
 

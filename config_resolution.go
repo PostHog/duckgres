@@ -29,6 +29,7 @@ type configCLIInputs struct {
 	MaxWorkers                int
 	MinWorkers                int
 	WorkerQueueTimeout        string
+	WorkerIdleTTL             string
 	ACMEDomain                string
 	ACMEEmail                 string
 	ACMECacheDir              string
@@ -38,6 +39,7 @@ type configCLIInputs struct {
 type resolvedConfig struct {
 	Server             server.Config
 	WorkerQueueTimeout time.Duration
+	WorkerIdleTTL      time.Duration
 }
 
 func defaultServerConfig() server.Config {
@@ -72,6 +74,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 
 	cfg := defaultServerConfig()
 	var workerQueueTimeout time.Duration
+	var workerIdleTTL time.Duration
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -218,6 +221,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 				workerQueueTimeout = d
 			} else {
 				warn("Invalid worker_queue_timeout duration: " + err.Error())
+			}
+		}
+		if fileCfg.WorkerIdleTTL != "" {
+			if d, err := time.ParseDuration(fileCfg.WorkerIdleTTL); err == nil {
+				workerIdleTTL = d
+			} else {
+				warn("Invalid worker_idle_ttl duration: " + err.Error())
 			}
 		}
 		if len(fileCfg.PassthroughUsers) > 0 {
@@ -382,6 +392,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_WORKER_QUEUE_TIMEOUT duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_WORKER_IDLE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			workerIdleTTL = d
+		} else {
+			warn("Invalid DUCKGRES_WORKER_IDLE_TTL duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_ACME_DOMAIN"); v != "" {
 		cfg.ACMEDomain = v
 	}
@@ -480,6 +497,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid --worker-queue-timeout duration: " + err.Error())
 		}
 	}
+	if cli.Set["worker-idle-ttl"] {
+		if d, err := time.ParseDuration(cli.WorkerIdleTTL); err == nil {
+			workerIdleTTL = d
+		} else {
+			warn("Invalid --worker-idle-ttl duration: " + err.Error())
+		}
+	}
 	if cli.Set["acme-domain"] {
 		cfg.ACMEDomain = cli.ACMEDomain
 	}
@@ -508,5 +532,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	return resolvedConfig{
 		Server:             cfg,
 		WorkerQueueTimeout: workerQueueTimeout,
+		WorkerIdleTTL:      workerIdleTTL,
 	}
 }

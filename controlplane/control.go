@@ -30,6 +30,7 @@ type ControlPlaneConfig struct {
 	HandoverSocket      string
 	HealthCheckInterval time.Duration
 	WorkerQueueTimeout  time.Duration // How long to wait for an available worker slot (default: 5m)
+	WorkerIdleTTL       time.Duration // How long idle workers stay alive for reuse (default: 30s, 0=disable)
 	MetricsServer       *http.Server  // Optional metrics server to shut down during handover
 }
 
@@ -67,6 +68,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 	if cfg.WorkerQueueTimeout == 0 {
 		cfg.WorkerQueueTimeout = 5 * time.Minute
+	}
+	if cfg.WorkerIdleTTL == 0 {
+		cfg.WorkerIdleTTL = 30 * time.Second
 	}
 
 	// Enforce secure defaults for control-plane mode.
@@ -109,9 +113,22 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}
 
-	// Use default rate limit config if not specified
+	// Fill in default rate limit config for any unset fields
+	defaults := server.DefaultRateLimitConfig()
 	if cfg.RateLimit.MaxFailedAttempts == 0 {
-		cfg.RateLimit = server.DefaultRateLimitConfig()
+		cfg.RateLimit.MaxFailedAttempts = defaults.MaxFailedAttempts
+	}
+	if cfg.RateLimit.FailedAttemptWindow == 0 {
+		cfg.RateLimit.FailedAttemptWindow = defaults.FailedAttemptWindow
+	}
+	if cfg.RateLimit.BanDuration == 0 {
+		cfg.RateLimit.BanDuration = defaults.BanDuration
+	}
+	if cfg.RateLimit.MaxConnectionsPerIP == 0 {
+		cfg.RateLimit.MaxConnectionsPerIP = defaults.MaxConnectionsPerIP
+	}
+	if cfg.RateLimit.MaxConnections == 0 {
+		cfg.RateLimit.MaxConnections = defaults.MaxConnections
 	}
 
 	// Initialize memory rebalancer. Every session gets the full memory budget
@@ -143,7 +160,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		minWorkers = maxWorkers
 	}
 
-	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
+	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers, cfg.WorkerIdleTTL)
 
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}
@@ -269,7 +286,8 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"max_workers", maxWorkers,
 		"worker_queue_timeout", cfg.WorkerQueueTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
-		"memory_rebalance", cfg.MemoryRebalance)
+		"memory_rebalance", cfg.MemoryRebalance,
+		"worker_idle_ttl", cfg.WorkerIdleTTL)
 
 	// Handle signals
 	go func() {
