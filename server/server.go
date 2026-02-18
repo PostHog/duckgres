@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -1125,7 +1127,11 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// before sending the TLS ClientHello, so unbuffered reads are safe here.
 	params, err := readStartupMessage(conn)
 	if err != nil {
-		slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
+		if err == io.EOF || errors.Is(err, io.EOF) {
+			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
+		} else {
+			slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
+		}
 		s.rateLimiter.UnregisterConnection(remoteAddr)
 		_ = conn.Close()
 		return

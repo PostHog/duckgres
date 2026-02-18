@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -195,7 +196,11 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	// Read startup message (sent by client after TLS handshake)
 	params, err := readStartupMessage(reader)
 	if err != nil {
-		slog.Error("Failed to read startup message", "error", err)
+		if err == io.EOF || errors.Is(err, io.EOF) {
+			slog.Debug("Client closed connection after TLS handshake but before sending startup message.")
+		} else {
+			slog.Error("Failed to read startup message", "error", err)
+		}
 		return ExitError
 	}
 

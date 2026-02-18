@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -375,7 +377,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Read startup message to determine SSL vs cancel
 	params, err := readStartupFromRaw(conn)
 	if err != nil {
-		slog.Error("Failed to read startup.", "remote_addr", remoteAddr, "error", err)
+		if err == io.EOF || errors.Is(err, io.EOF) {
+			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
+		} else {
+			slog.Error("Failed to read startup.", "remote_addr", remoteAddr, "error", err)
+		}
 		_ = conn.Close()
 		return
 	}
