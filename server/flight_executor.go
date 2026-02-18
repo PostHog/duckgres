@@ -41,6 +41,9 @@ type FlightExecutor struct {
 	// dead is set to true when the backing worker crashes. Once set, all
 	// RPC methods return ErrWorkerDead without touching the gRPC client.
 	dead atomic.Bool
+
+	ctx    context.Context    // base context for all requests
+	cancel context.CancelFunc // cancels the base context
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -64,11 +67,14 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 		return nil, fmt.Errorf("flight sql client: %w", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
 		alloc:        memory.DefaultAllocator,
 		ownsClient:   true,
+		ctx:          ctx,
+		cancel:       cancel,
 	}, nil
 }
 
@@ -76,11 +82,14 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 // Flight SQL client. The client is NOT closed when this executor is closed.
 // This avoids creating a new gRPC connection per session.
 func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) *FlightExecutor {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
 		alloc:        memory.DefaultAllocator,
 		ownsClient:   false,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
@@ -125,9 +134,17 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		query = interpolateArgs(query, args)
 	}
 
-	ctx = e.withSession(ctx)
+	reqCtx, cancel := e.mergedContext(ctx)
+	success := false
+	defer func() {
+		if !success {
+			cancel()
+		}
+	}()
 
-	info, err := e.client.Execute(ctx, query)
+	reqCtx = e.withSession(reqCtx)
+
+	info, err := e.client.Execute(reqCtx, query)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute: %w", err)
 	}
@@ -136,7 +153,7 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return &emptyRowSet{}, nil
 	}
 
-	reader, err := e.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	reader, err := e.client.DoGet(reqCtx, info.Endpoint[0].Ticket)
 	if err != nil {
 		return nil, fmt.Errorf("flight doget: %w", err)
 	}
@@ -147,9 +164,11 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return nil, fmt.Errorf("flight deserialize schema: %w", err)
 	}
 
+	success = true
 	return &FlightRowSet{
 		reader: reader,
 		schema: schema,
+		cancel: cancel,
 	}, nil
 }
 
@@ -163,9 +182,12 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 		query = interpolateArgs(query, args)
 	}
 
-	ctx = e.withSession(ctx)
+	reqCtx, cancel := e.mergedContext(ctx)
+	defer cancel()
 
-	affected, err := e.client.ExecuteUpdate(ctx, query)
+	reqCtx = e.withSession(reqCtx)
+
+	affected, err := e.client.ExecuteUpdate(reqCtx, query)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute update: %w", err)
 	}
@@ -194,7 +216,28 @@ func (e *FlightExecutor) PingContext(ctx context.Context) error {
 	return rows.Close()
 }
 
+// mergedContext returns a context that is cancelled when either the caller's
+// context or the executor's base context is done. This ensures gRPC calls are
+// cancelled both when the client disconnects (caller ctx) and when the
+// executor is closed (e.g. worker crash).
+func (e *FlightExecutor) mergedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	merged, cancel := context.WithCancel(ctx)
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-merged.Done():
+			}
+		}()
+	}
+	return merged, cancel
+}
+
 func (e *FlightExecutor) Close() error {
+	if e.cancel != nil {
+		e.cancel()
+	}
 	if e.ownsClient {
 		return e.client.Close()
 	}
@@ -212,6 +255,7 @@ type FlightRowSet struct {
 	done         bool
 	err          error
 	closeOnce    sync.Once
+	cancel       context.CancelFunc
 }
 
 func (r *FlightRowSet) Columns() ([]string, error) {
@@ -289,6 +333,9 @@ func (r *FlightRowSet) Scan(dest ...any) error {
 
 func (r *FlightRowSet) Close() error {
 	r.closeOnce.Do(func() {
+		if r.cancel != nil {
+			r.cancel()
+		}
 		if r.currentBatch != nil {
 			r.currentBatch.Release()
 			r.currentBatch = nil

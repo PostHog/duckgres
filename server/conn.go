@@ -144,6 +144,8 @@ type clientConn struct {
 	txStatus    byte                     // current transaction status ('I', 'T', or 'E')
 	passthrough bool                     // true for passthrough users (skip transpiler + pg_catalog)
 	cursors     map[string]*cursorState  // server-side cursor emulation
+	ctx         context.Context          // connection context, cancelled when connection is closed
+	cancel      context.CancelFunc       // cancels the connection context
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -174,10 +176,29 @@ func (c *clientConn) backendKey() BackendKey {
 // via a cancel request from another connection.
 // The caller must call the returned cleanup function when the query completes.
 //
+// A disconnect monitor goroutine runs for the duration of the query. It uses
+// bufio.Reader.Peek to detect client disconnects (TCP FIN/RST) while the
+// query is in-flight, without consuming any bytes from the stream. When a
+// disconnect is detected, the connection context (c.ctx) is cancelled,
+// propagating cancellation to gRPC calls on Flight SQL workers.
+//
 // In child worker processes, the context is also cancelled when the server's
 // externalCancelCh is closed (triggered by SIGUSR1 signal).
 func (c *clientConn) queryContext() (context.Context, func()) {
-	ctx, cancel := context.WithCancel(context.Background())
+	return c.queryContextInner(true)
+}
+
+// queryContextForCursor returns a cancellable context without a disconnect
+// monitor. Cursors are long-lived and span multiple message loop iterations,
+// so the monitor cannot be used — it would race with readMessage on the
+// bufio.Reader between FETCH calls. Disconnect detection still works via
+// c.ctx cancellation when the connection handler exits.
+func (c *clientConn) queryContextForCursor() (context.Context, func()) {
+	return c.queryContextInner(false)
+}
+
+func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(c.ctx)
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
 
@@ -194,12 +215,78 @@ func (c *clientConn) queryContext() (context.Context, func()) {
 		}()
 	}
 
+	var stopMonitor func()
+	if monitor {
+		stopMonitor = c.startDisconnectMonitor(ctx)
+	}
+
 	cleanup := func() {
+		if stopMonitor != nil {
+			stopMonitor()
+		}
 		c.server.UnregisterQuery(key)
 		cancel()
 	}
 
 	return ctx, cleanup
+}
+
+// startDisconnectMonitor starts a goroutine that polls the client connection
+// for disconnects using bufio.Reader.Peek. During query execution the message
+// loop is blocked on the executor, so nobody else touches the bufio.Reader,
+// making concurrent Peek calls safe. When the client sends a TCP FIN or RST,
+// Peek returns a non-timeout error and the connection context is cancelled.
+//
+// The returned stop function MUST be called when query execution completes.
+// It waits for the monitor goroutine to exit before returning, ensuring the
+// bufio.Reader is not accessed concurrently with the message loop.
+func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
+	stopped := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		for {
+			_ = c.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			_, err := c.reader.Peek(1)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					select {
+					case <-done:
+						return
+					case <-ctx.Done():
+						return
+					default:
+						continue
+					}
+				}
+				// Non-timeout error: client disconnected (EOF, connection reset, etc.)
+				c.cancel()
+				return
+			}
+			// Data available (e.g. pipelined Sync message) — safe in the
+			// bufio.Reader buffer. Throttle to avoid busy-waiting since
+			// Peek returns instantly when data is already buffered.
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+				continue
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		// Interrupt any in-progress Peek by setting a past deadline.
+		_ = c.conn.SetReadDeadline(time.Now())
+		<-stopped
+		// Clear the deadline so the message loop's next read uses
+		// the idle timeout (or no deadline).
+		_ = c.conn.SetReadDeadline(time.Time{})
+	}
 }
 
 // isQueryCancelled checks if an error is due to query cancellation
@@ -415,6 +502,9 @@ func hasCommandPrefix(query, prefix string) bool {
 }
 
 func (c *clientConn) serve() error {
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	defer c.cancel()
+
 	c.reader = bufio.NewReader(c.conn)
 	c.writer = bufio.NewWriter(c.conn)
 	c.pid = int32(os.Getpid())
@@ -745,6 +835,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	//    that pg_query can't parse
 	// 2. handleCopyOut() already extracts and transpiles the inner SELECT separately
 	// 3. validateWithDuckDB() can't EXPLAIN COPY with FORMAT "binary"
+	//
+	// NOTE: This must stay above queryContext(). handleCopyIn reads from
+	// c.reader directly, which would race with the disconnect monitor.
 	upperQueryEarly := strings.ToUpper(query)
 	if copyToStdoutRegex.MatchString(upperQueryEarly) || copyFromStdinRegex.MatchString(upperQueryEarly) {
 		return c.handleCopy(query, upperQueryEarly)
@@ -3918,7 +4011,7 @@ func deparseInnerQuery(node *pg_query.Node) string {
 
 // openCursor executes the cursor's stored query and caches the result set metadata.
 func (c *clientConn) openCursor(cursor *cursorState) error {
-	ctx, cleanup := c.queryContext()
+	ctx, cleanup := c.queryContextForCursor()
 	cursor.cleanup = cleanup
 
 	rows, err := c.executor.QueryContext(ctx, cursor.query)

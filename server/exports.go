@@ -48,6 +48,7 @@ func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
 func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio.Writer,
 	username, database string, executor QueryExecutor, pid, secretKey int32) *clientConn {
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &clientConn{
 		server:      s,
 		conn:        conn,
@@ -63,6 +64,8 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 		portals:     make(map[string]*portal),
 		cursors:     make(map[string]*cursorState),
 		txStatus:    txStatusIdle,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -72,7 +75,10 @@ func SendInitialParams(cc *clientConn) {
 }
 
 // RunMessageLoop runs the main message loop for a client connection.
+// It cancels the connection context when the loop exits, ensuring in-flight
+// query contexts (and any gRPC calls derived from them) are cancelled promptly.
 func RunMessageLoop(cc *clientConn) error {
+	defer cc.cancel()
 	return cc.messageLoop()
 }
 
