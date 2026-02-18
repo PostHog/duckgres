@@ -265,13 +265,14 @@ func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
 				return
 			}
 			// Data available (e.g. pipelined Sync message) — safe in the
-			// bufio.Reader buffer. Keep polling for disconnect.
+			// bufio.Reader buffer. Throttle to avoid busy-waiting since
+			// Peek returns instantly when data is already buffered.
 			select {
 			case <-done:
 				return
 			case <-ctx.Done():
 				return
-			default:
+			case <-time.After(50 * time.Millisecond):
 				continue
 			}
 		}
