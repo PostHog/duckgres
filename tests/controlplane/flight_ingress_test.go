@@ -117,7 +117,7 @@ func requireGetTablesIncludeSchema(t *testing.T, client *flightsql.Client, ctx c
 func TestFlightIngressIncludeSchemaLowWorkerRegression(t *testing.T) {
 	h := startControlPlane(t, cpOpts{
 		flightPort: freePort(t),
-		maxWorkers: 1,
+		maxWorkers: 3,
 	})
 
 	const goroutines = 3

@@ -1086,18 +1086,37 @@ func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, 
 }
 
 func (s *flightAuthSessionStore) Create(ctx context.Context, username string) (*flightClientSession, error) {
-	// Apply worker queue timeout so Flight SQL clients don't queue indefinitely.
+	bootstrapNonce, err := generateSessionIdentityToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate bootstrap nonce: %w", err)
+	}
+	key := "bootstrap|" + username + "|" + bootstrapNonce
+
+	// 1. Try a fast acquisition first. If slots are available (busy or idle), this succeeds immediately.
+	fastCtx, fastCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	sess, err := s.GetOrCreate(fastCtx, key, username)
+	fastCancel()
+	if err == nil {
+		return sess, nil
+	}
+
+	// 2. Acquisition failed or is queuing. Trigger a forced reap of IDLE sessions
+	// to free up slots for this and other queued requests.
+	if ctx.Err() == nil {
+		reaped := s.reapIdle(time.Now(), ReapTriggerForced)
+		if reaped > 0 {
+			slog.Info("Flight auth session store forced idle reap due to worker exhaustion.", "reaped_sessions", reaped)
+		}
+	}
+
+	// 3. Apply worker queue timeout for the final (potentially blocking) attempt.
 	if s.workerQueueTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.workerQueueTimeout)
 		defer cancel()
 	}
 
-	bootstrapNonce, err := generateSessionIdentityToken()
-	if err != nil {
-		return nil, fmt.Errorf("generate bootstrap nonce: %w", err)
-	}
-	return s.GetOrCreate(ctx, "bootstrap|"+username+"|"+bootstrapNonce, username)
+	return s.GetOrCreate(ctx, key, username)
 }
 
 func (s *flightAuthSessionStore) notifySessionCountChanged(count int) {
