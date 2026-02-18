@@ -135,6 +135,12 @@ func initMetrics() *http.Server {
 }
 
 func main() {
+	// Ignore SIGPIPE to prevent DuckDB's C++ code (and libraries like libpq
+	// inside DuckLake) from crashing the process when a network connection
+	// drops mid-query. Go already converts EPIPE to errors on Write; the
+	// default SIGPIPE handler is a legacy Unix footgun that kills the process.
+	signal.Ignore(syscall.SIGPIPE)
+
 	// Set version on server package so catalog macros can expose it
 	server.SetProcessVersion(version)
 
