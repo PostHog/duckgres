@@ -780,7 +780,7 @@ func TestConcurrentFirstConnections(t *testing.T) {
 				errors[idx] = fmt.Errorf("conn %d open: %w", idx, err)
 				return
 			}
-			defer db.Close()
+			defer func() { _ = db.Close() }()
 			db.SetMaxOpenConns(1)
 			db.SetMaxIdleConns(1)
 			var result int
