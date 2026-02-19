@@ -393,30 +393,6 @@ func sendFDs(uc *net.UnixConn, files []*os.File) error {
 	return err
 }
 
-// recvFD receives a file descriptor from a Unix socket using SCM_RIGHTS.
-func recvFD(uc *net.UnixConn) (*os.File, error) {
-	buf := make([]byte, 1)
-	oob := make([]byte, 64)
-	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
-	if err != nil {
-		return nil, err
-	}
-	scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return nil, fmt.Errorf("parse control message: %w", err)
-	}
-	for _, scm := range scms {
-		fds, err := syscall.ParseUnixRights(&scm)
-		if err != nil {
-			continue
-		}
-		if len(fds) > 0 {
-			return os.NewFile(uintptr(fds[0]), "received-fd"), nil
-		}
-	}
-	return nil, fmt.Errorf("no file descriptor received")
-}
-
 // recvFDs receives multiple file descriptors from a Unix socket via SCM_RIGHTS.
 func recvFDs(uc *net.UnixConn, expectedCount int) ([]*os.File, error) {
 	buf := make([]byte, 1)
