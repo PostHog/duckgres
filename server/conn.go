@@ -18,8 +18,10 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -31,6 +33,22 @@ import (
 // processed. This signals serve() to exit without creating a DB connection.
 var errCancelHandled = errors.New("cancel request handled")
 
+// nextPID generates a unique per-connection PID for standalone mode.
+// In standalone mode, os.Getpid() is the same for all connections, which causes
+// the pg_stat_activity registry (keyed by PID) to overwrite entries when connections
+// are replaced. Using a counter ensures each connection has a unique identity.
+// The counter starts at os.Getpid()-1 so the first Add(1) returns os.Getpid(),
+// matching the OS PID for debugging. Subsequent connections get unique incrementing PIDs.
+var pidCounter = func() *atomic.Int32 {
+	c := &atomic.Int32{}
+	c.Store(int32(os.Getpid()) - 1)
+	return c
+}()
+
+func nextPID() int32 {
+	return pidCounter.Add(1)
+}
+
 // cursorOp identifies cursor-related statement types detected during Parse.
 type cursorOp int
 
@@ -40,6 +58,7 @@ const (
 	cursorOpFetch                   // FETCH [count] FROM cursor_name
 	cursorOpClose                   // CLOSE cursor_name / CLOSE ALL
 	cursorOpPgCursorsQuery          // SELECT ... FROM pg_cursors WHERE name = ...
+	cursorOpPgStatActivity          // SELECT ... FROM pg_stat_activity
 )
 
 // cursorState holds the state of an emulated server-side cursor.
@@ -146,6 +165,12 @@ type clientConn struct {
 	cursors     map[string]*cursorState  // server-side cursor emulation
 	ctx         context.Context          // connection context, cancelled when connection is closed
 	cancel      context.CancelFunc       // cancels the connection context
+
+	// pg_stat_activity fields
+	backendStart    time.Time    // when this connection started
+	applicationName string       // from startup params
+	currentQuery    atomic.Value // stores string — current/last query (lock-free)
+	workerID        int          // control plane worker ID, -1 for standalone
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -507,7 +532,7 @@ func (c *clientConn) serve() error {
 
 	c.reader = bufio.NewReader(c.conn)
 	c.writer = bufio.NewWriter(c.conn)
-	c.pid = int32(os.Getpid())
+	c.pid = nextPID()
 	c.secretKey = generateSecretKey()
 	c.stmts = make(map[string]*preparedStmt)
 	c.portals = make(map[string]*portal)
@@ -521,6 +546,12 @@ func (c *clientConn) serve() error {
 		}
 		return fmt.Errorf("startup failed: %w", err)
 	}
+
+	// Track connection for pg_stat_activity
+	c.backendStart = time.Now()
+	c.workerID = -1
+	c.server.registerConn(c)
+	defer c.server.unregisterConn(c.pid)
 
 	// Check if this is a passthrough user (skip transpiler + pg_catalog)
 	c.passthrough = c.server.cfg.PassthroughUsers[c.username]
@@ -632,6 +663,7 @@ func (c *clientConn) handleStartup() error {
 
 		c.username = params["user"]
 		c.database = params["database"]
+		c.applicationName = params["application_name"]
 
 		if c.username == "" {
 			c.sendError("FATAL", "28000", "no user specified")
@@ -792,6 +824,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
+	c.currentQuery.Store(query)
+	defer c.currentQuery.Store("")
+
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
@@ -817,6 +852,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// DuckDB doesn't have this system view; return synthetic results from cursor emulation state.
 	if cursorName, _, ok := matchPgCursorsQuery(query); ok {
 		return c.handlePgCursorsQuery(cursorName)
+	}
+
+	// Intercept pg_stat_activity queries. Return synthetic results from the connection registry.
+	if matchPgStatActivityQuery(query) {
+		return c.handlePgStatActivity()
 	}
 
 	// Passthrough mode: skip all transpilation, send query directly to DuckDB
@@ -1274,6 +1314,18 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			rowCount = 1
 		}
 		_ = writeCommandComplete(c.writer, fmt.Sprintf("SELECT %d", rowCount))
+		return false, nil
+	}
+
+	// Intercept pg_stat_activity queries
+	if matchPgStatActivityQuery(query) {
+		_ = c.sendPgStatActivityRowDescription()
+		conns := c.server.listConns()
+		sort.Slice(conns, func(i, j int) bool { return conns[i].pid < conns[j].pid })
+		for _, conn := range conns {
+			_ = c.sendPgStatActivityDataRow(conn, nil)
+		}
+		_ = writeCommandComplete(c.writer, fmt.Sprintf("SELECT %d", len(conns)))
 		return false, nil
 	}
 
@@ -3402,6 +3454,18 @@ func (c *clientConn) handleParse(body []byte) {
 		return
 	}
 
+	// Intercept pg_stat_activity queries. Return synthetic results from the connection registry.
+	if matchPgStatActivityQuery(query) {
+		delete(c.stmts, stmtName)
+		c.stmts[stmtName] = &preparedStmt{
+			query:          query,
+			convertedQuery: query,
+			cursorOp:       cursorOpPgStatActivity,
+		}
+		_ = writeParseComplete(c.writer)
+		return
+	}
+
 	// Passthrough mode: skip transpilation, store query directly
 	if c.passthrough {
 		// Count $N parameters with a simple regex (pg_query.Parse may fail on DuckDB-native SQL)
@@ -3620,6 +3684,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 			_ = c.sendPgCursorsRowDescription()
 			ps.described = true
 			return
+		case cursorOpPgStatActivity:
+			_ = c.sendPgStatActivityRowDescription()
+			ps.described = true
+			return
 		}
 
 		// For queries that return results, we need to send RowDescription
@@ -3708,6 +3776,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 			_ = c.sendPgCursorsRowDescription()
 			p.described = true
 			return
+		case cursorOpPgStatActivity:
+			_ = c.sendPgStatActivityRowDescription()
+			p.described = true
+			return
 		}
 
 		// For queries that don't return results, send NoData
@@ -3777,6 +3849,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	c.currentQuery.Store(p.stmt.query)
+	defer c.currentQuery.Store("")
+
 	// Handle cursor operations before normal execution
 	switch p.stmt.cursorOp {
 	case cursorOpDeclare:
@@ -3790,6 +3865,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	case cursorOpPgCursorsQuery:
 		c.handlePgCursorsQueryExtended(p)
+		return
+	case cursorOpPgStatActivity:
+		c.handlePgStatActivityExtended(p)
 		return
 	}
 
@@ -4181,6 +4259,178 @@ func (c *clientConn) sendPgCursorsRowDescription() error {
 	_ = binary.Write(&buf, binary.BigEndian, int32(-1)) // typmod
 	_ = binary.Write(&buf, binary.BigEndian, int16(0))  // text format
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
+}
+
+// pgStatActivityRegex matches queries that reference pg_stat_activity:
+//
+//	SELECT ... FROM pg_stat_activity ...
+//	SELECT ... FROM pg_catalog.pg_stat_activity ...
+//
+// Limitation: this intercepts any query containing FROM pg_stat_activity,
+// so WHERE clauses, JOINs, and column selection are ignored — all rows
+// with all columns are always returned. This is acceptable because most
+// tools simply do SELECT * FROM pg_stat_activity.
+var pgStatActivityRegex = regexp.MustCompile(
+	`(?i)\bFROM\s+(?:pg_catalog\s*\.\s*)?pg_stat_activity\b`,
+)
+
+// matchPgStatActivityQuery returns true if a query references pg_stat_activity.
+func matchPgStatActivityQuery(query string) bool {
+	if !strings.Contains(query, "pg_stat_activity") {
+		return false
+	}
+	return pgStatActivityRegex.MatchString(query)
+}
+
+// pg_stat_activity column definitions
+var pgStatActivityColumns = []struct {
+	name    string
+	oid     int32
+	typSize int16
+}{
+	{"datid", 23, 4},              // int4
+	{"datname", 25, -1},           // text
+	{"pid", 23, 4},                // int4
+	{"usesysid", 23, 4},           // int4
+	{"usename", 25, -1},           // text
+	{"application_name", 25, -1},  // text
+	{"client_addr", 25, -1},       // text (inet in PG, text here)
+	{"client_port", 23, 4},        // int4
+	{"backend_start", 1184, 8},    // timestamptz
+	{"xact_start", 1184, 8},       // timestamptz (NULL)
+	{"query_start", 1184, 8},      // timestamptz (NULL)
+	{"state_change", 1184, 8},     // timestamptz (NULL)
+	{"wait_event_type", 25, -1},   // text (NULL)
+	{"wait_event", 25, -1},        // text (NULL)
+	{"state", 25, -1},             // text
+	{"backend_xid", 28, 4},        // xid (NULL)
+	{"backend_xmin", 28, 4},       // xid (NULL)
+	{"query", 25, -1},             // text
+	{"backend_type", 25, -1},      // text
+	{"leader_pid", 23, 4},         // int4 (NULL)
+	{"worker_id", 23, 4},          // int4 (duckgres extension)
+}
+
+// pgStatActivityTypeOIDs is precomputed from pgStatActivityColumns to avoid per-row allocation.
+var pgStatActivityTypeOIDs = func() []int32 {
+	oids := make([]int32, len(pgStatActivityColumns))
+	for i, col := range pgStatActivityColumns {
+		oids[i] = col.oid
+	}
+	return oids
+}()
+
+// handlePgStatActivity handles SELECT FROM pg_stat_activity in the Simple Query protocol.
+func (c *clientConn) handlePgStatActivity() error {
+	if err := c.sendPgStatActivityRowDescription(); err != nil {
+		return err
+	}
+
+	conns := c.server.listConns()
+	sort.Slice(conns, func(i, j int) bool { return conns[i].pid < conns[j].pid })
+
+	for _, conn := range conns {
+		if err := c.sendPgStatActivityDataRow(conn, nil); err != nil {
+			return err
+		}
+	}
+
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("SELECT %d", len(conns)))
+	_ = writeReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// handlePgStatActivityExtended handles SELECT FROM pg_stat_activity in the Extended Query protocol.
+func (c *clientConn) handlePgStatActivityExtended(p *portal) {
+	if !p.stmt.described && !p.described {
+		_ = c.sendPgStatActivityRowDescription()
+	}
+
+	conns := c.server.listConns()
+	sort.Slice(conns, func(i, j int) bool { return conns[i].pid < conns[j].pid })
+
+	for _, conn := range conns {
+		_ = c.sendPgStatActivityDataRow(conn, p.resultFormats)
+	}
+
+	_ = writeCommandComplete(c.writer, fmt.Sprintf("SELECT %d", len(conns)))
+}
+
+// sendPgStatActivityRowDescription sends a RowDescription for pg_stat_activity.
+func (c *clientConn) sendPgStatActivityRowDescription() error {
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.BigEndian, int16(len(pgStatActivityColumns)))
+	for _, col := range pgStatActivityColumns {
+		buf.WriteString(col.name)
+		buf.WriteByte(0)
+		_ = binary.Write(&buf, binary.BigEndian, int32(0))       // table OID
+		_ = binary.Write(&buf, binary.BigEndian, int16(0))       // column attr
+		_ = binary.Write(&buf, binary.BigEndian, col.oid)        // type OID
+		_ = binary.Write(&buf, binary.BigEndian, col.typSize)    // type size
+		_ = binary.Write(&buf, binary.BigEndian, int32(-1))      // typmod
+		_ = binary.Write(&buf, binary.BigEndian, int16(0))       // text format
+	}
+	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
+}
+
+// sendPgStatActivityDataRow sends a DataRow for a single connection in pg_stat_activity.
+func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []int16) error {
+	// Determine state.
+	// NOTE: conn.txStatus is read without synchronization. This is a benign race —
+	// txStatus is a single byte written only by the owning goroutine, and a stale
+	// read just means a briefly inaccurate state string. Making txStatus atomic
+	// would require changing dozens of write sites for negligible benefit.
+	var state string
+	q, _ := conn.currentQuery.Load().(string)
+	if q != "" {
+		state = "active"
+	} else {
+		switch conn.txStatus {
+		case txStatusTransaction:
+			state = "idle in transaction"
+		case txStatusError:
+			state = "idle in transaction (aborted)"
+		default:
+			state = "idle"
+		}
+	}
+
+	// Extract client IP and port from RemoteAddr
+	var clientAddr string
+	var clientPort int32
+	if conn.conn != nil {
+		if addr, ok := conn.conn.RemoteAddr().(*net.TCPAddr); ok {
+			clientAddr = addr.IP.String()
+			clientPort = int32(addr.Port)
+		}
+	}
+
+	values := []interface{}{
+		int32(0),                // datid
+		conn.database,           // datname
+		conn.pid,                // pid
+		int32(10),               // usesysid
+		conn.username,           // usename
+		conn.applicationName,    // application_name
+		clientAddr,              // client_addr
+		clientPort,              // client_port
+		conn.backendStart,       // backend_start
+		nil,                     // xact_start (NULL)
+		nil,                     // query_start (NULL)
+		nil,                     // state_change (NULL)
+		nil,                     // wait_event_type (NULL)
+		nil,                     // wait_event (NULL)
+		state,                   // state
+		nil,                     // backend_xid (NULL)
+		nil,                     // backend_xmin (NULL)
+		q,                       // query
+		"client backend",        // backend_type
+		nil,                     // leader_pid (NULL)
+		int32(conn.workerID),    // worker_id
+	}
+
+	return c.sendDataRowWithFormats(values, formatCodes, pgStatActivityTypeOIDs)
 }
 
 // handleDeclareCursor handles DECLARE cursor in the Simple Query protocol.

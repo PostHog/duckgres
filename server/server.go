@@ -238,6 +238,10 @@ type Server struct {
 
 	// ACME manager for Let's Encrypt certificates (nil when using static certs)
 	acmeManager *ACMEManager
+
+	// Connection registry for pg_stat_activity
+	connsMu sync.RWMutex
+	conns   map[int32]*clientConn
 }
 
 func New(cfg Config) (*Server, error) {
@@ -277,6 +281,7 @@ func New(cfg Config) (*Server, error) {
 		rateLimiter:   NewRateLimiter(cfg.RateLimit),
 		activeQueries: make(map[BackendKey]context.CancelFunc),
 		duckLakeSem:   make(chan struct{}, 1),
+		conns:         make(map[int32]*clientConn),
 	}
 
 	// Configure TLS: ACME (Let's Encrypt) or static certificate files
@@ -507,6 +512,38 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 		return true
 	}
 	return false
+}
+
+// initConnsMap initializes the connection registry map.
+// This is a separate method to work around cases where a local variable
+// named "clientConn" shadows the type name (e.g., in worker.go).
+func (s *Server) initConnsMap() {
+	s.conns = make(map[int32]*clientConn)
+}
+
+// registerConn adds a client connection to the registry for pg_stat_activity.
+func (s *Server) registerConn(c *clientConn) {
+	s.connsMu.Lock()
+	s.conns[c.pid] = c
+	s.connsMu.Unlock()
+}
+
+// unregisterConn removes a client connection from the registry.
+func (s *Server) unregisterConn(pid int32) {
+	s.connsMu.Lock()
+	delete(s.conns, pid)
+	s.connsMu.Unlock()
+}
+
+// listConns returns a snapshot of all registered client connections.
+func (s *Server) listConns() []*clientConn {
+	s.connsMu.RLock()
+	defer s.connsMu.RUnlock()
+	conns := make([]*clientConn, 0, len(s.conns))
+	for _, c := range s.conns {
+		conns = append(conns, c)
+	}
+	return conns
 }
 
 // createDBConnection creates a DuckDB connection for a client session.

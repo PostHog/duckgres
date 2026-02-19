@@ -218,6 +218,16 @@ func (sm *SessionManager) SessionCountForWorker(workerID int) int {
 	return len(sm.byWorker[workerID])
 }
 
+// WorkerIDForPID returns the worker ID for a session, or -1 if not found.
+func (sm *SessionManager) WorkerIDForPID(pid int32) int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[pid]; ok {
+		return s.WorkerID
+	}
+	return -1
+}
+
 // AllSessions returns a snapshot of all active sessions.
 // The returned slice is safe to iterate without holding the lock.
 func (sm *SessionManager) AllSessions() []*ManagedSession {

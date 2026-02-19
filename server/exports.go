@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"time"
 )
 
 // Exported wrappers for protocol functions used by the control plane worker.
@@ -46,26 +47,29 @@ func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
 // the control plane worker. The returned value is opaque (*clientConn) but
 // can be used with SendInitialParams and RunMessageLoop.
 func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio.Writer,
-	username, database string, executor QueryExecutor, pid, secretKey int32) *clientConn {
+	username, database, applicationName string, executor QueryExecutor, pid, secretKey int32, workerID int) *clientConn {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &clientConn{
-		server:      s,
-		conn:        conn,
-		reader:      reader,
-		writer:      writer,
-		username:    username,
-		database:    database,
-		executor:    executor,
-		pid:         pid,
-		secretKey:   secretKey,
-		passthrough: s.cfg.PassthroughUsers[username],
-		stmts:       make(map[string]*preparedStmt),
-		portals:     make(map[string]*portal),
-		cursors:     make(map[string]*cursorState),
-		txStatus:    txStatusIdle,
-		ctx:         ctx,
-		cancel:      cancel,
+		server:          s,
+		conn:            conn,
+		reader:          reader,
+		writer:          writer,
+		username:        username,
+		database:        database,
+		applicationName: applicationName,
+		executor:        executor,
+		pid:             pid,
+		secretKey:       secretKey,
+		passthrough:     s.cfg.PassthroughUsers[username],
+		stmts:           make(map[string]*preparedStmt),
+		portals:         make(map[string]*portal),
+		cursors:         make(map[string]*cursorState),
+		txStatus:        txStatusIdle,
+		ctx:             ctx,
+		cancel:          cancel,
+		backendStart:    time.Now(),
+		workerID:        workerID,
 	}
 }
 
@@ -79,6 +83,8 @@ func SendInitialParams(cc *clientConn) {
 // query contexts (and any gRPC calls derived from them) are cancelled promptly.
 func RunMessageLoop(cc *clientConn) error {
 	defer cc.cancel()
+	cc.server.registerConn(cc)
+	defer cc.server.unregisterConn(cc.pid)
 	return cc.messageLoop()
 }
 
@@ -89,6 +95,7 @@ func InitMinimalServer(s *Server, cfg Config, queryCancelCh <-chan struct{}) {
 	s.activeQueries = make(map[BackendKey]context.CancelFunc)
 	s.duckLakeSem = make(chan struct{}, 1)
 	s.externalCancelCh = queryCancelCh
+	s.conns = make(map[int32]*clientConn)
 }
 
 // GenerateSecretKey generates a cryptographically random secret key for cancel requests.
