@@ -41,8 +41,11 @@ type SessionPool struct {
 	startTime   time.Time
 	maxSessions int
 	stopCh      chan struct{}
-	warmupDB    *sql.DB  // Keep this open to keep shared cache alive
+	warmupDB    *sql.DB      // Keep this open to keep shared cache alive
 	warmupDone  chan struct{} // Closed when Warmup() completes (success or failure)
+	dbInitOnce  sync.Once    // Serializes fallback CreateDBConnection when warmup fails
+	fallbackDB  *sql.DB      // Lazily created if warmup fails
+	fallbackErr error        // Cached error from fallback creation
 }
 
 type trackedTx struct {
@@ -301,18 +304,19 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	p.mu.RUnlock()
 
 	if db == nil {
-		// Fallback: create a new DB connection if warmup failed or wasn't run
-		if p.cfg.PassthroughUsers[username] {
-			db, err = server.CreatePassthroughDBConnection(p.cfg, p.duckLakeSem, username, p.startTime, server.ProcessVersion())
-		} else {
-			db, err = server.CreateDBConnection(p.cfg, p.duckLakeSem, username, p.startTime, server.ProcessVersion())
-		}
-		if err != nil {
+		// Fallback: create a shared DB if warmup failed or wasn't run.
+		// Uses sync.Once to ensure only one goroutine loads native extensions;
+		// concurrent LOAD of the same C++ extension corrupts the heap.
+		p.dbInitOnce.Do(func() {
+			p.fallbackDB, p.fallbackErr = server.CreateDBConnection(p.cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
+		})
+		if p.fallbackErr != nil {
 			p.mu.Lock()
 			p.reserved--
 			p.mu.Unlock()
-			return nil, fmt.Errorf("create session db: %w", err)
+			return nil, fmt.Errorf("create session db: %w", p.fallbackErr)
 		}
+		db = p.fallbackDB
 	}
 
 	// Obtain a dedicated connection for this session to ensure isolation
@@ -394,9 +398,9 @@ func (p *SessionPool) DestroySession(token string) error {
 	if session.Conn != nil {
 		_ = session.Conn.Close()
 	}
-	// Do NOT close session.DB if it is the shared warmupDB
+	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
 	p.mu.RLock()
-	isShared := session.DB == p.warmupDB
+	isShared := session.DB == p.warmupDB || session.DB == p.fallbackDB
 	p.mu.RUnlock()
 
 	if session.DB != nil && !isShared {
@@ -449,13 +453,16 @@ func (p *SessionPool) CloseAll() {
 		if session.Conn != nil {
 			_ = session.Conn.Close()
 		}
-		if session.DB != nil && session.DB != p.warmupDB {
+		if session.DB != nil && session.DB != p.warmupDB && session.DB != p.fallbackDB {
 			_ = session.DB.Close()
 		}
 	}
 
 	if p.warmupDB != nil {
 		_ = p.warmupDB.Close()
+	}
+	if p.fallbackDB != nil && p.fallbackDB != p.warmupDB {
+		_ = p.fallbackDB.Close()
 	}
 }
 

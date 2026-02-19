@@ -712,6 +712,67 @@ func TestHandoverChildCrashThenRetry(t *testing.T) {
 // the race triggers), this test holds an idle connection open. The idle
 // connection keeps the old CP's WaitGroup at 1, so the drain blocks until
 // we explicitly close the connection. This makes the test deterministic.
+// TestConcurrentFirstConnections verifies that multiple connections arriving
+// simultaneously at a freshly-started control plane all succeed. This is a
+// regression test for a race where the first CreateSession on a new worker
+// could overlap with warmup, causing two goroutines to LOAD the same native
+// C++ extension concurrently — corrupting the heap (malloc: unaligned tcache
+// chunk detected → SIGABRT).
+func TestConcurrentFirstConnections(t *testing.T) {
+	h := startControlPlane(t, defaultOpts())
+
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require connect_timeout=30", h.port)
+
+	// Open multiple connections in parallel — all hitting the worker before
+	// warmup may have finished. Prior to the fix, this would crash the
+	// worker with heap corruption.
+	const numConns = 5
+	var wg sync.WaitGroup
+	errors := make([]error, numConns)
+	for i := range numConns {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			db, err := sql.Open("postgres", dsn)
+			if err != nil {
+				errors[idx] = fmt.Errorf("conn %d open: %w", idx, err)
+				return
+			}
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			db.SetMaxIdleConns(1)
+			var result int
+			if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+				errors[idx] = fmt.Errorf("conn %d query: %w", idx, err)
+				return
+			}
+			if result != 1 {
+				errors[idx] = fmt.Errorf("conn %d: expected 1, got %d", idx, result)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	var errCount int
+	for _, err := range errors {
+		if err != nil {
+			errCount++
+			t.Logf("Error: %v", err)
+		}
+	}
+
+	if errCount > 0 {
+		t.Fatalf("%d/%d concurrent first connections failed.\nLogs:\n%s",
+			errCount, numConns, h.logBuf.String())
+	}
+
+	// Verify no worker crashes in the logs
+	if strings.Contains(h.logBuf.String(), "malloc()") ||
+		strings.Contains(h.logBuf.String(), "signal: aborted") {
+		t.Fatalf("Worker heap corruption detected in logs.\nLogs:\n%s", h.logBuf.String())
+	}
+}
+
 func TestHandoverDrainsBeforeExit(t *testing.T) {
 	h := startControlPlane(t, defaultOpts())
 
