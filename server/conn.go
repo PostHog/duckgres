@@ -33,6 +33,22 @@ import (
 // processed. This signals serve() to exit without creating a DB connection.
 var errCancelHandled = errors.New("cancel request handled")
 
+// nextPID generates a unique per-connection PID for standalone mode.
+// In standalone mode, os.Getpid() is the same for all connections, which causes
+// the pg_stat_activity registry (keyed by PID) to overwrite entries when connections
+// are replaced. Using a counter ensures each connection has a unique identity.
+// The counter starts at os.Getpid() and increments, so the first connection's PID
+// matches the OS PID (useful for debugging) and subsequent PIDs are unique.
+var pidCounter = func() *atomic.Int32 {
+	c := &atomic.Int32{}
+	c.Store(int32(os.Getpid()))
+	return c
+}()
+
+func nextPID() int32 {
+	return pidCounter.Add(1)
+}
+
 // cursorOp identifies cursor-related statement types detected during Parse.
 type cursorOp int
 
@@ -516,7 +532,7 @@ func (c *clientConn) serve() error {
 
 	c.reader = bufio.NewReader(c.conn)
 	c.writer = bufio.NewWriter(c.conn)
-	c.pid = int32(os.Getpid())
+	c.pid = nextPID()
 	c.secretKey = generateSecretKey()
 	c.stmts = make(map[string]*preparedStmt)
 	c.portals = make(map[string]*portal)

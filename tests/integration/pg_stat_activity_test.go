@@ -66,7 +66,7 @@ func queryPgStatActivity(db *sql.DB) ([]map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var result []map[string]interface{}
 	for rows.Next() {
@@ -88,7 +88,7 @@ func TestPgStatActivity(t *testing.T) {
 		if err != nil {
 			t.Fatalf("query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		cols, err := rows.Columns()
 		if err != nil {
@@ -277,7 +277,7 @@ func TestPgStatActivity(t *testing.T) {
 }
 
 // TestPgStatActivityFromSecondConnection verifies that pg_stat_activity
-// works from a separately opened connection.
+// works from a separately opened connection and can see multiple connections.
 func TestPgStatActivityFromSecondConnection(t *testing.T) {
 	// Open a second connection to verify pg_stat_activity works independently
 	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require",
@@ -286,39 +286,42 @@ func TestPgStatActivityFromSecondConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open second connection: %v", err)
 	}
-	defer db2.Close()
+	defer func() { _ = db2.Close() }()
 
 	ctx := context.Background()
 	conn2, err := db2.Conn(ctx)
 	if err != nil {
 		t.Fatalf("failed to acquire connection: %v", err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	// Query pg_stat_activity from the second connection
 	rows, err := conn2.QueryContext(ctx, "SELECT * FROM pg_stat_activity")
 	if err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	count := 0
+	hasActive := false
 	for rows.Next() {
 		row, err := scanPgStatActivityRow(rows)
 		if err != nil {
 			t.Fatalf("scan failed: %v", err)
 		}
-		// Verify basic fields
 		if row["pid"].(int) == 0 {
 			t.Error("expected non-zero pid")
 		}
-		if row["state"].(string) != "active" {
-			t.Errorf("expected state 'active', got %q", row["state"])
+		if row["state"].(string) == "active" {
+			hasActive = true
 		}
 		count++
 	}
 	if count < 1 {
 		t.Error("expected at least 1 row from second connection")
+	}
+	if !hasActive {
+		t.Error("expected at least one connection in 'active' state (self)")
 	}
 }
 
@@ -333,13 +336,13 @@ func TestPgStatActivityExtendedQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		rows, err := stmt.Query()
 		if err != nil {
 			t.Fatalf("query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		count := 0
 		for rows.Next() {
@@ -363,7 +366,7 @@ func TestPgStatActivityExtendedQuery(t *testing.T) {
 		if err != nil {
 			t.Fatalf("prepare failed: %v", err)
 		}
-		defer stmt.Close()
+		defer func() { _ = stmt.Close() }()
 
 		for i := 0; i < 3; i++ {
 			rows, err := stmt.Query()
@@ -401,7 +404,7 @@ func TestPgStatActivityStubView(t *testing.T) {
 		if err != nil {
 			t.Fatalf("query failed: %v", err)
 		}
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 
 		var cols []string
 		for rows.Next() {
