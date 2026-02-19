@@ -4245,10 +4245,15 @@ func (c *clientConn) sendPgCursorsRowDescription() error {
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
 }
 
-// pgStatActivityRegex matches SELECT queries from pg_stat_activity:
+// pgStatActivityRegex matches queries that reference pg_stat_activity:
 //
 //	SELECT ... FROM pg_stat_activity ...
 //	SELECT ... FROM pg_catalog.pg_stat_activity ...
+//
+// Limitation: this intercepts any query containing FROM pg_stat_activity,
+// so WHERE clauses, JOINs, and column selection are ignored — all rows
+// with all columns are always returned. This is acceptable because most
+// tools simply do SELECT * FROM pg_stat_activity.
 var pgStatActivityRegex = regexp.MustCompile(
 	`(?i)\bFROM\s+(?:pg_catalog\s*\.\s*)?pg_stat_activity\b`,
 )
@@ -4290,6 +4295,15 @@ var pgStatActivityColumns = []struct {
 	{"worker_id", 23, 4},          // int4 (duckgres extension)
 }
 
+// pgStatActivityTypeOIDs is precomputed from pgStatActivityColumns to avoid per-row allocation.
+var pgStatActivityTypeOIDs = func() []int32 {
+	oids := make([]int32, len(pgStatActivityColumns))
+	for i, col := range pgStatActivityColumns {
+		oids[i] = col.oid
+	}
+	return oids
+}()
+
 // handlePgStatActivity handles SELECT FROM pg_stat_activity in the Simple Query protocol.
 func (c *clientConn) handlePgStatActivity() error {
 	if err := c.sendPgStatActivityRowDescription(); err != nil {
@@ -4313,7 +4327,7 @@ func (c *clientConn) handlePgStatActivity() error {
 
 // handlePgStatActivityExtended handles SELECT FROM pg_stat_activity in the Extended Query protocol.
 func (c *clientConn) handlePgStatActivityExtended(p *portal) {
-	if !p.stmt.described {
+	if !p.stmt.described && !p.described {
 		_ = c.sendPgStatActivityRowDescription()
 	}
 
@@ -4346,7 +4360,11 @@ func (c *clientConn) sendPgStatActivityRowDescription() error {
 
 // sendPgStatActivityDataRow sends a DataRow for a single connection in pg_stat_activity.
 func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []int16) error {
-	// Determine state
+	// Determine state.
+	// NOTE: conn.txStatus is read without synchronization. This is a benign race —
+	// txStatus is a single byte written only by the owning goroutine, and a stale
+	// read just means a briefly inaccurate state string. Making txStatus atomic
+	// would require changing dozens of write sites for negligible benefit.
 	var state string
 	q, _ := conn.currentQuery.Load().(string)
 	if q != "" {
@@ -4370,11 +4388,6 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 			clientAddr = addr.IP.String()
 			clientPort = int32(addr.Port)
 		}
-	}
-
-	typeOIDs := make([]int32, len(pgStatActivityColumns))
-	for i, col := range pgStatActivityColumns {
-		typeOIDs[i] = col.oid
 	}
 
 	values := []interface{}{
@@ -4401,7 +4414,7 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		int32(conn.workerID),    // worker_id
 	}
 
-	return c.sendDataRowWithFormats(values, formatCodes, typeOIDs)
+	return c.sendDataRowWithFormats(values, formatCodes, pgStatActivityTypeOIDs)
 }
 
 // handleDeclareCursor handles DECLARE cursor in the Simple Query protocol.

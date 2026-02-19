@@ -206,6 +206,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 
 	username := params["user"]
 	database := params["database"]
+	applicationName := params["application_name"]
 
 	if username == "" {
 		slog.Error("No user specified in startup message")
@@ -306,28 +307,39 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 
 	// Create client connection struct
 	clientConn := &clientConn{
-		server:    nil, // Will set up a minimal interface
-		conn:      tlsConn,
-		reader:    reader,
-		writer:    writer,
-		username:  username,
-		database:  database,
-		executor:  NewLocalExecutor(db),
-		pid:       pid,
-		secretKey: cfg.BackendSecretKey,
-		stmts:     make(map[string]*preparedStmt),
-		portals:   make(map[string]*portal),
-		txStatus:  txStatusIdle,
+		server:          nil, // Will set up below
+		conn:            tlsConn,
+		reader:          reader,
+		writer:          writer,
+		username:        username,
+		database:        database,
+		applicationName: applicationName,
+		executor:        NewLocalExecutor(db),
+		pid:             pid,
+		secretKey:       cfg.BackendSecretKey,
+		stmts:           make(map[string]*preparedStmt),
+		portals:         make(map[string]*portal),
+		txStatus:        txStatusIdle,
+		backendStart:    time.Now(),
+		workerID:        -1,
 	}
 
-	// Set up worker server reference for clientConn
-	clientConn.server = &Server{
+	// Set up worker server reference for clientConn.
+	// NOTE: conns map is initialized via initConnsMap() to avoid a compile error —
+	// the local variable "clientConn" shadows the type name "clientConn".
+	srv := &Server{
 		cfg: serverCfg,
 		// Minimal server for child process - no listener, rate limiter, etc.
 		activeQueries:    make(map[BackendKey]context.CancelFunc),
 		duckLakeSem:      make(chan struct{}, 1),
 		externalCancelCh: queryCancelCh, // Wire signal-based cancellation to query context
 	}
+	srv.initConnsMap()
+	clientConn.server = srv
+
+	// Register this connection for pg_stat_activity visibility.
+	// In process isolation mode each child only sees itself.
+	srv.registerConn(clientConn)
 
 	// Ensure cleanup on exit
 	defer func() {

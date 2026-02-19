@@ -514,6 +514,13 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 	return false
 }
 
+// initConnsMap initializes the connection registry map.
+// This is a separate method to work around cases where a local variable
+// named "clientConn" shadows the type name (e.g., in worker.go).
+func (s *Server) initConnsMap() {
+	s.conns = make(map[int32]*clientConn)
+}
+
 // registerConn adds a client connection to the registry for pg_stat_activity.
 func (s *Server) registerConn(c *clientConn) {
 	s.connsMu.Lock()
