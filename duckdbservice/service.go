@@ -400,7 +400,7 @@ func (p *SessionPool) DestroySession(token string) error {
 		// sql.Conn.Close() returns the underlying driver connection to sql.DB's
 		// pool rather than closing it. DuckDB temp tables are connection-scoped,
 		// so they'd leak into the next session that gets the same connection.
-		cleanupTempTables(session.Conn)
+		cleanupSessionState(session.Conn)
 		_ = session.Conn.Close()
 	}
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
@@ -471,27 +471,48 @@ func (p *SessionPool) CloseAll() {
 	}
 }
 
-// cleanupTempTables drops all temporary tables on the connection so that
-// session-scoped state doesn't leak when the connection is returned to the pool.
-func cleanupTempTables(conn *sql.Conn) {
+// cleanupSessionState drops temporary tables and views on the connection so
+// that session-scoped state doesn't leak when the connection is returned to
+// the pool.
+func cleanupSessionState(conn *sql.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rows, err := conn.QueryContext(ctx, "SELECT table_name FROM duckdb_tables() WHERE temporary = true")
+	// Drop temporary tables
+	dropTemporary(ctx, conn,
+		"SELECT table_name FROM duckdb_tables() WHERE temporary = true",
+		`DROP TABLE IF EXISTS temp."%s"`,
+	)
+
+	// Drop temporary views
+	dropTemporary(ctx, conn,
+		"SELECT view_name FROM duckdb_views() WHERE temporary = true",
+		`DROP VIEW IF EXISTS temp."%s"`,
+	)
+}
+
+func dropTemporary(ctx context.Context, conn *sql.Conn, query, dropFmt string) {
+	rows, err := conn.QueryContext(ctx, query)
 	if err != nil {
+		slog.Warn("Failed to query temporary objects for cleanup.", "error", err)
 		return
 	}
-	var tables []string
+	var names []string
 	for rows.Next() {
 		var name string
 		if rows.Scan(&name) == nil {
-			tables = append(tables, name)
+			names = append(names, name)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("Error iterating temporary objects for cleanup.", "error", err)
 	}
 	_ = rows.Close()
 
-	for _, t := range tables {
-		_, _ = conn.ExecContext(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS temp."%s"`, t))
+	for _, name := range names {
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf(dropFmt, name)); err != nil {
+			slog.Warn("Failed to drop temporary object during cleanup.", "name", name, "error", err)
+		}
 	}
 }
 
