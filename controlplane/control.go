@@ -449,6 +449,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	username := startupParams["user"]
 	database := startupParams["database"]
+	applicationName := startupParams["application_name"]
 
 	if username == "" {
 		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
@@ -522,7 +523,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	secretKey := server.GenerateSecretKey()
 
 	// Create clientConn with FlightExecutor
-	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, database, executor, pid, secretKey)
+	workerID := cp.sessions.WorkerIDForPID(pid)
+	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, database, applicationName, executor, pid, secretKey, workerID)
 
 	// Send initial parameters and ReadyForQuery
 	server.SendInitialParams(cc)

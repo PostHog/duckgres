@@ -98,8 +98,8 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-			'pg_type', 'pg_attribute',
+			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
+			'pg_partitioned_table', 'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
@@ -389,6 +389,38 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 	`
 	if _, err := db.Exec(pgStatioUserTablesSQL); err != nil {
 		slog.Warn("Failed to create pg_statio_user_tables view.", "error", err)
+	}
+
+	// Create pg_stat_activity stub view (empty, intercepted at query time for live data).
+	// This view exists for schema introspection and JOIN queries that reference pg_stat_activity.
+	pgStatActivitySQL := `
+		CREATE OR REPLACE VIEW pg_stat_activity AS
+		SELECT
+			0::INTEGER AS datid,
+			''::VARCHAR AS datname,
+			0::INTEGER AS pid,
+			0::INTEGER AS usesysid,
+			''::VARCHAR AS usename,
+			''::VARCHAR AS application_name,
+			''::VARCHAR AS client_addr,
+			0::INTEGER AS client_port,
+			NULL::TIMESTAMP AS backend_start,
+			NULL::TIMESTAMP AS xact_start,
+			NULL::TIMESTAMP AS query_start,
+			NULL::TIMESTAMP AS state_change,
+			NULL::VARCHAR AS wait_event_type,
+			NULL::VARCHAR AS wait_event,
+			''::VARCHAR AS state,
+			NULL::INTEGER AS backend_xid,
+			NULL::INTEGER AS backend_xmin,
+			''::VARCHAR AS query,
+			''::VARCHAR AS backend_type,
+			NULL::INTEGER AS leader_pid,
+			0::INTEGER AS worker_id
+		WHERE false
+	`
+	if _, err := db.Exec(pgStatActivitySQL); err != nil {
+		slog.Warn("Failed to create pg_stat_activity view.", "error", err)
 	}
 
 	// Create pg_namespace wrapper that maps 'main' to 'public' for PostgreSQL compatibility
@@ -1130,7 +1162,8 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
-			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table', 'pg_attribute',
+			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
+			'pg_partitioned_table', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -1197,7 +1230,8 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_class_full', 'pg_collation', 'pg_database', 'pg_inherits',
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
-			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table', 'pg_attribute',
+			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
+			'pg_partitioned_table', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -1265,8 +1299,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 				'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-				'pg_attribute',
+				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
+				'pg_partitioned_table', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
@@ -1315,8 +1349,8 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_database', 'pg_class_full', 'pg_collation', 'pg_policy', 'pg_roles',
 				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 				'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
-				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_partitioned_table',
-				'pg_attribute',
+				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
+				'pg_partitioned_table', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
