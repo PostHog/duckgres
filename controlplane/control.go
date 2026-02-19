@@ -86,15 +86,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
-	// Create socket directory and verify it is writable. Under
-	// ProtectSystem=strict, the ReadWritePaths bind mount may be missing
-	// if the process was started outside systemd's normal lifecycle.
+	// Create socket directory. Writability is checked below, after
+	// attempting handover — the old CP may provide pre-bound socket FDs,
+	// making a writable directory unnecessary under EROFS.
 	if err := os.MkdirAll(cfg.SocketDir, 0755); err != nil {
 		slog.Error("Failed to create socket directory.", "error", err)
-		os.Exit(1)
-	}
-	if err := checkSocketDirWritable(cfg.SocketDir); err != nil {
-		slog.Error("Socket directory is not writable. Control plane will not be able to create worker sockets.", "dir", cfg.SocketDir, "error", err)
 		os.Exit(1)
 	}
 
@@ -117,6 +113,43 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 		tlsCfg = &tls.Config{
 			Certificates: []tls.Certificate{cert},
+		}
+	}
+
+	// --- Attempt handover from existing control plane ---
+	// This must happen BEFORE the writability check because under systemd's
+	// ProtectSystem=strict, the RuntimeDirectory can become read-only (EROFS)
+	// after startup. The old CP sends pre-bound socket FDs during handover,
+	// allowing the new CP to work without creating new sockets.
+	var handoverPgLn *net.TCPListener
+	var handoverPrebound []*preboundSocket
+	handoverDone := false
+	if cfg.HandoverSocket == "" {
+		slog.Info("No handover socket configured, starting fresh.")
+	} else {
+		if _, err := os.Stat(cfg.HandoverSocket); err != nil {
+			slog.Info("Handover socket not found, starting fresh.", "socket", cfg.HandoverSocket, "error", err)
+		} else {
+			slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
+			pgLn, prebound, err := receiveHandover(cfg.HandoverSocket, cfg.SocketDir)
+			if err != nil {
+				slog.Warn("Handover failed, starting fresh.", "error", err)
+			} else {
+				handoverPgLn = pgLn
+				handoverPrebound = prebound
+				handoverDone = true
+				slog.Info("Handover complete, took over PG listener.", "prebound_count", len(prebound))
+			}
+		}
+	}
+
+	// Verify socket directory is writable. Skip when handover provided
+	// pre-bound sockets — the directory may be read-only (EROFS under
+	// systemd ProtectSystem=strict), which is fine since we use inherited FDs.
+	if len(handoverPrebound) == 0 {
+		if err := checkSocketDirWritable(cfg.SocketDir); err != nil {
+			slog.Error("Socket directory is not writable. Control plane will not be able to create worker sockets.", "dir", cfg.SocketDir, "error", err)
+			os.Exit(1)
 		}
 	}
 
@@ -157,11 +190,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
 	pool.idleTimeout = cfg.WorkerIdleTimeout
 
-	// Pre-bind worker sockets eagerly while the socket directory is verified
-	// writable. Under systemd's ProtectSystem=strict, the RuntimeDirectory
-	// bind mount can go read-only after startup. Pre-binding ensures all
-	// maxWorkers sockets are available regardless of later filesystem state.
-	if maxWorkers > 0 {
+	// Import pre-bound sockets from handover, or pre-bind new ones.
+	// During handover, the old CP passes its pre-bound socket FDs so the
+	// new CP works even when the socket directory is read-only (EROFS).
+	if len(handoverPrebound) > 0 {
+		pool.ImportPrebound(handoverPrebound)
+	} else if maxWorkers > 0 {
 		if err := pool.PreBindSockets(maxWorkers); err != nil {
 			slog.Error("Failed to pre-bind worker sockets.", "error", err)
 			os.Exit(1)
@@ -198,27 +232,10 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1)
 
-	// Try handover from existing control plane if handover socket exists
-	handoverDone := false
-	if cfg.HandoverSocket == "" {
-		slog.Info("No handover socket configured, starting fresh.")
+	// Set PG listener from handover or bind a fresh TCP listener.
+	if handoverDone {
+		cp.pgListener = handoverPgLn
 	} else {
-		if _, err := os.Stat(cfg.HandoverSocket); err != nil {
-			slog.Info("Handover socket not found, starting fresh.", "socket", cfg.HandoverSocket, "error", err)
-		} else {
-			slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
-			pgLn, err := receiveHandover(cfg.HandoverSocket, cfg.SocketDir)
-			if err != nil {
-				slog.Warn("Handover failed, starting fresh.", "error", err)
-			} else {
-				cp.pgListener = pgLn
-				handoverDone = true
-				slog.Info("Handover complete, took over PG listener.")
-			}
-		}
-	}
-
-	if !handoverDone {
 		// Bind TCP listener FIRST, before spawning workers. If the port is
 		// already in use (e.g. old CP still running after a failed handover),
 		// we exit immediately without touching worker sockets.

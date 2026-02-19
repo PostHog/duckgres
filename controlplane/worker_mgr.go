@@ -168,6 +168,25 @@ func (p *FlightWorkerPool) closeAllPrebound() {
 	p.prebound = nil
 }
 
+// TakeAllPrebound removes and returns all available pre-bound sockets.
+// Used during handover to pass socket FDs to the new control plane.
+func (p *FlightWorkerPool) TakeAllPrebound() []*preboundSocket {
+	p.preboundMu.Lock()
+	defer p.preboundMu.Unlock()
+	result := p.prebound
+	p.prebound = nil
+	return result
+}
+
+// ImportPrebound imports pre-bound sockets received from a handover into the pool.
+// These sockets were created by the old control plane and passed via SCM_RIGHTS.
+func (p *FlightWorkerPool) ImportPrebound(sockets []*preboundSocket) {
+	p.preboundMu.Lock()
+	defer p.preboundMu.Unlock()
+	p.prebound = append(p.prebound, sockets...)
+	slog.Info("Imported pre-bound sockets from handover.", "count", len(sockets))
+}
+
 // SpawnWorker starts a new duckdb-service worker process.
 // It uses a pre-bound socket from the pool if available, falling back to
 // binding a new socket (which may fail with EROFS under systemd's
@@ -263,7 +282,7 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	// Wait for the worker's gRPC server to become healthy.
 	// The socket file already exists (we created it above), so waitForWorker
 	// will immediately try connecting and rely on the health check.
-	client, err := waitForWorker(socketPath, token, 10*time.Second)
+	client, err := waitForWorker(socketPath, token, 20*time.Second)
 	if err != nil {
 		// Kill the process if we can't connect
 		_ = cmd.Process.Kill()

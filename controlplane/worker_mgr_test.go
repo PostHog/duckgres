@@ -1002,6 +1002,151 @@ func TestReleaseWorkerSocketIdempotent(t *testing.T) {
 	}
 }
 
+func TestTakeAllPrebound(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 5)
+
+	if err := pool.PreBindSockets(3); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	result := pool.TakeAllPrebound()
+	if len(result) != 3 {
+		t.Fatalf("expected 3 sockets, got %d", len(result))
+	}
+
+	// Pool should be empty
+	pool.preboundMu.Lock()
+	remaining := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if remaining != 0 {
+		t.Fatalf("expected 0 remaining, got %d", remaining)
+	}
+
+	// Clean up listeners
+	for _, ps := range result {
+		_ = ps.listener.Close()
+	}
+}
+
+func TestTakeAllPreboundEmpty(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+
+	result := pool.TakeAllPrebound()
+	if result != nil {
+		t.Fatalf("expected nil from empty pool, got %d sockets", len(result))
+	}
+}
+
+func TestImportPrebound(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 5)
+
+	// Create some sockets to import
+	sockets := make([]*preboundSocket, 3)
+	for i := range sockets {
+		path := fmt.Sprintf("%s/imported-%d.sock", dir, i)
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatalf("listen %d: %v", i, err)
+		}
+		sockets[i] = &preboundSocket{socketPath: path, listener: ln}
+	}
+
+	pool.ImportPrebound(sockets)
+
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 3 {
+		t.Fatalf("expected 3 imported sockets, got %d", count)
+	}
+
+	// Verify they can be taken
+	ps := pool.takePrebound()
+	if ps == nil {
+		t.Fatal("takePrebound returned nil after import")
+	}
+	_ = ps.listener.Close()
+
+	// Clean up remaining
+	pool.closeAllPrebound()
+}
+
+func TestImportPreboundAppendsToExisting(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 5)
+
+	// Pre-bind 2 sockets
+	if err := pool.PreBindSockets(2); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	// Import 2 more
+	imported := make([]*preboundSocket, 2)
+	for i := range imported {
+		path := fmt.Sprintf("%s/imported-%d.sock", dir, i)
+		ln, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatalf("listen %d: %v", i, err)
+		}
+		imported[i] = &preboundSocket{socketPath: path, listener: ln}
+	}
+
+	pool.ImportPrebound(imported)
+
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 4 {
+		t.Fatalf("expected 4 total sockets (2 pre-bound + 2 imported), got %d", count)
+	}
+
+	pool.closeAllPrebound()
+}
+
+func TestTakeAllPreboundThenImport(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 5)
+
+	if err := pool.PreBindSockets(3); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	// Take all
+	taken := pool.TakeAllPrebound()
+	if len(taken) != 3 {
+		t.Fatalf("expected 3 taken, got %d", len(taken))
+	}
+
+	// Import them into a different pool (simulating handover)
+	pool2 := NewFlightWorkerPool(dir, "", 5)
+	pool2.ImportPrebound(taken)
+
+	pool2.preboundMu.Lock()
+	count := len(pool2.prebound)
+	pool2.preboundMu.Unlock()
+
+	if count != 3 {
+		t.Fatalf("expected 3 in new pool, got %d", count)
+	}
+
+	// Take one from new pool and verify it works
+	ps := pool2.takePrebound()
+	if ps == nil {
+		t.Fatal("takePrebound from new pool returned nil")
+	}
+	if ps.listener == nil {
+		t.Fatal("listener is nil")
+	}
+	_ = ps.listener.Close()
+
+	pool2.closeAllPrebound()
+}
+
 func TestConcurrentTakeReturn(t *testing.T) {
 	dir := shortTempDir(t)
 	pool := NewFlightWorkerPool(dir, "", 10)
