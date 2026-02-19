@@ -31,6 +31,7 @@ type ManagedWorker struct {
 	client         *flightsql.Client
 	parentListener net.Listener     // CP-side listener; lifecycle managed by releaseSocket
 	prebound       *preboundSocket  // non-nil if using a pre-bound socket slot
+	releaseOnce    sync.Once        // ensures releaseWorkerSocket body runs exactly once
 	done           chan struct{}    // closed when process exits
 	exitErr        error
 	activeSessions int       // Number of sessions currently assigned to this worker
@@ -137,16 +138,21 @@ func (p *FlightWorkerPool) returnPrebound(ps *preboundSocket) {
 
 // releaseWorkerSocket returns a pre-bound socket to the pool for reuse, or
 // closes the listener and removes the socket file for non-pre-bound sockets.
+// Safe to call multiple times; only the first call takes effect. This prevents
+// a race between ShutdownAll and HealthCheckLoop both calling this on the same
+// worker, which could otherwise return a pre-bound socket to the pool twice.
 func (p *FlightWorkerPool) releaseWorkerSocket(w *ManagedWorker) {
-	if w.prebound != nil {
-		p.returnPrebound(w.prebound)
-		w.prebound = nil
-	} else {
-		if w.parentListener != nil {
-			_ = w.parentListener.Close()
+	w.releaseOnce.Do(func() {
+		if w.prebound != nil {
+			p.returnPrebound(w.prebound)
+			w.prebound = nil
+		} else {
+			if w.parentListener != nil {
+				_ = w.parentListener.Close()
+			}
+			_ = os.Remove(w.socketPath)
 		}
-		_ = os.Remove(w.socketPath)
-	}
+	})
 }
 
 // closeAllPrebound permanently closes all remaining pre-bound sockets.
@@ -795,6 +801,10 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 			return
 		case <-ticker.C:
 			p.mu.RLock()
+			if p.shuttingDown {
+				p.mu.RUnlock()
+				return
+			}
 			workers := make([]*ManagedWorker, 0, len(p.workers))
 			for _, w := range p.workers {
 				workers = append(workers, w)

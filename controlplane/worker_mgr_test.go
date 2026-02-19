@@ -725,7 +725,7 @@ func shortTempDir(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
 }
 
@@ -957,6 +957,48 @@ func TestShutdownAllReturnsPreboundToPool(t *testing.T) {
 
 	if count != 0 {
 		t.Fatalf("expected 0 pre-bound sockets after shutdown, got %d", count)
+	}
+}
+
+func TestReleaseWorkerSocketIdempotent(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 2)
+
+	if err := pool.PreBindSockets(2); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	ps := pool.takePrebound()
+	if ps == nil {
+		t.Fatal("takePrebound returned nil")
+	}
+
+	w := &ManagedWorker{
+		parentListener: ps.listener,
+		prebound:       ps,
+		socketPath:     ps.socketPath,
+	}
+
+	// Call releaseWorkerSocket twice concurrently — the second call must be
+	// a no-op (sync.Once). Without this, a race between ShutdownAll and
+	// HealthCheckLoop could return the same socket to the pool twice.
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pool.releaseWorkerSocket(w)
+		}()
+	}
+	wg.Wait()
+
+	// The pre-bound socket should be returned exactly once (1 remaining in pool + 1 returned = 2)
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 2 {
+		t.Fatalf("expected 2 pre-bound sockets (1 never taken + 1 returned once), got %d", count)
 	}
 }
 
