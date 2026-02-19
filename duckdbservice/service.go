@@ -396,6 +396,11 @@ func (p *SessionPool) DestroySession(token string) error {
 		stop()
 	}
 	if session.Conn != nil {
+		// Drop temporary tables before returning the connection to the pool.
+		// sql.Conn.Close() returns the underlying driver connection to sql.DB's
+		// pool rather than closing it. DuckDB temp tables are connection-scoped,
+		// so they'd leak into the next session that gets the same connection.
+		cleanupTempTables(session.Conn)
 		_ = session.Conn.Close()
 	}
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
@@ -463,6 +468,30 @@ func (p *SessionPool) CloseAll() {
 	}
 	if p.fallbackDB != nil && p.fallbackDB != p.warmupDB {
 		_ = p.fallbackDB.Close()
+	}
+}
+
+// cleanupTempTables drops all temporary tables on the connection so that
+// session-scoped state doesn't leak when the connection is returned to the pool.
+func cleanupTempTables(conn *sql.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rows, err := conn.QueryContext(ctx, "SELECT table_name FROM duckdb_tables() WHERE temporary = true")
+	if err != nil {
+		return
+	}
+	var tables []string
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) == nil {
+			tables = append(tables, name)
+		}
+	}
+	_ = rows.Close()
+
+	for _, t := range tables {
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS temp."%s"`, t))
 	}
 }
 
