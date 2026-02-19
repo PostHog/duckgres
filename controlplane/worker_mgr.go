@@ -109,7 +109,9 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	cmd.ExtraFiles = []*os.File{file}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	// Build env with DUCKGRES_MODE=duckdb-service, filtering any existing
+	// value to avoid duplicates (glibc getenv returns the first match).
+	cmd.Env = appendOrReplaceEnv(os.Environ(), "DUCKGRES_MODE=duckdb-service")
 
 	if err := cmd.Start(); err != nil {
 		_ = file.Close()
@@ -602,6 +604,7 @@ func (p *FlightWorkerPool) ShutdownAll() {
 			if w.cmd.Process != nil {
 				_ = w.cmd.Process.Kill()
 			}
+			<-w.done
 		}
 		if w.client != nil {
 			_ = w.client.Close()
@@ -840,6 +843,24 @@ func (c *workerBearerCreds) GetRequestMetadata(ctx context.Context, uri ...strin
 
 func (c *workerBearerCreds) RequireTransportSecurity() bool {
 	return false
+}
+
+// appendOrReplaceEnv appends entry (in KEY=VALUE form) to env, removing any
+// existing entry with the same key. This prevents duplicate environment
+// variables which can confuse glibc's getenv (returns first match).
+func appendOrReplaceEnv(env []string, entry string) []string {
+	idx := strings.Index(entry, "=")
+	if idx < 0 {
+		return append(env, entry)
+	}
+	key := entry[:idx+1] // e.g. "DUCKGRES_MODE="
+	filtered := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if !strings.HasPrefix(e, key) {
+			filtered = append(filtered, e)
+		}
+	}
+	return append(filtered, entry)
 }
 
 func generateToken() string {

@@ -87,6 +87,7 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 			slog.Warn("Handover failed, recovering.")
 			if cp.recoverFromFailedReload() {
 				cp.startHandoverListener()
+				cp.recoverAfterFailedReload()
 			}
 		}
 	}()
@@ -171,6 +172,21 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	// Clear reloading flag so the timeout-based recovery in selfExecDetached
 	// doesn't fire during a long drain.
 	cp.reloading.Store(false)
+
+	// Shut down Flight ingress and ACME now that the new CP has confirmed
+	// handover_complete. The new CP will bind these ports after
+	// receiveHandover returns. Shutting down here (instead of in the
+	// SIGUSR1 handler) keeps these services available during the entire
+	// handover protocol + pre-warm, minimizing downtime.
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
+	}
+	if cp.acmeManager != nil {
+		if err := cp.acmeManager.Close(); err != nil {
+			slog.Warn("ACME manager shutdown during handover.", "error", err)
+		}
+	}
 
 	// Stop accepting new connections immediately. The new CP has its own
 	// listener FD copy (from SCM_RIGHTS), so closing our copy doesn't
