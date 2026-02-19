@@ -754,6 +754,90 @@ func TestHandoverDrainsBeforeExit(t *testing.T) {
 	}
 }
 
+// TestHandoverPassesPreboundSockets verifies that during a graceful handover,
+// the old CP passes its pre-bound worker socket FDs to the new CP. The new CP
+// imports them and uses them to spawn workers without creating new socket files.
+func TestHandoverPassesPreboundSockets(t *testing.T) {
+	opts := defaultOpts()
+	opts.maxWorkers = 3
+	h := startControlPlane(t, opts)
+
+	// Trigger handover (no active connections, so all pre-bound sockets
+	// should be available for transfer)
+	h.doHandover(t)
+
+	// Wait for the new CP to import pre-bound sockets
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify pre-bound sockets were imported
+	logs := h.logBuf.String()
+	if !strings.Contains(logs, "Imported pre-bound sockets from handover.") {
+		t.Fatalf("Expected pre-bound socket import log.\nLogs:\n%s", logs)
+	}
+
+	// Verify new connections work (spawns a worker using an imported socket)
+	db := h.openConn(t)
+	var v int
+	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
+		t.Fatalf("Post-handover query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if v != 42 {
+		t.Fatalf("Expected 42, got %d", v)
+	}
+}
+
+// TestHandoverWithReadOnlySocketDir verifies the core EROFS fix: when the
+// socket directory becomes read-only (simulating systemd ProtectSystem=strict),
+// the handover still succeeds because the old CP passes pre-bound socket FDs.
+// Without this fix, the new CP would exit(1) before attempting handover.
+func TestHandoverWithReadOnlySocketDir(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping EROFS test: running as root (chmod ineffective)")
+	}
+
+	opts := defaultOpts()
+	opts.maxWorkers = 2
+	h := startControlPlane(t, opts)
+
+	// Make the socket directory read-only to simulate EROFS
+	if err := os.Chmod(h.socketDir, 0555); err != nil {
+		t.Fatalf("chmod failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.socketDir, 0755) })
+
+	// Verify the dir is actually read-only
+	testFile := filepath.Join(h.socketDir, ".test-write")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err == nil {
+		_ = os.Remove(testFile)
+		_ = os.Chmod(h.socketDir, 0755) // restore for cleanup
+		t.Skip("socket dir is still writable despite chmod 0555")
+	}
+
+	// Trigger handover — the new CP should succeed by using pre-bound
+	// sockets from the old CP, bypassing the writability check.
+	h.doHandover(t)
+
+	// Restore permissions so the test can clean up and the new CP's workers
+	// can potentially create dynamic sockets if needed.
+	_ = os.Chmod(h.socketDir, 0755)
+
+	// Verify the new CP can serve connections using inherited sockets
+	db := h.openConn(t)
+	var v int
+	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
+		t.Fatalf("Post-EROFS-handover query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if v != 42 {
+		t.Fatalf("Expected 42, got %d", v)
+	}
+
+	// Verify the expected log messages
+	logs := h.logBuf.String()
+	if !strings.Contains(logs, "Imported pre-bound sockets from handover.") {
+		t.Fatalf("Expected pre-bound socket import log.\nLogs:\n%s", logs)
+	}
+}
+
 // TestConcurrentFirstConnections verifies that multiple connections arriving
 // simultaneously at a freshly-started control plane all succeed. This is a
 // regression test for a race where the first CreateSession on a new worker
