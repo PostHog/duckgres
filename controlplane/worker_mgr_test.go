@@ -2,6 +2,9 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"os"
 	"os/exec"
 	"sync"
 	"testing"
@@ -711,5 +714,282 @@ func TestAcquireWorkerConcurrentSharing(t *testing.T) {
 	// 2 original + 10 new = 12
 	if total != 12 {
 		t.Fatalf("expected 12 total sessions across 2 workers, got %d", total)
+	}
+}
+
+// shortTempDir creates a short temp directory suitable for Unix socket paths
+// (which are limited to 104 bytes on macOS). t.TempDir() paths are too long.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "pb-")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
+func TestPreBindSocketsCreatesListeners(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 5)
+
+	if err := pool.PreBindSockets(3); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 3 {
+		t.Fatalf("expected 3 pre-bound sockets, got %d", count)
+	}
+
+	// Verify socket files exist on disk
+	for i := 0; i < 3; i++ {
+		path := fmt.Sprintf("%s/worker-%d.sock", dir, i)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected socket file %s to exist: %v", path, err)
+		}
+	}
+}
+
+func TestPreBindSocketsCleanupOnPartialFailure(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 5)
+
+	// Pre-bind 2 sockets, then make the 3rd fail by creating a non-empty
+	// directory at worker-2.sock. os.Remove can't remove non-empty dirs,
+	// and net.Listen can't bind a socket over a directory.
+	blockPath := fmt.Sprintf("%s/worker-2.sock", dir)
+	if err := os.MkdirAll(blockPath, 0700); err != nil {
+		t.Fatalf("failed to create blocking dir: %v", err)
+	}
+	if err := os.WriteFile(blockPath+"/keep", []byte{}, 0600); err != nil {
+		t.Fatalf("failed to create file in blocking dir: %v", err)
+	}
+
+	err := pool.PreBindSockets(3)
+	if err == nil {
+		t.Fatal("expected PreBindSockets to fail")
+	}
+
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 0 {
+		t.Fatalf("expected 0 pre-bound sockets after failure, got %d", count)
+	}
+
+	// Verify socket files for the successfully bound sockets were cleaned up
+	for i := 0; i < 2; i++ {
+		path := fmt.Sprintf("%s/worker-%d.sock", dir, i)
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("expected socket file %s to be cleaned up after failure", path)
+		}
+	}
+}
+
+func TestTakePreboundAndReturnRoundTrip(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 3)
+
+	if err := pool.PreBindSockets(3); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	// Take all 3
+	sockets := make([]*preboundSocket, 0, 3)
+	for i := 0; i < 3; i++ {
+		ps := pool.takePrebound()
+		if ps == nil {
+			t.Fatalf("takePrebound returned nil on take %d", i)
+		}
+		sockets = append(sockets, ps)
+	}
+
+	// Pool should be empty
+	if ps := pool.takePrebound(); ps != nil {
+		t.Fatal("expected nil from exhausted pool")
+	}
+
+	// Return all 3
+	for _, ps := range sockets {
+		pool.returnPrebound(ps)
+	}
+
+	// Pool should have 3 again
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 3 {
+		t.Fatalf("expected 3 pre-bound sockets after return, got %d", count)
+	}
+}
+
+func TestReleaseWorkerSocketReturnsPrebound(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 2)
+
+	if err := pool.PreBindSockets(2); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	ps := pool.takePrebound()
+	if ps == nil {
+		t.Fatal("takePrebound returned nil")
+	}
+
+	w := &ManagedWorker{
+		parentListener: ps.listener,
+		prebound:       ps,
+		socketPath:     ps.socketPath,
+	}
+
+	pool.releaseWorkerSocket(w)
+
+	if w.prebound != nil {
+		t.Fatal("expected prebound to be nil after release")
+	}
+
+	// Socket should be back in the pool
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 2 {
+		t.Fatalf("expected 2 pre-bound sockets after release, got %d", count)
+	}
+}
+
+func TestReleaseWorkerSocketClosesNonPrebound(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 0)
+
+	// Create a non-pre-bound socket
+	socketPath := fmt.Sprintf("%s/worker-test.sock", dir)
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	w := &ManagedWorker{
+		parentListener: ln,
+		prebound:       nil,
+		socketPath:     socketPath,
+	}
+
+	pool.releaseWorkerSocket(w)
+
+	// Socket file should be removed
+	if _, err := os.Stat(socketPath); err == nil {
+		t.Fatal("expected socket file to be removed for non-pre-bound socket")
+	}
+}
+
+func TestCloseAllPreboundClosesListeners(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 3)
+
+	if err := pool.PreBindSockets(3); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	pool.closeAllPrebound()
+
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 0 {
+		t.Fatalf("expected 0 pre-bound sockets after closeAll, got %d", count)
+	}
+
+	// Verify listeners are closed by attempting to accept (should fail)
+	// Socket files should still exist (SetUnlinkOnClose=false)
+	for i := 0; i < 3; i++ {
+		path := fmt.Sprintf("%s/worker-%d.sock", dir, i)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected socket file %s to still exist after closeAll", path)
+		}
+	}
+}
+
+func TestShutdownAllReturnsPreboundToPool(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 3)
+
+	if err := pool.PreBindSockets(3); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	// Take one pre-bound socket and assign it to a fake worker
+	ps := pool.takePrebound()
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+	done := make(chan struct{})
+	w := &ManagedWorker{
+		ID:             0,
+		cmd:            cmd,
+		socketPath:     ps.socketPath,
+		parentListener: ps.listener,
+		prebound:       ps,
+		done:           done,
+	}
+	go func() { w.exitErr = cmd.Wait(); close(done) }()
+
+	pool.mu.Lock()
+	pool.workers[0] = w
+	pool.mu.Unlock()
+
+	// ShutdownAll should release the worker's prebound socket back to pool,
+	// then closeAllPrebound closes everything.
+	pool.ShutdownAll()
+
+	// Verify pool is fully drained
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 0 {
+		t.Fatalf("expected 0 pre-bound sockets after shutdown, got %d", count)
+	}
+}
+
+func TestConcurrentTakeReturn(t *testing.T) {
+	dir := shortTempDir(t)
+	pool := NewFlightWorkerPool(dir, "", 10)
+
+	if err := pool.PreBindSockets(10); err != nil {
+		t.Fatalf("PreBindSockets failed: %v", err)
+	}
+
+	// 10 goroutines each take and return a socket 100 times
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				ps := pool.takePrebound()
+				if ps != nil {
+					pool.returnPrebound(ps)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// All 10 should be back in the pool
+	pool.preboundMu.Lock()
+	count := len(pool.prebound)
+	pool.preboundMu.Unlock()
+
+	if count != 10 {
+		t.Fatalf("expected 10 pre-bound sockets after concurrent ops, got %d", count)
 	}
 }

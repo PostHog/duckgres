@@ -93,9 +93,12 @@ func (p *FlightWorkerPool) PreBindSockets(count int) error {
 		_ = os.Remove(socketPath)
 		ln, err := net.Listen("unix", socketPath)
 		if err != nil {
-			// Clean up already-bound sockets on failure
+			// Clean up already-bound sockets on failure.
+			// SetUnlinkOnClose(false) means Close() won't remove the files,
+			// so we must remove them explicitly.
 			for _, ps := range p.prebound {
 				_ = ps.listener.Close()
+				_ = os.Remove(ps.socketPath)
 			}
 			p.prebound = nil
 			return fmt.Errorf("pre-bind worker socket %s: %w", socketPath, err)
@@ -177,8 +180,11 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 		ln = ps.listener
 		socketPath = ps.socketPath
 	} else {
-		// Fallback: bind a new socket (may fail with EROFS if dir went read-only)
-		socketPath = fmt.Sprintf("%s/worker-%d.sock", p.socketDir, id)
+		// Fallback: bind a new socket. This can happen when workers are being
+		// retired asynchronously and their pre-bound sockets haven't been
+		// returned to the pool yet. May fail with EROFS if the dir went
+		// read-only, but that's the best we can do.
+		socketPath = fmt.Sprintf("%s/worker-dyn-%d.sock", p.socketDir, id)
 		_ = os.Remove(socketPath)
 		var err error
 		ln, err = net.Listen("unix", socketPath)
@@ -743,13 +749,9 @@ func (p *FlightWorkerPool) ShutdownAll() {
 		if w.client != nil {
 			_ = w.client.Close()
 		}
-		// Close listeners but do NOT remove socket files. During handover,
-		// the new CP may have already re-created these files via PreBindSockets.
-		// Removing them would break the new CP's pre-bound sockets. Stale
-		// files are harmlessly cleaned up by the next PreBindSockets call.
-		if w.parentListener != nil {
-			_ = w.parentListener.Close()
-		}
+		// Return pre-bound sockets to the pool (consistent with retire/crash paths).
+		// Non-pre-bound sockets are closed and removed directly.
+		p.releaseWorkerSocket(w)
 	}
 
 	p.mu.Lock()
@@ -757,7 +759,10 @@ func (p *FlightWorkerPool) ShutdownAll() {
 	p.mu.Unlock()
 	observeControlPlaneWorkers(0)
 
-	// Close any remaining pre-bound sockets not assigned to workers.
+	// Close all pre-bound sockets: both those returned above and any that
+	// were never assigned to workers. Socket files are not removed — during
+	// handover the new CP may have already replaced them via PreBindSockets.
+	// Stale files are cleaned up by the next startup's PreBindSockets.
 	p.closeAllPrebound()
 }
 
