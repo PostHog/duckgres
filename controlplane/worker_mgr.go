@@ -39,6 +39,7 @@ type FlightWorkerPool struct {
 	workers      map[int]*ManagedWorker
 	nextWorkerID int // auto-incrementing worker ID
 	socketDir    string
+	socketPrefix string // unique per CP instance to avoid collisions during handover
 	configPath   string
 	binaryPath   string
 	maxWorkers   int           // 0 = unlimited
@@ -52,12 +53,13 @@ type FlightWorkerPool struct {
 func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWorkerPool {
 	binaryPath, _ := os.Executable()
 	pool := &FlightWorkerPool{
-		workers:    make(map[int]*ManagedWorker),
-		socketDir:  socketDir,
-		configPath: configPath,
-		binaryPath: binaryPath,
-		maxWorkers: maxWorkers,
-		shutdownCh: make(chan struct{}),
+		workers:      make(map[int]*ManagedWorker),
+		socketDir:    socketDir,
+		socketPrefix: fmt.Sprintf("w%d", os.Getpid()),
+		configPath:   configPath,
+		binaryPath:   binaryPath,
+		maxWorkers:   maxWorkers,
+		shutdownCh:   make(chan struct{}),
 	}
 	if maxWorkers > 0 {
 		pool.workerSem = make(chan struct{}, maxWorkers)
@@ -70,7 +72,7 @@ func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWo
 // SpawnWorker starts a new duckdb-service worker process.
 func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	token := generateToken()
-	socketPath := fmt.Sprintf("%s/worker-%d.sock", p.socketDir, id)
+	socketPath := fmt.Sprintf("%s/%s-%d.sock", p.socketDir, p.socketPrefix, id)
 
 	// Clean up stale socket
 	_ = os.Remove(socketPath)
