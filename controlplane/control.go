@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ControlPlaneConfig extends server.Config with control-plane-specific settings.
@@ -93,7 +94,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 	if err := checkSocketDirWritable(cfg.SocketDir); err != nil {
-		slog.Error("Socket directory is not writable. Workers will not be able to create Unix sockets.", "dir", cfg.SocketDir, "error", err)
+		slog.Error("Socket directory is not writable. Control plane will not be able to create worker sockets.", "dir", cfg.SocketDir, "error", err)
 		os.Exit(1)
 	}
 
@@ -182,24 +183,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		acmeManager: acmeMgr,
 	}
 
-	// Optional Flight ingress (disabled when flight_port is 0).
-	// It is intentionally started after pre-warm to avoid concurrent worker
-	// creation races between pre-warm and first external Flight requests.
-	if cfg.FlightPort > 0 {
-		flightIngress, err := NewFlightIngress(cfg.Host, cfg.FlightPort, tlsCfg, cfg.Users, sessions, cp.rateLimiter, FlightIngressConfig{
-			SessionIdleTTL:     cfg.FlightSessionIdleTTL,
-			SessionReapTick:    cfg.FlightSessionReapInterval,
-			HandleIdleTTL:      cfg.FlightHandleIdleTTL,
-			SessionTokenTTL:    cfg.FlightSessionTokenTTL,
-			WorkerQueueTimeout: cfg.WorkerQueueTimeout,
-		})
-		if err != nil {
-			slog.Error("Failed to initialize Flight ingress.", "error", err)
-			os.Exit(1)
-		}
-		cp.flight = flightIngress
-	}
-
 	// Set up signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1)
@@ -245,9 +228,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}
 
-	if cp.flight != nil {
-		cp.flight.Start()
-	}
+	// Flight ingress is created AFTER handover so the old CP can keep
+	// serving Flight SQL clients until it shuts down its listener in
+	// handleHandoverRequest. This minimizes the Flight unavailability
+	// window to just the brief port rebind, rather than the entire
+	// handover + pre-warm duration.
+	cp.startFlightIngress()
 
 	// Start health check loop with crash notification
 	onCrash := func(workerID int) {
@@ -301,12 +287,17 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 					}
 					cancel()
 				}
-				// Flight listener is not part of the handover FD transfer; stop it
-				// before spawning the replacement process so the new CP can bind.
-				if cp.flight != nil {
-					cp.flight.Shutdown()
-					cp.flight = nil
+				// ACME HTTP challenge listener (port 80) must be stopped before
+				// spawning the replacement so the new CP can bind it.
+				if cp.acmeManager != nil {
+					if err := cp.acmeManager.Close(); err != nil {
+						slog.Warn("ACME manager shutdown failed.", "error", err)
+					}
 				}
+				// Flight ingress is NOT stopped here. The old CP keeps serving
+				// Flight SQL clients during the handover. It is shut down in
+				// handleHandoverRequest after the new CP confirms handover_complete,
+				// minimizing the unavailability window.
 				if err := sdNotify("RELOADING=1"); err != nil {
 					slog.Warn("sd_notify RELOADING failed.", "error", err)
 				}
@@ -657,7 +648,7 @@ func (cp *ControlPlane) selfExec() {
 	if err := cmd.Start(); err != nil {
 		slog.Error("Self-exec failed.", "error", err)
 		cp.recoverFromFailedReload()
-		cp.recoverFlightIngressAfterFailedReload()
+		cp.recoverAfterFailedReload()
 		return
 	}
 
@@ -685,7 +676,7 @@ func (cp *ControlPlane) selfExec() {
 			slog.Warn("Child process exited before completing handover, recovering.", "error", err)
 			cp.cancelHandoverListener()
 			cp.startHandoverListener()
-			cp.recoverFlightIngressAfterFailedReload()
+			cp.recoverAfterFailedReload()
 		}
 	}()
 }
@@ -705,7 +696,7 @@ func (cp *ControlPlane) selfExecDetached() {
 	if err := cmd.Run(); err != nil {
 		slog.Error("Self-exec (detached) failed.", "error", err)
 		cp.recoverFromFailedReload()
-		cp.recoverFlightIngressAfterFailedReload()
+		cp.recoverAfterFailedReload()
 		return
 	}
 
@@ -722,7 +713,7 @@ func (cp *ControlPlane) selfExecDetached() {
 			slog.Warn("Handover timeout: new CP did not connect within 30s, recovering.")
 			cp.cancelHandoverListener()
 			cp.startHandoverListener()
-			cp.recoverFlightIngressAfterFailedReload()
+			cp.recoverAfterFailedReload()
 		}
 	}()
 }
@@ -753,31 +744,85 @@ func (cp *ControlPlane) recoverFromFailedReload() bool {
 	return true
 }
 
-func (cp *ControlPlane) recoverFlightIngressAfterFailedReload() {
+// startFlightIngress creates and starts the Flight SQL ingress listener.
+// During handover, the old CP's Flight listener may still be shutting down,
+// so we retry port binding briefly before giving up.
+func (cp *ControlPlane) startFlightIngress() {
 	if cp.cfg.FlightPort <= 0 {
 		return
 	}
 
-	cp.closeMu.Lock()
-	defer cp.closeMu.Unlock()
-	if cp.closed || cp.flight != nil {
-		return
-	}
-
-	flightIngress, err := NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions, cp.rateLimiter, FlightIngressConfig{
+	flightCfg := FlightIngressConfig{
 		SessionIdleTTL:     cp.cfg.FlightSessionIdleTTL,
 		SessionReapTick:    cp.cfg.FlightSessionReapInterval,
 		HandleIdleTTL:      cp.cfg.FlightHandleIdleTTL,
 		SessionTokenTTL:    cp.cfg.FlightSessionTokenTTL,
 		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
-	})
+	}
+
+	var flightIngress *FlightIngress
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		flightIngress, err = NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions, cp.rateLimiter, flightCfg)
+		if err == nil {
+			break
+		}
+		if attempt < 9 {
+			slog.Warn("Flight ingress port not yet available, retrying...", "attempt", attempt+1, "error", err)
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
 	if err != nil {
-		slog.Error("Failed to recover Flight ingress after reload failure.", "error", err)
+		slog.Error("Failed to initialize Flight ingress, continuing without Flight SQL.", "error", err)
 		return
 	}
+
 	cp.flight = flightIngress
 	cp.flight.Start()
-	slog.Info("Recovered Flight ingress after reload failure.", "flight_addr", cp.flight.Addr())
+}
+
+// recoverAfterFailedReload restores all subsystems that were shut down in the
+// SIGUSR1 handler when the new CP fails to complete the handover.
+func (cp *ControlPlane) recoverAfterFailedReload() {
+	cp.recoverMetricsAfterFailedReload()
+	cp.recoverACMEAfterFailedReload()
+	// Flight ingress is NOT shut down in the SIGUSR1 handler (it keeps
+	// serving during handover), so no recovery is needed here.
+}
+
+func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
+	if cp.cfg.MetricsServer == nil {
+		return
+	}
+
+	// The old http.Server is in a "closed" state after Shutdown() and cannot
+	// be restarted. Create a fresh one on the same address.
+	addr := cp.cfg.MetricsServer.Addr
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	newSrv := &http.Server{Addr: addr, Handler: mux}
+	cp.cfg.MetricsServer = newSrv
+	go func() {
+		slog.Info("Recovered metrics server after reload failure.", "addr", addr)
+		if err := newSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Warn("Recovered metrics server error.", "error", err)
+		}
+	}()
+}
+
+func (cp *ControlPlane) recoverACMEAfterFailedReload() {
+	if cp.cfg.ACMEDomain == "" {
+		return
+	}
+	// ACME manager was shut down in SIGUSR1 handler. Restart it.
+	mgr, err := server.NewACMEManager(cp.cfg.ACMEDomain, cp.cfg.ACMEEmail, cp.cfg.ACMECacheDir, ":80")
+	if err != nil {
+		slog.Error("Failed to recover ACME manager after reload failure.", "error", err)
+		return
+	}
+	cp.acmeManager = mgr
+	cp.tlsConfig = mgr.TLSConfig()
+	slog.Info("Recovered ACME manager after reload failure.")
 }
 
 func (cp *ControlPlane) flightAddr() string {
