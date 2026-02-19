@@ -2681,6 +2681,54 @@ func TestTranspile_RangeFunction(t *testing.T) {
 	}
 }
 
+func TestTranspile_ArrayUpperInRangeFunction(t *testing.T) {
+	// Test that array_upper inside a FROM-clause function (RangeFunction) is properly
+	// transformed to len() with the dimension argument stripped. This is the exact
+	// pattern used by the pgx driver for type resolution.
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "array_upper in generate_series FROM clause",
+			input:    "SELECT s.r FROM generate_series(1, array_upper(current_schemas(false), 1)) AS s(r)",
+			contains: "len(current_schemas(false))",
+			excludes: "array_upper",
+		},
+		{
+			name:     "array_upper in SELECT expression",
+			input:    "SELECT array_upper(ARRAY[1,2,3], 1)",
+			contains: "len(ARRAY[1, 2, 3])",
+			excludes: "array_upper",
+		},
+		{
+			name:     "array_length dimension arg stripped",
+			input:    "SELECT array_length(ARRAY[1,2,3], 1)",
+			contains: "len(ARRAY[1, 2, 3])",
+			excludes: "array_length",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
 func TestTranspile_CtidToRowid(t *testing.T) {
 	tests := []struct {
 		name     string
