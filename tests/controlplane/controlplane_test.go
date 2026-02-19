@@ -712,6 +712,48 @@ func TestHandoverChildCrashThenRetry(t *testing.T) {
 // the race triggers), this test holds an idle connection open. The idle
 // connection keeps the old CP's WaitGroup at 1, so the drain blocks until
 // we explicitly close the connection. This makes the test deterministic.
+func TestHandoverDrainsBeforeExit(t *testing.T) {
+	h := startControlPlane(t, defaultOpts())
+
+	db := h.openConn(t)
+	var warmup int
+	if err := db.QueryRow("SELECT 1").Scan(&warmup); err != nil {
+		t.Fatalf("Warmup query failed: %v", err)
+	}
+
+	// Trigger handover while the connection is idle in the pool.
+	// The old CP's handleConnection goroutine is blocked in ReadMessage,
+	// waiting for the next query. This keeps wg at 1, so drain blocks.
+	h.doHandover(t)
+	oldPid := h.cmd.Process.Pid
+
+	// Wait long enough for the race to manifest. Without the fix, main()
+	// returns within milliseconds of acceptLoop detecting the closed
+	// listener, killing the handleConnection goroutine.
+	time.Sleep(3 * time.Second)
+
+	// The old CP process must still be alive — it should be waiting for
+	// this idle connection to close (drain). Without the fix, main()
+	// already returned and the process exited.
+	if err := syscall.Kill(oldPid, 0); err != nil {
+		t.Fatalf("Old CP (pid %d) died while connection still open.\n"+
+			"acceptLoop returned and main() exited before drain completed.\n"+
+			"Logs:\n%s", oldPid, h.logBuf.String())
+	}
+	t.Logf("Old CP (pid %d) still alive 3s after handover — drain is active", oldPid)
+
+	// Close the connection to unblock the drain.
+	_ = db.Close()
+
+	// Verify the old CP went through the proper drain → exit path
+	if err := h.waitForLog("All connections drained after handover.", 30*time.Second); err != nil {
+		t.Fatalf("Old CP did not drain properly.\nLogs:\n%s", h.logBuf.String())
+	}
+	if err := h.waitForLog("Old control plane exiting after handover.", 10*time.Second); err != nil {
+		t.Fatalf("Old CP did not exit via handover path.\nLogs:\n%s", h.logBuf.String())
+	}
+}
+
 // TestConcurrentFirstConnections verifies that multiple connections arriving
 // simultaneously at a freshly-started control plane all succeed. This is a
 // regression test for a race where the first CreateSession on a new worker
@@ -770,47 +812,5 @@ func TestConcurrentFirstConnections(t *testing.T) {
 	if strings.Contains(h.logBuf.String(), "malloc()") ||
 		strings.Contains(h.logBuf.String(), "signal: aborted") {
 		t.Fatalf("Worker heap corruption detected in logs.\nLogs:\n%s", h.logBuf.String())
-	}
-}
-
-func TestHandoverDrainsBeforeExit(t *testing.T) {
-	h := startControlPlane(t, defaultOpts())
-
-	db := h.openConn(t)
-	var warmup int
-	if err := db.QueryRow("SELECT 1").Scan(&warmup); err != nil {
-		t.Fatalf("Warmup query failed: %v", err)
-	}
-
-	// Trigger handover while the connection is idle in the pool.
-	// The old CP's handleConnection goroutine is blocked in ReadMessage,
-	// waiting for the next query. This keeps wg at 1, so drain blocks.
-	h.doHandover(t)
-	oldPid := h.cmd.Process.Pid
-
-	// Wait long enough for the race to manifest. Without the fix, main()
-	// returns within milliseconds of acceptLoop detecting the closed
-	// listener, killing the handleConnection goroutine.
-	time.Sleep(3 * time.Second)
-
-	// The old CP process must still be alive — it should be waiting for
-	// this idle connection to close (drain). Without the fix, main()
-	// already returned and the process exited.
-	if err := syscall.Kill(oldPid, 0); err != nil {
-		t.Fatalf("Old CP (pid %d) died while connection still open.\n"+
-			"acceptLoop returned and main() exited before drain completed.\n"+
-			"Logs:\n%s", oldPid, h.logBuf.String())
-	}
-	t.Logf("Old CP (pid %d) still alive 3s after handover — drain is active", oldPid)
-
-	// Close the connection to unblock the drain.
-	_ = db.Close()
-
-	// Verify the old CP went through the proper drain → exit path
-	if err := h.waitForLog("All connections drained after handover.", 30*time.Second); err != nil {
-		t.Fatalf("Old CP did not drain properly.\nLogs:\n%s", h.logBuf.String())
-	}
-	if err := h.waitForLog("Old control plane exiting after handover.", 10*time.Second); err != nil {
-		t.Fatalf("Old CP did not exit via handover path.\nLogs:\n%s", h.logBuf.String())
 	}
 }
