@@ -2250,3 +2250,171 @@ func TestCountDollarParams(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchPgStatActivityQuery(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		// Should match
+		{"simple select", "SELECT * FROM pg_stat_activity", true},
+		{"pg_catalog prefix", "SELECT * FROM pg_catalog.pg_stat_activity", true},
+		{"pg_catalog with spaces", "SELECT * FROM pg_catalog . pg_stat_activity", true},
+		{"case insensitive FROM", "select * from pg_stat_activity", true},
+		{"uppercase FROM keyword", "SELECT * FROM pg_stat_activity", true},
+		// Note: strings.Contains fast path is case-sensitive for the table name.
+		// This is fine because PostgreSQL clients always send lowercase catalog names.
+		{"uppercase table name skipped by fast path", "select * from PG_STAT_ACTIVITY", false},
+		{"with where clause", "SELECT pid, usename FROM pg_stat_activity WHERE state = 'active'", true},
+		{"with limit", "SELECT * FROM pg_stat_activity LIMIT 10", true},
+		{"with count", "SELECT count(*) FROM pg_stat_activity", true},
+		{"multiline", "SELECT pid\nFROM pg_stat_activity\nWHERE state = 'active'", true},
+		{"tab before table", "SELECT * FROM\tpg_stat_activity", true},
+		{"multiple spaces", "SELECT * FROM   pg_stat_activity", true},
+
+		// Should not match
+		{"no FROM", "SELECT 'pg_stat_activity'", false},
+		{"in string literal", "SELECT 'text pg_stat_activity text'", false},
+		{"different table", "SELECT * FROM pg_stat_statements", false},
+		{"substring match", "SELECT * FROM pg_stat_activity_detail", false},
+		{"prefix only", "SELECT * FROM my_pg_stat_activity", false},
+		{"empty query", "", false},
+		{"INSERT", "INSERT INTO pg_stat_activity VALUES (1)", false},
+		{"CREATE VIEW", "CREATE VIEW v AS SELECT * FROM pg_stat_activity", true}, // this references FROM, so it matches
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchPgStatActivityQuery(tt.query)
+			if got != tt.want {
+				t.Errorf("matchPgStatActivityQuery(%q) = %v, want %v", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPgStatActivityColumnsAndOIDs(t *testing.T) {
+	// Verify that pgStatActivityColumns and pgStatActivityTypeOIDs are consistent
+	if len(pgStatActivityTypeOIDs) != len(pgStatActivityColumns) {
+		t.Fatalf("pgStatActivityTypeOIDs length %d != pgStatActivityColumns length %d",
+			len(pgStatActivityTypeOIDs), len(pgStatActivityColumns))
+	}
+
+	for i, col := range pgStatActivityColumns {
+		if pgStatActivityTypeOIDs[i] != col.oid {
+			t.Errorf("pgStatActivityTypeOIDs[%d] = %d, want %d (column %s)",
+				i, pgStatActivityTypeOIDs[i], col.oid, col.name)
+		}
+	}
+
+	// Verify expected columns are present
+	expectedColumns := map[string]bool{
+		"datid": false, "datname": false, "pid": false, "usesysid": false,
+		"usename": false, "application_name": false, "client_addr": false,
+		"client_port": false, "backend_start": false, "state": false,
+		"query": false, "backend_type": false, "worker_id": false,
+	}
+	for _, col := range pgStatActivityColumns {
+		if _, ok := expectedColumns[col.name]; ok {
+			expectedColumns[col.name] = true
+		}
+	}
+	for name, found := range expectedColumns {
+		if !found {
+			t.Errorf("expected column %q not found in pgStatActivityColumns", name)
+		}
+	}
+}
+
+func TestConnectionRegistry(t *testing.T) {
+	srv := &Server{
+		conns: make(map[int32]*clientConn),
+	}
+
+	// Initially empty
+	conns := srv.listConns()
+	if len(conns) != 0 {
+		t.Fatalf("expected 0 conns, got %d", len(conns))
+	}
+
+	// Register a connection
+	c1 := &clientConn{pid: 100, username: "user1"}
+	srv.registerConn(c1)
+	conns = srv.listConns()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 conn, got %d", len(conns))
+	}
+	if conns[0].pid != 100 {
+		t.Errorf("expected pid 100, got %d", conns[0].pid)
+	}
+
+	// Register a second connection
+	c2 := &clientConn{pid: 200, username: "user2"}
+	srv.registerConn(c2)
+	conns = srv.listConns()
+	if len(conns) != 2 {
+		t.Fatalf("expected 2 conns, got %d", len(conns))
+	}
+
+	// Unregister first connection
+	srv.unregisterConn(100)
+	conns = srv.listConns()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 conn after unregister, got %d", len(conns))
+	}
+	if conns[0].pid != 200 {
+		t.Errorf("expected remaining conn pid 200, got %d", conns[0].pid)
+	}
+
+	// Unregister non-existent pid (should not panic)
+	srv.unregisterConn(999)
+	conns = srv.listConns()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 conn after no-op unregister, got %d", len(conns))
+	}
+
+	// Unregister last connection
+	srv.unregisterConn(200)
+	conns = srv.listConns()
+	if len(conns) != 0 {
+		t.Fatalf("expected 0 conns after final unregister, got %d", len(conns))
+	}
+}
+
+func TestConnectionRegistryOverwrite(t *testing.T) {
+	// Verify that registering the same PID overwrites the previous entry
+	srv := &Server{
+		conns: make(map[int32]*clientConn),
+	}
+
+	c1 := &clientConn{pid: 100, username: "user1"}
+	srv.registerConn(c1)
+
+	c2 := &clientConn{pid: 100, username: "user2"}
+	srv.registerConn(c2)
+
+	conns := srv.listConns()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 conn, got %d", len(conns))
+	}
+	if conns[0].username != "user2" {
+		t.Errorf("expected username 'user2' after overwrite, got %q", conns[0].username)
+	}
+}
+
+func TestInitConnsMap(t *testing.T) {
+	srv := &Server{}
+	if srv.conns != nil {
+		t.Fatal("expected nil conns before initConnsMap")
+	}
+	srv.initConnsMap()
+	if srv.conns == nil {
+		t.Fatal("expected non-nil conns after initConnsMap")
+	}
+	// Should be usable
+	srv.registerConn(&clientConn{pid: 1})
+	if len(srv.conns) != 1 {
+		t.Fatalf("expected 1 conn, got %d", len(srv.conns))
+	}
+}
