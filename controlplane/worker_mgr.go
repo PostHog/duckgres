@@ -29,11 +29,21 @@ type ManagedWorker struct {
 	socketPath     string
 	bearerToken    string
 	client         *flightsql.Client
-	parentListener net.Listener  // CP-side listener; closed during retire to remove socket file
-	done           chan struct{} // closed when process exits
+	parentListener net.Listener     // CP-side listener; lifecycle managed by releaseSocket
+	prebound       *preboundSocket  // non-nil if using a pre-bound socket slot
+	done           chan struct{}    // closed when process exits
 	exitErr        error
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
+}
+
+// preboundSocket is a Unix socket pre-bound at startup while the socket
+// directory is verified writable. This avoids EROFS errors that can occur
+// later under systemd's ProtectSystem=strict when the RuntimeDirectory
+// bind mount goes read-only.
+type preboundSocket struct {
+	socketPath string
+	listener   net.Listener
 }
 
 type FlightWorkerPool struct {
@@ -48,6 +58,9 @@ type FlightWorkerPool struct {
 	idleTimeout  time.Duration // how long to keep an idle worker alive
 	shuttingDown bool
 	shutdownCh   chan struct{} // closed by ShutdownAll to stop idle reaper
+
+	preboundMu sync.Mutex
+	prebound   []*preboundSocket // available pre-bound socket slots
 }
 
 // NewFlightWorkerPool creates a new worker pool.
@@ -66,34 +79,125 @@ func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWo
 	return pool
 }
 
+// PreBindSockets eagerly binds count Unix sockets at startup while the socket
+// directory is verified writable. Under systemd's ProtectSystem=strict, the
+// RuntimeDirectory bind mount can go read-only after the service finishes
+// starting (e.g., after a handover or namespace event). Pre-binding ensures
+// sockets are available regardless of later filesystem state.
+func (p *FlightWorkerPool) PreBindSockets(count int) error {
+	p.preboundMu.Lock()
+	defer p.preboundMu.Unlock()
+
+	for i := 0; i < count; i++ {
+		socketPath := fmt.Sprintf("%s/worker-%d.sock", p.socketDir, i)
+		_ = os.Remove(socketPath)
+		ln, err := net.Listen("unix", socketPath)
+		if err != nil {
+			// Clean up already-bound sockets on failure
+			for _, ps := range p.prebound {
+				_ = ps.listener.Close()
+			}
+			p.prebound = nil
+			return fmt.Errorf("pre-bind worker socket %s: %w", socketPath, err)
+		}
+		// Prevent Close() from removing the socket file. During handover,
+		// the old CP's Close() would otherwise delete socket files that the
+		// new CP has already replaced with its own pre-bound sockets.
+		// Socket files are cleaned up by os.Remove in PreBindSockets at next startup.
+		ln.(*net.UnixListener).SetUnlinkOnClose(false)
+		if err := os.Chmod(socketPath, 0700); err != nil {
+			slog.Warn("Failed to set pre-bound socket permissions.", "error", err)
+		}
+		p.prebound = append(p.prebound, &preboundSocket{socketPath: socketPath, listener: ln})
+	}
+	slog.Info("Pre-bound worker sockets.", "count", count)
+	return nil
+}
+
+func (p *FlightWorkerPool) takePrebound() *preboundSocket {
+	p.preboundMu.Lock()
+	defer p.preboundMu.Unlock()
+	if len(p.prebound) == 0 {
+		return nil
+	}
+	n := len(p.prebound) - 1
+	ps := p.prebound[n]
+	p.prebound = p.prebound[:n]
+	return ps
+}
+
+func (p *FlightWorkerPool) returnPrebound(ps *preboundSocket) {
+	p.preboundMu.Lock()
+	defer p.preboundMu.Unlock()
+	p.prebound = append(p.prebound, ps)
+}
+
+// releaseWorkerSocket returns a pre-bound socket to the pool for reuse, or
+// closes the listener and removes the socket file for non-pre-bound sockets.
+func (p *FlightWorkerPool) releaseWorkerSocket(w *ManagedWorker) {
+	if w.prebound != nil {
+		p.returnPrebound(w.prebound)
+		w.prebound = nil
+	} else {
+		if w.parentListener != nil {
+			_ = w.parentListener.Close()
+		}
+		_ = os.Remove(w.socketPath)
+	}
+}
+
+// closeAllPrebound permanently closes all remaining pre-bound sockets.
+// Called during ShutdownAll. Does NOT remove socket files — during handover,
+// the new CP may have already replaced them. Stale files are cleaned up by
+// the next startup's PreBindSockets.
+func (p *FlightWorkerPool) closeAllPrebound() {
+	p.preboundMu.Lock()
+	defer p.preboundMu.Unlock()
+	for _, ps := range p.prebound {
+		_ = ps.listener.Close()
+	}
+	p.prebound = nil
+}
+
 // SpawnWorker starts a new duckdb-service worker process.
-// The control plane pre-binds the Unix socket and passes the listening FD to
-// the worker via cmd.ExtraFiles. This avoids the worker needing filesystem
-// write access to the socket directory, which can fail with EROFS under
-// systemd's ProtectSystem=strict after a handover.
+// It uses a pre-bound socket from the pool if available, falling back to
+// binding a new socket (which may fail with EROFS under systemd's
+// ProtectSystem=strict after startup).
 func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	token := generateToken()
-	socketPath := fmt.Sprintf("%s/worker-%d.sock", p.socketDir, id)
 
-	// Clean up stale socket
-	_ = os.Remove(socketPath)
+	// Try to use a pre-bound socket first. These are bound eagerly at startup
+	// while the socket directory is verified writable, avoiding EROFS errors
+	// that can occur later under systemd ProtectSystem=strict.
+	ps := p.takePrebound()
 
-	// Pre-bind the socket in the control plane process, which has verified
-	// write access to the socket directory. The worker inherits the FD.
-	ln, err := net.Listen("unix", socketPath)
-	if err != nil {
-		return fmt.Errorf("bind worker socket %s: %w", socketPath, err)
-	}
-
-	// Restrict socket permissions to owner only
-	if err := os.Chmod(socketPath, 0700); err != nil {
-		slog.Warn("Failed to set worker socket permissions.", "error", err)
+	var ln net.Listener
+	var socketPath string
+	if ps != nil {
+		ln = ps.listener
+		socketPath = ps.socketPath
+	} else {
+		// Fallback: bind a new socket (may fail with EROFS if dir went read-only)
+		socketPath = fmt.Sprintf("%s/worker-%d.sock", p.socketDir, id)
+		_ = os.Remove(socketPath)
+		var err error
+		ln, err = net.Listen("unix", socketPath)
+		if err != nil {
+			return fmt.Errorf("bind worker socket %s: %w", socketPath, err)
+		}
+		if err := os.Chmod(socketPath, 0700); err != nil {
+			slog.Warn("Failed to set worker socket permissions.", "error", err)
+		}
 	}
 
 	// Get a dup'd FD to pass to the child. ExtraFiles[0] becomes FD 3.
 	file, err := ln.(*net.UnixListener).File()
 	if err != nil {
-		_ = ln.Close()
+		if ps != nil {
+			p.returnPrebound(ps)
+		} else {
+			_ = ln.Close()
+		}
 		return fmt.Errorf("get listener fd for worker %d: %w", id, err)
 	}
 
@@ -116,7 +220,11 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 
 	if err := cmd.Start(); err != nil {
 		_ = file.Close()
-		_ = ln.Close()
+		if ps != nil {
+			p.returnPrebound(ps)
+		} else {
+			_ = ln.Close()
+		}
 		return fmt.Errorf("spawn worker %d: %w", id, err)
 	}
 
@@ -130,6 +238,7 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 		socketPath:     socketPath,
 		bearerToken:    token,
 		parentListener: ln,
+		prebound:       ps,
 		done:           done,
 	}
 
@@ -147,7 +256,11 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 		// Kill the process if we can't connect
 		_ = cmd.Process.Kill()
 		<-done
-		_ = ln.Close()
+		if ps != nil {
+			p.returnPrebound(ps)
+		} else {
+			_ = ln.Close()
+		}
 		return fmt.Errorf("worker %d failed to start: %w", id, err)
 	}
 	w.client = client
@@ -420,7 +533,7 @@ func (p *FlightWorkerPool) reapIdleWorkers() {
 		slog.Info("Reaping idle workers.", "count", len(toRetire))
 		observeControlPlaneWorkers(workerCount)
 		for _, w := range toRetire {
-			go retireWorkerProcess(w)
+			go p.retireWorkerProcess(w)
 		}
 	}
 }
@@ -484,7 +597,7 @@ func (p *FlightWorkerPool) cleanDeadWorkersLocked() {
 		select {
 		case <-w.done:
 			delete(p.workers, id)
-			go cleanupDeadWorker(w)
+			go p.cleanupDeadWorker(w)
 		default:
 		}
 	}
@@ -493,14 +606,11 @@ func (p *FlightWorkerPool) cleanDeadWorkersLocked() {
 // cleanupDeadWorker releases resources for a worker whose process has already
 // exited. Called from cleanDeadWorkersLocked when a dead worker is discovered
 // before the HealthCheckLoop gets to it.
-func cleanupDeadWorker(w *ManagedWorker) {
+func (p *FlightWorkerPool) cleanupDeadWorker(w *ManagedWorker) {
 	if w.client != nil {
 		_ = w.client.Close()
 	}
-	if w.parentListener != nil {
-		_ = w.parentListener.Close()
-	}
-	_ = os.Remove(w.socketPath)
+	p.releaseWorkerSocket(w)
 }
 
 // RetireWorker stops a worker process and cleans up its resources.
@@ -520,7 +630,7 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 
 	// Run the actual process cleanup asynchronously so DestroySession
 	// doesn't block the connection handler goroutine for up to 3s+.
-	go retireWorkerProcess(w)
+	go p.retireWorkerProcess(w)
 }
 
 // RetireWorkerIfNoSessions retires a worker only if it has no active sessions
@@ -545,7 +655,7 @@ func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 		workerCount := len(p.workers)
 		p.mu.Unlock()
 		observeControlPlaneWorkers(workerCount)
-		go retireWorkerProcess(w)
+		go p.retireWorkerProcess(w)
 		return true
 	}
 	p.mu.Unlock()
@@ -553,7 +663,7 @@ func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 }
 
 // retireWorkerProcess handles the actual process shutdown and socket cleanup.
-func retireWorkerProcess(w *ManagedWorker) {
+func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 	// Check if the process already exited before we try to retire it.
 	// This happens when a worker crashes and the client disconnect triggers
 	// RetireWorker before the health check loop detects the crash.
@@ -596,11 +706,8 @@ func retireWorkerProcess(w *ManagedWorker) {
 		_ = w.client.Close()
 	}
 
-	// Close the CP-side listener (removes the socket file) and belt-and-suspenders remove.
-	if w.parentListener != nil {
-		_ = w.parentListener.Close()
-	}
-	_ = os.Remove(w.socketPath)
+	// Return pre-bound socket to pool for reuse, or close non-pre-bound listener.
+	p.releaseWorkerSocket(w)
 }
 
 // ShutdownAll stops all workers gracefully.
@@ -636,16 +743,22 @@ func (p *FlightWorkerPool) ShutdownAll() {
 		if w.client != nil {
 			_ = w.client.Close()
 		}
+		// Close listeners but do NOT remove socket files. During handover,
+		// the new CP may have already re-created these files via PreBindSockets.
+		// Removing them would break the new CP's pre-bound sockets. Stale
+		// files are harmlessly cleaned up by the next PreBindSockets call.
 		if w.parentListener != nil {
 			_ = w.parentListener.Close()
 		}
-		_ = os.Remove(w.socketPath)
 	}
 
 	p.mu.Lock()
 	p.workers = make(map[int]*ManagedWorker)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(0)
+
+	// Close any remaining pre-bound sockets not assigned to workers.
+	p.closeAllPrebound()
 }
 
 // WorkerCrashHandler is called when a worker crash is detected, before respawning.
@@ -718,10 +831,7 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						if w.client != nil {
 							_ = w.client.Close()
 						}
-						if w.parentListener != nil {
-							_ = w.parentListener.Close()
-						}
-						_ = os.Remove(w.socketPath)
+						p.releaseWorkerSocket(w)
 					default:
 						// Worker is alive, do a health check.
 						// Recover nil-pointer panics: w.client.Close() (from a
@@ -773,10 +883,7 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 									if w.client != nil {
 										_ = w.client.Close()
 									}
-									if w.parentListener != nil {
-										_ = w.parentListener.Close()
-									}
-									_ = os.Remove(w.socketPath)
+									p.releaseWorkerSocket(w)
 								}
 							}
 						} else {

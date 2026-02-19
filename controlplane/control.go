@@ -157,6 +157,17 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
 	pool.idleTimeout = cfg.WorkerIdleTimeout
 
+	// Pre-bind worker sockets eagerly while the socket directory is verified
+	// writable. Under systemd's ProtectSystem=strict, the RuntimeDirectory
+	// bind mount can go read-only after startup. Pre-binding ensures all
+	// maxWorkers sockets are available regardless of later filesystem state.
+	if maxWorkers > 0 {
+		if err := pool.PreBindSockets(maxWorkers); err != nil {
+			slog.Error("Failed to pre-bind worker sockets.", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)

@@ -83,6 +83,8 @@ func TestHealthCheckFailureCountingCleanupOnWorkerExit(t *testing.T) {
 }
 
 func TestRetireWorkerProcessAlreadyDead(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+
 	// Create a process that exits immediately so we can test the alreadyDead path
 	cmd := exec.Command("true")
 	if err := cmd.Start(); err != nil {
@@ -104,7 +106,7 @@ func TestRetireWorkerProcessAlreadyDead(t *testing.T) {
 	<-done
 
 	// retireWorkerProcess should detect alreadyDead and not panic
-	retireWorkerProcess(w)
+	pool.retireWorkerProcess(w)
 
 	// Verify the process state is accessible
 	if w.cmd.ProcessState == nil {
@@ -116,6 +118,8 @@ func TestRetireWorkerProcessAlreadyDead(t *testing.T) {
 }
 
 func TestRetireWorkerProcessAlreadyDeadNonZeroExit(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+
 	cmd := exec.Command("false")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("failed to start test process: %v", err)
@@ -134,7 +138,7 @@ func TestRetireWorkerProcessAlreadyDeadNonZeroExit(t *testing.T) {
 	}()
 	<-done
 
-	retireWorkerProcess(w)
+	pool.retireWorkerProcess(w)
 
 	if w.exitErr == nil {
 		t.Fatal("expected non-nil exitErr for process that exited with non-zero code")
@@ -145,6 +149,8 @@ func TestRetireWorkerProcessAlreadyDeadNonZeroExit(t *testing.T) {
 }
 
 func TestRetireWorkerProcessGracefulShutdown(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+
 	// Start a process that will respond to SIGINT (sleep)
 	cmd := exec.Command("sleep", "60")
 	if err := cmd.Start(); err != nil {
@@ -164,7 +170,7 @@ func TestRetireWorkerProcessGracefulShutdown(t *testing.T) {
 	}()
 
 	// retireWorkerProcess should send SIGINT and the process should exit
-	retireWorkerProcess(w)
+	pool.retireWorkerProcess(w)
 
 	// Verify the done channel was closed (process exited)
 	select {
