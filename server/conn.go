@@ -37,11 +37,11 @@ var errCancelHandled = errors.New("cancel request handled")
 // In standalone mode, os.Getpid() is the same for all connections, which causes
 // the pg_stat_activity registry (keyed by PID) to overwrite entries when connections
 // are replaced. Using a counter ensures each connection has a unique identity.
-// The counter starts at os.Getpid() and increments, so the first connection's PID
-// matches the OS PID (useful for debugging) and subsequent PIDs are unique.
+// The counter starts at os.Getpid()-1 so the first Add(1) returns os.Getpid(),
+// matching the OS PID for debugging. Subsequent connections get unique incrementing PIDs.
 var pidCounter = func() *atomic.Int32 {
 	c := &atomic.Int32{}
-	c.Store(int32(os.Getpid()))
+	c.Store(int32(os.Getpid()) - 1)
 	return c
 }()
 

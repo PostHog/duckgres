@@ -380,7 +380,7 @@ func TestPgStatActivityExtendedQuery(t *testing.T) {
 				}
 				count++
 			}
-			rows.Close()
+			_ = rows.Close()
 			if count < 1 {
 				t.Errorf("iteration %d: expected at least 1 row, got %d", i, count)
 			}
