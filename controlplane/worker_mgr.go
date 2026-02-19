@@ -40,6 +40,7 @@ type FlightWorkerPool struct {
 	mu           sync.RWMutex
 	workers      map[int]*ManagedWorker
 	nextWorkerID int // auto-incrementing worker ID
+	spawning     int // number of workers currently being spawned (not yet in workers map)
 	socketDir    string
 	configPath   string
 	binaryPath   string
@@ -306,9 +307,16 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 	if p.maxWorkers == 0 || liveCount < p.maxWorkers {
 		id := p.nextWorkerID
 		p.nextWorkerID++
+		p.spawning++
 		p.mu.Unlock()
 
-		if err := p.SpawnWorker(id); err != nil {
+		err := p.SpawnWorker(id)
+
+		p.mu.Lock()
+		p.spawning--
+		p.mu.Unlock()
+
+		if err != nil {
 			return nil, err
 		}
 
@@ -332,11 +340,27 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 	}
 
 	// All workers are dead (already cleaned above). Spawn a replacement.
+	// Still respect maxWorkers — another goroutine may already be spawning.
+	liveCount = p.liveWorkerCountLocked()
+	if p.maxWorkers > 0 && liveCount >= p.maxWorkers {
+		// A spawn is already in progress; wait for it to finish and use that worker.
+		p.mu.Unlock()
+		// Brief backoff then retry — the in-progress spawn will add a worker shortly.
+		time.Sleep(100 * time.Millisecond)
+		return p.AcquireWorker(ctx)
+	}
 	id := p.nextWorkerID
 	p.nextWorkerID++
+	p.spawning++
 	p.mu.Unlock()
 
-	if err := p.SpawnWorker(id); err != nil {
+	err := p.SpawnWorker(id)
+
+	p.mu.Lock()
+	p.spawning--
+	p.mu.Unlock()
+
+	if err != nil {
 		return nil, err
 	}
 
@@ -435,9 +459,12 @@ func (p *FlightWorkerPool) leastLoadedWorkerLocked() *ManagedWorker {
 }
 
 // liveWorkerCountLocked returns the number of workers whose process is still
-// running (done channel not closed). Caller must hold p.mu.
+// running (done channel not closed) plus workers currently being spawned.
+// Including spawning prevents a TOCTOU race where concurrent AcquireWorker
+// calls all see the same stale count and exceed maxWorkers.
+// Caller must hold p.mu.
 func (p *FlightWorkerPool) liveWorkerCountLocked() int {
-	count := 0
+	count := p.spawning
 	for _, w := range p.workers {
 		select {
 		case <-w.done:
