@@ -41,7 +41,8 @@ type SessionPool struct {
 	startTime   time.Time
 	maxSessions int
 	stopCh      chan struct{}
-	warmupDB    *sql.DB // Keep this open to keep shared cache alive
+	warmupDB    *sql.DB  // Keep this open to keep shared cache alive
+	warmupDone  chan struct{} // Closed when Warmup() completes (success or failure)
 }
 
 type trackedTx struct {
@@ -82,6 +83,7 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		startTime:   time.Now(),
 		maxSessions: cfg.MaxSessions,
 		stopCh:      make(chan struct{}),
+		warmupDone:  make(chan struct{}),
 	}
 	go pool.reapLoop()
 
@@ -95,6 +97,8 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 // This loads extensions and attaches catalogs so that subsequent session
 // creations are nearly instantaneous.
 func (p *SessionPool) Warmup() error {
+	defer close(p.warmupDone)
+
 	if os.Getenv("DUCKGRES_MODE") != "duckdb-service" {
 		return nil
 	}
@@ -283,6 +287,13 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 		conn *sql.Conn
 		err  error
 	)
+
+	// Wait for warmup to complete before checking warmupDB.
+	// Without this, a CreateSession arriving while warmup is in progress would
+	// see warmupDB==nil and call CreateDBConnection concurrently with warmup,
+	// causing two goroutines to LOAD native extensions simultaneously in the
+	// same process — which corrupts the heap (malloc: unaligned tcache chunk).
+	<-p.warmupDone
 
 	// Use shared warmupDB if available (highly preferred for performance)
 	p.mu.RLock()
