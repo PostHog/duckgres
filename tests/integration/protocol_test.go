@@ -11,8 +11,8 @@ import (
 )
 
 // TestPgxPing tests that pgx.Conn.Ping() works correctly.
-// pgx sends "-- ping" via the extended query protocol for Ping(), which exercises
-// empty/comment-only query handling through Parse/Bind/Execute.
+// pgx sends "-- ping" via the simple query protocol for Ping(), which exercises
+// comment-only query handling through handleQuery.
 func TestPgxPing(t *testing.T) {
 	connStr := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass dbname=test sslmode=require", testHarness.dgPort)
 

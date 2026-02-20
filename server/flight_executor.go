@@ -129,10 +129,9 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return nil, ErrWorkerDead
 	}
 
-	// Return empty results for queries that are only semicolons/whitespace.
-	// These represent PostgreSQL client pings (e.g., pgx sends ";").
-	trimmed := strings.TrimSpace(query)
-	if trimmed == "" || IsEmptyQuery(trimmed) {
+	// Return empty results for queries that are only semicolons, whitespace,
+	// and/or comments. These represent PostgreSQL client pings (e.g., pgx sends "-- ping").
+	if IsEmptyQuery(query) {
 		return &emptyRowSet{}, nil
 	}
 
@@ -185,9 +184,8 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 		return nil, ErrWorkerDead
 	}
 
-	// Return zero rows affected for queries that are only semicolons/whitespace.
-	trimmed := strings.TrimSpace(query)
-	if trimmed == "" || IsEmptyQuery(trimmed) {
+	// Return zero rows affected for empty/comment-only queries.
+	if IsEmptyQuery(query) {
 		return &flightExecResult{rowsAffected: 0}, nil
 	}
 

@@ -103,8 +103,8 @@ func GenerateSecretKey() int32 {
 	return generateSecretKey()
 }
 
-// IsEmptyQuery checks if a query contains only semicolons and whitespace.
-// PostgreSQL returns EmptyQueryResponse for queries like ";" or ";;;" or "; ; ;".
+// IsEmptyQuery checks if a query contains only semicolons, whitespace, and/or SQL comments.
+// PostgreSQL returns EmptyQueryResponse for queries like ";", "-- ping", "/* */", etc.
 func IsEmptyQuery(query string) bool {
 	return isEmptyQuery(query)
 }

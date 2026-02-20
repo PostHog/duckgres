@@ -205,6 +205,13 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 	schema := handle.Schema
 
 	ch := make(chan flight.StreamChunk, 10)
+
+	// Empty queries have no rows to fetch — return an empty stream immediately.
+	if isEmptyFlightQuery(handle.Query) {
+		close(ch)
+		return schema, ch, nil
+	}
+
 	go func() {
 		defer close(ch)
 		defer func() {
@@ -464,6 +471,13 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 	schema := handle.Schema
 
 	ch := make(chan flight.StreamChunk, 10)
+
+	// Empty queries have no rows to fetch — return an empty stream immediately.
+	if isEmptyFlightQuery(handle.Query) {
+		close(ch)
+		return schema, ch, nil
+	}
+
 	go func() {
 		defer close(ch)
 		var rows *sql.Rows

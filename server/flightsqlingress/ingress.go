@@ -328,8 +328,8 @@ func (h *ControlPlaneFlightSQLHandler) GetFlightInfoStatement(ctx context.Contex
 
 	query := cmd.GetQuery()
 
-	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
-	if server.IsEmptyQuery(strings.TrimSpace(query)) || strings.TrimSpace(query) == "" {
+	// Handle empty queries (e.g., ";" or "-- ping" from PostgreSQL client pings).
+	if server.IsEmptyQuery(query) {
 		emptySchema := arrow.NewSchema(nil, nil)
 		handleID := s.nextHandle("query")
 		s.addQuery(handleID, &flightQueryHandle{
@@ -439,10 +439,9 @@ func (h *ControlPlaneFlightSQLHandler) DoPutCommandStatementUpdate(ctx context.C
 		return 0, err
 	}
 
-	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
+	// Handle empty queries (e.g., ";" or "-- ping" from PostgreSQL client pings).
 	query := cmd.GetQuery()
-	trimmed := strings.TrimSpace(query)
-	if trimmed == "" || server.IsEmptyQuery(trimmed) {
+	if server.IsEmptyQuery(query) {
 		return 0, nil
 	}
 
@@ -556,9 +555,8 @@ func (h *ControlPlaneFlightSQLHandler) CreatePreparedStatement(ctx context.Conte
 
 	query := req.GetQuery()
 
-	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
-	trimmed := strings.TrimSpace(query)
-	if trimmed == "" || server.IsEmptyQuery(trimmed) {
+	// Handle empty queries (e.g., ";" or "-- ping" from PostgreSQL client pings).
+	if server.IsEmptyQuery(query) {
 		emptySchema := arrow.NewSchema(nil, nil)
 		handleID := s.nextHandle("prep")
 		s.addQuery(handleID, &flightQueryHandle{
