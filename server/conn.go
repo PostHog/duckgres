@@ -2178,7 +2178,9 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 	// DuckDB syntax: COPY table FROM 'file' (FORMAT CSV, HEADER, NULL 'value', DELIMITER ',', QUOTE '"')
 	// AUTO_DETECT FALSE disables sniffer to prevent it from overriding our settings
 	// STRICT_MODE FALSE allows reading rows that don't strictly comply with CSV standard
-	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE"}
+	// PARALLEL FALSE avoids "Parallel CSV Reader does not support full read" errors
+	// on files streamed from COPY FROM STDIN (temp files with no seek support for sniffing)
+	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE", "PARALLEL FALSE"}
 	if opts.HasHeader {
 		copyOptions = append(copyOptions, "HEADER")
 	}
