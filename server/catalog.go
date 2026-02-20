@@ -880,6 +880,67 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// version - return PostgreSQL-compatible version string
 		// Fivetran and other tools check this to determine compatibility
 		`CREATE OR REPLACE MACRO version() AS 'PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit (Duckgres/DuckDB)'`,
+
+		// div - integer division (PostgreSQL div(y, x) returns integer quotient)
+		`CREATE OR REPLACE MACRO div(y, x) AS y // x`,
+
+		// array_remove - remove all occurrences of element from array
+		`CREATE OR REPLACE MACRO array_remove(arr, elem) AS list_filter(arr, x -> x != elem)`,
+
+		// to_number - parse formatted number string to numeric
+		// Simplified: strips common formatting characters and casts to NUMERIC
+		`CREATE OR REPLACE MACRO to_number(text_val, fmt) AS CAST(REPLACE(REPLACE(REPLACE(text_val, ',', ''), ' ', ''), '$', '') AS NUMERIC)`,
+
+		// pg_backend_pid - process ID of the backend
+		`CREATE OR REPLACE MACRO pg_backend_pid() AS 0`,
+
+		// pg_total_relation_size - total disk space used by table (stub, returns 0)
+		`CREATE OR REPLACE MACRO pg_total_relation_size(rel) AS 0`,
+
+		// pg_relation_size - size of table on disk (stub, returns 0)
+		`CREATE OR REPLACE MACRO pg_relation_size(rel) AS 0`,
+
+		// pg_table_size - size of table excluding indexes (stub, returns 0)
+		`CREATE OR REPLACE MACRO pg_table_size(rel) AS 0`,
+
+		// pg_indexes_size - total size of indexes on table (stub, returns 0)
+		`CREATE OR REPLACE MACRO pg_indexes_size(rel) AS 0`,
+
+		// pg_database_size - size of a database (stub, returns 0)
+		`CREATE OR REPLACE MACRO pg_database_size(db_name) AS 0`,
+
+		// pg_size_pretty - format byte count as human-readable string
+		// Uses // (integer division) since DuckDB macro params lose integer typing with /
+		// For sub-unit precision, PostgreSQL shows one decimal place for values < 10 units
+		`CREATE OR REPLACE MACRO pg_size_pretty(sz) AS
+			CASE
+				WHEN sz < 1024 THEN sz::VARCHAR || ' bytes'
+				WHEN sz < 10240 THEN ROUND(sz / 1024.0, 1)::VARCHAR || ' kB'
+				WHEN sz < 1048576 THEN (sz // 1024)::VARCHAR || ' kB'
+				WHEN sz < 10485760 THEN ROUND(sz / 1048576.0, 1)::VARCHAR || ' MB'
+				WHEN sz < 1073741824 THEN (sz // 1048576)::VARCHAR || ' MB'
+				WHEN sz < 10737418240 THEN ROUND(sz / 1073741824.0, 1)::VARCHAR || ' GB'
+				WHEN sz < 1099511627776 THEN (sz // 1073741824)::VARCHAR || ' GB'
+				ELSE (sz // 1099511627776)::VARCHAR || ' TB'
+			END`,
+
+		// txid_current - current transaction ID (stub, returns epoch-based pseudo ID)
+		`CREATE OR REPLACE MACRO txid_current() AS CAST(epoch_ms(now()) AS BIGINT)`,
+
+		// pg_current_xact_id - current transaction ID (PG 13+ name)
+		`CREATE OR REPLACE MACRO pg_current_xact_id() AS CAST(epoch_ms(now()) AS BIGINT)`,
+
+		// quote_ident - quote an identifier for use in SQL
+		`CREATE OR REPLACE MACRO quote_ident(identifier) AS '"' || REPLACE(CAST(identifier AS VARCHAR), '"', '""') || '"'`,
+
+		// quote_literal - quote a string for use in SQL
+		`CREATE OR REPLACE MACRO quote_literal(val) AS '''' || REPLACE(CAST(val AS VARCHAR), '''', '''''') || ''''`,
+
+		// quote_nullable - quote a value, or return NULL string for NULL
+		`CREATE OR REPLACE MACRO quote_nullable(val) AS
+			CASE WHEN val IS NULL THEN 'NULL'
+			ELSE '''' || REPLACE(CAST(val AS VARCHAR), '''', '''''') || ''''
+			END`,
 	}
 
 	for _, f := range functions {

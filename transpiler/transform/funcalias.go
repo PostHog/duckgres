@@ -28,6 +28,11 @@ var funcAliasMapping = map[string]string{
 	"current_catalog":  "current_catalog",
 }
 
+// FuncAliasNames returns all function names that need alias normalization.
+func FuncAliasNames() map[string]string {
+	return funcAliasMapping
+}
+
 func (t *FuncAliasTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
 	changed := false
 
