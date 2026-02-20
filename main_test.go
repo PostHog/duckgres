@@ -14,9 +14,10 @@ func envFromMap(values map[string]string) func(string) string {
 
 func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	fileCfg := &FileConfig{
-		Host:    "file-host",
-		Port:    5000,
-		DataDir: "/tmp/file-data",
+		Host:       "file-host",
+		Port:       5000,
+		FlightPort: 5001,
+		DataDir:    "/tmp/file-data",
 		TLS: TLSConfig{
 			Cert: "/tmp/file.crt",
 			Key:  "/tmp/file.key",
@@ -28,6 +29,7 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_HOST":              "env-host",
 		"DUCKGRES_PORT":              "6000",
+		"DUCKGRES_FLIGHT_PORT":       "6001",
 		"DUCKGRES_DATA_DIR":          "/tmp/env-data",
 		"DUCKGRES_CERT":              "/tmp/env.crt",
 		"DUCKGRES_KEY":               "/tmp/env.key",
@@ -39,6 +41,7 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		Set: map[string]bool{
 			"host":              true,
 			"port":              true,
+			"flight-port":       true,
 			"data-dir":          true,
 			"cert":              true,
 			"key":               true,
@@ -47,6 +50,7 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		},
 		Host:             "cli-host",
 		Port:             7000,
+		FlightPort:       7001,
 		DataDir:          "/tmp/cli-data",
 		CertFile:         "/tmp/cli.crt",
 		KeyFile:          "/tmp/cli.key",
@@ -59,6 +63,9 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	}
 	if resolved.Server.Port != 7000 {
 		t.Fatalf("port precedence mismatch: got %d", resolved.Server.Port)
+	}
+	if resolved.Server.FlightPort != 7001 {
+		t.Fatalf("flight port precedence mismatch: got %d", resolved.Server.FlightPort)
 	}
 	if resolved.Server.DataDir != "/tmp/cli-data" {
 		t.Fatalf("data dir precedence mismatch: got %q", resolved.Server.DataDir)
@@ -79,13 +86,15 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 
 func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	fileCfg := &FileConfig{
-		Host: "file-host",
-		Port: 5000,
+		Host:       "file-host",
+		Port:       5000,
+		FlightPort: 5001,
 	}
 
 	env := map[string]string{
-		"DUCKGRES_HOST": "env-host",
-		"DUCKGRES_PORT": "6000",
+		"DUCKGRES_HOST":        "env-host",
+		"DUCKGRES_PORT":        "6000",
+		"DUCKGRES_FLIGHT_PORT": "6001",
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
@@ -95,6 +104,9 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	}
 	if resolved.Server.Port != 6000 {
 		t.Fatalf("expected env port, got %d", resolved.Server.Port)
+	}
+	if resolved.Server.FlightPort != 6001 {
+		t.Fatalf("expected env flight port, got %d", resolved.Server.FlightPort)
 	}
 }
 
@@ -358,6 +370,125 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
+	fileCfg := &FileConfig{
+		FlightSessionIdleTTL:      "7m",
+		FlightSessionReapInterval: "45s",
+		FlightHandleIdleTTL:       "3m",
+		FlightSessionTokenTTL:     "2h",
+	}
+
+	env := map[string]string{
+		"DUCKGRES_FLIGHT_SESSION_IDLE_TTL":      "9m",
+		"DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL": "30s",
+		"DUCKGRES_FLIGHT_HANDLE_IDLE_TTL":       "4m",
+		"DUCKGRES_FLIGHT_SESSION_TOKEN_TTL":     "90m",
+	}
+
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set: map[string]bool{
+			"flight-session-idle-ttl":      true,
+			"flight-session-reap-interval": true,
+			"flight-handle-idle-ttl":       true,
+			"flight-session-token-ttl":     true,
+		},
+		FlightSessionIdleTTL:      "11m",
+		FlightSessionReapInterval: "15s",
+		FlightHandleIdleTTL:       "5m",
+		FlightSessionTokenTTL:     "75m",
+	}, envFromMap(env), nil)
+
+	if resolved.Server.FlightSessionIdleTTL != 11*time.Minute {
+		t.Fatalf("expected CLI flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
+	}
+	if resolved.Server.FlightSessionReapInterval != 15*time.Second {
+		t.Fatalf("expected CLI flight_session_reap_interval, got %s", resolved.Server.FlightSessionReapInterval)
+	}
+	if resolved.Server.FlightHandleIdleTTL != 5*time.Minute {
+		t.Fatalf("expected CLI flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
+	}
+	if resolved.Server.FlightSessionTokenTTL != 75*time.Minute {
+		t.Fatalf("expected CLI flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
+	}
+}
+
+func TestResolveEffectiveConfigFlightIngressDurationsFromFile(t *testing.T) {
+	fileCfg := &FileConfig{
+		FlightSessionIdleTTL:      "7m",
+		FlightSessionReapInterval: "45s",
+		FlightHandleIdleTTL:       "3m",
+		FlightSessionTokenTTL:     "2h",
+	}
+
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+
+	if resolved.Server.FlightSessionIdleTTL != 7*time.Minute {
+		t.Fatalf("expected file flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
+	}
+	if resolved.Server.FlightSessionReapInterval != 45*time.Second {
+		t.Fatalf("expected file flight_session_reap_interval, got %s", resolved.Server.FlightSessionReapInterval)
+	}
+	if resolved.Server.FlightHandleIdleTTL != 3*time.Minute {
+		t.Fatalf("expected file flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
+	}
+	if resolved.Server.FlightSessionTokenTTL != 2*time.Hour {
+		t.Fatalf("expected file flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
+	}
+}
+
+func TestResolveEffectiveConfigFlightIngressDurationsFromEnv(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_FLIGHT_SESSION_IDLE_TTL":      "9m",
+		"DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL": "30s",
+		"DUCKGRES_FLIGHT_HANDLE_IDLE_TTL":       "4m",
+		"DUCKGRES_FLIGHT_SESSION_TOKEN_TTL":     "30m",
+	}
+
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+
+	if resolved.Server.FlightSessionIdleTTL != 9*time.Minute {
+		t.Fatalf("expected env flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
+	}
+	if resolved.Server.FlightSessionReapInterval != 30*time.Second {
+		t.Fatalf("expected env flight_session_reap_interval, got %s", resolved.Server.FlightSessionReapInterval)
+	}
+	if resolved.Server.FlightHandleIdleTTL != 4*time.Minute {
+		t.Fatalf("expected env flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
+	}
+	if resolved.Server.FlightSessionTokenTTL != 30*time.Minute {
+		t.Fatalf("expected env flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
+	}
+}
+
+func TestResolveEffectiveConfigInvalidFlightPortEnv(t *testing.T) {
+	fileCfg := &FileConfig{
+		FlightPort: 8815,
+	}
+	env := map[string]string{
+		"DUCKGRES_FLIGHT_PORT": "not-a-number",
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.FlightPort != 8815 {
+		t.Fatalf("invalid env flight port should not override valid file value, got %d", resolved.Server.FlightPort)
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "Invalid DUCKGRES_FLIGHT_PORT") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about invalid DUCKGRES_FLIGHT_PORT, warnings: %v", warns)
+	}
+}
+
 func TestResolveEffectiveConfigPassthroughUsers(t *testing.T) {
 	fileCfg := &FileConfig{
 		PassthroughUsers: []string{"alice", "bob"},
@@ -378,5 +509,77 @@ func TestResolveEffectiveConfigPassthroughUsers(t *testing.T) {
 	resolved = resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.PassthroughUsers != nil {
 		t.Fatalf("expected nil passthrough users for empty config, got %v", resolved.Server.PassthroughUsers)
+	}
+}
+
+func TestResolveEffectiveConfigACME(t *testing.T) {
+	// Test YAML config
+	fileCfg := &FileConfig{
+		TLS: TLSConfig{
+			ACME: ACMEConfig{
+				Domain:   "test.us.duckgres.com",
+				Email:    "infra@posthog.com",
+				CacheDir: "/var/lib/duckgres/acme",
+			},
+		},
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.ACMEDomain != "test.us.duckgres.com" {
+		t.Fatalf("expected ACME domain from file, got %q", resolved.Server.ACMEDomain)
+	}
+	if resolved.Server.ACMEEmail != "infra@posthog.com" {
+		t.Fatalf("expected ACME email from file, got %q", resolved.Server.ACMEEmail)
+	}
+	if resolved.Server.ACMECacheDir != "/var/lib/duckgres/acme" {
+		t.Fatalf("expected ACME cache dir from file, got %q", resolved.Server.ACMECacheDir)
+	}
+
+	// Env overrides file
+	env := map[string]string{
+		"DUCKGRES_ACME_DOMAIN":    "env.us.duckgres.com",
+		"DUCKGRES_ACME_EMAIL":     "ops@posthog.com",
+		"DUCKGRES_ACME_CACHE_DIR": "/tmp/acme-cache",
+	}
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.ACMEDomain != "env.us.duckgres.com" {
+		t.Fatalf("expected ACME domain from env, got %q", resolved.Server.ACMEDomain)
+	}
+	if resolved.Server.ACMEEmail != "ops@posthog.com" {
+		t.Fatalf("expected ACME email from env, got %q", resolved.Server.ACMEEmail)
+	}
+	if resolved.Server.ACMECacheDir != "/tmp/acme-cache" {
+		t.Fatalf("expected ACME cache dir from env, got %q", resolved.Server.ACMECacheDir)
+	}
+
+	// CLI overrides env
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:          map[string]bool{"acme-domain": true, "acme-email": true, "acme-cache-dir": true},
+		ACMEDomain:   "cli.us.duckgres.com",
+		ACMEEmail:    "cli@posthog.com",
+		ACMECacheDir: "/cli/acme-cache",
+	}, envFromMap(env), nil)
+	if resolved.Server.ACMEDomain != "cli.us.duckgres.com" {
+		t.Fatalf("expected ACME domain from CLI, got %q", resolved.Server.ACMEDomain)
+	}
+	if resolved.Server.ACMEEmail != "cli@posthog.com" {
+		t.Fatalf("expected ACME email from CLI, got %q", resolved.Server.ACMEEmail)
+	}
+	if resolved.Server.ACMECacheDir != "/cli/acme-cache" {
+		t.Fatalf("expected ACME cache dir from CLI, got %q", resolved.Server.ACMECacheDir)
+	}
+}
+
+func TestResolveEffectiveConfigACMEEnvOnly(t *testing.T) {
+	// No file config, just env vars
+	env := map[string]string{
+		"DUCKGRES_ACME_DOMAIN": "envonly.us.duckgres.com",
+		"DUCKGRES_ACME_EMAIL":  "test@example.com",
+	}
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.ACMEDomain != "envonly.us.duckgres.com" {
+		t.Fatalf("expected ACME domain from env, got %q", resolved.Server.ACMEDomain)
+	}
+	if resolved.Server.ACMEEmail != "test@example.com" {
+		t.Fatalf("expected ACME email from env, got %q", resolved.Server.ACMEEmail)
 	}
 }

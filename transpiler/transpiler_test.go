@@ -39,6 +39,34 @@ func TestTranspile_PassThrough(t *testing.T) {
 	}
 }
 
+func TestCountParametersRegex(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected int
+	}{
+		{"no parameters", "SELECT 1", 0},
+		{"simple parameters", "SELECT $1, $2", 2},
+		{"parameter in string", "SELECT '$1'", 0},
+		{"parameter in ident", "SELECT \"$1\"", 0},
+		{"parameter in line comment", "SELECT $1 -- $2", 1},
+		{"parameter in block comment", "SELECT $1 /* $2 */ $3", 3},
+		{"escaped quote in string", "SELECT '$1''$2'", 0},
+		{"highest parameter number", "SELECT $1, $10, $2", 10},
+		{"multiple occurrences", "SELECT $1, $1, $1", 1},
+		{"duckdb native syntax with parameters", "INSTALL httpfs; SELECT $1", 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual := countParametersRegex(tt.input)
+			if actual != tt.expected {
+				t.Errorf("countParametersRegex(%q) = %d, expected %d", tt.input, actual, tt.expected)
+			}
+		})
+	}
+}
+
 func TestTranspile_PgCatalog(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -2634,6 +2662,54 @@ func TestTranspile_RangeFunction(t *testing.T) {
 	}
 
 	tr := New(DefaultConfig())
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_ArrayUpperInRangeFunction(t *testing.T) {
+	// Test that array_upper inside a FROM-clause function (RangeFunction) is properly
+	// transformed to len() with the dimension argument stripped. This is the exact
+	// pattern used by the pgx driver for type resolution.
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "array_upper in generate_series FROM clause",
+			input:    "SELECT s.r FROM generate_series(1, array_upper(current_schemas(false), 1)) AS s(r)",
+			contains: "len(current_schemas(false))",
+			excludes: "array_upper",
+		},
+		{
+			name:     "array_upper in SELECT expression",
+			input:    "SELECT array_upper(ARRAY[1,2,3], 1)",
+			contains: "len(ARRAY[1, 2, 3])",
+			excludes: "array_upper",
+		},
+		{
+			name:     "array_length dimension arg stripped",
+			input:    "SELECT array_length(ARRAY[1,2,3], 1)",
+			contains: "len(ARRAY[1, 2, 3])",
+			excludes: "array_length",
+		},
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

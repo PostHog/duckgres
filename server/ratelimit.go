@@ -16,6 +16,8 @@ type RateLimitConfig struct {
 	BanDuration time.Duration
 	// MaxConnectionsPerIP is the max concurrent connections from a single IP (0 = unlimited)
 	MaxConnectionsPerIP int
+	// MaxConnections is the total max concurrent connections (0 = unlimited)
+	MaxConnections int
 }
 
 // DefaultRateLimitConfig returns sensible defaults for rate limiting
@@ -24,7 +26,8 @@ func DefaultRateLimitConfig() RateLimitConfig {
 		MaxFailedAttempts:   5,
 		FailedAttemptWindow: 5 * time.Minute,
 		BanDuration:         15 * time.Minute,
-		MaxConnectionsPerIP: 100,
+		MaxConnectionsPerIP: 500,
+		MaxConnections:      1024,
 	}
 }
 
@@ -37,9 +40,10 @@ type ipRecord struct {
 
 // RateLimiter tracks and limits connections per IP
 type RateLimiter struct {
-	mu      sync.Mutex
-	config  RateLimitConfig
-	records map[string]*ipRecord
+	mu               sync.Mutex
+	config           RateLimitConfig
+	records          map[string]*ipRecord
+	totalActiveConns int
 }
 
 // NewRateLimiter creates a new rate limiter with the given config
@@ -76,6 +80,11 @@ func (rl *RateLimiter) CheckConnection(addr net.Addr) string {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
+	// Check global connection limit
+	if rl.config.MaxConnections > 0 && rl.totalActiveConns >= rl.config.MaxConnections {
+		return "too many concurrent connections"
+	}
+
 	record := rl.getOrCreateRecord(ip)
 
 	// Check if IP is banned
@@ -103,6 +112,11 @@ func (rl *RateLimiter) RegisterConnection(addr net.Addr) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
+	// Check global connection limit
+	if rl.config.MaxConnections > 0 && rl.totalActiveConns >= rl.config.MaxConnections {
+		return false
+	}
+
 	record := rl.getOrCreateRecord(ip)
 
 	// Check if banned
@@ -116,6 +130,7 @@ func (rl *RateLimiter) RegisterConnection(addr net.Addr) bool {
 	}
 
 	record.activeConns++
+	rl.totalActiveConns++
 	return true
 }
 
@@ -128,6 +143,11 @@ func (rl *RateLimiter) UnregisterConnection(addr net.Addr) {
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+
+	rl.totalActiveConns--
+	if rl.totalActiveConns < 0 {
+		rl.totalActiveConns = 0
+	}
 
 	if record, ok := rl.records[ip]; ok {
 		record.activeConns--

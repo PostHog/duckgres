@@ -63,6 +63,10 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
 | `duckgres_rate_limit_rejects_total` | Counter | Total number of connections rejected due to rate limiting |
 | `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
+| `duckgres_flight_auth_sessions_active` | Gauge | Number of active Flight auth sessions on the control plane |
+| `duckgres_control_plane_workers_active` | Gauge | Number of active control-plane worker processes |
+| `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
+| `duckgres_flight_max_workers_retry_total{outcome}` | Counter | Max-worker retry outcomes for Flight session creation (`outcome=attempted|succeeded|failed`) |
 
 ### Testing Metrics
 
@@ -127,6 +131,11 @@ Create a `duckgres.yaml` file (see `duckgres.example.yaml` for a complete exampl
 ```yaml
 host: "0.0.0.0"
 port: 5432
+flight_port: 8815
+flight_session_idle_ttl: "10m"
+flight_session_reap_interval: "1m"
+flight_handle_idle_ttl: "15m"
+flight_session_token_ttl: "1h"
 data_dir: "./data"
 
 tls:
@@ -164,6 +173,11 @@ Run with config file:
 | `DUCKGRES_CONFIG` | Path to YAML config file | - |
 | `DUCKGRES_HOST` | Host to bind to | `0.0.0.0` |
 | `DUCKGRES_PORT` | Port to listen on | `5432` |
+| `DUCKGRES_FLIGHT_PORT` | Control-plane Flight SQL ingress port (`0` disables) | `0` |
+| `DUCKGRES_FLIGHT_SESSION_IDLE_TTL` | Flight auth session idle TTL | `10m` |
+| `DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL` | Flight auth session reap interval | `1m` |
+| `DUCKGRES_FLIGHT_HANDLE_IDLE_TTL` | Flight prepared/query handle idle TTL | `15m` |
+| `DUCKGRES_FLIGHT_SESSION_TOKEN_TTL` | Flight issued session token absolute TTL | `1h` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
@@ -205,6 +219,11 @@ Options:
   -config string           Path to YAML config file
   -host string             Host to bind to
   -port int                Port to listen on
+  -flight-port int         Control-plane Arrow Flight SQL ingress port, 0=disabled
+  -flight-session-idle-ttl string      Flight auth session idle TTL (e.g., '10m')
+  -flight-session-reap-interval string Flight auth session reap interval (e.g., '1m')
+  -flight-handle-idle-ttl string       Flight prepared/query handle idle TTL (e.g., '15m')
+  -flight-session-token-ttl string     Flight issued session token absolute TTL (e.g., '1h')
   -data-dir string         Directory for DuckDB files
   -cert string             TLS certificate file
   -key string              TLS private key file
@@ -492,12 +511,13 @@ The default mode runs everything in a single process:
 
 ### Control Plane Mode
 
-For production deployments, control-plane mode splits the server into a **control plane** and a pool of long-lived **worker processes**. The control plane owns client connections end-to-end (TLS, authentication, PostgreSQL wire protocol, SQL transpilation), while workers are thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets. This enables zero-downtime deployments and cross-session DuckDB cache reuse.
+For production deployments, control-plane mode splits the server into a **control plane** and a pool of long-lived **worker processes**. The control plane owns client connections end-to-end (TLS, authentication, PostgreSQL wire protocol, SQL transpilation), while workers are thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets. Optional control-plane Flight ingress (`flight_port`) also exposes Arrow Flight SQL directly with HTTP Basic auth (`Authorization: Basic ...`), compatible with Duckhog clients.
 
 ```
                     CONTROL PLANE (duckgres --mode control-plane)
                     ┌──────────────────────────────────────────────┐
   PG Client ──TLS──>│ PG TCP Listener                              │
+ Flight SQL Client ─>│ Flight SQL TCP Listener (Basic Auth)         │
                     │ TLS Termination + Password Auth              │
                     │ PostgreSQL Wire Protocol                     │
                     │ SQL Transpilation (PG → DuckDB)              │
@@ -529,11 +549,17 @@ Start in control-plane mode:
 # Start in control-plane mode (workers spawn on demand, 1 per connection)
 ./duckgres --mode control-plane --port 5432
 
+# Enable Flight SQL ingress for Duckhog-compatible clients
+./duckgres --mode control-plane --port 5432 --flight-port 8815
+
 # Pre-warm 2 workers and cap at 10
 ./duckgres --mode control-plane --port 5432 --min-workers 2 --max-workers 10
 
 # Connect with psql (identical to standalone mode)
 PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"
+
+# Flight SQL clients use Basic auth headers (user/password)
+# Example endpoint: grpc+tls://localhost:8815
 ```
 
 **Zero-downtime deployment** using the handover protocol:
@@ -545,6 +571,8 @@ PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require
 # Deploy a new version - it takes over the listener and workers without dropping connections
 ./duckgres-v2 --mode control-plane --port 5432 --handover-socket /var/run/duckgres/handover.sock
 ```
+
+When running under **systemd** with `RuntimeDirectory`, ensure `RuntimeDirectoryPreserve=yes` is set in your unit file. This prevents systemd from cleaning up or remounting the socket directory as read-only when the old process exits during a handover.
 
 **Rolling worker updates** via signal:
 

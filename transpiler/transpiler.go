@@ -1,16 +1,13 @@
 package transpiler
 
 import (
-	"regexp"
+	"log/slog"
 	"strconv"
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/transpiler/transform"
 )
-
-// paramRegex matches PostgreSQL-style $N parameter placeholders
-var paramRegex = regexp.MustCompile(`\$(\d+)`)
 
 // TransformFlags is a bitmask indicating which transforms a query needs.
 type TransformFlags uint32
@@ -51,7 +48,6 @@ type taggedTransform struct {
 	flag TransformFlags
 	tr   transform.Transform
 }
-
 // Transpiler converts PostgreSQL SQL to DuckDB-compatible SQL
 type Transpiler struct {
 	config     Config
@@ -180,6 +176,9 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 	if err != nil {
 		// PostgreSQL parsing failed - signal that we should try native DuckDB execution
 		// Count parameters using regex since we can't use the AST
+		slog.Debug("PostgreSQL parse failed, falling back to native DuckDB.",
+			"error", err,
+			"sql", sql)
 		return &Result{
 			SQL:              sql,
 			FallbackToNative: true,
@@ -487,23 +486,100 @@ func CountParameters(sql string) (int, error) {
 	return result.ParamCount, nil
 }
 
-// countParametersRegex counts $N parameter placeholders using regex.
+// countParametersRegex counts $N parameter placeholders using a stateful scan.
 // This is a fallback for when pg_query can't parse the SQL (e.g., DuckDB-specific syntax).
+// It ignores $N placeholders inside single-quoted strings, double-quoted identifiers,
+// and comments (both -- and /* */).
 // It finds the highest $N placeholder number, which represents the parameter count.
 func countParametersRegex(sql string) int {
-	matches := paramRegex.FindAllStringSubmatch(sql, -1)
-	if len(matches) == 0 {
-		return 0
-	}
-
 	maxParam := 0
-	for _, match := range matches {
-		if len(match) > 1 {
-			if n, err := strconv.Atoi(match[1]); err == nil && n > maxParam {
+	inString := false
+	inIdent := false
+	inLineComment := false
+	inBlockComment := false
+
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+
+		// Handle block comments
+		if inBlockComment {
+			if c == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+
+		// Handle line comments
+		if inLineComment {
+			if c == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+
+		// Handle strings
+		if inString {
+			if c == '\'' {
+				// Check for escaped quote ''
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					i++
+				} else {
+					inString = false
+				}
+			}
+			continue
+		}
+
+		// Handle double-quoted identifiers
+		if inIdent {
+			if c == '"' {
+				// Check for escaped quote ""
+				if i+1 < len(sql) && sql[i+1] == '"' {
+					i++
+				} else {
+					inIdent = false
+				}
+			}
+			continue
+		}
+
+		// Check for comment start
+		if c == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			inLineComment = true
+			i++
+			continue
+		}
+		if c == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			inBlockComment = true
+			i++
+			continue
+		}
+
+		// Check for string/ident start
+		if c == '\'' {
+			inString = true
+			continue
+		}
+		if c == '"' {
+			inIdent = true
+			continue
+		}
+
+		// Check for parameter placeholder $N
+		if c == '$' && i+1 < len(sql) && sql[i+1] >= '0' && sql[i+1] <= '9' {
+			j := i + 1
+			for j < len(sql) && sql[j] >= '0' && sql[j] <= '9' {
+				j++
+			}
+			numStr := sql[i+1 : j]
+			if n, err := strconv.Atoi(numStr); err == nil && n > maxParam {
 				maxParam = n
 			}
+			i = j - 1
 		}
 	}
+
 	return maxParam
 }
 

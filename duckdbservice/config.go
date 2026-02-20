@@ -14,6 +14,12 @@ type ServiceConfig struct {
 	// Formats: "unix:///var/run/duckgres/duckdb.sock" or ":8816" or "0.0.0.0:8816"
 	ListenAddr string
 
+	// ListenFD is an inherited file descriptor for a pre-bound listener.
+	// When > 0, the service uses this FD instead of creating a new socket.
+	// This is used by the control plane to pass a pre-bound Unix socket to
+	// worker processes, avoiding EROFS errors under ProtectSystem=strict.
+	ListenFD int
+
 	// ServerConfig is reused for CreateDBConnection (data_dir, extensions, DuckLake).
 	ServerConfig server.Config
 

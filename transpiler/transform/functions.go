@@ -188,6 +188,12 @@ func (t *FunctionTransform) transformFuncCall(fc *pg_query.FuncCall) bool {
 			str.Sval = newName
 		}
 
+		// array_upper(arr, dim) and array_length(arr, dim) take a dimension
+		// parameter that DuckDB's len() doesn't accept. Strip the second arg.
+		if (funcName == "array_upper" || funcName == "array_length") && len(fc.Args) == 2 {
+			fc.Args = fc.Args[:1]
+		}
+
 		// Remove schema prefix if present, BUT preserve pg_catalog for functions
 		// using SQL syntax (COERCE_SQL_SYNTAX) like EXTRACT(field FROM source)
 		// because the deparser only outputs the special syntax with the prefix.

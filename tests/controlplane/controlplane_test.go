@@ -101,6 +101,7 @@ func (sb *syncBuffer) String() string {
 type cpHarness struct {
 	cmd        *exec.Cmd
 	port       int
+	flightPort int
 	socketDir  string
 	configFile string
 	logBuf     *syncBuffer
@@ -108,6 +109,8 @@ type cpHarness struct {
 
 type cpOpts struct {
 	handoverSocket string
+	flightPort     int
+	maxWorkers     int
 }
 
 func defaultOpts() cpOpts {
@@ -117,8 +120,8 @@ func defaultOpts() cpOpts {
 func startControlPlane(t *testing.T, opts cpOpts) *cpHarness {
 	t.Helper()
 
-
 	port := freePort(t)
+	flightPort := opts.flightPort
 
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
@@ -145,6 +148,12 @@ tls:
 users:
   testuser: testpass
 `, port, dataDir, certFile, keyFile)
+	if flightPort > 0 {
+		configContent += fmt.Sprintf("flight_port: %d\n", flightPort)
+	}
+	if opts.maxWorkers > 0 {
+		configContent += fmt.Sprintf("max_workers: %d\n", opts.maxWorkers)
+	}
 	if err := os.WriteFile(configFile, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write config: %v", err)
 	}
@@ -182,6 +191,7 @@ users:
 	h := &cpHarness{
 		cmd:        cmd,
 		port:       port,
+		flightPort: flightPort,
 		socketDir:  socketDir,
 		configFile: configFile,
 		logBuf:     logBuf,
@@ -227,7 +237,6 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 	}
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
 }
-
 
 var newCPPidRe = regexp.MustCompile(`New control plane spawned\.\s.*pid=(\d+)`)
 
@@ -687,5 +696,205 @@ func TestHandoverChildCrashThenRetry(t *testing.T) {
 	}
 	if v != 42 {
 		t.Fatalf("Expected 42, got %d", v)
+	}
+}
+
+// TestHandoverDrainsBeforeExit verifies that the old control plane process
+// stays alive after the handover to drain in-flight connections, rather than
+// exiting immediately when acceptLoop returns.
+//
+// Regression test: without the fix (select {} in acceptLoop), closing the
+// PG listener causes acceptLoop to return, which unwinds through
+// RunControlPlane() → main() → process exit. All connection goroutines
+// are killed before the drain logic in handleHandoverRequest runs.
+//
+// Instead of relying on query timing (fast machines complete queries before
+// the race triggers), this test holds an idle connection open. The idle
+// connection keeps the old CP's WaitGroup at 1, so the drain blocks until
+// we explicitly close the connection. This makes the test deterministic.
+func TestHandoverDrainsBeforeExit(t *testing.T) {
+	h := startControlPlane(t, defaultOpts())
+
+	db := h.openConn(t)
+	var warmup int
+	if err := db.QueryRow("SELECT 1").Scan(&warmup); err != nil {
+		t.Fatalf("Warmup query failed: %v", err)
+	}
+
+	// Trigger handover while the connection is idle in the pool.
+	// The old CP's handleConnection goroutine is blocked in ReadMessage,
+	// waiting for the next query. This keeps wg at 1, so drain blocks.
+	h.doHandover(t)
+	oldPid := h.cmd.Process.Pid
+
+	// Wait long enough for the race to manifest. Without the fix, main()
+	// returns within milliseconds of acceptLoop detecting the closed
+	// listener, killing the handleConnection goroutine.
+	time.Sleep(3 * time.Second)
+
+	// The old CP process must still be alive — it should be waiting for
+	// this idle connection to close (drain). Without the fix, main()
+	// already returned and the process exited.
+	if err := syscall.Kill(oldPid, 0); err != nil {
+		t.Fatalf("Old CP (pid %d) died while connection still open.\n"+
+			"acceptLoop returned and main() exited before drain completed.\n"+
+			"Logs:\n%s", oldPid, h.logBuf.String())
+	}
+	t.Logf("Old CP (pid %d) still alive 3s after handover — drain is active", oldPid)
+
+	// Close the connection to unblock the drain.
+	_ = db.Close()
+
+	// Verify the old CP went through the proper drain → exit path
+	if err := h.waitForLog("All connections drained after handover.", 30*time.Second); err != nil {
+		t.Fatalf("Old CP did not drain properly.\nLogs:\n%s", h.logBuf.String())
+	}
+	if err := h.waitForLog("Old control plane exiting after handover.", 10*time.Second); err != nil {
+		t.Fatalf("Old CP did not exit via handover path.\nLogs:\n%s", h.logBuf.String())
+	}
+}
+
+// TestHandoverPassesPreboundSockets verifies that during a graceful handover,
+// the old CP passes its pre-bound worker socket FDs to the new CP. The new CP
+// imports them and uses them to spawn workers without creating new socket files.
+func TestHandoverPassesPreboundSockets(t *testing.T) {
+	opts := defaultOpts()
+	opts.maxWorkers = 3
+	h := startControlPlane(t, opts)
+
+	// Trigger handover (no active connections, so all pre-bound sockets
+	// should be available for transfer)
+	h.doHandover(t)
+
+	// Wait for the new CP to import pre-bound sockets
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify pre-bound sockets were imported
+	logs := h.logBuf.String()
+	if !strings.Contains(logs, "Imported pre-bound sockets from handover.") {
+		t.Fatalf("Expected pre-bound socket import log.\nLogs:\n%s", logs)
+	}
+
+	// Verify new connections work (spawns a worker using an imported socket)
+	db := h.openConn(t)
+	var v int
+	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
+		t.Fatalf("Post-handover query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if v != 42 {
+		t.Fatalf("Expected 42, got %d", v)
+	}
+}
+
+// TestHandoverWithReadOnlySocketDir verifies the core EROFS fix: when the
+// socket directory becomes read-only (simulating systemd ProtectSystem=strict),
+// the handover still succeeds because the old CP passes pre-bound socket FDs.
+// Without this fix, the new CP would exit(1) before attempting handover.
+func TestHandoverWithReadOnlySocketDir(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping EROFS test: running as root (chmod ineffective)")
+	}
+
+	opts := defaultOpts()
+	opts.maxWorkers = 2
+	h := startControlPlane(t, opts)
+
+	// Make the socket directory read-only to simulate EROFS
+	if err := os.Chmod(h.socketDir, 0555); err != nil {
+		t.Fatalf("chmod failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.socketDir, 0755) })
+
+	// Verify the dir is actually read-only
+	testFile := filepath.Join(h.socketDir, ".test-write")
+	if err := os.WriteFile(testFile, []byte("test"), 0644); err == nil {
+		_ = os.Remove(testFile)
+		_ = os.Chmod(h.socketDir, 0755) // restore for cleanup
+		t.Skip("socket dir is still writable despite chmod 0555")
+	}
+
+	// Trigger handover — the new CP should succeed by using pre-bound
+	// sockets from the old CP, bypassing the writability check.
+	h.doHandover(t)
+
+	// Restore permissions so the test can clean up and the new CP's workers
+	// can potentially create dynamic sockets if needed.
+	_ = os.Chmod(h.socketDir, 0755)
+
+	// Verify the new CP can serve connections using inherited sockets
+	db := h.openConn(t)
+	var v int
+	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
+		t.Fatalf("Post-EROFS-handover query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if v != 42 {
+		t.Fatalf("Expected 42, got %d", v)
+	}
+
+	// Verify the expected log messages
+	logs := h.logBuf.String()
+	if !strings.Contains(logs, "Imported pre-bound sockets from handover.") {
+		t.Fatalf("Expected pre-bound socket import log.\nLogs:\n%s", logs)
+	}
+}
+
+// TestConcurrentFirstConnections verifies that multiple connections arriving
+// simultaneously at a freshly-started control plane all succeed. This is a
+// regression test for a race where the first CreateSession on a new worker
+// could overlap with warmup, causing two goroutines to LOAD the same native
+// C++ extension concurrently — corrupting the heap (malloc: unaligned tcache
+// chunk detected → SIGABRT).
+func TestConcurrentFirstConnections(t *testing.T) {
+	h := startControlPlane(t, defaultOpts())
+
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require connect_timeout=30", h.port)
+
+	// Open multiple connections in parallel — all hitting the worker before
+	// warmup may have finished. Prior to the fix, this would crash the
+	// worker with heap corruption.
+	const numConns = 5
+	var wg sync.WaitGroup
+	errors := make([]error, numConns)
+	for i := range numConns {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			db, err := sql.Open("postgres", dsn)
+			if err != nil {
+				errors[idx] = fmt.Errorf("conn %d open: %w", idx, err)
+				return
+			}
+			defer func() { _ = db.Close() }()
+			db.SetMaxOpenConns(1)
+			db.SetMaxIdleConns(1)
+			var result int
+			if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+				errors[idx] = fmt.Errorf("conn %d query: %w", idx, err)
+				return
+			}
+			if result != 1 {
+				errors[idx] = fmt.Errorf("conn %d: expected 1, got %d", idx, result)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	var errCount int
+	for _, err := range errors {
+		if err != nil {
+			errCount++
+			t.Logf("Error: %v", err)
+		}
+	}
+
+	if errCount > 0 {
+		t.Fatalf("%d/%d concurrent first connections failed.\nLogs:\n%s",
+			errCount, numConns, h.logBuf.String())
+	}
+
+	// Verify no worker crashes in the logs
+	if strings.Contains(h.logBuf.String(), "malloc()") ||
+		strings.Contains(h.logBuf.String(), "signal: aborted") {
+		t.Fatalf("Worker heap corruption detected in logs.\nLogs:\n%s", h.logBuf.String())
 	}
 }

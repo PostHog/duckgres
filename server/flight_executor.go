@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -20,6 +23,13 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// MaxGRPCMessageSize is the max gRPC message size for Flight SQL communication.
+// DuckDB query results can easily exceed the default 4MB limit.
+const MaxGRPCMessageSize = 1 << 30 // 1GB
+
+// ErrWorkerDead is returned when the backing worker process has crashed.
+var ErrWorkerDead = errors.New("flight worker is dead")
+
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.
 type FlightExecutor struct {
@@ -27,6 +37,13 @@ type FlightExecutor struct {
 	sessionToken string
 	alloc        memory.Allocator
 	ownsClient   bool // if true, Close() closes the client
+
+	// dead is set to true when the backing worker crashes. Once set, all
+	// RPC methods return ErrWorkerDead without touching the gRPC client.
+	dead atomic.Bool
+
+	ctx    context.Context    // base context for all requests
+	cancel context.CancelFunc // cancels the base context
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -36,6 +53,10 @@ type FlightExecutor struct {
 func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor, error) {
 	var dialOpts []grpc.DialOption
 	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(MaxGRPCMessageSize),
+		grpc.MaxCallSendMsgSize(MaxGRPCMessageSize),
+	))
 
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&bearerCreds{token: bearerToken}))
@@ -46,11 +67,14 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 		return nil, fmt.Errorf("flight sql client: %w", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
 		alloc:        memory.DefaultAllocator,
 		ownsClient:   true,
+		ctx:          ctx,
+		cancel:       cancel,
 	}, nil
 }
 
@@ -58,12 +82,26 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 // Flight SQL client. The client is NOT closed when this executor is closed.
 // This avoids creating a new gRPC connection per session.
 func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) *FlightExecutor {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
 		alloc:        memory.DefaultAllocator,
 		ownsClient:   false,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
+}
+
+// MarkDead marks this executor's backing worker as dead. All subsequent RPC
+// calls will return ErrWorkerDead without touching the (possibly closed) gRPC client.
+func (e *FlightExecutor) MarkDead() {
+	e.dead.Store(true)
+}
+
+// IsDead reports whether this executor has been marked dead.
+func (e *FlightExecutor) IsDead() bool {
+	return e.dead.Load()
 }
 
 // withSession adds the session token to the gRPC context.
@@ -71,14 +109,42 @@ func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
 	return metadata.AppendToOutgoingContext(ctx, "x-duckgres-session", e.sessionToken)
 }
 
-func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ...any) (RowSet, error) {
+// recoverClientPanic converts a nil-pointer panic from a closed Flight SQL
+// client into an error. The arrow-go Close() method nils out the embedded
+// FlightServiceClient, so any concurrent RPC on the shared client panics.
+// Only nil-pointer dereferences are recovered; other panics are re-raised
+// to preserve stack traces for unrelated programmer errors.
+func recoverClientPanic(err *error) {
+	if r := recover(); r != nil {
+		if re, ok := r.(runtime.Error); ok && strings.Contains(re.Error(), "nil pointer") {
+			*err = fmt.Errorf("flight client panic (worker likely crashed): %v", r)
+			return
+		}
+		panic(r)
+	}
+}
+
+func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ...any) (rs RowSet, err error) {
+	if e.dead.Load() {
+		return nil, ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+
 	if len(args) > 0 {
 		query = interpolateArgs(query, args)
 	}
 
-	ctx = e.withSession(ctx)
+	reqCtx, cancel := e.mergedContext(ctx)
+	success := false
+	defer func() {
+		if !success {
+			cancel()
+		}
+	}()
 
-	info, err := e.client.Execute(ctx, query)
+	reqCtx = e.withSession(reqCtx)
+
+	info, err := e.client.Execute(reqCtx, query)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute: %w", err)
 	}
@@ -87,7 +153,7 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return &emptyRowSet{}, nil
 	}
 
-	reader, err := e.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	reader, err := e.client.DoGet(reqCtx, info.Endpoint[0].Ticket)
 	if err != nil {
 		return nil, fmt.Errorf("flight doget: %w", err)
 	}
@@ -98,20 +164,30 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return nil, fmt.Errorf("flight deserialize schema: %w", err)
 	}
 
+	success = true
 	return &FlightRowSet{
 		reader: reader,
 		schema: schema,
+		cancel: cancel,
 	}, nil
 }
 
-func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...any) (ExecResult, error) {
+func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...any) (result ExecResult, err error) {
+	if e.dead.Load() {
+		return nil, ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+
 	if len(args) > 0 {
 		query = interpolateArgs(query, args)
 	}
 
-	ctx = e.withSession(ctx)
+	reqCtx, cancel := e.mergedContext(ctx)
+	defer cancel()
 
-	affected, err := e.client.ExecuteUpdate(ctx, query)
+	reqCtx = e.withSession(reqCtx)
+
+	affected, err := e.client.ExecuteUpdate(reqCtx, query)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute update: %w", err)
 	}
@@ -140,7 +216,28 @@ func (e *FlightExecutor) PingContext(ctx context.Context) error {
 	return rows.Close()
 }
 
+// mergedContext returns a context that is cancelled when either the caller's
+// context or the executor's base context is done. This ensures gRPC calls are
+// cancelled both when the client disconnects (caller ctx) and when the
+// executor is closed (e.g. worker crash).
+func (e *FlightExecutor) mergedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	merged, cancel := context.WithCancel(ctx)
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-merged.Done():
+			}
+		}()
+	}
+	return merged, cancel
+}
+
 func (e *FlightExecutor) Close() error {
+	if e.cancel != nil {
+		e.cancel()
+	}
 	if e.ownsClient {
 		return e.client.Close()
 	}
@@ -158,6 +255,7 @@ type FlightRowSet struct {
 	done         bool
 	err          error
 	closeOnce    sync.Once
+	cancel       context.CancelFunc
 }
 
 func (r *FlightRowSet) Columns() ([]string, error) {
@@ -235,6 +333,9 @@ func (r *FlightRowSet) Scan(dest ...any) error {
 
 func (r *FlightRowSet) Close() error {
 	r.closeOnce.Do(func() {
+		if r.cancel != nil {
+			r.cancel()
+		}
 		if r.currentBatch != nil {
 			r.currentBatch.Release()
 			r.currentBatch = nil

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -84,14 +86,39 @@ func redactConnectionString(connStr string) string {
 }
 
 type Config struct {
-	Host    string
-	Port    int
-	DataDir string
-	Users   map[string]string // username -> password
+	Host string
+	Port int
+	// FlightPort enables Arrow Flight SQL ingress on the control plane.
+	// 0 disables Flight ingress.
+	FlightPort int
 
-	// TLS configuration (required)
+	// FlightSessionIdleTTL controls how long an idle Flight auth session is kept
+	// before being reaped.
+	FlightSessionIdleTTL time.Duration
+
+	// FlightSessionReapInterval controls how frequently idle Flight auth sessions
+	// are scanned and reaped.
+	FlightSessionReapInterval time.Duration
+
+	// FlightHandleIdleTTL controls stale prepared/query handle cleanup inside a
+	// Flight auth session.
+	FlightHandleIdleTTL time.Duration
+
+	// FlightSessionTokenTTL controls the absolute lifetime of issued
+	// x-duckgres-session tokens. Expired tokens are rejected and require
+	// a fresh bootstrap request.
+	FlightSessionTokenTTL time.Duration
+	DataDir               string
+	Users                 map[string]string // username -> password
+
+	// TLS configuration (required unless ACME is configured)
 	TLSCertFile string // Path to TLS certificate file
 	TLSKeyFile  string // Path to TLS private key file
+
+	// ACME/Let's Encrypt configuration (alternative to static TLS cert/key)
+	ACMEDomain   string // Domain for ACME certificate (e.g., "decisive-mongoose-wine.us.duckgres.com")
+	ACMEEmail    string // Contact email for Let's Encrypt notifications
+	ACMECacheDir string // Directory for cached certificates (default: "./certs/acme")
 
 	// Rate limiting configuration
 	RateLimit RateLimitConfig
@@ -128,6 +155,12 @@ type Config struct {
 	// Used in control-plane mode for dynamic per-session memory allocation.
 	// If empty, defaults to 75% of system RAM.
 	MemoryBudget string
+
+	// MemoryRebalance enables dynamic per-connection memory reallocation in control-plane mode.
+	// When enabled, the memory budget is redistributed across all active sessions on every
+	// connect/disconnect. When disabled (default), each session gets a static allocation
+	// of budget/max_workers at creation time.
+	MemoryRebalance bool
 
 	// MaxWorkers is the maximum number of worker processes in control-plane mode.
 	// 0 means unlimited.
@@ -202,22 +235,32 @@ type Server struct {
 	// When this channel is closed, all active queries should be cancelled.
 	// This is used to propagate SIGUSR1 from signal handler to query execution.
 	externalCancelCh <-chan struct{}
+
+	// ACME manager for Let's Encrypt certificates (nil when using static certs)
+	acmeManager *ACMEManager
+
+	// Connection registry for pg_stat_activity
+	connsMu sync.RWMutex
+	conns   map[int32]*clientConn
 }
 
 func New(cfg Config) (*Server, error) {
-	// TLS is required
-	if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
-		return nil, fmt.Errorf("TLS certificate and key are required")
-	}
-
-	cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
-	}
-
-	// Use default rate limit config if not specified
+	// Apply default rate limit config for any unset fields
+	defaults := DefaultRateLimitConfig()
 	if cfg.RateLimit.MaxFailedAttempts == 0 {
-		cfg.RateLimit = DefaultRateLimitConfig()
+		cfg.RateLimit.MaxFailedAttempts = defaults.MaxFailedAttempts
+	}
+	if cfg.RateLimit.FailedAttemptWindow == 0 {
+		cfg.RateLimit.FailedAttemptWindow = defaults.FailedAttemptWindow
+	}
+	if cfg.RateLimit.BanDuration == 0 {
+		cfg.RateLimit.BanDuration = defaults.BanDuration
+	}
+	if cfg.RateLimit.MaxConnectionsPerIP == 0 {
+		cfg.RateLimit.MaxConnectionsPerIP = defaults.MaxConnectionsPerIP
+	}
+	if cfg.RateLimit.MaxConnections == 0 {
+		cfg.RateLimit.MaxConnections = defaults.MaxConnections
 	}
 
 	// Use default shutdown timeout if not specified
@@ -237,10 +280,32 @@ func New(cfg Config) (*Server, error) {
 		cfg:           cfg,
 		rateLimiter:   NewRateLimiter(cfg.RateLimit),
 		activeQueries: make(map[BackendKey]context.CancelFunc),
-		tlsConfig: &tls.Config{
+		duckLakeSem:   make(chan struct{}, 1),
+		conns:         make(map[int32]*clientConn),
+	}
+
+	// Configure TLS: ACME (Let's Encrypt) or static certificate files
+	if cfg.ACMEDomain != "" {
+		mgr, err := NewACMEManager(cfg.ACMEDomain, cfg.ACMEEmail, cfg.ACMECacheDir, ":80")
+		if err != nil {
+			return nil, fmt.Errorf("failed to start ACME manager: %w", err)
+		}
+		s.acmeManager = mgr
+		s.tlsConfig = mgr.TLSConfig()
+		slog.Info("TLS enabled via ACME/Let's Encrypt.", "domain", cfg.ACMEDomain)
+	} else {
+		// Static certificate files
+		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
+			return nil, fmt.Errorf("TLS certificate and key are required (or configure --acme-domain)")
+		}
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS certificates: %w", err)
+		}
+		s.tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
-		},
-		duckLakeSem: make(chan struct{}, 1),
+		}
+		slog.Info("TLS enabled.", "cert_file", cfg.TLSCertFile)
 	}
 
 	// Initialize child tracker if process isolation is enabled
@@ -249,7 +314,6 @@ func New(cfg Config) (*Server, error) {
 		slog.Info("Process isolation enabled. Each connection will spawn a child process.")
 	}
 
-	slog.Info("TLS enabled.", "cert_file", cfg.TLSCertFile)
 	slog.Info("Rate limiting enabled.", "max_failed_attempts", cfg.RateLimit.MaxFailedAttempts, "window", cfg.RateLimit.FailedAttemptWindow, "ban_duration", cfg.RateLimit.BanDuration)
 	if cfg.IdleTimeout > 0 {
 		slog.Info("Idle timeout enabled.", "timeout", cfg.IdleTimeout)
@@ -341,6 +405,13 @@ func (s *Server) Close() error {
 		}
 	}
 
+	// Shut down ACME HTTP challenge listener if active
+	if s.acmeManager != nil {
+		if err := s.acmeManager.Close(); err != nil {
+			slog.Warn("ACME manager shutdown error.", "error", err)
+		}
+	}
+
 	// Database connections are now closed by each clientConn when it terminates
 	slog.Info("Shutdown complete.")
 	return nil
@@ -394,6 +465,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 
+	// Shut down ACME HTTP challenge listener if active
+	if s.acmeManager != nil {
+		if err := s.acmeManager.Close(); err != nil {
+			slog.Warn("ACME manager shutdown error.", "error", err)
+		}
+	}
+
 	// Database connections are now closed by each clientConn when it terminates
 	slog.Info("Shutdown complete.")
 	return nil
@@ -436,6 +514,38 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 	return false
 }
 
+// initConnsMap initializes the connection registry map.
+// This is a separate method to work around cases where a local variable
+// named "clientConn" shadows the type name (e.g., in worker.go).
+func (s *Server) initConnsMap() {
+	s.conns = make(map[int32]*clientConn)
+}
+
+// registerConn adds a client connection to the registry for pg_stat_activity.
+func (s *Server) registerConn(c *clientConn) {
+	s.connsMu.Lock()
+	s.conns[c.pid] = c
+	s.connsMu.Unlock()
+}
+
+// unregisterConn removes a client connection from the registry.
+func (s *Server) unregisterConn(pid int32) {
+	s.connsMu.Lock()
+	delete(s.conns, pid)
+	s.connsMu.Unlock()
+}
+
+// listConns returns a snapshot of all registered client connections.
+func (s *Server) listConns() []*clientConn {
+	s.connsMu.RLock()
+	defer s.connsMu.RUnlock()
+	conns := make([]*clientConn, 0, len(s.conns))
+	for _, c := range s.conns {
+		conns = append(conns, c)
+	}
+	return conns
+}
+
 // createDBConnection creates a DuckDB connection for a client session.
 // This is a thin wrapper around CreateDBConnection using the server's config.
 func (s *Server) createDBConnection(username string) (*sql.DB, error) {
@@ -464,7 +574,7 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set DuckDB threads
 	threads := cfg.Threads
 	if threads == 0 {
-		threads = runtime.NumCPU()
+		threads = runtime.NumCPU() * 2
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET threads = %d", threads)); err != nil {
 		slog.Warn("Failed to set DuckDB threads.", "threads", threads, "error", err)
@@ -504,7 +614,7 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		cacheDir := filepath.Join(cfg.DataDir, "cache")
 		if err := os.MkdirAll(cacheDir, 0750); err != nil {
 			slog.Warn("Failed to create cache_httpfs cache directory.", "cache_directory", cacheDir, "error", err)
-		} else if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_cache_directory = '%s'", cacheDir)); err != nil {
+		} else if _, err := db.Exec(fmt.Sprintf("SET cache_httpfs_cache_directory = '%s/'", cacheDir)); err != nil {
 			// NOTE: cache directory path comes from trusted server config (DataDir), not user input.
 			slog.Warn("Failed to set cache_httpfs cache directory.", "cache_directory", cacheDir, "error", err)
 		} else {
@@ -527,6 +637,17 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 		return nil, err
 	}
 
+	if err := ConfigureDBConnection(db, cfg, duckLakeSem, username, serverStartTime, serverVersion); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	return db, nil
+}
+
+// ConfigureDBConnection initializes an existing DuckDB connection with pg_catalog,
+// information_schema, and DuckLake catalog attachment.
+func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time, serverVersion string) error {
 	// Initialize pg_catalog schema for PostgreSQL compatibility
 	// Must be done BEFORE attaching DuckLake so macros are created in memory.main,
 	// not in the DuckLake catalog (which doesn't support macro storage).
@@ -541,8 +662,7 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
 		if cfg.DuckLake.MetadataStore != "" {
-			_ = db.Close()
-			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+			return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 		}
 		// DuckLake not configured, this warning is just informational
 		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
@@ -575,12 +695,11 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 	// Now set DuckLake as the default catalog so all user queries use it
 	if duckLakeMode {
 		if err := setDuckLakeDefault(db); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
+			return fmt.Errorf("failed to set DuckLake as default: %w", err)
 		}
 	}
 
-	return db, nil
+	return nil
 }
 
 // CreatePassthroughDBConnection creates a DuckDB connection without pg_catalog
@@ -1045,7 +1164,11 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// before sending the TLS ClientHello, so unbuffered reads are safe here.
 	params, err := readStartupMessage(conn)
 	if err != nil {
-		slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
+		if err == io.EOF || errors.Is(err, io.EOF) {
+			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
+		} else {
+			slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
+		}
 		s.rateLimiter.UnregisterConnection(remoteAddr)
 		_ = conn.Close()
 		return

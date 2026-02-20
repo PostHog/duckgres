@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
@@ -20,27 +22,43 @@ import (
 
 // FileConfig represents the YAML configuration file structure
 type FileConfig struct {
-	Host             string              `yaml:"host"`
-	Port             int                 `yaml:"port"`
-	DataDir          string              `yaml:"data_dir"`
-	TLS              TLSConfig           `yaml:"tls"`
-	Users            map[string]string   `yaml:"users"`
-	RateLimit        RateLimitFileConfig `yaml:"rate_limit"`
-	Extensions       []string            `yaml:"extensions"`
-	DuckLake         DuckLakeFileConfig  `yaml:"ducklake"`
-	ProcessIsolation bool                `yaml:"process_isolation"` // Enable process isolation per connection
-	IdleTimeout      string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
-	MemoryLimit      string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
-	Threads          int                 `yaml:"threads"`           // DuckDB threads per session
-	MemoryBudget     string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
-	MaxWorkers       int                 `yaml:"max_workers"`       // Max worker processes (control-plane mode)
-	MinWorkers       int                 `yaml:"min_workers"`       // Pre-warm worker count (control-plane mode)
-	PassthroughUsers []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
+	Host                      string              `yaml:"host"`
+	Port                      int                 `yaml:"port"`
+	FlightPort                int                 `yaml:"flight_port"`                  // Control-plane Flight SQL ingress port (0 disables)
+	FlightSessionIdleTTL      string              `yaml:"flight_session_idle_ttl"`      // e.g., "10m"
+	FlightSessionReapInterval string              `yaml:"flight_session_reap_interval"` // e.g., "1m"
+	FlightHandleIdleTTL       string              `yaml:"flight_handle_idle_ttl"`       // e.g., "15m"
+	FlightSessionTokenTTL     string              `yaml:"flight_session_token_ttl"`     // e.g., "1h"
+	DataDir                   string              `yaml:"data_dir"`
+	TLS                       TLSConfig           `yaml:"tls"`
+	Users                     map[string]string   `yaml:"users"`
+	RateLimit                 RateLimitFileConfig `yaml:"rate_limit"`
+	Extensions                []string            `yaml:"extensions"`
+	DuckLake                  DuckLakeFileConfig  `yaml:"ducklake"`
+	ProcessIsolation          bool                `yaml:"process_isolation"` // Enable process isolation per connection
+	IdleTimeout               string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
+	MemoryLimit               string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
+	Threads                   int                 `yaml:"threads"`           // DuckDB threads per session
+	MemoryBudget              string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
+	MemoryRebalance           *bool               `yaml:"memory_rebalance"`  // Enable dynamic per-connection memory reallocation
+	MaxWorkers                int                 `yaml:"max_workers"`           // Max worker processes (control-plane mode)
+	MinWorkers                int                 `yaml:"min_workers"`           // Pre-warm worker count (control-plane mode)
+	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`        // e.g., "5m"
+	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`         // e.g., "5m"
+	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"`      // e.g., "24h"
+	PassthroughUsers          []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
 }
 
 type TLSConfig struct {
-	Cert string `yaml:"cert"`
-	Key  string `yaml:"key"`
+	Cert string     `yaml:"cert"`
+	Key  string     `yaml:"key"`
+	ACME ACMEConfig `yaml:"acme"`
+}
+
+type ACMEConfig struct {
+	Domain   string `yaml:"domain"`
+	Email    string `yaml:"email"`
+	CacheDir string `yaml:"cache_dir"`
 }
 
 type RateLimitFileConfig struct {
@@ -48,6 +66,7 @@ type RateLimitFileConfig struct {
 	FailedAttemptWindow string `yaml:"failed_attempt_window"` // e.g., "5m"
 	BanDuration         string `yaml:"ban_duration"`          // e.g., "15m"
 	MaxConnectionsPerIP int    `yaml:"max_connections_per_ip"`
+	MaxConnections      int    `yaml:"max_connections"`
 }
 
 type DuckLakeFileConfig struct {
@@ -92,18 +111,36 @@ func env(key, defaultVal string) string {
 	return defaultVal
 }
 
-// initMetrics starts the Prometheus metrics HTTP server on :9090/metrics
-func initMetrics() {
+// initMetrics starts the Prometheus metrics HTTP server on :9090/metrics.
+// Returns the http.Server instance so it can be shut down during handover.
+func initMetrics() *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	srv := &http.Server{
+		Addr:    ":9090",
+		Handler: mux,
+	}
 	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		slog.Info("Starting metrics server", "addr", ":9090")
-		if err := http.ListenAndServe(":9090", nil); err != nil {
-			slog.Error("Metrics server error", "error", err)
+		for {
+			slog.Info("Starting metrics server", "addr", srv.Addr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Warn("Metrics server error, retrying in 1s.", "error", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			return
 		}
 	}()
+	return srv
 }
 
 func main() {
+	// Ignore SIGPIPE to prevent DuckDB's C++ code (and libraries like libpq
+	// inside DuckLake) from crashing the process when a network connection
+	// drops mid-query. Go already converts EPIPE to errors on Write; the
+	// default SIGPIPE handler is a legacy Unix footgun that kills the process.
+	signal.Ignore(syscall.SIGPIPE)
+
 	// Set version on server package so catalog macros can expose it
 	server.SetProcessVersion(version)
 
@@ -120,6 +157,11 @@ func main() {
 	configFile := flag.String("config", env("DUCKGRES_CONFIG", ""), "Path to YAML config file (env: DUCKGRES_CONFIG)")
 	host := flag.String("host", "", "Host to bind to (env: DUCKGRES_HOST)")
 	port := flag.Int("port", 0, "Port to listen on (env: DUCKGRES_PORT)")
+	flightPort := flag.Int("flight-port", 0, "Control-plane Arrow Flight SQL ingress port, 0=disabled (env: DUCKGRES_FLIGHT_PORT)")
+	flightSessionIdleTTL := flag.String("flight-session-idle-ttl", "", "Flight auth session idle TTL (e.g., '10m') (env: DUCKGRES_FLIGHT_SESSION_IDLE_TTL)")
+	flightSessionReapInterval := flag.String("flight-session-reap-interval", "", "Flight auth session reap interval (e.g., '1m') (env: DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL)")
+	flightHandleIdleTTL := flag.String("flight-handle-idle-ttl", "", "Flight prepared/query handle idle TTL (e.g., '15m') (env: DUCKGRES_FLIGHT_HANDLE_IDLE_TTL)")
+	flightSessionTokenTTL := flag.String("flight-session-token-ttl", "", "Flight issued session token absolute TTL (e.g., '1h') (env: DUCKGRES_FLIGHT_SESSION_TOKEN_TTL)")
 	dataDir := flag.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	certFile := flag.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
@@ -128,20 +170,33 @@ func main() {
 	memoryLimit := flag.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
 	threads := flag.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	memoryBudget := flag.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
+	memoryRebalance := flag.Bool("memory-rebalance", false, "Enable dynamic per-connection memory reallocation (control-plane mode) (env: DUCKGRES_MEMORY_REBALANCE)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
 
+	// Rate limiting flags
+	maxConnections := flag.Int("max-connections", 0, "Max concurrent connections, 0=unlimited (env: DUCKGRES_MAX_CONNECTIONS)")
+
 	// Control plane flags
 	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
 	minWorkers := flag.Int("min-workers", 0, "Pre-warm worker count at startup (control-plane mode) (env: DUCKGRES_MIN_WORKERS)")
 	maxWorkers := flag.Int("max-workers", 0, "Max worker processes, 0=unlimited (control-plane mode) (env: DUCKGRES_MAX_WORKERS)")
+	workerQueueTimeout := flag.String("worker-queue-timeout", "", "How long to wait for an available worker slot (e.g., '5m') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
+	workerIdleTimeout := flag.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
+	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for connections to drain during handover (default: '24h') (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
 
+	// ACME/Let's Encrypt flags
+	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
+	acmeEmail := flag.String("acme-email", "", "Contact email for Let's Encrypt notifications (env: DUCKGRES_ACME_EMAIL)")
+	acmeCacheDir := flag.String("acme-cache-dir", "", "Directory for ACME certificate cache (env: DUCKGRES_ACME_CACHE_DIR)")
+
 	// DuckDB service flags
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
+	duckdbListenFD := flag.Int("duckdb-listen-fd", 0, "Inherit a pre-bound listener FD instead of creating a new socket (duckdb-service mode, set by control plane)")
 	duckdbToken := flag.String("duckdb-token", "", "Bearer token for DuckDB service auth (duckdb-service mode, env: DUCKGRES_DUCKDB_TOKEN)")
 	duckdbMaxSessions := flag.Int("duckdb-max-sessions", 0, "Max concurrent sessions, 0=unlimited (duckdb-service mode, env: DUCKGRES_DUCKDB_MAX_SESSIONS)")
 
@@ -154,6 +209,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG             Path to YAML config file\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST               Host to bind to (default: 0.0.0.0)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT               Port to listen on (default: 5432)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_PORT        Control-plane Arrow Flight SQL ingress port (default: disabled)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_IDLE_TTL      Flight auth session idle TTL (default: 10m)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL Flight auth session reap interval (default: 1m)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_HANDLE_IDLE_TTL       Flight prepared/query handle idle TTL (default: 15m)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_TOKEN_TTL     Flight issued session token absolute TTL (default: 1h)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
@@ -162,8 +222,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_THREADS            DuckDB threads per session\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_BUDGET      Total memory for all DuckDB sessions (e.g., 24GB)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_REBALANCE   Enable dynamic per-connection memory reallocation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MIN_WORKERS        Pre-warm worker count (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_WORKERS        Max worker processes (control-plane mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_WORKER_QUEUE_TIMEOUT  Worker queue timeout (default: 5m)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_HANDOVER_DRAIN_TIMEOUT  Handover drain timeout (default: 24h)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DOMAIN        Domain for ACME/Let's Encrypt certificate\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_EMAIL         Contact email for Let's Encrypt notifications\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_CACHE_DIR     Directory for ACME certificate cache\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_CONNECTIONS    Max concurrent connections (default: CPUs * 2)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
@@ -225,19 +292,32 @@ func main() {
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
-		Set:              cliSet,
-		Host:             *host,
-		Port:             *port,
-		DataDir:          *dataDir,
-		CertFile:         *certFile,
-		KeyFile:          *keyFile,
-		ProcessIsolation: *processIsolation,
-		IdleTimeout:      *idleTimeout,
-		MemoryLimit:      *memoryLimit,
-		Threads:          *threads,
-		MemoryBudget:     *memoryBudget,
-		MinWorkers:       *minWorkers,
-		MaxWorkers:       *maxWorkers,
+		Set:                       cliSet,
+		Host:                      *host,
+		Port:                      *port,
+		FlightPort:                *flightPort,
+		FlightSessionIdleTTL:      *flightSessionIdleTTL,
+		FlightSessionReapInterval: *flightSessionReapInterval,
+		FlightHandleIdleTTL:       *flightHandleIdleTTL,
+		FlightSessionTokenTTL:     *flightSessionTokenTTL,
+		DataDir:                   *dataDir,
+		CertFile:                  *certFile,
+		KeyFile:                   *keyFile,
+		ProcessIsolation:          *processIsolation,
+		IdleTimeout:               *idleTimeout,
+		MemoryLimit:               *memoryLimit,
+		Threads:                   *threads,
+		MemoryBudget:              *memoryBudget,
+		MemoryRebalance:           *memoryRebalance,
+		MinWorkers:                *minWorkers,
+		MaxWorkers:                *maxWorkers,
+		WorkerQueueTimeout:        *workerQueueTimeout,
+		WorkerIdleTimeout:         *workerIdleTimeout,
+		HandoverDrainTimeout:      *handoverDrainTimeout,
+		ACMEDomain:                *acmeDomain,
+		ACMEEmail:                 *acmeEmail,
+		ACMECacheDir:              *acmeCacheDir,
+		MaxConnections:            *maxConnections,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})
@@ -286,7 +366,7 @@ func main() {
 		if listenAddr == "" {
 			listenAddr = env("DUCKGRES_DUCKDB_LISTEN", "")
 		}
-		if listenAddr == "" {
+		if *duckdbListenFD == 0 && listenAddr == "" {
 			fatal("duckdb-service mode requires --duckdb-listen flag or DUCKGRES_DUCKDB_LISTEN env var")
 		}
 
@@ -310,10 +390,13 @@ func main() {
 			fatal("Failed to create data directory: " + err.Error())
 		}
 
-		initMetrics()
+		// No initMetrics() here — in control-plane mode, workers are spawned
+		// with --mode duckdb-service and would all fight over :9090. The
+		// control plane process owns the metrics endpoint.
 
 		duckdbservice.Run(duckdbservice.ServiceConfig{
 			ListenAddr:   listenAddr,
+			ListenFD:     *duckdbListenFD,
 			ServerConfig: cfg,
 			BearerToken:  token,
 			MaxSessions:  maxSessions,
@@ -330,26 +413,34 @@ func main() {
 		return
 	}
 
-	initMetrics()
+	metricsSrv := initMetrics()
 
 	// Create data directory if it doesn't exist
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		fatal("Failed to create data directory: " + err.Error())
 	}
 
-	// Auto-generate self-signed certificates if they don't exist
-	if err := server.EnsureCertificates(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
-		fatal("Failed to ensure TLS certificates: " + err.Error())
+	// Auto-generate self-signed certificates if they don't exist (skip when ACME is configured)
+	if cfg.ACMEDomain == "" {
+		if err := server.EnsureCertificates(cfg.TLSCertFile, cfg.TLSKeyFile); err != nil {
+			fatal("Failed to ensure TLS certificates: " + err.Error())
+		}
+		slog.Info("Using TLS certificates", "cert_file", cfg.TLSCertFile, "key_file", cfg.TLSKeyFile)
+	} else {
+		slog.Info("ACME/Let's Encrypt mode enabled", "domain", cfg.ACMEDomain)
 	}
-	slog.Info("Using TLS certificates", "cert_file", cfg.TLSCertFile, "key_file", cfg.TLSKeyFile)
 
 	// Handle control-plane mode
 	if *mode == "control-plane" {
 		cpCfg := controlplane.ControlPlaneConfig{
-			Config:         cfg,
-			SocketDir:      *socketDir,
-			ConfigPath:     *configFile,
-			HandoverSocket: *handoverSocket,
+			Config:             cfg,
+			SocketDir:          *socketDir,
+			ConfigPath:         *configFile,
+			HandoverSocket:     *handoverSocket,
+			WorkerQueueTimeout:   resolved.WorkerQueueTimeout,
+			WorkerIdleTimeout:    resolved.WorkerIdleTimeout,
+			HandoverDrainTimeout: resolved.HandoverDrainTimeout,
+			MetricsServer:        metricsSrv,
 		}
 		controlplane.RunControlPlane(cpCfg)
 		return
@@ -368,6 +459,11 @@ func main() {
 	go func() {
 		<-sigChan
 		slog.Info("Shutting down...")
+		if metricsSrv != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = metricsSrv.Shutdown(ctx)
+			cancel()
+		}
 		_ = srv.Close()
 		loggingShutdown()
 		os.Exit(0)

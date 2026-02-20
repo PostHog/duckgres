@@ -202,6 +202,17 @@ func walkNode(node *pg_query.Node, fn func(*pg_query.Node) bool) bool {
 		if n.RangeSubselect != nil {
 			walkNode(n.RangeSubselect.Subquery, fn)
 		}
+	case *pg_query.Node_RangeFunction:
+		// Function in FROM clause like: FROM generate_series(1, 10)
+		if n.RangeFunction != nil {
+			for _, funcList := range n.RangeFunction.Functions {
+				if list := funcList.GetList(); list != nil {
+					for _, item := range list.Items {
+						walkNode(item, fn)
+					}
+				}
+			}
+		}
 	case *pg_query.Node_SortBy:
 		if n.SortBy != nil {
 			walkNode(n.SortBy.Node, fn)

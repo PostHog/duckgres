@@ -10,31 +10,52 @@ import (
 type configCLIInputs struct {
 	Set map[string]bool
 
-	Host             string
-	Port             int
-	DataDir          string
-	CertFile         string
-	KeyFile          string
-	ProcessIsolation bool
-	IdleTimeout      string
-	MemoryLimit      string
-	Threads          int
-	MemoryBudget     string
-	MaxWorkers       int
-	MinWorkers       int
+	Host                      string
+	Port                      int
+	FlightPort                int
+	FlightSessionIdleTTL      string
+	FlightSessionReapInterval string
+	FlightHandleIdleTTL       string
+	FlightSessionTokenTTL     string
+	DataDir                   string
+	CertFile                  string
+	KeyFile                   string
+	ProcessIsolation          bool
+	IdleTimeout               string
+	MemoryLimit               string
+	Threads                   int
+	MemoryBudget              string
+	MemoryRebalance           bool
+	MaxWorkers                int
+	MinWorkers                int
+	WorkerQueueTimeout        string
+	WorkerIdleTimeout         string
+	HandoverDrainTimeout      string
+	ACMEDomain                string
+	ACMEEmail                 string
+	ACMECacheDir              string
+	MaxConnections            int
 }
 
 type resolvedConfig struct {
-	Server server.Config
+	Server               server.Config
+	WorkerQueueTimeout   time.Duration
+	WorkerIdleTimeout    time.Duration
+	HandoverDrainTimeout time.Duration
 }
 
 func defaultServerConfig() server.Config {
 	return server.Config{
-		Host:        "0.0.0.0",
-		Port:        5432,
-		DataDir:     "./data",
-		TLSCertFile: "./certs/server.crt",
-		TLSKeyFile:  "./certs/server.key",
+		Host:                      "0.0.0.0",
+		Port:                      5432,
+		FlightPort:                0,
+		FlightSessionIdleTTL:      10 * time.Minute,
+		FlightSessionReapInterval: 1 * time.Minute,
+		FlightHandleIdleTTL:       15 * time.Minute,
+		FlightSessionTokenTTL:     1 * time.Hour,
+		DataDir:                   "./data",
+		TLSCertFile:               "./certs/server.crt",
+		TLSKeyFile:                "./certs/server.key",
 		Users: map[string]string{
 			"postgres": "postgres",
 		},
@@ -54,6 +75,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	cfg := defaultServerConfig()
+	var workerQueueTimeout time.Duration
+	var workerIdleTimeout time.Duration
+	var handoverDrainTimeout time.Duration
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -61,6 +85,37 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.Port != 0 {
 			cfg.Port = fileCfg.Port
+		}
+		if fileCfg.FlightPort != 0 {
+			cfg.FlightPort = fileCfg.FlightPort
+		}
+		if fileCfg.FlightSessionIdleTTL != "" {
+			if d, err := time.ParseDuration(fileCfg.FlightSessionIdleTTL); err == nil {
+				cfg.FlightSessionIdleTTL = d
+			} else {
+				warn("Invalid flight_session_idle_ttl duration: " + err.Error())
+			}
+		}
+		if fileCfg.FlightSessionReapInterval != "" {
+			if d, err := time.ParseDuration(fileCfg.FlightSessionReapInterval); err == nil {
+				cfg.FlightSessionReapInterval = d
+			} else {
+				warn("Invalid flight_session_reap_interval duration: " + err.Error())
+			}
+		}
+		if fileCfg.FlightHandleIdleTTL != "" {
+			if d, err := time.ParseDuration(fileCfg.FlightHandleIdleTTL); err == nil {
+				cfg.FlightHandleIdleTTL = d
+			} else {
+				warn("Invalid flight_handle_idle_ttl duration: " + err.Error())
+			}
+		}
+		if fileCfg.FlightSessionTokenTTL != "" {
+			if d, err := time.ParseDuration(fileCfg.FlightSessionTokenTTL); err == nil {
+				cfg.FlightSessionTokenTTL = d
+			} else {
+				warn("Invalid flight_session_token_ttl duration: " + err.Error())
+			}
 		}
 		if fileCfg.DataDir != "" {
 			cfg.DataDir = fileCfg.DataDir
@@ -80,6 +135,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.RateLimit.MaxConnectionsPerIP > 0 {
 			cfg.RateLimit.MaxConnectionsPerIP = fileCfg.RateLimit.MaxConnectionsPerIP
+		}
+		if fileCfg.RateLimit.MaxConnections > 0 {
+			cfg.RateLimit.MaxConnections = fileCfg.RateLimit.MaxConnections
 		}
 		if fileCfg.RateLimit.FailedAttemptWindow != "" {
 			if d, err := time.ParseDuration(fileCfg.RateLimit.FailedAttemptWindow); err == nil {
@@ -152,17 +210,51 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.MemoryBudget != "" {
 			cfg.MemoryBudget = fileCfg.MemoryBudget
 		}
+		if fileCfg.MemoryRebalance != nil {
+			cfg.MemoryRebalance = *fileCfg.MemoryRebalance
+		}
 		if fileCfg.MaxWorkers != 0 {
 			cfg.MaxWorkers = fileCfg.MaxWorkers
 		}
 		if fileCfg.MinWorkers != 0 {
 			cfg.MinWorkers = fileCfg.MinWorkers
 		}
+		if fileCfg.WorkerQueueTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.WorkerQueueTimeout); err == nil {
+				workerQueueTimeout = d
+			} else {
+				warn("Invalid worker_queue_timeout duration: " + err.Error())
+			}
+		}
+		if fileCfg.WorkerIdleTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.WorkerIdleTimeout); err == nil {
+				workerIdleTimeout = d
+			} else {
+				warn("Invalid worker_idle_timeout duration: " + err.Error())
+			}
+		}
+		if fileCfg.HandoverDrainTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.HandoverDrainTimeout); err == nil {
+				handoverDrainTimeout = d
+			} else {
+				warn("Invalid handover_drain_timeout duration: " + err.Error())
+			}
+		}
 		if len(fileCfg.PassthroughUsers) > 0 {
 			cfg.PassthroughUsers = make(map[string]bool, len(fileCfg.PassthroughUsers))
 			for _, u := range fileCfg.PassthroughUsers {
 				cfg.PassthroughUsers[u] = true
 			}
+		}
+
+		if fileCfg.TLS.ACME.Domain != "" {
+			cfg.ACMEDomain = fileCfg.TLS.ACME.Domain
+		}
+		if fileCfg.TLS.ACME.Email != "" {
+			cfg.ACMEEmail = fileCfg.TLS.ACME.Email
+		}
+		if fileCfg.TLS.ACME.CacheDir != "" {
+			cfg.ACMECacheDir = fileCfg.TLS.ACME.CacheDir
 		}
 	}
 
@@ -172,6 +264,41 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {
 			cfg.Port = p
+		}
+	}
+	if v := getenv("DUCKGRES_FLIGHT_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.FlightPort = p
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_PORT: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_FLIGHT_SESSION_IDLE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FlightSessionIdleTTL = d
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_SESSION_IDLE_TTL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FlightSessionReapInterval = d
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_FLIGHT_HANDLE_IDLE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FlightHandleIdleTTL = d
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_HANDLE_IDLE_TTL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_FLIGHT_SESSION_TOKEN_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.FlightSessionTokenTTL = d
+		} else {
+			warn("Invalid DUCKGRES_FLIGHT_SESSION_TOKEN_TTL duration: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_DATA_DIR"); v != "" {
@@ -247,6 +374,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_MEMORY_BUDGET"); v != "" {
 		cfg.MemoryBudget = v
 	}
+	if v := getenv("DUCKGRES_MEMORY_REBALANCE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.MemoryRebalance = b
+		} else {
+			warn("Invalid DUCKGRES_MEMORY_REBALANCE: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_MIN_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.MinWorkers = n
@@ -261,12 +395,80 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_MAX_WORKERS: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_WORKER_QUEUE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			workerQueueTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_WORKER_QUEUE_TIMEOUT duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_WORKER_IDLE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			workerIdleTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_WORKER_IDLE_TIMEOUT duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_HANDOVER_DRAIN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			handoverDrainTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_HANDOVER_DRAIN_TIMEOUT duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_ACME_DOMAIN"); v != "" {
+		cfg.ACMEDomain = v
+	}
+	if v := getenv("DUCKGRES_ACME_EMAIL"); v != "" {
+		cfg.ACMEEmail = v
+	}
+	if v := getenv("DUCKGRES_ACME_CACHE_DIR"); v != "" {
+		cfg.ACMECacheDir = v
+	}
+	if v := getenv("DUCKGRES_MAX_CONNECTIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.RateLimit.MaxConnections = n
+		} else {
+			warn("Invalid DUCKGRES_MAX_CONNECTIONS: " + err.Error())
+		}
+	}
 
 	if cli.Set["host"] {
 		cfg.Host = cli.Host
 	}
 	if cli.Set["port"] {
 		cfg.Port = cli.Port
+	}
+	if cli.Set["flight-port"] {
+		cfg.FlightPort = cli.FlightPort
+	}
+	if cli.Set["flight-session-idle-ttl"] {
+		if d, err := time.ParseDuration(cli.FlightSessionIdleTTL); err == nil {
+			cfg.FlightSessionIdleTTL = d
+		} else {
+			warn("Invalid --flight-session-idle-ttl duration: " + err.Error())
+		}
+	}
+	if cli.Set["flight-session-reap-interval"] {
+		if d, err := time.ParseDuration(cli.FlightSessionReapInterval); err == nil {
+			cfg.FlightSessionReapInterval = d
+		} else {
+			warn("Invalid --flight-session-reap-interval duration: " + err.Error())
+		}
+	}
+	if cli.Set["flight-handle-idle-ttl"] {
+		if d, err := time.ParseDuration(cli.FlightHandleIdleTTL); err == nil {
+			cfg.FlightHandleIdleTTL = d
+		} else {
+			warn("Invalid --flight-handle-idle-ttl duration: " + err.Error())
+		}
+	}
+	if cli.Set["flight-session-token-ttl"] {
+		if d, err := time.ParseDuration(cli.FlightSessionTokenTTL); err == nil {
+			cfg.FlightSessionTokenTTL = d
+		} else {
+			warn("Invalid --flight-session-token-ttl duration: " + err.Error())
+		}
 	}
 	if cli.Set["data-dir"] {
 		cfg.DataDir = cli.DataDir
@@ -296,11 +498,47 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["memory-budget"] {
 		cfg.MemoryBudget = cli.MemoryBudget
 	}
+	if cli.Set["memory-rebalance"] {
+		cfg.MemoryRebalance = cli.MemoryRebalance
+	}
 	if cli.Set["min-workers"] {
 		cfg.MinWorkers = cli.MinWorkers
 	}
 	if cli.Set["max-workers"] {
 		cfg.MaxWorkers = cli.MaxWorkers
+	}
+	if cli.Set["worker-queue-timeout"] {
+		if d, err := time.ParseDuration(cli.WorkerQueueTimeout); err == nil {
+			workerQueueTimeout = d
+		} else {
+			warn("Invalid --worker-queue-timeout duration: " + err.Error())
+		}
+	}
+	if cli.Set["worker-idle-timeout"] {
+		if d, err := time.ParseDuration(cli.WorkerIdleTimeout); err == nil {
+			workerIdleTimeout = d
+		} else {
+			warn("Invalid --worker-idle-timeout duration: " + err.Error())
+		}
+	}
+	if cli.Set["handover-drain-timeout"] {
+		if d, err := time.ParseDuration(cli.HandoverDrainTimeout); err == nil {
+			handoverDrainTimeout = d
+		} else {
+			warn("Invalid --handover-drain-timeout duration: " + err.Error())
+		}
+	}
+	if cli.Set["acme-domain"] {
+		cfg.ACMEDomain = cli.ACMEDomain
+	}
+	if cli.Set["acme-email"] {
+		cfg.ACMEEmail = cli.ACMEEmail
+	}
+	if cli.Set["acme-cache-dir"] {
+		cfg.ACMECacheDir = cli.ACMECacheDir
+	}
+	if cli.Set["max-connections"] {
+		cfg.RateLimit.MaxConnections = cli.MaxConnections
 	}
 
 	// Validate memory_limit format if explicitly set
@@ -316,6 +554,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	return resolvedConfig{
-		Server: cfg,
+		Server:               cfg,
+		WorkerQueueTimeout:   workerQueueTimeout,
+		WorkerIdleTimeout:    workerIdleTimeout,
+		HandoverDrainTimeout: handoverDrainTimeout,
 	}
 }

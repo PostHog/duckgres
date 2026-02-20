@@ -1,6 +1,10 @@
 package controlplane
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 func TestValidateTLSFiles(t *testing.T) {
 	if err := validateTLSFiles("cert.pem", "key.pem"); err != nil {
@@ -90,5 +94,42 @@ func TestValidateControlPlaneSecurity(t *testing.T) {
 	noUsers.Users = map[string]string{}
 	if err := validateControlPlaneSecurity(noUsers); err == nil {
 		t.Fatalf("expected error for missing users")
+	}
+}
+
+func TestCheckSocketDirWritable(t *testing.T) {
+	// Happy path: writable directory
+	tmpDir := t.TempDir()
+	// Unix socket paths have a max length (~104 bytes on macOS). t.TempDir()
+	// paths can be very long, so use a short filename for the check.
+	if err := checkSocketDirWritable(tmpDir); err != nil {
+		// If t.TempDir is still too long, fallback to /tmp
+		if strings.Contains(err.Error(), "invalid argument") || strings.Contains(err.Error(), "too long") {
+			shortDir, err2 := os.MkdirTemp("/tmp", "dg-test-*")
+			if err2 == nil {
+				defer func() { _ = os.RemoveAll(shortDir) }()
+				if err3 := checkSocketDirWritable(shortDir); err3 != nil {
+					t.Fatalf("expected short directory %s to be writable: %v", shortDir, err3)
+				}
+				return
+			}
+		}
+		t.Fatalf("expected directory %s to be writable: %v", tmpDir, err)
+	}
+
+	// Failure path: non-existent directory
+	if err := checkSocketDirWritable("/non/existent/path/for/duckgres/test"); err == nil {
+		t.Fatalf("expected error for non-existent directory")
+	}
+
+	// Failure path: read-only directory (if we can create one)
+	roDir := t.TempDir()
+	if err := os.Chmod(roDir, 0555); err != nil {
+		t.Fatalf("failed to chmod directory to read-only: %v", err)
+	}
+	defer func() { _ = os.Chmod(roDir, 0755) }() // Restore for cleanup
+
+	if err := checkSocketDirWritable(roDir); err == nil {
+		t.Fatalf("expected error for read-only directory")
 	}
 }

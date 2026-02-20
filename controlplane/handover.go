@@ -12,7 +12,9 @@ import (
 
 // Handover protocol messages
 type handoverMsg struct {
-	Type string `json:"type"`
+	Type          string   `json:"type"`
+	PID           int      `json:"pid,omitempty"`
+	PreboundPaths []string `json:"prebound_paths,omitempty"`
 }
 
 // startHandoverListener starts listening for handover requests from a new control plane.
@@ -86,6 +88,7 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 			slog.Warn("Handover failed, recovering.")
 			if cp.recoverFromFailedReload() {
 				cp.startHandoverListener()
+				cp.recoverAfterFailedReload()
 			}
 		}
 	}()
@@ -111,8 +114,30 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 
 	slog.Info("Received handover request, preparing transfer...")
 
-	// Send ack
-	if err := encoder.Encode(handoverMsg{Type: "handover_ack"}); err != nil {
+	// Collect available pre-bound sockets to pass to the new CP.
+	// This allows the new CP to work even when the socket directory is
+	// read-only (EROFS under systemd ProtectSystem=strict).
+	preboundSockets := cp.pool.TakeAllPrebound()
+	var preboundPaths []string
+	var preboundFiles []*os.File
+	for _, ps := range preboundSockets {
+		f, err := ps.listener.(*net.UnixListener).File()
+		if err != nil {
+			slog.Warn("Failed to get pre-bound socket FD, skipping.", "path", ps.socketPath, "error", err)
+			continue
+		}
+		preboundPaths = append(preboundPaths, ps.socketPath)
+		preboundFiles = append(preboundFiles, f)
+	}
+	defer func() {
+		for _, f := range preboundFiles {
+			_ = f.Close()
+		}
+	}()
+
+	// Send ack with pre-bound socket paths so the new CP knows what to expect
+	ack := handoverMsg{Type: "handover_ack", PreboundPaths: preboundPaths}
+	if err := encoder.Encode(ack); err != nil {
 		slog.Error("Failed to send handover ack.", "error", err)
 		return
 	}
@@ -124,12 +149,12 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 		return
 	}
 
-	file, err := tcpLn.File()
+	pgFile, err := tcpLn.File()
 	if err != nil {
 		slog.Error("Failed to get listener FD.", "error", err)
 		return
 	}
-	defer func() { _ = file.Close() }()
+	defer func() { _ = pgFile.Close() }()
 
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
@@ -137,11 +162,17 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 		return
 	}
 
-	if err := sendFD(uc, file); err != nil {
-		slog.Error("Failed to send PG listener FD.", "error", err)
+	// Send PG listener FD + all pre-bound socket FDs in a single SCM_RIGHTS message.
+	// The first FD is always the PG listener; subsequent FDs match preboundPaths order.
+	allFiles := make([]*os.File, 0, 1+len(preboundFiles))
+	allFiles = append(allFiles, pgFile)
+	allFiles = append(allFiles, preboundFiles...)
+
+	if err := sendFDs(uc, allFiles); err != nil {
+		slog.Error("Failed to send FDs.", "error", err)
 		return
 	}
-	slog.Info("PG listener FD sent to new control plane.")
+	slog.Info("PG listener + pre-bound socket FDs sent to new control plane.", "prebound_count", len(preboundFiles))
 
 	// Wait for handover_complete
 	var complete handoverMsg
@@ -156,6 +187,36 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	}
 
 	handoverOK = true
+	cp.handoverDraining.Store(true)
+
+	// Belt and suspenders: also send MAINPID from the old CP (which is the
+	// currently trusted main PID). This eliminates the race where systemd
+	// sees our PID die before processing the new CP's sd_notify MAINPID.
+	// When we send it, systemd updates the tracked PID before we exit.
+	if complete.PID > 0 {
+		if err := sdNotify(fmt.Sprintf("MAINPID=%d", complete.PID)); err != nil {
+			slog.Warn("sd_notify MAINPID (from old CP) failed.", "error", err)
+		}
+	}
+
+	// Clear reloading flag so the timeout-based recovery in selfExecDetached
+	// doesn't fire during a long drain.
+	cp.reloading.Store(false)
+
+	// Shut down Flight ingress and ACME now that the new CP has confirmed
+	// handover_complete. The new CP will bind these ports after
+	// receiveHandover returns. Shutting down here (instead of in the
+	// SIGUSR1 handler) keeps these services available during the entire
+	// handover protocol + pre-warm, minimizing downtime.
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
+	}
+	if cp.acmeManager != nil {
+		if err := cp.acmeManager.Close(); err != nil {
+			slog.Warn("ACME manager shutdown during handover.", "error", err)
+		}
+	}
 
 	// Stop accepting new connections immediately. The new CP has its own
 	// listener FD copy (from SCM_RIGHTS), so closing our copy doesn't
@@ -164,6 +225,14 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	cp.closed = true
 	cp.closeMu.Unlock()
 	_ = cp.pgListener.Close()
+
+	// Close the original pre-bound socket listeners. Their FDs were dup'd
+	// and sent to the new CP via SCM_RIGHTS, so the new CP has its own
+	// copies. Closing here prevents an FD leak during the (potentially
+	// hours-long) drain.
+	for _, ps := range preboundSockets {
+		_ = ps.listener.Close()
+	}
 
 	// Wait for in-flight connections to finish (with timeout)
 	drainDone := make(chan struct{})
@@ -175,23 +244,36 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	select {
 	case <-drainDone:
 		slog.Info("All connections drained after handover.")
-	case <-time.After(5 * time.Minute):
-		slog.Warn("Handover drain timeout after 5 minutes, forcing exit.")
+	case <-time.After(cp.cfg.HandoverDrainTimeout):
+		slog.Warn("Handover drain timeout, forcing exit.", "timeout", cp.cfg.HandoverDrainTimeout)
 	}
 
 	// Shut down workers
 	cp.pool.ShutdownAll()
+
+	// Give systemd time to process the MAINPID notification before we exit.
+	// Without this delay there is a small window where systemd could see our
+	// PID die before it has updated the tracked main PID, causing it to
+	// briefly consider the service failed and tear down the RuntimeDirectory
+	// bind mount inside the ProtectSystem=strict mount namespace.
+	// Only sleep when running under systemd — no point delaying in tests or
+	// manual runs where there is no NOTIFY_SOCKET.
+	if os.Getenv("NOTIFY_SOCKET") != "" {
+		time.Sleep(2 * time.Second)
+	}
 
 	slog.Info("Old control plane exiting after handover.")
 	os.Exit(0)
 }
 
 // receiveHandover connects to an existing control plane's handover socket,
-// receives the PG listener FD, and takes over.
-func receiveHandover(handoverSocket string) (*net.TCPListener, error) {
+// receives the PG listener FD and any pre-bound worker socket FDs, and takes
+// over. When no pre-bound sockets are received (old CP without this feature),
+// socketDir is validated for writability before completing the handover.
+func receiveHandover(handoverSocket, socketDir string) (*net.TCPListener, []*preboundSocket, error) {
 	conn, err := net.Dial("unix", handoverSocket)
 	if err != nil {
-		return nil, fmt.Errorf("connect handover socket: %w", err)
+		return nil, nil, fmt.Errorf("connect handover socket: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 
@@ -199,7 +281,7 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, error) {
 
 	// Send handover request
 	if err := encoder.Encode(handoverMsg{Type: "handover_request"}); err != nil {
-		return nil, fmt.Errorf("send handover request: %w", err)
+		return nil, nil, fmt.Errorf("send handover request: %w", err)
 	}
 
 	// Read ack. We must NOT use json.NewDecoder here because
@@ -207,35 +289,78 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, error) {
 	// FD send, silently discarding the ancillary file descriptor.
 	var ack handoverMsg
 	if err := readJSONLine(conn, &ack); err != nil {
-		return nil, fmt.Errorf("read handover ack: %w", err)
+		return nil, nil, fmt.Errorf("read handover ack: %w", err)
 	}
 
 	if ack.Type != "handover_ack" {
-		return nil, fmt.Errorf("unexpected handover message: %s", ack.Type)
+		return nil, nil, fmt.Errorf("unexpected handover message: %s", ack.Type)
 	}
 
-	// Receive PG listener FD
+	// Receive FDs via SCM_RIGHTS. The first FD is always the PG listener;
+	// subsequent FDs are pre-bound worker sockets matching ack.PreboundPaths.
 	uc, ok := conn.(*net.UnixConn)
 	if !ok {
-		return nil, fmt.Errorf("handover connection is not Unix")
+		return nil, nil, fmt.Errorf("handover connection is not Unix")
 	}
 
-	file, err := recvFD(uc)
+	expectedFDs := 1 + len(ack.PreboundPaths)
+	files, err := recvFDs(uc, expectedFDs)
 	if err != nil {
-		return nil, fmt.Errorf("receive PG listener FD: %w", err)
+		return nil, nil, fmt.Errorf("receive handover FDs: %w", err)
 	}
-	defer func() { _ = file.Close() }()
+	defer func() {
+		for _, f := range files {
+			_ = f.Close()
+		}
+	}()
 
-	// Reconstruct listener from FD
-	ln, err := net.FileListener(file)
+	if len(files) < 1 {
+		return nil, nil, fmt.Errorf("no PG listener FD received")
+	}
+
+	// First FD is the PG listener.
+	ln, err := net.FileListener(files[0])
 	if err != nil {
-		return nil, fmt.Errorf("FileListener PG: %w", err)
+		return nil, nil, fmt.Errorf("FileListener PG: %w", err)
 	}
 
 	tcpLn, ok := ln.(*net.TCPListener)
 	if !ok {
 		_ = ln.Close()
-		return nil, fmt.Errorf("PG listener is not TCP")
+		return nil, nil, fmt.Errorf("PG listener is not TCP")
+	}
+
+	// Reconstruct pre-bound sockets from remaining FDs.
+	var prebound []*preboundSocket
+	for i := 1; i < len(files) && i-1 < len(ack.PreboundPaths); i++ {
+		pln, pErr := net.FileListener(files[i])
+		if pErr != nil {
+			slog.Warn("Failed to reconstruct pre-bound socket from FD.", "path", ack.PreboundPaths[i-1], "error", pErr)
+			continue
+		}
+		ul, ulOK := pln.(*net.UnixListener)
+		if !ulOK {
+			_ = pln.Close()
+			slog.Warn("Pre-bound FD is not a Unix listener.", "path", ack.PreboundPaths[i-1])
+			continue
+		}
+		ul.SetUnlinkOnClose(false)
+		prebound = append(prebound, &preboundSocket{
+			socketPath: ack.PreboundPaths[i-1],
+			listener:   ul,
+		})
+	}
+
+	// When pre-bound sockets were received, the socket directory doesn't
+	// need to be writable — the whole point of passing FDs is to work
+	// around EROFS under systemd ProtectSystem=strict.
+	// When no pre-bound sockets were received (backward compat with old CP),
+	// fall back to the writability check.
+	if len(prebound) == 0 {
+		if err := checkSocketDirWritable(socketDir); err != nil {
+			_ = tcpLn.Close()
+			return nil, nil, fmt.Errorf("socket dir not writable, aborting handover: %w", err)
+		}
 	}
 
 	// Notify systemd of our PID BEFORE telling the old CP we're done.
@@ -245,27 +370,42 @@ func receiveHandover(handoverSocket string) (*net.TCPListener, error) {
 		slog.Warn("sd_notify MAINPID+READY failed.", "error", err)
 	}
 
-	// Send handover complete
-	if err := encoder.Encode(handoverMsg{Type: "handover_complete"}); err != nil {
+	// Send handover complete (include our PID so the old CP can also send
+	// MAINPID to systemd as the currently trusted main process).
+	if err := encoder.Encode(handoverMsg{Type: "handover_complete", PID: os.Getpid()}); err != nil {
 		_ = tcpLn.Close()
-		return nil, fmt.Errorf("send handover complete: %w", err)
+		for _, ps := range prebound {
+			_ = ps.listener.Close()
+		}
+		return nil, nil, fmt.Errorf("send handover complete: %w", err)
 	}
 
-	slog.Info("Handover received: got PG listener.")
-	return tcpLn, nil
+	slog.Info("Handover received.", "prebound_count", len(prebound))
+	return tcpLn, prebound, nil
 }
 
-// sendFD sends a file descriptor over a Unix socket using SCM_RIGHTS.
+// sendFD sends a single file descriptor over a Unix socket using SCM_RIGHTS.
 func sendFD(uc *net.UnixConn, file *os.File) error {
 	rights := syscall.UnixRights(int(file.Fd()))
 	_, _, err := uc.WriteMsgUnix([]byte{0}, rights, nil)
 	return err
 }
 
-// recvFD receives a file descriptor from a Unix socket using SCM_RIGHTS.
-func recvFD(uc *net.UnixConn) (*os.File, error) {
+// sendFDs sends multiple file descriptors over a Unix socket in a single SCM_RIGHTS message.
+func sendFDs(uc *net.UnixConn, files []*os.File) error {
+	fds := make([]int, len(files))
+	for i, f := range files {
+		fds[i] = int(f.Fd())
+	}
+	rights := syscall.UnixRights(fds...)
+	_, _, err := uc.WriteMsgUnix([]byte{0}, rights, nil)
+	return err
+}
+
+// recvFDs receives multiple file descriptors from a Unix socket via SCM_RIGHTS.
+func recvFDs(uc *net.UnixConn, expectedCount int) ([]*os.File, error) {
 	buf := make([]byte, 1)
-	oob := make([]byte, 64)
+	oob := make([]byte, syscall.CmsgSpace(expectedCount*4))
 	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
 	if err != nil {
 		return nil, err
@@ -274,16 +414,47 @@ func recvFD(uc *net.UnixConn) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse control message: %w", err)
 	}
+	var files []*os.File
 	for _, scm := range scms {
 		fds, err := syscall.ParseUnixRights(&scm)
 		if err != nil {
 			continue
 		}
-		if len(fds) > 0 {
-			return os.NewFile(uintptr(fds[0]), "received-fd"), nil
+		for i, fd := range fds {
+			files = append(files, os.NewFile(uintptr(fd), fmt.Sprintf("received-fd-%d", i)))
 		}
 	}
-	return nil, fmt.Errorf("no file descriptor received")
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no file descriptors received")
+	}
+	return files, nil
+}
+
+// checkSocketDirWritable verifies that the socket directory is writable by
+// creating and removing both a temporary file and a Unix socket. This catches
+// cases where ProtectSystem=strict's ReadWritePaths bind mount has been lost
+// or remounted RO (e.g., after a handover race with systemd's RuntimeDirectory cleanup).
+func checkSocketDirWritable(dir string) error {
+	// Test regular file creation
+	f, err := os.CreateTemp(dir, ".writable-check-*")
+	if err != nil {
+		return fmt.Errorf("cannot write to socket directory %s: %w", dir, err)
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+
+	// Test Unix socket binding specifically (catches different EROFS/EPERM cases)
+	socketPath := fmt.Sprintf("%s/.socket-check-%d.sock", dir, os.Getpid())
+	_ = os.Remove(socketPath)
+	l, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return fmt.Errorf("cannot bind unix socket in %s: %w", dir, err)
+	}
+	_ = l.Close()
+	_ = os.Remove(socketPath)
+
+	return nil
 }
 
 // readJSONLine reads one newline-terminated JSON message from conn without

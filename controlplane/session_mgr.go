@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ type ManagedSession struct {
 	WorkerID     int
 	SessionToken string
 	Executor     *server.FlightExecutor
+	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
 }
 
 // SessionManager tracks all active sessions and their worker assignments.
@@ -46,15 +48,16 @@ func NewSessionManager(pool *FlightWorkerPool, rebalancer *MemoryRebalancer) *Se
 // creates a session on it, and rebalances memory/thread limits across all active sessions.
 func (sm *SessionManager) CreateSession(ctx context.Context, username string) (int32, *server.FlightExecutor, error) {
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
-	// Max-workers check is atomic inside AcquireWorker to prevent TOCTOU races.
-	worker, err := sm.pool.AcquireWorker()
+	// When max-workers is set, this blocks until a slot is available.
+	worker, err := sm.pool.AcquireWorker(ctx)
 	if err != nil {
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
 
 	sessionToken, err := worker.CreateSession(ctx, username)
 	if err != nil {
-		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker)
+		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker
+		// that has sessions from other concurrent requests).
 		sm.pool.RetireWorkerIfNoSessions(worker.ID)
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
 	}
@@ -74,16 +77,14 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 	sm.mu.Lock()
 	sm.sessions[pid] = session
 	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
-	totalSessions := len(sm.sessions)
 	sm.mu.Unlock()
 
 	slog.Debug("Session created.", "pid", pid, "worker", worker.ID, "user", username)
 
-	// Set initial memory/thread limits on this session synchronously so it
-	// never runs with unlimited resources (debounced rebalance would be too late).
-	// Then trigger an async rebalance to adjust all other sessions.
+	// Set memory/thread limits on this session synchronously so it never
+	// runs with unlimited resources.
 	if sm.rebalancer != nil {
-		sm.rebalancer.SetInitialLimits(ctx, session, totalSessions)
+		sm.rebalancer.SetInitialLimits(ctx, session)
 		sm.rebalancer.RequestRebalance()
 	}
 
@@ -129,8 +130,8 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Retire the dedicated worker (1:1 model)
-	sm.pool.RetireWorker(session.WorkerID)
+	// Release the worker for reuse instead of retiring it immediately (pooled model)
+	sm.pool.ReleaseWorker(session.WorkerID)
 
 	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
 
@@ -140,12 +141,22 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	}
 }
 
-// OnWorkerCrash handles a worker crash by sending errors to all affected sessions.
+// OnWorkerCrash handles a worker crash by marking all affected executors as
+// dead and notifying sessions. Executors are marked dead BEFORE the shared
+// gRPC client is closed to prevent nil-pointer panics from concurrent RPCs.
 // errorFn is called for each affected session to send an error to the client.
 func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	sm.mu.Lock()
 	pids := make([]int32, len(sm.byWorker[workerID]))
 	copy(pids, sm.byWorker[workerID])
+
+	// Mark all executors as dead first (under lock) so any concurrent RPC
+	// sees the dead flag before the gRPC client is closed.
+	for _, pid := range pids {
+		if s, ok := sm.sessions[pid]; ok && s.Executor != nil {
+			s.Executor.MarkDead()
+		}
+	}
 	sm.mu.Unlock()
 
 	slog.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids))
@@ -158,6 +169,15 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			delete(sm.sessions, pid)
 			if session.Executor != nil {
 				_ = session.Executor.Close()
+			}
+			// Close the TCP connection to unblock the message loop's read.
+			// This causes the session goroutine to exit instead of looping
+			// with ErrWorkerDead on every query. The deferred close in
+			// handleConnection will also call Close() on the same conn;
+			// that's harmless (net.Conn.Close on a closed socket returns
+			// an error which is discarded).
+			if session.connCloser != nil {
+				_ = session.connCloser.Close()
 			}
 		}
 		sm.mu.Unlock()
@@ -173,6 +193,17 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	}
 }
 
+// SetConnCloser registers the client's TCP connection so it can be closed
+// when the backing worker crashes. This unblocks the message loop's read,
+// causing it to exit cleanly instead of looping on ErrWorkerDead.
+func (sm *SessionManager) SetConnCloser(pid int32, closer io.Closer) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if s, ok := sm.sessions[pid]; ok {
+		s.connCloser = closer
+	}
+}
+
 // SessionCount returns the number of active sessions.
 func (sm *SessionManager) SessionCount() int {
 	sm.mu.RLock()
@@ -185,6 +216,16 @@ func (sm *SessionManager) SessionCountForWorker(workerID int) int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return len(sm.byWorker[workerID])
+}
+
+// WorkerIDForPID returns the worker ID for a session, or -1 if not found.
+func (sm *SessionManager) WorkerIDForPID(pid int32) int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[pid]; ok {
+		return s.WorkerID
+	}
+	return -1
 }
 
 // AllSessions returns a snapshot of all active sessions.

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 func TestIsEmptyQuery(t *testing.T) {
@@ -1974,6 +1975,258 @@ func TestFormatInterval(t *testing.T) {
 	}
 }
 
+func TestMatchPgCursorsQuery(t *testing.T) {
+	tests := []struct {
+		name           string
+		query          string
+		wantName       string
+		wantParam      bool
+		wantOK         bool
+	}{
+		// Literal cursor name queries
+		{
+			name:      "basic pg_cursors query",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = 'test_cursor'",
+			wantName:  "test_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "pg_catalog prefix",
+			query:     "SELECT 1 FROM pg_catalog.pg_cursors WHERE name = 'test_cursor'",
+			wantName:  "test_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "psycopg3 style cursor name with dots",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = 'posthog_2_data_imports_team_2.users'",
+			wantName:  "posthog_2_data_imports_team_2.users",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "leading whitespace",
+			query:     "  SELECT 1 FROM pg_cursors WHERE name = 'my_cursor'",
+			wantName:  "my_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "leading newline",
+			query:     "\nSELECT 1 FROM pg_cursors WHERE name = 'my_cursor'\n",
+			wantName:  "my_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "case insensitive",
+			query:     "select 1 from pg_cursors where name = 'test'",
+			wantName:  "test",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "trailing semicolon",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = 'test_cursor';",
+			wantName:  "test_cursor",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "pg_catalog with spaces around dot",
+			query:     "SELECT 1 FROM pg_catalog . pg_cursors WHERE name = 'test'",
+			wantName:  "test",
+			wantParam: false,
+			wantOK:    true,
+		},
+		{
+			name:      "empty cursor name",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = ''",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    true,
+		},
+
+		// Parameterized queries ($1)
+		{
+			name:      "parameterized query",
+			query:     "SELECT 1 FROM pg_cursors WHERE name = $1",
+			wantName:  "",
+			wantParam: true,
+			wantOK:    true,
+		},
+		{
+			name:      "parameterized with pg_catalog",
+			query:     "SELECT 1 FROM pg_catalog.pg_cursors WHERE name = $1",
+			wantName:  "",
+			wantParam: true,
+			wantOK:    true,
+		},
+
+		// Non-matching queries
+		{
+			name:      "regular SELECT",
+			query:     "SELECT * FROM users",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    false,
+		},
+		{
+			name:      "pg_cursors in different context",
+			query:     "SELECT * FROM pg_cursors",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    false,
+		},
+		{
+			name:      "pg_cursors without WHERE name",
+			query:     "SELECT count(*) FROM pg_cursors WHERE is_holdable = true",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    false,
+		},
+		{
+			name:      "empty query",
+			query:     "",
+			wantName:  "",
+			wantParam: false,
+			wantOK:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, param, ok := matchPgCursorsQuery(tt.query)
+			if ok != tt.wantOK {
+				t.Errorf("matchPgCursorsQuery(%q) ok = %v, want %v", tt.query, ok, tt.wantOK)
+			}
+			if name != tt.wantName {
+				t.Errorf("matchPgCursorsQuery(%q) name = %q, want %q", tt.query, name, tt.wantName)
+			}
+			if param != tt.wantParam {
+				t.Errorf("matchPgCursorsQuery(%q) parameterized = %v, want %v", tt.query, param, tt.wantParam)
+			}
+		})
+	}
+}
+
+func TestCursorCloseAllCursors(t *testing.T) {
+	c := &clientConn{
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+			"cur2": {query: "SELECT 2"},
+			"cur3": {query: "SELECT 3"},
+		},
+	}
+
+	if len(c.cursors) != 3 {
+		t.Fatalf("expected 3 cursors, got %d", len(c.cursors))
+	}
+
+	c.closeAllCursors()
+
+	if len(c.cursors) != 0 {
+		t.Errorf("after closeAllCursors, expected 0 cursors, got %d", len(c.cursors))
+	}
+}
+
+func TestCursorCloseSingle(t *testing.T) {
+	c := &clientConn{
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+			"cur2": {query: "SELECT 2"},
+		},
+	}
+
+	c.closeCursor("cur1")
+
+	if len(c.cursors) != 1 {
+		t.Errorf("expected 1 cursor remaining, got %d", len(c.cursors))
+	}
+	if _, ok := c.cursors["cur2"]; !ok {
+		t.Error("expected cur2 to still exist")
+	}
+	if _, ok := c.cursors["cur1"]; ok {
+		t.Error("expected cur1 to be removed")
+	}
+}
+
+func TestCursorCloseNonexistent(t *testing.T) {
+	c := &clientConn{
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+		},
+	}
+
+	// Should not panic
+	c.closeCursor("nonexistent")
+
+	if len(c.cursors) != 1 {
+		t.Errorf("expected 1 cursor, got %d", len(c.cursors))
+	}
+}
+
+func TestTransactionCommitClosesAllCursors(t *testing.T) {
+	c := &clientConn{
+		txStatus: txStatusTransaction,
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+			"cur2": {query: "SELECT 2"},
+		},
+	}
+
+	c.updateTxStatus("COMMIT")
+
+	if c.txStatus != txStatusIdle {
+		t.Errorf("txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+	if len(c.cursors) != 0 {
+		t.Errorf("expected 0 cursors after COMMIT, got %d", len(c.cursors))
+	}
+}
+
+func TestTransactionRollbackClosesAllCursors(t *testing.T) {
+	c := &clientConn{
+		txStatus: txStatusTransaction,
+		cursors: map[string]*cursorState{
+			"cur1": {query: "SELECT 1"},
+		},
+	}
+
+	c.updateTxStatus("ROLLBACK")
+
+	if c.txStatus != txStatusIdle {
+		t.Errorf("txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+	if len(c.cursors) != 0 {
+		t.Errorf("expected 0 cursors after ROLLBACK, got %d", len(c.cursors))
+	}
+}
+
+func TestIsFetchForwardOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		dir  pg_query.FetchDirection
+		want bool
+	}{
+		{"undefined (default)", pg_query.FetchDirection_FETCH_DIRECTION_UNDEFINED, true},
+		{"forward", pg_query.FetchDirection_FETCH_FORWARD, true},
+		{"backward", pg_query.FetchDirection_FETCH_BACKWARD, false},
+		{"absolute", pg_query.FetchDirection_FETCH_ABSOLUTE, false},
+		{"relative", pg_query.FetchDirection_FETCH_RELATIVE, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isFetchForwardOnly(tt.dir)
+			if got != tt.want {
+				t.Errorf("isFetchForwardOnly(%v) = %v, want %v", tt.dir, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCountDollarParams(t *testing.T) {
 	tests := []struct {
 		query    string
@@ -1995,5 +2248,173 @@ func TestCountDollarParams(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("countDollarParams(%q) = %d, want %d", tt.query, got, tt.expected)
 		}
+	}
+}
+
+func TestMatchPgStatActivityQuery(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		want  bool
+	}{
+		// Should match
+		{"simple select", "SELECT * FROM pg_stat_activity", true},
+		{"pg_catalog prefix", "SELECT * FROM pg_catalog.pg_stat_activity", true},
+		{"pg_catalog with spaces", "SELECT * FROM pg_catalog . pg_stat_activity", true},
+		{"case insensitive FROM", "select * from pg_stat_activity", true},
+		{"uppercase FROM keyword", "SELECT * FROM pg_stat_activity", true},
+		// Note: strings.Contains fast path is case-sensitive for the table name.
+		// This is fine because PostgreSQL clients always send lowercase catalog names.
+		{"uppercase table name skipped by fast path", "select * from PG_STAT_ACTIVITY", false},
+		{"with where clause", "SELECT pid, usename FROM pg_stat_activity WHERE state = 'active'", true},
+		{"with limit", "SELECT * FROM pg_stat_activity LIMIT 10", true},
+		{"with count", "SELECT count(*) FROM pg_stat_activity", true},
+		{"multiline", "SELECT pid\nFROM pg_stat_activity\nWHERE state = 'active'", true},
+		{"tab before table", "SELECT * FROM\tpg_stat_activity", true},
+		{"multiple spaces", "SELECT * FROM   pg_stat_activity", true},
+
+		// Should not match
+		{"no FROM", "SELECT 'pg_stat_activity'", false},
+		{"in string literal", "SELECT 'text pg_stat_activity text'", false},
+		{"different table", "SELECT * FROM pg_stat_statements", false},
+		{"substring match", "SELECT * FROM pg_stat_activity_detail", false},
+		{"prefix only", "SELECT * FROM my_pg_stat_activity", false},
+		{"empty query", "", false},
+		{"INSERT", "INSERT INTO pg_stat_activity VALUES (1)", false},
+		{"CREATE VIEW", "CREATE VIEW v AS SELECT * FROM pg_stat_activity", true}, // this references FROM, so it matches
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchPgStatActivityQuery(tt.query)
+			if got != tt.want {
+				t.Errorf("matchPgStatActivityQuery(%q) = %v, want %v", tt.query, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPgStatActivityColumnsAndOIDs(t *testing.T) {
+	// Verify that pgStatActivityColumns and pgStatActivityTypeOIDs are consistent
+	if len(pgStatActivityTypeOIDs) != len(pgStatActivityColumns) {
+		t.Fatalf("pgStatActivityTypeOIDs length %d != pgStatActivityColumns length %d",
+			len(pgStatActivityTypeOIDs), len(pgStatActivityColumns))
+	}
+
+	for i, col := range pgStatActivityColumns {
+		if pgStatActivityTypeOIDs[i] != col.oid {
+			t.Errorf("pgStatActivityTypeOIDs[%d] = %d, want %d (column %s)",
+				i, pgStatActivityTypeOIDs[i], col.oid, col.name)
+		}
+	}
+
+	// Verify expected columns are present
+	expectedColumns := map[string]bool{
+		"datid": false, "datname": false, "pid": false, "usesysid": false,
+		"usename": false, "application_name": false, "client_addr": false,
+		"client_port": false, "backend_start": false, "state": false,
+		"query": false, "backend_type": false, "worker_id": false,
+	}
+	for _, col := range pgStatActivityColumns {
+		if _, ok := expectedColumns[col.name]; ok {
+			expectedColumns[col.name] = true
+		}
+	}
+	for name, found := range expectedColumns {
+		if !found {
+			t.Errorf("expected column %q not found in pgStatActivityColumns", name)
+		}
+	}
+}
+
+func TestConnectionRegistry(t *testing.T) {
+	srv := &Server{
+		conns: make(map[int32]*clientConn),
+	}
+
+	// Initially empty
+	conns := srv.listConns()
+	if len(conns) != 0 {
+		t.Fatalf("expected 0 conns, got %d", len(conns))
+	}
+
+	// Register a connection
+	c1 := &clientConn{pid: 100, username: "user1"}
+	srv.registerConn(c1)
+	conns = srv.listConns()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 conn, got %d", len(conns))
+	}
+	if conns[0].pid != 100 {
+		t.Errorf("expected pid 100, got %d", conns[0].pid)
+	}
+
+	// Register a second connection
+	c2 := &clientConn{pid: 200, username: "user2"}
+	srv.registerConn(c2)
+	conns = srv.listConns()
+	if len(conns) != 2 {
+		t.Fatalf("expected 2 conns, got %d", len(conns))
+	}
+
+	// Unregister first connection
+	srv.unregisterConn(100)
+	conns = srv.listConns()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 conn after unregister, got %d", len(conns))
+	}
+	if conns[0].pid != 200 {
+		t.Errorf("expected remaining conn pid 200, got %d", conns[0].pid)
+	}
+
+	// Unregister non-existent pid (should not panic)
+	srv.unregisterConn(999)
+	conns = srv.listConns()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 conn after no-op unregister, got %d", len(conns))
+	}
+
+	// Unregister last connection
+	srv.unregisterConn(200)
+	conns = srv.listConns()
+	if len(conns) != 0 {
+		t.Fatalf("expected 0 conns after final unregister, got %d", len(conns))
+	}
+}
+
+func TestConnectionRegistryOverwrite(t *testing.T) {
+	// Verify that registering the same PID overwrites the previous entry
+	srv := &Server{
+		conns: make(map[int32]*clientConn),
+	}
+
+	c1 := &clientConn{pid: 100, username: "user1"}
+	srv.registerConn(c1)
+
+	c2 := &clientConn{pid: 100, username: "user2"}
+	srv.registerConn(c2)
+
+	conns := srv.listConns()
+	if len(conns) != 1 {
+		t.Fatalf("expected 1 conn, got %d", len(conns))
+	}
+	if conns[0].username != "user2" {
+		t.Errorf("expected username 'user2' after overwrite, got %q", conns[0].username)
+	}
+}
+
+func TestInitConnsMap(t *testing.T) {
+	srv := &Server{}
+	if srv.conns != nil {
+		t.Fatal("expected nil conns before initConnsMap")
+	}
+	srv.initConnsMap()
+	if srv.conns == nil {
+		t.Fatal("expected non-nil conns after initConnsMap")
+	}
+	// Should be usable
+	srv.registerConn(&clientConn{pid: 1})
+	if len(srv.conns) != 1 {
+		t.Fatalf("expected 1 conn, got %d", len(srv.conns))
 	}
 }
