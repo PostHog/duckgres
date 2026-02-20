@@ -910,18 +910,18 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		`CREATE OR REPLACE MACRO pg_database_size(db_name) AS 0`,
 
 		// pg_size_pretty - format byte count as human-readable string
-		// Uses integer division to match PostgreSQL behavior (displays whole units)
+		// Uses // (integer division) since DuckDB macro params lose integer typing with /
 		// For sub-unit precision, PostgreSQL shows one decimal place for values < 10 units
 		`CREATE OR REPLACE MACRO pg_size_pretty(sz) AS
 			CASE
 				WHEN sz < 1024 THEN sz::VARCHAR || ' bytes'
 				WHEN sz < 10240 THEN ROUND(sz / 1024.0, 1)::VARCHAR || ' kB'
-				WHEN sz < 1048576 THEN (sz / 1024)::VARCHAR || ' kB'
+				WHEN sz < 1048576 THEN (sz // 1024)::VARCHAR || ' kB'
 				WHEN sz < 10485760 THEN ROUND(sz / 1048576.0, 1)::VARCHAR || ' MB'
-				WHEN sz < 1073741824 THEN (sz / 1048576)::VARCHAR || ' MB'
+				WHEN sz < 1073741824 THEN (sz // 1048576)::VARCHAR || ' MB'
 				WHEN sz < 10737418240 THEN ROUND(sz / 1073741824.0, 1)::VARCHAR || ' GB'
-				WHEN sz < 1099511627776 THEN (sz / 1073741824)::VARCHAR || ' GB'
-				ELSE (sz / 1099511627776)::VARCHAR || ' TB'
+				WHEN sz < 1099511627776 THEN (sz // 1073741824)::VARCHAR || ' GB'
+				ELSE (sz // 1099511627776)::VARCHAR || ' TB'
 			END`,
 
 		// txid_current - current transaction ID (stub, returns epoch-based pseudo ID)
