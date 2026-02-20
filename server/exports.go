@@ -102,3 +102,9 @@ func InitMinimalServer(s *Server, cfg Config, queryCancelCh <-chan struct{}) {
 func GenerateSecretKey() int32 {
 	return generateSecretKey()
 }
+
+// IsEmptyQuery checks if a query contains only semicolons, whitespace, and/or SQL comments.
+// PostgreSQL returns EmptyQueryResponse for queries like ";", "-- ping", "/* */", etc.
+func IsEmptyQuery(query string) bool {
+	return isEmptyQuery(query)
+}

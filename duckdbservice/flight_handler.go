@@ -117,6 +117,31 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	}
 
 	query := cmd.GetQuery()
+
+	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
+	// Return an empty schema instead of sending to DuckDB which rejects empty queries.
+	if isEmptyFlightQuery(query) {
+		emptySchema := arrow.NewSchema(nil, nil)
+		handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
+		session.mu.Lock()
+		session.queries[handleID] = &QueryHandle{Query: query, Schema: emptySchema}
+		session.mu.Unlock()
+
+		ticketBytes, ticketErr := flightsql.CreateStatementQueryTicket([]byte(handleID))
+		if ticketErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to create ticket: %v", ticketErr)
+		}
+		return &flight.FlightInfo{
+			Schema:           flight.SerializeSchema(emptySchema, h.alloc),
+			FlightDescriptor: desc,
+			Endpoint: []*flight.FlightEndpoint{{
+				Ticket: &flight.Ticket{Ticket: ticketBytes},
+			}},
+			TotalRecords: 0,
+			TotalBytes:   0,
+		}, nil
+	}
+
 	tx, txnKey, err := session.getOpenTxn(cmd.GetTransactionId())
 	if err != nil {
 		return nil, err
@@ -180,6 +205,13 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 	schema := handle.Schema
 
 	ch := make(chan flight.StreamChunk, 10)
+
+	// Empty queries have no rows to fetch — return an empty stream immediately.
+	if isEmptyFlightQuery(handle.Query) {
+		close(ch)
+		return schema, ch, nil
+	}
+
 	go func() {
 		defer close(ch)
 		defer func() {
@@ -233,6 +265,11 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	}
 
 	query := cmd.GetQuery()
+
+	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
+	if isEmptyFlightQuery(query) {
+		return 0, nil
+	}
 	var result sql.Result
 	if tx != nil {
 		result, err = tx.ExecContext(ctx, query)
@@ -331,14 +368,29 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
 
-	schema, err := GetQuerySchema(ctx, session.Conn, req.GetQuery(), tx)
+	query := req.GetQuery()
+
+	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
+	if isEmptyFlightQuery(query) {
+		emptySchema := arrow.NewSchema(nil, nil)
+		handleID := fmt.Sprintf("prep-%d", session.handleCounter.Add(1))
+		session.mu.Lock()
+		session.queries[handleID] = &QueryHandle{Query: query, Schema: emptySchema, TxnID: txnKey}
+		session.mu.Unlock()
+		return flightsql.ActionCreatePreparedStatementResult{
+			Handle:        []byte(handleID),
+			DatasetSchema: emptySchema,
+		}, nil
+	}
+
+	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.InvalidArgument, "failed to prepare: %v", err)
 	}
 
 	handleID := fmt.Sprintf("prep-%d", session.handleCounter.Add(1))
 	session.mu.Lock()
-	session.queries[handleID] = &QueryHandle{Query: req.GetQuery(), Schema: schema, TxnID: txnKey}
+	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey}
 	session.mu.Unlock()
 
 	return flightsql.ActionCreatePreparedStatementResult{
@@ -419,6 +471,13 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 	schema := handle.Schema
 
 	ch := make(chan flight.StreamChunk, 10)
+
+	// Empty queries have no rows to fetch — return an empty stream immediately.
+	if isEmptyFlightQuery(handle.Query) {
+		close(ch)
+		return schema, ch, nil
+	}
+
 	go func() {
 		defer close(ch)
 		var rows *sql.Rows
@@ -701,6 +760,41 @@ func (h *FlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 	}()
 
 	return schema, ch, nil
+}
+
+// isEmptyFlightQuery checks if a query is empty or contains only semicolons, whitespace, and/or comments.
+// DuckDB rejects empty queries with SQLSTATE 42000, but PostgreSQL clients use these for pings
+// (e.g., pgx sends "-- ping").
+func isEmptyFlightQuery(query string) bool {
+	stripped := stripFlightComments(query)
+	for _, r := range stripped {
+		if r != ';' && r != ' ' && r != '\t' && r != '\n' && r != '\r' {
+			return false
+		}
+	}
+	return true
+}
+
+// stripFlightComments removes leading SQL comments (block and line) from a query.
+func stripFlightComments(query string) string {
+	for {
+		query = strings.TrimSpace(query)
+		if strings.HasPrefix(query, "/*") {
+			end := strings.Index(query, "*/")
+			if end == -1 {
+				return query
+			}
+			query = query[end+2:]
+		} else if strings.HasPrefix(query, "--") {
+			end := strings.Index(query, "\n")
+			if end == -1 {
+				return ""
+			}
+			query = query[end+1:]
+		} else {
+			return query
+		}
+	}
 }
 
 // Session helpers

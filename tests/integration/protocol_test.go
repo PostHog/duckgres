@@ -1,9 +1,69 @@
 package integration
 
 import (
+	"context"
+	"crypto/tls"
 	"database/sql"
+	"fmt"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
+
+// TestPgxPing tests that pgx.Conn.Ping() works correctly.
+// pgx sends "-- ping" via the simple query protocol for Ping(), which exercises
+// comment-only query handling through handleQuery.
+func TestPgxPing(t *testing.T) {
+	connStr := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass dbname=test sslmode=require", testHarness.dgPort)
+
+	cfg, err := pgx.ParseConfig(connStr)
+	if err != nil {
+		t.Fatalf("Failed to parse config: %v", err)
+	}
+	cfg.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+
+	ctx := context.Background()
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	// Ping should succeed (pgx sends "-- ping" via extended query protocol)
+	if err := conn.Ping(ctx); err != nil {
+		t.Fatalf("Ping failed: %v", err)
+	}
+
+	// Multiple pings should work
+	for i := 0; i < 5; i++ {
+		if err := conn.Ping(ctx); err != nil {
+			t.Fatalf("Ping %d failed: %v", i, err)
+		}
+	}
+}
+
+// TestEmptyQuery tests that empty queries return EmptyQueryResponse, not an error.
+func TestEmptyQuery(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"semicolon", ";"},
+		{"semicolon_newline", ";\n"},
+		{"multiple_semicolons", ";;;"},
+		{"whitespace_semicolons", " ; ; "},
+		{"empty_string", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := testHarness.DuckgresDB.Exec(tt.query)
+			if err != nil {
+				t.Errorf("Empty query %q should not return an error, got: %v", tt.query, err)
+			}
+		})
+	}
+}
 
 // TestProtocolSimpleQuery tests the simple query protocol
 func TestProtocolSimpleQuery(t *testing.T) {

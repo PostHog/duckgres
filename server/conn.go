@@ -1847,10 +1847,12 @@ func countDollarParams(query string) int {
 	return max
 }
 
-// isEmptyQuery checks if a query contains only semicolons and whitespace.
-// PostgreSQL returns EmptyQueryResponse for queries like ";" or ";;;" or "; ; ;"
+// isEmptyQuery checks if a query contains only semicolons, whitespace, and/or comments.
+// PostgreSQL returns EmptyQueryResponse for queries like ";", ";;;", "-- ping", etc.
 func isEmptyQuery(query string) bool {
-	for _, r := range query {
+	// Strip SQL comments first (e.g., pgx sends "-- ping" for Ping())
+	stripped := stripLeadingComments(query)
+	for _, r := range stripped {
 		if r != ';' && r != ' ' && r != '\t' && r != '\n' && r != '\r' {
 			return false
 		}
