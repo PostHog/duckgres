@@ -280,7 +280,8 @@ func Classify(sql string, cfg Config) Classification {
 		"PG_GET_EXPR", "PG_GET_USERBYID", "PG_TABLE_IS_VISIBLE",
 		"PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_SERIAL_SEQUENCE",
 		"PG_RELATION_SIZE", "PG_TOTAL_RELATION_SIZE",
-		"SIMILAR_TO_ESCAPE",
+		"PG_ENCODING_TO_CHAR", "PG_IS_IN_RECOVERY",
+		"SIMILAR_TO_ESCAPE", "CURRENT_SETTING(",
 	) {
 		flags |= FlagPgCatalog
 	}
@@ -326,7 +327,7 @@ func Classify(sql string, cfg Config) Classification {
 		"ARRAY_AGG(", "STRING_TO_ARRAY(", "REGEXP_MATCHES(", "PG_TYPEOF(",
 		"JSON_BUILD_OBJECT(", "JSONB_BUILD_OBJECT(", "ARRAY_TO_STRING(",
 		"JSON_AGG(", "JSONB_AGG(", "ARRAY_UPPER(", "ARRAY_LENGTH(",
-		"JSON_OBJECT(",
+		"JSON_OBJECT(", "BTRIM(", "DIV(", "EVERY(",
 	) {
 		flags |= FlagFunctions
 	}
@@ -382,7 +383,8 @@ func Classify(sql string, cfg Config) Classification {
 	if cfg.DuckLakeMode {
 		if containsAny(upper, "CREATE INDEX", "DROP INDEX", "VACUUM", "GRANT ", "REVOKE ",
 			"PRIMARY KEY", "UNIQUE", "REFERENCES", "SERIAL", "BIGSERIAL",
-			"DEFAULT NOW()", "FOREIGN KEY", "ALTER TABLE", "CASCADE",
+			"DEFAULT ", "FOREIGN KEY", "ALTER TABLE", "CASCADE",
+			"CHECK ", "CHECK(",
 			"REINDEX", "CLUSTER", "COMMENT ON", "REFRESH ") {
 			flags |= FlagDDL
 		}
