@@ -815,9 +815,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	query := string(bytes.TrimRight(body, "\x00"))
 	query = strings.TrimSpace(query)
 
-	// Treat empty queries or queries with just semicolons as empty
-	// PostgreSQL returns EmptyQueryResponse for queries like "" or ";" or ";;;"
-	if query == "" || isEmptyQuery(query) {
+	// Treat empty queries, semicolons-only, or comment-only queries as empty.
+	// PostgreSQL returns EmptyQueryResponse for queries like "", ";", "-- ping", "/* */".
+	if query == "" || isEmptyQuery(query) || isEmptyQuery(stripLeadingComments(query)) {
 		_ = writeEmptyQueryResponse(c.writer)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
@@ -3874,8 +3874,9 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	// Handle empty queries - PostgreSQL returns EmptyQueryResponse for these
+	// Also catches comment-only queries like "-- ping" or "/* check */"
 	trimmedQuery := strings.TrimSpace(p.stmt.query)
-	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) {
+	if trimmedQuery == "" || isEmptyQuery(trimmedQuery) || isEmptyQuery(stripLeadingComments(trimmedQuery)) {
 		_ = writeEmptyQueryResponse(c.writer)
 		return
 	}

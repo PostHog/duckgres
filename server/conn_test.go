@@ -42,6 +42,35 @@ func TestIsEmptyQuery(t *testing.T) {
 	}
 }
 
+func TestIsCommentOnlyQuery(t *testing.T) {
+	// Comment-only queries should be treated as empty (PostgreSQL returns EmptyQueryResponse)
+	tests := []struct {
+		name    string
+		query   string
+		isEmpty bool
+	}{
+		{"line comment", "-- ping", true},
+		{"line comment with spaces", "  -- ping  ", true},
+		{"block comment", "/* check */", true},
+		{"block comment with spaces", "  /* check */  ", true},
+		{"multiple comments", "-- first\n-- second", true},
+		{"block then line comment", "/* a */ -- b", true},
+		{"comment then query", "-- comment\nSELECT 1", false},
+		{"block comment then query", "/* sync */ SELECT 1", false},
+		{"plain query", "SELECT 1", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q := strings.TrimSpace(tt.query)
+			result := q == "" || isEmptyQuery(q) || isEmptyQuery(stripLeadingComments(q))
+			if result != tt.isEmpty {
+				t.Errorf("isEmpty(%q) = %v, want %v", tt.query, result, tt.isEmpty)
+			}
+		})
+	}
+}
+
 func TestStripLeadingComments(t *testing.T) {
 	tests := []struct {
 		name     string
