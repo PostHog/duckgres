@@ -56,7 +56,8 @@ type ControlPlane struct {
 	closed      bool
 	closeMu     sync.Mutex
 	wg          sync.WaitGroup
-	reloading   atomic.Bool         // guards against concurrent selfExec from double SIGUSR1
+	reloading        atomic.Bool    // guards against concurrent selfExec from double SIGUSR1
+	handoverDraining atomic.Bool    // true after handover succeeded; SIGTERM should exit immediately
 	handoverLn  net.Listener        // current handover listener; protected by closeMu
 	acmeManager *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
 }
@@ -331,6 +332,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 				}
 				go cp.selfExec()
 			case syscall.SIGTERM, syscall.SIGINT:
+				if cp.handoverDraining.Load() {
+					slog.Info("Received shutdown signal during handover drain, exiting immediately.", "signal", sig)
+					cp.pool.ShutdownAll()
+					os.Exit(0)
+				}
 				slog.Info("Received shutdown signal.", "signal", sig)
 				cp.shutdown()
 				os.Exit(0)

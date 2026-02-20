@@ -309,6 +309,8 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 // waitForWorker polls for the worker socket and creates a Flight SQL client.
 func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flightsql.Client, error) {
 	deadline := time.Now().Add(timeout)
+	var lastErr error
+	attempts := 0
 
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(socketPath); err == nil {
@@ -334,13 +336,22 @@ func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flig
 				if err == nil {
 					return client, nil
 				}
+				lastErr = err
 				_ = client.Close()
+			} else {
+				lastErr = fmt.Errorf("grpc dial: %w", err)
 			}
+			attempts++
+			if attempts <= 3 || attempts%10 == 0 {
+				slog.Debug("waitForWorker health check attempt failed.", "socket", socketPath, "attempt", attempts, "error", lastErr)
+			}
+		} else {
+			lastErr = err
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	return nil, fmt.Errorf("timeout waiting for worker socket %s", socketPath)
+	return nil, fmt.Errorf("timeout waiting for worker socket %s (last error: %v, attempts: %d)", socketPath, lastErr, attempts)
 }
 
 // doHealthCheck performs a HealthCheck action on the worker.
@@ -744,6 +755,10 @@ func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 // ShutdownAll stops all workers gracefully.
 func (p *FlightWorkerPool) ShutdownAll() {
 	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return
+	}
 	p.shuttingDown = true
 	workers := make([]*ManagedWorker, 0, len(p.workers))
 	for _, w := range p.workers {
