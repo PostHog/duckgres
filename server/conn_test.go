@@ -26,9 +26,14 @@ func TestIsEmptyQuery(t *testing.T) {
 		{"semicolons with tabs", ";\t;\t;", true},
 		{"semicolons with newlines", ";\n;\n;", true},
 		{"only whitespace", "   \t\n", true},
+		{"line comment only", "-- ping", true},
+		{"line comment with newline", "-- ping\n", true},
+		{"block comment only", "/* comment */", true},
+		{"block comment then semicolons", "/* comment */;", true},
+		{"comment then query", "-- comment\nSELECT 1", false},
+		{"block comment then query", "/* comment */SELECT 1", false},
 		{"SELECT query", "SELECT 1", false},
 		{"SELECT with semicolon", "SELECT 1;", false},
-		{"comment", "/* comment */", false},
 		{"semicolon then query", ";SELECT 1", false},
 	}
 

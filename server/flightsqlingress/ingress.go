@@ -327,6 +327,31 @@ func (h *ControlPlaneFlightSQLHandler) GetFlightInfoStatement(ctx context.Contex
 	}
 
 	query := cmd.GetQuery()
+
+	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
+	if server.IsEmptyQuery(strings.TrimSpace(query)) || strings.TrimSpace(query) == "" {
+		emptySchema := arrow.NewSchema(nil, nil)
+		handleID := s.nextHandle("query")
+		s.addQuery(handleID, &flightQueryHandle{
+			Query:  query,
+			Schema: emptySchema,
+			TxnID:  txnKey,
+		})
+		ticketBytes, ticketErr := flightsql.CreateStatementQueryTicket([]byte(handleID))
+		if ticketErr != nil {
+			return nil, status.Errorf(codes.Internal, "failed to create ticket: %v", ticketErr)
+		}
+		return &flight.FlightInfo{
+			Schema:           flight.SerializeSchema(emptySchema, h.alloc),
+			FlightDescriptor: desc,
+			Endpoint: []*flight.FlightEndpoint{{
+				Ticket: &flight.Ticket{Ticket: ticketBytes},
+			}},
+			TotalRecords: 0,
+			TotalBytes:   0,
+		}, nil
+	}
+
 	schema, err := getQuerySchema(ctx, s, query)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
@@ -414,7 +439,14 @@ func (h *ControlPlaneFlightSQLHandler) DoPutCommandStatementUpdate(ctx context.C
 		return 0, err
 	}
 
-	res, err := s.exec(ctx, cmd.GetQuery())
+	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
+	query := cmd.GetQuery()
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" || server.IsEmptyQuery(trimmed) {
+		return 0, nil
+	}
+
+	res, err := s.exec(ctx, query)
 	if err != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
 	}
@@ -522,14 +554,32 @@ func (h *ControlPlaneFlightSQLHandler) CreatePreparedStatement(ctx context.Conte
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
 
-	schema, err := getQuerySchema(ctx, s, req.GetQuery())
+	query := req.GetQuery()
+
+	// Handle empty queries (e.g., ";" from PostgreSQL client pings).
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" || server.IsEmptyQuery(trimmed) {
+		emptySchema := arrow.NewSchema(nil, nil)
+		handleID := s.nextHandle("prep")
+		s.addQuery(handleID, &flightQueryHandle{
+			Query:  query,
+			Schema: emptySchema,
+			TxnID:  txnKey,
+		})
+		return flightsql.ActionCreatePreparedStatementResult{
+			Handle:        []byte(handleID),
+			DatasetSchema: emptySchema,
+		}, nil
+	}
+
+	schema, err := getQuerySchema(ctx, s, query)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
 
 	handleID := s.nextHandle("prep")
 	s.addQuery(handleID, &flightQueryHandle{
-		Query:  req.GetQuery(),
+		Query:  query,
 		Schema: schema,
 		TxnID:  txnKey,
 	})

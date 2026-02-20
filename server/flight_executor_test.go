@@ -11,6 +11,79 @@ import (
 	"time"
 )
 
+func TestFlightExecutor_EmptyQuery_QueryContext(t *testing.T) {
+	// Empty queries (semicolons, whitespace) should return an empty result set
+	// without touching the Flight SQL client. This supports PostgreSQL client pings.
+	e := &FlightExecutor{client: nil} // client is nil — would panic if accessed
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"empty string", ""},
+		{"semicolon", ";"},
+		{"semicolons", ";;;"},
+		{"semicolon with newline", ";\n"},
+		{"whitespace and semicolons", " ; ; "},
+		{"just whitespace", "   "},
+		{"tabs and semicolons", "\t;\t"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rows, err := e.QueryContext(context.Background(), tt.query)
+			if err != nil {
+				t.Fatalf("expected no error for empty query %q, got: %v", tt.query, err)
+			}
+			if rows == nil {
+				t.Fatal("expected non-nil rows")
+			}
+			if err := rows.Close(); err != nil {
+				t.Fatalf("unexpected error closing rows: %v", err)
+			}
+		})
+	}
+}
+
+func TestFlightExecutor_EmptyQuery_ExecContext(t *testing.T) {
+	e := &FlightExecutor{client: nil}
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"empty string", ""},
+		{"semicolon", ";"},
+		{"semicolon with newline", ";\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := e.ExecContext(context.Background(), tt.query)
+			if err != nil {
+				t.Fatalf("expected no error for empty query %q, got: %v", tt.query, err)
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				t.Fatalf("unexpected error getting rows affected: %v", err)
+			}
+			if affected != 0 {
+				t.Fatalf("expected 0 rows affected, got %d", affected)
+			}
+		})
+	}
+}
+
+func TestFlightExecutor_NonEmptyQuery_StillNeedsFlight(t *testing.T) {
+	// A real (non-empty) query with nil client should still panic/error.
+	e := &FlightExecutor{client: nil}
+
+	_, err := e.QueryContext(context.Background(), "SELECT 1")
+	if err == nil {
+		t.Fatal("expected error for non-empty query with nil client")
+	}
+}
+
 func TestFlightExecutorMarkDead_QueryContext(t *testing.T) {
 	// A dead executor should return ErrWorkerDead without touching the client.
 	e := &FlightExecutor{} // client is nil — would panic if accessed
