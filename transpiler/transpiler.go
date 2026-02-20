@@ -48,6 +48,7 @@ type taggedTransform struct {
 	flag TransformFlags
 	tr   transform.Transform
 }
+
 // Transpiler converts PostgreSQL SQL to DuckDB-compatible SQL
 type Transpiler struct {
 	config     Config
