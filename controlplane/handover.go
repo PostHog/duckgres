@@ -187,6 +187,7 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	}
 
 	handoverOK = true
+	cp.handoverDraining.Store(true)
 
 	// Belt and suspenders: also send MAINPID from the old CP (which is the
 	// currently trusted main PID). This eliminates the race where systemd
@@ -224,6 +225,14 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	cp.closed = true
 	cp.closeMu.Unlock()
 	_ = cp.pgListener.Close()
+
+	// Close the original pre-bound socket listeners. Their FDs were dup'd
+	// and sent to the new CP via SCM_RIGHTS, so the new CP has its own
+	// copies. Closing here prevents an FD leak during the (potentially
+	// hours-long) drain.
+	for _, ps := range preboundSockets {
+		_ = ps.listener.Close()
+	}
 
 	// Wait for in-flight connections to finish (with timeout)
 	drainDone := make(chan struct{})
