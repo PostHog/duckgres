@@ -438,10 +438,10 @@ func Classify(sql string, cfg Config) Classification {
 		flags |= FlagPlaceholder
 	}
 
-	// pg_query's parser adds pg_catalog. prefix to many built-in functions during parsing.
-	// Ensure PgCatalog transform runs whenever function-related transforms are needed,
-	// to strip these prefixes before they reach DuckDB.
-	if flags&(FlagFunctions|FlagFuncAlias|FlagOperators|FlagTypeCast|FlagTypeMapping) != 0 {
+	// pg_query's parser adds pg_catalog. prefix to many built-in types and functions
+	// during parsing (e.g., JSON → pg_catalog.json, int → pg_catalog.int4).
+	// The PgCatalog transform must run for ANY Tier 1 query to strip these prefixes.
+	if flags != 0 {
 		flags |= FlagPgCatalog
 	}
 
