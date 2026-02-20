@@ -52,8 +52,9 @@ type FlightWorkerPool struct {
 	workers      map[int]*ManagedWorker
 	nextWorkerID int // auto-incrementing worker ID
 	spawning     int // number of workers currently being spawned (not yet in workers map)
-	socketDir    string
-	configPath   string
+	socketDir        string
+	fallbackSocketDir string // set lazily when socketDir is EROFS; empty means use primary
+	configPath       string
 	binaryPath   string
 	maxWorkers   int           // 0 = unlimited; caps the number of live worker processes
 	idleTimeout  time.Duration // how long to keep an idle worker alive
@@ -120,13 +121,26 @@ func (p *FlightWorkerPool) PreBindSockets(count int) error {
 
 func (p *FlightWorkerPool) takePrebound() *preboundSocket {
 	p.preboundMu.Lock()
-	defer p.preboundMu.Unlock()
 	if len(p.prebound) == 0 {
+		p.preboundMu.Unlock()
 		return nil
 	}
 	n := len(p.prebound) - 1
 	ps := p.prebound[n]
 	p.prebound = p.prebound[:n]
+	p.preboundMu.Unlock()
+
+	// Validate the socket file still exists on disk. After a handover,
+	// systemd may tear down the writable bind mount for /run/duckgres when
+	// the old CP exits, causing all pre-bound socket files to disappear.
+	// Workers can still LISTEN on inherited FDs, but the CP can't CONNECT
+	// because the Unix socket paths don't exist on disk.
+	if _, err := os.Stat(ps.socketPath); err != nil {
+		slog.Warn("Pre-bound socket file disappeared, discarding all pre-bound sockets.", "path", ps.socketPath, "error", err)
+		_ = ps.listener.Close()
+		p.closeAllPrebound() // if one is gone, all are gone (same mount)
+		return nil
+	}
 	return ps
 }
 
@@ -144,7 +158,13 @@ func (p *FlightWorkerPool) returnPrebound(ps *preboundSocket) {
 func (p *FlightWorkerPool) releaseWorkerSocket(w *ManagedWorker) {
 	w.releaseOnce.Do(func() {
 		if w.prebound != nil {
-			p.returnPrebound(w.prebound)
+			// Verify the socket file still exists before returning to the pool.
+			// After a handover, the bind mount may be gone and the file missing.
+			if _, err := os.Stat(w.prebound.socketPath); err != nil {
+				_ = w.prebound.listener.Close()
+			} else {
+				p.returnPrebound(w.prebound)
+			}
 			w.prebound = nil
 		} else {
 			if w.parentListener != nil {
@@ -166,6 +186,31 @@ func (p *FlightWorkerPool) closeAllPrebound() {
 		_ = ps.listener.Close()
 	}
 	p.prebound = nil
+}
+
+// effectiveSocketDir returns a writable directory for dynamic worker sockets.
+// It tries the primary socketDir first, falling back to /tmp/duckgres if
+// the primary is read-only (e.g., after systemd tears down the RuntimeDirectory
+// bind mount following a handover).
+func (p *FlightWorkerPool) effectiveSocketDir() (string, error) {
+	p.preboundMu.Lock()
+	cached := p.fallbackSocketDir
+	p.preboundMu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+	if err := checkSocketDirWritable(p.socketDir); err == nil {
+		return p.socketDir, nil
+	}
+	const fallback = "/tmp/duckgres"
+	if err := os.MkdirAll(fallback, 0700); err != nil {
+		return "", fmt.Errorf("create fallback socket dir %s: %w", fallback, err)
+	}
+	slog.Warn("Primary socket directory is read-only, falling back.", "primary", p.socketDir, "fallback", fallback)
+	p.preboundMu.Lock()
+	p.fallbackSocketDir = fallback
+	p.preboundMu.Unlock()
+	return fallback, nil
 }
 
 // TakeAllPrebound removes and returns all available pre-bound sockets.
@@ -207,14 +252,18 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	} else {
 		// Fallback: bind a new socket. This can happen when workers are being
 		// retired asynchronously and their pre-bound sockets haven't been
-		// returned to the pool yet. May fail with EROFS if the dir went
-		// read-only, but that's the best we can do.
-		socketPath = fmt.Sprintf("%s/worker-dyn-%d.sock", p.socketDir, id)
-		_ = os.Remove(socketPath)
-		var err error
-		ln, err = net.Listen("unix", socketPath)
+		// returned to the pool yet. Uses effectiveSocketDir() to fall back
+		// to /tmp/duckgres if the primary dir went read-only (EROFS).
+		dir, err := p.effectiveSocketDir()
 		if err != nil {
-			return fmt.Errorf("bind worker socket %s: %w", socketPath, err)
+			return fmt.Errorf("no writable socket directory: %w", err)
+		}
+		socketPath = fmt.Sprintf("%s/worker-dyn-%d.sock", dir, id)
+		_ = os.Remove(socketPath)
+		var listenErr error
+		ln, listenErr = net.Listen("unix", socketPath)
+		if listenErr != nil {
+			return fmt.Errorf("bind worker socket %s: %w", socketPath, listenErr)
 		}
 		if err := os.Chmod(socketPath, 0700); err != nil {
 			slog.Warn("Failed to set worker socket permissions.", "error", err)
