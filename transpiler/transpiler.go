@@ -280,8 +280,14 @@ func Classify(sql string, cfg Config) Classification {
 		"PG_GET_EXPR", "PG_GET_USERBYID", "PG_TABLE_IS_VISIBLE",
 		"PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_SERIAL_SEQUENCE",
 		"PG_RELATION_SIZE", "PG_TOTAL_RELATION_SIZE",
-		"PG_ENCODING_TO_CHAR", "PG_IS_IN_RECOVERY",
+		"PG_ENCODING_TO_CHAR", "PG_IS_IN_RECOVERY", "PG_PARTITIONED_TABLE",
+		"PG_RELATION_IS_PUBLISHABLE", "PG_GET_PARTKEYDEF",
+		"PG_GET_STATISTICSOBJDEF_COLUMNS",
+		"PG_RULES",
+		"HAS_SCHEMA_PRIVILEGE(", "HAS_TABLE_PRIVILEGE(",
 		"SIMILAR_TO_ESCAPE", "CURRENT_SETTING(",
+		"UPTIME(", "WORKER_UPTIME(", "WORKER_VERSION(",
+		"UNNEST(",
 	) {
 		flags |= FlagPgCatalog
 	}
@@ -324,16 +330,42 @@ func Classify(sql string, cfg Config) Classification {
 
 	// PostgreSQL functions that need mapping
 	if containsAny(upper,
-		"ARRAY_AGG(", "STRING_TO_ARRAY(", "REGEXP_MATCHES(", "PG_TYPEOF(",
-		"JSON_BUILD_OBJECT(", "JSONB_BUILD_OBJECT(", "ARRAY_TO_STRING(",
-		"JSON_AGG(", "JSONB_AGG(", "ARRAY_UPPER(", "ARRAY_LENGTH(",
-		"JSON_OBJECT(", "BTRIM(", "DIV(", "EVERY(",
+		// Array functions
+		"ARRAY_AGG(", "ARRAY_LENGTH(", "ARRAY_UPPER(", "ARRAY_TO_STRING(",
+		"ARRAY_CAT(", "ARRAY_APPEND(", "ARRAY_PREPEND(", "ARRAY_REMOVE(", "ARRAY_POSITION(",
+		"STRING_TO_ARRAY(",
+		// String functions
+		"BTRIM(",
+		// Math functions
+		"DIV(", "LOG(",
+		// Aggregate functions
+		"EVERY(",
+		// JSON functions
+		"JSON_BUILD_OBJECT(", "JSONB_BUILD_OBJECT(",
+		"JSON_BUILD_ARRAY(", "JSONB_BUILD_ARRAY(",
+		"JSON_AGG(", "JSONB_AGG(",
+		"JSON_OBJECT_AGG(", "JSONB_OBJECT_AGG(",
+		"JSON_TYPEOF(", "JSONB_TYPEOF(",
+		"JSON_EXTRACT_PATH(", "JSONB_EXTRACT_PATH(",
+		"JSON_EXTRACT_PATH_TEXT(", "JSONB_EXTRACT_PATH_TEXT(",
+		"JSON_OBJECT(",
+		// Regex functions
+		"REGEXP_MATCHES(", "REGEXP_MATCH(",
+		// Type/conversion functions
+		"PG_TYPEOF(", "TO_CHAR(", "TO_DATE(", "TO_NUMBER(",
+		// Date/time functions
+		"TIMEOFDAY(", "LOCALTIME(", "LOCALTIMESTAMP(",
+		// Identity functions
+		"SESSION_USER", "USER(",
 	) {
 		flags |= FlagFunctions
 	}
 
 	// Function alias normalization
-	if containsAny(upper, "CURRENT_DATABASE(", "CURRENT_SCHEMA(", "CURRENT_SCHEMAS(") {
+	if containsAny(upper,
+		"CURRENT_DATABASE(", "CURRENT_SCHEMA(", "CURRENT_SCHEMAS(",
+		"CURRENT_USER", "CURRENT_CATALOG(", "SESSION_USER",
+	) {
 		flags |= FlagFuncAlias
 	}
 

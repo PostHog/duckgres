@@ -1,8 +1,11 @@
 package transpiler
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/posthog/duckgres/transpiler/transform"
 )
 
 func TestTranspile_PassThrough(t *testing.T) {
@@ -3213,5 +3216,78 @@ func BenchmarkClassify_PgCatalog(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		Classify(query, cfg)
+	}
+}
+
+// --- Classifier Coverage Safety Net ---
+// These tests verify that Classify() detects all function/macro names registered
+// in the transform package. If a new mapping is added without a corresponding
+// classifier pattern, these tests will fail — preventing silent correctness bugs.
+
+func TestClassifierCovers_FunctionMappings(t *testing.T) {
+	cfg := Config{DuckLakeMode: true, ConvertPlaceholders: true}
+
+	for pgFunc, duckFunc := range transform.FunctionNames() {
+		// Skip identity mappings — the function works the same in DuckDB,
+		// so the transform is a no-op and skipping it is harmless.
+		if pgFunc == duckFunc {
+			continue
+		}
+
+		t.Run(pgFunc, func(t *testing.T) {
+			sql := fmt.Sprintf("SELECT %s(x) FROM t", pgFunc)
+			cls := Classify(sql, cfg)
+			if cls.Direct {
+				t.Errorf("Classify(%q) = Direct, but %q is in functionNameMapping (maps to %q). "+
+					"Add a detection pattern to Classify().", sql, pgFunc, duckFunc)
+			}
+		})
+	}
+}
+
+func TestClassifierCovers_FuncAliasMappings(t *testing.T) {
+	cfg := Config{DuckLakeMode: true, ConvertPlaceholders: true}
+
+	for pgFunc := range transform.FuncAliasNames() {
+		t.Run(pgFunc, func(t *testing.T) {
+			sql := fmt.Sprintf("SELECT %s()", pgFunc)
+			cls := Classify(sql, cfg)
+			if cls.Direct {
+				t.Errorf("Classify(%q) = Direct, but %q is in funcAliasMapping. "+
+					"Add a detection pattern to Classify().", sql, pgFunc)
+			}
+		})
+	}
+}
+
+func TestClassifierCovers_PgCatalogFunctions(t *testing.T) {
+	cfg := Config{DuckLakeMode: true, ConvertPlaceholders: true}
+
+	pct := transform.NewPgCatalogTransformWithConfig(true)
+	for funcName := range pct.Functions {
+		t.Run(funcName, func(t *testing.T) {
+			sql := fmt.Sprintf("SELECT %s(x) FROM t", funcName)
+			cls := Classify(sql, cfg)
+			if cls.Direct {
+				t.Errorf("Classify(%q) = Direct, but %q is in PgCatalogTransform.Functions. "+
+					"Add a detection pattern to Classify().", sql, funcName)
+			}
+		})
+	}
+}
+
+func TestClassifierCovers_PgCatalogViews(t *testing.T) {
+	cfg := Config{DuckLakeMode: true, ConvertPlaceholders: true}
+
+	pct := transform.NewPgCatalogTransformWithConfig(true)
+	for viewName := range pct.ViewMappings {
+		t.Run(viewName, func(t *testing.T) {
+			sql := fmt.Sprintf("SELECT * FROM %s", viewName)
+			cls := Classify(sql, cfg)
+			if cls.Direct {
+				t.Errorf("Classify(%q) = Direct, but %q is in PgCatalogTransform.ViewMappings. "+
+					"Add a detection pattern to Classify().", sql, viewName)
+			}
+		})
 	}
 }

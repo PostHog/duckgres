@@ -135,6 +135,11 @@ var functionNameMapping = map[string]string{
 	"user":             "current_user",
 }
 
+// FunctionNames returns all PostgreSQL function names that have DuckDB mappings.
+func FunctionNames() map[string]string {
+	return functionNameMapping
+}
+
 // Functions that need special transformation (not just renaming)
 var specialFunctions = map[string]bool{
 	"to_char":           true, // format string conversion
