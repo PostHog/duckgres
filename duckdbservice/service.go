@@ -331,9 +331,7 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 
 	// Initialize the session connection with username-specific state if needed.
 	// Since the DB is shared, we must set session-local parameters here.
-	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET search_path = '%s,public,ducklake'", username)); err != nil {
-		slog.Warn("Failed to set search_path for session.", "user", username, "error", err)
-	}
+	initSearchPath(conn, username)
 
 	stop := server.StartCredentialRefresh(db, p.cfg.DuckLake)
 
@@ -512,6 +510,18 @@ func dropTemporary(ctx context.Context, conn *sql.Conn, query, dropFmt string) {
 	for _, name := range names {
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf(dropFmt, name)); err != nil {
 			slog.Warn("Failed to drop temporary object during cleanup.", "name", name, "error", err)
+		}
+	}
+}
+
+// initSearchPath sets the DuckDB search_path for a session connection.
+// It tries to include the user's schema first; if that schema doesn't exist,
+// it falls back to just 'main' (DuckDB's default schema).
+func initSearchPath(conn *sql.Conn, username string) {
+	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET search_path = '%s,main'", username)); err != nil {
+		slog.Debug("User schema not found, using default search_path.", "user", username)
+		if _, err := conn.ExecContext(context.Background(), "SET search_path = 'main'"); err != nil {
+			slog.Warn("Failed to set search_path for session.", "user", username, "error", err)
 		}
 	}
 }
