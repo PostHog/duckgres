@@ -85,6 +85,21 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"worker_uptime":                   true, // Current process uptime as INTERVAL
 			"control_plane_version":           true, // Server/control-plane version
 			"worker_version":                  true, // Worker process version
+			"div":                             true, // Integer division macro
+			"array_remove":                    true, // Remove element from array macro
+			"to_number":                       true, // Parse formatted number string macro
+			"pg_backend_pid":                  true, // Backend process ID macro
+			"pg_total_relation_size":          true, // Total table size stub
+			"pg_relation_size":                true, // Table size stub
+			"pg_table_size":                   true, // Table size excl. indexes stub
+			"pg_indexes_size":                 true, // Index size stub
+			"pg_database_size":                true, // Database size stub
+			"pg_size_pretty":                  true, // Format bytes as human-readable
+			"txid_current":                    true, // Transaction ID stub
+			"pg_current_xact_id":              true, // Transaction ID PG13+ stub
+			"quote_ident":                     true, // Quote identifier
+			"quote_literal":                   true, // Quote literal
+			"quote_nullable":                  true, // Quote nullable value
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
@@ -100,6 +115,8 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"current_setting":                 true, // Override DuckDB's built-in with our PostgreSQL-compatible version
 			"version":                         true, // PostgreSQL-compatible version string for SQLAlchemy
 			"format_type":                     true, // Custom format_type with full PostgreSQL typemod support
+			"has_schema_privilege":            true, // Schema access check
+			"has_table_privilege":             true, // Table access check
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
 			"pg_get_expr":                     true, // Our version that accepts 2 or 3 args
 			"pg_get_indexdef":                 true, // Returns empty string
@@ -111,6 +128,21 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"worker_uptime":                   true, // Current process uptime as INTERVAL
 			"control_plane_version":           true, // Server/control-plane version
 			"worker_version":                  true, // Worker process version
+			"div":                             true, // Integer division
+			"array_remove":                    true, // Remove element from array
+			"to_number":                       true, // Parse formatted number string
+			"pg_backend_pid":                  true, // Backend process ID
+			"pg_total_relation_size":          true, // Total table size
+			"pg_relation_size":                true, // Table size
+			"pg_table_size":                   true, // Table size excl. indexes
+			"pg_indexes_size":                 true, // Index size
+			"pg_database_size":                true, // Database size
+			"pg_size_pretty":                  true, // Format bytes as human-readable
+			"txid_current":                    true, // Transaction ID
+			"pg_current_xact_id":              true, // Transaction ID PG13+
+			"quote_ident":                     true, // Quote identifier
+			"quote_literal":                   true, // Quote literal
+			"quote_nullable":                  true, // Quote nullable value
 		},
 	}
 }

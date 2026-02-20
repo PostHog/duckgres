@@ -3276,6 +3276,213 @@ func TestClassifierCovers_PgCatalogFunctions(t *testing.T) {
 	}
 }
 
+func TestClassifierCovers_SpecialFunctions(t *testing.T) {
+	cfg := Config{DuckLakeMode: true, ConvertPlaceholders: true}
+
+	for funcName := range transform.SpecialFunctionNames() {
+		t.Run(funcName, func(t *testing.T) {
+			sql := fmt.Sprintf("SELECT %s(x) FROM t", funcName)
+			cls := Classify(sql, cfg)
+			if cls.Direct {
+				t.Errorf("Classify(%q) = Direct, but %q is in specialFunctions. "+
+					"Add a detection pattern to Classify().", sql, funcName)
+			}
+		})
+	}
+}
+
+func TestTranspile_FormatStringConversion(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains []string
+		excludes []string
+	}{
+		// to_char with date/time formats
+		{
+			name:     "to_char YYYY-MM-DD",
+			input:    "SELECT to_char(TIMESTAMP '2024-01-15', 'YYYY-MM-DD')",
+			contains: []string{"strftime", "%Y-%m-%d"},
+			excludes: []string{"YYYY", "to_char"},
+		},
+		{
+			name:     "to_char full datetime",
+			input:    "SELECT to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')",
+			contains: []string{"strftime", "%Y-%m-%d %H:%M:%S"},
+			excludes: []string{"HH24"},
+		},
+		{
+			name:     "to_char with month name",
+			input:    "SELECT to_char(NOW(), 'DD Mon YYYY')",
+			contains: []string{"strftime", "%d %b %Y"},
+		},
+		{
+			name:     "to_char with full month",
+			input:    "SELECT to_char(NOW(), 'Month DD, YYYY')",
+			contains: []string{"strftime", "%B %d, %Y"},
+		},
+		{
+			name:     "to_char with AM/PM",
+			input:    "SELECT to_char(NOW(), 'HH12:MI AM')",
+			contains: []string{"strftime", "%I:%M %p"},
+		},
+		{
+			name:     "to_char with fill mode",
+			input:    "SELECT to_char(NOW(), 'FMMonth FMDD, YYYY')",
+			contains: []string{"strftime", "%B %d, %Y"},
+			excludes: []string{"FM"},
+		},
+		// to_char with number formats
+		{
+			name:     "to_char number with commas",
+			input:    "SELECT to_char(123456.78, '999,999.99')",
+			contains: []string{"format", "{:,.2f}"},
+			excludes: []string{"strftime", "to_char"},
+		},
+		{
+			name:     "to_char number no commas",
+			input:    "SELECT to_char(123.4, '999.9')",
+			contains: []string{"format", "{:.1f}"},
+		},
+		{
+			name:     "to_char number integer",
+			input:    "SELECT to_char(42, '999')",
+			contains: []string{"format", "{:.0f}"},
+		},
+		// to_date
+		{
+			name:     "to_date YYYY-MM-DD",
+			input:    "SELECT to_date('2024-01-15', 'YYYY-MM-DD')",
+			contains: []string{"strptime", "%Y-%m-%d"},
+			excludes: []string{"to_date"},
+		},
+		{
+			name:     "to_date DD-Mon-YYYY",
+			input:    "SELECT to_date('15-Jan-2024', 'DD-Mon-YYYY')",
+			contains: []string{"strptime", "%d-%b-%Y"},
+		},
+		// to_timestamp (2-arg form)
+		{
+			name:     "to_timestamp with format",
+			input:    "SELECT to_timestamp('2024-01-15 10:30:00', 'YYYY-MM-DD HH24:MI:SS')",
+			contains: []string{"strptime", "%Y-%m-%d %H:%M:%S"},
+			excludes: []string{"to_timestamp"},
+		},
+		// to_timestamp (1-arg epoch form - unchanged)
+		{
+			name:     "to_timestamp epoch unchanged",
+			input:    "SELECT to_timestamp(1705363200)",
+			contains: []string{"to_timestamp"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			lowerSQL := strings.ToLower(result.SQL)
+			for _, c := range tt.contains {
+				if !strings.Contains(lowerSQL, strings.ToLower(c)) {
+					t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, c)
+				}
+			}
+			for _, e := range tt.excludes {
+				if strings.Contains(lowerSQL, strings.ToLower(e)) {
+					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, e)
+				}
+			}
+		})
+	}
+}
+
+func TestTranspile_MacroFunctions(t *testing.T) {
+	// These functions are now DuckDB macros — the transpiler should leave them
+	// as-is (just strip pg_catalog prefix). Correct behavior is verified at runtime.
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string // function name should survive transpilation
+	}{
+		{"div", "SELECT div(7, 2)", "div"},
+		{"array_remove", "SELECT array_remove(ARRAY[1,2,3], 2)", "array_remove"},
+		{"to_number", "SELECT to_number('12,454.8', '99G999D9')", "to_number"},
+		{"pg_backend_pid", "SELECT pg_backend_pid()", "pg_backend_pid"},
+		{"pg_total_relation_size", "SELECT pg_total_relation_size('t')", "pg_total_relation_size"},
+		{"pg_size_pretty", "SELECT pg_size_pretty(1234)", "pg_size_pretty"},
+		{"txid_current", "SELECT txid_current()", "txid_current"},
+		{"quote_ident", "SELECT quote_ident('my_table')", "quote_ident"},
+		{"quote_literal", "SELECT quote_literal('hello')", "quote_literal"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(strings.ToLower(result.SQL), tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			// Should not contain pg_catalog prefix
+			if strings.Contains(result.SQL, "pg_catalog") {
+				t.Errorf("Transpile(%q) = %q, should not contain pg_catalog prefix", tt.input, result.SQL)
+			}
+		})
+	}
+}
+
+func TestTranspile_NewFunctionMappings(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "json_object_keys -> json_keys",
+			input:    "SELECT json_object_keys('{\"a\":1}')",
+			contains: "json_keys",
+			excludes: "json_object_keys",
+		},
+		{
+			name:     "jsonb_object_keys -> json_keys",
+			input:    "SELECT jsonb_object_keys('{\"a\":1}')",
+			contains: "json_keys",
+			excludes: "jsonb_object_keys",
+		},
+		{
+			name:     "clock_timestamp -> now",
+			input:    "SELECT clock_timestamp()",
+			contains: "now",
+			excludes: "clock_timestamp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			lowerSQL := strings.ToLower(result.SQL)
+			if !strings.Contains(lowerSQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(lowerSQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
 func TestClassifierCovers_PgCatalogViews(t *testing.T) {
 	cfg := Config{DuckLakeMode: true, ConvertPlaceholders: true}
 
