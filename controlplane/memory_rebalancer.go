@@ -15,6 +15,11 @@ const (
 	// minMemoryPerSession is the floor per-session memory limit (256MB).
 	minMemoryPerSession = 256 * 1024 * 1024
 
+	// maxWorkersPerCPU is the CPU-based multiplier for DefaultMaxWorkers.
+	// Each worker is a separate DuckDB process; this limits concurrent workers
+	// to avoid CPU starvation that causes health check timeouts on small instances.
+	maxWorkersPerCPU = 4
+
 	// rebalanceTimeout is the per-session timeout for sending SET commands.
 	rebalanceTimeout = 5 * time.Second
 
@@ -208,9 +213,29 @@ func memoryLimit(budget uint64) uint64 {
 }
 
 // DefaultMaxWorkers returns a reasonable default for max_workers.
-// Derived from the memory budget (budget / 256MB).
+// Takes the minimum of memory-based and CPU-based limits to prevent
+// CPU starvation on small instances (e.g., 22 workers on a 2-vCPU box).
 func (r *MemoryRebalancer) DefaultMaxWorkers() int {
-	return int(r.memoryBudget / minMemoryPerSession)
+	return defaultMaxWorkers(r.memoryBudget, runtime.NumCPU())
+}
+
+// defaultMaxWorkers computes max_workers from memory budget and CPU count.
+// Takes the minimum of:
+//   - Memory-based: budget / 256MB
+//   - CPU-based: numCPU * 4 (allows moderate oversubscription for I/O-bound workloads)
+//
+// Returns at least 1.
+func defaultMaxWorkers(memoryBudget uint64, numCPU int) int {
+	memBased := int(memoryBudget / minMemoryPerSession)
+	cpuBased := numCPU * maxWorkersPerCPU
+	result := memBased
+	if cpuBased < result {
+		result = cpuBased
+	}
+	if result < 1 {
+		result = 1
+	}
+	return result
 }
 
 // SetInitialLimits sets memory_limit and threads on a single session synchronously.
