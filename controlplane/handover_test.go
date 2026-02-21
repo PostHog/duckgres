@@ -181,6 +181,66 @@ func TestSendRecvFDsBackwardCompat(t *testing.T) {
 	}
 }
 
+// TestSendRecvFDsBatched verifies that sendFDs/recvFDs correctly handle more
+// than maxFDsPerMsg (253) file descriptors by batching across multiple sendmsg
+// calls. This reproduces the production EINVAL that occurred when a machine with
+// 284GB RAM derived max_workers=1113, requiring 1114 FDs in the handover.
+func TestSendRecvFDsBatched(t *testing.T) {
+	client, server := unixSocketPair(t)
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+
+	// Use 300 FDs to exceed the 253-per-message limit and exercise batching.
+	const count = 300
+	var files []*os.File
+	for i := 0; i < count; i++ {
+		f, err := os.CreateTemp("", fmt.Sprintf("fd-batch-%d-*", i))
+		if err != nil {
+			t.Fatalf("create temp %d: %v", i, err)
+		}
+		defer func() { _ = os.Remove(f.Name()) }()
+		defer func() { _ = f.Close() }()
+		// Write a unique marker so we can verify each FD is distinct.
+		if _, err := fmt.Fprintf(f, "file-%d", i); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		files = append(files, f)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sendFDs(server, files)
+	}()
+
+	received, err := recvFDs(client, count)
+	if err != nil {
+		t.Fatalf("recvFDs: %v", err)
+	}
+	defer func() {
+		for _, rf := range received {
+			_ = rf.Close()
+		}
+	}()
+
+	if sendErr := <-errCh; sendErr != nil {
+		t.Fatalf("sendFDs: %v", sendErr)
+	}
+
+	if len(received) != count {
+		t.Fatalf("expected %d FDs, got %d", count, len(received))
+	}
+
+	// Verify each received FD is readable and contains the expected marker.
+	for i, rf := range received {
+		buf := make([]byte, 20)
+		n, _ := rf.ReadAt(buf, 0)
+		expected := fmt.Sprintf("file-%d", i)
+		if string(buf[:n]) != expected {
+			t.Errorf("FD %d: expected %q, got %q", i, expected, string(buf[:n]))
+		}
+	}
+}
+
 // TestHandoverProtocolWithPrebound simulates the full handover protocol between
 // an old CP (sending pre-bound sockets) and a new CP (receiving them).
 func TestHandoverProtocolWithPrebound(t *testing.T) {
