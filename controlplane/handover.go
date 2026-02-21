@@ -384,6 +384,12 @@ func receiveHandover(handoverSocket, socketDir string) (*net.TCPListener, []*pre
 	return tcpLn, prebound, nil
 }
 
+// maxFDsPerMsg is the maximum number of file descriptors that can be sent in a
+// single SCM_RIGHTS message. The Linux kernel enforces this via SCM_MAX_FD
+// (include/net/scm.h) and returns EINVAL if exceeded. macOS has a similar
+// limit. We batch sends/receives to stay within this limit.
+const maxFDsPerMsg = 253
+
 // sendFD sends a single file descriptor over a Unix socket using SCM_RIGHTS.
 func sendFD(uc *net.UnixConn, file *os.File) error {
 	rights := syscall.UnixRights(int(file.Fd()))
@@ -391,41 +397,78 @@ func sendFD(uc *net.UnixConn, file *os.File) error {
 	return err
 }
 
-// sendFDs sends multiple file descriptors over a Unix socket in a single SCM_RIGHTS message.
+// sendFDs sends multiple file descriptors over a Unix socket using SCM_RIGHTS.
+// When more than maxFDsPerMsg FDs need to be sent, they are batched into
+// multiple sendmsg calls to avoid the kernel's SCM_MAX_FD EINVAL.
 func sendFDs(uc *net.UnixConn, files []*os.File) error {
-	fds := make([]int, len(files))
-	for i, f := range files {
-		fds[i] = int(f.Fd())
+	for i := 0; i < len(files); i += maxFDsPerMsg {
+		end := i + maxFDsPerMsg
+		if end > len(files) {
+			end = len(files)
+		}
+		batch := files[i:end]
+		fds := make([]int, len(batch))
+		for j, f := range batch {
+			fds[j] = int(f.Fd())
+		}
+		rights := syscall.UnixRights(fds...)
+		if _, _, err := uc.WriteMsgUnix([]byte{0}, rights, nil); err != nil {
+			return err
+		}
 	}
-	rights := syscall.UnixRights(fds...)
-	_, _, err := uc.WriteMsgUnix([]byte{0}, rights, nil)
-	return err
+	return nil
 }
 
 // recvFDs receives multiple file descriptors from a Unix socket via SCM_RIGHTS.
+// When the sender batches FDs across multiple sendmsg calls (due to the
+// SCM_MAX_FD limit), this function loops ReadMsgUnix until all expectedCount
+// FDs have been accumulated.
 func recvFDs(uc *net.UnixConn, expectedCount int) ([]*os.File, error) {
+	if expectedCount <= 0 {
+		return nil, fmt.Errorf("expectedCount must be positive, got %d", expectedCount)
+	}
+
 	buf := make([]byte, 1)
-	oob := make([]byte, syscall.CmsgSpace(expectedCount*4))
-	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
-	if err != nil {
-		return nil, err
+	// Size the OOB buffer for the max batch size (maxFDsPerMsg), not the full
+	// expectedCount, since each ReadMsgUnix receives at most one batch.
+	oobSize := maxFDsPerMsg
+	if expectedCount < oobSize {
+		oobSize = expectedCount
 	}
-	scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return nil, fmt.Errorf("parse control message: %w", err)
+	oob := make([]byte, syscall.CmsgSpace(oobSize*4))
+
+	closeFDs := func(files []*os.File) {
+		for _, f := range files {
+			_ = f.Close()
+		}
 	}
+
 	var files []*os.File
-	for _, scm := range scms {
-		fds, err := syscall.ParseUnixRights(&scm)
+	for len(files) < expectedCount {
+		prevCount := len(files)
+		_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
 		if err != nil {
-			continue
+			closeFDs(files)
+			return nil, err
 		}
-		for i, fd := range fds {
-			files = append(files, os.NewFile(uintptr(fd), fmt.Sprintf("received-fd-%d", i)))
+		scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
+		if err != nil {
+			closeFDs(files)
+			return nil, fmt.Errorf("parse control message: %w", err)
 		}
-	}
-	if len(files) == 0 {
-		return nil, fmt.Errorf("no file descriptors received")
+		for _, scm := range scms {
+			fds, err := syscall.ParseUnixRights(&scm)
+			if err != nil {
+				continue
+			}
+			for _, fd := range fds {
+				files = append(files, os.NewFile(uintptr(fd), fmt.Sprintf("received-fd-%d", len(files))))
+			}
+		}
+		if len(files) == prevCount {
+			closeFDs(files)
+			return nil, fmt.Errorf("received message without file descriptors")
+		}
 	}
 	return files, nil
 }
