@@ -12,9 +12,13 @@ RUN CGO_ENABLED=1 go build -ldflags "-X main.version=${VERSION} -X main.commit=$
 
 FROM debian:bookworm-slim
 
+RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
+
 WORKDIR /app
 COPY --from=builder /build/duckgres .
-RUN mkdir -p data certs
+RUN mkdir -p data certs && chown -R duckgres:duckgres /app
+
+USER duckgres
 
 EXPOSE 5432 9090
 
