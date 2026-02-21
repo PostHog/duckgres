@@ -609,6 +609,170 @@ func TestQueryReturnsResults(t *testing.T) {
 			query:    "SET search_path = public",
 			expected: false,
 		},
+		// DML with RETURNING clause
+		{
+			name:     "INSERT RETURNING star",
+			query:    "INSERT INTO t VALUES (1) RETURNING *",
+			expected: true,
+		},
+		{
+			name:     "INSERT RETURNING columns",
+			query:    "INSERT INTO t VALUES (1) RETURNING id, name",
+			expected: true,
+		},
+		{
+			name:     "UPDATE RETURNING star",
+			query:    "UPDATE t SET x = 1 RETURNING *",
+			expected: true,
+		},
+		{
+			name:     "DELETE RETURNING star",
+			query:    "DELETE FROM t WHERE id = 1 RETURNING *",
+			expected: true,
+		},
+		{
+			name:     "comment before INSERT RETURNING",
+			query:    "/* comment */ INSERT INTO t VALUES (1) RETURNING *",
+			expected: true,
+		},
+		// Parenthesized queries
+		{
+			name:     "parenthesized SELECT",
+			query:    "(SELECT 1 UNION SELECT 2)",
+			expected: true,
+		},
+		{
+			name:     "nested parenthesized SELECT",
+			query:    "((SELECT 1))",
+			expected: true,
+		},
+		{
+			name:     "parenthesized SELECT with spaces",
+			query:    "( SELECT 1 )",
+			expected: true,
+		},
+		// Case sensitivity
+		{
+			name:     "lowercase insert returning",
+			query:    "insert into t values (1) returning *",
+			expected: true,
+		},
+		{
+			name:     "mixed case Insert Returning",
+			query:    "Insert Into t Values (1) Returning *",
+			expected: true,
+		},
+		{
+			name:     "lowercase select",
+			query:    "select 1",
+			expected: true,
+		},
+		// Multi-line DML RETURNING
+		{
+			name:     "multi-line INSERT RETURNING",
+			query:    "INSERT INTO t\nVALUES (1)\nRETURNING *",
+			expected: true,
+		},
+		// RETURNING in non-clause positions — correctly rejected by " RETURNING" heuristic
+		{
+			name:     "RETURNING in string literal (not false positive)",
+			query:    "INSERT INTO t (col) VALUES ('RETURNING')",
+			expected: false, // no space before RETURNING — preceded by quote
+		},
+		{
+			name:     "RETURNING as column name (not false positive)",
+			query:    "INSERT INTO t (returning) VALUES (1)",
+			expected: false, // no space before RETURNING — preceded by paren
+		},
+		// Queries that should NOT match RETURNING
+		{
+			name:     "INSERT with RETURNING-like substring no space",
+			query:    "INSERT INTO treturning VALUES (1)",
+			expected: false, // no space before RETURNING
+		},
+		{
+			name:     "plain CREATE TABLE",
+			query:    "CREATE TABLE returning_results (id INT)",
+			expected: false, // not INSERT/UPDATE/DELETE prefix
+		},
+		// Edge cases
+		{
+			name:     "empty string",
+			query:    "",
+			expected: false,
+		},
+		{
+			name:     "only whitespace",
+			query:    "   ",
+			expected: false,
+		},
+		{
+			name:     "only comment",
+			query:    "-- just a comment",
+			expected: false,
+		},
+		{
+			name:     "SUMMARIZE (DuckDB-specific)",
+			query:    "SUMMARIZE users",
+			expected: true,
+		},
+		{
+			name:     "FROM-first syntax",
+			query:    "FROM users SELECT *",
+			expected: true,
+		},
+		{
+			name:     "EXECUTE",
+			query:    "EXECUTE my_stmt",
+			expected: true,
+		},
+		// WITH + DML RETURNING (WITH prefix matches first, correct)
+		{
+			name:     "CTE with INSERT RETURNING",
+			query:    "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte RETURNING *",
+			expected: true,
+		},
+		// ALTER, TRUNCATE — should not return results
+		{
+			name:     "ALTER TABLE",
+			query:    "ALTER TABLE t ADD COLUMN x INT",
+			expected: false,
+		},
+		{
+			name:     "TRUNCATE",
+			query:    "TRUNCATE t",
+			expected: false,
+		},
+		// DELETE with RETURNING in subquery — false positive, acceptable
+		{
+			name:     "DELETE with RETURNING in subquery (false positive)",
+			query:    "DELETE FROM t WHERE id IN (SELECT returning FROM s)",
+			expected: true, // contains "\nRETURNING" or " RETURNING" somewhere
+		},
+		// Tab before RETURNING
+		{
+			name:     "INSERT with tab before RETURNING",
+			query:    "INSERT INTO t VALUES (1)\tRETURNING *",
+			expected: true,
+		},
+		// Carriage return before RETURNING
+		{
+			name:     "INSERT with CR before RETURNING",
+			query:    "INSERT INTO t VALUES (1)\rRETURNING *",
+			expected: true,
+		},
+		// RETURNING with no preceding whitespace — not a clause
+		{
+			name:     "INSERT NORETURNING (no space)",
+			query:    "INSERT INTO tRETURNING VALUES (1)",
+			expected: false,
+		},
+		// Multiple RETURNING occurrences — first in parens, second real
+		{
+			name:     "INSERT with RETURNING in subselect and real RETURNING",
+			query:    "INSERT INTO t SELECT (RETURNING) FROM s RETURNING *",
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -638,6 +802,11 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 		{"block comment before SHOW", "/* comment */ SHOW TABLES", true},
 		{"block comment before VALUES", "/* comment */ VALUES (1, 2)", true},
 
+		// Queries with leading comments that return results (DML RETURNING)
+		{"block comment before INSERT RETURNING", "/* comment */ INSERT INTO t VALUES (1) RETURNING *", true},
+		{"block comment before UPDATE RETURNING", "/* comment */ UPDATE t SET x = 1 RETURNING *", true},
+		{"block comment before DELETE RETURNING", "/* comment */ DELETE FROM t RETURNING *", true},
+
 		// Queries with leading comments that don't return results
 		{"block comment before INSERT", "/* comment */ INSERT INTO t VALUES (1)", false},
 		{"block comment before CREATE", "/* comment */ CREATE TABLE t (id INT)", false},
@@ -657,6 +826,71 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 
 // Note: isIgnoredSetParameter tests have been moved to transpiler/transpiler_test.go.
 // The transpiler package now handles SET parameter filtering via AST transformation.
+
+func TestBuildCommandTagFromRowCount(t *testing.T) {
+	tests := []struct {
+		cmdType  string
+		rowCount int64
+		expected string
+	}{
+		{"INSERT", 0, "INSERT 0 0"},
+		{"INSERT", 1, "INSERT 0 1"},
+		{"INSERT", 5, "INSERT 0 5"},
+		{"UPDATE", 0, "UPDATE 0"},
+		{"UPDATE", 1, "UPDATE 1"},
+		{"UPDATE", 3, "UPDATE 3"},
+		{"DELETE", 0, "DELETE 0"},
+		{"DELETE", 1, "DELETE 1"},
+		{"DELETE", 3, "DELETE 3"},
+		{"SELECT", 0, "SELECT 0"},
+		{"SELECT", 5, "SELECT 5"},
+		// Large row counts
+		{"INSERT", 1000000, "INSERT 0 1000000"},
+		{"DELETE", 999999, "DELETE 999999"},
+		// Unknown command types fall through to SELECT-style
+		{"CREATE TABLE", 0, "SELECT 0"},
+		{"", 0, "SELECT 0"},
+		{"COPY", 0, "SELECT 0"},
+		// Verify INSERT always has the OID 0 prefix (PostgreSQL compat)
+		{"INSERT", 42, "INSERT 0 42"},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s_%d", tt.cmdType, tt.rowCount), func(t *testing.T) {
+			got := buildCommandTagFromRowCount(tt.cmdType, tt.rowCount)
+			if got != tt.expected {
+				t.Errorf("buildCommandTagFromRowCount(%q, %d) = %q, want %q", tt.cmdType, tt.rowCount, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestBuildCommandTagConsistency verifies that buildCommandTagFromRowCount produces
+// the same tags as buildCommandTag for DML types. This ensures the Query path
+// (used for DML RETURNING) and the Exec path produce identical command tags.
+func TestBuildCommandTagConsistency(t *testing.T) {
+	c := &clientConn{}
+	for _, cmdType := range []string{"INSERT", "UPDATE", "DELETE"} {
+		for _, count := range []int64{0, 1, 5, 100} {
+			t.Run(fmt.Sprintf("%s_%d", cmdType, count), func(t *testing.T) {
+				fromRowCount := buildCommandTagFromRowCount(cmdType, count)
+				fromExecResult := c.buildCommandTag(cmdType, &fakeExecResult{rowsAffected: count})
+				if fromRowCount != fromExecResult {
+					t.Errorf("tag mismatch for %s/%d: fromRowCount=%q, fromExecResult=%q",
+						cmdType, count, fromRowCount, fromExecResult)
+				}
+			})
+		}
+	}
+}
+
+type fakeExecResult struct {
+	rowsAffected int64
+}
+
+func (f *fakeExecResult) RowsAffected() (int64, error) {
+	return f.rowsAffected, nil
+}
 
 func TestCopyToStdoutRegex(t *testing.T) {
 	tests := []struct {

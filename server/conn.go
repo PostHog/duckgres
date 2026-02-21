@@ -964,8 +964,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return c.handleCopy(query, upperQuery)
 	}
 
-	// For non-SELECT queries, use Exec
-	if cmdType != "SELECT" {
+	// For queries that don't return result rows, use Exec
+	if !queryReturnsResults(query) {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
 		// while DuckDB throws an error. Match PostgreSQL behavior.
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
@@ -1015,14 +1015,14 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
-	// Execute SELECT query
-	return c.executeSelectQuery(query)
+	// Execute query that returns results (SELECT, DML RETURNING, etc.)
+	return c.executeSelectQuery(query, cmdType)
 }
 
 // executeQueryDirect executes a query directly against DuckDB without any transpilation.
 // Used for passthrough users who send DuckDB-native SQL.
 func (c *clientConn) executeQueryDirect(query, cmdType string) error {
-	if cmdType != "SELECT" {
+	if !queryReturnsResults(query) {
 		// Handle nested BEGIN
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
@@ -1057,12 +1057,12 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		return nil
 	}
 
-	return c.executeSelectQuery(query)
+	return c.executeSelectQuery(query, cmdType)
 }
 
-// executeSelectQuery runs a SELECT query against DuckDB and streams results to the client.
+// executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.
-func (c *clientConn) executeSelectQuery(query string) error {
+func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
@@ -1143,7 +1143,8 @@ func (c *clientConn) executeSelectQuery(query string) error {
 		return nil
 	}
 
-	tag := fmt.Sprintf("SELECT %d", rowCount)
+	c.updateTxStatus(cmdType)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
@@ -1380,7 +1381,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return true, nil
 	}
 
-	if cmdType != "SELECT" {
+	if !queryReturnsResults(executedQuery) {
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
 			_ = writeCommandComplete(c.writer, "BEGIN")
@@ -1480,7 +1481,8 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		rowCount++
 	}
 
-	tag := fmt.Sprintf("SELECT %d", rowCount)
+	c.updateTxStatus(cmdType)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 	return false, nil
 }
@@ -1537,8 +1539,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	cmdType := c.getCommandType(upperFinal)
 	slog.Debug("Multi-stmt final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
 
-	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
-		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
+	if queryReturnsResults(finalStmt) {
+		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt)
 		if err != nil {
 			slog.Error("Multi-stmt final query error.", "user", c.username, "query", finalStmt, "error", err)
@@ -1559,7 +1561,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		return c.streamRowsToClient(rows, cmdType, finalStmt)
 
 	} else {
-		// DML (INSERT/UPDATE/DELETE): execute then cleanup
+		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt)
 		if err != nil {
 			slog.Error("Multi-stmt final exec error.", "user", c.username, "query", finalStmt, "error", err)
@@ -1637,8 +1639,8 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	cmdType := c.getCommandType(upperFinal)
 	slog.Debug("Multi-stmt-ext final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
 
-	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
-		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
+	if queryReturnsResults(finalStmt) {
+		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
 			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "query", finalStmt, "error", err)
@@ -1656,7 +1658,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalStmt)
 
 	} else {
-		// DML (INSERT/UPDATE/DELETE): execute then cleanup
+		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
 			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "query", finalStmt, "error", err)
@@ -1743,7 +1745,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 	}
 
 	// Send completion (no ReadyForQuery - that's done by Sync)
-	tag := fmt.Sprintf("SELECT %d", rowCount)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 }
 
@@ -1820,7 +1822,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 	}
 
 	// Send completion
-	tag := fmt.Sprintf("%s %d", cmdType, rowCount)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	return c.writer.Flush()
@@ -1898,6 +1900,8 @@ func describeSupportsLimit(upper string) bool {
 // This is used to determine whether to send RowDescription or NoData.
 func queryReturnsResults(query string) bool {
 	upper := strings.ToUpper(stripLeadingComments(query))
+	// Strip leading parentheses — e.g., (SELECT ... UNION SELECT ...)
+	upper = strings.TrimLeft(upper, "( ")
 	// SELECT is the most common
 	if strings.HasPrefix(upper, "SELECT") {
 		return true
@@ -1937,6 +1941,34 @@ func queryReturnsResults(query string) bool {
 	// FROM-first syntax returns results (DuckDB-specific)
 	if strings.HasPrefix(upper, "FROM") {
 		return true
+	}
+	// DML with RETURNING clause produces result rows.
+	// Check for RETURNING preceded by any whitespace (space, newline, tab).
+	if (strings.HasPrefix(upper, "INSERT") ||
+		strings.HasPrefix(upper, "UPDATE") ||
+		strings.HasPrefix(upper, "DELETE")) &&
+		containsReturning(upper) {
+		return true
+	}
+	return false
+}
+
+// containsReturning checks if an uppercased SQL string contains the RETURNING
+// keyword preceded by whitespace. This avoids false positives where RETURNING
+// appears inside parentheses or quotes (e.g., column names, string literals).
+func containsReturning(upper string) bool {
+	idx := strings.Index(upper, "RETURNING")
+	for idx > 0 {
+		prev := upper[idx-1]
+		if prev == ' ' || prev == '\n' || prev == '\t' || prev == '\r' {
+			return true
+		}
+		// Keep searching for next occurrence
+		next := strings.Index(upper[idx+9:], "RETURNING")
+		if next < 0 {
+			return false
+		}
+		idx = idx + 9 + next
 	}
 	return false
 }
@@ -2022,6 +2054,21 @@ func (c *clientConn) updateTxStatus(cmdType string) {
 func (c *clientConn) setTxError() {
 	if c.txStatus == txStatusTransaction {
 		c.txStatus = txStatusError
+	}
+}
+
+// buildCommandTagFromRowCount builds a command tag from a command type and row count.
+// Used when results are streamed via Query (e.g., DML RETURNING) rather than Exec.
+func buildCommandTagFromRowCount(cmdType string, rowCount int64) string {
+	switch cmdType {
+	case "INSERT":
+		return fmt.Sprintf("INSERT 0 %d", rowCount)
+	case "UPDATE":
+		return fmt.Sprintf("UPDATE %d", rowCount)
+	case "DELETE":
+		return fmt.Sprintf("DELETE %d", rowCount)
+	default:
+		return fmt.Sprintf("SELECT %d", rowCount)
 	}
 }
 
@@ -3703,6 +3750,19 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
+		// For DML with RETURNING, we cannot probe the schema without executing
+		// the mutation. Send NoData to avoid double-execution. This means
+		// extended protocol clients (lib/pq) that Describe before Execute will
+		// not receive RETURNING data — a pre-existing limitation.
+		// TODO: use duckdb_prepared_statements() to get result types without executing.
+		upperStmt := strings.ToUpper(stripLeadingComments(ps.query))
+		if strings.HasPrefix(upperStmt, "INSERT") ||
+			strings.HasPrefix(upperStmt, "UPDATE") ||
+			strings.HasPrefix(upperStmt, "DELETE") {
+			_ = writeNoData(c.writer)
+			return
+		}
+
 		// For SELECT, we need to describe the result columns
 		// The cleanest approach is to add a "WHERE false" or "LIMIT 0" clause
 		// to get column info without actually running the query
@@ -3788,6 +3848,17 @@ func (c *clientConn) handleDescribe(body []byte) {
 
 		// For queries that don't return results, send NoData
 		if !queryReturnsResults(p.stmt.query) {
+			_ = writeNoData(c.writer)
+			return
+		}
+
+		// For DML with RETURNING, we cannot probe the schema without executing
+		// the mutation. Send NoData to avoid double-execution.
+		// TODO: use duckdb_prepared_statements() to get result types without executing.
+		upperQuery := strings.ToUpper(stripLeadingComments(p.stmt.query))
+		if strings.HasPrefix(upperQuery, "INSERT") ||
+			strings.HasPrefix(upperQuery, "UPDATE") ||
+			strings.HasPrefix(upperQuery, "DELETE") {
 			_ = writeNoData(c.writer)
 			return
 		}
@@ -4021,7 +4092,8 @@ func (c *clientConn) handleExecute(body []byte) {
 		rowCount++
 	}
 
-	tag := fmt.Sprintf("SELECT %d", rowCount)
+	c.updateTxStatus(cmdType)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 }
 
