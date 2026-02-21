@@ -520,6 +520,8 @@ func dropTemporary(ctx context.Context, conn *sql.Conn, query, dropFmt string) {
 func initSearchPath(conn *sql.Conn, username string) {
 	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET search_path = '%s,main'", username)); err != nil {
 		slog.Debug("User schema not found, using default search_path.", "user", username)
+		// Clear the aborted transaction state before retrying.
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		if _, err := conn.ExecContext(context.Background(), "SET search_path = 'main'"); err != nil {
 			slog.Warn("Failed to set search_path for session.", "user", username, "error", err)
 		}
