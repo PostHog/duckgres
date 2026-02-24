@@ -1973,6 +1973,20 @@ func containsReturning(upper string) bool {
 	return false
 }
 
+// isDMLReturning reports whether query is a DML statement (INSERT/UPDATE/DELETE)
+// with a RETURNING clause. Such statements produce result rows but cannot be
+// described without executing the mutation.
+func isDMLReturning(query string) bool {
+	upper := strings.ToUpper(stripLeadingComments(query))
+	upper = strings.TrimLeft(upper, "( ")
+	if !strings.HasPrefix(upper, "INSERT") &&
+		!strings.HasPrefix(upper, "UPDATE") &&
+		!strings.HasPrefix(upper, "DELETE") {
+		return false
+	}
+	return containsReturning(upper)
+}
+
 func (c *clientConn) getCommandType(upperQuery string) string {
 	// Strip leading comments like /*Fivetran*/ before checking command type
 	upperQuery = stripLeadingComments(upperQuery)
@@ -3750,16 +3764,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// For DML with RETURNING, we cannot probe the schema without executing
-		// the mutation. Send NoData to avoid double-execution. This means
-		// extended protocol clients (lib/pq) that Describe before Execute will
-		// not receive RETURNING data — a pre-existing limitation.
-		// TODO: use duckdb_prepared_statements() to get result types without executing.
-		upperStmt := strings.ToUpper(stripLeadingComments(ps.query))
-		if strings.HasPrefix(upperStmt, "INSERT") ||
-			strings.HasPrefix(upperStmt, "UPDATE") ||
-			strings.HasPrefix(upperStmt, "DELETE") {
-			_ = writeNoData(c.writer)
+		// DML with RETURNING cannot be described without executing the mutation.
+		// Reject with an explicit error so clients don't desync (e.g., lib/pq
+		// would use Exec-like handling after NoData, silently dropping rows).
+		if isDMLReturning(ps.query) {
+			c.sendError("ERROR", "0A000", "DML with RETURNING clause is not supported via extended query protocol; use simple query protocol instead")
 			return
 		}
 
@@ -3852,14 +3861,10 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// For DML with RETURNING, we cannot probe the schema without executing
-		// the mutation. Send NoData to avoid double-execution.
-		// TODO: use duckdb_prepared_statements() to get result types without executing.
-		upperQuery := strings.ToUpper(stripLeadingComments(p.stmt.query))
-		if strings.HasPrefix(upperQuery, "INSERT") ||
-			strings.HasPrefix(upperQuery, "UPDATE") ||
-			strings.HasPrefix(upperQuery, "DELETE") {
-			_ = writeNoData(c.writer)
+		// DML with RETURNING cannot be described without executing the mutation.
+		// Reject with an explicit error so clients don't desync.
+		if isDMLReturning(p.stmt.query) {
+			c.sendError("ERROR", "0A000", "DML with RETURNING clause is not supported via extended query protocol; use simple query protocol instead")
 			return
 		}
 

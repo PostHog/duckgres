@@ -824,6 +824,43 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 	}
 }
 
+func TestIsDMLReturning(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		// DML with RETURNING → true
+		{"INSERT RETURNING", "INSERT INTO t VALUES (1) RETURNING *", true},
+		{"UPDATE RETURNING", "UPDATE t SET x = 1 RETURNING id", true},
+		{"DELETE RETURNING", "DELETE FROM t WHERE id = 1 RETURNING *", true},
+		{"INSERT RETURNING with comment", "/* comment */ INSERT INTO t VALUES (1) RETURNING *", true},
+		{"INSERT RETURNING multiline", "INSERT INTO t\nVALUES (1)\nRETURNING *", true},
+
+		// DML without RETURNING → false
+		{"plain INSERT", "INSERT INTO t VALUES (1)", false},
+		{"plain UPDATE", "UPDATE t SET x = 1", false},
+		{"plain DELETE", "DELETE FROM t WHERE id = 1", false},
+
+		// Non-DML → false
+		{"SELECT", "SELECT * FROM t", false},
+		{"CREATE TABLE", "CREATE TABLE t (id INT)", false},
+		{"WITH CTE", "WITH cte AS (SELECT 1) SELECT * FROM cte", false},
+
+		// Edge cases: RETURNING in non-keyword positions → false
+		{"column named returning", "INSERT INTO t (returning_col) VALUES (1)", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isDMLReturning(tt.query)
+			if result != tt.expected {
+				t.Errorf("isDMLReturning(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
 // Note: isIgnoredSetParameter tests have been moved to transpiler/transpiler_test.go.
 // The transpiler package now handles SET parameter filtering via AST transformation.
 
