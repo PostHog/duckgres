@@ -1892,7 +1892,7 @@ func stripLeadingNoise(query string) string {
 	for {
 		prev := query
 		query = stripLeadingComments(query)
-		query = strings.TrimLeft(query, "( ")
+		query = strings.TrimLeft(query, "( \t\n\r")
 		if query == prev {
 			return query
 		}
