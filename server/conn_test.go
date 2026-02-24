@@ -302,6 +302,53 @@ func TestGetCommandType(t *testing.T) {
 			query:    "/*Test*/Select * From Users",
 			expected: "SELECT",
 		},
+
+		// WITH (CTE) queries — command type from outer statement
+		{
+			name:     "WITH + SELECT",
+			query:    "WITH CTE AS (SELECT 1) SELECT * FROM CTE",
+			expected: "SELECT",
+		},
+		{
+			name:     "WITH + INSERT",
+			query:    "WITH CTE AS (SELECT 1) INSERT INTO T SELECT * FROM CTE",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH + UPDATE",
+			query:    "WITH CTE AS (SELECT 1) UPDATE T SET X = CTE.X FROM CTE",
+			expected: "UPDATE",
+		},
+		{
+			name:     "WITH + DELETE",
+			query:    "WITH CTE AS (SELECT 1) DELETE FROM T USING CTE",
+			expected: "DELETE",
+		},
+		{
+			name:     "WITH + INSERT RETURNING",
+			query:    "WITH CTE AS (SELECT 1) INSERT INTO T VALUES (1) RETURNING *",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH RECURSIVE + SELECT",
+			query:    "WITH RECURSIVE CTE AS (SELECT 1 UNION ALL SELECT N+1 FROM CTE WHERE N < 10) SELECT * FROM CTE",
+			expected: "SELECT",
+		},
+		{
+			name:     "WITH RECURSIVE + DELETE",
+			query:    "WITH RECURSIVE CTE AS (SELECT 1) DELETE FROM T USING CTE",
+			expected: "DELETE",
+		},
+		{
+			name:     "WITH multiple CTEs + INSERT",
+			query:    "WITH A AS (SELECT 1), B AS (SELECT 2) INSERT INTO T SELECT * FROM A, B",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH + comment before",
+			query:    "/* batch */ WITH CTE AS (SELECT 1) DELETE FROM T",
+			expected: "DELETE",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1132,6 +1179,11 @@ func TestIsWithDML(t *testing.T) {
 		// Edge cases in CTE body
 		{"CTE with parens in body", "WITH cte AS (SELECT (1+2) FROM t WHERE x IN (1,2,3)) INSERT INTO t2 SELECT * FROM cte", true},
 		{"CTE with string in body", "WITH cte AS (SELECT 'hello)world' FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with escaped quote in body", "WITH cte AS (SELECT 'it''s)here' FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with block comment containing paren", "WITH cte AS (SELECT /* ) */ 1 FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with line comment containing paren", "WITH cte AS (SELECT 1 -- )\nFROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with dollar-quoted string containing paren", "WITH cte AS (SELECT $$)$$ FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with double-quoted id containing paren", `WITH cte AS (SELECT "col)" FROM t) INSERT INTO t2 SELECT * FROM cte`, true},
 		{"CTE with quoted name", `WITH "my cte" AS (SELECT 1) INSERT INTO t SELECT * FROM "my cte"`, true},
 		{"CTE with quoted name + SELECT", `WITH "my cte" AS (SELECT 1) SELECT * FROM "my cte"`, false},
 

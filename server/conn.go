@@ -2163,13 +2163,127 @@ func isDMLReturning(query string) bool {
 // DML (INSERT/UPDATE/DELETE). Such queries don't return results (unless they
 // have a RETURNING clause, handled separately by isDMLReturning) and must not
 // be executed during Describe to avoid unintended mutations.
-//
-// It scans past "WITH [RECURSIVE] name AS (...) [, name AS (...)]" at depth 0,
-// then checks if the remaining text starts with a DML keyword.
 func isWithDML(query string) bool {
 	upper := strings.ToUpper(stripLeadingNoise(query))
-	if !strings.HasPrefix(upper, "WITH") {
+	outer := outerStatementOfCTE(upper)
+	if outer == "" {
 		return false
+	}
+	return strings.HasPrefix(outer, "INSERT") ||
+		strings.HasPrefix(outer, "UPDATE") ||
+		strings.HasPrefix(outer, "DELETE")
+}
+
+// outerStatementOfCTE returns the portion of an uppercased query after all CTE
+// definitions, or "" if the query doesn't start with WITH.
+// For "WITH a AS (...) SELECT ...", it returns "SELECT ...".
+// skipBalancedParens advances past a parenthesized group in an uppercased SQL
+// string. i must point to the character immediately after the opening '('.
+// It tracks paren depth while correctly skipping SQL constructs that may
+// contain literal parentheses: single-quoted strings (including '' escapes and
+// E-string backslash escapes), double-quoted identifiers, dollar-quoted strings,
+// line comments (--), and block comments (/* */).
+// Returns the position immediately after the matching ')'.
+func skipBalancedParens(upper string, i int) int {
+	depth := 1
+	for i < len(upper) && depth > 0 {
+		switch upper[i] {
+		case '(':
+			depth++
+			i++
+		case ')':
+			depth--
+			i++
+
+		case '\'':
+			// Single-quoted string; handle E-string prefix and '' escapes.
+			estring := i > 0 && upper[i-1] == 'E'
+			i++
+			for i < len(upper) {
+				if upper[i] == '\'' {
+					i++
+					if i < len(upper) && upper[i] == '\'' {
+						i++
+						continue
+					}
+					break
+				}
+				if estring && upper[i] == '\\' {
+					i++
+					if i < len(upper) {
+						i++
+					}
+					continue
+				}
+				i++
+			}
+
+		case '"':
+			// Double-quoted identifier.
+			i++
+			for i < len(upper) {
+				if upper[i] == '"' {
+					i++
+					if i < len(upper) && upper[i] == '"' {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+
+		case '$':
+			// Dollar-quoted string.
+			if tag, ok := parseDollarTag(upper, i); ok {
+				i += len(tag)
+				for i+len(tag) <= len(upper) {
+					if upper[i] == '$' && upper[i:i+len(tag)] == tag {
+						i += len(tag)
+						break
+					}
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case '-':
+			// Line comment: -- ... \n
+			if i+1 < len(upper) && upper[i+1] == '-' {
+				i += 2
+				for i < len(upper) && upper[i] != '\n' {
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case '/':
+			// Block comment: /* ... */
+			if i+1 < len(upper) && upper[i+1] == '*' {
+				i += 2
+				for i+1 < len(upper) {
+					if upper[i] == '*' && upper[i+1] == '/' {
+						i += 2
+						break
+					}
+					i++
+				}
+			} else {
+				i++
+			}
+
+		default:
+			i++
+		}
+	}
+	return i
+}
+
+func outerStatementOfCTE(upper string) string {
+	if !strings.HasPrefix(upper, "WITH") {
+		return ""
 	}
 
 	// Skip past "WITH" (and optional "RECURSIVE")
@@ -2219,24 +2333,10 @@ func isWithDML(query string) bool {
 			}
 		}
 
-		// Skip the CTE body: balanced parentheses
+		// Skip the CTE body: balanced parentheses with SQL-aware scanning
+		// to correctly handle parens inside strings, comments, and identifiers.
 		if i < len(upper) && upper[i] == '(' {
-			depth := 1
-			i++
-			for i < len(upper) && depth > 0 {
-				switch upper[i] {
-				case '(':
-					depth++
-				case ')':
-					depth--
-				case '\'':
-					i++
-					for i < len(upper) && upper[i] != '\'' {
-						i++
-					}
-				}
-				i++
-			}
+			i = skipBalancedParens(upper, i+1)
 		}
 
 		// Skip whitespace
@@ -2257,16 +2357,20 @@ func isWithDML(query string) bool {
 		break
 	}
 
-	// Check if the outer statement starts with DML
-	rest := upper[i:]
-	return strings.HasPrefix(rest, "INSERT") ||
-		strings.HasPrefix(rest, "UPDATE") ||
-		strings.HasPrefix(rest, "DELETE")
+	return upper[i:]
 }
 
 func (c *clientConn) getCommandType(upperQuery string) string {
 	// Strip leading comments like /*Fivetran*/ before checking command type
 	upperQuery = stripLeadingComments(upperQuery)
+
+	// For WITH (CTE) queries, determine command type from the outer statement.
+	// e.g. "WITH cte AS (...) INSERT INTO t ..." → "INSERT"
+	if strings.HasPrefix(upperQuery, "WITH") {
+		if outer := outerStatementOfCTE(upperQuery); outer != "" {
+			return c.getCommandType(outer)
+		}
+	}
 
 	switch {
 	case strings.HasPrefix(upperQuery, "SELECT"):
@@ -4045,7 +4149,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// Reject with an explicit error so clients don't desync (e.g., lib/pq
 		// would use Exec-like handling after NoData, silently dropping rows).
 		if isDMLReturning(ps.query) {
-			c.sendError("ERROR", "0A000", "DML with RETURNING clause is not supported via extended query protocol; use simple query protocol instead")
+			c.sendError("ERROR", "0A000", "DML with RETURNING clause cannot be described without executing the mutation; use simple query protocol or skip the Describe step")
 			return
 		}
 
@@ -4149,7 +4253,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// DML with RETURNING cannot be described without executing the mutation.
 		// Reject with an explicit error so clients don't desync.
 		if isDMLReturning(p.stmt.query) {
-			c.sendError("ERROR", "0A000", "DML with RETURNING clause is not supported via extended query protocol; use simple query protocol instead")
+			c.sendError("ERROR", "0A000", "DML with RETURNING clause cannot be described without executing the mutation; use simple query protocol or skip the Describe step")
 			return
 		}
 
