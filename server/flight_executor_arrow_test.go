@@ -80,7 +80,7 @@ func TestArrowTypeToDuckDB_ListOfStruct(t *testing.T) {
 //
 // Expected return types (matching what conn.go formatValue consumes):
 //   STRUCT → map[string]interface{}
-//   MAP    → map[any]any (keys preserve original Arrow types)
+//   MAP    → OrderedMapValue (keys preserve original Arrow types and insertion order)
 
 func TestExtractArrowValue_Struct(t *testing.T) {
 	alloc := memory.NewGoAllocator()
@@ -211,31 +211,31 @@ func TestExtractArrowValue_Map(t *testing.T) {
 
 	// Row 0: single-entry map
 	val := extractArrowValue(rec.Column(0), 0)
-	m, ok := val.(map[any]any)
+	m, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("extractArrowValue(MAP) row 0 returned %T, want map[any]any", val)
+		t.Fatalf("extractArrowValue(MAP) row 0 returned %T, want OrderedMapValue", val)
 	}
-	if len(m) != 1 {
-		t.Fatalf("expected 1 map entry, got %d", len(m))
+	if len(m.Keys) != 1 {
+		t.Fatalf("expected 1 map entry, got %d", len(m.Keys))
 	}
-	if m["a"] != int32(1) {
-		t.Errorf("m[\"a\"] = %v, want int32(1)", m["a"])
+	if m.Map["a"] != int32(1) {
+		t.Errorf("m[\"a\"] = %v, want int32(1)", m.Map["a"])
 	}
 
 	// Row 1: two-entry map
 	val = extractArrowValue(rec.Column(0), 1)
-	m, ok = val.(map[any]any)
+	m, ok = val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("extractArrowValue(MAP) row 1 returned %T, want map[any]any", val)
+		t.Fatalf("extractArrowValue(MAP) row 1 returned %T, want OrderedMapValue", val)
 	}
-	if len(m) != 2 {
-		t.Fatalf("expected 2 map entries, got %d", len(m))
+	if len(m.Keys) != 2 {
+		t.Fatalf("expected 2 map entries, got %d", len(m.Keys))
 	}
-	if m["x"] != int32(10) {
-		t.Errorf("m[\"x\"] = %v, want int32(10)", m["x"])
+	if m.Map["x"] != int32(10) {
+		t.Errorf("m[\"x\"] = %v, want int32(10)", m.Map["x"])
 	}
-	if m["y"] != int32(20) {
-		t.Errorf("m[\"y\"] = %v, want int32(20)", m["y"])
+	if m.Map["y"] != int32(20) {
+		t.Errorf("m[\"y\"] = %v, want int32(20)", m.Map["y"])
 	}
 }
 
@@ -372,12 +372,12 @@ func TestExtractArrowValue_MapEmpty(t *testing.T) {
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
-	m, ok := val.(map[any]any)
+	m, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("extractArrowValue(empty MAP) returned %T, want map[any]any", val)
+		t.Fatalf("extractArrowValue(empty MAP) returned %T, want OrderedMapValue", val)
 	}
-	if len(m) != 0 {
-		t.Errorf("expected empty map, got %d entries", len(m))
+	if len(m.Keys) != 0 {
+		t.Errorf("expected empty map, got %d entries", len(m.Keys))
 	}
 }
 
@@ -404,15 +404,15 @@ func TestExtractArrowValue_MapIntegerKeys(t *testing.T) {
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
-	m, ok := val.(map[any]any)
+	m, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("extractArrowValue(MAP int keys) returned %T, want map[any]any", val)
+		t.Fatalf("extractArrowValue(MAP int keys) returned %T, want OrderedMapValue", val)
 	}
-	if m[int32(1)] != "one" {
-		t.Errorf("m[int32(1)] = %v, want \"one\"", m[int32(1)])
+	if m.Map[int32(1)] != "one" {
+		t.Errorf("m[int32(1)] = %v, want \"one\"", m.Map[int32(1)])
 	}
-	if m[int32(2)] != "two" {
-		t.Errorf("m[int32(2)] = %v, want \"two\"", m[int32(2)])
+	if m.Map[int32(2)] != "two" {
+		t.Errorf("m[int32(2)] = %v, want \"two\"", m.Map[int32(2)])
 	}
 }
 
@@ -438,15 +438,15 @@ func TestExtractArrowValue_MapWithNullValues(t *testing.T) {
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
-	m, ok := val.(map[any]any)
+	m, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("extractArrowValue(MAP with null values) returned %T, want map[any]any", val)
+		t.Fatalf("extractArrowValue(MAP with null values) returned %T, want OrderedMapValue", val)
 	}
-	if m["present"] != int32(42) {
-		t.Errorf("m[\"present\"] = %v, want int32(42)", m["present"])
+	if m.Map["present"] != int32(42) {
+		t.Errorf("m[\"present\"] = %v, want int32(42)", m.Map["present"])
 	}
-	if m["missing"] != nil {
-		t.Errorf("m[\"missing\"] = %v, want nil", m["missing"])
+	if m.Map["missing"] != nil {
+		t.Errorf("m[\"missing\"] = %v, want nil", m.Map["missing"])
 	}
 }
 
@@ -517,31 +517,31 @@ func TestExtractArrowValue_MapMultipleRows(t *testing.T) {
 
 	// Row 0
 	val := extractArrowValue(rec.Column(0), 0)
-	m0, ok := val.(map[any]any)
+	m0, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("row 0: returned %T, want map[any]any", val)
+		t.Fatalf("row 0: returned %T, want OrderedMapValue", val)
 	}
-	if len(m0) != 1 || m0["a"] != int32(1) {
+	if len(m0.Keys) != 1 || m0.Map["a"] != int32(1) {
 		t.Errorf("row 0: got %v, want {a:1}", m0)
 	}
 
 	// Row 1 (empty)
 	val = extractArrowValue(rec.Column(0), 1)
-	m1, ok := val.(map[any]any)
+	m1, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("row 1: returned %T, want map[any]any", val)
+		t.Fatalf("row 1: returned %T, want OrderedMapValue", val)
 	}
-	if len(m1) != 0 {
+	if len(m1.Keys) != 0 {
 		t.Errorf("row 1: expected empty map, got %v", m1)
 	}
 
 	// Row 2
 	val = extractArrowValue(rec.Column(0), 2)
-	m2, ok := val.(map[any]any)
+	m2, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("row 2: returned %T, want map[any]any", val)
+		t.Fatalf("row 2: returned %T, want OrderedMapValue", val)
 	}
-	if len(m2) != 3 || m2["z"] != int32(30) {
+	if len(m2.Keys) != 3 || m2.Map["z"] != int32(30) {
 		t.Errorf("row 2: got %v, want {x:10,y:20,z:30}", m2)
 	}
 }
@@ -619,19 +619,19 @@ func TestExtractArrowValue_ListOfMap(t *testing.T) {
 	if len(elems) != 2 {
 		t.Fatalf("expected 2 elements, got %d", len(elems))
 	}
-	m0, ok := elems[0].(map[any]any)
+	m0, ok := elems[0].(OrderedMapValue)
 	if !ok {
-		t.Fatalf("element 0 returned %T, want map[any]any", elems[0])
+		t.Fatalf("element 0 returned %T, want OrderedMapValue", elems[0])
 	}
-	if m0["a"] != int32(1) {
-		t.Errorf("elem[0][\"a\"] = %v, want int32(1)", m0["a"])
+	if m0.Map["a"] != int32(1) {
+		t.Errorf("elem[0][\"a\"] = %v, want int32(1)", m0.Map["a"])
 	}
-	m1, ok := elems[1].(map[any]any)
+	m1, ok := elems[1].(OrderedMapValue)
 	if !ok {
-		t.Fatalf("element 1 returned %T, want map[any]any", elems[1])
+		t.Fatalf("element 1 returned %T, want OrderedMapValue", elems[1])
 	}
-	if len(m1) != 2 {
-		t.Errorf("elem[1] has %d entries, want 2", len(m1))
+	if len(m1.Keys) != 2 {
+		t.Errorf("elem[1] has %d entries, want 2", len(m1.Keys))
 	}
 }
 
@@ -659,16 +659,16 @@ func TestExtractArrowValue_MapOfMapValues(t *testing.T) {
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
-	m, ok := val.(map[any]any)
+	m, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("extractArrowValue(MAP of MAP) returned %T, want map[any]any", val)
+		t.Fatalf("extractArrowValue(MAP of MAP) returned %T, want OrderedMapValue", val)
 	}
-	inner_val, ok := m["outer_key"].(map[any]any)
+	inner_val, ok := m.Map["outer_key"].(OrderedMapValue)
 	if !ok {
-		t.Fatalf("inner map returned %T, want map[any]any", m["outer_key"])
+		t.Fatalf("inner map returned %T, want OrderedMapValue", m.Map["outer_key"])
 	}
-	if inner_val["inner_key"] != int32(99) {
-		t.Errorf("inner[\"inner_key\"] = %v, want int32(99)", inner_val["inner_key"])
+	if inner_val.Map["inner_key"] != int32(99) {
+		t.Errorf("inner[\"inner_key\"] = %v, want int32(99)", inner_val.Map["inner_key"])
 	}
 }
 
@@ -696,13 +696,13 @@ func TestExtractArrowValue_MapOfListValues(t *testing.T) {
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
-	m, ok := val.(map[any]any)
+	m, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("extractArrowValue(MAP of LIST) returned %T, want map[any]any", val)
+		t.Fatalf("extractArrowValue(MAP of LIST) returned %T, want OrderedMapValue", val)
 	}
-	nums, ok := m["nums"].([]any)
+	nums, ok := m.Map["nums"].([]any)
 	if !ok {
-		t.Fatalf("m[\"nums\"] returned %T, want []any", m["nums"])
+		t.Fatalf("m[\"nums\"] returned %T, want []any", m.Map["nums"])
 	}
 	if len(nums) != 3 || nums[0] != int32(10) || nums[2] != int32(30) {
 		t.Errorf("nums = %v, want [10, 20, 30]", nums)
@@ -742,12 +742,12 @@ func TestExtractArrowValue_StructContainingMap(t *testing.T) {
 	if m["id"] != int32(1) {
 		t.Errorf("id = %v, want int32(1)", m["id"])
 	}
-	meta, ok := m["meta"].(map[any]any)
+	meta, ok := m["meta"].(OrderedMapValue)
 	if !ok {
-		t.Fatalf("meta field returned %T, want map[any]any", m["meta"])
+		t.Fatalf("meta field returned %T, want OrderedMapValue", m["meta"])
 	}
-	if meta["color"] != "red" {
-		t.Errorf("meta[\"color\"] = %v, want \"red\"", meta["color"])
+	if meta.Map["color"] != "red" {
+		t.Errorf("meta[\"color\"] = %v, want \"red\"", meta.Map["color"])
 	}
 }
 
@@ -955,12 +955,12 @@ func TestExtractArrowValue_MapMixedNullNonNullRows(t *testing.T) {
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
-	m, ok := val.(map[any]any)
+	m, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("row 0: returned %T, want map[any]any", val)
+		t.Fatalf("row 0: returned %T, want OrderedMapValue", val)
 	}
-	if m["a"] != int32(1) {
-		t.Errorf("row 0: a = %v, want 1", m["a"])
+	if m.Map["a"] != int32(1) {
+		t.Errorf("row 0: a = %v, want 1", m.Map["a"])
 	}
 
 	if extractArrowValue(rec.Column(0), 1) != nil {
@@ -968,12 +968,12 @@ func TestExtractArrowValue_MapMixedNullNonNullRows(t *testing.T) {
 	}
 
 	val = extractArrowValue(rec.Column(0), 2)
-	m, ok = val.(map[any]any)
+	m, ok = val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("row 2: returned %T, want map[any]any", val)
+		t.Fatalf("row 2: returned %T, want OrderedMapValue", val)
 	}
-	if m["b"] != int32(2) {
-		t.Errorf("row 2: b = %v, want 2", m["b"])
+	if m.Map["b"] != int32(2) {
+		t.Errorf("row 2: b = %v, want 2", m.Map["b"])
 	}
 }
 
@@ -1158,14 +1158,14 @@ func TestExtractArrowValue_MapWithStructValues(t *testing.T) {
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
-	m, ok := val.(map[any]any)
+	m, ok := val.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("returned %T, want map[any]any", val)
+		t.Fatalf("returned %T, want OrderedMapValue", val)
 	}
 	// MAP values that are STRUCTs come back as map[string]interface{} from extractArrowValue
-	point, ok := m["point"].(map[string]interface{})
+	point, ok := m.Map["point"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("m[\"point\"] returned %T, want map[string]interface{}", m["point"])
+		t.Fatalf("m[\"point\"] returned %T, want map[string]interface{}", m.Map["point"])
 	}
 	if point["x"] != int32(10) || point["y"] != int32(20) {
 		t.Errorf("point = %v, want {x:10, y:20}", point)
@@ -1354,11 +1354,11 @@ func TestExtractThenAppend_MapBasic(t *testing.T) {
 	}
 	// Re-extract from rebuilt record to verify data
 	rebuilt := extractArrowValue(col, 0)
-	rm, ok := rebuilt.(map[any]any)
+	rm, ok := rebuilt.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("re-extracted value is %T, want map[any]any", rebuilt)
+		t.Fatalf("re-extracted value is %T, want OrderedMapValue", rebuilt)
 	}
-	if rm["a"] != int32(1) || rm["b"] != int32(2) {
+	if rm.Map["a"] != int32(1) || rm.Map["b"] != int32(2) {
 		t.Errorf("rebuilt MAP = %v, want {a:1, b:2}", rm)
 	}
 }
@@ -1396,11 +1396,11 @@ func TestExtractThenAppend_MapIntegerKeys(t *testing.T) {
 		t.Fatal("rebuilt MAP(INT,VARCHAR) is null")
 	}
 	rebuilt := extractArrowValue(col, 0)
-	rm, ok := rebuilt.(map[any]any)
+	rm, ok := rebuilt.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("re-extracted value is %T, want map[any]any", rebuilt)
+		t.Fatalf("re-extracted value is %T, want OrderedMapValue", rebuilt)
 	}
-	if rm[int32(1)] != "one" || rm[int32(2)] != "two" {
+	if rm.Map[int32(1)] != "one" || rm.Map[int32(2)] != "two" {
 		t.Errorf("rebuilt MAP = %v, want {1:one, 2:two}", rm)
 	}
 }
@@ -1462,12 +1462,12 @@ func TestExtractThenAppend_MapEmpty(t *testing.T) {
 		t.Fatal("rebuilt empty MAP should not be null")
 	}
 	rebuilt := extractArrowValue(col, 0)
-	rm, ok := rebuilt.(map[any]any)
+	rm, ok := rebuilt.(OrderedMapValue)
 	if !ok {
-		t.Fatalf("re-extracted value is %T, want map[any]any", rebuilt)
+		t.Fatalf("re-extracted value is %T, want OrderedMapValue", rebuilt)
 	}
-	if len(rm) != 0 {
-		t.Errorf("rebuilt MAP has %d entries, want 0", len(rm))
+	if len(rm.Keys) != 0 {
+		t.Errorf("rebuilt MAP has %d entries, want 0", len(rm.Keys))
 	}
 }
 
@@ -1518,9 +1518,9 @@ func TestExtractThenAppend_MapMultipleRows(t *testing.T) {
 	if col.IsNull(0) {
 		t.Fatal("row 0: should not be null")
 	}
-	r0 := extractArrowValue(col, 0).(map[any]any)
-	if r0["x"] != int32(10) {
-		t.Errorf("row 0: x = %v, want 10", r0["x"])
+	r0 := extractArrowValue(col, 0).(OrderedMapValue)
+	if r0.Map["x"] != int32(10) {
+		t.Errorf("row 0: x = %v, want 10", r0.Map["x"])
 	}
 
 	// Row 1: NULL
@@ -1532,8 +1532,8 @@ func TestExtractThenAppend_MapMultipleRows(t *testing.T) {
 	if col.IsNull(2) {
 		t.Fatal("row 2: should not be null")
 	}
-	r2 := extractArrowValue(col, 2).(map[any]any)
-	if len(r2) != 0 {
+	r2 := extractArrowValue(col, 2).(OrderedMapValue)
+	if len(r2.Keys) != 0 {
 		t.Errorf("row 2: expected empty, got %v", r2)
 	}
 
@@ -1541,8 +1541,8 @@ func TestExtractThenAppend_MapMultipleRows(t *testing.T) {
 	if col.IsNull(3) {
 		t.Fatal("row 3: should not be null")
 	}
-	r3 := extractArrowValue(col, 3).(map[any]any)
-	if len(r3) != 3 || r3["a"] != int32(1) || r3["b"] != int32(2) || r3["c"] != int32(3) {
+	r3 := extractArrowValue(col, 3).(OrderedMapValue)
+	if len(r3.Keys) != 3 || r3.Map["a"] != int32(1) || r3.Map["b"] != int32(2) || r3.Map["c"] != int32(3) {
 		t.Errorf("row 3: got %v, want {a:1,b:2,c:3}", r3)
 	}
 }
@@ -1579,12 +1579,12 @@ func TestExtractThenAppend_MapWithNullValues(t *testing.T) {
 	if col.IsNull(0) {
 		t.Fatal("rebuilt MAP with null values should not itself be null")
 	}
-	rebuilt := extractArrowValue(col, 0).(map[any]any)
-	if rebuilt["present"] != int32(42) {
-		t.Errorf("present = %v, want 42", rebuilt["present"])
+	rebuilt := extractArrowValue(col, 0).(OrderedMapValue)
+	if rebuilt.Map["present"] != int32(42) {
+		t.Errorf("present = %v, want 42", rebuilt.Map["present"])
 	}
-	if rebuilt["missing"] != nil {
-		t.Errorf("missing = %v, want nil", rebuilt["missing"])
+	if rebuilt.Map["missing"] != nil {
+		t.Errorf("missing = %v, want nil", rebuilt.Map["missing"])
 	}
 }
 
@@ -1622,13 +1622,13 @@ func TestExtractThenAppend_MapOfMap(t *testing.T) {
 	if col.IsNull(0) {
 		t.Fatal("rebuilt nested MAP is null")
 	}
-	rebuilt := extractArrowValue(col, 0).(map[any]any)
-	innerMap, ok := rebuilt["outer"].(map[any]any)
+	rebuilt := extractArrowValue(col, 0).(OrderedMapValue)
+	innerMap, ok := rebuilt.Map["outer"].(OrderedMapValue)
 	if !ok {
-		t.Fatalf("inner value is %T, want map[any]any", rebuilt["outer"])
+		t.Fatalf("inner value is %T, want OrderedMapValue", rebuilt.Map["outer"])
 	}
-	if innerMap["inner"] != int32(99) {
-		t.Errorf("inner[\"inner\"] = %v, want 99", innerMap["inner"])
+	if innerMap.Map["inner"] != int32(99) {
+		t.Errorf("inner[\"inner\"] = %v, want 99", innerMap.Map["inner"])
 	}
 }
 
@@ -1672,12 +1672,12 @@ func TestExtractThenAppend_StructContainingMap(t *testing.T) {
 	if rebuilt["id"] != int32(1) {
 		t.Errorf("id = %v, want 1", rebuilt["id"])
 	}
-	meta, ok := rebuilt["meta"].(map[any]any)
+	meta, ok := rebuilt["meta"].(OrderedMapValue)
 	if !ok {
-		t.Fatalf("meta is %T, want map[any]any", rebuilt["meta"])
+		t.Fatalf("meta is %T, want OrderedMapValue", rebuilt["meta"])
 	}
-	if meta["color"] != "red" {
-		t.Errorf("meta[color] = %v, want red", meta["color"])
+	if meta.Map["color"] != "red" {
+		t.Errorf("meta[color] = %v, want red", meta.Map["color"])
 	}
 }
 
@@ -1718,10 +1718,10 @@ func TestExtractThenAppend_MapWithStructValues(t *testing.T) {
 	if col.IsNull(0) {
 		t.Fatal("rebuilt MAP(VARCHAR,STRUCT) is null")
 	}
-	rebuilt := extractArrowValue(col, 0).(map[any]any)
-	point, ok := rebuilt["point"].(map[string]interface{})
+	rebuilt := extractArrowValue(col, 0).(OrderedMapValue)
+	point, ok := rebuilt.Map["point"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("point value is %T, want map[string]interface{}", rebuilt["point"])
+		t.Fatalf("point value is %T, want map[string]interface{}", rebuilt.Map["point"])
 	}
 	if point["x"] != int32(10) || point["y"] != int32(20) {
 		t.Errorf("point = %v, want {x:10, y:20}", point)
@@ -1767,12 +1767,12 @@ func TestExtractThenAppend_ListOfMap(t *testing.T) {
 	if len(rebuilt) != 2 {
 		t.Fatalf("expected 2 elements, got %d", len(rebuilt))
 	}
-	e0 := rebuilt[0].(map[any]any)
-	if e0["a"] != int32(1) {
+	e0 := rebuilt[0].(OrderedMapValue)
+	if e0.Map["a"] != int32(1) {
 		t.Errorf("elem[0] = %v, want {a:1}", e0)
 	}
-	e1 := rebuilt[1].(map[any]any)
-	if e1["b"] != int32(2) {
+	e1 := rebuilt[1].(OrderedMapValue)
+	if e1.Map["b"] != int32(2) {
 		t.Errorf("elem[1] = %v, want {b:2}", e1)
 	}
 }
@@ -1815,19 +1815,18 @@ func appendValue(builder array.Builder, val interface{}) {
 		}
 	case *array.MapBuilder:
 		switch v := val.(type) {
-		case map[any]any:
+		case OrderedMapValue:
 			b.Append(true)
-			for k, item := range v {
+			for _, k := range v.Keys {
 				appendValue(b.KeyBuilder(), k)
+				item := v.Map[k]
 				if item == nil {
 					b.ItemBuilder().AppendNull()
 				} else {
 					appendValue(b.ItemBuilder(), item)
 				}
 			}
-		case map[string]interface{}:
-			// This was the old return type — should NOT be needed anymore.
-			// If this branch fires, the fix is incomplete.
+		case map[any]any:
 			b.Append(true)
 			for k, item := range v {
 				appendValue(b.KeyBuilder(), k)
@@ -1845,36 +1844,49 @@ func appendValue(builder array.Builder, val interface{}) {
 	}
 }
 
-// --- formatAnyMapValue tests ---
+// --- formatOrderedMapValue tests ---
 
-func TestFormatAnyMapValue_Basic(t *testing.T) {
-	m := map[any]any{"a": int32(1)}
-	got := formatAnyMapValue(m)
+func TestFormatOrderedMapValue_Basic(t *testing.T) {
+	m := OrderedMapValue{Keys: []any{"a"}, Map: map[any]any{"a": int32(1)}}
+	got := formatOrderedMapValue(m)
 	if got != "{a=1}" {
-		t.Errorf("formatAnyMapValue = %q, want %q", got, "{a=1}")
+		t.Errorf("formatOrderedMapValue = %q, want %q", got, "{a=1}")
 	}
 }
 
-func TestFormatAnyMapValue_IntegerKeys(t *testing.T) {
-	m := map[any]any{int32(1): "one"}
-	got := formatAnyMapValue(m)
+func TestFormatOrderedMapValue_IntegerKeys(t *testing.T) {
+	m := OrderedMapValue{Keys: []any{int32(1)}, Map: map[any]any{int32(1): "one"}}
+	got := formatOrderedMapValue(m)
 	if got != "{1=one}" {
-		t.Errorf("formatAnyMapValue = %q, want %q", got, "{1=one}")
+		t.Errorf("formatOrderedMapValue = %q, want %q", got, "{1=one}")
 	}
 }
 
-func TestFormatAnyMapValue_Empty(t *testing.T) {
-	m := map[any]any{}
-	got := formatAnyMapValue(m)
+func TestFormatOrderedMapValue_Empty(t *testing.T) {
+	m := OrderedMapValue{Keys: []any{}, Map: map[any]any{}}
+	got := formatOrderedMapValue(m)
 	if got != "{}" {
-		t.Errorf("formatAnyMapValue = %q, want %q", got, "{}")
+		t.Errorf("formatOrderedMapValue = %q, want %q", got, "{}")
 	}
 }
 
-func TestFormatAnyMapValue_NilValue(t *testing.T) {
-	m := map[any]any{"k": nil}
-	got := formatAnyMapValue(m)
+func TestFormatOrderedMapValue_NilValue(t *testing.T) {
+	m := OrderedMapValue{Keys: []any{"k"}, Map: map[any]any{"k": nil}}
+	got := formatOrderedMapValue(m)
 	if got != "{k=}" {
-		t.Errorf("formatAnyMapValue = %q, want %q", got, "{k=}")
+		t.Errorf("formatOrderedMapValue = %q, want %q", got, "{k=}")
+	}
+}
+
+func TestFormatOrderedMapValue_PreservesOrder(t *testing.T) {
+	// Verifies that key order in output matches Keys slice, not Go map iteration.
+	m := OrderedMapValue{
+		Keys: []any{"z", "a", "m"},
+		Map:  map[any]any{"z": int32(1), "a": int32(2), "m": int32(3)},
+	}
+	got := formatOrderedMapValue(m)
+	expected := "{z=1, a=2, m=3}"
+	if got != expected {
+		t.Errorf("formatOrderedMapValue = %q, want %q", got, expected)
 	}
 }

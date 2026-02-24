@@ -3474,8 +3474,8 @@ func (c *clientConn) formatCopyValue(v interface{}) string {
 		return formatArrayValue(val)
 	case map[string]any:
 		return formatMapValue(val)
-	case map[any]any:
-		return formatAnyMapValue(val)
+	case OrderedMapValue:
+		return formatOrderedMapValue(val)
 	default:
 		return fmt.Sprintf("%v", val)
 	}
@@ -3669,9 +3669,8 @@ func formatValue(v interface{}) string {
 	case map[string]any:
 		// STRUCT text format: {"key1": val1, "key2": val2}
 		return formatMapValue(val)
-	case map[any]any:
-		// MAP text format: {key1=val1, key2=val2}
-		return formatAnyMapValue(val)
+	case OrderedMapValue:
+		return formatOrderedMapValue(val)
 	default:
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)
@@ -3797,20 +3796,18 @@ func formatMapValue(m map[string]any) string {
 	return buf.String()
 }
 
-// formatAnyMapValue formats a map[any]any as a key-value text representation.
-// Used for MAP values extracted from Arrow (keys preserve their original types).
-func formatAnyMapValue(m map[any]any) string {
+// formatOrderedMapValue formats an OrderedMapValue as a key-value text
+// representation, preserving the original insertion order from the Arrow array.
+func formatOrderedMapValue(m OrderedMapValue) string {
 	var buf strings.Builder
 	buf.WriteByte('{')
-	first := true
-	for k, v := range m {
-		if !first {
+	for i, k := range m.Keys {
+		if i > 0 {
 			buf.WriteString(", ")
 		}
-		first = false
 		buf.WriteString(formatValue(k))
 		buf.WriteString("=")
-		buf.WriteString(formatValue(v))
+		buf.WriteString(formatValue(m.Map[k]))
 	}
 	buf.WriteByte('}')
 	return buf.String()

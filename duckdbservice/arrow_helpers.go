@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	duckdb "github.com/duckdb/duckdb-go/v2"
+	"github.com/posthog/duckgres/server"
 )
 
 // RowsToRecord converts sql.Rows into an Arrow RecordBatch of up to batchSize rows.
@@ -502,6 +503,13 @@ func AppendValue(builder array.Builder, val interface{}) {
 			for k, item := range v {
 				AppendValue(kb, k)
 				AppendValue(ib, item)
+			}
+		case server.OrderedMapValue:
+			b.Append(true)
+			kb, ib := b.KeyBuilder(), b.ItemBuilder()
+			for _, k := range v.Keys {
+				AppendValue(kb, k)
+				AppendValue(ib, v.Map[k])
 			}
 		default:
 			b.AppendNull()

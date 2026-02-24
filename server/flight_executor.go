@@ -30,6 +30,15 @@ const MaxGRPCMessageSize = 1 << 30 // 1GB
 // ErrWorkerDead is returned when the backing worker process has crashed.
 var ErrWorkerDead = errors.New("flight worker is dead")
 
+// OrderedMapValue wraps a map[any]any with an ordered key slice, preserving
+// insertion order from Arrow MAP arrays. Go maps lose iteration order, but
+// DuckDB MAPs are ordered. The Keys slice records the original order from the
+// Arrow array; the Map provides O(1) lookup for formatValue/AppendValue.
+type OrderedMapValue struct {
+	Keys []any
+	Map  map[any]any
+}
+
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.
 type FlightExecutor struct {
@@ -531,13 +540,15 @@ func extractArrowValue(col arrow.Array, row int) interface{} {
 		keys := arr.Keys()
 		items := arr.Items()
 		start, end := arr.ValueOffsets(row)
+		orderedKeys := make([]any, 0, end-start)
 		m := make(map[any]any, end-start)
 		for i := int(start); i < int(end); i++ {
 			k := extractArrowValue(keys, i)
 			v := extractArrowValue(items, i)
+			orderedKeys = append(orderedKeys, k)
 			m[k] = v
 		}
-		return m
+		return OrderedMapValue{Keys: orderedKeys, Map: m}
 	default:
 		// Fallback: use String representation
 		return arr.ValueStr(row)
