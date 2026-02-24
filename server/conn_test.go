@@ -136,6 +136,9 @@ func TestStripLeadingNoise(t *testing.T) {
 		{"line comment then paren", "-- comment\n(SELECT 1)", "SELECT 1)"},
 		{"paren then line comment", "( -- comment\nSELECT 1)", "SELECT 1)"},
 		{"only noise", "( /* comment */ )", ")"},
+		{"paren then newline", "(\nSELECT 1)", "SELECT 1)"},
+		{"paren then tab", "(\tSELECT 1)", "SELECT 1)"},
+		{"paren then CRLF", "(\r\nSELECT 1)", "SELECT 1)"},
 		{"empty", "", ""},
 	}
 
@@ -678,6 +681,21 @@ func TestQueryReturnsResults(t *testing.T) {
 		{
 			name:     "parenthesized SELECT with spaces",
 			query:    "( SELECT 1 )",
+			expected: true,
+		},
+		{
+			name:     "parenthesized SELECT with newline",
+			query:    "(\nSELECT 1)",
+			expected: true,
+		},
+		{
+			name:     "parenthesized SELECT with tab",
+			query:    "(\tSELECT 1)",
+			expected: true,
+		},
+		{
+			name:     "parenthesized SELECT with CRLF",
+			query:    "(\r\nSELECT 1)",
 			expected: true,
 		},
 		// Case sensitivity
