@@ -1971,6 +1971,21 @@ func queryReturnsResults(query string) bool {
 // dollar-quoted strings, double-quoted identifiers, and SQL comments to avoid
 // false positives.
 func containsReturning(upper string) bool {
+	return scanForReturning(upper, true)
+}
+
+// containsReturningAnyDepth is like containsReturning but matches RETURNING at
+// any parenthesis depth. This is needed for WITH-prefixed queries (writable
+// CTEs) where the RETURNING clause is structurally inside AS (...) parens.
+func containsReturningAnyDepth(upper string) bool {
+	return scanForReturning(upper, false)
+}
+
+// scanForReturning is the shared SQL-aware lexer for RETURNING detection.
+// When topLevelOnly is true, RETURNING is only matched at parenthesis depth 0.
+// When false, RETURNING is matched at any depth (for writable CTE detection).
+// In both modes, content inside strings, identifiers, and comments is skipped.
+func scanForReturning(upper string, topLevelOnly bool) bool {
 	depth := 0
 	i := 0
 	for i < len(upper) {
@@ -2065,7 +2080,7 @@ func containsReturning(upper string) bool {
 			}
 
 		case 'R':
-			if depth == 0 && i+9 <= len(upper) && upper[i:i+9] == "RETURNING" {
+			if (!topLevelOnly || depth == 0) && i+9 <= len(upper) && upper[i:i+9] == "RETURNING" {
 				// Check preceded by whitespace
 				if i > 0 && isWSChar(upper[i-1]) {
 					// Check followed by end-of-string or a non-identifier character
@@ -2120,16 +2135,25 @@ func isReturningTrailer(c byte) bool {
 }
 
 // isDMLReturning reports whether query is a DML statement (INSERT/UPDATE/DELETE)
-// with a RETURNING clause. Such statements produce result rows but cannot be
-// described without executing the mutation.
+// with a RETURNING clause, or a writable CTE (WITH ... DML ... RETURNING).
+// Such statements produce result rows but cannot be described without executing
+// the mutation.
+//
+// For WITH-prefixed queries, RETURNING is matched at any parenthesis depth
+// because writable CTEs place the RETURNING clause inside AS (...), making
+// depth-0-only matching structurally unable to detect them.
 func isDMLReturning(query string) bool {
 	upper := strings.ToUpper(stripLeadingNoise(query))
-	if !strings.HasPrefix(upper, "INSERT") &&
-		!strings.HasPrefix(upper, "UPDATE") &&
-		!strings.HasPrefix(upper, "DELETE") {
+	switch {
+	case strings.HasPrefix(upper, "INSERT"),
+		strings.HasPrefix(upper, "UPDATE"),
+		strings.HasPrefix(upper, "DELETE"):
+		return containsReturning(upper)
+	case strings.HasPrefix(upper, "WITH"):
+		return containsReturningAnyDepth(upper)
+	default:
 		return false
 	}
-	return containsReturning(upper)
 }
 
 func (c *clientConn) getCommandType(upperQuery string) string {

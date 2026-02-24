@@ -949,6 +949,44 @@ func TestContainsReturning(t *testing.T) {
 	}
 }
 
+func TestContainsReturningAnyDepth(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		// Matches at depth 0 (same as containsReturning)
+		{"depth 0", "DELETE FROM T RETURNING *", true},
+
+		// Matches at depth 1 (writable CTE pattern)
+		{"depth 1 in CTE", "WITH D AS (DELETE FROM T RETURNING *) SELECT * FROM D", true},
+		{"depth 1 multi-CTE", "WITH A AS (SELECT 1), B AS (DELETE FROM T RETURNING *) SELECT * FROM B", true},
+
+		// Matches at depth 2
+		{"depth 2", "WITH A AS (SELECT * FROM (DELETE FROM T RETURNING *)) SELECT 1", true},
+
+		// Still skips strings/comments/identifiers
+		{"in string at depth 1", "WITH CTE AS (SELECT ' RETURNING ' FROM T) SELECT 1", false},
+		{"in block comment at depth 1", "WITH CTE AS (SELECT /* RETURNING */ 1) SELECT 1", false},
+		{"in double-quoted id at depth 1", `WITH CTE AS (SELECT "RETURNING" FROM T) SELECT 1`, false},
+		{"in dollar-quote at depth 1", "WITH CTE AS (SELECT $$ RETURNING $$ FROM T) SELECT 1", false},
+		{"in line comment at depth 1", "WITH CTE AS (SELECT 1 -- RETURNING\nFROM T) SELECT 1", false},
+
+		// No RETURNING at all
+		{"no RETURNING", "WITH CTE AS (SELECT 1) SELECT * FROM CTE", false},
+		{"empty", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := containsReturningAnyDepth(tt.input)
+			if result != tt.expected {
+				t.Errorf("containsReturningAnyDepth(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsDMLReturning(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -982,6 +1020,29 @@ func TestIsDMLReturning(t *testing.T) {
 		{"subquery + real RETURNING", "DELETE FROM t WHERE id IN (SELECT x FROM s) RETURNING *", true},
 		{"RETURNING*", "DELETE FROM t RETURNING*", true},
 		{"RETURNING(id)", "DELETE FROM t RETURNING(id)", true},
+
+		// Writable CTEs (WITH ... DML ... RETURNING)
+		// For WITH-prefixed queries, RETURNING is matched at any depth to catch
+		// writable CTEs where RETURNING is inside AS (...).
+		{"writable CTE with outer RETURNING", "WITH d AS (DELETE FROM t RETURNING *) INSERT INTO audit SELECT * FROM d RETURNING *", true},
+		{"writable CTE INSERT outer RETURNING", "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte RETURNING *", true},
+		{"writable CTE no RETURNING", "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte", false},
+		{"plain CTE SELECT", "WITH cte AS (SELECT 1) SELECT * FROM cte", false},
+
+		// Writable CTEs with RETURNING only inside AS (...) — previously missed
+		{"canonical writable CTE", "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", true},
+		{"multi-CTE writable", "WITH a AS (SELECT 1), b AS (DELETE FROM t RETURNING *) SELECT * FROM b", true},
+		{"writable CTE UPDATE", "WITH u AS (UPDATE t SET x = 1 RETURNING *) SELECT * FROM u", true},
+		{"writable CTE INSERT", "WITH i AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM i", true},
+		{"WITH RECURSIVE + DML RETURNING", "WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT r+1 FROM r WHERE r < 5) DELETE FROM t WHERE id IN (SELECT * FROM r) RETURNING *", true},
+
+		// False positive we accept: column named "returning" in CTE
+		{"CTE with returning column (false positive)", "WITH cte AS (SELECT returning FROM t) SELECT * FROM cte", true},
+
+		// RETURNING inside string/comment in CTE — still correctly skipped
+		{"CTE with RETURNING in string", "WITH cte AS (SELECT 'returning' FROM t) SELECT * FROM cte", false},
+		{"CTE with RETURNING in comment", "WITH cte AS (SELECT /* returning */ 1) SELECT * FROM cte", false},
+		{"CTE with RETURNING in dollar-quote", "WITH cte AS (SELECT $$ returning $$ FROM t) SELECT * FROM cte", false},
 	}
 
 	for _, tt := range tests {
