@@ -349,6 +349,26 @@ func TestGetCommandType(t *testing.T) {
 			query:    "/* batch */ WITH CTE AS (SELECT 1) DELETE FROM T",
 			expected: "DELETE",
 		},
+		{
+			name:     "WITH column aliases + INSERT",
+			query:    "WITH CTE (COL1, COL2) AS (SELECT 1, 2) INSERT INTO T SELECT * FROM CTE",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH column aliases + SELECT",
+			query:    "WITH CTE (COL1, COL2) AS (SELECT 1, 2) SELECT * FROM CTE",
+			expected: "SELECT",
+		},
+		{
+			name:     "WITH comment between name and AS",
+			query:    "WITH CTE /* HI */ AS (SELECT 1) INSERT INTO T SELECT 1",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH RECURSIVE + column aliases + INSERT",
+			query:    "WITH RECURSIVE CTE (N) AS (SELECT 1 UNION ALL SELECT N+1 FROM CTE WHERE N < 5) INSERT INTO T SELECT * FROM CTE",
+			expected: "INSERT",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1031,6 +1051,14 @@ func TestContainsReturning(t *testing.T) {
 		// --- Combined edge cases ---
 		{"string + subquery + real RETURNING", "INSERT INTO T SELECT 'RETURNING', (SELECT RETURNING FROM S) RETURNING *", true},
 		{"comment + string + RETURNING", "DELETE FROM T /* skip */ WHERE X = ' RETURNING ' RETURNING *", true},
+
+		// --- Malformed SQL: must not panic or infinite loop ---
+		{"unclosed single quote", "INSERT INTO T VALUES ('UNCLOSED RETURNING *", false},
+		{"unclosed double quote", `INSERT INTO T VALUES ("UNCLOSED RETURNING *`, false},
+		{"unclosed block comment", "INSERT INTO T /* UNCLOSED RETURNING *", false},
+		{"unclosed dollar quote", "INSERT INTO T VALUES ($$UNCLOSED RETURNING *", false},
+		{"unclosed parens (RETURNING at depth > 0)", "INSERT INTO T VALUES ((( RETURNING *", false},
+		{"empty string", "", false},
 	}
 
 	for _, tt := range tests {
@@ -1186,6 +1214,36 @@ func TestIsWithDML(t *testing.T) {
 		{"CTE with double-quoted id containing paren", `WITH cte AS (SELECT "col)" FROM t) INSERT INTO t2 SELECT * FROM cte`, true},
 		{"CTE with quoted name", `WITH "my cte" AS (SELECT 1) INSERT INTO t SELECT * FROM "my cte"`, true},
 		{"CTE with quoted name + SELECT", `WITH "my cte" AS (SELECT 1) SELECT * FROM "my cte"`, false},
+
+		// CTE with column aliases
+		{"CTE with column aliases + INSERT", "WITH cte (col1, col2) AS (SELECT 1, 2) INSERT INTO t SELECT * FROM cte", true},
+		{"CTE with column aliases + SELECT", "WITH cte (col1, col2) AS (SELECT 1, 2) SELECT * FROM cte", false},
+		{"CTE with column aliases + DELETE", "WITH cte (x) AS (SELECT id FROM t) DELETE FROM t2 USING cte WHERE t2.id = cte.x", true},
+		{"multiple CTEs with column aliases", "WITH a (x) AS (SELECT 1), b (y) AS (SELECT 2) INSERT INTO t SELECT * FROM a, b", true},
+
+		// Comments between CTE elements
+		{"comment between name and AS", "WITH cte /* hi */ AS (SELECT 1) INSERT INTO t SELECT 1", true},
+		{"line comment between name and AS", "WITH cte -- hi\nAS (SELECT 1) INSERT INTO t SELECT 1", true},
+		{"comment between AS and body", "WITH cte AS /* hi */ (SELECT 1) INSERT INTO t SELECT 1", true},
+		{"comment between CTEs", "WITH a AS (SELECT 1) /* hi */ , b AS (SELECT 2) INSERT INTO t SELECT 1", true},
+		{"comment after CTE body + SELECT", "WITH cte /* hi */ AS (SELECT 1) SELECT * FROM cte", false},
+
+		// RECURSIVE + column aliases
+		{"RECURSIVE with column aliases + INSERT", "WITH RECURSIVE cte (n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cte WHERE n < 5) INSERT INTO t SELECT * FROM cte", true},
+		{"RECURSIVE with column aliases + SELECT", "WITH RECURSIVE cte (n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cte WHERE n < 5) SELECT * FROM cte", false},
+
+		// CTE name is a keyword
+		{"keyword CTE name + INSERT", "WITH insert AS (SELECT 1) INSERT INTO t SELECT * FROM insert", true},
+		{"keyword CTE name + SELECT", "WITH delete AS (SELECT 1) SELECT * FROM delete", false},
+
+		// Malformed SQL — must not panic or loop
+		{"truncated WITH", "WITH", false},
+		{"truncated WITH space", "WITH ", false},
+		{"truncated WITH RECURSIVE", "WITH RECURSIVE", false},
+		{"truncated CTE name", "WITH cte", false},
+		{"truncated after AS", "WITH cte AS", false},
+		{"unclosed CTE body", "WITH cte AS (SELECT 1", false},
+		{"unclosed string in CTE body", "WITH cte AS (SELECT 'unclosed) INSERT INTO t SELECT 1", false},
 
 		// WITH + VALUES (returns results, not DML) → false
 		{"WITH + VALUES", "WITH cte AS (SELECT 1) VALUES (1, 2)", false},

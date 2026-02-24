@@ -2281,6 +2281,33 @@ func skipBalancedParens(upper string, i int) int {
 	return i
 }
 
+// skipWhitespaceAndComments advances i past any whitespace, line comments (--),
+// and block comments (/* */) in an uppercased SQL string. Returns the new position.
+func skipWhitespaceAndComments(upper string, i int) int {
+	for i < len(upper) {
+		if isWSChar(upper[i]) {
+			i++
+		} else if i+1 < len(upper) && upper[i] == '-' && upper[i+1] == '-' {
+			i += 2
+			for i < len(upper) && upper[i] != '\n' {
+				i++
+			}
+		} else if i+1 < len(upper) && upper[i] == '/' && upper[i+1] == '*' {
+			i += 2
+			for i+1 < len(upper) {
+				if upper[i] == '*' && upper[i+1] == '/' {
+					i += 2
+					break
+				}
+				i++
+			}
+		} else {
+			break
+		}
+	}
+	return i
+}
+
 func outerStatementOfCTE(upper string) string {
 	if !strings.HasPrefix(upper, "WITH") {
 		return ""
@@ -2288,14 +2315,10 @@ func outerStatementOfCTE(upper string) string {
 
 	// Skip past "WITH" (and optional "RECURSIVE")
 	i := 4 // len("WITH")
-	for i < len(upper) && isWSChar(upper[i]) {
-		i++
-	}
+	i = skipWhitespaceAndComments(upper, i)
 	if i+9 <= len(upper) && upper[i:i+9] == "RECURSIVE" {
 		i += 9
-		for i < len(upper) && isWSChar(upper[i]) {
-			i++
-		}
+		i = skipWhitespaceAndComments(upper, i)
 	}
 
 	// Skip CTE definitions: name AS (...) [, name AS (...)]
@@ -2315,22 +2338,30 @@ func outerStatementOfCTE(upper string) string {
 				i++
 			}
 		} else {
-			for i < len(upper) && !isWSChar(upper[i]) && upper[i] != '(' {
+			for i < len(upper) && !isWSChar(upper[i]) && upper[i] != '(' && upper[i] != '/' && upper[i] != '-' {
 				i++
 			}
 		}
 
-		// Skip whitespace
-		for i < len(upper) && isWSChar(upper[i]) {
-			i++
+		i = skipWhitespaceAndComments(upper, i)
+
+		// Skip optional column alias list: cte (col1, col2) AS (...)
+		if i < len(upper) && upper[i] == '(' {
+			// Only treat as column list if "AS" follows the closing paren.
+			// Peek ahead to distinguish column list from CTE body (when AS is missing).
+			saved := i
+			i = skipBalancedParens(upper, i+1)
+			i = skipWhitespaceAndComments(upper, i)
+			if i+2 > len(upper) || upper[i:i+2] != "AS" || (i+2 < len(upper) && !isWSChar(upper[i+2]) && upper[i+2] != '(') {
+				// No AS after parens — this wasn't a column list, restore position.
+				i = saved
+			}
 		}
 
 		// Expect "AS"
 		if i+2 <= len(upper) && upper[i:i+2] == "AS" {
 			i += 2
-			for i < len(upper) && isWSChar(upper[i]) {
-				i++
-			}
+			i = skipWhitespaceAndComments(upper, i)
 		}
 
 		// Skip the CTE body: balanced parentheses with SQL-aware scanning
@@ -2339,17 +2370,12 @@ func outerStatementOfCTE(upper string) string {
 			i = skipBalancedParens(upper, i+1)
 		}
 
-		// Skip whitespace
-		for i < len(upper) && isWSChar(upper[i]) {
-			i++
-		}
+		i = skipWhitespaceAndComments(upper, i)
 
 		// If there's a comma, another CTE definition follows
 		if i < len(upper) && upper[i] == ',' {
 			i++
-			for i < len(upper) && isWSChar(upper[i]) {
-				i++
-			}
+			i = skipWhitespaceAndComments(upper, i)
 			continue
 		}
 
