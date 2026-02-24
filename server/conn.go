@@ -3807,7 +3807,7 @@ func formatOrderedMapValue(m OrderedMapValue) string {
 		}
 		buf.WriteString(formatValue(k))
 		buf.WriteString("=")
-		buf.WriteString(formatValue(m.Map[k]))
+		buf.WriteString(formatValue(m.Values[i]))
 	}
 	buf.WriteByte('}')
 	return buf.String()

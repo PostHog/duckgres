@@ -30,13 +30,13 @@ const MaxGRPCMessageSize = 1 << 30 // 1GB
 // ErrWorkerDead is returned when the backing worker process has crashed.
 var ErrWorkerDead = errors.New("flight worker is dead")
 
-// OrderedMapValue wraps a map[any]any with an ordered key slice, preserving
-// insertion order from Arrow MAP arrays. Go maps lose iteration order, but
-// DuckDB MAPs are ordered. The Keys slice records the original order from the
-// Arrow array; the Map provides O(1) lookup for formatValue/AppendValue.
+// OrderedMapValue represents a DuckDB MAP as parallel key/value slices,
+// preserving insertion order from Arrow MAP arrays. Using parallel slices
+// instead of a Go map avoids panics on non-comparable key types (e.g.,
+// []byte from BLOB keys) and preserves DuckDB's MAP ordering.
 type OrderedMapValue struct {
-	Keys []any
-	Map  map[any]any
+	Keys   []any
+	Values []any
 }
 
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
@@ -540,15 +540,14 @@ func extractArrowValue(col arrow.Array, row int) interface{} {
 		keys := arr.Keys()
 		items := arr.Items()
 		start, end := arr.ValueOffsets(row)
-		orderedKeys := make([]any, 0, end-start)
-		m := make(map[any]any, end-start)
+		n := int(end - start)
+		ks := make([]any, 0, n)
+		vs := make([]any, 0, n)
 		for i := int(start); i < int(end); i++ {
-			k := extractArrowValue(keys, i)
-			v := extractArrowValue(items, i)
-			orderedKeys = append(orderedKeys, k)
-			m[k] = v
+			ks = append(ks, extractArrowValue(keys, i))
+			vs = append(vs, extractArrowValue(items, i))
 		}
-		return OrderedMapValue{Keys: orderedKeys, Map: m}
+		return OrderedMapValue{Keys: ks, Values: vs}
 	default:
 		// Fallback: use String representation
 		return arr.ValueStr(row)

@@ -507,9 +507,9 @@ func AppendValue(builder array.Builder, val interface{}) {
 		case server.OrderedMapValue:
 			b.Append(true)
 			kb, ib := b.KeyBuilder(), b.ItemBuilder()
-			for _, k := range v.Keys {
+			for i, k := range v.Keys {
 				AppendValue(kb, k)
-				AppendValue(ib, v.Map[k])
+				AppendValue(ib, v.Values[i])
 			}
 		default:
 			b.AppendNull()
