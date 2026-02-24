@@ -120,6 +120,35 @@ func TestStripLeadingComments(t *testing.T) {
 	}
 }
 
+func TestStripLeadingNoise(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"no noise", "SELECT 1", "SELECT 1"},
+		{"leading comment", "/* comment */ SELECT 1", "SELECT 1"},
+		{"leading paren", "(SELECT 1)", "SELECT 1)"},
+		{"paren then comment", "(/* comment */ SELECT 1)", "SELECT 1)"},
+		{"comment then paren", "/* comment */ (SELECT 1)", "SELECT 1)"},
+		{"nested parens and comments", "( ( /* comment */ SELECT 1 ) )", "SELECT 1 ) )"},
+		{"paren comment paren", "(/* c1 */(/* c2 */ SELECT 1))", "SELECT 1))"},
+		{"line comment then paren", "-- comment\n(SELECT 1)", "SELECT 1)"},
+		{"paren then line comment", "( -- comment\nSELECT 1)", "SELECT 1)"},
+		{"only noise", "( /* comment */ )", ")"},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := stripLeadingNoise(tt.input)
+			if result != tt.expected {
+				t.Errorf("stripLeadingNoise(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestGetCommandType(t *testing.T) {
 	// Create a minimal clientConn for testing
 	c := &clientConn{}
@@ -806,6 +835,14 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 		{"block comment before INSERT RETURNING", "/* comment */ INSERT INTO t VALUES (1) RETURNING *", true},
 		{"block comment before UPDATE RETURNING", "/* comment */ UPDATE t SET x = 1 RETURNING *", true},
 		{"block comment before DELETE RETURNING", "/* comment */ DELETE FROM t RETURNING *", true},
+
+		// Parentheses interleaved with comments
+		{"paren then comment then SELECT", "(/* comment */ SELECT 1)", true},
+		{"comment then paren then SELECT", "/* comment */ (SELECT 1)", true},
+		{"nested parens and comments", "( ( /* comment */ SELECT 1 ) )", true},
+		{"paren then line comment then SELECT", "( -- comment\nSELECT 1)", true},
+		{"paren comment paren SELECT", "(/* c1 */(/* c2 */ SELECT 1))", true},
+		{"paren then comment then INSERT RETURNING", "(/* comment */ INSERT INTO t VALUES (1) RETURNING *)", true},
 
 		// Queries with leading comments that don't return results
 		{"block comment before INSERT", "/* comment */ INSERT INTO t VALUES (1)", false},

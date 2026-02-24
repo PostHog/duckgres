@@ -1885,6 +1885,20 @@ func stripLeadingComments(query string) string {
 	}
 }
 
+// stripLeadingNoise strips leading whitespace, comments, and parentheses from
+// a query string in a loop until none remain. This handles cases like
+// "(/* comment */ SELECT 1)" where comments are interleaved with parens.
+func stripLeadingNoise(query string) string {
+	for {
+		prev := query
+		query = stripLeadingComments(query)
+		query = strings.TrimLeft(query, "( ")
+		if query == prev {
+			return query
+		}
+	}
+}
+
 // describeSupportsLimit returns true if the (uppercased) query supports a LIMIT clause.
 // SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL etc. do not.
 func describeSupportsLimit(upper string) bool {
@@ -1899,9 +1913,7 @@ func describeSupportsLimit(upper string) bool {
 // queryReturnsResults checks if a SQL query returns a result set.
 // This is used to determine whether to send RowDescription or NoData.
 func queryReturnsResults(query string) bool {
-	upper := strings.ToUpper(stripLeadingComments(query))
-	// Strip leading parentheses — e.g., (SELECT ... UNION SELECT ...)
-	upper = strings.TrimLeft(upper, "( ")
+	upper := strings.ToUpper(stripLeadingNoise(query))
 	// SELECT is the most common
 	if strings.HasPrefix(upper, "SELECT") {
 		return true
@@ -2111,8 +2123,7 @@ func isReturningTrailer(c byte) bool {
 // with a RETURNING clause. Such statements produce result rows but cannot be
 // described without executing the mutation.
 func isDMLReturning(query string) bool {
-	upper := strings.ToUpper(stripLeadingComments(query))
-	upper = strings.TrimLeft(upper, "( ")
+	upper := strings.ToUpper(stripLeadingNoise(query))
 	if !strings.HasPrefix(upper, "INSERT") &&
 		!strings.HasPrefix(upper, "UPDATE") &&
 		!strings.HasPrefix(upper, "DELETE") {
