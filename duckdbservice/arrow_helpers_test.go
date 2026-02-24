@@ -628,7 +628,6 @@ func TestAppendValue(t *testing.T) {
 // and runs a validate function against the deserialized record.
 //
 // These tests confirm Duckgres correctly serializes nested types over Flight SQL.
-// See STRUCT_TYPE_BUGS.md for the bug investigation context.
 func TestNestedTypesRoundTrip(t *testing.T) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -1166,11 +1165,13 @@ func TestNestedTypesRoundTrip(t *testing.T) {
 			// Serialize through Arrow IPC (same path as Flight SQL transport)
 			var buf bytes.Buffer
 			w := ipc.NewWriter(&buf, ipc.WithSchema(schema), ipc.WithAllocator(alloc))
+			defer func() {
+				if err := w.Close(); err != nil {
+					t.Fatalf("IPC close: %v", err)
+				}
+			}()
 			if err := w.Write(rec); err != nil {
 				t.Fatalf("IPC write: %v", err)
-			}
-			if err := w.Close(); err != nil {
-				t.Fatalf("IPC close: %v", err)
 			}
 
 			r, err := ipc.NewReader(bytes.NewReader(buf.Bytes()), ipc.WithAllocator(alloc))
