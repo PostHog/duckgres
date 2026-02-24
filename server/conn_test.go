@@ -743,11 +743,11 @@ func TestQueryReturnsResults(t *testing.T) {
 			query:    "TRUNCATE t",
 			expected: false,
 		},
-		// DELETE with RETURNING in subquery — false positive, acceptable
+		// DELETE with RETURNING in subquery — correctly rejected (depth > 0)
 		{
-			name:     "DELETE with RETURNING in subquery (false positive)",
+			name:     "DELETE with RETURNING in subquery",
 			query:    "DELETE FROM t WHERE id IN (SELECT returning FROM s)",
-			expected: true, // contains "\nRETURNING" or " RETURNING" somewhere
+			expected: false,
 		},
 		// Tab before RETURNING
 		{

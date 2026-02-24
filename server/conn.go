@@ -1953,22 +1953,55 @@ func queryReturnsResults(query string) bool {
 	return false
 }
 
-// containsReturning checks if an uppercased SQL string contains the RETURNING
-// keyword preceded by whitespace. This avoids false positives where RETURNING
-// appears inside parentheses or quotes (e.g., column names, string literals).
+// containsReturning checks if an uppercased SQL string contains a top-level
+// RETURNING keyword (preceded by whitespace, at parenthesis depth 0).
+// This avoids false positives where RETURNING appears inside subqueries,
+// function calls, or other parenthesized expressions.
 func containsReturning(upper string) bool {
-	idx := strings.Index(upper, "RETURNING")
-	for idx > 0 {
-		prev := upper[idx-1]
-		if prev == ' ' || prev == '\n' || prev == '\t' || prev == '\r' {
-			return true
+	depth := 0
+	i := 0
+	for i < len(upper) {
+		switch upper[i] {
+		case '(':
+			depth++
+			i++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+		case '\'':
+			// Skip single-quoted string literal
+			i++
+			for i < len(upper) {
+				if upper[i] == '\'' {
+					i++
+					if i < len(upper) && upper[i] == '\'' {
+						i++ // escaped quote
+						continue
+					}
+					break
+				}
+				i++
+			}
+		case 'R':
+			if depth == 0 && i+9 <= len(upper) && upper[i:i+9] == "RETURNING" {
+				// Check preceded by whitespace
+				if i > 0 {
+					prev := upper[i-1]
+					if prev == ' ' || prev == '\n' || prev == '\t' || prev == '\r' {
+						// Check followed by end-of-string, whitespace, or semicolon
+						end := i + 9
+						if end >= len(upper) || upper[end] == ' ' || upper[end] == '\n' || upper[end] == '\t' || upper[end] == '\r' || upper[end] == ';' {
+							return true
+						}
+					}
+				}
+			}
+			i++
+		default:
+			i++
 		}
-		// Keep searching for next occurrence
-		next := strings.Index(upper[idx+9:], "RETURNING")
-		if next < 0 {
-			return false
-		}
-		idx = idx + 9 + next
 	}
 	return false
 }
