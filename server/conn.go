@@ -2316,7 +2316,7 @@ func outerStatementOfCTE(upper string) string {
 	// Skip past "WITH" (and optional "RECURSIVE")
 	i := 4 // len("WITH")
 	i = skipWhitespaceAndComments(upper, i)
-	if i+9 <= len(upper) && upper[i:i+9] == "RECURSIVE" {
+	if i+9 <= len(upper) && upper[i:i+9] == "RECURSIVE" && (i+9 >= len(upper) || isWSChar(upper[i+9]) || upper[i+9] == '/' || upper[i+9] == '-') {
 		i += 9
 		i = skipWhitespaceAndComments(upper, i)
 	}
