@@ -2174,9 +2174,6 @@ func isWithDML(query string) bool {
 		strings.HasPrefix(outer, "DELETE")
 }
 
-// outerStatementOfCTE returns the portion of an uppercased query after all CTE
-// definitions, or "" if the query doesn't start with WITH.
-// For "WITH a AS (...) SELECT ...", it returns "SELECT ...".
 // skipBalancedParens advances past a parenthesized group in an uppercased SQL
 // string. i must point to the character immediately after the opening '('.
 // It tracks paren depth while correctly skipping SQL constructs that may
@@ -2308,6 +2305,9 @@ func skipWhitespaceAndComments(upper string, i int) int {
 	return i
 }
 
+// outerStatementOfCTE returns the portion of an uppercased query after all CTE
+// definitions, or "" if the query doesn't start with WITH.
+// For "WITH a AS (...) SELECT ...", it returns "SELECT ...".
 func outerStatementOfCTE(upper string) string {
 	if !strings.HasPrefix(upper, "WITH") {
 		return ""
