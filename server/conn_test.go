@@ -673,16 +673,16 @@ func TestQueryReturnsResults(t *testing.T) {
 			query:    "INSERT INTO t\nVALUES (1)\nRETURNING *",
 			expected: true,
 		},
-		// RETURNING in non-clause positions — correctly rejected by " RETURNING" heuristic
+		// RETURNING in non-clause positions — correctly rejected
 		{
 			name:     "RETURNING in string literal (not false positive)",
 			query:    "INSERT INTO t (col) VALUES ('RETURNING')",
-			expected: false, // no space before RETURNING — preceded by quote
+			expected: false, // inside string literal, skipped by scanner
 		},
 		{
 			name:     "RETURNING as column name (not false positive)",
 			query:    "INSERT INTO t (returning) VALUES (1)",
-			expected: false, // no space before RETURNING — preceded by paren
+			expected: false, // inside parentheses (depth > 0)
 		},
 		// Queries that should NOT match RETURNING
 		{
@@ -824,6 +824,94 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 	}
 }
 
+// TestContainsReturning tests the low-level scanner directly.
+// Input must be pre-uppercased (matching how callers invoke it).
+func TestContainsReturning(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		// --- Basic positive cases ---
+		{"simple", "INSERT INTO T VALUES (1) RETURNING *", true},
+		{"tab before", "DELETE FROM T\tRETURNING *", true},
+		{"newline before", "INSERT INTO T VALUES (1)\nRETURNING *", true},
+		{"cr before", "UPDATE T SET X = 1\rRETURNING *", true},
+		{"at end of string", "DELETE FROM T RETURNING", true},
+		{"semicolon after", "INSERT INTO T VALUES (1) RETURNING *;", true},
+
+		// --- Trailing character variations ---
+		{"RETURNING*", "DELETE FROM T RETURNING*", true},
+		{"RETURNING(expr)", "DELETE FROM T RETURNING(ID)", true},
+		{"RETURNING,col", "INSERT INTO T VALUES (1) RETURNING ID,NAME", true},
+
+		// --- Basic negative cases ---
+		{"no RETURNING", "INSERT INTO T VALUES (1)", false},
+		{"empty string", "", false},
+		{"bare RETURNING no prefix", "RETURNING", false},
+		{"RETURNING as prefix of word", "INSERT INTO T VALUES (1) RETURNING_ID", false},
+		{"RETURNINGS", "INSERT INTO T VALUES (1) RETURNINGS", false},
+		{"no space before", "INSERT INTO TRETURNING VALUES (1)", false},
+
+		// --- Parenthesis depth ---
+		{"RETURNING in subquery", "INSERT INTO T SELECT * FROM (SELECT RETURNING FROM S)", false},
+		{"RETURNING in nested subquery", "INSERT INTO T SELECT * FROM (SELECT * FROM (SELECT RETURNING FROM A))", false},
+		{"RETURNING in subquery + real RETURNING", "INSERT INTO T SELECT (RETURNING) FROM S RETURNING *", true},
+		{"only in depth-1 parens", "DELETE FROM T WHERE ID IN (SELECT RETURNING FROM S)", false},
+		{"real RETURNING after subquery", "DELETE FROM T WHERE ID IN (SELECT X FROM S) RETURNING *", true},
+		{"ON CONFLICT with parens", "INSERT INTO T VALUES (1) ON CONFLICT (ID) DO UPDATE SET X = EXCLUDED.X RETURNING *", true},
+		{"subquery in ON CONFLICT", "INSERT INTO T VALUES (1) ON CONFLICT (ID) DO UPDATE SET X = (SELECT MAX(X) FROM T2) RETURNING *", true},
+
+		// --- Single-quoted string literals ---
+		{"RETURNING in string literal", "INSERT INTO T VALUES (' RETURNING ') ", false},
+		{"parens in string literal", "INSERT INTO T VALUES ('(') RETURNING *", true},
+		{"close paren in string literal", "INSERT INTO T VALUES (')') RETURNING *", true},
+		{"unbalanced parens in string literal", "INSERT INTO T VALUES ('(((') RETURNING *", true},
+		{"escaped quote in string", "INSERT INTO T VALUES ('IT''S RETURNING')", false},
+		{"escaped quote then real RETURNING", "INSERT INTO T VALUES ('IT''S') RETURNING *", true},
+
+		// --- E-string backslash escapes ---
+		{"E-string with backslash quote", "UPDATE T SET X = E'FOO\\'S RETURNING BAR' WHERE ID = 1", false},
+		{"E-string then real RETURNING", "UPDATE T SET X = E'FOO\\'S' RETURNING *", true},
+		{"E-string with backslash-n", "INSERT INTO T VALUES (E'LINE1\\NLINE2') RETURNING *", true},
+
+		// --- Double-quoted identifiers ---
+		{"RETURNING as quoted identifier", `INSERT INTO T ("RETURNING") VALUES (1)`, false},
+		{"quoted identifier then real RETURNING", `INSERT INTO T ("RETURNING") VALUES (1) RETURNING *`, true},
+		{"escaped quote in identifier", `INSERT INTO T ("COL""RETURNING") VALUES (1)`, false},
+
+		// --- Dollar-quoted strings ---
+		{"RETURNING in $$", "UPDATE T SET BODY = $$ RETURNING $$ WHERE ID = 1", false},
+		{"RETURNING in $tag$", "UPDATE T SET BODY = $TAG$ RETURNING $TAG$ WHERE ID = 1", false},
+		{"dollar-quoted then real RETURNING", "UPDATE T SET BODY = $$ X $$ RETURNING *", true},
+		{"$$ with parens inside", "UPDATE T SET BODY = $$(RETURNING)$$ RETURNING *", true},
+		{"incomplete dollar tag (not a tag)", "UPDATE T SET X = $5 RETURNING *", true},
+
+		// --- Block comments ---
+		{"RETURNING in block comment", "DELETE FROM T /* RETURNING * */ WHERE ID = 1", false},
+		{"block comment then real RETURNING", "DELETE FROM T /* comment */ RETURNING *", true},
+		{"nested-ish block comment content", "INSERT INTO T /* RETURNING * /* nested */ */ VALUES (1)", false},
+
+		// --- Line comments ---
+		{"RETURNING in line comment", "UPDATE T SET X = 1 -- RETURNING *\nWHERE ID = 1", false},
+		{"line comment then real RETURNING", "UPDATE T SET X = 1 -- comment\nRETURNING *", true},
+		{"line comment at end (no newline)", "INSERT INTO T VALUES (1) -- RETURNING *", false},
+
+		// --- Combined edge cases ---
+		{"string + subquery + real RETURNING", "INSERT INTO T SELECT 'RETURNING', (SELECT RETURNING FROM S) RETURNING *", true},
+		{"comment + string + RETURNING", "DELETE FROM T /* skip */ WHERE X = ' RETURNING ' RETURNING *", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := containsReturning(tt.input)
+			if result != tt.expected {
+				t.Errorf("containsReturning(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsDMLReturning(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -849,6 +937,14 @@ func TestIsDMLReturning(t *testing.T) {
 
 		// Edge cases: RETURNING in non-keyword positions → false
 		{"column named returning", "INSERT INTO t (returning_col) VALUES (1)", false},
+		{"RETURNING in subquery only", "DELETE FROM t WHERE id IN (SELECT returning FROM s)", false},
+		{"RETURNING in string literal only", "INSERT INTO t VALUES ('returning')", false},
+		{"RETURNING in block comment only", "DELETE FROM t /* returning * */ WHERE id = 1", false},
+
+		// Edge cases: real RETURNING with noise → true
+		{"subquery + real RETURNING", "DELETE FROM t WHERE id IN (SELECT x FROM s) RETURNING *", true},
+		{"RETURNING*", "DELETE FROM t RETURNING*", true},
+		{"RETURNING(id)", "DELETE FROM t RETURNING(id)", true},
 	}
 
 	for _, tt := range tests {

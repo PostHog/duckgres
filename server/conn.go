@@ -1954,9 +1954,10 @@ func queryReturnsResults(query string) bool {
 }
 
 // containsReturning checks if an uppercased SQL string contains a top-level
-// RETURNING keyword (preceded by whitespace, at parenthesis depth 0).
-// This avoids false positives where RETURNING appears inside subqueries,
-// function calls, or other parenthesized expressions.
+// RETURNING keyword at parenthesis depth 0. It skips content inside
+// parentheses, single-quoted strings (including E-string backslash escapes),
+// dollar-quoted strings, double-quoted identifiers, and SQL comments to avoid
+// false positives.
 func containsReturning(upper string) bool {
 	depth := 0
 	i := 0
@@ -1970,40 +1971,140 @@ func containsReturning(upper string) bool {
 				depth--
 			}
 			i++
+
 		case '\'':
-			// Skip single-quoted string literal
+			// Single-quoted string literal.
+			// Check for E-string prefix (E'...' with backslash escaping).
+			estring := i > 0 && upper[i-1] == 'E'
 			i++
 			for i < len(upper) {
 				if upper[i] == '\'' {
 					i++
 					if i < len(upper) && upper[i] == '\'' {
-						i++ // escaped quote
+						i++ // '' escape (works in both normal and E-strings)
+						continue
+					}
+					break
+				}
+				if estring && upper[i] == '\\' {
+					i++ // skip escaped character in E-string
+					if i < len(upper) {
+						i++
+					}
+					continue
+				}
+				i++
+			}
+
+		case '"':
+			// Double-quoted identifier — skip to closing quote.
+			i++
+			for i < len(upper) {
+				if upper[i] == '"' {
+					i++
+					if i < len(upper) && upper[i] == '"' {
+						i++ // "" escape
 						continue
 					}
 					break
 				}
 				i++
 			}
+
+		case '$':
+			// Dollar-quoted string: $tag$...$tag$ or $$...$$
+			if tag, ok := parseDollarTag(upper, i); ok {
+				i += len(tag) // skip opening tag
+				for i+len(tag) <= len(upper) {
+					if upper[i] == '$' && upper[i:i+len(tag)] == tag {
+						i += len(tag) // skip closing tag
+						break
+					}
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case '-':
+			// Line comment: -- ... \n
+			if i+1 < len(upper) && upper[i+1] == '-' {
+				i += 2
+				for i < len(upper) && upper[i] != '\n' {
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case '/':
+			// Block comment: /* ... */
+			if i+1 < len(upper) && upper[i+1] == '*' {
+				i += 2
+				for i+1 < len(upper) {
+					if upper[i] == '*' && upper[i+1] == '/' {
+						i += 2
+						break
+					}
+					i++
+				}
+			} else {
+				i++
+			}
+
 		case 'R':
 			if depth == 0 && i+9 <= len(upper) && upper[i:i+9] == "RETURNING" {
 				// Check preceded by whitespace
-				if i > 0 {
-					prev := upper[i-1]
-					if prev == ' ' || prev == '\n' || prev == '\t' || prev == '\r' {
-						// Check followed by end-of-string, whitespace, or semicolon
-						end := i + 9
-						if end >= len(upper) || upper[end] == ' ' || upper[end] == '\n' || upper[end] == '\t' || upper[end] == '\r' || upper[end] == ';' {
-							return true
-						}
+				if i > 0 && isWSChar(upper[i-1]) {
+					// Check followed by end-of-string or a non-identifier character
+					end := i + 9
+					if end >= len(upper) || isReturningTrailer(upper[end]) {
+						return true
 					}
 				}
 			}
 			i++
+
 		default:
 			i++
 		}
 	}
 	return false
+}
+
+// parseDollarTag extracts a dollar-quote tag starting at position i.
+// Returns the full tag (e.g., "$$" or "$tag$") and true, or ("", false).
+func parseDollarTag(s string, i int) (string, bool) {
+	if i >= len(s) || s[i] != '$' {
+		return "", false
+	}
+	j := i + 1
+	// Tag is $[identifier]$ where identifier is [A-Z_0-9] (already uppercased).
+	for j < len(s) {
+		if s[j] == '$' {
+			return s[i : j+1], true
+		}
+		c := s[j]
+		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			j++
+			continue
+		}
+		return "", false // invalid tag character
+	}
+	return "", false
+}
+
+// isWSChar reports whether c is an ASCII whitespace character.
+func isWSChar(c byte) bool {
+	return c == ' ' || c == '\n' || c == '\t' || c == '\r'
+}
+
+// isReturningTrailer reports whether c is a valid character immediately after
+// the RETURNING keyword (i.e., not a continuation of an identifier).
+func isReturningTrailer(c byte) bool {
+	// Whitespace, semicolon, common expression starters
+	return c == ' ' || c == '\n' || c == '\t' || c == '\r' ||
+		c == ';' || c == '*' || c == '(' || c == ','
 }
 
 // isDMLReturning reports whether query is a DML statement (INSERT/UPDATE/DELETE)
