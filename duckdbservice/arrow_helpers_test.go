@@ -634,7 +634,7 @@ func TestNestedTypesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	tests := []struct {
 		name     string
@@ -1147,7 +1147,7 @@ func TestNestedTypesRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("query: %v", err)
 			}
-			defer rows.Close()
+			defer func() { _ = rows.Close() }()
 
 			rec, err := RowsToRecord(alloc, rows, schema, 1024)
 			if err != nil {
@@ -1182,7 +1182,7 @@ func TestNestedTypesRoundTrip(t *testing.T) {
 			if !r.Next() {
 				t.Fatal("no record in IPC stream")
 			}
-			got := r.Record()
+			got := r.RecordBatch()
 
 			// Validate after IPC (tests the serialization path)
 			t.Run("post-IPC", func(t *testing.T) {
