@@ -820,6 +820,19 @@ func TestQueryReturnsResults(t *testing.T) {
 			query:    "INSERT INTO t SELECT (RETURNING) FROM s RETURNING *",
 			expected: true,
 		},
+		// WITH + DML (no RETURNING) — queryReturnsResults returns true because
+		// of the WITH prefix, but these don't actually return results.
+		// The isWithDML guard in handleDescribe prevents mutation during probing.
+		{
+			name:     "WITH + INSERT (no RETURNING)",
+			query:    "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte",
+			expected: true, // WITH prefix → true (isWithDML handles this in Describe)
+		},
+		{
+			name:     "WITH + DELETE (no RETURNING)",
+			query:    "WITH cte AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM cte)",
+			expected: true, // WITH prefix → true (isWithDML handles this in Describe)
+		},
 	}
 
 	for _, tt := range tests {
@@ -952,6 +965,22 @@ func TestContainsReturning(t *testing.T) {
 		{"line comment then real RETURNING", "UPDATE T SET X = 1 -- comment\nRETURNING *", true},
 		{"line comment at end (no newline)", "INSERT INTO T VALUES (1) -- RETURNING *", false},
 
+		// --- Additional trailing characters ---
+		{`RETURNING"col"`, `DELETE FROM T RETURNING"ID"`, true},
+		{"RETURNING--comment", "DELETE FROM T RETURNING-- get id\n*", true},
+		{"RETURNING/*comment*/", "DELETE FROM T RETURNING/* cols */*", true},
+		{"RETURNING$tag$", "DELETE FROM T RETURNING$TAG$ID$TAG$", true},
+
+		// --- Nested block comments (known limitation) ---
+		// PostgreSQL supports nested block comments, but our scanner doesn't.
+		// The scanner exits at the first */, so residual text is parsed as SQL.
+		// In this example, /* inner */ closes the comment early, exposing RETURNING.
+		{"nested block comment exposes RETURNING (known limitation)",
+			"DELETE FROM T /* outer /* inner */ RETURNING * */ WHERE ID = 1", true},
+		// When RETURNING is consumed by the comment, it's correctly not matched.
+		{"nested block comment hides RETURNING",
+			"DELETE FROM T /* outer /* RETURNING * */ end */ WHERE ID = 1", false},
+
 		// --- Combined edge cases ---
 		{"string + subquery + real RETURNING", "INSERT INTO T SELECT 'RETURNING', (SELECT RETURNING FROM S) RETURNING *", true},
 		{"comment + string + RETURNING", "DELETE FROM T /* skip */ WHERE X = ' RETURNING ' RETURNING *", true},
@@ -1068,6 +1097,53 @@ func TestIsDMLReturning(t *testing.T) {
 			result := isDMLReturning(tt.query)
 			if result != tt.expected {
 				t.Errorf("isDMLReturning(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsWithDML(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		// WITH + DML → true
+		{"WITH + INSERT", "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte", true},
+		{"WITH + UPDATE", "WITH cte AS (SELECT 1) UPDATE t SET x = cte.x FROM cte", true},
+		{"WITH + DELETE", "WITH cte AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM cte)", true},
+		{"WITH RECURSIVE + INSERT", "WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT r+1 FROM r WHERE r < 5) INSERT INTO t SELECT * FROM r", true},
+		{"multiple CTEs + INSERT", "WITH a AS (SELECT 1), b AS (SELECT 2) INSERT INTO t SELECT * FROM a, b", true},
+
+		// WITH + DML with leading noise
+		{"comment + WITH + INSERT", "/* comment */ WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte", true},
+		{"paren + WITH + INSERT", "(WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte)", true},
+
+		// WITH + SELECT → false
+		{"WITH + SELECT", "WITH cte AS (SELECT 1) SELECT * FROM cte", false},
+		{"WITH RECURSIVE + SELECT", "WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT r+1 FROM r WHERE r < 5) SELECT * FROM r", false},
+		{"multiple CTEs + SELECT", "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b", false},
+
+		// Not WITH → false
+		{"plain INSERT", "INSERT INTO t VALUES (1)", false},
+		{"plain SELECT", "SELECT 1", false},
+		{"plain DELETE", "DELETE FROM t", false},
+
+		// Edge cases in CTE body
+		{"CTE with parens in body", "WITH cte AS (SELECT (1+2) FROM t WHERE x IN (1,2,3)) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with string in body", "WITH cte AS (SELECT 'hello)world' FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with quoted name", `WITH "my cte" AS (SELECT 1) INSERT INTO t SELECT * FROM "my cte"`, true},
+		{"CTE with quoted name + SELECT", `WITH "my cte" AS (SELECT 1) SELECT * FROM "my cte"`, false},
+
+		// WITH + VALUES (returns results, not DML) → false
+		{"WITH + VALUES", "WITH cte AS (SELECT 1) VALUES (1, 2)", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isWithDML(tt.query)
+			if result != tt.expected {
+				t.Errorf("isWithDML(%q) = %v, want %v", tt.query, result, tt.expected)
 			}
 		})
 	}

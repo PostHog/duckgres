@@ -2129,9 +2129,12 @@ func isWSChar(c byte) bool {
 // isReturningTrailer reports whether c is a valid character immediately after
 // the RETURNING keyword (i.e., not a continuation of an identifier).
 func isReturningTrailer(c byte) bool {
-	// Whitespace, semicolon, common expression starters
 	return c == ' ' || c == '\n' || c == '\t' || c == '\r' ||
-		c == ';' || c == '*' || c == '(' || c == ','
+		c == ';' || c == '*' || c == '(' || c == ',' ||
+		c == '"' || // double-quoted identifier: RETURNING"col"
+		c == '-' || // line comment: RETURNING-- comment
+		c == '/' || // block comment: RETURNING/* comment */
+		c == '$' // dollar-quoted: RETURNING$tag$expr$tag$
 }
 
 // isDMLReturning reports whether query is a DML statement (INSERT/UPDATE/DELETE)
@@ -2154,6 +2157,111 @@ func isDMLReturning(query string) bool {
 	default:
 		return false
 	}
+}
+
+// isWithDML reports whether a query is a WITH (CTE) whose outer statement is
+// DML (INSERT/UPDATE/DELETE). Such queries don't return results (unless they
+// have a RETURNING clause, handled separately by isDMLReturning) and must not
+// be executed during Describe to avoid unintended mutations.
+//
+// It scans past "WITH [RECURSIVE] name AS (...) [, name AS (...)]" at depth 0,
+// then checks if the remaining text starts with a DML keyword.
+func isWithDML(query string) bool {
+	upper := strings.ToUpper(stripLeadingNoise(query))
+	if !strings.HasPrefix(upper, "WITH") {
+		return false
+	}
+
+	// Skip past "WITH" (and optional "RECURSIVE")
+	i := 4 // len("WITH")
+	for i < len(upper) && isWSChar(upper[i]) {
+		i++
+	}
+	if i+9 <= len(upper) && upper[i:i+9] == "RECURSIVE" {
+		i += 9
+		for i < len(upper) && isWSChar(upper[i]) {
+			i++
+		}
+	}
+
+	// Skip CTE definitions: name AS (...) [, name AS (...)]
+	for i < len(upper) {
+		// Skip CTE name (identifier or quoted identifier)
+		if i < len(upper) && upper[i] == '"' {
+			i++
+			for i < len(upper) {
+				if upper[i] == '"' {
+					i++
+					if i < len(upper) && upper[i] == '"' {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+		} else {
+			for i < len(upper) && !isWSChar(upper[i]) && upper[i] != '(' {
+				i++
+			}
+		}
+
+		// Skip whitespace
+		for i < len(upper) && isWSChar(upper[i]) {
+			i++
+		}
+
+		// Expect "AS"
+		if i+2 <= len(upper) && upper[i:i+2] == "AS" {
+			i += 2
+			for i < len(upper) && isWSChar(upper[i]) {
+				i++
+			}
+		}
+
+		// Skip the CTE body: balanced parentheses
+		if i < len(upper) && upper[i] == '(' {
+			depth := 1
+			i++
+			for i < len(upper) && depth > 0 {
+				switch upper[i] {
+				case '(':
+					depth++
+				case ')':
+					depth--
+				case '\'':
+					i++
+					for i < len(upper) && upper[i] != '\'' {
+						i++
+					}
+				}
+				i++
+			}
+		}
+
+		// Skip whitespace
+		for i < len(upper) && isWSChar(upper[i]) {
+			i++
+		}
+
+		// If there's a comma, another CTE definition follows
+		if i < len(upper) && upper[i] == ',' {
+			i++
+			for i < len(upper) && isWSChar(upper[i]) {
+				i++
+			}
+			continue
+		}
+
+		// Otherwise, we've reached the outer statement
+		break
+	}
+
+	// Check if the outer statement starts with DML
+	rest := upper[i:]
+	return strings.HasPrefix(rest, "INSERT") ||
+		strings.HasPrefix(rest, "UPDATE") ||
+		strings.HasPrefix(rest, "DELETE")
 }
 
 func (c *clientConn) getCommandType(upperQuery string) string {
@@ -3941,6 +4049,14 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
+		// WITH + DML (no RETURNING) doesn't return results but queryReturnsResults
+		// returns true for all WITH-prefixed queries. Send NoData to avoid executing
+		// the mutation during schema probing.
+		if isWithDML(ps.query) {
+			_ = writeNoData(c.writer)
+			return
+		}
+
 		// For SELECT, we need to describe the result columns
 		// The cleanest approach is to add a "WHERE false" or "LIMIT 0" clause
 		// to get column info without actually running the query
@@ -4034,6 +4150,14 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// Reject with an explicit error so clients don't desync.
 		if isDMLReturning(p.stmt.query) {
 			c.sendError("ERROR", "0A000", "DML with RETURNING clause is not supported via extended query protocol; use simple query protocol instead")
+			return
+		}
+
+		// WITH + DML (no RETURNING) doesn't return results but queryReturnsResults
+		// returns true for all WITH-prefixed queries. Send NoData to avoid executing
+		// the mutation during schema probing.
+		if isWithDML(p.stmt.query) {
+			_ = writeNoData(c.writer)
 			return
 		}
 
