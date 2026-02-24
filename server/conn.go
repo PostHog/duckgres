@@ -2359,7 +2359,7 @@ func outerStatementOfCTE(upper string) string {
 		}
 
 		// Expect "AS"
-		if i+2 <= len(upper) && upper[i:i+2] == "AS" {
+		if i+2 <= len(upper) && upper[i:i+2] == "AS" && (i+2 >= len(upper) || isWSChar(upper[i+2]) || upper[i+2] == '(' || upper[i+2] == '/' || upper[i+2] == '-') {
 			i += 2
 			i = skipWhitespaceAndComments(upper, i)
 		}
