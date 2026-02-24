@@ -1,8 +1,10 @@
 package duckdbservice
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
@@ -617,6 +620,576 @@ func TestAppendValue(t *testing.T) {
 			t.Errorf("map entries = %d, want 1", end-start)
 		}
 	})
+}
+
+// TestNestedTypesRoundTrip exercises DuckDB driver → Scan → RowsToRecord → Arrow IPC
+// round-trip for STRUCT, MAP, and nested combinations. Each subtest creates a table,
+// inserts data, converts through RowsToRecord, serializes via Arrow IPC, deserializes,
+// and runs a validate function against the deserialized record.
+//
+// These tests confirm Duckgres correctly serializes nested types over Flight SQL.
+// See STRUCT_TYPE_BUGS.md for the bug investigation context.
+func TestNestedTypesRoundTrip(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	tests := []struct {
+		name     string
+		ddl      string
+		inserts  []string
+		query    string
+		validate func(t *testing.T, rec arrow.RecordBatch)
+	}{
+		{
+			name:    "struct basic",
+			ddl:     `CREATE TABLE t_struct(s STRUCT(i INTEGER, j INTEGER))`,
+			inserts: []string{`INSERT INTO t_struct VALUES ({'i': 10, 'j': 20})`},
+			query:   "SELECT * FROM t_struct",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				col := rec.Column(0).(*array.Struct)
+				iCol := col.Field(0).(*array.Int32)
+				jCol := col.Field(1).(*array.Int32)
+				if v := iCol.Value(0); v != 10 {
+					t.Errorf("s.i = %d, want 10", v)
+				}
+				if v := jCol.Value(0); v != 20 {
+					t.Errorf("s.j = %d, want 20", v)
+				}
+			},
+		},
+		{
+			name: "struct with nulls",
+			ddl:  `CREATE TABLE t_struct_null(s STRUCT(i INTEGER, j INTEGER))`,
+			inserts: []string{
+				`INSERT INTO t_struct_null VALUES ({'i': 1, 'j': 2})`,
+				`INSERT INTO t_struct_null VALUES (NULL)`,
+				`INSERT INTO t_struct_null VALUES ({'i': 3, 'j': 4})`,
+			},
+			query: "SELECT * FROM t_struct_null ORDER BY rowid",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				if rec.NumRows() != 3 {
+					t.Fatalf("rows = %d, want 3", rec.NumRows())
+				}
+				col := rec.Column(0).(*array.Struct)
+				iCol := col.Field(0).(*array.Int32)
+
+				if v := iCol.Value(0); v != 1 {
+					t.Errorf("row0.i = %d, want 1", v)
+				}
+				if !col.IsNull(1) {
+					t.Error("row1 should be null")
+				}
+				if v := iCol.Value(2); v != 3 {
+					t.Errorf("row2.i = %d, want 3", v)
+				}
+			},
+		},
+		{
+			name: "struct multiple rows",
+			ddl:  `CREATE TABLE t_struct_multi(s STRUCT(x BIGINT, y VARCHAR))`,
+			inserts: []string{
+				`INSERT INTO t_struct_multi VALUES ({'x': 100, 'y': 'alpha'})`,
+				`INSERT INTO t_struct_multi VALUES ({'x': 200, 'y': 'beta'})`,
+				`INSERT INTO t_struct_multi VALUES ({'x': 300, 'y': 'gamma'})`,
+			},
+			query: "SELECT * FROM t_struct_multi ORDER BY rowid",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				if rec.NumRows() != 3 {
+					t.Fatalf("rows = %d, want 3", rec.NumRows())
+				}
+				col := rec.Column(0).(*array.Struct)
+				xCol := col.Field(0).(*array.Int64)
+				yCol := col.Field(1).(*array.String)
+
+				wantX := []int64{100, 200, 300}
+				wantY := []string{"alpha", "beta", "gamma"}
+				for i := range wantX {
+					if v := xCol.Value(i); v != wantX[i] {
+						t.Errorf("row%d.x = %d, want %d", i, v, wantX[i])
+					}
+					if v := yCol.Value(i); v != wantY[i] {
+						t.Errorf("row%d.y = %q, want %q", i, v, wantY[i])
+					}
+				}
+			},
+		},
+		{
+			name:    "nested struct in struct",
+			ddl:     `CREATE TABLE t_nested_struct(s STRUCT(nested STRUCT(x INTEGER), label VARCHAR))`,
+			inserts: []string{`INSERT INTO t_nested_struct VALUES ({'nested': {'x': 42}, 'label': 'hi'})`},
+			query:   "SELECT * FROM t_nested_struct",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				outer := rec.Column(0).(*array.Struct)
+				nested := outer.Field(0).(*array.Struct)
+				xCol := nested.Field(0).(*array.Int32)
+				label := outer.Field(1).(*array.String)
+
+				if v := xCol.Value(0); v != 42 {
+					t.Errorf("s.nested.x = %d, want 42", v)
+				}
+				if v := label.Value(0); v != "hi" {
+					t.Errorf("s.label = %q, want %q", v, "hi")
+				}
+			},
+		},
+		{
+			name:    "struct with list field",
+			ddl:     `CREATE TABLE t_struct_list(s STRUCT(tags VARCHAR[], count INTEGER))`,
+			inserts: []string{`INSERT INTO t_struct_list VALUES ({'tags': ['a', 'b', 'c'], 'count': 3})`},
+			query:   "SELECT * FROM t_struct_list",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				outer := rec.Column(0).(*array.Struct)
+				tags := outer.Field(0).(*array.List)
+				countCol := outer.Field(1).(*array.Int32)
+
+				start, end := tags.ValueOffsets(0)
+				if end-start != 3 {
+					t.Fatalf("tags length = %d, want 3", end-start)
+				}
+				vals := tags.ListValues().(*array.String)
+				want := []string{"a", "b", "c"}
+				for i, w := range want {
+					if v := vals.Value(int(start) + i); v != w {
+						t.Errorf("tags[%d] = %q, want %q", i, v, w)
+					}
+				}
+				if v := countCol.Value(0); v != 3 {
+					t.Errorf("count = %d, want 3", v)
+				}
+			},
+		},
+		{
+			name:    "list of struct",
+			ddl:     `CREATE TABLE t_list_struct(items STRUCT(k VARCHAR, v INTEGER)[])`,
+			inserts: []string{`INSERT INTO t_list_struct VALUES ([{'k': 'one', 'v': 1}, {'k': 'two', 'v': 2}])`},
+			query:   "SELECT * FROM t_list_struct",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				col := rec.Column(0).(*array.List)
+				start, end := col.ValueOffsets(0)
+				if end-start != 2 {
+					t.Fatalf("list length = %d, want 2", end-start)
+				}
+				structs := col.ListValues().(*array.Struct)
+				kCol := structs.Field(0).(*array.String)
+				vCol := structs.Field(1).(*array.Int32)
+
+				if v := kCol.Value(int(start)); v != "one" {
+					t.Errorf("items[0].k = %q, want %q", v, "one")
+				}
+				if v := vCol.Value(int(start) + 1); v != 2 {
+					t.Errorf("items[1].v = %d, want 2", v)
+				}
+			},
+		},
+		{
+			name:    "map basic",
+			ddl:     `CREATE TABLE t_map(m MAP(VARCHAR, INTEGER))`,
+			inserts: []string{`INSERT INTO t_map VALUES (map {'a': 1, 'b': 2})`},
+			query:   "SELECT * FROM t_map",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				col := rec.Column(0).(*array.Map)
+				start, end := col.ValueOffsets(0)
+				if end-start != 2 {
+					t.Fatalf("map entries = %d, want 2", end-start)
+				}
+				keys := col.Keys().(*array.String)
+				items := col.Items().(*array.Int32)
+				got := make(map[string]int32)
+				for i := int(start); i < int(end); i++ {
+					got[keys.Value(i)] = items.Value(i)
+				}
+				if got["a"] != 1 || got["b"] != 2 {
+					t.Errorf("map = %v, want {a:1, b:2}", got)
+				}
+			},
+		},
+		{
+			name: "map with null and empty",
+			ddl:  `CREATE TABLE t_map_null(m MAP(VARCHAR, INTEGER))`,
+			inserts: []string{
+				`INSERT INTO t_map_null VALUES (map {'x': 99})`,
+				`INSERT INTO t_map_null VALUES (NULL)`,
+				`INSERT INTO t_map_null VALUES (map([],  []))`,
+			},
+			query: "SELECT * FROM t_map_null ORDER BY rowid",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				if rec.NumRows() != 3 {
+					t.Fatalf("rows = %d, want 3", rec.NumRows())
+				}
+				col := rec.Column(0).(*array.Map)
+
+				// Row 0: one entry
+				s0, e0 := col.ValueOffsets(0)
+				if e0-s0 != 1 {
+					t.Errorf("row0 entries = %d, want 1", e0-s0)
+				}
+
+				// Row 1: null
+				if !col.IsNull(1) {
+					t.Error("row1 should be null")
+				}
+
+				// Row 2: empty map (not null)
+				s2, e2 := col.ValueOffsets(2)
+				if e2-s2 != 0 {
+					t.Errorf("row2 entries = %d, want 0", e2-s2)
+				}
+				if col.IsNull(2) {
+					t.Error("row2 should not be null (empty map)")
+				}
+			},
+		},
+		{
+			name:    "map with struct values",
+			ddl:     `CREATE TABLE t_map_struct(m MAP(VARCHAR, STRUCT(x INTEGER)))`,
+			inserts: []string{`INSERT INTO t_map_struct VALUES (map {'key1': {'x': 10}})`},
+			query:   "SELECT * FROM t_map_struct",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				col := rec.Column(0).(*array.Map)
+				start, end := col.ValueOffsets(0)
+				if end-start != 1 {
+					t.Fatalf("map entries = %d, want 1", end-start)
+				}
+				keys := col.Keys().(*array.String)
+				structs := col.Items().(*array.Struct)
+				xCol := structs.Field(0).(*array.Int32)
+
+				if v := keys.Value(int(start)); v != "key1" {
+					t.Errorf("key = %q, want %q", v, "key1")
+				}
+				if v := xCol.Value(int(start)); v != 10 {
+					t.Errorf("value.x = %d, want 10", v)
+				}
+			},
+		},
+		{
+			name: "struct with null fields",
+			ddl:  `CREATE TABLE t_struct_nullfield(s STRUCT(i INTEGER, j INTEGER))`,
+			inserts: []string{
+				`INSERT INTO t_struct_nullfield VALUES ({'i': 10, 'j': NULL})`,
+				`INSERT INTO t_struct_nullfield VALUES ({'i': NULL, 'j': 20})`,
+			},
+			query: "SELECT * FROM t_struct_nullfield ORDER BY rowid",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				if rec.NumRows() != 2 {
+					t.Fatalf("rows = %d, want 2", rec.NumRows())
+				}
+				col := rec.Column(0).(*array.Struct)
+				iCol := col.Field(0).(*array.Int32)
+				jCol := col.Field(1).(*array.Int32)
+
+				// Row 0: i=10, j=NULL
+				if !col.IsValid(0) {
+					t.Error("row0 struct should not be null")
+				}
+				if v := iCol.Value(0); v != 10 {
+					t.Errorf("row0.i = %d, want 10", v)
+				}
+				if !jCol.IsNull(0) {
+					t.Errorf("row0.j should be null, got %d", jCol.Value(0))
+				}
+
+				// Row 1: i=NULL, j=20
+				if !iCol.IsNull(1) {
+					t.Errorf("row1.i should be null, got %d", iCol.Value(1))
+				}
+				if v := jCol.Value(1); v != 20 {
+					t.Errorf("row1.j = %d, want 20", v)
+				}
+			},
+		},
+		{
+			name:    "nested struct with null inner",
+			ddl:     `CREATE TABLE t_struct_nullinner(s STRUCT(nested STRUCT(x INTEGER), label VARCHAR))`,
+			inserts: []string{`INSERT INTO t_struct_nullinner VALUES ({'nested': NULL, 'label': 'test'})`},
+			query:   "SELECT * FROM t_struct_nullinner",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				outer := rec.Column(0).(*array.Struct)
+				nested := outer.Field(0).(*array.Struct)
+				label := outer.Field(1).(*array.String)
+
+				if !nested.IsNull(0) {
+					t.Error("inner struct should be null")
+				}
+				if v := label.Value(0); v != "test" {
+					t.Errorf("label = %q, want %q", v, "test")
+				}
+			},
+		},
+		{
+			name: "map with null values in entries",
+			ddl:  `CREATE TABLE t_map_nullval(m MAP(VARCHAR, INTEGER))`,
+			inserts: []string{
+				`INSERT INTO t_map_nullval VALUES (map {'a': 1, 'b': NULL})`,
+			},
+			query: "SELECT * FROM t_map_nullval",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				col := rec.Column(0).(*array.Map)
+				start, end := col.ValueOffsets(0)
+				if end-start != 2 {
+					t.Fatalf("map entries = %d, want 2", end-start)
+				}
+				keys := col.Keys().(*array.String)
+				items := col.Items().(*array.Int32)
+
+				for i := int(start); i < int(end); i++ {
+					k := keys.Value(i)
+					switch k {
+					case "a":
+						if items.IsNull(i) {
+							t.Error("m['a'] should not be null")
+						} else if v := items.Value(i); v != 1 {
+							t.Errorf("m['a'] = %d, want 1", v)
+						}
+					case "b":
+						if !items.IsNull(i) {
+							t.Errorf("m['b'] should be null, got %d", items.Value(i))
+						}
+					default:
+						t.Errorf("unexpected key %q", k)
+					}
+				}
+			},
+		},
+		{
+			name:    "map with integer keys",
+			ddl:     `CREATE TABLE t_map_intkey(m MAP(INTEGER, VARCHAR))`,
+			inserts: []string{`INSERT INTO t_map_intkey VALUES (map {1: 'one', 2: 'two'})`},
+			query:   "SELECT * FROM t_map_intkey",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				col := rec.Column(0).(*array.Map)
+				start, end := col.ValueOffsets(0)
+				if end-start != 2 {
+					t.Fatalf("map entries = %d, want 2", end-start)
+				}
+				keys := col.Keys().(*array.Int32)
+				items := col.Items().(*array.String)
+
+				got := make(map[int32]string)
+				for i := int(start); i < int(end); i++ {
+					got[keys.Value(i)] = items.Value(i)
+				}
+				if got[1] != "one" || got[2] != "two" {
+					t.Errorf("map = %v, want {1:one, 2:two}", got)
+				}
+			},
+		},
+		{
+			name:    "map with list values",
+			ddl:     `CREATE TABLE t_map_list(m MAP(VARCHAR, INTEGER[]))`,
+			inserts: []string{`INSERT INTO t_map_list VALUES (map {'x': [1, 2, 3], 'y': [4]})`},
+			query:   "SELECT * FROM t_map_list",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				col := rec.Column(0).(*array.Map)
+				start, end := col.ValueOffsets(0)
+				if end-start != 2 {
+					t.Fatalf("map entries = %d, want 2", end-start)
+				}
+				keys := col.Keys().(*array.String)
+				lists := col.Items().(*array.List)
+
+				for i := int(start); i < int(end); i++ {
+					k := keys.Value(i)
+					ls, le := lists.ValueOffsets(i)
+					vals := lists.ListValues().(*array.Int32)
+					switch k {
+					case "x":
+						if le-ls != 3 {
+							t.Errorf("m['x'] length = %d, want 3", le-ls)
+						}
+						for j, want := range []int32{1, 2, 3} {
+							if v := vals.Value(int(ls) + j); v != want {
+								t.Errorf("m['x'][%d] = %d, want %d", j, v, want)
+							}
+						}
+					case "y":
+						if le-ls != 1 {
+							t.Errorf("m['y'] length = %d, want 1", le-ls)
+						}
+						if v := vals.Value(int(ls)); v != 4 {
+							t.Errorf("m['y'][0] = %d, want 4", v)
+						}
+					default:
+						t.Errorf("unexpected key %q", k)
+					}
+				}
+			},
+		},
+		{
+			name: "struct with empty list field",
+			ddl:  `CREATE TABLE t_struct_emptylist(s STRUCT(tags VARCHAR[], n INTEGER))`,
+			inserts: []string{
+				`INSERT INTO t_struct_emptylist VALUES ({'tags': [], 'n': 0})`,
+				`INSERT INTO t_struct_emptylist VALUES ({'tags': ['a'], 'n': 1})`,
+			},
+			query: "SELECT * FROM t_struct_emptylist ORDER BY rowid",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				if rec.NumRows() != 2 {
+					t.Fatalf("rows = %d, want 2", rec.NumRows())
+				}
+				outer := rec.Column(0).(*array.Struct)
+				tags := outer.Field(0).(*array.List)
+
+				// Row 0: empty list
+				s0, e0 := tags.ValueOffsets(0)
+				if e0-s0 != 0 {
+					t.Errorf("row0 tags length = %d, want 0", e0-s0)
+				}
+				if tags.IsNull(0) {
+					t.Error("row0 tags should be empty list, not null")
+				}
+
+				// Row 1: one element
+				s1, e1 := tags.ValueOffsets(1)
+				if e1-s1 != 1 {
+					t.Errorf("row1 tags length = %d, want 1", e1-s1)
+				}
+			},
+		},
+		{
+			name:    "deeply nested three levels",
+			ddl:     `CREATE TABLE t_deep(s STRUCT(a STRUCT(b STRUCT(c INTEGER))))`,
+			inserts: []string{`INSERT INTO t_deep VALUES ({'a': {'b': {'c': 777}}})`},
+			query:   "SELECT * FROM t_deep",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				l1 := rec.Column(0).(*array.Struct)
+				l2 := l1.Field(0).(*array.Struct)
+				l3 := l2.Field(0).(*array.Struct)
+				cCol := l3.Field(0).(*array.Int32)
+
+				if v := cCol.Value(0); v != 777 {
+					t.Errorf("s.a.b.c = %d, want 777", v)
+				}
+			},
+		},
+		{
+			name: "struct many rows offset stress",
+			ddl:  `CREATE TABLE t_struct_stress(s STRUCT(v INTEGER))`,
+			inserts: func() []string {
+				stmts := make([]string, 50)
+				for i := range stmts {
+					stmts[i] = fmt.Sprintf(`INSERT INTO t_struct_stress VALUES ({'v': %d})`, i)
+				}
+				return stmts
+			}(),
+			query: "SELECT * FROM t_struct_stress ORDER BY rowid",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				if rec.NumRows() != 50 {
+					t.Fatalf("rows = %d, want 50", rec.NumRows())
+				}
+				col := rec.Column(0).(*array.Struct)
+				vCol := col.Field(0).(*array.Int32)
+				for i := 0; i < 50; i++ {
+					if v := vCol.Value(i); v != int32(i) {
+						t.Errorf("row%d.v = %d, want %d", i, v, i)
+					}
+				}
+			},
+		},
+		{
+			name: "map many rows offset stress",
+			ddl:  `CREATE TABLE t_map_stress(m MAP(VARCHAR, INTEGER))`,
+			inserts: func() []string {
+				stmts := make([]string, 50)
+				for i := range stmts {
+					stmts[i] = fmt.Sprintf(`INSERT INTO t_map_stress VALUES (map {'k': %d})`, i)
+				}
+				return stmts
+			}(),
+			query: "SELECT * FROM t_map_stress ORDER BY rowid",
+			validate: func(t *testing.T, rec arrow.RecordBatch) {
+				if rec.NumRows() != 50 {
+					t.Fatalf("rows = %d, want 50", rec.NumRows())
+				}
+				col := rec.Column(0).(*array.Map)
+				for i := 0; i < 50; i++ {
+					s, e := col.ValueOffsets(i)
+					if e-s != 1 {
+						t.Errorf("row%d entries = %d, want 1", i, e-s)
+						continue
+					}
+					keys := col.Keys().(*array.String)
+					items := col.Items().(*array.Int32)
+					if k := keys.Value(int(s)); k != "k" {
+						t.Errorf("row%d key = %q, want %q", i, k, "k")
+					}
+					if v := items.Value(int(s)); v != int32(i) {
+						t.Errorf("row%d value = %d, want %d", i, v, i)
+					}
+				}
+			},
+		},
+	}
+
+	alloc := memory.NewGoAllocator()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Setup table
+			if _, err := db.Exec(tt.ddl); err != nil {
+				t.Fatalf("DDL: %v", err)
+			}
+			for _, ins := range tt.inserts {
+				if _, err := db.Exec(ins); err != nil {
+					t.Fatalf("insert: %v", err)
+				}
+			}
+
+			// Get schema and rows
+			schema, err := GetQuerySchema(context.Background(), db, tt.query, nil)
+			if err != nil {
+				t.Fatalf("schema: %v", err)
+			}
+			rows, err := db.Query(tt.query)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			defer rows.Close()
+
+			rec, err := RowsToRecord(alloc, rows, schema, 1024)
+			if err != nil {
+				t.Fatalf("RowsToRecord: %v", err)
+			}
+			if rec == nil {
+				t.Fatal("RowsToRecord returned nil")
+			}
+			defer rec.Release()
+
+			// Validate before IPC (driver → Arrow builder path)
+			t.Run("pre-IPC", func(t *testing.T) {
+				tt.validate(t, rec)
+			})
+
+			// Serialize through Arrow IPC (same path as Flight SQL transport)
+			var buf bytes.Buffer
+			w := ipc.NewWriter(&buf, ipc.WithSchema(schema), ipc.WithAllocator(alloc))
+			if err := w.Write(rec); err != nil {
+				t.Fatalf("IPC write: %v", err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("IPC close: %v", err)
+			}
+
+			r, err := ipc.NewReader(bytes.NewReader(buf.Bytes()), ipc.WithAllocator(alloc))
+			if err != nil {
+				t.Fatalf("IPC reader: %v", err)
+			}
+			defer r.Release()
+
+			if !r.Next() {
+				t.Fatal("no record in IPC stream")
+			}
+			got := r.Record()
+
+			// Validate after IPC (tests the serialization path)
+			t.Run("post-IPC", func(t *testing.T) {
+				tt.validate(t, got)
+			})
+		})
+	}
 }
 
 func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
