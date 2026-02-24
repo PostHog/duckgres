@@ -1215,8 +1215,10 @@ func TestIsWithDML(t *testing.T) {
 		{"CTE with quoted name", `WITH "my cte" AS (SELECT 1) INSERT INTO t SELECT * FROM "my cte"`, true},
 		{"CTE with quoted name + SELECT", `WITH "my cte" AS (SELECT 1) SELECT * FROM "my cte"`, false},
 
-		// RECURSIVE word boundary
+		// Word boundary checks
 		{"CTE name starting with RECURSIVE prefix", "WITH RECURSIVELY AS (SELECT 1) INSERT INTO t SELECT 1", true},
+		{"WITHOUT is not WITH", "WITHOUT RECURSIVE INSERT INTO t SELECT 1", false},
+		{"WITHDRAW is not WITH", "WITHDRAW FROM t", false},
 
 		// CTE with column aliases
 		{"CTE with column aliases + INSERT", "WITH cte (col1, col2) AS (SELECT 1, 2) INSERT INTO t SELECT * FROM cte", true},

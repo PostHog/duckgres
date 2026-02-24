@@ -1919,7 +1919,7 @@ func queryReturnsResults(query string) bool {
 		return true
 	}
 	// WITH ... SELECT (CTEs)
-	if strings.HasPrefix(upper, "WITH") {
+	if strings.HasPrefix(upper, "WITH") && (len(upper) == 4 || isWSChar(upper[4]) || upper[4] == '/' || upper[4] == '-') {
 		return true
 	}
 	// VALUES clause returns rows
@@ -2152,7 +2152,7 @@ func isDMLReturning(query string) bool {
 		strings.HasPrefix(upper, "UPDATE"),
 		strings.HasPrefix(upper, "DELETE"):
 		return containsReturning(upper)
-	case strings.HasPrefix(upper, "WITH"):
+	case strings.HasPrefix(upper, "WITH") && (len(upper) == 4 || isWSChar(upper[4]) || upper[4] == '/' || upper[4] == '-'):
 		return containsReturningAnyDepth(upper)
 	default:
 		return false
@@ -2309,7 +2309,7 @@ func skipWhitespaceAndComments(upper string, i int) int {
 // definitions, or "" if the query doesn't start with WITH.
 // For "WITH a AS (...) SELECT ...", it returns "SELECT ...".
 func outerStatementOfCTE(upper string) string {
-	if !strings.HasPrefix(upper, "WITH") {
+	if !strings.HasPrefix(upper, "WITH") || (len(upper) > 4 && !isWSChar(upper[4]) && upper[4] != '/' && upper[4] != '-') {
 		return ""
 	}
 
@@ -2392,7 +2392,7 @@ func (c *clientConn) getCommandType(upperQuery string) string {
 
 	// For WITH (CTE) queries, determine command type from the outer statement.
 	// e.g. "WITH cte AS (...) INSERT INTO t ..." → "INSERT"
-	if strings.HasPrefix(upperQuery, "WITH") {
+	if strings.HasPrefix(upperQuery, "WITH") && (len(upperQuery) == 4 || isWSChar(upperQuery[4]) || upperQuery[4] == '/' || upperQuery[4] == '-') {
 		if outer := outerStatementOfCTE(upperQuery); outer != "" {
 			return c.getCommandType(outer)
 		}
