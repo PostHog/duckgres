@@ -120,6 +120,38 @@ func TestStripLeadingComments(t *testing.T) {
 	}
 }
 
+func TestStripLeadingNoise(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"no noise", "SELECT 1", "SELECT 1"},
+		{"leading comment", "/* comment */ SELECT 1", "SELECT 1"},
+		{"leading paren", "(SELECT 1)", "SELECT 1)"},
+		{"paren then comment", "(/* comment */ SELECT 1)", "SELECT 1)"},
+		{"comment then paren", "/* comment */ (SELECT 1)", "SELECT 1)"},
+		{"nested parens and comments", "( ( /* comment */ SELECT 1 ) )", "SELECT 1 ) )"},
+		{"paren comment paren", "(/* c1 */(/* c2 */ SELECT 1))", "SELECT 1))"},
+		{"line comment then paren", "-- comment\n(SELECT 1)", "SELECT 1)"},
+		{"paren then line comment", "( -- comment\nSELECT 1)", "SELECT 1)"},
+		{"only noise", "( /* comment */ )", ")"},
+		{"paren then newline", "(\nSELECT 1)", "SELECT 1)"},
+		{"paren then tab", "(\tSELECT 1)", "SELECT 1)"},
+		{"paren then CRLF", "(\r\nSELECT 1)", "SELECT 1)"},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := stripLeadingNoise(tt.input)
+			if result != tt.expected {
+				t.Errorf("stripLeadingNoise(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestGetCommandType(t *testing.T) {
 	// Create a minimal clientConn for testing
 	c := &clientConn{}
@@ -268,6 +300,80 @@ func TestGetCommandType(t *testing.T) {
 		{
 			name:     "mixed case with comment",
 			query:    "/*Test*/Select * From Users",
+			expected: "SELECT",
+		},
+
+		// WITH (CTE) queries — command type from outer statement
+		{
+			name:     "WITH + SELECT",
+			query:    "WITH CTE AS (SELECT 1) SELECT * FROM CTE",
+			expected: "SELECT",
+		},
+		{
+			name:     "WITH + INSERT",
+			query:    "WITH CTE AS (SELECT 1) INSERT INTO T SELECT * FROM CTE",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH + UPDATE",
+			query:    "WITH CTE AS (SELECT 1) UPDATE T SET X = CTE.X FROM CTE",
+			expected: "UPDATE",
+		},
+		{
+			name:     "WITH + DELETE",
+			query:    "WITH CTE AS (SELECT 1) DELETE FROM T USING CTE",
+			expected: "DELETE",
+		},
+		{
+			name:     "WITH + INSERT RETURNING",
+			query:    "WITH CTE AS (SELECT 1) INSERT INTO T VALUES (1) RETURNING *",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH RECURSIVE + SELECT",
+			query:    "WITH RECURSIVE CTE AS (SELECT 1 UNION ALL SELECT N+1 FROM CTE WHERE N < 10) SELECT * FROM CTE",
+			expected: "SELECT",
+		},
+		{
+			name:     "WITH RECURSIVE + DELETE",
+			query:    "WITH RECURSIVE CTE AS (SELECT 1) DELETE FROM T USING CTE",
+			expected: "DELETE",
+		},
+		{
+			name:     "WITH multiple CTEs + INSERT",
+			query:    "WITH A AS (SELECT 1), B AS (SELECT 2) INSERT INTO T SELECT * FROM A, B",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH + comment before",
+			query:    "/* batch */ WITH CTE AS (SELECT 1) DELETE FROM T",
+			expected: "DELETE",
+		},
+		{
+			name:     "WITH column aliases + INSERT",
+			query:    "WITH CTE (COL1, COL2) AS (SELECT 1, 2) INSERT INTO T SELECT * FROM CTE",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH column aliases + SELECT",
+			query:    "WITH CTE (COL1, COL2) AS (SELECT 1, 2) SELECT * FROM CTE",
+			expected: "SELECT",
+		},
+		{
+			name:     "WITH comment between name and AS",
+			query:    "WITH CTE /* HI */ AS (SELECT 1) INSERT INTO T SELECT 1",
+			expected: "INSERT",
+		},
+		{
+			name:     "WITH RECURSIVE + column aliases + INSERT",
+			query:    "WITH RECURSIVE CTE (N) AS (SELECT 1 UNION ALL SELECT N+1 FROM CTE WHERE N < 5) INSERT INTO T SELECT * FROM CTE",
+			expected: "INSERT",
+		},
+
+		// WITH word boundary — must not match identifiers starting with WITH
+		{
+			name:     "WITHOUT falls through to SELECT",
+			query:    "WITHOUT SOMETHING",
 			expected: "SELECT",
 		},
 	}
@@ -609,6 +715,203 @@ func TestQueryReturnsResults(t *testing.T) {
 			query:    "SET search_path = public",
 			expected: false,
 		},
+		// DML with RETURNING clause
+		{
+			name:     "INSERT RETURNING star",
+			query:    "INSERT INTO t VALUES (1) RETURNING *",
+			expected: true,
+		},
+		{
+			name:     "INSERT RETURNING columns",
+			query:    "INSERT INTO t VALUES (1) RETURNING id, name",
+			expected: true,
+		},
+		{
+			name:     "UPDATE RETURNING star",
+			query:    "UPDATE t SET x = 1 RETURNING *",
+			expected: true,
+		},
+		{
+			name:     "DELETE RETURNING star",
+			query:    "DELETE FROM t WHERE id = 1 RETURNING *",
+			expected: true,
+		},
+		{
+			name:     "comment before INSERT RETURNING",
+			query:    "/* comment */ INSERT INTO t VALUES (1) RETURNING *",
+			expected: true,
+		},
+		// Parenthesized queries
+		{
+			name:     "parenthesized SELECT",
+			query:    "(SELECT 1 UNION SELECT 2)",
+			expected: true,
+		},
+		{
+			name:     "nested parenthesized SELECT",
+			query:    "((SELECT 1))",
+			expected: true,
+		},
+		{
+			name:     "parenthesized SELECT with spaces",
+			query:    "( SELECT 1 )",
+			expected: true,
+		},
+		{
+			name:     "parenthesized SELECT with newline",
+			query:    "(\nSELECT 1)",
+			expected: true,
+		},
+		{
+			name:     "parenthesized SELECT with tab",
+			query:    "(\tSELECT 1)",
+			expected: true,
+		},
+		{
+			name:     "parenthesized SELECT with CRLF",
+			query:    "(\r\nSELECT 1)",
+			expected: true,
+		},
+		// Case sensitivity
+		{
+			name:     "lowercase insert returning",
+			query:    "insert into t values (1) returning *",
+			expected: true,
+		},
+		{
+			name:     "mixed case Insert Returning",
+			query:    "Insert Into t Values (1) Returning *",
+			expected: true,
+		},
+		{
+			name:     "lowercase select",
+			query:    "select 1",
+			expected: true,
+		},
+		// Multi-line DML RETURNING
+		{
+			name:     "multi-line INSERT RETURNING",
+			query:    "INSERT INTO t\nVALUES (1)\nRETURNING *",
+			expected: true,
+		},
+		// RETURNING in non-clause positions — correctly rejected
+		{
+			name:     "RETURNING in string literal (not false positive)",
+			query:    "INSERT INTO t (col) VALUES ('RETURNING')",
+			expected: false, // inside string literal, skipped by scanner
+		},
+		{
+			name:     "RETURNING as column name (not false positive)",
+			query:    "INSERT INTO t (returning) VALUES (1)",
+			expected: false, // inside parentheses (depth > 0)
+		},
+		// Queries that should NOT match RETURNING
+		{
+			name:     "INSERT with RETURNING-like substring no space",
+			query:    "INSERT INTO treturning VALUES (1)",
+			expected: false, // no space before RETURNING
+		},
+		{
+			name:     "plain CREATE TABLE",
+			query:    "CREATE TABLE returning_results (id INT)",
+			expected: false, // not INSERT/UPDATE/DELETE prefix
+		},
+		// Edge cases
+		{
+			name:     "empty string",
+			query:    "",
+			expected: false,
+		},
+		{
+			name:     "only whitespace",
+			query:    "   ",
+			expected: false,
+		},
+		{
+			name:     "only comment",
+			query:    "-- just a comment",
+			expected: false,
+		},
+		{
+			name:     "SUMMARIZE (DuckDB-specific)",
+			query:    "SUMMARIZE users",
+			expected: true,
+		},
+		{
+			name:     "FROM-first syntax",
+			query:    "FROM users SELECT *",
+			expected: true,
+		},
+		{
+			name:     "EXECUTE",
+			query:    "EXECUTE my_stmt",
+			expected: true,
+		},
+		// WITH + DML RETURNING (WITH prefix matches first, correct)
+		{
+			name:     "CTE with INSERT RETURNING",
+			query:    "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte RETURNING *",
+			expected: true,
+		},
+		// ALTER, TRUNCATE — should not return results
+		{
+			name:     "ALTER TABLE",
+			query:    "ALTER TABLE t ADD COLUMN x INT",
+			expected: false,
+		},
+		{
+			name:     "TRUNCATE",
+			query:    "TRUNCATE t",
+			expected: false,
+		},
+		// DELETE with RETURNING in subquery — correctly rejected (depth > 0)
+		{
+			name:     "DELETE with RETURNING in subquery",
+			query:    "DELETE FROM t WHERE id IN (SELECT returning FROM s)",
+			expected: false,
+		},
+		// Tab before RETURNING
+		{
+			name:     "INSERT with tab before RETURNING",
+			query:    "INSERT INTO t VALUES (1)\tRETURNING *",
+			expected: true,
+		},
+		// Carriage return before RETURNING
+		{
+			name:     "INSERT with CR before RETURNING",
+			query:    "INSERT INTO t VALUES (1)\rRETURNING *",
+			expected: true,
+		},
+		// RETURNING with no preceding whitespace — not a clause
+		{
+			name:     "INSERT NORETURNING (no space)",
+			query:    "INSERT INTO tRETURNING VALUES (1)",
+			expected: false,
+		},
+		// Multiple RETURNING occurrences — first in parens, second real
+		{
+			name:     "INSERT with RETURNING in subselect and real RETURNING",
+			query:    "INSERT INTO t SELECT (RETURNING) FROM s RETURNING *",
+			expected: true,
+		},
+		// WITH + DML (no RETURNING) — queryReturnsResults returns true because
+		// of the WITH prefix, but these don't actually return results.
+		// The isWithDML guard in handleDescribe prevents mutation during probing.
+		{
+			name:     "WITH + INSERT (no RETURNING)",
+			query:    "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte",
+			expected: true, // WITH prefix → true (isWithDML handles this in Describe)
+		},
+		{
+			name:     "WITH + DELETE (no RETURNING)",
+			query:    "WITH cte AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM cte)",
+			expected: true, // WITH prefix → true (isWithDML handles this in Describe)
+		},
+		{
+			name:     "WITHOUT is not WITH",
+			query:    "WITHOUT SOMETHING",
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -638,6 +941,19 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 		{"block comment before SHOW", "/* comment */ SHOW TABLES", true},
 		{"block comment before VALUES", "/* comment */ VALUES (1, 2)", true},
 
+		// Queries with leading comments that return results (DML RETURNING)
+		{"block comment before INSERT RETURNING", "/* comment */ INSERT INTO t VALUES (1) RETURNING *", true},
+		{"block comment before UPDATE RETURNING", "/* comment */ UPDATE t SET x = 1 RETURNING *", true},
+		{"block comment before DELETE RETURNING", "/* comment */ DELETE FROM t RETURNING *", true},
+
+		// Parentheses interleaved with comments
+		{"paren then comment then SELECT", "(/* comment */ SELECT 1)", true},
+		{"comment then paren then SELECT", "/* comment */ (SELECT 1)", true},
+		{"nested parens and comments", "( ( /* comment */ SELECT 1 ) )", true},
+		{"paren then line comment then SELECT", "( -- comment\nSELECT 1)", true},
+		{"paren comment paren SELECT", "(/* c1 */(/* c2 */ SELECT 1))", true},
+		{"paren then comment then INSERT RETURNING", "(/* comment */ INSERT INTO t VALUES (1) RETURNING *)", true},
+
 		// Queries with leading comments that don't return results
 		{"block comment before INSERT", "/* comment */ INSERT INTO t VALUES (1)", false},
 		{"block comment before CREATE", "/* comment */ CREATE TABLE t (id INT)", false},
@@ -655,8 +971,382 @@ func TestQueryReturnsResultsWithComments(t *testing.T) {
 	}
 }
 
+// TestContainsReturning tests the low-level scanner directly.
+// Input must be pre-uppercased (matching how callers invoke it).
+func TestContainsReturning(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		// --- Basic positive cases ---
+		{"simple", "INSERT INTO T VALUES (1) RETURNING *", true},
+		{"tab before", "DELETE FROM T\tRETURNING *", true},
+		{"newline before", "INSERT INTO T VALUES (1)\nRETURNING *", true},
+		{"cr before", "UPDATE T SET X = 1\rRETURNING *", true},
+		{"at end of string", "DELETE FROM T RETURNING", true},
+		{"semicolon after", "INSERT INTO T VALUES (1) RETURNING *;", true},
+
+		// --- Trailing character variations ---
+		{"RETURNING*", "DELETE FROM T RETURNING*", true},
+		{"RETURNING(expr)", "DELETE FROM T RETURNING(ID)", true},
+		{"RETURNING,col", "INSERT INTO T VALUES (1) RETURNING ID,NAME", true},
+
+		// --- Basic negative cases ---
+		{"no RETURNING", "INSERT INTO T VALUES (1)", false},
+		{"empty string", "", false},
+		{"bare RETURNING no prefix", "RETURNING", false},
+		{"RETURNING as prefix of word", "INSERT INTO T VALUES (1) RETURNING_ID", false},
+		{"RETURNINGS", "INSERT INTO T VALUES (1) RETURNINGS", false},
+		{"no space before", "INSERT INTO TRETURNING VALUES (1)", false},
+
+		// --- Parenthesis depth ---
+		{"RETURNING in subquery", "INSERT INTO T SELECT * FROM (SELECT RETURNING FROM S)", false},
+		{"RETURNING in nested subquery", "INSERT INTO T SELECT * FROM (SELECT * FROM (SELECT RETURNING FROM A))", false},
+		{"RETURNING in subquery + real RETURNING", "INSERT INTO T SELECT (RETURNING) FROM S RETURNING *", true},
+		{"only in depth-1 parens", "DELETE FROM T WHERE ID IN (SELECT RETURNING FROM S)", false},
+		{"real RETURNING after subquery", "DELETE FROM T WHERE ID IN (SELECT X FROM S) RETURNING *", true},
+		{"ON CONFLICT with parens", "INSERT INTO T VALUES (1) ON CONFLICT (ID) DO UPDATE SET X = EXCLUDED.X RETURNING *", true},
+		{"subquery in ON CONFLICT", "INSERT INTO T VALUES (1) ON CONFLICT (ID) DO UPDATE SET X = (SELECT MAX(X) FROM T2) RETURNING *", true},
+
+		// --- Single-quoted string literals ---
+		{"RETURNING in string literal", "INSERT INTO T VALUES (' RETURNING ') ", false},
+		{"parens in string literal", "INSERT INTO T VALUES ('(') RETURNING *", true},
+		{"close paren in string literal", "INSERT INTO T VALUES (')') RETURNING *", true},
+		{"unbalanced parens in string literal", "INSERT INTO T VALUES ('(((') RETURNING *", true},
+		{"escaped quote in string", "INSERT INTO T VALUES ('IT''S RETURNING')", false},
+		{"escaped quote then real RETURNING", "INSERT INTO T VALUES ('IT''S') RETURNING *", true},
+
+		// --- E-string backslash escapes ---
+		{"E-string with backslash quote", "UPDATE T SET X = E'FOO\\'S RETURNING BAR' WHERE ID = 1", false},
+		{"E-string then real RETURNING", "UPDATE T SET X = E'FOO\\'S' RETURNING *", true},
+		{"E-string with backslash-n", "INSERT INTO T VALUES (E'LINE1\\NLINE2') RETURNING *", true},
+
+		// --- Double-quoted identifiers ---
+		{"RETURNING as quoted identifier", `INSERT INTO T ("RETURNING") VALUES (1)`, false},
+		{"quoted identifier then real RETURNING", `INSERT INTO T ("RETURNING") VALUES (1) RETURNING *`, true},
+		{"escaped quote in identifier", `INSERT INTO T ("COL""RETURNING") VALUES (1)`, false},
+
+		// --- Dollar-quoted strings ---
+		{"RETURNING in $$", "UPDATE T SET BODY = $$ RETURNING $$ WHERE ID = 1", false},
+		{"RETURNING in $tag$", "UPDATE T SET BODY = $TAG$ RETURNING $TAG$ WHERE ID = 1", false},
+		{"dollar-quoted then real RETURNING", "UPDATE T SET BODY = $$ X $$ RETURNING *", true},
+		{"$$ with parens inside", "UPDATE T SET BODY = $$(RETURNING)$$ RETURNING *", true},
+		{"incomplete dollar tag (not a tag)", "UPDATE T SET X = $5 RETURNING *", true},
+
+		// --- Block comments ---
+		{"RETURNING in block comment", "DELETE FROM T /* RETURNING * */ WHERE ID = 1", false},
+		{"block comment then real RETURNING", "DELETE FROM T /* comment */ RETURNING *", true},
+		{"nested-ish block comment content", "INSERT INTO T /* RETURNING * /* nested */ */ VALUES (1)", false},
+
+		// --- Line comments ---
+		{"RETURNING in line comment", "UPDATE T SET X = 1 -- RETURNING *\nWHERE ID = 1", false},
+		{"line comment then real RETURNING", "UPDATE T SET X = 1 -- comment\nRETURNING *", true},
+		{"line comment at end (no newline)", "INSERT INTO T VALUES (1) -- RETURNING *", false},
+
+		// --- Additional trailing characters ---
+		{`RETURNING"col"`, `DELETE FROM T RETURNING"ID"`, true},
+		{"RETURNING--comment", "DELETE FROM T RETURNING-- get id\n*", true},
+		{"RETURNING/*comment*/", "DELETE FROM T RETURNING/* cols */*", true},
+		{"RETURNING$tag$", "DELETE FROM T RETURNING$TAG$ID$TAG$", true},
+
+		// --- Nested block comments (known limitation) ---
+		// PostgreSQL supports nested block comments, but our scanner doesn't.
+		// The scanner exits at the first */, so residual text is parsed as SQL.
+		// In this example, /* inner */ closes the comment early, exposing RETURNING.
+		{"nested block comment exposes RETURNING (known limitation)",
+			"DELETE FROM T /* outer /* inner */ RETURNING * */ WHERE ID = 1", true},
+		// When RETURNING is consumed by the comment, it's correctly not matched.
+		{"nested block comment hides RETURNING",
+			"DELETE FROM T /* outer /* RETURNING * */ end */ WHERE ID = 1", false},
+
+		// --- Combined edge cases ---
+		{"string + subquery + real RETURNING", "INSERT INTO T SELECT 'RETURNING', (SELECT RETURNING FROM S) RETURNING *", true},
+		{"comment + string + RETURNING", "DELETE FROM T /* skip */ WHERE X = ' RETURNING ' RETURNING *", true},
+
+		// --- Malformed SQL: must not panic or infinite loop ---
+		{"unclosed single quote", "INSERT INTO T VALUES ('UNCLOSED RETURNING *", false},
+		{"unclosed double quote", `INSERT INTO T VALUES ("UNCLOSED RETURNING *`, false},
+		{"unclosed block comment", "INSERT INTO T /* UNCLOSED RETURNING *", false},
+		{"unclosed dollar quote", "INSERT INTO T VALUES ($$UNCLOSED RETURNING *", false},
+		{"unclosed parens (RETURNING at depth > 0)", "INSERT INTO T VALUES ((( RETURNING *", false},
+		{"empty string", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := containsReturning(tt.input)
+			if result != tt.expected {
+				t.Errorf("containsReturning(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestContainsReturningAnyDepth(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		// Matches at depth 0 (same as containsReturning)
+		{"depth 0", "DELETE FROM T RETURNING *", true},
+
+		// Matches at depth 1 (writable CTE pattern)
+		{"depth 1 in CTE", "WITH D AS (DELETE FROM T RETURNING *) SELECT * FROM D", true},
+		{"depth 1 multi-CTE", "WITH A AS (SELECT 1), B AS (DELETE FROM T RETURNING *) SELECT * FROM B", true},
+
+		// Matches at depth 2
+		{"depth 2", "WITH A AS (SELECT * FROM (DELETE FROM T RETURNING *)) SELECT 1", true},
+
+		// Still skips strings/comments/identifiers
+		{"in string at depth 1", "WITH CTE AS (SELECT ' RETURNING ' FROM T) SELECT 1", false},
+		{"in block comment at depth 1", "WITH CTE AS (SELECT /* RETURNING */ 1) SELECT 1", false},
+		{"in double-quoted id at depth 1", `WITH CTE AS (SELECT "RETURNING" FROM T) SELECT 1`, false},
+		{"in dollar-quote at depth 1", "WITH CTE AS (SELECT $$ RETURNING $$ FROM T) SELECT 1", false},
+		{"in line comment at depth 1", "WITH CTE AS (SELECT 1 -- RETURNING\nFROM T) SELECT 1", false},
+
+		// No RETURNING at all
+		{"no RETURNING", "WITH CTE AS (SELECT 1) SELECT * FROM CTE", false},
+		{"empty", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := containsReturningAnyDepth(tt.input)
+			if result != tt.expected {
+				t.Errorf("containsReturningAnyDepth(%q) = %v, want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsDMLReturning(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		// DML with RETURNING → true
+		{"INSERT RETURNING", "INSERT INTO t VALUES (1) RETURNING *", true},
+		{"UPDATE RETURNING", "UPDATE t SET x = 1 RETURNING id", true},
+		{"DELETE RETURNING", "DELETE FROM t WHERE id = 1 RETURNING *", true},
+		{"INSERT RETURNING with comment", "/* comment */ INSERT INTO t VALUES (1) RETURNING *", true},
+		{"INSERT RETURNING multiline", "INSERT INTO t\nVALUES (1)\nRETURNING *", true},
+
+		// DML without RETURNING → false
+		{"plain INSERT", "INSERT INTO t VALUES (1)", false},
+		{"plain UPDATE", "UPDATE t SET x = 1", false},
+		{"plain DELETE", "DELETE FROM t WHERE id = 1", false},
+
+		// Non-DML → false
+		{"SELECT", "SELECT * FROM t", false},
+		{"CREATE TABLE", "CREATE TABLE t (id INT)", false},
+		{"WITH CTE", "WITH cte AS (SELECT 1) SELECT * FROM cte", false},
+
+		// Edge cases: RETURNING in non-keyword positions → false
+		{"column named returning", "INSERT INTO t (returning_col) VALUES (1)", false},
+		{"RETURNING in subquery only", "DELETE FROM t WHERE id IN (SELECT returning FROM s)", false},
+		{"RETURNING in string literal only", "INSERT INTO t VALUES ('returning')", false},
+		{"RETURNING in block comment only", "DELETE FROM t /* returning * */ WHERE id = 1", false},
+
+		// Edge cases: real RETURNING with noise → true
+		{"subquery + real RETURNING", "DELETE FROM t WHERE id IN (SELECT x FROM s) RETURNING *", true},
+		{"RETURNING*", "DELETE FROM t RETURNING*", true},
+		{"RETURNING(id)", "DELETE FROM t RETURNING(id)", true},
+
+		// Writable CTEs (WITH ... DML ... RETURNING)
+		// For WITH-prefixed queries, RETURNING is matched at any depth to catch
+		// writable CTEs where RETURNING is inside AS (...).
+		{"writable CTE with outer RETURNING", "WITH d AS (DELETE FROM t RETURNING *) INSERT INTO audit SELECT * FROM d RETURNING *", true},
+		{"writable CTE INSERT outer RETURNING", "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte RETURNING *", true},
+		{"writable CTE no RETURNING", "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte", false},
+		{"plain CTE SELECT", "WITH cte AS (SELECT 1) SELECT * FROM cte", false},
+
+		// Writable CTEs with RETURNING only inside AS (...) — previously missed
+		{"canonical writable CTE", "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", true},
+		{"multi-CTE writable", "WITH a AS (SELECT 1), b AS (DELETE FROM t RETURNING *) SELECT * FROM b", true},
+		{"writable CTE UPDATE", "WITH u AS (UPDATE t SET x = 1 RETURNING *) SELECT * FROM u", true},
+		{"writable CTE INSERT", "WITH i AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM i", true},
+		{"WITH RECURSIVE + DML RETURNING", "WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT r+1 FROM r WHERE r < 5) DELETE FROM t WHERE id IN (SELECT * FROM r) RETURNING *", true},
+
+		// False positive we accept: column named "returning" in CTE
+		{"CTE with returning column (false positive)", "WITH cte AS (SELECT returning FROM t) SELECT * FROM cte", true},
+
+		// RETURNING inside string/comment in CTE — still correctly skipped
+		{"CTE with RETURNING in string", "WITH cte AS (SELECT 'returning' FROM t) SELECT * FROM cte", false},
+		{"CTE with RETURNING in comment", "WITH cte AS (SELECT /* returning */ 1) SELECT * FROM cte", false},
+		{"CTE with RETURNING in dollar-quote", "WITH cte AS (SELECT $$ returning $$ FROM t) SELECT * FROM cte", false},
+
+		// WITH word boundary — WITHOUT/WITHDRAW must not match CTE path
+		{"WITHOUT not treated as WITH", "WITHOUT RETURNING *", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isDMLReturning(tt.query)
+			if result != tt.expected {
+				t.Errorf("isDMLReturning(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsWithDML(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    string
+		expected bool
+	}{
+		// WITH + DML → true
+		{"WITH + INSERT", "WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte", true},
+		{"WITH + UPDATE", "WITH cte AS (SELECT 1) UPDATE t SET x = cte.x FROM cte", true},
+		{"WITH + DELETE", "WITH cte AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM cte)", true},
+		{"WITH RECURSIVE + INSERT", "WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT r+1 FROM r WHERE r < 5) INSERT INTO t SELECT * FROM r", true},
+		{"multiple CTEs + INSERT", "WITH a AS (SELECT 1), b AS (SELECT 2) INSERT INTO t SELECT * FROM a, b", true},
+
+		// WITH + DML with leading noise
+		{"comment + WITH + INSERT", "/* comment */ WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte", true},
+		{"paren + WITH + INSERT", "(WITH cte AS (SELECT 1) INSERT INTO t SELECT * FROM cte)", true},
+
+		// WITH + SELECT → false
+		{"WITH + SELECT", "WITH cte AS (SELECT 1) SELECT * FROM cte", false},
+		{"WITH RECURSIVE + SELECT", "WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT r+1 FROM r WHERE r < 5) SELECT * FROM r", false},
+		{"multiple CTEs + SELECT", "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b", false},
+
+		// Not WITH → false
+		{"plain INSERT", "INSERT INTO t VALUES (1)", false},
+		{"plain SELECT", "SELECT 1", false},
+		{"plain DELETE", "DELETE FROM t", false},
+
+		// Edge cases in CTE body
+		{"CTE with parens in body", "WITH cte AS (SELECT (1+2) FROM t WHERE x IN (1,2,3)) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with string in body", "WITH cte AS (SELECT 'hello)world' FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with escaped quote in body", "WITH cte AS (SELECT 'it''s)here' FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with block comment containing paren", "WITH cte AS (SELECT /* ) */ 1 FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with line comment containing paren", "WITH cte AS (SELECT 1 -- )\nFROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with dollar-quoted string containing paren", "WITH cte AS (SELECT $$)$$ FROM t) INSERT INTO t2 SELECT * FROM cte", true},
+		{"CTE with double-quoted id containing paren", `WITH cte AS (SELECT "col)" FROM t) INSERT INTO t2 SELECT * FROM cte`, true},
+		{"CTE with quoted name", `WITH "my cte" AS (SELECT 1) INSERT INTO t SELECT * FROM "my cte"`, true},
+		{"CTE with quoted name + SELECT", `WITH "my cte" AS (SELECT 1) SELECT * FROM "my cte"`, false},
+
+		// Word boundary checks
+		{"CTE name starting with RECURSIVE prefix", "WITH RECURSIVELY AS (SELECT 1) INSERT INTO t SELECT 1", true},
+		{"WITHOUT is not WITH", "WITHOUT RECURSIVE INSERT INTO t SELECT 1", false},
+		{"WITHDRAW is not WITH", "WITHDRAW FROM t", false},
+		{"CTE name causing AS prefix match", "WITH cte ASIN (SELECT 1) INSERT INTO t SELECT 1", false},
+
+		// CTE with column aliases
+		{"CTE with column aliases + INSERT", "WITH cte (col1, col2) AS (SELECT 1, 2) INSERT INTO t SELECT * FROM cte", true},
+		{"CTE with column aliases + SELECT", "WITH cte (col1, col2) AS (SELECT 1, 2) SELECT * FROM cte", false},
+		{"CTE with column aliases + DELETE", "WITH cte (x) AS (SELECT id FROM t) DELETE FROM t2 USING cte WHERE t2.id = cte.x", true},
+		{"multiple CTEs with column aliases", "WITH a (x) AS (SELECT 1), b (y) AS (SELECT 2) INSERT INTO t SELECT * FROM a, b", true},
+
+		// Comments between CTE elements
+		{"comment between name and AS", "WITH cte /* hi */ AS (SELECT 1) INSERT INTO t SELECT 1", true},
+		{"line comment between name and AS", "WITH cte -- hi\nAS (SELECT 1) INSERT INTO t SELECT 1", true},
+		{"comment between AS and body", "WITH cte AS /* hi */ (SELECT 1) INSERT INTO t SELECT 1", true},
+		{"comment between CTEs", "WITH a AS (SELECT 1) /* hi */ , b AS (SELECT 2) INSERT INTO t SELECT 1", true},
+		{"comment after CTE body + SELECT", "WITH cte /* hi */ AS (SELECT 1) SELECT * FROM cte", false},
+
+		// RECURSIVE + column aliases
+		{"RECURSIVE with column aliases + INSERT", "WITH RECURSIVE cte (n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cte WHERE n < 5) INSERT INTO t SELECT * FROM cte", true},
+		{"RECURSIVE with column aliases + SELECT", "WITH RECURSIVE cte (n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cte WHERE n < 5) SELECT * FROM cte", false},
+
+		// CTE name is a keyword
+		{"keyword CTE name + INSERT", "WITH insert AS (SELECT 1) INSERT INTO t SELECT * FROM insert", true},
+		{"keyword CTE name + SELECT", "WITH delete AS (SELECT 1) SELECT * FROM delete", false},
+
+		// Malformed SQL — must not panic or loop
+		{"truncated WITH", "WITH", false},
+		{"truncated WITH space", "WITH ", false},
+		{"truncated WITH RECURSIVE", "WITH RECURSIVE", false},
+		{"truncated CTE name", "WITH cte", false},
+		{"truncated after AS", "WITH cte AS", false},
+		{"unclosed CTE body", "WITH cte AS (SELECT 1", false},
+		{"unclosed string in CTE body", "WITH cte AS (SELECT 'unclosed) INSERT INTO t SELECT 1", false},
+
+		// WITH + VALUES (returns results, not DML) → false
+		{"WITH + VALUES", "WITH cte AS (SELECT 1) VALUES (1, 2)", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isWithDML(tt.query)
+			if result != tt.expected {
+				t.Errorf("isWithDML(%q) = %v, want %v", tt.query, result, tt.expected)
+			}
+		})
+	}
+}
+
 // Note: isIgnoredSetParameter tests have been moved to transpiler/transpiler_test.go.
 // The transpiler package now handles SET parameter filtering via AST transformation.
+
+func TestBuildCommandTagFromRowCount(t *testing.T) {
+	tests := []struct {
+		cmdType  string
+		rowCount int64
+		expected string
+	}{
+		{"INSERT", 0, "INSERT 0 0"},
+		{"INSERT", 1, "INSERT 0 1"},
+		{"INSERT", 5, "INSERT 0 5"},
+		{"UPDATE", 0, "UPDATE 0"},
+		{"UPDATE", 1, "UPDATE 1"},
+		{"UPDATE", 3, "UPDATE 3"},
+		{"DELETE", 0, "DELETE 0"},
+		{"DELETE", 1, "DELETE 1"},
+		{"DELETE", 3, "DELETE 3"},
+		{"SELECT", 0, "SELECT 0"},
+		{"SELECT", 5, "SELECT 5"},
+		// Large row counts
+		{"INSERT", 1000000, "INSERT 0 1000000"},
+		{"DELETE", 999999, "DELETE 999999"},
+		// Unknown command types fall through to SELECT-style
+		{"CREATE TABLE", 0, "SELECT 0"},
+		{"", 0, "SELECT 0"},
+		{"COPY", 0, "SELECT 0"},
+		// Verify INSERT always has the OID 0 prefix (PostgreSQL compat)
+		{"INSERT", 42, "INSERT 0 42"},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s_%d", tt.cmdType, tt.rowCount), func(t *testing.T) {
+			got := buildCommandTagFromRowCount(tt.cmdType, tt.rowCount)
+			if got != tt.expected {
+				t.Errorf("buildCommandTagFromRowCount(%q, %d) = %q, want %q", tt.cmdType, tt.rowCount, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestBuildCommandTagConsistency verifies that buildCommandTagFromRowCount produces
+// the same tags as buildCommandTag for DML types. This ensures the Query path
+// (used for DML RETURNING) and the Exec path produce identical command tags.
+func TestBuildCommandTagConsistency(t *testing.T) {
+	c := &clientConn{}
+	for _, cmdType := range []string{"INSERT", "UPDATE", "DELETE"} {
+		for _, count := range []int64{0, 1, 5, 100} {
+			t.Run(fmt.Sprintf("%s_%d", cmdType, count), func(t *testing.T) {
+				fromRowCount := buildCommandTagFromRowCount(cmdType, count)
+				fromExecResult := c.buildCommandTag(cmdType, &fakeExecResult{rowsAffected: count})
+				if fromRowCount != fromExecResult {
+					t.Errorf("tag mismatch for %s/%d: fromRowCount=%q, fromExecResult=%q",
+						cmdType, count, fromRowCount, fromExecResult)
+				}
+			})
+		}
+	}
+}
+
+type fakeExecResult struct {
+	rowsAffected int64
+}
+
+func (f *fakeExecResult) RowsAffected() (int64, error) {
+	return f.rowsAffected, nil
+}
 
 func TestCopyToStdoutRegex(t *testing.T) {
 	tests := []struct {
