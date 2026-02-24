@@ -3474,6 +3474,8 @@ func (c *clientConn) formatCopyValue(v interface{}) string {
 		return formatArrayValue(val)
 	case map[string]any:
 		return formatMapValue(val)
+	case map[any]any:
+		return formatAnyMapValue(val)
 	default:
 		return fmt.Sprintf("%v", val)
 	}
@@ -3667,6 +3669,9 @@ func formatValue(v interface{}) string {
 	case map[string]any:
 		// STRUCT text format: {"key1": val1, "key2": val2}
 		return formatMapValue(val)
+	case map[any]any:
+		// MAP text format: {key1=val1, key2=val2}
+		return formatAnyMapValue(val)
 	default:
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)
@@ -3773,7 +3778,8 @@ func needsArrayQuoting(s string) bool {
 	return false
 }
 
-// formatMapValue formats a map[string]any as a key-value text representation
+// formatMapValue formats a map[string]any as a key-value text representation.
+// Used for STRUCT values extracted from Arrow (keys are field names → always strings).
 func formatMapValue(m map[string]any) string {
 	var buf strings.Builder
 	buf.WriteByte('{')
@@ -3784,6 +3790,25 @@ func formatMapValue(m map[string]any) string {
 		}
 		first = false
 		buf.WriteString(k)
+		buf.WriteString("=")
+		buf.WriteString(formatValue(v))
+	}
+	buf.WriteByte('}')
+	return buf.String()
+}
+
+// formatAnyMapValue formats a map[any]any as a key-value text representation.
+// Used for MAP values extracted from Arrow (keys preserve their original types).
+func formatAnyMapValue(m map[any]any) string {
+	var buf strings.Builder
+	buf.WriteByte('{')
+	first := true
+	for k, v := range m {
+		if !first {
+			buf.WriteString(", ")
+		}
+		first = false
+		buf.WriteString(formatValue(k))
 		buf.WriteString("=")
 		buf.WriteString(formatValue(v))
 	}

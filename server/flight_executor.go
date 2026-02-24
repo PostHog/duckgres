@@ -531,11 +531,11 @@ func extractArrowValue(col arrow.Array, row int) interface{} {
 		keys := arr.Keys()
 		items := arr.Items()
 		start, end := arr.ValueOffsets(row)
-		m := make(map[string]interface{}, end-start)
+		m := make(map[any]any, end-start)
 		for i := int(start); i < int(end); i++ {
 			k := extractArrowValue(keys, i)
 			v := extractArrowValue(items, i)
-			m[fmt.Sprintf("%v", k)] = v
+			m[k] = v
 		}
 		return m
 	default:
