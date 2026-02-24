@@ -369,6 +369,13 @@ func TestGetCommandType(t *testing.T) {
 			query:    "WITH RECURSIVE CTE (N) AS (SELECT 1 UNION ALL SELECT N+1 FROM CTE WHERE N < 5) INSERT INTO T SELECT * FROM CTE",
 			expected: "INSERT",
 		},
+
+		// WITH word boundary — must not match identifiers starting with WITH
+		{
+			name:     "WITHOUT falls through to SELECT",
+			query:    "WITHOUT SOMETHING",
+			expected: "SELECT",
+		},
 	}
 
 	for _, tt := range tests {
@@ -900,6 +907,11 @@ func TestQueryReturnsResults(t *testing.T) {
 			query:    "WITH cte AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM cte)",
 			expected: true, // WITH prefix → true (isWithDML handles this in Describe)
 		},
+		{
+			name:     "WITHOUT is not WITH",
+			query:    "WITHOUT SOMETHING",
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1165,6 +1177,9 @@ func TestIsDMLReturning(t *testing.T) {
 		{"CTE with RETURNING in string", "WITH cte AS (SELECT 'returning' FROM t) SELECT * FROM cte", false},
 		{"CTE with RETURNING in comment", "WITH cte AS (SELECT /* returning */ 1) SELECT * FROM cte", false},
 		{"CTE with RETURNING in dollar-quote", "WITH cte AS (SELECT $$ returning $$ FROM t) SELECT * FROM cte", false},
+
+		// WITH word boundary — WITHOUT/WITHDRAW must not match CTE path
+		{"WITHOUT not treated as WITH", "WITHOUT RETURNING *", false},
 	}
 
 	for _, tt := range tests {
