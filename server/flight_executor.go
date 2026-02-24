@@ -437,6 +437,22 @@ func arrowTypeToDuckDB(dt arrow.DataType) string {
 	case arrow.LIST:
 		elem := dt.(*arrow.ListType).Elem()
 		return arrowTypeToDuckDB(elem) + "[]"
+	case arrow.STRUCT:
+		st := dt.(*arrow.StructType)
+		var buf strings.Builder
+		buf.WriteString("STRUCT(")
+		for i := 0; i < st.NumFields(); i++ {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			f := st.Field(i)
+			fmt.Fprintf(&buf, "%q %s", f.Name, arrowTypeToDuckDB(f.Type))
+		}
+		buf.WriteByte(')')
+		return buf.String()
+	case arrow.MAP:
+		mt := dt.(*arrow.MapType)
+		return fmt.Sprintf("MAP(%s, %s)", arrowTypeToDuckDB(mt.KeyType()), arrowTypeToDuckDB(mt.ItemType()))
 	default:
 		return "VARCHAR"
 	}
@@ -504,6 +520,24 @@ func extractArrowValue(col arrow.Array, row int) interface{} {
 			elems = append(elems, extractArrowValue(child, i))
 		}
 		return elems
+	case *array.Struct:
+		st := arr.DataType().(*arrow.StructType)
+		m := make(map[string]interface{}, st.NumFields())
+		for i := 0; i < st.NumFields(); i++ {
+			m[st.Field(i).Name] = extractArrowValue(arr.Field(i), row)
+		}
+		return m
+	case *array.Map:
+		keys := arr.Keys()
+		items := arr.Items()
+		start, end := arr.ValueOffsets(row)
+		m := make(map[string]interface{}, end-start)
+		for i := int(start); i < int(end); i++ {
+			k := extractArrowValue(keys, i)
+			v := extractArrowValue(items, i)
+			m[fmt.Sprintf("%v", k)] = v
+		}
+		return m
 	default:
 		// Fallback: use String representation
 		return arr.ValueStr(row)
