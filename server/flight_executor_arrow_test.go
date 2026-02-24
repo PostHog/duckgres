@@ -100,7 +100,7 @@ func TestExtractArrowValue_Struct(t *testing.T) {
 	sb.FieldBuilder(0).(*array.Int32Builder).Append(10)
 	sb.FieldBuilder(1).(*array.Int32Builder).Append(20)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -131,7 +131,7 @@ func TestExtractArrowValue_StructNull(t *testing.T) {
 	sb := rb.Field(0).(*array.StructBuilder)
 	sb.AppendNull()
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -163,7 +163,7 @@ func TestExtractArrowValue_NestedStruct(t *testing.T) {
 	ib.FieldBuilder(0).(*array.Int32Builder).Append(42)
 	ob.FieldBuilder(1).(*array.Int32Builder).Append(99)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -206,7 +206,7 @@ func TestExtractArrowValue_Map(t *testing.T) {
 	mb.KeyBuilder().(*array.StringBuilder).Append("y")
 	mb.ItemBuilder().(*array.Int32Builder).Append(20)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	// Row 0: single-entry map
@@ -252,7 +252,7 @@ func TestExtractArrowValue_MapNull(t *testing.T) {
 	mb := rb.Field(0).(*array.MapBuilder)
 	mb.AppendNull()
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -288,7 +288,7 @@ func TestExtractArrowValue_ListOfStruct(t *testing.T) {
 	sb.FieldBuilder(0).(*array.Int32Builder).Append(2)
 	sb.FieldBuilder(1).(*array.StringBuilder).Append("world")
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -334,7 +334,7 @@ func TestExtractArrowValue_StructContainingList(t *testing.T) {
 	lb.ValueBuilder().(*array.StringBuilder).Append("admin")
 	lb.ValueBuilder().(*array.StringBuilder).Append("user")
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -368,7 +368,7 @@ func TestExtractArrowValue_MapEmpty(t *testing.T) {
 	mb := rb.Field(0).(*array.MapBuilder)
 	mb.Append(true) // non-null, zero entries
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -400,7 +400,7 @@ func TestExtractArrowValue_MapIntegerKeys(t *testing.T) {
 	mb.KeyBuilder().(*array.Int32Builder).Append(2)
 	mb.ItemBuilder().(*array.StringBuilder).Append("two")
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -434,7 +434,7 @@ func TestExtractArrowValue_MapWithNullValues(t *testing.T) {
 	mb.KeyBuilder().(*array.StringBuilder).Append("missing")
 	mb.ItemBuilder().(*array.Int32Builder).AppendNull()
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -469,7 +469,7 @@ func TestExtractArrowValue_StructMultipleRows(t *testing.T) {
 		sb.FieldBuilder(0).(*array.Int32Builder).Append(i * 10)
 	}
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	for row := 0; row < 5; row++ {
@@ -512,7 +512,7 @@ func TestExtractArrowValue_MapMultipleRows(t *testing.T) {
 	mb.KeyBuilder().(*array.StringBuilder).Append("z")
 	mb.ItemBuilder().(*array.Int32Builder).Append(30)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	// Row 0
@@ -608,7 +608,7 @@ func TestExtractArrowValue_ListOfMap(t *testing.T) {
 	mb.KeyBuilder().(*array.StringBuilder).Append("c")
 	mb.ItemBuilder().(*array.Int32Builder).Append(3)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -655,7 +655,7 @@ func TestExtractArrowValue_MapOfMapValues(t *testing.T) {
 	im.KeyBuilder().(*array.StringBuilder).Append("inner_key")
 	im.ItemBuilder().(*array.Int32Builder).Append(99)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -692,7 +692,7 @@ func TestExtractArrowValue_MapOfListValues(t *testing.T) {
 	lb.ValueBuilder().(*array.Int32Builder).Append(20)
 	lb.ValueBuilder().(*array.Int32Builder).Append(30)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -731,7 +731,7 @@ func TestExtractArrowValue_StructContainingMap(t *testing.T) {
 	mb.KeyBuilder().(*array.StringBuilder).Append("color")
 	mb.ItemBuilder().(*array.StringBuilder).Append("red")
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -772,7 +772,7 @@ func TestExtractArrowValue_DeeplyNestedThreeLevels(t *testing.T) {
 	sb2.Append(true)
 	sb2.FieldBuilder(0).(*array.Int32Builder).Append(7)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -813,7 +813,7 @@ func TestExtractArrowValue_StructAllFieldsNull(t *testing.T) {
 	sb.FieldBuilder(0).(*array.Int32Builder).AppendNull()
 	sb.FieldBuilder(1).(*array.StringBuilder).AppendNull()
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -846,7 +846,7 @@ func TestExtractArrowValue_StructSingleField(t *testing.T) {
 	sb.Append(true)
 	sb.FieldBuilder(0).(*array.Float64Builder).Append(3.14)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -888,7 +888,7 @@ func TestExtractArrowValue_StructMixedNullNonNullRows(t *testing.T) {
 	sb.Append(true)
 	sb.FieldBuilder(0).(*array.Int32Builder).Append(300)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	// Row 0
@@ -951,7 +951,7 @@ func TestExtractArrowValue_MapMixedNullNonNullRows(t *testing.T) {
 	mb.KeyBuilder().(*array.StringBuilder).Append("b")
 	mb.ItemBuilder().(*array.Int32Builder).Append(2)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -1002,7 +1002,7 @@ func TestExtractArrowValue_StructManyFields(t *testing.T) {
 		sb.FieldBuilder(i).(*array.Int32Builder).Append(int32(i * 100))
 	}
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -1034,7 +1034,7 @@ func TestExtractArrowValue_ListEmpty(t *testing.T) {
 	lb := rb.Field(0).(*array.ListBuilder)
 	lb.Append(true) // non-null, 0 elements
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -1063,7 +1063,7 @@ func TestExtractArrowValue_ListWithNullElements(t *testing.T) {
 	lb.ValueBuilder().(*array.Int32Builder).AppendNull()
 	lb.ValueBuilder().(*array.Int32Builder).Append(3)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -1104,7 +1104,7 @@ func TestExtractArrowValue_ListOfList(t *testing.T) {
 	inner.Append(true)
 	inner.ValueBuilder().(*array.Int32Builder).Append(3)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -1154,7 +1154,7 @@ func TestExtractArrowValue_MapWithStructValues(t *testing.T) {
 	sb.FieldBuilder(0).(*array.Int32Builder).Append(10)
 	sb.FieldBuilder(1).(*array.Int32Builder).Append(20)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -1194,7 +1194,7 @@ func TestExtractArrowValue_NestedStructWithNullInner(t *testing.T) {
 	sb.FieldBuilder(0).(*array.StructBuilder).AppendNull() // inner is null
 	sb.FieldBuilder(1).(*array.Int32Builder).Append(42)
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
@@ -1295,7 +1295,7 @@ func TestExtractArrowValue_StructWithNullField(t *testing.T) {
 	sb.FieldBuilder(0).(*array.Int32Builder).Append(10)
 	sb.FieldBuilder(1).(*array.Int32Builder).AppendNull()
 
-	rec := rb.NewRecord()
+	rec := rb.NewRecordBatch()
 	defer rec.Release()
 
 	val := extractArrowValue(rec.Column(0), 0)
