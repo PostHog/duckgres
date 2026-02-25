@@ -333,7 +333,7 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	// Since the DB is shared, we must set session-local parameters here.
 	initSearchPath(conn, username)
 
-	stop := server.StartCredentialRefresh(db, p.cfg.DuckLake)
+	stop := server.StartCredentialRefresh(conn, p.cfg.DuckLake)
 
 	token := generateSessionToken()
 	session := &Session{
