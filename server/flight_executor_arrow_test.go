@@ -218,8 +218,11 @@ func TestExtractArrowValue_Map(t *testing.T) {
 	if len(m.Keys) != 1 {
 		t.Fatalf("expected 1 map entry, got %d", len(m.Keys))
 	}
+	if m.Keys[0] != "a" {
+		t.Errorf("Keys[0] = %v (%T), want \"a\"", m.Keys[0], m.Keys[0])
+	}
 	if m.Values[0] != int32(1) {
-		t.Errorf("m[\"a\"] = %v, want int32(1)", m.Values[0])
+		t.Errorf("Values[0] = %v, want int32(1)", m.Values[0])
 	}
 
 	// Row 1: two-entry map
@@ -231,11 +234,14 @@ func TestExtractArrowValue_Map(t *testing.T) {
 	if len(m.Keys) != 2 {
 		t.Fatalf("expected 2 map entries, got %d", len(m.Keys))
 	}
+	if m.Keys[0] != "x" || m.Keys[1] != "y" {
+		t.Errorf("Keys = %v, want [x, y]", m.Keys)
+	}
 	if m.Values[0] != int32(10) {
-		t.Errorf("m[\"x\"] = %v, want int32(10)", m.Values[0])
+		t.Errorf("Values[0] = %v, want int32(10)", m.Values[0])
 	}
 	if m.Values[1] != int32(20) {
-		t.Errorf("m[\"y\"] = %v, want int32(20)", m.Values[1])
+		t.Errorf("Values[1] = %v, want int32(20)", m.Values[1])
 	}
 }
 
@@ -1364,8 +1370,11 @@ func TestExtractThenAppend_MapBasic(t *testing.T) {
 	if !ok {
 		t.Fatalf("re-extracted value is %T, want OrderedMapValue", rebuilt)
 	}
+	if rm.Keys[0] != "a" || rm.Keys[1] != "b" {
+		t.Errorf("rebuilt Keys = %v, want [a, b]", rm.Keys)
+	}
 	if rm.Values[0] != int32(1) || rm.Values[1] != int32(2) {
-		t.Errorf("rebuilt MAP = %v, want {a:1, b:2}", rm)
+		t.Errorf("rebuilt Values = %v, want [1, 2]", rm.Values)
 	}
 }
 
