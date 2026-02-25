@@ -1059,6 +1059,11 @@ type sqlExecer interface {
 // The execer parameter accepts either *sql.DB (standalone mode) or *sql.Conn (worker
 // mode where the pool's only connection is pinned by the session).
 //
+// Note: ExecContext serializes behind any running query (pool contention for *sql.DB,
+// internal mutex for *sql.Conn). This means credentials are refreshed between queries,
+// not during them. A query that runs longer than the credential TTL (~6h for instance
+// roles) could still fail if DuckDB makes S3 requests with stale cached credentials.
+//
 // Returns a stop function that cancels the refresh goroutine. The caller must call
 // the stop function when the connection is closed to prevent goroutine leaks.
 // If credential refresh is not needed (static credentials, no S3, etc.), returns a no-op.

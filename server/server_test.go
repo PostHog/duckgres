@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"testing"
 	"time"
@@ -122,6 +123,44 @@ func TestStartCredentialRefresh_StopsCleanly(t *testing.T) {
 	}
 
 	stop := StartCredentialRefresh(db, cfg)
+
+	// Give the goroutine time to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Stop should not hang or panic
+	stop()
+}
+
+func TestStartCredentialRefresh_WorksWithPinnedConn(t *testing.T) {
+	// Simulate the worker path: MaxOpenConns(1) with the sole connection
+	// pinned via db.Conn(). Passing the pinned *sql.Conn must not deadlock.
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec("INSTALL httpfs"); err != nil {
+		t.Skip("httpfs extension not available:", err)
+	}
+	if _, err := db.Exec("LOAD httpfs"); err != nil {
+		t.Skip("httpfs extension not loadable:", err)
+	}
+
+	// Pin the pool's only connection — exactly what the worker does.
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	cfg := DuckLakeConfig{
+		ObjectStore: "s3://bucket/path/",
+		S3Provider:  "credential_chain",
+	}
+
+	stop := StartCredentialRefresh(conn, cfg)
 
 	// Give the goroutine time to start
 	time.Sleep(10 * time.Millisecond)
