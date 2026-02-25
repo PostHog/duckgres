@@ -408,11 +408,17 @@ func TestExtractArrowValue_MapIntegerKeys(t *testing.T) {
 	if !ok {
 		t.Fatalf("extractArrowValue(MAP int keys) returned %T, want OrderedMapValue", val)
 	}
+	if m.Keys[0] != int32(1) {
+		t.Errorf("Keys[0] = %v (%T), want int32(1)", m.Keys[0], m.Keys[0])
+	}
+	if m.Keys[1] != int32(2) {
+		t.Errorf("Keys[1] = %v (%T), want int32(2)", m.Keys[1], m.Keys[1])
+	}
 	if m.Values[0] != "one" {
-		t.Errorf("m[int32(1)] = %v, want \"one\"", m.Values[0])
+		t.Errorf("Values[0] = %v, want \"one\"", m.Values[0])
 	}
 	if m.Values[1] != "two" {
-		t.Errorf("m[int32(2)] = %v, want \"two\"", m.Values[1])
+		t.Errorf("Values[1] = %v, want \"two\"", m.Values[1])
 	}
 }
 
@@ -1400,8 +1406,14 @@ func TestExtractThenAppend_MapIntegerKeys(t *testing.T) {
 	if !ok {
 		t.Fatalf("re-extracted value is %T, want OrderedMapValue", rebuilt)
 	}
+	if rm.Keys[0] != int32(1) {
+		t.Errorf("rebuilt Keys[0] = %v (%T), want int32(1)", rm.Keys[0], rm.Keys[0])
+	}
+	if rm.Keys[1] != int32(2) {
+		t.Errorf("rebuilt Keys[1] = %v (%T), want int32(2)", rm.Keys[1], rm.Keys[1])
+	}
 	if rm.Values[0] != "one" || rm.Values[1] != "two" {
-		t.Errorf("rebuilt MAP = %v, want {1:one, 2:two}", rm)
+		t.Errorf("rebuilt MAP values = %v, want {1:one, 2:two}", rm)
 	}
 }
 
