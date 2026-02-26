@@ -12,25 +12,54 @@ build:
     docker compose build
 
 # Run psycopg2 compatibility tests (standalone, no report)
+[group('client')]
 psycopg: build
     docker compose run --rm psycopg
     docker compose down -v
 
 # Run harlequin compatibility tests (standalone, no report)
+[group('client')]
 harlequin: build
     docker compose run --rm harlequin
     docker compose down -v
 
 # Run pgx (Go) compatibility tests (standalone, no report)
+[group('client')]
 pgx: build
     docker compose run --rm pgx
     docker compose down -v
 
 # Run psql compatibility tests (standalone, no report)
+[group('client')]
 psql: build
     docker compose run --rm psql
     docker compose down -v
 
-# Tear down containers and volumes
-clean:
+# Run JDBC compatibility tests (standalone, no report)
+[group('client')]
+jdbc: build
+    docker compose run --rm jdbc
     docker compose down -v
+
+# Tear down containers and volumes
+down:
+    docker compose down -v
+
+# Remove results directory
+clean:
+    rm -rf results
+
+# Open the most recent results database in the DuckDB CLI
+query-last-run:
+    #!/usr/bin/env bash
+    if [ ! -d results ]; then
+        echo "No results directory found. Run 'just all' first."
+        exit 1
+    fi
+    db=$(ls -t results/*.duckdb 2>/dev/null | head -1)
+    if [ -z "$db" ]; then
+        echo "No .duckdb files found in results/. Run 'just all' first."
+        exit 1
+    fi
+    echo "Opening $db"
+    duckdb "$db"
