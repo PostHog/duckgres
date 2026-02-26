@@ -29,6 +29,9 @@ just query-last-run
 | `just <client>` | Run a single client standalone (no report) |
 | `just down` | Tear down containers and volumes |
 | `just clean` | Remove the `results/` directory |
+| `just summary` | Pass/fail counts by client and suite |
+| `just client-results <client>` | Full results for a specific client |
+| `just view-last-run` | Print the full results table |
 | `just query-last-run` | Open the latest results database in DuckDB CLI |
 
 Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `sqlalchemy`.
@@ -57,7 +60,7 @@ Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgr
                 |                           |
     +-----------+---------------------------+-----------+
     |           |           |           |           |   |
- psycopg      pgx        psql       jdbc       rust  sqlalchemy
+ psycopg      pgx        psql       jdbc  tokio-postgres  sqlalchemy
     |           |           |           |           |   |
     +-----------+-----------+-----------+-----------+---+
                             |

@@ -59,17 +59,69 @@ down:
 clean:
     rm -rf results
 
-# Open the most recent results database in the DuckDB CLI
-query-last-run:
+[private]
+find-db:
     #!/usr/bin/env bash
     if [ ! -d results ]; then
-        echo "No results directory found. Run 'just all' first."
+        echo "No results directory found. Run 'just all' first." >&2
         exit 1
     fi
     db=$(ls -t results/*.duckdb 2>/dev/null | head -1)
     if [ -z "$db" ]; then
-        echo "No .duckdb files found in results/. Run 'just all' first."
+        echo "No .duckdb files found in results/. Run 'just all' first." >&2
         exit 1
     fi
+    echo "$db"
+
+# Summary of pass/fail counts by client and suite
+[group('results')]
+summary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -c "
+        SELECT client, suite,
+               count(*) FILTER (WHERE status = 'pass') AS pass,
+               count(*) FILTER (WHERE status = 'fail') AS fail
+        FROM results
+        GROUP BY client, suite
+        ORDER BY client, suite;
+    "
+
+# Results for a specific client
+[group('results')]
+client-results client:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -c "
+        SELECT suite, test_name, status, detail
+        FROM results
+        WHERE client = '{{ client }}'
+        ORDER BY suite, test_name;
+    "
+
+# Print the full results table from the most recent run
+[group('results')]
+view-last-run:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -c "SELECT client, suite, test_name, status, detail FROM results ORDER BY client, suite, test_name;"
+
+# Open the most recent results database in the DuckDB CLI
+[group('results')]
+query-last-run:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
     echo "Opening $db"
     duckdb "$db"
+
+# Open the most recent results in the DuckDB web UI
+[group('results')]
+web:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -ui
