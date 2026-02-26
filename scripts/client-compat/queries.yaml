@@ -340,3 +340,245 @@
 - suite: catalog_stubs
   name: pg_statio_user_tables
   sql: SELECT * FROM pg_statio_user_tables LIMIT 5
+
+# --- DBeaver introspection queries ---
+# Queries that DBeaver CE fires on connect for metadata discovery.
+# Sourced from https://github.com/cockroachdb/cockroach/issues/28309
+# which catalogued every introspection query DBeaver sends.
+#
+# These test the same catalog surface that a real DBeaver connection
+# would exercise. We cannot run DBeaver headlessly (GTK3 SWT bug
+# freezes the event loop under Xvfb) so we test the queries directly.
+
+# Database list
+- suite: dbeaver_introspection
+  name: database_list
+  stub: true
+  sql: SELECT db.datname FROM pg_catalog.pg_database AS db WHERE datallowconn
+
+# Role list
+- suite: dbeaver_introspection
+  name: role_list
+  stub: true
+  sql: SELECT a.oid, a.* FROM pg_catalog.pg_roles AS a
+
+# Access methods
+- suite: dbeaver_introspection
+  name: pg_am
+  stub: true
+  sql: SELECT am.oid, am.* FROM pg_catalog.pg_am AS am
+
+# Collations
+- suite: dbeaver_introspection
+  name: pg_collation
+  stub: true
+  sql: SELECT c.oid, c.* FROM pg_catalog.pg_collation AS c
+
+# Tablespaces
+- suite: dbeaver_introspection
+  name: pg_tablespace
+  stub: true
+  sql: SELECT t.oid, t.* FROM pg_catalog.pg_tablespace AS t
+
+# Schemas with descriptions
+- suite: dbeaver_introspection
+  name: schemas_with_desc
+  stub: true
+  sql: >-
+    SELECT n.oid, n.*, d.description
+    FROM pg_catalog.pg_namespace AS n
+    LEFT JOIN pg_catalog.pg_description AS d ON d.objoid = n.oid
+
+# Sequences
+- suite: dbeaver_introspection
+  name: pg_sequences
+  stub: true
+  sql: SELECT * FROM pg_catalog.pg_sequences LIMIT 5
+
+# Enums
+- suite: dbeaver_introspection
+  name: pg_enum
+  stub: true
+  sql: SELECT e.enumlabel FROM pg_catalog.pg_enum AS e LIMIT 5
+
+# Classes (tables/views) with descriptions — DBeaver's main catalog query
+- suite: dbeaver_introspection
+  name: classes_with_desc
+  stub: true
+  sql: >-
+    SELECT c.oid, c.relname, c.relkind, c.relnamespace, d.description
+    FROM pg_catalog.pg_class AS c
+    LEFT JOIN pg_catalog.pg_description AS d ON d.objoid = c.oid AND d.objsubid = 0
+    WHERE c.relkind NOT IN ('i', 'c')
+    LIMIT 20
+
+# Attributes (columns) with defaults and descriptions
+- suite: dbeaver_introspection
+  name: attributes_with_defaults
+  sql: >-
+    SELECT c.relname, a.attname, a.atttypid, a.attnum,
+    pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) AS def_value,
+    dsc.description
+    FROM pg_catalog.pg_attribute AS a
+    INNER JOIN pg_catalog.pg_class AS c ON a.attrelid = c.oid
+    LEFT JOIN pg_catalog.pg_attrdef AS ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+    LEFT JOIN pg_catalog.pg_description AS dsc ON c.oid = dsc.objoid AND a.attnum = dsc.objsubid
+    WHERE a.attnum > 0 AND NOT a.attisdropped
+    LIMIT 20
+
+# Constraints with table names
+- suite: dbeaver_introspection
+  name: constraints_with_tables
+  stub: true
+  sql: >-
+    SELECT c.oid, c.conname, c.contype, t.relname AS tabrelname,
+    rt.relnamespace AS refnamespace, d.description
+    FROM pg_catalog.pg_constraint AS c
+    INNER JOIN pg_catalog.pg_class AS t ON t.oid = c.conrelid
+    LEFT JOIN pg_catalog.pg_class AS rt ON rt.oid = c.confrelid
+    LEFT JOIN pg_catalog.pg_description AS d ON d.objoid = c.oid AND d.objsubid = 0
+    LIMIT 20
+
+# Indexes with descriptions
+- suite: dbeaver_introspection
+  name: indexes_with_desc
+  stub: true
+  sql: >-
+    SELECT i.indexrelid, i.indrelid, i.indisunique, i.indisprimary,
+    c.relname, tc.relname AS tabrelname, dsc.description
+    FROM pg_catalog.pg_index AS i
+    INNER JOIN pg_catalog.pg_class AS c ON c.oid = i.indexrelid
+    INNER JOIN pg_catalog.pg_class AS tc ON tc.oid = i.indrelid
+    LEFT JOIN pg_catalog.pg_description AS dsc ON i.indexrelid = dsc.objoid
+    LIMIT 20
+
+# Procedures (functions)
+- suite: dbeaver_introspection
+  name: pg_proc
+  sql: >-
+    SELECT p.oid, p.proname, p.pronamespace, p.prorettype
+    FROM pg_catalog.pg_proc AS p
+    LIMIT 20
+
+# Data types (filtered)
+- suite: dbeaver_introspection
+  name: pg_type_filtered
+  sql: >-
+    SELECT t.oid, t.typname, t.typnamespace, t.typtype, t.typcategory
+    FROM pg_catalog.pg_type AS t
+    WHERE t.typcategory NOT IN ('A', 'C')
+    LIMIT 20
+
+# Inheritance
+- suite: dbeaver_introspection
+  name: pg_inherits
+  stub: true
+  sql: >-
+    SELECT i.*, c.relnamespace
+    FROM pg_catalog.pg_inherits AS i, pg_catalog.pg_class AS c
+    WHERE c.oid = i.inhparent
+    LIMIT 5
+
+# Activity
+- suite: dbeaver_introspection
+  name: pg_stat_activity
+  stub: true
+  sql: SELECT sa.* FROM pg_catalog.pg_stat_activity AS sa LIMIT 5
+
+# Object comments
+- suite: dbeaver_introspection
+  name: object_comments
+  stub: true
+  sql: >-
+    SELECT description
+    FROM pg_catalog.pg_description
+    JOIN pg_catalog.pg_class ON pg_description.objoid = pg_class.oid
+    JOIN pg_catalog.pg_namespace ON pg_class.relnamespace = pg_namespace.oid
+    LIMIT 5
+
+# View definition function
+- suite: dbeaver_introspection
+  name: pg_get_viewdef
+  stub: true
+  sql: SELECT pg_get_viewdef(0)
+
+# View definition function (pretty-print overload)
+- suite: dbeaver_introspection
+  name: pg_get_viewdef_pretty
+  stub: true
+  sql: SELECT pg_get_viewdef(0, true)
+
+# --- Missing tables: DBeaver queries these but duckgres doesn't have them yet ---
+# These will fail until stubs are added to catalog.go.
+
+# Role membership
+- suite: dbeaver_introspection
+  name: pg_auth_members
+  stub: true
+  sql: SELECT * FROM pg_catalog.pg_auth_members LIMIT 5
+
+# Operator classes
+- suite: dbeaver_introspection
+  name: pg_opclass
+  stub: true
+  sql: SELECT oc.oid, oc.* FROM pg_catalog.pg_opclass AS oc LIMIT 5
+
+# Encoding conversions
+- suite: dbeaver_introspection
+  name: pg_conversion
+  stub: true
+  sql: SELECT * FROM pg_catalog.pg_conversion AS c LIMIT 5
+
+# Procedural languages
+- suite: dbeaver_introspection
+  name: pg_language
+  stub: true
+  sql: SELECT l.oid, l.* FROM pg_catalog.pg_language AS l
+
+# Extensions
+- suite: dbeaver_introspection
+  name: pg_extension
+  stub: true
+  sql: SELECT e.oid, e.* FROM pg_catalog.pg_extension AS e
+
+# Foreign servers
+- suite: dbeaver_introspection
+  name: pg_foreign_server
+  stub: true
+  sql: SELECT l.oid, l.* FROM pg_catalog.pg_foreign_server AS l
+
+# Foreign data wrappers (with handler proc join)
+- suite: dbeaver_introspection
+  name: pg_foreign_data_wrapper
+  stub: true
+  sql: >-
+    SELECT l.oid, l.*, p.pronamespace AS handler_schema_id
+    FROM pg_catalog.pg_foreign_data_wrapper AS l
+    LEFT JOIN pg_catalog.pg_proc AS p ON p.oid = l.fdwhandler
+    ORDER BY l.fdwname
+
+# Foreign tables
+- suite: dbeaver_introspection
+  name: pg_foreign_table
+  stub: true
+  sql: SELECT * FROM pg_catalog.pg_foreign_table LIMIT 5
+
+# Triggers (with proc join)
+- suite: dbeaver_introspection
+  name: pg_trigger
+  stub: true
+  sql: >-
+    SELECT x.oid, x.*, p.pronamespace AS func_schema_id
+    FROM pg_catalog.pg_trigger AS x
+    LEFT JOIN pg_catalog.pg_proc AS p ON p.oid = x.tgfoid
+    LIMIT 5
+
+# Transaction locks
+- suite: dbeaver_introspection
+  name: pg_locks
+  stub: true
+  sql: >-
+    SELECT COALESCE(lock.locktype, '') AS locktype,
+    lock.pid, lock.granted
+    FROM pg_catalog.pg_locks AS lock
+    LIMIT 5
