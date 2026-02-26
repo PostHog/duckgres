@@ -26,6 +26,11 @@ pgx: build
     docker compose run --rm pgx
     docker compose down -v
 
+# Run psql compatibility tests (standalone, no report)
+psql: build
+    docker compose run --rm psql
+    docker compose down -v
+
 # Tear down containers and volumes
 clean:
     docker compose down -v

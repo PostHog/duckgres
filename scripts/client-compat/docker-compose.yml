@@ -24,7 +24,7 @@ services:
       - ./results:/results
     environment:
       RESULTS_DIR: /results
-      EXPECTED_CLIENTS: "psycopg,harlequin,pgx"
+      EXPECTED_CLIENTS: "psycopg,harlequin,pgx,psql"
       LOG_DIR: /results/results-gatherer
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
@@ -92,3 +92,23 @@ services:
       PGPASSWORD: postgres
       RESULTS_URL: http://results-gatherer:8080
       LOG_DIR: /results/pgx
+
+  psql:
+    build:
+      context: .
+      dockerfile: Dockerfile.psql
+    container_name: compat-psql
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/psql
