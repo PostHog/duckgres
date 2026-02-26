@@ -1,0 +1,154 @@
+# Client compatibility tests for duckgres
+default:
+    just --list
+
+# Client container names (must match docker-compose.yml)
+clients := "compat-psycopg compat-pgx compat-psql compat-jdbc compat-tokio-postgres compat-node-postgres compat-sqlalchemy"
+
+# Run all client tests with results report
+all: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker compose up -d
+    # Wait for all client containers to exit, then tell the gatherer to shut down.
+    docker wait {{ clients }}
+    docker exec compat-results python -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8080/shutdown', method='POST'))" || true
+    exit_code=$(docker wait compat-results)
+    docker compose logs results-gatherer
+    docker compose down -v
+    exit "$exit_code"
+
+# Build all containers
+build:
+    docker compose build
+
+# Rebuild all containers from scratch (no cache)
+rebuild:
+    docker compose build --no-cache
+
+[private]
+run-client client: build
+    -docker compose run --rm {{ client }}
+    docker compose down -v
+
+# Run psycopg2 compatibility tests (standalone, no report)
+[group('client')]
+psycopg: (run-client "psycopg")
+
+# Run pgx (Go) compatibility tests (standalone, no report)
+[group('client')]
+pgx: (run-client "pgx")
+
+# Run psql compatibility tests (standalone, no report)
+[group('client')]
+psql: (run-client "psql")
+
+# Run JDBC compatibility tests (standalone, no report)
+[group('client')]
+jdbc: (run-client "jdbc")
+
+# Run tokio-postgres (Rust) compatibility tests (standalone, no report)
+[group('client')]
+tokio-postgres: (run-client "tokio-postgres")
+
+# Run node-postgres (Node.js) compatibility tests (standalone, no report)
+[group('client')]
+node-postgres: (run-client "node-postgres")
+
+# Run SQLAlchemy compatibility tests (standalone, no report)
+[group('client')]
+sqlalchemy: (run-client "sqlalchemy")
+
+# Tear down containers and volumes
+down:
+    docker compose down -v
+
+# Remove results directory
+clean:
+    rm -rf results
+
+[private]
+find-db:
+    #!/usr/bin/env bash
+    if [ ! -d results ]; then
+        echo "No results directory found. Run 'just all' first." >&2
+        exit 1
+    fi
+    db=$(ls -t results/*.duckdb 2>/dev/null | head -1)
+    if [ -z "$db" ]; then
+        echo "No .duckdb files found in results/. Run 'just all' first." >&2
+        exit 1
+    fi
+    echo "$db"
+
+# One-line-per-client overview with per-suite success percentages
+[group('results')]
+overview:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -c "
+        SELECT client,
+               round(100.0 * count(*) FILTER (WHERE status = 'pass' AND suite IN (SELECT DISTINCT suite FROM queries))
+                           / count(*) FILTER (WHERE suite IN (SELECT DISTINCT suite FROM queries)), 0)::INT || '%' AS shared,
+               round(100.0 * count(*) FILTER (WHERE status = 'pass' AND suite NOT IN (SELECT DISTINCT suite FROM queries))
+                           / nullif(count(*) FILTER (WHERE suite NOT IN (SELECT DISTINCT suite FROM queries)), 0), 0)::INT || '%' AS client_specific,
+               count(*) FILTER (WHERE status = 'pass') AS pass,
+               count(*) FILTER (WHERE status = 'fail') AS fail
+        FROM results
+        GROUP BY client
+        ORDER BY client;
+    "
+
+# Summary of pass/fail counts by client and suite
+[group('results')]
+summary:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -c "
+        SELECT client, suite,
+               count(*) FILTER (WHERE status = 'pass') AS pass,
+               count(*) FILTER (WHERE status = 'fail') AS fail
+        FROM results
+        GROUP BY client, suite
+        ORDER BY client, suite;
+    "
+
+# Results for a specific client
+[group('results')]
+client-results client:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -c "
+        SELECT suite, test_name, status, detail
+        FROM results
+        WHERE client = '{{ client }}'
+        ORDER BY suite, test_name;
+    "
+
+# Print the full results table from the most recent run
+[group('results')]
+view-last-run:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -c "SELECT client, suite, test_name, status, detail FROM results ORDER BY client, suite, test_name;"
+
+# Open the most recent results database in the DuckDB CLI
+[group('results')]
+query-last-run:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    echo "Opening $db"
+    duckdb "$db"
+
+# Open the most recent results in the DuckDB web UI
+[group('results')]
+web:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -ui

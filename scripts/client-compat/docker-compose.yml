@@ -1,0 +1,172 @@
+name: duckgres-client-compat
+
+services:
+  duckgres:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: compat-duckgres
+    command: ["--port", "5432"]
+    volumes:
+      - ./results:/results
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/5432'"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  results-gatherer:
+    build:
+      context: .
+      dockerfile: Dockerfile.results
+    container_name: compat-results
+    volumes:
+      - ./results:/results
+    environment:
+      RESULTS_DIR: /results
+      LOG_DIR: /results/results-gatherer
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  psycopg:
+    build:
+      context: .
+      dockerfile: clients/psycopg/Dockerfile
+    container_name: compat-psycopg
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/psycopg
+
+  pgx:
+    build:
+      context: .
+      dockerfile: clients/pgx/Dockerfile
+    container_name: compat-pgx
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/pgx
+
+  psql:
+    build:
+      context: .
+      dockerfile: clients/psql/Dockerfile
+    container_name: compat-psql
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/psql
+
+  jdbc:
+    build:
+      context: .
+      dockerfile: clients/jdbc/Dockerfile
+    container_name: compat-jdbc
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/jdbc
+
+  tokio-postgres:
+    build:
+      context: .
+      dockerfile: clients/tokio-postgres/Dockerfile
+    container_name: compat-tokio-postgres
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/tokio-postgres
+
+  node-postgres:
+    build:
+      context: .
+      dockerfile: clients/node-postgres/Dockerfile
+    container_name: compat-node-postgres
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/node-postgres
+
+  sqlalchemy:
+    build:
+      context: .
+      dockerfile: clients/sqlalchemy/Dockerfile
+    container_name: compat-sqlalchemy
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/sqlalchemy
