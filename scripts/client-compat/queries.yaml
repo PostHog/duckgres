@@ -7,10 +7,13 @@
 #   suite     - test grouping (catalog_views, catalog_funcs, etc.)
 #   name      - unique test name within the suite
 #   sql       - the query to execute (must succeed without error)
+#   stub      - (optional) true if the function/view returns a hardcoded
+#               dummy value rather than meaningful data
 
 # --- pg_catalog views ---
 - suite: catalog_views
   name: pg_database
+  stub: true
   sql: SELECT datname FROM pg_database WHERE datallowconn
 
 - suite: catalog_views
@@ -31,10 +34,12 @@
 
 - suite: catalog_views
   name: pg_roles
+  stub: true
   sql: SELECT rolname FROM pg_roles
 
 - suite: catalog_views
   name: pg_database_filtered
+  stub: true
   sql: >-
     SELECT datname FROM pg_database
     WHERE datistemplate IS false AND datallowconn IS true
@@ -55,46 +60,116 @@
 
 - suite: catalog_funcs
   name: pg_get_userbyid
+  stub: true
   sql: SELECT pg_get_userbyid(10)
 
 - suite: catalog_funcs
   name: pg_table_is_visible
+  stub: true
   sql: SELECT pg_table_is_visible(0)
 
 - suite: catalog_funcs
   name: has_schema_privilege
+  stub: true
   sql: SELECT has_schema_privilege('public', 'USAGE')
 
 - suite: catalog_funcs
   name: has_table_privilege
+  stub: true
   sql: SELECT has_table_privilege('pg_class', 'SELECT')
 
 - suite: catalog_funcs
   name: pg_encoding_to_char
+  stub: true
   sql: SELECT pg_encoding_to_char(6)
 
 - suite: catalog_funcs
   name: version
+  stub: true
   sql: SELECT version()
 
 - suite: catalog_funcs
   name: current_setting
+  stub: true
   sql: SELECT current_setting('server_version')
 
 - suite: catalog_funcs
   name: obj_description
+  stub: true
   sql: SELECT obj_description(0, 'pg_class')
 
 - suite: catalog_funcs
   name: col_description
+  stub: true
   sql: SELECT col_description(0, 1)
 
 - suite: catalog_funcs
+  name: pg_get_expr
+  stub: true
+  sql: SELECT pg_get_expr(NULL, 0)
+
+- suite: catalog_funcs
+  name: pg_get_indexdef
+  stub: true
+  sql: SELECT pg_get_indexdef(0)
+
+- suite: catalog_funcs
+  name: pg_get_constraintdef
+  stub: true
+  sql: SELECT pg_get_constraintdef(0)
+
+- suite: catalog_funcs
+  name: pg_get_serial_sequence
+  stub: true
+  sql: SELECT pg_get_serial_sequence('pg_class', 'oid')
+
+- suite: catalog_funcs
+  name: shobj_description
+  stub: true
+  sql: SELECT shobj_description(0, 'pg_database')
+
+- suite: catalog_funcs
+  name: pg_total_relation_size
+  stub: true
+  sql: SELECT pg_total_relation_size(0)
+
+- suite: catalog_funcs
+  name: pg_relation_size
+  stub: true
+  sql: SELECT pg_relation_size(0)
+
+- suite: catalog_funcs
+  name: pg_table_size
+  stub: true
+  sql: SELECT pg_table_size(0)
+
+- suite: catalog_funcs
+  name: pg_indexes_size
+  stub: true
+  sql: SELECT pg_indexes_size(0)
+
+- suite: catalog_funcs
+  name: pg_database_size
+  stub: true
+  sql: SELECT pg_database_size('main')
+
+- suite: catalog_funcs
+  name: quote_nullable
+  sql: SELECT quote_nullable('hello')
+
+- suite: catalog_funcs
+  name: txid_current
+  stub: true
+  sql: SELECT txid_current()
+
+- suite: catalog_funcs
   name: pg_is_in_recovery
+  stub: true
   sql: SELECT pg_is_in_recovery()
 
 - suite: catalog_funcs
   name: pg_backend_pid
+  stub: true
   sql: SELECT pg_backend_pid()
 
 - suite: catalog_funcs
@@ -190,56 +265,78 @@
 # --- stub views (should return empty, not error) ---
 - suite: catalog_stubs
   name: pg_matviews
+  stub: true
   sql: SELECT matviewname FROM pg_matviews
 
 - suite: catalog_stubs
   name: pg_policy
+  stub: true
   sql: SELECT * FROM pg_policy LIMIT 5
 
 - suite: catalog_stubs
   name: pg_collation
+  stub: true
   sql: SELECT collname FROM pg_collation LIMIT 5
 
 - suite: catalog_stubs
   name: pg_statistic_ext
+  stub: true
   sql: SELECT * FROM pg_statistic_ext LIMIT 5
 
 - suite: catalog_stubs
   name: pg_publication
+  stub: true
   sql: SELECT * FROM pg_publication LIMIT 5
 
 - suite: catalog_stubs
   name: pg_inherits
+  stub: true
   sql: SELECT * FROM pg_inherits LIMIT 5
 
 - suite: catalog_stubs
   name: pg_rules
+  stub: true
   sql: SELECT * FROM pg_rules LIMIT 5
 
 - suite: catalog_stubs
   name: pg_stat_statements
+  stub: true
   sql: SELECT * FROM pg_stat_statements LIMIT 5
 
 - suite: catalog_stubs
   name: pg_partitioned_table
+  stub: true
   sql: SELECT * FROM pg_partitioned_table LIMIT 5
 
 - suite: catalog_stubs
   name: pg_constraint
+  stub: true
   sql: SELECT * FROM pg_constraint LIMIT 5
 
 - suite: catalog_stubs
   name: pg_enum
+  stub: true
   sql: SELECT * FROM pg_enum LIMIT 5
 
 - suite: catalog_stubs
   name: pg_indexes
+  stub: true
   sql: SELECT * FROM pg_indexes LIMIT 5
 
 - suite: catalog_stubs
   name: pg_stat_activity
+  stub: true
   sql: SELECT * FROM pg_stat_activity LIMIT 5
 
 - suite: catalog_stubs
   name: pg_stat_user_tables
   sql: SELECT relname FROM pg_stat_user_tables LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_publication_rel
+  stub: true
+  sql: SELECT * FROM pg_publication_rel LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_statio_user_tables
+  sql: SELECT * FROM pg_statio_user_tables LIMIT 5

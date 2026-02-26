@@ -38,7 +38,8 @@ db.execute("""
     CREATE TABLE queries (
         suite VARCHAR,
         name VARCHAR,
-        sql VARCHAR
+        sql VARCHAR,
+        stub BOOLEAN DEFAULT false
     )
 """)
 db.execute("""
@@ -55,7 +56,7 @@ db.execute("""
 
 db.execute("""
     CREATE VIEW coverage AS
-    SELECT q.suite, q.name, q.sql, r.client, r.status, r.detail, r.ts
+    SELECT q.suite, q.name, q.sql, q.stub, r.client, r.status, r.detail, r.ts
     FROM queries q
     LEFT JOIN results r ON q.suite = r.suite AND q.name = r.test_name
 """)
@@ -67,8 +68,8 @@ def load_queries():
         entries = yaml.safe_load(f)
     for entry in entries:
         db.execute(
-            "INSERT INTO queries VALUES (?, ?, ?)",
-            [entry["suite"], entry["name"], entry["sql"]],
+            "INSERT INTO queries VALUES (?, ?, ?, ?)",
+            [entry["suite"], entry["name"], entry["sql"], entry.get("stub", False)],
         )
     count = db.execute("SELECT count(*) FROM queries").fetchone()[0]
     print(f"Loaded {count} query definitions from {QUERIES_PATH}", flush=True)
@@ -262,7 +263,7 @@ def write_results():
         db.execute("CREATE TABLE export_db.results AS SELECT * FROM results")
         db.execute("""
             CREATE VIEW export_db.coverage AS
-            SELECT q.suite, q.name, q.sql, r.client, r.status, r.detail, r.ts
+            SELECT q.suite, q.name, q.sql, q.stub, r.client, r.status, r.detail, r.ts
             FROM export_db.queries q
             LEFT JOIN export_db.results r ON q.suite = r.suite AND q.name = r.test_name
         """)

@@ -850,11 +850,11 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		`DROP MACRO IF EXISTS pg_get_expr`,
 		`CREATE MACRO pg_get_expr(expr, relid, pretty := false) AS NULL`,
 		// pg_get_indexdef - get index definition
-		`CREATE OR REPLACE MACRO pg_get_indexdef(index_oid) AS ''`,
-		`CREATE OR REPLACE MACRO pg_get_indexdef(index_oid, col, pretty) AS ''`,
+		`DROP MACRO IF EXISTS pg_get_indexdef`,
+		`CREATE MACRO pg_get_indexdef(index_oid, col := NULL, pretty := false) AS ''`,
 		// pg_get_constraintdef - get constraint definition
-		`CREATE OR REPLACE MACRO pg_get_constraintdef(constraint_oid) AS ''`,
-		`CREATE OR REPLACE MACRO pg_get_constraintdef(constraint_oid, pretty) AS ''`,
+		`DROP MACRO IF EXISTS pg_get_constraintdef`,
+		`CREATE MACRO pg_get_constraintdef(constraint_oid, pretty := false) AS ''`,
 		// pg_get_serial_sequence - get sequence name for a serial/identity column
 		// Returns NULL because DuckLake doesn't support sequences
 		`CREATE OR REPLACE MACRO pg_get_serial_sequence(table_name, column_name) AS NULL`,
