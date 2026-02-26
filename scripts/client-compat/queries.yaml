@@ -156,7 +156,7 @@
     LIMIT 20
 
 - suite: catalog_joins
-  name: psql_dt
+  name: list_tables
   sql: >-
     SELECT n.nspname as "Schema",
     c.relname as "Name",
@@ -170,7 +170,7 @@
     LIMIT 20
 
 - suite: catalog_joins
-  name: psql_dn
+  name: list_schemas
   sql: >-
     SELECT n.nspname AS "Name",
     pg_catalog.pg_get_userbyid(n.nspowner) AS "Owner"
@@ -179,7 +179,7 @@
     ORDER BY 1
 
 - suite: catalog_joins
-  name: psql_l
+  name: list_databases
   sql: >-
     SELECT d.datname as "Name",
     pg_catalog.pg_get_userbyid(d.datdba) as "Owner",
