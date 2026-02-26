@@ -35,7 +35,7 @@ services:
   psycopg:
     build:
       context: .
-      dockerfile: Dockerfile.psycopg
+      dockerfile: psycopg/Dockerfile
     container_name: compat-psycopg
     depends_on:
       duckgres:
@@ -55,7 +55,7 @@ services:
   harlequin:
     build:
       context: .
-      dockerfile: Dockerfile.harlequin
+      dockerfile: harlequin/Dockerfile
     container_name: compat-harlequin
     depends_on:
       duckgres:
@@ -76,7 +76,7 @@ services:
   pgx:
     build:
       context: .
-      dockerfile: Dockerfile.pgx
+      dockerfile: pgx/Dockerfile
     container_name: compat-pgx
     depends_on:
       duckgres:
@@ -96,7 +96,7 @@ services:
   psql:
     build:
       context: .
-      dockerfile: Dockerfile.psql
+      dockerfile: psql/Dockerfile
     container_name: compat-psql
     depends_on:
       duckgres:
