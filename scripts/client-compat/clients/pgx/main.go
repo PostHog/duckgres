@@ -98,6 +98,9 @@ func connect(ctx context.Context) (*pgx.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Safe to go without a cert check here since it's just in a test
+	// codeql[go/disabled-certificate-check]
 	cfg.TLSConfig = &tls.Config{InsecureSkipVerify: true}
 	return pgx.ConnectConfig(ctx, cfg)
 }
