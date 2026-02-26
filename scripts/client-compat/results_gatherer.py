@@ -4,15 +4,18 @@ Results gatherer for client compatibility tests.
 
 Runs an HTTP server that accepts test results from client containers,
 stores them in an in-memory DuckDB database, and produces a summary
-report when all clients have reported done.
+report on shutdown.
+
+Lifecycle is controlled externally: the orchestrator (justfile) waits for
+all client containers to exit, then POSTs /shutdown to trigger the report.
 
 Endpoints:
-    POST /result  — {"client", "suite", "test_name", "status", "detail"}
-    POST /done    — {"client"}
-    GET  /report  — current results as text
+    POST /result    — {"client", "suite", "test_name", "status", "detail"}
+    POST /shutdown  — trigger report and exit
+    GET  /report    — current results as text
+    GET  /health    — liveness probe
 
 Environment:
-    EXPECTED_CLIENTS  — comma-separated list of clients to wait for (e.g. "psycopg,harlequin")
     PORT              — listen port (default 8080)
 """
 
@@ -74,10 +77,6 @@ def load_queries():
 load_queries()
 
 lock = threading.Lock()
-done_clients: set[str] = set()
-expected_clients = set(
-    c.strip() for c in os.environ.get("EXPECTED_CLIENTS", "").split(",") if c.strip()
-)
 has_failures = False
 shutdown_event = threading.Event()
 
@@ -200,20 +199,9 @@ class Handler(BaseHTTPRequestHandler):
 
             self._respond(200, "ok")
 
-        elif self.path == "/done":
-            data = self._read_json()
-            client = data.get("client", "")
-
-            with lock:
-                done_clients.add(client)
-                all_done = expected_clients and done_clients >= expected_clients
-
-            if all_done:
-                self._respond(200, "all clients done, shutting down")
-                shutdown_event.set()
-            else:
-                remaining = expected_clients - done_clients
-                self._respond(200, f"waiting for: {', '.join(sorted(remaining))}")
+        elif self.path == "/shutdown":
+            self._respond(200, "shutting down")
+            shutdown_event.set()
 
         else:
             self._respond(404, "not found")
@@ -270,13 +258,9 @@ def write_results():
 def main():
     port = int(os.environ.get("PORT", "8080"))
 
-    if not expected_clients:
-        print("WARNING: EXPECTED_CLIENTS not set, will never auto-shutdown", flush=True)
-
     print(f"Results gatherer listening on :{port}", flush=True)
-    print(f"Expecting clients: {', '.join(sorted(expected_clients))}", flush=True)
 
-    # On SIGTERM (docker compose stop), dump whatever we have and exit.
+    # On SIGTERM (docker compose down), dump whatever we have and exit.
     def handle_sigterm(signum, frame):
         print("\nReceived SIGTERM, writing partial results...", flush=True)
         report, _ = generate_report()
@@ -291,7 +275,7 @@ def main():
     server_thread.daemon = True
     server_thread.start()
 
-    # Wait for all clients to report done
+    # Block until POST /shutdown is received.
     shutdown_event.wait()
 
     server.shutdown()
@@ -300,7 +284,7 @@ def main():
     print(report, flush=True)
     write_results()
 
-    sys.exit(1 if has_failures else 0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

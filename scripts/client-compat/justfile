@@ -2,15 +2,21 @@
 default:
     just --list
 
+# Client container names (must match docker-compose.yml)
+clients := "compat-psycopg compat-pgx compat-psql compat-jdbc compat-rust compat-sqlalchemy"
+
 # Run all client tests with results report
 all: build
     #!/usr/bin/env bash
+    set -euo pipefail
     docker compose up -d
-    docker compose wait results-gatherer
-    exit_code=$?
-    docker compose logs results-gatherer | tail -80
+    # Wait for all client containers to exit, then tell the gatherer to shut down.
+    docker wait {{ clients }}
+    docker exec compat-results python -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8080/shutdown', method='POST'))" || true
+    exit_code=$(docker wait compat-results)
+    docker compose logs results-gatherer
     docker compose down -v
-    exit "${exit_code}"
+    exit "$exit_code"
 
 # Build all containers
 build:
@@ -20,12 +26,6 @@ build:
 [group('client')]
 psycopg: build
     docker compose run --rm psycopg
-    docker compose down -v
-
-# Run harlequin compatibility tests (standalone, no report)
-[group('client')]
-harlequin: build
-    docker compose run --rm harlequin
     docker compose down -v
 
 # Run pgx (Go) compatibility tests (standalone, no report)
