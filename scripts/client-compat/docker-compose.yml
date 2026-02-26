@@ -1,0 +1,74 @@
+name: duckgres-client-compat
+
+services:
+  duckgres:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: compat-duckgres
+    command: ["--port", "5432"]
+    volumes:
+      - ./results:/results
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/5432'"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  results-gatherer:
+    build:
+      context: .
+      dockerfile: Dockerfile.results
+    container_name: compat-results
+    volumes:
+      - ./results:/results
+    environment:
+      RESULTS_DIR: /results
+      EXPECTED_CLIENTS: "psycopg,harlequin"
+      LOG_DIR: /results/results-gatherer
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  psycopg:
+    build:
+      context: .
+      dockerfile: Dockerfile.psycopg
+    container_name: compat-psycopg
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/psycopg
+
+  harlequin:
+    build:
+      context: .
+      dockerfile: Dockerfile.harlequin
+    container_name: compat-harlequin
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/harlequin

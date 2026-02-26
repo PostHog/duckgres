@@ -1,0 +1,26 @@
+# Client compatibility tests for duckgres
+default:
+    just --list
+
+# Run all client tests with results report
+all: build
+    docker compose up --abort-on-container-exit --exit-code-from results-gatherer
+    docker compose down -v
+
+# Build all containers
+build:
+    docker compose build
+
+# Run psycopg2 compatibility tests (standalone, no report)
+psycopg: build
+    docker compose run --rm psycopg
+    docker compose down -v
+
+# Run harlequin compatibility tests (standalone, no report)
+harlequin: build
+    docker compose run --rm harlequin
+    docker compose down -v
+
+# Tear down containers and volumes
+clean:
+    docker compose down -v

@@ -1,0 +1,245 @@
+# Shared catalog introspection queries for client compatibility testing.
+#
+# Every client runner loads this file, executes each query, and reports
+# pass/fail to the results gatherer.
+#
+# Fields:
+#   suite     - test grouping (catalog_views, catalog_funcs, etc.)
+#   name      - unique test name within the suite
+#   sql       - the query to execute (must succeed without error)
+
+# --- pg_catalog views ---
+- suite: catalog_views
+  name: pg_database
+  sql: SELECT datname FROM pg_database WHERE datallowconn
+
+- suite: catalog_views
+  name: pg_namespace
+  sql: SELECT nspname FROM pg_namespace
+
+- suite: catalog_views
+  name: pg_type
+  sql: SELECT typname, typtype FROM pg_type LIMIT 10
+
+- suite: catalog_views
+  name: pg_class
+  sql: SELECT relname, relkind FROM pg_class WHERE relkind = 'r' LIMIT 10
+
+- suite: catalog_views
+  name: pg_attribute
+  sql: SELECT attname, atttypid FROM pg_attribute WHERE attnum > 0 LIMIT 10
+
+- suite: catalog_views
+  name: pg_roles
+  sql: SELECT rolname FROM pg_roles
+
+- suite: catalog_views
+  name: pg_database_filtered
+  sql: >-
+    SELECT datname FROM pg_database
+    WHERE datistemplate IS false AND datallowconn IS true
+    ORDER BY datname
+
+# --- pg_catalog functions/macros ---
+- suite: catalog_funcs
+  name: format_type
+  sql: SELECT format_type(23, -1)
+
+- suite: catalog_funcs
+  name: format_type_varchar
+  sql: SELECT format_type(1043, 54)
+
+- suite: catalog_funcs
+  name: format_type_numeric
+  sql: SELECT format_type(1700, 655366)
+
+- suite: catalog_funcs
+  name: pg_get_userbyid
+  sql: SELECT pg_get_userbyid(10)
+
+- suite: catalog_funcs
+  name: pg_table_is_visible
+  sql: SELECT pg_table_is_visible(0)
+
+- suite: catalog_funcs
+  name: has_schema_privilege
+  sql: SELECT has_schema_privilege('public', 'USAGE')
+
+- suite: catalog_funcs
+  name: has_table_privilege
+  sql: SELECT has_table_privilege('pg_class', 'SELECT')
+
+- suite: catalog_funcs
+  name: pg_encoding_to_char
+  sql: SELECT pg_encoding_to_char(6)
+
+- suite: catalog_funcs
+  name: version
+  sql: SELECT version()
+
+- suite: catalog_funcs
+  name: current_setting
+  sql: SELECT current_setting('server_version')
+
+- suite: catalog_funcs
+  name: obj_description
+  sql: SELECT obj_description(0, 'pg_class')
+
+- suite: catalog_funcs
+  name: col_description
+  sql: SELECT col_description(0, 1)
+
+- suite: catalog_funcs
+  name: pg_is_in_recovery
+  sql: SELECT pg_is_in_recovery()
+
+- suite: catalog_funcs
+  name: pg_backend_pid
+  sql: SELECT pg_backend_pid()
+
+- suite: catalog_funcs
+  name: pg_size_pretty
+  sql: SELECT pg_size_pretty(1048576)
+
+- suite: catalog_funcs
+  name: quote_ident
+  sql: SELECT quote_ident('my_table')
+
+- suite: catalog_funcs
+  name: quote_literal
+  sql: SELECT quote_literal('hello')
+
+# --- information_schema views ---
+- suite: info_schema
+  name: tables
+  sql: SELECT table_name, table_type FROM information_schema.tables LIMIT 10
+
+- suite: info_schema
+  name: columns
+  sql: >-
+    SELECT table_name, column_name, data_type
+    FROM information_schema.columns LIMIT 10
+
+- suite: info_schema
+  name: schemata
+  sql: SELECT schema_name FROM information_schema.schemata
+
+- suite: info_schema
+  name: schemata_filtered
+  sql: >-
+    SELECT schema_name FROM information_schema.schemata
+    WHERE schema_name != 'information_schema'
+    AND schema_name NOT LIKE 'pg_%'
+    ORDER BY schema_name
+
+# --- multi-table joins that real tools send ---
+- suite: catalog_joins
+  name: pg_class_join_namespace
+  sql: >-
+    SELECT n.nspname, c.relname, c.relkind
+    FROM pg_class c
+    JOIN pg_namespace n ON c.relnamespace = n.oid
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+    ORDER BY n.nspname, c.relname
+    LIMIT 20
+
+- suite: catalog_joins
+  name: pg_attribute_join_format_type
+  sql: >-
+    SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
+    FROM pg_attribute a
+    JOIN pg_class t ON a.attrelid = t.oid
+    JOIN pg_namespace s ON t.relnamespace = s.oid
+    WHERE a.attnum > 0 AND NOT a.attisdropped
+    AND s.nspname NOT IN ('pg_catalog', 'information_schema')
+    ORDER BY a.attnum
+    LIMIT 20
+
+- suite: catalog_joins
+  name: psql_dt
+  sql: >-
+    SELECT n.nspname as "Schema",
+    c.relname as "Name",
+    CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' END as "Type",
+    pg_catalog.pg_get_userbyid(c.relowner) as "Owner"
+    FROM pg_catalog.pg_class c
+    LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r','v')
+    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    ORDER BY 1, 2
+    LIMIT 20
+
+- suite: catalog_joins
+  name: psql_dn
+  sql: >-
+    SELECT n.nspname AS "Name",
+    pg_catalog.pg_get_userbyid(n.nspowner) AS "Owner"
+    FROM pg_catalog.pg_namespace n
+    WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+    ORDER BY 1
+
+- suite: catalog_joins
+  name: psql_l
+  sql: >-
+    SELECT d.datname as "Name",
+    pg_catalog.pg_get_userbyid(d.datdba) as "Owner",
+    pg_catalog.pg_encoding_to_char(d.encoding) as "Encoding"
+    FROM pg_catalog.pg_database d
+    ORDER BY 1
+
+# --- stub views (should return empty, not error) ---
+- suite: catalog_stubs
+  name: pg_matviews
+  sql: SELECT matviewname FROM pg_matviews
+
+- suite: catalog_stubs
+  name: pg_policy
+  sql: SELECT * FROM pg_policy LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_collation
+  sql: SELECT collname FROM pg_collation LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_statistic_ext
+  sql: SELECT * FROM pg_statistic_ext LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_publication
+  sql: SELECT * FROM pg_publication LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_inherits
+  sql: SELECT * FROM pg_inherits LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_rules
+  sql: SELECT * FROM pg_rules LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_stat_statements
+  sql: SELECT * FROM pg_stat_statements LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_partitioned_table
+  sql: SELECT * FROM pg_partitioned_table LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_constraint
+  sql: SELECT * FROM pg_constraint LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_enum
+  sql: SELECT * FROM pg_enum LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_indexes
+  sql: SELECT * FROM pg_indexes LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_stat_activity
+  sql: SELECT * FROM pg_stat_activity LIMIT 5
+
+- suite: catalog_stubs
+  name: pg_stat_user_tables
+  sql: SELECT relname FROM pg_stat_user_tables LIMIT 5
