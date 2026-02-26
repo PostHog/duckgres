@@ -4,8 +4,13 @@ default:
 
 # Run all client tests with results report
 all: build
-    docker compose up --abort-on-container-exit --exit-code-from results-gatherer
+    #!/usr/bin/env bash
+    docker compose up -d
+    docker compose wait results-gatherer
+    exit_code=$?
+    docker compose logs results-gatherer | tail -80
     docker compose down -v
+    exit "${exit_code}"
 
 # Build all containers
 build:
@@ -39,6 +44,18 @@ psql: build
 [group('client')]
 jdbc: build
     docker compose run --rm jdbc
+    docker compose down -v
+
+# Run Rust (tokio-postgres) compatibility tests (standalone, no report)
+[group('client')]
+rust: build
+    docker compose run --rm rust
+    docker compose down -v
+
+# Run SQLAlchemy compatibility tests (standalone, no report)
+[group('client')]
+sqlalchemy: build
+    docker compose run --rm sqlalchemy
     docker compose down -v
 
 # Tear down containers and volumes

@@ -24,7 +24,7 @@ services:
       - ./results:/results
     environment:
       RESULTS_DIR: /results
-      EXPECTED_CLIENTS: "psycopg,harlequin,pgx,psql,jdbc"
+      EXPECTED_CLIENTS: "psycopg,harlequin,pgx,psql,jdbc,rust,sqlalchemy"
       LOG_DIR: /results/results-gatherer
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
@@ -132,3 +132,43 @@ services:
       PGPASSWORD: postgres
       RESULTS_URL: http://results-gatherer:8080
       LOG_DIR: /results/jdbc
+
+  rust:
+    build:
+      context: .
+      dockerfile: rust/Dockerfile
+    container_name: compat-rust
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/rust
+
+  sqlalchemy:
+    build:
+      context: .
+      dockerfile: sqlalchemy/Dockerfile
+    container_name: compat-sqlalchemy
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/sqlalchemy
