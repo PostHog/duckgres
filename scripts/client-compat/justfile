@@ -81,6 +81,25 @@ find-db:
     fi
     echo "$db"
 
+# One-line-per-client overview with per-suite success percentages
+[group('results')]
+overview:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    db=$(just find-db)
+    duckdb "$db" -c "
+        SELECT client,
+               round(100.0 * count(*) FILTER (WHERE status = 'pass' AND suite IN (SELECT DISTINCT suite FROM queries))
+                           / count(*) FILTER (WHERE suite IN (SELECT DISTINCT suite FROM queries)), 0)::INT || '%' AS shared,
+               round(100.0 * count(*) FILTER (WHERE status = 'pass' AND suite NOT IN (SELECT DISTINCT suite FROM queries))
+                           / nullif(count(*) FILTER (WHERE suite NOT IN (SELECT DISTINCT suite FROM queries)), 0), 0)::INT || '%' AS client_specific,
+               count(*) FILTER (WHERE status = 'pass') AS pass,
+               count(*) FILTER (WHERE status = 'fail') AS fail
+        FROM results
+        GROUP BY client
+        ORDER BY client;
+    "
+
 # Summary of pass/fail counts by client and suite
 [group('results')]
 summary:
