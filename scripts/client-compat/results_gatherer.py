@@ -25,9 +25,19 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import duckdb
+import yaml
 
+
+QUERIES_PATH = os.environ.get("QUERIES_PATH", "/queries.yaml")
 
 db = duckdb.connect(":memory:")
+db.execute("""
+    CREATE TABLE queries (
+        suite VARCHAR,
+        name VARCHAR,
+        sql VARCHAR
+    )
+""")
 db.execute("""
     CREATE TABLE results (
         client VARCHAR,
@@ -38,6 +48,30 @@ db.execute("""
         ts TIMESTAMP DEFAULT current_timestamp
     )
 """)
+
+
+db.execute("""
+    CREATE VIEW coverage AS
+    SELECT q.suite, q.name, q.sql, r.client, r.status, r.detail, r.ts
+    FROM queries q
+    LEFT JOIN results r ON q.suite = r.suite AND q.name = r.test_name
+""")
+
+
+def load_queries():
+    """Load query definitions from YAML into the queries table."""
+    with open(QUERIES_PATH) as f:
+        entries = yaml.safe_load(f)
+    for entry in entries:
+        db.execute(
+            "INSERT INTO queries VALUES (?, ?, ?)",
+            [entry["suite"], entry["name"], entry["sql"]],
+        )
+    count = db.execute("SELECT count(*) FROM queries").fetchone()[0]
+    print(f"Loaded {count} query definitions from {QUERIES_PATH}", flush=True)
+
+
+load_queries()
 
 lock = threading.Lock()
 done_clients: set[str] = set()
@@ -106,6 +140,21 @@ def generate_report() -> tuple[str, bool]:
         for client, suite, test_name, detail in failures:
             detail_str = f": {detail}" if detail else ""
             lines.append(f"    {client} / {suite} / {test_name}{detail_str}")
+
+    # Coverage: queries with no results from any client
+    untested = db.execute("""
+        SELECT q.suite, q.name
+        FROM queries q
+        LEFT JOIN results r ON q.suite = r.suite AND q.name = r.test_name
+        WHERE r.test_name IS NULL
+        ORDER BY q.suite, q.name
+    """).fetchall()
+
+    if untested:
+        lines.append("")
+        lines.append("  UNTESTED QUERIES:")
+        for suite, name in untested:
+            lines.append(f"    {suite} / {name}")
 
     lines.append("=" * 70)
     lines.append("")
@@ -183,10 +232,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def write_results():
-    """Write results JSON to volume if configured."""
+    """Write results JSON and DuckDB database to volume if configured."""
     results_dir = os.environ.get("RESULTS_DIR")
     if not results_dir:
         return
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    # JSON export
     with lock:
         rows = db.execute("""
             SELECT client, suite, test_name, status, detail, ts::VARCHAR AS ts
@@ -194,11 +246,25 @@ def write_results():
         """).fetchall()
     cols = ["client", "suite", "test_name", "status", "detail", "ts"]
     records = [dict(zip(cols, row)) for row in rows]
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(results_dir, f"results_{ts}.json")
-    with open(out_path, "w") as f:
+    json_path = os.path.join(results_dir, f"results_{ts}.json")
+    with open(json_path, "w") as f:
         json.dump(records, f, indent=2)
-    print(f"Results written to {out_path}", flush=True)
+    print(f"Results written to {json_path}", flush=True)
+
+    # DuckDB file export (contains both queries and results tables)
+    db_path = os.path.join(results_dir, f"results_{ts}.duckdb")
+    with lock:
+        db.execute(f"ATTACH '{db_path}' AS export_db")
+        db.execute("CREATE TABLE export_db.queries AS SELECT * FROM queries")
+        db.execute("CREATE TABLE export_db.results AS SELECT * FROM results")
+        db.execute("""
+            CREATE VIEW export_db.coverage AS
+            SELECT q.suite, q.name, q.sql, r.client, r.status, r.detail, r.ts
+            FROM export_db.queries q
+            LEFT JOIN export_db.results r ON q.suite = r.suite AND q.name = r.test_name
+        """)
+        db.execute("DETACH export_db")
+    print(f"DuckDB written to {db_path}", flush=True)
 
 
 def main():
