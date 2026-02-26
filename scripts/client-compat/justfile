@@ -22,41 +22,34 @@ all: build
 build:
     docker compose build
 
+[private]
+run-client client: build
+    -docker compose run --rm {{ client }}
+    docker compose down -v
+
 # Run psycopg2 compatibility tests (standalone, no report)
 [group('client')]
-psycopg: build
-    docker compose run --rm psycopg
-    docker compose down -v
+psycopg: (run-client "psycopg")
 
 # Run pgx (Go) compatibility tests (standalone, no report)
 [group('client')]
-pgx: build
-    docker compose run --rm pgx
-    docker compose down -v
+pgx: (run-client "pgx")
 
 # Run psql compatibility tests (standalone, no report)
 [group('client')]
-psql: build
-    docker compose run --rm psql
-    docker compose down -v
+psql: (run-client "psql")
 
 # Run JDBC compatibility tests (standalone, no report)
 [group('client')]
-jdbc: build
-    docker compose run --rm jdbc
-    docker compose down -v
+jdbc: (run-client "jdbc")
 
 # Run tokio-postgres (Rust) compatibility tests (standalone, no report)
 [group('client')]
-tokio-postgres: build
-    docker compose run --rm tokio-postgres
-    docker compose down -v
+tokio-postgres: (run-client "tokio-postgres")
 
 # Run SQLAlchemy compatibility tests (standalone, no report)
 [group('client')]
-sqlalchemy: build
-    docker compose run --rm sqlalchemy
-    docker compose down -v
+sqlalchemy: (run-client "sqlalchemy")
 
 # Tear down containers and volumes
 down:
