@@ -1,11 +1,11 @@
 FROM rust:1.84-bookworm AS builder
 
 WORKDIR /app
-COPY rust/Cargo.toml ./
+COPY clients/tokio-postgres/Cargo.toml ./
 # Create dummy main to cache dependency builds
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
 
-COPY rust/src ./src
+COPY clients/tokio-postgres/src ./src
 # Touch main.rs so cargo rebuilds it (not just the deps)
 RUN touch src/main.rs && cargo build --release
 

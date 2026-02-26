@@ -31,7 +31,7 @@ just query-last-run
 | `just clean` | Remove the `results/` directory |
 | `just query-last-run` | Open the latest results database in DuckDB CLI |
 
-Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `rust`, `sqlalchemy`.
+Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `sqlalchemy`.
 
 ## Clients
 
@@ -41,7 +41,7 @@ Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `rust`, `sqla
 | pgx | Go 1.24 | jackc/pgx/v5 | golang:1.24 |
 | psql | Bash | psql CLI | postgres:17 |
 | jdbc | Java 17 | org.postgresql:postgresql 42.7 | maven:3-eclipse-temurin-17 |
-| rust | Rust 1.84 | tokio-postgres 0.7 | rust:1.84-slim |
+| tokio-postgres | Rust 1.84 | tokio-postgres 0.7 | rust:1.84-bookworm |
 | sqlalchemy | Python 3.12 | SQLAlchemy 2.x + psycopg2 | python:3.12-slim |
 
 ## Architecture
@@ -107,7 +107,7 @@ Each client tests driver-specific features beyond the shared catalog:
 | pgx | `connection`, `ddl_dml`, `batch` (pgx.Batch / SendBatch) |
 | psql | `psql_commands` (`\dt`, `\dn`, `\l`, `\di`, `\dv`, `\df`), `ddl_dml`, `copy` |
 | jdbc | `connection`, `ddl_dml`, `metadata` (DatabaseMetaData), `batch`, `resultset_metadata` |
-| rust | `connection`, `ddl_dml`, `prepared` |
+| tokio-postgres | `connection`, `ddl_dml`, `prepared` |
 | sqlalchemy | `connection`, `core_ddl_dml`, `orm`, `inspection`, `raw_params` |
 
 ## Results
@@ -176,7 +176,7 @@ WHERE client IS NULL;
 
 ## Adding a New Client
 
-1. Create a directory under `scripts/client-compat/` (e.g. `dotnet/`)
+1. Create a directory under `scripts/client-compat/clients/` (e.g. `clients/dotnet/`)
 2. Add a `Dockerfile` that:
    - Copies `entrypoint.sh` and `queries.yaml`
    - Sets `ENTRYPOINT ["/entrypoint.sh"]` and `CMD` to run your test script

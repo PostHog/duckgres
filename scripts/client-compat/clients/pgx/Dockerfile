@@ -1,9 +1,9 @@
 FROM golang:1.24-bookworm AS builder
 
 WORKDIR /app
-COPY pgx/go.mod pgx/go.sum ./
+COPY clients/pgx/go.mod clients/pgx/go.sum ./
 RUN go mod download
-COPY pgx/main.go .
+COPY clients/pgx/main.go .
 RUN CGO_ENABLED=0 go build -o /test_pgx .
 
 FROM debian:bookworm-slim

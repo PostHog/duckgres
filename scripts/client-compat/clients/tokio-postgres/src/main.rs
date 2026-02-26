@@ -14,7 +14,7 @@ use tokio_postgres::Client;
 static PASSED: AtomicU32 = AtomicU32::new(0);
 static FAILED: AtomicU32 = AtomicU32::new(0);
 
-const CLIENT_NAME: &str = "rust";
+const CLIENT_NAME: &str = "tokio-postgres";
 
 fn env_or(key: &str, fallback: &str) -> String {
     env::var(key).unwrap_or_else(|_| fallback.to_string())

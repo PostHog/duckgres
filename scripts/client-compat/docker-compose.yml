@@ -34,7 +34,7 @@ services:
   psycopg:
     build:
       context: .
-      dockerfile: psycopg/Dockerfile
+      dockerfile: clients/psycopg/Dockerfile
     container_name: compat-psycopg
     depends_on:
       duckgres:
@@ -54,7 +54,7 @@ services:
   pgx:
     build:
       context: .
-      dockerfile: pgx/Dockerfile
+      dockerfile: clients/pgx/Dockerfile
     container_name: compat-pgx
     depends_on:
       duckgres:
@@ -74,7 +74,7 @@ services:
   psql:
     build:
       context: .
-      dockerfile: psql/Dockerfile
+      dockerfile: clients/psql/Dockerfile
     container_name: compat-psql
     depends_on:
       duckgres:
@@ -94,7 +94,7 @@ services:
   jdbc:
     build:
       context: .
-      dockerfile: jdbc/Dockerfile
+      dockerfile: clients/jdbc/Dockerfile
     container_name: compat-jdbc
     depends_on:
       duckgres:
@@ -111,11 +111,11 @@ services:
       RESULTS_URL: http://results-gatherer:8080
       LOG_DIR: /results/jdbc
 
-  rust:
+  tokio-postgres:
     build:
       context: .
-      dockerfile: rust/Dockerfile
-    container_name: compat-rust
+      dockerfile: clients/tokio-postgres/Dockerfile
+    container_name: compat-tokio-postgres
     depends_on:
       duckgres:
         condition: service_healthy
@@ -129,12 +129,12 @@ services:
       PGUSER: postgres
       PGPASSWORD: postgres
       RESULTS_URL: http://results-gatherer:8080
-      LOG_DIR: /results/rust
+      LOG_DIR: /results/tokio-postgres
 
   sqlalchemy:
     build:
       context: .
-      dockerfile: sqlalchemy/Dockerfile
+      dockerfile: clients/sqlalchemy/Dockerfile
     container_name: compat-sqlalchemy
     depends_on:
       duckgres:
