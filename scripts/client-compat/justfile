@@ -3,7 +3,7 @@ default:
     just --list
 
 # Client container names (must match docker-compose.yml)
-clients := "compat-psycopg compat-pgx compat-psql compat-jdbc compat-tokio-postgres compat-sqlalchemy"
+clients := "compat-psycopg compat-pgx compat-psql compat-jdbc compat-tokio-postgres compat-node-postgres compat-sqlalchemy"
 
 # Run all client tests with results report
 all: build
@@ -21,6 +21,10 @@ all: build
 # Build all containers
 build:
     docker compose build
+
+# Rebuild all containers from scratch (no cache)
+rebuild:
+    docker compose build --no-cache
 
 [private]
 run-client client: build
@@ -46,6 +50,10 @@ jdbc: (run-client "jdbc")
 # Run tokio-postgres (Rust) compatibility tests (standalone, no report)
 [group('client')]
 tokio-postgres: (run-client "tokio-postgres")
+
+# Run node-postgres (Node.js) compatibility tests (standalone, no report)
+[group('client')]
+node-postgres: (run-client "node-postgres")
 
 # Run SQLAlchemy compatibility tests (standalone, no report)
 [group('client')]

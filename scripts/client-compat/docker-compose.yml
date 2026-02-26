@@ -131,6 +131,26 @@ services:
       RESULTS_URL: http://results-gatherer:8080
       LOG_DIR: /results/tokio-postgres
 
+  node-postgres:
+    build:
+      context: .
+      dockerfile: clients/node-postgres/Dockerfile
+    container_name: compat-node-postgres
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/node-postgres
+
   sqlalchemy:
     build:
       context: .

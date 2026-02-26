@@ -34,7 +34,7 @@ just query-last-run
 | `just view-last-run` | Print the full results table |
 | `just query-last-run` | Open the latest results database in DuckDB CLI |
 
-Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `sqlalchemy`.
+Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `node-postgres`, `sqlalchemy`.
 
 ## Clients
 
@@ -45,6 +45,7 @@ Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgr
 | psql | Bash | psql CLI | postgres:17 |
 | jdbc | Java 17 | org.postgresql:postgresql 42.7 | maven:3-eclipse-temurin-17 |
 | tokio-postgres | Rust 1.84 | tokio-postgres 0.7 | rust:1.84-bookworm |
+| node-postgres | Node.js 22 | pg 8.x | node:22-bookworm-slim |
 | sqlalchemy | Python 3.12 | SQLAlchemy 2.x + psycopg2 | python:3.12-slim |
 
 ## Architecture
@@ -111,6 +112,7 @@ Each client tests driver-specific features beyond the shared catalog:
 | psql | `psql_commands` (`\dt`, `\dn`, `\l`, `\di`, `\dv`, `\df`), `ddl_dml`, `copy` |
 | jdbc | `connection`, `ddl_dml`, `metadata` (DatabaseMetaData), `batch`, `resultset_metadata` |
 | tokio-postgres | `connection`, `ddl_dml`, `prepared` |
+| node-postgres | `connection`, `ddl_dml`, `prepared`, `result_metadata` |
 | sqlalchemy | `connection`, `core_ddl_dml`, `orm`, `inspection`, `raw_params` |
 
 ## Results

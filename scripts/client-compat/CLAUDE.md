@@ -23,6 +23,7 @@ scripts/client-compat/
 │   ├── psql/
 │   ├── jdbc/
 │   ├── tokio-postgres/
+│   ├── node-postgres/
 │   ├── sqlalchemy/
 │   └── harlequin/
 └── results/                    # output volume (.gitignored)

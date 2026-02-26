@@ -79,6 +79,8 @@ load_queries()
 lock = threading.Lock()
 has_failures = False
 shutdown_event = threading.Event()
+result_count = 0
+clients_seen: set[str] = set()
 
 
 def generate_report() -> tuple[str, bool]:
@@ -179,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body.encode())
 
     def do_POST(self):
-        global has_failures
+        global has_failures, result_count
 
         if self.path == "/result":
             data = self._read_json()
@@ -196,10 +198,23 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if status == "fail":
                     has_failures = True
+                result_count += 1
+                is_new_client = client not in clients_seen
+                clients_seen.add(client)
+
+            marker = "PASS" if status == "pass" else "FAIL"
+            detail_str = f" ({detail})" if detail else ""
+            if is_new_client:
+                print(f"[{client}] first result received", flush=True)
+            print(f"  [{client}] {marker}  {suite}/{test_name}{detail_str}", flush=True)
 
             self._respond(200, "ok")
 
         elif self.path == "/shutdown":
+            with lock:
+                n = result_count
+                c = len(clients_seen)
+            print(f"\nShutdown requested. {n} results from {c} client(s): {', '.join(sorted(clients_seen))}", flush=True)
             self._respond(200, "shutting down")
             shutdown_event.set()
 
