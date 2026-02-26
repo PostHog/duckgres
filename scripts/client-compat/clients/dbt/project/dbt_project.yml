@@ -1,0 +1,7 @@
+name: duckgres_compat
+version: "1.0.0"
+
+profile: duckgres
+
+model-paths: ["models"]
+test-paths: ["tests"]

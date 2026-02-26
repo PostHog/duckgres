@@ -1,0 +1,12 @@
+duckgres:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('PGHOST', 'duckgres') }}"
+      port: "{{ env_var('PGPORT', '5432') | int }}"
+      user: "{{ env_var('PGUSER', 'postgres') }}"
+      pass: "{{ env_var('PGPASSWORD', 'postgres') }}"
+      dbname: postgres
+      schema: public
+      sslmode: require

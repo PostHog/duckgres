@@ -34,7 +34,7 @@ just query-last-run
 | `just view-last-run` | Print the full results table |
 | `just query-last-run` | Open the latest results database in DuckDB CLI |
 
-Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `node-postgres`, `sqlalchemy`.
+Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `node-postgres`, `sqlalchemy`, `dbt`.
 
 ## Clients
 
@@ -47,6 +47,7 @@ Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgr
 | tokio-postgres | Rust 1.84 | tokio-postgres 0.7 | rust:1.84-bookworm |
 | node-postgres | Node.js 22 | pg 8.x | node:22-bookworm-slim |
 | sqlalchemy | Python 3.12 | SQLAlchemy 2.x + psycopg2 | python:3.12-slim |
+| dbt | Python 3.12 | dbt-postgres (psycopg2) | python:3.12-slim |
 
 ## Architecture
 
@@ -114,6 +115,7 @@ Each client tests driver-specific features beyond the shared catalog:
 | tokio-postgres | `connection`, `ddl_dml`, `prepared` |
 | node-postgres | `connection`, `ddl_dml`, `prepared`, `result_metadata` |
 | sqlalchemy | `connection`, `core_ddl_dml`, `orm`, `inspection`, `raw_params` |
+| dbt | `dbt_lifecycle` (`dbt debug`, `dbt run`, `dbt test`, `dbt docs generate`) |
 
 ## Results
 

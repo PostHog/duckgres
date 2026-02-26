@@ -3,7 +3,7 @@ default:
     just --list
 
 # Client container names (must match docker-compose.yml)
-clients := "compat-psycopg compat-pgx compat-psql compat-jdbc compat-tokio-postgres compat-node-postgres compat-sqlalchemy"
+clients := "compat-psycopg compat-pgx compat-psql compat-jdbc compat-tokio-postgres compat-node-postgres compat-sqlalchemy compat-dbt"
 
 # Run all client tests with results report
 all: build
@@ -58,6 +58,10 @@ node-postgres: (run-client "node-postgres")
 # Run SQLAlchemy compatibility tests (standalone, no report)
 [group('client')]
 sqlalchemy: (run-client "sqlalchemy")
+
+# Run dbt-postgres compatibility tests (standalone, no report)
+[group('client')]
+dbt: (run-client "dbt")
 
 # Tear down containers and volumes
 down:

@@ -1,0 +1,15 @@
+version: 2
+
+models:
+  - name: staging_numbers
+    columns:
+      - name: id
+        tests:
+          - not_null
+          - unique
+
+  - name: agg_summary
+    columns:
+      - name: total_rows
+        tests:
+          - not_null
