@@ -25,8 +25,7 @@ scripts/client-compat/
 │   ├── tokio-postgres/
 │   ├── node-postgres/
 │   ├── sqlalchemy/
-│   ├── dbt/
-│   └── harlequin/
+│   └── dbt/
 └── results/                    # output volume (.gitignored)
 ```
 
@@ -190,7 +189,16 @@ Duckgres auto-generates a self-signed cert. Clients must accept it:
 Group related tests under a suite name. Common conventions:
 - `connection` — TLS, auth, server version, driver info
 - `ddl_dml` / `core_ddl_dml` — CREATE, INSERT, UPDATE, DELETE, DROP
+- `dbeaver_introspection` — DBeaver CE metadata queries (see below)
 - Library-specific features get their own suite (`batch`, `copy`, `orm`, `prepared`, etc.)
+
+### DBeaver introspection suite
+
+DBeaver CE cannot run headlessly in Docker (GTK3 SWT bug freezes the event loop under Xvfb).
+Instead, the `dbeaver_introspection` suite in `queries.yaml` contains the exact catalog queries
+DBeaver fires on connect, sourced from [cockroachdb/cockroach#28309](https://github.com/cockroachdb/cockroach/issues/28309).
+These queries are executed by every client, testing the same catalog surface a real DBeaver
+connection would exercise.
 
 ## Results Database
 
