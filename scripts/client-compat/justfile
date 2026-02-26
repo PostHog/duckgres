@@ -21,6 +21,11 @@ harlequin: build
     docker compose run --rm harlequin
     docker compose down -v
 
+# Run pgx (Go) compatibility tests (standalone, no report)
+pgx: build
+    docker compose run --rm pgx
+    docker compose down -v
+
 # Tear down containers and volumes
 clean:
     docker compose down -v
