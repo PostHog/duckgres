@@ -170,3 +170,23 @@ services:
       PGPASSWORD: postgres
       RESULTS_URL: http://results-gatherer:8080
       LOG_DIR: /results/sqlalchemy
+
+  dbt:
+    build:
+      context: .
+      dockerfile: clients/dbt/Dockerfile
+    container_name: compat-dbt
+    depends_on:
+      duckgres:
+        condition: service_healthy
+      results-gatherer:
+        condition: service_healthy
+    volumes:
+      - ./results:/results
+    environment:
+      PGHOST: duckgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      RESULTS_URL: http://results-gatherer:8080
+      LOG_DIR: /results/dbt

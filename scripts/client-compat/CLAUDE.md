@@ -25,6 +25,7 @@ scripts/client-compat/
 │   ├── tokio-postgres/
 │   ├── node-postgres/
 │   ├── sqlalchemy/
+│   ├── dbt/
 │   └── harlequin/
 └── results/                    # output volume (.gitignored)
 ```
@@ -118,6 +119,7 @@ The shared queries YAML format:
 ```yaml
 - suite: catalog_views
   name: pg_database
+  stub: true            # optional — flags hardcoded dummy return values
   sql: SELECT datname FROM pg_database WHERE datallowconn
 ```
 
@@ -194,8 +196,8 @@ Group related tests under a suite name. Common conventions:
 
 Exported to `results/results_<timestamp>.duckdb` with:
 
-- `queries` table — the shared query catalog from `queries.yaml`
+- `queries` table — the shared query catalog from `queries.yaml` (includes `stub` boolean)
 - `results` table — all test outcomes (client, suite, test_name, status, detail, ts)
-- `coverage` view — LEFT JOIN of queries to results (shows gaps)
+- `coverage` view — LEFT JOIN of queries to results (shows gaps, includes `stub` flag)
 
 Open with `just query-last-run` or `duckdb results/results_*.duckdb`.

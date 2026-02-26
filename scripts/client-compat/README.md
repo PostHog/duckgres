@@ -34,7 +34,7 @@ just query-last-run
 | `just view-last-run` | Print the full results table |
 | `just query-last-run` | Open the latest results database in DuckDB CLI |
 
-Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `node-postgres`, `sqlalchemy`.
+Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `node-postgres`, `sqlalchemy`, `dbt`.
 
 ## Clients
 
@@ -47,6 +47,7 @@ Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgr
 | tokio-postgres | Rust 1.84 | tokio-postgres 0.7 | rust:1.84-bookworm |
 | node-postgres | Node.js 22 | pg 8.x | node:22-bookworm-slim |
 | sqlalchemy | Python 3.12 | SQLAlchemy 2.x + psycopg2 | python:3.12-slim |
+| dbt | Python 3.12 | dbt-postgres (psycopg2) | python:3.12-slim |
 
 ## Architecture
 
@@ -91,15 +92,17 @@ Every client runs two categories of tests:
 
 ### Shared Queries (`queries.yaml`)
 
-A YAML catalog of 44 queries across 5 suites that every client executes. A query passes if it executes without error (row counts are reported but not validated).
+A YAML catalog of 58 queries across 5 suites that every client executes. A query passes if it executes without error (row counts are reported but not validated).
+
+Queries may be tagged `stub: true` to indicate the underlying function or view returns a hardcoded dummy value (empty string, NULL, 0, false, or empty result set) rather than meaningful data. This distinguishes "won't crash your client" from "returns useful information" in the results.
 
 | Suite | Count | Purpose |
 |-------|-------|---------|
 | `catalog_views` | 7 | Core pg_catalog views (`pg_database`, `pg_namespace`, `pg_type`, etc.) |
-| `catalog_funcs` | 14 | PostgreSQL functions (`format_type`, `version()`, `current_setting`, etc.) |
+| `catalog_funcs` | 26 | PostgreSQL functions (`format_type`, `version()`, `pg_get_indexdef`, size functions, etc.) |
 | `info_schema` | 4 | `information_schema.tables`, `.columns`, `.schemata` |
 | `catalog_joins` | 5 | Multi-table joins that real tools emit (psql `\dt`, `\dn`, `\l` queries) |
-| `catalog_stubs` | 14 | Stub views that must exist but return empty (`pg_matviews`, `pg_policy`, etc.) |
+| `catalog_stubs` | 16 | Stub views that must exist but return empty (`pg_matviews`, `pg_policy`, etc.) |
 
 ### Client-Specific Suites
 
@@ -114,6 +117,7 @@ Each client tests driver-specific features beyond the shared catalog:
 | tokio-postgres | `connection`, `ddl_dml`, `prepared` |
 | node-postgres | `connection`, `ddl_dml`, `prepared`, `result_metadata` |
 | sqlalchemy | `connection`, `core_ddl_dml`, `orm`, `inspection`, `raw_params` |
+| dbt | `dbt_lifecycle` (`dbt debug`, `dbt run`, `dbt test`, `dbt docs generate`) |
 
 ## Results
 
@@ -139,7 +143,8 @@ results/
 CREATE TABLE queries (
     suite VARCHAR,
     name  VARCHAR,
-    sql   VARCHAR
+    sql   VARCHAR,
+    stub  BOOLEAN DEFAULT false  -- true = hardcoded dummy return value
 );
 
 -- Test outcomes
@@ -154,7 +159,7 @@ CREATE TABLE results (
 
 -- Coverage: LEFT JOIN of queries to results (shows untested queries)
 CREATE VIEW coverage AS
-SELECT q.suite, q.name, q.sql,
+SELECT q.suite, q.name, q.sql, q.stub,
        r.client, r.status, r.detail, r.ts
 FROM queries q
 LEFT JOIN results r ON q.suite = r.suite AND q.name = r.test_name;
