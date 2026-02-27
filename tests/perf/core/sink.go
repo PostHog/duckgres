@@ -66,7 +66,7 @@ func (s *ArtifactSink) Record(result QueryResult) error {
 		result.Error,
 		result.ErrorClass,
 		strconv.FormatInt(result.Rows, 10),
-		strconv.FormatFloat(float64(result.Duration)/float64(time.Millisecond), 'f', 3, 64),
+		strconv.FormatFloat(float64(result.Duration)/float64(time.Millisecond), 'f', 6, 64),
 		result.StartedAt.UTC().Format(time.RFC3339Nano),
 	}
 	if err := s.csvWriter.Write(row); err != nil {

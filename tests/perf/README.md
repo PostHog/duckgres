@@ -11,11 +11,15 @@ This package contains the golden-query performance harness.
 This runs:
 
 ```bash
-go test ./tests/perf/... \
+go test ./tests/perf \
   -run TestGoldenQueryPerformanceHarness \
   -perf-run \
   -perf-catalog tests/perf/queries/smoke.yaml
 ```
+
+By default the harness auto-starts a temporary local Duckgres control-plane
+instance with Flight ingress, executes queries over both protocols, then shuts
+it down after artifact generation.
 
 Artifacts are written to `artifacts/perf/<run_id>`:
 
@@ -45,4 +49,5 @@ Optional upload hook:
 - `-perf-catalog`: catalog YAML path.
 - `-perf-output-base`: base output directory.
 - `-perf-run-id`: fixed run id.
-
+- `-perf-pgwire-dsn`: use an existing PGWire endpoint instead of auto-start.
+- `-perf-flight-addr`: use an existing Flight endpoint instead of auto-start.

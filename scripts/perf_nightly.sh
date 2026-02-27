@@ -6,8 +6,8 @@ cd "$ROOT_DIR"
 
 LOCK_FILE="${DUCKGRES_PERF_LOCK_FILE:-/tmp/duckgres-perf-nightly.lock}"
 MAX_RUNTIME_SECONDS="${DUCKGRES_PERF_MAX_RUNTIME_SECONDS:-3600}"
-CATALOG_PATH="${DUCKGRES_PERF_CATALOG:-tests/perf/queries/smoke.yaml}"
-OUTPUT_BASE="${DUCKGRES_PERF_OUTPUT_BASE:-artifacts/perf}"
+CATALOG_PATH="${DUCKGRES_PERF_CATALOG:-$ROOT_DIR/tests/perf/queries/smoke.yaml}"
+OUTPUT_BASE="${DUCKGRES_PERF_OUTPUT_BASE:-$ROOT_DIR/artifacts/perf}"
 RUN_ID="${DUCKGRES_PERF_RUN_ID:-nightly-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 run_smoke() {
@@ -32,7 +32,12 @@ run_with_timeout() {
 if command -v flock >/dev/null 2>&1; then
   flock -n "$LOCK_FILE" bash -c "set -euo pipefail; $(declare -f run_smoke); $(declare -f run_with_timeout); run_with_timeout"
 else
-  echo "WARN: flock not found; continuing without overlap protection."
+  LOCK_DIR="${LOCK_FILE}.d"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "Another nightly perf run is active (lock: $LOCK_DIR)"
+    exit 1
+  fi
+  trap 'rm -rf "$LOCK_DIR"' EXIT
   run_with_timeout
 fi
 
