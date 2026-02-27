@@ -77,20 +77,26 @@ func TestNewMemoryRebalancerDefaults(t *testing.T) {
 }
 
 func TestDefaultMaxWorkers(t *testing.T) {
-	// 4GB budget / 256MB = 16
-	r := NewMemoryRebalancer(4*1024*1024*1024, 8, &mockSessionLister{}, true)
-	t.Cleanup(r.Stop)
-	got := r.DefaultMaxWorkers()
-	if got != 16 {
-		t.Errorf("DefaultMaxWorkers() = %d, want 16", got)
+	tests := []struct {
+		name   string
+		budget uint64
+		numCPU int
+		want   int
+	}{
+		{"memory limited", 4 * 1024 * 1024 * 1024, 64, 16},   // 4GB/256MB=16, 64*4=256 → 16
+		{"CPU limited", 24 * 1024 * 1024 * 1024, 2, 8},        // 24GB/256MB=96, 2*4=8 → 8
+		{"equal", 1024 * 1024 * 1024, 1, 4},                    // 1GB/256MB=4, 1*4=4 → 4
+		{"floor of 1", 128 * 1024 * 1024, 1, 1},                // 128MB/256MB=0, floor → 1
+		{"large instance", 192 * 1024 * 1024 * 1024, 48, 192},  // 192GB/256MB=768, 48*4=192 → 192
 	}
-
-	// 24GB budget / 256MB = 96
-	r2 := NewMemoryRebalancer(24*1024*1024*1024, 8, &mockSessionLister{}, true)
-	t.Cleanup(r2.Stop)
-	got2 := r2.DefaultMaxWorkers()
-	if got2 != 96 {
-		t.Errorf("DefaultMaxWorkers() = %d, want 96", got2)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := defaultMaxWorkers(tt.budget, tt.numCPU)
+			if got != tt.want {
+				t.Errorf("defaultMaxWorkers(%dGB, %d CPUs) = %d, want %d",
+					tt.budget/(1024*1024*1024), tt.numCPU, got, tt.want)
+			}
+		})
 	}
 }
 
