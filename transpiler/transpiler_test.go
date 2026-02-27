@@ -690,6 +690,46 @@ func TestTranspile_SetShow(t *testing.T) {
 		}
 	})
 
+	// Test DuckDB SHOW commands pass through unchanged
+	t.Run("SHOW TABLES passthrough", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW TABLES")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if result.Error != nil {
+			t.Fatalf("SHOW TABLES should not error, got: %v", result.Error)
+		}
+		if !strings.Contains(strings.ToUpper(result.SQL), "SHOW TABLES") {
+			t.Errorf("SHOW TABLES should pass through, got: %q", result.SQL)
+		}
+	})
+
+	t.Run("SHOW DATABASES passthrough", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW DATABASES")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if result.Error != nil {
+			t.Fatalf("SHOW DATABASES should not error, got: %v", result.Error)
+		}
+		if !strings.Contains(strings.ToUpper(result.SQL), "SHOW DATABASES") {
+			t.Errorf("SHOW DATABASES should pass through, got: %q", result.SQL)
+		}
+	})
+
+	t.Run("SHOW ALL passthrough", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW ALL")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if result.Error != nil {
+			t.Fatalf("SHOW ALL should not error, got: %v", result.Error)
+		}
+		if !strings.Contains(strings.ToUpper(result.SQL), "SHOW ALL") {
+			t.Errorf("SHOW ALL should pass through, got: %q", result.SQL)
+		}
+	})
+
 	// Test SET application_name is ignored
 	t.Run("SET application_name ignored", func(t *testing.T) {
 		result, err := tr.Transpile("SET application_name = 'fivetran'")
