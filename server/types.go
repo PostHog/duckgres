@@ -156,28 +156,28 @@ func mapDuckDBType(typeName string) TypeInfo {
 			return TypeInfo{OID: arrayOID, Size: -1, Typmod: elemInfo.Typmod}
 		}
 		// Unknown element type — fall through to text
-		return TypeInfo{OID: OidText, Size: -1}
+		return TypeInfo{OID: OidText, Size: -1, Typmod: -1}
 	}
 
 	switch {
 	case upper == "BOOLEAN" || upper == "BOOL":
-		return TypeInfo{OID: OidBool, Size: 1}
+		return TypeInfo{OID: OidBool, Size: 1, Typmod: -1}
 	case upper == "TINYINT" || upper == "INT1":
-		return TypeInfo{OID: OidInt2, Size: 2} // PostgreSQL doesn't have int1
+		return TypeInfo{OID: OidInt2, Size: 2, Typmod: -1} // PostgreSQL doesn't have int1
 	case upper == "SMALLINT" || upper == "INT2":
-		return TypeInfo{OID: OidInt2, Size: 2}
+		return TypeInfo{OID: OidInt2, Size: 2, Typmod: -1}
 	case upper == "INTEGER" || upper == "INT4" || upper == "INT":
-		return TypeInfo{OID: OidInt4, Size: 4}
+		return TypeInfo{OID: OidInt4, Size: 4, Typmod: -1}
 	case upper == "BIGINT" || upper == "INT8":
-		return TypeInfo{OID: OidInt8, Size: 8}
+		return TypeInfo{OID: OidInt8, Size: 8, Typmod: -1}
 	case upper == "HUGEINT" || upper == "INT128":
 		// Map to NUMERIC(38,0) so postgres_scanner reads it as DECIMAL(38,0) → INT128,
 		// matching the HUGEINT physical type. Typmod = ((38 << 16) | 0) + 4 = 2490372.
 		return TypeInfo{OID: OidNumeric, Size: -1, Typmod: 2490372}
 	case upper == "UTINYINT" || upper == "USMALLINT":
-		return TypeInfo{OID: OidInt4, Size: 4}
+		return TypeInfo{OID: OidInt4, Size: 4, Typmod: -1}
 	case upper == "UINTEGER":
-		return TypeInfo{OID: OidOid, Size: 4} // PostgreSQL oid type for pg_catalog columns
+		return TypeInfo{OID: OidOid, Size: 4, Typmod: -1} // PostgreSQL oid type for pg_catalog columns
 	case upper == "UBIGINT":
 		// Map to NUMERIC(20,0) so postgres_scanner reads it as DECIMAL(20,0) → INT128.
 		// UBIGINT max (2^64-1 = 18446744073709551615) is 20 digits.
@@ -185,36 +185,36 @@ func mapDuckDBType(typeName string) TypeInfo {
 		// "out of buffer in ReadInteger". Typmod = ((20 << 16) | 0) + 4 = 1310724.
 		return TypeInfo{OID: OidNumeric, Size: -1, Typmod: 1310724}
 	case upper == "REAL" || upper == "FLOAT4" || upper == "FLOAT":
-		return TypeInfo{OID: OidFloat4, Size: 4}
+		return TypeInfo{OID: OidFloat4, Size: 4, Typmod: -1}
 	case upper == "DOUBLE" || upper == "FLOAT8":
-		return TypeInfo{OID: OidFloat8, Size: 8}
+		return TypeInfo{OID: OidFloat8, Size: 8, Typmod: -1}
 	case strings.HasPrefix(upper, "DECIMAL") || strings.HasPrefix(upper, "NUMERIC"):
 		return TypeInfo{OID: OidNumeric, Size: -1, Typmod: parseNumericTypmod(typeName)}
 	case upper == "VARCHAR" || strings.HasPrefix(upper, "VARCHAR("):
-		return TypeInfo{OID: OidVarchar, Size: -1}
+		return TypeInfo{OID: OidVarchar, Size: -1, Typmod: -1}
 	case upper == "TEXT" || upper == "STRING":
-		return TypeInfo{OID: OidText, Size: -1}
+		return TypeInfo{OID: OidText, Size: -1, Typmod: -1}
 	case upper == "BLOB" || upper == "BYTEA":
-		return TypeInfo{OID: OidBytea, Size: -1}
+		return TypeInfo{OID: OidBytea, Size: -1, Typmod: -1}
 	case upper == "DATE":
-		return TypeInfo{OID: OidDate, Size: 4}
+		return TypeInfo{OID: OidDate, Size: 4, Typmod: -1}
 	case upper == "TIME":
-		return TypeInfo{OID: OidTime, Size: 8}
+		return TypeInfo{OID: OidTime, Size: 8, Typmod: -1}
 	case upper == "TIME WITH TIME ZONE" || upper == "TIMETZ":
-		return TypeInfo{OID: OidTimetz, Size: 12}
+		return TypeInfo{OID: OidTimetz, Size: 12, Typmod: -1}
 	case upper == "TIMESTAMP":
-		return TypeInfo{OID: OidTimestamp, Size: 8}
+		return TypeInfo{OID: OidTimestamp, Size: 8, Typmod: -1}
 	case upper == "TIMESTAMP WITH TIME ZONE" || upper == "TIMESTAMPTZ":
-		return TypeInfo{OID: OidTimestamptz, Size: 8}
+		return TypeInfo{OID: OidTimestamptz, Size: 8, Typmod: -1}
 	case upper == "INTERVAL":
-		return TypeInfo{OID: OidInterval, Size: 16}
+		return TypeInfo{OID: OidInterval, Size: 16, Typmod: -1}
 	case upper == "UUID":
-		return TypeInfo{OID: OidUUID, Size: 16}
+		return TypeInfo{OID: OidUUID, Size: 16, Typmod: -1}
 	case upper == "JSON":
-		return TypeInfo{OID: OidJSON, Size: -1}
+		return TypeInfo{OID: OidJSON, Size: -1, Typmod: -1}
 	default:
 		// Default to text for unknown types
-		return TypeInfo{OID: OidText, Size: -1}
+		return TypeInfo{OID: OidText, Size: -1, Typmod: -1}
 	}
 }
 
