@@ -27,6 +27,8 @@ Thumbs.db
 *.test
 *.out
 coverage.html
+duckgres.yaml
+artifacts/perf/
 
 .gemini/
 gha-creds-*.json

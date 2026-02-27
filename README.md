@@ -10,6 +10,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 - [Features](#features)
 - [Metrics](#metrics)
+- [Perf Runbook](#perf-runbook)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
   - [YAML Configuration](#yaml-configuration)
@@ -66,6 +67,11 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
 | `duckgres_flight_auth_sessions_active` | Gauge | Number of active Flight auth sessions on the control plane |
 | `duckgres_control_plane_workers_active` | Gauge | Number of active control-plane worker processes |
+| `duckgres_control_plane_worker_acquire_seconds` | Histogram | Time spent acquiring a worker for a new session |
+| `duckgres_control_plane_worker_queue_depth` | Gauge | Approximate number of session requests waiting on worker acquisition |
+| `duckgres_control_plane_worker_spawn_seconds` | Histogram | Time spent spawning and health-checking a new worker |
+| `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
+| `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
 | `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
 | `duckgres_flight_max_workers_retry_total{outcome}` | Counter | Max-worker retry outcomes for Flight session creation (`outcome=attempted|succeeded|failed`) |
 
@@ -73,7 +79,13 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 
 - `scripts/test_metrics.sh` - Runs a quick sanity check (starts server, runs queries, verifies counts)
 - `scripts/load_generator.sh` - Generates continuous query load until Ctrl-C
+- `scripts/perf_smoke.sh` - Runs the golden-query perf harness and writes artifacts to `artifacts/perf/<run_id>`
+- `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact upload hook
 - `prometheus-docker-compose.yml` - Starts Prometheus locally to scrape metrics (UI at http://localhost:9091)
+
+## Perf Runbook
+
+See [docs/perf-harness-runbook.md](docs/perf-harness-runbook.md) and [tests/perf/README.md](tests/perf/README.md) for local smoke and nightly operations.
 
 ## Quick Start
 
