@@ -1,0 +1,26 @@
+name: golden-smoke-v1
+description: Minimal golden query corpus for perf smoke runs.
+seed: 42
+dataset_scale: 1
+targets:
+  - pgwire
+  - flight
+warmup_iterations: 1
+measure_iterations: 2
+queries:
+  - query_id: q_select_constant
+    intent_id: intent_select_constant
+    tags: [smoke, select]
+    params:
+      value: 1
+    pgwire_sql: SELECT 1 AS value
+    duckhog_sql: SELECT 1 AS value
+  - query_id: q_select_arithmetic
+    intent_id: intent_select_arithmetic
+    tags: [smoke, select]
+    params:
+      lhs: 2
+      rhs: 40
+    pgwire_sql: SELECT 2 + 40 AS total
+    duckhog_sql: SELECT 2 + 40 AS total
+
