@@ -29,10 +29,10 @@ type ManagedWorker struct {
 	socketPath     string
 	bearerToken    string
 	client         *flightsql.Client
-	parentListener net.Listener     // CP-side listener; lifecycle managed by releaseSocket
-	prebound       *preboundSocket  // non-nil if using a pre-bound socket slot
-	releaseOnce    sync.Once        // ensures releaseWorkerSocket body runs exactly once
-	done           chan struct{}    // closed when process exits
+	parentListener net.Listener    // CP-side listener; lifecycle managed by releaseSocket
+	prebound       *preboundSocket // non-nil if using a pre-bound socket slot
+	releaseOnce    sync.Once       // ensures releaseWorkerSocket body runs exactly once
+	done           chan struct{}   // closed when process exits
 	exitErr        error
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
@@ -48,18 +48,18 @@ type preboundSocket struct {
 }
 
 type FlightWorkerPool struct {
-	mu           sync.RWMutex
-	workers      map[int]*ManagedWorker
-	nextWorkerID int // auto-incrementing worker ID
-	spawning     int // number of workers currently being spawned (not yet in workers map)
-	socketDir        string
+	mu                sync.RWMutex
+	workers           map[int]*ManagedWorker
+	nextWorkerID      int // auto-incrementing worker ID
+	spawning          int // number of workers currently being spawned (not yet in workers map)
+	socketDir         string
 	fallbackSocketDir string // set lazily when socketDir is EROFS; empty means use primary
-	configPath       string
-	binaryPath   string
-	maxWorkers   int           // 0 = unlimited; caps the number of live worker processes
-	idleTimeout  time.Duration // how long to keep an idle worker alive
-	shuttingDown bool
-	shutdownCh   chan struct{} // closed by ShutdownAll to stop idle reaper
+	configPath        string
+	binaryPath        string
+	maxWorkers        int           // 0 = unlimited; caps the number of live worker processes
+	idleTimeout       time.Duration // how long to keep an idle worker alive
+	shuttingDown      bool
+	shutdownCh        chan struct{} // closed by ShutdownAll to stop idle reaper
 
 	preboundMu sync.Mutex
 	prebound   []*preboundSocket // available pre-bound socket slots
@@ -237,6 +237,11 @@ func (p *FlightWorkerPool) ImportPrebound(sockets []*preboundSocket) {
 // binding a new socket (which may fail with EROFS under systemd's
 // ProtectSystem=strict after startup).
 func (p *FlightWorkerPool) SpawnWorker(id int) error {
+	spawnStart := time.Now()
+	defer func() {
+		observeControlPlaneWorkerSpawn(time.Since(spawnStart))
+	}()
+
 	token := generateToken()
 
 	// Try to use a pre-bound socket first. These are bound eagerly at startup
@@ -489,6 +494,11 @@ func (p *FlightWorkerPool) SpawnMinWorkers(count int) error {
 // This ensures the number of worker processes never exceeds maxWorkers while
 // allowing unlimited concurrent sessions across the fixed pool.
 func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+	acquireStart := time.Now()
+	defer func() {
+		observeControlPlaneWorkerAcquire(time.Since(acquireStart))
+	}()
+
 	p.mu.Lock()
 	if p.shuttingDown {
 		p.mu.Unlock()

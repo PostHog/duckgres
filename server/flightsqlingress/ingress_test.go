@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -76,6 +77,70 @@ func metricCounterValue(t *testing.T, metricName string) float64 {
 	}
 	t.Fatalf("metric %q not found", metricName)
 	return 0
+}
+
+func metricCounterValueByLabel(t *testing.T, metricName string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_COUNTER {
+			t.Fatalf("metric %q is not a counter", metricName)
+		}
+		var total float64
+		for _, metric := range fam.GetMetric() {
+			if metricLabelsMatch(metric, labels) {
+				total += metric.GetCounter().GetValue()
+			}
+		}
+		return total
+	}
+	return 0
+}
+
+func metricHistogramCountByLabel(t *testing.T, metricName string, labels map[string]string) uint64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_HISTOGRAM {
+			t.Fatalf("metric %q is not a histogram", metricName)
+		}
+		var total uint64
+		for _, metric := range fam.GetMetric() {
+			if metricLabelsMatch(metric, labels) {
+				total += metric.GetHistogram().GetSampleCount()
+			}
+		}
+		return total
+	}
+	return 0
+}
+
+func metricLabelsMatch(metric *dto.Metric, labels map[string]string) bool {
+	for k, v := range labels {
+		found := false
+		for _, lp := range metric.GetLabel() {
+			if lp.GetName() == k && lp.GetValue() == v {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func authContextForPeer(addr net.Addr, username, password string) context.Context {
@@ -279,6 +344,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithBasicAuth(t *testi
 	}
 	if got == nil {
 		t.Fatalf("expected non-nil session")
+		return
 	}
 	if got.username != "postgres" {
 		t.Fatalf("expected postgres session, got %q", got.username)
@@ -781,6 +847,57 @@ func TestSessionFromContextInvalidCredentialsIncrementsAuthFailureMetric(t *test
 	}
 	if after-before != 1 {
 		t.Fatalf("expected duckgres_auth_failures_total delta 1, got %.0f", after-before)
+	}
+}
+
+func TestSessionFromContextInvalidCredentialsIncrementsIngressSessionOutcomeMetric(t *testing.T) {
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, nil)
+	ctx := authContextForPeer(&net.TCPAddr{IP: net.ParseIP("203.0.113.48"), Port: 30008}, "postgres", "wrong")
+
+	before := metricCounterValueByLabel(t, "duckgres_flight_ingress_sessions_total", map[string]string{"outcome": "auth_failed"})
+	_, err := h.sessionFromContext(ctx)
+	after := metricCounterValueByLabel(t, "duckgres_flight_ingress_sessions_total", map[string]string{"outcome": "auth_failed"})
+
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated error, got %v", err)
+	}
+	if after-before != 1 {
+		t.Fatalf("expected duckgres_flight_ingress_sessions_total{outcome=auth_failed} delta 1, got %.0f", after-before)
+	}
+}
+
+func TestSessionFromContextSuccessIncrementsIngressSessionOutcomeMetric(t *testing.T) {
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, nil)
+	ctx := authContextForPeer(&net.TCPAddr{IP: net.ParseIP("203.0.113.49"), Port: 30009}, "postgres", "postgres")
+
+	before := metricCounterValueByLabel(t, "duckgres_flight_ingress_sessions_total", map[string]string{"outcome": "created"})
+	s, err := h.sessionFromContext(ctx)
+	after := metricCounterValueByLabel(t, "duckgres_flight_ingress_sessions_total", map[string]string{"outcome": "created"})
+
+	if err != nil {
+		t.Fatalf("expected successful auth, got %v", err)
+	}
+	if s == nil {
+		t.Fatalf("expected non-nil session")
+	}
+	if after-before != 1 {
+		t.Fatalf("expected duckgres_flight_ingress_sessions_total{outcome=created} delta 1, got %.0f", after-before)
+	}
+}
+
+func TestRPCDurationMetricRecordsOnError(t *testing.T) {
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, nil)
+
+	before := metricHistogramCountByLabel(t, "duckgres_flight_rpc_duration_seconds", map[string]string{"method": "GetFlightInfoSchemas"})
+	var cmd flightsql.GetDBSchemas
+	_, err := h.GetFlightInfoSchemas(context.Background(), cmd, &flight.FlightDescriptor{})
+	after := metricHistogramCountByLabel(t, "duckgres_flight_rpc_duration_seconds", map[string]string{"method": "GetFlightInfoSchemas"})
+
+	if err == nil {
+		t.Fatalf("expected GetFlightInfoSchemas to fail without auth context")
+	}
+	if after-before != 1 {
+		t.Fatalf("expected duckgres_flight_rpc_duration_seconds sample count delta 1, got %d", after-before)
 	}
 }
 
