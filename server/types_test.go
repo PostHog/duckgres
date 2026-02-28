@@ -133,8 +133,8 @@ func TestMapDuckDBTypeTypmod(t *testing.T) {
 		// NUMERIC with precision should have a positive typmod
 		{"DECIMAL(10,2)", int32((10<<16)|2) + 4},
 		// HUGEINT and UBIGINT have specific typmods for postgres_scanner
-		{"HUGEINT", int32((38<<16)|0) + 4},
-		{"UBIGINT", int32((20<<16)|0) + 4},
+		{"HUGEINT", int32(38<<16) + 4},
+		{"UBIGINT", int32(20<<16) + 4},
 		// Aliases and long-form type names
 		{"STRING", -1},
 		{"TIME WITH TIME ZONE", -1},
