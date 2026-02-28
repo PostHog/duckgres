@@ -4542,6 +4542,17 @@ func (c *clientConn) handleExecute(body []byte) {
 		rowCount++
 	}
 
+	if err := rows.Err(); err != nil {
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			slog.Error("Row iteration error.", "user", c.username, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+		}
+		c.setTxError()
+		return
+	}
+
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
