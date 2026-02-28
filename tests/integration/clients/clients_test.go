@@ -1,6 +1,7 @@
 package clients
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -561,6 +562,68 @@ func TestPreparedStatements(t *testing.T) {
 
 		// Cleanup
 		_, _ = testDB.Exec("DELETE FROM users WHERE id = 999")
+	})
+}
+
+// TestExtendedQueryErrorHandling verifies that errors during the extended query
+// protocol (prepared statements) are properly reported to the client and don't
+// corrupt the connection state.
+func TestExtendedQueryErrorHandling(t *testing.T) {
+	t.Run("error_during_prepared_execution", func(t *testing.T) {
+		// Use a single connection so we can verify the SAME connection survives errors.
+		conn, err := testDB.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("Conn failed: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		// CAST($1 AS INTEGER) with a non-numeric string uses the extended query
+		// protocol (Parse/Bind/Execute) and produces a conversion error at execution time.
+		var val int
+		err = conn.QueryRowContext(context.Background(), "SELECT CAST($1 AS INTEGER)", "not-a-number").Scan(&val)
+		if err == nil {
+			t.Fatal("Expected conversion error, got none")
+		}
+
+		// The SAME connection should still be usable after the error.
+		// If handleExecute didn't properly handle the error (e.g., protocol desync),
+		// this would fail or hang.
+		var result int
+		err = conn.QueryRowContext(context.Background(), "SELECT $1::int", 42).Scan(&result)
+		if err != nil {
+			t.Fatalf("Connection unusable after error: %v", err)
+		}
+		if result != 42 {
+			t.Errorf("Expected 42, got %d", result)
+		}
+	})
+
+	t.Run("error_recovery_multi_cycle", func(t *testing.T) {
+		// Run multiple error/success cycles on the same connection.
+		conn, err := testDB.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("Conn failed: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		for i := 0; i < 3; i++ {
+			// Failing query via extended protocol
+			var badVal int
+			err := conn.QueryRowContext(context.Background(), "SELECT CAST($1 AS INTEGER)", "bad").Scan(&badVal)
+			if err == nil {
+				t.Fatalf("Expected error on iteration %d", i)
+			}
+
+			// Successful query via extended protocol on the same connection
+			var val int
+			err = conn.QueryRowContext(context.Background(), "SELECT $1::int + 1", i).Scan(&val)
+			if err != nil {
+				t.Fatalf("Success query failed on iteration %d: %v", i, err)
+			}
+			if val != i+1 {
+				t.Errorf("Expected %d, got %d on iteration %d", i+1, val, i)
+			}
+		}
 	})
 }
 

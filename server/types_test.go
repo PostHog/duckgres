@@ -135,9 +135,15 @@ func TestMapDuckDBTypeTypmod(t *testing.T) {
 		// HUGEINT and UBIGINT have specific typmods for postgres_scanner
 		{"HUGEINT", int32((38<<16)|0) + 4},
 		{"UBIGINT", int32((20<<16)|0) + 4},
+		// Aliases and long-form type names
+		{"STRING", -1},
+		{"TIME WITH TIME ZONE", -1},
+		{"TIMESTAMP WITH TIME ZONE", -1},
 		// Array types inherit element typmod
 		{"INTEGER[]", -1},
 		{"INTERVAL[]", -1},
+		// Unknown types should default to typmod=-1
+		{"SOMECUSTOMTYPE", -1},
 	}
 
 	for _, tt := range tests {
