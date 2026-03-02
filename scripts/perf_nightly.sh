@@ -6,11 +6,19 @@ cd "$ROOT_DIR"
 
 LOCK_FILE="${DUCKGRES_PERF_LOCK_FILE:-/tmp/duckgres-perf-nightly.lock}"
 MAX_RUNTIME_SECONDS="${DUCKGRES_PERF_MAX_RUNTIME_SECONDS:-3600}"
-CATALOG_PATH="${DUCKGRES_PERF_CATALOG:-$ROOT_DIR/tests/perf/queries/smoke.yaml}"
+DATASET_VERSION="${DUCKGRES_PERF_DATASET_VERSION:-}"
+if [[ -z "$DATASET_VERSION" ]]; then
+  echo "DUCKGRES_PERF_DATASET_VERSION is required for nightly frozen dataset runs"
+  exit 1
+fi
+CATALOG_PATH="${DUCKGRES_PERF_CATALOG:-$ROOT_DIR/tests/perf/queries/ducklake_frozen.yaml}"
 OUTPUT_BASE="${DUCKGRES_PERF_OUTPUT_BASE:-$ROOT_DIR/artifacts/perf}"
-RUN_ID="${DUCKGRES_PERF_RUN_ID:-nightly-$(date -u +%Y%m%dT%H%M%SZ)}"
+RUN_ID="${DUCKGRES_PERF_RUN_ID:-nightly-${DATASET_VERSION}-$(date -u +%Y%m%dT%H%M%SZ)}"
+MANIFEST_TABLE="${DUCKGRES_PERF_DATASET_MANIFEST_TABLE:-ducklake.main.dataset_manifest}"
 
 run_smoke() {
+  export DUCKGRES_PERF_DATASET_VERSION="$DATASET_VERSION"
+  export DUCKGRES_PERF_DATASET_MANIFEST_TABLE="$MANIFEST_TABLE"
   DUCKGRES_PERF_CATALOG="$CATALOG_PATH" \
   DUCKGRES_PERF_OUTPUT_BASE="$OUTPUT_BASE" \
   DUCKGRES_PERF_RUN_ID="$RUN_ID" \
@@ -42,6 +50,16 @@ else
 fi
 
 RUN_DIR="$OUTPUT_BASE/$RUN_ID"
+MANIFEST_ARTIFACT="$RUN_DIR/dataset_manifest.json"
+if [[ ! -f "$MANIFEST_ARTIFACT" ]]; then
+  echo "Expected dataset manifest artifact missing: $MANIFEST_ARTIFACT"
+  exit 1
+fi
+if ! grep -Fq "\"dataset_version\":\"$DATASET_VERSION\"" "$MANIFEST_ARTIFACT"; then
+  echo "Dataset manifest artifact does not match DUCKGRES_PERF_DATASET_VERSION=$DATASET_VERSION"
+  exit 1
+fi
+
 if [[ -n "${DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD:-}" ]]; then
   DUCKGRES_PERF_RUN_DIR="$RUN_DIR" bash -lc "$DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD"
 fi

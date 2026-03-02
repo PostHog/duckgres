@@ -1,0 +1,44 @@
+name: ducklake-frozen-v1
+description: Read-only DuckLake frozen dataset query corpus for nightly perf.
+seed: 42
+dataset_scale: 1
+targets:
+  - pgwire
+  - flight
+warmup_iterations: 1
+measure_iterations: 3
+queries:
+  - query_id: q_orders_total
+    intent_id: intent_orders_total
+    tags: [nightly, frozen, ducklake, select-only]
+    params: {}
+    pgwire_sql: SELECT COUNT(*) AS order_count FROM ducklake.main.orders
+    duckhog_sql: SELECT COUNT(*) AS order_count FROM ducklake.main.orders
+
+  - query_id: q_order_status_mix
+    intent_id: intent_order_status_mix
+    tags: [nightly, frozen, ducklake, select-only]
+    params: {}
+    pgwire_sql: SELECT status, COUNT(*) AS order_count, ROUND(SUM(total_amount), 2) AS gross_amount FROM ducklake.main.orders GROUP BY status ORDER BY status
+    duckhog_sql: SELECT status, COUNT(*) AS order_count, ROUND(SUM(total_amount), 2) AS gross_amount FROM ducklake.main.orders GROUP BY status ORDER BY status
+
+  - query_id: q_category_revenue
+    intent_id: intent_category_revenue
+    tags: [nightly, frozen, ducklake, select-only, join]
+    params: {}
+    pgwire_sql: SELECT c.name AS category_name, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS gross_revenue FROM ducklake.main.order_items oi JOIN ducklake.main.products p ON oi.product_id = p.id JOIN ducklake.main.categories c ON p.category_id = c.id GROUP BY c.name ORDER BY gross_revenue DESC, c.name LIMIT 10
+    duckhog_sql: SELECT c.name AS category_name, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS gross_revenue FROM ducklake.main.order_items oi JOIN ducklake.main.products p ON oi.product_id = p.id JOIN ducklake.main.categories c ON p.category_id = c.id GROUP BY c.name ORDER BY gross_revenue DESC, c.name LIMIT 10
+
+  - query_id: q_events_by_name
+    intent_id: intent_events_by_name
+    tags: [nightly, frozen, ducklake, select-only, analytics]
+    params: {}
+    pgwire_sql: SELECT event_name, COUNT(*) AS event_count FROM ducklake.main.events GROUP BY event_name ORDER BY event_count DESC, event_name
+    duckhog_sql: SELECT event_name, COUNT(*) AS event_count FROM ducklake.main.events GROUP BY event_name ORDER BY event_count DESC, event_name
+
+  - query_id: q_avg_page_duration
+    intent_id: intent_avg_page_duration
+    tags: [nightly, frozen, ducklake, select-only, analytics]
+    params: {}
+    pgwire_sql: SELECT page_path, ROUND(AVG(duration_seconds), 2) AS avg_duration_seconds, COUNT(*) AS views FROM ducklake.main.page_views GROUP BY page_path ORDER BY avg_duration_seconds DESC, page_path LIMIT 20
+    duckhog_sql: SELECT page_path, ROUND(AVG(duration_seconds), 2) AS avg_duration_seconds, COUNT(*) AS views FROM ducklake.main.page_views GROUP BY page_path ORDER BY avg_duration_seconds DESC, page_path LIMIT 20

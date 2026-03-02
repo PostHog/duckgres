@@ -65,3 +65,39 @@ queries:
 		t.Fatalf("expected duplicate query_id error, got %v", err)
 	}
 }
+
+func TestValidateReadOnlyCatalogAcceptsSelectOnlyQueries(t *testing.T) {
+	catalog := Catalog{
+		Queries: []Query{
+			{
+				QueryID:    "q1",
+				IntentID:   "i1",
+				PGWireSQL:  "SELECT 1;",
+				DuckhogSQL: "/* comment */ SELECT 1",
+			},
+		},
+	}
+	if err := ValidateReadOnlyCatalog(catalog); err != nil {
+		t.Fatalf("ValidateReadOnlyCatalog returned error: %v", err)
+	}
+}
+
+func TestValidateReadOnlyCatalogRejectsNonSelectQueries(t *testing.T) {
+	catalog := Catalog{
+		Queries: []Query{
+			{
+				QueryID:    "q_write",
+				IntentID:   "i_write",
+				PGWireSQL:  "INSERT INTO perf_orders VALUES (1, 'na', 100)",
+				DuckhogSQL: "SELECT 1",
+			},
+		},
+	}
+	err := ValidateReadOnlyCatalog(catalog)
+	if err == nil {
+		t.Fatalf("expected non-select query to fail")
+	}
+	if !strings.Contains(err.Error(), "SELECT-only") {
+		t.Fatalf("expected SELECT-only error, got %v", err)
+	}
+}

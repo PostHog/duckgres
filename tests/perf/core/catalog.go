@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -72,4 +73,62 @@ func validateCatalog(c Catalog) error {
 		}
 	}
 	return nil
+}
+
+func ValidateReadOnlyCatalog(c Catalog) error {
+	for _, q := range c.Queries {
+		if err := validateSelectOnlySQL("pgwire_sql", q.QueryID, q.PGWireSQL); err != nil {
+			return err
+		}
+		if err := validateSelectOnlySQL("duckhog_sql", q.QueryID, q.DuckhogSQL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSelectOnlySQL(field, queryID, sql string) error {
+	trimmed := trimLeadingSQLComments(sql)
+	trimmed = strings.TrimSpace(trimmed)
+	trimmed = strings.TrimSuffix(trimmed, ";")
+	trimmed = strings.TrimSpace(trimmed)
+	if trimmed == "" {
+		return fmt.Errorf("query %s missing %s", queryID, field)
+	}
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, "SELECT") {
+		return fmt.Errorf("query %s %s must be SELECT-only in frozen mode", queryID, field)
+	}
+	if len(upper) > len("SELECT") {
+		next := upper[len("SELECT")]
+		if (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_' {
+			return fmt.Errorf("query %s %s must be SELECT-only in frozen mode", queryID, field)
+		}
+	}
+	if strings.Contains(trimmed, ";") {
+		return fmt.Errorf("query %s %s must contain a single SELECT statement in frozen mode", queryID, field)
+	}
+	return nil
+}
+
+func trimLeadingSQLComments(sql string) string {
+	remaining := strings.TrimSpace(sql)
+	for {
+		switch {
+		case strings.HasPrefix(remaining, "--"):
+			idx := strings.IndexByte(remaining, '\n')
+			if idx < 0 {
+				return ""
+			}
+			remaining = strings.TrimSpace(remaining[idx+1:])
+		case strings.HasPrefix(remaining, "/*"):
+			idx := strings.Index(remaining, "*/")
+			if idx < 0 {
+				return ""
+			}
+			remaining = strings.TrimSpace(remaining[idx+2:])
+		default:
+			return remaining
+		}
+	}
 }

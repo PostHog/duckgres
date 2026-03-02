@@ -47,10 +47,11 @@ type QueryResult struct {
 }
 
 type RunSummary struct {
-	RunID         string    `json:"run_id"`
-	StartedAt     time.Time `json:"started_at"`
-	FinishedAt    time.Time `json:"finished_at"`
-	TotalQueries  int       `json:"total_queries"`
-	TotalErrors   int       `json:"total_errors"`
-	WarmupQueries int       `json:"warmup_queries"`
+	RunID          string    `json:"run_id"`
+	DatasetVersion string    `json:"dataset_version"`
+	StartedAt      time.Time `json:"started_at"`
+	FinishedAt     time.Time `json:"finished_at"`
+	TotalQueries   int       `json:"total_queries"`
+	TotalErrors    int       `json:"total_errors"`
+	WarmupQueries  int       `json:"warmup_queries"`
 }

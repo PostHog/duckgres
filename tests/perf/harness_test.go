@@ -42,15 +42,30 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 		t.Skip("set -perf-run to execute the perf harness")
 	}
 
+	runID := *perfRunID
+	if runID == "" {
+		runID = time.Now().UTC().Format("20060102T150405Z")
+	}
+	nightlyMode := strings.HasPrefix(runID, "nightly-")
+
 	catalog, err := core.LoadCatalog(*perfCatalog)
 	if err != nil {
 		t.Fatalf("LoadCatalog(%s): %v", *perfCatalog, err)
 	}
 
-	runID := *perfRunID
-	if runID == "" {
-		runID = time.Now().UTC().Format("20060102T150405Z")
+	runtimeContract, err := datasets.ResolveRuntimeContract(defaultManifestPath(*perfCatalog))
+	if err != nil {
+		t.Fatalf("resolve dataset runtime contract: %v", err)
 	}
+	if nightlyMode && !runtimeContract.Frozen {
+		t.Fatalf("nightly run requires %s", datasets.DatasetVersionEnv)
+	}
+	if nightlyMode || runtimeContract.Frozen {
+		if err := core.ValidateReadOnlyCatalog(catalog); err != nil {
+			t.Fatalf("read-only catalog validation failed: %v", err)
+		}
+	}
+
 	outputDir := filepath.Join(*perfOutputBase, runID)
 	sink, err := core.NewArtifactSink(outputDir)
 	if err != nil {
@@ -83,13 +98,17 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 	t.Cleanup(func() { _ = flight.Close() })
 
 	runner := core.NewQueryRunner(core.RunnerConfig{
-		Catalog: catalog,
+		Catalog:        catalog,
+		DatasetVersion: runtimeContract.DatasetVersion,
 		Drivers: map[core.Protocol]core.ProtocolDriver{
 			core.ProtocolPGWire: pg,
 			core.ProtocolFlight: flight,
 		},
 		Sink: sink,
 		OnSetup: func(ctx context.Context) error {
+			if runtimeContract.Frozen {
+				return nil
+			}
 			records, err := datasets.GenerateDeterministic(catalog.Seed, catalog.DatasetScale)
 			if err != nil {
 				return fmt.Errorf("generate dataset: %w", err)
@@ -142,6 +161,11 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 			t.Fatalf("expected artifact %s: %v", artifact, err)
 		}
 	}
+}
+
+func defaultManifestPath(catalogPath string) string {
+	catalogDir := filepath.Dir(filepath.Clean(catalogPath))
+	return filepath.Join(filepath.Dir(catalogDir), "datasets", "manifest.yaml")
 }
 
 func seedDatasetViaDriver(ctx context.Context, driver core.ProtocolDriver, records []datasets.Record) error {

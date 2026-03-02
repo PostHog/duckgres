@@ -40,11 +40,12 @@ func TestArtifactSinkWritesSummaryCSVAndMetrics(t *testing.T) {
 	}
 
 	summary := RunSummary{
-		RunID:        "run-1",
-		StartedAt:    time.Unix(1700000000, 0),
-		FinishedAt:   time.Unix(1700000030, 0),
-		TotalQueries: 2,
-		TotalErrors:  1,
+		RunID:          "run-1",
+		DatasetVersion: "v1",
+		StartedAt:      time.Unix(1700000000, 0),
+		FinishedAt:     time.Unix(1700000030, 0),
+		TotalQueries:   2,
+		TotalErrors:    1,
 	}
 	if err := sink.Close(summary, "# HELP sample sample\nsample 1\n"); err != nil {
 		t.Fatalf("Close returned error: %v", err)
@@ -67,7 +68,7 @@ func TestArtifactSinkWritesSummaryCSVAndMetrics(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("summary json parse: %v", err)
 	}
-	if got.TotalQueries != 2 || got.TotalErrors != 1 {
+	if got.TotalQueries != 2 || got.TotalErrors != 1 || got.DatasetVersion != "v1" {
 		t.Fatalf("unexpected summary in file: %+v", got)
 	}
 

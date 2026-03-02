@@ -57,7 +57,8 @@ func TestRunnerLifecycleAndPerQueryRecording(t *testing.T) {
 			ProtocolPGWire: pg,
 			ProtocolFlight: fl,
 		},
-		Sink: sink,
+		Sink:           sink,
+		DatasetVersion: "v1",
 		OnSetup: func(context.Context) error {
 			setupCalled++
 			return nil
@@ -84,5 +85,8 @@ func TestRunnerLifecycleAndPerQueryRecording(t *testing.T) {
 	}
 	if summary.TotalQueries != 4 || summary.TotalErrors != 0 {
 		t.Fatalf("unexpected summary: %+v", summary)
+	}
+	if summary.DatasetVersion != "v1" {
+		t.Fatalf("expected dataset version v1, got %q", summary.DatasetVersion)
 	}
 }

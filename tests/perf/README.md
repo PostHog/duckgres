@@ -21,12 +21,28 @@ By default the harness auto-starts a temporary local Duckgres control-plane
 instance with Flight ingress, executes queries over both protocols, then shuts
 it down after artifact generation.
 
+For frozen DuckLake dataset smoke runs, set:
+
+```bash
+DUCKGRES_PERF_DATASET_VERSION=v1 \
+DUCKGRES_PERF_PGWIRE_DSN="host=127.0.0.1 port=5432 user=perfuser dbname=test sslmode=require" \
+DUCKGRES_PERF_FLIGHT_ADDR="127.0.0.1:50051" \
+./scripts/perf_smoke.sh
+```
+
+When `DUCKGRES_PERF_DATASET_VERSION` is set:
+
+- default catalog switches to `tests/perf/queries/ducklake_frozen.yaml`
+- manifest verification is required in `ducklake.main.dataset_manifest` (override with `DUCKGRES_PERF_DATASET_MANIFEST_TABLE`)
+- artifact `dataset_manifest.json` is written under `artifacts/perf/<run_id>/`
+
 Artifacts are written to `artifacts/perf/<run_id>`:
 
 - `summary.json`
 - `query_results.csv`
 - `server_metrics.prom`
 - `runner.log`
+- `dataset_manifest.json` (only when `DUCKGRES_PERF_DATASET_VERSION` is set)
 
 ## Nightly Run
 
@@ -38,6 +54,13 @@ Nightly uses lock/timeout guards:
 
 - `DUCKGRES_PERF_LOCK_FILE` (default: `/tmp/duckgres-perf-nightly.lock`)
 - `DUCKGRES_PERF_MAX_RUNTIME_SECONDS` (default: `3600`)
+
+Nightly frozen dataset requirements:
+
+- `DUCKGRES_PERF_DATASET_VERSION` is required
+- `DUCKGRES_PERF_PGWIRE_DSN` and `DUCKGRES_PERF_FLIGHT_ADDR` are required
+- default catalog is `tests/perf/queries/ducklake_frozen.yaml`
+- `dataset_manifest.json` must exist after run and match the configured dataset version
 
 Optional upload hook:
 

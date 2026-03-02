@@ -21,12 +21,13 @@ type ResultSink interface {
 }
 
 type RunnerConfig struct {
-	Catalog    Catalog
-	Drivers    map[Protocol]ProtocolDriver
-	Sink       ResultSink
-	OnSetup    func(context.Context) error
-	OnTeardown func(context.Context) error
-	Now        func() time.Time
+	Catalog        Catalog
+	DatasetVersion string
+	Drivers        map[Protocol]ProtocolDriver
+	Sink           ResultSink
+	OnSetup        func(context.Context) error
+	OnTeardown     func(context.Context) error
+	Now            func() time.Time
 }
 
 type QueryRunner struct {
@@ -49,9 +50,10 @@ func NewQueryRunner(cfg RunnerConfig) *QueryRunner {
 func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 	startedAt := r.cfg.Now()
 	summary := RunSummary{
-		RunID:      startedAt.UTC().Format("20060102T150405Z"),
-		StartedAt:  startedAt,
-		FinishedAt: startedAt,
+		RunID:          startedAt.UTC().Format("20060102T150405Z"),
+		DatasetVersion: r.cfg.DatasetVersion,
+		StartedAt:      startedAt,
+		FinishedAt:     startedAt,
 	}
 
 	if r.cfg.OnSetup != nil {
