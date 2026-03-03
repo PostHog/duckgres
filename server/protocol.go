@@ -73,6 +73,12 @@ func readStartupMessage(r io.Reader) (map[string]string, error) {
 		return map[string]string{"__ssl_request": "true"}, nil
 	}
 
+	// Check for GSSENCRequest (80877104, PostgreSQL 12+)
+	// JDBC drivers with gssEncMode=prefer send this before SSLRequest.
+	if protocolVersion == 80877104 {
+		return map[string]string{"__gssenc_request": "true"}, nil
+	}
+
 	// Check for cancel request (80877102)
 	// Format: 4 bytes length, 4 bytes request code, 4 bytes pid, 4 bytes secret key
 	if protocolVersion == 80877102 {

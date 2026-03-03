@@ -618,6 +618,15 @@ func (c *clientConn) handleStartup() error {
 			return err
 		}
 
+		// Handle GSSENCRequest - decline and let client retry with SSL
+		if params["__gssenc_request"] == "true" {
+			slog.Info("GSSENCRequest received, declining.", "remote_addr", c.conn.RemoteAddr())
+			if _, err := c.conn.Write([]byte("N")); err != nil {
+				return err
+			}
+			continue
+		}
+
 		// Handle SSL request - upgrade to TLS
 		if params["__ssl_request"] == "true" {
 			// Send 'S' to indicate we support SSL

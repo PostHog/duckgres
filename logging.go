@@ -76,18 +76,36 @@ func newPostHogExporter(ctx context.Context, host, apiKey string) *otlploghttp.E
 	return exporter
 }
 
+// parseLogLevel returns the slog.Level for the DUCKGRES_LOG_LEVEL env var.
+// Supported values: debug, info, warn, error. Defaults to info.
+func parseLogLevel() slog.Level {
+	switch strings.ToLower(os.Getenv("DUCKGRES_LOG_LEVEL")) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
 // initLogging configures slog to send logs to PostHog via OTLP when
 // POSTHOG_API_KEY is set. Additional PostHog projects can be targeted by
 // setting ADDITIONAL_POSTHOG_API_KEYS to a comma-separated list of API keys.
 // Logs always go to stderr; PostHog is additive.
+// The log level is controlled by DUCKGRES_LOG_LEVEL (debug, info, warn, error).
 // Returns a shutdown function that flushes all OTLP batch processors.
 func initLogging() func() {
+	level := parseLogLevel()
+
 	apiKey := os.Getenv("POSTHOG_API_KEY")
 	if apiKey == "" {
 		if os.Getenv("ADDITIONAL_POSTHOG_API_KEYS") != "" {
 			fmt.Fprintln(os.Stderr, "ADDITIONAL_POSTHOG_API_KEYS is set but POSTHOG_API_KEY is not; ignoring additional keys")
 		}
-		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 		return func() {}
 	}
 	fmt.Fprintln(os.Stderr, "PostHog logging enabled, configuring OTLP exporter...")
@@ -148,7 +166,7 @@ func initLogging() func() {
 	provider := sdklog.NewLoggerProvider(opts...)
 
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
-	textHandler := slog.NewTextHandler(os.Stderr, nil)
+	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 
 	slog.SetDefault(slog.New(&multiHandler{
 		handlers: []slog.Handler{textHandler, otelHandler},

@@ -403,6 +403,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	defer releaseRateLimit()
 
+	// Set a startup read timeout to prevent goroutine leaks from clients
+	// that connect but never send data (e.g., load balancer TCP health checks).
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		slog.Error("Failed to set startup deadline.", "remote_addr", remoteAddr, "error", err)
+		_ = conn.Close()
+		return
+	}
+
 	// Read startup message to determine SSL vs cancel
 	params, err := readStartupFromRaw(conn)
 	if err != nil {
@@ -419,6 +427,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	if params.cancelRequest {
 		key := server.BackendKey{Pid: params.cancelPid, SecretKey: params.cancelSecretKey}
 		cp.srv.CancelQuery(key)
+		_ = conn.Close()
+		return
+	}
+
+	// Clear the startup read deadline before proceeding to TLS (which sets its own).
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -606,6 +621,17 @@ func readStartupFromRaw(conn net.Conn) (startupResult, error) {
 		pid := int32(binary.BigEndian.Uint32(remaining[4:8]))
 		key := int32(binary.BigEndian.Uint32(remaining[8:12]))
 		return startupResult{cancelRequest: true, cancelPid: pid, cancelSecretKey: key}, nil
+	}
+
+	// GSSENCRequest (PostgreSQL 12+, JDBC driver gssEncMode=prefer)
+	// Respond with 'N' (GSSAPI encryption not supported) and re-read.
+	// The client will follow up with SSLRequest on the same connection.
+	if protocolVersion == 80877104 {
+		slog.Info("GSSENCRequest received, declining.", "remote_addr", conn.RemoteAddr())
+		if _, err := conn.Write([]byte("N")); err != nil {
+			return startupResult{}, fmt.Errorf("write GSSENC decline: %w", err)
+		}
+		return readStartupFromRaw(conn)
 	}
 
 	return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)

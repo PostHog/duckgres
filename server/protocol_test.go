@@ -72,6 +72,23 @@ func TestReadStartupMessage(t *testing.T) {
 		}
 	})
 
+	t.Run("GSSENCRequest", func(t *testing.T) {
+		var buf bytes.Buffer
+
+		// GSSENCRequest: length=8, version=80877104
+		_ = binary.Write(&buf, binary.BigEndian, int32(8))
+		_ = binary.Write(&buf, binary.BigEndian, uint32(80877104))
+
+		result, err := readStartupMessage(&buf)
+		if err != nil {
+			t.Fatalf("readStartupMessage() error = %v", err)
+		}
+
+		if result["__gssenc_request"] != "true" {
+			t.Error("should detect GSSENCRequest")
+		}
+	})
+
 	t.Run("cancel request", func(t *testing.T) {
 		var buf bytes.Buffer
 

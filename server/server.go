@@ -1232,6 +1232,29 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 		return
 	}
 
+	// Handle GSSENCRequest - decline and re-read for SSLRequest
+	if params["__gssenc_request"] == "true" {
+		slog.Info("GSSENCRequest received, declining.", "remote_addr", remoteAddr)
+		if _, err := conn.Write([]byte("N")); err != nil {
+			slog.Error("Failed to send GSSENC decline.", "remote_addr", remoteAddr, "error", err)
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+		// Re-read: client will send SSLRequest next
+		params, err = readStartupMessage(conn)
+		if err != nil {
+			if err == io.EOF || errors.Is(err, io.EOF) {
+				slog.Debug("Client closed connection after GSSENC decline.", "remote_addr", remoteAddr)
+			} else {
+				slog.Error("Failed to read startup message after GSSENC decline.", "remote_addr", remoteAddr, "error", err)
+			}
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+	}
+
 	// Handle cancel request in parent (no child spawn needed)
 	if params["__cancel_request"] == "true" {
 		s.handleCancelRequestIsolated(params)
