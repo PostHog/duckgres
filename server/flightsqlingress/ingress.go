@@ -53,7 +53,7 @@ type Config struct {
 }
 
 type SessionProvider interface {
-	CreateSession(context.Context, string) (int32, *server.FlightExecutor, error)
+	CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error)
 	DestroySession(int32)
 }
 
@@ -1149,7 +1149,7 @@ type flightAuthSessionStore struct {
 	workerQueueTimeout time.Duration
 	hooks              Hooks
 
-	createSessionFn  func(context.Context, string) (int32, *server.FlightExecutor, error)
+	createSessionFn  func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error)
 	destroySessionFn func(int32)
 
 	mu       sync.RWMutex
@@ -1174,7 +1174,7 @@ func (r *lockedRowSet) Close() error {
 }
 
 func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, handleIdleTTL, tokenTTL, workerQueueTimeout time.Duration, opts Options) *flightAuthSessionStore {
-	createFn := func(context.Context, string) (int32, *server.FlightExecutor, error) {
+	createFn := func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 		return 0, nil, fmt.Errorf("session provider is not configured")
 	}
 	destroyFn := func(int32) {}
@@ -1258,7 +1258,7 @@ func (s *flightAuthSessionStore) GetOrCreate(ctx context.Context, key, username 
 		return existing, nil
 	}
 
-	pid, executor, err := s.createSessionFn(ctx, username)
+	pid, executor, err := s.createSessionFn(ctx, username, 0, "", 0)
 	if err != nil {
 		return nil, err
 	}

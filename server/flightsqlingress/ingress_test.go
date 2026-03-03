@@ -158,7 +158,7 @@ func testFlightHandlerWithStoreAndRateLimiter(t *testing.T, users map[string]str
 		sessions:      make(map[string]*flightClientSession),
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 1234, nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -289,7 +289,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithoutBasicAuth(t *te
 
 func TestSessionFromContextRejectsUnknownSessionTokenEvenWithBasicAuth(t *testing.T) {
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 9876, nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -392,7 +392,7 @@ func TestSessionFromContextTokenPathDoesNotClearRateLimiterFailures(t *testing.T
 func TestSessionFromContextWithoutTokenCreatesDistinctSessions(t *testing.T) {
 	var createCalls atomic.Int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return createCalls.Add(1), nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -544,7 +544,7 @@ func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T
 		idleTTL:       time.Minute,
 		handleIdleTTL: time.Minute,
 		tokenTTL:      time.Hour,
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 1234, nil, nil
 		},
 		destroySessionFn: func(pid int32) {
@@ -709,7 +709,7 @@ func TestCloseSessionRevokesTokenAndDestroysWorker(t *testing.T) {
 func TestCloseSessionMissingTokenDoesNotBootstrap(t *testing.T) {
 	var createCalls atomic.Int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			createCalls.Add(1)
 			return 1234, nil, nil
 		},
@@ -741,7 +741,7 @@ func TestCloseSessionTokenOnlyRevokesTokenAndDoesNotBootstrap(t *testing.T) {
 	var createCalls atomic.Int32
 	var destroyed []int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			createCalls.Add(1)
 			return 9876, nil, nil
 		},
@@ -979,7 +979,7 @@ func TestFlightAuthSessionStoreReapHookReceivesTrigger(t *testing.T) {
 				reapedCount = count
 			},
 		},
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(int32) {},
@@ -1014,7 +1014,7 @@ func TestFlightAuthSessionStoreReapKeepsSessionWithFreshHandle(t *testing.T) {
 		},
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(pid int32) {
@@ -1051,7 +1051,7 @@ func TestFlightAuthSessionStoreReapStaleHandleAllowsSessionReap(t *testing.T) {
 		},
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(pid int32) {

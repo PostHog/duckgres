@@ -30,6 +30,10 @@ var processStartTime = time.Now()
 // processVersion is set from main() via SetProcessVersion. Defaults to "dev".
 var processVersion = "dev"
 
+// startupReadTimeout bounds pre-TLS startup negotiation reads to avoid stalled
+// clients pinning connection goroutines indefinitely.
+var startupReadTimeout = 30 * time.Second
+
 // SetProcessVersion sets the version string for this process. Called from main().
 func SetProcessVersion(v string) { processVersion = v }
 
@@ -1021,7 +1025,7 @@ func buildCredentialChainSecret(dlCfg DuckLakeConfig) string {
 // credentialRefreshInterval is how often to refresh S3 credentials for long-lived connections.
 // EC2 instance role credentials typically expire after 6 hours. Refreshing every 5 minutes
 // ensures fresh credentials are always available without excessive IMDS calls.
-const credentialRefreshInterval = 5 * time.Minute
+var credentialRefreshInterval = 5 * time.Minute
 
 // s3ProviderForConfig returns the effective S3 provider for the given DuckLake config.
 func s3ProviderForConfig(dlCfg DuckLakeConfig) string {
@@ -1045,6 +1049,12 @@ func needsCredentialRefresh(dlCfg DuckLakeConfig) bool {
 	return s3ProviderForConfig(dlCfg) == "credential_chain"
 }
 
+// isTransactionAborted returns true if the error indicates DuckDB's connection
+// is stuck in an aborted transaction state (requires ROLLBACK to recover).
+func isTransactionAborted(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Current transaction is aborted")
+}
+
 // sqlExecer is satisfied by both *sql.DB and *sql.Conn, allowing
 // StartCredentialRefresh to work with either a connection pool or a pinned connection.
 type sqlExecer interface {
@@ -1059,6 +1069,12 @@ type sqlExecer interface {
 // The execer parameter accepts either *sql.DB (standalone mode) or *sql.Conn (worker
 // mode where the pool's only connection is pinned by the session).
 //
+// The optional isTxActive callback reports whether the caller currently has an active
+// user transaction on this connection. When provided and returning false, aborted
+// transaction errors are auto-recovered by issuing ROLLBACK and retrying once.
+// When omitted (or returning true), automatic rollback is skipped to avoid rolling
+// back caller-owned transactions.
+//
 // Note: ExecContext serializes behind any running query (pool contention for *sql.DB,
 // internal mutex for *sql.Conn). This means credentials are refreshed between queries,
 // not during them. A query that runs longer than the credential TTL (~6h for instance
@@ -1067,22 +1083,55 @@ type sqlExecer interface {
 // Returns a stop function that cancels the refresh goroutine. The caller must call
 // the stop function when the connection is closed to prevent goroutine leaks.
 // If credential refresh is not needed (static credentials, no S3, etc.), returns a no-op.
-func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig) func() {
+func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig, isTxActive ...func() bool) func() {
 	if !needsCredentialRefresh(dlCfg) {
 		return func() {}
+	}
+
+	var txActiveProbe func() bool
+	if len(isTxActive) > 0 {
+		txActiveProbe = isTxActive[0]
 	}
 
 	done := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(credentialRefreshInterval)
 		defer ticker.Stop()
+		var consecutiveFailures int
 		for {
 			select {
 			case <-ticker.C:
 				secretStmt := buildCredentialChainSecret(dlCfg)
-				if _, err := execer.ExecContext(context.Background(), secretStmt); err != nil {
-					slog.Warn("Failed to refresh S3 credentials.", "error", err)
+				_, err := execer.ExecContext(context.Background(), secretStmt)
+
+				// If stuck in aborted transaction, only auto-rollback when caller
+				// confirms there is no active user transaction.
+				if isTransactionAborted(err) {
+					switch {
+					case txActiveProbe == nil:
+						slog.Warn("S3 credential refresh hit aborted transaction; skipping automatic ROLLBACK because transaction state is unknown.")
+					case txActiveProbe():
+						slog.Warn("S3 credential refresh hit aborted transaction; skipping automatic ROLLBACK while user transaction is active.")
+					default:
+						slog.Warn("S3 credential refresh hit aborted transaction, issuing ROLLBACK.")
+						_, _ = execer.ExecContext(context.Background(), "ROLLBACK")
+						_, err = execer.ExecContext(context.Background(), secretStmt)
+					}
+				}
+
+				if err != nil {
+					consecutiveFailures++
+					lvl := slog.LevelWarn
+					if consecutiveFailures >= 3 {
+						lvl = slog.LevelError
+					}
+					slog.Log(context.Background(), lvl, "Failed to refresh S3 credentials.",
+						"error", err, "consecutive_failures", consecutiveFailures)
 				} else {
+					if consecutiveFailures > 0 {
+						slog.Info("S3 credential refresh recovered.", "after_failures", consecutiveFailures)
+					}
+					consecutiveFailures = 0
 					slog.Debug("Refreshed S3 credentials.")
 				}
 			case <-done:
@@ -1129,6 +1178,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 // handleConnectionInProcess handles a connection in the current process (non-isolated mode).
 func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
+	slog.Debug("Connection accepted.", "remote_addr", remoteAddr)
+
 	// Track active connections (only after rate limiting passes)
 	atomic.AddInt64(&s.activeConns, 1)
 	connectionsGauge.Inc()
@@ -1158,7 +1209,9 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 	}
 
 	if err := c.serve(); err != nil {
-		slog.Error("Connection error.", "error", err)
+		slog.Error("Connection error.", "user", c.username, "remote_addr", remoteAddr, "error", err)
+	} else {
+		slog.Info("Client disconnected.", "user", c.username, "remote_addr", remoteAddr)
 	}
 }
 
@@ -1166,6 +1219,13 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 // The parent handles SSL request and cancel requests, then spawns a child process
 // for TLS handshake, authentication, and query execution.
 func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
+	if err := conn.SetReadDeadline(time.Now().Add(startupReadTimeout)); err != nil {
+		slog.Error("Failed to set startup deadline.", "remote_addr", remoteAddr, "error", err)
+		s.rateLimiter.UnregisterConnection(remoteAddr)
+		_ = conn.Close()
+		return
+	}
+
 	// IMPORTANT: Use the raw connection (not a buffered reader) for reading the
 	// SSL request message. This ensures we don't accidentally buffer data that
 	// should be read by the child process after FD passing.
@@ -1183,6 +1243,33 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 		return
 	}
 
+	// Handle GSSENCRequest - decline and re-read for SSLRequest.
+	// Loop to handle the unlikely case of multiple GSSENCRequests.
+	for range 3 {
+		if params["__gssenc_request"] != "true" {
+			break
+		}
+		slog.Debug("GSSENCRequest received, declining.", "remote_addr", remoteAddr)
+		if _, err := conn.Write([]byte("N")); err != nil {
+			slog.Error("Failed to send GSSENC decline.", "remote_addr", remoteAddr, "error", err)
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+		// Re-read: client will send SSLRequest next
+		params, err = readStartupMessage(conn)
+		if err != nil {
+			if err == io.EOF || errors.Is(err, io.EOF) {
+				slog.Debug("Client closed connection after GSSENC decline.", "remote_addr", remoteAddr)
+			} else {
+				slog.Error("Failed to read startup message after GSSENC decline.", "remote_addr", remoteAddr, "error", err)
+			}
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+	}
+
 	// Handle cancel request in parent (no child spawn needed)
 	if params["__cancel_request"] == "true" {
 		s.handleCancelRequestIsolated(params)
@@ -1193,6 +1280,13 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 
 	// Handle SSL request: send 'S' then spawn child for TLS handshake
 	if params["__ssl_request"] == "true" {
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+
 		// Send 'S' to indicate we support SSL
 		if _, err := conn.Write([]byte("S")); err != nil {
 			slog.Error("Failed to send SSL response.", "remote_addr", remoteAddr, "error", err)

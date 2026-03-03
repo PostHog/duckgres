@@ -95,6 +95,67 @@ func TestMapDuckDBType(t *testing.T) {
 	}
 }
 
+func TestMapDuckDBTypeTypmod(t *testing.T) {
+	// PostgreSQL uses typmod=-1 to mean "no modifier". JDBC clients (pgjdbc)
+	// interpret typmod=0 differently from -1. For example, INTERVAL with typmod=0
+	// means "second precision 0" (no fractional seconds), while typmod=-1 means
+	// default precision (microseconds). Sending the wrong typmod breaks JDBC
+	// metadata and can cause client-side errors.
+	tests := []struct {
+		typeName      string
+		wantTypmod    int32
+	}{
+		// Types without modifiers should have typmod=-1
+		{"BOOLEAN", -1},
+		{"TINYINT", -1},
+		{"SMALLINT", -1},
+		{"INTEGER", -1},
+		{"BIGINT", -1},
+		{"REAL", -1},
+		{"DOUBLE", -1},
+		{"VARCHAR", -1},
+		{"TEXT", -1},
+		{"BYTEA", -1},
+		{"DATE", -1},
+		{"TIME", -1},
+		{"TIMETZ", -1},
+		{"TIMESTAMP", -1},
+		{"TIMESTAMPTZ", -1},
+		{"INTERVAL", -1},
+		{"UUID", -1},
+		{"JSON", -1},
+		{"UTINYINT", -1},
+		{"USMALLINT", -1},
+		{"UINTEGER", -1},
+		// NUMERIC without precision should have typmod=-1
+		{"NUMERIC", -1},
+		{"DECIMAL", -1},
+		// NUMERIC with precision should have a positive typmod
+		{"DECIMAL(10,2)", int32((10<<16)|2) + 4},
+		// HUGEINT and UBIGINT have specific typmods for postgres_scanner
+		{"HUGEINT", int32(38<<16) + 4},
+		{"UBIGINT", int32(20<<16) + 4},
+		// Aliases and long-form type names
+		{"STRING", -1},
+		{"TIME WITH TIME ZONE", -1},
+		{"TIMESTAMP WITH TIME ZONE", -1},
+		// Array types inherit element typmod
+		{"INTEGER[]", -1},
+		{"INTERVAL[]", -1},
+		// Unknown types should default to typmod=-1
+		{"SOMECUSTOMTYPE", -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.typeName, func(t *testing.T) {
+			info := mapDuckDBType(tt.typeName)
+			if info.Typmod != tt.wantTypmod {
+				t.Errorf("mapDuckDBType(%q).Typmod = %d, want %d", tt.typeName, info.Typmod, tt.wantTypmod)
+			}
+		})
+	}
+}
+
 func TestEncodeBool(t *testing.T) {
 	tests := []struct {
 		name     string

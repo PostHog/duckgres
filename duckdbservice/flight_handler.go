@@ -53,7 +53,9 @@ func (h *FlightSQLHandler) sessionFromContext(ctx context.Context) (*Session, er
 
 func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightService_DoActionServer) error {
 	var req struct {
-		Username string `json:"username"`
+		Username    string `json:"username"`
+		MemoryLimit string `json:"memory_limit"`
+		Threads     int    `json:"threads"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return status.Errorf(codes.InvalidArgument, "invalid CreateSession request: %v", err)
@@ -67,7 +69,7 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 		return status.Error(codes.PermissionDenied, "unknown username")
 	}
 
-	session, err := h.pool.CreateSession(req.Username)
+	session, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads)
 	if err != nil {
 		return status.Errorf(codes.ResourceExhausted, "create session: %v", err)
 	}

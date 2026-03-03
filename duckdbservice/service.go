@@ -41,11 +41,11 @@ type SessionPool struct {
 	startTime   time.Time
 	maxSessions int
 	stopCh      chan struct{}
-	warmupDB    *sql.DB      // Keep this open to keep shared cache alive
+	warmupDB    *sql.DB       // Keep this open to keep shared cache alive
 	warmupDone  chan struct{} // Closed when Warmup() completes (success or failure)
-	dbInitOnce  sync.Once    // Serializes fallback CreateDBConnection when warmup fails
-	fallbackDB  *sql.DB      // Lazily created if warmup fails
-	fallbackErr error        // Cached error from fallback creation
+	dbInitOnce  sync.Once     // Serializes fallback CreateDBConnection when warmup fails
+	fallbackDB  *sql.DB       // Lazily created if warmup fails
+	fallbackErr error         // Cached error from fallback creation
 }
 
 type trackedTx struct {
@@ -106,18 +106,19 @@ func (p *SessionPool) Warmup() error {
 		return nil
 	}
 
+	start := time.Now()
 	slog.Info("Pre-warming worker DuckDB instance...")
 	// Use a system-level username for warmup
 	db, err := server.CreateDBConnection(p.cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
 	if err != nil {
-		return fmt.Errorf("warmup failed: %w", err)
+		return fmt.Errorf("warmup failed after %v: %w", time.Since(start), err)
 	}
 
 	p.mu.Lock()
 	p.warmupDB = db
 	p.mu.Unlock()
 
-	slog.Info("Worker pre-warmed successfully.")
+	slog.Info("Worker pre-warmed successfully.", "duration", time.Since(start))
 	return nil
 }
 
@@ -275,7 +276,8 @@ func (svc *DuckDBService) Shutdown() {
 }
 
 // CreateSession creates a new DuckDB session for the given username.
-func (p *SessionPool) CreateSession(username string) (*Session, error) {
+func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (*Session, error) {
+	start := time.Now()
 	// Reserve a slot under the lock to prevent TOCTOU race on maxSessions.
 	p.mu.Lock()
 	if p.maxSessions > 0 && len(p.sessions)+p.reserved >= p.maxSessions {
@@ -296,7 +298,11 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	// see warmupDB==nil and call CreateDBConnection concurrently with warmup,
 	// causing two goroutines to LOAD native extensions simultaneously in the
 	// same process — which corrupts the heap (malloc: unaligned tcache chunk).
+	waitStart := time.Now()
 	<-p.warmupDone
+	if waitDur := time.Since(waitStart); waitDur > 100*time.Millisecond {
+		slog.Info("Waited for warmup to complete.", "duration", waitDur)
+	}
 
 	// Use shared warmupDB if available (highly preferred for performance)
 	p.mu.RLock()
@@ -307,6 +313,7 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 		// Fallback: create a shared DB if warmup failed or wasn't run.
 		// Uses sync.Once to ensure only one goroutine loads native extensions;
 		// concurrent LOAD of the same C++ extension corrupts the heap.
+		fallbackStart := time.Now()
 		p.dbInitOnce.Do(func() {
 			p.fallbackDB, p.fallbackErr = server.CreateDBConnection(p.cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
 		})
@@ -317,6 +324,7 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 			return nil, fmt.Errorf("create session db: %w", p.fallbackErr)
 		}
 		db = p.fallbackDB
+		slog.Info("Using fallback DB (warmup failed).", "duration", time.Since(fallbackStart))
 	}
 
 	// Obtain a dedicated connection for this session to ensure isolation
@@ -333,7 +341,18 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	// Since the DB is shared, we must set session-local parameters here.
 	initSearchPath(conn, username)
 
-	stop := server.StartCredentialRefresh(conn, p.cfg.DuckLake)
+	// Apply initial resource limits if provided (optimizes handshake by avoiding
+	// roundtrips from control plane).
+	if memoryLimit != "" {
+		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET memory_limit = '%s'", memoryLimit)); err != nil {
+			slog.Warn("Failed to set initial memory_limit.", "user", username, "error", err)
+		}
+	}
+	if threads > 0 {
+		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET threads = %d", threads)); err != nil {
+			slog.Warn("Failed to set initial threads.", "user", username, "error", err)
+		}
+	}
 
 	token := generateSessionToken()
 	session := &Session{
@@ -348,13 +367,19 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	}
 	session.lastUsed.Store(time.Now().UnixNano())
 
+	stop := server.StartCredentialRefresh(conn, p.cfg.DuckLake, func() bool {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return len(session.txns) > 0
+	})
+
 	p.mu.Lock()
 	p.reserved--
 	p.sessions[token] = session
 	p.stopRefresh[token] = stop
 	p.mu.Unlock()
 
-	slog.Debug("Created DuckDB session", "user", username)
+	slog.Debug("Created DuckDB session", "user", username, "duration", time.Since(start))
 	return session, nil
 }
 

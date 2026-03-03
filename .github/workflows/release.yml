@@ -19,6 +19,12 @@ jobs:
           - os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+          - os: macos-15
+            goos: darwin
+            goarch: amd64
 
     runs-on: ${{ matrix.os }}
 
@@ -35,6 +41,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           go build -ldflags "-X main.version=build-${SHORT_SHA} -X main.commit=${{ github.sha }} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres-${{ matrix.goos }}-${{ matrix.goarch }} .
@@ -65,8 +72,12 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum duckgres-linux-amd64/duckgres-linux-amd64 duckgres-linux-arm64/duckgres-linux-arm64 | \
-            sed 's|duckgres-linux-\([^/]*\)/||g' > checksums.txt
+          sha256sum \
+            duckgres-linux-amd64/duckgres-linux-amd64 \
+            duckgres-linux-arm64/duckgres-linux-arm64 \
+            duckgres-darwin-arm64/duckgres-darwin-arm64 \
+            duckgres-darwin-amd64/duckgres-darwin-amd64 | \
+            sed 's|duckgres-[^/]*/||g' > checksums.txt
           cat checksums.txt
 
       - name: Check if build release already exists
@@ -97,6 +108,8 @@ jobs:
           files: |
             artifacts/duckgres-linux-amd64/duckgres-linux-amd64
             artifacts/duckgres-linux-arm64/duckgres-linux-arm64
+            artifacts/duckgres-darwin-arm64/duckgres-darwin-arm64
+            artifacts/duckgres-darwin-amd64/duckgres-darwin-amd64
             artifacts/checksums.txt
 
       - name: Delete existing latest release
@@ -124,4 +137,6 @@ jobs:
           files: |
             artifacts/duckgres-linux-amd64/duckgres-linux-amd64
             artifacts/duckgres-linux-arm64/duckgres-linux-arm64
+            artifacts/duckgres-darwin-arm64/duckgres-darwin-arm64
+            artifacts/duckgres-darwin-amd64/duckgres-darwin-amd64
             artifacts/checksums.txt

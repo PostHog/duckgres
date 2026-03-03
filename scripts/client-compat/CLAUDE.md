@@ -25,7 +25,7 @@ scripts/client-compat/
 │   ├── tokio-postgres/
 │   ├── node-postgres/
 │   ├── sqlalchemy/
-│   └── harlequin/
+│   └── dbt/
 └── results/                    # output volume (.gitignored)
 ```
 
@@ -118,6 +118,7 @@ The shared queries YAML format:
 ```yaml
 - suite: catalog_views
   name: pg_database
+  stub: true            # optional — flags hardcoded dummy return values
   sql: SELECT datname FROM pg_database WHERE datallowconn
 ```
 
@@ -188,14 +189,23 @@ Duckgres auto-generates a self-signed cert. Clients must accept it:
 Group related tests under a suite name. Common conventions:
 - `connection` — TLS, auth, server version, driver info
 - `ddl_dml` / `core_ddl_dml` — CREATE, INSERT, UPDATE, DELETE, DROP
+- `dbeaver_introspection` — DBeaver CE metadata queries (see below)
 - Library-specific features get their own suite (`batch`, `copy`, `orm`, `prepared`, etc.)
+
+### DBeaver introspection suite
+
+DBeaver CE cannot run headlessly in Docker (GTK3 SWT bug freezes the event loop under Xvfb).
+Instead, the `dbeaver_introspection` suite in `queries.yaml` contains the exact catalog queries
+DBeaver fires on connect, sourced from [cockroachdb/cockroach#28309](https://github.com/cockroachdb/cockroach/issues/28309).
+These queries are executed by every client, testing the same catalog surface a real DBeaver
+connection would exercise.
 
 ## Results Database
 
 Exported to `results/results_<timestamp>.duckdb` with:
 
-- `queries` table — the shared query catalog from `queries.yaml`
+- `queries` table — the shared query catalog from `queries.yaml` (includes `stub` boolean)
 - `results` table — all test outcomes (client, suite, test_name, status, detail, ts)
-- `coverage` view — LEFT JOIN of queries to results (shows gaps)
+- `coverage` view — LEFT JOIN of queries to results (shows gaps, includes `stub` flag)
 
 Open with `just query-last-run` or `duckdb results/results_*.duckdb`.

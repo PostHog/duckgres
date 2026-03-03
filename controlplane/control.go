@@ -28,10 +28,10 @@ import (
 type ControlPlaneConfig struct {
 	server.Config
 
-	SocketDir           string
-	ConfigPath          string // Path to config file, passed to workers
-	HandoverSocket      string
-	HealthCheckInterval time.Duration
+	SocketDir            string
+	ConfigPath           string // Path to config file, passed to workers
+	HandoverSocket       string
+	HealthCheckInterval  time.Duration
 	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during handover (default: 24h)
@@ -43,23 +43,23 @@ type ControlPlaneConfig struct {
 // PostgreSQL wire protocol, and SQL transpilation all happen here. Workers are
 // thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
-	cfg         ControlPlaneConfig
-	pool        *FlightWorkerPool
-	sessions    *SessionManager
-	flight      *FlightIngress
-	rebalancer  *MemoryRebalancer
-	srv         *server.Server // Minimal server for cancel request routing
-	rateLimiter *server.RateLimiter
-	tlsConfig   *tls.Config
-	pgListener  net.Listener
-	activeConns int64
-	closed      bool
-	closeMu     sync.Mutex
-	wg          sync.WaitGroup
-	reloading        atomic.Bool    // guards against concurrent selfExec from double SIGUSR1
-	handoverDraining atomic.Bool    // true after handover succeeded; SIGTERM should exit immediately
-	handoverLn  net.Listener        // current handover listener; protected by closeMu
-	acmeManager *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
+	cfg              ControlPlaneConfig
+	pool             *FlightWorkerPool
+	sessions         *SessionManager
+	flight           *FlightIngress
+	rebalancer       *MemoryRebalancer
+	srv              *server.Server // Minimal server for cancel request routing
+	rateLimiter      *server.RateLimiter
+	tlsConfig        *tls.Config
+	pgListener       net.Listener
+	activeConns      int64
+	closed           bool
+	closeMu          sync.Mutex
+	wg               sync.WaitGroup
+	reloading        atomic.Bool         // guards against concurrent selfExec from double SIGUSR1
+	handoverDraining atomic.Bool         // true after handover succeeded; SIGTERM should exit immediately
+	handoverLn       net.Listener        // current handover listener; protected by closeMu
+	acmeManager      *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -188,7 +188,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		minWorkers = maxWorkers
 	}
 
-	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
+	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, minWorkers, maxWorkers)
 	pool.idleTimeout = cfg.WorkerIdleTimeout
 
 	// Import pre-bound sockets from handover, or pre-bind new ones.
@@ -392,8 +392,24 @@ func (cp *ControlPlane) acceptLoop() {
 	}
 }
 
+func createSessionWithRegisteredCancel(
+	srv *server.Server,
+	timeout time.Duration,
+	key server.BackendKey,
+	createFn func(context.Context) (int32, *server.FlightExecutor, error),
+) (int32, *server.FlightExecutor, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	srv.RegisterQuery(key, cancel)
+	defer srv.UnregisterQuery(key)
+
+	return createFn(ctx)
+}
+
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
+	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
 
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
@@ -403,7 +419,16 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	defer releaseRateLimit()
 
-	// Read startup message to determine SSL vs cancel
+	// Set a startup read timeout to prevent goroutine leaks from clients
+	// that connect but never send data (e.g., load balancer TCP health checks).
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		slog.Error("Failed to set startup deadline.", "remote_addr", remoteAddr, "error", err)
+		_ = conn.Close()
+		return
+	}
+
+	// Read startup message to determine SSL vs cancel.
+	// readStartupFromRaw handles GSSENC probes by replying 'N' and continuing.
 	params, err := readStartupFromRaw(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
@@ -419,6 +444,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	if params.cancelRequest {
 		key := server.BackendKey{Pid: params.cancelPid, SecretKey: params.cancelSecretKey}
 		cp.srv.CancelQuery(key)
+		_ = conn.Close()
+		return
+	}
+
+	// Clear the startup read deadline before proceeding to TLS (which sets its own).
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -453,6 +485,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = tlsConn.Close()
 		return
 	}
+	slog.Info("TLS connection established.", "remote_addr", remoteAddr)
 	defer func() { _ = tlsConn.Close() }()
 
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
@@ -526,14 +559,47 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
+	// Feed initial parameters and backend key data to the client IMMEDIATELY.
+	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
+	pid := cp.sessions.ReservePID()
+	secretKey := server.GenerateSecretKey()
+
+	// Use a temporary clientConn just to send initial params
+	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, database, applicationName, nil, pid, secretKey, -1)
+	defer server.CancelClientConn(tmpCC)
+	server.SendInitialParams(tmpCC)
+	if err := writer.Flush(); err != nil {
+		slog.Error("Failed to flush initial params.", "remote_addr", remoteAddr, "error", err)
+		return
+	}
+
 	// Create session on a worker. The timeout controls how long we wait in the
 	// worker queue when all slots are occupied.
-	ctx, cancel := context.WithTimeout(context.Background(), cp.cfg.WorkerQueueTimeout)
-	pid, executor, err := cp.sessions.CreateSession(ctx, username)
-	cancel()
+	// Pass resource limits to be applied immediately by the worker (one RPC).
+	var (
+		memLimit string
+		threads  int
+	)
+	if cp.rebalancer != nil {
+		memLimit = cp.rebalancer.MemoryLimit()
+		threads = cp.rebalancer.PerSessionThreads()
+	}
+
+	_, executor, err := createSessionWithRegisteredCancel(
+		cp.srv,
+		cp.cfg.WorkerQueueTimeout,
+		server.BackendKey{Pid: pid, SecretKey: secretKey},
+		func(ctx context.Context) (int32, *server.FlightExecutor, error) {
+			return cp.sessions.CreateSession(ctx, username, pid, memLimit, threads)
+		},
+	)
 	if err != nil {
 		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
-		_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
+		if errors.Is(err, context.Canceled) {
+			_ = server.WriteErrorResponse(writer, "FATAL", "57014", "canceling authentication due to user request")
+		} else {
+			_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
+		}
 		_ = writer.Flush()
 		return
 	}
@@ -543,14 +609,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// the message loop if the backing worker dies.
 	cp.sessions.SetConnCloser(pid, tlsConn)
 
-	secretKey := server.GenerateSecretKey()
-
-	// Create clientConn with FlightExecutor
+	// Create real clientConn with FlightExecutor and worker assignment
 	workerID := cp.sessions.WorkerIDForPID(pid)
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, database, applicationName, executor, pid, secretKey, workerID)
 
-	// Send initial parameters and ReadyForQuery
-	server.SendInitialParams(cc)
+	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
 		slog.Error("Failed to send ReadyForQuery.", "remote_addr", remoteAddr, "error", err)
 		return
@@ -572,43 +635,87 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 // startupResult holds the parsed initial startup message.
 type startupResult struct {
 	sslRequest      bool
+	gssRequest      bool
 	cancelRequest   bool
 	cancelPid       int32
 	cancelSecretKey int32
 }
 
 // readStartupFromRaw reads the startup message from a raw (unbuffered) connection.
+// It handles GSSENCRequest negotiation (up to maxNegotiationRounds) before returning.
 func readStartupFromRaw(conn net.Conn) (startupResult, error) {
-	// Read length (4 bytes)
-	var length int32
-	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-		return startupResult{}, fmt.Errorf("read length: %w", err)
+	// A legitimate client sends at most one GSSENCRequest followed by SSLRequest.
+	// Cap iterations to prevent a malicious client from looping indefinitely.
+	const maxNegotiationRounds = 3
+
+	for range maxNegotiationRounds {
+		// Read length (4 bytes)
+		var length int32
+		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+			return startupResult{}, fmt.Errorf("read length: %w", err)
+		}
+
+		if length < 8 || length > 10000 {
+			return startupResult{}, fmt.Errorf("invalid startup message length: %d", length)
+		}
+
+		remaining := make([]byte, length-4)
+		if _, err := fullRead(conn, remaining); err != nil {
+			return startupResult{}, fmt.Errorf("read body: %w", err)
+		}
+
+		protocolVersion := binary.BigEndian.Uint32(remaining[:4])
+
+		// SSL request
+		if protocolVersion == 80877103 {
+			return startupResult{sslRequest: true}, nil
+		}
+
+		// Cancel request
+		if protocolVersion == 80877102 && len(remaining) >= 12 {
+			pid := int32(binary.BigEndian.Uint32(remaining[4:8]))
+			key := int32(binary.BigEndian.Uint32(remaining[8:12]))
+			return startupResult{cancelRequest: true, cancelPid: pid, cancelSecretKey: key}, nil
+		}
+
+		// GSSENCRequest (PostgreSQL 12+, JDBC driver gssEncMode=prefer)
+		// Respond with 'N' (GSSAPI encryption not supported) and re-read.
+		// The client will follow up with SSLRequest on the same connection.
+		// The startup read deadline set in handleConnection covers all rounds.
+		if protocolVersion == 80877104 {
+			slog.Debug("GSSENCRequest received, declining.", "remote_addr", conn.RemoteAddr())
+			if _, err := conn.Write([]byte("N")); err != nil {
+				return startupResult{}, fmt.Errorf("write GSSENC decline: %w", err)
+			}
+			continue
+		}
+
+		return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
 	}
 
-	if length < 8 || length > 10000 {
-		return startupResult{}, fmt.Errorf("invalid startup message length: %d", length)
+	return startupResult{}, fmt.Errorf("too many negotiation rounds")
+}
+
+// readStartupWithGSSFallback accepts a GSSAPI probe, rejects it with 'N',
+// and keeps reading startup packets on the same connection so clients can
+// continue with SSLRequest/startup without reconnecting.
+func readStartupWithGSSFallback(conn net.Conn) (startupResult, error) {
+	for i := 0; i < 4; i++ {
+		params, err := readStartupFromRaw(conn)
+		if err != nil {
+			return startupResult{}, err
+		}
+
+		if !params.gssRequest {
+			return params, nil
+		}
+
+		if _, err := conn.Write([]byte{'N'}); err != nil {
+			return startupResult{}, fmt.Errorf("write GSSAPI rejection: %w", err)
+		}
 	}
 
-	remaining := make([]byte, length-4)
-	if _, err := fullRead(conn, remaining); err != nil {
-		return startupResult{}, fmt.Errorf("read body: %w", err)
-	}
-
-	protocolVersion := binary.BigEndian.Uint32(remaining[:4])
-
-	// SSL request
-	if protocolVersion == 80877103 {
-		return startupResult{sslRequest: true}, nil
-	}
-
-	// Cancel request
-	if protocolVersion == 80877102 && len(remaining) >= 12 {
-		pid := int32(binary.BigEndian.Uint32(remaining[4:8]))
-		key := int32(binary.BigEndian.Uint32(remaining[8:12]))
-		return startupResult{cancelRequest: true, cancelPid: pid, cancelSecretKey: key}, nil
-	}
-
-	return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
+	return startupResult{}, fmt.Errorf("too many GSSAPI startup requests")
 }
 
 func fullRead(conn net.Conn, buf []byte) (int, error) {
