@@ -454,6 +454,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = tlsConn.Close()
 		return
 	}
+	slog.Info("TLS connection established.", "remote_addr", remoteAddr)
 	defer func() { _ = tlsConn.Close() }()
 
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
