@@ -490,11 +490,13 @@ func TestAcquireWorker_AtomicClaimRace(t *testing.T) {
 		w := <-results
 		if w == nil {
 			t.Fatal("failed to acquire worker")
+			return
 		}
-		if workers[w.ID] {
-			t.Errorf("worker %d was assigned multiple times!", w.ID)
+		workerID := w.ID
+		if workers[workerID] {
+			t.Errorf("worker %d was assigned multiple times!", workerID)
 		}
-		workers[w.ID] = true
+		workers[workerID] = true
 	}
 }
 
@@ -660,6 +662,7 @@ func TestLeastLoadedWorkerLocked(t *testing.T) {
 
 	if best == nil {
 		t.Fatal("expected a worker")
+		return
 	}
 	if best.ID != 1 {
 		t.Fatalf("expected worker 1 (least loaded with 2 sessions), got worker %d", best.ID)
@@ -840,6 +843,7 @@ func TestReleaseWorkerSocketReturnsPrebound(t *testing.T) {
 	ps := pool.takePrebound()
 	if ps == nil {
 		t.Fatal("takePrebound returned nil")
+		return
 	}
 
 	w := &ManagedWorker{
@@ -971,6 +975,7 @@ func TestReleaseWorkerSocketIdempotent(t *testing.T) {
 	ps := pool.takePrebound()
 	if ps == nil {
 		t.Fatal("takePrebound returned nil")
+		return
 	}
 
 	w := &ManagedWorker{
@@ -1068,6 +1073,7 @@ func TestImportPrebound(t *testing.T) {
 	ps := pool.takePrebound()
 	if ps == nil {
 		t.Fatal("takePrebound returned nil after import")
+		return
 	}
 	_ = ps.listener.Close()
 
@@ -1138,9 +1144,11 @@ func TestTakeAllPreboundThenImport(t *testing.T) {
 	ps := pool2.takePrebound()
 	if ps == nil {
 		t.Fatal("takePrebound from new pool returned nil")
+		return
 	}
 	if ps.listener == nil {
 		t.Fatal("listener is nil")
+		return
 	}
 	_ = ps.listener.Close()
 

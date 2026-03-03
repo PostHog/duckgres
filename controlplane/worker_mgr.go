@@ -239,6 +239,11 @@ func (p *FlightWorkerPool) ImportPrebound(sockets []*preboundSocket) {
 // binding a new socket (which may fail with EROFS under systemd's
 // ProtectSystem=strict after startup).
 func (p *FlightWorkerPool) SpawnWorker(id int) error {
+	spawnStart := time.Now()
+	defer func() {
+		observeControlPlaneWorkerSpawn(time.Since(spawnStart))
+	}()
+
 	token := generateToken()
 
 	// Try to use a pre-bound socket first. These are bound eagerly at startup
@@ -491,6 +496,11 @@ func (p *FlightWorkerPool) SpawnMinWorkers(count int) error {
 // This ensures the number of worker processes never exceeds maxWorkers while
 // allowing unlimited concurrent sessions across the fixed pool.
 func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+	acquireStart := time.Now()
+	defer func() {
+		observeControlPlaneWorkerAcquire(time.Since(acquireStart))
+	}()
+
 	p.mu.Lock()
 	if p.shuttingDown {
 		p.mu.Unlock()

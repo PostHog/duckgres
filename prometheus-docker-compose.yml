@@ -2,13 +2,15 @@
 #
 # Usage:
 #   1. Start duckgres: ./duckgres --port 5432
-#   2. Start prometheus: docker compose -f prometheus-docker-compose.yml up
-#   3. Open http://localhost:9091 to view metrics
+#   2. (Optional) Start perf harness metrics endpoint on :9095 during perf runs
+#   3. Start prometheus: docker compose -f prometheus-docker-compose.yml up
+#   4. Open http://localhost:9091 to view metrics
 #
 # Available metrics:
 #   - duckgres_connections_open: current number of open connections
 #   - duckgres_query_duration_seconds: histogram of query latencies
 #   - duckgres_query_errors_total: counter of failed queries
+#   - duckgres_perf_query_duration_seconds: per-query perf harness latency histograms
 #
 # Note: Uses port 9091 for Prometheus UI to avoid conflict with duckgres metrics on 9090.
 

@@ -224,6 +224,7 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContextWithTokenMetadata(ctx c
 		s, ok := h.sessions.GetByToken(sessionToken)
 		if !ok {
 			server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
+			observeFlightIngressSessionOutcome("token_invalid")
 			return nil, status.Error(codes.Unauthenticated, "session not found")
 		}
 
@@ -236,6 +237,7 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContextWithTokenMetadata(ctx c
 			}
 			if username != s.username {
 				server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
+				observeFlightIngressSessionOutcome("auth_failed")
 				return nil, status.Error(codes.PermissionDenied, "session token does not match authenticated user")
 			}
 		}
@@ -244,6 +246,7 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContextWithTokenMetadata(ctx c
 			setSessionTokenMetadata(ctx, sessionToken)
 		}
 		s.touch()
+		observeFlightIngressSessionOutcome("reused")
 		return s, nil
 	}
 
@@ -252,21 +255,25 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContextWithTokenMetadata(ctx c
 	defer releaseRateLimit()
 	if rejectReason != "" {
 		slog.Warn("Flight auth rejected by rate limit policy.", "remote_addr", remoteAddr, "reason", rejectReason)
+		observeFlightIngressSessionOutcome("rate_limited")
 		return nil, status.Error(codes.ResourceExhausted, "authentication rate limit exceeded")
 	}
 
 	username, err := h.authenticateBasicCredentials(md, remoteAddr)
 	if err != nil {
+		observeFlightIngressSessionOutcome("auth_failed")
 		return nil, err
 	}
 
 	s, err := h.sessions.Create(ctx, username)
 	if err != nil {
+		observeFlightIngressSessionOutcome("create_failed")
 		return nil, status.Errorf(codes.Unavailable, "create bootstrap session: %v", err)
 	}
 
 	setSessionTokenMetadata(ctx, s.token)
 	s.touch()
+	observeFlightIngressSessionOutcome("created")
 	return s, nil
 }
 
@@ -316,6 +323,8 @@ func setSessionTokenMetadata(ctx context.Context, sessionToken string) {
 }
 
 func (h *ControlPlaneFlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	defer observeFlightRPCDuration("GetFlightInfoStatement", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, err
@@ -381,6 +390,8 @@ func (h *ControlPlaneFlightSQLHandler) GetFlightInfoStatement(ctx context.Contex
 }
 
 func (h *ControlPlaneFlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	defer observeFlightRPCDuration("DoGetStatement", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -430,6 +441,8 @@ func (h *ControlPlaneFlightSQLHandler) DoGetStatement(ctx context.Context, ticke
 }
 
 func (h *ControlPlaneFlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context, cmd flightsql.StatementUpdate) (int64, error) {
+	defer observeFlightRPCDuration("DoPutCommandStatementUpdate", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return 0, err
@@ -462,6 +475,8 @@ func rowsAffectedOrError(res server.ExecResult) (int64, error) {
 }
 
 func (h *ControlPlaneFlightSQLHandler) BeginTransaction(ctx context.Context, req flightsql.ActionBeginTransactionRequest) ([]byte, error) {
+	defer observeFlightRPCDuration("BeginTransaction", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, err
@@ -482,6 +497,8 @@ func (h *ControlPlaneFlightSQLHandler) BeginTransaction(ctx context.Context, req
 }
 
 func (h *ControlPlaneFlightSQLHandler) EndTransaction(ctx context.Context, req flightsql.ActionEndTransactionRequest) error {
+	defer observeFlightRPCDuration("EndTransaction", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return err
@@ -515,6 +532,8 @@ func (h *ControlPlaneFlightSQLHandler) EndTransaction(ctx context.Context, req f
 }
 
 func (h *ControlPlaneFlightSQLHandler) CloseSession(ctx context.Context, req *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
+	defer observeFlightRPCDuration("CloseSession", time.Now())
+
 	_ = req
 	if h.sessions == nil {
 		return nil, status.Error(codes.Unavailable, "session store is not configured")
@@ -543,6 +562,8 @@ func (h *ControlPlaneFlightSQLHandler) CloseSession(ctx context.Context, req *fl
 }
 
 func (h *ControlPlaneFlightSQLHandler) CreatePreparedStatement(ctx context.Context, req flightsql.ActionCreatePreparedStatementRequest) (flightsql.ActionCreatePreparedStatementResult, error) {
+	defer observeFlightRPCDuration("CreatePreparedStatement", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, err
@@ -589,6 +610,8 @@ func (h *ControlPlaneFlightSQLHandler) CreatePreparedStatement(ctx context.Conte
 }
 
 func (h *ControlPlaneFlightSQLHandler) ClosePreparedStatement(ctx context.Context, req flightsql.ActionClosePreparedStatementRequest) error {
+	defer observeFlightRPCDuration("ClosePreparedStatement", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return err
@@ -598,6 +621,8 @@ func (h *ControlPlaneFlightSQLHandler) ClosePreparedStatement(ctx context.Contex
 }
 
 func (h *ControlPlaneFlightSQLHandler) GetFlightInfoPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	defer observeFlightRPCDuration("GetFlightInfoPreparedStatement", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, err
@@ -624,6 +649,8 @@ func (h *ControlPlaneFlightSQLHandler) GetFlightInfoPreparedStatement(ctx contex
 }
 
 func (h *ControlPlaneFlightSQLHandler) DoGetPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	defer observeFlightRPCDuration("DoGetPreparedStatement", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -672,6 +699,8 @@ func (h *ControlPlaneFlightSQLHandler) DoGetPreparedStatement(ctx context.Contex
 }
 
 func (h *ControlPlaneFlightSQLHandler) GetFlightInfoSchemas(ctx context.Context, cmd flightsql.GetDBSchemas, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	defer observeFlightRPCDuration("GetFlightInfoSchemas", time.Now())
+
 	if _, err := h.sessionFromContext(ctx); err != nil {
 		return nil, err
 	}
@@ -689,6 +718,8 @@ func (h *ControlPlaneFlightSQLHandler) GetFlightInfoSchemas(ctx context.Context,
 }
 
 func (h *ControlPlaneFlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd flightsql.GetDBSchemas) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	defer observeFlightRPCDuration("DoGetDBSchemas", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -741,6 +772,8 @@ func (h *ControlPlaneFlightSQLHandler) DoGetDBSchemas(ctx context.Context, cmd f
 }
 
 func (h *ControlPlaneFlightSQLHandler) GetFlightInfoTables(ctx context.Context, cmd flightsql.GetTables, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	defer observeFlightRPCDuration("GetFlightInfoTables", time.Now())
+
 	if _, err := h.sessionFromContext(ctx); err != nil {
 		return nil, err
 	}
@@ -762,6 +795,8 @@ func (h *ControlPlaneFlightSQLHandler) GetFlightInfoTables(ctx context.Context, 
 }
 
 func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	defer observeFlightRPCDuration("DoGetTables", time.Now())
+
 	s, err := h.sessionFromContext(ctx)
 	if err != nil {
 		return nil, nil, err

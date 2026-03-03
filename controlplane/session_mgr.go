@@ -57,6 +57,9 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
 	// When max-workers is set, this blocks until a slot is available.
+	observeControlPlaneWorkerQueueDepthDelta(1)
+	defer observeControlPlaneWorkerQueueDepthDelta(-1)
+
 	worker, err := sm.pool.AcquireWorker(ctx)
 	if err != nil {
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
