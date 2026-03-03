@@ -534,6 +534,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Use a temporary clientConn just to send initial params
 	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, database, applicationName, nil, pid, secretKey, -1)
+	defer server.CancelClientConn(tmpCC)
 	server.SendInitialParams(tmpCC)
 	if err := writer.Flush(); err != nil {
 		slog.Error("Failed to flush initial params.", "remote_addr", remoteAddr, "error", err)
@@ -553,11 +554,24 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cp.cfg.WorkerQueueTimeout)
+	defer cancel()
+
+	// Register query cancellation for the backend key so that a CancelRequest
+	// can abort CreateSession while we are waiting for a worker.
+	key := server.BackendKey{Pid: pid, SecretKey: secretKey}
+	cp.srv.RegisterQuery(key, cancel)
+
 	_, executor, err := cp.sessions.CreateSession(ctx, username, pid, memLimit, threads)
-	cancel()
+
+	cp.srv.UnregisterQuery(key)
+
 	if err != nil {
 		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
-		_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
+		if errors.Is(err, context.Canceled) {
+			_ = server.WriteErrorResponse(writer, "FATAL", "57014", "canceling authentication due to user request")
+		} else {
+			_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
+		}
 		_ = writer.Flush()
 		return
 	}
