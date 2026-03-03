@@ -4348,8 +4348,14 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// Try to get column info
-		rows, err := c.executor.Query(p.stmt.convertedQuery, args...)
+		// Try to get column info without fully executing expensive queries.
+		describeQuery := strings.TrimRight(strings.TrimSpace(p.stmt.convertedQuery), ";")
+		upperDesc := strings.ToUpper(describeQuery)
+		if !strings.Contains(upperDesc, "LIMIT") && describeSupportsLimit(upperDesc) {
+			describeQuery = describeQuery + " LIMIT 0"
+		}
+
+		rows, err := c.executor.Query(describeQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
 			_ = writeNoData(c.writer)
