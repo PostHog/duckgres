@@ -371,6 +371,30 @@ func TestCatalogSystemFunctions(t *testing.T) {
 			DuckgresOnly: true,
 		},
 
+		// has_any_column_privilege
+		{
+			Name:         "has_any_column_privilege",
+			Query:        "SELECT has_any_column_privilege('users', 'SELECT')",
+			DuckgresOnly: true,
+		},
+
+		// 3-arg privilege checks should rewrite to 2-arg forms
+		{
+			Name:         "has_schema_privilege_three_arg",
+			Query:        "SELECT has_schema_privilege('postgres', 'public', 'USAGE')",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "has_table_privilege_three_arg",
+			Query:        "SELECT has_table_privilege('postgres', 'users', 'SELECT')",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "has_any_column_privilege_three_arg",
+			Query:        "SELECT has_any_column_privilege('postgres', 'users', 'SELECT')",
+			DuckgresOnly: true,
+		},
+
 		// pg_is_in_recovery
 		{
 			Name:         "pg_is_in_recovery",
