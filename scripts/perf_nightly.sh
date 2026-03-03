@@ -16,6 +16,14 @@ OUTPUT_BASE="${DUCKGRES_PERF_OUTPUT_BASE:-$ROOT_DIR/artifacts/perf}"
 RUN_ID="${DUCKGRES_PERF_RUN_ID:-nightly-${DATASET_VERSION}-$(date -u +%Y%m%dT%H%M%SZ)}"
 MANIFEST_TABLE="${DUCKGRES_PERF_DATASET_MANIFEST_TABLE:-ducklake.main.dataset_manifest}"
 
+# Child shells launched via timeout/flock only inherit exported variables.
+export MAX_RUNTIME_SECONDS
+export DATASET_VERSION
+export CATALOG_PATH
+export OUTPUT_BASE
+export RUN_ID
+export MANIFEST_TABLE
+
 run_smoke() {
   export DUCKGRES_PERF_DATASET_VERSION="$DATASET_VERSION"
   export DUCKGRES_PERF_DATASET_MANIFEST_TABLE="$MANIFEST_TABLE"
