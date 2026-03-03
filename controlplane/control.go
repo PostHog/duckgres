@@ -188,7 +188,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		minWorkers = maxWorkers
 	}
 
-	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
+	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, minWorkers, maxWorkers)
 	pool.idleTimeout = cfg.WorkerIdleTimeout
 
 	// Import pre-bound sockets from handover, or pre-bind new ones.
@@ -423,6 +423,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
+	// Reject GSSAPI encryption request
+	if params.gssRequest {
+		_, _ = conn.Write([]byte{'N'})
+		_ = conn.Close()
+		return
+	}
+
 	// Require SSL
 	if !params.sslRequest {
 		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
@@ -526,10 +533,33 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
+	// Feed initial parameters and backend key data to the client IMMEDIATELY.
+	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
+	pid := cp.sessions.ReservePID()
+	secretKey := server.GenerateSecretKey()
+
+	// Use a temporary clientConn just to send initial params
+	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, database, applicationName, nil, pid, secretKey, -1)
+	server.SendInitialParams(tmpCC)
+	if err := writer.Flush(); err != nil {
+		slog.Error("Failed to flush initial params.", "remote_addr", remoteAddr, "error", err)
+		return
+	}
+
 	// Create session on a worker. The timeout controls how long we wait in the
 	// worker queue when all slots are occupied.
+	// Pass resource limits to be applied immediately by the worker (one RPC).
+	var (
+		memLimit string
+		threads  int
+	)
+	if cp.rebalancer != nil {
+		memLimit = cp.rebalancer.MemoryLimit()
+		threads = cp.rebalancer.PerSessionThreads()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), cp.cfg.WorkerQueueTimeout)
-	pid, executor, err := cp.sessions.CreateSession(ctx, username)
+	_, executor, err := cp.sessions.CreateSession(ctx, username, pid, memLimit, threads)
 	cancel()
 	if err != nil {
 		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
@@ -543,14 +573,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// the message loop if the backing worker dies.
 	cp.sessions.SetConnCloser(pid, tlsConn)
 
-	secretKey := server.GenerateSecretKey()
-
-	// Create clientConn with FlightExecutor
+	// Create real clientConn with FlightExecutor and worker assignment
 	workerID := cp.sessions.WorkerIDForPID(pid)
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, database, applicationName, executor, pid, secretKey, workerID)
 
-	// Send initial parameters and ReadyForQuery
-	server.SendInitialParams(cc)
+	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
 		slog.Error("Failed to send ReadyForQuery.", "remote_addr", remoteAddr, "error", err)
 		return
@@ -572,6 +599,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 // startupResult holds the parsed initial startup message.
 type startupResult struct {
 	sslRequest      bool
+	gssRequest      bool
 	cancelRequest   bool
 	cancelPid       int32
 	cancelSecretKey int32
@@ -599,6 +627,11 @@ func readStartupFromRaw(conn net.Conn) (startupResult, error) {
 	// SSL request
 	if protocolVersion == 80877103 {
 		return startupResult{sslRequest: true}, nil
+	}
+
+	// GSSAPI request
+	if protocolVersion == 80877104 {
+		return startupResult{gssRequest: true}, nil
 	}
 
 	// Cancel request

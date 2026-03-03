@@ -44,9 +44,15 @@ func NewSessionManager(pool *FlightWorkerPool, rebalancer *MemoryRebalancer) *Se
 	return sm
 }
 
+// ReservePID generates a new unique PID for a session.
+func (sm *SessionManager) ReservePID() int32 {
+	return sm.nextPID.Add(1)
+}
+
 // CreateSession acquires a worker (reusing an idle one or spawning a new one),
 // creates a session on it, and rebalances memory/thread limits across all active sessions.
-func (sm *SessionManager) CreateSession(ctx context.Context, username string) (int32, *server.FlightExecutor, error) {
+// If pid is 0, a new one is generated.
+func (sm *SessionManager) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
 	// When max-workers is set, this blocks until a slot is available.
 	worker, err := sm.pool.AcquireWorker(ctx)
@@ -54,7 +60,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
 
-	sessionToken, err := worker.CreateSession(ctx, username)
+	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
 	if err != nil {
 		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker
 		// that has sessions from other concurrent requests).
@@ -65,7 +71,9 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 	// Create FlightExecutor sharing the worker's existing gRPC connection
 	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
 
-	pid := sm.nextPID.Add(1)
+	if pid == 0 {
+		pid = sm.nextPID.Add(1)
+	}
 
 	session := &ManagedSession{
 		PID:          pid,
@@ -81,10 +89,9 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string) (i
 
 	slog.Debug("Session created.", "pid", pid, "worker", worker.ID, "user", username)
 
-	// Set memory/thread limits on this session synchronously so it never
-	// runs with unlimited resources.
+	// Set initial limits synchronously if they weren't passed to worker.CreateSession.
+	// We still call RequestRebalance to update other sessions if needed.
 	if sm.rebalancer != nil {
-		sm.rebalancer.SetInitialLimits(ctx, session)
 		sm.rebalancer.RequestRebalance()
 	}
 
