@@ -612,6 +612,10 @@ func (c *clientConn) serve() error {
 func (c *clientConn) handleStartup() error {
 	tlsUpgraded := false
 
+	if err := c.conn.SetReadDeadline(time.Now().Add(startupReadTimeout)); err != nil {
+		return fmt.Errorf("failed to set startup deadline: %w", err)
+	}
+
 	for {
 		params, err := readStartupMessage(c.reader)
 		if err != nil {
@@ -629,6 +633,10 @@ func (c *clientConn) handleStartup() error {
 
 		// Handle SSL request - upgrade to TLS
 		if params["__ssl_request"] == "true" {
+			if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+				return fmt.Errorf("failed to clear startup deadline: %w", err)
+			}
+
 			// Send 'S' to indicate we support SSL
 			if _, err := c.conn.Write([]byte("S")); err != nil {
 				return err
@@ -739,12 +747,12 @@ func (c *clientConn) handleStartup() error {
 
 func (c *clientConn) sendInitialParams() {
 	params := map[string]string{
-		"server_version":          "15.0 (Duckgres)",
-		"server_encoding":         "UTF8",
-		"client_encoding":         "UTF8",
-		"DateStyle":               "ISO, MDY",
-		"TimeZone":                "UTC",
-		"integer_datetimes":       "on",
+		"server_version":              "15.0 (Duckgres)",
+		"server_encoding":             "UTF8",
+		"client_encoding":             "UTF8",
+		"DateStyle":                   "ISO, MDY",
+		"TimeZone":                    "UTC",
+		"integer_datetimes":           "on",
 		"standard_conforming_strings": "on",
 	}
 
@@ -1530,7 +1538,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 	// If already in a transaction, skip our BEGIN/COMMIT wrapper
 	if hasOurTransaction && c.txStatus == txStatusTransaction {
-		statements = statements[1:] // Strip BEGIN
+		statements = statements[1:]        // Strip BEGIN
 		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
@@ -1632,8 +1640,8 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	// If already in a transaction, skip our BEGIN/COMMIT wrapper
 	if hasOurTransaction && c.txStatus == txStatusTransaction {
-		statements = statements[1:]            // Strip BEGIN
-		cleanup = cleanup[:len(cleanup)-1]     // Strip COMMIT from cleanup
+		statements = statements[1:]        // Strip BEGIN
+		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
 	// Execute setup statements (all but last)
@@ -2195,7 +2203,7 @@ func isWithDML(query string) bool {
 // skipBalancedParens advances past a parenthesized group in an uppercased SQL
 // string. i must point to the character immediately after the opening '('.
 // It tracks paren depth while correctly skipping SQL constructs that may
-// contain literal parentheses: single-quoted strings (including '' escapes and
+// contain literal parentheses: single-quoted strings (including ” escapes and
 // E-string backslash escapes), double-quoted identifiers, dollar-quoted strings,
 // line comments (--), and block comments (/* */).
 // Returns the position immediately after the matching ')'.
@@ -2579,7 +2587,7 @@ func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
 
 	opts := &CopyFromOptions{
 		TableName:  stripPublicSchema(matches[1]),
-		Delimiter:  "\t", // Default PostgreSQL text format delimiter
+		Delimiter:  "\t",  // Default PostgreSQL text format delimiter
 		NullString: "\\N", // Default PostgreSQL null representation
 	}
 
@@ -4021,8 +4029,8 @@ func (c *clientConn) handleParse(body []byte) {
 	delete(c.stmts, stmtName)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:             query,             // Keep original for logging and Describe
-		convertedQuery:    result.SQL,        // Transpiled SQL for execution
+		query:             query,      // Keep original for logging and Describe
+		convertedQuery:    result.SQL, // Transpiled SQL for execution
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
 		isIgnoredSet:      result.IsIgnoredSet,
@@ -4727,14 +4735,16 @@ func isFetchForwardOnly(dir pg_query.FetchDirection) bool {
 }
 
 // pgCursorsLiteralRegex matches pg_cursors queries with a literal name value:
-//   SELECT 1 FROM pg_cursors WHERE name = 'cursor_name'
-//   SELECT 1 FROM pg_catalog.pg_cursors WHERE name = 'cursor_name'
+//
+//	SELECT 1 FROM pg_cursors WHERE name = 'cursor_name'
+//	SELECT 1 FROM pg_catalog.pg_cursors WHERE name = 'cursor_name'
 var pgCursorsLiteralRegex = regexp.MustCompile(
 	`(?i)^\s*SELECT\s+.+\s+FROM\s+(?:pg_catalog\s*\.\s*)?pg_cursors\s+WHERE\s+name\s*=\s*'([^']*)'`,
 )
 
 // pgCursorsParamRegex matches pg_cursors queries with a parameterized name:
-//   SELECT 1 FROM pg_cursors WHERE name = $1
+//
+//	SELECT 1 FROM pg_cursors WHERE name = $1
 var pgCursorsParamRegex = regexp.MustCompile(
 	`(?i)^\s*SELECT\s+.+\s+FROM\s+(?:pg_catalog\s*\.\s*)?pg_cursors\s+WHERE\s+name\s*=\s*\$1\s*$`,
 )
@@ -4843,27 +4853,27 @@ var pgStatActivityColumns = []struct {
 	oid     int32
 	typSize int16
 }{
-	{"datid", 23, 4},              // int4
-	{"datname", 25, -1},           // text
-	{"pid", 23, 4},                // int4
-	{"usesysid", 23, 4},           // int4
-	{"usename", 25, -1},           // text
-	{"application_name", 25, -1},  // text
-	{"client_addr", 25, -1},       // text (inet in PG, text here)
-	{"client_port", 23, 4},        // int4
-	{"backend_start", 1184, 8},    // timestamptz
-	{"xact_start", 1184, 8},       // timestamptz (NULL)
-	{"query_start", 1184, 8},      // timestamptz (NULL)
-	{"state_change", 1184, 8},     // timestamptz (NULL)
-	{"wait_event_type", 25, -1},   // text (NULL)
-	{"wait_event", 25, -1},        // text (NULL)
-	{"state", 25, -1},             // text
-	{"backend_xid", 28, 4},        // xid (NULL)
-	{"backend_xmin", 28, 4},       // xid (NULL)
-	{"query", 25, -1},             // text
-	{"backend_type", 25, -1},      // text
-	{"leader_pid", 23, 4},         // int4 (NULL)
-	{"worker_id", 23, 4},          // int4 (duckgres extension)
+	{"datid", 23, 4},             // int4
+	{"datname", 25, -1},          // text
+	{"pid", 23, 4},               // int4
+	{"usesysid", 23, 4},          // int4
+	{"usename", 25, -1},          // text
+	{"application_name", 25, -1}, // text
+	{"client_addr", 25, -1},      // text (inet in PG, text here)
+	{"client_port", 23, 4},       // int4
+	{"backend_start", 1184, 8},   // timestamptz
+	{"xact_start", 1184, 8},      // timestamptz (NULL)
+	{"query_start", 1184, 8},     // timestamptz (NULL)
+	{"state_change", 1184, 8},    // timestamptz (NULL)
+	{"wait_event_type", 25, -1},  // text (NULL)
+	{"wait_event", 25, -1},       // text (NULL)
+	{"state", 25, -1},            // text
+	{"backend_xid", 28, 4},       // xid (NULL)
+	{"backend_xmin", 28, 4},      // xid (NULL)
+	{"query", 25, -1},            // text
+	{"backend_type", 25, -1},     // text
+	{"leader_pid", 23, 4},        // int4 (NULL)
+	{"worker_id", 23, 4},         // int4 (duckgres extension)
 }
 
 // pgStatActivityTypeOIDs is precomputed from pgStatActivityColumns to avoid per-row allocation.
@@ -4919,12 +4929,12 @@ func (c *clientConn) sendPgStatActivityRowDescription() error {
 	for _, col := range pgStatActivityColumns {
 		buf.WriteString(col.name)
 		buf.WriteByte(0)
-		_ = binary.Write(&buf, binary.BigEndian, int32(0))       // table OID
-		_ = binary.Write(&buf, binary.BigEndian, int16(0))       // column attr
-		_ = binary.Write(&buf, binary.BigEndian, col.oid)        // type OID
-		_ = binary.Write(&buf, binary.BigEndian, col.typSize)    // type size
-		_ = binary.Write(&buf, binary.BigEndian, int32(-1))      // typmod
-		_ = binary.Write(&buf, binary.BigEndian, int16(0))       // text format
+		_ = binary.Write(&buf, binary.BigEndian, int32(0))    // table OID
+		_ = binary.Write(&buf, binary.BigEndian, int16(0))    // column attr
+		_ = binary.Write(&buf, binary.BigEndian, col.oid)     // type OID
+		_ = binary.Write(&buf, binary.BigEndian, col.typSize) // type size
+		_ = binary.Write(&buf, binary.BigEndian, int32(-1))   // typmod
+		_ = binary.Write(&buf, binary.BigEndian, int16(0))    // text format
 	}
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
 }
@@ -4962,27 +4972,27 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 	}
 
 	values := []interface{}{
-		int32(0),                // datid
-		conn.database,           // datname
-		conn.pid,                // pid
-		int32(10),               // usesysid
-		conn.username,           // usename
-		conn.applicationName,    // application_name
-		clientAddr,              // client_addr
-		clientPort,              // client_port
-		conn.backendStart,       // backend_start
-		nil,                     // xact_start (NULL)
-		nil,                     // query_start (NULL)
-		nil,                     // state_change (NULL)
-		nil,                     // wait_event_type (NULL)
-		nil,                     // wait_event (NULL)
-		state,                   // state
-		nil,                     // backend_xid (NULL)
-		nil,                     // backend_xmin (NULL)
-		q,                       // query
-		"client backend",        // backend_type
-		nil,                     // leader_pid (NULL)
-		int32(conn.workerID),    // worker_id
+		int32(0),             // datid
+		conn.database,        // datname
+		conn.pid,             // pid
+		int32(10),            // usesysid
+		conn.username,        // usename
+		conn.applicationName, // application_name
+		clientAddr,           // client_addr
+		clientPort,           // client_port
+		conn.backendStart,    // backend_start
+		nil,                  // xact_start (NULL)
+		nil,                  // query_start (NULL)
+		nil,                  // state_change (NULL)
+		nil,                  // wait_event_type (NULL)
+		nil,                  // wait_event (NULL)
+		state,                // state
+		nil,                  // backend_xid (NULL)
+		nil,                  // backend_xmin (NULL)
+		q,                    // query
+		"client backend",     // backend_type
+		nil,                  // leader_pid (NULL)
+		int32(conn.workerID), // worker_id
 	}
 
 	return c.sendDataRowWithFormats(values, formatCodes, pgStatActivityTypeOIDs)
