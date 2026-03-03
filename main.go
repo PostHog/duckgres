@@ -171,6 +171,7 @@ func main() {
 	threads := flag.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	memoryBudget := flag.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
 	memoryRebalance := flag.Bool("memory-rebalance", false, "Enable dynamic per-connection memory reallocation (control-plane mode) (env: DUCKGRES_MEMORY_REBALANCE)")
+	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error (env: DUCKGRES_LOG_LEVEL)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
@@ -234,6 +235,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
 
@@ -257,6 +259,11 @@ func main() {
 	flag.Visit(func(f *flag.Flag) {
 		cliSet[f.Name] = true
 	})
+
+	// Set log level env var from CLI flag so workers inherit it.
+	if *logLevel != "" {
+		_ = os.Setenv("DUCKGRES_LOG_LEVEL", *logLevel)
+	}
 
 	loggingShutdown := initLogging()
 	defer loggingShutdown()

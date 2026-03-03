@@ -394,6 +394,7 @@ func (cp *ControlPlane) acceptLoop() {
 
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
+	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
 
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
@@ -403,9 +404,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	defer releaseRateLimit()
 
-	// Read startup message to determine SSL vs cancel, allowing GSS probing
-	// clients to fall back on the same connection.
-	params, err := readStartupWithGSSFallback(conn)
+	// Set a startup read timeout to prevent goroutine leaks from clients
+	// that connect but never send data (e.g., load balancer TCP health checks).
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		slog.Error("Failed to set startup deadline.", "remote_addr", remoteAddr, "error", err)
+		_ = conn.Close()
+		return
+	}
+
+	// Read startup message to determine SSL vs cancel.
+	// readStartupFromRaw handles GSSENC probes by replying 'N' and continuing.
+	params, err := readStartupFromRaw(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
@@ -420,6 +429,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	if params.cancelRequest {
 		key := server.BackendKey{Pid: params.cancelPid, SecretKey: params.cancelSecretKey}
 		cp.srv.CancelQuery(key)
+		_ = conn.Close()
+		return
+	}
+
+	// Clear the startup read deadline before proceeding to TLS (which sets its own).
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -454,6 +470,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = tlsConn.Close()
 		return
 	}
+	slog.Info("TLS connection established.", "remote_addr", remoteAddr)
 	defer func() { _ = tlsConn.Close() }()
 
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
@@ -614,42 +631,58 @@ type startupResult struct {
 }
 
 // readStartupFromRaw reads the startup message from a raw (unbuffered) connection.
+// It handles GSSENCRequest negotiation (up to maxNegotiationRounds) before returning.
 func readStartupFromRaw(conn net.Conn) (startupResult, error) {
-	// Read length (4 bytes)
-	var length int32
-	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-		return startupResult{}, fmt.Errorf("read length: %w", err)
+	// A legitimate client sends at most one GSSENCRequest followed by SSLRequest.
+	// Cap iterations to prevent a malicious client from looping indefinitely.
+	const maxNegotiationRounds = 3
+
+	for range maxNegotiationRounds {
+		// Read length (4 bytes)
+		var length int32
+		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+			return startupResult{}, fmt.Errorf("read length: %w", err)
+		}
+
+		if length < 8 || length > 10000 {
+			return startupResult{}, fmt.Errorf("invalid startup message length: %d", length)
+		}
+
+		remaining := make([]byte, length-4)
+		if _, err := fullRead(conn, remaining); err != nil {
+			return startupResult{}, fmt.Errorf("read body: %w", err)
+		}
+
+		protocolVersion := binary.BigEndian.Uint32(remaining[:4])
+
+		// SSL request
+		if protocolVersion == 80877103 {
+			return startupResult{sslRequest: true}, nil
+		}
+
+		// Cancel request
+		if protocolVersion == 80877102 && len(remaining) >= 12 {
+			pid := int32(binary.BigEndian.Uint32(remaining[4:8]))
+			key := int32(binary.BigEndian.Uint32(remaining[8:12]))
+			return startupResult{cancelRequest: true, cancelPid: pid, cancelSecretKey: key}, nil
+		}
+
+		// GSSENCRequest (PostgreSQL 12+, JDBC driver gssEncMode=prefer)
+		// Respond with 'N' (GSSAPI encryption not supported) and re-read.
+		// The client will follow up with SSLRequest on the same connection.
+		// The startup read deadline set in handleConnection covers all rounds.
+		if protocolVersion == 80877104 {
+			slog.Debug("GSSENCRequest received, declining.", "remote_addr", conn.RemoteAddr())
+			if _, err := conn.Write([]byte("N")); err != nil {
+				return startupResult{}, fmt.Errorf("write GSSENC decline: %w", err)
+			}
+			continue
+		}
+
+		return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
 	}
 
-	if length < 8 || length > 10000 {
-		return startupResult{}, fmt.Errorf("invalid startup message length: %d", length)
-	}
-
-	remaining := make([]byte, length-4)
-	if _, err := fullRead(conn, remaining); err != nil {
-		return startupResult{}, fmt.Errorf("read body: %w", err)
-	}
-
-	protocolVersion := binary.BigEndian.Uint32(remaining[:4])
-
-	// SSL request
-	if protocolVersion == 80877103 {
-		return startupResult{sslRequest: true}, nil
-	}
-
-	// GSSAPI request
-	if protocolVersion == 80877104 {
-		return startupResult{gssRequest: true}, nil
-	}
-
-	// Cancel request
-	if protocolVersion == 80877102 && len(remaining) >= 12 {
-		pid := int32(binary.BigEndian.Uint32(remaining[4:8]))
-		key := int32(binary.BigEndian.Uint32(remaining[8:12]))
-		return startupResult{cancelRequest: true, cancelPid: pid, cancelSecretKey: key}, nil
-	}
-
-	return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
+	return startupResult{}, fmt.Errorf("too many negotiation rounds")
 }
 
 // readStartupWithGSSFallback accepts a GSSAPI probe, rejects it with 'N',
