@@ -392,6 +392,21 @@ func (cp *ControlPlane) acceptLoop() {
 	}
 }
 
+func createSessionWithRegisteredCancel(
+	srv *server.Server,
+	timeout time.Duration,
+	key server.BackendKey,
+	createFn func(context.Context) (int32, *server.FlightExecutor, error),
+) (int32, *server.FlightExecutor, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	srv.RegisterQuery(key, cancel)
+	defer srv.UnregisterQuery(key)
+
+	return createFn(ctx)
+}
+
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 
@@ -552,9 +567,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		threads = cp.rebalancer.PerSessionThreads()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cp.cfg.WorkerQueueTimeout)
-	_, executor, err := cp.sessions.CreateSession(ctx, username, pid, memLimit, threads)
-	cancel()
+	_, executor, err := createSessionWithRegisteredCancel(
+		cp.srv,
+		cp.cfg.WorkerQueueTimeout,
+		server.BackendKey{Pid: pid, SecretKey: secretKey},
+		func(ctx context.Context) (int32, *server.FlightExecutor, error) {
+			return cp.sessions.CreateSession(ctx, username, pid, memLimit, threads)
+		},
+	)
 	if err != nil {
 		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
 		_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
