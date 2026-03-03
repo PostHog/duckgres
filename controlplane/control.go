@@ -28,10 +28,10 @@ import (
 type ControlPlaneConfig struct {
 	server.Config
 
-	SocketDir           string
-	ConfigPath          string // Path to config file, passed to workers
-	HandoverSocket      string
-	HealthCheckInterval time.Duration
+	SocketDir            string
+	ConfigPath           string // Path to config file, passed to workers
+	HandoverSocket       string
+	HealthCheckInterval  time.Duration
 	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during handover (default: 24h)
@@ -43,23 +43,23 @@ type ControlPlaneConfig struct {
 // PostgreSQL wire protocol, and SQL transpilation all happen here. Workers are
 // thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
-	cfg         ControlPlaneConfig
-	pool        *FlightWorkerPool
-	sessions    *SessionManager
-	flight      *FlightIngress
-	rebalancer  *MemoryRebalancer
-	srv         *server.Server // Minimal server for cancel request routing
-	rateLimiter *server.RateLimiter
-	tlsConfig   *tls.Config
-	pgListener  net.Listener
-	activeConns int64
-	closed      bool
-	closeMu     sync.Mutex
-	wg          sync.WaitGroup
-	reloading        atomic.Bool    // guards against concurrent selfExec from double SIGUSR1
-	handoverDraining atomic.Bool    // true after handover succeeded; SIGTERM should exit immediately
-	handoverLn  net.Listener        // current handover listener; protected by closeMu
-	acmeManager *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
+	cfg              ControlPlaneConfig
+	pool             *FlightWorkerPool
+	sessions         *SessionManager
+	flight           *FlightIngress
+	rebalancer       *MemoryRebalancer
+	srv              *server.Server // Minimal server for cancel request routing
+	rateLimiter      *server.RateLimiter
+	tlsConfig        *tls.Config
+	pgListener       net.Listener
+	activeConns      int64
+	closed           bool
+	closeMu          sync.Mutex
+	wg               sync.WaitGroup
+	reloading        atomic.Bool         // guards against concurrent selfExec from double SIGUSR1
+	handoverDraining atomic.Bool         // true after handover succeeded; SIGTERM should exit immediately
+	handoverLn       net.Listener        // current handover listener; protected by closeMu
+	acmeManager      *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -394,6 +394,7 @@ func (cp *ControlPlane) acceptLoop() {
 
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
+	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
 
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
@@ -453,6 +454,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = tlsConn.Close()
 		return
 	}
+	slog.Info("TLS connection established.", "remote_addr", remoteAddr)
 	defer func() { _ = tlsConn.Close() }()
 
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
