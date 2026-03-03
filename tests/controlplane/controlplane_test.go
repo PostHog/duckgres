@@ -238,7 +238,7 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
 }
 
-var newCPPidRe = regexp.MustCompile(`New control plane spawned\.\s.*pid=(\d+)`)
+var newCPPidRe = regexp.MustCompile(`New control plane spawned\..*pid=(\d+)`)
 
 // parseNewCPPid extracts the new CP PID from the logs after a handover.
 func (h *cpHarness) parseNewCPPid() (int, error) {

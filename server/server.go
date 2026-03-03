@@ -30,6 +30,10 @@ var processStartTime = time.Now()
 // processVersion is set from main() via SetProcessVersion. Defaults to "dev".
 var processVersion = "dev"
 
+// startupReadTimeout bounds pre-TLS startup negotiation reads to avoid stalled
+// clients pinning connection goroutines indefinitely.
+var startupReadTimeout = 30 * time.Second
+
 // SetProcessVersion sets the version string for this process. Called from main().
 func SetProcessVersion(v string) { processVersion = v }
 
@@ -1215,6 +1219,13 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 // The parent handles SSL request and cancel requests, then spawns a child process
 // for TLS handshake, authentication, and query execution.
 func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
+	if err := conn.SetReadDeadline(time.Now().Add(startupReadTimeout)); err != nil {
+		slog.Error("Failed to set startup deadline.", "remote_addr", remoteAddr, "error", err)
+		s.rateLimiter.UnregisterConnection(remoteAddr)
+		_ = conn.Close()
+		return
+	}
+
 	// IMPORTANT: Use the raw connection (not a buffered reader) for reading the
 	// SSL request message. This ensures we don't accidentally buffer data that
 	// should be read by the child process after FD passing.
@@ -1232,6 +1243,33 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 		return
 	}
 
+	// Handle GSSENCRequest - decline and re-read for SSLRequest.
+	// Loop to handle the unlikely case of multiple GSSENCRequests.
+	for range 3 {
+		if params["__gssenc_request"] != "true" {
+			break
+		}
+		slog.Debug("GSSENCRequest received, declining.", "remote_addr", remoteAddr)
+		if _, err := conn.Write([]byte("N")); err != nil {
+			slog.Error("Failed to send GSSENC decline.", "remote_addr", remoteAddr, "error", err)
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+		// Re-read: client will send SSLRequest next
+		params, err = readStartupMessage(conn)
+		if err != nil {
+			if err == io.EOF || errors.Is(err, io.EOF) {
+				slog.Debug("Client closed connection after GSSENC decline.", "remote_addr", remoteAddr)
+			} else {
+				slog.Error("Failed to read startup message after GSSENC decline.", "remote_addr", remoteAddr, "error", err)
+			}
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+	}
+
 	// Handle cancel request in parent (no child spawn needed)
 	if params["__cancel_request"] == "true" {
 		s.handleCancelRequestIsolated(params)
@@ -1242,6 +1280,13 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 
 	// Handle SSL request: send 'S' then spawn child for TLS handshake
 	if params["__ssl_request"] == "true" {
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
+			s.rateLimiter.UnregisterConnection(remoteAddr)
+			_ = conn.Close()
+			return
+		}
+
 		// Send 'S' to indicate we support SSL
 		if _, err := conn.Write([]byte("S")); err != nil {
 			slog.Error("Failed to send SSL response.", "remote_addr", remoteAddr, "error", err)
