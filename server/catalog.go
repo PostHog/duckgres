@@ -779,15 +779,14 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			END`,
 		// pg_table_is_visible - checks if table is in search path
 		`CREATE OR REPLACE MACRO pg_table_is_visible(oid) AS true`,
-		// has_schema_privilege - check schema access (2-arg: current user implied, 3-arg: explicit user)
+		// has_schema_privilege - check schema access
+		// Note: DuckDB doesn't support macro overloading with CREATE OR REPLACE MACRO,
+		// so we only define 2-arg versions and rewrite 3-arg calls in the transpiler.
 		`CREATE OR REPLACE MACRO has_schema_privilege(schema_name, priv) AS true`,
-		`CREATE OR REPLACE MACRO has_schema_privilege(user_name, schema_name, priv) AS true`,
-		// has_table_privilege - check table access (2-arg: current user implied, 3-arg: explicit user)
+		// has_table_privilege - check table access
 		`CREATE OR REPLACE MACRO has_table_privilege(table_name, priv) AS true`,
-		`CREATE OR REPLACE MACRO has_table_privilege(user_name, table_name, priv) AS true`,
-		// has_any_column_privilege - check column access (2-arg: current user implied, 3-arg: explicit user)
+		// has_any_column_privilege - check any column access
 		`CREATE OR REPLACE MACRO has_any_column_privilege(table_name, priv) AS true`,
-		`CREATE OR REPLACE MACRO has_any_column_privilege(user_name, table_name, priv) AS true`,
 		// pg_encoding_to_char - convert encoding ID to name
 		`CREATE OR REPLACE MACRO pg_encoding_to_char(enc) AS 'UTF8'`,
 		// format_type - format a type OID as string with typemod support

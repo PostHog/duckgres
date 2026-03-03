@@ -223,6 +223,11 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 				}
 			}
 
+			if dropsUserArgFromPrivilegeCheck(funcName, len(n.FuncCall.Args)) {
+				n.FuncCall.Args = n.FuncCall.Args[1:]
+				*changed = true
+			}
+
 			// Handle pg_catalog prefixed functions
 			if len(n.FuncCall.Funcname) >= 2 {
 				if first := n.FuncCall.Funcname[0]; first != nil {
@@ -473,6 +478,19 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 			}
 			t.walkAndTransform(n.ViewStmt.Query, changed)
 		}
+	}
+}
+
+func dropsUserArgFromPrivilegeCheck(funcName string, argCount int) bool {
+	if argCount != 3 {
+		return false
+	}
+
+	switch funcName {
+	case "has_schema_privilege", "has_table_privilege", "has_any_column_privilege":
+		return true
+	default:
+		return false
 	}
 }
 

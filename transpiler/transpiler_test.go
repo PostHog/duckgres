@@ -2333,10 +2333,10 @@ func TestTranspile_FallbackParamCount(t *testing.T) {
 	// Queries with $ go through Tier 1 (FlagPlaceholder) → pg_query fails → FallbackToNative
 	// Queries without $ go through Tier 0 (Direct) → param count via regex (returns 0)
 	tests := []struct {
-		name           string
-		input          string
-		paramCount     int
-		wantFallback   bool // true for Tier 1 (has $), false for Tier 0 (no $)
+		name         string
+		input        string
+		paramCount   int
+		wantFallback bool // true for Tier 1 (has $), false for Tier 0 (no $)
 	}{
 		{
 			name:         "DuckDB FROM-first with parameter",
@@ -3472,6 +3472,66 @@ func TestTranspile_MacroFunctions(t *testing.T) {
 			// Should not contain pg_catalog prefix
 			if strings.Contains(result.SQL, "pg_catalog") {
 				t.Errorf("Transpile(%q) = %q, should not contain pg_catalog prefix", tt.input, result.SQL)
+			}
+		})
+	}
+}
+
+func TestTranspile_PrivilegeFunctions_ThreeArgRewrite(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      Config
+		input    string
+		contains []string
+		excludes []string
+	}{
+		{
+			name:     "has_schema_privilege drops explicit user",
+			cfg:      DefaultConfig(),
+			input:    "SELECT has_schema_privilege('postgres', 'public', 'USAGE')",
+			contains: []string{"has_schema_privilege", "'public'", "'USAGE'"},
+			excludes: []string{"'postgres', 'public', 'USAGE'"},
+		},
+		{
+			name:     "has_table_privilege drops explicit user",
+			cfg:      DefaultConfig(),
+			input:    "SELECT has_table_privilege('postgres', 'users', 'SELECT')",
+			contains: []string{"has_table_privilege", "'users'", "'SELECT'"},
+			excludes: []string{"'postgres', 'users', 'SELECT'"},
+		},
+		{
+			name:     "has_any_column_privilege drops explicit user",
+			cfg:      DefaultConfig(),
+			input:    "SELECT has_any_column_privilege('postgres', 'users', 'SELECT')",
+			contains: []string{"has_any_column_privilege", "'users'", "'SELECT'"},
+			excludes: []string{"'postgres', 'users', 'SELECT'"},
+		},
+		{
+			name:     "ducklake mode keeps macro qualification while dropping explicit user",
+			cfg:      Config{DuckLakeMode: true},
+			input:    "SELECT pg_catalog.has_schema_privilege('postgres', 'public', 'USAGE')",
+			contains: []string{"memory.main.has_schema_privilege", "'public'", "'USAGE'"},
+			excludes: []string{"'postgres', 'public', 'USAGE'"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tr := New(tt.cfg)
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			lowerSQL := strings.ToLower(result.SQL)
+			for _, c := range tt.contains {
+				if !strings.Contains(lowerSQL, strings.ToLower(c)) {
+					t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, c)
+				}
+			}
+			for _, e := range tt.excludes {
+				if strings.Contains(lowerSQL, strings.ToLower(e)) {
+					t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, e)
+				}
 			}
 		})
 	}
