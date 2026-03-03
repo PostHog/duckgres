@@ -1232,3 +1232,33 @@ func TestReapIdleWorkersReapsAllAboveMin(t *testing.T) {
 		t.Errorf("expected 1 worker remaining, got %d", count)
 	}
 }
+
+func TestReapIdleWorkersPreservesIdleFloor(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2, 6)
+	pool.idleTimeout = 10 * time.Millisecond
+
+	// 2 busy workers
+	pool.workers[0] = &ManagedWorker{ID: 0, activeSessions: 1, done: make(chan struct{})}
+	pool.workers[1] = &ManagedWorker{ID: 1, activeSessions: 1, done: make(chan struct{})}
+
+	// 3 idle workers eligible for reaping
+	stale := time.Now().Add(-1 * time.Hour)
+	pool.workers[2] = &ManagedWorker{ID: 2, lastUsed: stale, done: make(chan struct{})}
+	pool.workers[3] = &ManagedWorker{ID: 3, lastUsed: stale, done: make(chan struct{})}
+	pool.workers[4] = &ManagedWorker{ID: 4, lastUsed: stale, done: make(chan struct{})}
+
+	pool.reapIdleWorkers()
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	idleCount := 0
+	for _, w := range pool.workers {
+		if w.activeSessions == 0 {
+			idleCount++
+		}
+	}
+
+	if idleCount < pool.minWorkers {
+		t.Fatalf("expected at least %d idle workers to remain, got %d", pool.minWorkers, idleCount)
+	}
+}

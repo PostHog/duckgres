@@ -613,13 +613,21 @@ func (p *FlightWorkerPool) reapIdleWorkers() {
 	p.mu.Lock()
 	var toRetire []*ManagedWorker
 	now := time.Now()
-
 	idleCount := 0
 	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
 		if w.activeSessions == 0 {
 			idleCount++
 		}
 	}
+
+	// Keep at least minWorkers idle workers as a warm pool.
+	// Map iteration is random, but that's fine for simple reaping.
+	// If we wanted to be smart, we'd sort by lastUsed.
 
 	for id, w := range p.workers {
 		if idleCount <= p.minWorkers {
