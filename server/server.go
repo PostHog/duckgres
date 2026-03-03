@@ -1045,6 +1045,12 @@ func needsCredentialRefresh(dlCfg DuckLakeConfig) bool {
 	return s3ProviderForConfig(dlCfg) == "credential_chain"
 }
 
+// isTransactionAborted returns true if the error indicates DuckDB's connection
+// is stuck in an aborted transaction state (requires ROLLBACK to recover).
+func isTransactionAborted(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Current transaction is aborted")
+}
+
 // sqlExecer is satisfied by both *sql.DB and *sql.Conn, allowing
 // StartCredentialRefresh to work with either a connection pool or a pinned connection.
 type sqlExecer interface {
@@ -1076,13 +1082,33 @@ func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig) func() {
 	go func() {
 		ticker := time.NewTicker(credentialRefreshInterval)
 		defer ticker.Stop()
+		var consecutiveFailures int
 		for {
 			select {
 			case <-ticker.C:
 				secretStmt := buildCredentialChainSecret(dlCfg)
-				if _, err := execer.ExecContext(context.Background(), secretStmt); err != nil {
-					slog.Warn("Failed to refresh S3 credentials.", "error", err)
+				_, err := execer.ExecContext(context.Background(), secretStmt)
+
+				// If stuck in aborted transaction, ROLLBACK and retry once.
+				if isTransactionAborted(err) {
+					slog.Warn("S3 credential refresh hit aborted transaction, issuing ROLLBACK.")
+					_, _ = execer.ExecContext(context.Background(), "ROLLBACK")
+					_, err = execer.ExecContext(context.Background(), secretStmt)
+				}
+
+				if err != nil {
+					consecutiveFailures++
+					lvl := slog.LevelWarn
+					if consecutiveFailures >= 3 {
+						lvl = slog.LevelError
+					}
+					slog.Log(context.Background(), lvl, "Failed to refresh S3 credentials.",
+						"error", err, "consecutive_failures", consecutiveFailures)
 				} else {
+					if consecutiveFailures > 0 {
+						slog.Info("S3 credential refresh recovered.", "after_failures", consecutiveFailures)
+					}
+					consecutiveFailures = 0
 					slog.Debug("Refreshed S3 credentials.")
 				}
 			case <-done:
@@ -1129,6 +1155,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 // handleConnectionInProcess handles a connection in the current process (non-isolated mode).
 func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
+	slog.Debug("Connection accepted.", "remote_addr", remoteAddr)
+
 	// Track active connections (only after rate limiting passes)
 	atomic.AddInt64(&s.activeConns, 1)
 	connectionsGauge.Inc()
@@ -1158,7 +1186,9 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 	}
 
 	if err := c.serve(); err != nil {
-		slog.Error("Connection error.", "error", err)
+		slog.Error("Connection error.", "user", c.username, "remote_addr", remoteAddr, "error", err)
+	} else {
+		slog.Info("Client disconnected.", "user", c.username, "remote_addr", remoteAddr)
 	}
 }
 
