@@ -28,10 +28,10 @@ import (
 type ControlPlaneConfig struct {
 	server.Config
 
-	SocketDir           string
-	ConfigPath          string // Path to config file, passed to workers
-	HandoverSocket      string
-	HealthCheckInterval time.Duration
+	SocketDir            string
+	ConfigPath           string // Path to config file, passed to workers
+	HandoverSocket       string
+	HealthCheckInterval  time.Duration
 	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during handover (default: 24h)
@@ -43,23 +43,23 @@ type ControlPlaneConfig struct {
 // PostgreSQL wire protocol, and SQL transpilation all happen here. Workers are
 // thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
-	cfg         ControlPlaneConfig
-	pool        *FlightWorkerPool
-	sessions    *SessionManager
-	flight      *FlightIngress
-	rebalancer  *MemoryRebalancer
-	srv         *server.Server // Minimal server for cancel request routing
-	rateLimiter *server.RateLimiter
-	tlsConfig   *tls.Config
-	pgListener  net.Listener
-	activeConns int64
-	closed      bool
-	closeMu     sync.Mutex
-	wg          sync.WaitGroup
-	reloading        atomic.Bool    // guards against concurrent selfExec from double SIGUSR1
-	handoverDraining atomic.Bool    // true after handover succeeded; SIGTERM should exit immediately
-	handoverLn  net.Listener        // current handover listener; protected by closeMu
-	acmeManager *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
+	cfg              ControlPlaneConfig
+	pool             *FlightWorkerPool
+	sessions         *SessionManager
+	flight           *FlightIngress
+	rebalancer       *MemoryRebalancer
+	srv              *server.Server // Minimal server for cancel request routing
+	rateLimiter      *server.RateLimiter
+	tlsConfig        *tls.Config
+	pgListener       net.Listener
+	activeConns      int64
+	closed           bool
+	closeMu          sync.Mutex
+	wg               sync.WaitGroup
+	reloading        atomic.Bool         // guards against concurrent selfExec from double SIGUSR1
+	handoverDraining atomic.Bool         // true after handover succeeded; SIGTERM should exit immediately
+	handoverLn       net.Listener        // current handover listener; protected by closeMu
+	acmeManager      *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -403,8 +403,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	defer releaseRateLimit()
 
-	// Read startup message to determine SSL vs cancel
-	params, err := readStartupFromRaw(conn)
+	// Read startup message to determine SSL vs cancel, allowing GSS probing
+	// clients to fall back on the same connection.
+	params, err := readStartupWithGSSFallback(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
@@ -419,13 +420,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	if params.cancelRequest {
 		key := server.BackendKey{Pid: params.cancelPid, SecretKey: params.cancelSecretKey}
 		cp.srv.CancelQuery(key)
-		_ = conn.Close()
-		return
-	}
-
-	// Reject GSSAPI encryption request
-	if params.gssRequest {
-		_, _ = conn.Write([]byte{'N'})
 		_ = conn.Close()
 		return
 	}
@@ -642,6 +636,28 @@ func readStartupFromRaw(conn net.Conn) (startupResult, error) {
 	}
 
 	return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
+}
+
+// readStartupWithGSSFallback accepts a GSSAPI probe, rejects it with 'N',
+// and keeps reading startup packets on the same connection so clients can
+// continue with SSLRequest/startup without reconnecting.
+func readStartupWithGSSFallback(conn net.Conn) (startupResult, error) {
+	for i := 0; i < 4; i++ {
+		params, err := readStartupFromRaw(conn)
+		if err != nil {
+			return startupResult{}, err
+		}
+
+		if !params.gssRequest {
+			return params, nil
+		}
+
+		if _, err := conn.Write([]byte{'N'}); err != nil {
+			return startupResult{}, fmt.Errorf("write GSSAPI rejection: %w", err)
+		}
+	}
+
+	return startupResult{}, fmt.Errorf("too many GSSAPI startup requests")
 }
 
 func fullRead(conn net.Conn, buf []byte) (int, error) {
