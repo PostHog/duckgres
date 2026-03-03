@@ -262,7 +262,7 @@ func main() {
 
 	// Set log level env var from CLI flag so workers inherit it.
 	if *logLevel != "" {
-		os.Setenv("DUCKGRES_LOG_LEVEL", *logLevel)
+		_ = os.Setenv("DUCKGRES_LOG_LEVEL", *logLevel)
 	}
 
 	loggingShutdown := initLogging()

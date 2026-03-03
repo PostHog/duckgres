@@ -10,8 +10,8 @@ import (
 
 func TestReadStartupFromRaw_SSLRequest(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	go func() {
 		// Send SSLRequest: length=8, version=80877103
@@ -30,8 +30,8 @@ func TestReadStartupFromRaw_SSLRequest(t *testing.T) {
 
 func TestReadStartupFromRaw_GSSENCRequest(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	go func() {
 		// Send GSSENCRequest: length=8, version=80877104
@@ -66,8 +66,8 @@ func TestReadStartupFromRaw_GSSENCRequest(t *testing.T) {
 
 func TestReadStartupFromRaw_CancelRequest(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	go func() {
 		// Cancel request: length=16, version=80877102, pid=123, key=456
@@ -94,8 +94,8 @@ func TestReadStartupFromRaw_CancelRequest(t *testing.T) {
 
 func TestReadStartupFromRaw_UnknownProtocol(t *testing.T) {
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	go func() {
 		// Unknown protocol version
@@ -111,10 +111,10 @@ func TestReadStartupFromRaw_UnknownProtocol(t *testing.T) {
 
 func TestReadStartupFromRaw_EOF(t *testing.T) {
 	client, server := net.Pipe()
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 
 	// Close immediately — should get io.EOF
-	client.Close()
+	_ = client.Close()
 
 	_, err := readStartupFromRaw(server)
 	if err == nil {
@@ -127,8 +127,8 @@ func TestReadStartupFromRaw_StartupTimeout(t *testing.T) {
 	// The startup read deadline (set in handleConnection) should prevent
 	// readStartupFromRaw from blocking forever.
 	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	// Set a short read deadline to simulate the startup timeout
 	_ = server.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
@@ -166,9 +166,9 @@ func isTimeoutErr(err error) bool {
 // Verify that io.EOF from a closed connection is not misidentified as a timeout.
 func TestReadStartupFromRaw_EOFNotTimeout(t *testing.T) {
 	client, server := net.Pipe()
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 
-	client.Close()
+	_ = client.Close()
 
 	_, err := readStartupFromRaw(server)
 	if err == nil {
