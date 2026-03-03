@@ -593,48 +593,58 @@ type startupResult struct {
 }
 
 // readStartupFromRaw reads the startup message from a raw (unbuffered) connection.
+// It handles GSSENCRequest negotiation (up to maxNegotiationRounds) before returning.
 func readStartupFromRaw(conn net.Conn) (startupResult, error) {
-	// Read length (4 bytes)
-	var length int32
-	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-		return startupResult{}, fmt.Errorf("read length: %w", err)
-	}
+	// A legitimate client sends at most one GSSENCRequest followed by SSLRequest.
+	// Cap iterations to prevent a malicious client from looping indefinitely.
+	const maxNegotiationRounds = 3
 
-	if length < 8 || length > 10000 {
-		return startupResult{}, fmt.Errorf("invalid startup message length: %d", length)
-	}
-
-	remaining := make([]byte, length-4)
-	if _, err := fullRead(conn, remaining); err != nil {
-		return startupResult{}, fmt.Errorf("read body: %w", err)
-	}
-
-	protocolVersion := binary.BigEndian.Uint32(remaining[:4])
-
-	// SSL request
-	if protocolVersion == 80877103 {
-		return startupResult{sslRequest: true}, nil
-	}
-
-	// Cancel request
-	if protocolVersion == 80877102 && len(remaining) >= 12 {
-		pid := int32(binary.BigEndian.Uint32(remaining[4:8]))
-		key := int32(binary.BigEndian.Uint32(remaining[8:12]))
-		return startupResult{cancelRequest: true, cancelPid: pid, cancelSecretKey: key}, nil
-	}
-
-	// GSSENCRequest (PostgreSQL 12+, JDBC driver gssEncMode=prefer)
-	// Respond with 'N' (GSSAPI encryption not supported) and re-read.
-	// The client will follow up with SSLRequest on the same connection.
-	if protocolVersion == 80877104 {
-		slog.Info("GSSENCRequest received, declining.", "remote_addr", conn.RemoteAddr())
-		if _, err := conn.Write([]byte("N")); err != nil {
-			return startupResult{}, fmt.Errorf("write GSSENC decline: %w", err)
+	for range maxNegotiationRounds {
+		// Read length (4 bytes)
+		var length int32
+		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+			return startupResult{}, fmt.Errorf("read length: %w", err)
 		}
-		return readStartupFromRaw(conn)
+
+		if length < 8 || length > 10000 {
+			return startupResult{}, fmt.Errorf("invalid startup message length: %d", length)
+		}
+
+		remaining := make([]byte, length-4)
+		if _, err := fullRead(conn, remaining); err != nil {
+			return startupResult{}, fmt.Errorf("read body: %w", err)
+		}
+
+		protocolVersion := binary.BigEndian.Uint32(remaining[:4])
+
+		// SSL request
+		if protocolVersion == 80877103 {
+			return startupResult{sslRequest: true}, nil
+		}
+
+		// Cancel request
+		if protocolVersion == 80877102 && len(remaining) >= 12 {
+			pid := int32(binary.BigEndian.Uint32(remaining[4:8]))
+			key := int32(binary.BigEndian.Uint32(remaining[8:12]))
+			return startupResult{cancelRequest: true, cancelPid: pid, cancelSecretKey: key}, nil
+		}
+
+		// GSSENCRequest (PostgreSQL 12+, JDBC driver gssEncMode=prefer)
+		// Respond with 'N' (GSSAPI encryption not supported) and re-read.
+		// The client will follow up with SSLRequest on the same connection.
+		// The startup read deadline set in handleConnection covers all rounds.
+		if protocolVersion == 80877104 {
+			slog.Debug("GSSENCRequest received, declining.", "remote_addr", conn.RemoteAddr())
+			if _, err := conn.Write([]byte("N")); err != nil {
+				return startupResult{}, fmt.Errorf("write GSSENC decline: %w", err)
+			}
+			continue
+		}
+
+		return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
 	}
 
-	return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
+	return startupResult{}, fmt.Errorf("too many negotiation rounds")
 }
 
 func fullRead(conn net.Conn, buf []byte) (int, error) {

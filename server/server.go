@@ -1232,9 +1232,13 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 		return
 	}
 
-	// Handle GSSENCRequest - decline and re-read for SSLRequest
-	if params["__gssenc_request"] == "true" {
-		slog.Info("GSSENCRequest received, declining.", "remote_addr", remoteAddr)
+	// Handle GSSENCRequest - decline and re-read for SSLRequest.
+	// Loop to handle the unlikely case of multiple GSSENCRequests.
+	for range 3 {
+		if params["__gssenc_request"] != "true" {
+			break
+		}
+		slog.Debug("GSSENCRequest received, declining.", "remote_addr", remoteAddr)
 		if _, err := conn.Write([]byte("N")); err != nil {
 			slog.Error("Failed to send GSSENC decline.", "remote_addr", remoteAddr, "error", err)
 			s.rateLimiter.UnregisterConnection(remoteAddr)

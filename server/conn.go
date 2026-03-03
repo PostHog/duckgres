@@ -620,7 +620,7 @@ func (c *clientConn) handleStartup() error {
 
 		// Handle GSSENCRequest - decline and let client retry with SSL
 		if params["__gssenc_request"] == "true" {
-			slog.Info("GSSENCRequest received, declining.", "remote_addr", c.conn.RemoteAddr())
+			slog.Debug("GSSENCRequest received, declining.", "remote_addr", c.conn.RemoteAddr())
 			if _, err := c.conn.Write([]byte("N")); err != nil {
 				return err
 			}

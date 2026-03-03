@@ -137,19 +137,8 @@ func TestReadStartupFromRaw_StartupTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
-	// Should be a timeout error, not io.EOF
-	if netErr, ok := err.(interface{ Timeout() bool }); !ok || !netErr.Timeout() {
-		// The error is wrapped, check the underlying
-		if unwrapped, ok := err.(interface{ Unwrap() error }); ok {
-			inner := unwrapped.Unwrap()
-			if netErr2, ok := inner.(interface{ Timeout() bool }); ok && netErr2.Timeout() {
-				return // OK, it's a timeout
-			}
-		}
-		// net.Pipe deadlines produce i/o timeout
-		if !isTimeoutErr(err) {
-			t.Fatalf("expected timeout error, got: %v (%T)", err, err)
-		}
+	if !isTimeoutErr(err) {
+		t.Fatalf("expected timeout error, got: %v (%T)", err, err)
 	}
 }
 

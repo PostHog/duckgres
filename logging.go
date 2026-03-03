@@ -79,14 +79,18 @@ func newPostHogExporter(ctx context.Context, host, apiKey string) *otlploghttp.E
 // parseLogLevel returns the slog.Level for the DUCKGRES_LOG_LEVEL env var.
 // Supported values: debug, info, warn, error. Defaults to info.
 func parseLogLevel() slog.Level {
-	switch strings.ToLower(os.Getenv("DUCKGRES_LOG_LEVEL")) {
+	val := strings.ToLower(os.Getenv("DUCKGRES_LOG_LEVEL"))
+	switch val {
 	case "debug":
 		return slog.LevelDebug
 	case "warn", "warning":
 		return slog.LevelWarn
 	case "error":
 		return slog.LevelError
+	case "info", "":
+		return slog.LevelInfo
 	default:
+		fmt.Fprintf(os.Stderr, "Unrecognized DUCKGRES_LOG_LEVEL %q, defaulting to info\n", val)
 		return slog.LevelInfo
 	}
 }
@@ -106,6 +110,7 @@ func initLogging() func() {
 			fmt.Fprintln(os.Stderr, "ADDITIONAL_POSTHOG_API_KEYS is set but POSTHOG_API_KEY is not; ignoring additional keys")
 		}
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
 		return func() {}
 	}
 	fmt.Fprintln(os.Stderr, "PostHog logging enabled, configuring OTLP exporter...")
