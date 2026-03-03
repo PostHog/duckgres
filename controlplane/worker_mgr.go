@@ -29,10 +29,10 @@ type ManagedWorker struct {
 	socketPath     string
 	bearerToken    string
 	client         *flightsql.Client
-	parentListener net.Listener     // CP-side listener; lifecycle managed by releaseSocket
-	prebound       *preboundSocket  // non-nil if using a pre-bound socket slot
-	releaseOnce    sync.Once        // ensures releaseWorkerSocket body runs exactly once
-	done           chan struct{}    // closed when process exits
+	parentListener net.Listener    // CP-side listener; lifecycle managed by releaseSocket
+	prebound       *preboundSocket // non-nil if using a pre-bound socket slot
+	releaseOnce    sync.Once       // ensures releaseWorkerSocket body runs exactly once
+	done           chan struct{}   // closed when process exits
 	exitErr        error
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
@@ -48,31 +48,33 @@ type preboundSocket struct {
 }
 
 type FlightWorkerPool struct {
-	mu           sync.RWMutex
-	workers      map[int]*ManagedWorker
-	nextWorkerID int // auto-incrementing worker ID
-	spawning     int // number of workers currently being spawned (not yet in workers map)
-	socketDir        string
+	mu                sync.RWMutex
+	workers           map[int]*ManagedWorker
+	nextWorkerID      int // auto-incrementing worker ID
+	spawning          int // number of workers currently being spawned (not yet in workers map)
+	socketDir         string
 	fallbackSocketDir string // set lazily when socketDir is EROFS; empty means use primary
-	configPath       string
-	binaryPath   string
-	maxWorkers   int           // 0 = unlimited; caps the number of live worker processes
-	idleTimeout  time.Duration // how long to keep an idle worker alive
-	shuttingDown bool
-	shutdownCh   chan struct{} // closed by ShutdownAll to stop idle reaper
+	configPath        string
+	binaryPath        string
+	maxWorkers        int           // 0 = unlimited; caps the number of live worker processes
+	minWorkers        int           // minimum number of workers to keep alive
+	idleTimeout       time.Duration // how long to keep an idle worker alive
+	shuttingDown      bool
+	shutdownCh        chan struct{} // closed by ShutdownAll to stop idle reaper
 
 	preboundMu sync.Mutex
 	prebound   []*preboundSocket // available pre-bound socket slots
 }
 
 // NewFlightWorkerPool creates a new worker pool.
-func NewFlightWorkerPool(socketDir, configPath string, maxWorkers int) *FlightWorkerPool {
+func NewFlightWorkerPool(socketDir, configPath string, minWorkers, maxWorkers int) *FlightWorkerPool {
 	binaryPath, _ := os.Executable()
 	pool := &FlightWorkerPool{
 		workers:    make(map[int]*ManagedWorker),
 		socketDir:  socketDir,
 		configPath: configPath,
 		binaryPath: binaryPath,
+		minWorkers: minWorkers,
 		maxWorkers: maxWorkers,
 		shutdownCh: make(chan struct{}),
 	}
@@ -611,17 +613,37 @@ func (p *FlightWorkerPool) reapIdleWorkers() {
 	p.mu.Lock()
 	var toRetire []*ManagedWorker
 	now := time.Now()
+	idleCount := 0
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if w.activeSessions == 0 {
+			idleCount++
+		}
+	}
+
+	// Keep at least minWorkers idle workers as a warm pool.
+	// Map iteration is random, but that's fine for simple reaping.
+	// If we wanted to be smart, we'd sort by lastUsed.
+
 	for id, w := range p.workers {
+		if idleCount <= p.minWorkers {
+			break
+		}
 		if w.activeSessions == 0 && !w.lastUsed.IsZero() && now.Sub(w.lastUsed) > p.idleTimeout {
 			toRetire = append(toRetire, w)
 			delete(p.workers, id)
+			idleCount--
 		}
 	}
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 
 	if len(toRetire) > 0 {
-		slog.Info("Reaping idle workers.", "count", len(toRetire))
+		slog.Info("Reaping idle workers.", "count", len(toRetire), "remaining", workerCount, "min", p.minWorkers)
 		observeControlPlaneWorkers(workerCount)
 		for _, w := range toRetire {
 			go p.retireWorkerProcess(w)
@@ -767,7 +789,7 @@ func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 
 	if alreadyDead {
 		exitCode := -1
-		if w.cmd.ProcessState != nil {
+		if w.cmd != nil && w.cmd.ProcessState != nil {
 			exitCode = w.cmd.ProcessState.ExitCode()
 		}
 		slog.Warn("Retiring worker that already exited unexpectedly.", "id", w.ID, "exit_code", exitCode, "error", w.exitErr)
@@ -775,7 +797,7 @@ func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 		slog.Info("Retiring worker.", "id", w.ID)
 
 		// Send SIGINT first so the worker can drain in-flight requests
-		if w.cmd.Process != nil {
+		if w.cmd != nil && w.cmd.Process != nil {
 			_ = w.cmd.Process.Signal(os.Interrupt)
 		}
 
@@ -785,10 +807,12 @@ func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 		case <-w.done:
 		case <-time.After(3 * time.Second):
 			slog.Warn("Worker did not exit in time, killing.", "id", w.ID)
-			if w.cmd.Process != nil {
+			if w.cmd != nil && w.cmd.Process != nil {
 				_ = w.cmd.Process.Kill()
 			}
-			<-w.done
+			if w.done != nil {
+				<-w.done
+			}
 		}
 	}
 
@@ -1011,10 +1035,14 @@ func recoverWorkerPanic(err *error) {
 }
 
 // CreateSession creates a new session on the given worker.
-func (w *ManagedWorker) CreateSession(ctx context.Context, username string) (token string, err error) {
+func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit string, threads int) (token string, err error) {
 	defer recoverWorkerPanic(&err)
 
-	body, _ := json.Marshal(map[string]string{"username": username})
+	body, _ := json.Marshal(map[string]interface{}{
+		"username":     username,
+		"memory_limit": memoryLimit,
+		"threads":      threads,
+	})
 
 	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
 		Type: "CreateSession",

@@ -251,3 +251,29 @@ func TestDestroySessionAfterOnWorkerCrash(t *testing.T) {
 		t.Fatal("expected 0 sessions after DestroySession")
 	}
 }
+
+func TestResolveSessionLimits_UsesRebalancerDefaultsWhenUnset(t *testing.T) {
+	r := NewMemoryRebalancer(24*1024*1024*1024, 8, nil, false)
+	sm := NewSessionManager(&FlightWorkerPool{workers: make(map[int]*ManagedWorker)}, r)
+
+	mem, threads := sm.resolveSessionLimits("", 0)
+	if mem != "24576MB" {
+		t.Fatalf("expected memory limit 24576MB, got %q", mem)
+	}
+	if threads != 8 {
+		t.Fatalf("expected threads 8, got %d", threads)
+	}
+}
+
+func TestResolveSessionLimits_PreservesExplicitValues(t *testing.T) {
+	r := NewMemoryRebalancer(24*1024*1024*1024, 8, nil, false)
+	sm := NewSessionManager(&FlightWorkerPool{workers: make(map[int]*ManagedWorker)}, r)
+
+	mem, threads := sm.resolveSessionLimits("1024MB", 2)
+	if mem != "1024MB" {
+		t.Fatalf("expected memory limit 1024MB, got %q", mem)
+	}
+	if threads != 2 {
+		t.Fatalf("expected threads 2, got %d", threads)
+	}
+}

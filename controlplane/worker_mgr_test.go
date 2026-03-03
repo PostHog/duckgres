@@ -86,7 +86,7 @@ func TestHealthCheckFailureCountingCleanupOnWorkerExit(t *testing.T) {
 }
 
 func TestRetireWorkerProcessAlreadyDead(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 1)
 
 	// Create a process that exits immediately so we can test the alreadyDead path
 	cmd := exec.Command("true")
@@ -121,7 +121,7 @@ func TestRetireWorkerProcessAlreadyDead(t *testing.T) {
 }
 
 func TestRetireWorkerProcessAlreadyDeadNonZeroExit(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 1)
 
 	cmd := exec.Command("false")
 	if err := cmd.Start(); err != nil {
@@ -152,7 +152,7 @@ func TestRetireWorkerProcessAlreadyDeadNonZeroExit(t *testing.T) {
 }
 
 func TestRetireWorkerProcessGracefulShutdown(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 1)
 
 	// Start a process that will respond to SIGINT (sleep)
 	cmd := exec.Command("sleep", "60")
@@ -268,7 +268,7 @@ func makeFakeWorker(t *testing.T, id int) (*ManagedWorker, func()) {
 }
 
 func TestAcquireWorkerReusesIdleWorker(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 
 	// Pre-populate an idle worker.
 	w0, cleanup0 := makeFakeWorker(t, 0)
@@ -293,7 +293,7 @@ func TestAcquireWorkerReusesIdleWorker(t *testing.T) {
 }
 
 func TestAcquireWorkerLeastLoadedAtCapacity(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 
 	// Pre-populate 2 busy workers (at capacity).
 	w0, cleanup0 := makeFakeWorker(t, 0)
@@ -323,7 +323,7 @@ func TestAcquireWorkerLeastLoadedAtCapacity(t *testing.T) {
 }
 
 func TestAcquireWorkerSpawnsWhenBelowCapacity(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 3)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 3)
 
 	// Pre-populate 1 busy worker (below capacity of 3).
 	w0, cleanup0 := makeFakeWorker(t, 0)
@@ -348,7 +348,7 @@ func TestAcquireWorkerSpawnsWhenBelowCapacity(t *testing.T) {
 }
 
 func TestAcquireWorkerCleansDeadWorkersWhenAllDead(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 
 	// Pre-populate 2 dead workers.
 	cmd0 := exec.Command("true")
@@ -388,7 +388,7 @@ func TestAcquireWorkerCleansDeadWorkersWhenAllDead(t *testing.T) {
 }
 
 func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 0)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 0)
 
 	// AcquireWorker should not block (it will fail trying to
 	// spawn a worker with a fake binary, but should get past any checks).
@@ -403,7 +403,7 @@ func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
 }
 
 func TestAcquireWorkerShutdownReturnsError(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 	pool.ShutdownAll()
 
 	_, err := pool.AcquireWorker(context.Background())
@@ -413,7 +413,7 @@ func TestAcquireWorkerShutdownReturnsError(t *testing.T) {
 }
 
 func TestRetireWorkerIfNoSessions_ReleasesClaimOnSharedWorker(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 
 	// Inject a worker with 2 sessions (shared worker).
 	w, cleanup := makeFakeWorker(t, 1)
@@ -441,7 +441,7 @@ func TestRetireWorkerIfNoSessions_ReleasesClaimOnSharedWorker(t *testing.T) {
 }
 
 func TestRetireWorkerIfNoSessions_RetiresWhenLastSession(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 1)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 1)
 
 	// Inject a worker with 1 session.
 	w, cleanup := makeFakeWorker(t, 1)
@@ -465,7 +465,7 @@ func TestRetireWorkerIfNoSessions_RetiresWhenLastSession(t *testing.T) {
 func TestAcquireWorker_AtomicClaimRace(t *testing.T) {
 	// Tests that two concurrent acquisitions don't pick the same idle worker.
 	const n = 5
-	pool := NewFlightWorkerPool(t.TempDir(), "", 10)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 10)
 
 	// Pre-warm with n idle workers
 	for i := 1; i <= n; i++ {
@@ -499,7 +499,7 @@ func TestAcquireWorker_AtomicClaimRace(t *testing.T) {
 }
 
 func TestRetireWorker_RemovesFromPool(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 5)
 
 	// Inject a worker with 2 sessions
 	w, cleanup := makeFakeWorker(t, 1)
@@ -518,7 +518,7 @@ func TestRetireWorker_RemovesFromPool(t *testing.T) {
 }
 
 func TestCrashRemovesWorkerFromPool(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 
 	// Create a worker that exits immediately (simulates crash).
 	cmd := exec.Command("true")
@@ -572,7 +572,7 @@ func TestCrashRemovesWorkerFromPool(t *testing.T) {
 }
 
 func TestLiveWorkerCountLocked(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 5)
 
 	// Add 2 live workers and 1 dead worker.
 	w0, cleanup0 := makeFakeWorker(t, 0)
@@ -600,7 +600,7 @@ func TestLiveWorkerCountLocked(t *testing.T) {
 }
 
 func TestCleanDeadWorkersLocked(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 5)
 
 	// Add 1 live worker and 2 dead workers.
 	w0, cleanup0 := makeFakeWorker(t, 0)
@@ -638,7 +638,7 @@ func TestCleanDeadWorkersLocked(t *testing.T) {
 }
 
 func TestLeastLoadedWorkerLocked(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 5)
 
 	w0, cleanup0 := makeFakeWorker(t, 0)
 	defer cleanup0()
@@ -669,7 +669,7 @@ func TestLeastLoadedWorkerLocked(t *testing.T) {
 func TestAcquireWorkerConcurrentSharing(t *testing.T) {
 	// With maxWorkers=2 and 2 busy workers, 10 concurrent acquires should
 	// all succeed by sharing the existing workers.
-	pool := NewFlightWorkerPool(t.TempDir(), "", 2)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 
 	w0, cleanup0 := makeFakeWorker(t, 0)
 	defer cleanup0()
@@ -731,7 +731,7 @@ func shortTempDir(t *testing.T) string {
 
 func TestPreBindSocketsCreatesListeners(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 5)
+	pool := NewFlightWorkerPool(dir, "", 0, 5)
 
 	if err := pool.PreBindSockets(3); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -756,7 +756,7 @@ func TestPreBindSocketsCreatesListeners(t *testing.T) {
 
 func TestPreBindSocketsCleanupOnPartialFailure(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 5)
+	pool := NewFlightWorkerPool(dir, "", 0, 5)
 
 	// Pre-bind 2 sockets, then make the 3rd fail by creating a non-empty
 	// directory at worker-2.sock. os.Remove can't remove non-empty dirs,
@@ -793,7 +793,7 @@ func TestPreBindSocketsCleanupOnPartialFailure(t *testing.T) {
 
 func TestTakePreboundAndReturnRoundTrip(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 3)
+	pool := NewFlightWorkerPool(dir, "", 0, 3)
 
 	if err := pool.PreBindSockets(3); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -831,7 +831,7 @@ func TestTakePreboundAndReturnRoundTrip(t *testing.T) {
 
 func TestReleaseWorkerSocketReturnsPrebound(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 2)
+	pool := NewFlightWorkerPool(dir, "", 0, 2)
 
 	if err := pool.PreBindSockets(2); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -866,7 +866,7 @@ func TestReleaseWorkerSocketReturnsPrebound(t *testing.T) {
 
 func TestReleaseWorkerSocketClosesNonPrebound(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 0)
+	pool := NewFlightWorkerPool(dir, "", 0, 0)
 
 	// Create a non-pre-bound socket
 	socketPath := fmt.Sprintf("%s/worker-test.sock", dir)
@@ -891,7 +891,7 @@ func TestReleaseWorkerSocketClosesNonPrebound(t *testing.T) {
 
 func TestCloseAllPreboundClosesListeners(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 3)
+	pool := NewFlightWorkerPool(dir, "", 0, 3)
 
 	if err := pool.PreBindSockets(3); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -919,7 +919,7 @@ func TestCloseAllPreboundClosesListeners(t *testing.T) {
 
 func TestShutdownAllReturnsPreboundToPool(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 3)
+	pool := NewFlightWorkerPool(dir, "", 0, 3)
 
 	if err := pool.PreBindSockets(3); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -962,7 +962,7 @@ func TestShutdownAllReturnsPreboundToPool(t *testing.T) {
 
 func TestReleaseWorkerSocketIdempotent(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 2)
+	pool := NewFlightWorkerPool(dir, "", 0, 2)
 
 	if err := pool.PreBindSockets(2); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -1004,7 +1004,7 @@ func TestReleaseWorkerSocketIdempotent(t *testing.T) {
 
 func TestTakeAllPrebound(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 5)
+	pool := NewFlightWorkerPool(dir, "", 0, 5)
 
 	if err := pool.PreBindSockets(3); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -1031,7 +1031,7 @@ func TestTakeAllPrebound(t *testing.T) {
 }
 
 func TestTakeAllPreboundEmpty(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 5)
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 5)
 
 	result := pool.TakeAllPrebound()
 	if result != nil {
@@ -1041,7 +1041,7 @@ func TestTakeAllPreboundEmpty(t *testing.T) {
 
 func TestImportPrebound(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 5)
+	pool := NewFlightWorkerPool(dir, "", 0, 5)
 
 	// Create some sockets to import
 	sockets := make([]*preboundSocket, 3)
@@ -1077,7 +1077,7 @@ func TestImportPrebound(t *testing.T) {
 
 func TestImportPreboundAppendsToExisting(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 5)
+	pool := NewFlightWorkerPool(dir, "", 0, 5)
 
 	// Pre-bind 2 sockets
 	if err := pool.PreBindSockets(2); err != nil {
@@ -1110,7 +1110,7 @@ func TestImportPreboundAppendsToExisting(t *testing.T) {
 
 func TestTakeAllPreboundThenImport(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 5)
+	pool := NewFlightWorkerPool(dir, "", 0, 5)
 
 	if err := pool.PreBindSockets(3); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -1123,7 +1123,7 @@ func TestTakeAllPreboundThenImport(t *testing.T) {
 	}
 
 	// Import them into a different pool (simulating handover)
-	pool2 := NewFlightWorkerPool(dir, "", 5)
+	pool2 := NewFlightWorkerPool(dir, "", 0, 5)
 	pool2.ImportPrebound(taken)
 
 	pool2.preboundMu.Lock()
@@ -1149,7 +1149,7 @@ func TestTakeAllPreboundThenImport(t *testing.T) {
 
 func TestConcurrentTakeReturn(t *testing.T) {
 	dir := shortTempDir(t)
-	pool := NewFlightWorkerPool(dir, "", 10)
+	pool := NewFlightWorkerPool(dir, "", 0, 10)
 
 	if err := pool.PreBindSockets(10); err != nil {
 		t.Fatalf("PreBindSockets failed: %v", err)
@@ -1178,5 +1178,87 @@ func TestConcurrentTakeReturn(t *testing.T) {
 
 	if count != 10 {
 		t.Fatalf("expected 10 pre-bound sockets after concurrent ops, got %d", count)
+	}
+}
+
+func TestReapIdleWorkersRespectsMinWorkers(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2, 5)
+	pool.idleTimeout = 10 * time.Millisecond
+
+	// Spawn 3 workers
+	for i := 0; i < 3; i++ {
+		w := &ManagedWorker{
+			ID:       i,
+			lastUsed: time.Now().Add(-1 * time.Hour), // long ago
+			done:     make(chan struct{}),
+		}
+		pool.workers[i] = w
+	}
+
+	// Reap - should only reap 1 worker, leaving 2 (minWorkers)
+	pool.reapIdleWorkers()
+
+	pool.mu.Lock()
+	count := len(pool.workers)
+	pool.mu.Unlock()
+
+	if count != 2 {
+		t.Errorf("expected 2 workers remaining, got %d", count)
+	}
+}
+
+func TestReapIdleWorkersReapsAllAboveMin(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1, 5)
+	pool.idleTimeout = 10 * time.Millisecond
+
+	// Spawn 3 workers
+	for i := 0; i < 3; i++ {
+		w := &ManagedWorker{
+			ID:       i,
+			lastUsed: time.Now().Add(-1 * time.Hour), // long ago
+			done:     make(chan struct{}),
+		}
+		pool.workers[i] = w
+	}
+
+	// Reap - should reap 2 workers, leaving 1 (minWorkers)
+	pool.reapIdleWorkers()
+
+	pool.mu.Lock()
+	count := len(pool.workers)
+	pool.mu.Unlock()
+
+	if count != 1 {
+		t.Errorf("expected 1 worker remaining, got %d", count)
+	}
+}
+
+func TestReapIdleWorkersPreservesIdleFloor(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 2, 6)
+	pool.idleTimeout = 10 * time.Millisecond
+
+	// 2 busy workers
+	pool.workers[0] = &ManagedWorker{ID: 0, activeSessions: 1, done: make(chan struct{})}
+	pool.workers[1] = &ManagedWorker{ID: 1, activeSessions: 1, done: make(chan struct{})}
+
+	// 3 idle workers eligible for reaping
+	stale := time.Now().Add(-1 * time.Hour)
+	pool.workers[2] = &ManagedWorker{ID: 2, lastUsed: stale, done: make(chan struct{})}
+	pool.workers[3] = &ManagedWorker{ID: 3, lastUsed: stale, done: make(chan struct{})}
+	pool.workers[4] = &ManagedWorker{ID: 4, lastUsed: stale, done: make(chan struct{})}
+
+	pool.reapIdleWorkers()
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	idleCount := 0
+	for _, w := range pool.workers {
+		if w.activeSessions == 0 {
+			idleCount++
+		}
+	}
+
+	if idleCount < pool.minWorkers {
+		t.Fatalf("expected at least %d idle workers to remain, got %d", pool.minWorkers, idleCount)
 	}
 }
