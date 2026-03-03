@@ -41,11 +41,11 @@ type SessionPool struct {
 	startTime   time.Time
 	maxSessions int
 	stopCh      chan struct{}
-	warmupDB    *sql.DB      // Keep this open to keep shared cache alive
+	warmupDB    *sql.DB       // Keep this open to keep shared cache alive
 	warmupDone  chan struct{} // Closed when Warmup() completes (success or failure)
-	dbInitOnce  sync.Once    // Serializes fallback CreateDBConnection when warmup fails
-	fallbackDB  *sql.DB      // Lazily created if warmup fails
-	fallbackErr error        // Cached error from fallback creation
+	dbInitOnce  sync.Once     // Serializes fallback CreateDBConnection when warmup fails
+	fallbackDB  *sql.DB       // Lazily created if warmup fails
+	fallbackErr error         // Cached error from fallback creation
 }
 
 type trackedTx struct {
@@ -333,8 +333,6 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 	// Since the DB is shared, we must set session-local parameters here.
 	initSearchPath(conn, username)
 
-	stop := server.StartCredentialRefresh(conn, p.cfg.DuckLake)
-
 	token := generateSessionToken()
 	session := &Session{
 		ID:        token,
@@ -347,6 +345,12 @@ func (p *SessionPool) CreateSession(username string) (*Session, error) {
 		txnOwner:  make(map[string]string),
 	}
 	session.lastUsed.Store(time.Now().UnixNano())
+
+	stop := server.StartCredentialRefresh(conn, p.cfg.DuckLake, func() bool {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return len(session.txns) > 0
+	})
 
 	p.mu.Lock()
 	p.reserved--

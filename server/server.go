@@ -1021,7 +1021,7 @@ func buildCredentialChainSecret(dlCfg DuckLakeConfig) string {
 // credentialRefreshInterval is how often to refresh S3 credentials for long-lived connections.
 // EC2 instance role credentials typically expire after 6 hours. Refreshing every 5 minutes
 // ensures fresh credentials are always available without excessive IMDS calls.
-const credentialRefreshInterval = 5 * time.Minute
+var credentialRefreshInterval = 5 * time.Minute
 
 // s3ProviderForConfig returns the effective S3 provider for the given DuckLake config.
 func s3ProviderForConfig(dlCfg DuckLakeConfig) string {
@@ -1065,6 +1065,12 @@ type sqlExecer interface {
 // The execer parameter accepts either *sql.DB (standalone mode) or *sql.Conn (worker
 // mode where the pool's only connection is pinned by the session).
 //
+// The optional isTxActive callback reports whether the caller currently has an active
+// user transaction on this connection. When provided and returning false, aborted
+// transaction errors are auto-recovered by issuing ROLLBACK and retrying once.
+// When omitted (or returning true), automatic rollback is skipped to avoid rolling
+// back caller-owned transactions.
+//
 // Note: ExecContext serializes behind any running query (pool contention for *sql.DB,
 // internal mutex for *sql.Conn). This means credentials are refreshed between queries,
 // not during them. A query that runs longer than the credential TTL (~6h for instance
@@ -1073,9 +1079,14 @@ type sqlExecer interface {
 // Returns a stop function that cancels the refresh goroutine. The caller must call
 // the stop function when the connection is closed to prevent goroutine leaks.
 // If credential refresh is not needed (static credentials, no S3, etc.), returns a no-op.
-func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig) func() {
+func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig, isTxActive ...func() bool) func() {
 	if !needsCredentialRefresh(dlCfg) {
 		return func() {}
+	}
+
+	var txActiveProbe func() bool
+	if len(isTxActive) > 0 {
+		txActiveProbe = isTxActive[0]
 	}
 
 	done := make(chan struct{})
@@ -1089,11 +1100,19 @@ func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig) func() {
 				secretStmt := buildCredentialChainSecret(dlCfg)
 				_, err := execer.ExecContext(context.Background(), secretStmt)
 
-				// If stuck in aborted transaction, ROLLBACK and retry once.
+				// If stuck in aborted transaction, only auto-rollback when caller
+				// confirms there is no active user transaction.
 				if isTransactionAborted(err) {
-					slog.Warn("S3 credential refresh hit aborted transaction, issuing ROLLBACK.")
-					_, _ = execer.ExecContext(context.Background(), "ROLLBACK")
-					_, err = execer.ExecContext(context.Background(), secretStmt)
+					switch {
+					case txActiveProbe == nil:
+						slog.Warn("S3 credential refresh hit aborted transaction; skipping automatic ROLLBACK because transaction state is unknown.")
+					case txActiveProbe():
+						slog.Warn("S3 credential refresh hit aborted transaction; skipping automatic ROLLBACK while user transaction is active.")
+					default:
+						slog.Warn("S3 credential refresh hit aborted transaction, issuing ROLLBACK.")
+						_, _ = execer.ExecContext(context.Background(), "ROLLBACK")
+						_, err = execer.ExecContext(context.Background(), secretStmt)
+					}
 				}
 
 				if err != nil {
