@@ -627,8 +627,14 @@ func (c *clientConn) handleStartup() error {
 
 			// Upgrade connection to TLS
 			tlsConn := tls.Server(c.conn, c.server.tlsConfig)
+			if err := tlsConn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				return fmt.Errorf("failed to set TLS deadline: %w", err)
+			}
 			if err := tlsConn.Handshake(); err != nil {
 				return fmt.Errorf("TLS handshake failed: %w", err)
+			}
+			if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+				return fmt.Errorf("failed to clear TLS deadline: %w", err)
 			}
 
 			// Replace connection with TLS connection
@@ -664,6 +670,9 @@ func (c *clientConn) handleStartup() error {
 		c.username = params["user"]
 		c.database = params["database"]
 		c.applicationName = params["application_name"]
+
+		slog.Info("Client startup.", "user", c.username, "database", c.database,
+			"application_name", c.applicationName, "remote_addr", c.conn.RemoteAddr())
 
 		if c.username == "" {
 			c.sendError("FATAL", "28000", "no user specified")
