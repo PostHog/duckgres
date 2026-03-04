@@ -357,57 +357,6 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 	}
 }
 
-func TestK8sPool_DiscoverExistingWorkers(t *testing.T) {
-	pool, cs := newTestK8sPool(t, 5)
-
-	// Create the bearer token secret
-	_, err := cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-secret", Namespace: "default"},
-		Data:       map[string][]byte{"bearer-token": []byte("test-token")},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Create a "running" worker pod (without a real gRPC server it will be deleted)
-	_, _ = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "duckgres-worker-test-cp-0",
-			Namespace: "default",
-			Labels: map[string]string{
-				"app":                    "duckgres-worker",
-				"duckgres/control-plane": "test-cp",
-				"duckgres/worker-id":     "0",
-			},
-		},
-		Status: corev1.PodStatus{
-			Phase: corev1.PodRunning,
-			PodIP: "10.0.0.5",
-		},
-	}, metav1.CreateOptions{})
-
-	// Create a failed worker pod
-	_, _ = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "duckgres-worker-test-cp-1",
-			Namespace: "default",
-			Labels: map[string]string{
-				"app":                    "duckgres-worker",
-				"duckgres/control-plane": "test-cp",
-				"duckgres/worker-id":     "1",
-			},
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodFailed},
-	}, metav1.CreateOptions{})
-
-	pool.DiscoverExistingWorkers(context.Background())
-
-	// The running pod will fail gRPC connection (no real server) and be deleted.
-	// The failed pod should be deleted directly.
-	// Both pods should have been processed.
-	// In a real cluster with actual workers, we'd verify reconnection.
-}
-
 func TestK8sPool_ShutdownAll(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 

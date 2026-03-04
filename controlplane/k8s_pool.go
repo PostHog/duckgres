@@ -13,15 +13,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -50,6 +49,8 @@ type K8sWorkerPool struct {
 	configMap       string
 	configPath      string
 	imagePullPolicy corev1.PullPolicy
+	memoryBudget    int64 // total memory budget in bytes
+	cachedToken     string // cached bearer token (immutable after setup)
 	informer        cache.SharedIndexInformer
 	stopInform      chan struct{}
 }
@@ -106,6 +107,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		configMap:       cfg.ConfigMap,
 		configPath:      cfg.ConfigPath,
 		imagePullPolicy: corev1.PullPolicy(cfg.ImagePullPolicy),
+		memoryBudget:    cfg.MemoryBudget,
 	}
 
 	// Resolve CP pod UID for owner references
@@ -201,8 +203,12 @@ func (p *K8sWorkerPool) ensureBearerTokenSecret(ctx context.Context) error {
 	return nil
 }
 
-// readBearerToken reads the bearer token from the K8s Secret.
+// readBearerToken returns the bearer token, using a cached value after the first read.
+// The token is immutable after ensureBearerTokenSecret sets it up at pool creation.
 func (p *K8sWorkerPool) readBearerToken(ctx context.Context) (string, error) {
+	if p.cachedToken != "" {
+		return p.cachedToken, nil
+	}
 	secret, err := p.clientset.CoreV1().Secrets(p.namespace).Get(ctx, p.secretName, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("get secret %s: %w", p.secretName, err)
@@ -211,7 +217,8 @@ func (p *K8sWorkerPool) readBearerToken(ctx context.Context) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("secret %s missing 'bearer-token' key", p.secretName)
 	}
-	return string(token), nil
+	p.cachedToken = string(token)
+	return p.cachedToken, nil
 }
 
 // startInformer starts a SharedIndexInformer to watch worker pods.
@@ -358,6 +365,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: boolPtr(false),
 					},
+					Resources: p.workerResources(),
 				},
 			},
 		},
@@ -510,25 +518,78 @@ func waitForWorkerTCP(addr, bearerToken string, timeout time.Duration) (*flights
 
 // AcquireWorker returns a worker for a new session.
 func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
-	p.mu.Lock()
-	if p.shuttingDown {
-		p.mu.Unlock()
-		return nil, fmt.Errorf("pool is shutting down")
-	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 
-	p.cleanDeadWorkersLocked()
+		p.mu.Lock()
+		if p.shuttingDown {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("pool is shutting down")
+		}
 
-	// 1. Try to claim an idle worker
-	idle := p.findIdleWorkerLocked()
-	if idle != nil {
-		idle.activeSessions++
-		p.mu.Unlock()
-		return idle, nil
-	}
+		p.cleanDeadWorkersLocked()
 
-	// 2. If below the process cap, spawn a new worker
-	liveCount := p.liveWorkerCountLocked()
-	if p.maxWorkers == 0 || liveCount < p.maxWorkers {
+		// 1. Try to claim an idle worker
+		idle := p.findIdleWorkerLocked()
+		if idle != nil {
+			idle.activeSessions++
+			p.mu.Unlock()
+			return idle, nil
+		}
+
+		// 2. If below the process cap, spawn a new worker
+		liveCount := p.liveWorkerCountLocked()
+		if p.maxWorkers == 0 || liveCount < p.maxWorkers {
+			id := p.nextWorkerID
+			p.nextWorkerID++
+			p.spawning++
+			p.mu.Unlock()
+
+			err := p.SpawnWorker(ctx, id)
+
+			p.mu.Lock()
+			p.spawning--
+			p.mu.Unlock()
+
+			if err != nil {
+				return nil, err
+			}
+
+			w, ok := p.Worker(id)
+			if !ok {
+				return nil, fmt.Errorf("worker %d not found after spawn", id)
+			}
+			p.mu.Lock()
+			w.activeSessions++
+			p.mu.Unlock()
+			return w, nil
+		}
+
+		// 3. At capacity — assign to the least-loaded worker
+		w := p.leastLoadedWorkerLocked()
+		if w != nil {
+			w.activeSessions++
+			p.mu.Unlock()
+			return w, nil
+		}
+
+		// All workers dead but at capacity (spawning in progress) — wait and retry
+		liveCount = p.liveWorkerCountLocked()
+		if p.maxWorkers > 0 && liveCount >= p.maxWorkers {
+			p.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+
+		// Below capacity with all workers dead — spawn a replacement
 		id := p.nextWorkerID
 		p.nextWorkerID++
 		p.spawning++
@@ -543,7 +604,6 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 		if err != nil {
 			return nil, err
 		}
-
 		w, ok := p.Worker(id)
 		if !ok {
 			return nil, fmt.Errorf("worker %d not found after spawn", id)
@@ -553,44 +613,6 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 		p.mu.Unlock()
 		return w, nil
 	}
-
-	// 3. At capacity — assign to the least-loaded worker
-	w := p.leastLoadedWorkerLocked()
-	if w != nil {
-		w.activeSessions++
-		p.mu.Unlock()
-		return w, nil
-	}
-
-	// All workers dead, spawn a replacement
-	liveCount = p.liveWorkerCountLocked()
-	if p.maxWorkers > 0 && liveCount >= p.maxWorkers {
-		p.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
-		return p.AcquireWorker(ctx)
-	}
-	id := p.nextWorkerID
-	p.nextWorkerID++
-	p.spawning++
-	p.mu.Unlock()
-
-	err := p.SpawnWorker(ctx, id)
-
-	p.mu.Lock()
-	p.spawning--
-	p.mu.Unlock()
-
-	if err != nil {
-		return nil, err
-	}
-	w, ok := p.Worker(id)
-	if !ok {
-		return nil, fmt.Errorf("worker %d not found after spawn", id)
-	}
-	p.mu.Lock()
-	w.activeSessions++
-	p.mu.Unlock()
-	return w, nil
 }
 
 // ReleaseWorker decrements the active session count for a worker.
@@ -743,6 +765,13 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						if w.client != nil {
 							_ = w.client.Close()
 						}
+						// Delete the failed pod from K8s
+						podName := fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, w.ID)
+						delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
+						_ = p.clientset.CoreV1().Pods(p.namespace).Delete(delCtx, podName, metav1.DeleteOptions{
+							GracePeriodSeconds: int64Ptr(0),
+						})
+						delCancel()
 					default:
 						// Worker alive, do health check
 						var healthErr error
@@ -837,102 +866,6 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	p.workers = make(map[int]*ManagedWorker)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(0)
-}
-
-// DiscoverExistingWorkers reconnects to worker pods from a previous CP instance.
-func (p *K8sWorkerPool) DiscoverExistingWorkers(ctx context.Context) {
-	selector := labels.Set{
-		"duckgres/control-plane": p.cpID,
-	}.AsSelector()
-
-	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: selector.String(),
-	})
-	if err != nil {
-		slog.Warn("Failed to list existing worker pods.", "error", err)
-		return
-	}
-
-	token, err := p.readBearerToken(ctx)
-	if err != nil {
-		slog.Warn("Cannot read bearer token for worker rediscovery.", "error", err)
-		return
-	}
-
-	for _, pod := range pods.Items {
-		idStr := pod.Labels["duckgres/worker-id"]
-		if idStr == "" {
-			continue
-		}
-		id, err := strconv.Atoi(idStr)
-		if err != nil {
-			continue
-		}
-
-		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
-			slog.Info("Deleting unhealthy existing worker pod.", "pod", pod.Name, "phase", pod.Status.Phase)
-			_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
-				GracePeriodSeconds: int64Ptr(0),
-			})
-			continue
-		}
-
-		addr := fmt.Sprintf("%s:%d", pod.Status.PodIP, p.workerPort)
-		client, err := waitForWorkerTCP(addr, token, 5*time.Second)
-		if err != nil {
-			slog.Warn("Could not reconnect to existing worker, deleting.", "pod", pod.Name, "error", err)
-			_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
-				GracePeriodSeconds: int64Ptr(0),
-			})
-			continue
-		}
-
-		// Clear stale sessions from the previous CP
-		p.destroyAllSessions(ctx, client)
-
-		done := make(chan struct{})
-		w := &ManagedWorker{
-			ID:          id,
-			bearerToken: token,
-			client:      client,
-			done:        done,
-		}
-
-		p.mu.Lock()
-		p.workers[id] = w
-		if id >= p.nextWorkerID {
-			p.nextWorkerID = id + 1
-		}
-		p.mu.Unlock()
-
-		slog.Info("Reconnected to existing worker pod.", "id", id, "pod", pod.Name, "addr", addr)
-	}
-
-	p.mu.RLock()
-	workerCount := len(p.workers)
-	p.mu.RUnlock()
-	observeControlPlaneWorkers(workerCount)
-	if workerCount > 0 {
-		slog.Info("Discovered existing worker pods.", "count", workerCount)
-	}
-}
-
-// destroyAllSessions clears all sessions on a worker to prevent stale state.
-func (p *K8sWorkerPool) destroyAllSessions(ctx context.Context, client *flightsql.Client) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	stream, err := client.Client.DoAction(ctx, &flight.Action{Type: "DestroyAllSessions"})
-	if err != nil {
-		slog.Debug("DestroyAllSessions failed (may not be supported).", "error", err)
-		return
-	}
-	// Drain the stream
-	for {
-		if _, err := stream.Recv(); err != nil {
-			break
-		}
-	}
 }
 
 // retireWorkerPod closes the gRPC client and deletes the worker pod.
@@ -1047,8 +980,40 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 			if w.client != nil {
 				go func(c *flightsql.Client) { _ = c.Close() }(w.client)
 			}
+			// Delete the failed pod from K8s to avoid accumulating terminated pods
+			go func(workerID int) {
+				podName := fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, workerID)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+					GracePeriodSeconds: int64Ptr(0),
+				})
+			}(id)
 		default:
 		}
+	}
+}
+
+// workerResources computes resource requests/limits for a worker pod.
+// If a memory budget is configured, each worker gets budget/maxWorkers as
+// memory limit (request = 50% of limit for Burstable QoS). If no budget
+// is set, returns an empty ResourceRequirements (BestEffort).
+func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
+	if p.memoryBudget <= 0 || p.maxWorkers <= 0 {
+		return corev1.ResourceRequirements{}
+	}
+	perWorkerBytes := p.memoryBudget / int64(p.maxWorkers)
+	memLimit := resource.NewQuantity(perWorkerBytes, resource.BinarySI)
+	memRequest := resource.NewQuantity(perWorkerBytes/2, resource.BinarySI)
+
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: *memRequest,
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: *memLimit,
+		},
 	}
 }
 

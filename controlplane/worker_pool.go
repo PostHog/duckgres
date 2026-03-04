@@ -51,6 +51,7 @@ type K8sWorkerPoolConfig struct {
 	IdleTimeout     time.Duration
 	ConfigPath      string // Path inside worker pod where config is mounted
 	ImagePullPolicy string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	MemoryBudget    int64  // Total memory budget in bytes; used to derive per-worker resource limits
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

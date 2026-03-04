@@ -230,6 +230,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			IdleTimeout:     cfg.WorkerIdleTimeout,
 			ConfigPath:      cfg.ConfigPath,
 			ImagePullPolicy: cfg.K8s.ImagePullPolicy,
+			MemoryBudget:    int64(memBudget),
 		})
 		if err != nil {
 			slog.Error("Failed to create Kubernetes worker pool.", "error", err)
