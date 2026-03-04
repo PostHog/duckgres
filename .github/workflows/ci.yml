@@ -124,4 +124,3 @@ jobs:
 
       - name: Run control plane tests
         run: go test -v -timeout 300s ./tests/controlplane/...
-
