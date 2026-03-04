@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckgres-config
+  namespace: duckgres
+data:
+  duckgres.yaml: |
+    host: "0.0.0.0"
+    port: 5432
+    data_dir: "/data"
+    users:
+      postgres: "postgres"
+    extensions:
+      - ducklake

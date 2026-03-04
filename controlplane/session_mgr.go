@@ -26,14 +26,14 @@ type SessionManager struct {
 	mu         sync.RWMutex
 	sessions   map[int32]*ManagedSession // PID → session
 	byWorker   map[int][]int32           // workerID → PIDs
-	pool       *FlightWorkerPool
+	pool       WorkerPool
 	rebalancer *MemoryRebalancer
 
 	nextPID atomic.Int32
 }
 
 // NewSessionManager creates a new session manager.
-func NewSessionManager(pool *FlightWorkerPool, rebalancer *MemoryRebalancer) *SessionManager {
+func NewSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer) *SessionManager {
 	sm := &SessionManager{
 		sessions:   make(map[int32]*ManagedSession),
 		byWorker:   make(map[int][]int32),

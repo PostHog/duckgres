@@ -35,6 +35,14 @@ type configCLIInputs struct {
 	ACMEEmail                 string
 	ACMECacheDir              string
 	MaxConnections            int
+	WorkerBackend             string
+	K8sWorkerImage            string
+	K8sWorkerNamespace        string
+	K8sControlPlaneID         string
+	K8sWorkerPort             int
+	K8sWorkerSecret           string
+	K8sWorkerConfigMap        string
+	K8sWorkerImagePullPolicy  string
 }
 
 type resolvedConfig struct {
@@ -42,6 +50,14 @@ type resolvedConfig struct {
 	WorkerQueueTimeout   time.Duration
 	WorkerIdleTimeout    time.Duration
 	HandoverDrainTimeout time.Duration
+	WorkerBackend        string
+	K8sWorkerImage       string
+	K8sWorkerNamespace   string
+	K8sControlPlaneID    string
+	K8sWorkerPort        int
+	K8sWorkerSecret      string
+	K8sWorkerConfigMap   string
+	K8sWorkerImagePullPolicy string
 }
 
 func defaultServerConfig() server.Config {
@@ -78,6 +94,10 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var workerQueueTimeout time.Duration
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
+	var workerBackend string
+	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
+	var k8sWorkerPort int
+	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -256,6 +276,31 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.TLS.ACME.CacheDir != "" {
 			cfg.ACMECacheDir = fileCfg.TLS.ACME.CacheDir
 		}
+
+		if fileCfg.WorkerBackend != "" {
+			workerBackend = fileCfg.WorkerBackend
+		}
+		if fileCfg.K8s.WorkerImage != "" {
+			k8sWorkerImage = fileCfg.K8s.WorkerImage
+		}
+		if fileCfg.K8s.WorkerNamespace != "" {
+			k8sWorkerNamespace = fileCfg.K8s.WorkerNamespace
+		}
+		if fileCfg.K8s.ControlPlaneID != "" {
+			k8sControlPlaneID = fileCfg.K8s.ControlPlaneID
+		}
+		if fileCfg.K8s.WorkerPort != 0 {
+			k8sWorkerPort = fileCfg.K8s.WorkerPort
+		}
+		if fileCfg.K8s.WorkerSecret != "" {
+			k8sWorkerSecret = fileCfg.K8s.WorkerSecret
+		}
+		if fileCfg.K8s.WorkerConfigMap != "" {
+			k8sWorkerConfigMap = fileCfg.K8s.WorkerConfigMap
+		}
+		if fileCfg.K8s.WorkerImagePullPolicy != "" {
+			k8sWorkerImagePullPolicy = fileCfg.K8s.WorkerImagePullPolicy
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -432,6 +477,34 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_MAX_CONNECTIONS: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
+		workerBackend = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_IMAGE"); v != "" {
+		k8sWorkerImage = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_NAMESPACE"); v != "" {
+		k8sWorkerNamespace = v
+	}
+	if v := getenv("DUCKGRES_K8S_CONTROL_PLANE_ID"); v != "" {
+		k8sControlPlaneID = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sWorkerPort = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_PORT: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_SECRET"); v != "" {
+		k8sWorkerSecret = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_CONFIGMAP"); v != "" {
+		k8sWorkerConfigMap = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY"); v != "" {
+		k8sWorkerImagePullPolicy = v
+	}
 
 	if cli.Set["host"] {
 		cfg.Host = cli.Host
@@ -540,6 +613,30 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["max-connections"] {
 		cfg.RateLimit.MaxConnections = cli.MaxConnections
 	}
+	if cli.Set["worker-backend"] {
+		workerBackend = cli.WorkerBackend
+	}
+	if cli.Set["k8s-worker-image"] {
+		k8sWorkerImage = cli.K8sWorkerImage
+	}
+	if cli.Set["k8s-worker-namespace"] {
+		k8sWorkerNamespace = cli.K8sWorkerNamespace
+	}
+	if cli.Set["k8s-control-plane-id"] {
+		k8sControlPlaneID = cli.K8sControlPlaneID
+	}
+	if cli.Set["k8s-worker-port"] {
+		k8sWorkerPort = cli.K8sWorkerPort
+	}
+	if cli.Set["k8s-worker-secret"] {
+		k8sWorkerSecret = cli.K8sWorkerSecret
+	}
+	if cli.Set["k8s-worker-configmap"] {
+		k8sWorkerConfigMap = cli.K8sWorkerConfigMap
+	}
+	if cli.Set["k8s-worker-image-pull-policy"] {
+		k8sWorkerImagePullPolicy = cli.K8sWorkerImagePullPolicy
+	}
 
 	// Validate memory_limit format if explicitly set
 	if cfg.MemoryLimit != "" && !server.ValidateMemoryLimit(cfg.MemoryLimit) {
@@ -554,9 +651,17 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	return resolvedConfig{
-		Server:               cfg,
-		WorkerQueueTimeout:   workerQueueTimeout,
-		WorkerIdleTimeout:    workerIdleTimeout,
-		HandoverDrainTimeout: handoverDrainTimeout,
+		Server:                   cfg,
+		WorkerQueueTimeout:       workerQueueTimeout,
+		WorkerIdleTimeout:        workerIdleTimeout,
+		HandoverDrainTimeout:     handoverDrainTimeout,
+		WorkerBackend:            workerBackend,
+		K8sWorkerImage:           k8sWorkerImage,
+		K8sWorkerNamespace:       k8sWorkerNamespace,
+		K8sControlPlaneID:        k8sControlPlaneID,
+		K8sWorkerPort:            k8sWorkerPort,
+		K8sWorkerSecret:          k8sWorkerSecret,
+		K8sWorkerConfigMap:       k8sWorkerConfigMap,
+		K8sWorkerImagePullPolicy: k8sWorkerImagePullPolicy,
 	}
 }

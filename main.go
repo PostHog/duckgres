@@ -47,6 +47,21 @@ type FileConfig struct {
 	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`         // e.g., "5m"
 	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"`      // e.g., "24h"
 	PassthroughUsers          []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
+
+	// Worker backend configuration
+	WorkerBackend string          `yaml:"worker_backend"` // "process" (default) or "kubernetes"
+	K8s           K8sFileConfig   `yaml:"k8s"`
+}
+
+// K8sFileConfig holds Kubernetes worker configuration from YAML.
+type K8sFileConfig struct {
+	WorkerImage         string `yaml:"worker_image"`
+	WorkerNamespace     string `yaml:"worker_namespace"`
+	ControlPlaneID      string `yaml:"control_plane_id"`
+	WorkerPort          int    `yaml:"worker_port"`
+	WorkerSecret        string `yaml:"worker_secret"`
+	WorkerConfigMap     string `yaml:"worker_configmap"`
+	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
 }
 
 type TLSConfig struct {
@@ -188,6 +203,14 @@ func main() {
 	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for connections to drain during handover (default: '24h') (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
+	workerBackend := flag.String("worker-backend", "", "Worker backend: process (default) or kubernetes (env: DUCKGRES_WORKER_BACKEND)")
+	k8sWorkerImage := flag.String("k8s-worker-image", "", "Container image for K8s worker pods (env: DUCKGRES_K8S_WORKER_IMAGE)")
+	k8sWorkerNamespace := flag.String("k8s-worker-namespace", "", "K8s namespace for worker pods (env: DUCKGRES_K8S_WORKER_NAMESPACE)")
+	k8sControlPlaneID := flag.String("k8s-control-plane-id", "", "Unique CP identifier for labeling worker pods (env: DUCKGRES_K8S_CONTROL_PLANE_ID)")
+	k8sWorkerPort := flag.Int("k8s-worker-port", 0, "gRPC port on K8s worker pods (default: 8816) (env: DUCKGRES_K8S_WORKER_PORT)")
+	k8sWorkerSecret := flag.String("k8s-worker-secret", "", "K8s Secret name for worker bearer token (env: DUCKGRES_K8S_WORKER_SECRET)")
+	k8sWorkerConfigMap := flag.String("k8s-worker-configmap", "", "ConfigMap name for worker duckgres.yaml (env: DUCKGRES_K8S_WORKER_CONFIGMAP)")
+	k8sWorkerImagePullPolicy := flag.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
 
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -318,6 +341,14 @@ func main() {
 		ACMEEmail:                 *acmeEmail,
 		ACMECacheDir:              *acmeCacheDir,
 		MaxConnections:            *maxConnections,
+		WorkerBackend:             *workerBackend,
+		K8sWorkerImage:            *k8sWorkerImage,
+		K8sWorkerNamespace:        *k8sWorkerNamespace,
+		K8sControlPlaneID:         *k8sControlPlaneID,
+		K8sWorkerPort:             *k8sWorkerPort,
+		K8sWorkerSecret:           *k8sWorkerSecret,
+		K8sWorkerConfigMap:        *k8sWorkerConfigMap,
+		K8sWorkerImagePullPolicy: *k8sWorkerImagePullPolicy,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})
@@ -441,6 +472,16 @@ func main() {
 			WorkerIdleTimeout:    resolved.WorkerIdleTimeout,
 			HandoverDrainTimeout: resolved.HandoverDrainTimeout,
 			MetricsServer:        metricsSrv,
+			WorkerBackend:         resolved.WorkerBackend,
+			K8s: controlplane.K8sConfig{
+				WorkerImage:     resolved.K8sWorkerImage,
+				WorkerNamespace: resolved.K8sWorkerNamespace,
+				ControlPlaneID:  resolved.K8sControlPlaneID,
+				WorkerPort:      resolved.K8sWorkerPort,
+				WorkerSecret:    resolved.K8sWorkerSecret,
+				WorkerConfigMap: resolved.K8sWorkerConfigMap,
+				ImagePullPolicy: resolved.K8sWorkerImagePullPolicy,
+			},
 		}
 		controlplane.RunControlPlane(cpCfg)
 		return

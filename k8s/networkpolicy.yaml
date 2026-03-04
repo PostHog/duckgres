@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: duckgres-worker-ingress
+  namespace: duckgres
+spec:
+  # Apply to worker pods
+  podSelector:
+    matchLabels:
+      app: duckgres-worker
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only allow traffic from control plane pods on gRPC port
+    - from:
+        - podSelector:
+            matchLabels:
+              app: duckgres-control-plane
+      ports:
+        - port: 8816
+          protocol: TCP

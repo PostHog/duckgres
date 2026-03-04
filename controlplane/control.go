@@ -36,6 +36,25 @@ type ControlPlaneConfig struct {
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during handover (default: 24h)
 	MetricsServer        *http.Server  // Optional metrics server to shut down during handover
+
+	// WorkerBackend selects the worker management backend.
+	// "process" (default): workers are local child processes communicating over Unix sockets.
+	// "kubernetes": workers are K8s pods communicating over TCP (requires -tags kubernetes build).
+	WorkerBackend string
+
+	// K8s contains Kubernetes-specific configuration. Only used when WorkerBackend == "kubernetes".
+	K8s K8sConfig
+}
+
+// K8sConfig holds Kubernetes worker backend configuration.
+type K8sConfig struct {
+	WorkerImage         string // Container image for worker pods (required)
+	WorkerNamespace     string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID      string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort          int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret        string // K8s Secret name containing bearer token
+	WorkerConfigMap     string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy     string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -44,7 +63,7 @@ type ControlPlaneConfig struct {
 // thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
 	cfg         ControlPlaneConfig
-	pool        *FlightWorkerPool
+	pool        WorkerPool
 	sessions    *SessionManager
 	flight      *FlightIngress
 	rebalancer  *MemoryRebalancer
@@ -87,12 +106,21 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
-	// Create socket directory. Writability is checked below, after
-	// attempting handover — the old CP may provide pre-bound socket FDs,
-	// making a writable directory unnecessary under EROFS.
-	if err := os.MkdirAll(cfg.SocketDir, 0755); err != nil {
-		slog.Error("Failed to create socket directory.", "error", err)
-		os.Exit(1)
+	isK8s := cfg.WorkerBackend == "kubernetes"
+
+	// Socket directory and handover are only used by the process backend.
+	var handoverPgLn *net.TCPListener
+	var handoverPrebound []*preboundSocket
+	handoverDone := false
+
+	if !isK8s {
+		// Create socket directory. Writability is checked below, after
+		// attempting handover — the old CP may provide pre-bound socket FDs,
+		// making a writable directory unnecessary under EROFS.
+		if err := os.MkdirAll(cfg.SocketDir, 0755); err != nil {
+			slog.Error("Failed to create socket directory.", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	// Configure TLS: ACME (Let's Encrypt) or static certificate files
@@ -117,40 +145,39 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}
 
-	// --- Attempt handover from existing control plane ---
-	// This must happen BEFORE the writability check because under systemd's
-	// ProtectSystem=strict, the RuntimeDirectory can become read-only (EROFS)
-	// after startup. The old CP sends pre-bound socket FDs during handover,
-	// allowing the new CP to work without creating new sockets.
-	var handoverPgLn *net.TCPListener
-	var handoverPrebound []*preboundSocket
-	handoverDone := false
-	if cfg.HandoverSocket == "" {
-		slog.Info("No handover socket configured, starting fresh.")
-	} else {
-		if _, err := os.Stat(cfg.HandoverSocket); err != nil {
-			slog.Info("Handover socket not found, starting fresh.", "socket", cfg.HandoverSocket, "error", err)
+	if !isK8s {
+		// --- Attempt handover from existing control plane ---
+		// This must happen BEFORE the writability check because under systemd's
+		// ProtectSystem=strict, the RuntimeDirectory can become read-only (EROFS)
+		// after startup. The old CP sends pre-bound socket FDs during handover,
+		// allowing the new CP to work without creating new sockets.
+		if cfg.HandoverSocket == "" {
+			slog.Info("No handover socket configured, starting fresh.")
 		} else {
-			slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
-			pgLn, prebound, err := receiveHandover(cfg.HandoverSocket, cfg.SocketDir)
-			if err != nil {
-				slog.Warn("Handover failed, starting fresh.", "error", err)
+			if _, err := os.Stat(cfg.HandoverSocket); err != nil {
+				slog.Info("Handover socket not found, starting fresh.", "socket", cfg.HandoverSocket, "error", err)
 			} else {
-				handoverPgLn = pgLn
-				handoverPrebound = prebound
-				handoverDone = true
-				slog.Info("Handover complete, took over PG listener.", "prebound_count", len(prebound))
+				slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
+				pgLn, prebound, err := receiveHandover(cfg.HandoverSocket, cfg.SocketDir)
+				if err != nil {
+					slog.Warn("Handover failed, starting fresh.", "error", err)
+				} else {
+					handoverPgLn = pgLn
+					handoverPrebound = prebound
+					handoverDone = true
+					slog.Info("Handover complete, took over PG listener.", "prebound_count", len(prebound))
+				}
 			}
 		}
-	}
 
-	// Verify socket directory is writable. Skip when handover provided
-	// pre-bound sockets — the directory may be read-only (EROFS under
-	// systemd ProtectSystem=strict), which is fine since we use inherited FDs.
-	if len(handoverPrebound) == 0 {
-		if err := checkSocketDirWritable(cfg.SocketDir); err != nil {
-			slog.Error("Socket directory is not writable. Control plane will not be able to create worker sockets.", "dir", cfg.SocketDir, "error", err)
-			os.Exit(1)
+		// Verify socket directory is writable. Skip when handover provided
+		// pre-bound sockets — the directory may be read-only (EROFS under
+		// systemd ProtectSystem=strict), which is fine since we use inherited FDs.
+		if len(handoverPrebound) == 0 {
+			if err := checkSocketDirWritable(cfg.SocketDir); err != nil {
+				slog.Error("Socket directory is not writable. Control plane will not be able to create worker sockets.", "dir", cfg.SocketDir, "error", err)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -188,19 +215,43 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		minWorkers = maxWorkers
 	}
 
-	pool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
-	pool.idleTimeout = cfg.WorkerIdleTimeout
+	var pool WorkerPool
 
-	// Import pre-bound sockets from handover, or pre-bind new ones.
-	// During handover, the old CP passes its pre-bound socket FDs so the
-	// new CP works even when the socket directory is read-only (EROFS).
-	if len(handoverPrebound) > 0 {
-		pool.ImportPrebound(handoverPrebound)
-	} else if maxWorkers > 0 {
-		if err := pool.PreBindSockets(maxWorkers); err != nil {
-			slog.Error("Failed to pre-bind worker sockets.", "error", err)
+	switch cfg.WorkerBackend {
+	case "kubernetes":
+		k8sPool, err := CreateK8sPool(K8sWorkerPoolConfig{
+			Namespace:       cfg.K8s.WorkerNamespace,
+			CPID:            cfg.K8s.ControlPlaneID,
+			WorkerImage:     cfg.K8s.WorkerImage,
+			WorkerPort:      cfg.K8s.WorkerPort,
+			SecretName:      cfg.K8s.WorkerSecret,
+			ConfigMap:       cfg.K8s.WorkerConfigMap,
+			MaxWorkers:      maxWorkers,
+			IdleTimeout:     cfg.WorkerIdleTimeout,
+			ConfigPath:      cfg.ConfigPath,
+			ImagePullPolicy: cfg.K8s.ImagePullPolicy,
+		})
+		if err != nil {
+			slog.Error("Failed to create Kubernetes worker pool.", "error", err)
 			os.Exit(1)
 		}
+		pool = k8sPool
+	default: // "process" or empty
+		procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, maxWorkers)
+		procPool.idleTimeout = cfg.WorkerIdleTimeout
+
+		// Import pre-bound sockets from handover, or pre-bind new ones.
+		// During handover, the old CP passes its pre-bound socket FDs so the
+		// new CP works even when the socket directory is read-only (EROFS).
+		if len(handoverPrebound) > 0 {
+			procPool.ImportPrebound(handoverPrebound)
+		} else if maxWorkers > 0 {
+			if err := procPool.PreBindSockets(maxWorkers); err != nil {
+				slog.Error("Failed to pre-bind worker sockets.", "error", err)
+				os.Exit(1)
+			}
+		}
+		pool = procPool
 	}
 
 	// Create a minimal server for cancel request routing
@@ -275,16 +326,19 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash)
 
-	// Start handover listener for future deployments
-	cp.startHandoverListener()
+	// Handover and systemd notifications are only relevant for process mode.
+	if !isK8s {
+		// Start handover listener for future deployments
+		cp.startHandoverListener()
 
-	// Notify systemd we're ready (fresh start only).
-	// After handover, sd_notify(MAINPID+READY) is sent synchronously in
-	// receiveHandover() before handover_complete, so the old CP can't exit
-	// before systemd knows our PID.
-	if !handoverDone {
-		if err := sdNotify("READY=1"); err != nil {
-			slog.Warn("sd_notify READY failed.", "error", err)
+		// Notify systemd we're ready (fresh start only).
+		// After handover, sd_notify(MAINPID+READY) is sent synchronously in
+		// receiveHandover() before handover_complete, so the old CP can't exit
+		// before systemd knows our PID.
+		if !handoverDone {
+			if err := sdNotify("READY=1"); err != nil {
+				slog.Warn("sd_notify READY failed.", "error", err)
+			}
 		}
 	}
 

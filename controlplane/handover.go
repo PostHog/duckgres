@@ -117,7 +117,12 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 	// Collect available pre-bound sockets to pass to the new CP.
 	// This allows the new CP to work even when the socket directory is
 	// read-only (EROFS under systemd ProtectSystem=strict).
-	preboundSockets := cp.pool.TakeAllPrebound()
+	// TakeAllPrebound is process-pool-specific; handover only applies to process mode.
+	procPool, _ := cp.pool.(*FlightWorkerPool)
+	var preboundSockets []*preboundSocket
+	if procPool != nil {
+		preboundSockets = procPool.TakeAllPrebound()
+	}
 	var preboundPaths []string
 	var preboundFiles []*os.File
 	for _, ps := range preboundSockets {
