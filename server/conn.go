@@ -975,9 +975,10 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Use the transpiled SQL
 	originalQuery := query
 	query = result.SQL
+	isTranspiled := query != originalQuery
 
 	// Log the transpiled query if it differs from the original
-	if query != originalQuery {
+	if isTranspiled {
 		slog.Debug("Query transpiled.", "user", c.username, "executed", query)
 	}
 
@@ -1020,29 +1021,43 @@ func (c *clientConn) handleQuery(body []byte) error {
 				}
 			}
 			if err != nil {
+				errCode := "42000"
+				errMsg := err.Error()
 				if isQueryCancelled(err) {
-					c.sendError("ERROR", "57014", "canceling statement due to user request")
+					errCode = "57014"
+					errMsg = "canceling statement due to user request"
+					c.sendError("ERROR", errCode, errMsg)
 				} else {
 					slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
-					c.sendError("ERROR", "42000", err.Error())
+					c.sendError("ERROR", errCode, errMsg)
 				}
 				c.setTxError()
+				c.logQuery(start, originalQuery, query, cmdType, 0, 0, errCode, errMsg, "simple")
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
 			}
 		}
 
+		var writtenRows int64
+		if result != nil {
+			writtenRows, _ = result.RowsAffected()
+		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
 		_ = writeCommandComplete(c.writer, tag)
+		c.logQuery(start, originalQuery, query, cmdType, 0, writtenRows, "", "", "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
 	}
 
 	// Execute query that returns results (SELECT, DML RETURNING, etc.)
-	return c.executeSelectQuery(query, cmdType)
+	rowCount, err := c.executeSelectQuery(query, cmdType)
+	if err == nil {
+		c.logQuery(start, originalQuery, query, cmdType, rowCount, 0, "", "", "simple")
+	}
+	return err
 }
 
 // executeQueryDirect executes a query directly against DuckDB without any transpilation.
@@ -1083,12 +1098,14 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		return nil
 	}
 
-	return c.executeSelectQuery(query, cmdType)
+	_, err := c.executeSelectQuery(query, cmdType)
+	return err
 }
 
 // executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.
-func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
+// Returns the number of rows sent and any connection-level error.
+func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, error) {
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
@@ -1103,7 +1120,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
-		return nil
+		return 0, nil
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -1113,7 +1130,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
-		return nil
+		return 0, nil
 	}
 
 	colTypes, err := rows.ColumnTypes()
@@ -1122,11 +1139,11 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
-		return nil
+		return 0, nil
 	}
 
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
-		return err
+		return 0, err
 	}
 
 	typeOIDs := make([]int32, len(colTypes))
@@ -1147,11 +1164,11 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
 			c.setTxError()
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
-			return nil
+			return 0, nil
 		}
 
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
-			return err
+			return 0, err
 		}
 		rowCount++
 	}
@@ -1166,7 +1183,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
-		return nil
+		return 0, nil
 	}
 
 	c.updateTxStatus(cmdType)
@@ -1174,7 +1191,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
 	_ = writeCommandComplete(c.writer, tag)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
-	return nil
+	return int64(rowCount), nil
 }
 
 // handleMultiStatementQuery processes multiple semicolon-separated statements
@@ -4475,6 +4492,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	originalQuery := p.stmt.query
+	convertedQuery := p.stmt.convertedQuery
+
 	if !returnsResults {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
 		// while DuckDB throws an error. Match PostgreSQL behavior.
@@ -4485,39 +4505,46 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 
 		// Non-result-returning query: use Exec with converted query
-		result, err := c.executor.Exec(p.stmt.convertedQuery, args...)
+		result, err := c.executor.Exec(convertedQuery, args...)
 		if err != nil {
 			// Retry ALTER TABLE as ALTER VIEW if target is a view
 			if isAlterTableNotTableError(err) {
-				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(p.stmt.convertedQuery); ok {
+				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(convertedQuery); ok {
 					result, err = c.executor.Exec(alteredQuery, args...)
 				}
 			}
 			// Retry DROP TABLE as DROP VIEW if target is a view
 			if isDropTableOnViewError(err) {
-				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(p.stmt.convertedQuery); ok {
+				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(convertedQuery); ok {
 					result, err = c.executor.Exec(alteredQuery, args...)
 				}
 			}
 			if err != nil {
-				slog.Error("Query execution failed.", "user", c.username, "query", p.stmt.convertedQuery, "original_query", p.stmt.query, "error", err)
+				slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
 				c.sendError("ERROR", "42000", err.Error())
 				c.setTxError()
+				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
 				return
 			}
+		}
+		var writtenRows int64
+		if result != nil {
+			writtenRows, _ = result.RowsAffected()
 		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
 		_ = writeCommandComplete(c.writer, tag)
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, writtenRows, "", "", "extended")
 		return
 	}
 
 	// Result-returning query: use Query with converted query
-	rows, err := c.executor.Query(p.stmt.convertedQuery, args...)
+	rows, err := c.executor.Query(convertedQuery, args...)
 	if err != nil {
-		slog.Error("Query execution failed.", "user", c.username, "query", p.stmt.convertedQuery, "original_query", p.stmt.query, "error", err)
+		slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
 		return
 	}
 	defer func() { _ = rows.Close() }()
@@ -4588,6 +4615,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
+	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")
 }
 
 func (c *clientConn) handleClose(body []byte) {

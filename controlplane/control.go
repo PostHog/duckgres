@@ -207,6 +207,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)
 
+	// Initialize query logger (non-fatal on error)
+	if ql, err := server.NewQueryLogger(cfg.Config); err != nil {
+		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
+	} else if ql != nil {
+		server.SetQueryLogger(srv, ql)
+	}
+
 	sessions := NewSessionManager(pool, rebalancer)
 
 	// Wire the circular dependency: rebalancer needs sessions to iterate,
@@ -759,6 +766,11 @@ func (cp *ControlPlane) shutdown() {
 		if err := cp.acmeManager.Close(); err != nil {
 			slog.Warn("ACME manager shutdown error.", "error", err)
 		}
+	}
+
+	// Stop query logger (drains remaining entries)
+	if cp.srv != nil && cp.srv.QueryLogger() != nil {
+		cp.srv.QueryLogger().Stop()
 	}
 
 	slog.Info("Control plane shutdown complete.")

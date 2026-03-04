@@ -177,6 +177,18 @@ type Config struct {
 	// PassthroughUsers are users that bypass the SQL transpiler and pg_catalog initialization.
 	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
 	PassthroughUsers map[string]bool
+
+	// QueryLog configures the DuckLake query log (system.query_log table).
+	QueryLog QueryLogConfig
+}
+
+// QueryLogConfig configures the query log feature.
+type QueryLogConfig struct {
+	Enabled              bool
+	FlushInterval        time.Duration
+	BatchSize            int
+	CompactInterval      time.Duration
+	DataInliningRowLimit int
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -246,6 +258,9 @@ type Server struct {
 	// Connection registry for pg_stat_activity
 	connsMu sync.RWMutex
 	conns   map[int32]*clientConn
+
+	// Query logger for DuckLake system.query_log
+	queryLogger *QueryLogger
 }
 
 func New(cfg Config) (*Server, error) {
@@ -324,6 +339,14 @@ func New(cfg Config) (*Server, error) {
 	} else {
 		slog.Info("Idle timeout disabled.")
 	}
+
+	// Initialize query logger (non-fatal on error)
+	if ql, err := NewQueryLogger(cfg); err != nil {
+		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
+	} else if ql != nil {
+		s.queryLogger = ql
+	}
+
 	return s, nil
 }
 
@@ -414,6 +437,11 @@ func (s *Server) Close() error {
 		if err := s.acmeManager.Close(); err != nil {
 			slog.Warn("ACME manager shutdown error.", "error", err)
 		}
+	}
+
+	// Stop query logger (drains remaining entries)
+	if s.queryLogger != nil {
+		s.queryLogger.Stop()
 	}
 
 	// Database connections are now closed by each clientConn when it terminates

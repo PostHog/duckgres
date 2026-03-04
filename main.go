@@ -47,6 +47,15 @@ type FileConfig struct {
 	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`         // e.g., "5m"
 	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"`      // e.g., "24h"
 	PassthroughUsers          []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
+	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`         // Query log configuration
+}
+
+type QueryLogFileConfig struct {
+	Enabled              *bool  `yaml:"enabled"`                // nil = default (true when DuckLake configured)
+	FlushInterval        string `yaml:"flush_interval"`         // e.g., "5s"
+	BatchSize            int    `yaml:"batch_size"`             // max entries per batch INSERT
+	CompactInterval      string `yaml:"compact_interval"`       // e.g., "10m"
+	DataInliningRowLimit int    `yaml:"data_inlining_row_limit"` // DuckLake inlining threshold
 }
 
 type TLSConfig struct {
@@ -195,6 +204,9 @@ func main() {
 	acmeEmail := flag.String("acme-email", "", "Contact email for Let's Encrypt notifications (env: DUCKGRES_ACME_EMAIL)")
 	acmeCacheDir := flag.String("acme-cache-dir", "", "Directory for ACME certificate cache (env: DUCKGRES_ACME_CACHE_DIR)")
 
+	// Query log flags
+	queryLog := flag.Bool("query-log", false, "Enable DuckLake query log (env: DUCKGRES_QUERY_LOG_ENABLED)")
+
 	// DuckDB service flags
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
 	duckdbListenFD := flag.Int("duckdb-listen-fd", 0, "Inherit a pre-bound listener FD instead of creating a new socket (duckdb-service mode, set by control plane)")
@@ -325,6 +337,7 @@ func main() {
 		ACMEEmail:                 *acmeEmail,
 		ACMECacheDir:              *acmeCacheDir,
 		MaxConnections:            *maxConnections,
+		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})
