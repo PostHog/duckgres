@@ -8,6 +8,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -38,10 +39,11 @@ type QueryLogEntry struct {
 
 // QueryLogger batches query log entries and writes them to a DuckLake table.
 type QueryLogger struct {
-	db   *sql.DB
-	cfg  QueryLogConfig
-	ch   chan QueryLogEntry
-	done chan struct{}
+	db       *sql.DB
+	cfg      QueryLogConfig
+	ch       chan QueryLogEntry
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 const (
@@ -164,9 +166,13 @@ func (ql *QueryLogger) Log(entry QueryLogEntry) {
 
 // Stop drains remaining entries and shuts down the flush goroutine.
 func (ql *QueryLogger) Stop() {
-	close(ql.ch)
-	<-ql.done
-	ql.db.Close()
+	ql.stopOnce.Do(func() {
+		close(ql.ch)
+		<-ql.done
+		if ql.db != nil {
+			_ = ql.db.Close()
+		}
+	})
 }
 
 func (ql *QueryLogger) flushLoop() {

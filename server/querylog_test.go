@@ -229,3 +229,14 @@ func TestEscapeSQLStringLiteral(t *testing.T) {
 		t.Fatalf("escapeSQLStringLiteral() = %q, want %q", got, want)
 	}
 }
+
+func TestQueryLoggerStopIsIdempotent(t *testing.T) {
+	ql := &QueryLogger{
+		ch:   make(chan QueryLogEntry, 1),
+		done: make(chan struct{}),
+	}
+	close(ql.done)
+
+	ql.Stop()
+	ql.Stop()
+}

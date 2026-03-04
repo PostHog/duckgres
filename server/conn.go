@@ -865,11 +865,23 @@ func (c *clientConn) handleQuery(body []byte) error {
 		if parseErr == nil && len(tree.Stmts) == 1 {
 			switch s := tree.Stmts[0].Stmt.Node.(type) {
 			case *pg_query.Node_DeclareCursorStmt:
-				return c.handleDeclareCursor(s.DeclareCursorStmt)
+				err := c.handleDeclareCursor(s.DeclareCursorStmt)
+				if err == nil {
+					c.logQuery(start, query, query, "DECLARE", 0, 0, "", "", "simple")
+				}
+				return err
 			case *pg_query.Node_FetchStmt:
-				return c.handleFetchCursor(s.FetchStmt)
+				err := c.handleFetchCursor(s.FetchStmt)
+				if err == nil {
+					c.logQuery(start, query, query, "FETCH", 0, 0, "", "", "simple")
+				}
+				return err
 			case *pg_query.Node_ClosePortalStmt:
-				return c.handleCloseCursor(s.ClosePortalStmt)
+				err := c.handleCloseCursor(s.ClosePortalStmt)
+				if err == nil {
+					c.logQuery(start, query, query, "CLOSE", 0, 0, "", "", "simple")
+				}
+				return err
 			}
 		}
 	}
@@ -890,7 +902,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 		upperQuery := strings.ToUpper(query)
 		cmdType := c.getCommandType(upperQuery)
 		if cmdType == "COPY" {
-			return c.handleCopy(query, upperQuery)
+			err := c.handleCopy(query, upperQuery)
+			if err == nil {
+				c.logQuery(start, query, query, cmdType, 0, 0, "", "", "simple")
+			}
+			return err
 		}
 		return c.executeQueryDirect(query, cmdType)
 	}
@@ -906,7 +922,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// c.reader directly, which would race with the disconnect monitor.
 	upperQueryEarly := strings.ToUpper(query)
 	if copyToStdoutRegex.MatchString(upperQueryEarly) || copyFromStdinRegex.MatchString(upperQueryEarly) {
-		return c.handleCopy(query, upperQueryEarly)
+		err := c.handleCopy(query, upperQueryEarly)
+		if err == nil {
+			c.logQuery(start, query, query, "COPY", 0, 0, "", "", "simple")
+		}
+		return err
 	}
 
 	// Check for multi-statement query (PostgreSQL simple query protocol supports
@@ -987,7 +1007,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle COPY commands specially
 	if cmdType == "COPY" {
-		return c.handleCopy(query, upperQuery)
+		err := c.handleCopy(query, upperQuery)
+		if err == nil {
+			c.logQuery(start, originalQuery, query, cmdType, 0, 0, "", "", "simple")
+		}
+		return err
 	}
 
 	// For queries that don't return result rows, use Exec
