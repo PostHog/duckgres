@@ -83,6 +83,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	cfg := defaultServerConfig()
+	defaultQueryLog := cfg.QueryLog
 	var workerQueueTimeout time.Duration
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
@@ -624,6 +625,19 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cfg.MemoryBudget != "" && !server.ValidateMemoryLimit(cfg.MemoryBudget) {
 		warn("Invalid memory_budget format: " + cfg.MemoryBudget + " (expected e.g. '24GB', '512MB')")
 		cfg.MemoryBudget = "" // fall back to auto-detection
+	}
+
+	if cfg.QueryLog.FlushInterval <= 0 {
+		warn("DUCKGRES_QUERY_LOG_FLUSH_INTERVAL must be > 0; using default")
+		cfg.QueryLog.FlushInterval = defaultQueryLog.FlushInterval
+	}
+	if cfg.QueryLog.BatchSize <= 0 {
+		warn("DUCKGRES_QUERY_LOG_BATCH_SIZE must be > 0; using default")
+		cfg.QueryLog.BatchSize = defaultQueryLog.BatchSize
+	}
+	if cfg.QueryLog.CompactInterval <= 0 {
+		warn("DUCKGRES_QUERY_LOG_COMPACT_INTERVAL must be > 0; using default")
+		cfg.QueryLog.CompactInterval = defaultQueryLog.CompactInterval
 	}
 
 	return resolvedConfig{

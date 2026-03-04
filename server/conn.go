@@ -1053,9 +1053,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	// Execute query that returns results (SELECT, DML RETURNING, etc.)
-	rowCount, err := c.executeSelectQuery(query, cmdType)
+	rowCount, errCode, errMsg, err := c.executeSelectQuery(query, cmdType)
 	if err == nil {
-		c.logQuery(start, originalQuery, query, cmdType, rowCount, 0, "", "", "simple")
+		c.logQuery(start, originalQuery, query, cmdType, rowCount, 0, errCode, errMsg, "simple")
 	}
 	return err
 }
@@ -1098,52 +1098,61 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		return nil
 	}
 
-	_, err := c.executeSelectQuery(query, cmdType)
+	_, _, _, err := c.executeSelectQuery(query, cmdType)
 	return err
 }
 
 // executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.
-// Returns the number of rows sent and any connection-level error.
-func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, error) {
+// Returns the number of rows sent, any SQLSTATE+message sent to the client,
+// and any connection-level error.
+func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, string, string, error) {
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
 	rows, err := c.executor.QueryContext(ctx, query)
 	if err != nil {
+		errCode := "42000"
+		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
+			c.sendError("ERROR", errCode, errMsg)
 		} else {
 			slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
-		return 0, nil
+		return 0, errCode, errMsg, nil
 	}
 	defer func() { _ = rows.Close() }()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		c.sendError("ERROR", "42000", err.Error())
+		errCode := "42000"
+		errMsg := err.Error()
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
-		return 0, nil
+		return 0, errCode, errMsg, nil
 	}
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		c.sendError("ERROR", "42000", err.Error())
+		errCode := "42000"
+		errMsg := err.Error()
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
-		return 0, nil
+		return 0, errCode, errMsg, nil
 	}
 
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
-		return 0, err
+		return 0, "", "", err
 	}
 
 	typeOIDs := make([]int32, len(colTypes))
@@ -1160,30 +1169,36 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, er
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			c.sendError("ERROR", "42000", err.Error())
+			errCode := "42000"
+			errMsg := err.Error()
+			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
-			return 0, nil
+			return 0, errCode, errMsg, nil
 		}
 
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
-			return 0, err
+			return 0, "", "", err
 		}
 		rowCount++
 	}
 
 	if err := rows.Err(); err != nil {
+		errCode := "42000"
+		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
+			c.sendError("ERROR", errCode, errMsg)
 		} else {
 			slog.Error("Row iteration error.", "user", c.username, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
-		return 0, nil
+		return 0, errCode, errMsg, nil
 	}
 
 	c.updateTxStatus(cmdType)
@@ -1191,7 +1206,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, er
 	_ = writeCommandComplete(c.writer, tag)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
-	return int64(rowCount), nil
+	return int64(rowCount), "", "", nil
 }
 
 // handleMultiStatementQuery processes multiple semicolon-separated statements

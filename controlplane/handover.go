@@ -250,6 +250,7 @@ func (cp *ControlPlane) handleHandoverRequest(conn net.Conn, handoverLn net.List
 
 	// Shut down workers
 	cp.pool.ShutdownAll()
+	cp.stopQueryLogger()
 
 	// Give systemd time to process the MAINPID notification before we exit.
 	// Without this delay there is a small window where systemd could see our

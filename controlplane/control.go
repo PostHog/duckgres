@@ -768,12 +768,15 @@ func (cp *ControlPlane) shutdown() {
 		}
 	}
 
-	// Stop query logger (drains remaining entries)
+	cp.stopQueryLogger()
+
+	slog.Info("Control plane shutdown complete.")
+}
+
+func (cp *ControlPlane) stopQueryLogger() {
 	if cp.srv != nil && cp.srv.QueryLogger() != nil {
 		cp.srv.QueryLogger().Stop()
 	}
-
-	slog.Info("Control plane shutdown complete.")
 }
 
 // selfExec spawns a new control plane process from the binary on disk.
