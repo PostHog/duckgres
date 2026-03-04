@@ -1,6 +1,6 @@
 # Kubernetes Deployment
 
-This directory contains manifests for running duckgres in Kubernetes with the control plane spawning DuckDB worker pods on demand.
+This directory contains **development/reference manifests** for running duckgres in Kubernetes with the control plane spawning DuckDB worker pods on demand. These are intended for local development and testing — production deployments should adapt these to your cluster's requirements (resource limits, persistent storage, ingress, monitoring, etc.).
 
 ## Architecture
 
@@ -60,7 +60,9 @@ Key flags for Kubernetes mode:
 
 The bearer token secret is used to authenticate gRPC connections between the control plane and workers. If the secret exists but is empty, the CP auto-generates a random token and populates it.
 
-## Deploy
+## Deploy (Dev)
+
+These manifests use permissive defaults suitable for local development (no resource limits, emptyDir volumes, self-signed TLS). For production, you should customize resource requests/limits, storage, TLS certificates, and network policies for your environment.
 
 ```bash
 # Build with Kubernetes support
