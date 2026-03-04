@@ -584,103 +584,17 @@ kill -USR2 <control-plane-pid>
 
 ### Kubernetes Worker Backend
 
-In Kubernetes environments, the control plane can spawn worker pods instead of local processes. The control plane creates worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
-
-```
-┌─────────────────────────────────────────────────────┐
-│  Kubernetes Cluster                                  │
-│                                                      │
-│  ┌────────────────────────────────┐                  │
-│  │ Control Plane Pod              │                  │
-│  │  duckgres --mode control-plane │                  │
-│  │  --worker-backend kubernetes   │                  │
-│  │                                │                  │
-│  │  Creates worker pods via K8s   │                  │
-│  │  API, routes queries via gRPC  │                  │
-│  └──────────┬─────────────────────┘                  │
-│             │ Arrow Flight SQL (TCP :8816)            │
-│             ├──────────────┬──────────────┐           │
-│             ▼              ▼              ▼           │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐  │
-│  │ Worker Pod 0 │ │ Worker Pod 1 │ │ Worker Pod N │  │
-│  │  DuckDB svc  │ │  DuckDB svc  │ │  DuckDB svc  │  │
-│  │  Bearer auth │ │  Bearer auth │ │  Bearer auth │  │
-│  └──────────────┘ └──────────────┘ └──────────────┘  │
-│                                                      │
-│  Worker pods have:                                   │
-│  - Owner references → CP pod (GC on CP deletion)    │
-│  - SecurityContext: non-root (UID 1000)              │
-│  - Bearer token from K8s Secret                      │
-│  - ConfigMap mount for shared config                 │
-└─────────────────────────────────────────────────────┘
-```
-
-Build with the `kubernetes` tag and deploy:
+In Kubernetes environments, the control plane can spawn worker pods instead of local processes using `--worker-backend kubernetes`. The control plane creates worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
 
 ```bash
 # Build with Kubernetes support
 docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:latest .
 
-# Apply manifests (namespace, RBAC, configmap, secret, networkpolicy, deployment)
+# Deploy
 kubectl apply -f k8s/
 ```
 
-Key flags for Kubernetes mode:
-
-| Flag | Env Var | Description |
-|------|---------|-------------|
-| `--worker-backend kubernetes` | - | Use K8s pod-based workers instead of local processes |
-| `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
-| `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |
-| `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |
-| `--k8s-worker-configmap` | `DUCKGRES_K8S_WORKER_CONFIGMAP` | ConfigMap name for worker config |
-
-The manifests in `k8s/` provide a ready-to-use deployment: namespace, service account with RBAC (pods + secrets), ConfigMap, bearer token Secret (auto-populated if empty), NetworkPolicy, Deployment, and ClusterIP Service.
-
-#### Local Development with OrbStack
-
-[OrbStack](https://orbstack.dev/) provides a lightweight Kubernetes cluster for macOS that shares Docker's image store — images built locally are immediately available to K8s pods without a load step.
-
-```bash
-# Start OrbStack Kubernetes
-orb start k8s
-
-# Build the image (automatically available to K8s)
-docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:test .
-
-# Deploy to OrbStack
-kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/rbac.yaml
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.yaml
-kubectl apply -f k8s/networkpolicy.yaml
-sed 's|duckgres:latest|duckgres:test|g' k8s/control-plane-deployment.yaml | kubectl apply -f -
-
-# Wait for the control plane
-kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
-
-# Connect via port-forward
-kubectl -n duckgres port-forward svc/duckgres 5432:5432 &
-PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres sslmode=require"
-```
-
-Run the K8s integration tests locally:
-
-```bash
-# With existing deployment (skip build/deploy, just run tests)
-DUCKGRES_K8S_TEST_SKIP_SETUP=true go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
-
-# Full setup (builds image, deploys, runs tests, cleans up)
-go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
-```
-
-The test suite defaults to `DUCKGRES_K8S_TEST_PROVIDER=orbstack` for local development. CI uses Kind via the `k8s-integration-tests` workflow job.
-
-#### Cleanup
-
-```bash
-kubectl delete namespace duckgres
-```
+See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and local development instructions using OrbStack.
 
 ## Two-Tier Query Processing
 
