@@ -32,28 +32,9 @@ var (
 func TestMain(m *testing.M) {
 	namespace = envOr("DUCKGRES_K8S_TEST_NAMESPACE", "duckgres")
 	skipSetup := envOr("DUCKGRES_K8S_TEST_SKIP_SETUP", "") == "true"
-	// Provider: "orbstack" (default, local dev) or "kind" (CI).
-	// OrbStack shares Docker's image store with K8s — no image load step needed.
-	// Kind requires `kind load docker-image` after building.
-	provider := envOr("DUCKGRES_K8S_TEST_PROVIDER", "orbstack")
-
 	if !skipSetup {
-		if provider == "kind" {
-			clusterName := envOr("DUCKGRES_K8S_TEST_CLUSTER", "duckgres-test")
-			if err := ensureKindCluster(clusterName); err != nil {
-				log.Fatalf("Failed to create Kind cluster: %v", err)
-			}
-			if err := buildImage(); err != nil {
-				log.Fatalf("Failed to build image: %v", err)
-			}
-			if err := kindLoadImage(clusterName); err != nil {
-				log.Fatalf("Failed to load image into Kind: %v", err)
-			}
-		} else {
-			// OrbStack: just build — images are shared with K8s automatically
-			if err := buildImage(); err != nil {
-				log.Fatalf("Failed to build image: %v", err)
-			}
+		if err := buildImage(); err != nil {
+			log.Fatalf("Failed to build image: %v", err)
 		}
 		if err := applyManifests(); err != nil {
 			log.Fatalf("Failed to apply manifests: %v", err)
@@ -96,13 +77,6 @@ func TestMain(m *testing.M) {
 	// Cleanup K8s resources (unless skip_setup, meaning external management)
 	if !skipSetup {
 		_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found")
-		if provider == "kind" {
-			reuse := envOr("DUCKGRES_K8S_TEST_REUSE", "") == "true"
-			if !reuse {
-				clusterName := envOr("DUCKGRES_K8S_TEST_CLUSTER", "duckgres-test")
-				_ = runCmd("kind", "delete", "cluster", "--name", clusterName)
-			}
-		}
 	}
 
 	os.Exit(code)
@@ -407,24 +381,6 @@ func runCmd(name string, args ...string) error {
 	return cmd.Run()
 }
 
-func runCmdOutput(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out)), err
-}
-
-func ensureKindCluster(name string) error {
-	out, _ := runCmdOutput("kind", "get", "clusters")
-	for _, line := range strings.Split(out, "\n") {
-		if strings.TrimSpace(line) == name {
-			log.Printf("Kind cluster %q already exists, reusing", name)
-			return nil
-		}
-	}
-	log.Printf("Creating Kind cluster %q...", name)
-	return runCmd("kind", "create", "cluster", "--name", name, "--wait", "60s")
-}
-
 func buildImage() error {
 	projectRoot := findProjectRoot()
 	log.Println("Building duckgres Docker image with -tags kubernetes...")
@@ -436,11 +392,6 @@ func buildImage() error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
-}
-
-func kindLoadImage(clusterName string) error {
-	log.Println("Loading image into Kind cluster...")
-	return runCmd("kind", "load", "docker-image", "duckgres:test", "--name", clusterName)
 }
 
 func applyManifests() error {

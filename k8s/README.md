@@ -125,17 +125,12 @@ DUCKGRES_K8S_TEST_SKIP_SETUP=true go test -v -tags k8s_integration -timeout 600s
 go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
 ```
 
-The test suite defaults to `DUCKGRES_K8S_TEST_PROVIDER=orbstack` for local development. CI uses Kind via the `k8s-integration-tests` workflow job.
-
 Test environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DUCKGRES_K8S_TEST_PROVIDER` | `orbstack` | `orbstack` (local) or `kind` (CI) |
 | `DUCKGRES_K8S_TEST_SKIP_SETUP` | - | Set to `true` to skip build/deploy/teardown |
 | `DUCKGRES_K8S_TEST_NAMESPACE` | `duckgres` | K8s namespace for test resources |
-| `DUCKGRES_K8S_TEST_CLUSTER` | `duckgres-test` | Kind cluster name (Kind only) |
-| `DUCKGRES_K8S_TEST_REUSE` | - | Set to `true` to keep Kind cluster after tests |
 
 ### Cleanup
 
