@@ -82,6 +82,13 @@ func TestNormalizeQueryHash(t *testing.T) {
 	if h9 != h10 {
 		t.Errorf("Expected same hash after case normalization, got %d and %d", h9, h10)
 	}
+
+	// Keywords in IS predicates should not be normalized away as literals.
+	h11 := normalizeQueryHash("SELECT * FROM users WHERE active IS TRUE")
+	h12 := normalizeQueryHash("SELECT * FROM users WHERE active IS NULL")
+	if h11 == h12 {
+		t.Errorf("Expected different hashes for IS TRUE vs IS NULL predicates, both got %d", h11)
+	}
 }
 
 func TestIsQueryLogSelfReferential(t *testing.T) {
@@ -159,6 +166,16 @@ func TestSplitHostPort(t *testing.T) {
 	}
 }
 
+func TestSplitHostPortIPv6(t *testing.T) {
+	host, port, err := splitHostPort("[::1]:5432")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "::1" || port != "5432" {
+		t.Errorf("Got host=%q port=%q", host, port)
+	}
+}
+
 func TestParsePort(t *testing.T) {
 	p, err := parsePort("5432")
 	if err != nil {
@@ -171,5 +188,44 @@ func TestParsePort(t *testing.T) {
 	_, err = parsePort("abc")
 	if err == nil {
 		t.Error("Expected error for non-numeric port")
+	}
+
+	_, err = parsePort("")
+	if err == nil {
+		t.Error("Expected error for empty port")
+	}
+}
+
+func TestTruncateNullableQuery(t *testing.T) {
+	if truncateNullableQuery(nil) != nil {
+		t.Fatal("nil query should stay nil")
+	}
+
+	short := "SELECT 1"
+	shortPtr := &short
+	if got := truncateNullableQuery(shortPtr); got == nil || *got != short {
+		t.Fatalf("expected short query unchanged, got %#v", got)
+	}
+
+	long := make([]byte, maxQueryLength+100)
+	for i := range long {
+		long[i] = 'x'
+	}
+	longStr := string(long)
+	longPtr := &longStr
+	got := truncateNullableQuery(longPtr)
+	if got == nil {
+		t.Fatal("expected non-nil truncated query")
+	}
+	if len(*got) != maxQueryLength {
+		t.Fatalf("expected truncated length %d, got %d", maxQueryLength, len(*got))
+	}
+}
+
+func TestEscapeSQLStringLiteral(t *testing.T) {
+	got := escapeSQLStringLiteral("postgres:host=localhost password=pa'ss")
+	want := "postgres:host=localhost password=pa''ss"
+	if got != want {
+		t.Fatalf("escapeSQLStringLiteral() = %q, want %q", got, want)
 	}
 }

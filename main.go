@@ -35,26 +35,26 @@ type FileConfig struct {
 	RateLimit                 RateLimitFileConfig `yaml:"rate_limit"`
 	Extensions                []string            `yaml:"extensions"`
 	DuckLake                  DuckLakeFileConfig  `yaml:"ducklake"`
-	ProcessIsolation          bool                `yaml:"process_isolation"` // Enable process isolation per connection
-	IdleTimeout               string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
-	MemoryLimit               string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
-	Threads                   int                 `yaml:"threads"`           // DuckDB threads per session
-	MemoryBudget              string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
-	MemoryRebalance           *bool               `yaml:"memory_rebalance"`  // Enable dynamic per-connection memory reallocation
-	MaxWorkers                int                 `yaml:"max_workers"`           // Max worker processes (control-plane mode)
-	MinWorkers                int                 `yaml:"min_workers"`           // Pre-warm worker count (control-plane mode)
-	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`        // e.g., "5m"
-	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`         // e.g., "5m"
-	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"`      // e.g., "24h"
-	PassthroughUsers          []string            `yaml:"passthrough_users"` // Users that bypass transpiler + pg_catalog
-	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`         // Query log configuration
+	ProcessIsolation          bool                `yaml:"process_isolation"`      // Enable process isolation per connection
+	IdleTimeout               string              `yaml:"idle_timeout"`           // e.g., "24h", "1h", "-1" to disable
+	MemoryLimit               string              `yaml:"memory_limit"`           // DuckDB memory_limit per session (e.g., "4GB")
+	Threads                   int                 `yaml:"threads"`                // DuckDB threads per session
+	MemoryBudget              string              `yaml:"memory_budget"`          // Total memory for all sessions (e.g., "24GB")
+	MemoryRebalance           *bool               `yaml:"memory_rebalance"`       // Enable dynamic per-connection memory reallocation
+	MaxWorkers                int                 `yaml:"max_workers"`            // Max worker processes (control-plane mode)
+	MinWorkers                int                 `yaml:"min_workers"`            // Pre-warm worker count (control-plane mode)
+	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`   // e.g., "5m"
+	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`    // e.g., "5m"
+	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"` // e.g., "24h"
+	PassthroughUsers          []string            `yaml:"passthrough_users"`      // Users that bypass transpiler + pg_catalog
+	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`              // Query log configuration
 }
 
 type QueryLogFileConfig struct {
-	Enabled              *bool  `yaml:"enabled"`                // nil = default (true when DuckLake configured)
-	FlushInterval        string `yaml:"flush_interval"`         // e.g., "5s"
-	BatchSize            int    `yaml:"batch_size"`             // max entries per batch INSERT
-	CompactInterval      string `yaml:"compact_interval"`       // e.g., "10m"
+	Enabled              *bool  `yaml:"enabled"`                 // nil = default (true when DuckLake configured)
+	FlushInterval        string `yaml:"flush_interval"`          // e.g., "5s"
+	BatchSize            int    `yaml:"batch_size"`              // max entries per batch INSERT
+	CompactInterval      string `yaml:"compact_interval"`        // e.g., "10m"
 	DataInliningRowLimit int    `yaml:"data_inlining_row_limit"` // DuckLake inlining threshold
 }
 
@@ -205,7 +205,7 @@ func main() {
 	acmeCacheDir := flag.String("acme-cache-dir", "", "Directory for ACME certificate cache (env: DUCKGRES_ACME_CACHE_DIR)")
 
 	// Query log flags
-	queryLog := flag.Bool("query-log", false, "Enable DuckLake query log (env: DUCKGRES_QUERY_LOG_ENABLED)")
+	queryLog := flag.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
 
 	// DuckDB service flags
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
@@ -453,10 +453,10 @@ func main() {
 	// Handle control-plane mode
 	if *mode == "control-plane" {
 		cpCfg := controlplane.ControlPlaneConfig{
-			Config:             cfg,
-			SocketDir:          *socketDir,
-			ConfigPath:         *configFile,
-			HandoverSocket:     *handoverSocket,
+			Config:               cfg,
+			SocketDir:            *socketDir,
+			ConfigPath:           *configFile,
+			HandoverSocket:       *handoverSocket,
 			WorkerQueueTimeout:   resolved.WorkerQueueTimeout,
 			WorkerIdleTimeout:    resolved.WorkerIdleTimeout,
 			HandoverDrainTimeout: resolved.HandoverDrainTimeout,

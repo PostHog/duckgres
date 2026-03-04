@@ -200,6 +200,30 @@ func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigQueryLogCLIOverride(t *testing.T) {
+	fileCfg := &FileConfig{}
+
+	// CLI true should override env false when flag is explicitly set.
+	envDisabled := map[string]string{"DUCKGRES_QUERY_LOG_ENABLED": "false"}
+	enabled := resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:      map[string]bool{"query-log": true},
+		QueryLog: true,
+	}, envFromMap(envDisabled), nil)
+	if !enabled.Server.QueryLog.Enabled {
+		t.Fatal("expected query log enabled when --query-log=true is set")
+	}
+
+	// CLI false should override env true when flag is explicitly set.
+	envEnabled := map[string]string{"DUCKGRES_QUERY_LOG_ENABLED": "true"}
+	disabled := resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:      map[string]bool{"query-log": true},
+		QueryLog: false,
+	}, envFromMap(envEnabled), nil)
+	if disabled.Server.QueryLog.Enabled {
+		t.Fatal("expected query log disabled when --query-log=false is set")
+	}
+}
+
 func TestResolveEffectiveConfigMemoryLimitAndThreads(t *testing.T) {
 	// Test YAML → env → CLI precedence for memory_limit and threads
 

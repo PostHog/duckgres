@@ -975,10 +975,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Use the transpiled SQL
 	originalQuery := query
 	query = result.SQL
-	isTranspiled := query != originalQuery
 
 	// Log the transpiled query if it differs from the original
-	if isTranspiled {
+	if query != originalQuery {
 		slog.Debug("Query transpiled.", "user", c.username, "executed", query)
 	}
 
@@ -1006,18 +1005,18 @@ func (c *clientConn) handleQuery(body []byte) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		result, err := c.executor.ExecContext(ctx, query)
+		execResult, err := c.executor.ExecContext(ctx, query)
 		if err != nil {
 			// Retry ALTER TABLE as ALTER VIEW if target is a view
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
-					result, err = c.executor.ExecContext(ctx, alteredQuery)
+					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
 			}
 			// Retry DROP TABLE as DROP VIEW if target is a view
 			if isDropTableOnViewError(err) {
 				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
-					result, err = c.executor.ExecContext(ctx, alteredQuery)
+					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
 			}
 			if err != nil {
@@ -1040,11 +1039,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 		}
 
 		var writtenRows int64
-		if result != nil {
-			writtenRows, _ = result.RowsAffected()
+		if execResult != nil {
+			writtenRows, _ = execResult.RowsAffected()
 		}
 		c.updateTxStatus(cmdType)
-		tag := c.buildCommandTag(cmdType, result)
+		tag := c.buildCommandTag(cmdType, execResult)
 		_ = writeCommandComplete(c.writer, tag)
 		c.logQuery(start, originalQuery, query, cmdType, 0, writtenRows, "", "", "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)

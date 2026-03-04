@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"net"
 	"regexp"
 	"strings"
 	"time"
@@ -13,34 +14,34 @@ import (
 
 // QueryLogEntry represents a single entry in the query log.
 type QueryLogEntry struct {
-	EventTime          time.Time
-	QueryDurationMs    int64
-	Type               string // "QueryFinish" or "ExceptionWhileProcessing"
-	Query              string
-	TranspiledQuery    *string // nil if unchanged
-	QueryKind          string  // "Select","Insert","Update","Delete","DDL","Utility","Copy","Cursor"
-	NormalizedHash     uint64
-	ResultRows         int64
-	WrittenRows        int64
-	ExceptionCode      string
-	Exception          string
-	UserName           string
-	CurrentDatabase    string
-	ClientAddress      string
-	ClientPort         int
-	ApplicationName    string
-	PID                int32
-	WorkerID           int
-	IsTranspiled       bool
-	Protocol           string // "simple" or "extended"
+	EventTime       time.Time
+	QueryDurationMs int64
+	Type            string // "QueryFinish" or "ExceptionWhileProcessing"
+	Query           string
+	TranspiledQuery *string // nil if unchanged
+	QueryKind       string  // "Select","Insert","Update","Delete","DDL","Utility","Copy","Cursor"
+	NormalizedHash  uint64
+	ResultRows      int64
+	WrittenRows     int64
+	ExceptionCode   string
+	Exception       string
+	UserName        string
+	CurrentDatabase string
+	ClientAddress   string
+	ClientPort      int
+	ApplicationName string
+	PID             int32
+	WorkerID        int
+	IsTranspiled    bool
+	Protocol        string // "simple" or "extended"
 }
 
 // QueryLogger batches query log entries and writes them to a DuckLake table.
 type QueryLogger struct {
-	db              *sql.DB
-	cfg             QueryLogConfig
-	ch              chan QueryLogEntry
-	done            chan struct{}
+	db   *sql.DB
+	cfg  QueryLogConfig
+	ch   chan QueryLogEntry
+	done chan struct{}
 }
 
 const (
@@ -90,9 +91,9 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	var attachStmt string
 	if dataPath != "" {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
-			dlCfg.MetadataStore, dataPath)
+			escapeSQLStringLiteral(dlCfg.MetadataStore), escapeSQLStringLiteral(dataPath))
 	} else {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", dlCfg.MetadataStore)
+		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", escapeSQLStringLiteral(dlCfg.MetadataStore))
 	}
 	if _, err := db.Exec(attachStmt); err != nil {
 		db.Close()
@@ -233,7 +234,7 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			e.QueryDurationMs,
 			e.Type,
 			truncateQuery(e.Query),
-			e.TranspiledQuery,
+			truncateNullableQuery(e.TranspiledQuery),
 			e.QueryKind,
 			e.NormalizedHash,
 			e.ResultRows,
@@ -272,6 +273,18 @@ func truncateQuery(q string) string {
 	return q
 }
 
+func truncateNullableQuery(q *string) *string {
+	if q == nil {
+		return nil
+	}
+	truncated := truncateQuery(*q)
+	return &truncated
+}
+
+func escapeSQLStringLiteral(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
 // classifyQuery maps a command type string to a query_kind value.
 func classifyQuery(cmdType string) string {
 	switch cmdType {
@@ -294,9 +307,11 @@ func classifyQuery(cmdType string) string {
 	}
 }
 
-// literalRegexp matches string literals, numeric literals, and boolean literals
-// for normalization purposes.
-var literalRegexp = regexp.MustCompile(`'[^']*'|"[^"]*"|\b\d+\.?\d*\b|\b(?:true|false|null)\b`)
+// literalRegexp matches string literals and numeric literals for normalization.
+var literalRegexp = regexp.MustCompile(`'[^']*'|"[^"]*"|\b\d+\.?\d*\b`)
+
+// comparisonBoolNullRegexp matches boolean/null values in comparison expressions.
+var comparisonBoolNullRegexp = regexp.MustCompile(`(=|<>|!=|<=|>=|<|>)\s*(TRUE|FALSE|NULL)\b`)
 
 // normalizeQueryHash computes a FNV-1a hash of a query after collapsing
 // whitespace and replacing literals with placeholders. This groups queries
@@ -320,6 +335,7 @@ func normalizeQueryHash(query string) uint64 {
 
 	// Replace literals with ?
 	normalized = literalRegexp.ReplaceAllString(normalized, "?")
+	normalized = comparisonBoolNullRegexp.ReplaceAllString(normalized, "$1 ?")
 
 	h := fnv.New64a()
 	h.Write([]byte(normalized))
@@ -394,17 +410,16 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	})
 }
 
-// splitHostPort is a simple wrapper to split host:port without importing net.
+// splitHostPort splits a host:port pair.
 func splitHostPort(addr string) (string, string, error) {
-	// Handle [IPv6]:port format
-	if idx := strings.LastIndex(addr, ":"); idx >= 0 {
-		return addr[:idx], addr[idx+1:], nil
-	}
-	return addr, "", fmt.Errorf("no port")
+	return net.SplitHostPort(addr)
 }
 
 // parsePort converts a port string to int.
 func parsePort(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("invalid port")
+	}
 	var port int
 	for _, c := range s {
 		if c < '0' || c > '9' {
