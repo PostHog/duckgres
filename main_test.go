@@ -648,3 +648,72 @@ func TestResolveEffectiveConfigACMEEnvOnly(t *testing.T) {
 		t.Fatalf("expected ACME email from env, got %q", resolved.Server.ACMEEmail)
 	}
 }
+
+func TestResolveEffectiveConfigACMEDNSProviderValidation(t *testing.T) {
+	fileCfg := &FileConfig{
+		TLS: TLSConfig{
+			ACME: ACMEConfig{
+				Domain:      "test.us.duckgres.com",
+				DNSProvider: "cloudflare",
+				DNSZoneID:   "Z123",
+			},
+		},
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.ACMEDNSProvider != "" {
+		t.Fatalf("expected unsupported DNS provider to be cleared, got %q", resolved.Server.ACMEDNSProvider)
+	}
+	if resolved.Server.ACMEDNSZoneID != "" {
+		t.Fatalf("expected DNS zone id to be cleared when provider unsupported, got %q", resolved.Server.ACMEDNSZoneID)
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "Unsupported ACME DNS provider") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about unsupported ACME DNS provider, warnings: %v", warns)
+	}
+}
+
+func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
+	fileCfg := &FileConfig{
+		TLS: TLSConfig{
+			ACME: ACMEConfig{
+				DNSProvider: "route53",
+				DNSZoneID:   "Z123",
+			},
+		},
+	}
+
+	var warns []string
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), func(msg string) {
+		warns = append(warns, msg)
+	})
+
+	if resolved.Server.ACMEDNSProvider != "" {
+		t.Fatalf("expected DNS provider without ACME domain to be cleared, got %q", resolved.Server.ACMEDNSProvider)
+	}
+	if resolved.Server.ACMEDNSZoneID != "" {
+		t.Fatalf("expected DNS zone id to be cleared without ACME domain, got %q", resolved.Server.ACMEDNSZoneID)
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "ACME DNS provider is set but ACME domain is empty") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about missing ACME domain for DNS mode, warnings: %v", warns)
+	}
+}

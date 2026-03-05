@@ -59,7 +59,8 @@ type ControlPlane struct {
 	reloading        atomic.Bool         // guards against concurrent selfExec from double SIGUSR1
 	handoverDraining atomic.Bool         // true after handover succeeded; SIGTERM should exit immediately
 	handoverLn       net.Listener        // current handover listener; protected by closeMu
-	acmeManager      *server.ACMEManager // ACME manager for Let's Encrypt (nil when using static certs)
+	acmeManager      *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
+	acmeDNSManager   *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -95,10 +96,19 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
-	// Configure TLS: ACME (Let's Encrypt) or static certificate files
+	// Configure TLS: ACME DNS-01, ACME HTTP-01, or static certificate files
 	var tlsCfg *tls.Config
 	var acmeMgr *server.ACMEManager
-	if cfg.ACMEDomain != "" {
+	var acmeDNSMgr *server.ACMEDNSManager
+	if cfg.ACMEDomain != "" && cfg.ACMEDNSProvider != "" {
+		mgr, err := server.NewACMEDNSManager(cfg.ACMEDomain, cfg.ACMEEmail, cfg.ACMEDNSZoneID, cfg.ACMECacheDir)
+		if err != nil {
+			slog.Error("Failed to start ACME DNS manager.", "error", err)
+			os.Exit(1)
+		}
+		acmeDNSMgr = mgr
+		tlsCfg = mgr.TLSConfig()
+	} else if cfg.ACMEDomain != "" {
 		mgr, err := server.NewACMEManager(cfg.ACMEDomain, cfg.ACMEEmail, cfg.ACMECacheDir, ":80")
 		if err != nil {
 			slog.Error("Failed to start ACME manager.", "error", err)
@@ -233,7 +243,8 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		srv:         srv,
 		rateLimiter: server.NewRateLimiter(cfg.RateLimit),
 		tlsConfig:   tlsCfg,
-		acmeManager: acmeMgr,
+		acmeManager:    acmeMgr,
+		acmeDNSManager: acmeDNSMgr,
 	}
 
 	// Set up signal handling
@@ -323,11 +334,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 					}
 					cancel()
 				}
-				// ACME HTTP challenge listener (port 80) must be stopped before
-				// spawning the replacement so the new CP can bind it.
+				// ACME managers must be stopped before spawning the replacement
+				// so the new CP can bind port 80 (HTTP-01) or manage DNS records.
 				if cp.acmeManager != nil {
 					if err := cp.acmeManager.Close(); err != nil {
 						slog.Warn("ACME manager shutdown failed.", "error", err)
+					}
+				}
+				if cp.acmeDNSManager != nil {
+					if err := cp.acmeDNSManager.Close(); err != nil {
+						slog.Warn("ACME DNS manager shutdown failed.", "error", err)
 					}
 				}
 				// Flight ingress is NOT stopped here. The old CP keeps serving
@@ -761,10 +777,15 @@ func (cp *ControlPlane) shutdown() {
 		cp.rebalancer.Stop()
 	}
 
-	// Shut down ACME HTTP challenge listener if active
+	// Shut down ACME managers if active
 	if cp.acmeManager != nil {
 		if err := cp.acmeManager.Close(); err != nil {
 			slog.Warn("ACME manager shutdown error.", "error", err)
+		}
+	}
+	if cp.acmeDNSManager != nil {
+		if err := cp.acmeDNSManager.Close(); err != nil {
+			slog.Warn("ACME DNS manager shutdown error.", "error", err)
 		}
 	}
 
@@ -972,7 +993,21 @@ func (cp *ControlPlane) recoverACMEAfterFailedReload() {
 	if cp.cfg.ACMEDomain == "" {
 		return
 	}
-	// ACME manager was shut down in SIGUSR1 handler. Restart it.
+
+	if cp.cfg.ACMEDNSProvider != "" {
+		// DNS-01 mode
+		mgr, err := server.NewACMEDNSManager(cp.cfg.ACMEDomain, cp.cfg.ACMEEmail, cp.cfg.ACMEDNSZoneID, cp.cfg.ACMECacheDir)
+		if err != nil {
+			slog.Error("Failed to recover ACME DNS manager after reload failure.", "error", err)
+			return
+		}
+		cp.acmeDNSManager = mgr
+		cp.tlsConfig = mgr.TLSConfig()
+		slog.Info("Recovered ACME DNS manager after reload failure.")
+		return
+	}
+
+	// HTTP-01 mode
 	mgr, err := server.NewACMEManager(cp.cfg.ACMEDomain, cp.cfg.ACMEEmail, cp.cfg.ACMECacheDir, ":80")
 	if err != nil {
 		slog.Error("Failed to recover ACME manager after reload failure.", "error", err)
