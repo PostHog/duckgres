@@ -84,7 +84,7 @@ func TestJDBCVersionQuery(t *testing.T) {
 			var ver string
 			err := conn.QueryRow(tctx, "SELECT version()").Scan(&ver)
 			cancel()
-			conn.Close(ctx)
+			_ = conn.Close(ctx)
 			if err != nil {
 				t.Fatalf("Connection %d: SELECT version() failed: %v", i, err)
 			}
@@ -111,7 +111,7 @@ func TestJDBCConcurrentVersionQueries(t *testing.T) {
 		go func(workerID int) {
 			defer wg.Done()
 			conn := pgxConnect(t)
-			defer conn.Close(tctx)
+			defer func() { _ = conn.Close(context.Background()) }()
 
 			for i := 0; i < queriesPerWorker; i++ {
 				qctx, qcancel := context.WithTimeout(tctx, 5*time.Second)
@@ -307,7 +307,7 @@ func TestJDBCRapidReconnect(t *testing.T) {
 		var val string
 		err := conn.QueryRow(tctx, "SELECT 'ok'").Scan(&val)
 		cancel()
-		conn.Close(ctx)
+		_ = conn.Close(ctx)
 		if err != nil {
 			t.Fatalf("Reconnect %d: query failed: %v", i, err)
 		}
