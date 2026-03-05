@@ -15,4 +15,4 @@ COPY --from=builder /app/target/lib/ /lib/
 COPY entrypoint.sh /entrypoint.sh
 COPY queries.yaml /queries.yaml
 
-ENTRYPOINT ["/entrypoint.sh", "java", "-cp", "/app.jar:/lib/*", "com.duckgres.compat.JdbcCompatTest"]
+ENTRYPOINT ["/entrypoint.sh", "java", "-cp", "/app.jar:/lib/*", "com.posthog.compat.JdbcCompatTest"]

@@ -37,7 +37,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>com.duckgres.compat.JdbcCompatTest</mainClass>
+                            <mainClass>com.posthog.compat.JdbcCompatTest</mainClass>
                         </manifest>
                     </archive>
                 </configuration>

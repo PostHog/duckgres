@@ -89,6 +89,11 @@
   sql: SELECT version()
 
 - suite: catalog_funcs
+  name: worker_version
+  stub: true
+  sql: SELECT worker_version()
+
+- suite: catalog_funcs
   name: current_setting
   stub: true
   sql: SELECT current_setting('server_version')

@@ -6,7 +6,7 @@ services:
       context: ../..
       dockerfile: Dockerfile
     container_name: compat-duckgres
-    command: ["--port", "5432"]
+    command: ["--mode", "control-plane", "--port", "5432", "--socket-dir", "/app/data/sockets"]
     volumes:
       - ./results:/results
     healthcheck:
