@@ -124,6 +124,12 @@ type Config struct {
 	ACMEEmail    string // Contact email for Let's Encrypt notifications
 	ACMECacheDir string // Directory for cached certificates (default: "./certs/acme")
 
+	// ACME DNS-01 challenge configuration (for private/internal interfaces)
+	// When ACMEDNSProvider is set, DNS-01 challenges are used instead of HTTP-01.
+	// This allows certificate issuance for hosts without public port 80 access.
+	ACMEDNSProvider string // DNS provider for ACME DNS-01 challenges (currently only "route53")
+	ACMEDNSZoneID   string // Route53 hosted zone ID for DNS-01 challenges
+
 	// Rate limiting configuration
 	RateLimit RateLimitConfig
 
@@ -253,7 +259,8 @@ type Server struct {
 	externalCancelCh <-chan struct{}
 
 	// ACME manager for Let's Encrypt certificates (nil when using static certs)
-	acmeManager *ACMEManager
+	acmeManager    *ACMEManager
+	acmeDNSManager *ACMEDNSManager
 
 	// Connection registry for pg_stat_activity
 	connsMu sync.RWMutex
@@ -303,8 +310,18 @@ func New(cfg Config) (*Server, error) {
 		conns:         make(map[int32]*clientConn),
 	}
 
-	// Configure TLS: ACME (Let's Encrypt) or static certificate files
-	if cfg.ACMEDomain != "" {
+	// Configure TLS: ACME DNS-01, ACME HTTP-01, or static certificate files
+	if cfg.ACMEDomain != "" && cfg.ACMEDNSProvider != "" {
+		// DNS-01 challenge mode (for private/internal interfaces)
+		mgr, err := NewACMEDNSManager(cfg.ACMEDomain, cfg.ACMEEmail, cfg.ACMEDNSZoneID, cfg.ACMECacheDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to start ACME DNS manager: %w", err)
+		}
+		s.acmeDNSManager = mgr
+		s.tlsConfig = mgr.TLSConfig()
+		slog.Info("TLS enabled via ACME DNS-01.", "domain", cfg.ACMEDomain, "provider", cfg.ACMEDNSProvider)
+	} else if cfg.ACMEDomain != "" {
+		// HTTP-01 challenge mode (requires port 80)
 		mgr, err := NewACMEManager(cfg.ACMEDomain, cfg.ACMEEmail, cfg.ACMECacheDir, ":80")
 		if err != nil {
 			return nil, fmt.Errorf("failed to start ACME manager: %w", err)
@@ -432,10 +449,15 @@ func (s *Server) Close() error {
 		}
 	}
 
-	// Shut down ACME HTTP challenge listener if active
+	// Shut down ACME managers if active
 	if s.acmeManager != nil {
 		if err := s.acmeManager.Close(); err != nil {
 			slog.Warn("ACME manager shutdown error.", "error", err)
+		}
+	}
+	if s.acmeDNSManager != nil {
+		if err := s.acmeDNSManager.Close(); err != nil {
+			slog.Warn("ACME DNS manager shutdown error.", "error", err)
 		}
 	}
 
@@ -497,10 +519,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	// Shut down ACME HTTP challenge listener if active
+	// Shut down ACME managers if active
 	if s.acmeManager != nil {
 		if err := s.acmeManager.Close(); err != nil {
 			slog.Warn("ACME manager shutdown error.", "error", err)
+		}
+	}
+	if s.acmeDNSManager != nil {
+		if err := s.acmeDNSManager.Close(); err != nil {
+			slog.Warn("ACME DNS manager shutdown error.", "error", err)
 		}
 	}
 

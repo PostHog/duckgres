@@ -65,9 +65,11 @@ type TLSConfig struct {
 }
 
 type ACMEConfig struct {
-	Domain   string `yaml:"domain"`
-	Email    string `yaml:"email"`
-	CacheDir string `yaml:"cache_dir"`
+	Domain      string `yaml:"domain"`
+	Email       string `yaml:"email"`
+	CacheDir    string `yaml:"cache_dir"`
+	DNSProvider string `yaml:"dns_provider"` // "route53" for DNS-01 challenges
+	DNSZoneID   string `yaml:"dns_zone_id"`  // Route53 hosted zone ID
 }
 
 type RateLimitFileConfig struct {
@@ -203,6 +205,8 @@ func main() {
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
 	acmeEmail := flag.String("acme-email", "", "Contact email for Let's Encrypt notifications (env: DUCKGRES_ACME_EMAIL)")
 	acmeCacheDir := flag.String("acme-cache-dir", "", "Directory for ACME certificate cache (env: DUCKGRES_ACME_CACHE_DIR)")
+	acmeDNSProvider := flag.String("acme-dns-provider", "", "DNS provider for ACME DNS-01 challenges, e.g. 'route53' (env: DUCKGRES_ACME_DNS_PROVIDER)")
+	acmeDNSZoneID := flag.String("acme-dns-zone-id", "", "Route53 hosted zone ID for ACME DNS-01 challenges (env: DUCKGRES_ACME_DNS_ZONE_ID)")
 
 	// Query log flags
 	queryLog := flag.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
@@ -243,6 +247,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DOMAIN        Domain for ACME/Let's Encrypt certificate\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_EMAIL         Contact email for Let's Encrypt notifications\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_CACHE_DIR     Directory for ACME certificate cache\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DNS_PROVIDER  DNS provider for DNS-01 challenges (e.g. 'route53')\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DNS_ZONE_ID   Route53 hosted zone ID for DNS-01 challenges\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_CONNECTIONS    Max concurrent connections (default: CPUs * 2)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
@@ -336,6 +342,8 @@ func main() {
 		ACMEDomain:                *acmeDomain,
 		ACMEEmail:                 *acmeEmail,
 		ACMECacheDir:              *acmeCacheDir,
+		ACMEDNSProvider:           *acmeDNSProvider,
+		ACMEDNSZoneID:             *acmeDNSZoneID,
 		MaxConnections:            *maxConnections,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
@@ -446,6 +454,8 @@ func main() {
 			fatal("Failed to ensure TLS certificates: " + err.Error())
 		}
 		slog.Info("Using TLS certificates", "cert_file", cfg.TLSCertFile, "key_file", cfg.TLSKeyFile)
+	} else if cfg.ACMEDNSProvider != "" {
+		slog.Info("ACME DNS-01 mode enabled", "domain", cfg.ACMEDomain, "provider", cfg.ACMEDNSProvider)
 	} else {
 		slog.Info("ACME/Let's Encrypt mode enabled", "domain", cfg.ACMEDomain)
 	}

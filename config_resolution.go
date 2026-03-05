@@ -34,6 +34,8 @@ type configCLIInputs struct {
 	ACMEDomain                string
 	ACMEEmail                 string
 	ACMECacheDir              string
+	ACMEDNSProvider           string
+	ACMEDNSZoneID             string
 	MaxConnections            int
 	QueryLog                  bool
 }
@@ -290,6 +292,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.TLS.ACME.CacheDir != "" {
 			cfg.ACMECacheDir = fileCfg.TLS.ACME.CacheDir
 		}
+		if fileCfg.TLS.ACME.DNSProvider != "" {
+			cfg.ACMEDNSProvider = fileCfg.TLS.ACME.DNSProvider
+		}
+		if fileCfg.TLS.ACME.DNSZoneID != "" {
+			cfg.ACMEDNSZoneID = fileCfg.TLS.ACME.DNSZoneID
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -459,6 +467,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_ACME_CACHE_DIR"); v != "" {
 		cfg.ACMECacheDir = v
 	}
+	if v := getenv("DUCKGRES_ACME_DNS_PROVIDER"); v != "" {
+		cfg.ACMEDNSProvider = v
+	}
+	if v := getenv("DUCKGRES_ACME_DNS_ZONE_ID"); v != "" {
+		cfg.ACMEDNSZoneID = v
+	}
 	if v := getenv("DUCKGRES_MAX_CONNECTIONS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.RateLimit.MaxConnections = n
@@ -607,6 +621,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["acme-cache-dir"] {
 		cfg.ACMECacheDir = cli.ACMECacheDir
+	}
+	if cli.Set["acme-dns-provider"] {
+		cfg.ACMEDNSProvider = cli.ACMEDNSProvider
+	}
+	if cli.Set["acme-dns-zone-id"] {
+		cfg.ACMEDNSZoneID = cli.ACMEDNSZoneID
 	}
 	if cli.Set["max-connections"] {
 		cfg.RateLimit.MaxConnections = cli.MaxConnections
