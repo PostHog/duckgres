@@ -2,6 +2,7 @@ package main
 
 import (
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/posthog/duckgres/server"
@@ -34,6 +35,8 @@ type configCLIInputs struct {
 	ACMEDomain                string
 	ACMEEmail                 string
 	ACMECacheDir              string
+	ACMEDNSProvider           string
+	ACMEDNSZoneID             string
 	MaxConnections            int
 	WorkerBackend             string
 	K8sWorkerImage            string
@@ -310,6 +313,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.TLS.ACME.CacheDir != "" {
 			cfg.ACMECacheDir = fileCfg.TLS.ACME.CacheDir
 		}
+		if fileCfg.TLS.ACME.DNSProvider != "" {
+			cfg.ACMEDNSProvider = fileCfg.TLS.ACME.DNSProvider
+		}
+		if fileCfg.TLS.ACME.DNSZoneID != "" {
+			cfg.ACMEDNSZoneID = fileCfg.TLS.ACME.DNSZoneID
+		}
 
 		if fileCfg.WorkerBackend != "" {
 			workerBackend = fileCfg.WorkerBackend
@@ -504,6 +513,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_ACME_CACHE_DIR"); v != "" {
 		cfg.ACMECacheDir = v
 	}
+	if v := getenv("DUCKGRES_ACME_DNS_PROVIDER"); v != "" {
+		cfg.ACMEDNSProvider = v
+	}
+	if v := getenv("DUCKGRES_ACME_DNS_ZONE_ID"); v != "" {
+		cfg.ACMEDNSZoneID = v
+	}
 	if v := getenv("DUCKGRES_MAX_CONNECTIONS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.RateLimit.MaxConnections = n
@@ -681,6 +696,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["acme-cache-dir"] {
 		cfg.ACMECacheDir = cli.ACMECacheDir
 	}
+	if cli.Set["acme-dns-provider"] {
+		cfg.ACMEDNSProvider = cli.ACMEDNSProvider
+	}
+	if cli.Set["acme-dns-zone-id"] {
+		cfg.ACMEDNSZoneID = cli.ACMEDNSZoneID
+	}
 	if cli.Set["max-connections"] {
 		cfg.RateLimit.MaxConnections = cli.MaxConnections
 	}
@@ -710,6 +731,28 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["query-log"] {
 		cfg.QueryLog.Enabled = cli.QueryLog
+	}
+
+	if cfg.ACMEDNSProvider != "" {
+		provider := strings.ToLower(cfg.ACMEDNSProvider)
+		if provider != "route53" {
+			warn("Unsupported ACME DNS provider: " + cfg.ACMEDNSProvider + " (only 'route53' is supported); disabling DNS-01")
+			cfg.ACMEDNSProvider = ""
+			cfg.ACMEDNSZoneID = ""
+		} else {
+			cfg.ACMEDNSProvider = provider
+			if cfg.ACMEDomain == "" {
+				warn("ACME DNS provider is set but ACME domain is empty; disabling DNS-01")
+				cfg.ACMEDNSProvider = ""
+				cfg.ACMEDNSZoneID = ""
+			} else if cfg.ACMEDNSZoneID == "" {
+				warn("ACME DNS provider 'route53' requires ACME DNS zone ID; disabling DNS-01")
+				cfg.ACMEDNSProvider = ""
+			}
+		}
+	} else if cfg.ACMEDNSZoneID != "" {
+		warn("ACME DNS zone ID is set without ACME DNS provider; ignoring zone ID")
+		cfg.ACMEDNSZoneID = ""
 	}
 
 	// Validate memory_limit format if explicitly set

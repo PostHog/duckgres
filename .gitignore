@@ -1,5 +1,5 @@
 # Binaries
-duckgres
+/duckgres
 *.exe
 *.dll
 *.so

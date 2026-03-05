@@ -4456,9 +4456,15 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// Only mark as described when we actually send RowDescription.
+		// Mark both portal and statement as described when we send RowDescription.
 		// If we sent NoData above, Execute should still send RowDescription.
+		// Setting ps.described ensures future Bind calls that create new portals
+		// from this statement inherit described=true, so Execute won't re-send
+		// RowDescription. Without this, JDBC drivers that reuse named statements
+		// (Bind/Execute without re-Describing) get an unexpected RowDescription
+		// and desync their message queue.
 		p.described = true
+		p.stmt.described = true
 		_ = c.sendRowDescription(cols, colTypes)
 
 	default:
