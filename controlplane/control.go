@@ -39,10 +39,11 @@ type ControlPlaneConfig struct {
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
-	// "kubernetes": workers are K8s pods communicating over TCP (requires -tags kubernetes build).
+	// "remote": workers are network-accessible pods/containers communicating over TCP.
+	//           Currently implemented via Kubernetes (requires -tags kubernetes build).
 	WorkerBackend string
 
-	// K8s contains Kubernetes-specific configuration. Only used when WorkerBackend == "kubernetes".
+	// K8s contains Kubernetes-specific configuration. Only used when WorkerBackend == "remote".
 	K8s K8sConfig
 }
 
@@ -107,7 +108,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
-	isK8s := cfg.WorkerBackend == "kubernetes"
+	isK8s := cfg.WorkerBackend == "remote"
 
 	// Socket directory and handover are only used by the process backend.
 	var handoverPgLn *net.TCPListener
@@ -228,7 +229,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	var pool WorkerPool
 
 	switch cfg.WorkerBackend {
-	case "kubernetes":
+	case "remote":
 		k8sPool, err := CreateK8sPool(K8sWorkerPoolConfig{
 			Namespace:       cfg.K8s.WorkerNamespace,
 			CPID:            cfg.K8s.ControlPlaneID,

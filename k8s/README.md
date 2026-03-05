@@ -11,7 +11,7 @@ This directory contains **development/reference manifests** for running duckgres
 │  ┌────────────────────────────────┐                  │
 │  │ Control Plane Pod              │                  │
 │  │  duckgres --mode control-plane │                  │
-│  │  --worker-backend kubernetes   │                  │
+│  │  --worker-backend remote       │                  │
 │  │                                │                  │
 │  │  Creates worker pods via K8s   │                  │
 │  │  API, routes queries via gRPC  │                  │
@@ -52,7 +52,7 @@ Key flags for Kubernetes mode:
 
 | Flag | Env Var | Description |
 |------|---------|-------------|
-| `--worker-backend kubernetes` | - | Use K8s pod-based workers instead of local processes |
+| `--worker-backend remote` | - | Use remote workers (K8s pods) instead of local processes |
 | `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
 | `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |
 | `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |

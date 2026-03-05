@@ -50,7 +50,7 @@ type FileConfig struct {
 	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`              // Query log configuration
 
 	// Worker backend configuration
-	WorkerBackend string          `yaml:"worker_backend"` // "process" (default) or "kubernetes"
+	WorkerBackend string          `yaml:"worker_backend"` // "process" (default) or "remote"
 	K8s           K8sFileConfig   `yaml:"k8s"`
 }
 
@@ -215,7 +215,7 @@ func main() {
 	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for connections to drain during handover (default: '24h') (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
-	workerBackend := flag.String("worker-backend", "", "Worker backend: process (default) or kubernetes (env: DUCKGRES_WORKER_BACKEND)")
+	workerBackend := flag.String("worker-backend", "", "Worker backend: process (default) or remote (env: DUCKGRES_WORKER_BACKEND)")
 	k8sWorkerImage := flag.String("k8s-worker-image", "", "Container image for K8s worker pods (env: DUCKGRES_K8S_WORKER_IMAGE)")
 	k8sWorkerNamespace := flag.String("k8s-worker-namespace", "", "K8s namespace for worker pods (env: DUCKGRES_K8S_WORKER_NAMESPACE)")
 	k8sControlPlaneID := flag.String("k8s-control-plane-id", "", "Unique CP identifier for labeling worker pods (env: DUCKGRES_K8S_CONTROL_PLANE_ID)")

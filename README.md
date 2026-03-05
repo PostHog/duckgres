@@ -29,7 +29,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - [Architecture](#architecture)
   - [Standalone Mode](#standalone-mode)
   - [Control Plane Mode](#control-plane-mode)
-  - [Kubernetes Worker Backend](#kubernetes-worker-backend)
+  - [Remote Worker Backend](#remote-worker-backend)
 - [Two-Tier Query Processing](#two-tier-query-processing)
 - [Supported Features](#supported-features)
 - [Limitations](#limitations)
@@ -595,9 +595,9 @@ When running under **systemd** with `RuntimeDirectory`, ensure `RuntimeDirectory
 kill -USR2 <control-plane-pid>
 ```
 
-### Kubernetes Worker Backend
+### Remote Worker Backend
 
-In Kubernetes environments, the control plane can spawn worker pods instead of local processes using `--worker-backend kubernetes`. The control plane creates worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
+In Kubernetes environments, the control plane can spawn worker pods instead of local processes using `--worker-backend remote`. The control plane creates worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
 
 ```bash
 # Build with Kubernetes support

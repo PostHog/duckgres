@@ -28,7 +28,7 @@ spec:
             - "--mode"
             - "control-plane"
             - "--worker-backend"
-            - "kubernetes"
+            - "remote"
             - "--k8s-worker-image"
             - "duckgres:latest"
             - "--k8s-worker-image-pull-policy"

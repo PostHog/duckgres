@@ -68,7 +68,7 @@ func RegisterK8sPoolFactory(f K8sPoolFactory) {
 // CreateK8sPool creates a Kubernetes worker pool if the kubernetes build tag is enabled.
 func CreateK8sPool(cfg K8sWorkerPoolConfig) (WorkerPool, error) {
 	if k8sPoolFactory == nil {
-		return nil, fmt.Errorf("kubernetes worker backend not available: binary was not built with -tags kubernetes")
+		return nil, fmt.Errorf("remote worker backend not available: binary was not built with -tags kubernetes")
 	}
 	return k8sPoolFactory(cfg)
 }
