@@ -65,7 +65,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 
 	// Load ducklake extension
 	if _, err := db.Exec("INSTALL ducklake; LOAD ducklake"); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("querylog: load ducklake: %w", err)
 	}
 
@@ -79,7 +79,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 			dlCfg.S3Profile != ""
 		if needsSecret {
 			if err := createS3Secret(db, dlCfg); err != nil {
-				db.Close()
+				_ = db.Close()
 				return nil, fmt.Errorf("querylog: create S3 secret: %w", err)
 			}
 		}
@@ -98,13 +98,13 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", escapeSQLStringLiteral(dlCfg.MetadataStore))
 	}
 	if _, err := db.Exec(attachStmt); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("querylog: attach ducklake: %w", err)
 	}
 
 	// Create schema and table
 	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("querylog: create schema: %w", err)
 	}
 
@@ -131,7 +131,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		protocol            VARCHAR DEFAULT 'simple'
 	)`
 	if _, err := db.Exec(createTable); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("querylog: create table: %w", err)
 	}
 
