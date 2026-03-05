@@ -166,9 +166,16 @@ func (ql *QueryLogger) Log(entry QueryLogEntry) {
 
 // Stop drains remaining entries and shuts down the flush goroutine.
 func (ql *QueryLogger) Stop() {
+	if ql == nil {
+		return
+	}
 	ql.stopOnce.Do(func() {
-		close(ql.ch)
-		<-ql.done
+		if ql.ch != nil {
+			close(ql.ch)
+		}
+		if ql.done != nil {
+			<-ql.done
+		}
 		if ql.db != nil {
 			_ = ql.db.Close()
 		}

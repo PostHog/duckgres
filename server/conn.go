@@ -865,23 +865,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 		if parseErr == nil && len(tree.Stmts) == 1 {
 			switch s := tree.Stmts[0].Stmt.Node.(type) {
 			case *pg_query.Node_DeclareCursorStmt:
-				err := c.handleDeclareCursor(s.DeclareCursorStmt)
-				if err == nil {
-					c.logQuery(start, query, query, "DECLARE", 0, 0, "", "", "simple")
-				}
-				return err
+				return c.handleDeclareCursor(query, s.DeclareCursorStmt)
 			case *pg_query.Node_FetchStmt:
-				err := c.handleFetchCursor(s.FetchStmt)
-				if err == nil {
-					c.logQuery(start, query, query, "FETCH", 0, 0, "", "", "simple")
-				}
-				return err
+				return c.handleFetchCursor(query, s.FetchStmt)
 			case *pg_query.Node_ClosePortalStmt:
-				err := c.handleCloseCursor(s.ClosePortalStmt)
-				if err == nil {
-					c.logQuery(start, query, query, "CLOSE", 0, 0, "", "", "simple")
-				}
-				return err
+				return c.handleCloseCursor(query, s.ClosePortalStmt)
 			}
 		}
 	}
@@ -902,11 +890,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		upperQuery := strings.ToUpper(query)
 		cmdType := c.getCommandType(upperQuery)
 		if cmdType == "COPY" {
-			err := c.handleCopy(query, upperQuery)
-			if err == nil {
-				c.logQuery(start, query, query, cmdType, 0, 0, "", "", "simple")
-			}
-			return err
+			return c.handleCopy(query, upperQuery)
 		}
 		return c.executeQueryDirect(query, cmdType)
 	}
@@ -922,11 +906,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// c.reader directly, which would race with the disconnect monitor.
 	upperQueryEarly := strings.ToUpper(query)
 	if copyToStdoutRegex.MatchString(upperQueryEarly) || copyFromStdinRegex.MatchString(upperQueryEarly) {
-		err := c.handleCopy(query, upperQueryEarly)
-		if err == nil {
-			c.logQuery(start, query, query, "COPY", 0, 0, "", "", "simple")
-		}
-		return err
+		return c.handleCopy(query, upperQueryEarly)
 	}
 
 	// Check for multi-statement query (PostgreSQL simple query protocol supports
@@ -1007,11 +987,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Handle COPY commands specially
 	if cmdType == "COPY" {
-		err := c.handleCopy(query, upperQuery)
-		if err == nil {
-			c.logQuery(start, originalQuery, query, cmdType, 0, 0, "", "", "simple")
-		}
-		return err
+		return c.handleCopy(query, upperQuery)
 	}
 
 	// For queries that don't return result rows, use Exec
@@ -2758,6 +2734,8 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 
 // handleCopy handles COPY TO STDOUT and COPY FROM STDIN commands
 func (c *clientConn) handleCopy(query, upperQuery string) error {
+	start := time.Now()
+
 	// Check if it's COPY TO STDOUT
 	if copyToStdoutRegex.MatchString(upperQuery) {
 		return c.handleCopyOut(query, upperQuery)
@@ -2773,6 +2751,7 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2780,6 +2759,7 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 
 	rowsAffected, _ := result.RowsAffected()
 	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowsAffected))
+	c.logQuery(start, query, query, "COPY", 0, rowsAffected, "", "", "simple")
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
@@ -2787,10 +2767,12 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 
 // handleCopyOut handles COPY ... TO STDOUT
 func (c *clientConn) handleCopyOut(query, upperQuery string) error {
+	start := time.Now()
 	matches := copyToStdoutRegex.FindStringSubmatch(query)
 	if len(matches) < 2 {
 		c.sendError("ERROR", "42601", "Invalid COPY TO STDOUT syntax")
 		c.setTxError()
+		c.logQuery(start, query, query, "COPY", 0, 0, "42601", "Invalid COPY TO STDOUT syntax", "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2822,6 +2804,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		slog.Error("COPY TO query failed.", "user", c.username, "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2833,6 +2816,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		slog.Error("COPY TO failed to get columns.", "user", c.username, "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2841,7 +2825,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	isBinary := copyBinaryRegex.MatchString(query)
 
 	if isBinary {
-		return c.handleCopyOutBinary(rows, cols)
+		return c.handleCopyOutBinary(query, rows, cols)
 	}
 
 	// Get column types for JSON-aware formatting
@@ -2849,6 +2833,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2891,6 +2876,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 		if err := rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
+			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
 			break
 		}
 
@@ -2910,12 +2896,22 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		rowCount++
 	}
 
+	if err := rows.Err(); err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
 	// Send CopyDone
 	if err := writeCopyDone(c.writer); err != nil {
 		return err
 	}
 
 	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
@@ -2926,11 +2922,13 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 // Sends one CopyData message per tuple, with header prepended to the first tuple
 // and trailer appended to the last, matching how clients like DuckDB's postgres
 // extension consume binary COPY streams via PQgetCopyData.
-func (c *clientConn) handleCopyOutBinary(rows RowSet, cols []string) error {
+func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []string) error {
+	start := time.Now()
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2989,6 +2987,7 @@ func (c *clientConn) handleCopyOutBinary(rows RowSet, cols []string) error {
 		if err := rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
+			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3013,6 +3012,15 @@ func (c *clientConn) handleCopyOutBinary(rows RowSet, cols []string) error {
 		rowCount++
 	}
 
+	if err := rows.Err(); err != nil {
+		c.sendError("ERROR", "42000", err.Error())
+		c.setTxError()
+		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+		_ = writeReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
 	// If no rows, still need to send header + trailer
 	if firstRow {
 		// No rows at all: send header + trailer in one message
@@ -3035,6 +3043,7 @@ func (c *clientConn) handleCopyOutBinary(rows RowSet, cols []string) error {
 	}
 
 	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
@@ -3050,6 +3059,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
 		c.setTxError()
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "42601", "Invalid COPY FROM STDIN syntax", "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -3071,8 +3081,10 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	testRows, err := c.executor.Query(colQuery)
 	if err != nil {
 		slog.Error("COPY FROM table check failed.", "user", c.username, "table", tableName, "error", err)
-		c.sendError("ERROR", "42P01", fmt.Sprintf("relation \"%s\" does not exist", tableName))
+		errMsg := fmt.Sprintf("relation \"%s\" does not exist", tableName)
+		c.sendError("ERROR", "42P01", errMsg)
 		c.setTxError()
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "42P01", errMsg, "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -3083,7 +3095,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 	// Branch to binary handler if binary format
 	if opts.IsBinary {
-		return c.handleCopyInBinary(opts, cols, colTypes)
+		return c.handleCopyInBinary(query, opts, cols, colTypes)
 	}
 
 	// Send CopyInResponse
@@ -3099,8 +3111,10 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
 	if err != nil {
 		slog.Error("COPY FROM STDIN failed to create temp file.", "user", c.username, "error", err)
-		c.sendError("ERROR", "58000", fmt.Sprintf("failed to create temp file: %v", err))
+		errMsg := fmt.Sprintf("failed to create temp file: %v", err)
+		c.sendError("ERROR", "58000", errMsg)
 		c.setTxError()
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "58000", errMsg, "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -3134,8 +3148,10 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			if err != nil {
 				slog.Error("COPY FROM STDIN failed to write to temp file.", "user", c.username, "error", err)
 				_ = tmpFile.Close()
-				c.sendError("ERROR", "58000", fmt.Sprintf("failed to write to temp file: %v", err))
+				errMsg := fmt.Sprintf("failed to write to temp file: %v", err)
+				c.sendError("ERROR", "58000", errMsg)
 				c.setTxError()
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "58000", errMsg, "simple")
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -3160,8 +3176,10 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			result, err := c.executor.Exec(copySQL)
 			if err != nil {
 				slog.Error("COPY FROM STDIN DuckDB COPY failed.", "user", c.username, "error", err)
-				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
+				errMsg := fmt.Sprintf("COPY failed: %v", err)
+				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -3175,6 +3193,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			slog.Info("COPY FROM STDIN completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
 
 			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3182,15 +3201,19 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		case msgCopyFail:
 			// Client cancelled COPY
 			errMsg := string(bytes.TrimRight(body, "\x00"))
-			c.sendError("ERROR", "57014", fmt.Sprintf("COPY failed: %s", errMsg))
+			exception := fmt.Sprintf("COPY failed: %s", errMsg)
+			c.sendError("ERROR", "57014", exception)
 			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "57014", exception, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
 
 		default:
-			c.sendError("ERROR", "08P01", fmt.Sprintf("unexpected message type during COPY: %c", msgType))
+			errMsg := fmt.Sprintf("unexpected message type during COPY: %c", msgType)
+			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "08P01", errMsg, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3200,7 +3223,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 // handleCopyInBinary handles COPY ... FROM STDIN with binary format.
 // It parses the PostgreSQL binary COPY format, decodes each field, and INSERTs rows.
-func (c *clientConn) handleCopyInBinary(opts *CopyFromOptions, cols []string, colTypes []ColumnTyper) error {
+func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, cols []string, colTypes []ColumnTyper) error {
 	copyStartTime := time.Now()
 
 	// Get type OIDs for decoding
@@ -3235,8 +3258,10 @@ func (c *clientConn) handleCopyInBinary(opts *CopyFromOptions, cols []string, co
 			rowCount, err := c.parseBinaryCopyAndInsert(data, opts.TableName, opts.ColumnList, cols, typeOIDs)
 			if err != nil {
 				slog.Error("COPY FROM STDIN binary: parse/insert failed.", "user", c.username, "error", err)
-				c.sendError("ERROR", "22P02", fmt.Sprintf("COPY failed: %v", err))
+				errMsg := fmt.Sprintf("COPY failed: %v", err)
+				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
+				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -3246,21 +3271,26 @@ func (c *clientConn) handleCopyInBinary(opts *CopyFromOptions, cols []string, co
 			slog.Info("COPY FROM STDIN binary completed.", "user", c.username, "rows", rowCount, "bytes", buf.Len(), "duration", elapsed)
 
 			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
 
 		case msgCopyFail:
 			errMsg := string(bytes.TrimRight(body, "\x00"))
-			c.sendError("ERROR", "57014", fmt.Sprintf("COPY failed: %s", errMsg))
+			exception := fmt.Sprintf("COPY failed: %s", errMsg)
+			c.sendError("ERROR", "57014", exception)
 			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
 
 		default:
-			c.sendError("ERROR", "08P01", fmt.Sprintf("unexpected message type during COPY: %c", msgType))
+			errMsg := fmt.Sprintf("unexpected message type during COPY: %c", msgType)
+			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -4592,6 +4622,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		slog.Error("Columns error.", "user", c.username, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
 		return
 	}
 
@@ -4630,6 +4661,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		if err := rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
+			c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
 			return
 		}
 
@@ -4640,13 +4672,18 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	if err := rows.Err(); err != nil {
+		errCode := "42000"
+		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
+			c.sendError("ERROR", errCode, errMsg)
 		} else {
 			slog.Error("Row iteration error.", "user", c.username, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 		return
 	}
 
@@ -5071,10 +5108,12 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 }
 
 // handleDeclareCursor handles DECLARE cursor in the Simple Query protocol.
-func (c *clientConn) handleDeclareCursor(stmt *pg_query.DeclareCursorStmt) error {
+func (c *clientConn) handleDeclareCursor(query string, stmt *pg_query.DeclareCursorStmt) error {
+	start := time.Now()
 	innerSQL := deparseInnerQuery(stmt.Query)
 	if innerSQL == "" {
 		c.sendError("ERROR", "42601", "could not deparse cursor query")
+		c.logQuery(start, query, query, "DECLARE", 0, 0, "42601", "could not deparse cursor query", "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5086,7 +5125,9 @@ func (c *clientConn) handleDeclareCursor(stmt *pg_query.DeclareCursorStmt) error
 		tr := c.newTranspiler(false)
 		result, err := tr.Transpile(innerSQL)
 		if err != nil {
-			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error in cursor query: %v", err))
+			errMsg := fmt.Sprintf("syntax error in cursor query: %v", err)
+			c.sendError("ERROR", "42601", errMsg)
+			c.logQuery(start, query, query, "DECLARE", 0, 0, "42601", errMsg, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -5104,16 +5145,19 @@ func (c *clientConn) handleDeclareCursor(stmt *pg_query.DeclareCursorStmt) error
 	slog.Debug("Cursor declared.", "user", c.username, "cursor", stmt.Portalname, "query", transpiledSQL)
 
 	_ = writeCommandComplete(c.writer, "DECLARE CURSOR")
+	c.logQuery(start, query, query, "DECLARE", 0, 0, "", "", "simple")
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
 }
 
 // handleFetchCursor handles FETCH in the Simple Query protocol.
-func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
+func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) error {
+	start := time.Now()
 	// Validate direction
 	if !isFetchForwardOnly(stmt.Direction) {
 		c.sendError("ERROR", "0A000", "cursor can only scan forward")
+		c.logQuery(start, query, query, "FETCH", 0, 0, "0A000", "cursor can only scan forward", "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5121,7 +5165,9 @@ func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
 
 	cursor, ok := c.cursors[stmt.Portalname]
 	if !ok {
-		c.sendError("ERROR", "34000", fmt.Sprintf("cursor %q does not exist", stmt.Portalname))
+		errMsg := fmt.Sprintf("cursor %q does not exist", stmt.Portalname)
+		c.sendError("ERROR", "34000", errMsg)
+		c.logQuery(start, query, query, "FETCH", 0, 0, "34000", errMsg, "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5130,12 +5176,15 @@ func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
 	// Open cursor on first FETCH
 	if cursor.rows == nil {
 		if err := c.openCursor(cursor); err != nil {
+			errCode := "42000"
+			errMsg := err.Error()
 			if isQueryCancelled(err) {
-				c.sendError("ERROR", "57014", "canceling statement due to user request")
-			} else {
-				c.sendError("ERROR", "42000", err.Error())
+				errCode = "57014"
+				errMsg = "canceling statement due to user request"
 			}
+			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
+			c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -5146,6 +5195,7 @@ func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
 	howMany := stmt.HowMany
 	if howMany < 0 {
 		c.sendError("ERROR", "0A000", "cursor can only scan forward")
+		c.logQuery(start, query, query, "FETCH", 0, 0, "0A000", "cursor can only scan forward", "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5165,6 +5215,7 @@ func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
 			moveCount++
 		}
 		_ = writeCommandComplete(c.writer, fmt.Sprintf("MOVE %d", moveCount))
+		c.logQuery(start, query, query, "FETCH", moveCount, 0, "", "", "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5187,6 +5238,7 @@ func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
 		if err := cursor.rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
+			c.logQuery(start, query, query, "FETCH", 0, 0, "42000", err.Error(), "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -5199,31 +5251,38 @@ func (c *clientConn) handleFetchCursor(stmt *pg_query.FetchStmt) error {
 	}
 
 	if err := cursor.rows.Err(); err != nil {
+		errCode := "42000"
+		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
-		} else {
-			c.sendError("ERROR", "42000", err.Error())
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
 		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
+		c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
 	}
 
 	_ = writeCommandComplete(c.writer, fmt.Sprintf("FETCH %d", rowCount))
+	c.logQuery(start, query, query, "FETCH", rowCount, 0, "", "", "simple")
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
 }
 
 // handleCloseCursor handles CLOSE in the Simple Query protocol.
-func (c *clientConn) handleCloseCursor(stmt *pg_query.ClosePortalStmt) error {
+func (c *clientConn) handleCloseCursor(query string, stmt *pg_query.ClosePortalStmt) error {
+	start := time.Now()
 	if stmt.Portalname == "" {
 		// CLOSE ALL
 		c.closeAllCursors()
 	} else {
 		if _, ok := c.cursors[stmt.Portalname]; !ok {
-			c.sendError("ERROR", "34000", fmt.Sprintf("cursor %q does not exist", stmt.Portalname))
+			errMsg := fmt.Sprintf("cursor %q does not exist", stmt.Portalname)
+			c.sendError("ERROR", "34000", errMsg)
+			c.logQuery(start, query, query, "CLOSE", 0, 0, "34000", errMsg, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -5233,6 +5292,7 @@ func (c *clientConn) handleCloseCursor(stmt *pg_query.ClosePortalStmt) error {
 
 	slog.Debug("Cursor closed.", "user", c.username, "cursor", stmt.Portalname)
 	_ = writeCommandComplete(c.writer, "CLOSE CURSOR")
+	c.logQuery(start, query, query, "CLOSE", 0, 0, "", "", "simple")
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil

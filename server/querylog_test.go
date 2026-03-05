@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 )
@@ -156,6 +157,29 @@ func TestQueryLogNonBlocking(t *testing.T) {
 	}
 }
 
+func TestQueryLoggerStopIsIdempotent(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+
+	ql := &QueryLogger{
+		db: db,
+		cfg: QueryLogConfig{
+			BatchSize:       1,
+			FlushInterval:   time.Hour,
+			CompactInterval: time.Hour,
+		},
+		ch:   make(chan QueryLogEntry, 1),
+		done: make(chan struct{}),
+	}
+
+	go ql.flushLoop()
+
+	ql.Stop()
+	ql.Stop()
+}
+
 func TestSplitHostPort(t *testing.T) {
 	host, port, err := splitHostPort("192.168.1.1:5432")
 	if err != nil {
@@ -228,15 +252,4 @@ func TestEscapeSQLStringLiteral(t *testing.T) {
 	if got != want {
 		t.Fatalf("escapeSQLStringLiteral() = %q, want %q", got, want)
 	}
-}
-
-func TestQueryLoggerStopIsIdempotent(t *testing.T) {
-	ql := &QueryLogger{
-		ch:   make(chan QueryLogEntry, 1),
-		done: make(chan struct{}),
-	}
-	close(ql.done)
-
-	ql.Stop()
-	ql.Stop()
 }
