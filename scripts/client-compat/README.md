@@ -92,17 +92,18 @@ Every client runs two categories of tests:
 
 ### Shared Queries (`queries.yaml`)
 
-A YAML catalog of 59 queries across 5 suites that every client executes. A query passes if it executes without error (row counts are reported but not validated).
+A YAML catalog of 91 queries across 6 suites that every client executes. A query passes if it executes without error (row counts are reported but not validated).
 
 Queries may be tagged `stub: true` to indicate the underlying function or view returns a hardcoded dummy value (empty string, NULL, 0, false, or empty result set) rather than meaningful data. This distinguishes "won't crash your client" from "returns useful information" in the results.
 
 | Suite | Count | Purpose |
 |-------|-------|---------|
 | `catalog_views` | 7 | Core pg_catalog views (`pg_database`, `pg_namespace`, `pg_type`, etc.) |
-| `catalog_funcs` | 26 | PostgreSQL functions (`format_type`, `version()`, `pg_get_indexdef`, size functions, etc.) |
+| `catalog_funcs` | 30 | PostgreSQL functions (`format_type`, `version()`, `pg_get_indexdef`, size functions, etc.) |
 | `info_schema` | 4 | `information_schema.tables`, `.columns`, `.schemata` |
 | `catalog_joins` | 5 | Multi-table joins that real tools emit (psql `\dt`, `\dn`, `\l` queries) |
 | `catalog_stubs` | 16 | Stub views that must exist but return empty (`pg_matviews`, `pg_policy`, etc.) |
+| `dbeaver_introspection` | 29 | DBeaver metadata discovery queries (catalog and function coverage seen on connect) |
 
 ### Client-Specific Suites
 
