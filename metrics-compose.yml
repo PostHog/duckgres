@@ -1,9 +1,9 @@
-# Prometheus setup for local development and testing.
+# Metrics stack for local development and testing.
 #
 # Usage:
 #   1. Start duckgres: ./duckgres --port 5432
 #   2. (Optional) Start perf harness metrics endpoint on :9095 during perf runs
-#   3. Start prometheus: docker compose -f metrics-compose.yml up
+#   3. Start stack: docker compose -f metrics-compose.yml up
 #   4. Open http://localhost:9091 to view metrics (Prometheus)
 #   5. Open http://localhost:3000 to view dashboards (Grafana, no login required)
 #
@@ -38,6 +38,37 @@ services:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    configs:
+      - source: grafana-datasources
+        target: /etc/grafana/provisioning/datasources/prometheus.yml
+      - source: grafana-dashboard-provider
+        target: /etc/grafana/provisioning/dashboards/dashboards.yml
+      - source: grafana-dashboard-duckgres
+        target: /var/lib/grafana/dashboards/duckgres.json
+
+configs:
+  grafana-datasources:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: false
+
+  grafana-dashboard-provider:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: duckgres
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards
+            foldersFromFilesStructure: false
+
+  grafana-dashboard-duckgres:
+    file: ./grafana/dashboards/duckgres.json
