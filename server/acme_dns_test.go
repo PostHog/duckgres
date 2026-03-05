@@ -69,3 +69,25 @@ func TestACMEDNSCertCache(t *testing.T) {
 		return
 	}
 }
+
+func TestLoadOrCreateAccountKey_InvalidExistingKeyReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	keyPath := filepath.Join(tmpDir, "account-key.pem")
+
+	original := []byte("-----BEGIN EC PRIVATE KEY-----\nnot-valid\n-----END EC PRIVATE KEY-----\n")
+	if err := os.WriteFile(keyPath, original, 0600); err != nil {
+		t.Fatalf("failed to write invalid key fixture: %v", err)
+	}
+
+	if _, err := loadOrCreateAccountKey(keyPath); err == nil {
+		t.Fatal("expected error when existing account key is invalid")
+	}
+
+	got, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("failed to read key file after error: %v", err)
+	}
+	if string(got) != string(original) {
+		t.Fatal("invalid key file should not be overwritten")
+	}
+}

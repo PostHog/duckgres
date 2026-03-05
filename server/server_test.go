@@ -249,6 +249,31 @@ func TestStartCredentialRefresh_DoesNotRollbackDuringActiveTransaction(t *testin
 	}
 }
 
+func TestNewRejectsUnsupportedACMEDNSProvider(t *testing.T) {
+	_, err := New(Config{
+		ACMEDomain:      "test.us.duckgres.com",
+		ACMEDNSProvider: "cloudflare",
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported ACME DNS provider")
+	}
+	if !strings.Contains(err.Error(), "unsupported ACME DNS provider") {
+		t.Fatalf("expected unsupported provider error, got: %v", err)
+	}
+}
+
+func TestNewRejectsACMEDNSProviderWithoutDomain(t *testing.T) {
+	_, err := New(Config{
+		ACMEDNSProvider: "route53",
+	})
+	if err == nil {
+		t.Fatal("expected error when ACME DNS provider is set without ACME domain")
+	}
+	if !strings.Contains(err.Error(), "ACME DNS provider requires ACME domain") {
+		t.Fatalf("expected missing domain error, got: %v", err)
+	}
+}
+
 func TestStartCredentialRefresh_RollbackAndRetryWhenNoActiveTransaction(t *testing.T) {
 	oldInterval := credentialRefreshInterval
 	credentialRefreshInterval = 5 * time.Millisecond

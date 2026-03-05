@@ -2,6 +2,7 @@ package main
 
 import (
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/posthog/duckgres/server"
@@ -633,6 +634,28 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["query-log"] {
 		cfg.QueryLog.Enabled = cli.QueryLog
+	}
+
+	if cfg.ACMEDNSProvider != "" {
+		provider := strings.ToLower(cfg.ACMEDNSProvider)
+		if provider != "route53" {
+			warn("Unsupported ACME DNS provider: " + cfg.ACMEDNSProvider + " (only 'route53' is supported); disabling DNS-01")
+			cfg.ACMEDNSProvider = ""
+			cfg.ACMEDNSZoneID = ""
+		} else {
+			cfg.ACMEDNSProvider = provider
+			if cfg.ACMEDomain == "" {
+				warn("ACME DNS provider is set but ACME domain is empty; disabling DNS-01")
+				cfg.ACMEDNSProvider = ""
+				cfg.ACMEDNSZoneID = ""
+			} else if cfg.ACMEDNSZoneID == "" {
+				warn("ACME DNS provider 'route53' requires ACME DNS zone ID; disabling DNS-01")
+				cfg.ACMEDNSProvider = ""
+			}
+		}
+	} else if cfg.ACMEDNSZoneID != "" {
+		warn("ACME DNS zone ID is set without ACME DNS provider; ignoring zone ID")
+		cfg.ACMEDNSZoneID = ""
 	}
 
 	// Validate memory_limit format if explicitly set

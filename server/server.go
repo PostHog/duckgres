@@ -302,6 +302,13 @@ func New(cfg Config) (*Server, error) {
 		cfg.IdleTimeout = 0
 	}
 
+	if cfg.ACMEDNSProvider != "" && cfg.ACMEDomain == "" {
+		return nil, errors.New("ACME DNS provider requires ACME domain")
+	}
+	if cfg.ACMEDNSProvider != "" && cfg.ACMEDNSProvider != "route53" {
+		return nil, fmt.Errorf("unsupported ACME DNS provider %q (only \"route53\" is supported)", cfg.ACMEDNSProvider)
+	}
+
 	s := &Server{
 		cfg:           cfg,
 		rateLimiter:   NewRateLimiter(cfg.RateLimit),

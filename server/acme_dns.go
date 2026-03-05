@@ -476,9 +476,20 @@ func loadOrCreateAccountKey(path string) (*ecdsa.PrivateKey, error) {
 	data, err := os.ReadFile(path)
 	if err == nil {
 		block, _ := pem.Decode(data)
-		if block != nil && block.Type == "EC PRIVATE KEY" {
-			return x509.ParseECPrivateKey(block.Bytes)
+		if block == nil {
+			return nil, fmt.Errorf("existing account key file %q is not valid PEM", path)
 		}
+		if block.Type != "EC PRIVATE KEY" {
+			return nil, fmt.Errorf("existing account key file %q has unsupported PEM type %q", path, block.Type)
+		}
+		key, parseErr := x509.ParseECPrivateKey(block.Bytes)
+		if parseErr != nil {
+			return nil, fmt.Errorf("failed to parse existing account key %q: %w", path, parseErr)
+		}
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to read account key %q: %w", path, err)
 	}
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
