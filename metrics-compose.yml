@@ -1,0 +1,74 @@
+# Metrics stack for local development and testing.
+#
+# Usage:
+#   1. Start duckgres: ./duckgres --port 5432
+#   2. (Optional) Start perf harness metrics endpoint on :9095 during perf runs
+#   3. Start stack: docker compose -f metrics-compose.yml up
+#   4. Open http://localhost:9091 to view metrics (Prometheus)
+#   5. Open http://localhost:3000 to view dashboards (Grafana, no login required)
+#
+# Available metrics:
+#   - duckgres_connections_open: current number of open connections
+#   - duckgres_query_duration_seconds: histogram of query latencies
+#   - duckgres_query_errors_total: counter of failed queries
+#   - duckgres_perf_query_duration_seconds: per-query perf harness latency histograms
+#
+# Note: Uses port 9091 for Prometheus UI to avoid conflict with duckgres metrics on 9090.
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    # On Linux, host.docker.internal is not defined by default; this mapping
+    # ensures the container can reach services on the host. If running with
+    # `docker run` instead of compose, you may need:
+    #   --add-host=host.docker.internal:host-gateway
+    # or use an alternative like: network_mode: "host".
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    configs:
+      - source: grafana-datasources
+        target: /etc/grafana/provisioning/datasources/prometheus.yml
+      - source: grafana-dashboard-provider
+        target: /etc/grafana/provisioning/dashboards/dashboards.yml
+      - source: grafana-dashboard-duckgres
+        target: /var/lib/grafana/dashboards/duckgres.json
+
+configs:
+  grafana-datasources:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: false
+
+  grafana-dashboard-provider:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: duckgres
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards
+            foldersFromFilesStructure: false
+
+  grafana-dashboard-duckgres:
+    file: ./grafana/dashboards/duckgres.json

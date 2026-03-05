@@ -1,4 +1,4 @@
-package main
+package main // duckgres entry point
 
 import (
 	"context"
