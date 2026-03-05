@@ -116,7 +116,35 @@ echo "DuckLake object store bucket: s3://${DUCKLAKE_BUCKET}/data/"
 echo "Perf artifacts root URI: ${PERF_ARTIFACTS_ROOT_URI}"
 ```
 
-Use `PERF_ARTIFACTS_ROOT_URI` for publishing nightly run artifacts (for example `.../perf-runs/<run_id>/`).
+Use `PERF_ARTIFACTS_ROOT_URI` for publishing nightly run artifacts.
+
+## Athena Path Contract (v1)
+
+Nightly uploads publish the canonical Athena source object at:
+
+`s3://<perf-artifacts-bucket>/perf-athena/query_results/dataset_version=<v>/run_date=<YYYY-MM-DD>/query_results-<run_id>.csv`
+
+The source CSV schema is fixed to:
+
+`query_id,intent_id,protocol,status,error,error_class,rows,duration_ms,started_at`
+
+`summary.json` is also uploaded for future dashboard expansion under:
+
+`s3://<perf-artifacts-bucket>/perf-athena/summary/dataset_version=<v>/run_date=<YYYY-MM-DD>/summary-<run_id>.json`
+
+## Grafana (Manual Athena Datasource Setup)
+
+1. Apply the managed warehouse Athena stack:
+   `terraform/environments/aws-accnt-managed-warehouse/us-east-1/athena-perf`
+2. Get role ARN from output `duckgres_perf_athena_reader_role_arn`.
+3. In Internal Grafana, create an Athena datasource:
+   - Datasource type: `Amazon Athena`
+   - Region: `us-east-1`
+   - Catalog: `AwsDataCatalog`
+   - Database: `duckgres_perf`
+   - Workgroup: `duckgres-perf`
+   - Assume role ARN: `duckgres_perf_athena_reader_role_arn`
+4. Set datasource UID to match dashboard variable default (`athena-duckgres-perf`) or update dashboard variable `ds_athena` accordingly.
 
 ## Frozen Dataset Bootstrap
 

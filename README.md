@@ -86,7 +86,11 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 
 ## Perf Runbook
 
-See [docs/perf-harness-runbook.md](docs/perf-harness-runbook.md) and [tests/perf/README.md](tests/perf/README.md) for local smoke and nightly operations.
+See [docs/perf-harness-runbook.md](docs/perf-harness-runbook.md) and [tests/perf/README.md](tests/perf/README.md) for local smoke and nightly operations, including:
+
+- Athena artifact path contract (`perf-athena/query_results/...`)
+- Internal Grafana Athena datasource setup
+- Perf CSV artifact schema contract (`query_results.csv`)
 
 ## Quick Start
 
