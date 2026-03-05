@@ -1,11 +1,16 @@
 package server
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"strings"
 	"testing"
 
@@ -1348,6 +1353,63 @@ func (f *fakeExecResult) RowsAffected() (int64, error) {
 	return f.rowsAffected, nil
 }
 
+type queryErrorExecutor struct {
+	err error
+}
+
+func (e *queryErrorExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	return nil, e.err
+}
+func (e *queryErrorExecutor) ExecContext(context.Context, string, ...any) (ExecResult, error) {
+	return nil, errors.New("not implemented")
+}
+func (e *queryErrorExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+func (e *queryErrorExecutor) Exec(string, ...any) (ExecResult, error) {
+	return nil, errors.New("not implemented")
+}
+func (e *queryErrorExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+func (e *queryErrorExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+func (e *queryErrorExecutor) Close() error { return nil }
+
+func TestExecuteSelectQueryReturnsErrorDetails(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	c := &clientConn{
+		server: &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:   clientSide,
+		reader: bufio.NewReader(clientSide),
+		writer: bufio.NewWriter(&out),
+		ctx:    context.Background(),
+		cancel: func() {},
+		executor: &queryErrorExecutor{
+			err: errors.New("relation missing_table does not exist"),
+		},
+	}
+
+	rowCount, errCode, errMsg, err := c.executeSelectQuery("SELECT * FROM missing_table", "SELECT")
+	if err != nil {
+		t.Fatalf("expected nil connection error, got %v", err)
+	}
+	if rowCount != 0 {
+		t.Fatalf("expected rowCount=0, got %d", rowCount)
+	}
+	if errCode != "42000" {
+		t.Fatalf("expected error code 42000, got %q", errCode)
+	}
+	if !strings.Contains(errMsg, "missing_table") {
+		t.Fatalf("expected error message mentioning missing_table, got %q", errMsg)
+	}
+}
+
 func TestCopyToStdoutRegex(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -1602,9 +1664,9 @@ func TestCopyOptionRegexes(t *testing.T) {
 	// option keyword, but may not work with trailing delimiters at end of query.
 	t.Run("delimiter detection with following keyword", func(t *testing.T) {
 		tests := []struct {
-			name      string
-			query     string
-			delimiter string
+			name        string
+			query       string
+			delimiter   string
 			shouldMatch bool
 		}{
 			{
@@ -2672,11 +2734,11 @@ func TestFormatInterval(t *testing.T) {
 
 func TestMatchPgCursorsQuery(t *testing.T) {
 	tests := []struct {
-		name           string
-		query          string
-		wantName       string
-		wantParam      bool
-		wantOK         bool
+		name      string
+		query     string
+		wantName  string
+		wantParam bool
+		wantOK    bool
 	}{
 		// Literal cursor name queries
 		{

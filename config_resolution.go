@@ -43,6 +43,7 @@ type configCLIInputs struct {
 	K8sWorkerSecret           string
 	K8sWorkerConfigMap        string
 	K8sWorkerImagePullPolicy  string
+	QueryLog                  bool
 }
 
 type resolvedConfig struct {
@@ -76,6 +77,13 @@ func defaultServerConfig() server.Config {
 			"postgres": "postgres",
 		},
 		Extensions: []string{"ducklake"},
+		QueryLog: server.QueryLogConfig{
+			Enabled:              true,
+			FlushInterval:        5 * time.Second,
+			BatchSize:            1000,
+			CompactInterval:      10 * time.Minute,
+			DataInliningRowLimit: 1000,
+		},
 	}
 }
 
@@ -91,6 +99,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	cfg := defaultServerConfig()
+	defaultQueryLog := cfg.QueryLog
 	var workerQueueTimeout time.Duration
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
@@ -265,6 +274,31 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			for _, u := range fileCfg.PassthroughUsers {
 				cfg.PassthroughUsers[u] = true
 			}
+		}
+
+		// Query log configuration
+		if fileCfg.QueryLog.Enabled != nil {
+			cfg.QueryLog.Enabled = *fileCfg.QueryLog.Enabled
+		}
+		if fileCfg.QueryLog.FlushInterval != "" {
+			if d, err := time.ParseDuration(fileCfg.QueryLog.FlushInterval); err == nil {
+				cfg.QueryLog.FlushInterval = d
+			} else {
+				warn("Invalid query_log.flush_interval duration: " + err.Error())
+			}
+		}
+		if fileCfg.QueryLog.BatchSize > 0 {
+			cfg.QueryLog.BatchSize = fileCfg.QueryLog.BatchSize
+		}
+		if fileCfg.QueryLog.CompactInterval != "" {
+			if d, err := time.ParseDuration(fileCfg.QueryLog.CompactInterval); err == nil {
+				cfg.QueryLog.CompactInterval = d
+			} else {
+				warn("Invalid query_log.compact_interval duration: " + err.Error())
+			}
+		}
+		if fileCfg.QueryLog.DataInliningRowLimit > 0 {
+			cfg.QueryLog.DataInliningRowLimit = fileCfg.QueryLog.DataInliningRowLimit
 		}
 
 		if fileCfg.TLS.ACME.Domain != "" {
@@ -506,6 +540,43 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		k8sWorkerImagePullPolicy = v
 	}
 
+	// Query log env vars
+	if v := getenv("DUCKGRES_QUERY_LOG_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.QueryLog.Enabled = b
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_ENABLED: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_FLUSH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.QueryLog.FlushInterval = d
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_FLUSH_INTERVAL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.QueryLog.BatchSize = n
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_BATCH_SIZE: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_COMPACT_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.QueryLog.CompactInterval = d
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_COMPACT_INTERVAL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_DATA_INLINING_ROW_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.QueryLog.DataInliningRowLimit = n
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_DATA_INLINING_ROW_LIMIT: " + err.Error())
+		}
+	}
+
 	if cli.Set["host"] {
 		cfg.Host = cli.Host
 	}
@@ -637,6 +708,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["k8s-worker-image-pull-policy"] {
 		k8sWorkerImagePullPolicy = cli.K8sWorkerImagePullPolicy
 	}
+	if cli.Set["query-log"] {
+		cfg.QueryLog.Enabled = cli.QueryLog
+	}
 
 	// Validate memory_limit format if explicitly set
 	if cfg.MemoryLimit != "" && !server.ValidateMemoryLimit(cfg.MemoryLimit) {
@@ -648,6 +722,19 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cfg.MemoryBudget != "" && !server.ValidateMemoryLimit(cfg.MemoryBudget) {
 		warn("Invalid memory_budget format: " + cfg.MemoryBudget + " (expected e.g. '24GB', '512MB')")
 		cfg.MemoryBudget = "" // fall back to auto-detection
+	}
+
+	if cfg.QueryLog.FlushInterval <= 0 {
+		warn("DUCKGRES_QUERY_LOG_FLUSH_INTERVAL must be > 0; using default")
+		cfg.QueryLog.FlushInterval = defaultQueryLog.FlushInterval
+	}
+	if cfg.QueryLog.BatchSize <= 0 {
+		warn("DUCKGRES_QUERY_LOG_BATCH_SIZE must be > 0; using default")
+		cfg.QueryLog.BatchSize = defaultQueryLog.BatchSize
+	}
+	if cfg.QueryLog.CompactInterval <= 0 {
+		warn("DUCKGRES_QUERY_LOG_COMPACT_INTERVAL must be > 0; using default")
+		cfg.QueryLog.CompactInterval = defaultQueryLog.CompactInterval
 	}
 
 	return resolvedConfig{

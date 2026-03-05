@@ -115,3 +115,14 @@ func GenerateSecretKey() int32 {
 func IsEmptyQuery(query string) bool {
 	return isEmptyQuery(query)
 }
+
+// SetQueryLogger sets the query logger on a Server. Used by the control plane
+// to attach a query logger to the minimal server after creation.
+func SetQueryLogger(s *Server, ql *QueryLogger) {
+	s.queryLogger = ql
+}
+
+// QueryLogger returns the server's query logger (may be nil).
+func (s *Server) QueryLogger() *QueryLogger {
+	return s.queryLogger
+}
