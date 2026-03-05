@@ -35,7 +35,7 @@ func TestJDBCVersionQuery(t *testing.T) {
 
 	t.Run("simple_version", func(t *testing.T) {
 		conn := pgxConnect(t)
-		defer conn.Close(ctx)
+		defer func() { _ = conn.Close(ctx) }()
 
 		var ver string
 		err := conn.QueryRow(ctx, "SELECT version()").Scan(&ver)
@@ -50,7 +50,7 @@ func TestJDBCVersionQuery(t *testing.T) {
 
 	t.Run("version_with_timeout", func(t *testing.T) {
 		conn := pgxConnect(t)
-		defer conn.Close(ctx)
+		defer func() { _ = conn.Close(ctx) }()
 
 		tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -64,7 +64,7 @@ func TestJDBCVersionQuery(t *testing.T) {
 
 	t.Run("repeated_version_same_connection", func(t *testing.T) {
 		conn := pgxConnect(t)
-		defer conn.Close(ctx)
+		defer func() { _ = conn.Close(ctx) }()
 
 		for i := 0; i < 50; i++ {
 			tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -153,7 +153,7 @@ func TestJDBCMetabaseProbeQueries(t *testing.T) {
 	for _, q := range probeQueries {
 		t.Run("extended_"+q.name, func(t *testing.T) {
 			conn := pgxConnect(t)
-			defer conn.Close(ctx)
+			defer func() { _ = conn.Close(ctx) }()
 
 			tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
@@ -229,7 +229,7 @@ func TestJDBCDatabaseMetaDataQueries(t *testing.T) {
 			defer cancel()
 
 			conn := pgxConnect(t)
-			defer conn.Close(ctx)
+			defer func() { _ = conn.Close(ctx) }()
 
 			rows, err := conn.Query(ctx, q.sql)
 			if err != nil {
@@ -253,7 +253,7 @@ func TestJDBCDatabaseMetaDataQueries(t *testing.T) {
 func TestJDBCPreparedStatementReuse(t *testing.T) {
 	ctx := context.Background()
 	conn := pgxConnect(t)
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 
 	// Create table
 	_, err := conn.Exec(ctx, "DROP TABLE IF EXISTS jdbc_prep_test")
