@@ -8,7 +8,8 @@ RUN go mod download
 COPY . .
 ARG VERSION=dev
 ARG COMMIT=unknown
-RUN CGO_ENABLED=1 go build -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
+ARG BUILD_TAGS=""
+RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 
 FROM debian:bookworm-slim
 
@@ -20,6 +21,6 @@ RUN mkdir -p data certs && chown -R duckgres:duckgres /app
 
 USER duckgres
 
-EXPOSE 5432 9090
+EXPOSE 5432 8816 9090
 
 ENTRYPOINT ["/app/duckgres"]

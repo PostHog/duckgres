@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-control-plane
+  namespace: duckgres
+  labels:
+    app: duckgres-control-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: duckgres-control-plane
+  template:
+    metadata:
+      labels:
+        app: duckgres-control-plane
+    spec:
+      serviceAccountName: duckgres-control-plane
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: control-plane
+          # Replace with your duckgres image built with -tags kubernetes
+          image: duckgres:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--mode"
+            - "control-plane"
+            - "--worker-backend"
+            - "remote"
+            - "--k8s-worker-image"
+            - "duckgres:latest"
+            - "--k8s-worker-image-pull-policy"
+            - "Never"
+            - "--k8s-worker-secret"
+            - "duckgres-worker-token"
+            - "--k8s-worker-configmap"
+            - "duckgres-config"
+            - "--cert"
+            - "/certs/server.crt"
+            - "--key"
+            - "/certs/server.key"
+            - "--config"
+            - "/etc/duckgres/duckgres.yaml"
+          ports:
+            - name: pg
+              containerPort: 5432
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/duckgres
+              readOnly: true
+            - name: certs
+              mountPath: /certs
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: config
+          configMap:
+            name: duckgres-config
+        - name: certs
+          emptyDir: {}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres
+  namespace: duckgres
+  labels:
+    app: duckgres-control-plane
+spec:
+  type: ClusterIP
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+      protocol: TCP
+  selector:
+    app: duckgres-control-plane

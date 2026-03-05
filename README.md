@@ -29,6 +29,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - [Architecture](#architecture)
   - [Standalone Mode](#standalone-mode)
   - [Control Plane Mode](#control-plane-mode)
+  - [Remote Worker Backend](#remote-worker-backend)
 - [Two-Tier Query Processing](#two-tier-query-processing)
 - [Supported Features](#supported-features)
 - [Limitations](#limitations)
@@ -593,6 +594,20 @@ When running under **systemd** with `RuntimeDirectory`, ensure `RuntimeDirectory
 # Replace workers one at a time (drains sessions before replacing each worker)
 kill -USR2 <control-plane-pid>
 ```
+
+### Remote Worker Backend
+
+In Kubernetes environments, the control plane can spawn worker pods instead of local processes using `--worker-backend remote`. The control plane creates worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
+
+```bash
+# Build with Kubernetes support
+docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:latest .
+
+# Deploy
+kubectl apply -f k8s/
+```
+
+See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and local development instructions using OrbStack.
 
 ## Two-Tier Query Processing
 
