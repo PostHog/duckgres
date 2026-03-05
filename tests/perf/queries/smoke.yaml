@@ -1,0 +1,22 @@
+name: golden-smoke-v1
+description: Minimal golden query corpus for perf smoke runs.
+seed: 42
+dataset_scale: 1
+targets:
+  - pgwire
+  - flight
+warmup_iterations: 1
+measure_iterations: 2
+queries:
+  - query_id: q_order_count
+    intent_id: intent_order_count
+    tags: [smoke, aggregate]
+    params: {}
+    pgwire_sql: SELECT COUNT(*) AS order_count FROM perf_orders WHERE amount_cents >= 10000
+    duckhog_sql: SELECT COUNT(*) AS order_count FROM perf_orders WHERE amount_cents >= 10000
+  - query_id: q_region_totals
+    intent_id: intent_region_totals
+    tags: [smoke, aggregate]
+    params: {}
+    pgwire_sql: SELECT region, SUM(amount_cents) AS total_amount FROM perf_orders GROUP BY region ORDER BY region
+    duckhog_sql: SELECT region, SUM(amount_cents) AS total_amount FROM perf_orders GROUP BY region ORDER BY region

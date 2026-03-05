@@ -30,6 +30,15 @@ const MaxGRPCMessageSize = 1 << 30 // 1GB
 // ErrWorkerDead is returned when the backing worker process has crashed.
 var ErrWorkerDead = errors.New("flight worker is dead")
 
+// OrderedMapValue represents a DuckDB MAP as parallel key/value slices,
+// preserving insertion order from Arrow MAP arrays. Using parallel slices
+// instead of a Go map avoids panics on non-comparable key types (e.g.,
+// []byte from BLOB keys) and preserves DuckDB's MAP ordering.
+type OrderedMapValue struct {
+	Keys   []any
+	Values []any
+}
+
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.
 type FlightExecutor struct {
@@ -437,6 +446,22 @@ func arrowTypeToDuckDB(dt arrow.DataType) string {
 	case arrow.LIST:
 		elem := dt.(*arrow.ListType).Elem()
 		return arrowTypeToDuckDB(elem) + "[]"
+	case arrow.STRUCT:
+		st := dt.(*arrow.StructType)
+		var buf strings.Builder
+		buf.WriteString("STRUCT(")
+		for i := 0; i < st.NumFields(); i++ {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			f := st.Field(i)
+			fmt.Fprintf(&buf, "%q %s", f.Name, arrowTypeToDuckDB(f.Type))
+		}
+		buf.WriteByte(')')
+		return buf.String()
+	case arrow.MAP:
+		mt := dt.(*arrow.MapType)
+		return fmt.Sprintf("MAP(%s, %s)", arrowTypeToDuckDB(mt.KeyType()), arrowTypeToDuckDB(mt.ItemType()))
 	default:
 		return "VARCHAR"
 	}
@@ -504,6 +529,25 @@ func extractArrowValue(col arrow.Array, row int) interface{} {
 			elems = append(elems, extractArrowValue(child, i))
 		}
 		return elems
+	case *array.Struct:
+		st := arr.DataType().(*arrow.StructType)
+		m := make(map[string]interface{}, st.NumFields())
+		for i := 0; i < st.NumFields(); i++ {
+			m[st.Field(i).Name] = extractArrowValue(arr.Field(i), row)
+		}
+		return m
+	case *array.Map:
+		keys := arr.Keys()
+		items := arr.Items()
+		start, end := arr.ValueOffsets(row)
+		n := int(end - start)
+		ks := make([]any, 0, n)
+		vs := make([]any, 0, n)
+		for i := int(start); i < int(end); i++ {
+			ks = append(ks, extractArrowValue(keys, i))
+			vs = append(vs, extractArrowValue(items, i))
+		}
+		return OrderedMapValue{Keys: ks, Values: vs}
 	default:
 		// Fallback: use String representation
 		return arr.ValueStr(row)

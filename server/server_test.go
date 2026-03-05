@@ -1,10 +1,59 @@
 package server
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type mockRefreshExecer struct {
+	mu            sync.Mutex
+	secretCalls   int
+	rollbackCalls int
+	secretErrFn   func(callNum int) error
+}
+
+func (m *mockRefreshExecer) ExecContext(_ context.Context, query string, _ ...any) (sql.Result, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	trimmed := strings.TrimSpace(strings.ToUpper(query))
+	if trimmed == "ROLLBACK" {
+		m.rollbackCalls++
+		return nil, nil
+	}
+
+	m.secretCalls++
+	if m.secretErrFn != nil {
+		if err := m.secretErrFn(m.secretCalls); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func (m *mockRefreshExecer) calls() (secretCalls, rollbackCalls int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.secretCalls, m.rollbackCalls
+}
+
+func waitForCalls(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for expected refresh calls")
+}
 
 func TestParseExtensionName(t *testing.T) {
 	tests := []struct {
@@ -128,6 +177,111 @@ func TestStartCredentialRefresh_StopsCleanly(t *testing.T) {
 
 	// Stop should not hang or panic
 	stop()
+}
+
+func TestStartCredentialRefresh_WorksWithPinnedConn(t *testing.T) {
+	// Simulate the worker path: MaxOpenConns(1) with the sole connection
+	// pinned via db.Conn(). Passing the pinned *sql.Conn must not deadlock.
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec("INSTALL httpfs"); err != nil {
+		t.Skip("httpfs extension not available:", err)
+	}
+	if _, err := db.Exec("LOAD httpfs"); err != nil {
+		t.Skip("httpfs extension not loadable:", err)
+	}
+
+	// Pin the pool's only connection — exactly what the worker does.
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	cfg := DuckLakeConfig{
+		ObjectStore: "s3://bucket/path/",
+		S3Provider:  "credential_chain",
+	}
+
+	stop := StartCredentialRefresh(conn, cfg)
+
+	// Give the goroutine time to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Stop should not hang or panic
+	stop()
+}
+
+func TestStartCredentialRefresh_DoesNotRollbackDuringActiveTransaction(t *testing.T) {
+	oldInterval := credentialRefreshInterval
+	credentialRefreshInterval = 5 * time.Millisecond
+	defer func() { credentialRefreshInterval = oldInterval }()
+
+	execer := &mockRefreshExecer{
+		secretErrFn: func(_ int) error {
+			return errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		},
+	}
+
+	var txnActive atomic.Bool
+	txnActive.Store(true)
+
+	stop := StartCredentialRefresh(execer, DuckLakeConfig{
+		ObjectStore: "s3://bucket/path/",
+		S3Provider:  "credential_chain",
+	}, txnActive.Load)
+
+	waitForCalls(t, 250*time.Millisecond, func() bool {
+		secretCalls, _ := execer.calls()
+		return secretCalls > 0
+	})
+
+	stop()
+
+	_, rollbackCalls := execer.calls()
+	if rollbackCalls != 0 {
+		t.Fatalf("expected no rollback while transaction is active, got %d", rollbackCalls)
+	}
+}
+
+func TestStartCredentialRefresh_RollbackAndRetryWhenNoActiveTransaction(t *testing.T) {
+	oldInterval := credentialRefreshInterval
+	credentialRefreshInterval = 5 * time.Millisecond
+	defer func() { credentialRefreshInterval = oldInterval }()
+
+	execer := &mockRefreshExecer{
+		secretErrFn: func(callNum int) error {
+			if callNum == 1 {
+				return errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+			}
+			return nil
+		},
+	}
+
+	stop := StartCredentialRefresh(execer, DuckLakeConfig{
+		ObjectStore: "s3://bucket/path/",
+		S3Provider:  "credential_chain",
+	}, func() bool { return false })
+
+	waitForCalls(t, 250*time.Millisecond, func() bool {
+		secretCalls, rollbackCalls := execer.calls()
+		return secretCalls >= 2 && rollbackCalls >= 1
+	})
+
+	stop()
+
+	secretCalls, rollbackCalls := execer.calls()
+	if rollbackCalls == 0 {
+		t.Fatalf("expected rollback before retry when no transaction is active, got %d", rollbackCalls)
+	}
+	if secretCalls < 2 {
+		t.Fatalf("expected retry after rollback, got %d secret executions", secretCalls)
+	}
 }
 
 func TestHasCacheHTTPFS(t *testing.T) {

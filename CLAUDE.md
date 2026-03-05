@@ -171,6 +171,57 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=35437 user=postgres sslmode=requir
 - No replication
 - Some pg_catalog tables are stubs (return empty)
 - Type OID mapping is incomplete (some types show as "unknown")
+- DML RETURNING is not supported via extended query protocol (see below)
+
+## DML RETURNING Detection (conn.go)
+
+DML statements with RETURNING clauses produce result rows but **cannot be described without executing the mutation**. The extended query protocol's Describe step probes schema by executing the query, which would cause unintended side effects. We reject these at Describe time with SQLSTATE `0A000` (feature_not_supported).
+
+### Architecture
+
+Three functions form the detection chain:
+
+- **`scanForReturning(upper, topLevelOnly)`** — SQL-aware lexer that scans for the RETURNING keyword while skipping strings (single-quoted, E-strings, dollar-quoted), double-quoted identifiers, block/line comments, and tracking parenthesis depth.
+- **`containsReturning(upper)`** — wrapper that matches RETURNING at depth 0 only. Used for plain DML (INSERT/UPDATE/DELETE prefix).
+- **`containsReturningAnyDepth(upper)`** — wrapper that matches RETURNING at any depth. Used for WITH-prefixed queries because writable CTEs place RETURNING inside `AS (...)` parens.
+- **`isDMLReturning(query)`** — top-level guard called from `handleDescribe`. Routes to depth-0 or any-depth scanning based on the query prefix.
+
+### Why WITH needs any-depth scanning
+
+In writable CTEs, RETURNING is syntactically required inside the CTE body:
+```sql
+WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d
+--                       ^^^^^^^^^ depth 1, inside AS (...)
+```
+Depth-0-only scanning structurally cannot detect this. The any-depth scan accepts a small false-positive risk (a column literally named `returning` in a CTE) in exchange for preventing mutation during Describe.
+
+### Supporting functions
+
+- **`stripLeadingNoise(query)`** — loops `stripLeadingComments` + `TrimLeft` to handle interleaved parentheses, whitespace, and comments before the query keyword.
+- **`queryReturnsResults(query)`** — determines whether a query produces result rows (SELECT, WITH, VALUES, SHOW, DML RETURNING, etc.). Gates whether Describe attempts schema probing at all.
+
+### Key edge cases with test coverage
+
+| Case | Handling |
+|------|----------|
+| RETURNING inside subquery `(SELECT returning FROM s)` | Skipped (depth > 0 for plain DML) |
+| RETURNING in string literal `'returning'` | Skipped by string scanner |
+| RETURNING in E-string `E'foo\'s RETURNING bar'` | Skipped by backslash-escape-aware scanner |
+| RETURNING in `$$`/`$tag$` dollar-quoted string | Skipped by dollar-quote scanner |
+| RETURNING in `"double-quoted"` identifier | Skipped by identifier scanner |
+| RETURNING in block/line comments | Skipped by comment scanner |
+| `RETURNING*`, `RETURNING(id)`, `RETURNING,col` | Matched (trailing `*`, `(`, `,` accepted) |
+| `RETURNING_ID`, `RETURNINGS` | Not matched (identifier continuation) |
+| Writable CTE with RETURNING in AS (...) | Matched via any-depth scan for WITH prefix |
+| Parenthesized queries with newlines `(\nSELECT 1)` | Handled by `stripLeadingNoise` |
+
+### When modifying this code
+
+- **False negatives are dangerous** — the Describe path executes the query, causing unintended mutations. Err on the side of false positives.
+- **False positives are safe** — the client gets an error but no data corruption. A column named `returning` triggering the guard is acceptable.
+- All detection is heuristic (string scanning). If precision becomes critical, consider using `pg_query_go` AST parsing instead.
+- LIMIT 0 does NOT prevent CTE side effects — PostgreSQL CTEs are optimization fences, so writable CTEs execute even with LIMIT 0.
+- DuckDB does not currently support MERGE. If it adds MERGE RETURNING in the future, add `MERGE` to the prefix check in `isDMLReturning`.
 
 ## TODO Reference
 

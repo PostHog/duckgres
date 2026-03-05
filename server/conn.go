@@ -612,14 +612,31 @@ func (c *clientConn) serve() error {
 func (c *clientConn) handleStartup() error {
 	tlsUpgraded := false
 
+	if err := c.conn.SetReadDeadline(time.Now().Add(startupReadTimeout)); err != nil {
+		return fmt.Errorf("failed to set startup deadline: %w", err)
+	}
+
 	for {
 		params, err := readStartupMessage(c.reader)
 		if err != nil {
 			return err
 		}
 
+		// Handle GSSENCRequest - decline and let client retry with SSL
+		if params["__gssenc_request"] == "true" {
+			slog.Debug("GSSENCRequest received, declining.", "remote_addr", c.conn.RemoteAddr())
+			if _, err := c.conn.Write([]byte("N")); err != nil {
+				return err
+			}
+			continue
+		}
+
 		// Handle SSL request - upgrade to TLS
 		if params["__ssl_request"] == "true" {
+			if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
+				return fmt.Errorf("failed to clear startup deadline: %w", err)
+			}
+
 			// Send 'S' to indicate we support SSL
 			if _, err := c.conn.Write([]byte("S")); err != nil {
 				return err
@@ -627,8 +644,14 @@ func (c *clientConn) handleStartup() error {
 
 			// Upgrade connection to TLS
 			tlsConn := tls.Server(c.conn, c.server.tlsConfig)
+			if err := tlsConn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				return fmt.Errorf("failed to set TLS deadline: %w", err)
+			}
 			if err := tlsConn.Handshake(); err != nil {
 				return fmt.Errorf("TLS handshake failed: %w", err)
+			}
+			if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+				return fmt.Errorf("failed to clear TLS deadline: %w", err)
 			}
 
 			// Replace connection with TLS connection
@@ -664,6 +687,9 @@ func (c *clientConn) handleStartup() error {
 		c.username = params["user"]
 		c.database = params["database"]
 		c.applicationName = params["application_name"]
+
+		slog.Info("Client startup.", "user", c.username, "database", c.database,
+			"application_name", c.applicationName, "remote_addr", c.conn.RemoteAddr())
 
 		if c.username == "" {
 			c.sendError("FATAL", "28000", "no user specified")
@@ -721,12 +747,12 @@ func (c *clientConn) handleStartup() error {
 
 func (c *clientConn) sendInitialParams() {
 	params := map[string]string{
-		"server_version":          "15.0 (Duckgres)",
-		"server_encoding":         "UTF8",
-		"client_encoding":         "UTF8",
-		"DateStyle":               "ISO, MDY",
-		"TimeZone":                "UTC",
-		"integer_datetimes":       "on",
+		"server_version":              "15.0 (Duckgres)",
+		"server_encoding":             "UTF8",
+		"client_encoding":             "UTF8",
+		"DateStyle":                   "ISO, MDY",
+		"TimeZone":                    "UTC",
+		"integer_datetimes":           "on",
 		"standard_conforming_strings": "on",
 	}
 
@@ -964,8 +990,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return c.handleCopy(query, upperQuery)
 	}
 
-	// For non-SELECT queries, use Exec
-	if cmdType != "SELECT" {
+	// For queries that don't return result rows, use Exec
+	if !queryReturnsResults(query) {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
 		// while DuckDB throws an error. Match PostgreSQL behavior.
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
@@ -1015,14 +1041,14 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return nil
 	}
 
-	// Execute SELECT query
-	return c.executeSelectQuery(query)
+	// Execute query that returns results (SELECT, DML RETURNING, etc.)
+	return c.executeSelectQuery(query, cmdType)
 }
 
 // executeQueryDirect executes a query directly against DuckDB without any transpilation.
 // Used for passthrough users who send DuckDB-native SQL.
 func (c *clientConn) executeQueryDirect(query, cmdType string) error {
-	if cmdType != "SELECT" {
+	if !queryReturnsResults(query) {
 		// Handle nested BEGIN
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
@@ -1057,12 +1083,12 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		return nil
 	}
 
-	return c.executeSelectQuery(query)
+	return c.executeSelectQuery(query, cmdType)
 }
 
-// executeSelectQuery runs a SELECT query against DuckDB and streams results to the client.
+// executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.
-func (c *clientConn) executeSelectQuery(query string) error {
+func (c *clientConn) executeSelectQuery(query string, cmdType string) error {
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
@@ -1143,7 +1169,8 @@ func (c *clientConn) executeSelectQuery(query string) error {
 		return nil
 	}
 
-	tag := fmt.Sprintf("SELECT %d", rowCount)
+	c.updateTxStatus(cmdType)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
@@ -1380,7 +1407,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return true, nil
 	}
 
-	if cmdType != "SELECT" {
+	if !queryReturnsResults(executedQuery) {
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
 			_ = writeCommandComplete(c.writer, "BEGIN")
@@ -1480,7 +1507,8 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		rowCount++
 	}
 
-	tag := fmt.Sprintf("SELECT %d", rowCount)
+	c.updateTxStatus(cmdType)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 	return false, nil
 }
@@ -1510,7 +1538,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 	// If already in a transaction, skip our BEGIN/COMMIT wrapper
 	if hasOurTransaction && c.txStatus == txStatusTransaction {
-		statements = statements[1:] // Strip BEGIN
+		statements = statements[1:]        // Strip BEGIN
 		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
@@ -1537,8 +1565,8 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	cmdType := c.getCommandType(upperFinal)
 	slog.Debug("Multi-stmt final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
 
-	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
-		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
+	if queryReturnsResults(finalStmt) {
+		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt)
 		if err != nil {
 			slog.Error("Multi-stmt final query error.", "user", c.username, "query", finalStmt, "error", err)
@@ -1559,7 +1587,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		return c.streamRowsToClient(rows, cmdType, finalStmt)
 
 	} else {
-		// DML (INSERT/UPDATE/DELETE): execute then cleanup
+		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt)
 		if err != nil {
 			slog.Error("Multi-stmt final exec error.", "user", c.username, "query", finalStmt, "error", err)
@@ -1612,8 +1640,8 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	// If already in a transaction, skip our BEGIN/COMMIT wrapper
 	if hasOurTransaction && c.txStatus == txStatusTransaction {
-		statements = statements[1:]            // Strip BEGIN
-		cleanup = cleanup[:len(cleanup)-1]     // Strip COMMIT from cleanup
+		statements = statements[1:]        // Strip BEGIN
+		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
 	// Execute setup statements (all but last)
@@ -1637,8 +1665,8 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	cmdType := c.getCommandType(upperFinal)
 	slog.Debug("Multi-stmt-ext final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
 
-	if cmdType == "SELECT" || strings.HasPrefix(upperFinal, "WITH") || strings.HasPrefix(upperFinal, "TABLE") {
-		// SELECT: obtain cursor FIRST, cleanup SECOND, stream THIRD
+	if queryReturnsResults(finalStmt) {
+		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
 			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "query", finalStmt, "error", err)
@@ -1656,7 +1684,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalStmt)
 
 	} else {
-		// DML (INSERT/UPDATE/DELETE): execute then cleanup
+		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
 			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "query", finalStmt, "error", err)
@@ -1743,7 +1771,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 	}
 
 	// Send completion (no ReadyForQuery - that's done by Sync)
-	tag := fmt.Sprintf("SELECT %d", rowCount)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 }
 
@@ -1820,7 +1848,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 	}
 
 	// Send completion
-	tag := fmt.Sprintf("%s %d", cmdType, rowCount)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	return c.writer.Flush()
@@ -1883,6 +1911,20 @@ func stripLeadingComments(query string) string {
 	}
 }
 
+// stripLeadingNoise strips leading whitespace, comments, and parentheses from
+// a query string in a loop until none remain. This handles cases like
+// "(/* comment */ SELECT 1)" where comments are interleaved with parens.
+func stripLeadingNoise(query string) string {
+	for {
+		prev := query
+		query = stripLeadingComments(query)
+		query = strings.TrimLeft(query, "( \t\n\r")
+		if query == prev {
+			return query
+		}
+	}
+}
+
 // describeSupportsLimit returns true if the (uppercased) query supports a LIMIT clause.
 // SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL etc. do not.
 func describeSupportsLimit(upper string) bool {
@@ -1897,13 +1939,13 @@ func describeSupportsLimit(upper string) bool {
 // queryReturnsResults checks if a SQL query returns a result set.
 // This is used to determine whether to send RowDescription or NoData.
 func queryReturnsResults(query string) bool {
-	upper := strings.ToUpper(stripLeadingComments(query))
+	upper := strings.ToUpper(stripLeadingNoise(query))
 	// SELECT is the most common
 	if strings.HasPrefix(upper, "SELECT") {
 		return true
 	}
 	// WITH ... SELECT (CTEs)
-	if strings.HasPrefix(upper, "WITH") {
+	if strings.HasPrefix(upper, "WITH") && (len(upper) == 4 || isWSChar(upper[4]) || upper[4] == '/' || upper[4] == '-') {
 		return true
 	}
 	// VALUES clause returns rows
@@ -1938,12 +1980,449 @@ func queryReturnsResults(query string) bool {
 	if strings.HasPrefix(upper, "FROM") {
 		return true
 	}
+	// DML with RETURNING clause produces result rows.
+	// Check for RETURNING preceded by any whitespace (space, newline, tab).
+	if (strings.HasPrefix(upper, "INSERT") ||
+		strings.HasPrefix(upper, "UPDATE") ||
+		strings.HasPrefix(upper, "DELETE")) &&
+		containsReturning(upper) {
+		return true
+	}
 	return false
+}
+
+// containsReturning checks if an uppercased SQL string contains a top-level
+// RETURNING keyword at parenthesis depth 0. It skips content inside
+// parentheses, single-quoted strings (including E-string backslash escapes),
+// dollar-quoted strings, double-quoted identifiers, and SQL comments to avoid
+// false positives.
+func containsReturning(upper string) bool {
+	return scanForReturning(upper, true)
+}
+
+// containsReturningAnyDepth is like containsReturning but matches RETURNING at
+// any parenthesis depth. This is needed for WITH-prefixed queries (writable
+// CTEs) where the RETURNING clause is structurally inside AS (...) parens.
+func containsReturningAnyDepth(upper string) bool {
+	return scanForReturning(upper, false)
+}
+
+// scanForReturning is the shared SQL-aware lexer for RETURNING detection.
+// When topLevelOnly is true, RETURNING is only matched at parenthesis depth 0.
+// When false, RETURNING is matched at any depth (for writable CTE detection).
+// In both modes, content inside strings, identifiers, and comments is skipped.
+func scanForReturning(upper string, topLevelOnly bool) bool {
+	depth := 0
+	i := 0
+	for i < len(upper) {
+		switch upper[i] {
+		case '(':
+			depth++
+			i++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+
+		case '\'':
+			// Single-quoted string literal.
+			// Check for E-string prefix (E'...' with backslash escaping).
+			estring := i > 0 && upper[i-1] == 'E'
+			i++
+			for i < len(upper) {
+				if upper[i] == '\'' {
+					i++
+					if i < len(upper) && upper[i] == '\'' {
+						i++ // '' escape (works in both normal and E-strings)
+						continue
+					}
+					break
+				}
+				if estring && upper[i] == '\\' {
+					i++ // skip escaped character in E-string
+					if i < len(upper) {
+						i++
+					}
+					continue
+				}
+				i++
+			}
+
+		case '"':
+			// Double-quoted identifier — skip to closing quote.
+			i++
+			for i < len(upper) {
+				if upper[i] == '"' {
+					i++
+					if i < len(upper) && upper[i] == '"' {
+						i++ // "" escape
+						continue
+					}
+					break
+				}
+				i++
+			}
+
+		case '$':
+			// Dollar-quoted string: $tag$...$tag$ or $$...$$
+			if tag, ok := parseDollarTag(upper, i); ok {
+				i += len(tag) // skip opening tag
+				for i+len(tag) <= len(upper) {
+					if upper[i] == '$' && upper[i:i+len(tag)] == tag {
+						i += len(tag) // skip closing tag
+						break
+					}
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case '-':
+			// Line comment: -- ... \n
+			if i+1 < len(upper) && upper[i+1] == '-' {
+				i += 2
+				for i < len(upper) && upper[i] != '\n' {
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case '/':
+			// Block comment: /* ... */
+			if i+1 < len(upper) && upper[i+1] == '*' {
+				i += 2
+				for i+1 < len(upper) {
+					if upper[i] == '*' && upper[i+1] == '/' {
+						i += 2
+						break
+					}
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case 'R':
+			if (!topLevelOnly || depth == 0) && i+9 <= len(upper) && upper[i:i+9] == "RETURNING" {
+				// Check preceded by whitespace
+				if i > 0 && isWSChar(upper[i-1]) {
+					// Check followed by end-of-string or a non-identifier character
+					end := i + 9
+					if end >= len(upper) || isReturningTrailer(upper[end]) {
+						return true
+					}
+				}
+			}
+			i++
+
+		default:
+			i++
+		}
+	}
+	return false
+}
+
+// parseDollarTag extracts a dollar-quote tag starting at position i.
+// Returns the full tag (e.g., "$$" or "$tag$") and true, or ("", false).
+func parseDollarTag(s string, i int) (string, bool) {
+	if i >= len(s) || s[i] != '$' {
+		return "", false
+	}
+	j := i + 1
+	// Tag is $[identifier]$ where identifier is [A-Z_0-9] (already uppercased).
+	for j < len(s) {
+		if s[j] == '$' {
+			return s[i : j+1], true
+		}
+		c := s[j]
+		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			j++
+			continue
+		}
+		return "", false // invalid tag character
+	}
+	return "", false
+}
+
+// isWSChar reports whether c is an ASCII whitespace character.
+func isWSChar(c byte) bool {
+	return c == ' ' || c == '\n' || c == '\t' || c == '\r'
+}
+
+// isReturningTrailer reports whether c is a valid character immediately after
+// the RETURNING keyword (i.e., not a continuation of an identifier).
+func isReturningTrailer(c byte) bool {
+	return c == ' ' || c == '\n' || c == '\t' || c == '\r' ||
+		c == ';' || c == '*' || c == '(' || c == ',' ||
+		c == '"' || // double-quoted identifier: RETURNING"col"
+		c == '-' || // line comment: RETURNING-- comment
+		c == '/' || // block comment: RETURNING/* comment */
+		c == '$' // dollar-quoted: RETURNING$tag$expr$tag$
+}
+
+// isDMLReturning reports whether query is a DML statement (INSERT/UPDATE/DELETE)
+// with a RETURNING clause, or a writable CTE (WITH ... DML ... RETURNING).
+// Such statements produce result rows but cannot be described without executing
+// the mutation.
+//
+// For WITH-prefixed queries, RETURNING is matched at any parenthesis depth
+// because writable CTEs place the RETURNING clause inside AS (...), making
+// depth-0-only matching structurally unable to detect them.
+func isDMLReturning(query string) bool {
+	upper := strings.ToUpper(stripLeadingNoise(query))
+	switch {
+	case strings.HasPrefix(upper, "INSERT"),
+		strings.HasPrefix(upper, "UPDATE"),
+		strings.HasPrefix(upper, "DELETE"):
+		return containsReturning(upper)
+	case strings.HasPrefix(upper, "WITH") && (len(upper) == 4 || isWSChar(upper[4]) || upper[4] == '/' || upper[4] == '-'):
+		return containsReturningAnyDepth(upper)
+	default:
+		return false
+	}
+}
+
+// isWithDML reports whether a query is a WITH (CTE) whose outer statement is
+// DML (INSERT/UPDATE/DELETE). Such queries don't return results (unless they
+// have a RETURNING clause, handled separately by isDMLReturning) and must not
+// be executed during Describe to avoid unintended mutations.
+func isWithDML(query string) bool {
+	upper := strings.ToUpper(stripLeadingNoise(query))
+	outer := outerStatementOfCTE(upper)
+	if outer == "" {
+		return false
+	}
+	return strings.HasPrefix(outer, "INSERT") ||
+		strings.HasPrefix(outer, "UPDATE") ||
+		strings.HasPrefix(outer, "DELETE")
+}
+
+// skipBalancedParens advances past a parenthesized group in an uppercased SQL
+// string. i must point to the character immediately after the opening '('.
+// It tracks paren depth while correctly skipping SQL constructs that may
+// contain literal parentheses: single-quoted strings (including ” escapes and
+// E-string backslash escapes), double-quoted identifiers, dollar-quoted strings,
+// line comments (--), and block comments (/* */).
+// Returns the position immediately after the matching ')'.
+func skipBalancedParens(upper string, i int) int {
+	depth := 1
+	for i < len(upper) && depth > 0 {
+		switch upper[i] {
+		case '(':
+			depth++
+			i++
+		case ')':
+			depth--
+			i++
+
+		case '\'':
+			// Single-quoted string; handle E-string prefix and '' escapes.
+			estring := i > 0 && upper[i-1] == 'E'
+			i++
+			for i < len(upper) {
+				if upper[i] == '\'' {
+					i++
+					if i < len(upper) && upper[i] == '\'' {
+						i++
+						continue
+					}
+					break
+				}
+				if estring && upper[i] == '\\' {
+					i++
+					if i < len(upper) {
+						i++
+					}
+					continue
+				}
+				i++
+			}
+
+		case '"':
+			// Double-quoted identifier.
+			i++
+			for i < len(upper) {
+				if upper[i] == '"' {
+					i++
+					if i < len(upper) && upper[i] == '"' {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+
+		case '$':
+			// Dollar-quoted string.
+			if tag, ok := parseDollarTag(upper, i); ok {
+				i += len(tag)
+				for i+len(tag) <= len(upper) {
+					if upper[i] == '$' && upper[i:i+len(tag)] == tag {
+						i += len(tag)
+						break
+					}
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case '-':
+			// Line comment: -- ... \n
+			if i+1 < len(upper) && upper[i+1] == '-' {
+				i += 2
+				for i < len(upper) && upper[i] != '\n' {
+					i++
+				}
+			} else {
+				i++
+			}
+
+		case '/':
+			// Block comment: /* ... */
+			if i+1 < len(upper) && upper[i+1] == '*' {
+				i += 2
+				for i+1 < len(upper) {
+					if upper[i] == '*' && upper[i+1] == '/' {
+						i += 2
+						break
+					}
+					i++
+				}
+			} else {
+				i++
+			}
+
+		default:
+			i++
+		}
+	}
+	return i
+}
+
+// skipWhitespaceAndComments advances i past any whitespace, line comments (--),
+// and block comments (/* */) in an uppercased SQL string. Returns the new position.
+func skipWhitespaceAndComments(upper string, i int) int {
+	for i < len(upper) {
+		if isWSChar(upper[i]) {
+			i++
+		} else if i+1 < len(upper) && upper[i] == '-' && upper[i+1] == '-' {
+			i += 2
+			for i < len(upper) && upper[i] != '\n' {
+				i++
+			}
+		} else if i+1 < len(upper) && upper[i] == '/' && upper[i+1] == '*' {
+			i += 2
+			for i+1 < len(upper) {
+				if upper[i] == '*' && upper[i+1] == '/' {
+					i += 2
+					break
+				}
+				i++
+			}
+		} else {
+			break
+		}
+	}
+	return i
+}
+
+// outerStatementOfCTE returns the portion of an uppercased query after all CTE
+// definitions, or "" if the query doesn't start with WITH.
+// For "WITH a AS (...) SELECT ...", it returns "SELECT ...".
+func outerStatementOfCTE(upper string) string {
+	if !strings.HasPrefix(upper, "WITH") || (len(upper) > 4 && !isWSChar(upper[4]) && upper[4] != '/' && upper[4] != '-') {
+		return ""
+	}
+
+	// Skip past "WITH" (and optional "RECURSIVE")
+	i := 4 // len("WITH")
+	i = skipWhitespaceAndComments(upper, i)
+	if i+9 <= len(upper) && upper[i:i+9] == "RECURSIVE" && (i+9 >= len(upper) || isWSChar(upper[i+9]) || upper[i+9] == '/' || upper[i+9] == '-') {
+		i += 9
+		i = skipWhitespaceAndComments(upper, i)
+	}
+
+	// Skip CTE definitions: name AS (...) [, name AS (...)]
+	for i < len(upper) {
+		// Skip CTE name (identifier or quoted identifier)
+		if i < len(upper) && upper[i] == '"' {
+			i++
+			for i < len(upper) {
+				if upper[i] == '"' {
+					i++
+					if i < len(upper) && upper[i] == '"' {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+		} else {
+			for i < len(upper) && !isWSChar(upper[i]) && upper[i] != '(' && upper[i] != '/' && upper[i] != '-' {
+				i++
+			}
+		}
+
+		i = skipWhitespaceAndComments(upper, i)
+
+		// Skip optional column alias list: cte (col1, col2) AS (...)
+		if i < len(upper) && upper[i] == '(' {
+			// Only treat as column list if "AS" follows the closing paren.
+			// Peek ahead to distinguish column list from CTE body (when AS is missing).
+			saved := i
+			i = skipBalancedParens(upper, i+1)
+			i = skipWhitespaceAndComments(upper, i)
+			if i+2 > len(upper) || upper[i:i+2] != "AS" || (i+2 < len(upper) && !isWSChar(upper[i+2]) && upper[i+2] != '(') {
+				// No AS after parens — this wasn't a column list, restore position.
+				i = saved
+			}
+		}
+
+		// Expect "AS"
+		if i+2 <= len(upper) && upper[i:i+2] == "AS" && (i+2 >= len(upper) || isWSChar(upper[i+2]) || upper[i+2] == '(' || upper[i+2] == '/' || upper[i+2] == '-') {
+			i += 2
+			i = skipWhitespaceAndComments(upper, i)
+		}
+
+		// Skip the CTE body: balanced parentheses with SQL-aware scanning
+		// to correctly handle parens inside strings, comments, and identifiers.
+		if i < len(upper) && upper[i] == '(' {
+			i = skipBalancedParens(upper, i+1)
+		}
+
+		i = skipWhitespaceAndComments(upper, i)
+
+		// If there's a comma, another CTE definition follows
+		if i < len(upper) && upper[i] == ',' {
+			i++
+			i = skipWhitespaceAndComments(upper, i)
+			continue
+		}
+
+		// Otherwise, we've reached the outer statement
+		break
+	}
+
+	return upper[i:]
 }
 
 func (c *clientConn) getCommandType(upperQuery string) string {
 	// Strip leading comments like /*Fivetran*/ before checking command type
 	upperQuery = stripLeadingComments(upperQuery)
+
+	// For WITH (CTE) queries, determine command type from the outer statement.
+	// e.g. "WITH cte AS (...) INSERT INTO t ..." → "INSERT"
+	if strings.HasPrefix(upperQuery, "WITH") && (len(upperQuery) == 4 || isWSChar(upperQuery[4]) || upperQuery[4] == '/' || upperQuery[4] == '-') {
+		if outer := outerStatementOfCTE(upperQuery); outer != "" {
+			return c.getCommandType(outer)
+		}
+	}
 
 	switch {
 	case strings.HasPrefix(upperQuery, "SELECT"):
@@ -2025,6 +2504,21 @@ func (c *clientConn) setTxError() {
 	}
 }
 
+// buildCommandTagFromRowCount builds a command tag from a command type and row count.
+// Used when results are streamed via Query (e.g., DML RETURNING) rather than Exec.
+func buildCommandTagFromRowCount(cmdType string, rowCount int64) string {
+	switch cmdType {
+	case "INSERT":
+		return fmt.Sprintf("INSERT 0 %d", rowCount)
+	case "UPDATE":
+		return fmt.Sprintf("UPDATE %d", rowCount)
+	case "DELETE":
+		return fmt.Sprintf("DELETE %d", rowCount)
+	default:
+		return fmt.Sprintf("SELECT %d", rowCount)
+	}
+}
+
 func (c *clientConn) buildCommandTag(cmdType string, result ExecResult) string {
 	switch cmdType {
 	case "INSERT":
@@ -2093,7 +2587,7 @@ func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
 
 	opts := &CopyFromOptions{
 		TableName:  stripPublicSchema(matches[1]),
-		Delimiter:  "\t", // Default PostgreSQL text format delimiter
+		Delimiter:  "\t",  // Default PostgreSQL text format delimiter
 		NullString: "\\N", // Default PostgreSQL null representation
 	}
 
@@ -3006,6 +3500,8 @@ func (c *clientConn) formatCopyValue(v interface{}) string {
 		return formatArrayValue(val)
 	case map[string]any:
 		return formatMapValue(val)
+	case OrderedMapValue:
+		return formatOrderedMapValue(val)
 	default:
 		return fmt.Sprintf("%v", val)
 	}
@@ -3199,6 +3695,8 @@ func formatValue(v interface{}) string {
 	case map[string]any:
 		// STRUCT text format: {"key1": val1, "key2": val2}
 		return formatMapValue(val)
+	case OrderedMapValue:
+		return formatOrderedMapValue(val)
 	default:
 		// For other types, try to convert to string
 		return fmt.Sprintf("%v", val)
@@ -3305,7 +3803,8 @@ func needsArrayQuoting(s string) bool {
 	return false
 }
 
-// formatMapValue formats a map[string]any as a key-value text representation
+// formatMapValue formats a map[string]any as a key-value text representation.
+// Used for STRUCT values extracted from Arrow (keys are field names → always strings).
 func formatMapValue(m map[string]any) string {
 	var buf strings.Builder
 	buf.WriteByte('{')
@@ -3318,6 +3817,23 @@ func formatMapValue(m map[string]any) string {
 		buf.WriteString(k)
 		buf.WriteString("=")
 		buf.WriteString(formatValue(v))
+	}
+	buf.WriteByte('}')
+	return buf.String()
+}
+
+// formatOrderedMapValue formats an OrderedMapValue as a key-value text
+// representation, preserving the original insertion order from the Arrow array.
+func formatOrderedMapValue(m OrderedMapValue) string {
+	var buf strings.Builder
+	buf.WriteByte('{')
+	for i, k := range m.Keys {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(formatValue(k))
+		buf.WriteString("=")
+		buf.WriteString(formatValue(m.Values[i]))
 	}
 	buf.WriteByte('}')
 	return buf.String()
@@ -3513,8 +4029,8 @@ func (c *clientConn) handleParse(body []byte) {
 	delete(c.stmts, stmtName)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:             query,             // Keep original for logging and Describe
-		convertedQuery:    result.SQL,        // Transpiled SQL for execution
+		query:             query,      // Keep original for logging and Describe
+		convertedQuery:    result.SQL, // Transpiled SQL for execution
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
 		isIgnoredSet:      result.IsIgnoredSet,
@@ -3703,6 +4219,22 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
+		// DML with RETURNING cannot be described without executing the mutation.
+		// Reject with an explicit error so clients don't desync (e.g., lib/pq
+		// would use Exec-like handling after NoData, silently dropping rows).
+		if isDMLReturning(ps.query) {
+			c.sendError("ERROR", "0A000", "DML with RETURNING clause cannot be described without executing the mutation; use simple query protocol or skip the Describe step")
+			return
+		}
+
+		// WITH + DML (no RETURNING) doesn't return results but queryReturnsResults
+		// returns true for all WITH-prefixed queries. Send NoData to avoid executing
+		// the mutation during schema probing.
+		if isWithDML(ps.query) {
+			_ = writeNoData(c.writer)
+			return
+		}
+
 		// For SELECT, we need to describe the result columns
 		// The cleanest approach is to add a "WHERE false" or "LIMIT 0" clause
 		// to get column info without actually running the query
@@ -3792,6 +4324,21 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
+		// DML with RETURNING cannot be described without executing the mutation.
+		// Reject with an explicit error so clients don't desync.
+		if isDMLReturning(p.stmt.query) {
+			c.sendError("ERROR", "0A000", "DML with RETURNING clause cannot be described without executing the mutation; use simple query protocol or skip the Describe step")
+			return
+		}
+
+		// WITH + DML (no RETURNING) doesn't return results but queryReturnsResults
+		// returns true for all WITH-prefixed queries. Send NoData to avoid executing
+		// the mutation during schema probing.
+		if isWithDML(p.stmt.query) {
+			_ = writeNoData(c.writer)
+			return
+		}
+
 		// For SELECT, we need to describe the result columns
 		// We'll do a trial query with LIMIT 0 to get column info
 		args, err := p.decodeParams()
@@ -3801,8 +4348,14 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// Try to get column info
-		rows, err := c.executor.Query(p.stmt.convertedQuery, args...)
+		// Try to get column info without fully executing expensive queries.
+		describeQuery := strings.TrimRight(strings.TrimSpace(p.stmt.convertedQuery), ";")
+		upperDesc := strings.ToUpper(describeQuery)
+		if !strings.Contains(upperDesc, "LIMIT") && describeSupportsLimit(upperDesc) {
+			describeQuery = describeQuery + " LIMIT 0"
+		}
+
+		rows, err := c.executor.Query(describeQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
 			_ = writeNoData(c.writer)
@@ -4021,7 +4574,19 @@ func (c *clientConn) handleExecute(body []byte) {
 		rowCount++
 	}
 
-	tag := fmt.Sprintf("SELECT %d", rowCount)
+	if err := rows.Err(); err != nil {
+		if isQueryCancelled(err) {
+			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		} else {
+			slog.Error("Row iteration error.", "user", c.username, "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+		}
+		c.setTxError()
+		return
+	}
+
+	c.updateTxStatus(cmdType)
+	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
 }
 
@@ -4176,14 +4741,16 @@ func isFetchForwardOnly(dir pg_query.FetchDirection) bool {
 }
 
 // pgCursorsLiteralRegex matches pg_cursors queries with a literal name value:
-//   SELECT 1 FROM pg_cursors WHERE name = 'cursor_name'
-//   SELECT 1 FROM pg_catalog.pg_cursors WHERE name = 'cursor_name'
+//
+//	SELECT 1 FROM pg_cursors WHERE name = 'cursor_name'
+//	SELECT 1 FROM pg_catalog.pg_cursors WHERE name = 'cursor_name'
 var pgCursorsLiteralRegex = regexp.MustCompile(
 	`(?i)^\s*SELECT\s+.+\s+FROM\s+(?:pg_catalog\s*\.\s*)?pg_cursors\s+WHERE\s+name\s*=\s*'([^']*)'`,
 )
 
 // pgCursorsParamRegex matches pg_cursors queries with a parameterized name:
-//   SELECT 1 FROM pg_cursors WHERE name = $1
+//
+//	SELECT 1 FROM pg_cursors WHERE name = $1
 var pgCursorsParamRegex = regexp.MustCompile(
 	`(?i)^\s*SELECT\s+.+\s+FROM\s+(?:pg_catalog\s*\.\s*)?pg_cursors\s+WHERE\s+name\s*=\s*\$1\s*$`,
 )
@@ -4292,27 +4859,27 @@ var pgStatActivityColumns = []struct {
 	oid     int32
 	typSize int16
 }{
-	{"datid", 23, 4},              // int4
-	{"datname", 25, -1},           // text
-	{"pid", 23, 4},                // int4
-	{"usesysid", 23, 4},           // int4
-	{"usename", 25, -1},           // text
-	{"application_name", 25, -1},  // text
-	{"client_addr", 25, -1},       // text (inet in PG, text here)
-	{"client_port", 23, 4},        // int4
-	{"backend_start", 1184, 8},    // timestamptz
-	{"xact_start", 1184, 8},       // timestamptz (NULL)
-	{"query_start", 1184, 8},      // timestamptz (NULL)
-	{"state_change", 1184, 8},     // timestamptz (NULL)
-	{"wait_event_type", 25, -1},   // text (NULL)
-	{"wait_event", 25, -1},        // text (NULL)
-	{"state", 25, -1},             // text
-	{"backend_xid", 28, 4},        // xid (NULL)
-	{"backend_xmin", 28, 4},       // xid (NULL)
-	{"query", 25, -1},             // text
-	{"backend_type", 25, -1},      // text
-	{"leader_pid", 23, 4},         // int4 (NULL)
-	{"worker_id", 23, 4},          // int4 (duckgres extension)
+	{"datid", 23, 4},             // int4
+	{"datname", 25, -1},          // text
+	{"pid", 23, 4},               // int4
+	{"usesysid", 23, 4},          // int4
+	{"usename", 25, -1},          // text
+	{"application_name", 25, -1}, // text
+	{"client_addr", 25, -1},      // text (inet in PG, text here)
+	{"client_port", 23, 4},       // int4
+	{"backend_start", 1184, 8},   // timestamptz
+	{"xact_start", 1184, 8},      // timestamptz (NULL)
+	{"query_start", 1184, 8},     // timestamptz (NULL)
+	{"state_change", 1184, 8},    // timestamptz (NULL)
+	{"wait_event_type", 25, -1},  // text (NULL)
+	{"wait_event", 25, -1},       // text (NULL)
+	{"state", 25, -1},            // text
+	{"backend_xid", 28, 4},       // xid (NULL)
+	{"backend_xmin", 28, 4},      // xid (NULL)
+	{"query", 25, -1},            // text
+	{"backend_type", 25, -1},     // text
+	{"leader_pid", 23, 4},        // int4 (NULL)
+	{"worker_id", 23, 4},         // int4 (duckgres extension)
 }
 
 // pgStatActivityTypeOIDs is precomputed from pgStatActivityColumns to avoid per-row allocation.
@@ -4368,12 +4935,12 @@ func (c *clientConn) sendPgStatActivityRowDescription() error {
 	for _, col := range pgStatActivityColumns {
 		buf.WriteString(col.name)
 		buf.WriteByte(0)
-		_ = binary.Write(&buf, binary.BigEndian, int32(0))       // table OID
-		_ = binary.Write(&buf, binary.BigEndian, int16(0))       // column attr
-		_ = binary.Write(&buf, binary.BigEndian, col.oid)        // type OID
-		_ = binary.Write(&buf, binary.BigEndian, col.typSize)    // type size
-		_ = binary.Write(&buf, binary.BigEndian, int32(-1))      // typmod
-		_ = binary.Write(&buf, binary.BigEndian, int16(0))       // text format
+		_ = binary.Write(&buf, binary.BigEndian, int32(0))    // table OID
+		_ = binary.Write(&buf, binary.BigEndian, int16(0))    // column attr
+		_ = binary.Write(&buf, binary.BigEndian, col.oid)     // type OID
+		_ = binary.Write(&buf, binary.BigEndian, col.typSize) // type size
+		_ = binary.Write(&buf, binary.BigEndian, int32(-1))   // typmod
+		_ = binary.Write(&buf, binary.BigEndian, int16(0))    // text format
 	}
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
 }
@@ -4411,27 +4978,27 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 	}
 
 	values := []interface{}{
-		int32(0),                // datid
-		conn.database,           // datname
-		conn.pid,                // pid
-		int32(10),               // usesysid
-		conn.username,           // usename
-		conn.applicationName,    // application_name
-		clientAddr,              // client_addr
-		clientPort,              // client_port
-		conn.backendStart,       // backend_start
-		nil,                     // xact_start (NULL)
-		nil,                     // query_start (NULL)
-		nil,                     // state_change (NULL)
-		nil,                     // wait_event_type (NULL)
-		nil,                     // wait_event (NULL)
-		state,                   // state
-		nil,                     // backend_xid (NULL)
-		nil,                     // backend_xmin (NULL)
-		q,                       // query
-		"client backend",        // backend_type
-		nil,                     // leader_pid (NULL)
-		int32(conn.workerID),    // worker_id
+		int32(0),             // datid
+		conn.database,        // datname
+		conn.pid,             // pid
+		int32(10),            // usesysid
+		conn.username,        // usename
+		conn.applicationName, // application_name
+		clientAddr,           // client_addr
+		clientPort,           // client_port
+		conn.backendStart,    // backend_start
+		nil,                  // xact_start (NULL)
+		nil,                  // query_start (NULL)
+		nil,                  // state_change (NULL)
+		nil,                  // wait_event_type (NULL)
+		nil,                  // wait_event (NULL)
+		state,                // state
+		nil,                  // backend_xid (NULL)
+		nil,                  // backend_xmin (NULL)
+		q,                    // query
+		"client backend",     // backend_type
+		nil,                  // leader_pid (NULL)
+		int32(conn.workerID), // worker_id
 	}
 
 	return c.sendDataRowWithFormats(values, formatCodes, pgStatActivityTypeOIDs)

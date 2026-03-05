@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -78,6 +79,70 @@ func metricCounterValue(t *testing.T, metricName string) float64 {
 	return 0
 }
 
+func metricCounterValueByLabel(t *testing.T, metricName string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_COUNTER {
+			t.Fatalf("metric %q is not a counter", metricName)
+		}
+		var total float64
+		for _, metric := range fam.GetMetric() {
+			if metricLabelsMatch(metric, labels) {
+				total += metric.GetCounter().GetValue()
+			}
+		}
+		return total
+	}
+	return 0
+}
+
+func metricHistogramCountByLabel(t *testing.T, metricName string, labels map[string]string) uint64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_HISTOGRAM {
+			t.Fatalf("metric %q is not a histogram", metricName)
+		}
+		var total uint64
+		for _, metric := range fam.GetMetric() {
+			if metricLabelsMatch(metric, labels) {
+				total += metric.GetHistogram().GetSampleCount()
+			}
+		}
+		return total
+	}
+	return 0
+}
+
+func metricLabelsMatch(metric *dto.Metric, labels map[string]string) bool {
+	for k, v := range labels {
+		found := false
+		for _, lp := range metric.GetLabel() {
+			if lp.GetName() == k && lp.GetValue() == v {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 func authContextForPeer(addr net.Addr, username, password string) context.Context {
 	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 	base := peer.NewContext(context.Background(), &peer.Peer{Addr: addr})
@@ -93,7 +158,7 @@ func testFlightHandlerWithStoreAndRateLimiter(t *testing.T, users map[string]str
 		sessions:      make(map[string]*flightClientSession),
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 1234, nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -224,7 +289,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithoutBasicAuth(t *te
 
 func TestSessionFromContextRejectsUnknownSessionTokenEvenWithBasicAuth(t *testing.T) {
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 9876, nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -279,6 +344,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithBasicAuth(t *testi
 	}
 	if got == nil {
 		t.Fatalf("expected non-nil session")
+		return
 	}
 	if got.username != "postgres" {
 		t.Fatalf("expected postgres session, got %q", got.username)
@@ -326,7 +392,7 @@ func TestSessionFromContextTokenPathDoesNotClearRateLimiterFailures(t *testing.T
 func TestSessionFromContextWithoutTokenCreatesDistinctSessions(t *testing.T) {
 	var createCalls atomic.Int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return createCalls.Add(1), nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -478,7 +544,7 @@ func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T
 		idleTTL:       time.Minute,
 		handleIdleTTL: time.Minute,
 		tokenTTL:      time.Hour,
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 1234, nil, nil
 		},
 		destroySessionFn: func(pid int32) {
@@ -643,7 +709,7 @@ func TestCloseSessionRevokesTokenAndDestroysWorker(t *testing.T) {
 func TestCloseSessionMissingTokenDoesNotBootstrap(t *testing.T) {
 	var createCalls atomic.Int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			createCalls.Add(1)
 			return 1234, nil, nil
 		},
@@ -675,7 +741,7 @@ func TestCloseSessionTokenOnlyRevokesTokenAndDoesNotBootstrap(t *testing.T) {
 	var createCalls atomic.Int32
 	var destroyed []int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			createCalls.Add(1)
 			return 9876, nil, nil
 		},
@@ -784,6 +850,57 @@ func TestSessionFromContextInvalidCredentialsIncrementsAuthFailureMetric(t *test
 	}
 }
 
+func TestSessionFromContextInvalidCredentialsIncrementsIngressSessionOutcomeMetric(t *testing.T) {
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, nil)
+	ctx := authContextForPeer(&net.TCPAddr{IP: net.ParseIP("203.0.113.48"), Port: 30008}, "postgres", "wrong")
+
+	before := metricCounterValueByLabel(t, "duckgres_flight_ingress_sessions_total", map[string]string{"outcome": "auth_failed"})
+	_, err := h.sessionFromContext(ctx)
+	after := metricCounterValueByLabel(t, "duckgres_flight_ingress_sessions_total", map[string]string{"outcome": "auth_failed"})
+
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected unauthenticated error, got %v", err)
+	}
+	if after-before != 1 {
+		t.Fatalf("expected duckgres_flight_ingress_sessions_total{outcome=auth_failed} delta 1, got %.0f", after-before)
+	}
+}
+
+func TestSessionFromContextSuccessIncrementsIngressSessionOutcomeMetric(t *testing.T) {
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, nil)
+	ctx := authContextForPeer(&net.TCPAddr{IP: net.ParseIP("203.0.113.49"), Port: 30009}, "postgres", "postgres")
+
+	before := metricCounterValueByLabel(t, "duckgres_flight_ingress_sessions_total", map[string]string{"outcome": "created"})
+	s, err := h.sessionFromContext(ctx)
+	after := metricCounterValueByLabel(t, "duckgres_flight_ingress_sessions_total", map[string]string{"outcome": "created"})
+
+	if err != nil {
+		t.Fatalf("expected successful auth, got %v", err)
+	}
+	if s == nil {
+		t.Fatalf("expected non-nil session")
+	}
+	if after-before != 1 {
+		t.Fatalf("expected duckgres_flight_ingress_sessions_total{outcome=created} delta 1, got %.0f", after-before)
+	}
+}
+
+func TestRPCDurationMetricRecordsOnError(t *testing.T) {
+	h := testFlightHandlerWithStoreAndRateLimiter(t, map[string]string{"postgres": "postgres"}, nil)
+
+	before := metricHistogramCountByLabel(t, "duckgres_flight_rpc_duration_seconds", map[string]string{"method": "GetFlightInfoSchemas"})
+	var cmd flightsql.GetDBSchemas
+	_, err := h.GetFlightInfoSchemas(context.Background(), cmd, &flight.FlightDescriptor{})
+	after := metricHistogramCountByLabel(t, "duckgres_flight_rpc_duration_seconds", map[string]string{"method": "GetFlightInfoSchemas"})
+
+	if err == nil {
+		t.Fatalf("expected GetFlightInfoSchemas to fail without auth context")
+	}
+	if after-before != 1 {
+		t.Fatalf("expected duckgres_flight_rpc_duration_seconds sample count delta 1, got %d", after-before)
+	}
+}
+
 func TestSessionFromContextRateLimitedRejectsAndIncrementsMetric(t *testing.T) {
 	addr := &net.TCPAddr{IP: net.ParseIP("203.0.113.45"), Port: 30002}
 	rateLimiter := server.NewRateLimiter(server.RateLimitConfig{
@@ -862,7 +979,7 @@ func TestFlightAuthSessionStoreReapHookReceivesTrigger(t *testing.T) {
 				reapedCount = count
 			},
 		},
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(int32) {},
@@ -897,7 +1014,7 @@ func TestFlightAuthSessionStoreReapKeepsSessionWithFreshHandle(t *testing.T) {
 		},
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(pid int32) {
@@ -934,7 +1051,7 @@ func TestFlightAuthSessionStoreReapStaleHandleAllowsSessionReap(t *testing.T) {
 		},
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
-		createSessionFn: func(context.Context, string) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(pid int32) {

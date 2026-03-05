@@ -14,23 +14,23 @@ type TransformFlags uint32
 
 const (
 	FlagWritableCTE  TransformFlags = 1 << iota // Writable CTE rewrite
-	FlagVersion                                  // version() replacement
-	FlagPgCatalog                                // pg_catalog schema/view mappings
-	FlagInfoSchema                               // information_schema mappings
-	FlagPublicSchema                             // public -> main schema mapping
-	FlagTypeMapping                              // Type mappings (JSONB->JSON, etc.)
-	FlagTypeCast                                 // Type casts (::regtype -> ::varchar)
-	FlagFunctions                                // Function mappings (array_agg->list, etc.)
-	FlagFuncAlias                                // Function alias normalization
-	FlagOperators                                // Operator mappings (regex, JSON)
-	FlagSetShow                                  // SET/SHOW command handling
-	FlagExpandArray                              // _pg_expandarray handling
-	FlagOnConflict                               // ON CONFLICT handling
-	FlagLocking                                  // FOR UPDATE/SHARE removal
-	FlagCtid                                     // ctid -> rowid mapping
-	FlagDDL                                      // DDL constraint stripping
-	FlagPlaceholder                              // $1/$2 placeholder conversion
-	flagSentinel                                 // must be last — used to derive FlagAll
+	FlagVersion                                 // version() replacement
+	FlagPgCatalog                               // pg_catalog schema/view mappings
+	FlagInfoSchema                              // information_schema mappings
+	FlagPublicSchema                            // public -> main schema mapping
+	FlagTypeMapping                             // Type mappings (JSONB->JSON, etc.)
+	FlagTypeCast                                // Type casts (::regtype -> ::varchar)
+	FlagFunctions                               // Function mappings (array_agg->list, etc.)
+	FlagFuncAlias                               // Function alias normalization
+	FlagOperators                               // Operator mappings (regex, JSON)
+	FlagSetShow                                 // SET/SHOW command handling
+	FlagExpandArray                             // _pg_expandarray handling
+	FlagOnConflict                              // ON CONFLICT handling
+	FlagLocking                                 // FOR UPDATE/SHARE removal
+	FlagCtid                                    // ctid -> rowid mapping
+	FlagDDL                                     // DDL constraint stripping
+	FlagPlaceholder                             // $1/$2 placeholder conversion
+	flagSentinel                                // must be last — used to derive FlagAll
 
 	FlagAll TransformFlags = flagSentinel - 1 // All flags set
 )
@@ -288,7 +288,7 @@ func Classify(sql string, cfg Config) Classification {
 		"PG_RELATION_IS_PUBLISHABLE", "PG_GET_PARTKEYDEF",
 		"PG_GET_STATISTICSOBJDEF_COLUMNS",
 		"PG_RULES",
-		"HAS_SCHEMA_PRIVILEGE(", "HAS_TABLE_PRIVILEGE(",
+		"HAS_SCHEMA_PRIVILEGE(", "HAS_TABLE_PRIVILEGE(", "HAS_ANY_COLUMN_PRIVILEGE(",
 		"SIMILAR_TO_ESCAPE", "CURRENT_SETTING(",
 		"UPTIME(", "WORKER_UPTIME(", "WORKER_VERSION(",
 		"UNNEST(",

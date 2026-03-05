@@ -12,6 +12,14 @@ import (
 // (lowercase letters, digits, and underscores, starting with a letter)
 var configParamPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
+// duckdbShowCommands are DuckDB-specific SHOW commands that should be passed
+// through to DuckDB rather than treated as PostgreSQL config parameters.
+var duckdbShowCommands = map[string]bool{
+	"tables":    true,
+	"databases": true,
+	"all":       true,
+}
+
 // SetShowTransform handles SET and SHOW commands:
 // - SET application_name = 'x' -> SET VARIABLE application_name = 'x'
 // - SHOW application_name -> SELECT getvariable('application_name') AS application_name
@@ -274,6 +282,13 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 						Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt},
 					}
 					changed = true
+					continue
+				}
+
+				// DuckDB SHOW commands (SHOW TABLES, SHOW DATABASES, SHOW ALL TABLES)
+				// are parsed as VariableShowStmt by pg_query but should be passed
+				// through to DuckDB as-is.
+				if duckdbShowCommands[paramName] {
 					continue
 				}
 

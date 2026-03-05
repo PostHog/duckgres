@@ -1,0 +1,11 @@
+FROM python:3.12-slim-bookworm
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+COPY entrypoint.sh /entrypoint.sh
+COPY results_gatherer.py /results_gatherer.py
+COPY queries.yaml /queries.yaml
+
+EXPOSE 8080
+
+ENTRYPOINT ["/entrypoint.sh", "uv", "run", "--with", "duckdb", "--with", "pyyaml", "python", "/results_gatherer.py"]

@@ -73,6 +73,13 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 	}
 }
 
+// CancelClientConn cancels the context of a clientConn.
+func CancelClientConn(cc *clientConn) {
+	if cc.cancel != nil {
+		cc.cancel()
+	}
+}
+
 // SendInitialParams sends the initial parameter status messages and backend key data.
 func SendInitialParams(cc *clientConn) {
 	cc.sendInitialParams()

@@ -780,11 +780,13 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// pg_table_is_visible - checks if table is in search path
 		`CREATE OR REPLACE MACRO pg_table_is_visible(oid) AS true`,
 		// has_schema_privilege - check schema access
-		// Note: DuckDB doesn't support macro overloading well, so we only define 2-arg versions
-		// The transpiler should handle 3-arg calls by dropping the user argument
+		// Note: DuckDB doesn't support macro overloading with CREATE OR REPLACE MACRO,
+		// so we only define 2-arg versions and rewrite 3-arg calls in the transpiler.
 		`CREATE OR REPLACE MACRO has_schema_privilege(schema_name, priv) AS true`,
 		// has_table_privilege - check table access
 		`CREATE OR REPLACE MACRO has_table_privilege(table_name, priv) AS true`,
+		// has_any_column_privilege - check any column access
+		`CREATE OR REPLACE MACRO has_any_column_privilege(table_name, priv) AS true`,
 		// pg_encoding_to_char - convert encoding ID to name
 		`CREATE OR REPLACE MACRO pg_encoding_to_char(enc) AS 'UTF8'`,
 		// format_type - format a type OID as string with typemod support
@@ -850,11 +852,11 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		`DROP MACRO IF EXISTS pg_get_expr`,
 		`CREATE MACRO pg_get_expr(expr, relid, pretty := false) AS NULL`,
 		// pg_get_indexdef - get index definition
-		`CREATE OR REPLACE MACRO pg_get_indexdef(index_oid) AS ''`,
-		`CREATE OR REPLACE MACRO pg_get_indexdef(index_oid, col, pretty) AS ''`,
+		`DROP MACRO IF EXISTS pg_get_indexdef`,
+		`CREATE MACRO pg_get_indexdef(index_oid, col := NULL, pretty := false) AS ''`,
 		// pg_get_constraintdef - get constraint definition
-		`CREATE OR REPLACE MACRO pg_get_constraintdef(constraint_oid) AS ''`,
-		`CREATE OR REPLACE MACRO pg_get_constraintdef(constraint_oid, pretty) AS ''`,
+		`DROP MACRO IF EXISTS pg_get_constraintdef`,
+		`CREATE MACRO pg_get_constraintdef(constraint_oid, pretty := false) AS ''`,
 		// pg_get_serial_sequence - get sequence name for a serial/identity column
 		// Returns NULL because DuckLake doesn't support sequences
 		`CREATE OR REPLACE MACRO pg_get_serial_sequence(table_name, column_name) AS NULL`,

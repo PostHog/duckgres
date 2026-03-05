@@ -10,6 +10,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 - [Features](#features)
 - [Metrics](#metrics)
+- [Perf Runbook](#perf-runbook)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
   - [YAML Configuration](#yaml-configuration)
@@ -32,6 +33,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - [Two-Tier Query Processing](#two-tier-query-processing)
 - [Supported Features](#supported-features)
 - [Limitations](#limitations)
+- [SQL Client Compatibility](#sql-client-compatibility)
 - [Dependencies](#dependencies)
 - [License](#license)
 
@@ -66,6 +68,11 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 | `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
 | `duckgres_flight_auth_sessions_active` | Gauge | Number of active Flight auth sessions on the control plane |
 | `duckgres_control_plane_workers_active` | Gauge | Number of active control-plane worker processes |
+| `duckgres_control_plane_worker_acquire_seconds` | Histogram | Time spent acquiring a worker for a new session |
+| `duckgres_control_plane_worker_queue_depth` | Gauge | Approximate number of session requests waiting on worker acquisition |
+| `duckgres_control_plane_worker_spawn_seconds` | Histogram | Time spent spawning and health-checking a new worker |
+| `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
+| `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
 | `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
 | `duckgres_flight_max_workers_retry_total{outcome}` | Counter | Max-worker retry outcomes for Flight session creation (`outcome=attempted|succeeded|failed`) |
 
@@ -73,7 +80,13 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 
 - `scripts/test_metrics.sh` - Runs a quick sanity check (starts server, runs queries, verifies counts)
 - `scripts/load_generator.sh` - Generates continuous query load until Ctrl-C
+- `scripts/perf_smoke.sh` - Runs the golden-query perf harness and writes artifacts to `artifacts/perf/<run_id>`
+- `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact upload hook
 - `prometheus-docker-compose.yml` - Starts Prometheus locally to scrape metrics (UI at http://localhost:9091)
+
+## Perf Runbook
+
+See [docs/perf-harness-runbook.md](docs/perf-harness-runbook.md) and [tests/perf/README.md](tests/perf/README.md) for local smoke and nightly operations.
 
 ## Quick Start
 
@@ -659,6 +672,104 @@ The following DuckDB features work transparently through the fallback mechanism:
 - **Single Node**: No built-in replication or clustering
 - **Limited System Catalog**: Some `pg_*` system tables are stubs (return empty)
 - **Type OID Mapping**: Incomplete (some types show as "unknown")
+
+## SQL Client Compatibility
+
+Duckgres implements a subset of PostgreSQL's system catalog to satisfy introspection queries from common SQL clients, ORMs, and BI tools. The tables below document current coverage.
+
+### pg_catalog Views
+
+| View | Status | Notes |
+|------|--------|-------|
+| `pg_class` | Implemented | `pg_class_full` wrapper adding `relforcerowsecurity`; DuckLake variant sources from `duckdb_tables()`/`duckdb_views()` |
+| `pg_namespace` | Implemented | Maps `main` → `public`; DuckLake variant derives from `duckdb_tables()`/`duckdb_views()` |
+| `pg_attribute` | Implemented | Maps DuckDB internal type OIDs to PG OIDs via `duckdb_columns()` JOIN; fixes `atttypmod` for NUMERIC |
+| `pg_type` | Implemented | Fixes NULLs + adds synthetic entries for missing OIDs (json, jsonb, bpchar, text, record, array types) |
+| `pg_database` | Implemented | Hardcoded: postgres, template0, template1, testdb |
+| `pg_stat_user_tables` | Implemented | Uses `reltuples` from pg_class; zeros for scan/tuple stats |
+| `pg_roles` | Stub (empty) | Single hardcoded `duckdb` superuser |
+| `pg_constraint` | Stub (empty) | |
+| `pg_enum` | Stub (empty) | |
+| `pg_collation` | Stub (empty) | |
+| `pg_policy` | Stub (empty) | |
+| `pg_inherits` | Stub (empty) | |
+| `pg_statistic_ext` | Stub (empty) | |
+| `pg_publication` | Stub (empty) | |
+| `pg_publication_rel` | Stub (empty) | |
+| `pg_publication_tables` | Stub (empty) | |
+| `pg_rules` | Stub (empty) | |
+| `pg_matviews` | Stub (empty) | |
+| `pg_partitioned_table` | Stub (empty) | |
+| `pg_stat_activity` | Stub (empty) | Intercepted at query time for live data |
+| `pg_statio_user_tables` | Stub (empty) | |
+| `pg_stat_statements` | Stub (empty) | |
+| `pg_indexes` | Stub (empty) | |
+| `pg_settings` | Missing | `current_setting()` macro handles `server_version` and `server_encoding` only |
+| `pg_proc` | Missing | DuckDB has native `pg_catalog.pg_proc` but no wrapper |
+| `pg_description` | Missing | Handled via `obj_description()`/`col_description()` macros returning NULL |
+| `pg_depend` | Missing | |
+| `pg_am` | Missing | |
+| `pg_attrdef` | Missing | |
+| `pg_tablespace` | Missing | |
+
+### information_schema Views
+
+| View | Status | Notes |
+|------|--------|-------|
+| `tables` | Implemented | Filters internal views, normalizes `main` → `public` |
+| `columns` | Implemented | DuckDB → PG type name normalization, optional metadata overlay |
+| `schemata` | Implemented | Adds synthetic entries for `pg_catalog`, `information_schema`, `pg_toast` |
+| `views` | Implemented | Filters internal views |
+| `key_column_usage` | Missing | Used by ORMs for relationship discovery |
+| `table_constraints` | Missing | Used by ORMs for relationship discovery |
+| `referential_constraints` | Missing | Used by ORMs for FK introspection |
+
+### Functions & Macros
+
+| Function | Status | Notes |
+|----------|--------|-------|
+| `format_type(oid, int)` | Implemented | Comprehensive OID → name mapping |
+| `pg_get_expr(text, oid)` | Implemented | Returns NULL |
+| `pg_get_indexdef(oid)` | Implemented | Returns empty string |
+| `pg_get_constraintdef(oid)` | Implemented | Returns empty string |
+| `pg_get_serial_sequence(text, text)` | Implemented | Returns NULL |
+| `pg_table_is_visible(oid)` | Implemented | Always true |
+| `pg_get_userbyid(oid)` | Implemented | Maps OID 10 → `postgres`, 6171 → `pg_database_owner` |
+| `obj_description(oid, text)` | Implemented | Returns NULL |
+| `col_description(oid, int)` | Implemented | Returns NULL |
+| `shobj_description(oid, text)` | Implemented | Returns NULL |
+| `has_table_privilege(text, text)` | Implemented | Always true |
+| `has_schema_privilege(text, text)` | Implemented | Always true |
+| `pg_encoding_to_char(int)` | Implemented | Always `UTF8` |
+| `version()` | Implemented | Returns PG 15.0 compatible string |
+| `current_setting(text)` | Implemented | Handles `server_version` and `server_encoding` |
+| `pg_is_in_recovery()` | Implemented | Always false |
+| `pg_backend_pid()` | Implemented | Returns 0 |
+| `pg_size_pretty(bigint)` | Implemented | Full human-readable formatting |
+| `pg_total_relation_size(oid)` | Implemented | Returns 0 |
+| `pg_relation_size(oid)` | Implemented | Returns 0 |
+| `pg_table_size(oid)` | Implemented | Returns 0 |
+| `pg_indexes_size(oid)` | Implemented | Returns 0 |
+| `pg_database_size(text)` | Implemented | Returns 0 |
+| `quote_ident(text)` | Implemented | |
+| `quote_literal(text)` | Implemented | |
+| `quote_nullable(text)` | Implemented | |
+| `txid_current()` | Implemented | Epoch-based pseudo ID |
+| `current_schema()` | Missing | |
+| `current_schemas(bool)` | Missing | |
+
+### Startup Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| `server_version` | `15.0 (Duckgres)` |
+| `server_encoding` | `UTF8` |
+| `client_encoding` | `UTF8` |
+| `DateStyle` | `ISO, MDY` |
+| `TimeZone` | `UTC` |
+| `integer_datetimes` | `on` |
+| `standard_conforming_strings` | `on` |
+| `IntervalStyle` | Missing |
 
 ## Dependencies
 

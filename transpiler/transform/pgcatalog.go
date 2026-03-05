@@ -76,6 +76,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_is_in_recovery":               true,
 			"has_schema_privilege":            true,
 			"has_table_privilege":             true,
+			"has_any_column_privilege":        true,
 			"array_to_string":                 true,
 			"version":                         true,
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
@@ -117,6 +118,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"format_type":                     true, // Custom format_type with full PostgreSQL typemod support
 			"has_schema_privilege":            true, // Schema access check
 			"has_table_privilege":             true, // Table access check
+			"has_any_column_privilege":        true, // Column access check
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
 			"pg_get_expr":                     true, // Our version that accepts 2 or 3 args
 			"pg_get_indexdef":                 true, // Returns empty string
@@ -219,6 +221,11 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 						funcName = strings.ToLower(funcStr.Sval)
 					}
 				}
+			}
+
+			if dropsUserArgFromPrivilegeCheck(funcName, len(n.FuncCall.Args)) {
+				n.FuncCall.Args = n.FuncCall.Args[1:]
+				*changed = true
 			}
 
 			// Handle pg_catalog prefixed functions
@@ -471,6 +478,19 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 			}
 			t.walkAndTransform(n.ViewStmt.Query, changed)
 		}
+	}
+}
+
+func dropsUserArgFromPrivilegeCheck(funcName string, argCount int) bool {
+	if argCount != 3 {
+		return false
+	}
+
+	switch funcName {
+	case "has_schema_privilege", "has_table_privilege", "has_any_column_privilege":
+		return true
+	default:
+		return false
 	}
 }
 
