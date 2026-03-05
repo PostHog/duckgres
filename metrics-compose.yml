@@ -3,8 +3,9 @@
 # Usage:
 #   1. Start duckgres: ./duckgres --port 5432
 #   2. (Optional) Start perf harness metrics endpoint on :9095 during perf runs
-#   3. Start prometheus: docker compose -f prometheus-docker-compose.yml up
-#   4. Open http://localhost:9091 to view metrics
+#   3. Start prometheus: docker compose -f metrics-compose.yml up
+#   4. Open http://localhost:9091 to view metrics (Prometheus)
+#   5. Open http://localhost:3000 to view dashboards (Grafana, no login required)
 #
 # Available metrics:
 #   - duckgres_connections_open: current number of open connections
@@ -28,3 +29,15 @@ services:
     # or use an alternative like: network_mode: "host".
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
