@@ -762,6 +762,21 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		slog.Warn("Failed to create pg_indexes view.", "error", err)
 	}
 
+	// Create pg_shdescription stub view for clients that query shared object descriptions
+	// (e.g., pgAdmin uses this to show database and role comments)
+	// Returns no rows since DuckDB doesn't have PostgreSQL shared descriptions
+	pgShdescriptionSQL := `
+		CREATE OR REPLACE VIEW pg_shdescription AS
+		SELECT
+			NULL::BIGINT AS objoid,
+			NULL::BIGINT AS classoid,
+			NULL::VARCHAR AS description
+		WHERE false
+	`
+	if _, err := db.Exec(pgShdescriptionSQL); err != nil {
+		slog.Warn("Failed to create pg_shdescription view.", "error", err)
+	}
+
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
 	//
@@ -787,6 +802,8 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		`CREATE OR REPLACE MACRO has_table_privilege(table_name, priv) AS true`,
 		// has_any_column_privilege - check any column access
 		`CREATE OR REPLACE MACRO has_any_column_privilege(table_name, priv) AS true`,
+		// has_database_privilege - check database access (pgAdmin checks this per-database)
+		`CREATE OR REPLACE MACRO has_database_privilege(db_name, priv) AS true`,
 		// pg_encoding_to_char - convert encoding ID to name
 		`CREATE OR REPLACE MACRO pg_encoding_to_char(enc) AS 'UTF8'`,
 		// format_type - format a type OID as string with typemod support

@@ -587,3 +587,110 @@
     lock.pid, lock.granted
     FROM pg_catalog.pg_locks AS lock
     LIMIT 5
+
+# --- pgAdmin 4 introspection queries ---
+# Extracted from pgAdmin 4 v9.x Jinja2 SQL templates, rendered for PG 15.0.
+# Source: github.com/pgadmin-org/pgadmin4, web/pgadmin/browser/server_groups/servers/
+# These queries are what pgAdmin fires when connecting to and browsing a server.
+# Update if a pgAdmin user reports breakage against a newer pgAdmin version.
+
+# pg_shdescription stub — must exist for pgAdmin's database/role comment queries
+- suite: pgadmin_introspection
+  name: pg_shdescription_basic
+  stub: true
+  sql: SELECT objoid, classoid, description FROM pg_catalog.pg_shdescription LIMIT 5
+
+# pgAdmin's database list query (databases/sql/default/nodes.sql)
+- suite: pgadmin_introspection
+  name: database_nodes
+  sql: >-
+    SELECT
+      db.oid::bigint AS did, db.datname AS name,
+      db.dattablespace AS spcoid,
+      shd.description AS comment,
+      db.datallowconn, has_database_privilege(db.oid, 'CREATE') AS cancreate,
+      datistemplate
+    FROM pg_catalog.pg_database db
+    LEFT JOIN pg_catalog.pg_shdescription shd
+      ON shd.objoid = db.oid
+    ORDER BY datname
+
+# pgAdmin's database properties query (databases/sql/default/properties.sql)
+- suite: pgadmin_introspection
+  name: database_properties
+  sql: >-
+    SELECT
+      db.oid::bigint AS did, db.datname AS name,
+      db.dattablespace AS spcoid,
+      shd.description AS comment,
+      pg_catalog.pg_encoding_to_char(db.encoding) AS encoding,
+      pg_catalog.pg_get_userbyid(db.datdba) AS datowner,
+      has_database_privilege(db.oid, 'CREATE') AS cancreate,
+      datistemplate, datallowconn, datconnlimit,
+      datcollate, datctype
+    FROM pg_catalog.pg_database db
+    LEFT JOIN pg_catalog.pg_shdescription shd
+      ON shd.objoid = db.oid
+    ORDER BY datname
+
+# pgAdmin's role listing (roles/sql/default/nodes.sql)
+- suite: pgadmin_introspection
+  name: role_nodes
+  sql: >-
+    SELECT
+      r.oid::bigint AS id, r.rolname AS name,
+      r.rolcanlogin, r.rolsuper,
+      shd.description
+    FROM pg_catalog.pg_roles r
+    LEFT JOIN pg_catalog.pg_shdescription shd
+      ON shd.objoid = r.oid
+    ORDER BY r.rolcanlogin, r.rolname
+
+# pgAdmin's schema listing (schemas/pg/default/sql/nodes.sql)
+- suite: pgadmin_introspection
+  name: schema_nodes
+  sql: >-
+    SELECT
+      nsp.oid::bigint AS id, nsp.nspname AS name,
+      has_schema_privilege(nsp.oid, 'CREATE') AS can_create,
+      has_schema_privilege(nsp.oid, 'USAGE') AS has_usage
+    FROM pg_catalog.pg_namespace nsp
+    WHERE nspname NOT LIKE 'pg\_%' AND nspname != 'information_schema'
+    ORDER BY nspname
+
+# pgAdmin's tablespace listing (tablespaces/sql/default/nodes.sql)
+- suite: pgadmin_introspection
+  name: tablespace_nodes
+  stub: true
+  sql: >-
+    SELECT
+      ts.oid::bigint AS id, spcname AS name,
+      shobj_description(ts.oid, 'pg_tablespace') AS description
+    FROM pg_catalog.pg_tablespace ts
+    ORDER BY name
+
+# pgAdmin's version detection — parses this to determine server capabilities
+- suite: pgadmin_introspection
+  name: version_detection
+  sql: SELECT version()
+
+# pgAdmin's has_database_privilege check — run per-database
+- suite: pgadmin_introspection
+  name: has_database_privilege
+  sql: SELECT has_database_privilege('postgres', 'CONNECT')
+
+# pgAdmin's combined database-with-owner query (the query that prompted this work)
+- suite: pgadmin_introspection
+  name: database_with_owner_and_description
+  sql: >-
+    SELECT
+      N.oid::bigint AS id, datname AS name,
+      D.description,
+      datistemplate AS is_template,
+      datallowconn AS allow_connections,
+      pg_catalog.pg_get_userbyid(N.datdba) AS "owner"
+    FROM pg_catalog.pg_database N
+    LEFT JOIN pg_catalog.pg_shdescription D ON N.oid = D.objoid
+    ORDER BY
+      CASE WHEN datname = pg_catalog.current_database()
+        THEN -1::bigint ELSE N.oid::bigint END

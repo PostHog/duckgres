@@ -56,11 +56,9 @@ func TestACMEManagerTLSConfig(t *testing.T) {
 	tlsCfg := mgr.TLSConfig()
 	if tlsCfg == nil {
 		t.Fatal("TLSConfig returned nil")
-	}
-	if tlsCfg.GetCertificate == nil {
+	} else if tlsCfg.GetCertificate == nil {
 		t.Fatal("TLSConfig.GetCertificate is nil")
-	}
-	if tlsCfg.MinVersion != 0x0303 { // tls.VersionTLS12
+	} else if tlsCfg.MinVersion != 0x0303 { // tls.VersionTLS12
 		t.Fatalf("expected MinVersion TLS 1.2 (0x0303), got 0x%04x", tlsCfg.MinVersion)
 	}
 }

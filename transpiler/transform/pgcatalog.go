@@ -56,6 +56,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_enum":               "pg_enum",
 			"pg_indexes":            "pg_indexes",
 			"pg_stat_activity":      "pg_stat_activity",
+			"pg_shdescription":     "pg_shdescription",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
@@ -77,6 +78,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_schema_privilege":            true,
 			"has_table_privilege":             true,
 			"has_any_column_privilege":        true,
+			"has_database_privilege":          true,
 			"array_to_string":                 true,
 			"version":                         true,
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
@@ -119,6 +121,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_schema_privilege":            true, // Schema access check
 			"has_table_privilege":             true, // Table access check
 			"has_any_column_privilege":        true, // Column access check
+			"has_database_privilege":          true, // Database access check
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
 			"pg_get_expr":                     true, // Our version that accepts 2 or 3 args
 			"pg_get_indexdef":                 true, // Returns empty string
@@ -487,7 +490,7 @@ func dropsUserArgFromPrivilegeCheck(funcName string, argCount int) bool {
 	}
 
 	switch funcName {
-	case "has_schema_privilege", "has_table_privilege", "has_any_column_privilege":
+	case "has_schema_privilege", "has_table_privilege", "has_any_column_privilege", "has_database_privilege":
 		return true
 	default:
 		return false

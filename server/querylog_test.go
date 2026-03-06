@@ -240,8 +240,7 @@ func TestTruncateNullableQuery(t *testing.T) {
 	got := truncateNullableQuery(longPtr)
 	if got == nil {
 		t.Fatal("expected non-nil truncated query")
-	}
-	if len(*got) != maxQueryLength {
+	} else if len(*got) != maxQueryLength {
 		t.Fatalf("expected truncated length %d, got %d", maxQueryLength, len(*got))
 	}
 }
