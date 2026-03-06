@@ -798,9 +798,17 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 				false AS lanispl, false AS lanpltrusted, NULL::BIGINT AS lanplcallfoid,
 				NULL::BIGINT AS laninline, NULL::BIGINT AS lanvalidator WHERE false`,
 		"pg_extension": `CREATE OR REPLACE VIEW pg_extension AS
-			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS extname, NULL::BIGINT AS extowner,
-				NULL::BIGINT AS extnamespace, false AS extrelocatable, NULL::VARCHAR AS extversion,
-				NULL::VARCHAR AS extconfig, NULL::VARCHAR AS extcondition WHERE false`,
+			SELECT
+				row_number() OVER ()::BIGINT AS oid,
+				extension_name::VARCHAR AS extname,
+				0::BIGINT AS extowner,
+				0::BIGINT AS extnamespace,
+				false AS extrelocatable,
+				extension_version::VARCHAR AS extversion,
+				NULL::VARCHAR AS extconfig,
+				NULL::VARCHAR AS extcondition
+			FROM duckdb_extensions()
+			WHERE installed = true`,
 		"pg_foreign_server": `CREATE OR REPLACE VIEW pg_foreign_server AS
 			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS srvname, NULL::BIGINT AS srvowner,
 				NULL::BIGINT AS srvfdw, NULL::VARCHAR AS srvtype, NULL::VARCHAR AS srvversion,
@@ -921,22 +929,14 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		`CREATE OR REPLACE MACRO col_description(table_oid, col_num) AS NULL`,
 		// shobj_description - get shared object comment
 		`CREATE OR REPLACE MACRO shobj_description(oid, catalog) AS NULL`,
-		// pg_get_expr - deparse an expression (used for defaults, etc.)
-		// Use default parameter so it works with both 2 and 3 args
-		`DROP MACRO IF EXISTS pg_get_expr`,
-		`CREATE MACRO pg_get_expr(expr, relid, pretty := false) AS NULL`,
-		// pg_get_indexdef - get index definition
-		`DROP MACRO IF EXISTS pg_get_indexdef`,
-		`CREATE MACRO pg_get_indexdef(index_oid, col := NULL, pretty := false) AS ''`,
-		// pg_get_constraintdef - get constraint definition
-		`DROP MACRO IF EXISTS pg_get_constraintdef`,
-		`CREATE MACRO pg_get_constraintdef(constraint_oid, pretty := false) AS ''`,
-		// pg_get_viewdef - stub that returns empty string for both 1-arg and 2-arg forms.
-		// DuckDB has a 1-arg built-in, but we need a 2-arg form (clients like DBeaver pass
-		// pg_get_viewdef(oid, true)). Since DuckDB macros shadow built-ins, this replaces
-		// the built-in entirely. Acceptable because view definitions aren't meaningful here.
-		`DROP MACRO IF EXISTS pg_get_viewdef`,
-		`CREATE MACRO pg_get_viewdef(view_oid, pretty := false) AS ''`,
+		// pg_get_expr - DuckDB has a 2-arg built-in that returns expression text.
+		// The 3-arg form (expr, relid, pretty) is handled by the transpiler,
+		// which drops the pretty arg. No macro needed here.
+		// pg_get_indexdef - get index definition (no DuckDB built-in)
+		`CREATE OR REPLACE MACRO pg_get_indexdef(index_oid, col := NULL, pretty := false) AS ''`,
+		// pg_get_constraintdef - DuckDB has a 1-arg built-in (returns NULL).
+		// The 2-arg form (oid, pretty) is handled by the transpiler, which drops
+		// the pretty arg so DuckDB's built-in handles it. No macro needed here.
 		// pg_get_serial_sequence - get sequence name for a serial/identity column
 		// Returns NULL because DuckLake doesn't support sequences
 		`CREATE OR REPLACE MACRO pg_get_serial_sequence(table_name, column_name) AS NULL`,

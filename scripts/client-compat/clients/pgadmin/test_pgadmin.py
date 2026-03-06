@@ -173,6 +173,8 @@ def test_pgadmin_connect_sequence(r):
         cur.execute("""
             SELECT
                 db.oid::bigint AS did, db.datname AS name,
+                db.dattablespace AS spcoid,
+                shd.description AS comment,
                 pg_catalog.pg_encoding_to_char(db.encoding) AS encoding,
                 pg_catalog.pg_get_userbyid(db.datdba) AS datowner,
                 has_database_privilege(db.oid, 'CREATE') AS cancreate,

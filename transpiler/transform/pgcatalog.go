@@ -134,10 +134,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_any_column_privilege":        true, // Column access check
 			"has_database_privilege":          true, // Database access check
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
-			"pg_get_viewdef":                  true, // Stub replacing DuckDB's built-in (need 2-arg form)
-			"pg_get_expr":                     true, // Our version that accepts 2 or 3 args
-			"pg_get_indexdef":                 true, // Returns empty string
-			"pg_get_constraintdef":            true, // Returns empty string
+			"pg_get_indexdef":                 true, // Returns empty string (no DuckDB built-in)
 			"obj_description":                 true, // Returns NULL
 			"col_description":                 true, // Returns NULL
 			"pg_get_partkeydef":               true, // Returns empty string
@@ -240,6 +237,31 @@ func (t *PgCatalogTransform) walkAndTransform(node *pg_query.Node, changed *bool
 
 			if dropsUserArgFromPrivilegeCheck(funcName, len(n.FuncCall.Args)) {
 				n.FuncCall.Args = n.FuncCall.Args[1:]
+				*changed = true
+			}
+
+			// pg_get_viewdef(oid, pretty) → pg_get_viewdef(oid)
+			// DuckDB only has the 1-arg form. The pretty arg controls whitespace
+			// formatting in PostgreSQL — purely cosmetic, no client depends on it.
+			// We drop it so DuckDB's built-in returns the actual view definition.
+			if funcName == "pg_get_viewdef" && len(n.FuncCall.Args) == 2 {
+				n.FuncCall.Args = n.FuncCall.Args[:1]
+				*changed = true
+			}
+
+			// pg_get_expr(expr, relid, pretty) → pg_get_expr(expr, relid)
+			// DuckDB has a 2-arg built-in that returns the expression text.
+			// The pretty arg is cosmetic (same as pg_get_viewdef). We drop it
+			// so DuckDB's built-in works instead of our NULL-returning stub.
+			if funcName == "pg_get_expr" && len(n.FuncCall.Args) == 3 {
+				n.FuncCall.Args = n.FuncCall.Args[:2]
+				*changed = true
+			}
+
+			// pg_get_constraintdef(oid, pretty) → pg_get_constraintdef(oid)
+			// Same pattern — DuckDB has a 1-arg built-in, pretty is cosmetic.
+			if funcName == "pg_get_constraintdef" && len(n.FuncCall.Args) == 2 {
+				n.FuncCall.Args = n.FuncCall.Args[:1]
 				*changed = true
 			}
 
