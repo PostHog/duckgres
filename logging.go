@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -67,10 +68,17 @@ func redactAttr(a slog.Attr) slog.Attr {
 		}
 		a.Value = slog.GroupValue(redacted...)
 	case slog.KindAny:
-		s := fmt.Sprintf("%v", a.Value.Any())
-		r := server.RedactSecrets(s)
-		if r != s {
-			a.Value = slog.StringValue(r)
+		if err, ok := a.Value.Any().(error); ok {
+			redacted := server.RedactSecrets(err.Error())
+			if redacted != err.Error() {
+				a.Value = slog.AnyValue(errors.New(redacted))
+			}
+		} else {
+			s := fmt.Sprintf("%v", a.Value.Any())
+			r := server.RedactSecrets(s)
+			if r != s {
+				a.Value = slog.StringValue(r)
+			}
 		}
 	}
 	return a
