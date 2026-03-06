@@ -142,6 +142,9 @@ func env(key, defaultVal string) string {
 func initMetrics() *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 	srv := &http.Server{
 		Addr:    ":9090",
 		Handler: mux,
