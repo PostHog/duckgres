@@ -170,7 +170,7 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=35437 user=postgres sslmode=requir
 
 - No replication
 - Some pg_catalog tables are stubs (return empty)
-- Type OID mapping is incomplete (some types show as "unknown")
+- Unmapped DuckDB types (MAP, STRUCT, UNION, ENUM, BIT) fall back to OidText
 - DML RETURNING is not supported via extended query protocol (see below)
 
 ## DML RETURNING Detection (conn.go)

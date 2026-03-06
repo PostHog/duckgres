@@ -17,16 +17,16 @@
 ### Protocol Compatibility
 - [ ] **Binary Format Support**: Encode results in binary format for better performance with some clients
 - [x] **COPY Protocol**: Support `COPY FROM`/`COPY TO` for bulk data loading
-- [ ] **Cancel Request Handling**: Properly cancel long-running queries
+- [x] **Cancel Request Handling**: Properly cancel long-running queries ([protocol.go](server/protocol.go), [cancel_test.go](tests/integration/cancel_test.go))
 
 ### Compatibility
 - [x] **System Catalog Emulation**: Basic `pg_catalog` compatibility for psql
   - [x] `\dt` (list tables) - working
   - [x] `\l` (list databases) - working
   - [x] `\d <table>` (describe table) - working
-- [ ] **Information Schema**: Emulate PostgreSQL's `information_schema`
-- [ ] **Session Variables**: Support `SET` commands (timezone, search_path, etc.)
-- [ ] **Type OID Mapping**: Proper PostgreSQL OID mapping for all DuckDB types
+- [x] **Information Schema**: Emulate PostgreSQL's `information_schema` ([information_schema.go](transpiler/transform/information_schema.go))
+- [x] **Session Variables**: Support `SET` commands (timezone, search_path, etc.) ([setshow.go](transpiler/transform/setshow.go))
+- [x] **Type OID Mapping**: Proper PostgreSQL OID mapping for all DuckDB types ([types.go](server/types.go))
 
 ### Features
 - [x] **Extensions**: Load DuckDB extensions on startup
@@ -34,18 +34,18 @@
 ### Operations
 - [ ] **Hot Reload**: Reload config without restart
 - [ ] **Admin Commands**: `\duckgres status`, `\duckgres users`, etc.
-- [ ] **Docker Image**: Official container image
+- [x] **Docker Image**: Official container image ([Dockerfile](Dockerfile))
 - [x] **Graceful Shutdown**: Finish in-flight queries before shutdown
 
 ## Medium Priority
 
 ### Performance
 - [ ] **DuckDB Per Connection**: each connection for each user is a separate duckdb instance 
-- [ ] **Connection Limits**: Max connections per user and globally
+- [x] **Connection Limits**: Max connections per user and globally ([ratelimit.go](server/ratelimit.go))
 
 ### Monitoring
-- [ ] **Prometheus Metrics**: Export query count, latency, connection stats
-- [ ] **Query Logging**: Configurable query logging to file/stdout
+- [x] **Prometheus Metrics**: Export query count, latency, connection stats ([metrics.go](server/flightsqlingress/metrics.go), [flight_ingress_metrics.go](controlplane/flight_ingress_metrics.go))
+- [x] **Query Logging**: Configurable query logging to file/stdout ([querylog.go](server/querylog.go))
 - [ ] **Slow Query Log**: Log queries exceeding threshold
 - [ ] **Health Check Endpoint**: HTTP endpoint for load balancer health checks
 
@@ -57,10 +57,10 @@
 - [ ] **Schema Support**: PostgreSQL schema emulation
 
 ### Testing
-- [ ] **Unit Tests**: Test wire protocol parsing/encoding
-- [ ] **Integration Tests**: Test with various PostgreSQL clients
-- [ ] **Compatibility Tests**: Run PostgreSQL regression tests
-- [ ] **Benchmark Suite**: Performance comparison with native PostgreSQL
+- [x] **Unit Tests**: Test wire protocol parsing/encoding ([protocol_test.go](server/protocol_test.go), [types_test.go](server/types_test.go), [conn_test.go](server/conn_test.go))
+- [x] **Integration Tests**: Test with various PostgreSQL clients ([tests/integration/](tests/integration/README.md))
+- [x] **Compatibility Tests**: Run PostgreSQL regression tests ([clients_test.go](tests/integration/clients/clients_test.go), [jdbc_test.go](tests/integration/jdbc_test.go))
+- [x] **Benchmark Suite**: Performance comparison with native PostgreSQL ([tests/perf/](tests/perf/README.md))
 
 ## Ideas / Research
 
@@ -72,11 +72,11 @@
 
 ## Known Issues
 
-- [ ] Some PostgreSQL drivers may fail with unsupported OIDs
+- [x] Some PostgreSQL drivers may fail with unsupported OIDs — unknown types fall back to `OidText` ([types.go](server/types.go))
 - [x] `\d` commands in psql don't work (need system catalog) - fixed
-- [ ] Transaction isolation may differ from PostgreSQL behavior
-- [ ] Large result sets may cause memory issues (no streaming)
+- [x] Transaction isolation may differ from PostgreSQL behavior — documented in [README](README.md#transaction-isolation)
+- [x] Large result sets may cause memory issues (no streaming) — results are streamed row-by-row via `rows.Next()` + server-side cursor emulation ([conn.go](server/conn.go))
 
 ## Contributing
 
-Pick an item from this list and submit a PR! Issues labeled `good first issue` are great starting points.
+Pick an item from this list and submit a PR! Issues labeled [`good first issue`](https://github.com/PostHog/duckgres/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are great starting points.

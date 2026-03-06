@@ -667,11 +667,26 @@ The following DuckDB features work transparently through the fallback mechanism:
 - Basic `pg_catalog` system tables for client compatibility
 - `\dt`, `\d`, and other psql meta-commands
 
+## Transaction Isolation
+
+DuckDB provides **snapshot isolation** (MVCC), which is stricter than PostgreSQL's default `read committed`. In practice this means:
+
+| Behavior | PostgreSQL (default) | Duckgres (DuckDB) |
+|----------|---------------------|-------------------|
+| Default isolation level | Read Committed | Snapshot (≈ Serializable) |
+| Non-repeatable reads | Possible | Not possible |
+| Phantom reads | Possible | Not possible |
+| Write conflicts | Last writer wins | Second writer gets a conflict error |
+
+Clients that issue `SET transaction_isolation` or `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...` will succeed silently — the setting is accepted but DuckDB always operates at snapshot isolation. `SHOW transaction_isolation` returns `read committed` for client compatibility.
+
+Since DuckDB's isolation is strictly stronger than PostgreSQL's default, applications that work correctly under read committed will also work correctly here. The only observable difference is write-write conflicts: DuckDB will reject a concurrent write that PostgreSQL would silently accept under read committed.
+
 ## Limitations
 
 - **Single Node**: No built-in replication or clustering
 - **Limited System Catalog**: Some `pg_*` system tables are stubs (return empty)
-- **Type OID Mapping**: Incomplete (some types show as "unknown")
+- Unmapped DuckDB types (MAP, STRUCT, UNION, ENUM, BIT) fall back to OidText
 
 ## SQL Client Compatibility
 
