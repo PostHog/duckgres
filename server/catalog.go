@@ -797,18 +797,6 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS lanname, NULL::BIGINT AS lanowner,
 				false AS lanispl, false AS lanpltrusted, NULL::BIGINT AS lanplcallfoid,
 				NULL::BIGINT AS laninline, NULL::BIGINT AS lanvalidator WHERE false`,
-		"pg_extension": `CREATE OR REPLACE VIEW pg_extension AS
-			SELECT
-				row_number() OVER ()::BIGINT AS oid,
-				extension_name::VARCHAR AS extname,
-				0::BIGINT AS extowner,
-				0::BIGINT AS extnamespace,
-				false AS extrelocatable,
-				extension_version::VARCHAR AS extversion,
-				NULL::VARCHAR AS extconfig,
-				NULL::VARCHAR AS extcondition
-			FROM duckdb_extensions()
-			WHERE installed = true`,
 		"pg_foreign_server": `CREATE OR REPLACE VIEW pg_foreign_server AS
 			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS srvname, NULL::BIGINT AS srvowner,
 				NULL::BIGINT AS srvfdw, NULL::VARCHAR AS srvtype, NULL::VARCHAR AS srvversion,
@@ -840,6 +828,25 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		if _, err := db.Exec(sql); err != nil {
 			slog.Warn("Failed to create stub view.", "view", name, "error", err)
 		}
+	}
+
+	// pg_extension: backed by DuckDB's real extension metadata
+	pgExtensionSQL := `
+		CREATE OR REPLACE VIEW pg_extension AS
+		SELECT
+			row_number() OVER ()::BIGINT AS oid,
+			extension_name::VARCHAR AS extname,
+			0::BIGINT AS extowner,
+			0::BIGINT AS extnamespace,
+			false AS extrelocatable,
+			extension_version::VARCHAR AS extversion,
+			NULL::VARCHAR AS extconfig,
+			NULL::VARCHAR AS extcondition
+		FROM duckdb_extensions()
+		WHERE installed = true
+	`
+	if _, err := db.Exec(pgExtensionSQL); err != nil {
+		slog.Warn("Failed to create pg_extension view.", "error", err)
 	}
 
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
