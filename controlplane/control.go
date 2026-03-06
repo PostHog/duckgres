@@ -1035,6 +1035,9 @@ func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
 	addr := cp.cfg.MetricsServer.Addr
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 	newSrv := &http.Server{Addr: addr, Handler: mux}
 	cp.cfg.MetricsServer = newSrv
 	go func() {
