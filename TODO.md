@@ -72,11 +72,11 @@
 
 ## Known Issues
 
-- [ ] Some PostgreSQL drivers may fail with unsupported OIDs
+- [x] Some PostgreSQL drivers may fail with unsupported OIDs — unknown types fall back to `OidText` ([types.go](server/types.go))
 - [x] `\d` commands in psql don't work (need system catalog) - fixed
-- [ ] Transaction isolation may differ from PostgreSQL behavior
-- [ ] Large result sets may cause memory issues (no streaming)
+- [x] Transaction isolation may differ from PostgreSQL behavior — documented in [README](README.md#transaction-isolation)
+- [x] Large result sets may cause memory issues (no streaming) — results are streamed row-by-row via `rows.Next()` + server-side cursor emulation ([conn.go](server/conn.go))
 
 ## Contributing
 
-Pick an item from this list and submit a PR! Issues labeled `good first issue` are great starting points.
+Pick an item from this list and submit a PR! Issues labeled [`good first issue`](https://github.com/PostHog/duckgres/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are great starting points.
