@@ -121,23 +121,9 @@ Three-tier configuration (highest to lowest priority):
 3. YAML config file
 4. Built-in defaults
 
-## Testing
+## Development
 
-```bash
-# Build
-go build -o duckgres .
-
-# Run on non-standard port
-./duckgres --port 35437
-
-# Connect with psql
-PGPASSWORD=postgres psql "host=127.0.0.1 port=35437 user=postgres sslmode=require"
-
-# Test commands
-\dt          # List tables
-\d tablename # Describe table
-\l           # List databases
-```
+The project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available recipes for building, testing, running, metrics, and scripts.
 
 ## Common Development Tasks
 
