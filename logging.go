@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/posthog/duckgres/server"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
@@ -16,9 +17,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
-
-// logPasswordPattern matches password=<value> in log output for redaction.
-var logPasswordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s"]+)`)
 
 // redactingHandler wraps an slog.Handler and scrubs password values from
 // log messages and string attributes before forwarding to the inner handler.
@@ -31,7 +29,7 @@ func (h *redactingHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *redactingHandler) Handle(ctx context.Context, r slog.Record) error {
-	r.Message = logPasswordPattern.ReplaceAllString(r.Message, "${1}[REDACTED]")
+	r.Message = server.RedactSecrets(r.Message)
 
 	// Rebuild attrs with redacted string values.
 	var redacted []slog.Attr
@@ -60,7 +58,7 @@ func (h *redactingHandler) WithGroup(name string) slog.Handler {
 func redactAttr(a slog.Attr) slog.Attr {
 	switch a.Value.Kind() {
 	case slog.KindString:
-		a.Value = slog.StringValue(logPasswordPattern.ReplaceAllString(a.Value.String(), "${1}[REDACTED]"))
+		a.Value = slog.StringValue(server.RedactSecrets(a.Value.String()))
 	case slog.KindGroup:
 		attrs := a.Value.Group()
 		redacted := make([]slog.Attr, len(attrs))
@@ -70,7 +68,7 @@ func redactAttr(a slog.Attr) slog.Attr {
 		a.Value = slog.GroupValue(redacted...)
 	case slog.KindAny:
 		s := fmt.Sprintf("%v", a.Value.Any())
-		r := logPasswordPattern.ReplaceAllString(s, "${1}[REDACTED]")
+		r := server.RedactSecrets(s)
 		if r != s {
 			a.Value = slog.StringValue(r)
 		}

@@ -49,6 +49,12 @@ func TestRedactingHandler(t *testing.T) {
 			notWant: "oops",
 			want:    "[REDACTED]",
 		},
+		{
+			name:    "quoted password value",
+			msg:     `Unable to connect at "host=db password="topSecret" dbname=prod"`,
+			notWant: "topSecret",
+			want:    "[REDACTED]",
+		},
 	}
 
 	for _, tt := range tests {

@@ -430,6 +430,16 @@ func TestRedactConnectionString(t *testing.T) {
 			input:    "host=localhost password=p@ss!word123 user=admin",
 			expected: "host=localhost password=[REDACTED] user=admin",
 		},
+		{
+			name:     "password at end of quoted DSN",
+			input:    `"host=localhost password=secret"`,
+			expected: `"host=localhost password=[REDACTED]"`,
+		},
+		{
+			name:     "quoted password value",
+			input:    `host=localhost password="my secret" dbname=test`,
+			expected: `host=localhost password=[REDACTED] dbname=test`,
+		},
 	}
 
 	for _, tt := range tests {

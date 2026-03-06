@@ -41,7 +41,7 @@ func SetProcessVersion(v string) { processVersion = v }
 func ProcessVersion() string { return processVersion }
 
 // redactConnectionString removes sensitive information (passwords) from connection strings for logging
-var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s]+)`)
+var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
 
 var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "duckgres_connections_open",
