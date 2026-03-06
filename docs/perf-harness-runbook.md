@@ -56,7 +56,8 @@ go test ./tests/perf \
 
 The perf runner is configured by code in `posthog-cloud-infra`:
 
-- Terraform creates `duckling-perf-runner`, `duckling-perf-duckgres`, and perf artifact bucket resources.
+- Terraform creates `duckling-perf-runner` and `duckling-perf-duckgres` in `aws-accnt-managed-warehouse-prod-us`.
+- Nightly result publishing writes the canonical `query_results.csv` artifact into `duckling-posthog` schema `duckgres_perf`.
 - Ansible role `ansible/roles/perf_runner` installs the runner script plus a systemd timer.
 
 From `posthog-cloud-infra` repository root, configure the runner:
@@ -86,65 +87,82 @@ GitHub Actions equivalents in `posthog-cloud-infra`:
 
 Provision and update AWS resources through `posthog-cloud-infra` (Terraform/Terragrunt), not ad-hoc AWS CLI scripts.
 
-Use the managed warehouse stack:
+Use the prod-us managed warehouse stacks:
 
-- `terraform/environments/aws-accnt-managed-warehouse/us-east-1/duckling-example`
+- `terraform/environments/aws-accnt-managed-warehouse-prod-us/us-east-1/duckling-perf`
+- `terraform/environments/aws-accnt-managed-warehouse-prod-us/us-east-1/duckling-perf-runner`
 
 From the `posthog-cloud-infra` repository root:
 
 ```bash
 set -euo pipefail
 
-STACK_DIR="terraform/environments/aws-accnt-managed-warehouse/us-east-1/duckling-example"
-cd "$STACK_DIR"
+terragrunt run-all plan \
+  --working-dir terraform/environments/aws-accnt-managed-warehouse-prod-us/us-east-1 \
+  --queue-include-dir duckling-perf \
+  --queue-include-dir duckling-perf-runner
 
-terragrunt plan
-terragrunt apply
+terragrunt run-all apply \
+  --working-dir terraform/environments/aws-accnt-managed-warehouse-prod-us/us-east-1 \
+  --queue-include-dir duckling-perf \
+  --queue-include-dir duckling-perf-runner
 ```
 
-After apply, retrieve the perf-harness connection/storage values from Terragrunt outputs:
+After apply, configure Duckgres and the perf runner from the same `posthog-cloud-infra` repo:
 
 ```bash
-set -euo pipefail
+ansible-playbook ansible/duckgres-setup-playbook.yml \
+  -i ansible/hosts/duckgres.yml \
+  -e "target_hosts=managed_warehouse_prod_us_perf"
 
-RDS_ENDPOINT="$(terragrunt output -raw rds_endpoint)"
-DUCKLAKE_BUCKET="$(terragrunt output -raw bucket_name)"
-PERF_ARTIFACTS_ROOT_URI="$(terragrunt output -raw perf_artifacts_root_uri)"
-
-echo "RDS endpoint: ${RDS_ENDPOINT}"
-echo "DuckLake object store bucket: s3://${DUCKLAKE_BUCKET}/data/"
-echo "Perf artifacts root URI: ${PERF_ARTIFACTS_ROOT_URI}"
+ansible-playbook ansible/perf-runner-setup-playbook.yml \
+  -i ansible/hosts/duckgres.yml \
+  -e "target_hosts=managed_warehouse_perf_runner"
 ```
 
-Use `PERF_ARTIFACTS_ROOT_URI` for publishing nightly run artifacts.
+This configures:
 
-## Athena Path Contract (v1)
+- benchmark target: `duckling-perf-duckgres`
+- writer target: `duckling-posthog-duckgres`
+- publish table: `duckgres_perf.query_results`
 
-Nightly uploads publish the canonical Athena source object at:
+## Publish Path Contract (v2)
 
-`s3://<perf-artifacts-bucket>/perf-athena/query_results/dataset_version=<v>/run_date=<YYYY-MM-DD>/query_results-<run_id>.csv`
+Nightly runs still emit canonical local artifacts under:
+
+`artifacts/perf/<run_id>/`
+
+The upload hook then loads `query_results.csv` into:
+
+`duckgres_perf.query_results`
+
+on `duckling-posthog` over PGWire.
+
+Rows are stored with:
+
+- `run_id`
+- `query_id`
+- `intent_id`
+- `protocol`
+- `status`
+- `error`
+- `error_class`
+- `rows`
+- `duration_ms`
+- `started_at`
+- `dataset_version`
+- `run_date`
 
 The source CSV schema is fixed to:
 
 `query_id,intent_id,protocol,status,error,error_class,rows,duration_ms,started_at`
 
-`summary.json` is also uploaded for future dashboard expansion under:
+`summary.json` remains a local run artifact for debugging and future dashboard expansion.
 
-`s3://<perf-artifacts-bucket>/perf-athena/summary/dataset_version=<v>/run_date=<YYYY-MM-DD>/summary-<run_id>.json`
+## Grafana
 
-## Grafana (Manual Athena Datasource Setup)
-
-1. Apply the managed warehouse Athena stack:
-   `terraform/environments/aws-accnt-managed-warehouse/us-east-1/athena-perf`
-2. Get role ARN from output `duckgres_perf_athena_reader_role_arn`.
-3. In Internal Grafana, create an Athena datasource:
-   - Datasource type: `Amazon Athena`
-   - Region: `us-east-1`
-   - Catalog: `AwsDataCatalog`
-   - Database: `duckgres_perf`
-   - Workgroup: `duckgres-perf`
-   - Assume role ARN: `duckgres_perf_athena_reader_role_arn`
-4. Set datasource UID to match dashboard variable default (`athena-duckgres-perf`) or update dashboard variable `ds_athena` accordingly.
+The repo-managed dashboard now lives in `posthog-cloud-infra` prod-us Grafana and queries
+`duckgres_perf.query_results` through the manually created `posthog-duckling` datasource.
 
 ## Frozen Dataset Bootstrap
 
