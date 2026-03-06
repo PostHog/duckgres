@@ -1,0 +1,170 @@
+# Duckgres — PostgreSQL wire protocol server backed by DuckDB
+
+# Default recipe: list all available recipes
+default:
+    @just --list --list-submodules
+
+# === Build ===
+
+# Build the duckgres binary
+[group('build')]
+build:
+    go build -o duckgres .
+
+# Build with version info baked in
+[group('build')]
+build-release version="dev":
+    go build -ldflags "-X main.version={{version}} -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
+
+# Build Docker image
+[group('build')]
+docker tag="duckgres:dev":
+    docker build -t {{tag}} .
+
+# Clean build artifacts
+[group('build')]
+clean:
+    go clean
+    rm -f duckgres
+
+# === Dev ===
+
+num_cores := `sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4`
+
+# Run in standalone mode
+[group('dev')]
+run: build
+    ./duckgres
+
+# Run in control-plane mode
+[group('dev')]
+run-control-plane: build
+    ./duckgres --mode control-plane --min-workers {{num_cores}} --socket-dir ./sockets
+
+# Run with DuckLake config
+[group('dev')]
+run-ducklake: build
+    ./duckgres --config duckgres_local_ducklake.yaml
+
+# Connect via psql (standalone default port)
+[group('dev')]
+psql port="5432":
+    PGPASSWORD=postgres psql "host=127.0.0.1 port={{port}} user=postgres sslmode=require"
+
+# Watch for changes and rebuild
+[group('dev')]
+watch:
+    watchexec -e go -- go build -o duckgres .
+
+# Format Go source files
+[group('dev')]
+format:
+    gofmt -w .
+
+# === Test ===
+
+# Run all tests
+[group('test')]
+test:
+    go test ./...
+
+# Run unit tests only (server + transpiler)
+[group('test')]
+test-unit:
+    go test -v ./server/... ./transpiler/...
+
+# Run integration tests
+[group('test')]
+test-integration:
+    go test -v ./tests/integration/...
+
+# Run control plane tests
+[group('test')]
+test-controlplane:
+    go test -v -timeout 300s ./tests/controlplane/...
+
+# Run perf tests
+[group('test')]
+test-perf:
+    go test -v ./tests/perf/...
+
+# Run DuckLake-specific tests
+[group('test')]
+test-ducklake:
+    ./scripts/test_ducklake.sh
+
+# Run extension loading tests
+[group('test')]
+test-extensions:
+    ./scripts/test_extensions.sh
+
+# Run rate limiting tests
+[group('test')]
+test-ratelimit:
+    ./scripts/test_ratelimit.sh
+
+# Run Prometheus metrics tests
+[group('test')]
+test-metrics:
+    ./scripts/test_metrics.sh
+
+# Quick perf smoke test
+[group('test')]
+perf-smoke:
+    ./scripts/perf_smoke.sh
+
+# Full perf nightly suite
+[group('test')]
+perf-nightly:
+    ./scripts/perf_nightly.sh
+
+# Lint (matches CI — uses golangci-lint, not go vet)
+[group('test')]
+lint:
+    golangci-lint run
+
+# Run what CI runs: lint + unit + integration + controlplane tests
+[group('test')]
+ci: lint test-unit test-integration test-controlplane
+
+# === Metrics ===
+
+# Start Prometheus only
+[group('metrics')]
+prometheus:
+    docker compose -f metrics-compose.yml up -d prometheus
+    @echo "Prometheus ready at http://localhost:9091"
+
+# Start Prometheus + Grafana, open dashboard
+[group('metrics')]
+grafana: prometheus
+    docker compose -f metrics-compose.yml up -d grafana
+    @echo "Waiting for Grafana to start..."
+    @until curl -sf http://localhost:3000/api/health > /dev/null 2>&1; do sleep 1; done
+    @echo "Grafana ready at http://localhost:3000/d/duckgres-overview/duckgres"
+    open http://localhost:3000/d/duckgres-overview/duckgres
+
+# Stop Prometheus + Grafana
+[group('metrics')]
+metrics-stop:
+    docker compose -f metrics-compose.yml down
+
+# Client compatibility tests (just client-compat --list to see recipes)
+mod client-compat 'scripts/client-compat/justfile'
+
+# === Scripts ===
+
+# Generate self-signed TLS certs
+[group('scripts')]
+gen-certs:
+    ./scripts/gen-certs.sh
+
+# Seed DuckLake test data
+[group('scripts')]
+seed-ducklake:
+    ./scripts/seed_ducklake.sh
+
+# Bootstrap DuckLake frozen dataset
+[group('scripts')]
+bootstrap-ducklake:
+    ./scripts/bootstrap_ducklake_frozen_dataset.sh
