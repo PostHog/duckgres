@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -389,6 +390,24 @@ func TestWriteErrorResponse(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte("Msyntax error")) {
 		t.Error("should contain message 'syntax error'")
+	}
+}
+
+func TestWriteErrorResponseRedactsPassword(t *testing.T) {
+	var buf bytes.Buffer
+
+	msg := `flight execute update: rpc error: Unable to connect to Postgres at "host=db.example.com port=5432 user=myuser password=superSecret123 dbname=mydb": connection failed`
+	err := writeErrorResponse(&buf, "ERROR", "42000", msg)
+	if err != nil {
+		t.Fatalf("writeErrorResponse() error = %v", err)
+	}
+
+	output := buf.String()
+	if strings.Contains(output, "superSecret123") {
+		t.Error("password was not redacted from error response sent to client")
+	}
+	if !strings.Contains(output, "[REDACTED]") {
+		t.Error("expected [REDACTED] placeholder in output")
 	}
 }
 

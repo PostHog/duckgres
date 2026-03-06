@@ -85,8 +85,13 @@ type BackendKey struct {
 	SecretKey int32
 }
 
+// RedactSecrets removes password values from strings for safe logging and error reporting.
+func RedactSecrets(s string) string {
+	return passwordPattern.ReplaceAllString(s, "${1}[REDACTED]")
+}
+
 func redactConnectionString(connStr string) string {
-	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
+	return RedactSecrets(connStr)
 }
 
 type Config struct {
