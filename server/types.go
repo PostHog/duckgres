@@ -213,7 +213,7 @@ func mapDuckDBType(typeName string) TypeInfo {
 	case upper == "JSON":
 		return TypeInfo{OID: OidJSON, Size: -1, Typmod: -1}
 	default:
-		// Default to text for unknown types
+		// Unmapped types (MAP, STRUCT, UNION, ENUM, BIT, etc.) fall back to text
 		return TypeInfo{OID: OidText, Size: -1, Typmod: -1}
 	}
 }

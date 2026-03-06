@@ -32,6 +32,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
   - [Remote Worker Backend](#remote-worker-backend)
 - [Two-Tier Query Processing](#two-tier-query-processing)
 - [Supported Features](#supported-features)
+- [Transaction Isolation](#transaction-isolation)
 - [Limitations](#limitations)
 - [SQL Client Compatibility](#sql-client-compatibility)
 - [Dependencies](#dependencies)
@@ -90,25 +91,29 @@ See [docs/perf-harness-runbook.md](docs/perf-harness-runbook.md) and [tests/perf
 
 ## Quick Start
 
-### Build
+The project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available recipes.
+
+### Build & Run
 
 ```bash
-go build -o duckgres .
-```
-
-### Run
-
-```bash
-./duckgres
+just build    # Build the binary
+just run      # Run in standalone mode
 ```
 
 The server starts on port 5432 by default with TLS enabled. Database files are stored in `./data/`. Self-signed certificates are auto-generated in `./certs/` if not present.
 
+### Connect
+
+```bash
+just psql     # Connect via psql (port 5432)
+just psql 35437  # Connect on a different port
+```
+
 ### Docker
 
 ```bash
-docker build -t duckgres .
-docker run --rm -p 5432:5432 -p 9090:9090 duckgres
+just docker   # Build image (tagged duckgres:dev)
+docker run --rm -p 5432:5432 -p 9090:9090 duckgres:dev
 ```
 
 Mount a config file and persist data:
@@ -118,16 +123,7 @@ docker run --rm \
   -p 5432:5432 -p 9090:9090 \
   -v ./duckgres.yaml:/app/duckgres.yaml \
   -v ./data:/app/data \
-  duckgres
-```
-
-### Connect
-
-```bash
-# Using psql (sslmode=require is needed for TLS)
-PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"
-
-# Or with any PostgreSQL driver
+  duckgres:dev
 ```
 
 ## Configuration
