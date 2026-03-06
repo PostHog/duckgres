@@ -9,7 +9,7 @@ import (
 // checkSocketDirWritable verifies that the socket directory is writable by
 // creating and removing both a temporary file and a Unix socket. This catches
 // cases where ProtectSystem=strict's ReadWritePaths bind mount has been lost
-// or remounted RO (e.g., after a handover race with systemd's RuntimeDirectory cleanup).
+// or remounted RO (e.g., after an upgrade race with systemd's RuntimeDirectory cleanup).
 func checkSocketDirWritable(dir string) error {
 	// Test regular file creation
 	f, err := os.CreateTemp(dir, ".writable-check-*")

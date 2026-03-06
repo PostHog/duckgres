@@ -866,7 +866,7 @@ func (p *FlightWorkerPool) ShutdownAll() {
 
 	// Close all pre-bound sockets: both those returned above and any that
 	// were never assigned to workers. Socket files are not removed — during
-	// handover the new CP may have already replaced them via PreBindSockets.
+	// upgrade the new CP may have already replaced them via PreBindSockets.
 	// Stale files are cleaned up by the next startup's PreBindSockets.
 	p.closeAllPrebound()
 }

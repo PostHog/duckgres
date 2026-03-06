@@ -33,8 +33,8 @@ type ControlPlaneConfig struct {
 	HealthCheckInterval  time.Duration
 	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
-	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during handover (default: 24h)
-	MetricsServer        *http.Server  // Optional metrics server to shut down during handover
+	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade (default: 24h)
+	MetricsServer        *http.Server  // Optional metrics server to shut down during upgrade
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
@@ -77,7 +77,7 @@ type ControlPlane struct {
 	closeMu          sync.Mutex
 	wg               sync.WaitGroup
 	reloading        atomic.Bool         // guards against concurrent upgrade from double SIGUSR1
-	handoverDraining atomic.Bool         // true after upgrade succeeded; SIGTERM should exit immediately
+	upgradeDraining  atomic.Bool         // true after upgrade succeeded; SIGTERM should exit immediately
 	acmeManager      *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
 	acmeDNSManager   *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 }
@@ -120,7 +120,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		slog.Error("Failed to create tableflip upgrader.", "error", err)
 		os.Exit(1)
 	}
-	defer upg.Stop()
 
 	if !isK8s {
 		// Create socket directory.
@@ -337,7 +336,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		s := <-sig
-		if cp.handoverDraining.Load() {
+		if cp.upgradeDraining.Load() {
 			slog.Info("Received shutdown signal during upgrade drain, exiting immediately.", "signal", s)
 			cp.pool.ShutdownAll()
 			os.Exit(0)
@@ -407,7 +406,7 @@ func (cp *ControlPlane) acceptLoop() {
 				// Block here instead of returning. Returning would cause
 				// RunControlPlane() → main() to exit, killing all in-flight
 				// connection goroutines before the drain completes.
-				// The handover handler or shutdown handler will call os.Exit(0)
+				// The upgrade drain or shutdown handler will call os.Exit(0)
 				// after draining connections.
 				select {}
 			}
@@ -836,16 +835,19 @@ func (cp *ControlPlane) handleUpgrade() {
 	}
 
 	// Stop ACME managers so the new CP can bind port 80 (HTTP-01) or
-	// manage DNS records.
+	// manage DNS records. Nil out after close so drainAfterUpgrade
+	// doesn't double-close.
 	if cp.acmeManager != nil {
 		if err := cp.acmeManager.Close(); err != nil {
 			slog.Warn("ACME manager shutdown failed.", "error", err)
 		}
+		cp.acmeManager = nil
 	}
 	if cp.acmeDNSManager != nil {
 		if err := cp.acmeDNSManager.Close(); err != nil {
 			slog.Warn("ACME DNS manager shutdown failed.", "error", err)
 		}
+		cp.acmeDNSManager = nil
 	}
 
 	// Flight ingress is NOT stopped here — the old CP keeps serving Flight
@@ -868,7 +870,7 @@ func (cp *ControlPlane) handleUpgrade() {
 	}
 
 	slog.Info("Upgrade succeeded, child process is ready. Draining connections.")
-	cp.handoverDraining.Store(true)
+	cp.upgradeDraining.Store(true)
 	cp.reloading.Store(false)
 	// upg.Exit() channel closes now, triggering drainAfterUpgrade in the main goroutine.
 }
@@ -881,11 +883,6 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 	if cp.flight != nil {
 		cp.flight.Shutdown()
 		cp.flight = nil
-	}
-	if cp.acmeManager != nil {
-		if err := cp.acmeManager.Close(); err != nil {
-			slog.Warn("ACME manager shutdown during upgrade.", "error", err)
-		}
 	}
 
 	// Stop accepting new connections. The new CP has its own listener copy
@@ -923,7 +920,7 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 }
 
 // startFlightIngress creates and starts the Flight SQL ingress listener.
-// During handover, the old CP's Flight listener may still be shutting down,
+// During upgrade, the old CP's Flight listener may still be shutting down,
 // so we retry port binding briefly before giving up.
 func (cp *ControlPlane) startFlightIngress() {
 	if cp.cfg.FlightPort <= 0 {
@@ -960,12 +957,12 @@ func (cp *ControlPlane) startFlightIngress() {
 }
 
 // recoverAfterFailedReload restores all subsystems that were shut down in the
-// SIGUSR1 handler when the new CP fails to complete the handover.
+// SIGUSR1 handler when the new CP fails to complete the upgrade.
 func (cp *ControlPlane) recoverAfterFailedReload() {
 	cp.recoverMetricsAfterFailedReload()
 	cp.recoverACMEAfterFailedReload()
 	// Flight ingress is NOT shut down in the SIGUSR1 handler (it keeps
-	// serving during handover), so no recovery is needed here.
+	// serving during upgrade), so no recovery is needed here.
 }
 
 func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
