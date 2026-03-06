@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -61,6 +62,13 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("querylog: open duckdb: %w", err)
+	}
+
+	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
+	extDir := filepath.Join(cfg.DataDir, "extensions")
+	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("querylog: set extension_directory: %w", err)
 	}
 
 	// Load ducklake extension

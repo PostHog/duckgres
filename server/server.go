@@ -669,6 +669,15 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		slog.Debug("Set DuckDB temp_directory.", "temp_directory", tempDir)
 	}
 
+	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
+	// for autoloading/installing extensions.
+	extDir := filepath.Join(cfg.DataDir, "extensions")
+	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
+		slog.Warn("Failed to set DuckDB extension_directory.", "extension_directory", extDir, "error", err)
+	} else {
+		slog.Debug("Set DuckDB extension_directory.", "extension_directory", extDir)
+	}
+
 	// Load configured extensions
 	if err := LoadExtensions(db, cfg.Extensions); err != nil {
 		slog.Warn("Failed to load some extensions.", "user", username, "error", err)
