@@ -777,6 +777,63 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		slog.Warn("Failed to create pg_shdescription view.", "error", err)
 	}
 
+	// Empty stub views for pg_catalog tables that don't apply to DuckDB
+	// but are queried by clients like DBeaver and pgAdmin during introspection.
+	stubViews := map[string]string{
+		"pg_auth_members": `CREATE OR REPLACE VIEW pg_auth_members AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS roleid, NULL::BIGINT AS member,
+				NULL::BIGINT AS grantor, false AS admin_option, false AS inherit_option,
+				false AS set_option WHERE false`,
+		"pg_opclass": `CREATE OR REPLACE VIEW pg_opclass AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS opcmethod, NULL::VARCHAR AS opcname,
+				NULL::BIGINT AS opcnamespace, NULL::BIGINT AS opcowner, NULL::BIGINT AS opcfamily,
+				NULL::BIGINT AS opcintype, false AS opcdefault, NULL::BIGINT AS opckeytype WHERE false`,
+		"pg_conversion": `CREATE OR REPLACE VIEW pg_conversion AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS conname, NULL::BIGINT AS connamespace,
+				NULL::BIGINT AS conowner, NULL::INTEGER AS conforencoding,
+				NULL::INTEGER AS contoencoding, NULL::BIGINT AS conproc,
+				false AS condefault WHERE false`,
+		"pg_language": `CREATE OR REPLACE VIEW pg_language AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS lanname, NULL::BIGINT AS lanowner,
+				false AS lanispl, false AS lanpltrusted, NULL::BIGINT AS lanplcallfoid,
+				NULL::BIGINT AS laninline, NULL::BIGINT AS lanvalidator WHERE false`,
+		"pg_extension": `CREATE OR REPLACE VIEW pg_extension AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS extname, NULL::BIGINT AS extowner,
+				NULL::BIGINT AS extnamespace, false AS extrelocatable, NULL::VARCHAR AS extversion,
+				NULL::VARCHAR AS extconfig, NULL::VARCHAR AS extcondition WHERE false`,
+		"pg_foreign_server": `CREATE OR REPLACE VIEW pg_foreign_server AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS srvname, NULL::BIGINT AS srvowner,
+				NULL::BIGINT AS srvfdw, NULL::VARCHAR AS srvtype, NULL::VARCHAR AS srvversion,
+				NULL::VARCHAR AS srvoptions WHERE false`,
+		"pg_foreign_data_wrapper": `CREATE OR REPLACE VIEW pg_foreign_data_wrapper AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS fdwname, NULL::BIGINT AS fdwowner,
+				NULL::BIGINT AS fdwhandler, NULL::BIGINT AS fdwvalidator,
+				NULL::VARCHAR AS fdwoptions WHERE false`,
+		"pg_foreign_table": `CREATE OR REPLACE VIEW pg_foreign_table AS
+			SELECT NULL::BIGINT AS ftrelid, NULL::BIGINT AS ftserver,
+				NULL::VARCHAR AS ftoptions WHERE false`,
+		"pg_trigger": `CREATE OR REPLACE VIEW pg_trigger AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS tgrelid, NULL::VARCHAR AS tgname,
+				NULL::BIGINT AS tgfoid, NULL::SMALLINT AS tgtype, NULL::VARCHAR AS tgenabled,
+				false AS tgisinternal, NULL::BIGINT AS tgconstrrelid, NULL::BIGINT AS tgconstrindid,
+				NULL::BIGINT AS tgconstraint, false AS tgdeferrable, false AS tginitdeferred,
+				NULL::SMALLINT AS tgnargs, NULL::VARCHAR AS tgattr, NULL::VARCHAR AS tgargs,
+				NULL::VARCHAR AS tgqual, NULL::VARCHAR AS tgoldtable, NULL::VARCHAR AS tgnewtable,
+				NULL::BIGINT AS tgparentid WHERE false`,
+		"pg_locks": `CREATE OR REPLACE VIEW pg_locks AS
+			SELECT NULL::VARCHAR AS locktype, NULL::BIGINT AS database, NULL::BIGINT AS relation,
+				NULL::INTEGER AS page, NULL::SMALLINT AS tuple, NULL::VARCHAR AS virtualxid,
+				NULL::BIGINT AS transactionid, NULL::BIGINT AS classid, NULL::BIGINT AS objid,
+				NULL::SMALLINT AS objsubid, NULL::VARCHAR AS virtualtransaction,
+				NULL::INTEGER AS pid, NULL::VARCHAR AS mode, false AS granted,
+				false AS fastpath WHERE false`,
+	}
+	for name, sql := range stubViews {
+		if _, err := db.Exec(sql); err != nil {
+			slog.Warn("Failed to create stub view.", "view", name, "error", err)
+		}
+	}
+
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
 	//
@@ -874,6 +931,10 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// pg_get_constraintdef - get constraint definition
 		`DROP MACRO IF EXISTS pg_get_constraintdef`,
 		`CREATE MACRO pg_get_constraintdef(constraint_oid, pretty := false) AS ''`,
+		// pg_get_viewdef - DuckDB has a 1-arg built-in; replace with a version that also
+		// accepts a pretty-print flag (some clients like DBeaver pass pg_get_viewdef(oid, true))
+		`DROP MACRO IF EXISTS pg_get_viewdef`,
+		`CREATE MACRO pg_get_viewdef(view_oid, pretty := false) AS ''`,
 		// pg_get_serial_sequence - get sequence name for a serial/identity column
 		// Returns NULL because DuckLake doesn't support sequences
 		`CREATE OR REPLACE MACRO pg_get_serial_sequence(table_name, column_name) AS NULL`,

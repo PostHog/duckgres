@@ -56,7 +56,17 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_enum":               "pg_enum",
 			"pg_indexes":            "pg_indexes",
 			"pg_stat_activity":      "pg_stat_activity",
-			"pg_shdescription":     "pg_shdescription",
+			"pg_shdescription":          "pg_shdescription",
+			"pg_auth_members":           "pg_auth_members",
+			"pg_opclass":                "pg_opclass",
+			"pg_conversion":             "pg_conversion",
+			"pg_language":               "pg_language",
+			"pg_extension":              "pg_extension",
+			"pg_foreign_server":         "pg_foreign_server",
+			"pg_foreign_data_wrapper":   "pg_foreign_data_wrapper",
+			"pg_foreign_table":          "pg_foreign_table",
+			"pg_trigger":                "pg_trigger",
+			"pg_locks":                  "pg_locks",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
@@ -67,6 +77,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"obj_description":                 true,
 			"col_description":                 true,
 			"shobj_description":               true,
+			"pg_get_viewdef":                  true,
 			"pg_get_indexdef":                 true,
 			"pg_get_constraintdef":            true,
 			"pg_get_partkeydef":               true,
@@ -123,6 +134,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_any_column_privilege":        true, // Column access check
 			"has_database_privilege":          true, // Database access check
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
+			"pg_get_viewdef":                  true, // 2-arg overload wrapping DuckDB's 1-arg built-in
 			"pg_get_expr":                     true, // Our version that accepts 2 or 3 args
 			"pg_get_indexdef":                 true, // Returns empty string
 			"pg_get_constraintdef":            true, // Returns empty string
