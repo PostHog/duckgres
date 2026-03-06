@@ -95,7 +95,7 @@ jobs:
 
       - name: Create Release
         if: steps.check-existing.outputs.exists == 'false'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
           tag_name: build-${{ steps.sha.outputs.short }}
           name: Build ${{ steps.sha.outputs.short }}
@@ -123,7 +123,7 @@ jobs:
           git push -f origin latest
 
       - name: Create latest release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
           tag_name: latest
           name: Latest Build
