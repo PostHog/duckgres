@@ -217,7 +217,6 @@ func main() {
 	workerIdleTimeout := flag.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
 	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for connections to drain during handover (default: '24h') (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
-	handoverSocket := flag.String("handover-socket", "", "Handover socket for graceful deployment (control-plane mode)")
 	workerBackend := flag.String("worker-backend", "", "Worker backend: process (default) or remote (env: DUCKGRES_WORKER_BACKEND)")
 	k8sWorkerImage := flag.String("k8s-worker-image", "", "Container image for K8s worker pods (env: DUCKGRES_K8S_WORKER_IMAGE)")
 	k8sWorkerNamespace := flag.String("k8s-worker-namespace", "", "K8s namespace for worker pods (env: DUCKGRES_K8S_WORKER_NAMESPACE)")
@@ -500,7 +499,6 @@ func main() {
 			Config:               cfg,
 			SocketDir:            *socketDir,
 			ConfigPath:           *configFile,
-			HandoverSocket:       *handoverSocket,
 			WorkerQueueTimeout:   resolved.WorkerQueueTimeout,
 			WorkerIdleTimeout:    resolved.WorkerIdleTimeout,
 			HandoverDrainTimeout: resolved.HandoverDrainTimeout,
