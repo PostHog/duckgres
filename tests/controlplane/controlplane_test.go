@@ -11,8 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -108,9 +106,8 @@ type cpHarness struct {
 }
 
 type cpOpts struct {
-	handoverSocket string
-	flightPort     int
-	maxWorkers     int
+	flightPort int
+	maxWorkers int
 }
 
 func defaultOpts() cpOpts {
@@ -158,18 +155,12 @@ users:
 		t.Fatalf("Failed to write config: %v", err)
 	}
 
-	handoverSocket := opts.handoverSocket
-	if handoverSocket == "" {
-		handoverSocket = filepath.Join(socketDir, "handover.sock")
-	}
-
 	logBuf := &syncBuffer{}
 
 	args := []string{
 		"--config", configFile,
 		"--mode", "control-plane",
 		"--socket-dir", socketDir,
-		"--handover-socket", handoverSocket,
 	}
 
 	cmd := exec.Command(binaryPath, args...)
@@ -181,7 +172,7 @@ users:
 		"PATH=" + os.Getenv("PATH"),
 	}
 	// Put CP in its own process group so cleanup can kill the entire tree
-	// (CP + selfExec'd new CPs + all workers) with a single signal.
+	// (CP + upgraded new CPs + all workers) with a single signal.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
@@ -238,20 +229,6 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
 }
 
-var newCPPidRe = regexp.MustCompile(`New control plane spawned\..*pid=(\d+)`)
-
-// parseNewCPPid extracts the new CP PID from the logs after a handover.
-func (h *cpHarness) parseNewCPPid() (int, error) {
-	matches := newCPPidRe.FindStringSubmatch(h.logBuf.String())
-	if len(matches) < 2 {
-		return 0, fmt.Errorf("could not find new CP PID in logs")
-	}
-	pid, err := strconv.Atoi(matches[1])
-	if err != nil {
-		return 0, fmt.Errorf("invalid PID %q: %w", matches[1], err)
-	}
-	return pid, nil
-}
 
 func (h *cpHarness) cleanup(t *testing.T) {
 	t.Helper()
@@ -261,7 +238,7 @@ func (h *cpHarness) cleanup(t *testing.T) {
 	}
 
 	// The CP was started with Setpgid: true, so it and all descendants
-	// (selfExec'd new CPs, all workers) share a process group. Killing
+	// (upgraded new CPs, all workers) share a process group. Killing
 	// the group ensures no orphan workers survive to hold pipe FDs open
 	// (which would block cmd.Wait() forever).
 	pgid := h.cmd.Process.Pid
@@ -290,9 +267,8 @@ func (h *cpHarness) cleanup(t *testing.T) {
 	}
 }
 
-// doHandover sends SIGUSR1, waits for the new CP to take over, and tracks
-// the new PID for cleanup. Returns the new CP's PID.
-func (h *cpHarness) doHandover(t *testing.T) int {
+// doHandover sends SIGUSR1 and waits for the new CP to take over.
+func (h *cpHarness) doHandover(t *testing.T) {
 	t.Helper()
 
 	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
@@ -300,15 +276,9 @@ func (h *cpHarness) doHandover(t *testing.T) int {
 	}
 
 	// Wait for the new CP to confirm it has taken over
-	if err := h.waitForLog("Handover complete, took over PG listener.", 30*time.Second); err != nil {
-		t.Fatalf("Handover did not complete.\nLogs:\n%s", h.logBuf.String())
+	if err := h.waitForLog("Upgrade complete, inherited PG listener.", 30*time.Second); err != nil {
+		t.Fatalf("Upgrade did not complete.\nLogs:\n%s", h.logBuf.String())
 	}
-
-	newPid, err := h.parseNewCPPid()
-	if err != nil {
-		t.Fatalf("Failed to parse new CP PID: %v\nLogs:\n%s", err, h.logBuf.String())
-	}
-	return newPid
 }
 
 // freePort allocates a free TCP port by briefly listening on :0.
@@ -454,7 +424,7 @@ func TestHandoverNewConnectionsDuringTransition(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 
 		// Stop once the new CP has taken over and we've confirmed connectivity
-		if strings.Contains(h.logBuf.String(), "Handover complete, took over PG listener.") && successes > 0 {
+		if strings.Contains(h.logBuf.String(), "Upgrade complete, inherited PG listener.") && successes > 0 {
 			break
 		}
 	}
@@ -518,7 +488,7 @@ func TestHandoverConcurrentConnections(t *testing.T) {
 	wg.Wait()
 
 	// Wait for the new CP to confirm it has taken over
-	if err := h.waitForLog("Handover complete, took over PG listener.", 60*time.Second); err != nil {
+	if err := h.waitForLog("Upgrade complete, inherited PG listener.", 60*time.Second); err != nil {
 		t.Fatalf("Handover did not complete.\nLogs:\n%s", h.logBuf.String())
 	}
 
@@ -562,12 +532,12 @@ func TestDoubleUSR1Ignored(t *testing.T) {
 	_ = h.sendSignal(syscall.SIGUSR1)
 
 	// Wait for the new CP to confirm it has taken over
-	if err := h.waitForLog("Handover complete, took over PG listener.", 30*time.Second); err != nil {
+	if err := h.waitForLog("Upgrade complete, inherited PG listener.", 30*time.Second); err != nil {
 		t.Fatalf("Handover did not complete.\nLogs:\n%s", h.logBuf.String())
 	}
 
 	// Verify exactly one handover happened
-	handoverCount := strings.Count(h.logBuf.String(), "Handover complete, took over PG listener.")
+	handoverCount := strings.Count(h.logBuf.String(), "Upgrade complete, inherited PG listener.")
 	if handoverCount != 1 {
 		t.Fatalf("Expected exactly 1 handover, got %d.\nLogs:\n%s", handoverCount, h.logBuf.String())
 	}
@@ -579,13 +549,9 @@ func TestDoubleUSR1Ignored(t *testing.T) {
 	}
 }
 
-// TestHandoverChildCrashRecovery verifies that when the self-exec'd child
-// process dies before connecting to the handover socket, the old control
-// plane recovers from the RELOADING state and continues serving.
-//
-// This is a regression test for a bug where selfExec()'s cmd.Wait goroutine
-// didn't trigger recovery, leaving the old CP stuck in "reloading" state
-// and causing systemd to log "Reload operation timed out" indefinitely.
+// TestHandoverChildCrashRecovery verifies that when the upgraded child
+// process dies during startup, the old control plane recovers from the
+// RELOADING state and continues serving.
 func TestHandoverChildCrashRecovery(t *testing.T) {
 	h := startControlPlane(t, defaultOpts())
 
@@ -597,9 +563,9 @@ func TestHandoverChildCrashRecovery(t *testing.T) {
 	}
 	_ = db.Close()
 
-	// Save the original config, then corrupt it so the self-exec'd child
-	// fails during startup (before reaching the handover socket).
-	// The old CP already loaded its config, so this doesn't affect it.
+	// Save the original config, then corrupt it so the upgraded child
+	// fails during startup. The old CP already loaded its config, so
+	// this doesn't affect it.
 	origConfig, err := os.ReadFile(h.configFile)
 	if err != nil {
 		t.Fatalf("Failed to read config file: %v", err)
@@ -617,7 +583,7 @@ func TestHandoverChildCrashRecovery(t *testing.T) {
 	}
 
 	// The old CP must detect the child failure and recover
-	if err := h.waitForLog("Child process exited before completing handover, recovering.", 15*time.Second); err != nil {
+	if err := h.waitForLog("Upgrade failed, recovering.", 15*time.Second); err != nil {
 		t.Fatalf("Recovery did not happen.\nLogs:\n%s", h.logBuf.String())
 	}
 
@@ -638,8 +604,8 @@ func TestHandoverChildCrashRecovery(t *testing.T) {
 }
 
 // TestHandoverChildCrashThenRetry verifies that after recovering from a
-// failed handover (child crash), a subsequent SIGUSR1 successfully completes
-// a full handover. This ensures the handover listener is properly restarted.
+// failed upgrade (child crash), a subsequent SIGUSR1 successfully completes
+// a full upgrade.
 func TestHandoverChildCrashThenRetry(t *testing.T) {
 	h := startControlPlane(t, defaultOpts())
 
@@ -664,7 +630,7 @@ func TestHandoverChildCrashThenRetry(t *testing.T) {
 	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
 		t.Fatalf("Failed to send first SIGUSR1: %v", err)
 	}
-	if err := h.waitForLog("Child process exited before completing handover, recovering.", 15*time.Second); err != nil {
+	if err := h.waitForLog("Upgrade failed, recovering.", 15*time.Second); err != nil {
 		t.Fatalf("First recovery did not happen.\nLogs:\n%s", h.logBuf.String())
 	}
 
@@ -685,7 +651,7 @@ func TestHandoverChildCrashThenRetry(t *testing.T) {
 	if err := h.sendSignal(syscall.SIGUSR1); err != nil {
 		t.Fatalf("Failed to send second SIGUSR1: %v", err)
 	}
-	if err := h.waitForLog("Handover complete, took over PG listener.", 30*time.Second); err != nil {
+	if err := h.waitForLog("Upgrade complete, inherited PG listener.", 30*time.Second); err != nil {
 		t.Fatalf("Second handover did not complete.\nLogs:\n%s", h.logBuf.String())
 	}
 
@@ -700,13 +666,8 @@ func TestHandoverChildCrashThenRetry(t *testing.T) {
 }
 
 // TestHandoverDrainsBeforeExit verifies that the old control plane process
-// stays alive after the handover to drain in-flight connections, rather than
-// exiting immediately when acceptLoop returns.
-//
-// Regression test: without the fix (select {} in acceptLoop), closing the
-// PG listener causes acceptLoop to return, which unwinds through
-// RunControlPlane() → main() → process exit. All connection goroutines
-// are killed before the drain logic in handleHandoverRequest runs.
+// stays alive after an upgrade to drain in-flight connections, rather than
+// exiting immediately.
 //
 // Instead of relying on query timing (fast machines complete queries before
 // the race triggers), this test holds an idle connection open. The idle
@@ -746,95 +707,31 @@ func TestHandoverDrainsBeforeExit(t *testing.T) {
 	_ = db.Close()
 
 	// Verify the old CP went through the proper drain → exit path
-	if err := h.waitForLog("All connections drained after handover.", 30*time.Second); err != nil {
+	if err := h.waitForLog("All connections drained after upgrade.", 30*time.Second); err != nil {
 		t.Fatalf("Old CP did not drain properly.\nLogs:\n%s", h.logBuf.String())
 	}
-	if err := h.waitForLog("Old control plane exiting after handover.", 10*time.Second); err != nil {
+	if err := h.waitForLog("Old control plane exiting after upgrade.", 10*time.Second); err != nil {
 		t.Fatalf("Old CP did not exit via handover path.\nLogs:\n%s", h.logBuf.String())
 	}
 }
 
-// TestHandoverPassesPreboundSockets verifies that during a graceful handover,
-// the old CP passes its pre-bound worker socket FDs to the new CP. The new CP
-// imports them and uses them to spawn workers without creating new socket files.
-func TestHandoverPassesPreboundSockets(t *testing.T) {
+// TestUpgradeWithMaxWorkers verifies that a graceful upgrade works when
+// max_workers is set. The new CP creates fresh pre-bound sockets.
+func TestUpgradeWithMaxWorkers(t *testing.T) {
 	opts := defaultOpts()
 	opts.maxWorkers = 3
 	h := startControlPlane(t, opts)
 
-	// Trigger handover (no active connections, so all pre-bound sockets
-	// should be available for transfer)
 	h.doHandover(t)
 
-	// Wait for the new CP to import pre-bound sockets
-	time.Sleep(500 * time.Millisecond)
-
-	// Verify pre-bound sockets were imported
-	logs := h.logBuf.String()
-	if !strings.Contains(logs, "Imported pre-bound sockets from handover.") {
-		t.Fatalf("Expected pre-bound socket import log.\nLogs:\n%s", logs)
-	}
-
-	// Verify new connections work (spawns a worker using an imported socket)
+	// Verify new connections work after upgrade
 	db := h.openConn(t)
 	var v int
 	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
-		t.Fatalf("Post-handover query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+		t.Fatalf("Post-upgrade query failed: %v\nLogs:\n%s", err, h.logBuf.String())
 	}
 	if v != 42 {
 		t.Fatalf("Expected 42, got %d", v)
-	}
-}
-
-// TestHandoverWithReadOnlySocketDir verifies the core EROFS fix: when the
-// socket directory becomes read-only (simulating systemd ProtectSystem=strict),
-// the handover still succeeds because the old CP passes pre-bound socket FDs.
-// Without this fix, the new CP would exit(1) before attempting handover.
-func TestHandoverWithReadOnlySocketDir(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("skipping EROFS test: running as root (chmod ineffective)")
-	}
-
-	opts := defaultOpts()
-	opts.maxWorkers = 2
-	h := startControlPlane(t, opts)
-
-	// Make the socket directory read-only to simulate EROFS
-	if err := os.Chmod(h.socketDir, 0555); err != nil {
-		t.Fatalf("chmod failed: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(h.socketDir, 0755) })
-
-	// Verify the dir is actually read-only
-	testFile := filepath.Join(h.socketDir, ".test-write")
-	if err := os.WriteFile(testFile, []byte("test"), 0644); err == nil {
-		_ = os.Remove(testFile)
-		_ = os.Chmod(h.socketDir, 0755) // restore for cleanup
-		t.Skip("socket dir is still writable despite chmod 0555")
-	}
-
-	// Trigger handover — the new CP should succeed by using pre-bound
-	// sockets from the old CP, bypassing the writability check.
-	h.doHandover(t)
-
-	// Restore permissions so the test can clean up and the new CP's workers
-	// can potentially create dynamic sockets if needed.
-	_ = os.Chmod(h.socketDir, 0755)
-
-	// Verify the new CP can serve connections using inherited sockets
-	db := h.openConn(t)
-	var v int
-	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
-		t.Fatalf("Post-EROFS-handover query failed: %v\nLogs:\n%s", err, h.logBuf.String())
-	}
-	if v != 42 {
-		t.Fatalf("Expected 42, got %d", v)
-	}
-
-	// Verify the expected log messages
-	logs := h.logBuf.String()
-	if !strings.Contains(logs, "Imported pre-bound sockets from handover.") {
-		t.Fatalf("Expected pre-bound socket import log.\nLogs:\n%s", logs)
 	}
 }
 

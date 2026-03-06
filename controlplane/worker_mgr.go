@@ -86,7 +86,7 @@ func NewFlightWorkerPool(socketDir, configPath string, minWorkers, maxWorkers in
 // PreBindSockets eagerly binds count Unix sockets at startup while the socket
 // directory is verified writable. Under systemd's ProtectSystem=strict, the
 // RuntimeDirectory bind mount can go read-only after the service finishes
-// starting (e.g., after a handover or namespace event). Pre-binding ensures
+// starting (e.g., after an upgrade or namespace event). Pre-binding ensures
 // sockets are available regardless of later filesystem state.
 func (p *FlightWorkerPool) PreBindSockets(count int) error {
 	p.preboundMu.Lock()
@@ -107,7 +107,7 @@ func (p *FlightWorkerPool) PreBindSockets(count int) error {
 			p.prebound = nil
 			return fmt.Errorf("pre-bind worker socket %s: %w", socketPath, err)
 		}
-		// Prevent Close() from removing the socket file. During handover,
+		// Prevent Close() from removing the socket file. During upgrade,
 		// the old CP's Close() would otherwise delete socket files that the
 		// new CP has already replaced with its own pre-bound sockets.
 		// Socket files are cleaned up by os.Remove in PreBindSockets at next startup.
@@ -132,7 +132,7 @@ func (p *FlightWorkerPool) takePrebound() *preboundSocket {
 	p.prebound = p.prebound[:n]
 	p.preboundMu.Unlock()
 
-	// Validate the socket file still exists on disk. After a handover,
+	// Validate the socket file still exists on disk. After an upgrade,
 	// systemd may tear down the writable bind mount for /run/duckgres when
 	// the old CP exits, causing all pre-bound socket files to disappear.
 	// Workers can still LISTEN on inherited FDs, but the CP can't CONNECT
@@ -161,7 +161,7 @@ func (p *FlightWorkerPool) releaseWorkerSocket(w *ManagedWorker) {
 	w.releaseOnce.Do(func() {
 		if w.prebound != nil {
 			// Verify the socket file still exists before returning to the pool.
-			// After a handover, the bind mount may be gone and the file missing.
+			// After an upgrade, the bind mount may be gone and the file missing.
 			if _, err := os.Stat(w.prebound.socketPath); err != nil {
 				_ = w.prebound.listener.Close()
 			} else {
@@ -178,7 +178,7 @@ func (p *FlightWorkerPool) releaseWorkerSocket(w *ManagedWorker) {
 }
 
 // closeAllPrebound permanently closes all remaining pre-bound sockets.
-// Called during ShutdownAll. Does NOT remove socket files — during handover,
+// Called during ShutdownAll. Does NOT remove socket files — during upgrade,
 // the new CP may have already replaced them. Stale files are cleaned up by
 // the next startup's PreBindSockets.
 func (p *FlightWorkerPool) closeAllPrebound() {
@@ -193,7 +193,7 @@ func (p *FlightWorkerPool) closeAllPrebound() {
 // effectiveSocketDir returns a writable directory for dynamic worker sockets.
 // It tries the primary socketDir first, falling back to /tmp/duckgres if
 // the primary is read-only (e.g., after systemd tears down the RuntimeDirectory
-// bind mount following a handover).
+// bind mount following an upgrade).
 func (p *FlightWorkerPool) effectiveSocketDir() (string, error) {
 	p.preboundMu.Lock()
 	cached := p.fallbackSocketDir
@@ -215,24 +215,6 @@ func (p *FlightWorkerPool) effectiveSocketDir() (string, error) {
 	return fallback, nil
 }
 
-// TakeAllPrebound removes and returns all available pre-bound sockets.
-// Used during handover to pass socket FDs to the new control plane.
-func (p *FlightWorkerPool) TakeAllPrebound() []*preboundSocket {
-	p.preboundMu.Lock()
-	defer p.preboundMu.Unlock()
-	result := p.prebound
-	p.prebound = nil
-	return result
-}
-
-// ImportPrebound imports pre-bound sockets received from a handover into the pool.
-// These sockets were created by the old control plane and passed via SCM_RIGHTS.
-func (p *FlightWorkerPool) ImportPrebound(sockets []*preboundSocket) {
-	p.preboundMu.Lock()
-	defer p.preboundMu.Unlock()
-	p.prebound = append(p.prebound, sockets...)
-	slog.Info("Imported pre-bound sockets from handover.", "count", len(sockets))
-}
 
 // SpawnWorker starts a new duckdb-service worker process.
 // It uses a pre-bound socket from the pool if available, falling back to
@@ -884,7 +866,7 @@ func (p *FlightWorkerPool) ShutdownAll() {
 
 	// Close all pre-bound sockets: both those returned above and any that
 	// were never assigned to workers. Socket files are not removed — during
-	// handover the new CP may have already replaced them via PreBindSockets.
+	// upgrade the new CP may have already replaced them via PreBindSockets.
 	// Stale files are cleaned up by the next startup's PreBindSockets.
 	p.closeAllPrebound()
 }

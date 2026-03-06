@@ -13,13 +13,13 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/cloudflare/tableflip"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -30,12 +30,11 @@ type ControlPlaneConfig struct {
 
 	SocketDir            string
 	ConfigPath           string // Path to config file, passed to workers
-	HandoverSocket       string
 	HealthCheckInterval  time.Duration
 	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
-	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during handover (default: 24h)
-	MetricsServer        *http.Server  // Optional metrics server to shut down during handover
+	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade (default: 24h)
+	MetricsServer        *http.Server  // Optional metrics server to shut down during upgrade
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
@@ -72,13 +71,13 @@ type ControlPlane struct {
 	rateLimiter      *server.RateLimiter
 	tlsConfig        *tls.Config
 	pgListener       net.Listener
+	upgrader         *tableflip.Upgrader
 	activeConns      int64
 	closed           bool
 	closeMu          sync.Mutex
 	wg               sync.WaitGroup
-	reloading        atomic.Bool         // guards against concurrent selfExec from double SIGUSR1
-	handoverDraining atomic.Bool         // true after handover succeeded; SIGTERM should exit immediately
-	handoverLn       net.Listener        // current handover listener; protected by closeMu
+	reloading        atomic.Bool         // guards against concurrent upgrade from double SIGUSR1
+	upgradeDraining  atomic.Bool         // true after upgrade succeeded; SIGTERM should exit immediately
 	acmeManager      *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
 	acmeDNSManager   *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 }
@@ -110,15 +109,20 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	isK8s := cfg.WorkerBackend == "remote"
 
-	// Socket directory and handover are only used by the process backend.
-	var handoverPgLn *net.TCPListener
-	var handoverPrebound []*preboundSocket
-	handoverDone := false
+	// --- tableflip upgrader for zero-downtime restarts ---
+	// tableflip handles process spawning, listener FD inheritance, and the
+	// parent/child ready/exit lifecycle. This replaces the bespoke handover
+	// protocol (SCM_RIGHTS, JSON messages, handover socket).
+	upg, err := tableflip.New(tableflip.Options{
+		UpgradeTimeout: 30 * time.Second,
+	})
+	if err != nil {
+		slog.Error("Failed to create tableflip upgrader.", "error", err)
+		os.Exit(1)
+	}
 
 	if !isK8s {
-		// Create socket directory. Writability is checked below, after
-		// attempting handover — the old CP may provide pre-bound socket FDs,
-		// making a writable directory unnecessary under EROFS.
+		// Create socket directory.
 		if err := os.MkdirAll(cfg.SocketDir, 0755); err != nil {
 			slog.Error("Failed to create socket directory.", "error", err)
 			os.Exit(1)
@@ -156,35 +160,25 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}
 
-	if !isK8s {
-		// --- Attempt handover from existing control plane ---
-		// This must happen BEFORE the writability check because under systemd's
-		// ProtectSystem=strict, the RuntimeDirectory can become read-only (EROFS)
-		// after startup. The old CP sends pre-bound socket FDs during handover,
-		// allowing the new CP to work without creating new sockets.
-		if cfg.HandoverSocket == "" {
-			slog.Info("No handover socket configured, starting fresh.")
-		} else {
-			if _, err := os.Stat(cfg.HandoverSocket); err != nil {
-				slog.Info("Handover socket not found, starting fresh.", "socket", cfg.HandoverSocket, "error", err)
-			} else {
-				slog.Info("Existing handover socket found, attempting handover.", "socket", cfg.HandoverSocket)
-				pgLn, prebound, err := receiveHandover(cfg.HandoverSocket, cfg.SocketDir)
-				if err != nil {
-					slog.Warn("Handover failed, starting fresh.", "error", err)
-				} else {
-					handoverPgLn = pgLn
-					handoverPrebound = prebound
-					handoverDone = true
-					slog.Info("Handover complete, took over PG listener.", "prebound_count", len(prebound))
-				}
-			}
-		}
+	// Inherit or bind the PG TCP listener. tableflip returns the inherited
+	// listener from the parent process on upgrade, or creates a fresh one.
+	pgAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	pgLn, err := upg.Listen("tcp", pgAddr)
+	if err != nil {
+		slog.Error("Failed to listen.", "addr", pgAddr, "error", err)
+		os.Exit(1)
+	}
 
-		// Verify socket directory is writable. Skip when handover provided
-		// pre-bound sockets — the directory may be read-only (EROFS under
-		// systemd ProtectSystem=strict), which is fine since we use inherited FDs.
-		if len(handoverPrebound) == 0 {
+	if upg.HasParent() {
+		slog.Info("Upgrade complete, inherited PG listener.", "addr", pgLn.Addr().String())
+	}
+
+	if !isK8s {
+		// Verify socket directory is writable. On upgrade, the directory
+		// may have gone read-only (EROFS under systemd ProtectSystem=strict);
+		// PreBindSockets is non-fatal in that case, and workers will use the
+		// /tmp fallback via effectiveSocketDir.
+		if !upg.HasParent() {
 			if err := checkSocketDirWritable(cfg.SocketDir); err != nil {
 				slog.Error("Socket directory is not writable. Control plane will not be able to create worker sockets.", "dir", cfg.SocketDir, "error", err)
 				os.Exit(1)
@@ -252,15 +246,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, minWorkers, maxWorkers)
 		procPool.idleTimeout = cfg.WorkerIdleTimeout
 
-		// Import pre-bound sockets from handover, or pre-bind new ones.
-		// During handover, the old CP passes its pre-bound socket FDs so the
-		// new CP works even when the socket directory is read-only (EROFS).
-		if len(handoverPrebound) > 0 {
-			procPool.ImportPrebound(handoverPrebound)
-		} else if maxWorkers > 0 {
+		// Pre-bind worker sockets. On upgrade with EROFS, this may fail —
+		// that's OK, workers will fall back to effectiveSocketDir (/tmp).
+		if maxWorkers > 0 {
 			if err := procPool.PreBindSockets(maxWorkers); err != nil {
-				slog.Error("Failed to pre-bind worker sockets.", "error", err)
-				os.Exit(1)
+				if upg.HasParent() {
+					slog.Warn("Failed to pre-bind worker sockets (will use dynamic sockets).", "error", err)
+				} else {
+					slog.Error("Failed to pre-bind worker sockets.", "error", err)
+					os.Exit(1)
+				}
 			}
 		}
 		pool = procPool
@@ -296,28 +291,10 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		srv:         srv,
 		rateLimiter: server.NewRateLimiter(cfg.RateLimit),
 		tlsConfig:   tlsCfg,
+		pgListener:  pgLn,
+		upgrader:    upg,
 		acmeManager:    acmeMgr,
 		acmeDNSManager: acmeDNSMgr,
-	}
-
-	// Set up signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1)
-
-	// Set PG listener from handover or bind a fresh TCP listener.
-	if handoverDone {
-		cp.pgListener = handoverPgLn
-	} else {
-		// Bind TCP listener FIRST, before spawning workers. If the port is
-		// already in use (e.g. old CP still running after a failed handover),
-		// we exit immediately without touching worker sockets.
-		addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			slog.Error("Failed to listen.", "addr", addr, "error", err)
-			os.Exit(1)
-		}
-		cp.pgListener = ln
 	}
 
 	// Pre-warm workers if min_workers is set
@@ -328,38 +305,63 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 	}
 
-	// Flight ingress is created AFTER handover so the old CP can keep
+	// Flight ingress is created AFTER upgrade so the old CP can keep
 	// serving Flight SQL clients until it shuts down its listener in
-	// handleHandoverRequest. This minimizes the Flight unavailability
+	// drainAfterUpgrade. This minimizes the Flight unavailability
 	// window to just the brief port rebind, rather than the entire
-	// handover + pre-warm duration.
+	// upgrade + pre-warm duration.
 	cp.startFlightIngress()
 
 	// Start health check loop with crash notification
 	onCrash := func(workerID int) {
 		cp.sessions.OnWorkerCrash(workerID, func(pid int32) {
-			// Sessions on the crashed worker will see gRPC errors on
-			// their next query. OnWorkerCrash cleans up session state
-			// so load balancing stays accurate.
 			slog.Warn("Session orphaned by worker crash.", "pid", pid, "worker", workerID)
 		})
 	}
 	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash)
 
-	// Handover and systemd notifications are only relevant for process mode.
+	// Handle SIGUSR1 for graceful upgrade (process mode only)
 	if !isK8s {
-		// Start handover listener for future deployments
-		cp.startHandoverListener()
-
-		// Notify systemd we're ready (fresh start only).
-		// After handover, sd_notify(MAINPID+READY) is sent synchronously in
-		// receiveHandover() before handover_complete, so the old CP can't exit
-		// before systemd knows our PID.
-		if !handoverDone {
-			if err := sdNotify("READY=1"); err != nil {
-				slog.Warn("sd_notify READY failed.", "error", err)
+		go func() {
+			sig := make(chan os.Signal, 1)
+			signal.Notify(sig, syscall.SIGUSR1)
+			for range sig {
+				cp.handleUpgrade()
 			}
+		}()
+	}
+
+	// Handle SIGTERM/SIGINT for shutdown
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+		s := <-sig
+		if cp.upgradeDraining.Load() {
+			slog.Info("Received shutdown signal during upgrade drain, exiting immediately.", "signal", s)
+			cp.pool.ShutdownAll()
+			os.Exit(0)
 		}
+		slog.Info("Received shutdown signal.", "signal", s)
+		cp.shutdown()
+		os.Exit(0)
+	}()
+
+	// Signal readiness to tableflip (completes the upgrade handshake with the
+	// parent process, if any) and to systemd.
+	if upg.HasParent() {
+		// We're the new process after an upgrade. Tell systemd our PID before
+		// signaling Ready to the parent — the parent may exit shortly after.
+		if err := sdNotify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); err != nil {
+			slog.Warn("sd_notify MAINPID+READY failed.", "error", err)
+		}
+	} else {
+		if err := sdNotify("READY=1"); err != nil {
+			slog.Warn("sd_notify READY failed.", "error", err)
+		}
+	}
+	if err := upg.Ready(); err != nil {
+		slog.Error("Failed to signal readiness.", "error", err)
+		os.Exit(1)
 	}
 
 	slog.Info("Control plane listening.",
@@ -371,60 +373,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
 		"memory_rebalance", cfg.MemoryRebalance)
 
-	// Handle signals
-	go func() {
-		for sig := range sigChan {
-			switch sig {
-			case syscall.SIGUSR1:
-				if !cp.reloading.CompareAndSwap(false, true) {
-					slog.Warn("SIGUSR1 ignored, handover already in progress.")
-					break
-				}
-				slog.Info("Received SIGUSR1, starting graceful handover via self-exec.")
-				// Metrics server must be stopped before spawning the replacement
-				// so it can bind to the same port.
-				if cp.cfg.MetricsServer != nil {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					if err := cp.cfg.MetricsServer.Shutdown(ctx); err != nil {
-						slog.Warn("Metrics server shutdown failed.", "error", err)
-					}
-					cancel()
-				}
-				// ACME managers must be stopped before spawning the replacement
-				// so the new CP can bind port 80 (HTTP-01) or manage DNS records.
-				if cp.acmeManager != nil {
-					if err := cp.acmeManager.Close(); err != nil {
-						slog.Warn("ACME manager shutdown failed.", "error", err)
-					}
-				}
-				if cp.acmeDNSManager != nil {
-					if err := cp.acmeDNSManager.Close(); err != nil {
-						slog.Warn("ACME DNS manager shutdown failed.", "error", err)
-					}
-				}
-				// Flight ingress is NOT stopped here. The old CP keeps serving
-				// Flight SQL clients during the handover. It is shut down in
-				// handleHandoverRequest after the new CP confirms handover_complete,
-				// minimizing the unavailability window.
-				if err := sdNotify("RELOADING=1"); err != nil {
-					slog.Warn("sd_notify RELOADING failed.", "error", err)
-				}
-				go cp.selfExec()
-			case syscall.SIGTERM, syscall.SIGINT:
-				if cp.handoverDraining.Load() {
-					slog.Info("Received shutdown signal during handover drain, exiting immediately.", "signal", sig)
-					cp.pool.ShutdownAll()
-					os.Exit(0)
-				}
-				slog.Info("Received shutdown signal.", "signal", sig)
-				cp.shutdown()
-				os.Exit(0)
-			}
-		}
-	}()
+	// Accept loop in background
+	go cp.acceptLoop()
 
-	// Accept loop (blocks)
-	cp.acceptLoop()
+	// Block until a successful upgrade causes tableflip to signal exit.
+	// SIGTERM/SIGINT are handled above and call os.Exit directly.
+	<-upg.Exit()
+
+	// A successful upgrade completed — drain in-flight connections and exit.
+	cp.drainAfterUpgrade()
 }
 
 func makeShutdownCtx() context.Context {
@@ -449,7 +406,7 @@ func (cp *ControlPlane) acceptLoop() {
 				// Block here instead of returning. Returning would cause
 				// RunControlPlane() → main() to exit, killing all in-flight
 				// connection goroutines before the drain completes.
-				// The handover handler or shutdown handler will call os.Exit(0)
+				// The upgrade drain or shutdown handler will call os.Exit(0)
 				// after draining connections.
 				select {}
 			}
@@ -856,131 +813,114 @@ func (cp *ControlPlane) stopQueryLogger() {
 	}
 }
 
-// selfExec spawns a new control plane process from the binary on disk.
-// The new process detects the existing handover socket and initiates the
-// handover protocol to receive listener FDs.
-//
-// Under systemd (Type=notify), the child must be reparented to PID 1 for
-// systemd to properly track it via waitpid(). We achieve this via
-// double-fork using setsid --fork: the intermediate exits immediately and
-// the grandchild (new CP) is reparented to PID 1. Without this, systemd
-// logs "Supervising process X which is not our child" and may not detect
-// crashes for Restart=always.
-//
-// Outside systemd (tests, manual runs), we use direct spawn so the old CP
-// can track the child's exit via cmd.Wait() for faster crash recovery.
-func (cp *ControlPlane) selfExec() {
-	if os.Getenv("NOTIFY_SOCKET") != "" {
-		cp.selfExecDetached()
+// handleUpgrade triggers a graceful upgrade via tableflip: stops subsystems
+// that need exclusive ports, calls upg.Upgrade() to spawn the child process
+// with inherited FDs, and on success lets the main goroutine proceed to drain.
+func (cp *ControlPlane) handleUpgrade() {
+	if !cp.reloading.CompareAndSwap(false, true) {
+		slog.Warn("SIGUSR1 ignored, upgrade already in progress.")
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], os.Args[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	slog.Info("Received SIGUSR1, starting graceful upgrade.")
 
-	if err := cmd.Start(); err != nil {
-		slog.Error("Self-exec failed.", "error", err)
-		cp.recoverFromFailedReload()
+	// Stop metrics server before spawning the replacement so it can bind
+	// to the same port.
+	if cp.cfg.MetricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := cp.cfg.MetricsServer.Shutdown(ctx); err != nil {
+			slog.Warn("Metrics server shutdown failed.", "error", err)
+		}
+		cancel()
+	}
+
+	// Stop ACME managers so the new CP can bind port 80 (HTTP-01) or
+	// manage DNS records. Nil out after close so drainAfterUpgrade
+	// doesn't double-close.
+	if cp.acmeManager != nil {
+		if err := cp.acmeManager.Close(); err != nil {
+			slog.Warn("ACME manager shutdown failed.", "error", err)
+		}
+		cp.acmeManager = nil
+	}
+	if cp.acmeDNSManager != nil {
+		if err := cp.acmeDNSManager.Close(); err != nil {
+			slog.Warn("ACME DNS manager shutdown failed.", "error", err)
+		}
+		cp.acmeDNSManager = nil
+	}
+
+	// Flight ingress is NOT stopped here — the old CP keeps serving Flight
+	// SQL clients during the upgrade. It is shut down in drainAfterUpgrade.
+
+	if err := sdNotify("RELOADING=1"); err != nil {
+		slog.Warn("sd_notify RELOADING failed.", "error", err)
+	}
+
+	// tableflip.Upgrade() spawns the child process with all Listen'd FDs
+	// inherited, then blocks until the child calls Ready() or times out.
+	if err := cp.upgrader.Upgrade(); err != nil {
+		slog.Error("Upgrade failed, recovering.", "error", err)
+		cp.reloading.Store(false)
+		if err := sdNotify("READY=1"); err != nil {
+			slog.Warn("sd_notify READY (recovery) failed.", "error", err)
+		}
 		cp.recoverAfterFailedReload()
 		return
 	}
 
-	slog.Info("New control plane spawned.", "pid", cmd.Process.Pid)
-
-	// Reap the child in the background to avoid a zombie. If the child exits
-	// before completing the handover (e.g. config error, crash, killed by
-	// systemd reload timeout), we must recover so the old CP exits the
-	// RELOADING state and the handover listener doesn't block forever.
-	go func() {
-		err := cmd.Wait()
-		if err != nil {
-			slog.Warn("Self-exec'd process exited with error.", "error", err)
-		}
-
-		// If we're still in reloading state, the handover never completed.
-		// handleHandoverRequest may also be trying to recover (child connected
-		// but died mid-protocol), so recoverFromFailedReload uses CAS to
-		// ensure only one goroutine runs the full recovery path.
-		//
-		// cancelHandoverListener must be inside the CAS winner branch —
-		// otherwise it could close a listener that handleHandoverRequest's
-		// recovery already created.
-		if cp.recoverFromFailedReload() {
-			slog.Warn("Child process exited before completing handover, recovering.", "error", err)
-			cp.cancelHandoverListener()
-			cp.startHandoverListener()
-			cp.recoverAfterFailedReload()
-		}
-	}()
+	slog.Info("Upgrade succeeded, child process is ready. Draining connections.")
+	cp.upgradeDraining.Store(true)
+	cp.reloading.Store(false)
+	// upg.Exit() channel closes now, triggering drainAfterUpgrade in the main goroutine.
 }
 
-// selfExecDetached spawns the new CP via setsid --fork so it is reparented
-// to PID 1 (systemd). Because we cannot track the detached grandchild's
-// exit directly, we use a timeout for crash recovery instead of cmd.Wait().
-func (cp *ControlPlane) selfExecDetached() {
-	args := append([]string{"--fork", os.Args[0]}, os.Args[1:]...)
-	cmd := exec.Command("setsid", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
-
-	// cmd.Run() returns almost immediately: setsid --fork double-forks and
-	// the intermediate exits right away. The grandchild (new CP) continues.
-	if err := cmd.Run(); err != nil {
-		slog.Error("Self-exec (detached) failed.", "error", err)
-		cp.recoverFromFailedReload()
-		cp.recoverAfterFailedReload()
-		return
+// drainAfterUpgrade is called after a successful tableflip upgrade. It stops
+// accepting new connections, waits for in-flight connections to finish, shuts
+// down workers, and exits.
+func (cp *ControlPlane) drainAfterUpgrade() {
+	// Shut down Flight ingress now that the new CP has started.
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
 	}
 
-	slog.Info("New control plane spawned (detached).")
-
-	// Recovery timeout: if no handover connection is received within 30s,
-	// the new CP likely crashed during startup. The handover protocol
-	// already has a 30s per-connection deadline (handleHandoverRequest),
-	// but that only fires after Accept — this timeout covers the case
-	// where the new CP never connects at all.
-	go func() {
-		time.Sleep(30 * time.Second)
-		if cp.recoverFromFailedReload() {
-			slog.Warn("Handover timeout: new CP did not connect within 30s, recovering.")
-			cp.cancelHandoverListener()
-			cp.startHandoverListener()
-			cp.recoverAfterFailedReload()
-		}
-	}()
-}
-
-// cancelHandoverListener closes the current handover listener, unblocking
-// any goroutine stuck in Accept().
-func (cp *ControlPlane) cancelHandoverListener() {
+	// Stop accepting new connections. The new CP has its own listener copy
+	// (inherited via tableflip), so closing ours doesn't affect it.
 	cp.closeMu.Lock()
-	defer cp.closeMu.Unlock()
-	if cp.handoverLn != nil {
-		_ = cp.handoverLn.Close()
-		cp.handoverLn = nil
-	}
-}
+	cp.closed = true
+	cp.closeMu.Unlock()
+	_ = cp.pgListener.Close()
 
-// recoverFromFailedReload atomically exits the RELOADING state and notifies
-// systemd that the service is ready again. Returns true if this call won the
-// race (i.e. actually recovered). Callers that need to restart the handover
-// listener should only do so when this returns true, to avoid duplicate
-// listeners.
-func (cp *ControlPlane) recoverFromFailedReload() bool {
-	if !cp.reloading.CompareAndSwap(true, false) {
-		return false // another goroutine already recovered
+	// Wait for in-flight connections to finish (with timeout)
+	drainDone := make(chan struct{})
+	go func() {
+		cp.wg.Wait()
+		close(drainDone)
+	}()
+
+	select {
+	case <-drainDone:
+		slog.Info("All connections drained after upgrade.")
+	case <-time.After(cp.cfg.HandoverDrainTimeout):
+		slog.Warn("Upgrade drain timeout, forcing exit.", "timeout", cp.cfg.HandoverDrainTimeout)
 	}
-	if err := sdNotify("READY=1"); err != nil {
-		slog.Warn("sd_notify READY (recovery) failed.", "error", err)
+
+	// Shut down workers
+	cp.pool.ShutdownAll()
+	cp.stopQueryLogger()
+
+	// Give systemd time to process the MAINPID notification before we exit.
+	if os.Getenv("NOTIFY_SOCKET") != "" {
+		time.Sleep(2 * time.Second)
 	}
-	return true
+
+	slog.Info("Old control plane exiting after upgrade.")
+	os.Exit(0)
 }
 
 // startFlightIngress creates and starts the Flight SQL ingress listener.
-// During handover, the old CP's Flight listener may still be shutting down,
+// During upgrade, the old CP's Flight listener may still be shutting down,
 // so we retry port binding briefly before giving up.
 func (cp *ControlPlane) startFlightIngress() {
 	if cp.cfg.FlightPort <= 0 {
@@ -1017,12 +957,12 @@ func (cp *ControlPlane) startFlightIngress() {
 }
 
 // recoverAfterFailedReload restores all subsystems that were shut down in the
-// SIGUSR1 handler when the new CP fails to complete the handover.
+// SIGUSR1 handler when the new CP fails to complete the upgrade.
 func (cp *ControlPlane) recoverAfterFailedReload() {
 	cp.recoverMetricsAfterFailedReload()
 	cp.recoverACMEAfterFailedReload()
 	// Flight ingress is NOT shut down in the SIGUSR1 handler (it keeps
-	// serving during handover), so no recovery is needed here.
+	// serving during upgrade), so no recovery is needed here.
 }
 
 func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
