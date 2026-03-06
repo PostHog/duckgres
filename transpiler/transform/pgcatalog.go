@@ -134,7 +134,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"has_any_column_privilege":        true, // Column access check
 			"has_database_privilege":          true, // Database access check
 			"similar_to_escape":               true, // Convert SIMILAR TO patterns to regex
-			"pg_get_viewdef":                  true, // 2-arg overload wrapping DuckDB's 1-arg built-in
+			"pg_get_viewdef":                  true, // Stub replacing DuckDB's built-in (need 2-arg form)
 			"pg_get_expr":                     true, // Our version that accepts 2 or 3 args
 			"pg_get_indexdef":                 true, // Returns empty string
 			"pg_get_constraintdef":            true, // Returns empty string

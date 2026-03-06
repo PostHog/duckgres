@@ -931,8 +931,10 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// pg_get_constraintdef - get constraint definition
 		`DROP MACRO IF EXISTS pg_get_constraintdef`,
 		`CREATE MACRO pg_get_constraintdef(constraint_oid, pretty := false) AS ''`,
-		// pg_get_viewdef - DuckDB has a 1-arg built-in; replace with a version that also
-		// accepts a pretty-print flag (some clients like DBeaver pass pg_get_viewdef(oid, true))
+		// pg_get_viewdef - stub that returns empty string for both 1-arg and 2-arg forms.
+		// DuckDB has a 1-arg built-in, but we need a 2-arg form (clients like DBeaver pass
+		// pg_get_viewdef(oid, true)). Since DuckDB macros shadow built-ins, this replaces
+		// the built-in entirely. Acceptable because view definitions aren't meaningful here.
 		`DROP MACRO IF EXISTS pg_get_viewdef`,
 		`CREATE MACRO pg_get_viewdef(view_oid, pretty := false) AS ''`,
 		// pg_get_serial_sequence - get sequence name for a serial/identity column
