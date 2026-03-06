@@ -40,8 +40,8 @@ func SetProcessVersion(v string) { processVersion = v }
 // ProcessVersion returns the version string for this process.
 func ProcessVersion() string { return processVersion }
 
-// redactConnectionString removes sensitive information (passwords) from connection strings for logging
-var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)([^\s]+)`)
+// passwordPattern matches password=<value> or password: <value> with quoted or unquoted values.
+var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
 
 var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "duckgres_connections_open",
@@ -85,8 +85,15 @@ type BackendKey struct {
 	SecretKey int32
 }
 
+// RedactSecrets replaces password=<value> (and password: <value>) patterns with
+// password=[REDACTED] for safe logging and error reporting. It handles both quoted
+// and unquoted values. It does not currently redact other secret types (tokens, keys).
+func RedactSecrets(s string) string {
+	return passwordPattern.ReplaceAllString(s, "${1}[REDACTED]")
+}
+
 func redactConnectionString(connStr string) string {
-	return passwordPattern.ReplaceAllString(connStr, "${1}[REDACTED]")
+	return RedactSecrets(connStr)
 }
 
 type Config struct {

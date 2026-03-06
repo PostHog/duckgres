@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,12 +10,79 @@ import (
 	"sync"
 	"time"
 
+	"github.com/posthog/duckgres/server"
+
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
+
+// redactingHandler wraps an slog.Handler and scrubs password values from
+// log messages and string attributes before forwarding to the inner handler.
+type redactingHandler struct {
+	inner slog.Handler
+}
+
+func (h *redactingHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h *redactingHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.Message = server.RedactSecrets(r.Message)
+
+	// Rebuild attrs with redacted string values.
+	var redacted []slog.Attr
+	r.Attrs(func(a slog.Attr) bool {
+		redacted = append(redacted, redactAttr(a))
+		return true
+	})
+	// Create a new record with the redacted attrs.
+	nr := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	nr.AddAttrs(redacted...)
+	return h.inner.Handle(ctx, nr)
+}
+
+func (h *redactingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	redacted := make([]slog.Attr, len(attrs))
+	for i, a := range attrs {
+		redacted[i] = redactAttr(a)
+	}
+	return &redactingHandler{inner: h.inner.WithAttrs(redacted)}
+}
+
+func (h *redactingHandler) WithGroup(name string) slog.Handler {
+	return &redactingHandler{inner: h.inner.WithGroup(name)}
+}
+
+func redactAttr(a slog.Attr) slog.Attr {
+	switch a.Value.Kind() {
+	case slog.KindString:
+		a.Value = slog.StringValue(server.RedactSecrets(a.Value.String()))
+	case slog.KindGroup:
+		attrs := a.Value.Group()
+		redacted := make([]slog.Attr, len(attrs))
+		for i, ga := range attrs {
+			redacted[i] = redactAttr(ga)
+		}
+		a.Value = slog.GroupValue(redacted...)
+	case slog.KindAny:
+		if err, ok := a.Value.Any().(error); ok {
+			redacted := server.RedactSecrets(err.Error())
+			if redacted != err.Error() {
+				a.Value = slog.AnyValue(errors.New(redacted))
+			}
+		} else {
+			s := fmt.Sprintf("%v", a.Value.Any())
+			r := server.RedactSecrets(s)
+			if r != s {
+				a.Value = slog.StringValue(r)
+			}
+		}
+	}
+	return a
+}
 
 // multiHandler fans out slog records to multiple handlers.
 type multiHandler struct {
@@ -109,7 +177,7 @@ func initLogging() func() {
 		if os.Getenv("ADDITIONAL_POSTHOG_API_KEYS") != "" {
 			fmt.Fprintln(os.Stderr, "ADDITIONAL_POSTHOG_API_KEYS is set but POSTHOG_API_KEY is not; ignoring additional keys")
 		}
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+		slog.SetDefault(slog.New(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})}))
 		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
 		return func() {}
 	}
@@ -143,6 +211,7 @@ func initLogging() func() {
 	// The primary exporter must succeed; additional ones are best-effort.
 	primaryExp := newPostHogExporter(ctx, host, apiKey)
 	if primaryExp == nil {
+		slog.SetDefault(slog.New(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})}))
 		fmt.Fprintln(os.Stderr, "Primary PostHog exporter failed to initialize, continuing with stderr only")
 		return func() {}
 	}
@@ -173,9 +242,9 @@ func initLogging() func() {
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
 	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 
-	slog.SetDefault(slog.New(&multiHandler{
+	slog.SetDefault(slog.New(&redactingHandler{inner: &multiHandler{
 		handlers: []slog.Handler{textHandler, otelHandler},
-	}))
+	}}))
 
 	slog.Info("PostHog logging enabled.", "host", host, "exporters", len(processors))
 

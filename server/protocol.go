@@ -216,6 +216,8 @@ func writeReadyForQuery(w io.Writer, txStatus byte) error {
 
 // writeErrorResponse sends an error to the client
 func writeErrorResponse(w io.Writer, severity, code, message string) error {
+	message = RedactSecrets(message)
+
 	var data []byte
 
 	// Severity

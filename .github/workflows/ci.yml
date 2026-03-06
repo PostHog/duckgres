@@ -19,7 +19,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v7
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
         with:
           version: v2.8.0
 
@@ -35,7 +35,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run unit tests
-        run: go test -v ./server/... ./transpiler/...
+        run: go test -v . ./server/... ./transpiler/...
 
   integration-tests:
     needs: unit-tests
@@ -50,7 +50,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: testdb
         ports:
-          - 35432:5432
+          - 127.0.0.1:35432:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -65,7 +65,7 @@ jobs:
           POSTGRES_PASSWORD: ducklake
           POSTGRES_DB: ducklake
         ports:
-          - 35433:5432
+          - 127.0.0.1:35433:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
