@@ -762,6 +762,93 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		slog.Warn("Failed to create pg_indexes view.", "error", err)
 	}
 
+	// Create pg_shdescription stub view for clients that query shared object descriptions
+	// (e.g., pgAdmin uses this to show database and role comments)
+	// Returns no rows since DuckDB doesn't have PostgreSQL shared descriptions
+	pgShdescriptionSQL := `
+		CREATE OR REPLACE VIEW pg_shdescription AS
+		SELECT
+			NULL::BIGINT AS objoid,
+			NULL::BIGINT AS classoid,
+			NULL::VARCHAR AS description
+		WHERE false
+	`
+	if _, err := db.Exec(pgShdescriptionSQL); err != nil {
+		slog.Warn("Failed to create pg_shdescription view.", "error", err)
+	}
+
+	// Empty stub views for pg_catalog tables that don't apply to DuckDB
+	// but are queried by clients like DBeaver and pgAdmin during introspection.
+	stubViews := map[string]string{
+		"pg_auth_members": `CREATE OR REPLACE VIEW pg_auth_members AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS roleid, NULL::BIGINT AS member,
+				NULL::BIGINT AS grantor, false AS admin_option, false AS inherit_option,
+				false AS set_option WHERE false`,
+		"pg_opclass": `CREATE OR REPLACE VIEW pg_opclass AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS opcmethod, NULL::VARCHAR AS opcname,
+				NULL::BIGINT AS opcnamespace, NULL::BIGINT AS opcowner, NULL::BIGINT AS opcfamily,
+				NULL::BIGINT AS opcintype, false AS opcdefault, NULL::BIGINT AS opckeytype WHERE false`,
+		"pg_conversion": `CREATE OR REPLACE VIEW pg_conversion AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS conname, NULL::BIGINT AS connamespace,
+				NULL::BIGINT AS conowner, NULL::INTEGER AS conforencoding,
+				NULL::INTEGER AS contoencoding, NULL::BIGINT AS conproc,
+				false AS condefault WHERE false`,
+		"pg_language": `CREATE OR REPLACE VIEW pg_language AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS lanname, NULL::BIGINT AS lanowner,
+				false AS lanispl, false AS lanpltrusted, NULL::BIGINT AS lanplcallfoid,
+				NULL::BIGINT AS laninline, NULL::BIGINT AS lanvalidator WHERE false`,
+		"pg_foreign_server": `CREATE OR REPLACE VIEW pg_foreign_server AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS srvname, NULL::BIGINT AS srvowner,
+				NULL::BIGINT AS srvfdw, NULL::VARCHAR AS srvtype, NULL::VARCHAR AS srvversion,
+				NULL::VARCHAR AS srvoptions WHERE false`,
+		"pg_foreign_data_wrapper": `CREATE OR REPLACE VIEW pg_foreign_data_wrapper AS
+			SELECT NULL::BIGINT AS oid, NULL::VARCHAR AS fdwname, NULL::BIGINT AS fdwowner,
+				NULL::BIGINT AS fdwhandler, NULL::BIGINT AS fdwvalidator,
+				NULL::VARCHAR AS fdwoptions WHERE false`,
+		"pg_foreign_table": `CREATE OR REPLACE VIEW pg_foreign_table AS
+			SELECT NULL::BIGINT AS ftrelid, NULL::BIGINT AS ftserver,
+				NULL::VARCHAR AS ftoptions WHERE false`,
+		"pg_trigger": `CREATE OR REPLACE VIEW pg_trigger AS
+			SELECT NULL::BIGINT AS oid, NULL::BIGINT AS tgrelid, NULL::VARCHAR AS tgname,
+				NULL::BIGINT AS tgfoid, NULL::SMALLINT AS tgtype, NULL::VARCHAR AS tgenabled,
+				false AS tgisinternal, NULL::BIGINT AS tgconstrrelid, NULL::BIGINT AS tgconstrindid,
+				NULL::BIGINT AS tgconstraint, false AS tgdeferrable, false AS tginitdeferred,
+				NULL::SMALLINT AS tgnargs, NULL::VARCHAR AS tgattr, NULL::VARCHAR AS tgargs,
+				NULL::VARCHAR AS tgqual, NULL::VARCHAR AS tgoldtable, NULL::VARCHAR AS tgnewtable,
+				NULL::BIGINT AS tgparentid WHERE false`,
+		"pg_locks": `CREATE OR REPLACE VIEW pg_locks AS
+			SELECT NULL::VARCHAR AS locktype, NULL::BIGINT AS database, NULL::BIGINT AS relation,
+				NULL::INTEGER AS page, NULL::SMALLINT AS tuple, NULL::VARCHAR AS virtualxid,
+				NULL::BIGINT AS transactionid, NULL::BIGINT AS classid, NULL::BIGINT AS objid,
+				NULL::SMALLINT AS objsubid, NULL::VARCHAR AS virtualtransaction,
+				NULL::INTEGER AS pid, NULL::VARCHAR AS mode, false AS granted,
+				false AS fastpath WHERE false`,
+	}
+	for name, sql := range stubViews {
+		if _, err := db.Exec(sql); err != nil {
+			slog.Warn("Failed to create stub view.", "view", name, "error", err)
+		}
+	}
+
+	// pg_extension: backed by DuckDB's real extension metadata
+	pgExtensionSQL := `
+		CREATE OR REPLACE VIEW pg_extension AS
+		SELECT
+			row_number() OVER ()::BIGINT AS oid,
+			extension_name::VARCHAR AS extname,
+			0::BIGINT AS extowner,
+			0::BIGINT AS extnamespace,
+			false AS extrelocatable,
+			extension_version::VARCHAR AS extversion,
+			NULL::VARCHAR AS extconfig,
+			NULL::VARCHAR AS extcondition
+		FROM duckdb_extensions()
+		WHERE installed = true
+	`
+	if _, err := db.Exec(pgExtensionSQL); err != nil {
+		slog.Warn("Failed to create pg_extension view.", "error", err)
+	}
+
 	// Create helper macros/functions that psql expects but DuckDB doesn't have
 	// These need to be created without schema prefix so DuckDB finds them
 	//
@@ -787,6 +874,8 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		`CREATE OR REPLACE MACRO has_table_privilege(table_name, priv) AS true`,
 		// has_any_column_privilege - check any column access
 		`CREATE OR REPLACE MACRO has_any_column_privilege(table_name, priv) AS true`,
+		// has_database_privilege - check database access (pgAdmin checks this per-database)
+		`CREATE OR REPLACE MACRO has_database_privilege(db_name, priv) AS true`,
 		// pg_encoding_to_char - convert encoding ID to name
 		`CREATE OR REPLACE MACRO pg_encoding_to_char(enc) AS 'UTF8'`,
 		// format_type - format a type OID as string with typemod support
@@ -847,16 +936,14 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		`CREATE OR REPLACE MACRO col_description(table_oid, col_num) AS NULL`,
 		// shobj_description - get shared object comment
 		`CREATE OR REPLACE MACRO shobj_description(oid, catalog) AS NULL`,
-		// pg_get_expr - deparse an expression (used for defaults, etc.)
-		// Use default parameter so it works with both 2 and 3 args
-		`DROP MACRO IF EXISTS pg_get_expr`,
-		`CREATE MACRO pg_get_expr(expr, relid, pretty := false) AS NULL`,
-		// pg_get_indexdef - get index definition
-		`DROP MACRO IF EXISTS pg_get_indexdef`,
-		`CREATE MACRO pg_get_indexdef(index_oid, col := NULL, pretty := false) AS ''`,
-		// pg_get_constraintdef - get constraint definition
-		`DROP MACRO IF EXISTS pg_get_constraintdef`,
-		`CREATE MACRO pg_get_constraintdef(constraint_oid, pretty := false) AS ''`,
+		// pg_get_expr - DuckDB has a 2-arg built-in that returns expression text.
+		// The 3-arg form (expr, relid, pretty) is handled by the transpiler,
+		// which drops the pretty arg. No macro needed here.
+		// pg_get_indexdef - get index definition (no DuckDB built-in)
+		`CREATE OR REPLACE MACRO pg_get_indexdef(index_oid, col := NULL, pretty := false) AS ''`,
+		// pg_get_constraintdef - DuckDB has a 1-arg built-in (returns NULL).
+		// The 2-arg form (oid, pretty) is handled by the transpiler, which drops
+		// the pretty arg so DuckDB's built-in handles it. No macro needed here.
 		// pg_get_serial_sequence - get sequence name for a serial/identity column
 		// Returns NULL because DuckLake doesn't support sequences
 		`CREATE OR REPLACE MACRO pg_get_serial_sequence(table_name, column_name) AS NULL`,

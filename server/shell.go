@@ -198,7 +198,7 @@ func executeShellQuery(ctx context.Context, db *sql.DB, query string) {
 			header.WriteString(" | ")
 			separator.WriteString("-+-")
 		}
-		header.WriteString(fmt.Sprintf("%-*s", widths[i], c))
+		fmt.Fprintf(&header, "%-*s", widths[i], c)
 		separator.WriteString(strings.Repeat("-", widths[i]))
 	}
 	fmt.Println(header.String())
@@ -211,7 +211,7 @@ func executeShellQuery(ctx context.Context, db *sql.DB, query string) {
 			if i > 0 {
 				line.WriteString(" | ")
 			}
-			line.WriteString(fmt.Sprintf("%-*s", widths[i], v))
+			fmt.Fprintf(&line, "%-*s", widths[i], v)
 		}
 		fmt.Println(line.String())
 	}

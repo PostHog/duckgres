@@ -2966,9 +2966,9 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 		contains string
 	}{
 		{
-			name:     "pg_get_expr gets memory.main prefix",
+			name:     "pg_get_expr uses DuckDB built-in (no memory.main prefix)",
 			input:    "SELECT pg_catalog.pg_get_expr(adbin, adrelid) FROM pg_attrdef",
-			contains: "memory.main.pg_get_expr",
+			contains: "pg_get_expr(adbin, adrelid)",
 		},
 		{
 			name:     "pg_get_indexdef gets memory.main prefix",
@@ -2976,9 +2976,9 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 			contains: "memory.main.pg_get_indexdef",
 		},
 		{
-			name:     "pg_get_constraintdef gets memory.main prefix",
+			name:     "pg_get_constraintdef uses DuckDB built-in (no memory.main prefix)",
 			input:    "SELECT pg_catalog.pg_get_constraintdef(oid) FROM pg_constraint",
-			contains: "memory.main.pg_get_constraintdef",
+			contains: "pg_get_constraintdef(oid)",
 		},
 		{
 			name:     "obj_description gets memory.main prefix",

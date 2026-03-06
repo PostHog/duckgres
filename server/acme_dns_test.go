@@ -17,10 +17,7 @@ func TestLoadOrCreateAccountKey(t *testing.T) {
 	}
 	if key1 == nil {
 		t.Fatal("first loadOrCreateAccountKey returned nil key")
-	}
-
-	// Verify key file was created
-	if _, err := os.Stat(keyPath); err != nil {
+	} else if _, err := os.Stat(keyPath); err != nil {
 		t.Fatalf("key file not created: %v", err)
 	}
 
@@ -31,10 +28,7 @@ func TestLoadOrCreateAccountKey(t *testing.T) {
 	}
 	if key2 == nil {
 		t.Fatal("second loadOrCreateAccountKey returned nil key")
-	}
-
-	// Keys should be identical (same D value)
-	if key1.D.Cmp(key2.D) != 0 {
+	} else if key1.D.Cmp(key2.D) != 0 {
 		t.Fatal("loaded key does not match created key")
 	}
 }
