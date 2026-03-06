@@ -211,6 +211,7 @@ func initLogging() func() {
 	// The primary exporter must succeed; additional ones are best-effort.
 	primaryExp := newPostHogExporter(ctx, host, apiKey)
 	if primaryExp == nil {
+		slog.SetDefault(slog.New(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})}))
 		fmt.Fprintln(os.Stderr, "Primary PostHog exporter failed to initialize, continuing with stderr only")
 		return func() {}
 	}

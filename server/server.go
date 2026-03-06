@@ -40,7 +40,7 @@ func SetProcessVersion(v string) { processVersion = v }
 // ProcessVersion returns the version string for this process.
 func ProcessVersion() string { return processVersion }
 
-// redactConnectionString removes sensitive information (passwords) from connection strings for logging
+// passwordPattern matches password=<value> or password: <value> with quoted or unquoted values.
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
 
 var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
