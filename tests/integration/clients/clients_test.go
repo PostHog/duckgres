@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/posthog/duckgres/server"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	_ "github.com/lib/pq"
+	"github.com/posthog/duckgres/server"
 )
 
 var (
@@ -683,6 +685,157 @@ func TestTransactions(t *testing.T) {
 		}
 		if count != 0 {
 			t.Errorf("Expected 0 rows after rollback, got %d", count)
+		}
+	})
+}
+
+// TestPgxBinaryFormatResults tests that the extended query protocol correctly
+// handles binary result format codes. pgx (and JDBC) request binary format for
+// types with binary codecs (int, float, bool, interval, timestamp, etc.).
+// The RowDescription format codes must match the actual data encoding.
+func TestPgxBinaryFormatResults(t *testing.T) {
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, "postgres://testuser:testpass@127.0.0.1:35499/test?sslmode=require")
+	if err != nil {
+		t.Fatalf("pgx.Connect failed: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	t.Run("int4", func(t *testing.T) {
+		var v int32
+		err := conn.QueryRow(ctx, "SELECT 42::int4").Scan(&v)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if v != 42 {
+			t.Errorf("expected 42, got %d", v)
+		}
+	})
+
+	t.Run("int8", func(t *testing.T) {
+		var v int64
+		err := conn.QueryRow(ctx, "SELECT 9999999999::int8").Scan(&v)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if v != 9999999999 {
+			t.Errorf("expected 9999999999, got %d", v)
+		}
+	})
+
+	t.Run("float8", func(t *testing.T) {
+		var v float64
+		err := conn.QueryRow(ctx, "SELECT 3.14::float8").Scan(&v)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if v != 3.14 {
+			t.Errorf("expected 3.14, got %f", v)
+		}
+	})
+
+	t.Run("bool", func(t *testing.T) {
+		var v bool
+		err := conn.QueryRow(ctx, "SELECT true").Scan(&v)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if !v {
+			t.Errorf("expected true, got false")
+		}
+	})
+
+	t.Run("text", func(t *testing.T) {
+		var v string
+		err := conn.QueryRow(ctx, "SELECT 'hello'::text").Scan(&v)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if v != "hello" {
+			t.Errorf("expected 'hello', got %q", v)
+		}
+	})
+
+	t.Run("timestamp", func(t *testing.T) {
+		var v time.Time
+		err := conn.QueryRow(ctx, "SELECT TIMESTAMP '2024-01-15 10:30:00'").Scan(&v)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if v.Year() != 2024 || v.Month() != 1 || v.Day() != 15 {
+			t.Errorf("unexpected timestamp: %v", v)
+		}
+	})
+
+	t.Run("interval_uptime", func(t *testing.T) {
+		// This was the original failing case: SELECT uptime() returns INTERVAL
+		// and pgx requests binary format for it.
+		var v pgtype.Interval
+		err := conn.QueryRow(ctx, "SELECT uptime()").Scan(&v)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if !v.Valid {
+			t.Error("expected valid interval")
+		}
+		if v.Microseconds <= 0 {
+			t.Errorf("expected positive uptime, got %d microseconds", v.Microseconds)
+		}
+	})
+
+	t.Run("interval_literal", func(t *testing.T) {
+		var v pgtype.Interval
+		err := conn.QueryRow(ctx, "SELECT INTERVAL '1 day 2 hours 30 minutes'").Scan(&v)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if v.Days != 1 {
+			t.Errorf("expected 1 day, got %d", v.Days)
+		}
+		expectedMicros := int64(2*3600+30*60) * 1_000_000
+		if v.Microseconds != expectedMicros {
+			t.Errorf("expected %d microseconds (2h30m), got %d", expectedMicros, v.Microseconds)
+		}
+	})
+
+	t.Run("multiple_columns_mixed_types", func(t *testing.T) {
+		var (
+			i int32
+			f float64
+			s string
+			b bool
+		)
+		err := conn.QueryRow(ctx, "SELECT 1::int4, 2.5::float8, 'abc'::text, true").Scan(&i, &f, &s, &b)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if i != 1 || f != 2.5 || s != "abc" || !b {
+			t.Errorf("unexpected values: %d, %f, %q, %v", i, f, s, b)
+		}
+	})
+
+	t.Run("values_from_table", func(t *testing.T) {
+		// pgx uses its own connection (separate in-memory DB), so create a table
+		_, err := conn.Exec(ctx, "CREATE TABLE IF NOT EXISTS pgx_test (id INTEGER, name TEXT, active BOOLEAN)")
+		if err != nil {
+			t.Fatalf("CREATE TABLE failed: %v", err)
+		}
+		_, err = conn.Exec(ctx, "INSERT INTO pgx_test VALUES (1, 'Alice', true)")
+		if err != nil {
+			t.Fatalf("INSERT failed: %v", err)
+		}
+
+		var (
+			id     int32
+			name   string
+			active bool
+		)
+		err = conn.QueryRow(ctx, "SELECT id, name, active FROM pgx_test WHERE id = 1").Scan(&id, &name, &active)
+		if err != nil {
+			t.Fatalf("QueryRow failed: %v", err)
+		}
+		if id != 1 || name != "Alice" || !active {
+			t.Errorf("unexpected values: %d, %q, %v", id, name, active)
 		}
 	})
 }
