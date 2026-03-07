@@ -4,21 +4,31 @@ import (
 	"testing"
 )
 
+// TestSessionSetSearchPath verifies SET search_path is forwarded to DuckDB
+// (not silently ignored) so that unqualified table names resolve correctly.
+func TestSessionSetSearchPath(t *testing.T) {
+	db := testHarness.DuckgresDB
+
+	// SET search_path and then SHOW it — should return the new value, not a hardcoded default
+	_, err := db.Exec("SET search_path TO 'main'")
+	if err != nil {
+		t.Fatalf("SET search_path failed: %v", err)
+	}
+
+	var searchPath string
+	err = db.QueryRow("SHOW search_path").Scan(&searchPath)
+	if err != nil {
+		t.Fatalf("SHOW search_path failed: %v", err)
+	}
+	if searchPath != "main" {
+		t.Errorf("expected search_path 'main', got %q", searchPath)
+	}
+}
+
 // TestSessionSetCommands tests SET command handling
 func TestSessionSetCommands(t *testing.T) {
 	// These SET commands should be handled (either executed or safely ignored)
 	tests := []QueryTest{
-		// Working SET commands
-		{
-			Name:         "set_search_path",
-			Query:        "SET search_path TO public",
-			DuckgresOnly: true,
-		},
-		{
-			Name:         "set_search_path_multiple",
-			Query:        "SET search_path TO public, myschema",
-			DuckgresOnly: true,
-		},
 		{
 			Name:         "set_client_encoding",
 			Query:        "SET client_encoding = 'UTF8'",
