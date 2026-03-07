@@ -1365,7 +1365,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	// Intercept pg_cursors queries
 	if cursorName, _, ok := matchPgCursorsQuery(query); ok {
 		_, exists := c.cursors[cursorName]
-		_ = c.sendPgCursorsRowDescription()
+		_ = c.sendPgCursorsRowDescriptionWithFormats(nil)
 		rowCount := 0
 		if exists {
 			_ = c.sendDataRowWithFormats([]interface{}{int64(1)}, nil, []int32{23})
@@ -1377,7 +1377,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	// Intercept pg_stat_activity queries
 	if matchPgStatActivityQuery(query) {
-		_ = c.sendPgStatActivityRowDescription()
+		_ = c.sendPgStatActivityRowDescriptionWithFormats(nil)
 		conns := c.server.listConns()
 		sort.Slice(conns, func(i, j int) bool { return conns[i].pid < conns[j].pid })
 		for _, conn := range conns {
@@ -1763,7 +1763,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 
 	// Send RowDescription if Describe wasn't called before Execute
 	if !described && len(cols) > 0 {
-		if err := c.sendRowDescription(cols, colTypes); err != nil {
+		if err := c.sendRowDescriptionWithFormats(cols, colTypes, resultFormats); err != nil {
 			return
 		}
 	}
@@ -3608,6 +3608,15 @@ func (c *clientConn) parseCopyLine(line, delimiter string) []string {
 }
 
 func (c *clientConn) sendRowDescription(cols []string, colTypes []ColumnTyper) error {
+	return c.sendRowDescriptionWithFormats(cols, colTypes, nil)
+}
+
+// sendRowDescriptionWithFormats sends a RowDescription message with per-column format codes.
+// formatCodes follow the same convention as Bind result format codes:
+//   - nil or empty: all text (format=0)
+//   - single element: applies to all columns
+//   - one per column: per-column format
+func (c *clientConn) sendRowDescriptionWithFormats(cols []string, colTypes []ColumnTyper, formatCodes []int16) error {
 	var buf bytes.Buffer
 
 	// Number of fields
@@ -3643,7 +3652,13 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []ColumnTyper) e
 		_ = binary.Write(&buf, binary.BigEndian, typmod)
 
 		// Format code (0 = text, 1 = binary)
-		_ = binary.Write(&buf, binary.BigEndian, int16(0))
+		var format int16
+		if len(formatCodes) == 1 {
+			format = formatCodes[0]
+		} else if i < len(formatCodes) {
+			format = formatCodes[i]
+		}
+		_ = binary.Write(&buf, binary.BigEndian, format)
 	}
 
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
@@ -4286,11 +4301,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 			ps.described = true
 			return
 		case cursorOpPgCursorsQuery:
-			_ = c.sendPgCursorsRowDescription()
+			_ = c.sendPgCursorsRowDescriptionWithFormats(nil)
 			ps.described = true
 			return
 		case cursorOpPgStatActivity:
-			_ = c.sendPgStatActivityRowDescription()
+			_ = c.sendPgStatActivityRowDescriptionWithFormats(nil)
 			ps.described = true
 			return
 		}
@@ -4391,14 +4406,14 @@ func (c *clientConn) handleDescribe(body []byte) {
 				return
 			}
 			p.described = true
-			_ = c.sendRowDescription(cols, colTypes)
+			_ = c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats)
 			return
 		case cursorOpPgCursorsQuery:
-			_ = c.sendPgCursorsRowDescription()
+			_ = c.sendPgCursorsRowDescriptionWithFormats(p.resultFormats)
 			p.described = true
 			return
 		case cursorOpPgStatActivity:
-			_ = c.sendPgStatActivityRowDescription()
+			_ = c.sendPgStatActivityRowDescriptionWithFormats(p.resultFormats)
 			p.described = true
 			return
 		}
@@ -4465,7 +4480,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// and desync their message queue.
 		p.described = true
 		p.stmt.described = true
-		_ = c.sendRowDescription(cols, colTypes)
+		_ = c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats)
 
 	default:
 		c.sendError("ERROR", "08P01", "invalid Describe type")
@@ -4645,7 +4660,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Skip if there are no columns - queries that return 0 columns (like
 	// DDL accidentally routed here) don't need RowDescription.
 	if !p.described && len(cols) > 0 {
-		if err := c.sendRowDescription(cols, colTypes); err != nil {
+		if err := c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats); err != nil {
 			return
 		}
 	}
@@ -4885,7 +4900,7 @@ func (c *clientConn) handlePgCursorsQuery(cursorName string) error {
 	_, exists := c.cursors[cursorName]
 
 	// Send RowDescription: single int4 column named "?column?"
-	if err := c.sendPgCursorsRowDescription(); err != nil {
+	if err := c.sendPgCursorsRowDescriptionWithFormats(nil); err != nil {
 		return err
 	}
 
@@ -4914,7 +4929,7 @@ func (c *clientConn) handlePgCursorsQueryExtended(p *portal) {
 	_, exists := c.cursors[cursorName]
 
 	if !p.stmt.described {
-		_ = c.sendPgCursorsRowDescription()
+		_ = c.sendPgCursorsRowDescriptionWithFormats(p.resultFormats)
 	}
 
 	rowCount := 0
@@ -4927,7 +4942,7 @@ func (c *clientConn) handlePgCursorsQueryExtended(p *portal) {
 }
 
 // sendPgCursorsRowDescription sends a RowDescription for a pg_cursors query result (single int4 column).
-func (c *clientConn) sendPgCursorsRowDescription() error {
+func (c *clientConn) sendPgCursorsRowDescriptionWithFormats(formatCodes []int16) error {
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.BigEndian, int16(1)) // 1 column
 	buf.WriteString("?column?")
@@ -4937,7 +4952,13 @@ func (c *clientConn) sendPgCursorsRowDescription() error {
 	_ = binary.Write(&buf, binary.BigEndian, int32(23)) // int4 OID
 	_ = binary.Write(&buf, binary.BigEndian, int16(4))  // type size
 	_ = binary.Write(&buf, binary.BigEndian, int32(-1)) // typmod
-	_ = binary.Write(&buf, binary.BigEndian, int16(0))  // text format
+	var format int16
+	if len(formatCodes) == 1 {
+		format = formatCodes[0]
+	} else if len(formatCodes) > 0 {
+		format = formatCodes[0]
+	}
+	_ = binary.Write(&buf, binary.BigEndian, format)
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
 }
 
@@ -5002,7 +5023,7 @@ var pgStatActivityTypeOIDs = func() []int32 {
 
 // handlePgStatActivity handles SELECT FROM pg_stat_activity in the Simple Query protocol.
 func (c *clientConn) handlePgStatActivity() error {
-	if err := c.sendPgStatActivityRowDescription(); err != nil {
+	if err := c.sendPgStatActivityRowDescriptionWithFormats(nil); err != nil {
 		return err
 	}
 
@@ -5024,7 +5045,7 @@ func (c *clientConn) handlePgStatActivity() error {
 // handlePgStatActivityExtended handles SELECT FROM pg_stat_activity in the Extended Query protocol.
 func (c *clientConn) handlePgStatActivityExtended(p *portal) {
 	if !p.stmt.described && !p.described {
-		_ = c.sendPgStatActivityRowDescription()
+		_ = c.sendPgStatActivityRowDescriptionWithFormats(p.resultFormats)
 	}
 
 	conns := c.server.listConns()
@@ -5038,10 +5059,10 @@ func (c *clientConn) handlePgStatActivityExtended(p *portal) {
 }
 
 // sendPgStatActivityRowDescription sends a RowDescription for pg_stat_activity.
-func (c *clientConn) sendPgStatActivityRowDescription() error {
+func (c *clientConn) sendPgStatActivityRowDescriptionWithFormats(formatCodes []int16) error {
 	var buf bytes.Buffer
 	_ = binary.Write(&buf, binary.BigEndian, int16(len(pgStatActivityColumns)))
-	for _, col := range pgStatActivityColumns {
+	for i, col := range pgStatActivityColumns {
 		buf.WriteString(col.name)
 		buf.WriteByte(0)
 		_ = binary.Write(&buf, binary.BigEndian, int32(0))    // table OID
@@ -5049,7 +5070,13 @@ func (c *clientConn) sendPgStatActivityRowDescription() error {
 		_ = binary.Write(&buf, binary.BigEndian, col.oid)     // type OID
 		_ = binary.Write(&buf, binary.BigEndian, col.typSize) // type size
 		_ = binary.Write(&buf, binary.BigEndian, int32(-1))   // typmod
-		_ = binary.Write(&buf, binary.BigEndian, int16(0))    // text format
+		var format int16
+		if len(formatCodes) == 1 {
+			format = formatCodes[0]
+		} else if i < len(formatCodes) {
+			format = formatCodes[i]
+		}
+		_ = binary.Write(&buf, binary.BigEndian, format)
 	}
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
 }
@@ -5340,7 +5367,7 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 
 	// Send RowDescription if Describe wasn't already called
 	if !p.described && len(cursor.cols) > 0 {
-		if err := c.sendRowDescription(cursor.cols, cursor.colTypes); err != nil {
+		if err := c.sendRowDescriptionWithFormats(cursor.cols, cursor.colTypes, p.resultFormats); err != nil {
 			return
 		}
 	}
