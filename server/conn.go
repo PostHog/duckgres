@@ -1763,7 +1763,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 
 	// Send RowDescription if Describe wasn't called before Execute
 	if !described && len(cols) > 0 {
-		if err := c.sendRowDescription(cols, colTypes); err != nil {
+		if err := c.sendRowDescriptionWithFormats(cols, colTypes, resultFormats); err != nil {
 			return
 		}
 	}
@@ -3608,6 +3608,15 @@ func (c *clientConn) parseCopyLine(line, delimiter string) []string {
 }
 
 func (c *clientConn) sendRowDescription(cols []string, colTypes []ColumnTyper) error {
+	return c.sendRowDescriptionWithFormats(cols, colTypes, nil)
+}
+
+// sendRowDescriptionWithFormats sends a RowDescription message with per-column format codes.
+// formatCodes follow the same convention as Bind result format codes:
+//   - nil or empty: all text (format=0)
+//   - single element: applies to all columns
+//   - one per column: per-column format
+func (c *clientConn) sendRowDescriptionWithFormats(cols []string, colTypes []ColumnTyper, formatCodes []int16) error {
 	var buf bytes.Buffer
 
 	// Number of fields
@@ -3643,7 +3652,13 @@ func (c *clientConn) sendRowDescription(cols []string, colTypes []ColumnTyper) e
 		_ = binary.Write(&buf, binary.BigEndian, typmod)
 
 		// Format code (0 = text, 1 = binary)
-		_ = binary.Write(&buf, binary.BigEndian, int16(0))
+		var format int16
+		if len(formatCodes) == 1 {
+			format = formatCodes[0]
+		} else if i < len(formatCodes) {
+			format = formatCodes[i]
+		}
+		_ = binary.Write(&buf, binary.BigEndian, format)
 	}
 
 	return writeMessage(c.writer, msgRowDescription, buf.Bytes())
@@ -4391,7 +4406,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 				return
 			}
 			p.described = true
-			_ = c.sendRowDescription(cols, colTypes)
+			_ = c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats)
 			return
 		case cursorOpPgCursorsQuery:
 			_ = c.sendPgCursorsRowDescription()
@@ -4465,7 +4480,7 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// and desync their message queue.
 		p.described = true
 		p.stmt.described = true
-		_ = c.sendRowDescription(cols, colTypes)
+		_ = c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats)
 
 	default:
 		c.sendError("ERROR", "08P01", "invalid Describe type")
@@ -4645,7 +4660,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Skip if there are no columns - queries that return 0 columns (like
 	// DDL accidentally routed here) don't need RowDescription.
 	if !p.described && len(cols) > 0 {
-		if err := c.sendRowDescription(cols, colTypes); err != nil {
+		if err := c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats); err != nil {
 			return
 		}
 	}
@@ -5340,7 +5355,7 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 
 	// Send RowDescription if Describe wasn't already called
 	if !p.described && len(cursor.cols) > 0 {
-		if err := c.sendRowDescription(cursor.cols, cursor.colTypes); err != nil {
+		if err := c.sendRowDescriptionWithFormats(cursor.cols, cursor.colTypes, p.resultFormats); err != nil {
 			return
 		}
 	}
