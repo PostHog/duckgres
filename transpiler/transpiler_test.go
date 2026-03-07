@@ -730,6 +730,34 @@ func TestTranspile_SetShow(t *testing.T) {
 		}
 	})
 
+	// Test SET search_path is passed through (DuckDB natively supports it)
+	t.Run("SET search_path passthrough", func(t *testing.T) {
+		result, err := tr.Transpile("SET search_path TO 'posthog'")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if result.IsIgnoredSet {
+			t.Error("SET search_path should NOT be marked as ignored — DuckDB supports it natively")
+		}
+		if !strings.Contains(strings.ToLower(result.SQL), "search_path") {
+			t.Errorf("SET search_path should pass through unchanged, got: %q", result.SQL)
+		}
+	})
+
+	// Test SHOW search_path queries duckdb_settings() (DuckDB's SHOW describes tables, not settings)
+	t.Run("SHOW search_path via duckdb_settings", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW search_path")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if result.IsIgnoredSet {
+			t.Error("SHOW search_path should NOT be marked as ignored")
+		}
+		if !strings.Contains(strings.ToLower(result.SQL), "duckdb_settings") {
+			t.Errorf("SHOW search_path should query duckdb_settings(), got: %q", result.SQL)
+		}
+	})
+
 	// Test SET application_name is ignored
 	t.Run("SET application_name ignored", func(t *testing.T) {
 		result, err := tr.Transpile("SET application_name = 'fivetran'")

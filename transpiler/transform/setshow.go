@@ -24,9 +24,14 @@ var duckdbShowCommands = map[string]bool{
 // - SET application_name = 'x' -> SET VARIABLE application_name = 'x'
 // - SHOW application_name -> SELECT getvariable('application_name') AS application_name
 // - PostgreSQL-specific SET parameters -> IsIgnoredSet = true
+// - DuckDB-native SET parameters (e.g. search_path) -> passed through unchanged
 type SetShowTransform struct {
 	// IgnoredParams are PostgreSQL-specific parameters that should be silently ignored
 	IgnoredParams map[string]bool
+
+	// PassthroughParams are parameters that DuckDB natively supports.
+	// SET is forwarded unchanged; SHOW is transformed to query duckdb_settings().
+	PassthroughParams map[string]bool
 
 	// VariableParams are parameters that need SET VARIABLE syntax in DuckDB
 	VariableParams map[string]bool
@@ -154,8 +159,7 @@ func NewSetShowTransform() *SetShowTransform {
 			"wal_sender_timeout":        true,
 			"wal_receiver_timeout":      true,
 
-			// Search path and session settings (silently accept)
-			"search_path":                  true,
+			// Session settings (silently accept)
 			"datestyle":                    true,
 			"intervalstyle":                true,
 			"standard_conforming_strings":  true,
@@ -178,6 +182,10 @@ func NewSetShowTransform() *SetShowTransform {
 			"timezone":         true,
 			"log_timezone":     true,
 			"timezone_abbreviations": true,
+		},
+		PassthroughParams: map[string]bool{
+			// Parameters that DuckDB natively supports — forward as-is
+			"search_path": true,
 		},
 		VariableParams: map[string]bool{
 			// Parameters that need SET VARIABLE syntax in DuckDB
@@ -223,6 +231,11 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 
 				paramName := strings.ToLower(n.VariableSetStmt.Name)
 
+				// Passthrough params are natively supported by DuckDB — forward unchanged
+				if t.PassthroughParams[paramName] {
+					return false, nil
+				}
+
 				// Check if this is an ignored parameter (including RESET single param)
 				if t.IgnoredParams[paramName] {
 					result.IsIgnoredSet = true
@@ -262,6 +275,17 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 		case *pg_query.Node_VariableShowStmt:
 			if n.VariableShowStmt != nil {
 				paramName := strings.ToLower(n.VariableShowStmt.Name)
+
+				// Passthrough params: SHOW → SELECT value FROM duckdb_settings() WHERE name = '...'
+				// (DuckDB's SHOW <name> describes a table, not a setting)
+				if t.PassthroughParams[paramName] {
+					selectStmt := t.createSettingsLookupSelect(paramName)
+					tree.Stmts[i].Stmt = &pg_query.Node{
+						Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt},
+					}
+					changed = true
+					continue
+				}
 
 				// For ignored params, return a sensible default value
 				if t.IgnoredParams[paramName] {
@@ -329,8 +353,7 @@ func (t *SetShowTransform) getDefaultValue(paramName string) string {
 		"maintenance_work_mem": "64MB",
 		"effective_cache_size": "4GB",
 
-		// Search path and session settings
-		"search_path":                 "\"$user\", public",
+		// Session settings
 		"datestyle":                   "ISO, MDY",
 		"intervalstyle":               "postgres",
 		"standard_conforming_strings": "on",
@@ -381,6 +404,89 @@ func (t *SetShowTransform) createDefaultValueSelect(paramName, value string) *pg
 									Val: &pg_query.A_Const_Sval{
 										Sval: &pg_query.String{Sval: value},
 									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// createSettingsLookupSelect creates:
+//
+//	SELECT value AS <name> FROM duckdb_settings() WHERE name = '<name>'
+//
+// Used for passthrough params where DuckDB's SHOW would try to describe a table.
+func (t *SetShowTransform) createSettingsLookupSelect(paramName string) *pg_query.SelectStmt {
+	return &pg_query.SelectStmt{
+		TargetList: []*pg_query.Node{
+			{
+				Node: &pg_query.Node_ResTarget{
+					ResTarget: &pg_query.ResTarget{
+						Name: paramName,
+						Val: &pg_query.Node{
+							Node: &pg_query.Node_ColumnRef{
+								ColumnRef: &pg_query.ColumnRef{
+									Fields: []*pg_query.Node{
+										{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "value"}}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		FromClause: []*pg_query.Node{
+			{
+				Node: &pg_query.Node_RangeFunction{
+					RangeFunction: &pg_query.RangeFunction{
+						Functions: []*pg_query.Node{
+							{
+								Node: &pg_query.Node_List{
+									List: &pg_query.List{
+										Items: []*pg_query.Node{
+											{
+												Node: &pg_query.Node_FuncCall{
+													FuncCall: &pg_query.FuncCall{
+														Funcname: []*pg_query.Node{
+															{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "duckdb_settings"}}},
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		WhereClause: &pg_query.Node{
+			Node: &pg_query.Node_AExpr{
+				AExpr: &pg_query.A_Expr{
+					Kind: pg_query.A_Expr_Kind_AEXPR_OP,
+					Name: []*pg_query.Node{
+						{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "="}}},
+					},
+					Lexpr: &pg_query.Node{
+						Node: &pg_query.Node_ColumnRef{
+							ColumnRef: &pg_query.ColumnRef{
+								Fields: []*pg_query.Node{
+									{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "name"}}},
+								},
+							},
+						},
+					},
+					Rexpr: &pg_query.Node{
+						Node: &pg_query.Node_AConst{
+							AConst: &pg_query.A_Const{
+								Val: &pg_query.A_Const_Sval{
+									Sval: &pg_query.String{Sval: paramName},
 								},
 							},
 						},
