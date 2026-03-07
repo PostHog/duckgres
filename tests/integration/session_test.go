@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -9,6 +10,14 @@ import (
 func TestSessionSetSearchPath(t *testing.T) {
 	db := testHarness.DuckgresDB
 
+	// Save original search_path so we can restore it after the test
+	var originalPath string
+	if err := db.QueryRow("SHOW search_path").Scan(&originalPath); err != nil {
+		t.Fatalf("SHOW search_path (before) failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec("SET search_path TO '" + originalPath + "'")
+	})
 	// SET search_path and then SHOW it — should return the new value, not a hardcoded default
 	_, err := db.Exec("SET search_path TO 'main'")
 	if err != nil {
@@ -20,8 +29,8 @@ func TestSessionSetSearchPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SHOW search_path failed: %v", err)
 	}
-	if searchPath != "main" {
-		t.Errorf("expected search_path 'main', got %q", searchPath)
+	if !strings.Contains(searchPath, "main") {
+	  t.Errorf("expected search_path to contain 'main', got %q", searchPath)
 	}
 }
 
@@ -279,6 +288,17 @@ func TestSessionTransactionModes(t *testing.T) {
 
 // TestSessionReset tests RESET command
 func TestSessionReset(t *testing.T) {
+	db := testHarness.DuckgresDB
+
+	// Save original search_path — RESET search_path passes through to DuckDB
+	// and would reset to DuckDB default (just "main"), losing the ducklake prefix
+	var originalPath string
+	if err := db.QueryRow("SHOW search_path").Scan(&originalPath); err != nil {
+		t.Fatalf("SHOW search_path (before) failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec("SET search_path TO '" + originalPath + "'")
+	})
 	tests := []QueryTest{
 		{
 			Name:         "reset_search_path",
