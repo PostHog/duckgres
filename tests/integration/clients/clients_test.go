@@ -699,7 +699,7 @@ func TestPgxBinaryFormatResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pgx.Connect failed: %v", err)
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 
 	t.Run("int4", func(t *testing.T) {
 		var v int32
