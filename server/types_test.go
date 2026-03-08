@@ -71,7 +71,7 @@ func TestMapDuckDBType(t *testing.T) {
 		{"TIMESTAMP", "TIMESTAMP", OidTimestamp, 8},
 		{"TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE", OidTimestamptz, 8},
 		{"TIMESTAMPTZ", "TIMESTAMPTZ", OidTimestamptz, 8},
-		{"INTERVAL", "INTERVAL", OidInterval, 16},
+		{"INTERVAL", "INTERVAL", OidVarchar, -1},
 
 		// Other types
 		{"UUID", "UUID", OidUUID, 16},

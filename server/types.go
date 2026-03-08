@@ -207,7 +207,11 @@ func mapDuckDBType(typeName string) TypeInfo {
 	case upper == "TIMESTAMP WITH TIME ZONE" || upper == "TIMESTAMPTZ":
 		return TypeInfo{OID: OidTimestamptz, Size: 8, Typmod: -1}
 	case upper == "INTERVAL":
-		return TypeInfo{OID: OidInterval, Size: 16, Typmod: -1}
+		// Map to VARCHAR instead of OidInterval (1186) so JDBC returns a plain
+		// string rather than a PGInterval object. Metabase (and other JDBC clients)
+		// NPE when processing PGInterval values. The text representation
+		// ("00:05:23", "1 day 02:30:00") is preserved and human-readable.
+		return TypeInfo{OID: OidVarchar, Size: -1, Typmod: -1}
 	case upper == "UUID":
 		return TypeInfo{OID: OidUUID, Size: 16, Typmod: -1}
 	case upper == "JSON":

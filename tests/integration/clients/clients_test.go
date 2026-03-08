@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	_ "github.com/lib/pq"
 	"github.com/posthog/duckgres/server"
 )
@@ -768,33 +768,32 @@ func TestPgxBinaryFormatResults(t *testing.T) {
 	})
 
 	t.Run("interval_uptime", func(t *testing.T) {
-		// This was the original failing case: SELECT uptime() returns INTERVAL
-		// and pgx requests binary format for it.
-		var v pgtype.Interval
+		// INTERVAL is mapped to VARCHAR OID so JDBC/Metabase gets a plain string
+		// instead of a PGInterval object (which causes NPE in Metabase).
+		var v string
 		err := conn.QueryRow(ctx, "SELECT uptime()").Scan(&v)
 		if err != nil {
 			t.Fatalf("QueryRow failed: %v", err)
 		}
-		if !v.Valid {
-			t.Error("expected valid interval")
+		if v == "" || v == "00:00:00" {
+			t.Errorf("expected non-zero uptime, got %q", v)
 		}
-		if v.Microseconds <= 0 {
-			t.Errorf("expected positive uptime, got %d microseconds", v.Microseconds)
+		if !strings.Contains(v, ":") {
+			t.Errorf("expected time format with colons, got %q", v)
 		}
 	})
 
 	t.Run("interval_literal", func(t *testing.T) {
-		var v pgtype.Interval
+		var v string
 		err := conn.QueryRow(ctx, "SELECT INTERVAL '1 day 2 hours 30 minutes'").Scan(&v)
 		if err != nil {
 			t.Fatalf("QueryRow failed: %v", err)
 		}
-		if v.Days != 1 {
-			t.Errorf("expected 1 day, got %d", v.Days)
+		if !strings.Contains(v, "1 day") {
+			t.Errorf("expected '1 day' in interval, got %q", v)
 		}
-		expectedMicros := int64(2*3600+30*60) * 1_000_000
-		if v.Microseconds != expectedMicros {
-			t.Errorf("expected %d microseconds (2h30m), got %d", expectedMicros, v.Microseconds)
+		if !strings.Contains(v, "02:30:00") {
+			t.Errorf("expected '02:30:00' in interval, got %q", v)
 		}
 	})
 
