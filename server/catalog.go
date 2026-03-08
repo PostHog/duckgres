@@ -1051,19 +1051,21 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 // including passthrough users who bypass pg_catalog initialization.
 func initUtilityMacros(db *sql.DB, serverStartTime, processStartTime time.Time, serverVersion, processVersion string) {
 	macros := []string{
-		// uptime - returns server uptime as an INTERVAL
+		// uptime - returns server uptime in seconds (DOUBLE)
 		// Bakes the server start timestamp into the macro; now() evaluates at query time.
 		// Uses TIMESTAMPTZ with explicit +00 suffix so the timezone is unambiguous —
 		// DuckDB's now() returns TIMESTAMPTZ in UTC, and a bare TIMESTAMP literal
 		// would be interpreted in the session timezone, causing an offset.
+		// Returns seconds via epoch() so JDBC/Metabase clients get a plain numeric
+		// value rather than a PGInterval object.
 		// In standalone mode this equals worker_uptime(). In process isolation mode
 		// this shows the parent server's lifetime.
-		fmt.Sprintf(`CREATE OR REPLACE MACRO uptime() AS (now() - TIMESTAMPTZ '%s+00')`,
+		fmt.Sprintf(`CREATE OR REPLACE MACRO uptime() AS epoch(now() - TIMESTAMPTZ '%s+00')`,
 			serverStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
-		// worker_uptime - returns current process uptime as an INTERVAL
+		// worker_uptime - returns current process uptime in seconds (DOUBLE)
 		// In standalone mode this equals uptime(). In process isolation mode
 		// this shows the child process lifetime (≈ connection duration).
-		fmt.Sprintf(`CREATE OR REPLACE MACRO worker_uptime() AS (now() - TIMESTAMPTZ '%s+00')`,
+		fmt.Sprintf(`CREATE OR REPLACE MACRO worker_uptime() AS epoch(now() - TIMESTAMPTZ '%s+00')`,
 			processStartTime.UTC().Format("2006-01-02 15:04:05.999999")),
 		// control_plane_version - returns the top-level server/control-plane version
 		// In standalone mode this equals worker_version().
