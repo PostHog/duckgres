@@ -767,19 +767,16 @@ func TestPgxBinaryFormatResults(t *testing.T) {
 		}
 	})
 
-	t.Run("interval_uptime", func(t *testing.T) {
-		// This was the original failing case: SELECT uptime() returns INTERVAL
-		// and pgx requests binary format for it.
-		var v pgtype.Interval
+	t.Run("uptime_seconds", func(t *testing.T) {
+		// uptime() returns epoch seconds (DOUBLE) so JDBC/Metabase gets a plain
+		// numeric value rather than a PGInterval object.
+		var v float64
 		err := conn.QueryRow(ctx, "SELECT uptime()").Scan(&v)
 		if err != nil {
 			t.Fatalf("QueryRow failed: %v", err)
 		}
-		if !v.Valid {
-			t.Error("expected valid interval")
-		}
-		if v.Microseconds <= 0 {
-			t.Errorf("expected positive uptime, got %d microseconds", v.Microseconds)
+		if v <= 0 {
+			t.Errorf("expected positive uptime seconds, got %f", v)
 		}
 	})
 
