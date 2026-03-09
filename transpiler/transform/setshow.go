@@ -2,6 +2,7 @@ package transform
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 
@@ -233,11 +234,13 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 
 				// Passthrough params are natively supported by DuckDB — forward unchanged
 				if t.PassthroughParams[paramName] {
+					slog.Debug("SET passthrough (DuckDB-native).", "param", paramName)
 					return false, nil
 				}
 
 				// Check if this is an ignored parameter (including RESET single param)
 				if t.IgnoredParams[paramName] {
+					slog.Debug("SET ignored (PostgreSQL-specific).", "param", paramName)
 					result.IsIgnoredSet = true
 					return true, nil
 				}
@@ -279,6 +282,7 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 				// Passthrough params: SHOW → SELECT value FROM duckdb_settings() WHERE name = '...'
 				// (DuckDB's SHOW <name> describes a table, not a setting)
 				if t.PassthroughParams[paramName] {
+					slog.Debug("SHOW passthrough → duckdb_settings() lookup.", "param", paramName)
 					selectStmt := t.createSettingsLookupSelect(paramName)
 					tree.Stmts[i].Stmt = &pg_query.Node{
 						Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt},

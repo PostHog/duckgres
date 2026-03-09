@@ -234,6 +234,7 @@ func initLogging() func() {
 	res := resource.NewWithAttributes(
 		semconv.SchemaURL,
 		semconv.ServiceName(serviceName),
+		semconv.ServiceVersion(server.ProcessVersion()),
 	)
 
 	opts := append(processors, sdklog.WithResource(res))
