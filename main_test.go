@@ -684,6 +684,60 @@ func TestResolveEffectiveConfigACMEDNSProviderValidation(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigFilePersistenceFromFile(t *testing.T) {
+	fileCfg := &FileConfig{
+		FilePersistence: true,
+		DataDir:         "/tmp/data",
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence from YAML to be true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceFromEnv(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "true",
+	}
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence from env to be true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceEnvOverridesFile(t *testing.T) {
+	fileCfg := &FileConfig{
+		FilePersistence: true,
+	}
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "false",
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected env false to override file true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceCLIOverridesEnv(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "false",
+	}
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{
+		Set:             map[string]bool{"file-persistence": true},
+		FilePersistence: true,
+	}, envFromMap(env), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected CLI true to override env false")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceDefaultFalse(t *testing.T) {
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence to default to false")
+	}
+}
+
 func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 	fileCfg := &FileConfig{
 		TLS: TLSConfig{

@@ -21,6 +21,7 @@ type configCLIInputs struct {
 	DataDir                   string
 	CertFile                  string
 	KeyFile                   string
+	FilePersistence           bool
 	ProcessIsolation          bool
 	IdleTimeout               string
 	MemoryLimit               string
@@ -225,6 +226,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
 		}
 
+		cfg.FilePersistence = fileCfg.FilePersistence
 		cfg.ProcessIsolation = fileCfg.ProcessIsolation
 		if fileCfg.IdleTimeout != "" {
 			if d, err := time.ParseDuration(fileCfg.IdleTimeout); err == nil {
@@ -435,6 +437,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
 	}
+	if v := getenv("DUCKGRES_FILE_PERSISTENCE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.FilePersistence = b
+		} else {
+			warn("Invalid DUCKGRES_FILE_PERSISTENCE: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.ProcessIsolation = b
@@ -637,6 +646,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["key"] {
 		cfg.TLSKeyFile = cli.KeyFile
+	}
+	if cli.Set["file-persistence"] {
+		cfg.FilePersistence = cli.FilePersistence
 	}
 	if cli.Set["process-isolation"] {
 		cfg.ProcessIsolation = cli.ProcessIsolation

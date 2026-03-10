@@ -309,6 +309,103 @@ func TestStartCredentialRefresh_RollbackAndRetryWhenNoActiveTransaction(t *testi
 	}
 }
 
+func TestOpenBaseDBInMemoryByDefault(t *testing.T) {
+	cfg := Config{}
+	db, err := openBaseDB(cfg, "testuser")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var dbName string
+	err = db.QueryRow("SELECT current_database()").Scan(&dbName)
+	if err != nil {
+		t.Fatalf("failed to query current_database(): %v", err)
+	}
+	if dbName != "memory" {
+		t.Fatalf("expected in-memory database (current_database()='memory'), got %q", dbName)
+	}
+}
+
+func TestOpenBaseDBFilePersistence(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         dataDir,
+	}
+	db, err := openBaseDB(cfg, "alice")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+
+	// Write data
+	if _, err := db.Exec("CREATE TABLE test_persist (id INTEGER)"); err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO test_persist VALUES (42)"); err != nil {
+		t.Fatalf("failed to insert: %v", err)
+	}
+	_ = db.Close()
+
+	// Reopen the same file and verify data survives
+	db2, err := openBaseDB(cfg, "alice")
+	if err != nil {
+		t.Fatalf("openBaseDB (reopen) failed: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	var val int
+	err = db2.QueryRow("SELECT id FROM test_persist").Scan(&val)
+	if err != nil {
+		t.Fatalf("failed to read persisted data: %v", err)
+	}
+	if val != 42 {
+		t.Fatalf("expected persisted value 42, got %d", val)
+	}
+}
+
+func TestOpenBaseDBFilePersistenceFallsBackWithoutDataDir(t *testing.T) {
+	cfg := Config{
+		FilePersistence: true,
+		// DataDir intentionally empty
+	}
+	db, err := openBaseDB(cfg, "testuser")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var dbName string
+	err = db.QueryRow("SELECT current_database()").Scan(&dbName)
+	if err != nil {
+		t.Fatalf("failed to query current_database(): %v", err)
+	}
+	if dbName != "memory" {
+		t.Fatalf("expected fallback to in-memory when DataDir is empty, got %q", dbName)
+	}
+}
+
+func TestOpenBaseDBFilePersistenceFallsBackWithoutUsername(t *testing.T) {
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         t.TempDir(),
+	}
+	db, err := openBaseDB(cfg, "")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var dbName string
+	err = db.QueryRow("SELECT current_database()").Scan(&dbName)
+	if err != nil {
+		t.Fatalf("failed to query current_database(): %v", err)
+	}
+	if dbName != "memory" {
+		t.Fatalf("expected fallback to in-memory when username is empty, got %q", dbName)
+	}
+}
+
 func TestHasCacheHTTPFS(t *testing.T) {
 	tests := []struct {
 		name       string

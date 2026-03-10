@@ -154,6 +154,11 @@ type Config struct {
 	// uncleanly. Default: 24 hours. Set to a negative value (e.g., -1) to disable.
 	IdleTimeout time.Duration
 
+	// FilePersistence stores DuckDB data in <DataDir>/<username>.duckdb instead of :memory:.
+	// DuckDB memory-maps the file and serves queries from RAM, so performance is similar
+	// to in-memory mode while data persists across connections and restarts.
+	FilePersistence bool
+
 	// ProcessIsolation enables spawning each client connection in a separate OS process.
 	// This prevents DuckDB C++ crashes from taking down the entire server.
 	// When enabled, rate limiting and cancel requests are handled by the parent process,
@@ -625,11 +630,21 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	return CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
 }
 
-// openBaseDB creates and configures a bare DuckDB in-memory connection with
-// threads, memory limit, temp directory, extensions, and cache_httpfs settings.
+// openBaseDB creates and configures a DuckDB connection with threads, memory
+// limit, temp directory, extensions, and cache_httpfs settings.
 // This shared setup is used by both regular and passthrough connections.
+//
+// When DataDir is set, the database is file-backed at <DataDir>/<username>.duckdb.
+// DuckDB memory-maps the file and serves queries from RAM (like Redis with AOF),
+// so performance is equivalent to in-memory while data persists across restarts.
+// When DataDir is empty, falls back to a pure in-memory database.
 func openBaseDB(cfg Config, username string) (*sql.DB, error) {
-	db, err := sql.Open("duckdb", ":memory:")
+	dsn := ":memory:"
+	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
+		dsn = filepath.Join(cfg.DataDir, username+".duckdb")
+		slog.Info("Opening file-backed DuckDB.", "path", dsn)
+	}
+	db, err := sql.Open("duckdb", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
