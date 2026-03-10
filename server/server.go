@@ -738,6 +738,9 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		// Continue anyway - basic queries will still work
 	}
 
+	// Register ClickHouse SQL macros (chsql compat)
+	initClickHouseMacros(db)
+
 	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
@@ -796,6 +799,9 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 
 	// Utility macros (uptime, version) are useful for all connections.
 	initUtilityMacros(db, serverStartTime, processStartTime, serverVersion, processVersion)
+
+	// Register ClickHouse SQL macros (chsql compat)
+	initClickHouseMacros(db)
 
 	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
