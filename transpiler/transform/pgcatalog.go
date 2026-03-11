@@ -67,6 +67,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"pg_foreign_table":          "pg_foreign_table",
 			"pg_trigger":                "pg_trigger",
 			"pg_locks":                  "pg_locks",
+			"pg_rewrite":                "pg_rewrite",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
@@ -104,6 +105,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"to_number":                       true, // Parse formatted number string macro
 			"pg_backend_pid":                  true, // Backend process ID macro
 			"pg_total_relation_size":          true, // Total table size stub
+			"pg_stat_get_numscans":            true, // Index/table scan count stub
 			"pg_relation_size":                true, // Table size stub
 			"pg_table_size":                   true, // Table size excl. indexes stub
 			"pg_indexes_size":                 true, // Index size stub
@@ -146,6 +148,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"array_remove":                    true, // Remove element from array
 			"to_number":                       true, // Parse formatted number string
 			"pg_backend_pid":                  true, // Backend process ID
+			"pg_stat_get_numscans":            true, // Index/table scan count
 			"pg_total_relation_size":          true, // Total table size
 			"pg_relation_size":                true, // Table size
 			"pg_table_size":                   true, // Table size excl. indexes
