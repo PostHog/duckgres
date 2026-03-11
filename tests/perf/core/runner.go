@@ -75,13 +75,13 @@ func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 
 	warmupIterations := r.cfg.Catalog.WarmupIterations
 	for i := 0; i < warmupIterations; i++ {
-		if err := r.executeIteration(ctx, false, &summary); err != nil {
+		if err := r.executeIteration(ctx, false, 0, &summary); err != nil {
 			return summary, err
 		}
 	}
 	measureIterations := r.cfg.Catalog.MeasureIterations
 	for i := 0; i < measureIterations; i++ {
-		if err := r.executeIteration(ctx, true, &summary); err != nil {
+		if err := r.executeIteration(ctx, true, i+1, &summary); err != nil {
 			return summary, err
 		}
 	}
@@ -103,17 +103,18 @@ func (r *QueryRunner) MetricsGatherer() prometheus.Gatherer {
 	return r.metrics.Gatherer()
 }
 
-func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, summary *RunSummary) error {
+func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measureIteration int, summary *RunSummary) error {
 	for _, query := range r.cfg.Catalog.Queries {
 		args := orderedParamValues(query.Params)
 		for _, protocol := range r.cfg.Catalog.Targets {
 			driver := r.cfg.Drivers[protocol]
 			started := r.cfg.Now()
 			result := QueryResult{
-				QueryID:   query.QueryID,
-				IntentID:  query.IntentID,
-				Protocol:  protocol,
-				StartedAt: started,
+				QueryID:          query.QueryID,
+				IntentID:         query.IntentID,
+				MeasureIteration: measureIteration,
+				Protocol:         protocol,
+				StartedAt:        started,
 			}
 
 			execResult, err := driver.Execute(ctx, query, args)

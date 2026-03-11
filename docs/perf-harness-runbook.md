@@ -155,9 +155,9 @@ Rows are stored with:
 
 The source CSV schema is fixed to:
 
-`query_id,intent_id,protocol,status,error,error_class,rows,duration_ms,started_at`
+`query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at`
 
-`summary.json` remains a local run artifact for debugging and future dashboard expansion.
+`summary.json` remains a local run artifact and is also consumed by the upload hook to populate run-level dashboard metadata.
 
 ## Grafana
 

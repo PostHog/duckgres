@@ -30,6 +30,7 @@ func NewArtifactSink(dir string) (*ArtifactSink, error) {
 	header := []string{
 		"query_id",
 		"intent_id",
+		"measure_iteration",
 		"protocol",
 		"status",
 		"error",
@@ -61,6 +62,7 @@ func (s *ArtifactSink) Record(result QueryResult) error {
 	row := []string{
 		result.QueryID,
 		result.IntentID,
+		strconv.Itoa(result.MeasureIteration),
 		string(result.Protocol),
 		result.Status,
 		result.Error,

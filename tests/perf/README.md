@@ -50,6 +50,7 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 
 - `query_id`
 - `intent_id`
+- `measure_iteration`
 - `protocol`
 - `status`
 - `error`
@@ -58,6 +59,7 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `duration_ms`
 - `started_at`
 
+`measure_iteration` is the 1-based measured repetition within a run (`0` is reserved for non-measured warmup work and is not emitted to the CSV today).
 `duration_ms` is emitted as milliseconds with fixed precision, and `started_at` is UTC RFC3339Nano.
 No CSV schema mutation is expected in this phase.
 
