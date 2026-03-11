@@ -82,8 +82,9 @@ jobs:
 
       - name: Check if build release already exists
         id: check-existing
+        env:
+          TAG: "build-${{ steps.sha.outputs.short }}"
         run: |
-          TAG="build-${{ steps.sha.outputs.short }}"
           if gh release view "$TAG" &>/dev/null; then
             echo "Release $TAG already exists — skipping to avoid overwriting a promoted release"
             echo "exists=true" >> $GITHUB_OUTPUT
