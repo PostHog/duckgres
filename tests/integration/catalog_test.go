@@ -401,6 +401,13 @@ func TestCatalogSystemFunctions(t *testing.T) {
 			Query:        "SELECT pg_is_in_recovery()",
 			DuckgresOnly: true,
 		},
+
+		// pg_get_partkeydef (stub, returns empty string - DuckDB has no partitioning)
+		{
+			Name:         "pg_get_partkeydef",
+			Query:        "SELECT pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LIMIT 1",
+			DuckgresOnly: true,
+		},
 	}
 	runQueryTests(t, tests)
 }
