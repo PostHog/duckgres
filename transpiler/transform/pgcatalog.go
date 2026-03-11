@@ -157,6 +157,33 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_ident":                     true, // Quote identifier
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
+
+			// ClickHouse SQL macros (server/chsql.go initClickHouseMacros)
+			"tostring":        true,
+			"toint32":         true,
+			"toint64":         true,
+			"tofloat":         true,
+			"toint32ornull":   true,
+			"toint32orzero":   true,
+			"intdiv":          true,
+			"modulo":          true,
+			"empty":           true,
+			"notempty":        true,
+			"splitbychar":     true,
+			"lengthutf8":      true,
+			"toyear":          true,
+			"tomonth":         true,
+			"todayofmonth":    true,
+			"toyyyymmdd":      true,
+			"toyyyymm":        true,
+			"protocol":        true,
+			"domain":          true,
+			"topleveldomain":  true,
+			"ipv4numtostring": true,
+			"jsonextractstring": true,
+			"jsonhas":         true,
+			"generateuuidv4":  true,
+			"ifnull":          true,
 		},
 	}
 }

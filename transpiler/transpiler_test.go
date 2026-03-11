@@ -3040,6 +3040,62 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 	}
 }
 
+func TestTranspile_ClickHouseMacros_DuckLakeMode(t *testing.T) {
+	// ClickHouse macros are created in memory.main and need explicit qualification
+	// in DuckLake mode. The PG parser lowercases unquoted identifiers, so the
+	// CustomMacros keys must be lowercase.
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			name:     "toString gets memory.main prefix",
+			input:    "SELECT toString(123)",
+			contains: "memory.main.tostring",
+		},
+		{
+			name:     "toInt32 gets memory.main prefix",
+			input:    "SELECT toInt32('42')",
+			contains: "memory.main.toint32",
+		},
+		{
+			name:     "intDiv gets memory.main prefix",
+			input:    "SELECT intDiv(10, 3)",
+			contains: "memory.main.intdiv",
+		},
+		{
+			name:     "JSONExtractString gets memory.main prefix",
+			input:    `SELECT JSONExtractString('{"a":"b"}', '$.a')`,
+			contains: "memory.main.jsonextractstring",
+		},
+		{
+			name:     "ifNull gets memory.main prefix",
+			input:    "SELECT ifNull(NULL, 'default')",
+			contains: "memory.main.ifnull",
+		},
+		{
+			name:     "generateUUIDv4 gets memory.main prefix",
+			input:    "SELECT generateUUIDv4()",
+			contains: "memory.main.generateuuidv4",
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+		})
+	}
+}
+
 // --- Three-Tier Intercept Tests ---
 
 func TestClassify_Direct(t *testing.T) {
