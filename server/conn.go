@@ -3098,6 +3098,20 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return c.handleCopyInBinary(query, opts, cols, colTypes)
 	}
 
+	// Check for BLOB columns. DuckDB's CSV parser cannot handle raw binary data
+	// in BLOB columns — it auto-detects the type but fails to parse the bytes.
+	// Fall back to in-process CSV parsing with batched INSERT for these tables.
+	var blobColIndices []int
+	for i, ct := range colTypes {
+		if ct.DatabaseTypeName() == "BLOB" {
+			blobColIndices = append(blobColIndices, i)
+		}
+	}
+	if len(blobColIndices) > 0 {
+		slog.Debug("COPY FROM STDIN: table has BLOB columns, using CSV parse fallback.", "user", c.username, "blob_columns", len(blobColIndices))
+		return c.handleCopyInCSVWithBlob(query, opts, cols, colTypes, blobColIndices)
+	}
+
 	// Send CopyInResponse
 	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
@@ -3214,6 +3228,141 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "08P01", errMsg, "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+	}
+}
+
+// handleCopyInCSVWithBlob handles COPY FROM STDIN for tables that contain BLOB columns.
+// DuckDB's native CSV COPY cannot handle raw binary data in BLOB columns because it
+// auto-detects the type and fails to parse the bytes. This method parses the CSV in Go,
+// converts BLOB column values to []byte, and uses batched INSERT statements.
+func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions, cols []string, colTypes []ColumnTyper, blobColIndices []int) error {
+	copyStartTime := time.Now()
+
+	// Build a set for O(1) BLOB column index lookup
+	isBlobCol := make(map[int]bool, len(blobColIndices))
+	for _, idx := range blobColIndices {
+		isBlobCol[idx] = true
+	}
+
+	// Send CopyInResponse (text format)
+	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
+		return err
+	}
+	_ = c.writer.Flush()
+
+	// Buffer all CopyData messages into memory (we need to parse CSV, not stream to file)
+	var buf bytes.Buffer
+	for {
+		msgType, body, err := readMessage(c.reader)
+		if err != nil {
+			return err
+		}
+
+		switch msgType {
+		case msgCopyData:
+			// Skip end-of-data marker
+			if (len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
+				(len(body) == 2 && body[0] == '\\' && body[1] == '.') {
+				continue
+			}
+			buf.Write(body)
+
+		case msgCopyDone:
+			dataReceiveElapsed := time.Since(copyStartTime)
+			slog.Debug("COPY FROM STDIN (BLOB fallback) CopyDone received.", "user", c.username, "bytes", buf.Len(), "duration", dataReceiveElapsed)
+
+			// Parse CSV from the buffered data
+			csvReader := csv.NewReader(&buf)
+			csvReader.Comma = rune(opts.Delimiter[0])
+			csvReader.LazyQuotes = true
+
+			// Skip header row if present
+			if opts.HasHeader {
+				if _, err := csvReader.Read(); err != nil {
+					errMsg := fmt.Sprintf("COPY failed: error reading CSV header: %v", err)
+					c.sendError("ERROR", "22P02", errMsg)
+					c.setTxError()
+					c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
+					_ = writeReadyForQuery(c.writer, c.txStatus)
+					_ = c.writer.Flush()
+					return nil
+				}
+			}
+
+			// Parse all rows and convert BLOB columns to []byte
+			var rows [][]interface{}
+			for {
+				record, err := csvReader.Read()
+				if err != nil {
+					break // EOF or error — stop reading
+				}
+				if len(record) != len(cols) {
+					slog.Warn("COPY FROM STDIN (BLOB fallback) skipping row with wrong field count.", "expected", len(cols), "got", len(record))
+					continue
+				}
+				row := make([]interface{}, len(cols))
+				for j, field := range record {
+					if field == opts.NullString {
+						row[j] = nil
+					} else if isBlobCol[j] {
+						row[j] = []byte(field)
+					} else {
+						row[j] = field
+					}
+				}
+				rows = append(rows, row)
+			}
+
+			if len(rows) == 0 {
+				_ = writeCommandComplete(c.writer, "COPY 0")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "", "", "simple")
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
+				return nil
+			}
+
+			loadStart := time.Now()
+			rowCount, err := c.batchInsertRows(opts.TableName, opts.ColumnList, cols, rows)
+			if err != nil {
+				slog.Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "user", c.username, "error", err)
+				errMsg := fmt.Sprintf("COPY failed: %v", err)
+				c.sendError("ERROR", "22P02", errMsg)
+				c.setTxError()
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
+				return nil
+			}
+
+			totalElapsed := time.Since(copyStartTime)
+			loadElapsed := time.Since(loadStart)
+			slog.Info("COPY FROM STDIN (BLOB fallback) completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
+
+			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		case msgCopyFail:
+			errMsg := string(bytes.TrimRight(body, "\x00"))
+			exception := fmt.Sprintf("COPY failed: %s", errMsg)
+			c.sendError("ERROR", "57014", exception)
+			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		default:
+			errMsg := fmt.Sprintf("unexpected message type during COPY: %c", msgType)
+			c.sendError("ERROR", "08P01", errMsg)
+			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"encoding/csv"
 	"errors"
@@ -3183,5 +3184,180 @@ func TestInitConnsMap(t *testing.T) {
 	srv.registerConn(&clientConn{pid: 1})
 	if len(srv.conns) != 1 {
 		t.Fatalf("expected 1 conn, got %d", len(srv.conns))
+	}
+}
+
+// writePGMessage writes a PostgreSQL wire protocol message (type byte + int32 length + body)
+// into w, matching the format readMessage() expects.
+func writePGMessage(w io.Writer, msgType byte, body []byte) {
+	_ = binary.Write(w, binary.BigEndian, msgType)
+	_ = binary.Write(w, binary.BigEndian, int32(len(body)+4))
+	_, _ = w.Write(body)
+}
+
+func TestHandleCopyInCSVWithBlob(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Create table with a BLOB column
+	_, err = db.Exec("CREATE TABLE test_blob_copy (id VARCHAR, name VARCHAR, data BLOB, count_val INTEGER)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build CSV data with binary content in the BLOB column
+	binaryData := make([]byte, 64)
+	for i := range binaryData {
+		binaryData[i] = byte(i)
+	}
+	var csvBuf bytes.Buffer
+	csvWriter := csv.NewWriter(&csvBuf)
+	csvWriter.Write([]string{"id", "name", "data", "count_val"})
+	csvWriter.Write([]string{"row1", "Alice", string(binaryData), "42"})
+	csvWriter.Write([]string{"row2", "Bob", string(binaryData[:32]), "99"})
+	csvWriter.Flush()
+
+	// Build protocol messages: CopyData with CSV content, then CopyDone
+	var msgBuf bytes.Buffer
+	writePGMessage(&msgBuf, msgCopyData, csvBuf.Bytes())
+	writePGMessage(&msgBuf, msgCopyDone, nil)
+
+	// Set up clientConn with real DuckDB executor and simulated reader/writer
+	var outputBuf bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &clientConn{
+		reader:   bufio.NewReader(&msgBuf),
+		writer:   bufio.NewWriter(&outputBuf),
+		executor: NewLocalExecutor(db),
+		server:   &Server{},
+		txStatus: txStatusIdle,
+		ctx:      ctx,
+		cancel:   cancel,
+	}
+
+	opts := &CopyFromOptions{
+		TableName:  "test_blob_copy",
+		Delimiter:  ",",
+		HasHeader:  true,
+		NullString: "\\N",
+		Quote:      `"`,
+	}
+	cols := []string{"id", "name", "data", "count_val"}
+	colTypes := []ColumnTyper{
+		describeColumnType("VARCHAR"),
+		describeColumnType("VARCHAR"),
+		describeColumnType("BLOB"),
+		describeColumnType("INTEGER"),
+	}
+	blobColIndices := []int{2}
+
+	err = c.handleCopyInCSVWithBlob(
+		"COPY test_blob_copy FROM STDIN WITH (FORMAT csv, HEADER true)",
+		opts, cols, colTypes, blobColIndices,
+	)
+	if err != nil {
+		t.Fatalf("handleCopyInCSVWithBlob returned error: %v", err)
+	}
+
+	// Verify data was inserted
+	rows, err := db.Query("SELECT id, name, octet_length(data), count_val FROM test_blob_copy ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	type result struct {
+		id       string
+		name     string
+		blobLen  int
+		countVal int
+	}
+	var results []result
+	for rows.Next() {
+		var r result
+		if err := rows.Scan(&r.id, &r.name, &r.blobLen, &r.countVal); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, r)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(results))
+	}
+	if results[0].id != "row1" || results[0].name != "Alice" || results[0].blobLen != 64 || results[0].countVal != 42 {
+		t.Errorf("row1 mismatch: %+v", results[0])
+	}
+	if results[1].id != "row2" || results[1].name != "Bob" || results[1].blobLen != 32 || results[1].countVal != 99 {
+		t.Errorf("row2 mismatch: %+v", results[1])
+	}
+}
+
+func TestHandleCopyInCSVWithBlob_NullValues(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE test_blob_null (id VARCHAR, data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// CSV with null BLOB value
+	csvData := "id\tdata\nrow1\t\\N\n"
+
+	var msgBuf bytes.Buffer
+	writePGMessage(&msgBuf, msgCopyData, []byte(csvData))
+	writePGMessage(&msgBuf, msgCopyDone, nil)
+
+	var outputBuf bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &clientConn{
+		reader:   bufio.NewReader(&msgBuf),
+		writer:   bufio.NewWriter(&outputBuf),
+		executor: NewLocalExecutor(db),
+		server:   &Server{},
+		txStatus: txStatusIdle,
+		ctx:      ctx,
+		cancel:   cancel,
+	}
+
+	opts := &CopyFromOptions{
+		TableName:  "test_blob_null",
+		Delimiter:  "\t",
+		HasHeader:  true,
+		NullString: "\\N",
+	}
+
+	err = c.handleCopyInCSVWithBlob(
+		"COPY test_blob_null FROM STDIN",
+		opts, []string{"id", "data"},
+		[]ColumnTyper{
+			describeColumnType("VARCHAR"),
+			describeColumnType("BLOB"),
+		},
+		[]int{1},
+	)
+	if err != nil {
+		t.Fatalf("handleCopyInCSVWithBlob returned error: %v", err)
+	}
+
+	var id string
+	var data *[]byte
+	err = db.QueryRow("SELECT id, data FROM test_blob_null").Scan(&id, &data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "row1" {
+		t.Errorf("expected id=row1, got %s", id)
+	}
+	if data != nil {
+		t.Errorf("expected data=nil (NULL), got %v", data)
 	}
 }
