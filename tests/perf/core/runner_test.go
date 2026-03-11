@@ -83,6 +83,17 @@ func TestRunnerLifecycleAndPerQueryRecording(t *testing.T) {
 	if len(sink.results) != 4 {
 		t.Fatalf("expected 4 measured records, got %d", len(sink.results))
 	}
+	for i, got := range []int{
+		sink.results[0].MeasureIteration,
+		sink.results[1].MeasureIteration,
+		sink.results[2].MeasureIteration,
+		sink.results[3].MeasureIteration,
+	} {
+		want := (i / 2) + 1
+		if got != want {
+			t.Fatalf("result %d measure iteration = %d, want %d", i, got, want)
+		}
+	}
 	if summary.TotalQueries != 4 || summary.TotalErrors != 0 {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}

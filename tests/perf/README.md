@@ -44,6 +44,25 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `runner.log`
 - `dataset_manifest.json` (only when `DUCKGRES_PERF_DATASET_VERSION` is set)
 
+## Artifact Schema Contract (v1)
+
+`query_results.csv` is the canonical per-query artifact and its columns are fixed in v1:
+
+- `query_id`
+- `intent_id`
+- `measure_iteration`
+- `protocol`
+- `status`
+- `error`
+- `error_class`
+- `rows`
+- `duration_ms`
+- `started_at`
+
+`measure_iteration` is the 1-based measured repetition within a run (`0` is reserved for non-measured warmup work and is not emitted to the CSV today).
+`duration_ms` is emitted as milliseconds with fixed precision, and `started_at` is UTC RFC3339Nano.
+No CSV schema mutation is expected in this phase.
+
 ## Nightly Run
 
 ```bash
