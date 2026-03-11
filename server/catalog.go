@@ -944,6 +944,8 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// pg_get_constraintdef - DuckDB has a 1-arg built-in (returns NULL).
 		// The 2-arg form (oid, pretty) is handled by the transpiler, which drops
 		// the pretty arg so DuckDB's built-in handles it. No macro needed here.
+		// pg_get_partkeydef - get partition key definition (DuckDB doesn't support partitioning)
+		`CREATE OR REPLACE MACRO pg_get_partkeydef(rel_oid) AS ''`,
 		// pg_get_serial_sequence - get sequence name for a serial/identity column
 		// Returns NULL because DuckLake doesn't support sequences
 		`CREATE OR REPLACE MACRO pg_get_serial_sequence(table_name, column_name) AS NULL`,
