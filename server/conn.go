@@ -162,6 +162,7 @@ type clientConn struct {
 	portals     map[string]*portal       // portals by name
 	txStatus    byte                     // current transaction status ('I', 'T', or 'E')
 	passthrough bool                     // true for passthrough users (skip transpiler + pg_catalog)
+	sharedDB    bool                     // true when using file persistence pool (don't close DB directly)
 	cursors     map[string]*cursorState  // server-side cursor emulation
 	ctx         context.Context          // connection context, cancelled when connection is closed
 	cancel      context.CancelFunc       // cancels the connection context
@@ -397,8 +398,9 @@ func (c *clientConn) safeCleanupDB() {
 		}
 	}
 
-	// Detach DuckLake to release the RDS metadata connection (only if connection is healthy)
-	if connHealthy && c.server.cfg.DuckLake.MetadataStore != "" {
+	// Detach DuckLake to release the RDS metadata connection (only if connection is healthy).
+	// Skip for shared file-backed DBs — DuckLake stays attached for the pool lifetime.
+	if connHealthy && !c.sharedDB && c.server.cfg.DuckLake.MetadataStore != "" {
 		// Must switch away from ducklake before detaching - DuckDB doesn't allow
 		// detaching the default database
 		ctx3, cancel3 := context.WithTimeout(context.Background(), cleanupTimeout)
@@ -419,6 +421,13 @@ func (c *clientConn) safeCleanupDB() {
 				slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err)
 			}
 		}
+	}
+
+	// For shared file-backed DBs, release our reference instead of closing.
+	// The pool will close the DB when the last reference is released.
+	if c.sharedDB {
+		c.server.releaseFileDB(c.username)
+		return
 	}
 
 	// Always attempt to close the database connection.
@@ -565,7 +574,7 @@ func (c *clientConn) serve() error {
 		var db *sql.DB
 		var err error
 		if c.passthrough {
-			db, err = CreatePassthroughDBConnection(c.server.cfg, c.server.duckLakeSem, c.username, processStartTime, processVersion)
+			db, err = c.server.createPassthroughDBConnection(c.username)
 		} else {
 			db, err = c.server.createDBConnection(c.username)
 		}
@@ -573,6 +582,7 @@ func (c *clientConn) serve() error {
 			c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
 			return err
 		}
+		c.sharedDB = c.server.cfg.FilePersistence
 		c.executor = NewLocalExecutor(db)
 
 		// Start background credential refresh for long-lived connections.

@@ -767,6 +767,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		cfg.ACMEDNSZoneID = ""
 	}
 
+	// Validate file persistence requires data_dir
+	if cfg.FilePersistence && cfg.DataDir == "" {
+		warn("file_persistence is enabled but data_dir is empty; disabling file persistence")
+		cfg.FilePersistence = false
+	}
+
 	// Validate memory_limit format if explicitly set
 	if cfg.MemoryLimit != "" && !server.ValidateMemoryLimit(cfg.MemoryLimit) {
 		warn("Invalid memory_limit format: " + cfg.MemoryLimit + " (expected e.g. '4GB', '512MB')")

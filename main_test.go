@@ -738,6 +738,32 @@ func TestResolveEffectiveConfigFilePersistenceDefaultFalse(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigFilePersistenceRequiresDataDir(t *testing.T) {
+	// Override data_dir to empty via CLI to test the validation guard.
+	var warnings []string
+	resolved := resolveEffectiveConfig(&FileConfig{
+		FilePersistence: true,
+	}, configCLIInputs{
+		Set:     map[string]bool{"data-dir": true},
+		DataDir: "", // explicitly empty
+	}, envFromMap(nil), func(msg string) {
+		warnings = append(warnings, msg)
+	})
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence to be disabled when data_dir is empty")
+	}
+	found := false
+	for _, w := range warnings {
+		if strings.Contains(w, "file_persistence") && strings.Contains(w, "data_dir") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about file_persistence + empty data_dir, got: %v", warnings)
+	}
+}
+
 func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 	fileCfg := &FileConfig{
 		TLS: TLSConfig{

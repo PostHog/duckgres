@@ -367,7 +367,7 @@ func TestOpenBaseDBFilePersistence(t *testing.T) {
 func TestOpenBaseDBFilePersistenceFallsBackWithoutDataDir(t *testing.T) {
 	cfg := Config{
 		FilePersistence: true,
-		// DataDir intentionally empty
+		// DataDir intentionally empty — falls back to :memory:
 	}
 	db, err := openBaseDB(cfg, "testuser")
 	if err != nil {
@@ -403,6 +403,100 @@ func TestOpenBaseDBFilePersistenceFallsBackWithoutUsername(t *testing.T) {
 	}
 	if dbName != "memory" {
 		t.Fatalf("expected fallback to in-memory when username is empty, got %q", dbName)
+	}
+}
+
+func TestOpenBaseDBFilePersistenceRejectsPathTraversal(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         dataDir,
+	}
+
+	cases := []string{
+		"../etc/evil",
+		"foo/bar",
+		"..\\windows",
+		"alice/../bob",
+	}
+	for _, username := range cases {
+		_, err := openBaseDB(cfg, username)
+		if err == nil {
+			t.Fatalf("expected error for username %q, got nil", username)
+		}
+		if !strings.Contains(err.Error(), "invalid username") {
+			t.Fatalf("expected 'invalid username' error for %q, got: %v", username, err)
+		}
+	}
+}
+
+func TestFileDBPoolConcurrentConnections(t *testing.T) {
+	dataDir := t.TempDir()
+	s := &Server{
+		cfg: Config{
+			FilePersistence: true,
+			DataDir:         dataDir,
+		},
+		duckLakeSem: make(chan struct{}, 1),
+		fileDBs:     make(map[string]*fileDBEntry),
+	}
+
+	// First connection creates the DB
+	db1, err := s.acquireFileDB("pooluser", false)
+	if err != nil {
+		t.Fatalf("first acquireFileDB failed: %v", err)
+	}
+
+	// Create a table via the first connection
+	if _, err := db1.Exec("CREATE TABLE pool_test (id INTEGER)"); err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+
+	// Second connection should reuse the same DB
+	db2, err := s.acquireFileDB("pooluser", false)
+	if err != nil {
+		t.Fatalf("second acquireFileDB failed: %v", err)
+	}
+	if db1 != db2 {
+		t.Fatal("expected same *sql.DB instance for same user")
+	}
+
+	// Verify both see the same table
+	var count int
+	if err := db2.QueryRow("SELECT count(*) FROM pool_test").Scan(&count); err != nil {
+		t.Fatalf("second connection can't see table: %v", err)
+	}
+
+	// Release first reference — DB should stay open
+	s.releaseFileDB("pooluser")
+	if _, ok := s.fileDBs["pooluser"]; !ok {
+		t.Fatal("expected pool entry to survive with one reference remaining")
+	}
+
+	// Release second reference — DB should be closed and removed
+	s.releaseFileDB("pooluser")
+	if _, ok := s.fileDBs["pooluser"]; ok {
+		t.Fatal("expected pool entry to be removed after last release")
+	}
+}
+
+func TestOpenBaseDBCreatesDataDir(t *testing.T) {
+	// Use a nested path that doesn't exist yet
+	base := t.TempDir()
+	dataDir := base + "/nested/data"
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         dataDir,
+	}
+	db, err := openBaseDB(cfg, "alice")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Verify the data directory was created
+	if _, err := db.Exec("SELECT 1"); err != nil {
+		t.Fatalf("query failed after dir creation: %v", err)
 	}
 }
 
