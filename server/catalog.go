@@ -99,7 +99,7 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-			'pg_partitioned_table', 'pg_type', 'pg_attribute',
+			'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
@@ -326,6 +326,24 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 	`
 	if _, err := db.Exec(pgPartitionedTableSQL); err != nil {
 		slog.Warn("Failed to create pg_partitioned_table view.", "error", err)
+	}
+
+	// Create pg_rewrite view (query rewrite rules, empty - DuckDB doesn't support rewrite rules)
+	pgRewriteSQL := `
+		CREATE OR REPLACE VIEW pg_rewrite AS
+		SELECT
+			0::BIGINT AS oid,
+			''::VARCHAR AS rulename,
+			0::BIGINT AS ev_class,
+			0::SMALLINT AS ev_type,
+			0::SMALLINT AS ev_enabled,
+			false::BOOLEAN AS is_instead,
+			NULL::TEXT AS ev_qual,
+			NULL::TEXT AS ev_action
+		WHERE false
+	`
+	if _, err := db.Exec(pgRewriteSQL); err != nil {
+		slog.Warn("Failed to create pg_rewrite view.", "error", err)
 	}
 
 	// Create pg_stat_user_tables view (table statistics)
@@ -994,6 +1012,9 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// pg_table_size - size of table excluding indexes (stub, returns 0)
 		`CREATE OR REPLACE MACRO pg_table_size(rel) AS 0`,
 
+		// pg_stat_get_numscans - number of sequential/index scans on a relation (stub, returns 0)
+		`CREATE OR REPLACE MACRO pg_stat_get_numscans(rel_oid) AS 0`,
+
 		// pg_indexes_size - total size of indexes on table (stub, returns 0)
 		`CREATE OR REPLACE MACRO pg_indexes_size(rel) AS 0`,
 
@@ -1317,7 +1338,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-			'pg_partitioned_table', 'pg_attribute',
+			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -1385,7 +1406,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-			'pg_partitioned_table', 'pg_attribute',
+			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -1454,7 +1475,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 				'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-				'pg_partitioned_table', 'pg_attribute',
+				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
@@ -1504,7 +1525,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 				'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-				'pg_partitioned_table', 'pg_attribute',
+				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
