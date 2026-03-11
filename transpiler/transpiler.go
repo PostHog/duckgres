@@ -432,6 +432,28 @@ func Classify(sql string, cfg Config) Classification {
 		}
 	}
 
+	// ClickHouse SQL macros (DuckLake mode only).
+	// These are created in memory.main and need explicit qualification.
+	if cfg.DuckLakeMode {
+		if containsAny(upper,
+			"TOSTRING(", "TOINT32(", "TOINT64(", "TOFLOAT(",
+			"TOINT32ORNULL(", "TOINT32ORZERO(",
+			"INTDIV(", "MODULO(",
+			"EMPTY(", "NOTEMPTY(",
+			"SPLITBYCHAR(", "LENGTHUTF8(",
+			"TOYEAR(", "TOMONTH(", "TODAYOFMONTH(",
+			"TOYYYYMMDD(", "TOYYYYMM(",
+			"PROTOCOL(", "DOMAIN(",
+			"TOPLEVELDOMAIN(",
+			"IPV4NUMTOSTRING(",
+			"JSONEXTRACTSTRING(", "JSONHAS(",
+			"GENERATEUUIDV4(",
+			"IFNULL(",
+		) {
+			flags |= FlagPgCatalog
+		}
+	}
+
 	// Writable CTEs: WITH ... (INSERT|UPDATE|DELETE).
 	// This can false-positive on read-only queries containing these keywords
 	// (e.g., WHERE action = 'UPDATE'), but the writable CTE transform checks
