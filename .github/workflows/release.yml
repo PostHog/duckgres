@@ -83,6 +83,7 @@ jobs:
       - name: Check if build release already exists
         id: check-existing
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: "build-${{ steps.sha.outputs.short }}"
         run: |
           if gh release view "$TAG" &>/dev/null; then
@@ -91,8 +92,6 @@ jobs:
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Release
         if: steps.check-existing.outputs.exists == 'false'
