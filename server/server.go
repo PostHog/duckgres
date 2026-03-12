@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -906,11 +908,12 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 
 	// Create S3 secret if using object store
 	// - With explicit credentials (S3AccessKey set) or custom endpoint
-	// - With credential_chain provider (for AWS S3)
+	// - With credential_chain or aws_sdk provider (for AWS S3)
 	if dlCfg.ObjectStore != "" {
 		needsSecret := dlCfg.S3Endpoint != "" ||
 			dlCfg.S3AccessKey != "" ||
 			dlCfg.S3Provider == "credential_chain" ||
+			dlCfg.S3Provider == "aws_sdk" ||
 			dlCfg.S3Chain != "" ||
 			dlCfg.S3Profile != ""
 
@@ -981,9 +984,10 @@ func setDuckLakeDefault(db *sql.DB) error {
 
 // createS3Secret creates a DuckDB secret for S3/MinIO access.
 // This is a standalone function so it can be reused by control plane workers.
-// Supports two providers:
+// Supports three providers:
 //   - "config": explicit credentials (for MinIO or when you have access keys)
-//   - "credential_chain": AWS SDK credential chain (env vars, config files, instance metadata, etc.)
+//   - "credential_chain": DuckDB's built-in credential chain (does NOT support EKS Pod Identity)
+//   - "aws_sdk": Go AWS SDK credential fetch → explicit config secret (supports EKS Pod Identity)
 //
 // Note: Caller must hold duckLakeSem to avoid race conditions.
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
@@ -1000,11 +1004,20 @@ func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 
 	var secretStmt string
 
-	if provider == "credential_chain" {
-		// Use AWS SDK credential chain
+	switch provider {
+	case "aws_sdk":
+		// Use Go AWS SDK to fetch credentials (supports EKS Pod Identity, IRSA, etc.)
+		var err error
+		secretStmt, err = buildAWSSdkSecret(context.Background(), dlCfg)
+		if err != nil {
+			return fmt.Errorf("aws_sdk credential fetch failed: %w", err)
+		}
+		slog.Info("Creating S3 secret with aws_sdk provider (Go SDK credentials).")
+	case "credential_chain":
+		// Use DuckDB's built-in credential chain (does NOT support EKS Pod Identity)
 		secretStmt = buildCredentialChainSecret(dlCfg)
 		slog.Info("Creating S3 secret with credential_chain provider.")
-	} else {
+	default:
 		// Use explicit credentials (config provider)
 		secretStmt = buildConfigSecret(dlCfg)
 		slog.Info("Creating S3 secret with config provider.", "endpoint", dlCfg.S3Endpoint)
@@ -1106,6 +1119,74 @@ func buildCredentialChainSecret(dlCfg DuckLakeConfig) string {
 	return secret
 }
 
+// fetchAWSSDKCredentials uses the Go AWS SDK's default credential chain to retrieve
+// temporary credentials. This supports all credential sources that the Go SDK supports,
+// including EKS Pod Identity (AWS_CONTAINER_CREDENTIALS_FULL_URI), IRSA, instance
+// metadata, environment variables, and config files — unlike DuckDB's built-in
+// credential_chain which does not support EKS Pod Identity.
+func fetchAWSSDKCredentials(ctx context.Context, region string) (aws.Credentials, error) {
+	var opts []func(*awsconfig.LoadOptions) error
+	if region != "" {
+		opts = append(opts, awsconfig.WithRegion(region))
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+	creds, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("failed to retrieve AWS credentials: %w", err)
+	}
+	return creds, nil
+}
+
+// buildAWSSdkSecret fetches credentials via the Go AWS SDK and builds a
+// CREATE SECRET statement with PROVIDER config using the explicit temporary credentials.
+func buildAWSSdkSecret(ctx context.Context, dlCfg DuckLakeConfig) (string, error) {
+	creds, err := fetchAWSSDKCredentials(ctx, dlCfg.S3Region)
+	if err != nil {
+		return "", err
+	}
+
+	region := dlCfg.S3Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	secret := fmt.Sprintf(`
+		CREATE OR REPLACE SECRET ducklake_s3 (
+			TYPE s3,
+			PROVIDER config,
+			KEY_ID '%s',
+			SECRET '%s',
+			REGION '%s'`,
+		creds.AccessKeyID,
+		creds.SecretAccessKey,
+		region,
+	)
+
+	if creds.SessionToken != "" {
+		secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", creds.SessionToken)
+	}
+
+	if dlCfg.S3Endpoint != "" {
+		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
+		urlStyle := dlCfg.S3URLStyle
+		if urlStyle == "" {
+			urlStyle = "path"
+		}
+		secret += fmt.Sprintf(",\n\t\t\tURL_STYLE '%s'", urlStyle)
+		useSSL := "false"
+		if dlCfg.S3UseSSL {
+			useSSL = "true"
+		}
+		secret += fmt.Sprintf(",\n\t\t\tUSE_SSL %s", useSSL)
+	}
+
+	secret += "\n\t\t)"
+	return secret, nil
+}
+
 // credentialRefreshInterval is how often to refresh S3 credentials for long-lived connections.
 // EC2 instance role credentials typically expire after 6 hours. Refreshing every 5 minutes
 // ensures fresh credentials are always available without excessive IMDS calls.
@@ -1125,12 +1206,13 @@ func s3ProviderForConfig(dlCfg DuckLakeConfig) string {
 }
 
 // needsCredentialRefresh returns true if the DuckLake config uses temporary credentials
-// that need periodic refresh (credential_chain provider with an S3 object store).
+// that need periodic refresh (credential_chain or aws_sdk provider with an S3 object store).
 func needsCredentialRefresh(dlCfg DuckLakeConfig) bool {
 	if dlCfg.ObjectStore == "" {
 		return false
 	}
-	return s3ProviderForConfig(dlCfg) == "credential_chain"
+	p := s3ProviderForConfig(dlCfg)
+	return p == "credential_chain" || p == "aws_sdk"
 }
 
 // isTransactionAborted returns true if the error indicates DuckDB's connection
@@ -1182,10 +1264,21 @@ func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig, isTxActive .
 		ticker := time.NewTicker(credentialRefreshInterval)
 		defer ticker.Stop()
 		var consecutiveFailures int
+		provider := s3ProviderForConfig(dlCfg)
 		for {
 			select {
 			case <-ticker.C:
-				secretStmt := buildCredentialChainSecret(dlCfg)
+				var secretStmt string
+				var buildErr error
+				if provider == "aws_sdk" {
+					secretStmt, buildErr = buildAWSSdkSecret(context.Background(), dlCfg)
+					if buildErr != nil {
+						slog.Warn("Failed to fetch AWS SDK credentials for refresh.", "error", buildErr)
+						continue
+					}
+				} else {
+					secretStmt = buildCredentialChainSecret(dlCfg)
+				}
 				_, err := execer.ExecContext(context.Background(), secretStmt)
 
 				// If stuck in aborted transaction, only auto-rollback when caller
