@@ -100,6 +100,12 @@ func (h *FlightSQLHandler) doDestroySession(body []byte, stream flight.FlightSer
 }
 
 func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionServer) error {
+	// Block until warmup (extension loading + DuckLake attachment) completes.
+	// Without this, the control plane's waitForWorkerTCP health check passes
+	// as soon as the gRPC server starts, and clients get routed to a worker
+	// that hasn't attached DuckLake yet.
+	<-h.pool.warmupDone
+
 	resp, _ := json.Marshal(map[string]interface{}{
 		"healthy":   true,
 		"sessions":  h.pool.ActiveSessions(),
