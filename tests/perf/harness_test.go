@@ -37,6 +37,7 @@ var (
 	perfUsername              = flag.String("perf-username", "perfuser", "username for harness-created duckgres")
 	perfPassword              = flag.String("perf-password", "perfpass", "password for harness-created duckgres")
 	perfFlightInsecureSkipTLS = flag.Bool("perf-flight-insecure-skip-verify", true, "skip TLS cert verification for Flight client")
+	perfDatasetManifestTable  = flag.String("perf-dataset-manifest-table", envOrDefault("DUCKGRES_PERF_DATASET_MANIFEST_TABLE", defaultDatasetManifestTable), "manifest table associated with frozen dataset runs")
 	perfPublishDSN            = flag.String("perf-publish-dsn", os.Getenv("DUCKGRES_PERF_PUBLISH_DSN"), "optional Duckgres DSN for publishing perf artifacts")
 	perfPublishPassword       = flag.String("perf-publish-password", os.Getenv("DUCKGRES_PERF_PUBLISH_PASSWORD"), "optional password override for the perf artifact publisher")
 	perfPublishSchema         = flag.String("perf-publish-schema", envOrDefault("DUCKGRES_PERF_PUBLISH_SCHEMA", "duckgres_perf"), "target schema for published perf artifacts")
@@ -172,7 +173,15 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 	}
 
 	publishCfg := currentPublisherConfig()
-	if err := publishArtifactsIfConfigured(context.Background(), publishCfg, outputDir); err != nil {
+	if err := finalizeRunArtifacts(
+		context.Background(),
+		publishCfg,
+		runtimeContract,
+		outputDir,
+		*perfCatalog,
+		*perfDatasetManifestTable,
+		time.Now,
+	); err != nil {
 		t.Fatal(err)
 	}
 }

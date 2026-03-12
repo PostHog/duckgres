@@ -40,7 +40,7 @@ DUCKGRES_PERF_FLIGHT_ADDR="127.0.0.1:50051" \
 ./scripts/perf_smoke.sh
 ```
 
-4. Inspect `artifacts/perf/<run_id>/summary.json`, `query_results.csv`, and (for frozen dataset mode) `dataset_manifest.json`.
+4. Inspect `artifacts/perf/<run_id>/summary.json`, `query_results.csv`, and (for frozen dataset mode) `dataset_manifest.json`. The harness writes and validates the frozen dataset metadata artifact before publishing.
 
 If `:9095` is already in use, run the harness directly with a different metrics address:
 
@@ -158,6 +158,7 @@ The source CSV schema is fixed to:
 `query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at`
 
 `summary.json` remains a local run artifact and is also consumed by the publisher to populate run-level dashboard metadata.
+For frozen runs, `dataset_manifest.json` is written and validated by the harness before publisher writes begin.
 
 Publisher configuration:
 

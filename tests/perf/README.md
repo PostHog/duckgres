@@ -34,7 +34,7 @@ When `DUCKGRES_PERF_DATASET_VERSION` is set:
 
 - default catalog switches to `tests/perf/queries/ducklake_frozen.yaml`
 - manifest verification is required in `ducklake.main.dataset_manifest` (override with `DUCKGRES_PERF_DATASET_MANIFEST_TABLE`)
-- artifact `dataset_manifest.json` is written under `artifacts/perf/<run_id>/`
+- the harness writes and validates `dataset_manifest.json` under `artifacts/perf/<run_id>/` before any configured publish step
 
 Artifacts are written to `artifacts/perf/<run_id>`:
 

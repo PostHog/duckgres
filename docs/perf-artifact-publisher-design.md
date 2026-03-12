@@ -140,7 +140,7 @@ Behavior:
 Add publisher configuration to `tests/perf/harness_test.go` flags alongside the
 existing run configuration.
 
-After artifact generation succeeds:
+After artifact generation succeeds and any frozen dataset metadata artifact is written/validated:
 
 ```text
 if publishing is configured:
