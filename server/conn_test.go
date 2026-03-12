@@ -3200,7 +3200,7 @@ func TestHandleCopyInCSVWithBlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Create table with a BLOB column
 	_, err = db.Exec("CREATE TABLE test_blob_copy (id VARCHAR, name VARCHAR, data BLOB, count_val INTEGER)")
@@ -3215,9 +3215,9 @@ func TestHandleCopyInCSVWithBlob(t *testing.T) {
 	}
 	var csvBuf bytes.Buffer
 	csvWriter := csv.NewWriter(&csvBuf)
-	csvWriter.Write([]string{"id", "name", "data", "count_val"})
-	csvWriter.Write([]string{"row1", "Alice", string(binaryData), "42"})
-	csvWriter.Write([]string{"row2", "Bob", string(binaryData[:32]), "99"})
+	_ = csvWriter.Write([]string{"id", "name", "data", "count_val"})
+	_ = csvWriter.Write([]string{"row1", "Alice", string(binaryData), "42"})
+	_ = csvWriter.Write([]string{"row2", "Bob", string(binaryData[:32]), "99"})
 	csvWriter.Flush()
 
 	// Build protocol messages: CopyData with CSV content, then CopyDone
@@ -3268,7 +3268,7 @@ func TestHandleCopyInCSVWithBlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	type result struct {
 		id       string
@@ -3301,7 +3301,7 @@ func TestHandleCopyInCSVWithBlob_NullValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_, err = db.Exec("CREATE TABLE test_blob_null (id VARCHAR, data BLOB)")
 	if err != nil {
