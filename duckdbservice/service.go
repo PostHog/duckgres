@@ -391,8 +391,8 @@ func (p *SessionPool) GetSession(token string) (*Session, bool) {
 	return s, ok
 }
 
-// DestroySession closes and removes a session, then replaces the DuckDB
-// instance with a fresh one so the next session starts with clean state.
+// DestroySession closes and removes a session, then resets the shared DuckDB
+// instance in-place so the next session starts with clean state.
 func (p *SessionPool) DestroySession(token string) error {
 	p.mu.Lock()
 	session, ok := p.sessions[token]
@@ -423,39 +423,16 @@ func (p *SessionPool) DestroySession(token string) error {
 		_ = session.Conn.Close()
 	}
 
-	// Close the old DuckDB instance entirely. This guarantees all session
-	// state is destroyed: SET variables, prepared statements, temp objects,
-	// attached databases, etc.
-	oldDB := session.DB
-	if oldDB != nil {
-		closeStart := time.Now()
-		if err := oldDB.Close(); err != nil {
-			slog.Warn("Failed to close old DuckDB instance.", "error", err)
+	// Reset the shared DuckDB instance in-place: drop user objects, reset
+	// settings, and re-apply warmup config. This avoids the ~90ms cost of
+	// closing and reopening the DB while still guaranteeing clean state.
+	if session.DB != nil {
+		if err := p.resetSessionState(session.DB); err != nil {
+			slog.Warn("Failed to reset session state.", "user", session.Username, "error", err)
 		}
-		slog.Info("Closed old DuckDB instance.", "user", session.Username, "duration", time.Since(closeStart))
 	}
 
-	// Eagerly create a fresh DuckDB instance so the next session can start
-	// immediately without waiting for extension loading + DuckLake attachment.
-	warmStart := time.Now()
-	newDB, err := server.CreateDBConnection(p.cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
-	if err != nil {
-		slog.Error("Failed to create replacement DuckDB instance.", "error", err)
-		p.mu.Lock()
-		p.warmupDB = nil
-		p.dbInitOnce = sync.Once{}
-		p.fallbackDB = nil
-		p.fallbackErr = nil
-		p.mu.Unlock()
-		return nil
-	}
-	slog.Info("Created replacement DuckDB instance.", "user", session.Username, "duration", time.Since(warmStart))
-
-	p.mu.Lock()
-	p.warmupDB = newDB
-	p.mu.Unlock()
-
-	slog.Info("Session destroyed, DuckDB recycled.", "user", session.Username)
+	slog.Info("Session destroyed.", "user", session.Username)
 	return nil
 }
 

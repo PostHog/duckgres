@@ -52,6 +52,9 @@ var (
 	autoMemoryLimitValue string
 )
 
+// AutoMemoryLimit returns the automatically computed DuckDB memory limit.
+func AutoMemoryLimit() string { return autoMemoryLimit() }
+
 // autoMemoryLimit computes a DuckDB memory_limit based on system memory.
 // Formula: totalMem * 0.75, with a floor of 256MB.
 // Every session gets the full budget — DuckDB will spill to disk/swap if
