@@ -93,6 +93,10 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 		pgwireDSN = h.pgwireDSN
 		flightAddr = h.flightAddr
 	}
+	pgwireDSN, err = pgwireDSNForHarness(pgwireDSN, *perfPassword)
+	if err != nil {
+		t.Fatalf("resolve pgwire dsn: %v", err)
+	}
 
 	pg, err := pgdriver.NewFromDSN(pgwireDSN)
 	if err != nil {

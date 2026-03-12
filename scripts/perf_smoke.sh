@@ -79,10 +79,6 @@ fi
 if [[ -n "$FLIGHT_ADDR" ]]; then
   go_test_args+=(-perf-flight-addr "$FLIGHT_ADDR")
 fi
-if [[ -n "$PGWIRE_DSN" ]]; then
-  PGPASSWORD="$PERF_PASSWORD" "${go_test_args[@]}"
-else
-  "${go_test_args[@]}"
-fi
+"${go_test_args[@]}"
 
 echo "Perf smoke artifacts written to $OUTPUT_BASE/$RUN_ID"
