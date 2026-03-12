@@ -688,7 +688,7 @@ func formatArgValue(v any) string {
 		escaped = strings.ReplaceAll(escaped, "'", "''")
 		return "'" + escaped + "'"
 	case []byte:
-		return "decode('" + hex.EncodeToString(val) + "', 'hex')"
+		return `'\x` + hex.EncodeToString(val) + `'::BLOB`
 	case bool:
 		if val {
 			return "TRUE"
