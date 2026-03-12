@@ -56,6 +56,7 @@ type K8sConfig struct {
 	WorkerSecret        string // K8s Secret name containing bearer token
 	WorkerConfigMap     string // ConfigMap name for duckgres.yaml
 	ImagePullPolicy     string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount      string // ServiceAccount name for worker pods (default: "default")
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -243,6 +244,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			IdleTimeout:     cfg.WorkerIdleTimeout,
 			ConfigPath:      cfg.ConfigPath,
 			ImagePullPolicy: cfg.K8s.ImagePullPolicy,
+			ServiceAccount:  cfg.K8s.ServiceAccount,
 			MemoryBudget:    int64(memBudget),
 		})
 		if err != nil {

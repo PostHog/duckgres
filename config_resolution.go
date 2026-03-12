@@ -46,6 +46,7 @@ type configCLIInputs struct {
 	K8sWorkerSecret           string
 	K8sWorkerConfigMap        string
 	K8sWorkerImagePullPolicy  string
+	K8sWorkerServiceAccount   string
 	QueryLog                  bool
 }
 
@@ -62,6 +63,7 @@ type resolvedConfig struct {
 	K8sWorkerSecret      string
 	K8sWorkerConfigMap   string
 	K8sWorkerImagePullPolicy string
+	K8sWorkerServiceAccount  string
 }
 
 func defaultServerConfig() server.Config {
@@ -109,7 +111,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var workerBackend string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
-	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
+	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -344,6 +346,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.K8s.WorkerImagePullPolicy != "" {
 			k8sWorkerImagePullPolicy = fileCfg.K8s.WorkerImagePullPolicy
 		}
+		if fileCfg.K8s.WorkerServiceAccount != "" {
+			k8sWorkerServiceAccount = fileCfg.K8s.WorkerServiceAccount
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -554,6 +559,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY"); v != "" {
 		k8sWorkerImagePullPolicy = v
 	}
+	if v := getenv("DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT"); v != "" {
+		k8sWorkerServiceAccount = v
+	}
 
 	// Query log env vars
 	if v := getenv("DUCKGRES_QUERY_LOG_ENABLED"); v != "" {
@@ -729,6 +737,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["k8s-worker-image-pull-policy"] {
 		k8sWorkerImagePullPolicy = cli.K8sWorkerImagePullPolicy
 	}
+	if cli.Set["k8s-worker-service-account"] {
+		k8sWorkerServiceAccount = cli.K8sWorkerServiceAccount
+	}
 	if cli.Set["query-log"] {
 		cfg.QueryLog.Enabled = cli.QueryLog
 	}
@@ -793,5 +804,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerSecret:          k8sWorkerSecret,
 		K8sWorkerConfigMap:       k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy: k8sWorkerImagePullPolicy,
+		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
 	}
 }
