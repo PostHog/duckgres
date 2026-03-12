@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -72,6 +73,7 @@ type ControlPlane struct {
 	tlsConfig        *tls.Config
 	pgListener       net.Listener
 	upgrader         *tableflip.Upgrader
+	parentPID        int // tableflip parent PID (0 if first generation)
 	activeConns      int64
 	closed           bool
 	closeMu          sync.Mutex
@@ -169,7 +171,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
+	// Save the tableflip parent PID before it potentially exits and we get
+	// reparented to init. We need this to kill a stuck parent during future
+	// upgrades (tableflip requires the parent to exit before the child can
+	// do its own upgrade).
+	var parentPID int
 	if upg.HasParent() {
+		parentPID = os.Getppid()
 		slog.Info("Upgrade complete, inherited PG listener.", "addr", pgLn.Addr().String())
 	}
 
@@ -293,6 +301,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		tlsConfig:   tlsCfg,
 		pgListener:  pgLn,
 		upgrader:    upg,
+		parentPID:   parentPID,
 		acmeManager:    acmeMgr,
 		acmeDNSManager: acmeDNSMgr,
 	}
@@ -860,6 +869,20 @@ func (cp *ControlPlane) handleUpgrade() {
 	// tableflip.Upgrade() spawns the child process with all Listen'd FDs
 	// inherited, then blocks until the child calls Ready() or times out.
 	if err := cp.upgrader.Upgrade(); err != nil {
+		// tableflip requires the parent process to have fully exited before
+		// the child can perform its own upgrade. If the parent is stuck
+		// draining long-lived connections, kill it and retry.
+		if strings.Contains(err.Error(), "parent hasn't exited") && cp.killStuckParent() {
+			if retryErr := cp.upgrader.Upgrade(); retryErr == nil {
+				slog.Info("Upgrade succeeded after terminating stuck parent.")
+				cp.upgradeDraining.Store(true)
+				cp.reloading.Store(false)
+				return
+			} else {
+				err = retryErr
+			}
+		}
+
 		slog.Error("Upgrade failed, recovering.", "error", err)
 		cp.reloading.Store(false)
 		if err := sdNotify("READY=1"); err != nil {
@@ -873,6 +896,43 @@ func (cp *ControlPlane) handleUpgrade() {
 	cp.upgradeDraining.Store(true)
 	cp.reloading.Store(false)
 	// upg.Exit() channel closes now, triggering drainAfterUpgrade in the main goroutine.
+}
+
+// killStuckParent sends SIGTERM (then SIGKILL) to the tableflip parent process
+// that failed to exit after the previous upgrade. Returns true if the parent
+// was found and terminated (or was already dead).
+func (cp *ControlPlane) killStuckParent() bool {
+	if cp.parentPID <= 1 {
+		return false
+	}
+
+	// Verify the parent is still alive.
+	if err := syscall.Kill(cp.parentPID, 0); err != nil {
+		slog.Info("Tableflip parent already exited.", "parent_pid", cp.parentPID)
+		return true
+	}
+
+	slog.Warn("Tableflip parent still alive, sending SIGTERM to unblock upgrade.", "parent_pid", cp.parentPID)
+	_ = syscall.Kill(cp.parentPID, syscall.SIGTERM)
+
+	// Wait up to 15 seconds for graceful exit.
+	deadline := time.After(15 * time.Second)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := syscall.Kill(cp.parentPID, 0); err != nil {
+				slog.Info("Tableflip parent exited after SIGTERM.", "parent_pid", cp.parentPID)
+				return true
+			}
+		case <-deadline:
+			slog.Warn("Tableflip parent did not exit after SIGTERM, sending SIGKILL.", "parent_pid", cp.parentPID)
+			_ = syscall.Kill(cp.parentPID, syscall.SIGKILL)
+			time.Sleep(1 * time.Second)
+			return true
+		}
+	}
 }
 
 // drainAfterUpgrade is called after a successful tableflip upgrade. It stops
