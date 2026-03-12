@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/hex"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -74,4 +75,23 @@ func TestEmptySchemaRowSetColumnTypes(t *testing.T) {
 		t.Errorf("BLOB detection = %v, want [1]", blobColIndices)
 	}
 	t.Log("AFTER fix: emptySchemaRowSet returns real colTypes → BLOB detected at index 1 → triggers CSV-with-BLOB fallback")
+}
+
+func TestFormatArgValue_Blob(t *testing.T) {
+	data := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	got := formatArgValue(data)
+	want := `'\x` + hex.EncodeToString(data) + `'::BLOB`
+	if got != want {
+		t.Errorf("formatArgValue([]byte) = %q, want %q", got, want)
+	}
+}
+
+func TestInterpolateArgs_BlobParam(t *testing.T) {
+	data := []byte{0x01, 0x02, 0x03}
+	query := "INSERT INTO t (col) VALUES ($1)"
+	got := interpolateArgs(query, []any{data})
+	want := `INSERT INTO t (col) VALUES ('\x010203'::BLOB)`
+	if got != want {
+		t.Errorf("interpolateArgs blob = %q, want %q", got, want)
+	}
 }
