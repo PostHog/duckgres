@@ -83,6 +83,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		needsSecret := dlCfg.S3Endpoint != "" ||
 			dlCfg.S3AccessKey != "" ||
 			dlCfg.S3Provider == "credential_chain" ||
+			dlCfg.S3Provider == "aws_sdk" ||
 			dlCfg.S3Chain != "" ||
 			dlCfg.S3Profile != ""
 		if needsSecret {
