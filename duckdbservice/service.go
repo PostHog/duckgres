@@ -329,13 +329,19 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 
 	// Obtain a dedicated connection for this session to ensure isolation
 	// and consistent session settings (search_path, etc.)
-	conn, err = db.Conn(context.Background())
+	// Use a timeout to prevent indefinite blocking when a previous session's
+	// cleanup hasn't returned its connection to the pool yet.
+	slog.Debug("Acquiring DB connection from pool.", "user", username)
+	connCtx, connCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	conn, err = db.Conn(connCtx)
+	connCancel()
 	if err != nil {
 		p.mu.Lock()
 		p.reserved--
 		p.mu.Unlock()
-		return nil, fmt.Errorf("failed to obtain connection from pool: %w", err)
+		return nil, fmt.Errorf("failed to obtain connection from pool (timeout after 30s): %w", err)
 	}
+	slog.Debug("Acquired DB connection from pool.", "user", username, "duration", time.Since(start))
 
 	// Initialize the session connection with username-specific state if needed.
 	// Since the DB is shared, we must set session-local parameters here.
@@ -423,8 +429,13 @@ func (p *SessionPool) DestroySession(token string) error {
 		// sql.Conn.Close() returns the underlying driver connection to sql.DB's
 		// pool rather than closing it. DuckDB temp tables are connection-scoped,
 		// so they'd leak into the next session that gets the same connection.
+		cleanupStart := time.Now()
+		slog.Debug("Cleaning up session state.", "user", session.Username)
 		cleanupSessionState(session.Conn)
+		slog.Debug("Session state cleaned up.", "user", session.Username, "duration", time.Since(cleanupStart))
+		connCloseStart := time.Now()
 		_ = session.Conn.Close()
+		slog.Debug("Session connection closed (returned to pool).", "user", session.Username, "duration", time.Since(connCloseStart))
 	}
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
 	p.mu.RLock()
