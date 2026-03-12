@@ -21,6 +21,7 @@ type ResultSink interface {
 }
 
 type RunnerConfig struct {
+	RunID          string
 	Catalog        Catalog
 	DatasetVersion string
 	Drivers        map[Protocol]ProtocolDriver
@@ -49,8 +50,12 @@ func NewQueryRunner(cfg RunnerConfig) *QueryRunner {
 
 func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 	startedAt := r.cfg.Now()
+	runID := r.cfg.RunID
+	if runID == "" {
+		runID = startedAt.UTC().Format("20060102T150405Z")
+	}
 	summary := RunSummary{
-		RunID:          startedAt.UTC().Format("20060102T150405Z"),
+		RunID:          runID,
 		DatasetVersion: r.cfg.DatasetVersion,
 		StartedAt:      startedAt,
 		FinishedAt:     startedAt,

@@ -101,3 +101,39 @@ func TestRunnerLifecycleAndPerQueryRecording(t *testing.T) {
 		t.Fatalf("expected dataset version v1, got %q", summary.DatasetVersion)
 	}
 }
+
+func TestRunnerUsesConfiguredRunID(t *testing.T) {
+	pg := &testDriver{protocol: ProtocolPGWire}
+	sink := &inMemorySink{}
+
+	runner := NewQueryRunner(RunnerConfig{
+		RunID: "nightly-v1-20260311T234300Z",
+		Catalog: Catalog{
+			Name:              "smoke",
+			WarmupIterations:  0,
+			MeasureIterations: 1,
+			Targets:           []Protocol{ProtocolPGWire},
+			Queries: []Query{
+				{
+					QueryID:    "q1",
+					IntentID:   "i1",
+					PGWireSQL:  "SELECT 1",
+					DuckhogSQL: "SELECT 1",
+				},
+			},
+		},
+		Drivers: map[Protocol]ProtocolDriver{
+			ProtocolPGWire: pg,
+		},
+		Sink: sink,
+		Now:  func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if summary.RunID != "nightly-v1-20260311T234300Z" {
+		t.Fatalf("summary run_id = %q", summary.RunID)
+	}
+}
