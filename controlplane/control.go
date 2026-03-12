@@ -103,7 +103,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if cfg.HandoverDrainTimeout == 0 {
 		cfg.HandoverDrainTimeout = 24 * time.Hour
 	}
-
 	// Enforce secure defaults for control-plane mode.
 	if err := validateControlPlaneSecurity(cfg); err != nil {
 		slog.Error("Invalid control-plane security configuration.", "error", err)

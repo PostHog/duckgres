@@ -60,11 +60,15 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	observeControlPlaneWorkerQueueDepthDelta(1)
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 
+	acquireStart := time.Now()
+	slog.Info("Acquiring worker for session.", "pid", pid, "user", username)
 	worker, err := sm.pool.AcquireWorker(ctx)
 	if err != nil {
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
+	slog.Info("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
+	createStart := time.Now()
 	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
 	if err != nil {
 		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker
@@ -92,7 +96,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
 	sm.mu.Unlock()
 
-	slog.Debug("Session created.", "pid", pid, "worker", worker.ID, "user", username)
+	slog.Info("Session created on worker.", "pid", pid, "worker", worker.ID, "user", username, "create_duration", time.Since(createStart))
 
 	// Update other sessions if rebalancing is enabled.
 	if sm.rebalancer != nil {
@@ -141,6 +145,14 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		_ = session.Executor.Close()
 	}
 
+	// Release the worker for reuse BEFORE the gRPC DestroySession call.
+	// This ensures the worker appears idle immediately so new connections
+	// can be routed to it. The worker's shared DB pool (MaxOpenConns=2)
+	// allows the new session's db.Conn() to proceed even if the old
+	// session's cleanup is still running.
+	sm.pool.ReleaseWorker(session.WorkerID)
+	slog.Info("Session released worker.", "pid", pid, "worker", session.WorkerID)
+
 	// Destroy session on worker (best effort, skip if worker already dead)
 	worker, ok := sm.pool.Worker(session.WorkerID)
 	if ok {
@@ -154,10 +166,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Release the worker for reuse instead of retiring it immediately (pooled model)
-	sm.pool.ReleaseWorker(session.WorkerID)
-
-	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
+	slog.Info("Session destroyed.", "pid", pid, "worker", session.WorkerID)
 
 	// Rebalance remaining sessions
 	if sm.rebalancer != nil {
