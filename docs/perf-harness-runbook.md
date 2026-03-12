@@ -132,7 +132,7 @@ Nightly runs still emit canonical local artifacts under:
 
 `artifacts/perf/<run_id>/`
 
-The upload hook then loads `query_results.csv` into:
+When publisher config is set, the perf harness publishes `query_results.csv` into:
 
 `duckgres_perf.query_results`
 
@@ -157,7 +157,19 @@ The source CSV schema is fixed to:
 
 `query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at`
 
-`summary.json` remains a local run artifact and is also consumed by the upload hook to populate run-level dashboard metadata.
+`summary.json` remains a local run artifact and is also consumed by the publisher to populate run-level dashboard metadata.
+
+Publisher configuration:
+
+- `DUCKGRES_PERF_PUBLISH_DSN`
+- `DUCKGRES_PERF_PUBLISH_PASSWORD`
+- `DUCKGRES_PERF_PUBLISH_SCHEMA`
+- `DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA`
+- `DUCKGRES_PERF_PUBLISH_STRICT`
+
+Deprecated compatibility fallback:
+
+- `DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD`
 
 ## Grafana
 

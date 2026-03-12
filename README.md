@@ -82,7 +82,7 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 - `scripts/test_metrics.sh` - Runs a quick sanity check (starts server, runs queries, verifies counts)
 - `scripts/load_generator.sh` - Generates continuous query load until Ctrl-C
 - `scripts/perf_smoke.sh` - Runs the golden-query perf harness and writes artifacts to `artifacts/perf/<run_id>`
-- `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact upload hook
+- `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact publisher
 - `metrics-compose.yml` - Starts Prometheus and Grafana locally for metrics (Prometheus at http://localhost:9091, Grafana at http://localhost:3000)
 
 ## Perf Runbook

@@ -68,7 +68,12 @@ if ! grep -Fq "\"dataset_version\":\"$DATASET_VERSION\"" "$MANIFEST_ARTIFACT"; t
   exit 1
 fi
 
-if [[ -n "${DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD:-}" ]]; then
+if [[ -n "${DUCKGRES_PERF_PUBLISH_DSN:-}" ]]; then
+  if [[ -n "${DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD:-}" ]]; then
+    echo "DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD is deprecated and ignored when DUCKGRES_PERF_PUBLISH_DSN is set"
+  fi
+elif [[ -n "${DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD:-}" ]]; then
+  echo "DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD is deprecated; prefer DUCKGRES_PERF_PUBLISH_DSN"
   DUCKGRES_PERF_RUN_DIR="$RUN_DIR" bash -lc "$DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD"
 fi
 
