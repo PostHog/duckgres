@@ -630,22 +630,7 @@ func (p *FlightWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 	return nil
 }
 
-// leastLoadedWorkerLocked returns the live worker with the fewest active
-// sessions, or nil if all workers are dead. Caller must hold p.mu.
-func (p *FlightWorkerPool) leastLoadedWorkerLocked() *ManagedWorker {
-	var best *ManagedWorker
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue // dead
-		default:
-		}
-		if best == nil || w.activeSessions < best.activeSessions {
-			best = w
-		}
-	}
-	return best
-}
+
 
 // liveWorkerCountLocked returns the number of workers whose process is still
 // running (done channel not closed) plus workers currently being spawned.

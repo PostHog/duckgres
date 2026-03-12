@@ -912,21 +912,6 @@ func (p *K8sWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 	return nil
 }
 
-func (p *K8sWorkerPool) leastLoadedWorkerLocked() *ManagedWorker {
-	var best *ManagedWorker
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if best == nil || w.activeSessions < best.activeSessions {
-			best = w
-		}
-	}
-	return best
-}
-
 func (p *K8sWorkerPool) liveWorkerCountLocked() int {
 	count := p.spawning
 	for _, w := range p.workers {
