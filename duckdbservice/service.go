@@ -391,7 +391,8 @@ func (p *SessionPool) GetSession(token string) (*Session, bool) {
 	return s, ok
 }
 
-// DestroySession closes and removes a session.
+// DestroySession closes and removes a session, then replaces the DuckDB
+// instance with a fresh one so the next session starts with clean state.
 func (p *SessionPool) DestroySession(token string) error {
 	p.mu.Lock()
 	session, ok := p.sessions[token]
@@ -419,25 +420,42 @@ func (p *SessionPool) DestroySession(token string) error {
 		stop()
 	}
 	if session.Conn != nil {
-		// Drop temporary tables before returning the connection to the pool.
-		// sql.Conn.Close() returns the underlying driver connection to sql.DB's
-		// pool rather than closing it. DuckDB temp tables are connection-scoped,
-		// so they'd leak into the next session that gets the same connection.
-		cleanupSessionState(session.Conn)
 		_ = session.Conn.Close()
 	}
-	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
-	p.mu.RLock()
-	isShared := session.DB == p.warmupDB || session.DB == p.fallbackDB
-	p.mu.RUnlock()
 
-	if session.DB != nil && !isShared {
-		if err := session.DB.Close(); err != nil {
-			slog.Warn("Failed to close session database", "error", err)
+	// Close the old DuckDB instance entirely. This guarantees all session
+	// state is destroyed: SET variables, prepared statements, temp objects,
+	// attached databases, etc.
+	oldDB := session.DB
+	if oldDB != nil {
+		closeStart := time.Now()
+		if err := oldDB.Close(); err != nil {
+			slog.Warn("Failed to close old DuckDB instance.", "error", err)
 		}
+		slog.Info("Closed old DuckDB instance.", "user", session.Username, "duration", time.Since(closeStart))
 	}
 
-	slog.Debug("Destroyed DuckDB session", "user", session.Username)
+	// Eagerly create a fresh DuckDB instance so the next session can start
+	// immediately without waiting for extension loading + DuckLake attachment.
+	warmStart := time.Now()
+	newDB, err := server.CreateDBConnection(p.cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
+	if err != nil {
+		slog.Error("Failed to create replacement DuckDB instance.", "error", err)
+		p.mu.Lock()
+		p.warmupDB = nil
+		p.dbInitOnce = sync.Once{}
+		p.fallbackDB = nil
+		p.fallbackErr = nil
+		p.mu.Unlock()
+		return nil
+	}
+	slog.Info("Created replacement DuckDB instance.", "user", session.Username, "duration", time.Since(warmStart))
+
+	p.mu.Lock()
+	p.warmupDB = newDB
+	p.mu.Unlock()
+
+	slog.Info("Session destroyed, DuckDB recycled.", "user", session.Username)
 	return nil
 }
 
@@ -470,6 +488,9 @@ func (p *SessionPool) CloseAll() {
 		}
 	}
 
+	// Track which DBs we've already closed to avoid double-close.
+	closedDBs := make(map[*sql.DB]bool)
+
 	for _, session := range sessions {
 		session.mu.Lock()
 		for id, ttx := range session.txns {
@@ -481,61 +502,18 @@ func (p *SessionPool) CloseAll() {
 		if session.Conn != nil {
 			_ = session.Conn.Close()
 		}
-		if session.DB != nil && session.DB != p.warmupDB && session.DB != p.fallbackDB {
+		if session.DB != nil && !closedDBs[session.DB] {
 			_ = session.DB.Close()
+			closedDBs[session.DB] = true
 		}
 	}
 
-	if p.warmupDB != nil {
+	if p.warmupDB != nil && !closedDBs[p.warmupDB] {
 		_ = p.warmupDB.Close()
+		closedDBs[p.warmupDB] = true
 	}
-	if p.fallbackDB != nil && p.fallbackDB != p.warmupDB {
+	if p.fallbackDB != nil && !closedDBs[p.fallbackDB] {
 		_ = p.fallbackDB.Close()
-	}
-}
-
-// cleanupSessionState drops temporary tables and views on the connection so
-// that session-scoped state doesn't leak when the connection is returned to
-// the pool.
-func cleanupSessionState(conn *sql.Conn) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Drop temporary tables
-	dropTemporary(ctx, conn,
-		"SELECT table_name FROM duckdb_tables() WHERE temporary = true",
-		`DROP TABLE IF EXISTS temp."%s"`,
-	)
-
-	// Drop temporary views
-	dropTemporary(ctx, conn,
-		"SELECT view_name FROM duckdb_views() WHERE temporary = true",
-		`DROP VIEW IF EXISTS temp."%s"`,
-	)
-}
-
-func dropTemporary(ctx context.Context, conn *sql.Conn, query, dropFmt string) {
-	rows, err := conn.QueryContext(ctx, query)
-	if err != nil {
-		slog.Warn("Failed to query temporary objects for cleanup.", "error", err)
-		return
-	}
-	var names []string
-	for rows.Next() {
-		var name string
-		if rows.Scan(&name) == nil {
-			names = append(names, name)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		slog.Warn("Error iterating temporary objects for cleanup.", "error", err)
-	}
-	_ = rows.Close()
-
-	for _, name := range names {
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf(dropFmt, name)); err != nil {
-			slog.Warn("Failed to drop temporary object during cleanup.", "name", name, "error", err)
-		}
 	}
 }
 

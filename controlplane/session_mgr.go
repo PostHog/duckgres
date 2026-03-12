@@ -141,23 +141,24 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		_ = session.Executor.Close()
 	}
 
-	// Destroy session on worker (best effort, skip if worker already dead)
+	// Destroy session on worker. This also recycles the DuckDB instance,
+	// so the worker is only released after it has a fresh DB ready.
 	worker, ok := sm.pool.Worker(session.WorkerID)
 	if ok {
 		select {
 		case <-worker.done:
 			// Worker already dead, skip RPC
 		default:
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			_ = worker.DestroySession(ctx, session.SessionToken)
 			cancel()
 		}
 	}
 
-	// Release the worker for reuse instead of retiring it immediately (pooled model)
+	// Release the worker for reuse AFTER the DuckDB instance has been recycled.
 	sm.pool.ReleaseWorker(session.WorkerID)
 
-	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
+	slog.Info("Session destroyed, worker recycled.", "pid", pid, "worker", session.WorkerID)
 
 	// Rebalance remaining sessions
 	if sm.rebalancer != nil {

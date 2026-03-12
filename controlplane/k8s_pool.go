@@ -572,49 +572,14 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 			return w, nil
 		}
 
-		// 3. At capacity — assign to the least-loaded worker
-		w := p.leastLoadedWorkerLocked()
-		if w != nil {
-			w.activeSessions++
-			p.mu.Unlock()
-			return w, nil
-		}
-
-		// All workers dead but at capacity (spawning in progress) — wait and retry
-		liveCount = p.liveWorkerCountLocked()
-		if p.maxWorkers > 0 && liveCount >= p.maxWorkers {
-			p.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(100 * time.Millisecond):
-			}
-			continue
-		}
-
-		// Below capacity with all workers dead — spawn a replacement
-		id := p.nextWorkerID
-		p.nextWorkerID++
-		p.spawning++
+		// 3. At capacity — wait for a worker to become idle.
 		p.mu.Unlock()
-
-		err := p.SpawnWorker(ctx, id)
-
-		p.mu.Lock()
-		p.spawning--
-		p.mu.Unlock()
-
-		if err != nil {
-			return nil, err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			// Retry
 		}
-		w, ok := p.Worker(id)
-		if !ok {
-			return nil, fmt.Errorf("worker %d not found after spawn", id)
-		}
-		p.mu.Lock()
-		w.activeSessions++
-		p.mu.Unlock()
-		return w, nil
 	}
 }
 

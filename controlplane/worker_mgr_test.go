@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -292,33 +293,60 @@ func TestAcquireWorkerReusesIdleWorker(t *testing.T) {
 	}
 }
 
-func TestAcquireWorkerLeastLoadedAtCapacity(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
+func TestAcquireWorkerWaitsWhenAtCapacity(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 1)
 
-	// Pre-populate 2 busy workers (at capacity).
+	// Pre-populate 1 busy worker (at capacity).
 	w0, cleanup0 := makeFakeWorker(t, 0)
 	defer cleanup0()
-	w1, cleanup1 := makeFakeWorker(t, 1)
-	defer cleanup1()
 
 	pool.mu.Lock()
-	w0.activeSessions = 3
-	w1.activeSessions = 1
+	w0.activeSessions = 1
 	pool.workers[0] = w0
-	pool.workers[1] = w1
-	pool.nextWorkerID = 2
+	pool.nextWorkerID = 1
 	pool.mu.Unlock()
 
-	// Acquire should pick the least-loaded worker (w1 with 1 session).
-	w, err := pool.AcquireWorker(context.Background())
+	// AcquireWorker should block since the only worker is busy.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	_, err := pool.AcquireWorker(ctx)
+	if err == nil {
+		t.Fatal("expected timeout error when all workers are busy")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got: %v", err)
+	}
+}
+
+func TestAcquireWorkerSucceedsAfterRelease(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 1)
+
+	// Pre-populate 1 busy worker.
+	w0, cleanup0 := makeFakeWorker(t, 0)
+	defer cleanup0()
+
+	pool.mu.Lock()
+	w0.activeSessions = 1
+	pool.workers[0] = w0
+	pool.nextWorkerID = 1
+	pool.mu.Unlock()
+
+	// Release the worker after a short delay.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		pool.ReleaseWorker(0)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	w, err := pool.AcquireWorker(ctx)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("expected acquire to succeed after release, got: %v", err)
 	}
-	if w.ID != 1 {
-		t.Fatalf("expected worker 1 (least loaded), got worker %d", w.ID)
-	}
-	if w.activeSessions != 2 {
-		t.Fatalf("expected 2 active sessions after acquire, got %d", w.activeSessions)
+	if w.ID != 0 {
+		t.Fatalf("expected worker 0, got worker %d", w.ID)
 	}
 }
 
@@ -639,84 +667,51 @@ func TestCleanDeadWorkersLocked(t *testing.T) {
 	}
 }
 
-func TestLeastLoadedWorkerLocked(t *testing.T) {
-	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 5)
+func TestAcquireWorkerConcurrentOneToOne(t *testing.T) {
+	// With maxWorkers=3 and 3 idle workers, 3 concurrent acquires should
+	// each get a different worker (1:1 model).
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 3)
 
-	w0, cleanup0 := makeFakeWorker(t, 0)
-	defer cleanup0()
-	w1, cleanup1 := makeFakeWorker(t, 1)
-	defer cleanup1()
-	w2, cleanup2 := makeFakeWorker(t, 2)
-	defer cleanup2()
-
-	w0.activeSessions = 5
-	w1.activeSessions = 2
-	w2.activeSessions = 8
-
+	for i := 0; i < 3; i++ {
+		w, cleanup := makeFakeWorker(t, i)
+		defer cleanup()
+		pool.mu.Lock()
+		pool.workers[i] = w
+		pool.mu.Unlock()
+	}
 	pool.mu.Lock()
-	pool.workers[0] = w0
-	pool.workers[1] = w1
-	pool.workers[2] = w2
-	best := pool.leastLoadedWorkerLocked()
+	pool.nextWorkerID = 3
 	pool.mu.Unlock()
 
-	if best == nil {
-		t.Fatal("expected a worker")
-		return
-	}
-	if best.ID != 1 {
-		t.Fatalf("expected worker 1 (least loaded with 2 sessions), got worker %d", best.ID)
-	}
-}
-
-func TestAcquireWorkerConcurrentSharing(t *testing.T) {
-	// With maxWorkers=2 and 2 busy workers, 10 concurrent acquires should
-	// all succeed by sharing the existing workers.
-	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
-
-	w0, cleanup0 := makeFakeWorker(t, 0)
-	defer cleanup0()
-	w1, cleanup1 := makeFakeWorker(t, 1)
-	defer cleanup1()
-
-	pool.mu.Lock()
-	w0.activeSessions = 1
-	w1.activeSessions = 1
-	pool.workers[0] = w0
-	pool.workers[1] = w1
-	pool.nextWorkerID = 2
-	pool.mu.Unlock()
-
-	const concurrency = 10
+	const concurrency = 3
 	var wg sync.WaitGroup
-	errors := make(chan error, concurrency)
+	results := make(chan *ManagedWorker, concurrency)
 
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := pool.AcquireWorker(context.Background())
+			w, err := pool.AcquireWorker(context.Background())
 			if err != nil {
-				errors <- err
+				t.Errorf("unexpected error: %v", err)
+				return
 			}
+			results <- w
 		}()
 	}
 
 	wg.Wait()
-	close(errors)
+	close(results)
 
-	for err := range errors {
-		t.Fatalf("unexpected error: %v", err)
+	workers := make(map[int]bool)
+	for w := range results {
+		if workers[w.ID] {
+			t.Errorf("worker %d was assigned multiple times", w.ID)
+		}
+		workers[w.ID] = true
 	}
-
-	// All 10 sessions should be spread across the 2 workers.
-	pool.mu.RLock()
-	total := w0.activeSessions + w1.activeSessions
-	pool.mu.RUnlock()
-
-	// 2 original + 10 new = 12
-	if total != 12 {
-		t.Fatalf("expected 12 total sessions across 2 workers, got %d", total)
+	if len(workers) != 3 {
+		t.Fatalf("expected 3 unique workers, got %d", len(workers))
 	}
 }
 
