@@ -166,6 +166,14 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 	}
 
 	if len(info.Endpoint) == 0 {
+		// No data, but the schema may still be available (e.g., LIMIT 0 queries).
+		// Preserve it so callers can inspect column types.
+		if len(info.Schema) > 0 {
+			schema, schemaErr := flight.DeserializeSchema(info.Schema, e.alloc)
+			if schemaErr == nil {
+				return &emptySchemaRowSet{schema: schema}, nil
+			}
+		}
 		return &emptyRowSet{}, nil
 	}
 
@@ -371,15 +379,44 @@ func (r *FlightRowSet) Err() error {
 	return r.err
 }
 
-// emptyRowSet is returned when a query produces no endpoints.
+// emptyRowSet is returned when a query produces no endpoints and no schema.
 type emptyRowSet struct{}
 
-func (e *emptyRowSet) Columns() ([]string, error)        { return nil, nil }
+func (e *emptyRowSet) Columns() ([]string, error)          { return nil, nil }
 func (e *emptyRowSet) ColumnTypes() ([]ColumnTyper, error) { return nil, nil }
-func (e *emptyRowSet) Next() bool                         { return false }
-func (e *emptyRowSet) Scan(dest ...any) error             { return fmt.Errorf("no rows") }
-func (e *emptyRowSet) Close() error                       { return nil }
-func (e *emptyRowSet) Err() error                         { return nil }
+func (e *emptyRowSet) Next() bool                          { return false }
+func (e *emptyRowSet) Scan(dest ...any) error              { return fmt.Errorf("no rows") }
+func (e *emptyRowSet) Close() error                        { return nil }
+func (e *emptyRowSet) Err() error                          { return nil }
+
+// emptySchemaRowSet is returned when a query produces no data rows but does
+// have schema information (e.g., SELECT ... LIMIT 0). This preserves column
+// names and types for callers like COPY FROM STDIN that need to inspect the
+// target table schema.
+type emptySchemaRowSet struct {
+	schema *arrow.Schema
+}
+
+func (e *emptySchemaRowSet) Columns() ([]string, error) {
+	cols := make([]string, e.schema.NumFields())
+	for i := 0; i < e.schema.NumFields(); i++ {
+		cols[i] = e.schema.Field(i).Name
+	}
+	return cols, nil
+}
+
+func (e *emptySchemaRowSet) ColumnTypes() ([]ColumnTyper, error) {
+	types := make([]ColumnTyper, e.schema.NumFields())
+	for i := 0; i < e.schema.NumFields(); i++ {
+		types[i] = &arrowColumnType{dt: e.schema.Field(i).Type}
+	}
+	return types, nil
+}
+
+func (e *emptySchemaRowSet) Next() bool      { return false }
+func (e *emptySchemaRowSet) Scan(...any) error { return fmt.Errorf("no rows") }
+func (e *emptySchemaRowSet) Close() error    { return nil }
+func (e *emptySchemaRowSet) Err() error      { return nil }
 
 // flightExecResult implements ExecResult for Flight SQL updates.
 type flightExecResult struct {
