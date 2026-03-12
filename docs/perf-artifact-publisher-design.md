@@ -15,8 +15,8 @@ removes `psql`/shell parsing failure modes, and makes the publish path testable.
 The current publish path is driven by:
 
 - `scripts/perf_nightly.sh`
-- `DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD`
-- an external shell script in `posthog-cloud-infra`
+- harness-owned publish config
+- runner configuration in `posthog-cloud-infra`
 
 That approach is brittle because:
 
@@ -121,7 +121,6 @@ Suggested flags:
 - `-perf-publish-password`
 - `-perf-publish-schema` default `duckgres_perf`
 - `-perf-publish-bootstrap-schema` default `true`
-- `-perf-publish-strict` default `true`
 
 Suggested environment variables for scripts:
 
@@ -129,14 +128,12 @@ Suggested environment variables for scripts:
 - `DUCKGRES_PERF_PUBLISH_PASSWORD`
 - `DUCKGRES_PERF_PUBLISH_SCHEMA`
 - `DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA`
-- `DUCKGRES_PERF_PUBLISH_STRICT`
 
 Behavior:
 
 - if `dsn` is empty, publishing is skipped
 - if `dsn` is set, publisher runs
-- if strict mode is enabled, publish failure fails the harness
-- if strict mode is disabled, publish failure is logged but artifacts remain
+- if publish fails, the harness fails the run with the publisher error
 
 ## Harness Integration
 
@@ -154,8 +151,7 @@ This is a direct Go call, not a shell hook.
 
 For nightly runs:
 
-- `scripts/perf_nightly.sh` should stop invoking `DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD`
-- instead it should pass publisher env vars through to the harness
+- `scripts/perf_nightly.sh` should pass publisher env vars through to the harness
 
 This keeps orchestration in shell but moves ingestion into typed code.
 
@@ -295,7 +291,6 @@ Tests should live in the Duckgres repository and cover:
 - unexpected CSV header
 - null/empty `error`, `error_class`, and `rows`
 - idempotent re-publish of the same `run_id`
-- strict vs non-strict publish behavior at the harness layer
 
 At least one integration-style test should exercise:
 
@@ -317,16 +312,15 @@ At least one integration-style test should exercise:
 
 - Add perf publish flags to `tests/perf/harness_test.go`.
 - Invoke publisher after artifact generation.
-- Fail the run on publish error when strict mode is enabled.
+- Fail the run on publish error with a clear harness error.
 - Document the new flags and env vars.
 
 ### [x] Phase 3: Update scripts and docs
 
 - Update `scripts/perf_nightly.sh` to pass publisher config to the harness.
-- Deprecate `DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD`.
 - Update `tests/perf/README.md` and `docs/perf-harness-runbook.md`.
 
-### [ ] Phase 4: Clean up external publisher script
+### [x] Phase 4: Clean up external publisher script
 
 - Remove the shell-based ingestion script from infra once the harness-integrated
   publisher is deployed and verified.

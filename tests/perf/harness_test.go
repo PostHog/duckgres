@@ -41,7 +41,6 @@ var (
 	perfPublishPassword       = flag.String("perf-publish-password", os.Getenv("DUCKGRES_PERF_PUBLISH_PASSWORD"), "optional password override for the perf artifact publisher")
 	perfPublishSchema         = flag.String("perf-publish-schema", envOrDefault("DUCKGRES_PERF_PUBLISH_SCHEMA", "duckgres_perf"), "target schema for published perf artifacts")
 	perfPublishBootstrap      = flag.Bool("perf-publish-bootstrap-schema", envBoolOrDefault("DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA", true), "bootstrap publisher schema/table definitions before inserting rows")
-	perfPublishStrict         = flag.Bool("perf-publish-strict", envBoolOrDefault("DUCKGRES_PERF_PUBLISH_STRICT", true), "fail the harness when publishing is configured and the publish step fails")
 )
 
 var publishRunDir = publisher.PublishRunDir
@@ -174,10 +173,7 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 
 	publishCfg := currentPublisherConfig()
 	if err := publishArtifactsIfConfigured(context.Background(), publishCfg, outputDir); err != nil {
-		if publishCfg.Strict {
-			t.Fatalf("publish perf artifacts: %v", err)
-		}
-		t.Logf("perf artifact publish failed (non-strict): %v", err)
+		t.Fatal(err)
 	}
 }
 
@@ -192,7 +188,6 @@ func currentPublisherConfig() publisher.Config {
 		Password:        *perfPublishPassword,
 		Schema:          *perfPublishSchema,
 		BootstrapSchema: *perfPublishBootstrap,
-		Strict:          *perfPublishStrict,
 	}
 }
 
@@ -200,7 +195,10 @@ func publishArtifactsIfConfigured(ctx context.Context, cfg publisher.Config, run
 	if !cfg.Enabled() {
 		return nil
 	}
-	return publishRunDir(ctx, cfg, runDir)
+	if err := publishRunDir(ctx, cfg, runDir); err != nil {
+		return fmt.Errorf("publish perf artifacts: %w", err)
+	}
+	return nil
 }
 
 func envOrDefault(key, fallback string) string {

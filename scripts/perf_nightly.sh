@@ -15,6 +15,10 @@ CATALOG_PATH="${DUCKGRES_PERF_CATALOG:-$ROOT_DIR/tests/perf/queries/ducklake_fro
 OUTPUT_BASE="${DUCKGRES_PERF_OUTPUT_BASE:-$ROOT_DIR/artifacts/perf}"
 RUN_ID="${DUCKGRES_PERF_RUN_ID:-nightly-${DATASET_VERSION}-$(date -u +%Y%m%dT%H%M%SZ)}"
 MANIFEST_TABLE="${DUCKGRES_PERF_DATASET_MANIFEST_TABLE:-ducklake.main.dataset_manifest}"
+if [[ -n "${DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD:-}" ]]; then
+  echo "DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD is no longer supported; use DUCKGRES_PERF_PUBLISH_DSN for in-harness publishing"
+  exit 1
+fi
 
 # Child shells launched via timeout/flock only inherit exported variables.
 export MAX_RUNTIME_SECONDS
@@ -66,15 +70,6 @@ fi
 if ! grep -Fq "\"dataset_version\":\"$DATASET_VERSION\"" "$MANIFEST_ARTIFACT"; then
   echo "Dataset manifest artifact does not match DUCKGRES_PERF_DATASET_VERSION=$DATASET_VERSION"
   exit 1
-fi
-
-if [[ -n "${DUCKGRES_PERF_PUBLISH_DSN:-}" ]]; then
-  if [[ -n "${DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD:-}" ]]; then
-    echo "DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD is deprecated and ignored when DUCKGRES_PERF_PUBLISH_DSN is set"
-  fi
-elif [[ -n "${DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD:-}" ]]; then
-  echo "DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD is deprecated; prefer DUCKGRES_PERF_PUBLISH_DSN"
-  DUCKGRES_PERF_RUN_DIR="$RUN_DIR" bash -lc "$DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD"
 fi
 
 echo "Nightly perf run complete: $RUN_DIR"

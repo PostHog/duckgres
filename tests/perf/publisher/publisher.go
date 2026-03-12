@@ -41,7 +41,6 @@ type Config struct {
 	Password        string
 	Schema          string
 	BootstrapSchema bool
-	Strict          bool
 }
 
 type artifacts struct {

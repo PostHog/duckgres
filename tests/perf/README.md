@@ -87,11 +87,6 @@ Optional artifact publisher:
 - `DUCKGRES_PERF_PUBLISH_PASSWORD`: optional password override for the publisher connection.
 - `DUCKGRES_PERF_PUBLISH_SCHEMA`: target schema for published rows. Default: `duckgres_perf`.
 - `DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA`: when `true`, create/extend publisher tables before inserting.
-- `DUCKGRES_PERF_PUBLISH_STRICT`: when `true`, fail the harness if publishing fails. Default: `true`.
-
-Deprecated fallback:
-
-- `DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD`: shell command executed after a successful nightly run with `DUCKGRES_PERF_RUN_DIR` set. This remains as a compatibility fallback until external publisher scripts are retired.
 
 ## Useful Flags
 
