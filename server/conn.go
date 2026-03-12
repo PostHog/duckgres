@@ -2707,7 +2707,7 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 	// STRICT_MODE FALSE allows reading rows that don't strictly comply with CSV standard
 	// PARALLEL FALSE avoids "Parallel CSV Reader does not support full read" errors
 	// on files streamed from COPY FROM STDIN (temp files with no seek support for sniffing)
-	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE", "PARALLEL FALSE"}
+	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE", "PARALLEL FALSE", "MAX_LINE_SIZE 10485760"}
 	if opts.HasHeader {
 		copyOptions = append(copyOptions, "HEADER")
 	}

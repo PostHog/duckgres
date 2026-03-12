@@ -2058,7 +2058,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				HasHeader:  false,
 				NullString: "\\N",
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, NULL '\\N', DELIMITER '\t')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, NULL '\\N', DELIMITER '\t')",
 		},
 		{
 			name:       "CSV with header",
@@ -2071,7 +2071,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "with column list",
@@ -2084,7 +2084,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "custom NULL string",
@@ -2097,7 +2097,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "NA",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, NULL 'NA', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, NULL 'NA', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "empty NULL string",
@@ -2110,7 +2110,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, HEADER, NULL '', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, HEADER, NULL '', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "schema qualified table",
@@ -2123,7 +2123,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, HEADER, NULL '\\N', DELIMITER '\t', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, HEADER, NULL '\\N', DELIMITER '\t', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "CSV with custom escape character",
@@ -2137,7 +2137,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				Quote:      `"`,
 				Escape:     `\`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\\')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\\')",
 		},
 	}
 
