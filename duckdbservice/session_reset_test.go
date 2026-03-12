@@ -73,7 +73,7 @@ func TestResetSessionState_ClearsSetVariables(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn3.Close()
+	defer func() { _ = conn3.Close() }()
 
 	if err := conn3.QueryRowContext(ctx, "SELECT value FROM duckdb_settings() WHERE name = 'default_null_order'").Scan(&val); err != nil {
 		t.Fatal(err)
@@ -105,7 +105,7 @@ func TestResetSessionState_ClearsTempTables(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx, "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = 'temp' AND table_name = 'tmp_test'").Scan(&count)
@@ -138,7 +138,7 @@ func TestResetSessionState_ClearsUserTables(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx, "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = 'memory' AND schema_name = 'main' AND table_name = 'user_data'").Scan(&count)
@@ -175,7 +175,7 @@ func TestResetSessionState_PreservesSystemTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx, "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = '__duckgres_column_metadata'").Scan(&count)
@@ -208,7 +208,7 @@ func TestResetSessionState_ClearsUserViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx, "SELECT COUNT(*) FROM duckdb_views() WHERE database_name = 'memory' AND schema_name = 'main' AND view_name = 'user_view'").Scan(&count)
@@ -242,7 +242,7 @@ func TestResetSessionState_PreservesSystemViews(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx, "SELECT COUNT(*) FROM duckdb_views() WHERE database_name = 'memory' AND schema_name = 'main' AND view_name = 'pg_database'").Scan(&count)
@@ -275,7 +275,7 @@ func TestResetSessionState_ClearsUserMacros(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx,
@@ -310,7 +310,7 @@ func TestResetSessionState_PreservesSystemMacros(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx,
@@ -347,7 +347,7 @@ func TestResetSessionState_ClearsUserSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx, "SELECT COUNT(*) FROM duckdb_schemas() WHERE database_name = 'memory' AND schema_name = 'user_schema'").Scan(&count)
@@ -380,7 +380,7 @@ func TestResetSessionState_DetachesUserDatabases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx, "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'user_db'").Scan(&count)
@@ -413,7 +413,7 @@ func TestResetSessionState_ClearsUserSequences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var count int
 	err = conn2.QueryRowContext(ctx, "SELECT COUNT(*) FROM duckdb_sequences() WHERE database_name = 'memory' AND schema_name = 'main' AND sequence_name = 'user_seq'").Scan(&count)
@@ -450,7 +450,7 @@ func TestResetSessionState_ReappliesSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	var threads string
 	if err := conn2.QueryRowContext(ctx, "SELECT value FROM duckdb_settings() WHERE name = 'threads'").Scan(&threads); err != nil {

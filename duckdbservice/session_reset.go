@@ -168,7 +168,7 @@ func (p *SessionPool) resetSessionState(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("reset session state: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	start := time.Now()
 
@@ -205,7 +205,7 @@ func resetAllSettings(ctx context.Context, conn *sql.Conn) {
 		slog.Warn("Failed to query settings for reset.", "error", err)
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var names []string
 	for rows.Next() {
@@ -321,7 +321,7 @@ func dropUserSecrets(ctx context.Context, conn *sql.Conn) {
 	if err != nil {
 		return // duckdb_secrets() may not exist
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var names []string
 	for rows.Next() {
@@ -400,7 +400,7 @@ func queryMacros(ctx context.Context, conn *sql.Conn) []macroInfo {
 		slog.Warn("Failed to query macros.", "error", err)
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var macros []macroInfo
 	for rows.Next() {
@@ -420,7 +420,7 @@ func queryPairs(ctx context.Context, conn *sql.Conn, query string) [][2]string {
 		slog.Debug("Catalog query returned no results.", "query", query, "error", err)
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results [][2]string
 	for rows.Next() {
