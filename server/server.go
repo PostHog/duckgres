@@ -636,9 +636,11 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
 
-	// No connection limit — DuckDB supports multiple concurrent connections.
-	// The shared warmup DB serves multiple sessions; limiting to 1 causes
-	// db.Conn() to block when session create/destroy overlap.
+	// Single connection per client session. This is the isolation boundary:
+	// DuckDB connections share a single catalog (tables, views, credentials),
+	// so concurrent sessions on the same DB would see each other's data.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// Verify connection
 	if err := db.Ping(); err != nil {

@@ -612,7 +612,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 		if idle != nil {
 			idle.activeSessions++
 			p.mu.Unlock()
-			slog.Info("Reusing idle worker.", "worker", idle.ID, "active_sessions", idle.activeSessions)
+			slog.Debug("Reusing idle worker.", "worker", idle.ID, "active_sessions", idle.activeSessions)
 			return idle, nil
 		}
 
@@ -631,12 +631,12 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 					p.nextWorkerID++
 					p.spawning++
 					p.mu.Unlock()
-					slog.Info("Assigned to least-loaded worker, spawning new worker in background.",
+					slog.Debug("Assigned to least-loaded worker, spawning new worker in background.",
 						"worker", w.ID, "active_sessions", w.activeSessions, "background_worker", id)
 					go p.spawnWorkerBackground(id)
 				} else {
 					p.mu.Unlock()
-					slog.Info("Assigned to least-loaded worker (at capacity).",
+					slog.Debug("Assigned to least-loaded worker (at capacity).",
 						"worker", w.ID, "active_sessions", w.activeSessions)
 				}
 				return w, nil
@@ -651,7 +651,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 			p.mu.Unlock()
 
 			slog.Info("No live workers, blocking on spawn.", "worker", id)
-			err := p.SpawnWorker(context.Background(), id)
+			err := p.SpawnWorker(ctx, id)
 
 			p.mu.Lock()
 			p.spawning--
