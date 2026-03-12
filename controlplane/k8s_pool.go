@@ -49,6 +49,7 @@ type K8sWorkerPool struct {
 	configMap       string
 	configPath      string
 	imagePullPolicy corev1.PullPolicy
+	serviceAccount  string
 	memoryBudget    int64 // total memory budget in bytes
 	cachedToken     string // cached bearer token (immutable after setup)
 	informer        cache.SharedIndexInformer
@@ -107,6 +108,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		configMap:       cfg.ConfigMap,
 		configPath:      cfg.ConfigPath,
 		imagePullPolicy: corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:  cfg.ServiceAccount,
 		memoryBudget:    cfg.MemoryBudget,
 	}
 
@@ -326,7 +328,8 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 			OwnerReferences: ownerRefs,
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			RestartPolicy:      corev1.RestartPolicyNever,
+			ServiceAccountName: p.serviceAccount,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),

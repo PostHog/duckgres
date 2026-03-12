@@ -63,6 +63,7 @@ type K8sFileConfig struct {
 	WorkerSecret          string `yaml:"worker_secret"`
 	WorkerConfigMap       string `yaml:"worker_configmap"`
 	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
+	WorkerServiceAccount  string `yaml:"worker_service_account"`
 }
 
 type QueryLogFileConfig struct {
@@ -225,6 +226,7 @@ func main() {
 	k8sWorkerSecret := flag.String("k8s-worker-secret", "", "K8s Secret name for worker bearer token (env: DUCKGRES_K8S_WORKER_SECRET)")
 	k8sWorkerConfigMap := flag.String("k8s-worker-configmap", "", "ConfigMap name for worker duckgres.yaml (env: DUCKGRES_K8S_WORKER_CONFIGMAP)")
 	k8sWorkerImagePullPolicy := flag.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
+	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "ServiceAccount name for K8s worker pods (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -377,7 +379,8 @@ func main() {
 		K8sWorkerPort:             *k8sWorkerPort,
 		K8sWorkerSecret:           *k8sWorkerSecret,
 		K8sWorkerConfigMap:        *k8sWorkerConfigMap,
-		K8sWorkerImagePullPolicy: *k8sWorkerImagePullPolicy,
+		K8sWorkerImagePullPolicy:  *k8sWorkerImagePullPolicy,
+		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
@@ -512,6 +515,7 @@ func main() {
 				WorkerSecret:    resolved.K8sWorkerSecret,
 				WorkerConfigMap: resolved.K8sWorkerConfigMap,
 				ImagePullPolicy: resolved.K8sWorkerImagePullPolicy,
+				ServiceAccount:  resolved.K8sWorkerServiceAccount,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)
