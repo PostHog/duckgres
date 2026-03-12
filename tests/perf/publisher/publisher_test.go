@@ -206,6 +206,62 @@ func TestPublishArtifactsRollsBackOnInsertFailure(t *testing.T) {
 	}
 }
 
+func TestResolveDSNPasswordOverridesKeywordPassword(t *testing.T) {
+	got, err := resolveDSNPassword(
+		"host=127.0.0.1 port=5432 user=duckgres password='old-secret' dbname=perf sslmode=require",
+		"new-secret",
+	)
+	if err != nil {
+		t.Fatalf("resolveDSNPassword returned error: %v", err)
+	}
+	want := "host=127.0.0.1 port=5432 user=duckgres password='new-secret' dbname=perf sslmode=require"
+	if got != want {
+		t.Fatalf("dsn = %q, want %q", got, want)
+	}
+}
+
+func TestResolveDSNPasswordOverridesBareKeywordPassword(t *testing.T) {
+	got, err := resolveDSNPassword(
+		"host=127.0.0.1 port=5432 user=duckgres password=oldsecret dbname=perf sslmode=require",
+		"new-secret",
+	)
+	if err != nil {
+		t.Fatalf("resolveDSNPassword returned error: %v", err)
+	}
+	want := "host=127.0.0.1 port=5432 user=duckgres password='new-secret' dbname=perf sslmode=require"
+	if got != want {
+		t.Fatalf("dsn = %q, want %q", got, want)
+	}
+}
+
+func TestResolveDSNPasswordEscapesKeywordPasswordOverride(t *testing.T) {
+	got, err := resolveDSNPassword(
+		"host=127.0.0.1 port=5432 user=duckgres password='old-secret' dbname=perf sslmode=require",
+		`new'\secret`,
+	)
+	if err != nil {
+		t.Fatalf("resolveDSNPassword returned error: %v", err)
+	}
+	want := "host=127.0.0.1 port=5432 user=duckgres password='new\\'\\\\secret' dbname=perf sslmode=require"
+	if got != want {
+		t.Fatalf("dsn = %q, want %q", got, want)
+	}
+}
+
+func TestResolveDSNPasswordTreatsDollarLiterallyInKeywordOverride(t *testing.T) {
+	got, err := resolveDSNPassword(
+		"host=127.0.0.1 port=5432 user=duckgres password='old-secret' dbname=perf sslmode=require",
+		`pa$$word$1`,
+	)
+	if err != nil {
+		t.Fatalf("resolveDSNPassword returned error: %v", err)
+	}
+	want := "host=127.0.0.1 port=5432 user=duckgres password='pa$$word$1' dbname=perf sslmode=require"
+	if got != want {
+		t.Fatalf("dsn = %q, want %q", got, want)
+	}
+}
+
 func writeFixtureRunDir(t *testing.T) string {
 	t.Helper()
 	runDir := t.TempDir()

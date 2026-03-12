@@ -22,6 +22,7 @@ import (
 const defaultSchema = "duckgres_perf"
 
 var schemaNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var keywordPasswordPattern = regexp.MustCompile(`(^|\s)password=(?:'[^']*(?:''[^']*)*'|\S+)`)
 
 var expectedQueryResultsHeader = []string{
 	"query_id",
@@ -373,10 +374,16 @@ func resolveDSNPassword(dsn, password string) (string, error) {
 		parsed.User = url.UserPassword(username, password)
 		return parsed.String(), nil
 	}
-	if strings.Contains(dsn, "password=") {
-		return dsn, nil
-	}
 	escaped := strings.ReplaceAll(password, `\`, `\\`)
 	escaped = strings.ReplaceAll(escaped, `'`, `\'`)
+	if keywordPasswordPattern.MatchString(dsn) {
+		return keywordPasswordPattern.ReplaceAllStringFunc(dsn, func(match string) string {
+			prefix := ""
+			if strings.HasPrefix(match, " ") || strings.HasPrefix(match, "\t") || strings.HasPrefix(match, "\n") {
+				prefix = match[:1]
+			}
+			return prefix + "password='" + escaped + "'"
+		}), nil
+	}
 	return fmt.Sprintf("%s password='%s'", dsn, escaped), nil
 }
