@@ -96,6 +96,59 @@ func (e *LocalExecutor) Close() error {
 	return e.db.Close()
 }
 
+// PinnedExecutor wraps a pinned *sql.Conn from a shared *sql.DB pool
+// to implement QueryExecutor for file-persistence mode.
+type PinnedExecutor struct {
+	conn *sql.Conn
+	db   *sql.DB
+}
+
+func NewPinnedExecutor(conn *sql.Conn, db *sql.DB) *PinnedExecutor {
+	return &PinnedExecutor{conn: conn, db: db}
+}
+
+// DB returns the underlying *sql.DB (for credential refresh and other direct access).
+func (e *PinnedExecutor) DB() *sql.DB {
+	return e.db
+}
+
+func (e *PinnedExecutor) QueryContext(ctx context.Context, query string, args ...any) (RowSet, error) {
+	rows, err := e.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &LocalRowSet{rows: rows}, nil
+}
+
+func (e *PinnedExecutor) ExecContext(ctx context.Context, query string, args ...any) (ExecResult, error) {
+	return e.conn.ExecContext(ctx, query, args...)
+}
+
+func (e *PinnedExecutor) Query(query string, args ...any) (RowSet, error) {
+	rows, err := e.conn.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &LocalRowSet{rows: rows}, nil
+}
+
+func (e *PinnedExecutor) Exec(query string, args ...any) (ExecResult, error) {
+	return e.conn.ExecContext(context.Background(), query, args...)
+}
+
+func (e *PinnedExecutor) ConnContext(ctx context.Context) (RawConn, error) {
+	return e.db.Conn(ctx)
+}
+
+func (e *PinnedExecutor) PingContext(ctx context.Context) error {
+	return e.conn.PingContext(ctx)
+}
+
+// Close returns the pinned connection to the pool; it does not close the underlying DB.
+func (e *PinnedExecutor) Close() error {
+	return e.conn.Close()
+}
+
 // LocalRowSet wraps *sql.Rows to implement RowSet.
 type LocalRowSet struct {
 	rows *sql.Rows

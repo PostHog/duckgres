@@ -244,6 +244,14 @@ type DuckLakeConfig struct {
 	S3Profile string // AWS profile name to use (for "config" chain)
 }
 
+// fileDBEntry tracks a shared *sql.DB for file-persistence mode.
+// One entry per user file; multiple PG connections share the pool via pinned *sql.Conn.
+type fileDBEntry struct {
+	db          *sql.DB
+	refs        int
+	stopRefresh func() // credential refresh goroutine
+}
+
 type Server struct {
 	cfg         Config
 	listener    net.Listener
@@ -280,6 +288,11 @@ type Server struct {
 
 	// Query logger for DuckLake system.query_log
 	queryLogger *QueryLogger
+
+	// Per-user shared DB pool for file persistence mode.
+	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
+	fileDBsMu sync.Mutex
+	fileDBs   map[string]*fileDBEntry
 }
 
 func New(cfg Config) (*Server, error) {
@@ -327,6 +340,7 @@ func New(cfg Config) (*Server, error) {
 		activeQueries: make(map[BackendKey]context.CancelFunc),
 		duckLakeSem:   make(chan struct{}, 1),
 		conns:         make(map[int32]*clientConn),
+		fileDBs:       make(map[string]*fileDBEntry),
 	}
 
 	// Configure TLS: ACME DNS-01, ACME HTTP-01, or static certificate files
@@ -630,6 +644,62 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	return CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
 }
 
+// acquireFileDB returns a shared *sql.DB for the given user, creating one if needed.
+// The caller must call releaseFileDB when the connection is no longer needed.
+func (s *Server) acquireFileDB(username string, passthrough bool) (*sql.DB, error) {
+	s.fileDBsMu.Lock()
+	defer s.fileDBsMu.Unlock()
+
+	if entry, ok := s.fileDBs[username]; ok {
+		entry.refs++
+		return entry.db, nil
+	}
+
+	var db *sql.DB
+	var err error
+	if passthrough {
+		db, err = CreatePassthroughDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
+	} else {
+		db, err = CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// openBaseDB sets MaxOpenConns(1) for single-session use; override for shared pool.
+	db.SetMaxOpenConns(0) // unlimited
+	db.SetMaxIdleConns(4)
+
+	stopRefresh := StartCredentialRefresh(db, s.cfg.DuckLake)
+
+	s.fileDBs[username] = &fileDBEntry{
+		db:          db,
+		refs:        1,
+		stopRefresh: stopRefresh,
+	}
+	return db, nil
+}
+
+// releaseFileDB decrements the ref count for a user's shared DB.
+// When the last reference is released, the DB is closed and removed from the pool.
+func (s *Server) releaseFileDB(username string) {
+	s.fileDBsMu.Lock()
+	defer s.fileDBsMu.Unlock()
+
+	entry, ok := s.fileDBs[username]
+	if !ok {
+		return
+	}
+	entry.refs--
+	if entry.refs <= 0 {
+		if entry.stopRefresh != nil {
+			entry.stopRefresh()
+		}
+		_ = entry.db.Close()
+		delete(s.fileDBs, username)
+	}
+}
+
 // openBaseDB creates and configures a DuckDB connection with threads, memory
 // limit, temp directory, extensions, and cache_httpfs settings.
 // This shared setup is used by both regular and passthrough connections.
@@ -641,6 +711,12 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	dsn := ":memory:"
 	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
+		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
+			return nil, fmt.Errorf("invalid username for file persistence: %q (contains path separator or ..)", username)
+		}
+		if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
+			return nil, fmt.Errorf("failed to create data directory %s: %w", cfg.DataDir, err)
+		}
 		dsn = filepath.Join(cfg.DataDir, username+".duckdb")
 		slog.Info("Opening file-backed DuckDB.", "path", dsn)
 	}

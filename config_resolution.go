@@ -745,6 +745,11 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		cfg.QueryLog.Enabled = cli.QueryLog
 	}
 
+	if cfg.FilePersistence && cfg.DataDir == "" {
+		warn("file_persistence is enabled but data_dir is empty; disabling file persistence")
+		cfg.FilePersistence = false
+	}
+
 	if cfg.ACMEDNSProvider != "" {
 		provider := strings.ToLower(cfg.ACMEDNSProvider)
 		if provider != "route53" {

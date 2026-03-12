@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -428,5 +430,120 @@ func TestHasCacheHTTPFS(t *testing.T) {
 				t.Errorf("hasCacheHTTPFS(%v) = %v, want %v", tt.extensions, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestOpenBaseDBFilePersistenceRejectsPathTraversal(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         dataDir,
+	}
+
+	cases := []struct {
+		name     string
+		username string
+	}{
+		{"parent directory", "../etc/evil"},
+		{"slash in name", "foo/bar"},
+		{"backslash dot-dot", "..\\windows"},
+		{"dot-dot between names", "alice/../bob"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := openBaseDB(cfg, tc.username)
+			if err == nil {
+				_ = db.Close()
+				t.Fatalf("expected error for username %q, got nil", tc.username)
+			}
+			if !strings.Contains(err.Error(), "invalid username for file persistence") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestOpenBaseDBCreatesDataDir(t *testing.T) {
+	base := t.TempDir()
+	nested := filepath.Join(base, "deep", "nested", "dir")
+
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         nested,
+	}
+	db, err := openBaseDB(cfg, "testuser")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	info, err := os.Stat(nested)
+	if err != nil {
+		t.Fatalf("data directory was not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("expected directory, got file")
+	}
+}
+
+func TestFileDBPoolRefCounting(t *testing.T) {
+	dataDir := t.TempDir()
+	s := &Server{
+		cfg: Config{
+			FilePersistence: true,
+			DataDir:         dataDir,
+		},
+		fileDBs:     make(map[string]*fileDBEntry),
+		duckLakeSem: make(chan struct{}, 1),
+	}
+
+	// First acquire
+	db1, err := s.acquireFileDB("alice", false)
+	if err != nil {
+		t.Fatalf("first acquireFileDB failed: %v", err)
+	}
+
+	// Second acquire should return the same *sql.DB
+	db2, err := s.acquireFileDB("alice", false)
+	if err != nil {
+		t.Fatalf("second acquireFileDB failed: %v", err)
+	}
+	if db1 != db2 {
+		t.Fatal("expected same *sql.DB for same user, got different instances")
+	}
+
+	// Check ref count is 2
+	s.fileDBsMu.Lock()
+	refs := s.fileDBs["alice"].refs
+	s.fileDBsMu.Unlock()
+	if refs != 2 {
+		t.Fatalf("expected refs=2, got %d", refs)
+	}
+
+	// Release one — DB should still be open
+	s.releaseFileDB("alice")
+	s.fileDBsMu.Lock()
+	entry, exists := s.fileDBs["alice"]
+	s.fileDBsMu.Unlock()
+	if !exists {
+		t.Fatal("entry removed too early (refs should be 1)")
+	}
+	if entry.refs != 1 {
+		t.Fatalf("expected refs=1, got %d", entry.refs)
+	}
+
+	// DB should still work
+	if err := db1.Ping(); err != nil {
+		t.Fatalf("db should still be usable: %v", err)
+	}
+
+	// Release last — DB should be closed and removed
+	s.releaseFileDB("alice")
+	s.fileDBsMu.Lock()
+	_, exists = s.fileDBs["alice"]
+	s.fileDBsMu.Unlock()
+	if exists {
+		t.Fatal("entry should be removed after last release")
 	}
 }

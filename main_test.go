@@ -771,3 +771,34 @@ func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 		t.Fatalf("expected warning about missing ACME domain for DNS mode, warnings: %v", warns)
 	}
 }
+
+func TestFilePersistenceRequiresDataDir(t *testing.T) {
+	var warns []string
+	// Use CLI to explicitly set data-dir to empty, overriding the default.
+	resolved := resolveEffectiveConfig(
+		&FileConfig{
+			FilePersistence: true,
+		},
+		configCLIInputs{
+			Set:     map[string]bool{"data-dir": true},
+			DataDir: "",
+		},
+		nil,
+		func(msg string) { warns = append(warns, msg) },
+	)
+
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected FilePersistence to be disabled when DataDir is empty")
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "file_persistence is enabled but data_dir is empty") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about empty data_dir, warnings: %v", warns)
+	}
+}
