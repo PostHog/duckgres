@@ -204,6 +204,8 @@ type QueryLogConfig struct {
 	BatchSize            int
 	CompactInterval      time.Duration
 	DataInliningRowLimit int
+	WALMaxBytes          int64         // Max WAL file size before backpressure (default: 256MB)
+	GroupCommitInterval  time.Duration // Batch WAL fsyncs (default: 1ms, 0 = sync every write)
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment

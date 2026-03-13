@@ -94,6 +94,8 @@ func defaultServerConfig() server.Config {
 			BatchSize:            1000,
 			CompactInterval:      10 * time.Minute,
 			DataInliningRowLimit: 1000,
+			WALMaxBytes:          256 * 1024 * 1024, // 256MB
+			GroupCommitInterval:  1 * time.Millisecond,
 		},
 	}
 }
@@ -313,6 +315,16 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.QueryLog.DataInliningRowLimit > 0 {
 			cfg.QueryLog.DataInliningRowLimit = fileCfg.QueryLog.DataInliningRowLimit
+		}
+		if fileCfg.QueryLog.WALMaxBytes > 0 {
+			cfg.QueryLog.WALMaxBytes = fileCfg.QueryLog.WALMaxBytes
+		}
+		if fileCfg.QueryLog.GroupCommitInterval != "" {
+			if d, err := time.ParseDuration(fileCfg.QueryLog.GroupCommitInterval); err == nil {
+				cfg.QueryLog.GroupCommitInterval = d
+			} else {
+				warn("Invalid query_log.group_commit_interval duration: " + err.Error())
+			}
 		}
 
 		if fileCfg.TLS.ACME.Domain != "" {
@@ -619,6 +631,20 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			cfg.QueryLog.DataInliningRowLimit = n
 		} else {
 			warn("Invalid DUCKGRES_QUERY_LOG_DATA_INLINING_ROW_LIMIT: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_WAL_MAX_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.QueryLog.WALMaxBytes = n
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_WAL_MAX_BYTES: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_GROUP_COMMIT_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.QueryLog.GroupCommitInterval = d
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_GROUP_COMMIT_INTERVAL duration: " + err.Error())
 		}
 	}
 

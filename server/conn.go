@@ -1031,7 +1031,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 					c.sendError("ERROR", errCode, errMsg)
 				}
 				c.setTxError()
-				c.logQuery(start, originalQuery, query, cmdType, 0, 0, errCode, errMsg, "simple")
+				c.logQuery(start, originalQuery, query, cmdType, 0, 0, errCode, errMsg, "simple", nil)
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -1045,7 +1045,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = writeCommandComplete(c.writer, tag)
-		c.logQuery(start, originalQuery, query, cmdType, 0, writtenRows, "", "", "simple")
+		c.logQuery(start, originalQuery, query, cmdType, 0, writtenRows, "", "", "simple", c.executorMetrics())
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -1054,7 +1054,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Execute query that returns results (SELECT, DML RETURNING, etc.)
 	rowCount, errCode, errMsg, err := c.executeSelectQuery(query, cmdType)
 	if err == nil {
-		c.logQuery(start, originalQuery, query, cmdType, rowCount, 0, errCode, errMsg, "simple")
+		c.logQuery(start, originalQuery, query, cmdType, rowCount, 0, errCode, errMsg, "simple", c.executorMetrics())
 	}
 	return err
 }
@@ -2751,7 +2751,7 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2759,7 +2759,7 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 
 	rowsAffected, _ := result.RowsAffected()
 	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowsAffected))
-	c.logQuery(start, query, query, "COPY", 0, rowsAffected, "", "", "simple")
+	c.logQuery(start, query, query, "COPY", 0, rowsAffected, "", "", "simple", nil)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
@@ -2772,7 +2772,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if len(matches) < 2 {
 		c.sendError("ERROR", "42601", "Invalid COPY TO STDOUT syntax")
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42601", "Invalid COPY TO STDOUT syntax", "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42601", "Invalid COPY TO STDOUT syntax", "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2804,7 +2804,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		slog.Error("COPY TO query failed.", "user", c.username, "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2816,7 +2816,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		slog.Error("COPY TO failed to get columns.", "user", c.username, "query", selectQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2833,7 +2833,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2876,7 +2876,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 		if err := rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
-			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple", nil)
 			break
 		}
 
@@ -2899,7 +2899,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	if err := rows.Err(); err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2911,7 +2911,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	}
 
 	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-	c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
+	c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "", "", "simple", nil)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
@@ -2928,7 +2928,7 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -2987,7 +2987,7 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 		if err := rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
-			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3015,7 +3015,7 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 	if err := rows.Err(); err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -3043,7 +3043,7 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 	}
 
 	_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-	c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
+	c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "", "", "simple", nil)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
@@ -3059,7 +3059,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	if err != nil {
 		c.sendError("ERROR", "42601", "Invalid COPY FROM STDIN syntax")
 		c.setTxError()
-		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "42601", "Invalid COPY FROM STDIN syntax", "simple")
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "42601", "Invalid COPY FROM STDIN syntax", "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -3084,7 +3084,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		errMsg := fmt.Sprintf("relation \"%s\" does not exist", tableName)
 		c.sendError("ERROR", "42P01", errMsg)
 		c.setTxError()
-		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "42P01", errMsg, "simple")
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "42P01", errMsg, "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -3128,7 +3128,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		errMsg := fmt.Sprintf("failed to create temp file: %v", err)
 		c.sendError("ERROR", "58000", errMsg)
 		c.setTxError()
-		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "58000", errMsg, "simple")
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "58000", errMsg, "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -3165,7 +3165,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 				errMsg := fmt.Sprintf("failed to write to temp file: %v", err)
 				c.sendError("ERROR", "58000", errMsg)
 				c.setTxError()
-				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "58000", errMsg, "simple")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "58000", errMsg, "simple", nil)
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -3193,7 +3193,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
-				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple", nil)
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -3207,7 +3207,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			slog.Info("COPY FROM STDIN completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
 
 			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3218,7 +3218,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			exception := fmt.Sprintf("COPY failed: %s", errMsg)
 			c.sendError("ERROR", "57014", exception)
 			c.setTxError()
-			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "57014", exception, "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "57014", exception, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3227,7 +3227,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			errMsg := fmt.Sprintf("unexpected message type during COPY: %c", msgType)
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
-			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "08P01", errMsg, "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "08P01", errMsg, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3286,7 +3286,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 					errMsg := fmt.Sprintf("COPY failed: error reading CSV header: %v", err)
 					c.sendError("ERROR", "22P02", errMsg)
 					c.setTxError()
-					c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
+					c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple", nil)
 					_ = writeReadyForQuery(c.writer, c.txStatus)
 					_ = c.writer.Flush()
 					return nil
@@ -3319,7 +3319,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 
 			if len(rows) == 0 {
 				_ = writeCommandComplete(c.writer, "COPY 0")
-				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "", "", "simple")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "", "", "simple", nil)
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -3332,7 +3332,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
-				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple", nil)
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -3343,7 +3343,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			slog.Info("COPY FROM STDIN (BLOB fallback) completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
 
 			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3353,7 +3353,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			exception := fmt.Sprintf("COPY failed: %s", errMsg)
 			c.sendError("ERROR", "57014", exception)
 			c.setTxError()
-			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3362,7 +3362,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			errMsg := fmt.Sprintf("unexpected message type during COPY: %c", msgType)
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
-			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3410,7 +3410,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
-				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple", nil)
 				_ = writeReadyForQuery(c.writer, c.txStatus)
 				_ = c.writer.Flush()
 				return nil
@@ -3420,7 +3420,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			slog.Info("COPY FROM STDIN binary completed.", "user", c.username, "rows", rowCount, "bytes", buf.Len(), "duration", elapsed)
 
 			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
-			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3430,7 +3430,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			exception := fmt.Sprintf("COPY failed: %s", errMsg)
 			c.sendError("ERROR", "57014", exception)
 			c.setTxError()
-			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3439,7 +3439,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			errMsg := fmt.Sprintf("unexpected message type during COPY: %c", msgType)
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
-			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple")
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -4761,7 +4761,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
 				c.sendError("ERROR", "42000", err.Error())
 				c.setTxError()
-				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended", nil)
 				return
 			}
 		}
@@ -4772,7 +4772,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
 		_ = writeCommandComplete(c.writer, tag)
-		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, writtenRows, "", "", "extended")
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, writtenRows, "", "", "extended", c.executorMetrics())
 		return
 	}
 
@@ -4782,7 +4782,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended", nil)
 		return
 	}
 	defer func() { _ = rows.Close() }()
@@ -4792,7 +4792,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		slog.Error("Columns error.", "user", c.username, "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
-		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended", nil)
 		return
 	}
 
@@ -4831,7 +4831,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		if err := rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
-			c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+			c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended", nil)
 			return
 		}
 
@@ -4853,14 +4853,14 @@ func (c *clientConn) handleExecute(body []byte) {
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
-		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended", nil)
 		return
 	}
 
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
-	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")
+	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended", c.executorMetrics())
 }
 
 func (c *clientConn) handleClose(body []byte) {
@@ -5295,7 +5295,7 @@ func (c *clientConn) handleDeclareCursor(query string, stmt *pg_query.DeclareCur
 	innerSQL := deparseInnerQuery(stmt.Query)
 	if innerSQL == "" {
 		c.sendError("ERROR", "42601", "could not deparse cursor query")
-		c.logQuery(start, query, query, "DECLARE", 0, 0, "42601", "could not deparse cursor query", "simple")
+		c.logQuery(start, query, query, "DECLARE", 0, 0, "42601", "could not deparse cursor query", "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5309,7 +5309,7 @@ func (c *clientConn) handleDeclareCursor(query string, stmt *pg_query.DeclareCur
 		if err != nil {
 			errMsg := fmt.Sprintf("syntax error in cursor query: %v", err)
 			c.sendError("ERROR", "42601", errMsg)
-			c.logQuery(start, query, query, "DECLARE", 0, 0, "42601", errMsg, "simple")
+			c.logQuery(start, query, query, "DECLARE", 0, 0, "42601", errMsg, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -5327,7 +5327,7 @@ func (c *clientConn) handleDeclareCursor(query string, stmt *pg_query.DeclareCur
 	slog.Debug("Cursor declared.", "user", c.username, "cursor", stmt.Portalname, "query", transpiledSQL)
 
 	_ = writeCommandComplete(c.writer, "DECLARE CURSOR")
-	c.logQuery(start, query, query, "DECLARE", 0, 0, "", "", "simple")
+	c.logQuery(start, query, query, "DECLARE", 0, 0, "", "", "simple", nil)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
@@ -5339,7 +5339,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	// Validate direction
 	if !isFetchForwardOnly(stmt.Direction) {
 		c.sendError("ERROR", "0A000", "cursor can only scan forward")
-		c.logQuery(start, query, query, "FETCH", 0, 0, "0A000", "cursor can only scan forward", "simple")
+		c.logQuery(start, query, query, "FETCH", 0, 0, "0A000", "cursor can only scan forward", "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5349,7 +5349,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	if !ok {
 		errMsg := fmt.Sprintf("cursor %q does not exist", stmt.Portalname)
 		c.sendError("ERROR", "34000", errMsg)
-		c.logQuery(start, query, query, "FETCH", 0, 0, "34000", errMsg, "simple")
+		c.logQuery(start, query, query, "FETCH", 0, 0, "34000", errMsg, "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5366,7 +5366,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 			}
 			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
-			c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
+			c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -5377,7 +5377,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	howMany := stmt.HowMany
 	if howMany < 0 {
 		c.sendError("ERROR", "0A000", "cursor can only scan forward")
-		c.logQuery(start, query, query, "FETCH", 0, 0, "0A000", "cursor can only scan forward", "simple")
+		c.logQuery(start, query, query, "FETCH", 0, 0, "0A000", "cursor can only scan forward", "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5397,7 +5397,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 			moveCount++
 		}
 		_ = writeCommandComplete(c.writer, fmt.Sprintf("MOVE %d", moveCount))
-		c.logQuery(start, query, query, "FETCH", moveCount, 0, "", "", "simple")
+		c.logQuery(start, query, query, "FETCH", moveCount, 0, "", "", "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
@@ -5420,7 +5420,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 		if err := cursor.rows.Scan(valuePtrs...); err != nil {
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
-			c.logQuery(start, query, query, "FETCH", 0, 0, "42000", err.Error(), "simple")
+			c.logQuery(start, query, query, "FETCH", 0, 0, "42000", err.Error(), "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -5441,14 +5441,14 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple")
+		c.logQuery(start, query, query, "FETCH", 0, 0, errCode, errMsg, "simple", nil)
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
 		return nil
 	}
 
 	_ = writeCommandComplete(c.writer, fmt.Sprintf("FETCH %d", rowCount))
-	c.logQuery(start, query, query, "FETCH", rowCount, 0, "", "", "simple")
+	c.logQuery(start, query, query, "FETCH", rowCount, 0, "", "", "simple", nil)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil
@@ -5464,7 +5464,7 @@ func (c *clientConn) handleCloseCursor(query string, stmt *pg_query.ClosePortalS
 		if _, ok := c.cursors[stmt.Portalname]; !ok {
 			errMsg := fmt.Sprintf("cursor %q does not exist", stmt.Portalname)
 			c.sendError("ERROR", "34000", errMsg)
-			c.logQuery(start, query, query, "CLOSE", 0, 0, "34000", errMsg, "simple")
+			c.logQuery(start, query, query, "CLOSE", 0, 0, "34000", errMsg, "simple", nil)
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -5474,7 +5474,7 @@ func (c *clientConn) handleCloseCursor(query string, stmt *pg_query.ClosePortalS
 
 	slog.Debug("Cursor closed.", "user", c.username, "cursor", stmt.Portalname)
 	_ = writeCommandComplete(c.writer, "CLOSE CURSOR")
-	c.logQuery(start, query, query, "CLOSE", 0, 0, "", "", "simple")
+	c.logQuery(start, query, query, "CLOSE", 0, 0, "", "", "simple", nil)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
 	return nil

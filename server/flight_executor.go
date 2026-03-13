@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,6 +54,10 @@ type FlightExecutor struct {
 
 	ctx    context.Context    // base context for all requests
 	cancel context.CancelFunc // cancels the base context
+
+	// lastMetrics stores resource metrics from the most recent query,
+	// captured from gRPC response headers sent by the worker.
+	lastMetrics atomic.Pointer[QueryMetrics]
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -60,6 +65,12 @@ type FlightExecutor struct {
 // bearerToken is the authentication token for the duckdb-service.
 // sessionToken is the session identifier for the x-duckgres-session header.
 func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor, error) {
+	fe := &FlightExecutor{
+		alloc:        memory.DefaultAllocator,
+		ownsClient:   true,
+		sessionToken: sessionToken,
+	}
+
 	var dialOpts []grpc.DialOption
 	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
@@ -71,20 +82,63 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&bearerCreds{token: bearerToken}))
 	}
 
+	// Install interceptor to capture resource metrics from gRPC response headers
+	dialOpts = append(dialOpts, grpc.WithUnaryInterceptor(fe.metricsUnaryInterceptor))
+
 	client, err := flightsql.NewClient(addr, nil, nil, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("flight sql client: %w", err)
 	}
+	fe.client = client
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &FlightExecutor{
-		client:       client,
-		sessionToken: sessionToken,
-		alloc:        memory.DefaultAllocator,
-		ownsClient:   true,
-		ctx:          ctx,
-		cancel:       cancel,
-	}, nil
+	fe.ctx = ctx
+	fe.cancel = cancel
+	return fe, nil
+}
+
+// metricsUnaryInterceptor captures resource metrics from gRPC response headers.
+func (e *FlightExecutor) metricsUnaryInterceptor(
+	ctx context.Context,
+	method string,
+	req, reply any,
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	var headerMD metadata.MD
+	opts = append(opts, grpc.Header(&headerMD))
+	err := invoker(ctx, method, req, reply, cc, opts...)
+	if headerMD != nil {
+		e.parseMetricsFromHeaders(headerMD)
+	}
+	return err
+}
+
+// parseMetricsFromHeaders extracts resource metrics from gRPC metadata headers.
+func (e *FlightExecutor) parseMetricsFromHeaders(md metadata.MD) {
+	m := &QueryMetrics{}
+	if v := md.Get("x-duckgres-memory-bytes"); len(v) > 0 {
+		m.MemoryBytes, _ = strconv.ParseInt(v[0], 10, 64)
+	}
+	if v := md.Get("x-duckgres-cpu-time-us"); len(v) > 0 {
+		m.CPUTimeUs, _ = strconv.ParseInt(v[0], 10, 64)
+	}
+	if v := md.Get("x-duckgres-bytes-scanned"); len(v) > 0 {
+		m.BytesScanned, _ = strconv.ParseInt(v[0], 10, 64)
+	}
+	if v := md.Get("x-duckgres-bytes-written"); len(v) > 0 {
+		m.BytesWritten, _ = strconv.ParseInt(v[0], 10, 64)
+	}
+	if m.MemoryBytes != 0 || m.CPUTimeUs != 0 || m.BytesScanned != 0 || m.BytesWritten != 0 {
+		e.lastMetrics.Store(m)
+	}
+}
+
+// LastQueryMetrics returns the resource metrics from the most recent query.
+// Returns nil if no metrics are available.
+func (e *FlightExecutor) LastQueryMetrics() *QueryMetrics {
+	return e.lastMetrics.Load()
 }
 
 // NewFlightExecutorFromClient creates a FlightExecutor that shares an existing

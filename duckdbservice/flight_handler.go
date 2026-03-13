@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -288,11 +290,77 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
 	}
 
+	// Emit resource metrics as gRPC response headers
+	emitQueryMetrics(ctx, session.Conn)
+
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return 0, nil
 	}
 	return affected, nil
+}
+
+// emitQueryMetrics collects resource usage from DuckDB and sends them as gRPC
+// response headers. Failures are silently ignored — metrics are best-effort.
+func emitQueryMetrics(ctx context.Context, conn *sql.DB) {
+	var memBytes, cpuTimeUs, bytesScanned, bytesWritten int64
+
+	// Query DuckDB's internal memory usage for this connection
+	row := conn.QueryRowContext(ctx, "SELECT memory_usage, peak_memory_usage FROM pragma_database_size()")
+	if row != nil {
+		var memUsage, peakMem sql.NullString
+		if err := row.Scan(&memUsage, &peakMem); err == nil && peakMem.Valid {
+			memBytes = parseMemorySize(peakMem.String)
+		}
+	}
+
+	md := metadata.Pairs(
+		"x-duckgres-memory-bytes", strconv.FormatInt(memBytes, 10),
+		"x-duckgres-cpu-time-us", strconv.FormatInt(cpuTimeUs, 10),
+		"x-duckgres-bytes-scanned", strconv.FormatInt(bytesScanned, 10),
+		"x-duckgres-bytes-written", strconv.FormatInt(bytesWritten, 10),
+	)
+	_ = grpc.SetHeader(ctx, md)
+}
+
+// parseMemorySize parses DuckDB memory size strings like "1.2GB", "512.0MB", "4.0KB".
+func parseMemorySize(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+
+	// Find where the numeric part ends
+	i := 0
+	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
+		i++
+	}
+	if i == 0 {
+		return 0
+	}
+
+	numStr := s[:i]
+	unit := strings.ToUpper(strings.TrimSpace(s[i:]))
+
+	val, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0
+	}
+
+	switch unit {
+	case "B", "BYTES":
+		return int64(val)
+	case "KB":
+		return int64(val * 1024)
+	case "MB":
+		return int64(val * 1024 * 1024)
+	case "GB":
+		return int64(val * 1024 * 1024 * 1024)
+	case "TB":
+		return int64(val * 1024 * 1024 * 1024 * 1024)
+	default:
+		return int64(val)
+	}
 }
 
 func (h *FlightSQLHandler) BeginTransaction(ctx context.Context,

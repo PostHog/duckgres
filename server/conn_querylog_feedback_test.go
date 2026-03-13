@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
@@ -74,12 +75,23 @@ func (r *feedbackErrRows) Err() error {
 	return r.err
 }
 
-func newFeedbackClientConn(t *testing.T) (*clientConn, *QueryLogger, func()) {
+func newFeedbackClientConn(t *testing.T) (*clientConn, *queryLogWAL, func()) {
 	t.Helper()
+
+	dir := t.TempDir()
+	wal, err := newWAL(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	serverSide, clientSide := net.Pipe()
 	out := &bytes.Buffer{}
-	ql := &QueryLogger{ch: make(chan QueryLogEntry, 10)}
+	ql := &QueryLogger{
+		wal:  wal,
+		cfg:  QueryLogConfig{BatchSize: 1000},
+		done: make(chan struct{}),
+		stop: make(chan struct{}),
+	}
 	srv := &Server{activeQueries: make(map[BackendKey]context.CancelFunc), queryLogger: ql}
 	c := &clientConn{
 		server:   srv,
@@ -94,13 +106,32 @@ func newFeedbackClientConn(t *testing.T) (*clientConn, *QueryLogger, func()) {
 	cleanup := func() {
 		_ = clientSide.Close()
 		_ = serverSide.Close()
+		_ = wal.Close()
 	}
 
-	return c, ql, cleanup
+	return c, wal, cleanup
+}
+
+// readWALEntry reads the latest WAL entry, retrying briefly for async writes.
+func readWALEntry(t *testing.T, wal *queryLogWAL) QueryLogEntry {
+	t.Helper()
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		entries, err := wal.ReadAll()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) > 0 {
+			return entries[len(entries)-1]
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expected query log entry in WAL, got none")
+	return QueryLogEntry{} // unreachable
 }
 
 func TestHandleFetchCursorLogsMissingCursorError(t *testing.T) {
-	c, ql, cleanup := newFeedbackClientConn(t)
+	c, wal, cleanup := newFeedbackClientConn(t)
 	defer cleanup()
 
 	stmt := &pg_query.FetchStmt{
@@ -113,42 +144,34 @@ func TestHandleFetchCursorLogsMissingCursorError(t *testing.T) {
 		t.Fatalf("handleFetchCursor returned error: %v", err)
 	}
 
-	select {
-	case entry := <-ql.ch:
-		if entry.ExceptionCode != "34000" {
-			t.Fatalf("expected exception code 34000, got %q", entry.ExceptionCode)
-		}
-		if entry.Type != "ExceptionWhileProcessing" {
-			t.Fatalf("expected exception entry type, got %q", entry.Type)
-		}
-	default:
-		t.Fatal("expected query log entry for missing cursor error")
+	entry := readWALEntry(t, wal)
+	if entry.ExceptionCode != "34000" {
+		t.Fatalf("expected exception code 34000, got %q", entry.ExceptionCode)
+	}
+	if entry.Type != "ExceptionWhileProcessing" {
+		t.Fatalf("expected exception entry type, got %q", entry.Type)
 	}
 }
 
 func TestHandleCopyOutLogsSyntaxError(t *testing.T) {
-	c, ql, cleanup := newFeedbackClientConn(t)
+	c, wal, cleanup := newFeedbackClientConn(t)
 	defer cleanup()
 
 	if err := c.handleCopyOut("COPY TO STDOUT", "COPY TO STDOUT"); err != nil {
 		t.Fatalf("handleCopyOut returned error: %v", err)
 	}
 
-	select {
-	case entry := <-ql.ch:
-		if entry.ExceptionCode != "42601" {
-			t.Fatalf("expected exception code 42601, got %q", entry.ExceptionCode)
-		}
-		if entry.Type != "ExceptionWhileProcessing" {
-			t.Fatalf("expected exception entry type, got %q", entry.Type)
-		}
-	default:
-		t.Fatal("expected query log entry for COPY syntax error")
+	entry := readWALEntry(t, wal)
+	if entry.ExceptionCode != "42601" {
+		t.Fatalf("expected exception code 42601, got %q", entry.ExceptionCode)
+	}
+	if entry.Type != "ExceptionWhileProcessing" {
+		t.Fatalf("expected exception entry type, got %q", entry.Type)
 	}
 }
 
 func TestHandleExecuteLogsRowsErr(t *testing.T) {
-	c, ql, cleanup := newFeedbackClientConn(t)
+	c, wal, cleanup := newFeedbackClientConn(t)
 	defer cleanup()
 
 	c.executor = &feedbackExecutor{
@@ -167,15 +190,11 @@ func TestHandleExecuteLogsRowsErr(t *testing.T) {
 	// Execute body: empty portal name + maxRows=0
 	c.handleExecute([]byte{0, 0, 0, 0, 0})
 
-	select {
-	case entry := <-ql.ch:
-		if entry.ExceptionCode != "42000" {
-			t.Fatalf("expected exception code 42000, got %q", entry.ExceptionCode)
-		}
-		if entry.Exception != "row iteration failed" {
-			t.Fatalf("expected row iteration error, got %q", entry.Exception)
-		}
-	default:
-		t.Fatal("expected query log entry for rows.Err path")
+	entry := readWALEntry(t, wal)
+	if entry.ExceptionCode != "42000" {
+		t.Fatalf("expected exception code 42000, got %q", entry.ExceptionCode)
+	}
+	if entry.Exception != "row iteration failed" {
+		t.Fatalf("expected row iteration error, got %q", entry.Exception)
 	}
 }

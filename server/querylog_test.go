@@ -131,33 +131,42 @@ func TestTruncateQuery(t *testing.T) {
 	}
 }
 
-func TestQueryLogNonBlocking(t *testing.T) {
-	// Create a logger with a tiny channel to test non-blocking behavior
+func TestQueryLogWALBacked(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := newWAL(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+
 	ql := &QueryLogger{
-		ch:   make(chan QueryLogEntry, 1),
+		wal:  wal,
 		cfg:  QueryLogConfig{BatchSize: 1000},
 		done: make(chan struct{}),
+		stop: make(chan struct{}),
 	}
 
-	// Fill the channel
-	ql.ch <- QueryLogEntry{EventTime: time.Now(), Query: "first"}
+	// Log should succeed (WAL-backed, no drops)
+	ql.Log(QueryLogEntry{EventTime: time.Now(), Query: "first"})
+	ql.Log(QueryLogEntry{EventTime: time.Now(), Query: "second"})
 
-	// This should not block
-	done := make(chan bool, 1)
-	go func() {
-		ql.Log(QueryLogEntry{EventTime: time.Now(), Query: "second"})
-		done <- true
-	}()
-
-	select {
-	case <-done:
-		// Success - Log returned without blocking
-	case <-time.After(100 * time.Millisecond):
-		t.Error("Log() blocked when channel was full")
+	// Verify entries are in the WAL
+	entries, err := wal.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 WAL entries, got %d", len(entries))
 	}
 }
 
 func TestQueryLoggerStopIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := newWAL(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
@@ -170,8 +179,9 @@ func TestQueryLoggerStopIsIdempotent(t *testing.T) {
 			FlushInterval:   time.Hour,
 			CompactInterval: time.Hour,
 		},
-		ch:   make(chan QueryLogEntry, 1),
+		wal:  wal,
 		done: make(chan struct{}),
+		stop: make(chan struct{}),
 	}
 
 	go ql.flushLoop()

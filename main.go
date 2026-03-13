@@ -72,6 +72,8 @@ type QueryLogFileConfig struct {
 	BatchSize            int    `yaml:"batch_size"`              // max entries per batch INSERT
 	CompactInterval      string `yaml:"compact_interval"`        // e.g., "10m"
 	DataInliningRowLimit int    `yaml:"data_inlining_row_limit"` // DuckLake inlining threshold
+	WALMaxBytes          int64  `yaml:"wal_max_bytes"`           // Max WAL file size (default: 256MB)
+	GroupCommitInterval  string `yaml:"group_commit_interval"`   // e.g., "1ms"
 }
 
 type TLSConfig struct {
