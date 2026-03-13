@@ -35,24 +35,29 @@ type WorkerPool interface {
 	// onCrash handlers are called when a worker crash is detected.
 	HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash ...WorkerCrashHandler)
 
+	// SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
+	SetMaxWorkers(n int)
+
 	// ShutdownAll stops all workers gracefully.
 	ShutdownAll()
 }
 
 // K8sWorkerPoolConfig holds the configuration for creating a K8sWorkerPool.
 type K8sWorkerPoolConfig struct {
-	Namespace       string
-	CPID            string // Control plane pod name, used in labels
-	WorkerImage     string
-	WorkerPort      int
-	SecretName      string // K8s Secret name containing bearer token
-	ConfigMap       string // ConfigMap name for duckgres.yaml
-	MaxWorkers      int
-	IdleTimeout     time.Duration
-	ConfigPath      string // Path inside worker pod where config is mounted
-	ImagePullPolicy string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount  string // ServiceAccount name for worker pods (default: "default")
-	MemoryBudget    int64  // Total memory budget in bytes; used to derive per-worker resource limits
+	Namespace         string
+	CPID              string        // Control plane pod name, used in labels
+	WorkerImage       string
+	WorkerPort        int
+	SecretName        string        // K8s Secret name containing bearer token
+	ConfigMap         string        // ConfigMap name for duckgres.yaml
+	MaxWorkers        int
+	IdleTimeout       time.Duration
+	ConfigPath        string        // Path inside worker pod where config is mounted
+	ImagePullPolicy   string        // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount    string        // ServiceAccount name for worker pods (default: "default")
+	MemoryBudget      int64         // Total memory budget in bytes; used to derive per-worker resource limits
+	TeamName          string        // Team name for pod labels (multi-tenant mode)
+	WorkerIDGenerator func() int    // Shared ID generator across teams (nil = internal counter)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the
