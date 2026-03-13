@@ -49,7 +49,6 @@ var functionNameMapping = map[string]string{
 	"array_to_string": "array_to_string", // DuckDB has this
 
 	// Math functions
-	"log":    "log10", // PostgreSQL log() is base 10, ln() is natural
 	"cbrt":   "cbrt",  // same
 	"mod":    "mod",   // same (also %)
 	"trunc":  "trunc", // same
@@ -151,6 +150,7 @@ var specialFunctions = map[string]bool{
 	"regexp_matches": true, // return type differs
 	"array_agg":      true, // becomes list()
 	"string_to_array": true, // argument order
+	"log":             true, // 1-arg -> log10, 2-arg -> ln(value)/ln(base)
 }
 
 func (t *FunctionTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
@@ -158,6 +158,13 @@ func (t *FunctionTransform) Transform(tree *pg_query.ParseResult, result *Result
 
 	WalkFunc(tree, func(node *pg_query.Node) bool {
 		if fc := node.GetFuncCall(); fc != nil {
+			// 2-arg log(base, value) -> ln(value) / ln(base)
+			// Must happen here because it replaces the FuncCall node with an A_Expr
+			if t.isLogTwoArg(fc) {
+				t.replaceLogWithLnDivision(node, fc)
+				changed = true
+				return true
+			}
 			if t.transformFuncCall(fc) {
 				changed = true
 			}
@@ -261,6 +268,11 @@ func (t *FunctionTransform) handleSpecialFunction(fc *pg_query.FuncCall, funcNam
 		}
 		return true
 
+	case "log":
+		// 1-arg log(x) -> log10(x) (2-arg is handled in Transform before this)
+		renameFuncAndStripPrefix(fc, funcNameIdx, "log10")
+		return true
+
 	case "to_char":
 		return t.handleToChar(fc, funcNameIdx)
 
@@ -272,6 +284,49 @@ func (t *FunctionTransform) handleSpecialFunction(fc *pg_query.FuncCall, funcNam
 
 	default:
 		return false
+	}
+}
+
+// isLogTwoArg checks if a FuncCall is log() with exactly 2 arguments.
+func (t *FunctionTransform) isLogTwoArg(fc *pg_query.FuncCall) bool {
+	if len(fc.Funcname) == 0 || len(fc.Args) != 2 {
+		return false
+	}
+	for _, name := range fc.Funcname {
+		if str := name.GetString_(); str != nil && strings.ToLower(str.Sval) == "log" {
+			return true
+		}
+	}
+	return false
+}
+
+// replaceLogWithLnDivision replaces log(base, value) with ln(value) / ln(base).
+func (t *FunctionTransform) replaceLogWithLnDivision(node *pg_query.Node, fc *pg_query.FuncCall) {
+	base := fc.Args[0]
+	value := fc.Args[1]
+
+	makeLn := func(arg *pg_query.Node) *pg_query.Node {
+		return &pg_query.Node{
+			Node: &pg_query.Node_FuncCall{
+				FuncCall: &pg_query.FuncCall{
+					Funcname: []*pg_query.Node{
+						{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "ln"}}},
+					},
+					Args: []*pg_query.Node{arg},
+				},
+			},
+		}
+	}
+
+	node.Node = &pg_query.Node_AExpr{
+		AExpr: &pg_query.A_Expr{
+			Kind: pg_query.A_Expr_Kind_AEXPR_OP,
+			Name: []*pg_query.Node{
+				{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "/"}}},
+			},
+			Lexpr: makeLn(value),
+			Rexpr: makeLn(base),
+		},
 	}
 }
 

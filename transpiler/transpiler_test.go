@@ -1117,6 +1117,18 @@ func TestTranspile_FunctionMappings(t *testing.T) {
 			contains: "json_object",
 			excludes: "pg_catalog",
 		},
+		{
+			name:     "log(x) -> log10(x)",
+			input:    "SELECT log(x) FROM t",
+			contains: "log10(x)",
+			excludes: "log(",
+		},
+		{
+			name:     "log(base, value) -> ln(value) / ln(base)",
+			input:    "SELECT log(2, x) FROM t",
+			contains: "ln(x) / ln(2)",
+			excludes: "log(",
+		},
 	}
 
 	tr := New(DefaultConfig())
