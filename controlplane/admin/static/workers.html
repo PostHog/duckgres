@@ -34,6 +34,11 @@
     </main>
 
     <script>
+    function esc(s) {
+        const d = document.createElement('div');
+        d.appendChild(document.createTextNode(s));
+        return d.innerHTML;
+    }
     document.body.addEventListener('htmx:beforeSwap', function(evt) {
         if (evt.detail.target.id === 'worker-table') {
             try {
@@ -48,8 +53,8 @@
                     const statusColor = w.status === 'active' ? 'text-green-400' : 'text-yellow-400';
                     html += `<tr class="border-b border-gray-700">
                         <td class="p-3 font-mono">${w.id}</td>
-                        <td class="p-3">${w.team}</td>
-                        <td class="p-3 ${statusColor}">${w.status}</td>
+                        <td class="p-3">${esc(w.team)}</td>
+                        <td class="p-3 ${statusColor}">${esc(w.status)}</td>
                         <td class="p-3">${w.active_sessions}</td></tr>`;
                 });
                 html += '</tbody></table>';

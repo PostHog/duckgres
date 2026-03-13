@@ -35,6 +35,9 @@ type WorkerPool interface {
 	// onCrash handlers are called when a worker crash is detected.
 	HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash ...WorkerCrashHandler)
 
+	// SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
+	SetMaxWorkers(n int)
+
 	// ShutdownAll stops all workers gracefully.
 	ShutdownAll()
 }

@@ -1135,6 +1135,13 @@ func (p *K8sWorkerPool) podNameForWorker(id int) string {
 	return fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
 }
 
+// SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
+func (p *K8sWorkerPool) SetMaxWorkers(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.maxWorkers = n
+}
+
 func boolPtr(b bool) *bool       { return &b }
 func int64Ptr(i int64) *int64     { return &i }
 

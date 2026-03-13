@@ -4,8 +4,13 @@ package controlplane
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -37,13 +42,16 @@ func (a *teamRouterAdapter) AllTeamStats() []admin.TeamStatus {
 	stacks := a.router.AllStacks()
 	stats := make([]admin.TeamStatus, 0, len(stacks))
 	for name, stack := range stacks {
+		sessionCount := stack.Sessions.SessionCount()
 		stats = append(stats, admin.TeamStatus{
 			Name:           name,
-			ActiveSessions: stack.Sessions.SessionCount(),
+			ActiveSessions: sessionCount,
 			MaxWorkers:     stack.Config.MaxWorkers,
 			MinWorkers:     stack.Config.MinWorkers,
 			MemoryBudget:   stack.Config.MemoryBudget,
 		})
+		// Emit per-team Prometheus metrics
+		observeTeamSessionsActive(name, sessionCount)
 	}
 	return stats
 }
@@ -57,10 +65,15 @@ func (a *teamRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 		for _, s := range sessions {
 			sessionsByWorker[s.WorkerID]++
 		}
+		activeCount := 0
+		idleCount := 0
 		for wID, count := range sessionsByWorker {
 			status := "active"
 			if count == 0 {
 				status = "idle"
+				idleCount++
+			} else {
+				activeCount++
 			}
 			result = append(result, admin.WorkerStatus{
 				ID:             wID,
@@ -69,6 +82,9 @@ func (a *teamRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 				Status:         status,
 			})
 		}
+		// Emit per-team worker Prometheus metrics
+		observeTeamWorkersActive(name, activeCount)
+		observeTeamWorkersIdle(name, idleCount)
 	}
 	return result
 }
@@ -138,19 +154,45 @@ func SetupMultiTenant(
 	// Start polling
 	store.Start(context.Background())
 
+	// Resolve admin bearer token
+	adminToken := cfg.AdminToken
+	if adminToken == "" {
+		tokenBytes := make([]byte, 32)
+		if _, err := rand.Read(tokenBytes); err != nil {
+			return nil, nil, nil, fmt.Errorf("generate admin token: %w", err)
+		}
+		adminToken = hex.EncodeToString(tokenBytes)
+		slog.Info("Generated admin API token (pass via --admin-token or DUCKGRES_ADMIN_TOKEN to set explicitly).", "token", adminToken)
+	}
+
 	// Set up Gin admin server (replaces the simple metrics server)
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 
-	// Existing endpoints
+	// Existing endpoints (unauthenticated)
 	engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
 	engine.GET("/health", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// Admin API
-	api := engine.Group("/api/v1")
+	// Bearer token middleware for admin API
+	bearerAuth := func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+		if auth == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing Authorization header"})
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+			return
+		}
+		c.Next()
+	}
+
+	// Admin API (authenticated)
+	api := engine.Group("/api/v1", bearerAuth)
 	admin.RegisterAPI(api, store, adpt)
 
 	// Dashboard

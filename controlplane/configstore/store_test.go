@@ -2,10 +2,25 @@ package configstore
 
 import (
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
+
+func mustHash(t *testing.T, password string) string {
+	t.Helper()
+	hash, err := HashPassword(password)
+	if err != nil {
+		t.Fatalf("HashPassword(%q) failed: %v", password, err)
+	}
+	return hash
+}
 
 func TestSnapshotBuild(t *testing.T) {
 	// Verify TeamConfig construction from models
+	hash1 := mustHash(t, "secret1")
+	hash2 := mustHash(t, "secret2")
+	hash3 := mustHash(t, "secret3")
+
 	teams := []Team{
 		{
 			Name:         "analytics",
@@ -13,15 +28,15 @@ func TestSnapshotBuild(t *testing.T) {
 			MinWorkers:   1,
 			MemoryBudget: "8GB",
 			Users: []TeamUser{
-				{Username: "alice", Password: "secret1", TeamName: "analytics"},
-				{Username: "bob", Password: "secret2", TeamName: "analytics"},
+				{Username: "alice", Password: hash1, TeamName: "analytics"},
+				{Username: "bob", Password: hash2, TeamName: "analytics"},
 			},
 		},
 		{
 			Name:       "ingestion",
 			MaxWorkers: 2,
 			Users: []TeamUser{
-				{Username: "charlie", Password: "secret3", TeamName: "ingestion"},
+				{Username: "charlie", Password: hash3, TeamName: "ingestion"},
 			},
 		},
 	}
@@ -70,9 +85,22 @@ func TestSnapshotBuild(t *testing.T) {
 		t.Errorf("expected charlie in ingestion, got %s", snap.UserTeam["charlie"])
 	}
 
-	// Verify password mapping
-	if snap.UserPassword["alice"] != "secret1" {
-		t.Errorf("expected alice password=secret1, got %s", snap.UserPassword["alice"])
+	// Verify bcrypt password hashes are stored (not plaintext)
+	if err := bcrypt.CompareHashAndPassword([]byte(snap.UserPassword["alice"]), []byte("secret1")); err != nil {
+		t.Errorf("expected alice password hash to match 'secret1': %v", err)
+	}
+}
+
+func TestHashPassword(t *testing.T) {
+	hash, err := HashPassword("testpass")
+	if err != nil {
+		t.Fatalf("HashPassword failed: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("testpass")); err != nil {
+		t.Errorf("bcrypt.CompareHashAndPassword failed for correct password: %v", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("wrongpass")); err == nil {
+		t.Error("bcrypt.CompareHashAndPassword should have failed for wrong password")
 	}
 }
 

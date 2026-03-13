@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -170,18 +171,32 @@ func (cs *ConfigStore) Snapshot() *Snapshot {
 }
 
 // ValidateUser checks username/password against the cached snapshot.
-// Returns the team name and whether auth succeeded.
+// Passwords are compared using bcrypt. Returns the team name and whether auth succeeded.
 func (cs *ConfigStore) ValidateUser(username, password string) (string, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if cs.snapshot == nil {
 		return "", false
 	}
-	storedPassword, ok := cs.snapshot.UserPassword[username]
-	if !ok || storedPassword != password {
+	storedHash, ok := cs.snapshot.UserPassword[username]
+	if !ok {
+		// Spend time on a dummy bcrypt compare to avoid timing leaks on username enumeration.
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		return "", false
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)); err != nil {
 		return "", false
 	}
 	return cs.snapshot.UserTeam[username], true
+}
+
+// HashPassword hashes a plaintext password using bcrypt.
+func HashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("hash password: %w", err)
+	}
+	return string(hash), nil
 }
 
 // TeamForUser returns the team name for a user, or "" if not found.

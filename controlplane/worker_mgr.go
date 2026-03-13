@@ -817,6 +817,13 @@ func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 	p.releaseWorkerSocket(w)
 }
 
+// SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
+func (p *FlightWorkerPool) SetMaxWorkers(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.maxWorkers = n
+}
+
 // ShutdownAll stops all workers gracefully.
 func (p *FlightWorkerPool) ShutdownAll() {
 	p.mu.Lock()

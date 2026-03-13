@@ -40,6 +40,7 @@ type configCLIInputs struct {
 	MaxConnections            int
 	ConfigStoreConn           string
 	ConfigPollInterval        string
+	AdminToken                string
 	WorkerBackend             string
 	K8sWorkerImage            string
 	K8sWorkerNamespace        string
@@ -68,6 +69,7 @@ type resolvedConfig struct {
 	K8sWorkerServiceAccount  string
 	ConfigStoreConn      string
 	ConfigPollInterval   time.Duration
+	AdminToken           string
 }
 
 func defaultServerConfig() server.Config {
@@ -118,6 +120,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
 	var configStoreConn string
 	var configPollInterval time.Duration
+	var adminToken string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -547,6 +550,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_CONFIG_POLL_INTERVAL duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_ADMIN_TOKEN"); v != "" {
+		adminToken = v
+	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
 	}
@@ -739,6 +745,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid --config-poll-interval duration: " + err.Error())
 		}
 	}
+	if cli.Set["admin-token"] {
+		adminToken = cli.AdminToken
+	}
 	if cli.Set["worker-backend"] {
 		workerBackend = cli.WorkerBackend
 	}
@@ -833,5 +842,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
+		AdminToken:               adminToken,
 	}
 }

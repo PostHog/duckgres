@@ -34,6 +34,11 @@
     </main>
 
     <script>
+    function esc(s) {
+        const d = document.createElement('div');
+        d.appendChild(document.createTextNode(s));
+        return d.innerHTML;
+    }
     document.body.addEventListener('htmx:beforeSwap', function(evt) {
         if (evt.detail.target.id === 'session-table') {
             try {
@@ -47,7 +52,7 @@
                 sessions.forEach(s => {
                     html += `<tr class="border-b border-gray-700">
                         <td class="p-3 font-mono">${s.pid}</td>
-                        <td class="p-3">${s.team}</td>
+                        <td class="p-3">${esc(s.team)}</td>
                         <td class="p-3">${s.worker_id}</td></tr>`;
                 });
                 html += '</tbody></table>';

@@ -231,6 +231,7 @@ func main() {
 	// Config store flags (multi-tenant mode)
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := flag.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
+	adminToken := flag.String("admin-token", "", "Bearer token for admin API authentication (env: DUCKGRES_ADMIN_TOKEN)")
 
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -286,6 +287,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_ADMIN_TOKEN        Bearer token for admin API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -380,6 +382,7 @@ func main() {
 		MaxConnections:            *maxConnections,
 		ConfigStoreConn:           *configStore,
 		ConfigPollInterval:        *configPollInterval,
+		AdminToken:                *adminToken,
 		WorkerBackend:             *workerBackend,
 		K8sWorkerImage:            *k8sWorkerImage,
 		K8sWorkerNamespace:        *k8sWorkerNamespace,
@@ -517,6 +520,7 @@ func main() {
 			WorkerBackend:        resolved.WorkerBackend,
 			ConfigStoreConn:      resolved.ConfigStoreConn,
 			ConfigPollInterval:   resolved.ConfigPollInterval,
+			AdminToken:           resolved.AdminToken,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:     resolved.K8sWorkerImage,
 				WorkerNamespace: resolved.K8sWorkerNamespace,

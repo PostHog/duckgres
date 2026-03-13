@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
@@ -85,16 +86,34 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 	sessions := NewSessionManager(pool, rebalancer)
 	rebalancer.SetSessionLister(sessions)
 
-	// Start health check loop
+	// Start health check loop with per-team metrics
+	teamName := tc.Name
 	go pool.HealthCheckLoop(ctx, tr.globalCfg.HealthCheckInterval, func(workerID int) {
+		observeTeamWorkerCrash(teamName)
 		sessions.OnWorkerCrash(workerID, func(pid int32) {
-			slog.Warn("Session orphaned by worker crash.", "team", tc.Name, "pid", pid, "worker", workerID)
+			slog.Warn("Session orphaned by worker crash.", "team", teamName, "pid", pid, "worker", workerID)
 		})
 	})
+
+	// Periodic per-team metrics emission
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sessionCount := sessions.SessionCount()
+				observeTeamSessionsActive(teamName, sessionCount)
+			}
+		}
+	}()
 
 	// Pre-warm workers
 	if tc.MinWorkers > 0 {
 		go func() {
+			observeTeamWorkerSpawn(teamName)
 			if err := pool.SpawnMinWorkers(tc.MinWorkers); err != nil {
 				slog.Warn("Failed to pre-warm workers for team.", "team", tc.Name, "error", err)
 			}
@@ -182,6 +201,12 @@ func (tr *TeamRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			tr.mu.Lock()
 			if stack, ok := tr.teams[name]; ok {
 				stack.Config = newTC
+				// Propagate MaxWorkers to the pool so it enforces the new limit
+				maxWorkers := newTC.MaxWorkers
+				if maxWorkers == 0 {
+					maxWorkers = tr.baseCfg.MaxWorkers
+				}
+				stack.Pool.SetMaxWorkers(maxWorkers)
 			}
 			tr.mu.Unlock()
 		}

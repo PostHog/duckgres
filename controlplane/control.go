@@ -54,6 +54,10 @@ type ControlPlaneConfig struct {
 	// ConfigPollInterval is how often to poll the config store for changes.
 	// Default: 30s.
 	ConfigPollInterval time.Duration
+
+	// AdminToken is the bearer token required for admin API requests.
+	// When empty, a random token is generated and logged at startup.
+	AdminToken string
 }
 
 // K8sConfig holds Kubernetes worker backend configuration.

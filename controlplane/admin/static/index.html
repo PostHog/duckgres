@@ -42,6 +42,11 @@
     </main>
 
     <script>
+    function esc(s) {
+        const d = document.createElement('div');
+        d.appendChild(document.createTextNode(s));
+        return d.innerHTML;
+    }
     // Format API responses into HTML
     document.body.addEventListener('htmx:beforeSwap', function(evt) {
         if (evt.detail.target.id === 'status') {
@@ -73,10 +78,10 @@
                     '<th class="p-3">Name</th><th class="p-3">Users</th><th class="p-3">Max Workers</th><th class="p-3">Memory Budget</th></tr></thead><tbody>';
                 teams.forEach(t => {
                     html += `<tr class="border-b border-gray-700 hover:bg-gray-750">
-                        <td class="p-3 font-medium">${t.name}</td>
+                        <td class="p-3 font-medium">${esc(t.name)}</td>
                         <td class="p-3">${(t.users || []).length}</td>
                         <td class="p-3">${t.max_workers || 'unlimited'}</td>
-                        <td class="p-3">${t.memory_budget || 'default'}</td></tr>`;
+                        <td class="p-3">${esc(t.memory_budget || 'default')}</td></tr>`;
                 });
                 html += '</tbody></table>';
                 evt.detail.serverResponse = html;

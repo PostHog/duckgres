@@ -59,11 +59,16 @@
     </main>
 
     <script>
+    function esc(s) {
+        const d = document.createElement('div');
+        d.appendChild(document.createTextNode(s));
+        return d.innerHTML;
+    }
     function renderConfig(data) {
         let html = '<dl class="grid grid-cols-2 gap-2">';
         for (const [key, value] of Object.entries(data)) {
             if (key === 'updated_at') continue;
-            html += `<dt class="text-gray-400">${key}</dt><dd class="text-gray-100">${value === '' ? '-' : value}</dd>`;
+            html += `<dt class="text-gray-400">${esc(String(key))}</dt><dd class="text-gray-100">${value === '' ? '-' : esc(String(value))}</dd>`;
         }
         html += '</dl>';
         return html;

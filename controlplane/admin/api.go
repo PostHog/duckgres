@@ -198,9 +198,14 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
 		return
 	}
+	hash, err := configstore.HashPassword(raw.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+		return
+	}
 	user := configstore.TeamUser{
 		Username: raw.Username,
-		Password: raw.Password,
+		Password: hash,
 		TeamName: raw.TeamName,
 	}
 	if err := h.store.DB().Create(&user).Error; err != nil {
@@ -232,7 +237,12 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 	}
 	updates := map[string]interface{}{}
 	if raw.Password != "" {
-		updates["password"] = raw.Password
+		hash, err := configstore.HashPassword(raw.Password)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+			return
+		}
+		updates["password"] = hash
 	}
 	if raw.TeamName != "" {
 		updates["team_name"] = raw.TeamName
