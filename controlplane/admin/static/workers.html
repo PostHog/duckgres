@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Duckgres - Ducklings</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+    <nav class="bg-gray-800 border-b border-gray-700 px-6 py-3">
+        <div class="flex items-center justify-between max-w-7xl mx-auto">
+            <div class="flex items-center space-x-2">
+                <span class="text-xl font-bold text-yellow-400">Duckgres</span>
+                <span class="text-sm text-gray-400">Admin</span>
+            </div>
+            <div class="flex space-x-4">
+                <a href="/" class="text-gray-400 hover:text-gray-200">Overview</a>
+                <a href="/teams" class="text-gray-400 hover:text-gray-200">Teams</a>
+                <a href="/workers" class="text-yellow-400 hover:text-yellow-300 font-medium">Ducklings</a>
+                <a href="/sessions" class="text-gray-400 hover:text-gray-200">Sessions</a>
+                <a href="/settings" class="text-gray-400 hover:text-gray-200">Settings</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-6 py-8">
+        <h1 class="text-2xl font-bold mb-6">Ducklings (Workers)</h1>
+
+        <div id="worker-table" hx-get="/api/v1/workers" hx-trigger="load, every 5s" hx-swap="innerHTML"
+             class="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+            <div class="p-4 text-gray-400">Loading...</div>
+        </div>
+    </main>
+
+    <script>
+    document.body.addEventListener('htmx:beforeSwap', function(evt) {
+        if (evt.detail.target.id === 'worker-table') {
+            try {
+                const workers = JSON.parse(evt.detail.serverResponse);
+                if (!workers || workers.length === 0) {
+                    evt.detail.serverResponse = '<div class="p-4 text-gray-400">No active workers</div>';
+                    return;
+                }
+                let html = '<table class="w-full"><thead><tr class="text-left text-gray-400 text-sm border-b border-gray-700">' +
+                    '<th class="p-3">ID</th><th class="p-3">Team</th><th class="p-3">Status</th><th class="p-3">Sessions</th></tr></thead><tbody>';
+                workers.forEach(w => {
+                    const statusColor = w.status === 'active' ? 'text-green-400' : 'text-yellow-400';
+                    html += `<tr class="border-b border-gray-700">
+                        <td class="p-3 font-mono">${w.id}</td>
+                        <td class="p-3">${w.team}</td>
+                        <td class="p-3 ${statusColor}">${w.status}</td>
+                        <td class="p-3">${w.active_sessions}</td></tr>`;
+                });
+                html += '</tbody></table>';
+                evt.detail.serverResponse = html;
+            } catch(e) {}
+        }
+    });
+    </script>
+</body>
+</html>

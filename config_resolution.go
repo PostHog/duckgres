@@ -38,6 +38,8 @@ type configCLIInputs struct {
 	ACMEDNSProvider           string
 	ACMEDNSZoneID             string
 	MaxConnections            int
+	ConfigStoreConn           string
+	ConfigPollInterval        string
 	WorkerBackend             string
 	K8sWorkerImage            string
 	K8sWorkerNamespace        string
@@ -64,6 +66,8 @@ type resolvedConfig struct {
 	K8sWorkerConfigMap   string
 	K8sWorkerImagePullPolicy string
 	K8sWorkerServiceAccount  string
+	ConfigStoreConn      string
+	ConfigPollInterval   time.Duration
 }
 
 func defaultServerConfig() server.Config {
@@ -112,6 +116,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
+	var configStoreConn string
+	var configPollInterval time.Duration
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -531,6 +537,16 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_MAX_CONNECTIONS: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_CONFIG_STORE"); v != "" {
+		configStoreConn = v
+	}
+	if v := getenv("DUCKGRES_CONFIG_POLL_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			configPollInterval = d
+		} else {
+			warn("Invalid DUCKGRES_CONFIG_POLL_INTERVAL duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
 	}
@@ -713,6 +729,16 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["max-connections"] {
 		cfg.RateLimit.MaxConnections = cli.MaxConnections
 	}
+	if cli.Set["config-store"] {
+		configStoreConn = cli.ConfigStoreConn
+	}
+	if cli.Set["config-poll-interval"] {
+		if d, err := time.ParseDuration(cli.ConfigPollInterval); err == nil {
+			configPollInterval = d
+		} else {
+			warn("Invalid --config-poll-interval duration: " + err.Error())
+		}
+	}
 	if cli.Set["worker-backend"] {
 		workerBackend = cli.WorkerBackend
 	}
@@ -805,5 +831,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerConfigMap:       k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy: k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
+		ConfigStoreConn:          configStoreConn,
+		ConfigPollInterval:       configPollInterval,
 	}
 }

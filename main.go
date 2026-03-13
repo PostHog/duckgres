@@ -228,6 +228,10 @@ func main() {
 	k8sWorkerImagePullPolicy := flag.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
 	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "ServiceAccount name for K8s worker pods (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 
+	// Config store flags (multi-tenant mode)
+	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
+	configPollInterval := flag.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
+
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
 	acmeEmail := flag.String("acme-email", "", "Contact email for Let's Encrypt notifications (env: DUCKGRES_ACME_EMAIL)")
@@ -280,6 +284,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_LISTEN      DuckDB service listen address (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_TOKEN       DuckDB service bearer token (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -372,6 +378,8 @@ func main() {
 		ACMEDNSProvider:           *acmeDNSProvider,
 		ACMEDNSZoneID:             *acmeDNSZoneID,
 		MaxConnections:            *maxConnections,
+		ConfigStoreConn:           *configStore,
+		ConfigPollInterval:        *configPollInterval,
 		WorkerBackend:             *workerBackend,
 		K8sWorkerImage:            *k8sWorkerImage,
 		K8sWorkerNamespace:        *k8sWorkerNamespace,
@@ -506,7 +514,9 @@ func main() {
 			WorkerIdleTimeout:    resolved.WorkerIdleTimeout,
 			HandoverDrainTimeout: resolved.HandoverDrainTimeout,
 			MetricsServer:        metricsSrv,
-			WorkerBackend:         resolved.WorkerBackend,
+			WorkerBackend:        resolved.WorkerBackend,
+			ConfigStoreConn:      resolved.ConfigStoreConn,
+			ConfigPollInterval:   resolved.ConfigPollInterval,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:     resolved.K8sWorkerImage,
 				WorkerNamespace: resolved.K8sWorkerNamespace,

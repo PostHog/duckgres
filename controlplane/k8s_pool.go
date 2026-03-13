@@ -50,9 +50,11 @@ type K8sWorkerPool struct {
 	configPath      string
 	imagePullPolicy corev1.PullPolicy
 	serviceAccount  string
-	memoryBudget    int64 // total memory budget in bytes
-	cachedToken     string // cached bearer token (immutable after setup)
-	informer        cache.SharedIndexInformer
+	memoryBudget      int64  // total memory budget in bytes
+	teamName          string // team name for pod labels (multi-tenant mode)
+	workerIDGenerator func() int // shared ID generator across teams (nil = internal counter)
+	cachedToken       string // cached bearer token (immutable after setup)
+	informer          cache.SharedIndexInformer
 	stopInform      chan struct{}
 	spawnSem        chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
 	podReady        sync.Map     // podName -> chan string (pod IP); signaled by informer
@@ -102,23 +104,25 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
 	spawnConcurrency := 3
 	pool := &K8sWorkerPool{
-		workers:         make(map[int]*ManagedWorker),
-		maxWorkers:      cfg.MaxWorkers,
-		idleTimeout:     cfg.IdleTimeout,
-		shutdownCh:      make(chan struct{}),
-		stopInform:      make(chan struct{}),
-		clientset:       clientset,
-		namespace:       cfg.Namespace,
-		cpID:            cfg.CPID,
-		workerImage:     cfg.WorkerImage,
-		workerPort:      cfg.WorkerPort,
-		secretName:      cfg.SecretName,
-		configMap:       cfg.ConfigMap,
-		configPath:      cfg.ConfigPath,
-		imagePullPolicy: corev1.PullPolicy(cfg.ImagePullPolicy),
-		serviceAccount:  cfg.ServiceAccount,
-		memoryBudget:    cfg.MemoryBudget,
-		spawnSem:        make(chan struct{}, spawnConcurrency),
+		workers:           make(map[int]*ManagedWorker),
+		maxWorkers:        cfg.MaxWorkers,
+		idleTimeout:       cfg.IdleTimeout,
+		shutdownCh:        make(chan struct{}),
+		stopInform:        make(chan struct{}),
+		clientset:         clientset,
+		namespace:         cfg.Namespace,
+		cpID:              cfg.CPID,
+		workerImage:       cfg.WorkerImage,
+		workerPort:        cfg.WorkerPort,
+		secretName:        cfg.SecretName,
+		configMap:         cfg.ConfigMap,
+		configPath:        cfg.ConfigPath,
+		imagePullPolicy:   corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:    cfg.ServiceAccount,
+		memoryBudget:      cfg.MemoryBudget,
+		teamName:          cfg.TeamName,
+		workerIDGenerator: cfg.WorkerIDGenerator,
+		spawnSem:          make(chan struct{}, spawnConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
@@ -234,12 +238,16 @@ func (p *K8sWorkerPool) readBearerToken(ctx context.Context) (string, error) {
 
 // startInformer starts a SharedIndexInformer to watch worker pods.
 func (p *K8sWorkerPool) startInformer() {
+	labelSelector := fmt.Sprintf("duckgres/control-plane=%s", p.cpID)
+	if p.teamName != "" {
+		labelSelector += fmt.Sprintf(",duckgres/team=%s", p.teamName)
+	}
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		p.clientset,
 		30*time.Second,
 		informers.WithNamespace(p.namespace),
 		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
-			opts.LabelSelector = fmt.Sprintf("duckgres/control-plane=%s", p.cpID)
+			opts.LabelSelector = labelSelector
 		}),
 	)
 	p.informer = factory.Core().V1().Pods().Informer()
@@ -335,7 +343,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		return fmt.Errorf("read bearer token: %w", err)
 	}
 
-	podName := fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
+	podName := p.podNameForWorker(id)
 
 	// Build owner references for GC on CP deletion
 	var ownerRefs []metav1.OwnerReference
@@ -350,16 +358,22 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		}
 	}
 
+	// Build pod labels
+	podLabels := map[string]string{
+		"app":                    "duckgres-worker",
+		"duckgres/control-plane": p.cpID,
+		"duckgres/worker-id":     strconv.Itoa(id),
+	}
+	if p.teamName != "" {
+		podLabels["duckgres/team"] = p.teamName
+	}
+
 	// Build pod spec
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: p.namespace,
-			Labels: map[string]string{
-				"app":                    "duckgres-worker",
-				"duckgres/control-plane": p.cpID,
-				"duckgres/worker-id":     strconv.Itoa(id),
-			},
+			Name:            podName,
+			Namespace:       p.namespace,
+			Labels:          podLabels,
 			OwnerReferences: ownerRefs,
 		},
 		Spec: corev1.PodSpec{
@@ -627,8 +641,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 			if w != nil {
 				w.activeSessions++
 				if canSpawn {
-					id := p.nextWorkerID
-					p.nextWorkerID++
+					id := p.allocateWorkerIDLocked()
 					p.spawning++
 					p.mu.Unlock()
 					slog.Debug("Assigned to least-loaded worker, spawning new worker in background.",
@@ -645,8 +658,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 
 		// 3. No live workers at all (cold start or all dead) — must block on spawn
 		if canSpawn {
-			id := p.nextWorkerID
-			p.nextWorkerID++
+			id := p.allocateWorkerIDLocked()
 			p.spawning++
 			p.mu.Unlock()
 
@@ -849,7 +861,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							_ = w.client.Close()
 						}
 						// Delete the failed pod from K8s
-						podName := fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, w.ID)
+						podName := p.podNameForWorker(w.ID)
 						delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
 						_ = p.clientset.CoreV1().Pods(p.namespace).Delete(delCtx, podName, metav1.DeleteOptions{
 							GracePeriodSeconds: int64Ptr(0),
@@ -893,7 +905,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 										h(w.ID)
 									}
 									// Delete the pod to force cleanup
-									podName := fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, w.ID)
+									podName := p.podNameForWorker(w.ID)
 									_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 										GracePeriodSeconds: int64Ptr(10),
 									})
@@ -934,7 +946,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 
 	ctx := context.Background()
 	for _, w := range workers {
-		podName := fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, w.ID)
+		podName := p.podNameForWorker(w.ID)
 		gracePeriod := int64(10)
 		slog.Info("Shutting down K8s worker.", "id", w.ID, "pod", podName)
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
@@ -957,7 +969,7 @@ func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
 	if w.client != nil {
 		_ = w.client.Close()
 	}
-	podName := fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
+	podName := p.podNameForWorker(id)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
@@ -1065,7 +1077,7 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 			}
 			// Delete the failed pod from K8s to avoid accumulating terminated pods
 			go func(workerID int) {
-				podName := fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, workerID)
+				podName := p.podNameForWorker(workerID)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
@@ -1101,6 +1113,27 @@ func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 }
 
 // --- Helpers ---
+
+// allocateWorkerID returns the next worker ID, using the shared generator
+// if configured (multi-tenant mode) or the pool's internal counter.
+// Must be called with p.mu held.
+func (p *K8sWorkerPool) allocateWorkerIDLocked() int {
+	if p.workerIDGenerator != nil {
+		return p.workerIDGenerator()
+	}
+	id := p.nextWorkerID
+	p.nextWorkerID++
+	return id
+}
+
+// podNameForWorker returns the pod name for a given worker ID,
+// including the team name if set (multi-tenant mode).
+func (p *K8sWorkerPool) podNameForWorker(id int) string {
+	if p.teamName != "" {
+		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.teamName, id)
+	}
+	return fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
+}
 
 func boolPtr(b bool) *bool       { return &b }
 func int64Ptr(i int64) *int64     { return &i }

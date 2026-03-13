@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Duckgres Admin</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+    <nav class="bg-gray-800 border-b border-gray-700 px-6 py-3">
+        <div class="flex items-center justify-between max-w-7xl mx-auto">
+            <div class="flex items-center space-x-2">
+                <span class="text-xl font-bold text-yellow-400">Duckgres</span>
+                <span class="text-sm text-gray-400">Admin</span>
+            </div>
+            <div class="flex space-x-4">
+                <a href="/" class="text-yellow-400 hover:text-yellow-300 font-medium">Overview</a>
+                <a href="/teams" class="text-gray-400 hover:text-gray-200">Teams</a>
+                <a href="/workers" class="text-gray-400 hover:text-gray-200">Ducklings</a>
+                <a href="/sessions" class="text-gray-400 hover:text-gray-200">Sessions</a>
+                <a href="/settings" class="text-gray-400 hover:text-gray-200">Settings</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-6 py-8">
+        <h1 class="text-2xl font-bold mb-6">Cluster Overview</h1>
+
+        <div id="status" hx-get="/api/v1/status" hx-trigger="load, every 5s" hx-swap="innerHTML"
+             class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                <div class="text-gray-400 text-sm">Loading...</div>
+            </div>
+        </div>
+
+        <h2 class="text-xl font-semibold mb-4">Teams</h2>
+        <div id="team-list" hx-get="/api/v1/teams" hx-trigger="load, every 10s" hx-swap="innerHTML"
+             class="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+            <div class="p-4 text-gray-400">Loading teams...</div>
+        </div>
+    </main>
+
+    <script>
+    // Format API responses into HTML
+    document.body.addEventListener('htmx:beforeSwap', function(evt) {
+        if (evt.detail.target.id === 'status') {
+            try {
+                const data = JSON.parse(evt.detail.serverResponse);
+                evt.detail.serverResponse = `
+                    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                        <div class="text-3xl font-bold text-yellow-400">${data.total_teams}</div>
+                        <div class="text-gray-400 text-sm mt-1">Teams</div>
+                    </div>
+                    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                        <div class="text-3xl font-bold text-green-400">${data.total_workers}</div>
+                        <div class="text-gray-400 text-sm mt-1">Ducklings</div>
+                    </div>
+                    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                        <div class="text-3xl font-bold text-blue-400">${data.total_sessions}</div>
+                        <div class="text-gray-400 text-sm mt-1">Active Sessions</div>
+                    </div>`;
+            } catch(e) {}
+        }
+        if (evt.detail.target.id === 'team-list') {
+            try {
+                const teams = JSON.parse(evt.detail.serverResponse);
+                if (!teams || teams.length === 0) {
+                    evt.detail.serverResponse = '<div class="p-4 text-gray-400">No teams configured</div>';
+                    return;
+                }
+                let html = '<table class="w-full"><thead><tr class="text-left text-gray-400 text-sm border-b border-gray-700">' +
+                    '<th class="p-3">Name</th><th class="p-3">Users</th><th class="p-3">Max Workers</th><th class="p-3">Memory Budget</th></tr></thead><tbody>';
+                teams.forEach(t => {
+                    html += `<tr class="border-b border-gray-700 hover:bg-gray-750">
+                        <td class="p-3 font-medium">${t.name}</td>
+                        <td class="p-3">${(t.users || []).length}</td>
+                        <td class="p-3">${t.max_workers || 'unlimited'}</td>
+                        <td class="p-3">${t.memory_budget || 'default'}</td></tr>`;
+                });
+                html += '</tbody></table>';
+                evt.detail.serverResponse = html;
+            } catch(e) {}
+        }
+    });
+    </script>
+</body>
+</html>
