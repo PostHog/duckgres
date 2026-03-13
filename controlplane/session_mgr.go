@@ -60,11 +60,15 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	observeControlPlaneWorkerQueueDepthDelta(1)
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 
+	acquireStart := time.Now()
+	slog.Debug("Acquiring worker for session.", "pid", pid, "user", username)
 	worker, err := sm.pool.AcquireWorker(ctx)
 	if err != nil {
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
+	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
+	createStart := time.Now()
 	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
 	if err != nil {
 		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker
@@ -92,7 +96,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
 	sm.mu.Unlock()
 
-	slog.Debug("Session created.", "pid", pid, "worker", worker.ID, "user", username)
+	slog.Debug("Session created on worker.", "pid", pid, "worker", worker.ID, "user", username, "create_duration", time.Since(createStart))
 
 	// Update other sessions if rebalancing is enabled.
 	if sm.rebalancer != nil {
@@ -141,8 +145,11 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		_ = session.Executor.Close()
 	}
 
-	// Destroy session on worker. This also recycles the DuckDB instance,
-	// so the worker is only released after it has a fresh DB ready.
+	// Destroy session on worker (best effort, skip if worker already dead).
+	// This must complete BEFORE ReleaseWorker so the next session doesn't
+	// overlap with cleanup on the shared DuckDB instance (MaxOpenConns=1
+	// enforces single-session isolation; releasing early would let a new
+	// session block on db.Conn() or, worse, share catalog state).
 	worker, ok := sm.pool.Worker(session.WorkerID)
 	if ok {
 		select {
@@ -155,7 +162,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Release the worker for reuse AFTER the DuckDB instance has been recycled.
+	// Release the worker for reuse after cleanup is complete.
 	sm.pool.ReleaseWorker(session.WorkerID)
 
 	slog.Info("Session destroyed, worker recycled.", "pid", pid, "worker", session.WorkerID)

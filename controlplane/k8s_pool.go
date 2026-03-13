@@ -54,6 +54,8 @@ type K8sWorkerPool struct {
 	cachedToken     string // cached bearer token (immutable after setup)
 	informer        cache.SharedIndexInformer
 	stopInform      chan struct{}
+	spawnSem        chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
+	podReady        sync.Map     // podName -> chan string (pod IP); signaled by informer
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -62,6 +64,10 @@ func NewK8sWorkerPool(cfg K8sWorkerPoolConfig) (*K8sWorkerPool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load in-cluster config: %w", err)
 	}
+	// Default client-go limits are 5 QPS / burst 10, which triggers
+	// client-side throttling when spawning multiple workers concurrently.
+	restCfg.QPS = 50
+	restCfg.Burst = 100
 	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create kubernetes client: %w", err)
@@ -93,6 +99,8 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		cfg.ConfigPath = "/etc/duckgres/duckgres.yaml"
 	}
 
+	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
+	spawnConcurrency := 3
 	pool := &K8sWorkerPool{
 		workers:         make(map[int]*ManagedWorker),
 		maxWorkers:      cfg.MaxWorkers,
@@ -110,6 +118,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		imagePullPolicy: corev1.PullPolicy(cfg.ImagePullPolicy),
 		serviceAccount:  cfg.ServiceAccount,
 		memoryBudget:    cfg.MemoryBudget,
+		spawnSem:        make(chan struct{}, spawnConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
@@ -241,8 +250,21 @@ func (p *K8sWorkerPool) startInformer() {
 			if !ok {
 				return
 			}
+			// Signal pod readiness to waiters (replaces polling waitForPodIP)
+			if newPod.Status.PodIP != "" && newPod.Status.Phase == corev1.PodRunning {
+				if ch, ok := p.podReady.LoadAndDelete(newPod.Name); ok {
+					select {
+					case ch.(chan string) <- newPod.Status.PodIP:
+					default:
+					}
+				}
+			}
 			// Detect pod phase transition to Failed/Succeeded (crash/OOM)
 			if newPod.Status.Phase == corev1.PodFailed || newPod.Status.Phase == corev1.PodSucceeded {
+				// Unblock any waiter with an error signal
+				if ch, ok := p.podReady.LoadAndDelete(newPod.Name); ok {
+					close(ch.(chan string))
+				}
 				p.onPodTerminated(newPod)
 			}
 		},
@@ -257,6 +279,9 @@ func (p *K8sWorkerPool) startInformer() {
 				if !ok {
 					return
 				}
+			}
+			if ch, loaded := p.podReady.LoadAndDelete(pod.Name); loaded {
+				close(ch.(chan string))
 			}
 			p.onPodTerminated(pod)
 		},
@@ -294,7 +319,17 @@ func (p *K8sWorkerPool) onPodTerminated(pod *corev1.Pod) {
 }
 
 // SpawnWorker creates a new worker pod and waits for it to become ready.
+// It acquires the spawn semaphore to limit concurrent K8s API calls and
+// retries transient API errors with exponential backoff.
 func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
+	// Acquire spawn semaphore to limit concurrent pod creates.
+	select {
+	case p.spawnSem <- struct{}{}:
+		defer func() { <-p.spawnSem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	token, err := p.readBearerToken(ctx)
 	if err != nil {
 		return fmt.Errorf("read bearer token: %w", err)
@@ -411,15 +446,14 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		GracePeriodSeconds: int64Ptr(0),
 	})
 
-	_, err = p.clientset.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{})
-	if err != nil {
-		return fmt.Errorf("create worker pod %s: %w", podName, err)
+	// Create pod with exponential backoff on transient errors.
+	if err := p.createPodWithBackoff(ctx, pod); err != nil {
+		return err
 	}
 
-	// Wait for pod to get an IP and become ready
-	podIP, err := p.waitForPodIP(ctx, podName, 60*time.Second)
+	// Wait for pod to get an IP via informer (no polling).
+	podIP, err := p.waitForPodReady(ctx, podName, 90*time.Second)
 	if err != nil {
-		// Clean up the failed pod
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
 		})
@@ -428,7 +462,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 
 	// Connect gRPC client
 	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
-	client, err := waitForWorkerTCP(addr, token, 30*time.Second)
+	client, err := waitForWorkerTCP(addr, token, 90*time.Second)
 	if err != nil {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
@@ -454,30 +488,67 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	return nil
 }
 
-// waitForPodIP polls for the pod to have a PodIP assigned and be in Running phase.
-func (p *K8sWorkerPool) waitForPodIP(ctx context.Context, podName string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
-		if err != nil {
-			return "", fmt.Errorf("get pod %s: %w", podName, err)
-		}
+// createPodWithBackoff creates a pod, retrying transient K8s API errors
+// with exponential backoff (500ms, 1s, 2s, 4s).
+func (p *K8sWorkerPool) createPodWithBackoff(ctx context.Context, pod *corev1.Pod) error {
+	backoff := 500 * time.Millisecond
+	const maxRetries = 4
 
-		if pod.Status.Phase == corev1.PodFailed {
-			return "", fmt.Errorf("pod %s failed", podName)
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		_, err := p.clientset.CoreV1().Pods(p.namespace).Create(ctx, pod, metav1.CreateOptions{})
+		if err == nil {
+			return nil
 		}
-
-		if pod.Status.PodIP != "" && pod.Status.Phase == corev1.PodRunning {
-			return pod.Status.PodIP, nil
+		// Don't retry on permanent errors (invalid spec, quota exceeded, etc.)
+		if errors.IsInvalid(err) || errors.IsForbidden(err) || errors.IsAlreadyExists(err) {
+			return fmt.Errorf("create worker pod %s: %w", pod.Name, err)
 		}
-
+		if attempt == maxRetries {
+			return fmt.Errorf("create worker pod %s after %d retries: %w", pod.Name, maxRetries, err)
+		}
+		slog.Warn("Transient K8s API error creating pod, retrying.",
+			"pod", pod.Name, "attempt", attempt+1, "backoff", backoff, "error", err)
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+			return ctx.Err()
+		case <-time.After(backoff):
 		}
+		backoff *= 2
 	}
-	return "", fmt.Errorf("timeout waiting for pod %s IP", podName)
+	return nil // unreachable
+}
+
+// waitForPodReady waits for a pod to become Running with an IP, using the
+// informer instead of polling the API. Falls back to a single API check
+// in case the informer event fired before we registered the channel.
+func (p *K8sWorkerPool) waitForPodReady(ctx context.Context, podName string, timeout time.Duration) (string, error) {
+	ch := make(chan string, 1)
+	p.podReady.Store(podName, ch)
+	defer p.podReady.Delete(podName)
+
+	// Check once in case the pod is already running (informer event already fired).
+	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err == nil && pod.Status.PodIP != "" && pod.Status.Phase == corev1.PodRunning {
+		return pod.Status.PodIP, nil
+	}
+	if err == nil && pod.Status.Phase == corev1.PodFailed {
+		return "", fmt.Errorf("pod %s failed", podName)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case ip, ok := <-ch:
+		if !ok || ip == "" {
+			return "", fmt.Errorf("pod %s failed or was deleted", podName)
+		}
+		return ip, nil
+	case <-timer.C:
+		return "", fmt.Errorf("timeout waiting for pod %s to become ready", podName)
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 // waitForWorkerTCP connects to a worker over TCP and verifies its health.
@@ -541,17 +612,21 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 		if idle != nil {
 			idle.activeSessions++
 			p.mu.Unlock()
+			slog.Debug("Reusing idle worker.", "worker", idle.ID, "active_sessions", idle.activeSessions)
 			return idle, nil
 		}
 
-		// 2. If below the process cap, spawn a new worker
+		// 2. No idle worker — spawn a new one if below capacity.
 		liveCount := p.liveWorkerCountLocked()
-		if p.maxWorkers == 0 || liveCount < p.maxWorkers {
+		canSpawn := p.maxWorkers == 0 || liveCount < p.maxWorkers
+
+		if canSpawn {
 			id := p.nextWorkerID
 			p.nextWorkerID++
 			p.spawning++
 			p.mu.Unlock()
 
+			slog.Info("No live workers, blocking on spawn.", "worker", id)
 			err := p.SpawnWorker(ctx, id)
 
 			p.mu.Lock()
