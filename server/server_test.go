@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -309,6 +311,103 @@ func TestStartCredentialRefresh_RollbackAndRetryWhenNoActiveTransaction(t *testi
 	}
 }
 
+func TestOpenBaseDBInMemoryByDefault(t *testing.T) {
+	cfg := Config{}
+	db, err := openBaseDB(cfg, "testuser")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var dbName string
+	err = db.QueryRow("SELECT current_database()").Scan(&dbName)
+	if err != nil {
+		t.Fatalf("failed to query current_database(): %v", err)
+	}
+	if dbName != "memory" {
+		t.Fatalf("expected in-memory database (current_database()='memory'), got %q", dbName)
+	}
+}
+
+func TestOpenBaseDBFilePersistence(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         dataDir,
+	}
+	db, err := openBaseDB(cfg, "alice")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+
+	// Write data
+	if _, err := db.Exec("CREATE TABLE test_persist (id INTEGER)"); err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO test_persist VALUES (42)"); err != nil {
+		t.Fatalf("failed to insert: %v", err)
+	}
+	_ = db.Close()
+
+	// Reopen the same file and verify data survives
+	db2, err := openBaseDB(cfg, "alice")
+	if err != nil {
+		t.Fatalf("openBaseDB (reopen) failed: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	var val int
+	err = db2.QueryRow("SELECT id FROM test_persist").Scan(&val)
+	if err != nil {
+		t.Fatalf("failed to read persisted data: %v", err)
+	}
+	if val != 42 {
+		t.Fatalf("expected persisted value 42, got %d", val)
+	}
+}
+
+func TestOpenBaseDBFilePersistenceFallsBackWithoutDataDir(t *testing.T) {
+	cfg := Config{
+		FilePersistence: true,
+		// DataDir intentionally empty
+	}
+	db, err := openBaseDB(cfg, "testuser")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var dbName string
+	err = db.QueryRow("SELECT current_database()").Scan(&dbName)
+	if err != nil {
+		t.Fatalf("failed to query current_database(): %v", err)
+	}
+	if dbName != "memory" {
+		t.Fatalf("expected fallback to in-memory when DataDir is empty, got %q", dbName)
+	}
+}
+
+func TestOpenBaseDBFilePersistenceFallsBackWithoutUsername(t *testing.T) {
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         t.TempDir(),
+	}
+	db, err := openBaseDB(cfg, "")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var dbName string
+	err = db.QueryRow("SELECT current_database()").Scan(&dbName)
+	if err != nil {
+		t.Fatalf("failed to query current_database(): %v", err)
+	}
+	if dbName != "memory" {
+		t.Fatalf("expected fallback to in-memory when username is empty, got %q", dbName)
+	}
+}
+
 func TestHasCacheHTTPFS(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -331,5 +430,120 @@ func TestHasCacheHTTPFS(t *testing.T) {
 				t.Errorf("hasCacheHTTPFS(%v) = %v, want %v", tt.extensions, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestOpenBaseDBFilePersistenceRejectsPathTraversal(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         dataDir,
+	}
+
+	cases := []struct {
+		name     string
+		username string
+	}{
+		{"parent directory", "../etc/evil"},
+		{"slash in name", "foo/bar"},
+		{"backslash dot-dot", "..\\windows"},
+		{"dot-dot between names", "alice/../bob"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := openBaseDB(cfg, tc.username)
+			if err == nil {
+				_ = db.Close()
+				t.Fatalf("expected error for username %q, got nil", tc.username)
+			}
+			if !strings.Contains(err.Error(), "invalid username for file persistence") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestOpenBaseDBCreatesDataDir(t *testing.T) {
+	base := t.TempDir()
+	nested := filepath.Join(base, "deep", "nested", "dir")
+
+	cfg := Config{
+		FilePersistence: true,
+		DataDir:         nested,
+	}
+	db, err := openBaseDB(cfg, "testuser")
+	if err != nil {
+		t.Fatalf("openBaseDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	info, err := os.Stat(nested)
+	if err != nil {
+		t.Fatalf("data directory was not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("expected directory, got file")
+	}
+}
+
+func TestFileDBPoolRefCounting(t *testing.T) {
+	dataDir := t.TempDir()
+	s := &Server{
+		cfg: Config{
+			FilePersistence: true,
+			DataDir:         dataDir,
+		},
+		fileDBs:     make(map[string]*fileDBEntry),
+		duckLakeSem: make(chan struct{}, 1),
+	}
+
+	// First acquire
+	db1, err := s.acquireFileDB("alice", false)
+	if err != nil {
+		t.Fatalf("first acquireFileDB failed: %v", err)
+	}
+
+	// Second acquire should return the same *sql.DB
+	db2, err := s.acquireFileDB("alice", false)
+	if err != nil {
+		t.Fatalf("second acquireFileDB failed: %v", err)
+	}
+	if db1 != db2 {
+		t.Fatal("expected same *sql.DB for same user, got different instances")
+	}
+
+	// Check ref count is 2
+	s.fileDBsMu.Lock()
+	refs := s.fileDBs["alice"].refs
+	s.fileDBsMu.Unlock()
+	if refs != 2 {
+		t.Fatalf("expected refs=2, got %d", refs)
+	}
+
+	// Release one — DB should still be open
+	s.releaseFileDB("alice")
+	s.fileDBsMu.Lock()
+	entry, exists := s.fileDBs["alice"]
+	s.fileDBsMu.Unlock()
+	if !exists {
+		t.Fatal("entry removed too early (refs should be 1)")
+	}
+	if entry.refs != 1 {
+		t.Fatalf("expected refs=1, got %d", entry.refs)
+	}
+
+	// DB should still work
+	if err := db1.Ping(); err != nil {
+		t.Fatalf("db should still be usable: %v", err)
+	}
+
+	// Release last — DB should be closed and removed
+	s.releaseFileDB("alice")
+	s.fileDBsMu.Lock()
+	_, exists = s.fileDBs["alice"]
+	s.fileDBsMu.Unlock()
+	if exists {
+		t.Fatal("entry should be removed after last release")
 	}
 }
