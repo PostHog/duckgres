@@ -616,34 +616,10 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 			return idle, nil
 		}
 
-		// 2. No idle worker — check if we have any live workers at all
+		// 2. No idle worker — spawn a new one if below capacity.
 		liveCount := p.liveWorkerCountLocked()
 		canSpawn := p.maxWorkers == 0 || liveCount < p.maxWorkers
 
-		if liveCount > 0 {
-			// We have live workers. Assign to the least-loaded one immediately
-			// and spawn a new worker in the background if below capacity.
-			w := p.leastLoadedWorkerLocked()
-			if w != nil {
-				w.activeSessions++
-				if canSpawn {
-					id := p.nextWorkerID
-					p.nextWorkerID++
-					p.spawning++
-					p.mu.Unlock()
-					slog.Debug("Assigned to least-loaded worker, spawning new worker in background.",
-						"worker", w.ID, "active_sessions", w.activeSessions, "background_worker", id)
-					go p.spawnWorkerBackground(id)
-				} else {
-					p.mu.Unlock()
-					slog.Debug("Assigned to least-loaded worker (at capacity).",
-						"worker", w.ID, "active_sessions", w.activeSessions)
-				}
-				return w, nil
-			}
-		}
-
-		// 3. No live workers at all (cold start or all dead) — must block on spawn
 		if canSpawn {
 			id := p.nextWorkerID
 			p.nextWorkerID++
@@ -671,30 +647,14 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 			return w, nil
 		}
 
-		// At capacity with all workers dead (spawning in progress) — wait and retry
+		// 3. At capacity — wait for a worker to become idle.
 		p.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(200 * time.Millisecond):
+			// Retry
 		}
-	}
-}
-
-// spawnWorkerBackground spawns a worker pod without blocking AcquireWorker.
-// The new worker becomes available for future sessions once ready.
-func (p *K8sWorkerPool) spawnWorkerBackground(id int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-
-	err := p.SpawnWorker(ctx, id)
-
-	p.mu.Lock()
-	p.spawning--
-	p.mu.Unlock()
-
-	if err != nil {
-		slog.Warn("Background worker spawn failed.", "worker", id, "error", err)
 	}
 }
 
@@ -1025,21 +985,6 @@ func (p *K8sWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 		}
 	}
 	return nil
-}
-
-func (p *K8sWorkerPool) leastLoadedWorkerLocked() *ManagedWorker {
-	var best *ManagedWorker
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if best == nil || w.activeSessions < best.activeSessions {
-			best = w
-		}
-	}
-	return best
 }
 
 func (p *K8sWorkerPool) liveWorkerCountLocked() int {

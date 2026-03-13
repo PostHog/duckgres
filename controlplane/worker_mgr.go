@@ -469,108 +469,79 @@ func (p *FlightWorkerPool) SpawnMinWorkers(count int) error {
 
 // AcquireWorker returns a worker for a new session.
 //
-// Strategy:
+// Strategy (1:1 worker-to-session model):
 //  1. Reuse an idle worker (0 active sessions) if available.
 //  2. If the pool has fewer live workers than maxWorkers (or maxWorkers is 0),
 //     spawn a new worker process.
-//  3. If the pool is at capacity, assign to the least-loaded live worker.
-//
-// This ensures the number of worker processes never exceeds maxWorkers while
-// allowing unlimited concurrent sessions across the fixed pool.
+//  3. If the pool is at capacity, wait with backoff until a worker becomes idle.
 func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
 	acquireStart := time.Now()
 	defer func() {
 		observeControlPlaneWorkerAcquire(time.Since(acquireStart))
 	}()
 
-	p.mu.Lock()
-	if p.shuttingDown {
-		p.mu.Unlock()
-		return nil, fmt.Errorf("pool is shutting down")
-	}
-
-	// Remove dead worker entries so they don't inflate the count.
-	p.cleanDeadWorkersLocked()
-
-	// 1. Try to claim an idle worker before spawning a new one.
-	idle := p.findIdleWorkerLocked()
-	if idle != nil {
-		idle.activeSessions++
-		p.mu.Unlock()
-		return idle, nil
-	}
-
-	// 2. If below the process cap (or unlimited), spawn a new worker.
-	liveCount := p.liveWorkerCountLocked()
-	if p.maxWorkers == 0 || liveCount < p.maxWorkers {
-		id := p.nextWorkerID
-		p.nextWorkerID++
-		p.spawning++
-		p.mu.Unlock()
-
-		err := p.SpawnWorker(id)
-
-		p.mu.Lock()
-		p.spawning--
-		p.mu.Unlock()
-
-		if err != nil {
-			return nil, err
-		}
-
-		w, ok := p.Worker(id)
-		if !ok {
-			return nil, fmt.Errorf("worker %d not found after spawn", id)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
 		}
 
 		p.mu.Lock()
-		w.activeSessions++
+		if p.shuttingDown {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("pool is shutting down")
+		}
+
+		// Remove dead worker entries so they don't inflate the count.
+		p.cleanDeadWorkersLocked()
+
+		// 1. Try to claim an idle worker before spawning a new one.
+		idle := p.findIdleWorkerLocked()
+		if idle != nil {
+			idle.activeSessions++
+			p.mu.Unlock()
+			return idle, nil
+		}
+
+		// 2. If below the process cap (or unlimited), spawn a new worker.
+		liveCount := p.liveWorkerCountLocked()
+		if p.maxWorkers == 0 || liveCount < p.maxWorkers {
+			id := p.nextWorkerID
+			p.nextWorkerID++
+			p.spawning++
+			p.mu.Unlock()
+
+			err := p.SpawnWorker(id)
+
+			p.mu.Lock()
+			p.spawning--
+			p.mu.Unlock()
+
+			if err != nil {
+				return nil, err
+			}
+
+			w, ok := p.Worker(id)
+			if !ok {
+				return nil, fmt.Errorf("worker %d not found after spawn", id)
+			}
+
+			p.mu.Lock()
+			w.activeSessions++
+			p.mu.Unlock()
+			return w, nil
+		}
+
+		// 3. At capacity — wait for a worker to become idle.
 		p.mu.Unlock()
-		return w, nil
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+			// Retry
+		}
 	}
-
-	// 3. At capacity — assign to the least-loaded live worker.
-	w := p.leastLoadedWorkerLocked()
-	if w != nil {
-		w.activeSessions++
-		p.mu.Unlock()
-		return w, nil
-	}
-
-	// All workers are dead (already cleaned above). Spawn a replacement.
-	// Still respect maxWorkers — another goroutine may already be spawning.
-	liveCount = p.liveWorkerCountLocked()
-	if p.maxWorkers > 0 && liveCount >= p.maxWorkers {
-		// A spawn is already in progress; wait for it to finish and use that worker.
-		p.mu.Unlock()
-		// Brief backoff then retry — the in-progress spawn will add a worker shortly.
-		time.Sleep(100 * time.Millisecond)
-		return p.AcquireWorker(ctx)
-	}
-	id := p.nextWorkerID
-	p.nextWorkerID++
-	p.spawning++
-	p.mu.Unlock()
-
-	err := p.SpawnWorker(id)
-
-	p.mu.Lock()
-	p.spawning--
-	p.mu.Unlock()
-
-	if err != nil {
-		return nil, err
-	}
-
-	w, ok := p.Worker(id)
-	if !ok {
-		return nil, fmt.Errorf("worker %d not found after spawn", id)
-	}
-
-	p.mu.Lock()
-	w.activeSessions++
-	p.mu.Unlock()
-	return w, nil
 }
 
 // ReleaseWorker decrements the active session count for a worker and updates its lastUsed time.
@@ -659,22 +630,7 @@ func (p *FlightWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 	return nil
 }
 
-// leastLoadedWorkerLocked returns the live worker with the fewest active
-// sessions, or nil if all workers are dead. Caller must hold p.mu.
-func (p *FlightWorkerPool) leastLoadedWorkerLocked() *ManagedWorker {
-	var best *ManagedWorker
-	for _, w := range p.workers {
-		select {
-		case <-w.done:
-			continue // dead
-		default:
-		}
-		if best == nil || w.activeSessions < best.activeSessions {
-			best = w
-		}
-	}
-	return best
-}
+
 
 // liveWorkerCountLocked returns the number of workers whose process is still
 // running (done channel not closed) plus workers currently being spawned.
