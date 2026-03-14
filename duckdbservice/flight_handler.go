@@ -125,7 +125,14 @@ func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionSer
 		qp := mapping.QueryProgress(session.duckdbConn)
 		pct, rows, total := mapping.QueryProgressTypeMembers(&qp)
 
-		sessionProgress[token] = sessionProgressInfo{Pct: pct, Rows: rows, Total: total}
+		// Use truncated token as key to avoid leaking full bearer tokens
+		// in the health check JSON response. 16 hex chars = 8 bytes of entropy,
+		// sufficient for matching on the control plane side.
+		key := token
+		if len(key) > 16 {
+			key = key[:16]
+		}
+		sessionProgress[key] = sessionProgressInfo{Pct: pct, Rows: rows, Total: total}
 
 		if !session.progress.queryActive.Load() {
 			// No query running — reset stall tracking.
@@ -204,8 +211,8 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	}
 
 	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
 	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
-	session.progress.queryActive.Store(false)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
@@ -331,13 +338,13 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		return 0, nil
 	}
 	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
 	var result sql.Result
 	if tx != nil {
 		result, err = tx.ExecContext(ctx, query)
 	} else {
 		result, err = session.Conn.ExecContext(ctx, query)
 	}
-	session.progress.queryActive.Store(false)
 	if err != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
 	}
@@ -446,8 +453,8 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 	}
 
 	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
 	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
-	session.progress.queryActive.Store(false)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.InvalidArgument, "failed to prepare: %v", err)
 	}

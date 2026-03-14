@@ -287,6 +287,8 @@ func (sm *SessionManager) GetProgress(pid int32) *SessionProgress {
 
 // UpdateProgress caches query progress data for sessions on the given worker.
 // Called from the health check loop after parsing the worker's health check response.
+// Progress keys are truncated session tokens (first 16 chars) to avoid leaking
+// full bearer tokens in health check JSON.
 func (sm *SessionManager) UpdateProgress(workerID int, progress map[string]*SessionProgress) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -295,7 +297,11 @@ func (sm *SessionManager) UpdateProgress(workerID int, progress map[string]*Sess
 		if !ok {
 			continue
 		}
-		if sp, ok := progress[s.SessionToken]; ok {
+		key := s.SessionToken
+		if len(key) > 16 {
+			key = key[:16]
+		}
+		if sp, ok := progress[key]; ok {
 			s.queryProgress.Store(sp)
 		}
 	}
