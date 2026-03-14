@@ -20,10 +20,13 @@ type duckdbConnHandle = mapping.Connection
 const stallCheckThreshold = 300
 
 // progressState tracks query activity and stall detection for a session.
+// All fields are atomic because queryActive is written by query goroutines
+// while lastRowsProcessed and stalledChecks are written by the health check
+// loop (which holds only an RLock on the session pool).
 type progressState struct {
 	queryActive       atomic.Bool
-	lastRowsProcessed uint64
-	stalledChecks     int32
+	lastRowsProcessed atomic.Uint64
+	stalledChecks     atomic.Int32
 }
 
 // extractDuckDBConnection extracts the raw mapping.Connection handle from a

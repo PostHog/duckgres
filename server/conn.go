@@ -5167,10 +5167,10 @@ var pgStatActivityColumns = []struct {
 	{"query", 25, -1},            // text
 	{"backend_type", 25, -1},     // text
 	{"leader_pid", 23, 4},        // int4 (NULL)
-	{"worker_id", 23, 4},                // int4 (duckgres extension)
-	{"query_progress", 701, 8},          // float8 (percentage, -1 if not tracked)
-	{"rows_processed", 20, 8},           // int8
-	{"total_rows_to_process", 20, 8},    // int8
+	{"worker_id", 23, 4},             // int4 (duckgres extension)
+	{"query_progress", 701, 8},       // float8 (percentage, -1 if not tracked)
+	{"rows_processed", 20, 8},        // int8
+	{"total_rows_to_process", 20, 8}, // int8
 }
 
 // pgStatActivityTypeOIDs is precomputed from pgStatActivityColumns to avoid per-row allocation.

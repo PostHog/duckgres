@@ -129,8 +129,8 @@ func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionSer
 
 		if !session.progress.queryActive.Load() {
 			// No query running — reset stall tracking.
-			session.progress.lastRowsProcessed = 0
-			session.progress.stalledChecks = 0
+			session.progress.lastRowsProcessed.Store(0)
+			session.progress.stalledChecks.Store(0)
 			continue
 		}
 
@@ -139,14 +139,14 @@ func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionSer
 			continue
 		}
 
-		if rows == session.progress.lastRowsProcessed {
-			session.progress.stalledChecks++
+		if rows == session.progress.lastRowsProcessed.Load() {
+			session.progress.stalledChecks.Add(1)
 		} else {
-			session.progress.lastRowsProcessed = rows
-			session.progress.stalledChecks = 0
+			session.progress.lastRowsProcessed.Store(rows)
+			session.progress.stalledChecks.Store(0)
 		}
 
-		if session.progress.stalledChecks >= stallCheckThreshold {
+		if session.progress.stalledChecks.Load() >= stallCheckThreshold {
 			stalledSessions++
 		}
 	}
@@ -279,6 +279,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		}()
 
 		session.progress.queryActive.Store(true)
+		defer session.progress.queryActive.Store(false)
 		var rows *sql.Rows
 		var qerr error
 		if tx != nil {
@@ -286,7 +287,6 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		} else {
 			rows, qerr = session.Conn.QueryContext(ctx, handle.Query)
 		}
-		session.progress.queryActive.Store(false)
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
 			return
@@ -545,6 +545,7 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 	go func() {
 		defer close(ch)
 		session.progress.queryActive.Store(true)
+		defer session.progress.queryActive.Store(false)
 		var rows *sql.Rows
 		var qerr error
 		if tx != nil {
@@ -552,7 +553,6 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 		} else {
 			rows, qerr = session.Conn.QueryContext(ctx, handle.Query)
 		}
-		session.progress.queryActive.Store(false)
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
 			return
