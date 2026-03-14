@@ -12,6 +12,13 @@ import (
 	"github.com/posthog/duckgres/server"
 )
 
+// SessionProgress holds cached query progress from a worker health check.
+type SessionProgress struct {
+	Percentage float64
+	Rows       uint64
+	TotalRows  uint64
+}
+
 // ManagedSession tracks a client session bound to a worker.
 type ManagedSession struct {
 	PID          int32
@@ -19,6 +26,9 @@ type ManagedSession struct {
 	SessionToken string
 	Executor     *server.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
+
+	// Cached query progress from worker health checks.
+	queryProgress atomic.Value // stores *SessionProgress (or nil)
 }
 
 // SessionManager tracks all active sessions and their worker assignments.
@@ -258,6 +268,43 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 		return s.WorkerID
 	}
 	return -1
+}
+
+// GetProgress returns the cached query progress for a session, or nil.
+func (sm *SessionManager) GetProgress(pid int32) *SessionProgress {
+	sm.mu.RLock()
+	s, ok := sm.sessions[pid]
+	sm.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	v := s.queryProgress.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(*SessionProgress)
+}
+
+// UpdateProgress caches query progress data for sessions on the given worker.
+// Called from the health check loop after parsing the worker's health check response.
+// Progress keys are truncated session tokens (first 16 chars) to avoid leaking
+// full bearer tokens in health check JSON.
+func (sm *SessionManager) UpdateProgress(workerID int, progress map[string]*SessionProgress) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, pid := range sm.byWorker[workerID] {
+		s, ok := sm.sessions[pid]
+		if !ok {
+			continue
+		}
+		key := s.SessionToken
+		if len(key) > 16 {
+			key = key[:16]
+		}
+		if sp, ok := progress[key]; ok {
+			s.queryProgress.Store(sp)
+		}
+	}
 }
 
 // AllSessions returns a snapshot of all active sessions.

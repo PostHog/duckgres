@@ -32,8 +32,10 @@ type WorkerPool interface {
 	SpawnMinWorkers(count int) error
 
 	// HealthCheckLoop runs periodic health checks on all workers.
-	// onCrash handlers are called when a worker crash is detected.
-	HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash ...WorkerCrashHandler)
+	// onCrash is called when a worker crash is detected.
+	// onProgress is called with per-session progress data after each successful check.
+	// Either callback may be nil.
+	HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler)
 
 	// SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
 	SetMaxWorkers(n int)

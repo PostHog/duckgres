@@ -14,6 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/duckdb/duckdb-go/mapping"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -106,10 +107,64 @@ func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionSer
 	// that hasn't attached DuckLake yet.
 	<-h.pool.warmupDone
 
+	// Poll DuckDB query progress for each active session.
+	type sessionProgressInfo struct {
+		Pct   float64 `json:"pct"`
+		Rows  uint64  `json:"rows"`
+		Total uint64  `json:"total"`
+	}
+	sessionProgress := make(map[string]sessionProgressInfo)
+	stalledSessions := 0
+
+	h.pool.mu.RLock()
+	for token, session := range h.pool.sessions {
+		if session.duckdbConn.Ptr == nil {
+			continue
+		}
+
+		qp := mapping.QueryProgress(session.duckdbConn)
+		pct, rows, total := mapping.QueryProgressTypeMembers(&qp)
+
+		// Use truncated token as key to avoid leaking full bearer tokens
+		// in the health check JSON response. 16 hex chars = 8 bytes of entropy,
+		// sufficient for matching on the control plane side.
+		key := token
+		if len(key) > 16 {
+			key = key[:16]
+		}
+		sessionProgress[key] = sessionProgressInfo{Pct: pct, Rows: rows, Total: total}
+
+		if !session.progress.queryActive.Load() {
+			// No query running — reset stall tracking.
+			session.progress.lastRowsProcessed.Store(0)
+			session.progress.stalledChecks.Store(0)
+			continue
+		}
+
+		// pct == -1 means DuckDB can't track this query; skip stall detection.
+		if pct < 0 {
+			continue
+		}
+
+		if rows == session.progress.lastRowsProcessed.Load() {
+			session.progress.stalledChecks.Add(1)
+		} else {
+			session.progress.lastRowsProcessed.Store(rows)
+			session.progress.stalledChecks.Store(0)
+		}
+
+		if session.progress.stalledChecks.Load() >= stallCheckThreshold {
+			stalledSessions++
+		}
+	}
+	h.pool.mu.RUnlock()
+
 	resp, _ := json.Marshal(map[string]interface{}{
-		"healthy":   true,
-		"sessions":  h.pool.ActiveSessions(),
-		"uptime_ns": time.Since(h.pool.startTime).Nanoseconds(),
+		"healthy":          stalledSessions == 0,
+		"sessions":         h.pool.ActiveSessions(),
+		"stalled_sessions": stalledSessions,
+		"uptime_ns":        time.Since(h.pool.startTime).Nanoseconds(),
+		"session_progress": sessionProgress,
 	})
 	return stream.Send(&flight.Result{Body: resp})
 }
@@ -155,6 +210,8 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		return nil, err
 	}
 
+	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
 	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
@@ -228,6 +285,8 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			session.mu.Unlock()
 		}()
 
+		session.progress.queryActive.Store(true)
+		defer session.progress.queryActive.Store(false)
 		var rows *sql.Rows
 		var qerr error
 		if tx != nil {
@@ -278,6 +337,8 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if isEmptyFlightQuery(query) {
 		return 0, nil
 	}
+	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
 	var result sql.Result
 	if tx != nil {
 		result, err = tx.ExecContext(ctx, query)
@@ -391,6 +452,8 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 		}, nil
 	}
 
+	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
 	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.InvalidArgument, "failed to prepare: %v", err)
@@ -488,6 +551,8 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 
 	go func() {
 		defer close(ch)
+		session.progress.queryActive.Store(true)
+		defer session.progress.queryActive.Store(false)
 		var rows *sql.Rows
 		var qerr error
 		if tx != nil {

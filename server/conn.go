@@ -170,6 +170,7 @@ type clientConn struct {
 	backendStart    time.Time    // when this connection started
 	applicationName string       // from startup params
 	currentQuery    atomic.Value // stores string — current/last query (lock-free)
+	queryStart      atomic.Value // stores time.Time — when current query started (lock-free)
 	workerID        int          // control plane worker ID, -1 for standalone
 }
 
@@ -851,7 +852,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	c.currentQuery.Store(query)
-	defer c.currentQuery.Store("")
+	c.queryStart.Store(time.Now())
+	defer func() {
+		c.currentQuery.Store("")
+		c.queryStart.Store(time.Time{})
+	}()
 
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
@@ -4662,7 +4667,11 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	c.currentQuery.Store(p.stmt.query)
-	defer c.currentQuery.Store("")
+	c.queryStart.Store(time.Now())
+	defer func() {
+		c.currentQuery.Store("")
+		c.queryStart.Store(time.Time{})
+	}()
 
 	// Handle cursor operations before normal execution
 	switch p.stmt.cursorOp {
@@ -5158,7 +5167,10 @@ var pgStatActivityColumns = []struct {
 	{"query", 25, -1},            // text
 	{"backend_type", 25, -1},     // text
 	{"leader_pid", 23, 4},        // int4 (NULL)
-	{"worker_id", 23, 4},         // int4 (duckgres extension)
+	{"worker_id", 23, 4},             // int4 (duckgres extension)
+	{"query_progress", 701, 8},       // float8 (percentage, -1 if not tracked)
+	{"rows_processed", 20, 8},        // int8
+	{"total_rows_to_process", 20, 8}, // int8
 }
 
 // pgStatActivityTypeOIDs is precomputed from pgStatActivityColumns to avoid per-row allocation.
@@ -5262,6 +5274,26 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		}
 	}
 
+	// query_start: populated from atomic.Value when a query is active.
+	var queryStart interface{}
+	if qs, ok := conn.queryStart.Load().(time.Time); ok && !qs.IsZero() {
+		queryStart = qs
+	}
+
+	// Query progress columns: populated from cached worker health check data
+	// (control plane mode) or nil (standalone mode).
+	var queryProgress, rowsProcessed, totalRowsToProcess interface{}
+	if c.server.progressFn != nil {
+		pct, rows, total := c.server.progressFn(conn.pid)
+		queryProgress = pct
+		rowsProcessed = int64(rows)
+		totalRowsToProcess = int64(total)
+	} else {
+		queryProgress = float64(-1)
+		rowsProcessed = int64(0)
+		totalRowsToProcess = int64(0)
+	}
+
 	values := []interface{}{
 		int32(0),             // datid
 		conn.database,        // datname
@@ -5273,7 +5305,7 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		clientPort,           // client_port
 		conn.backendStart,    // backend_start
 		nil,                  // xact_start (NULL)
-		nil,                  // query_start (NULL)
+		queryStart,           // query_start
 		nil,                  // state_change (NULL)
 		nil,                  // wait_event_type (NULL)
 		nil,                  // wait_event (NULL)
@@ -5284,6 +5316,9 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		"client backend",     // backend_type
 		nil,                  // leader_pid (NULL)
 		int32(conn.workerID), // worker_id
+		queryProgress,        // query_progress (float8)
+		rowsProcessed,        // rows_processed (int8)
+		totalRowsToProcess,   // total_rows_to_process (int8)
 	}
 
 	return c.sendDataRowWithFormats(values, formatCodes, pgStatActivityTypeOIDs)

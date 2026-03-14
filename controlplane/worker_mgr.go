@@ -369,7 +369,7 @@ func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flig
 			if err == nil {
 				// Verify with a health check
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				err = doHealthCheck(ctx, client)
+				_, err = doHealthCheck(ctx, client)
 				cancel()
 				if err == nil {
 					return client, nil
@@ -392,32 +392,62 @@ func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flig
 	return nil, fmt.Errorf("timeout waiting for worker socket %s (last error: %v, attempts: %d)", socketPath, lastErr, attempts)
 }
 
+// sessionProgressJSON is the wire format for per-session progress in health check responses.
+type sessionProgressJSON struct {
+	Pct   float64 `json:"pct"`
+	Rows  uint64  `json:"rows"`
+	Total uint64  `json:"total"`
+}
+
+// healthCheckResult is the parsed health check response from a worker.
+type healthCheckResult struct {
+	Healthy         bool                                `json:"healthy"`
+	StalledSessions int                                 `json:"stalled_sessions"`
+	SessionProgress map[string]*sessionProgressJSON     `json:"session_progress"`
+}
+
+// toSessionProgress converts wire-format progress data to SessionProgress values.
+func (r *healthCheckResult) toSessionProgress() map[string]*SessionProgress {
+	if len(r.SessionProgress) == 0 {
+		return nil
+	}
+	out := make(map[string]*SessionProgress, len(r.SessionProgress))
+	for token, sp := range r.SessionProgress {
+		out[token] = &SessionProgress{
+			Percentage: sp.Pct,
+			Rows:       sp.Rows,
+			TotalRows:  sp.Total,
+		}
+	}
+	return out
+}
+
 // doHealthCheck performs a HealthCheck action on the worker.
 // The server sends exactly one Result message with {"healthy": true, ...}.
-func doHealthCheck(ctx context.Context, client *flightsql.Client) error {
+// Returns the parsed result (including per-session progress) and an error if
+// the worker is unreachable or reports unhealthy.
+func doHealthCheck(ctx context.Context, client *flightsql.Client) (*healthCheckResult, error) {
 	// Use the underlying flight client for custom actions.
 	// flightsql.Client.Client is a flight.Client interface which embeds
 	// FlightServiceClient, giving us access to DoAction directly.
 	stream, err := client.Client.DoAction(ctx, &flight.Action{Type: "HealthCheck"})
 	if err != nil {
-		return fmt.Errorf("health check action: %w", err)
+		return nil, fmt.Errorf("health check action: %w", err)
 	}
 
 	msg, err := stream.Recv()
 	if err != nil {
-		return fmt.Errorf("health check recv: %w", err)
+		return nil, fmt.Errorf("health check recv: %w", err)
 	}
 
-	var body struct {
-		Healthy bool `json:"healthy"`
+	var result healthCheckResult
+	if err := json.Unmarshal(msg.Body, &result); err != nil {
+		return nil, fmt.Errorf("health check unmarshal: %w", err)
 	}
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		return fmt.Errorf("health check unmarshal: %w", err)
+	if !result.Healthy {
+		return &result, fmt.Errorf("worker reported unhealthy")
 	}
-	if !body.Healthy {
-		return fmt.Errorf("worker reported unhealthy")
-	}
-	return nil
+	return &result, nil
 }
 
 // Worker returns a worker by ID.
@@ -881,6 +911,10 @@ func (p *FlightWorkerPool) ShutdownAll() {
 // WorkerCrashHandler is called when a worker crash is detected, before respawning.
 type WorkerCrashHandler func(workerID int)
 
+// ProgressHandler is called after a successful health check with per-session
+// progress data parsed from the worker's health check response.
+type ProgressHandler func(workerID int, progress map[string]*SessionProgress)
+
 // maxConsecutiveHealthFailures is the number of consecutive health check failures
 // before a worker is force-killed. With a typical 2s health check interval,
 // this means ~6s of unresponsiveness triggers retirement.
@@ -892,7 +926,7 @@ const maxConsecutiveHealthFailures = 3
 // Workers without sessions are simply retired.
 // Workers that fail maxConsecutiveHealthFailures health checks in a row are
 // force-killed and their sessions notified.
-func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash ...WorkerCrashHandler) {
+func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -946,8 +980,8 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						}
 						// Worker crashed — notify sessions, clean up
 						slog.Warn("Worker crashed.", "id", w.ID, "error", w.exitErr)
-						for _, h := range onCrash {
-							h(w.ID)
+						if onCrash != nil {
+							onCrash(w.ID)
 						}
 						if w.client != nil {
 							_ = w.client.Close()
@@ -959,10 +993,11 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						// concurrent crash/retire) nils out FlightServiceClient,
 						// racing with the DoAction call inside doHealthCheck.
 						var healthErr error
+						var hcResult *healthCheckResult
 						func() {
 							defer recoverWorkerPanic(&healthErr)
 							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-							healthErr = doHealthCheck(hctx, w.client)
+							hcResult, healthErr = doHealthCheck(hctx, w.client)
 							cancel()
 						}()
 						err := healthErr
@@ -991,8 +1026,8 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 								observeControlPlaneWorkers(workerCount)
 
 								if stillInPool {
-									for _, h := range onCrash {
-										h(w.ID)
+									if onCrash != nil {
+										onCrash(w.ID)
 									}
 									// Skip SIGINT (unlike retireWorkerProcess) since the worker
 									// has already proven unresponsive. Go straight to SIGKILL.
@@ -1011,6 +1046,13 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 							mu.Lock()
 							delete(failures, w.ID)
 							mu.Unlock()
+
+							// Forward progress data to the control plane.
+							if onProgress != nil && hcResult != nil {
+								if sp := hcResult.toSessionProgress(); len(sp) > 0 {
+									onProgress(w.ID, sp)
+								}
+							}
 						}
 					}
 				}(w)

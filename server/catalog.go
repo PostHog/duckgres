@@ -434,7 +434,10 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			''::VARCHAR AS query,
 			''::VARCHAR AS backend_type,
 			NULL::INTEGER AS leader_pid,
-			0::INTEGER AS worker_id
+			0::INTEGER AS worker_id,
+			0.0::DOUBLE AS query_progress,
+			0::BIGINT AS rows_processed,
+			0::BIGINT AS total_rows_to_process
 		WHERE false
 	`
 	if _, err := db.Exec(pgStatActivitySQL); err != nil {
