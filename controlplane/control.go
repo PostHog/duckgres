@@ -354,6 +354,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.sessions = sessions
 		cp.rebalancer = rebalancer
 
+		// Wire progress lookup so pg_stat_activity can show query progress.
+		server.SetProgressFn(srv, func(pid int32) (float64, uint64, uint64) {
+			sp := sessions.GetProgress(pid)
+			if sp == nil {
+				return -1, 0, 0
+			}
+			return sp.Percentage, sp.Rows, sp.TotalRows
+		})
+
 		// Pre-warm workers if min_workers is set
 		if minWorkers > 0 {
 			if err := pool.SpawnMinWorkers(minWorkers); err != nil {
@@ -362,13 +371,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			}
 		}
 
-		// Start health check loop with crash notification
+		// Start health check loop with crash notification and progress caching.
 		onCrash := func(workerID int) {
 			sessions.OnWorkerCrash(workerID, func(pid int32) {
 				slog.Warn("Session orphaned by worker crash.", "pid", pid, "worker", workerID)
 			})
 		}
-		go pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash)
+		onProgress := func(workerID int, progress map[string]*SessionProgress) {
+			sessions.UpdateProgress(workerID, progress)
+		}
+		go pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash, onProgress)
 	}
 
 	// Flight ingress is created AFTER upgrade so the old CP can keep

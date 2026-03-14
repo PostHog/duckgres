@@ -21,6 +21,8 @@ func scanPgStatActivityRow(rows *sql.Rows) (map[string]interface{}, error) {
 		xactStart, queryStart, stateChange                     sql.NullTime
 		waitEventType, waitEvent                               sql.NullString
 		backendXid, backendXmin, leaderPid                     sql.NullInt32
+		queryProgress                                          float64
+		rowsProcessed, totalRowsToProcess                      int64
 	)
 
 	err := rows.Scan(
@@ -30,33 +32,37 @@ func scanPgStatActivityRow(rows *sql.Rows) (map[string]interface{}, error) {
 		&waitEventType, &waitEvent, &state,
 		&backendXid, &backendXmin, &query,
 		&backendType, &leaderPid, &workerID,
+		&queryProgress, &rowsProcessed, &totalRowsToProcess,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	return map[string]interface{}{
-		"datid":            datid,
-		"datname":          datname,
-		"pid":              pid,
-		"usesysid":         usesysid,
-		"usename":          usename,
-		"application_name": appName,
-		"client_addr":      clientAddr,
-		"client_port":      clientPort,
-		"backend_start":    backendStart,
-		"xact_start":       xactStart,
-		"query_start":      queryStart,
-		"state_change":     stateChange,
-		"wait_event_type":  waitEventType,
-		"wait_event":       waitEvent,
-		"state":            state,
-		"backend_xid":      backendXid,
-		"backend_xmin":     backendXmin,
-		"query":            query,
-		"backend_type":     backendType,
-		"leader_pid":       leaderPid,
-		"worker_id":        workerID,
+		"datid":                  datid,
+		"datname":                datname,
+		"pid":                    pid,
+		"usesysid":               usesysid,
+		"usename":                usename,
+		"application_name":       appName,
+		"client_addr":            clientAddr,
+		"client_port":            clientPort,
+		"backend_start":          backendStart,
+		"xact_start":             xactStart,
+		"query_start":            queryStart,
+		"state_change":           stateChange,
+		"wait_event_type":        waitEventType,
+		"wait_event":             waitEvent,
+		"state":                  state,
+		"backend_xid":            backendXid,
+		"backend_xmin":           backendXmin,
+		"query":                  query,
+		"backend_type":           backendType,
+		"leader_pid":             leaderPid,
+		"worker_id":              workerID,
+		"query_progress":         queryProgress,
+		"rows_processed":         rowsProcessed,
+		"total_rows_to_process":  totalRowsToProcess,
 	}, nil
 }
 
@@ -103,6 +109,7 @@ func TestPgStatActivity(t *testing.T) {
 			"wait_event_type", "wait_event", "state",
 			"backend_xid", "backend_xmin", "query",
 			"backend_type", "leader_pid", "worker_id",
+			"query_progress", "rows_processed", "total_rows_to_process",
 		}
 		if len(cols) != len(expectedCols) {
 			t.Fatalf("expected %d columns, got %d: %v", len(expectedCols), len(cols), cols)
@@ -209,8 +216,9 @@ func TestPgStatActivity(t *testing.T) {
 		}
 		row := result[0]
 
-		// These columns should always be NULL in our implementation
-		nullFields := []string{"xact_start", "query_start", "state_change",
+		// These columns should always be NULL in our implementation.
+		// query_start is now populated when a query is active, so it's not in this list.
+		nullFields := []string{"xact_start", "state_change",
 			"wait_event_type", "wait_event", "backend_xid", "backend_xmin", "leader_pid"}
 		for _, field := range nullFields {
 			switch v := row[field].(type) {
@@ -241,6 +249,38 @@ func TestPgStatActivity(t *testing.T) {
 		state := result[0]["state"].(string)
 		if state != "active" {
 			t.Errorf("expected state 'active' during query execution, got %q", state)
+		}
+	})
+
+	t.Run("query_start_populated", func(t *testing.T) {
+		result, err := queryPgStatActivity(db)
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if len(result) == 0 {
+			t.Fatal("expected at least 1 row")
+		}
+		qs := result[0]["query_start"].(sql.NullTime)
+		if !qs.Valid {
+			t.Error("query_start should be non-NULL during active query")
+		} else if qs.Time.IsZero() {
+			t.Error("query_start should not be zero")
+		}
+	})
+
+	t.Run("progress_columns_standalone", func(t *testing.T) {
+		result, err := queryPgStatActivity(db)
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if len(result) == 0 {
+			t.Fatal("expected at least 1 row")
+		}
+		row := result[0]
+		// In standalone mode (no progressFn), query_progress defaults to -1.
+		qp := row["query_progress"].(float64)
+		if qp != -1 {
+			t.Errorf("expected query_progress=-1 in standalone mode, got %f", qp)
 		}
 	})
 

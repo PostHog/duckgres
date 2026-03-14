@@ -222,7 +222,7 @@ func TestHealthCheckLoopDetectsCrashedWorker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	go pool.HealthCheckLoop(ctx, 50*time.Millisecond, onCrash)
+	go pool.HealthCheckLoop(ctx, 50*time.Millisecond, onCrash, nil)
 
 	select {
 	case id := <-crashedWorkers:
@@ -555,7 +555,7 @@ func TestCrashRemovesWorkerFromPool(t *testing.T) {
 		case crashCh <- workerID:
 		default:
 		}
-	})
+	}, nil)
 
 	// Wait for crash to be detected.
 	select {

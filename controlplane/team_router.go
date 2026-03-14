@@ -93,6 +93,8 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 		sessions.OnWorkerCrash(workerID, func(pid int32) {
 			slog.Warn("Session orphaned by worker crash.", "team", teamName, "pid", pid, "worker", workerID)
 		})
+	}, func(workerID int, progress map[string]*SessionProgress) {
+		sessions.UpdateProgress(workerID, progress)
 	})
 
 	// Periodic per-team metrics emission

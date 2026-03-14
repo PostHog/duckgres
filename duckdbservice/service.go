@@ -67,6 +67,9 @@ type Session struct {
 	txns          map[string]*trackedTx
 	txnOwner      map[string]string
 	handleCounter atomic.Uint64
+
+	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
+	progress   progressState    // stall detection state
 }
 
 // QueryHandle stores a prepared or ad-hoc query for later execution.
@@ -360,16 +363,27 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		}
 	}
 
+	// Extract the raw DuckDB connection handle for progress polling.
+	// Non-fatal if extraction fails — progress monitoring will be unavailable
+	// for this session but everything else works normally.
+	var duckConn duckdbConnHandle
+	if dc, err := extractDuckDBConnection(conn); err != nil {
+		slog.Debug("Could not extract DuckDB connection for progress polling.", "user", username, "error", err)
+	} else {
+		duckConn = dc
+	}
+
 	token := generateSessionToken()
 	session := &Session{
-		ID:        token,
-		DB:        db,
-		Conn:      conn,
-		Username:  username,
-		CreatedAt: time.Now(),
-		queries:   make(map[string]*QueryHandle),
-		txns:      make(map[string]*trackedTx),
-		txnOwner:  make(map[string]string),
+		ID:         token,
+		DB:         db,
+		Conn:       conn,
+		Username:   username,
+		CreatedAt:  time.Now(),
+		queries:    make(map[string]*QueryHandle),
+		txns:       make(map[string]*trackedTx),
+		txnOwner:   make(map[string]string),
+		duckdbConn: duckConn,
 	}
 	session.lastUsed.Store(time.Now().UnixNano())
 
