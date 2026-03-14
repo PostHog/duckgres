@@ -63,6 +63,8 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("querylog: open duckdb: %w", err)
 	}
+	// Pin to a single connection so ATTACH/CREATE TABLE state is shared with INSERT calls.
+	db.SetMaxOpenConns(1)
 
 	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
 	extDir := filepath.Join(cfg.DataDir, "extensions")
@@ -124,9 +126,9 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		query               VARCHAR NOT NULL,
 		transpiled_query    VARCHAR,
 		query_kind          VARCHAR,
-		normalized_query_hash UBIGINT,
-		result_rows         BIGINT DEFAULT 0,
-		written_rows        BIGINT DEFAULT 0,
+		normalized_query_hash BIGINT,
+		result_rows         BIGINT,
+		written_rows        BIGINT,
 		exception_code      VARCHAR,
 		exception           VARCHAR,
 		user_name           VARCHAR NOT NULL,
@@ -135,9 +137,9 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		client_port         INTEGER,
 		application_name    VARCHAR,
 		pid                 INTEGER,
-		worker_id           INTEGER DEFAULT -1,
-		is_transpiled       BOOLEAN DEFAULT FALSE,
-		protocol            VARCHAR DEFAULT 'simple'
+		worker_id           INTEGER,
+		is_transpiled       BOOLEAN,
+		protocol            VARCHAR
 	)`
 	if _, err := db.Exec(createTable); err != nil {
 		_ = db.Close()
@@ -146,7 +148,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 
 	// Configure data inlining
 	inlineStmt := fmt.Sprintf(
-		"CALL ducklake.set_option('data_inlining_row_limit', %d, schema_name => 'system', table_name => 'query_log')",
+		"CALL ducklake.set_option('data_inlining_row_limit', %d, schema => 'system', table_name => 'query_log')",
 		cfg.QueryLog.DataInliningRowLimit)
 	if _, err := db.Exec(inlineStmt); err != nil {
 		slog.Warn("querylog: failed to set data_inlining_row_limit, continuing without it.", "error", err)
@@ -258,7 +260,7 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			truncateQuery(e.Query),
 			truncateNullableQuery(e.TranspiledQuery),
 			e.QueryKind,
-			e.NormalizedHash,
+			int64(e.NormalizedHash),
 			e.ResultRows,
 			e.WrittenRows,
 			e.ExceptionCode,
