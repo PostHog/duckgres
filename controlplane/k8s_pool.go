@@ -585,7 +585,7 @@ func waitForWorkerTCP(addr, bearerToken string, timeout time.Duration) (*flights
 		client, err := flightsql.NewClient(addr, nil, nil, dialOpts...)
 		if err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			err = doHealthCheck(ctx, client)
+			_, err = doHealthCheck(ctx, client)
 			cancel()
 			if err == nil {
 				return client, nil
@@ -854,8 +854,8 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							return
 						}
 						slog.Warn("K8s worker crashed.", "id", w.ID)
-						for _, h := range onCrash {
-							h(w.ID)
+						if onCrash != nil {
+							onCrash(w.ID)
 						}
 						if w.client != nil {
 							_ = w.client.Close()
@@ -870,10 +870,11 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 					default:
 						// Worker alive, do health check
 						var healthErr error
+						var hcResult *healthCheckResult
 						func() {
 							defer recoverWorkerPanic(&healthErr)
 							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-							healthErr = doHealthCheck(hctx, w.client)
+							hcResult, healthErr = doHealthCheck(hctx, w.client)
 							cancel()
 						}()
 
