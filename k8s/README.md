@@ -117,6 +117,64 @@ kubectl -n duckgres rollout restart deployment/duckgres-control-plane
 kubectl -n duckgres rollout status deployment/duckgres-control-plane
 ```
 
+## Local Multi-Tenant Dev
+
+The repo now includes a concrete local workflow for the multi-tenant control-plane path added behind `--config-store`.
+
+Prerequisites:
+
+- macOS with [OrbStack](https://orbstack.dev/) Kubernetes enabled
+- Docker and `kubectl`
+- `host.docker.internal` reachable from the cluster (OrbStack supports this)
+
+The workflow uses:
+
+- `k8s/local-config-store.compose.yaml` for the PostgreSQL config store on `localhost:5434`
+- `k8s/local-config-store.seed.sql` for the default local tenant/user bootstrap
+- `k8s/control-plane-multitenant-local.yaml` for a local K8s deployment that enables `--config-store`
+- `duckgres:test` as both the control-plane and worker image tag
+
+Bring everything up:
+
+```bash
+orb start k8s
+just run-multitenant-local
+```
+
+Port-forward PostgreSQL and the admin UI in separate terminals:
+
+```bash
+just multitenant-port-forward-pg
+just multitenant-port-forward-admin
+```
+
+Then connect and inspect:
+
+```bash
+PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres sslmode=require"
+open http://127.0.0.1:9090/
+```
+
+The local workflow seeds a default login:
+
+```text
+username: postgres
+password: postgres
+```
+
+Tear down the local config store when finished:
+
+```bash
+just multitenant-config-store-down
+```
+
+Notes:
+
+- The committed local manifest hardcodes the config-store DSN as `postgres://duckgres:duckgres@host.docker.internal:5434/duckgres_config?sslmode=disable`.
+- The control plane polls the config store every `2s` in this local-only manifest so seeded users become available quickly after startup.
+- If you are not using OrbStack, update `k8s/control-plane-multitenant-local.yaml` to point at a reachable Postgres hostname before deploying.
+- The admin API and dashboard are exposed on `:9090` without authentication in the current implementation. Treat this workflow as local-only.
+
 ### Running Integration Tests
 
 ```bash

@@ -1,0 +1,20 @@
+services:
+  config-store-postgres:
+    image: postgres:16-alpine
+    container_name: duckgres-config-store
+    environment:
+      POSTGRES_USER: duckgres
+      POSTGRES_PASSWORD: duckgres
+      POSTGRES_DB: duckgres_config
+    ports:
+      - "5434:5432"
+    volumes:
+      - duckgres-config-store-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U duckgres -d duckgres_config"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  duckgres-config-store-data:
