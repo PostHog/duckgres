@@ -5284,10 +5284,14 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 	// (control plane mode) or nil (standalone mode).
 	var queryProgress, rowsProcessed, totalRowsToProcess interface{}
 	if c.server.progressFn != nil {
-		pct, rows, total := c.server.progressFn(conn.pid)
+		pct, rows, total, stalled := c.server.progressFn(conn.pid)
 		queryProgress = pct
 		rowsProcessed = int64(rows)
 		totalRowsToProcess = int64(total)
+		// Override state to "active (stuck)" when the worker detects no progress.
+		if stalled && state == "active" {
+			state = "active (stuck)"
+		}
 	} else {
 		queryProgress = float64(-1)
 		rowsProcessed = int64(0)

@@ -17,6 +17,7 @@ type SessionProgress struct {
 	Percentage float64
 	Rows       uint64
 	TotalRows  uint64
+	Stalled    bool
 }
 
 // ManagedSession tracks a client session bound to a worker.

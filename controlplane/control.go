@@ -355,12 +355,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.rebalancer = rebalancer
 
 		// Wire progress lookup so pg_stat_activity can show query progress.
-		server.SetProgressFn(srv, func(pid int32) (float64, uint64, uint64) {
+		server.SetProgressFn(srv, func(pid int32) (pct float64, rows, totalRows uint64, stalled bool) {
 			sp := sessions.GetProgress(pid)
 			if sp == nil {
-				return -1, 0, 0
+				return -1, 0, 0, false
 			}
-			return sp.Percentage, sp.Rows, sp.TotalRows
+			return sp.Percentage, sp.Rows, sp.TotalRows, sp.Stalled
 		})
 
 		// Pre-warm workers if min_workers is set

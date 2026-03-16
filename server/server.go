@@ -281,7 +281,7 @@ type Server struct {
 	// Progress lookup function for pg_stat_activity.
 	// In control plane mode, returns cached progress from worker health checks.
 	// Nil in standalone mode.
-	progressFn func(pid int32) (pct float64, rows, totalRows uint64)
+	progressFn func(pid int32) (pct float64, rows, totalRows uint64, stalled bool)
 }
 
 func New(cfg Config) (*Server, error) {
