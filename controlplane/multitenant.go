@@ -5,12 +5,10 @@ package controlplane
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -176,27 +174,12 @@ func SetupMultiTenant(
 		c.String(http.StatusOK, "ok")
 	})
 
-	// Bearer token middleware for admin API
-	bearerAuth := func(c *gin.Context) {
-		auth := c.GetHeader("Authorization")
-		if auth == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing Authorization header"})
-			return
-		}
-		token := strings.TrimPrefix(auth, "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
-			return
-		}
-		c.Next()
-	}
-
 	// Admin API (authenticated)
-	api := engine.Group("/api/v1", bearerAuth)
+	api := engine.Group("/api/v1", admin.APIAuthMiddleware(adminToken))
 	admin.RegisterAPI(api, store, adpt)
 
 	// Dashboard
-	admin.RegisterDashboard(engine)
+	admin.RegisterDashboard(engine, adminToken)
 
 	adminServer := &http.Server{
 		Addr:    ":9090",
