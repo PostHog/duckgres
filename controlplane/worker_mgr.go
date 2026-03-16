@@ -394,16 +394,16 @@ func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flig
 
 // sessionProgressJSON is the wire format for per-session progress in health check responses.
 type sessionProgressJSON struct {
-	Pct   float64 `json:"pct"`
-	Rows  uint64  `json:"rows"`
-	Total uint64  `json:"total"`
+	Pct     float64 `json:"pct"`
+	Rows    uint64  `json:"rows"`
+	Total   uint64  `json:"total"`
+	Stalled bool    `json:"stalled,omitempty"`
 }
 
 // healthCheckResult is the parsed health check response from a worker.
 type healthCheckResult struct {
-	Healthy         bool                                `json:"healthy"`
-	StalledSessions int                                 `json:"stalled_sessions"`
-	SessionProgress map[string]*sessionProgressJSON     `json:"session_progress"`
+	Healthy         bool                            `json:"healthy"`
+	SessionProgress map[string]*sessionProgressJSON `json:"session_progress"`
 }
 
 // toSessionProgress converts wire-format progress data to SessionProgress values.
@@ -417,6 +417,7 @@ func (r *healthCheckResult) toSessionProgress() map[string]*SessionProgress {
 			Percentage: sp.Pct,
 			Rows:       sp.Rows,
 			TotalRows:  sp.Total,
+			Stalled:    sp.Stalled,
 		}
 	}
 	return out
@@ -425,7 +426,7 @@ func (r *healthCheckResult) toSessionProgress() map[string]*SessionProgress {
 // doHealthCheck performs a HealthCheck action on the worker.
 // The server sends exactly one Result message with {"healthy": true, ...}.
 // Returns the parsed result (including per-session progress) and an error if
-// the worker is unreachable or reports unhealthy.
+// the worker is unreachable.
 func doHealthCheck(ctx context.Context, client *flightsql.Client) (*healthCheckResult, error) {
 	// Use the underlying flight client for custom actions.
 	// flightsql.Client.Client is a flight.Client interface which embeds
@@ -443,9 +444,6 @@ func doHealthCheck(ctx context.Context, client *flightsql.Client) (*healthCheckR
 	var result healthCheckResult
 	if err := json.Unmarshal(msg.Body, &result); err != nil {
 		return nil, fmt.Errorf("health check unmarshal: %w", err)
-	}
-	if !result.Healthy {
-		return &result, fmt.Errorf("worker reported unhealthy")
 	}
 	return &result, nil
 }

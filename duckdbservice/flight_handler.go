@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -109,12 +110,12 @@ func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionSer
 
 	// Poll DuckDB query progress for each active session.
 	type sessionProgressInfo struct {
-		Pct   float64 `json:"pct"`
-		Rows  uint64  `json:"rows"`
-		Total uint64  `json:"total"`
+		Pct     float64 `json:"pct"`
+		Rows    uint64  `json:"rows"`
+		Total   uint64  `json:"total"`
+		Stalled bool    `json:"stalled,omitempty"`
 	}
 	sessionProgress := make(map[string]sessionProgressInfo)
-	stalledSessions := 0
 
 	h.pool.mu.RLock()
 	for token, session := range h.pool.sessions {
@@ -132,37 +133,41 @@ func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionSer
 		if len(key) > 16 {
 			key = key[:16]
 		}
-		sessionProgress[key] = sessionProgressInfo{Pct: pct, Rows: rows, Total: total}
+
+		stalled := false
 
 		if !session.progress.queryActive.Load() {
 			// No query running — reset stall tracking.
 			session.progress.lastRowsProcessed.Store(0)
 			session.progress.stalledChecks.Store(0)
-			continue
-		}
-
-		// pct == -1 means DuckDB can't track this query; skip stall detection.
-		if pct < 0 {
-			continue
-		}
-
-		if rows == session.progress.lastRowsProcessed.Load() {
-			session.progress.stalledChecks.Add(1)
+		} else if pct < 0 {
+			// pct == -1 means DuckDB can't track this query; skip stall detection.
 		} else {
-			session.progress.lastRowsProcessed.Store(rows)
-			session.progress.stalledChecks.Store(0)
+			if rows == session.progress.lastRowsProcessed.Load() {
+				session.progress.stalledChecks.Add(1)
+			} else {
+				session.progress.lastRowsProcessed.Store(rows)
+				session.progress.stalledChecks.Store(0)
+			}
+
+			if session.progress.stalledChecks.Load() >= stallCheckThreshold {
+				stalled = true
+				// Log once when first crossing the threshold (exact match avoids log spam).
+				if session.progress.stalledChecks.Load() == stallCheckThreshold {
+					slog.Warn("Query appears stuck — no progress detected.",
+						"session", key, "rows_processed", rows, "total_rows", total,
+						"stalled_checks", stallCheckThreshold)
+				}
+			}
 		}
 
-		if session.progress.stalledChecks.Load() >= stallCheckThreshold {
-			stalledSessions++
-		}
+		sessionProgress[key] = sessionProgressInfo{Pct: pct, Rows: rows, Total: total, Stalled: stalled}
 	}
 	h.pool.mu.RUnlock()
 
 	resp, _ := json.Marshal(map[string]interface{}{
-		"healthy":          stalledSessions == 0,
+		"healthy":          true,
 		"sessions":         h.pool.ActiveSessions(),
-		"stalled_sessions": stalledSessions,
 		"uptime_ns":        time.Since(h.pool.startTime).Nanoseconds(),
 		"session_progress": sessionProgress,
 	})
