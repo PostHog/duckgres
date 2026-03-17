@@ -162,7 +162,7 @@ username: postgres
 password: postgres
 ```
 
-The seed data also creates a placeholder managed-warehouse record for the `local` team so the config store exercises the full team-scoped warehouse contract. It stores metadata and structured secret references only, not secret values.
+The seed data also creates a placeholder managed-warehouse record for the `local` team so the config store exercises the full team-scoped warehouse contract. It includes separate warehouse-DB and metadata-store sections plus structured secret references only, not secret values.
 
 Tear down the local config store when finished:
 

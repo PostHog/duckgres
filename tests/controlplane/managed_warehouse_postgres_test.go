@@ -47,7 +47,22 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 			DatabaseName: "analytics_wh",
 			Username:     "warehouse_user",
 		},
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind:         "dedicated_rds",
+			Engine:       "postgres",
+			Region:       "us-east-1",
+			Endpoint:     "analytics-metadata.cluster.example",
+			Port:         5432,
+			DatabaseName: "ducklake_metadata",
+			Username:     "metadata_user",
+		},
+		MetadataStoreCredentials: configstore.SecretRef{
+			Namespace: "duckgres",
+			Name:      "analytics-metadata",
+			Key:       "dsn",
+		},
 		State: configstore.ManagedWarehouseStateReady,
+		MetadataStoreState: configstore.ManagedWarehouseStateReady,
 	}).Error; err != nil {
 		t.Fatalf("create warehouse: %v", err)
 	}
@@ -65,6 +80,12 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	}
 	if teamCfg.Warehouse.Aurora.DatabaseName != "analytics_wh" {
 		t.Fatalf("expected analytics_wh, got %q", teamCfg.Warehouse.Aurora.DatabaseName)
+	}
+	if teamCfg.Warehouse.MetadataStore.Kind != "dedicated_rds" {
+		t.Fatalf("expected metadata store kind dedicated_rds, got %q", teamCfg.Warehouse.MetadataStore.Kind)
+	}
+	if teamCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata" {
+		t.Fatalf("expected ducklake_metadata, got %q", teamCfg.Warehouse.MetadataStore.DatabaseName)
 	}
 	if teamCfg.Users["alice"] != passwordHash {
 		t.Fatal("expected user credentials to remain loaded in snapshot")

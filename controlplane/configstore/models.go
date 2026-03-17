@@ -56,6 +56,17 @@ type ManagedWarehouseAurora struct {
 	Username     string `gorm:"size:255" json:"username"`
 }
 
+// ManagedWarehouseMetadataStore stores team-scoped DuckLake metadata DB info.
+type ManagedWarehouseMetadataStore struct {
+	Kind         string `gorm:"size:64" json:"kind"`
+	Engine       string `gorm:"size:64" json:"engine"`
+	Region       string `gorm:"size:64" json:"region"`
+	Endpoint     string `gorm:"size:512" json:"endpoint"`
+	Port         int    `json:"port"`
+	DatabaseName string `gorm:"size:255" json:"database_name"`
+	Username     string `gorm:"size:255" json:"username"`
+}
+
 // ManagedWarehouseS3 stores object-store metadata for a team's warehouse.
 type ManagedWarehouseS3 struct {
 	Provider   string `gorm:"size:64" json:"provider"`
@@ -79,27 +90,31 @@ type ManagedWarehouse struct {
 	TeamName string `gorm:"primaryKey;size:255" json:"team_name"`
 
 	Aurora         ManagedWarehouseAurora         `gorm:"embedded;embeddedPrefix:aurora_" json:"aurora"`
+	MetadataStore  ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
 	S3             ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
 	WorkerIdentity ManagedWarehouseWorkerIdentity `gorm:"embedded;embeddedPrefix:worker_identity_" json:"worker_identity"`
 
-	AuroraCredentials SecretRef `gorm:"embedded;embeddedPrefix:aurora_credentials_" json:"aurora_credentials"`
-	S3Credentials     SecretRef `gorm:"embedded;embeddedPrefix:s3_credentials_" json:"s3_credentials"`
-	RuntimeConfig     SecretRef `gorm:"embedded;embeddedPrefix:runtime_config_" json:"runtime_config"`
+	AuroraCredentials        SecretRef `gorm:"embedded;embeddedPrefix:aurora_credentials_" json:"aurora_credentials"`
+	MetadataStoreCredentials SecretRef `gorm:"embedded;embeddedPrefix:metadata_store_credentials_" json:"metadata_store_credentials"`
+	S3Credentials            SecretRef `gorm:"embedded;embeddedPrefix:s3_credentials_" json:"s3_credentials"`
+	RuntimeConfig            SecretRef `gorm:"embedded;embeddedPrefix:runtime_config_" json:"runtime_config"`
 
-	State                 ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
-	StatusMessage         string                            `gorm:"size:1024" json:"status_message"`
-	AuroraState           ManagedWarehouseProvisioningState `gorm:"size:32" json:"aurora_state"`
-	AuroraStatusMessage   string                            `gorm:"size:1024" json:"aurora_status_message"`
-	S3State               ManagedWarehouseProvisioningState `gorm:"size:32" json:"s3_state"`
-	S3StatusMessage       string                            `gorm:"size:1024" json:"s3_status_message"`
-	IdentityState         ManagedWarehouseProvisioningState `gorm:"size:32" json:"identity_state"`
-	IdentityStatusMessage string                            `gorm:"size:1024" json:"identity_status_message"`
-	SecretsState          ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
-	SecretsStatusMessage  string                            `gorm:"size:1024" json:"secrets_status_message"`
-	ReadyAt               *time.Time                        `json:"ready_at"`
-	FailedAt              *time.Time                        `json:"failed_at"`
-	CreatedAt             time.Time                         `json:"created_at"`
-	UpdatedAt             time.Time                         `json:"updated_at"`
+	State                      ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
+	StatusMessage              string                            `gorm:"size:1024" json:"status_message"`
+	AuroraState                ManagedWarehouseProvisioningState `gorm:"size:32" json:"aurora_state"`
+	AuroraStatusMessage        string                            `gorm:"size:1024" json:"aurora_status_message"`
+	MetadataStoreState         ManagedWarehouseProvisioningState `gorm:"size:32" json:"metadata_store_state"`
+	MetadataStoreStatusMessage string                            `gorm:"size:1024" json:"metadata_store_status_message"`
+	S3State                    ManagedWarehouseProvisioningState `gorm:"size:32" json:"s3_state"`
+	S3StatusMessage            string                            `gorm:"size:1024" json:"s3_status_message"`
+	IdentityState              ManagedWarehouseProvisioningState `gorm:"size:32" json:"identity_state"`
+	IdentityStatusMessage      string                            `gorm:"size:1024" json:"identity_status_message"`
+	SecretsState               ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
+	SecretsStatusMessage       string                            `gorm:"size:1024" json:"secrets_status_message"`
+	ReadyAt                    *time.Time                        `json:"ready_at"`
+	FailedAt                   *time.Time                        `json:"failed_at"`
+	CreatedAt                  time.Time                         `json:"created_at"`
+	UpdatedAt                  time.Time                         `json:"updated_at"`
 }
 
 func (ManagedWarehouse) TableName() string { return "duckgres_managed_warehouses" }
@@ -181,25 +196,29 @@ type ManagedWarehouseConfig struct {
 	TeamName string
 
 	Aurora         ManagedWarehouseAurora
+	MetadataStore  ManagedWarehouseMetadataStore
 	S3             ManagedWarehouseS3
 	WorkerIdentity ManagedWarehouseWorkerIdentity
 
-	AuroraCredentials SecretRef
-	S3Credentials     SecretRef
-	RuntimeConfig     SecretRef
+	AuroraCredentials        SecretRef
+	MetadataStoreCredentials SecretRef
+	S3Credentials            SecretRef
+	RuntimeConfig            SecretRef
 
-	State                 ManagedWarehouseProvisioningState
-	StatusMessage         string
-	AuroraState           ManagedWarehouseProvisioningState
-	AuroraStatusMessage   string
-	S3State               ManagedWarehouseProvisioningState
-	S3StatusMessage       string
-	IdentityState         ManagedWarehouseProvisioningState
-	IdentityStatusMessage string
-	SecretsState          ManagedWarehouseProvisioningState
-	SecretsStatusMessage  string
-	ReadyAt               *time.Time
-	FailedAt              *time.Time
+	State                      ManagedWarehouseProvisioningState
+	StatusMessage              string
+	AuroraState                ManagedWarehouseProvisioningState
+	AuroraStatusMessage        string
+	MetadataStoreState         ManagedWarehouseProvisioningState
+	MetadataStoreStatusMessage string
+	S3State                    ManagedWarehouseProvisioningState
+	S3StatusMessage            string
+	IdentityState              ManagedWarehouseProvisioningState
+	IdentityStatusMessage      string
+	SecretsState               ManagedWarehouseProvisioningState
+	SecretsStatusMessage       string
+	ReadyAt                    *time.Time
+	FailedAt                   *time.Time
 }
 
 func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseConfig {
@@ -208,23 +227,27 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 	}
 
 	cfg := &ManagedWarehouseConfig{
-		TeamName:              warehouse.TeamName,
-		Aurora:                warehouse.Aurora,
-		S3:                    warehouse.S3,
-		WorkerIdentity:        warehouse.WorkerIdentity,
-		AuroraCredentials:     warehouse.AuroraCredentials,
-		S3Credentials:         warehouse.S3Credentials,
-		RuntimeConfig:         warehouse.RuntimeConfig,
-		State:                 warehouse.State,
-		StatusMessage:         warehouse.StatusMessage,
-		AuroraState:           warehouse.AuroraState,
-		AuroraStatusMessage:   warehouse.AuroraStatusMessage,
-		S3State:               warehouse.S3State,
-		S3StatusMessage:       warehouse.S3StatusMessage,
-		IdentityState:         warehouse.IdentityState,
-		IdentityStatusMessage: warehouse.IdentityStatusMessage,
-		SecretsState:          warehouse.SecretsState,
-		SecretsStatusMessage:  warehouse.SecretsStatusMessage,
+		TeamName:                   warehouse.TeamName,
+		Aurora:                     warehouse.Aurora,
+		MetadataStore:              warehouse.MetadataStore,
+		S3:                         warehouse.S3,
+		WorkerIdentity:             warehouse.WorkerIdentity,
+		AuroraCredentials:          warehouse.AuroraCredentials,
+		MetadataStoreCredentials:   warehouse.MetadataStoreCredentials,
+		S3Credentials:              warehouse.S3Credentials,
+		RuntimeConfig:              warehouse.RuntimeConfig,
+		State:                      warehouse.State,
+		StatusMessage:              warehouse.StatusMessage,
+		AuroraState:                warehouse.AuroraState,
+		AuroraStatusMessage:        warehouse.AuroraStatusMessage,
+		MetadataStoreState:         warehouse.MetadataStoreState,
+		MetadataStoreStatusMessage: warehouse.MetadataStoreStatusMessage,
+		S3State:                    warehouse.S3State,
+		S3StatusMessage:            warehouse.S3StatusMessage,
+		IdentityState:              warehouse.IdentityState,
+		IdentityStatusMessage:      warehouse.IdentityStatusMessage,
+		SecretsState:               warehouse.SecretsState,
+		SecretsStatusMessage:       warehouse.SecretsStatusMessage,
 	}
 	if warehouse.ReadyAt != nil {
 		readyAt := *warehouse.ReadyAt

@@ -113,6 +113,10 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 		Aurora: configstore.ManagedWarehouseAurora{
 			DatabaseName: "analytics_wh",
 		},
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind:         "shared_aurora",
+			DatabaseName: "analytics_metadata",
+		},
 	}
 	if err := store.DB().Create(original).Error; err != nil {
 		t.Fatalf("create warehouse: %v", err)
@@ -127,6 +131,11 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 		Aurora: configstore.ManagedWarehouseAurora{
 			DatabaseName: "analytics_ready",
 		},
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind:         "dedicated_rds",
+			Engine:       "postgres",
+			DatabaseName: "ducklake_metadata",
+		},
 	})
 	if err != nil {
 		t.Fatalf("upsert warehouse: %v", err)
@@ -140,5 +149,8 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	}
 	if stored.Aurora.DatabaseName != "analytics_ready" {
 		t.Fatalf("expected updated aurora db name, got %q", stored.Aurora.DatabaseName)
+	}
+	if stored.MetadataStore.DatabaseName != "ducklake_metadata" {
+		t.Fatalf("expected updated metadata db name, got %q", stored.MetadataStore.DatabaseName)
 	}
 }

@@ -220,6 +220,15 @@ func seedTeamWithWarehouse(store *fakeAPIStore, name string) {
 			DatabaseName: name + "_warehouse",
 			Username:     "warehouse_user",
 		},
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind:         "dedicated_rds",
+			Engine:       "postgres",
+			Region:       "us-east-1",
+			Endpoint:     fmt.Sprintf("%s-metadata.cluster.example", name),
+			Port:         5432,
+			DatabaseName: name + "_metadata",
+			Username:     "metadata_user",
+		},
 		S3: configstore.ManagedWarehouseS3{
 			Provider:   "aws",
 			Region:     "us-east-1",
@@ -236,6 +245,11 @@ func seedTeamWithWarehouse(store *fakeAPIStore, name string) {
 			Name:      name + "-aurora",
 			Key:       "dsn",
 		},
+		MetadataStoreCredentials: configstore.SecretRef{
+			Namespace: "duckgres",
+			Name:      name + "-metadata",
+			Key:       "dsn",
+		},
 		S3Credentials: configstore.SecretRef{
 			Namespace: "duckgres",
 			Name:      name + "-s3",
@@ -248,6 +262,7 @@ func seedTeamWithWarehouse(store *fakeAPIStore, name string) {
 		},
 		State:         configstore.ManagedWarehouseStateReady,
 		AuroraState:   configstore.ManagedWarehouseStateReady,
+		MetadataStoreState: configstore.ManagedWarehouseStateReady,
 		S3State:       configstore.ManagedWarehouseStateReady,
 		IdentityState: configstore.ManagedWarehouseStateReady,
 		SecretsState:  configstore.ManagedWarehouseStateReady,
@@ -281,6 +296,9 @@ func TestGetTeamIncludesWarehouse(t *testing.T) {
 	}
 	if team.Warehouse.Aurora.DatabaseName != "analytics_warehouse" {
 		t.Fatalf("expected analytics_warehouse, got %q", team.Warehouse.Aurora.DatabaseName)
+	}
+	if team.Warehouse.MetadataStore.Kind != "dedicated_rds" {
+		t.Fatalf("expected metadata store kind dedicated_rds, got %q", team.Warehouse.MetadataStore.Kind)
 	}
 }
 
@@ -337,6 +355,15 @@ func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
 			"database_name": "analytics_warehouse",
 			"username": "warehouse_user"
 		},
+		"metadata_store": {
+			"kind": "dedicated_rds",
+			"engine": "postgres",
+			"region": "us-east-1",
+			"endpoint": "analytics-metadata.cluster.example",
+			"port": 5432,
+			"database_name": "ducklake_metadata",
+			"username": "metadata_user"
+		},
 		"s3": {
 			"provider": "aws",
 			"region": "us-east-1",
@@ -356,6 +383,11 @@ func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
 			"name": "analytics-aurora",
 			"key": "dsn"
 		},
+		"metadata_store_credentials": {
+			"namespace": "duckgres",
+			"name": "analytics-metadata",
+			"key": "dsn"
+		},
 		"s3_credentials": {
 			"namespace": "duckgres",
 			"name": "analytics-s3",
@@ -369,6 +401,7 @@ func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
 		"state": "ready",
 		"status_message": "ready",
 		"aurora_state": "ready",
+		"metadata_store_state": "ready",
 		"s3_state": "ready",
 		"identity_state": "ready",
 		"secrets_state": "ready"
@@ -392,6 +425,9 @@ func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
 	}
 	if warehouse.RuntimeConfig.Name != "analytics-runtime" {
 		t.Fatalf("expected runtime secret analytics-runtime, got %q", warehouse.RuntimeConfig.Name)
+	}
+	if warehouse.MetadataStore.DatabaseName != "ducklake_metadata" {
+		t.Fatalf("expected metadata db ducklake_metadata, got %q", warehouse.MetadataStore.DatabaseName)
 	}
 }
 
@@ -473,5 +509,8 @@ func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	}
 	if !slices.Contains(columns, "aurora_database_name") {
 		t.Fatal("expected aurora_database_name to be included in managed warehouse upserts")
+	}
+	if !slices.Contains(columns, "metadata_store_database_name") {
+		t.Fatal("expected metadata_store_database_name to be included in managed warehouse upserts")
 	}
 }

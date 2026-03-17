@@ -38,6 +38,15 @@ func TestSnapshotBuild(t *testing.T) {
 					DatabaseName: "analytics_wh",
 					Username:     "warehouse_user",
 				},
+				MetadataStore: ManagedWarehouseMetadataStore{
+					Kind:         "dedicated_rds",
+					Engine:       "postgres",
+					Region:       "us-east-1",
+					Endpoint:     "analytics-meta.cluster-xyz.us-east-1.rds.amazonaws.com",
+					Port:         5432,
+					DatabaseName: "ducklake_metadata",
+					Username:     "metadata_user",
+				},
 				S3: ManagedWarehouseS3{
 					Provider:   "aws",
 					Region:     "us-east-1",
@@ -57,6 +66,11 @@ func TestSnapshotBuild(t *testing.T) {
 					Name:      "analytics-aurora",
 					Key:       "dsn",
 				},
+				MetadataStoreCredentials: SecretRef{
+					Namespace: "duckgres",
+					Name:      "analytics-metadata",
+					Key:       "dsn",
+				},
 				S3Credentials: SecretRef{
 					Namespace: "duckgres",
 					Name:      "analytics-s3",
@@ -70,6 +84,7 @@ func TestSnapshotBuild(t *testing.T) {
 				State:         ManagedWarehouseStateReady,
 				StatusMessage: "warehouse ready",
 				AuroraState:   ManagedWarehouseStateReady,
+				MetadataStoreState: ManagedWarehouseStateReady,
 				S3State:       ManagedWarehouseStateReady,
 				IdentityState: ManagedWarehouseStateReady,
 				SecretsState:  ManagedWarehouseStateReady,
@@ -133,6 +148,12 @@ func TestSnapshotBuild(t *testing.T) {
 	}
 	if snap.Teams["analytics"].Warehouse.Aurora.DatabaseName != "analytics_wh" {
 		t.Fatalf("expected analytics warehouse db name analytics_wh, got %q", snap.Teams["analytics"].Warehouse.Aurora.DatabaseName)
+	}
+	if snap.Teams["analytics"].Warehouse.MetadataStore.Kind != "dedicated_rds" {
+		t.Fatalf("expected metadata store kind dedicated_rds, got %q", snap.Teams["analytics"].Warehouse.MetadataStore.Kind)
+	}
+	if snap.Teams["analytics"].Warehouse.MetadataStoreCredentials.Name != "analytics-metadata" {
+		t.Fatalf("expected metadata secret analytics-metadata, got %q", snap.Teams["analytics"].Warehouse.MetadataStoreCredentials.Name)
 	}
 	if snap.Teams["analytics"].Warehouse.RuntimeConfig.Name != "analytics-runtime" {
 		t.Fatalf("expected runtime config secret analytics-runtime, got %q", snap.Teams["analytics"].Warehouse.RuntimeConfig.Name)
