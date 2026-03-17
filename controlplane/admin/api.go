@@ -268,7 +268,7 @@ func (s *gormAPIStore) UpsertManagedWarehouse(teamName string, warehouse *config
 	warehouse.TeamName = teamName
 	if err := s.db().Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "team_name"}},
-		UpdateAll: true,
+		DoUpdates: clause.AssignmentColumns(managedWarehouseUpsertColumns()),
 	}).Create(warehouse).Error; err != nil {
 		return nil, true, err
 	}
@@ -277,6 +277,48 @@ func (s *gormAPIStore) UpsertManagedWarehouse(teamName string, warehouse *config
 		return nil, true, err
 	}
 	return stored, true, nil
+}
+
+func managedWarehouseUpsertColumns() []string {
+	return []string{
+		"aurora_region",
+		"aurora_endpoint",
+		"aurora_port",
+		"aurora_database_name",
+		"aurora_username",
+		"s3_provider",
+		"s3_region",
+		"s3_bucket",
+		"s3_path_prefix",
+		"s3_endpoint",
+		"s3_use_ssl",
+		"s3_url_style",
+		"worker_identity_namespace",
+		"worker_identity_service_account_name",
+		"worker_identity_iam_role_arn",
+		"aurora_credentials_namespace",
+		"aurora_credentials_name",
+		"aurora_credentials_key",
+		"s3_credentials_namespace",
+		"s3_credentials_name",
+		"s3_credentials_key",
+		"runtime_config_namespace",
+		"runtime_config_name",
+		"runtime_config_key",
+		"state",
+		"status_message",
+		"aurora_state",
+		"aurora_status_message",
+		"s3_state",
+		"s3_status_message",
+		"identity_state",
+		"identity_status_message",
+		"secrets_state",
+		"secrets_status_message",
+		"ready_at",
+		"failed_at",
+		"updated_at",
+	}
 }
 
 func (s *gormAPIStore) GetGlobalConfig() (configstore.GlobalConfig, error) {

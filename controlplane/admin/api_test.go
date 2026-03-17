@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -405,5 +406,22 @@ func TestPutWarehouseRejectsUnknownTeam(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
+	columns := managedWarehouseUpsertColumns()
+
+	if slices.Contains(columns, "created_at") {
+		t.Fatal("expected created_at to be excluded from managed warehouse upserts")
+	}
+	if slices.Contains(columns, "team_name") {
+		t.Fatal("expected team_name to be excluded from managed warehouse upserts")
+	}
+	if !slices.Contains(columns, "updated_at") {
+		t.Fatal("expected updated_at to be included in managed warehouse upserts")
+	}
+	if !slices.Contains(columns, "aurora_database_name") {
+		t.Fatal("expected aurora_database_name to be included in managed warehouse upserts")
 	}
 }
