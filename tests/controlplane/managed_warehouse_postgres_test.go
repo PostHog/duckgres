@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	integrationtest "github.com/posthog/duckgres/tests/integration"
-	_ "github.com/lib/pq"
 )
 
 var ensureIntegrationPostgresOnce sync.Once
@@ -40,7 +40,7 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{
 		TeamName: "analytics",
-		Aurora: configstore.ManagedWarehouseAurora{
+		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			Region:       "us-east-1",
 			Endpoint:     "analytics.cluster.example",
 			Port:         5432,
@@ -61,7 +61,7 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 			Name:      "analytics-metadata",
 			Key:       "dsn",
 		},
-		State: configstore.ManagedWarehouseStateReady,
+		State:              configstore.ManagedWarehouseStateReady,
 		MetadataStoreState: configstore.ManagedWarehouseStateReady,
 	}).Error; err != nil {
 		t.Fatalf("create warehouse: %v", err)
@@ -78,8 +78,8 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	if teamCfg.Warehouse == nil {
 		t.Fatal("expected warehouse to be preloaded into snapshot")
 	}
-	if teamCfg.Warehouse.Aurora.DatabaseName != "analytics_wh" {
-		t.Fatalf("expected analytics_wh, got %q", teamCfg.Warehouse.Aurora.DatabaseName)
+	if teamCfg.Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
+		t.Fatalf("expected analytics_wh, got %q", teamCfg.Warehouse.WarehouseDatabase.DatabaseName)
 	}
 	if teamCfg.Warehouse.MetadataStore.Kind != "dedicated_rds" {
 		t.Fatalf("expected metadata store kind dedicated_rds, got %q", teamCfg.Warehouse.MetadataStore.Kind)

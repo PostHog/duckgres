@@ -31,7 +31,7 @@ func TestSnapshotBuild(t *testing.T) {
 			MemoryBudget: "8GB",
 			Warehouse: &ManagedWarehouse{
 				TeamName: "analytics",
-				Aurora: ManagedWarehouseAurora{
+				WarehouseDatabase: ManagedWarehouseDatabase{
 					Region:       "us-east-1",
 					Endpoint:     "analytics.cluster-xyz.us-east-1.rds.amazonaws.com",
 					Port:         5432,
@@ -61,9 +61,9 @@ func TestSnapshotBuild(t *testing.T) {
 					ServiceAccountName: "team-analytics-worker",
 					IAMRoleARN:         "arn:aws:iam::123456789012:role/team-analytics-worker",
 				},
-				AuroraCredentials: SecretRef{
+				WarehouseDatabaseCredentials: SecretRef{
 					Namespace: "duckgres",
-					Name:      "analytics-aurora",
+					Name:      "analytics-warehouse-db",
 					Key:       "dsn",
 				},
 				MetadataStoreCredentials: SecretRef{
@@ -81,14 +81,14 @@ func TestSnapshotBuild(t *testing.T) {
 					Name:      "analytics-runtime",
 					Key:       "duckgres.yaml",
 				},
-				State:         ManagedWarehouseStateReady,
-				StatusMessage: "warehouse ready",
-				AuroraState:   ManagedWarehouseStateReady,
-				MetadataStoreState: ManagedWarehouseStateReady,
-				S3State:       ManagedWarehouseStateReady,
-				IdentityState: ManagedWarehouseStateReady,
-				SecretsState:  ManagedWarehouseStateReady,
-				ReadyAt:       &readyAt,
+				State:                  ManagedWarehouseStateReady,
+				StatusMessage:          "warehouse ready",
+				WarehouseDatabaseState: ManagedWarehouseStateReady,
+				MetadataStoreState:     ManagedWarehouseStateReady,
+				S3State:                ManagedWarehouseStateReady,
+				IdentityState:          ManagedWarehouseStateReady,
+				SecretsState:           ManagedWarehouseStateReady,
+				ReadyAt:                &readyAt,
 			},
 			Users: []TeamUser{
 				{Username: "alice", Password: hash1, TeamName: "analytics"},
@@ -146,8 +146,8 @@ func TestSnapshotBuild(t *testing.T) {
 	if snap.Teams["analytics"].Warehouse == nil {
 		t.Fatal("expected analytics warehouse to be present")
 	}
-	if snap.Teams["analytics"].Warehouse.Aurora.DatabaseName != "analytics_wh" {
-		t.Fatalf("expected analytics warehouse db name analytics_wh, got %q", snap.Teams["analytics"].Warehouse.Aurora.DatabaseName)
+	if snap.Teams["analytics"].Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
+		t.Fatalf("expected analytics warehouse db name analytics_wh, got %q", snap.Teams["analytics"].Warehouse.WarehouseDatabase.DatabaseName)
 	}
 	if snap.Teams["analytics"].Warehouse.MetadataStore.Kind != "dedicated_rds" {
 		t.Fatalf("expected metadata store kind dedicated_rds, got %q", snap.Teams["analytics"].Warehouse.MetadataStore.Kind)

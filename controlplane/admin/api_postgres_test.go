@@ -110,7 +110,7 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 		State:     configstore.ManagedWarehouseStatePending,
 		CreatedAt: createdAt,
 		UpdatedAt: createdAt,
-		Aurora: configstore.ManagedWarehouseAurora{
+		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			DatabaseName: "analytics_wh",
 		},
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
@@ -128,7 +128,7 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 		UpdatedAt:     replacementCreatedAt,
 		State:         configstore.ManagedWarehouseStateReady,
 		StatusMessage: "ready",
-		Aurora: configstore.ManagedWarehouseAurora{
+		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			DatabaseName: "analytics_ready",
 		},
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
@@ -147,8 +147,8 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	if !stored.CreatedAt.Equal(createdAt) {
 		t.Fatalf("expected created_at %s, got %s", createdAt.Format(time.RFC3339Nano), stored.CreatedAt.Format(time.RFC3339Nano))
 	}
-	if stored.Aurora.DatabaseName != "analytics_ready" {
-		t.Fatalf("expected updated aurora db name, got %q", stored.Aurora.DatabaseName)
+	if stored.WarehouseDatabase.DatabaseName != "analytics_ready" {
+		t.Fatalf("expected updated warehouse db name, got %q", stored.WarehouseDatabase.DatabaseName)
 	}
 	if stored.MetadataStore.DatabaseName != "ducklake_metadata" {
 		t.Fatalf("expected updated metadata db name, got %q", stored.MetadataStore.DatabaseName)
