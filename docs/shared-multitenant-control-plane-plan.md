@@ -41,5 +41,14 @@ Separate from the end-user query path, operators use the admin API/dashboard to 
 - Add end-to-end provisioning controller that turns a PostHog warehouse request into Aurora, S3, IAM/Pod Identity, K8s Secret creation, and config-store updates.
 - Implement team-specific DuckLake/Aurora/S3 runtime wiring.
 - Change worker pod spec from global to be team-specific. 
-- Enable Duckhog / Flight SQL is currently disabled in multi-tenant mode.
-- Production exposure and operations for the shared control plane still need to be defined: stable shared endpoint, admin auth, observability, rotation, and recovery runbooks.
+- Implement non-disruptive customer-initiated duckgres login rotation mechanism.
+- Enable Duckhog / Flight SQL in multi-tenant mode.
+- Dev Infra
+  - Aurora cluster
+  - Deploy control plane in k8
+  - Public access exposure
+- Runbooks for deployment, debugging and regular security/isolation reviews
+
+## Out of scope for MVP / dev release
+- full fledged admin console/dashboard
+- comprehensive observability
