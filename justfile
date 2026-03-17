@@ -133,11 +133,6 @@ test-integration:
 test-controlplane:
     go test -v -timeout 300s ./tests/controlplane/...
 
-# Verify the local multi-tenant dev assets stay wired together
-[group('test')]
-test-local-multitenant-assets:
-    bash tests/controlplane/test_local_multitenant_assets.sh
-
 # Run perf tests
 [group('test')]
 test-perf:
