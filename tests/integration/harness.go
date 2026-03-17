@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -580,27 +581,11 @@ func findAvailablePort() int {
 }
 
 func getTestDir() string {
-	// Get the directory of this source file
-	_, filename, _, ok := getCallerInfo()
+	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		return "tests/integration"
 	}
 	return filepath.Dir(filename)
-}
-
-func getCallerInfo() (pc uintptr, file string, line int, ok bool) {
-	// This is a placeholder - in real code we'd use runtime.Caller
-	// For now, we'll use a relative path approach
-	cwd, _ := os.Getwd()
-	// Check if we're in the integration directory
-	if _, err := os.Stat(filepath.Join(cwd, "docker-compose.yml")); err == nil {
-		return 0, filepath.Join(cwd, "harness.go"), 0, true
-	}
-	// Check if we're in the project root
-	if _, err := os.Stat(filepath.Join(cwd, "tests", "integration", "docker-compose.yml")); err == nil {
-		return 0, filepath.Join(cwd, "tests", "integration", "harness.go"), 0, true
-	}
-	return 0, "", 0, false
 }
 
 func splitSQLStatements(sql string) []string {
