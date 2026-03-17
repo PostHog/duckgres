@@ -114,7 +114,7 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 			DatabaseName: "analytics_wh",
 		},
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
-			Kind:         "shared_aurora",
+			Kind:         "shared",
 			DatabaseName: "analytics_metadata",
 		},
 	}
