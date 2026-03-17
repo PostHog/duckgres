@@ -608,6 +608,7 @@ kubectl apply -f k8s/
 ```
 
 See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and local development instructions using OrbStack.
+For the new multi-tenant config-store flow, the repo also includes a concrete local OrbStack workflow via `just run-multitenant-local`.
 
 ## Two-Tier Query Processing
 
