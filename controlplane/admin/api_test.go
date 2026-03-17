@@ -409,6 +409,56 @@ func TestPutWarehouseRejectsUnknownTeam(t *testing.T) {
 	}
 }
 
+func TestCreateTeamRejectsNestedWarehousePayload(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"name": "analytics",
+		"max_workers": 4,
+		"warehouse": {
+			"state": "ready"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/teams", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.teams["analytics"]; ok {
+		t.Fatal("expected team create to be rejected when warehouse payload is present")
+	}
+}
+
+func TestUpdateTeamRejectsNestedWarehousePayload(t *testing.T) {
+	store := newFakeAPIStore()
+	store.teams["analytics"] = &configstore.Team{Name: "analytics", MaxWorkers: 2}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"max_workers": 4,
+		"warehouse": {
+			"state": "ready"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/analytics", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if store.teams["analytics"].MaxWorkers != 2 {
+		t.Fatalf("expected team update to be rejected, max_workers = %d", store.teams["analytics"].MaxWorkers)
+	}
+}
+
 func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	columns := managedWarehouseUpsertColumns()
 

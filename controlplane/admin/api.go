@@ -12,6 +12,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /teams/:name/warehouse")
+
 // WorkerStatus represents a worker's current status for the API.
 type WorkerStatus struct {
 	ID             int    `json:"id"`
@@ -391,6 +393,10 @@ func (h *apiHandler) createTeam(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if err := validateTeamMutationPayload(&team); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if team.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
@@ -419,6 +425,10 @@ func (h *apiHandler) updateTeam(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if err := validateTeamMutationPayload(&updates); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	team, ok, err := h.store.UpdateTeam(name, updates)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -443,6 +453,13 @@ func (h *apiHandler) deleteTeam(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": name})
+}
+
+func validateTeamMutationPayload(team *configstore.Team) error {
+	if team != nil && team.Warehouse != nil {
+		return errWarehousePayloadNotAllowed
+	}
+	return nil
 }
 
 func (h *apiHandler) getManagedWarehouse(c *gin.Context) {
