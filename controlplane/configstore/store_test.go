@@ -2,6 +2,7 @@ package configstore
 
 import (
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -20,6 +21,7 @@ func TestSnapshotBuild(t *testing.T) {
 	hash1 := mustHash(t, "secret1")
 	hash2 := mustHash(t, "secret2")
 	hash3 := mustHash(t, "secret3")
+	readyAt := time.Date(2026, time.March, 17, 12, 0, 0, 0, time.UTC)
 
 	teams := []Team{
 		{
@@ -27,6 +29,52 @@ func TestSnapshotBuild(t *testing.T) {
 			MaxWorkers:   4,
 			MinWorkers:   1,
 			MemoryBudget: "8GB",
+			Warehouse: &ManagedWarehouse{
+				TeamName: "analytics",
+				Aurora: ManagedWarehouseAurora{
+					Region:       "us-east-1",
+					Endpoint:     "analytics.cluster-xyz.us-east-1.rds.amazonaws.com",
+					Port:         5432,
+					DatabaseName: "analytics_wh",
+					Username:     "warehouse_user",
+				},
+				S3: ManagedWarehouseS3{
+					Provider:   "aws",
+					Region:     "us-east-1",
+					Bucket:     "analytics-bucket",
+					PathPrefix: "ducklake/team-analytics/",
+					Endpoint:   "s3.us-east-1.amazonaws.com",
+					UseSSL:     true,
+					URLStyle:   "vhost",
+				},
+				WorkerIdentity: ManagedWarehouseWorkerIdentity{
+					Namespace:          "duckgres",
+					ServiceAccountName: "team-analytics-worker",
+					IAMRoleARN:         "arn:aws:iam::123456789012:role/team-analytics-worker",
+				},
+				AuroraCredentials: SecretRef{
+					Namespace: "duckgres",
+					Name:      "analytics-aurora",
+					Key:       "dsn",
+				},
+				S3Credentials: SecretRef{
+					Namespace: "duckgres",
+					Name:      "analytics-s3",
+					Key:       "credentials",
+				},
+				RuntimeConfig: SecretRef{
+					Namespace: "duckgres",
+					Name:      "analytics-runtime",
+					Key:       "duckgres.yaml",
+				},
+				State:         ManagedWarehouseStateReady,
+				StatusMessage: "warehouse ready",
+				AuroraState:   ManagedWarehouseStateReady,
+				S3State:       ManagedWarehouseStateReady,
+				IdentityState: ManagedWarehouseStateReady,
+				SecretsState:  ManagedWarehouseStateReady,
+				ReadyAt:       &readyAt,
+			},
 			Users: []TeamUser{
 				{Username: "alice", Password: hash1, TeamName: "analytics"},
 				{Username: "bob", Password: hash2, TeamName: "analytics"},
@@ -53,7 +101,11 @@ func TestSnapshotBuild(t *testing.T) {
 			MaxWorkers:   t2.MaxWorkers,
 			MinWorkers:   t2.MinWorkers,
 			MemoryBudget: t2.MemoryBudget,
+			IdleTimeoutS: t2.IdleTimeoutS,
 			Users:        make(map[string]string),
+		}
+		if t2.Warehouse != nil {
+			tc.Warehouse = copyManagedWarehouseConfig(t2.Warehouse)
 		}
 		for _, u := range t2.Users {
 			tc.Users[u.Username] = u.Password
@@ -75,6 +127,21 @@ func TestSnapshotBuild(t *testing.T) {
 	}
 	if len(snap.Teams["analytics"].Users) != 2 {
 		t.Errorf("expected 2 analytics users, got %d", len(snap.Teams["analytics"].Users))
+	}
+	if snap.Teams["analytics"].Warehouse == nil {
+		t.Fatal("expected analytics warehouse to be present")
+	}
+	if snap.Teams["analytics"].Warehouse.Aurora.DatabaseName != "analytics_wh" {
+		t.Fatalf("expected analytics warehouse db name analytics_wh, got %q", snap.Teams["analytics"].Warehouse.Aurora.DatabaseName)
+	}
+	if snap.Teams["analytics"].Warehouse.RuntimeConfig.Name != "analytics-runtime" {
+		t.Fatalf("expected runtime config secret analytics-runtime, got %q", snap.Teams["analytics"].Warehouse.RuntimeConfig.Name)
+	}
+	if snap.Teams["analytics"].Warehouse.ReadyAt == nil || !snap.Teams["analytics"].Warehouse.ReadyAt.Equal(readyAt) {
+		t.Fatalf("expected ready_at %v, got %v", readyAt, snap.Teams["analytics"].Warehouse.ReadyAt)
+	}
+	if snap.Teams["ingestion"].Warehouse != nil {
+		t.Fatal("expected ingestion warehouse to be nil")
 	}
 
 	// Verify user → team mapping
@@ -112,6 +179,7 @@ func TestTableNames(t *testing.T) {
 	}{
 		{Team{}, "duckgres_teams"},
 		{TeamUser{}, "duckgres_team_users"},
+		{ManagedWarehouse{}, "duckgres_managed_warehouses"},
 		{GlobalConfig{}, "duckgres_global_config"},
 		{DuckLakeConfig{}, "duckgres_ducklake_config"},
 		{RateLimitConfig{}, "duckgres_rate_limit_config"},
