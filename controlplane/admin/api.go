@@ -3,8 +3,10 @@
 package admin
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -268,6 +270,7 @@ func (s *gormAPIStore) UpsertManagedWarehouse(teamName string, warehouse *config
 	}
 
 	warehouse.TeamName = teamName
+	warehouse.UpdatedAt = time.Now().UTC()
 	if err := s.db().Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "team_name"}},
 		DoUpdates: clause.AssignmentColumns(managedWarehouseUpsertColumns()),
@@ -388,6 +391,64 @@ type apiHandler struct {
 	info  TeamStackInfo
 }
 
+type managedWarehouseRequest struct {
+	WarehouseDatabase              configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
+	MetadataStore                  configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
+	S3                             configstore.ManagedWarehouseS3                `json:"s3"`
+	WorkerIdentity                 configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
+	WarehouseDatabaseCredentials   configstore.SecretRef                         `json:"warehouse_database_credentials"`
+	MetadataStoreCredentials       configstore.SecretRef                         `json:"metadata_store_credentials"`
+	S3Credentials                  configstore.SecretRef                         `json:"s3_credentials"`
+	RuntimeConfig                  configstore.SecretRef                         `json:"runtime_config"`
+	State                          configstore.ManagedWarehouseProvisioningState `json:"state"`
+	StatusMessage                  string                                        `json:"status_message"`
+	WarehouseDatabaseState         configstore.ManagedWarehouseProvisioningState `json:"warehouse_database_state"`
+	WarehouseDatabaseStatusMessage string                                        `json:"warehouse_database_status_message"`
+	MetadataStoreState             configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
+	MetadataStoreStatusMessage     string                                        `json:"metadata_store_status_message"`
+	S3State                        configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
+	S3StatusMessage                string                                        `json:"s3_status_message"`
+	IdentityState                  configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
+	IdentityStatusMessage          string                                        `json:"identity_status_message"`
+	SecretsState                   configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
+	SecretsStatusMessage           string                                        `json:"secrets_status_message"`
+	ReadyAt                        *time.Time                                    `json:"ready_at"`
+	FailedAt                       *time.Time                                    `json:"failed_at"`
+}
+
+func (r managedWarehouseRequest) toManagedWarehouse() configstore.ManagedWarehouse {
+	return configstore.ManagedWarehouse{
+		WarehouseDatabase:              r.WarehouseDatabase,
+		MetadataStore:                  r.MetadataStore,
+		S3:                             r.S3,
+		WorkerIdentity:                 r.WorkerIdentity,
+		WarehouseDatabaseCredentials:   r.WarehouseDatabaseCredentials,
+		MetadataStoreCredentials:       r.MetadataStoreCredentials,
+		S3Credentials:                  r.S3Credentials,
+		RuntimeConfig:                  r.RuntimeConfig,
+		State:                          r.State,
+		StatusMessage:                  r.StatusMessage,
+		WarehouseDatabaseState:         r.WarehouseDatabaseState,
+		WarehouseDatabaseStatusMessage: r.WarehouseDatabaseStatusMessage,
+		MetadataStoreState:             r.MetadataStoreState,
+		MetadataStoreStatusMessage:     r.MetadataStoreStatusMessage,
+		S3State:                        r.S3State,
+		S3StatusMessage:                r.S3StatusMessage,
+		IdentityState:                  r.IdentityState,
+		IdentityStatusMessage:          r.IdentityStatusMessage,
+		SecretsState:                   r.SecretsState,
+		SecretsStatusMessage:           r.SecretsStatusMessage,
+		ReadyAt:                        r.ReadyAt,
+		FailedAt:                       r.FailedAt,
+	}
+}
+
+func decodeStrictWarehouseRequest(c *gin.Context, dst *managedWarehouseRequest) error {
+	dec := json.NewDecoder(c.Request.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(dst)
+}
+
 // --- Teams ---
 
 func (h *apiHandler) listTeams(c *gin.Context) {
@@ -489,11 +550,12 @@ func (h *apiHandler) getManagedWarehouse(c *gin.Context) {
 
 func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 	teamName := c.Param("name")
-	var warehouse configstore.ManagedWarehouse
-	if err := c.ShouldBindJSON(&warehouse); err != nil {
+	var req managedWarehouseRequest
+	if err := decodeStrictWarehouseRequest(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	warehouse := req.toManagedWarehouse()
 	stored, ok, err := h.store.UpsertManagedWarehouse(teamName, &warehouse)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

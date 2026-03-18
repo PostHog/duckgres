@@ -347,7 +347,6 @@ func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
-		"team_name": "wrong-team",
 		"warehouse_database": {
 			"region": "us-east-1",
 			"endpoint": "analytics.cluster.example",
@@ -445,6 +444,67 @@ func TestPutWarehouseRejectsUnknownTeam(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestPutWarehouseRejectsServerManagedFields(t *testing.T) {
+	store := newFakeAPIStore()
+	store.teams["analytics"] = &configstore.Team{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"team_name": "wrong-team",
+		"created_at": "2026-03-18T10:00:00Z",
+		"warehouse_database": {
+			"database_name": "analytics_warehouse"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
+	store := newFakeAPIStore()
+	store.teams["analytics"] = &configstore.Team{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"state": "awaiting-human-approval",
+		"warehouse_database_state": "queued-for-bootstrap",
+		"metadata_store_state": "vendor-pending",
+		"s3_state": "bucket-handshake",
+		"identity_state": "iam-review",
+		"secrets_state": "waiting-external-secret"
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	warehouse := store.warehouses["analytics"]
+	if warehouse == nil {
+		t.Fatal("expected stored warehouse")
+	}
+	if warehouse.State != "awaiting-human-approval" {
+		t.Fatalf("expected custom overall state, got %q", warehouse.State)
+	}
+	if warehouse.WarehouseDatabaseState != "queued-for-bootstrap" {
+		t.Fatalf("expected custom warehouse db state, got %q", warehouse.WarehouseDatabaseState)
+	}
+	if warehouse.MetadataStoreState != "vendor-pending" {
+		t.Fatalf("expected custom metadata state, got %q", warehouse.MetadataStoreState)
 	}
 }
 
