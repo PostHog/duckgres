@@ -5,6 +5,8 @@ package controlplane_test
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -114,6 +116,45 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	}
 }
 
+func TestLocalConfigStoreSeedSQL(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	if err := applyLocalConfigStoreSeed(t, store); err != nil {
+		t.Fatalf("apply local seed: %v", err)
+	}
+
+	if err := store.Reload(); err != nil {
+		t.Fatalf("reload store: %v", err)
+	}
+
+	snap := store.Snapshot()
+	teamCfg := snap.Teams["local"]
+	if teamCfg == nil {
+		t.Fatal("expected local team from seed")
+	}
+	if teamCfg.Warehouse == nil {
+		t.Fatal("expected local warehouse from seed")
+	}
+	if teamCfg.Warehouse.WarehouseDatabase.DatabaseName != "duckgres_local" {
+		t.Fatalf("expected duckgres_local warehouse db, got %q", teamCfg.Warehouse.WarehouseDatabase.DatabaseName)
+	}
+	if teamCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata_local" {
+		t.Fatalf("expected ducklake_metadata_local metadata db, got %q", teamCfg.Warehouse.MetadataStore.DatabaseName)
+	}
+	if teamCfg.Warehouse.WarehouseDatabaseCredentials.Name != "duckgres-local-warehouse-db" {
+		t.Fatalf("expected duckgres-local-warehouse-db secret ref, got %q", teamCfg.Warehouse.WarehouseDatabaseCredentials.Name)
+	}
+	if teamCfg.Warehouse.State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected ready warehouse state, got %q", teamCfg.Warehouse.State)
+	}
+	if teamCfg.Warehouse.MetadataStoreState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected ready metadata store state, got %q", teamCfg.Warehouse.MetadataStoreState)
+	}
+	if _, ok := teamCfg.Users["postgres"]; !ok {
+		t.Fatal("expected seeded postgres user to belong to local team")
+	}
+}
+
 func newIsolatedConfigStore(t *testing.T) *configstore.ConfigStore {
 	t.Helper()
 
@@ -164,4 +205,23 @@ func ensureIntegrationPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
 	}
+}
+
+func applyLocalConfigStoreSeed(t *testing.T, store *configstore.ConfigStore) error {
+	t.Helper()
+
+	seedPath := filepath.Join(findProjectRoot(), "k8s", "local-config-store.seed.sql")
+	seedSQL, err := os.ReadFile(seedPath)
+	if err != nil {
+		return fmt.Errorf("read seed sql: %w", err)
+	}
+
+	sqlDB, err := store.DB().DB()
+	if err != nil {
+		return fmt.Errorf("store sql db: %w", err)
+	}
+	if _, err := sqlDB.Exec(string(seedSQL)); err != nil {
+		return fmt.Errorf("exec seed sql: %w", err)
+	}
+	return nil
 }
