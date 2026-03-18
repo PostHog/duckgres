@@ -82,98 +82,41 @@ kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=avail
 
 ## Local Development with OrbStack
 
-[OrbStack](https://orbstack.dev/) provides a lightweight Kubernetes cluster for macOS that shares Docker's image store — images built locally are immediately available to K8s pods without a registry or load step.
-
-```bash
-# Start OrbStack Kubernetes
-orb start k8s
-
-# Build the image (automatically available to K8s)
-docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:test .
-
-# Deploy to OrbStack (patch image to use :test tag)
-kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/rbac.yaml
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.yaml
-kubectl apply -f k8s/networkpolicy.yaml
-sed 's|duckgres:latest|duckgres:test|g' k8s/control-plane-deployment.yaml | kubectl apply -f -
-
-# Wait for the control plane
-kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
-
-# Connect via port-forward
-kubectl -n duckgres port-forward svc/duckgres 5432:5432 &
-PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres sslmode=require"
-```
-
-### Iterating
-
-After code changes, rebuild and restart the deployment:
-
-```bash
-docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:test .
-kubectl -n duckgres rollout restart deployment/duckgres-control-plane
-kubectl -n duckgres rollout status deployment/duckgres-control-plane
-```
-
-## Local Multi-Tenant Dev
-
-The repo now includes a concrete local workflow for the multi-tenant control-plane path added behind `--config-store`.
-
-Prerequisites:
-
-- macOS with [OrbStack](https://orbstack.dev/) Kubernetes enabled
-- Docker and `kubectl`
-- `host.docker.internal` reachable from the cluster (OrbStack supports this)
-
-The workflow uses:
-
-- `k8s/local-config-store.compose.yaml` for the PostgreSQL config store on `localhost:5434`
-- `k8s/local-config-store.seed.sql` for the default local tenant/user bootstrap
-- `k8s/control-plane-multitenant-local.yaml` for a local K8s deployment that enables `--config-store`
-- `duckgres:test` as both the control-plane and worker image tag
-
-Bring everything up:
+[OrbStack](https://orbstack.dev/) provides a lightweight Kubernetes cluster for macOS that shares Docker's image store, so locally built images are immediately available to pods. Local development now defaults to the multi-tenant config-store workflow. Prerequisites: OrbStack Kubernetes enabled, Docker, and `kubectl`. This flow assumes `host.docker.internal` is reachable from the cluster.
 
 ```bash
 orb start k8s
 just run-multitenant-local
-```
-
-Port-forward PostgreSQL and the admin UI in separate terminals:
-
-```bash
 just multitenant-port-forward-pg
 just multitenant-port-forward-admin
-```
-
-Then connect and inspect:
-
-```bash
 PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres sslmode=require"
 open http://127.0.0.1:9090/
 ```
 
-The local workflow seeds a default login:
+Default login: `postgres / postgres`
 
-```text
-username: postgres
-password: postgres
+The admin dashboard requires the admin token printed in the control-plane logs. Fetch it with:
+
+```bash
+kubectl -n duckgres logs deployment/duckgres-control-plane | rg "Generated admin API token"
 ```
 
-Tear down the local config store when finished:
+The local seed populates one managed-warehouse contract for the `local` team. That row includes separate `warehouse_database` and `metadata_store` sections plus secret references only, not secret values.
+
+Seeded warehouse contract notes:
+
+- The config store keeps at most one managed-warehouse row per team.
+- `GET /api/v1/teams/local/warehouse` reads that row.
+- `PUT /api/v1/teams/local/warehouse` replaces that row for the team.
+- `just multitenant-seed-local` is idempotent and updates the same `local` warehouse row rather than creating duplicates.
+
+Tear down the local config store:
 
 ```bash
 just multitenant-config-store-down
 ```
 
-Notes:
-
-- The committed local manifest hardcodes the config-store DSN as `postgres://duckgres:duckgres@host.docker.internal:5434/duckgres_config?sslmode=disable`.
-- The control plane polls the config store every `2s` in this local-only manifest so seeded users become available quickly after startup.
-- If you are not using OrbStack, update `k8s/control-plane-multitenant-local.yaml` to point at a reachable Postgres hostname before deploying.
-- The admin API and dashboard are exposed on `:9090` without authentication in the current implementation. Treat this workflow as local-only.
+After code changes, rerun `just run-multitenant-local` to rebuild, redeploy, and reseed the local environment.
 
 ### Running Integration Tests
 

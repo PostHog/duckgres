@@ -50,6 +50,7 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	// Auto-migrate all models
 	if err := db.AutoMigrate(
 		&Team{},
+		&ManagedWarehouse{},
 		&TeamUser{},
 		&GlobalConfig{},
 		&DuckLakeConfig{},
@@ -117,7 +118,7 @@ func (cs *ConfigStore) Start(ctx context.Context) {
 // load fetches all config from the database and builds a Snapshot.
 func (cs *ConfigStore) load() (*Snapshot, error) {
 	var teams []Team
-	if err := cs.db.Preload("Users").Find(&teams).Error; err != nil {
+	if err := cs.db.Preload("Users").Preload("Warehouse").Find(&teams).Error; err != nil {
 		return nil, fmt.Errorf("load teams: %w", err)
 	}
 
@@ -151,6 +152,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			MemoryBudget: t.MemoryBudget,
 			IdleTimeoutS: t.IdleTimeoutS,
 			Users:        make(map[string]string),
+			Warehouse:    copyManagedWarehouseConfig(t.Warehouse),
 		}
 		for _, u := range t.Users {
 			tc.Users[u.Username] = u.Password

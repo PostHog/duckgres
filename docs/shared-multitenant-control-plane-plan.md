@@ -1,16 +1,16 @@
 # Shared Multi-Tenant Control Plane Summary
 
 - Each team owns exactly one managed warehouse, "team" is used interchangeably with "client".
-- A provisioning layer, driven by PostHog and backed by Duckling/Crossplane, creates each team's Aurora database, S3 bucket, worker identity, and secrets.
+- A provisioning layer, driven by PostHog and backed by Duckling/Crossplane, creates each team's warehouse database, metadata store, S3 bucket, worker identity, and secrets.
 - A shared duckgres multi-tenant control plane stores team metadata, user credentials, warehouse config, and secret refs in a separate config-store PostgreSQL database.
 - The control plane also exposes an admin API and dashboard for operator visibility and config management.
 - A shared K8s cluster runs team-scoped worker pods for the multi-tenant control plane.
-- Each worker pod gets only the runtime configuration and access needed for that team's Aurora database and S3 bucket.
+- Each worker pod gets only the runtime configuration and access needed for that team's warehouse database, metadata store, and S3 bucket.
 
 ## Core Flow
 
 1. A user clicks "provision managed warehouse" in PostHog.
-2. The provisioning workflow creates the team's Aurora database, S3 bucket, worker identity, and secrets, then writes the team's connection metadata into the duckgres config store.
+2. The provisioning workflow creates the team's warehouse database, metadata store, S3 bucket, worker identity, and secrets, then writes the team's connection metadata into the duckgres config store.
 3. Once provisioning completes, the UI shows the team's pgwire and Duckhog connection instructions for the shared control-plane endpoint.
 4. The user connects to the shared multi-tenant duckgres control plane.
 5. The control plane authenticates the user against the config store, resolves the user's team, and assigns the session to that team's worker pool.
@@ -37,9 +37,9 @@ Separate from the end-user query path, operators use the admin API/dashboard to 
 
 ## Remaining Work
 
-- Add full managed-warehouse contract to the config store. It needs team-scoped warehouse metadata such as Aurora database info, S3 bucket info, worker identity, secret refs, and provisioning state.
-- Add end-to-end provisioning controller that turns a PostHog warehouse request into Aurora, S3, IAM/Pod Identity, K8s Secret creation, and config-store updates.
-- Implement team-specific DuckLake/Aurora/S3 runtime wiring.
+- Add full managed-warehouse contract to the config store. It needs team-scoped warehouse metadata such as warehouse-database info, metadata-store info, S3 bucket info, worker identity, secret refs, and provisioning state.
+- Add end-to-end provisioning controller that turns a PostHog warehouse request into warehouse DB, metadata store, S3, IAM/Pod Identity, K8s Secret creation, and config-store updates.
+- Implement team-specific DuckLake/warehouse-db/metadata-store/S3 runtime wiring.
 - Change worker pod spec from global to be team-specific. 
 - Implement non-disruptive customer-initiated duckgres login rotation mechanism.
 - Enable Duckhog / Flight SQL in multi-tenant mode.

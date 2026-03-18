@@ -79,6 +79,7 @@ run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multit
     kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
     @echo "Multi-tenant control plane ready."
     @echo "Default login: postgres / postgres"
+    @echo "Fetch admin token with: kubectl -n duckgres logs deployment/duckgres-control-plane | rg 'Generated admin API token'"
     @echo "Run 'just multitenant-port-forward-pg' in one terminal and 'just multitenant-port-forward-admin' in another."
 
 # Port-forward PostgreSQL traffic from the local control plane
@@ -132,11 +133,6 @@ test-integration:
 [group('test')]
 test-controlplane:
     go test -v -timeout 300s ./tests/controlplane/...
-
-# Verify the local multi-tenant dev assets stay wired together
-[group('test')]
-test-local-multitenant-assets:
-    bash tests/controlplane/test_local_multitenant_assets.sh
 
 # Run perf tests
 [group('test')]
