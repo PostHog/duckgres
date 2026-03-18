@@ -101,6 +101,15 @@ The admin dashboard requires the admin token printed in the control-plane logs. 
 kubectl -n duckgres logs deployment/duckgres-control-plane | rg "Generated admin API token"
 ```
 
+The local seed populates one managed-warehouse contract for the `local` team. That row includes separate `warehouse_database` and `metadata_store` sections plus secret references only, not secret values.
+
+Seeded warehouse contract notes:
+
+- The config store keeps at most one managed-warehouse row per team.
+- `GET /api/v1/teams/local/warehouse` reads that row.
+- `PUT /api/v1/teams/local/warehouse` replaces that row for the team.
+- `just multitenant-seed-local` is idempotent and updates the same `local` warehouse row rather than creating duplicates.
+
 Tear down the local config store:
 
 ```bash

@@ -611,6 +611,14 @@ See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration re
 
 On the multi-tenant path, the config store now keeps per-team managed-warehouse metadata in addition to team/user auth and limits. That team-scoped contract is intended to become the source of truth for the tenant warehouse DB, the tenant DuckLake metadata store (which may live on shared Aurora or a dedicated RDS instance), object-store settings, worker identity, secret references, and provisioning state. The older config-store `DuckLakeConfig` singleton remains only as a legacy cluster-wide setting and should not be treated as authoritative for multi-tenant runtime wiring.
 
+Managed-warehouse contract notes:
+
+- At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
+- The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
+- The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`.
+- Secret references only are stored in the config store. Secret material remains outside the database.
+- The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.
+
 ## Two-Tier Query Processing
 
 Duckgres uses a two-tier approach to handle both PostgreSQL and DuckDB-specific SQL syntax transparently:
