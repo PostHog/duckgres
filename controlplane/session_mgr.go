@@ -24,6 +24,7 @@ type SessionProgress struct {
 type ManagedSession struct {
 	PID          int32
 	WorkerID     int
+	Protocol     string // "postgres" or "flight"
 	SessionToken string
 	Executor     *server.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
@@ -98,6 +99,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	session := &ManagedSession{
 		PID:          pid,
 		WorkerID:     worker.ID,
+		Protocol:     "postgres",
 		SessionToken: sessionToken,
 		Executor:     executor,
 	}
@@ -305,6 +307,15 @@ func (sm *SessionManager) UpdateProgress(workerID int, progress map[string]*Sess
 		if sp, ok := progress[key]; ok {
 			s.queryProgress.Store(sp)
 		}
+	}
+}
+
+// SetProtocol updates the protocol label for an active session.
+func (sm *SessionManager) SetProtocol(pid int32, protocol string) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[pid]; ok {
+		s.Protocol = protocol
 	}
 }
 

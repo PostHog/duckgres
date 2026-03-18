@@ -29,6 +29,7 @@ type SessionStatus struct {
 	PID      int32  `json:"pid"`
 	WorkerID int    `json:"worker_id"`
 	Team     string `json:"team"`
+	Protocol string `json:"protocol"`
 }
 
 // ClusterStatus aggregates cluster state for the dashboard.

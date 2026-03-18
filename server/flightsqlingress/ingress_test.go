@@ -163,7 +163,7 @@ func testFlightHandlerWithStoreAndRateLimiter(t *testing.T, users map[string]str
 		},
 		destroySessionFn: func(int32) {},
 	}
-	h, err := NewControlPlaneFlightSQLHandler(store, users)
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: users})
 	if err != nil {
 		t.Fatalf("NewControlPlaneFlightSQLHandler returned error: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithoutBasicAuth(t *te
 		},
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestSessionFromContextRejectsUnknownSessionTokenEvenWithBasicAuth(t *testin
 		sessions:         make(map[string]*flightClientSession),
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithBasicAuth(t *testi
 		},
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestSessionFromContextTokenPathDoesNotClearRateLimiterFailures(t *testing.T
 			"issued-token": s,
 		},
 	}
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -400,7 +400,7 @@ func TestSessionFromContextWithoutTokenCreatesDistinctSessions(t *testing.T) {
 		byKey:            make(map[string]string),
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -488,7 +488,7 @@ func TestSessionFromContextRejectsExpiredSessionToken(t *testing.T) {
 		},
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -514,10 +514,10 @@ func TestSessionFromContextRejectsTokenUserMismatch(t *testing.T) {
 		},
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{
 		"postgres": "postgres",
 		"alice":    "alice",
-	})
+	}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -608,7 +608,7 @@ func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T
 			t.Fatalf("expected revoke path to destroy session pid %d, got %v", issued.pid, destroyedPIDs)
 		}
 
-		h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+		h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 		if err != nil {
 			t.Fatalf("failed to construct handler: %v", err)
 		}
@@ -670,7 +670,7 @@ func TestCloseSessionRevokesTokenAndDestroysWorker(t *testing.T) {
 		},
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -718,7 +718,7 @@ func TestCloseSessionMissingTokenDoesNotBootstrap(t *testing.T) {
 		byKey:            make(map[string]string),
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -756,7 +756,7 @@ func TestCloseSessionTokenOnlyRevokesTokenAndDoesNotBootstrap(t *testing.T) {
 		},
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -791,7 +791,7 @@ func TestCloseSessionDoesNotReissueSessionTokenMetadata(t *testing.T) {
 		destroySessionFn: func(int32) {},
 	}
 
-	h, err := NewControlPlaneFlightSQLHandler(store, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("failed to construct handler: %v", err)
 	}
@@ -825,7 +825,7 @@ func TestSupportsReadOnlySchemaInference(t *testing.T) {
 }
 
 func TestNewControlPlaneFlightSQLHandlerReturnsError(t *testing.T) {
-	h, err := NewControlPlaneFlightSQLHandler(nil, map[string]string{"postgres": "postgres"})
+	h, err := NewControlPlaneFlightSQLHandler(nil, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
 	if err != nil {
 		t.Fatalf("expected handler constructor to return nil error, got %v", err)
 	}

@@ -96,6 +96,7 @@ func (a *teamRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 				PID:      s.PID,
 				WorkerID: s.WorkerID,
 				Team:     name,
+				Protocol: s.Protocol,
 			})
 		}
 	}

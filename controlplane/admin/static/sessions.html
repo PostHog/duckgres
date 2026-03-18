@@ -48,11 +48,16 @@
                     return;
                 }
                 let html = '<table class="w-full"><thead><tr class="text-left text-gray-400 text-sm border-b border-gray-700">' +
-                    '<th class="p-3">PID</th><th class="p-3">Team</th><th class="p-3">Worker</th></tr></thead><tbody>';
+                    '<th class="p-3">PID</th><th class="p-3">Team</th><th class="p-3">Protocol</th><th class="p-3">Worker</th></tr></thead><tbody>';
                 sessions.forEach(s => {
+                    const proto = s.protocol || 'postgres';
+                    const badge = proto === 'flight'
+                        ? '<span class="px-2 py-0.5 rounded text-xs font-medium bg-blue-900 text-blue-300">flight</span>'
+                        : '<span class="px-2 py-0.5 rounded text-xs font-medium bg-green-900 text-green-300">postgres</span>';
                     html += `<tr class="border-b border-gray-700">
                         <td class="p-3 font-mono">${s.pid}</td>
                         <td class="p-3">${esc(s.team)}</td>
+                        <td class="p-3">${badge}</td>
                         <td class="p-3">${s.worker_id}</td></tr>`;
                 });
                 html += '</tbody></table>';
