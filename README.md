@@ -607,8 +607,7 @@ docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:latest .
 kubectl apply -f k8s/
 ```
 
-See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and local development instructions using OrbStack.
-For the new multi-tenant config-store flow, the repo also includes a concrete local OrbStack workflow via `just run-multitenant-local`.
+See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and the default local OrbStack config-store workflow via `just run-multitenant-local`.
 
 On the multi-tenant path, the config store now keeps per-team managed-warehouse metadata in addition to team/user auth and limits. That team-scoped contract is intended to become the source of truth for the tenant warehouse DB, the tenant DuckLake metadata store (which may live on shared Aurora or a dedicated RDS instance), object-store settings, worker identity, secret references, and provisioning state. The older config-store `DuckLakeConfig` singleton remains only as a legacy cluster-wide setting and should not be treated as authoritative for multi-tenant runtime wiring.
 

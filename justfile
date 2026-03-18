@@ -79,6 +79,7 @@ run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multit
     kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
     @echo "Multi-tenant control plane ready."
     @echo "Default login: postgres / postgres"
+    @echo "Fetch admin token with: kubectl -n duckgres logs deployment/duckgres-control-plane | rg 'Generated admin API token'"
     @echo "Run 'just multitenant-port-forward-pg' in one terminal and 'just multitenant-port-forward-admin' in another."
 
 # Port-forward PostgreSQL traffic from the local control plane
