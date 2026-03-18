@@ -47,6 +47,7 @@ type FileConfig struct {
 	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`    // e.g., "5m"
 	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"` // e.g., "24h"
 	PassthroughUsers          []string            `yaml:"passthrough_users"`      // Users that bypass transpiler + pg_catalog
+	LogLevel                  string              `yaml:"log_level"`              // Log level: debug, info, warn, error
 	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`              // Query log configuration
 
 	// Worker backend configuration
@@ -313,13 +314,38 @@ func main() {
 		cliSet[f.Name] = true
 	})
 
-	// Set log level env var from CLI flag so workers inherit it.
+	// Auto-detect duckgres.yaml if no config file was explicitly specified
+	if *configFile == "" {
+		if _, err := os.Stat("duckgres.yaml"); err == nil {
+			*configFile = "duckgres.yaml"
+		}
+	}
+
+	// Load config file early so log_level from YAML can feed into initLogging().
+	var fileCfg *FileConfig
+	if *configFile != "" {
+		loadedCfg, err := loadConfigFile(*configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config file: %s\n", err)
+			os.Exit(1)
+		}
+		fileCfg = loadedCfg
+	}
+
+	// Resolve log level: CLI flag > env var > YAML config > default (info).
+	// Set the env var so workers inherit it and parseLogLevel() picks it up.
 	if *logLevel != "" {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", *logLevel)
+	} else if os.Getenv("DUCKGRES_LOG_LEVEL") == "" && fileCfg != nil && fileCfg.LogLevel != "" {
+		_ = os.Setenv("DUCKGRES_LOG_LEVEL", fileCfg.LogLevel)
 	}
 
 	loggingShutdown := initLogging()
 	defer loggingShutdown()
+
+	if fileCfg != nil {
+		slog.Info("Loaded configuration from " + *configFile)
+	}
 
 	fatal := func(msg string) {
 		slog.Error(msg)
@@ -330,25 +356,6 @@ func main() {
 	if *showHelp {
 		flag.Usage()
 		os.Exit(0)
-	}
-
-	// Auto-detect duckgres.yaml if no config file was explicitly specified
-	if *configFile == "" {
-		if _, err := os.Stat("duckgres.yaml"); err == nil {
-			*configFile = "duckgres.yaml"
-		}
-	}
-
-	var fileCfg *FileConfig
-	// Load config file if specified (or auto-detected)
-	if *configFile != "" {
-		loadedCfg, err := loadConfigFile(*configFile)
-		if err != nil {
-			slog.Error("Failed to load config file: " + err.Error())
-			os.Exit(1)
-		}
-		slog.Info("Loaded configuration from " + *configFile)
-		fileCfg = loadedCfg
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
