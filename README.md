@@ -618,6 +618,7 @@ Managed-warehouse contract notes:
 - The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`.
 - Secret references only are stored in the config store. Secret material remains outside the database.
 - The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.
+- Those state fields are open strings. Canonical values are `pending`, `provisioning`, `ready`, `failed`, `deleting`, and `deleted`, but callers may persist other values while workflows evolve.
 
 ## Two-Tier Query Processing
 

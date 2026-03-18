@@ -28,7 +28,9 @@ type TeamUser struct {
 
 func (TeamUser) TableName() string { return "duckgres_team_users" }
 
-// ManagedWarehouseProvisioningState is the lifecycle state for a managed warehouse or sub-resource.
+// ManagedWarehouseProvisioningState is an open string used for warehouse lifecycle status.
+// The constants below are the canonical values used by current tooling, but callers may
+// persist other states while provisioning workflows evolve.
 type ManagedWarehouseProvisioningState string
 
 const (
