@@ -47,6 +47,7 @@ type FileConfig struct {
 	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`    // e.g., "5m"
 	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"` // e.g., "24h"
 	PassthroughUsers          []string            `yaml:"passthrough_users"`      // Users that bypass transpiler + pg_catalog
+	LogQueries                *bool               `yaml:"log_queries"`            // Log all queries at Info level
 	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`              // Query log configuration
 
 	// Worker backend configuration
@@ -240,7 +241,8 @@ func main() {
 	acmeDNSProvider := flag.String("acme-dns-provider", "", "DNS provider for ACME DNS-01 challenges, e.g. 'route53' (env: DUCKGRES_ACME_DNS_PROVIDER)")
 	acmeDNSZoneID := flag.String("acme-dns-zone-id", "", "Route53 hosted zone ID for ACME DNS-01 challenges (env: DUCKGRES_ACME_DNS_ZONE_ID)")
 
-	// Query log flags
+	// Query logging flags
+	logQueries := flag.Bool("log-queries", false, "Log all queries at Info level for debugging (env: DUCKGRES_LOG_QUERIES)")
 	queryLog := flag.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
 
 	// DuckDB service flags
@@ -288,6 +290,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ADMIN_TOKEN        Bearer token for admin API authentication\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_QUERIES        Log all queries at Info level (default: false)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -392,6 +395,7 @@ func main() {
 		K8sWorkerConfigMap:        *k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy:  *k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
+		LogQueries:                *logQueries,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)

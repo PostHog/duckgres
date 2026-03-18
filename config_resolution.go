@@ -50,6 +50,7 @@ type configCLIInputs struct {
 	K8sWorkerConfigMap        string
 	K8sWorkerImagePullPolicy  string
 	K8sWorkerServiceAccount   string
+	LogQueries                bool
 	QueryLog                  bool
 }
 
@@ -288,6 +289,10 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			for _, u := range fileCfg.PassthroughUsers {
 				cfg.PassthroughUsers[u] = true
 			}
+		}
+
+		if fileCfg.LogQueries != nil {
+			cfg.LogQueries = *fileCfg.LogQueries
 		}
 
 		// Query log configuration
@@ -585,6 +590,14 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		k8sWorkerServiceAccount = v
 	}
 
+	if v := getenv("DUCKGRES_LOG_QUERIES"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.LogQueries = b
+		} else {
+			warn("Invalid DUCKGRES_LOG_QUERIES: " + err.Error())
+		}
+	}
+
 	// Query log env vars
 	if v := getenv("DUCKGRES_QUERY_LOG_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -774,6 +787,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["k8s-worker-service-account"] {
 		k8sWorkerServiceAccount = cli.K8sWorkerServiceAccount
+	}
+	if cli.Set["log-queries"] {
+		cfg.LogQueries = cli.LogQueries
 	}
 	if cli.Set["query-log"] {
 		cfg.QueryLog.Enabled = cli.QueryLog

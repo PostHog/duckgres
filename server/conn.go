@@ -860,7 +860,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
-	slog.Debug("Query received.", "user", c.username, "query", query)
+	if c.server.cfg.LogQueries {
+		slog.Info("Query received.", "user", c.username, "query", query)
+	} else {
+		slog.Debug("Query received.", "user", c.username, "query", query)
+	}
 
 	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
 	// or transpilation. DuckDB doesn't support these natively, so cursor
@@ -983,7 +987,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Log the transpiled query if it differs from the original
 	if query != originalQuery {
-		slog.Debug("Query transpiled.", "user", c.username, "executed", query)
+		if c.server.cfg.LogQueries {
+			slog.Info("Query transpiled.", "user", c.username, "original", originalQuery, "executed", query)
+		} else {
+			slog.Debug("Query transpiled.", "user", c.username, "executed", query)
+		}
 	}
 
 	// Determine command type for proper response
@@ -4294,11 +4302,20 @@ func (c *clientConn) handleParse(body []byte) {
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 	}
 
-	slog.Debug("Prepared statement.", "user", c.username, "name", stmtName, "query", query)
-	if len(result.Statements) > 0 {
-		slog.Debug("Prepared statement multi-statement.", "user", c.username, "name", stmtName, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
-	} else if result.SQL != query {
-		slog.Debug("Prepared statement transpiled.", "user", c.username, "name", stmtName, "transpiled", result.SQL)
+	if c.server.cfg.LogQueries {
+		slog.Info("Prepared statement.", "user", c.username, "name", stmtName, "query", query)
+		if len(result.Statements) > 0 {
+			slog.Info("Prepared statement multi-statement.", "user", c.username, "name", stmtName, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
+		} else if result.SQL != query {
+			slog.Info("Prepared statement transpiled.", "user", c.username, "name", stmtName, "transpiled", result.SQL)
+		}
+	} else {
+		slog.Debug("Prepared statement.", "user", c.username, "name", stmtName, "query", query)
+		if len(result.Statements) > 0 {
+			slog.Debug("Prepared statement multi-statement.", "user", c.username, "name", stmtName, "statements", len(result.Statements), "cleanup", len(result.CleanupStatements))
+		} else if result.SQL != query {
+			slog.Debug("Prepared statement transpiled.", "user", c.username, "name", stmtName, "transpiled", result.SQL)
+		}
 	}
 	_ = writeParseComplete(c.writer)
 }

@@ -193,6 +193,10 @@ type Config struct {
 	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
 	PassthroughUsers map[string]bool
 
+	// LogQueries logs every incoming query (simple and extended protocol) at Info level.
+	// Useful for debugging client interactions.
+	LogQueries bool
+
 	// QueryLog configures the DuckLake query log (system.query_log table).
 	QueryLog QueryLogConfig
 }
