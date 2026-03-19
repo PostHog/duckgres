@@ -1025,7 +1025,7 @@ func ensureDuckLakeMetadataIndexes(dlCfg DuckLakeConfig) {
 		slog.Warn("Failed to open connection for DuckLake metadata indexes.", "error", err)
 		return
 	}
-	defer pgDB.Close()
+	defer func() { _ = pgDB.Close() }()
 
 	// Use a generous timeout — CREATE INDEX on large tables (e.g., ducklake_file_column_stats
 	// at 1.2 GB) can take minutes on first run. Subsequent runs are instant (IF NOT EXISTS).
