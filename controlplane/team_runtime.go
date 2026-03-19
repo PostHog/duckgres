@@ -53,6 +53,12 @@ func ResolveTeamRuntime(team *configstore.TeamConfig) (*TeamRuntime, bool) {
 
 // ApplyTeamRuntimeToPoolConfig overlays runtime-specific worker settings onto
 // the base pool configuration.
+//
+// Design note: on the multi-tenant path the control plane currently assumes
+// provisioning has already rendered a complete, worker-ready runtime_config
+// Secret from the structured managed-warehouse contract. The control plane only
+// selects and mounts that Secret; it does not synthesize DuckLake /
+// warehouse-db / metadata-store / S3 settings from the config-store fields.
 func ApplyTeamRuntimeToPoolConfig(base K8sWorkerPoolConfig, runtime *TeamRuntime) (K8sWorkerPoolConfig, error) {
 	if runtime == nil {
 		return base, nil
