@@ -38,8 +38,6 @@ spec:
             - "IfNotPresent"
             - "--k8s-worker-secret"
             - "duckgres-worker-token"
-            - "--k8s-worker-configmap"
-            - "duckgres-config"
             - "--cert"
             - "/certs/server.crt"
             - "--key"

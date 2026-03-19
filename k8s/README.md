@@ -26,10 +26,10 @@ This directory contains **development/reference manifests** for running duckgres
 │  └──────────────┘ └──────────────┘ └──────────────┘  │
 │                                                      │
 │  Worker pods have:                                   │
-│  - Owner references → CP pod (GC on CP deletion)    │
+│  - Team-specific runtime Secret mount                │
 │  - SecurityContext: non-root (UID 1000)              │
 │  - Bearer token from K8s Secret                      │
-│  - ConfigMap mount for shared config                 │
+│  - Team-scoped labels and identity                   │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -41,7 +41,7 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 |------|-------------|
 | `shared/namespace.yaml` | `duckgres` namespace |
 | `shared/rbac.yaml` | ServiceAccount, Role (pods + secrets), RoleBinding |
-| `shared/configmap.yaml` | Shared duckgres config (users, extensions, data dir) |
+| `shared/configmap.yaml` | Shared control-plane config for the local manifests |
 | `shared/secret.yaml` | Bearer token secret (auto-populated by CP if empty) |
 | `shared/networkpolicy.yaml` | Restricts worker ingress to CP pods only |
 | `shared/config-store.compose.yaml` | Shared local config-store PostgreSQL plus the warehouse-db, DuckLake metadata DB, and MinIO runtime dependencies |
@@ -62,9 +62,8 @@ Key flags for Kubernetes mode:
 | `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
 | `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |
 | `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |
-| `--k8s-worker-configmap` | `DUCKGRES_K8S_WORKER_CONFIGMAP` | ConfigMap name for worker config |
 
-The bearer token secret is used to authenticate gRPC connections between the control plane and workers. If the secret exists but is empty, the CP auto-generates a random token and populates it.
+The bearer token secret is used to authenticate gRPC connections between the control plane and workers. If the secret exists but is empty, the CP auto-generates a random token and populates it. On the multitenant managed-warehouse path, team workers no longer fall back to a shared worker ConfigMap; they require a per-team `runtime_config` Secret.
 
 Kubernetes support in this repo is now centered on the multi-tenant control-plane path. The supported local and CI workflow is `kind` via `just run-multitenant-kind`, with OrbStack retained only as an alternate local workflow.
 

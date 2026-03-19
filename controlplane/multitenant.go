@@ -108,6 +108,22 @@ var _ admin.TeamStackInfo = (*teamRouterAdapter)(nil)
 
 // SetupMultiTenant initializes the config store, team router, and Gin admin server.
 // Called from RunControlPlane when --config-store is set with remote backend.
+func buildMultiTenantBasePoolConfig(cfg ControlPlaneConfig, memBudget uint64, maxWorkers int) K8sWorkerPoolConfig {
+	return K8sWorkerPoolConfig{
+		Namespace:       cfg.K8s.WorkerNamespace,
+		CPID:            cfg.K8s.ControlPlaneID,
+		WorkerImage:     cfg.K8s.WorkerImage,
+		WorkerPort:      cfg.K8s.WorkerPort,
+		SecretName:      cfg.K8s.WorkerSecret,
+		MaxWorkers:      maxWorkers,
+		IdleTimeout:     cfg.WorkerIdleTimeout,
+		ConfigPath:      cfg.ConfigPath,
+		ImagePullPolicy: cfg.K8s.ImagePullPolicy,
+		ServiceAccount:  cfg.K8s.ServiceAccount,
+		MemoryBudget:    int64(memBudget),
+	}
+}
+
 func SetupMultiTenant(
 	cfg ControlPlaneConfig,
 	srv *server.Server,
@@ -124,20 +140,7 @@ func SetupMultiTenant(
 		return nil, nil, nil, err
 	}
 
-	baseCfg := K8sWorkerPoolConfig{
-		Namespace:       cfg.K8s.WorkerNamespace,
-		CPID:            cfg.K8s.ControlPlaneID,
-		WorkerImage:     cfg.K8s.WorkerImage,
-		WorkerPort:      cfg.K8s.WorkerPort,
-		SecretName:      cfg.K8s.WorkerSecret,
-		ConfigMap:       cfg.K8s.WorkerConfigMap,
-		MaxWorkers:      maxWorkers,
-		IdleTimeout:     cfg.WorkerIdleTimeout,
-		ConfigPath:      cfg.ConfigPath,
-		ImagePullPolicy: cfg.K8s.ImagePullPolicy,
-		ServiceAccount:  cfg.K8s.ServiceAccount,
-		MemoryBudget:    int64(memBudget),
-	}
+	baseCfg := buildMultiTenantBasePoolConfig(cfg, memBudget, maxWorkers)
 
 	router, err := NewTeamRouter(store, baseCfg, cfg, srv)
 	if err != nil {

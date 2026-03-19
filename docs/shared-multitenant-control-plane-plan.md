@@ -40,8 +40,9 @@ Separate from the end-user query path, operators use the admin API/dashboard to 
 - [x] Add full managed-warehouse contract to the config store. It needs team-scoped warehouse metadata such as warehouse-database info, metadata-store info, S3 bucket info, worker identity, secret refs, and provisioning state.
 - [ ] Add end-to-end provisioning controller that turns a PostHog warehouse request into warehouse DB, metadata store, S3, IAM/Pod Identity, K8s Secret creation, and config-store updates.
 - [x] Implement team-specific DuckLake/warehouse-db/metadata-store/S3 runtime wiring.
-  The control plane now selects and mounts a per-team `runtime_config` Secret, and the provisioning-side helper path can render that worker-ready Secret plus the supporting warehouse-db / metadata-store / S3 secrets from the structured managed-warehouse contract. The local multi-tenant dev/test flow uses that same artifact-rendering path instead of a hand-written runtime Secret.
+  The control plane now selects and mounts a per-team `runtime_config` Secret, and the provisioning-side helper path can render that worker-ready Secret plus the supporting warehouse-db / metadata-store / S3 secrets from the structured managed-warehouse contract. Managed-warehouse teams now fail closed if that runtime artifact is missing, rather than falling back to a shared worker config. The local multi-tenant dev/test flow uses that same artifact-rendering path instead of a hand-written runtime Secret.
 - [x] Change worker pod spec from global to be team-specific.
+- [ ] Replace same-namespace worker owner-ref GC with explicit cross-namespace worker cleanup/reconciliation for per-team namespaces.
 - [ ] Implement non-disruptive customer-initiated duckgres login rotation mechanism.
 - [ ] Enable Duckhog / Flight SQL in multi-tenant mode.
 - [ ] Dev Infra

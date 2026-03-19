@@ -488,3 +488,131 @@ func TestTeamRouter_HandleConfigChange_KeepsExistingStackWhenReplacementFails(t 
 		t.Fatal("expected analytics stack to keep original pool after failed replacement")
 	}
 }
+
+func TestTeamRouter_HandleConfigChange_KeepsExistingStackWhenNewRuntimeConfigIsMissing(t *testing.T) {
+	factory := installFakePoolFactory(t)
+
+	baseCfg := K8sWorkerPoolConfig{
+		Namespace:      "shared-workers",
+		CPID:           "cp-1",
+		WorkerImage:    "duckgres:test",
+		WorkerPort:     8816,
+		SecretName:     "worker-token",
+		ConfigMap:      "shared-config",
+		MaxWorkers:     4,
+		IdleTimeout:    5 * time.Minute,
+		ConfigPath:     "/etc/duckgres/duckgres.yaml",
+		ServiceAccount: "default",
+		MemoryBudget:   8 << 30,
+	}
+	globalCfg := ControlPlaneConfig{HealthCheckInterval: 2 * time.Second}
+	store := &fakeTeamConfigStore{
+		snap: testSnapshot(testTeamConfig("analytics", 4, testWarehouse("warehouse-a.internal"))),
+	}
+
+	router, err := NewTeamRouter(store, baseCfg, globalCfg, nil)
+	if err != nil {
+		t.Fatalf("NewTeamRouter: %v", err)
+	}
+
+	originalPool := factory.lastPool()
+	oldSnap := store.snap
+	brokenWarehouse := testWarehouse("warehouse-b.internal")
+	brokenWarehouse.RuntimeConfig = configstore.SecretRef{}
+	newSnap := testSnapshot(testTeamConfig("analytics", 4, brokenWarehouse))
+
+	router.HandleConfigChange(oldSnap, newSnap)
+
+	if got := factory.poolCount(); got != 1 {
+		t.Fatalf("expected invalid runtime replacement to keep original pool count, got %d", got)
+	}
+	if got := originalPool.shutdowns; got != 0 {
+		t.Fatalf("expected original pool to remain running, got %d shutdowns", got)
+	}
+
+	stack, ok := router.AllStacks()["analytics"]
+	if !ok {
+		t.Fatal("expected analytics stack to remain present after invalid replacement")
+	}
+	if stack.Pool != originalPool {
+		t.Fatal("expected analytics stack to keep original pool when runtime_config is missing")
+	}
+}
+
+func TestNewTeamRouter_SkipsManagedWarehouseTeamsMissingRuntimeConfig(t *testing.T) {
+	factory := installFakePoolFactory(t)
+
+	baseCfg := K8sWorkerPoolConfig{
+		Namespace:      "shared-workers",
+		CPID:           "cp-1",
+		WorkerImage:    "duckgres:test",
+		WorkerPort:     8816,
+		SecretName:     "worker-token",
+		MaxWorkers:     4,
+		IdleTimeout:    5 * time.Minute,
+		ConfigPath:     "/etc/duckgres/duckgres.yaml",
+		ServiceAccount: "default",
+		MemoryBudget:   8 << 30,
+	}
+	globalCfg := ControlPlaneConfig{HealthCheckInterval: 2 * time.Second}
+	brokenWarehouse := testWarehouse("warehouse-a.internal")
+	brokenWarehouse.RuntimeConfig = configstore.SecretRef{}
+	store := &fakeTeamConfigStore{
+		snap: testSnapshot(testTeamConfig("analytics", 4, brokenWarehouse)),
+	}
+
+	router, err := NewTeamRouter(store, baseCfg, globalCfg, nil)
+	if err != nil {
+		t.Fatalf("NewTeamRouter: %v", err)
+	}
+	if got := factory.poolCount(); got != 0 {
+		t.Fatalf("expected no pool to be created for incomplete managed warehouse, got %d", got)
+	}
+	if stacks := router.AllStacks(); len(stacks) != 0 {
+		t.Fatalf("expected no team stacks for incomplete managed warehouse, got %d", len(stacks))
+	}
+}
+
+func TestTeamRouter_HandleConfigChange_IgnoresDuckLakeSingletonChanges(t *testing.T) {
+	factory := installFakePoolFactory(t)
+
+	baseCfg := K8sWorkerPoolConfig{
+		Namespace:      "shared-workers",
+		CPID:           "cp-1",
+		WorkerImage:    "duckgres:test",
+		WorkerPort:     8816,
+		SecretName:     "worker-token",
+		MaxWorkers:     4,
+		IdleTimeout:    5 * time.Minute,
+		ConfigPath:     "/etc/duckgres/duckgres.yaml",
+		ServiceAccount: "default",
+		MemoryBudget:   8 << 30,
+	}
+	globalCfg := ControlPlaneConfig{HealthCheckInterval: 2 * time.Second}
+	store := &fakeTeamConfigStore{
+		snap: testSnapshot(testTeamConfig("analytics", 4, testWarehouse("warehouse-a.internal"))),
+	}
+
+	router, err := NewTeamRouter(store, baseCfg, globalCfg, nil)
+	if err != nil {
+		t.Fatalf("NewTeamRouter: %v", err)
+	}
+
+	oldSnap := store.snap
+	newSnap := testSnapshot(testTeamConfig("analytics", 4, testWarehouse("warehouse-a.internal")))
+	newSnap.DuckLake = configstore.DuckLakeConfig{
+		ID:            1,
+		ObjectStore:   "s3://legacy/fallback/",
+		MetadataStore: "postgres:host=legacy.example port=5432 user=ducklake password=ducklake dbname=ducklake",
+	}
+
+	router.HandleConfigChange(oldSnap, newSnap)
+
+	if got := factory.poolCount(); got != 1 {
+		t.Fatalf("expected ducklake singleton changes to keep existing pool, got %d pools", got)
+	}
+	pool := factory.lastPool()
+	if got := pool.shutdowns; got != 0 {
+		t.Fatalf("expected existing pool to stay running, got %d shutdowns", got)
+	}
+}

@@ -167,6 +167,16 @@ func TestApplyTeamRuntimeToPoolConfigRejectsInvalidRuntimeConfig(t *testing.T) {
 	_, err := ApplyTeamRuntimeToPoolConfig(base, &TeamRuntime{
 		TeamName: "analytics",
 		RuntimeConfig: configstore.SecretRef{
+			Key: "duckgres.yaml",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected missing runtime config name to fail")
+	}
+
+	_, err = ApplyTeamRuntimeToPoolConfig(base, &TeamRuntime{
+		TeamName: "analytics",
+		RuntimeConfig: configstore.SecretRef{
 			Name: "analytics-runtime",
 		},
 	})

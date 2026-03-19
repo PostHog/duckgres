@@ -214,6 +214,7 @@ func TestK8sPool_BuildWorkerPodUsesConfigSecret(t *testing.T) {
 
 	foundConfigVolume := false
 	foundConfigMount := false
+	foundConfigMapVolume := false
 	for _, volume := range pod.Spec.Volumes {
 		if volume.Name == "duckgres-config-secret" &&
 			volume.VolumeSource.Secret != nil &&
@@ -222,6 +223,9 @@ func TestK8sPool_BuildWorkerPodUsesConfigSecret(t *testing.T) {
 			volume.VolumeSource.Secret.Items[0].Key == "duckgres.yaml" &&
 			volume.VolumeSource.Secret.Items[0].Path == "duckgres.yaml" {
 			foundConfigVolume = true
+		}
+		if volume.VolumeSource.ConfigMap != nil {
+			foundConfigMapVolume = true
 		}
 	}
 	for _, mount := range c.VolumeMounts {
@@ -234,6 +238,9 @@ func TestK8sPool_BuildWorkerPodUsesConfigSecret(t *testing.T) {
 	}
 	if !foundConfigMount {
 		t.Fatal("expected runtime config secret mount to be present")
+	}
+	if foundConfigMapVolume {
+		t.Fatal("expected runtime-config secret path to avoid configmap-backed config volumes")
 	}
 }
 

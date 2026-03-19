@@ -73,10 +73,10 @@ func ApplyTeamRuntimeToPoolConfig(base K8sWorkerPoolConfig, runtime *TeamRuntime
 		cfg.ServiceAccount = runtime.WorkerIdentity.ServiceAccountName
 	}
 
+	if runtime.RuntimeConfig.Name == "" || runtime.RuntimeConfig.Key == "" {
+		return K8sWorkerPoolConfig{}, fmt.Errorf("team %s runtime config secret ref requires both name and key", runtime.TeamName)
+	}
 	if runtime.RuntimeConfig.Name != "" {
-		if runtime.RuntimeConfig.Key == "" {
-			return K8sWorkerPoolConfig{}, fmt.Errorf("team %s runtime config secret %s missing key", runtime.TeamName, runtime.RuntimeConfig.Name)
-		}
 		if runtime.RuntimeConfig.Namespace != "" {
 			if namespace != "" && runtime.RuntimeConfig.Namespace != namespace {
 				return K8sWorkerPoolConfig{}, fmt.Errorf(
