@@ -802,6 +802,102 @@ func TestTranspile_SetShow(t *testing.T) {
 	})
 }
 
+func TestTranspile_ShowCreateTable(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name       string
+		input      string
+		wantSchema string
+		wantTable  string
+	}{
+		{
+			name:       "basic table",
+			input:      "SHOW CREATE TABLE my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "schema qualified",
+			input:      "SHOW CREATE TABLE my_schema.my_table",
+			wantSchema: "my_schema",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "quoted table preserves case",
+			input:      `SHOW CREATE TABLE "MyTable"`,
+			wantSchema: "main",
+			wantTable:  "MyTable",
+		},
+		{
+			name:       "quoted schema and table",
+			input:      `SHOW CREATE TABLE "MySchema"."MyTable"`,
+			wantSchema: "MySchema",
+			wantTable:  "MyTable",
+		},
+		{
+			name:       "trailing semicolon",
+			input:      "SHOW CREATE TABLE my_table;",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "case insensitive keyword",
+			input:      "show create table my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "public schema maps to main",
+			input:      "SHOW CREATE TABLE public.my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "SHOW CREATE VIEW",
+			input:      "SHOW CREATE VIEW my_view",
+			wantSchema: "main",
+			wantTable:  "my_view",
+		},
+		{
+			name:       "table name with single quote is escaped",
+			input:      `SHOW CREATE TABLE "it's"`,
+			wantSchema: "main",
+			wantTable:  "it''s",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			if result.Error != nil {
+				t.Fatalf("Transpile returned error: %v", result.Error)
+			}
+			// Should produce a SELECT query against duckdb_tables/duckdb_views
+			if !strings.Contains(result.SQL, "AS statement") {
+				t.Errorf("expected 'AS statement' column alias, got: %q", result.SQL)
+			}
+			if !strings.Contains(result.SQL, "duckdb_tables()") {
+				t.Errorf("expected duckdb_tables() in SQL, got: %q", result.SQL)
+			}
+			if !strings.Contains(result.SQL, "duckdb_views()") {
+				t.Errorf("expected duckdb_views() in SQL, got: %q", result.SQL)
+			}
+			wantTableFilter := fmt.Sprintf("table_name = '%s'", tt.wantTable)
+			if !strings.Contains(result.SQL, wantTableFilter) {
+				t.Errorf("expected %q in SQL, got: %q", wantTableFilter, result.SQL)
+			}
+			wantSchemaFilter := fmt.Sprintf("schema_name = '%s'", tt.wantSchema)
+			if !strings.Contains(result.SQL, wantSchemaFilter) {
+				t.Errorf("expected %q in SQL, got: %q", wantSchemaFilter, result.SQL)
+			}
+		})
+	}
+}
+
 func TestTranspile_ComplexQueries(t *testing.T) {
 	tests := []struct {
 		name  string

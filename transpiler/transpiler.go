@@ -141,6 +141,12 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 		return &Result{SQL: sql}, nil
 	}
 
+	// Pre-parse interceptions for SQL that isn't valid PostgreSQL syntax
+	// but has well-defined duckgres semantics (e.g., SHOW CREATE TABLE).
+	if rewritten, ok := interceptShowCreate(sql); ok {
+		return &Result{SQL: rewritten}, nil
+	}
+
 	// Tier 0: Pre-parse classification
 	cls := Classify(sql, t.config)
 	if cls.Direct {
