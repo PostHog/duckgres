@@ -80,7 +80,7 @@ run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multit
     @echo "Multi-tenant control plane ready."
     @echo "Default login: postgres / postgres"
     @echo "Fetch admin token with: kubectl -n duckgres logs deployment/duckgres-control-plane | rg 'Generated admin API token'"
-    @echo "Run 'just multitenant-port-forward-pg' in one terminal and 'just multitenant-port-forward-admin' in another."
+    @echo "Run 'just multitenant-port-forward-pg', 'just multitenant-port-forward-admin', and 'just multitenant-port-forward-provisioning' in separate terminals."
 
 # Port-forward PostgreSQL traffic from the local control plane
 [group('dev')]
@@ -91,6 +91,11 @@ multitenant-port-forward-pg:
 [group('dev')]
 multitenant-port-forward-admin:
     kubectl -n duckgres port-forward deployment/duckgres-control-plane 9090:9090
+
+# Port-forward the provisioning API from the local control plane
+[group('dev')]
+multitenant-port-forward-provisioning:
+    kubectl -n duckgres port-forward deployment/duckgres-control-plane 9091:9091
 
 # Run with DuckLake config
 [group('dev')]

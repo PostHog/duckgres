@@ -14,6 +14,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/provisioner"
+	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -105,14 +107,15 @@ func (a *orgRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 var _ OrgRouterInterface = (*orgRouterAdapter)(nil)
 var _ admin.OrgStackInfo = (*orgRouterAdapter)(nil)
 
-// SetupMultiTenant initializes the config store, org router, and Gin admin server.
+// SetupMultiTenant initializes the config store, org router, admin server, and provisioning server.
 // Called from RunControlPlane when --config-store is set with remote backend.
+// Returns the admin server and provisioning server for graceful shutdown.
 func SetupMultiTenant(
 	cfg ControlPlaneConfig,
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, error) {
+) (ConfigStoreInterface, OrgRouterInterface, []*http.Server, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -121,6 +124,11 @@ func SetupMultiTenant(
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	provisioningPort := cfg.ProvisioningPort
+	if provisioningPort == 0 {
+		provisioningPort = 9091
 	}
 
 	baseCfg := K8sWorkerPoolConfig{
@@ -144,6 +152,14 @@ func SetupMultiTenant(
 	}
 
 	adpt := &orgRouterAdapter{router: router}
+
+	// Start provisioning controller (best-effort — K8s API may not be available locally)
+	provCtrl, err := provisioner.NewController(store, 10*time.Second)
+	if err != nil {
+		slog.Warn("Provisioning controller unavailable.", "error", err)
+	} else {
+		go provCtrl.Run(context.Background())
+	}
 
 	// Register config change handler
 	store.OnChange(router.HandleConfigChange)
@@ -191,5 +207,30 @@ func SetupMultiTenant(
 		}
 	}()
 
-	return store, adpt, adminServer, nil
+	// Set up provisioning API server (separate from admin — production-facing)
+	provToken := cfg.ProvisioningToken
+	if provToken == "" {
+		provToken = adminToken // fall back to admin token if not set
+	}
+
+	provEngine := gin.New()
+	provEngine.Use(gin.Recovery())
+	provEngine.GET("/health", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+	provAPI := provEngine.Group("/api/v1", admin.APIAuthMiddleware(provToken))
+	provisioning.RegisterAPI(provAPI, provisioning.NewGormStore(store))
+
+	provServer := &http.Server{
+		Addr:    fmt.Sprintf(":%d", provisioningPort),
+		Handler: provEngine,
+	}
+	go func() {
+		slog.Info("Starting provisioning API server.", "addr", provServer.Addr)
+		if err := provServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Warn("Provisioning API server error.", "error", err)
+		}
+	}()
+
+	return store, adpt, []*http.Server{adminServer, provServer}, nil
 }

@@ -284,6 +284,9 @@ func (s *gormAPIStore) UpsertManagedWarehouse(orgID string, warehouse *configsto
 
 func managedWarehouseUpsertColumns() []string {
 	return []string{
+		"image",
+		"aurora_min_acu",
+		"aurora_max_acu",
 		"warehouse_database_region",
 		"warehouse_database_endpoint",
 		"warehouse_database_port",

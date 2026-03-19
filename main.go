@@ -244,6 +244,8 @@ func main() {
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := flag.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
 	adminToken := flag.String("admin-token", "", "Bearer token for admin API authentication (env: DUCKGRES_ADMIN_TOKEN)")
+	provisioningToken := flag.String("provisioning-token", "", "Bearer token for provisioning API authentication; falls back to admin-token if empty (env: DUCKGRES_PROVISIONING_TOKEN)")
+	provisioningPort := flag.Int("provisioning-port", 0, "Listen port for provisioning API server (default: 9091) (env: DUCKGRES_PROVISIONING_PORT)")
 
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -302,6 +304,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ADMIN_TOKEN        Bearer token for admin API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROVISIONING_TOKEN Bearer token for provisioning API (falls back to admin token)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROVISIONING_PORT  Listen port for provisioning API (default: 9091)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -403,6 +407,8 @@ func main() {
 		ConfigStoreConn:           *configStore,
 		ConfigPollInterval:        *configPollInterval,
 		AdminToken:                *adminToken,
+		ProvisioningToken:         *provisioningToken,
+		ProvisioningPort:          *provisioningPort,
 		WorkerBackend:             *workerBackend,
 		K8sWorkerImage:            *k8sWorkerImage,
 		K8sWorkerNamespace:        *k8sWorkerNamespace,
@@ -547,6 +553,8 @@ func main() {
 			ConfigStoreConn:      resolved.ConfigStoreConn,
 			ConfigPollInterval:   resolved.ConfigPollInterval,
 			AdminToken:           resolved.AdminToken,
+			ProvisioningToken:    resolved.ProvisioningToken,
+			ProvisioningPort:     resolved.ProvisioningPort,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:      resolved.K8sWorkerImage,
 				WorkerNamespace:  resolved.K8sWorkerNamespace,
