@@ -50,6 +50,8 @@ build-k8s-image tag="duckgres:test":
 [group('dev')]
 multitenant-config-store-up:
     docker compose -f k8s/local-config-store.compose.yaml up -d --wait
+    docker exec duckgres-local-minio mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+    docker exec duckgres-local-minio mc mb local/duckgres-local --ignore-existing
 
 # Stop the local PostgreSQL config store used by the multi-tenant K8s flow
 [group('dev')]
@@ -61,6 +63,21 @@ multitenant-config-store-down:
 multitenant-seed-local:
     docker exec -i duckgres-config-store psql -U duckgres -d duckgres_config < k8s/local-config-store.seed.sql
 
+# Render the local managed-warehouse runtime artifacts from the seeded config store
+[group('dev')]
+multitenant-render-local-runtime output="/tmp/duckgres-multitenant-local-runtime.yaml":
+    go run ./cmd/render-multitenant-local-runtime \
+      --config-store postgres://duckgres:duckgres@127.0.0.1:5434/duckgres_config?sslmode=disable \
+      --team local \
+      --namespace duckgres \
+      --data-dir /data/runtime-secret \
+      --extensions ducklake,httpfs \
+      --warehouse-db-password duckgres \
+      --metadata-store-password ducklake \
+      --s3-access-key minioadmin \
+      --s3-secret-key minioadmin \
+      --output {{output}}
+
 # Deploy the local multi-tenant control plane to OrbStack Kubernetes
 [group('dev')]
 deploy-multitenant-local:
@@ -69,13 +86,15 @@ deploy-multitenant-local:
     kubectl apply -f k8s/configmap.yaml
     kubectl apply -f k8s/secret.yaml
     kubectl apply -f k8s/multitenant-local-runtime.yaml
+    just multitenant-render-local-runtime output=/tmp/duckgres-multitenant-local-runtime.yaml
+    kubectl apply -f /tmp/duckgres-multitenant-local-runtime.yaml
     kubectl apply -f k8s/networkpolicy.yaml
     kubectl apply -f k8s/control-plane-multitenant-local.yaml
     kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
 
 # End-to-end local multi-tenant setup: OrbStack K8s + config store + control plane
 [group('dev')]
-run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multitenant-local multitenant-seed-local
+run-multitenant-local: multitenant-config-store-up build-k8s-image multitenant-seed-local deploy-multitenant-local
     kubectl -n duckgres rollout restart deployment/duckgres-control-plane
     kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
     @echo "Multi-tenant control plane ready."

@@ -11,11 +11,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	_ "github.com/lib/pq"
+	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -270,12 +272,59 @@ func TestK8sWorkerUsesRuntimeConfigSecret(t *testing.T) {
 	db := openDB(t)
 	defer db.Close()
 
+	var duckLakeAttached int
+	if err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&duckLakeAttached); err != nil {
+		t.Fatalf("failed to check ducklake attachment: %v", err)
+	}
+	if duckLakeAttached != 1 {
+		t.Fatalf("expected ducklake catalog to be attached once, got %d", duckLakeAttached)
+	}
+
 	var tempDir string
 	if err := db.QueryRow("SELECT value FROM duckdb_settings() WHERE name = 'temp_directory'").Scan(&tempDir); err != nil {
 		t.Fatalf("failed to read temp_directory setting: %v", err)
 	}
 	if tempDir != "/data/runtime-secret/tmp" {
 		t.Fatalf("expected runtime config temp_directory=/data/runtime-secret/tmp, got %q", tempDir)
+	}
+
+	secret, err := clientset.CoreV1().Secrets(namespace).Get(context.Background(), "duckgres-local-runtime", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to read runtime config secret: %v", err)
+	}
+	var runtime renderedLocalRuntimeConfig
+	if err := yaml.Unmarshal(secret.Data["duckgres.yaml"], &runtime); err != nil {
+		t.Fatalf("failed to unmarshal runtime config secret: %v", err)
+	}
+	if runtime.DataDir != "/data/runtime-secret" {
+		t.Fatalf("expected runtime data_dir /data/runtime-secret, got %q", runtime.DataDir)
+	}
+	if strings.Join(runtime.Extensions, ",") != "ducklake,httpfs" {
+		t.Fatalf("expected runtime extensions ducklake,httpfs, got %#v", runtime.Extensions)
+	}
+	if runtime.DuckLake.MetadataStore != "postgres:host=host.docker.internal port=35433 user=ducklake password=ducklake dbname=ducklake_metadata_local" {
+		t.Fatalf("unexpected metadata store %q", runtime.DuckLake.MetadataStore)
+	}
+	if runtime.DuckLake.ObjectStore != "s3://duckgres-local/teams/local/" {
+		t.Fatalf("unexpected object store %q", runtime.DuckLake.ObjectStore)
+	}
+	if runtime.DuckLake.S3Provider != "config" {
+		t.Fatalf("expected s3_provider config, got %q", runtime.DuckLake.S3Provider)
+	}
+	if runtime.DuckLake.S3Endpoint != "host.docker.internal:39000" {
+		t.Fatalf("unexpected s3 endpoint %q", runtime.DuckLake.S3Endpoint)
+	}
+	if runtime.DuckLake.S3AccessKey != "minioadmin" || runtime.DuckLake.S3SecretKey != "minioadmin" {
+		t.Fatalf("unexpected explicit s3 credentials: %#v", runtime.DuckLake)
+	}
+	if runtime.DuckLake.S3Region != "us-east-1" {
+		t.Fatalf("unexpected s3 region %q", runtime.DuckLake.S3Region)
+	}
+	if runtime.DuckLake.S3UseSSL {
+		t.Fatal("expected s3_use_ssl=false")
+	}
+	if runtime.DuckLake.S3URLStyle != "path" {
+		t.Fatalf("unexpected s3 url style %q", runtime.DuckLake.S3URLStyle)
 	}
 
 	pod := latestWorkerPod(t)
@@ -301,6 +350,47 @@ func TestK8sWorkerUsesRuntimeConfigSecret(t *testing.T) {
 	}
 	if !mount.ReadOnly {
 		t.Fatalf("expected runtime config mount to be read-only")
+	}
+}
+
+func TestK8sDuckLakeDataPersistsAcrossWorkerRestart(t *testing.T) {
+	db := openDB(t)
+
+	tableName := fmt.Sprintf("runtime_probe_%d", time.Now().UnixNano())
+
+	createStmt := fmt.Sprintf("CREATE TABLE ducklake.main.%s (id INTEGER, payload VARCHAR)", tableName)
+	if _, err := db.Exec(createStmt); err != nil {
+		t.Fatalf("create ducklake table: %v", err)
+	}
+	insertStmt := fmt.Sprintf("INSERT INTO ducklake.main.%s VALUES (1, 'persisted')", tableName)
+	if _, err := db.Exec(insertStmt); err != nil {
+		t.Fatalf("insert ducklake row: %v", err)
+	}
+
+	var payload string
+	verifyStmt := fmt.Sprintf("SELECT payload FROM ducklake.main.%s WHERE id = 1", tableName)
+	if err := db.QueryRow(verifyStmt).Scan(&payload); err != nil {
+		t.Fatalf("verify inserted row before restart: %v", err)
+	}
+	if payload != "persisted" {
+		t.Fatalf("expected persisted payload before restart, got %q", payload)
+	}
+
+	worker := latestWorkerPod(t)
+	if err := clientset.CoreV1().Pods(namespace).Delete(context.Background(), worker.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("failed to delete worker pod %s: %v", worker.Name, err)
+	}
+	waitForPodGone(t, namespace, worker.Name, 60*time.Second)
+
+	db.Close()
+
+	db2 := openDB(t)
+	defer func() {
+		_, _ = db2.Exec(fmt.Sprintf("DROP TABLE IF EXISTS ducklake.main.%s", tableName))
+		db2.Close()
+	}()
+	if err := retryQueryString(db2, verifyStmt, "persisted", 90*time.Second); err != nil {
+		t.Fatalf("query failed after worker restart: %v", err)
 	}
 }
 
@@ -630,6 +720,20 @@ func retryQuery(db *sql.DB, query string, timeout time.Duration) error {
 	return fmt.Errorf("query %q failed after %s: %w", query, timeout, lastErr)
 }
 
+func retryQueryString(db *sql.DB, query, want string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		var result string
+		lastErr = db.QueryRow(query).Scan(&result)
+		if lastErr == nil && result == want {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("query %q failed after %s: %w", query, timeout, lastErr)
+}
+
 func findProjectRoot() string {
 	dir, _ := os.Getwd()
 	for {
@@ -642,4 +746,20 @@ func findProjectRoot() string {
 		}
 		dir = parent
 	}
+}
+
+type renderedLocalRuntimeConfig struct {
+	DataDir    string   `yaml:"data_dir"`
+	Extensions []string `yaml:"extensions"`
+	DuckLake   struct {
+		MetadataStore string `yaml:"metadata_store"`
+		ObjectStore   string `yaml:"object_store"`
+		S3Provider    string `yaml:"s3_provider"`
+		S3Endpoint    string `yaml:"s3_endpoint"`
+		S3AccessKey   string `yaml:"s3_access_key"`
+		S3SecretKey   string `yaml:"s3_secret_key"`
+		S3Region      string `yaml:"s3_region"`
+		S3UseSSL      bool   `yaml:"s3_use_ssl"`
+		S3URLStyle    string `yaml:"s3_url_style"`
+	} `yaml:"ducklake"`
 }

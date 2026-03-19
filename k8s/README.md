@@ -43,7 +43,8 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | `rbac.yaml` | ServiceAccount, Role (pods + secrets), RoleBinding |
 | `configmap.yaml` | Shared duckgres config (users, extensions, data dir) |
 | `secret.yaml` | Bearer token secret (auto-populated by CP if empty) |
-| `multitenant-local-runtime.yaml` | Local multi-tenant worker ServiceAccount + Secret-backed runtime config |
+| `local-config-store.compose.yaml` | Local config-store PostgreSQL plus the warehouse-db, DuckLake metadata DB, and MinIO runtime dependencies |
+| `multitenant-local-runtime.yaml` | Local multi-tenant worker ServiceAccount; the runtime Secret is generated at deploy time |
 | `networkpolicy.yaml` | Restricts worker ingress to CP pods only |
 | `control-plane-deployment.yaml` | CP Deployment + ClusterIP Service |
 
@@ -102,6 +103,8 @@ The admin dashboard requires the admin token printed in the control-plane logs. 
 kubectl -n duckgres logs deployment/duckgres-control-plane | rg "Generated admin API token"
 ```
 
+`just run-multitenant-local` starts the config-store PostgreSQL plus the local warehouse database, DuckLake metadata PostgreSQL, and MinIO bucket backing the managed-warehouse contract. The config-store seed points the `local` team at those host-reachable endpoints, and `go run ./cmd/render-multitenant-local-runtime` renders the `duckgres-local-runtime` Secret from the seeded contract during `deploy-multitenant-local`.
+
 The local seed populates one managed-warehouse contract for the `local` team. That row includes separate `warehouse_database` and `metadata_store` sections plus secret references only, not secret values.
 
 Seeded warehouse contract notes:
@@ -110,6 +113,7 @@ Seeded warehouse contract notes:
 - `GET /api/v1/teams/local/warehouse` reads that row.
 - `PUT /api/v1/teams/local/warehouse` replaces that row for the team.
 - `just multitenant-seed-local` is idempotent and updates the same `local` warehouse row rather than creating duplicates.
+- The worker runtime Secret is generated locally from the seeded contract and resolved secret material instead of being checked into git.
 
 Tear down the local config store:
 
@@ -117,7 +121,7 @@ Tear down the local config store:
 just multitenant-config-store-down
 ```
 
-After code changes, rerun `just run-multitenant-local` to rebuild, redeploy, and reseed the local environment.
+After code changes, rerun `just run-multitenant-local` to rebuild, redeploy, reseed, and refresh the local runtime artifacts.
 
 ### Running Integration Tests
 
@@ -125,7 +129,7 @@ After code changes, rerun `just run-multitenant-local` to rebuild, redeploy, and
 # Against an existing multi-tenant deployment (skip setup, just run tests)
 DUCKGRES_K8S_TEST_SKIP_SETUP=true go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
 
-# Full setup (builds image, starts the config store, deploys multi-tenant control plane, seeds config store, runs tests, cleans up)
+# Full setup (builds image, starts the config store and local warehouse/metadata/S3 deps, deploys the multi-tenant control plane, seeds config store, renders runtime artifacts, runs tests, cleans up)
 go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
 ```
 
