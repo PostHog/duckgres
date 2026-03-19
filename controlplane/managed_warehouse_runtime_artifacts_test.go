@@ -166,7 +166,7 @@ func TestBuildManagedWarehouseRuntimeArtifactsRendersSecretsFromContract(t *test
 	if strings.Join(cfg.Extensions, ",") != "ducklake,httpfs" {
 		t.Fatalf("unexpected extensions %#v", cfg.Extensions)
 	}
-	if cfg.DuckLake.MetadataStore != "postgres:host='metadata.internal' port=5433 user='ducklake_user' password='metadata-pass' dbname='ducklake_metadata_local'" {
+	if cfg.DuckLake.MetadataStore != "postgres:host=metadata.internal port=5433 user=ducklake_user password=metadata-pass dbname=ducklake_metadata_local" {
 		t.Fatalf("unexpected ducklake metadata store %q", cfg.DuckLake.MetadataStore)
 	}
 	if cfg.DuckLake.ObjectStore != "s3://duckgres-local/teams/local/" {
@@ -258,6 +258,18 @@ func TestRenderManagedWarehouseRuntimeConfigRejectsNonAWSObjectStoreWithoutExpli
 	}
 	if !strings.Contains(err.Error(), "explicit s3 credentials") {
 		t.Fatalf("expected explicit s3 credentials error, got %v", err)
+	}
+}
+
+func TestBuildManagedWarehouseDuckLakeMetadataStoreEscapesValues(t *testing.T) {
+	conn, err := buildManagedWarehouseDuckLakeMetadataStore("metadata.internal", 5432, "duck lake", `p@ss word'\path`, "duck lake db")
+	if err != nil {
+		t.Fatalf("buildManagedWarehouseDuckLakeMetadataStore: %v", err)
+	}
+
+	want := `postgres:host=metadata.internal port=5432 user=duck\ lake password=p@ss\ word\'\\path dbname=duck\ lake\ db`
+	if conn != want {
+		t.Fatalf("unexpected ducklake metadata store string\nwant: %q\n got: %q", want, conn)
 	}
 }
 

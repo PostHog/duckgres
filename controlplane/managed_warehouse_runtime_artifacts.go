@@ -59,7 +59,7 @@ func RenderManagedWarehouseRuntimeConfig(runtime *TeamRuntime, secretMaterial Ma
 		return nil, fmt.Errorf("managed warehouse runtime is required")
 	}
 
-	metadataStoreDSN, err := buildManagedWarehousePostgresDSN(runtime.MetadataStore.Endpoint, runtime.MetadataStore.Port, runtime.MetadataStore.Username, secretMaterial.MetadataStorePassword, runtime.MetadataStore.DatabaseName)
+	metadataStoreDSN, err := buildManagedWarehouseDuckLakeMetadataStore(runtime.MetadataStore.Endpoint, runtime.MetadataStore.Port, runtime.MetadataStore.Username, secretMaterial.MetadataStorePassword, runtime.MetadataStore.DatabaseName)
 	if err != nil {
 		return nil, fmt.Errorf("metadata store dsn: %w", err)
 	}
@@ -199,6 +199,33 @@ func buildManagedWarehousePostgresDSN(host string, port int, username, password,
 	), nil
 }
 
+func buildManagedWarehouseDuckLakeMetadataStore(host string, port int, username, password, database string) (string, error) {
+	if host == "" {
+		return "", fmt.Errorf("host is required")
+	}
+	if port == 0 {
+		return "", fmt.Errorf("port is required")
+	}
+	if username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	if password == "" {
+		return "", fmt.Errorf("password is required")
+	}
+	if database == "" {
+		return "", fmt.Errorf("database name is required")
+	}
+
+	return fmt.Sprintf(
+		"postgres:host=%s port=%d user=%s password=%s dbname=%s",
+		escapeDuckLakeConnStringValue(host),
+		port,
+		escapeDuckLakeConnStringValue(username),
+		escapeDuckLakeConnStringValue(password),
+		escapeDuckLakeConnStringValue(database),
+	), nil
+}
+
 func buildManagedWarehouseObjectStore(s3 configstore.ManagedWarehouseS3) string {
 	if s3.Bucket == "" {
 		return ""
@@ -246,6 +273,19 @@ func escapeLibPQConnStringValue(value string) string {
 	value = strings.ReplaceAll(value, `\`, `\\`)
 	value = strings.ReplaceAll(value, `'`, `\'`)
 	return value
+}
+
+func escapeDuckLakeConnStringValue(value string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		` `, `\ `,
+		`'`, `\'`,
+		`"`, `\"`,
+		"\t", `\t`,
+		"\n", `\n`,
+		"\r", `\r`,
+	)
+	return replacer.Replace(value)
 }
 
 func secretNamespace(ref configstore.SecretRef, fallback string) string {
