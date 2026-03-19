@@ -830,6 +830,277 @@ func TestTranspile_SetShow(t *testing.T) {
 	})
 }
 
+func TestTranspile_ShowCreateTable(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name        string
+		input       string
+		wantCatalog string // empty means no database_name filter
+		wantSchema  string
+		wantTable   string
+	}{
+		{
+			name:       "basic table",
+			input:      "SHOW CREATE TABLE my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "schema qualified",
+			input:      "SHOW CREATE TABLE my_schema.my_table",
+			wantSchema: "my_schema",
+			wantTable:  "my_table",
+		},
+		{
+			name:        "three-part catalog.schema.table",
+			input:       "SHOW CREATE TABLE memory.my_schema.my_table",
+			wantCatalog: "memory",
+			wantSchema:  "my_schema",
+			wantTable:   "my_table",
+		},
+		{
+			name:        "three-part with quoted identifiers",
+			input:       `SHOW CREATE TABLE "MyCatalog"."MySchema"."MyTable"`,
+			wantCatalog: "MyCatalog",
+			wantSchema:  "MySchema",
+			wantTable:   "MyTable",
+		},
+		{
+			name:       "quoted table preserves case",
+			input:      `SHOW CREATE TABLE "MyTable"`,
+			wantSchema: "main",
+			wantTable:  "MyTable",
+		},
+		{
+			name:       "quoted schema and table",
+			input:      `SHOW CREATE TABLE "MySchema"."MyTable"`,
+			wantSchema: "MySchema",
+			wantTable:  "MyTable",
+		},
+		{
+			name:       "trailing semicolon",
+			input:      "SHOW CREATE TABLE my_table;",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "case insensitive keyword",
+			input:      "show create table my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "public schema maps to main",
+			input:      "SHOW CREATE TABLE public.my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "SHOW CREATE VIEW",
+			input:      "SHOW CREATE VIEW my_view",
+			wantSchema: "main",
+			wantTable:  "my_view",
+		},
+		{
+			name:       "table name with single quote is escaped",
+			input:      `SHOW CREATE TABLE "it's"`,
+			wantSchema: "main",
+			wantTable:  "it''s",
+		},
+		{
+			name:       "leading line comment",
+			input:      "-- get DDL\nSHOW CREATE TABLE my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "leading block comment",
+			input:      "/* get DDL */ SHOW CREATE TABLE my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "multiple leading comments",
+			input:      "-- first\n/* second */ SHOW CREATE TABLE my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "tab between keywords",
+			input:      "SHOW\tCREATE\tTABLE\tmy_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "multiple spaces between keywords",
+			input:      "SHOW  CREATE  TABLE  my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "newline between keywords",
+			input:      "SHOW\nCREATE\nTABLE\nmy_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile error: %v", err)
+			}
+			if result.Error != nil {
+				t.Fatalf("Transpile returned error: %v", result.Error)
+			}
+			// Should produce a SELECT query against duckdb_tables/duckdb_views
+			if !strings.Contains(result.SQL, "AS statement") {
+				t.Errorf("expected 'AS statement' column alias, got: %q", result.SQL)
+			}
+			if !strings.Contains(result.SQL, "duckdb_tables()") {
+				t.Errorf("expected duckdb_tables() in SQL, got: %q", result.SQL)
+			}
+			if !strings.Contains(result.SQL, "duckdb_views()") {
+				t.Errorf("expected duckdb_views() in SQL, got: %q", result.SQL)
+			}
+			wantTableFilter := fmt.Sprintf("table_name = '%s'", tt.wantTable)
+			if !strings.Contains(result.SQL, wantTableFilter) {
+				t.Errorf("expected %q in SQL, got: %q", wantTableFilter, result.SQL)
+			}
+			wantSchemaFilter := fmt.Sprintf("schema_name = '%s'", tt.wantSchema)
+			if !strings.Contains(result.SQL, wantSchemaFilter) {
+				t.Errorf("expected %q in SQL, got: %q", wantSchemaFilter, result.SQL)
+			}
+			if tt.wantCatalog != "" {
+				wantCatalogFilter := fmt.Sprintf("database_name = '%s'", tt.wantCatalog)
+				if !strings.Contains(result.SQL, wantCatalogFilter) {
+					t.Errorf("expected %q in SQL, got: %q", wantCatalogFilter, result.SQL)
+				}
+			}
+		})
+	}
+
+	// Negative cases: these should NOT be intercepted as SHOW CREATE TABLE
+	t.Run("negative cases", func(t *testing.T) {
+		negatives := []struct {
+			name  string
+			input string
+		}{
+			{"SHOW CREATE no object type", "SHOW CREATE my_table"},
+			{"SHOW CREATE TABLE no name", "SHOW CREATE TABLE"},
+			{"SHOW CREATE TABLE no name with semicolon", "SHOW CREATE TABLE ;"},
+			{"SHOW CREATE FUNCTION", "SHOW CREATE FUNCTION my_func"},
+			{"plain SHOW", "SHOW TABLES"},
+			{"SHOW without CREATE", "SHOW TABLE my_table"},
+		}
+		for _, tt := range negatives {
+			t.Run(tt.name, func(t *testing.T) {
+				result, err := tr.Transpile(tt.input)
+				if err != nil {
+					return // parse error is fine — it means it wasn't intercepted
+				}
+				if strings.Contains(result.SQL, "duckdb_tables()") {
+					t.Errorf("should NOT have been intercepted as SHOW CREATE TABLE, but got: %q", result.SQL)
+				}
+			})
+		}
+	})
+}
+
+func TestTranspile_ShowCreateTable_DuckLakeMode(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true})
+
+	t.Run("includes partition metadata joins", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		sql := result.SQL
+		// Should query DuckLake partition metadata
+		if !strings.Contains(sql, "ducklake_partition_column") {
+			t.Error("DuckLake mode should query ducklake_partition_column")
+		}
+		if !strings.Contains(sql, "ducklake_partition_info") {
+			t.Error("DuckLake mode should query ducklake_partition_info")
+		}
+		if !strings.Contains(sql, "ducklake_column") {
+			t.Error("DuckLake mode should query ducklake_column")
+		}
+		if !strings.Contains(sql, "ducklake_schema") {
+			t.Error("DuckLake mode should query ducklake_schema")
+		}
+		// Should reconstruct PARTITIONED BY clause
+		if !strings.Contains(sql, "PARTITIONED BY") {
+			t.Error("DuckLake mode should include PARTITIONED BY reconstruction")
+		}
+		// Should still include views fallback
+		if !strings.Contains(sql, "duckdb_views()") {
+			t.Error("DuckLake mode should still query duckdb_views()")
+		}
+		// Should filter by correct table/schema
+		if !strings.Contains(sql, "table_name = 'my_table'") {
+			t.Errorf("expected table_name filter, got: %q", sql)
+		}
+		if !strings.Contains(sql, "schema_name = 'main'") {
+			t.Errorf("expected schema_name filter, got: %q", sql)
+		}
+	})
+
+	t.Run("handles transform functions in partition clause", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		// The generated SQL should handle identity vs function transforms
+		if !strings.Contains(result.SQL, "WHEN transform = 'identity' THEN column_name") {
+			t.Error("should handle identity transform")
+		}
+		if !strings.Contains(result.SQL, "transform || '(' || column_name || ')'") {
+			t.Error("should handle function transforms like year(), month()")
+		}
+	})
+
+	t.Run("filters active partition only", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		// Should only select partitions where end_snapshot IS NULL (active)
+		if !strings.Contains(result.SQL, "end_snapshot IS NULL") {
+			t.Error("should filter for active partition (end_snapshot IS NULL)")
+		}
+	})
+
+	t.Run("uses regexp_replace not rtrim to strip trailing semicolon", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		// Must use regexp_replace to strip trailing semicolon, NOT rtrim.
+		// rtrim(sql, '; ') treats the second arg as a character SET, so it
+		// would eat single quotes from string defaults near the end of the DDL.
+		if strings.Contains(result.SQL, "rtrim") {
+			t.Error("should use regexp_replace, not rtrim, to strip trailing semicolon")
+		}
+		if !strings.Contains(result.SQL, "regexp_replace") {
+			t.Error("should use regexp_replace to safely strip trailing semicolon")
+		}
+	})
+
+	t.Run("non-DuckLake mode does not include partition metadata", func(t *testing.T) {
+		trPlain := New(DefaultConfig())
+		result, err := trPlain.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if strings.Contains(result.SQL, "ducklake_partition") {
+			t.Error("non-DuckLake mode should not reference partition metadata")
+		}
+	})
+}
+
 func TestTranspile_ComplexQueries(t *testing.T) {
 	tests := []struct {
 		name  string
