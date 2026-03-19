@@ -335,6 +335,69 @@ func TestTeamRouter_HandleConfigChange_UpdatesMaxWorkersInPlace(t *testing.T) {
 	}
 }
 
+func TestTeamRouter_HandleConfigChange_RecreatesStackOnMemoryBudgetChange(t *testing.T) {
+	factory := installFakePoolFactory(t)
+
+	baseCfg := K8sWorkerPoolConfig{
+		Namespace:      "shared-workers",
+		CPID:           "cp-1",
+		WorkerImage:    "duckgres:test",
+		WorkerPort:     8816,
+		SecretName:     "worker-token",
+		MaxWorkers:     4,
+		IdleTimeout:    5 * time.Minute,
+		ConfigPath:     "/etc/duckgres/duckgres.yaml",
+		ServiceAccount: "default",
+		MemoryBudget:   8 << 30,
+	}
+	globalCfg := ControlPlaneConfig{HealthCheckInterval: 2 * time.Second}
+	team := testTeamConfig("analytics", 4, testWarehouse("warehouse-a.internal"))
+	team.MemoryBudget = "8GB"
+	store := &fakeTeamConfigStore{
+		snap: testSnapshot(team),
+	}
+
+	router, err := NewTeamRouter(store, baseCfg, globalCfg, nil)
+	if err != nil {
+		t.Fatalf("NewTeamRouter: %v", err)
+	}
+	if got := factory.poolCount(); got != 1 {
+		t.Fatalf("expected one initial pool, got %d", got)
+	}
+
+	oldPool := factory.lastPool()
+	oldSnap := store.snap
+	newTeam := testTeamConfig("analytics", 4, testWarehouse("warehouse-a.internal"))
+	newTeam.MemoryBudget = "16GB"
+	newSnap := testSnapshot(newTeam)
+
+	router.HandleConfigChange(oldSnap, newSnap)
+
+	if got := factory.poolCount(); got != 2 {
+		t.Fatalf("expected memory-budget change to create a replacement pool, got %d pools", got)
+	}
+	if got := oldPool.shutdowns; got != 1 {
+		t.Fatalf("expected old pool to be shut down once, got %d", got)
+	}
+	if got := len(oldPool.setMaxWorkers); got != 0 {
+		t.Fatalf("expected no in-place SetMaxWorkers calls on replaced pool, got %d", got)
+	}
+
+	stack, ok := router.AllStacks()["analytics"]
+	if !ok {
+		t.Fatal("expected analytics team stack to exist after reconcile")
+	}
+	if stack.Pool == oldPool {
+		t.Fatal("expected analytics team stack to use a replacement pool after memory-budget change")
+	}
+	if stack.Config.MemoryBudget != "16GB" {
+		t.Fatalf("expected stack config memory budget to update to 16GB, got %q", stack.Config.MemoryBudget)
+	}
+	if cfg := factory.lastCfg(); cfg.MemoryBudget != 16<<30 {
+		t.Fatalf("expected replacement pool memory budget 16GiB, got %d", cfg.MemoryBudget)
+	}
+}
+
 func TestTeamRouter_HandleConfigChange_IgnoresWarehouseStatusOnlyChanges(t *testing.T) {
 	factory := installFakePoolFactory(t)
 

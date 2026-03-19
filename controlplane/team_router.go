@@ -194,6 +194,23 @@ func shutdownTeamStack(teamName string, stack *TeamStack) {
 	}
 }
 
+func (tr *TeamRouter) replaceTeamStack(name string, tc *configstore.TeamConfig, reason string) {
+	slog.Info(reason, "team", name)
+	replacement, err := tr.buildTeamStack(tc)
+	if err != nil {
+		slog.Error("Failed to recreate team stack.", "team", name, "error", err)
+		return
+	}
+
+	tr.mu.Lock()
+	oldStack := tr.teams[name]
+	tr.teams[name] = replacement
+	tr.mu.Unlock()
+
+	slog.Info("Team stack recreated.", "team", name, "max_workers", replacement.Config.MaxWorkers)
+	shutdownTeamStack(name, oldStack)
+}
+
 // DestroyTeamStack drains and cleans up a team's resources.
 func (tr *TeamRouter) DestroyTeamStack(teamName string) {
 	tr.mu.Lock()
@@ -248,23 +265,14 @@ func (tr *TeamRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			continue
 		}
 		if warehouseRuntimeChanged(oldTC, newTC) {
-			slog.Info("Team warehouse config changed; recreating stack.", "team", name)
-			replacement, err := tr.buildTeamStack(newTC)
-			if err != nil {
-				slog.Error("Failed to recreate team stack after warehouse config change.", "team", name, "error", err)
-				continue
-			}
-
-			tr.mu.Lock()
-			oldStack := tr.teams[name]
-			tr.teams[name] = replacement
-			tr.mu.Unlock()
-
-			slog.Info("Team stack recreated.", "team", name, "max_workers", replacement.Config.MaxWorkers)
-			shutdownTeamStack(name, oldStack)
+			tr.replaceTeamStack(name, newTC, "Team warehouse config changed; recreating stack.")
 			continue
 		}
-		if oldTC.MaxWorkers != newTC.MaxWorkers || oldTC.MemoryBudget != newTC.MemoryBudget {
+		if oldTC.MemoryBudget != newTC.MemoryBudget {
+			tr.replaceTeamStack(name, newTC, "Team memory budget changed; recreating stack.")
+			continue
+		}
+		if oldTC.MaxWorkers != newTC.MaxWorkers {
 			slog.Info("Team config changed.", "team", name,
 				"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)
 			tr.mu.Lock()
