@@ -51,6 +51,8 @@ type renderedS3Credentials struct {
 	SecretAccessKey string `json:"secret_access_key"`
 }
 
+const eksRoleARNAnnotation = "eks.amazonaws.com/role-arn"
+
 // RenderManagedWarehouseRuntimeConfig renders the worker-ready duckgres.yaml
 // implied by a resolved team runtime and resolved secret material. This helper
 // is intended for provisioning flows that materialize the runtime_config Secret.
@@ -122,14 +124,21 @@ func BuildManagedWarehouseRuntimeArtifacts(team *configstore.TeamConfig, secretM
 	var objects []any
 
 	if runtime.WorkerIdentity.ServiceAccountName != "" {
+		annotations := map[string]string(nil)
+		if runtime.WorkerIdentity.IAMRoleARN != "" {
+			annotations = map[string]string{
+				eksRoleARNAnnotation: runtime.WorkerIdentity.IAMRoleARN,
+			}
+		}
 		objects = append(objects, &corev1.ServiceAccount{
 			TypeMeta: metav1.TypeMeta{
 				APIVersion: "v1",
 				Kind:       "ServiceAccount",
 			},
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      runtime.WorkerIdentity.ServiceAccountName,
-				Namespace: namespace,
+				Name:        runtime.WorkerIdentity.ServiceAccountName,
+				Namespace:   namespace,
+				Annotations: annotations,
 			},
 		})
 	}
@@ -263,6 +272,12 @@ func resolveManagedWarehouseS3Provider(runtime *TeamRuntime, secretMaterial Mana
 	case !hasObjectStore:
 		return "", nil
 	case runtime != nil && strings.EqualFold(runtime.S3.Provider, "aws"):
+		if runtime.WorkerIdentity.ServiceAccountName == "" {
+			return "", fmt.Errorf("team %s aws object store requires worker identity service_account_name", runtime.TeamName)
+		}
+		if runtime.WorkerIdentity.IAMRoleARN == "" {
+			return "", fmt.Errorf("team %s aws object store requires worker identity iam_role_arn", runtime.TeamName)
+		}
 		return "aws_sdk", nil
 	default:
 		return "", fmt.Errorf("team %s object store provider %q requires explicit s3 credentials", runtime.TeamName, runtime.S3.Provider)

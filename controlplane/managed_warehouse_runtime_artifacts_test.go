@@ -14,6 +14,7 @@ type manifestDoc struct {
 	Metadata   struct {
 		Name      string `yaml:"name"`
 		Namespace string `yaml:"namespace"`
+		Annotations map[string]string `yaml:"annotations"`
 	} `yaml:"metadata"`
 	StringData map[string]string `yaml:"stringData"`
 }
@@ -62,6 +63,7 @@ func TestBuildManagedWarehouseRuntimeArtifactsRendersSecretsFromContract(t *test
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace:          "duckgres",
 				ServiceAccountName: "duckgres-local-worker",
+				IAMRoleARN:         "arn:aws:iam::123456789012:role/duckgres-local-worker",
 			},
 			WarehouseDatabaseCredentials: configstore.SecretRef{
 				Name: "duckgres-local-warehouse-db",
@@ -129,6 +131,9 @@ func TestBuildManagedWarehouseRuntimeArtifactsRendersSecretsFromContract(t *test
 	}
 	if serviceAccount.Metadata.Namespace != "duckgres" {
 		t.Fatalf("expected service account namespace duckgres, got %q", serviceAccount.Metadata.Namespace)
+	}
+	if got := serviceAccount.Metadata.Annotations["eks.amazonaws.com/role-arn"]; got != "arn:aws:iam::123456789012:role/duckgres-local-worker" {
+		t.Fatalf("expected service account iam role annotation, got %q", got)
 	}
 
 	if warehouseDB == nil || warehouseDB.Kind != "Secret" {
@@ -226,6 +231,71 @@ func TestRenderManagedWarehouseRuntimeConfigPrefersIdentityBasedS3WhenNoExplicit
 	}
 	if cfg.DuckLake.ObjectStore != "s3://analytics-bucket/warehouse/analytics/" {
 		t.Fatalf("unexpected object store %q", cfg.DuckLake.ObjectStore)
+	}
+}
+
+func TestRenderManagedWarehouseRuntimeConfigRejectsAWSObjectStoreWithoutWorkerIdentity(t *testing.T) {
+	runtime := &TeamRuntime{
+		TeamName: "analytics",
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Endpoint:     "aurora.internal",
+			Port:         5432,
+			DatabaseName: "ducklake_analytics",
+			Username:     "ducklake_user",
+		},
+		S3: configstore.ManagedWarehouseS3{
+			Provider:   "aws",
+			Region:     "us-east-1",
+			Bucket:     "analytics-bucket",
+			PathPrefix: "warehouse/analytics",
+		},
+	}
+
+	_, err := RenderManagedWarehouseRuntimeConfig(runtime, ManagedWarehouseSecretMaterial{
+		MetadataStorePassword: "metadata-pass",
+	}, ManagedWarehouseRuntimeArtifactOptions{
+		DataDir:    "/data",
+		Extensions: []string{"ducklake"},
+	})
+	if err == nil {
+		t.Fatal("expected error for aws object store without worker identity")
+	}
+	if !strings.Contains(err.Error(), "worker identity") {
+		t.Fatalf("expected worker identity error, got %v", err)
+	}
+}
+
+func TestRenderManagedWarehouseRuntimeConfigRejectsAWSObjectStoreWithoutIAMRoleBinding(t *testing.T) {
+	runtime := &TeamRuntime{
+		TeamName: "analytics",
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Endpoint:     "aurora.internal",
+			Port:         5432,
+			DatabaseName: "ducklake_analytics",
+			Username:     "ducklake_user",
+		},
+		S3: configstore.ManagedWarehouseS3{
+			Provider:   "aws",
+			Region:     "us-east-1",
+			Bucket:     "analytics-bucket",
+			PathPrefix: "warehouse/analytics",
+		},
+		WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+			ServiceAccountName: "analytics-worker",
+		},
+	}
+
+	_, err := RenderManagedWarehouseRuntimeConfig(runtime, ManagedWarehouseSecretMaterial{
+		MetadataStorePassword: "metadata-pass",
+	}, ManagedWarehouseRuntimeArtifactOptions{
+		DataDir:    "/data",
+		Extensions: []string{"ducklake"},
+	})
+	if err == nil {
+		t.Fatal("expected error for aws object store without iam role binding")
+	}
+	if !strings.Contains(err.Error(), "iam_role_arn") {
+		t.Fatalf("expected iam_role_arn error, got %v", err)
 	}
 }
 
