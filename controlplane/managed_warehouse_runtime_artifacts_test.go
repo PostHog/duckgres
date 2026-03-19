@@ -134,14 +134,14 @@ func TestBuildManagedWarehouseRuntimeArtifactsRendersSecretsFromContract(t *test
 	if warehouseDB == nil || warehouseDB.Kind != "Secret" {
 		t.Fatalf("expected warehouse db secret manifest, got %#v", warehouseDB)
 	}
-	if got := warehouseDB.StringData["dsn"]; got != "postgres:host=warehouse.internal port=5432 user=warehouse_user password=warehouse-pass dbname=warehouse_local" {
+	if got := warehouseDB.StringData["dsn"]; got != "postgres:host='warehouse.internal' port=5432 user='warehouse_user' password='warehouse-pass' dbname='warehouse_local'" {
 		t.Fatalf("unexpected warehouse dsn %q", got)
 	}
 
 	if metadataStore == nil || metadataStore.Kind != "Secret" {
 		t.Fatalf("expected metadata secret manifest, got %#v", metadataStore)
 	}
-	if got := metadataStore.StringData["dsn"]; got != "postgres:host=metadata.internal port=5433 user=ducklake_user password=metadata-pass dbname=ducklake_metadata_local" {
+	if got := metadataStore.StringData["dsn"]; got != "postgres:host='metadata.internal' port=5433 user='ducklake_user' password='metadata-pass' dbname='ducklake_metadata_local'" {
 		t.Fatalf("unexpected metadata dsn %q", got)
 	}
 
@@ -166,7 +166,7 @@ func TestBuildManagedWarehouseRuntimeArtifactsRendersSecretsFromContract(t *test
 	if strings.Join(cfg.Extensions, ",") != "ducklake,httpfs" {
 		t.Fatalf("unexpected extensions %#v", cfg.Extensions)
 	}
-	if cfg.DuckLake.MetadataStore != "postgres:host=metadata.internal port=5433 user=ducklake_user password=metadata-pass dbname=ducklake_metadata_local" {
+	if cfg.DuckLake.MetadataStore != "postgres:host='metadata.internal' port=5433 user='ducklake_user' password='metadata-pass' dbname='ducklake_metadata_local'" {
 		t.Fatalf("unexpected ducklake metadata store %q", cfg.DuckLake.MetadataStore)
 	}
 	if cfg.DuckLake.ObjectStore != "s3://duckgres-local/teams/local/" {
@@ -226,6 +226,56 @@ func TestRenderManagedWarehouseRuntimeConfigPrefersIdentityBasedS3WhenNoExplicit
 	}
 	if cfg.DuckLake.ObjectStore != "s3://analytics-bucket/warehouse/analytics/" {
 		t.Fatalf("unexpected object store %q", cfg.DuckLake.ObjectStore)
+	}
+}
+
+func TestRenderManagedWarehouseRuntimeConfigRejectsNonAWSObjectStoreWithoutExplicitCredentials(t *testing.T) {
+	runtime := &TeamRuntime{
+		TeamName: "local",
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Endpoint:     "metadata.internal",
+			Port:         5432,
+			DatabaseName: "ducklake_local",
+			Username:     "ducklake",
+		},
+		S3: configstore.ManagedWarehouseS3{
+			Provider:   "minio",
+			Bucket:     "duckgres-local",
+			PathPrefix: "teams/local",
+			Endpoint:   "minio.internal:9000",
+			URLStyle:   "path",
+		},
+	}
+
+	_, err := RenderManagedWarehouseRuntimeConfig(runtime, ManagedWarehouseSecretMaterial{
+		MetadataStorePassword: "metadata-pass",
+	}, ManagedWarehouseRuntimeArtifactOptions{
+		DataDir:    "/data",
+		Extensions: []string{"ducklake"},
+	})
+	if err == nil {
+		t.Fatal("expected error for non-AWS object store without explicit credentials")
+	}
+	if !strings.Contains(err.Error(), "explicit s3 credentials") {
+		t.Fatalf("expected explicit s3 credentials error, got %v", err)
+	}
+}
+
+func TestBuildManagedWarehousePostgresDSNEscapesCredentials(t *testing.T) {
+	dsn, err := buildManagedWarehousePostgresDSN(
+		"db.internal",
+		5432,
+		"user name",
+		`pa'ss\word value`,
+		"warehouse db",
+	)
+	if err != nil {
+		t.Fatalf("buildManagedWarehousePostgresDSN: %v", err)
+	}
+
+	want := `postgres:host='db.internal' port=5432 user='user name' password='pa\'ss\\word value' dbname='warehouse db'`
+	if dsn != want {
+		t.Fatalf("unexpected dsn\nwant: %s\ngot:  %s", want, dsn)
 	}
 }
 

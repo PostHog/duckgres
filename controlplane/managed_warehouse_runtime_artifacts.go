@@ -77,16 +77,17 @@ func RenderManagedWarehouseRuntimeConfig(runtime *TeamRuntime, secretMaterial Ma
 		},
 	}
 
-	switch {
-	case secretMaterial.S3AccessKey != "" || secretMaterial.S3SecretKey != "":
-		if secretMaterial.S3AccessKey == "" || secretMaterial.S3SecretKey == "" {
-			return nil, fmt.Errorf("s3 explicit credentials require both access key and secret key")
-		}
-		cfg.DuckLake.S3Provider = "config"
+	provider, err := resolveManagedWarehouseS3Provider(runtime, secretMaterial, cfg.DuckLake.ObjectStore != "")
+	if err != nil {
+		return nil, err
+	}
+	switch provider {
+	case "config":
+		cfg.DuckLake.S3Provider = provider
 		cfg.DuckLake.S3AccessKey = secretMaterial.S3AccessKey
 		cfg.DuckLake.S3SecretKey = secretMaterial.S3SecretKey
-	case cfg.DuckLake.ObjectStore != "":
-		cfg.DuckLake.S3Provider = "aws_sdk"
+	case "aws_sdk":
+		cfg.DuckLake.S3Provider = provider
 	}
 
 	rendered, err := yaml.Marshal(cfg)
@@ -188,7 +189,14 @@ func buildManagedWarehousePostgresDSN(host string, port int, username, password,
 		return "", fmt.Errorf("database name is required")
 	}
 
-	return fmt.Sprintf("postgres:host=%s port=%d user=%s password=%s dbname=%s", host, port, username, password, database), nil
+	return fmt.Sprintf(
+		"postgres:host='%s' port=%d user='%s' password='%s' dbname='%s'",
+		escapeLibPQConnStringValue(host),
+		port,
+		escapeLibPQConnStringValue(username),
+		escapeLibPQConnStringValue(password),
+		escapeLibPQConnStringValue(database),
+	), nil
 }
 
 func buildManagedWarehouseObjectStore(s3 configstore.ManagedWarehouseS3) string {
@@ -216,6 +224,28 @@ func buildStringSecret(namespace, name, key, value string) *corev1.Secret {
 		Type:       corev1.SecretTypeOpaque,
 		StringData: map[string]string{key: value},
 	}
+}
+
+func resolveManagedWarehouseS3Provider(runtime *TeamRuntime, secretMaterial ManagedWarehouseSecretMaterial, hasObjectStore bool) (string, error) {
+	switch {
+	case secretMaterial.S3AccessKey != "" || secretMaterial.S3SecretKey != "":
+		if secretMaterial.S3AccessKey == "" || secretMaterial.S3SecretKey == "" {
+			return "", fmt.Errorf("s3 explicit credentials require both access key and secret key")
+		}
+		return "config", nil
+	case !hasObjectStore:
+		return "", nil
+	case runtime != nil && strings.EqualFold(runtime.S3.Provider, "aws"):
+		return "aws_sdk", nil
+	default:
+		return "", fmt.Errorf("team %s object store provider %q requires explicit s3 credentials", runtime.TeamName, runtime.S3.Provider)
+	}
+}
+
+func escapeLibPQConnStringValue(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `'`, `\'`)
+	return value
 }
 
 func secretNamespace(ref configstore.SecretRef, fallback string) string {
