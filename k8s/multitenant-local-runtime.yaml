@@ -13,4 +13,3 @@ type: Opaque
 stringData:
   duckgres.yaml: |
     data_dir: "/data/runtime-secret"
-    threads: 7
