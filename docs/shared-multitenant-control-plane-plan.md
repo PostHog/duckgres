@@ -42,7 +42,6 @@ Separate from the end-user query path, operators use the admin API/dashboard to 
 - Implement team-specific DuckLake/warehouse-db/metadata-store/S3 runtime wiring.
 - Change worker pod spec from global to be team-specific. 
 - Implement non-disruptive customer-initiated duckgres login rotation mechanism.
-- Enable Duckhog / Flight SQL in multi-tenant mode.
 - Dev Infra
   - Aurora cluster
   - Deploy control plane in k8
