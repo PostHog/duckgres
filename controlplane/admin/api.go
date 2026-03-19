@@ -93,8 +93,6 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info TeamStackInfo
 	// Config singletons
 	r.GET("/config/global", h.getGlobalConfig)
 	r.PUT("/config/global", h.updateGlobalConfig)
-	r.GET("/config/ducklake", h.getDuckLakeConfig)
-	r.PUT("/config/ducklake", h.updateDuckLakeConfig)
 	r.GET("/config/ratelimit", h.getRateLimitConfig)
 	r.PUT("/config/ratelimit", h.updateRateLimitConfig)
 	r.GET("/config/querylog", h.getQueryLogConfig)
@@ -122,8 +120,6 @@ type apiStore interface {
 
 	GetGlobalConfig() (configstore.GlobalConfig, error)
 	SaveGlobalConfig(cfg *configstore.GlobalConfig) error
-	GetDuckLakeConfig() (configstore.DuckLakeConfig, error)
-	SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error
 	GetRateLimitConfig() (configstore.RateLimitConfig, error)
 	SaveRateLimitConfig(cfg *configstore.RateLimitConfig) error
 	GetQueryLogConfig() (configstore.QueryLogConfig, error)
@@ -347,18 +343,6 @@ func (s *gormAPIStore) GetGlobalConfig() (configstore.GlobalConfig, error) {
 }
 
 func (s *gormAPIStore) SaveGlobalConfig(cfg *configstore.GlobalConfig) error {
-	return s.db().Save(cfg).Error
-}
-
-func (s *gormAPIStore) GetDuckLakeConfig() (configstore.DuckLakeConfig, error) {
-	var cfg configstore.DuckLakeConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.DuckLakeConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error {
 	return s.db().Save(cfg).Error
 }
 
@@ -709,29 +693,6 @@ func (h *apiHandler) updateGlobalConfig(c *gin.Context) {
 	}
 	cfg.ID = 1
 	if err := h.store.SaveGlobalConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) getDuckLakeConfig(c *gin.Context) {
-	cfg, err := h.store.GetDuckLakeConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateDuckLakeConfig(c *gin.Context) {
-	var cfg configstore.DuckLakeConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveDuckLakeConfig(&cfg); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

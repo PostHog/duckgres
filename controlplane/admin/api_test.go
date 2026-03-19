@@ -577,3 +577,23 @@ func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 		t.Fatal("expected metadata_store_database_name to be included in managed warehouse upserts")
 	}
 }
+
+func TestDuckLakeConfigEndpointsAreNotRegistered(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config/ducklake", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected GET /config/ducklake to return 404, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/config/ducklake", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected PUT /config/ducklake to return 404, got %d", rec.Code)
+	}
+}

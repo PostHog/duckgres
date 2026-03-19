@@ -36,13 +36,6 @@
             </div>
 
             <div class="bg-gray-800 rounded-lg border border-gray-700 p-6">
-                <h2 class="text-lg font-semibold mb-4">DuckLake Configuration</h2>
-                <div id="ducklake-config" hx-get="/api/v1/config/ducklake" hx-trigger="load" hx-swap="innerHTML">
-                    <div class="text-gray-400">Loading...</div>
-                </div>
-            </div>
-
-            <div class="bg-gray-800 rounded-lg border border-gray-700 p-6">
                 <h2 class="text-lg font-semibold mb-4">Rate Limit Configuration</h2>
                 <div id="ratelimit-config" hx-get="/api/v1/config/ratelimit" hx-trigger="load" hx-swap="innerHTML">
                     <div class="text-gray-400">Loading...</div>
@@ -75,7 +68,7 @@
     }
 
     document.body.addEventListener('htmx:beforeSwap', function(evt) {
-        const configTargets = ['global-config', 'ducklake-config', 'ratelimit-config', 'querylog-config'];
+        const configTargets = ['global-config', 'ratelimit-config', 'querylog-config'];
         if (configTargets.includes(evt.detail.target.id)) {
             try {
                 const data = JSON.parse(evt.detail.serverResponse);
