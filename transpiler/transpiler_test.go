@@ -1045,6 +1045,22 @@ func TestTranspile_ShowCreateTable_DuckLakeMode(t *testing.T) {
 		}
 	})
 
+	t.Run("uses regexp_replace not rtrim to strip trailing semicolon", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		// Must use regexp_replace to strip trailing semicolon, NOT rtrim.
+		// rtrim(sql, '; ') treats the second arg as a character SET, so it
+		// would eat single quotes from string defaults near the end of the DDL.
+		if strings.Contains(result.SQL, "rtrim") {
+			t.Error("should use regexp_replace, not rtrim, to strip trailing semicolon")
+		}
+		if !strings.Contains(result.SQL, "regexp_replace") {
+			t.Error("should use regexp_replace to safely strip trailing semicolon")
+		}
+	})
+
 	t.Run("non-DuckLake mode does not include partition metadata", func(t *testing.T) {
 		trPlain := New(DefaultConfig())
 		result, err := trPlain.Transpile("SHOW CREATE TABLE my_table")

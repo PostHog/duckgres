@@ -70,6 +70,13 @@ func interceptShowCreate(sql string, duckLakeMode bool) (string, bool) {
 // in ducklake_partition_info/ducklake_partition_column (inside the
 // __ducklake_metadata_ducklake schema), not in duckdb_tables().sql.
 //
+// Note: the __ducklake_metadata_ducklake schema name derives from the catalog
+// being attached as "ducklake" in server.go. If that name changes, update dlm.
+//
+// TODO: Add SORTED BY reconstruction when DuckLake adds sort metadata tables.
+// DuckDB PR #20431 introduces SORTED BY grammar, but the current DuckLake
+// extension does not yet expose sort metadata (no ducklake_sort_* tables).
+//
 // For non-partitioned tables, the base DDL is returned unchanged.
 // For views, the duckdb_views() sql is returned as-is (no partition support).
 func buildDuckLakeShowCreate(where, schema, table string) string {
@@ -110,7 +117,7 @@ func buildDuckLakeShowCreate(where, schema, table string) string {
 			`) `+
 			`SELECT CASE `+
 			`WHEN pc.clause IS NOT NULL AND pc.clause != '' `+
-			`THEN rtrim(b.sql, '; ') || ' PARTITIONED BY (' || pc.clause || ');' `+
+			`THEN regexp_replace(b.sql, ';\s*$', '') || ' PARTITIONED BY (' || pc.clause || ');' `+
 			`ELSE b.sql END AS statement `+
 			`FROM base b CROSS JOIN partition_clause pc `+
 			`UNION ALL `+
