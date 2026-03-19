@@ -806,10 +806,11 @@ func TestTranspile_ShowCreateTable(t *testing.T) {
 	tr := New(DefaultConfig())
 
 	tests := []struct {
-		name       string
-		input      string
-		wantSchema string
-		wantTable  string
+		name        string
+		input       string
+		wantCatalog string // empty means no database_name filter
+		wantSchema  string
+		wantTable   string
 	}{
 		{
 			name:       "basic table",
@@ -822,6 +823,20 @@ func TestTranspile_ShowCreateTable(t *testing.T) {
 			input:      "SHOW CREATE TABLE my_schema.my_table",
 			wantSchema: "my_schema",
 			wantTable:  "my_table",
+		},
+		{
+			name:        "three-part catalog.schema.table",
+			input:       "SHOW CREATE TABLE memory.my_schema.my_table",
+			wantCatalog: "memory",
+			wantSchema:  "my_schema",
+			wantTable:   "my_table",
+		},
+		{
+			name:        "three-part with quoted identifiers",
+			input:       `SHOW CREATE TABLE "MyCatalog"."MySchema"."MyTable"`,
+			wantCatalog: "MyCatalog",
+			wantSchema:  "MySchema",
+			wantTable:   "MyTable",
 		},
 		{
 			name:       "quoted table preserves case",
@@ -865,6 +880,42 @@ func TestTranspile_ShowCreateTable(t *testing.T) {
 			wantSchema: "main",
 			wantTable:  "it''s",
 		},
+		{
+			name:       "leading line comment",
+			input:      "-- get DDL\nSHOW CREATE TABLE my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "leading block comment",
+			input:      "/* get DDL */ SHOW CREATE TABLE my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "multiple leading comments",
+			input:      "-- first\n/* second */ SHOW CREATE TABLE my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "tab between keywords",
+			input:      "SHOW\tCREATE\tTABLE\tmy_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "multiple spaces between keywords",
+			input:      "SHOW  CREATE  TABLE  my_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
+		{
+			name:       "newline between keywords",
+			input:      "SHOW\nCREATE\nTABLE\nmy_table",
+			wantSchema: "main",
+			wantTable:  "my_table",
+		},
 	}
 
 	for _, tt := range tests {
@@ -894,8 +945,40 @@ func TestTranspile_ShowCreateTable(t *testing.T) {
 			if !strings.Contains(result.SQL, wantSchemaFilter) {
 				t.Errorf("expected %q in SQL, got: %q", wantSchemaFilter, result.SQL)
 			}
+			if tt.wantCatalog != "" {
+				wantCatalogFilter := fmt.Sprintf("database_name = '%s'", tt.wantCatalog)
+				if !strings.Contains(result.SQL, wantCatalogFilter) {
+					t.Errorf("expected %q in SQL, got: %q", wantCatalogFilter, result.SQL)
+				}
+			}
 		})
 	}
+
+	// Negative cases: these should NOT be intercepted as SHOW CREATE TABLE
+	t.Run("negative cases", func(t *testing.T) {
+		negatives := []struct {
+			name  string
+			input string
+		}{
+			{"SHOW CREATE no object type", "SHOW CREATE my_table"},
+			{"SHOW CREATE TABLE no name", "SHOW CREATE TABLE"},
+			{"SHOW CREATE TABLE no name with semicolon", "SHOW CREATE TABLE ;"},
+			{"SHOW CREATE FUNCTION", "SHOW CREATE FUNCTION my_func"},
+			{"plain SHOW", "SHOW TABLES"},
+			{"SHOW without CREATE", "SHOW TABLE my_table"},
+		}
+		for _, tt := range negatives {
+			t.Run(tt.name, func(t *testing.T) {
+				result, err := tr.Transpile(tt.input)
+				if err != nil {
+					return // parse error is fine — it means it wasn't intercepted
+				}
+				if strings.Contains(result.SQL, "duckdb_tables()") {
+					t.Errorf("should NOT have been intercepted as SHOW CREATE TABLE, but got: %q", result.SQL)
+				}
+			})
+		}
+	})
 }
 
 func TestTranspile_ComplexQueries(t *testing.T) {

@@ -2,59 +2,85 @@ package transpiler
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
-// interceptShowCreate rewrites SHOW CREATE TABLE/VIEW [schema.]name into a
-// DuckDB metadata query. This runs before pg_query parsing because these
-// statements are not valid PostgreSQL syntax.
+// showCreateRe matches SHOW CREATE TABLE/VIEW with flexible whitespace
+// after leading comments have been stripped.
+var showCreateRe = regexp.MustCompile(`(?i)^SHOW\s+CREATE\s+(TABLE|VIEW)\s+(.+)$`)
+
+// interceptShowCreate rewrites SHOW CREATE TABLE/VIEW [catalog.][schema.]name
+// into a DuckDB metadata query. This runs before pg_query parsing because
+// these statements are not valid PostgreSQL syntax.
 //
 // Supported forms:
 //   - SHOW CREATE TABLE my_table
 //   - SHOW CREATE TABLE my_schema.my_table
+//   - SHOW CREATE TABLE my_catalog.my_schema.my_table
 //   - SHOW CREATE TABLE "MyTable"
 //   - SHOW CREATE TABLE "my_schema"."MyTable"
 //   - SHOW CREATE VIEW (same forms)
+//
+// Leading SQL comments (-- and /* */) and flexible whitespace are handled.
 func interceptShowCreate(sql string) (string, bool) {
-	trimmed := strings.TrimSpace(sql)
+	// Strip leading comments and whitespace (matching hasAnyPrefix behavior)
+	trimmed := stripLeadingSQL(sql)
+	// Strip trailing semicolons and whitespace
 	trimmed = strings.TrimRight(trimmed, "; \t\n\r")
-	upper := strings.ToUpper(trimmed)
 
-	var rest string
-	switch {
-	case strings.HasPrefix(upper, "SHOW CREATE TABLE "):
-		rest = strings.TrimSpace(trimmed[len("SHOW CREATE TABLE "):])
-	case strings.HasPrefix(upper, "SHOW CREATE VIEW "):
-		rest = strings.TrimSpace(trimmed[len("SHOW CREATE VIEW "):])
-	default:
+	m := showCreateRe.FindStringSubmatch(trimmed)
+	if m == nil {
 		return "", false
 	}
 
-	if rest == "" {
+	ref := strings.TrimSpace(m[2])
+	if ref == "" {
 		return "", false
 	}
 
-	schema, table := parseShowCreateRef(rest)
-	es, et := escapeStringLiteral(schema), escapeStringLiteral(table)
+	catalog, schema, table := parseShowCreateRef(ref)
+	et := escapeStringLiteral(table)
+
+	// Build WHERE clause, optionally filtering by database
+	where := fmt.Sprintf("schema_name = '%s'", escapeStringLiteral(schema))
+	if catalog != "" {
+		where += fmt.Sprintf(" AND database_name = '%s'", escapeStringLiteral(catalog))
+	}
 
 	// Query both duckdb_tables() and duckdb_views() so SHOW CREATE TABLE works
 	// for views too (matching MySQL/ClickHouse behavior).
 	return fmt.Sprintf(
-		`SELECT sql AS statement FROM duckdb_tables() WHERE schema_name = '%s' AND table_name = '%s' UNION ALL SELECT sql AS statement FROM duckdb_views() WHERE schema_name = '%s' AND view_name = '%s'`,
-		es, et, es, et,
+		`SELECT sql AS statement FROM duckdb_tables() WHERE %s AND table_name = '%s' `+
+			`UNION ALL `+
+			`SELECT sql AS statement FROM duckdb_views() WHERE %s AND view_name = '%s'`,
+		where, et, where, et,
 	), true
 }
 
-// parseShowCreateRef splits a possibly schema-qualified, possibly double-quoted
-// table reference into (schema, table). Returns "main" as default schema.
-func parseShowCreateRef(ref string) (schema, table string) {
+// parseShowCreateRef splits a possibly catalog- and schema-qualified, possibly
+// double-quoted table reference into (catalog, schema, table).
+// Defaults: catalog="" (omitted from filter), schema="main".
+func parseShowCreateRef(ref string) (catalog, schema, table string) {
 	ref = strings.TrimSpace(ref)
+	dots := findAllUnquotedDots(ref)
 
-	dotIdx := findUnquotedDot(ref)
-	if dotIdx >= 0 {
-		schema = unquoteIdent(strings.TrimSpace(ref[:dotIdx]))
-		table = unquoteIdent(strings.TrimSpace(ref[dotIdx+1:]))
-	} else {
+	switch len(dots) {
+	case 0:
+		// table
+		schema = "main"
+		table = unquoteIdent(ref)
+	case 1:
+		// schema.table
+		schema = unquoteIdent(ref[:dots[0]])
+		table = unquoteIdent(ref[dots[0]+1:])
+	case 2:
+		// catalog.schema.table
+		catalog = unquoteIdent(ref[:dots[0]])
+		schema = unquoteIdent(ref[dots[0]+1 : dots[1]])
+		table = unquoteIdent(ref[dots[1]+1:])
+	default:
+		// Too many parts — treat as plain table name (will likely not match anything)
 		schema = "main"
 		table = unquoteIdent(ref)
 	}
@@ -66,8 +92,32 @@ func parseShowCreateRef(ref string) (schema, table string) {
 	return
 }
 
-// findUnquotedDot returns the index of the first dot outside double quotes, or -1.
-func findUnquotedDot(s string) int {
+// stripLeadingSQL strips leading whitespace, line comments (--), and block
+// comments (/* ... */) from SQL. Mirrors the logic in hasAnyPrefix.
+func stripLeadingSQL(s string) string {
+	s = strings.TrimLeft(s, " \t\n\r")
+	for {
+		if strings.HasPrefix(s, "--") {
+			nl := strings.IndexByte(s, '\n')
+			if nl < 0 {
+				return ""
+			}
+			s = strings.TrimLeft(s[nl+1:], " \t\n\r")
+		} else if strings.HasPrefix(s, "/*") {
+			end := strings.Index(s, "*/")
+			if end < 0 {
+				return ""
+			}
+			s = strings.TrimLeft(s[end+2:], " \t\n\r")
+		} else {
+			return s
+		}
+	}
+}
+
+// findAllUnquotedDots returns indices of all dots outside double-quoted identifiers.
+func findAllUnquotedDots(s string) []int {
+	var dots []int
 	inQuote := false
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
@@ -75,11 +125,11 @@ func findUnquotedDot(s string) int {
 			inQuote = !inQuote
 		case '.':
 			if !inQuote {
-				return i
+				dots = append(dots, i)
 			}
 		}
 	}
-	return -1
+	return dots
 }
 
 // unquoteIdent strips double quotes and preserves case, or lowercases unquoted identifiers.
