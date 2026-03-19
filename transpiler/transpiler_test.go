@@ -981,6 +981,82 @@ func TestTranspile_ShowCreateTable(t *testing.T) {
 	})
 }
 
+func TestTranspile_ShowCreateTable_DuckLakeMode(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true})
+
+	t.Run("includes partition metadata joins", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		sql := result.SQL
+		// Should query DuckLake partition metadata
+		if !strings.Contains(sql, "ducklake_partition_column") {
+			t.Error("DuckLake mode should query ducklake_partition_column")
+		}
+		if !strings.Contains(sql, "ducklake_partition_info") {
+			t.Error("DuckLake mode should query ducklake_partition_info")
+		}
+		if !strings.Contains(sql, "ducklake_column") {
+			t.Error("DuckLake mode should query ducklake_column")
+		}
+		if !strings.Contains(sql, "ducklake_schema") {
+			t.Error("DuckLake mode should query ducklake_schema")
+		}
+		// Should reconstruct PARTITIONED BY clause
+		if !strings.Contains(sql, "PARTITIONED BY") {
+			t.Error("DuckLake mode should include PARTITIONED BY reconstruction")
+		}
+		// Should still include views fallback
+		if !strings.Contains(sql, "duckdb_views()") {
+			t.Error("DuckLake mode should still query duckdb_views()")
+		}
+		// Should filter by correct table/schema
+		if !strings.Contains(sql, "table_name = 'my_table'") {
+			t.Errorf("expected table_name filter, got: %q", sql)
+		}
+		if !strings.Contains(sql, "schema_name = 'main'") {
+			t.Errorf("expected schema_name filter, got: %q", sql)
+		}
+	})
+
+	t.Run("handles transform functions in partition clause", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		// The generated SQL should handle identity vs function transforms
+		if !strings.Contains(result.SQL, "WHEN transform = 'identity' THEN column_name") {
+			t.Error("should handle identity transform")
+		}
+		if !strings.Contains(result.SQL, "transform || '(' || column_name || ')'") {
+			t.Error("should handle function transforms like year(), month()")
+		}
+	})
+
+	t.Run("filters active partition only", func(t *testing.T) {
+		result, err := tr.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		// Should only select partitions where end_snapshot IS NULL (active)
+		if !strings.Contains(result.SQL, "end_snapshot IS NULL") {
+			t.Error("should filter for active partition (end_snapshot IS NULL)")
+		}
+	})
+
+	t.Run("non-DuckLake mode does not include partition metadata", func(t *testing.T) {
+		trPlain := New(DefaultConfig())
+		result, err := trPlain.Transpile("SHOW CREATE TABLE my_table")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if strings.Contains(result.SQL, "ducklake_partition") {
+			t.Error("non-DuckLake mode should not reference partition metadata")
+		}
+	})
+}
+
 func TestTranspile_ComplexQueries(t *testing.T) {
 	tests := []struct {
 		name  string

@@ -14,6 +14,10 @@ var showCreateRe = regexp.MustCompile(`(?i)^SHOW\s+CREATE\s+(TABLE|VIEW)\s+(.+)$
 // into a DuckDB metadata query. This runs before pg_query parsing because
 // these statements are not valid PostgreSQL syntax.
 //
+// In DuckLake mode, the generated query also joins against DuckLake partition
+// metadata to reconstruct the PARTITIONED BY clause (e.g., PARTITIONED BY
+// (category, year(created_at))).
+//
 // Supported forms:
 //   - SHOW CREATE TABLE my_table
 //   - SHOW CREATE TABLE my_schema.my_table
@@ -23,7 +27,7 @@ var showCreateRe = regexp.MustCompile(`(?i)^SHOW\s+CREATE\s+(TABLE|VIEW)\s+(.+)$
 //   - SHOW CREATE VIEW (same forms)
 //
 // Leading SQL comments (-- and /* */) and flexible whitespace are handled.
-func interceptShowCreate(sql string) (string, bool) {
+func interceptShowCreate(sql string, duckLakeMode bool) (string, bool) {
 	// Strip leading comments and whitespace (matching hasAnyPrefix behavior)
 	trimmed := stripLeadingSQL(sql)
 	// Strip trailing semicolons and whitespace
@@ -40,22 +44,86 @@ func interceptShowCreate(sql string) (string, bool) {
 	}
 
 	catalog, schema, table := parseShowCreateRef(ref)
-	et := escapeStringLiteral(table)
+	es, et := escapeStringLiteral(schema), escapeStringLiteral(table)
 
 	// Build WHERE clause, optionally filtering by database
-	where := fmt.Sprintf("schema_name = '%s'", escapeStringLiteral(schema))
+	where := fmt.Sprintf("schema_name = '%s'", es)
 	if catalog != "" {
 		where += fmt.Sprintf(" AND database_name = '%s'", escapeStringLiteral(catalog))
 	}
 
-	// Query both duckdb_tables() and duckdb_views() so SHOW CREATE TABLE works
-	// for views too (matching MySQL/ClickHouse behavior).
+	if duckLakeMode {
+		return buildDuckLakeShowCreate(where, es, et), true
+	}
+
+	// Non-DuckLake: simple metadata lookup
 	return fmt.Sprintf(
 		`SELECT sql AS statement FROM duckdb_tables() WHERE %s AND table_name = '%s' `+
 			`UNION ALL `+
 			`SELECT sql AS statement FROM duckdb_views() WHERE %s AND view_name = '%s'`,
 		where, et, where, et,
 	), true
+}
+
+// buildDuckLakeShowCreate generates a query that enriches the base CREATE TABLE
+// DDL with PARTITIONED BY from DuckLake metadata. The partition info is stored
+// in ducklake_partition_info/ducklake_partition_column (inside the
+// __ducklake_metadata_ducklake schema), not in duckdb_tables().sql.
+//
+// For non-partitioned tables, the base DDL is returned unchanged.
+// For views, the duckdb_views() sql is returned as-is (no partition support).
+func buildDuckLakeShowCreate(where, schema, table string) string {
+	const dlm = `"__ducklake_metadata_ducklake"` // DuckLake metadata schema
+
+	// CTE-based query:
+	//   1. base: get raw CREATE TABLE DDL from duckdb_tables()
+	//   2. partition_cols: join partition metadata to get ordered column+transform pairs
+	//   3. partition_clause: aggregate into a single "col1, year(col2)" string
+	//   4. Final SELECT: append PARTITIONED BY (...) if partition clause is non-empty
+	//
+	// UNION ALL with duckdb_views() for SHOW CREATE VIEW (views have no partitioning).
+	return fmt.Sprintf(
+		`WITH base AS (`+
+			`SELECT sql FROM duckdb_tables() WHERE %s AND table_name = '%s'`+
+			`), `+
+			`partition_cols AS (`+
+			`SELECT pc.partition_key_index, col.column_name, pc.transform `+
+			`FROM %s.ducklake_partition_column pc `+
+			`JOIN %s.ducklake_partition_info pi `+
+			`ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id `+
+			`JOIN %s.ducklake_table t `+
+			`ON pi.table_id = t.table_id `+
+			`JOIN %s.ducklake_schema s `+
+			`ON t.schema_id = s.schema_id `+
+			`JOIN %s.ducklake_column col `+
+			`ON pc.column_id = col.column_id AND pc.table_id = col.table_id `+
+			`WHERE t.table_name = '%s' AND s.schema_name = '%s' `+
+			`AND pi.end_snapshot IS NULL AND col.end_snapshot IS NULL `+
+			`ORDER BY pc.partition_key_index`+
+			`), `+
+			`partition_clause AS (`+
+			`SELECT string_agg(`+
+			`CASE WHEN transform = 'identity' THEN column_name `+
+			`ELSE transform || '(' || column_name || ')' END, `+
+			`', ' ORDER BY partition_key_index) AS clause `+
+			`FROM partition_cols`+
+			`) `+
+			`SELECT CASE `+
+			`WHEN pc.clause IS NOT NULL AND pc.clause != '' `+
+			`THEN rtrim(b.sql, '; ') || ' PARTITIONED BY (' || pc.clause || ');' `+
+			`ELSE b.sql END AS statement `+
+			`FROM base b CROSS JOIN partition_clause pc `+
+			`UNION ALL `+
+			`SELECT sql AS statement FROM duckdb_views() WHERE %s AND view_name = '%s'`,
+		// base CTE
+		where, table,
+		// partition_cols CTE - 5x dlm for the 5 metadata table references
+		dlm, dlm, dlm, dlm, dlm,
+		// partition_cols WHERE
+		table, schema,
+		// views UNION
+		where, table,
+	)
 }
 
 // parseShowCreateRef splits a possibly catalog- and schema-qualified, possibly

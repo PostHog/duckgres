@@ -143,7 +143,7 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 
 	// Pre-parse interceptions for SQL that isn't valid PostgreSQL syntax
 	// but has well-defined duckgres semantics (e.g., SHOW CREATE TABLE).
-	if rewritten, ok := interceptShowCreate(sql); ok {
+	if rewritten, ok := interceptShowCreate(sql, t.config.DuckLakeMode); ok {
 		return &Result{SQL: rewritten}, nil
 	}
 
