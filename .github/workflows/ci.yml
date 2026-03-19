@@ -13,9 +13,11 @@ permissions:
 
 jobs:
   lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: extractions/setup-just@v3
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -23,11 +25,14 @@ jobs:
         with:
           version: v2.8.0
 
-  unit-tests:
+  test-unit:
+    name: test-unit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Set up just
+        uses: extractions/setup-just@v3
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -35,10 +40,11 @@ jobs:
           go-version-file: go.mod
 
       - name: Run unit tests
-        run: go test -v . ./server/... ./transpiler/...
+        run: just test-unit
 
-  integration-tests:
-    needs: unit-tests
+  test-standalone-integration:
+    name: test-standalone-integration
+    needs: test-unit
     runs-on: ubuntu-latest
 
     services:
@@ -75,6 +81,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Set up just
+        uses: extractions/setup-just@v3
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -106,21 +114,24 @@ jobs:
           /tmp/mc alias set minio http://localhost:39000 minioadmin minioadmin
           /tmp/mc mb minio/ducklake --ignore-existing
 
-      - name: Run integration tests
-        run: go test -v ./tests/integration/...
+      - name: Run standalone integration tests
+        run: just test-standalone-integration
 
-  controlplane-tests:
-    needs: unit-tests
+  test-control-plane:
+    name: test-control-plane
+    needs: test-unit
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Set up just
+        uses: extractions/setup-just@v3
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: Run control plane tests
-        run: go test -v -timeout 300s ./tests/controlplane/...
+      - name: Run control-plane tests
+        run: just test-control-plane

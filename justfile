@@ -144,15 +144,29 @@ test:
 test-unit:
     go test -v ./server/... ./transpiler/...
 
-# Run integration tests
+# Run standalone integration tests (server behavior, non-Kubernetes)
 [group('test')]
-test-integration:
+test-standalone-integration:
     go test -v ./tests/integration/...
 
-# Run control plane tests
+# Backward-compatible alias for standalone integration tests
 [group('test')]
-test-controlplane:
+test-integration: test-standalone-integration
+
+# Run control-plane tests
+[group('test')]
+test-control-plane:
     go test -v -timeout 300s ./tests/controlplane/...
+
+# Backward-compatible alias for control-plane tests
+[group('test')]
+test-controlplane: test-control-plane
+
+# Run Kubernetes integration tests
+[group('test')]
+test-k8s-integration:
+    go test -tags kubernetes ./controlplane -count=1
+    go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
 
 # Run perf tests
 [group('test')]
@@ -169,10 +183,14 @@ test-ducklake:
 test-extensions:
     ./scripts/test_extensions.sh
 
-# Run rate limiting tests
+# Run rate-limit tests
 [group('test')]
-test-ratelimit:
+test-rate-limit:
     ./scripts/test_ratelimit.sh
+
+# Backward-compatible alias for rate-limit tests
+[group('test')]
+test-ratelimit: test-rate-limit
 
 # Run Prometheus metrics tests
 [group('test')]
@@ -181,12 +199,12 @@ test-metrics:
 
 # Quick perf smoke test
 [group('test')]
-perf-smoke:
+test-perf-smoke:
     ./scripts/perf_smoke.sh
 
 # Full perf nightly suite
 [group('test')]
-perf-nightly:
+test-perf-nightly:
     ./scripts/perf_nightly.sh
 
 # Lint (matches CI — uses golangci-lint, not go vet)
@@ -194,9 +212,17 @@ perf-nightly:
 lint:
     golangci-lint run
 
-# Run what CI runs: lint + unit + integration + controlplane tests
+# Run the core CI suite: lint + unit + standalone integration + control-plane
 [group('test')]
-ci: lint test-unit test-integration test-controlplane
+ci-core: lint test-unit test-standalone-integration test-control-plane
+
+# Run the Kubernetes CI suite locally: lint + Kubernetes-tagged + live K8s integration
+[group('test')]
+ci-k8s: lint test-k8s-integration
+
+# Backward-compatible alias for the core CI suite
+[group('test')]
+ci: ci-core
 
 # === Metrics ===
 
