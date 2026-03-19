@@ -978,79 +978,100 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 	}
 
 	// Ensure performance indexes exist on the DuckLake metadata tables.
-	// DuckLake does not create indexes on its PostgreSQL metadata tables, which
-	// causes severe performance issues when the catalog grows large. DuckDB's
-	// postgres scanner uses COPY with ctid range batches and pushes down filters,
-	// but without indexes PostgreSQL must do sequential scans within each batch.
+	// Run in a goroutine so it doesn't block the DuckLake semaphore or
+	// delay connection setup. Uses atomic flag to retry on transient failures.
 	// See: https://github.com/duckdb/ducklake/issues/859
-	ensureDuckLakeMetadataIndexes(dlCfg)
+	go ensureDuckLakeMetadataIndexes(dlCfg)
 
 	return nil
 }
 
-// duckLakeIndexOnce ensures metadata index creation runs at most once per process.
-var duckLakeIndexOnce sync.Once
+// duckLakeIndexDone tracks whether metadata indexes have been successfully created.
+// Uses atomic.Bool instead of sync.Once so transient failures can be retried.
+var duckLakeIndexDone atomic.Bool
+
+// duckLakeIndexMu serializes concurrent index creation attempts.
+var duckLakeIndexMu sync.Mutex
 
 // ensureDuckLakeMetadataIndexes connects directly to the DuckLake PostgreSQL
 // metadata store and creates indexes that dramatically improve query planning
 // performance. This is non-fatal — if it fails, DuckLake still works, just slower.
+// Retries on subsequent AttachDuckLake calls until it succeeds.
 func ensureDuckLakeMetadataIndexes(dlCfg DuckLakeConfig) {
-	duckLakeIndexOnce.Do(func() {
-		// MetadataStore format is "postgres:host=... port=... user=... dbname=..."
-		// Strip the "postgres:" prefix to get a standard libpq connection string.
-		connStr := dlCfg.MetadataStore
-		if strings.HasPrefix(connStr, "postgres:") {
-			connStr = connStr[len("postgres:"):]
+	if duckLakeIndexDone.Load() {
+		return
+	}
+
+	// Only relevant for PostgreSQL metadata stores.
+	if !strings.HasPrefix(dlCfg.MetadataStore, "postgres:") {
+		return
+	}
+
+	// Serialize concurrent attempts (multiple connections attaching simultaneously).
+	duckLakeIndexMu.Lock()
+	defer duckLakeIndexMu.Unlock()
+
+	// Double-check after acquiring the lock.
+	if duckLakeIndexDone.Load() {
+		return
+	}
+
+	// Strip the "postgres:" DuckLake protocol prefix to get a standard libpq connection string.
+	connStr := strings.TrimPrefix(dlCfg.MetadataStore, "postgres:")
+
+	// pgx/stdlib accepts libpq key=value format directly.
+	pgDB, err := sql.Open("pgx", connStr)
+	if err != nil {
+		slog.Warn("Failed to open connection for DuckLake metadata indexes.", "error", err)
+		return
+	}
+	defer pgDB.Close()
+
+	// Use a generous timeout — CREATE INDEX on large tables (e.g., ducklake_file_column_stats
+	// at 1.2 GB) can take minutes on first run. Subsequent runs are instant (IF NOT EXISTS).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if err := pgDB.PingContext(ctx); err != nil {
+		slog.Warn("Failed to connect to DuckLake metadata store for index creation.", "error", err)
+		return
+	}
+
+	// Indexes that improve DuckDB postgres scanner performance.
+	// The scanner uses COPY with ctid batches and pushes down filters,
+	// but without indexes each batch requires a sequential scan.
+	indexes := []string{
+		// Critical: ducklake_file_column_stats is often the largest table (millions of rows).
+		// Filter pushdown CTEs query by (table_id, column_id) on every query.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_file_col_stats_tbl_col ON ducklake_file_column_stats (table_id, column_id)",
+
+		// Catalog loading queries (GetCatalogForSnapshot) filter by snapshot ranges.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_tag_object_snap ON ducklake_tag (object_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_col_tag_tbl_col_snap ON ducklake_column_tag (table_id, column_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_snap ON ducklake_table (begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_column_tbl_snap ON ducklake_column (table_id, begin_snapshot, end_snapshot, column_order)",
+
+		// File and stats queries.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_tbl_snap ON ducklake_data_file (table_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_delete_file_tbl_snap ON ducklake_delete_file (table_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_stats_tbl ON ducklake_table_stats (table_id)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_col_stats_tbl ON ducklake_table_column_stats (table_id)",
+	}
+
+	created := 0
+	for _, stmt := range indexes {
+		if _, err := pgDB.ExecContext(ctx, stmt); err != nil {
+			slog.Warn("Failed to create DuckLake metadata index.", "statement", stmt, "error", err)
+			// Continue — create as many indexes as possible
+		} else {
+			created++
 		}
+	}
 
-		// pgx/stdlib accepts libpq key=value format directly.
-		pgDB, err := sql.Open("pgx", connStr)
-		if err != nil {
-			slog.Warn("Failed to open connection for DuckLake metadata indexes.", "error", err)
-			return
-		}
-		defer pgDB.Close()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		if err := pgDB.PingContext(ctx); err != nil {
-			slog.Warn("Failed to connect to DuckLake metadata store for index creation.", "error", err)
-			return
-		}
-
-		// Indexes that improve DuckDB postgres scanner performance.
-		// The scanner uses COPY with ctid batches and pushes down filters,
-		// but without indexes each batch requires a sequential scan.
-		indexes := []string{
-			// Critical: ducklake_file_column_stats is often the largest table (millions of rows).
-			// Filter pushdown CTEs query by (table_id, column_id) on every query.
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_file_col_stats_tbl_col ON ducklake_file_column_stats (table_id, column_id)",
-
-			// Catalog loading queries (GetCatalogForSnapshot) filter by snapshot ranges.
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_tag_object_snap ON ducklake_tag (object_id, begin_snapshot, end_snapshot)",
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_col_tag_tbl_col_snap ON ducklake_column_tag (table_id, column_id, begin_snapshot, end_snapshot)",
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_table_snap ON ducklake_table (begin_snapshot, end_snapshot)",
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_column_tbl_snap ON ducklake_column (table_id, begin_snapshot, end_snapshot, column_order)",
-
-			// File and stats queries.
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_tbl_snap ON ducklake_data_file (table_id, begin_snapshot, end_snapshot)",
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_delete_file_tbl_snap ON ducklake_delete_file (table_id, begin_snapshot, end_snapshot)",
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_table_stats_tbl ON ducklake_table_stats (table_id)",
-			"CREATE INDEX IF NOT EXISTS idx_ducklake_table_col_stats_tbl ON ducklake_table_column_stats (table_id)",
-		}
-
-		created := 0
-		for _, stmt := range indexes {
-			if _, err := pgDB.ExecContext(ctx, stmt); err != nil {
-				slog.Warn("Failed to create DuckLake metadata index.", "statement", stmt, "error", err)
-				// Continue — create as many indexes as possible
-			} else {
-				created++
-			}
-		}
-		slog.Info("Ensured DuckLake metadata indexes.", "created_or_verified", created, "total", len(indexes))
-	})
+	if created == len(indexes) {
+		duckLakeIndexDone.Store(true)
+	}
+	slog.Info("Ensured DuckLake metadata indexes.", "created_or_verified", created, "total", len(indexes))
 }
 
 // setDuckLakeDefault sets the DuckLake catalog as the default so all queries use it.
