@@ -43,6 +43,7 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | `rbac.yaml` | ServiceAccount, Role (pods + secrets), RoleBinding |
 | `configmap.yaml` | Shared duckgres config (users, extensions, data dir) |
 | `secret.yaml` | Bearer token secret (auto-populated by CP if empty) |
+| `multitenant-local-runtime.yaml` | Local multi-tenant worker ServiceAccount + Secret-backed runtime config |
 | `networkpolicy.yaml` | Restricts worker ingress to CP pods only |
 | `control-plane-deployment.yaml` | CP Deployment + ClusterIP Service |
 
@@ -121,10 +122,10 @@ After code changes, rerun `just run-multitenant-local` to rebuild, redeploy, and
 ### Running Integration Tests
 
 ```bash
-# Against an existing deployment (skip build/deploy, just run tests)
+# Against an existing multi-tenant deployment (skip setup, just run tests)
 DUCKGRES_K8S_TEST_SKIP_SETUP=true go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
 
-# Full setup (builds image, deploys, runs tests, cleans up)
+# Full setup (builds image, starts the config store, deploys multi-tenant control plane, seeds config store, runs tests, cleans up)
 go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
 ```
 
@@ -133,7 +134,7 @@ Test environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DUCKGRES_K8S_TEST_SKIP_SETUP` | - | Set to `true` to skip build/deploy/teardown |
-| `DUCKGRES_K8S_TEST_NAMESPACE` | `duckgres` | K8s namespace for test resources |
+| `DUCKGRES_K8S_TEST_NAMESPACE` | `duckgres` | K8s namespace for externally managed deployments; managed setup uses `duckgres` |
 
 ### Cleanup
 

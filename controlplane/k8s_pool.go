@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"strconv"
 	"sync"
 	"time"
@@ -39,25 +40,31 @@ type K8sWorkerPool struct {
 	shuttingDown bool
 	shutdownCh   chan struct{}
 
-	clientset       kubernetes.Interface
-	namespace       string
-	cpID            string
-	cpUID           types.UID
-	workerImage     string
-	workerPort      int
-	secretName      string
-	configMap       string
-	configPath      string
-	imagePullPolicy corev1.PullPolicy
-	serviceAccount  string
-	memoryBudget      int64  // total memory budget in bytes
-	teamName          string // team name for pod labels (multi-tenant mode)
-	workerIDGenerator func() int // shared ID generator across teams (nil = internal counter)
-	cachedToken       string // cached bearer token (immutable after setup)
-	informer          cache.SharedIndexInformer
-	stopInform      chan struct{}
-	spawnSem        chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
-	podReady        sync.Map     // podName -> chan string (pod IP); signaled by informer
+	clientset           kubernetes.Interface
+	namespace           string
+	cpID                string
+	cpUID               types.UID
+	workerImage         string
+	workerPort          int
+	secretName          string
+	configMap           string
+	configSecretName    string
+	configSecretKey     string
+	configPath          string
+	imagePullPolicy     corev1.PullPolicy
+	serviceAccount      string
+	memoryBudget        int64      // total memory budget in bytes
+	teamName            string     // team name for pod labels (multi-tenant mode)
+	workerIDGenerator   func() int // shared ID generator across teams (nil = internal counter)
+	cachedToken         string     // cached bearer token (immutable after setup)
+	informer            cache.SharedIndexInformer
+	stopInform          chan struct{}
+	spawnSem            chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
+	podReady            sync.Map      // podName -> chan string (pod IP); signaled by informer
+	runtimeEnv          []corev1.EnvVar
+	runtimeEnvFrom      []corev1.EnvFromSource
+	runtimeVolumes      []corev1.Volume
+	runtimeVolumeMounts []corev1.VolumeMount
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -100,29 +107,41 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	if cfg.ConfigPath == "" {
 		cfg.ConfigPath = "/etc/duckgres/duckgres.yaml"
 	}
+	if cfg.ConfigMap != "" && cfg.ConfigSecretName != "" {
+		return nil, fmt.Errorf("k8s worker config cannot use both config map and config secret")
+	}
+	if cfg.ConfigSecretName != "" && cfg.ConfigSecretKey == "" {
+		return nil, fmt.Errorf("k8s worker config secret %s requires a key", cfg.ConfigSecretName)
+	}
 
 	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
 	spawnConcurrency := 3
 	pool := &K8sWorkerPool{
-		workers:           make(map[int]*ManagedWorker),
-		maxWorkers:        cfg.MaxWorkers,
-		idleTimeout:       cfg.IdleTimeout,
-		shutdownCh:        make(chan struct{}),
-		stopInform:        make(chan struct{}),
-		clientset:         clientset,
-		namespace:         cfg.Namespace,
-		cpID:              cfg.CPID,
-		workerImage:       cfg.WorkerImage,
-		workerPort:        cfg.WorkerPort,
-		secretName:        cfg.SecretName,
-		configMap:         cfg.ConfigMap,
-		configPath:        cfg.ConfigPath,
-		imagePullPolicy:   corev1.PullPolicy(cfg.ImagePullPolicy),
-		serviceAccount:    cfg.ServiceAccount,
-		memoryBudget:      cfg.MemoryBudget,
-		teamName:          cfg.TeamName,
-		workerIDGenerator: cfg.WorkerIDGenerator,
-		spawnSem:          make(chan struct{}, spawnConcurrency),
+		workers:             make(map[int]*ManagedWorker),
+		maxWorkers:          cfg.MaxWorkers,
+		idleTimeout:         cfg.IdleTimeout,
+		shutdownCh:          make(chan struct{}),
+		stopInform:          make(chan struct{}),
+		clientset:           clientset,
+		namespace:           cfg.Namespace,
+		cpID:                cfg.CPID,
+		workerImage:         cfg.WorkerImage,
+		workerPort:          cfg.WorkerPort,
+		secretName:          cfg.SecretName,
+		configMap:           cfg.ConfigMap,
+		configSecretName:    cfg.ConfigSecretName,
+		configSecretKey:     cfg.ConfigSecretKey,
+		configPath:          cfg.ConfigPath,
+		imagePullPolicy:     corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:      cfg.ServiceAccount,
+		memoryBudget:        cfg.MemoryBudget,
+		teamName:            cfg.TeamName,
+		workerIDGenerator:   cfg.WorkerIDGenerator,
+		runtimeEnv:          append([]corev1.EnvVar(nil), cfg.RuntimeEnv...),
+		runtimeEnvFrom:      append([]corev1.EnvFromSource(nil), cfg.RuntimeEnvFrom...),
+		runtimeVolumes:      append([]corev1.Volume(nil), cfg.RuntimeVolumes...),
+		runtimeVolumeMounts: append([]corev1.VolumeMount(nil), cfg.RuntimeVolumeMounts...),
+		spawnSem:            make(chan struct{}, spawnConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
@@ -343,6 +362,57 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		return fmt.Errorf("read bearer token: %w", err)
 	}
 
+	pod := p.buildWorkerPod(id)
+	podName := pod.Name
+
+	// Delete stale pod with the same name if it exists (from a previous run)
+	_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+		GracePeriodSeconds: int64Ptr(0),
+	})
+
+	// Create pod with exponential backoff on transient errors.
+	if err := p.createPodWithBackoff(ctx, pod); err != nil {
+		return err
+	}
+
+	// Wait for pod to get an IP via informer (no polling).
+	podIP, err := p.waitForPodReady(ctx, podName, 90*time.Second)
+	if err != nil {
+		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+			GracePeriodSeconds: int64Ptr(0),
+		})
+		return fmt.Errorf("worker pod %s failed to start: %w", podName, err)
+	}
+
+	// Connect gRPC client
+	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
+	client, err := waitForWorkerTCP(addr, token, 90*time.Second)
+	if err != nil {
+		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+			GracePeriodSeconds: int64Ptr(0),
+		})
+		return fmt.Errorf("worker %d gRPC connection failed: %w", id, err)
+	}
+
+	done := make(chan struct{})
+	w := &ManagedWorker{
+		ID:          id,
+		bearerToken: token,
+		client:      client,
+		done:        done,
+	}
+
+	p.mu.Lock()
+	p.workers[id] = w
+	workerCount := len(p.workers)
+	p.mu.Unlock()
+	observeControlPlaneWorkers(workerCount)
+
+	slog.Info("K8s worker spawned.", "id", id, "pod", podName, "addr", addr)
+	return nil
+}
+
+func (p *K8sWorkerPool) buildWorkerPod(id int) *corev1.Pod {
 	podName := p.podNameForWorker(id)
 
 	// Build owner references for GC on CP deletion
@@ -368,7 +438,6 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		podLabels["duckgres/team"] = p.teamName
 	}
 
-	// Build pod spec
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            podName,
@@ -423,6 +492,8 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		},
 	}
 
+	container := &pod.Spec.Containers[0]
+
 	// Add writable data directory for DuckDB databases
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 		Name: "data",
@@ -430,16 +501,19 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 			EmptyDir: &corev1.EmptyDirVolumeSource{},
 		},
 	})
-	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+	container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
 		Name:      "data",
 		MountPath: "/data",
 	})
 
+	configMountDir := path.Dir(p.configPath)
+	configFileName := path.Base(p.configPath)
+	if p.configMap != "" || p.configSecretName != "" {
+		container.Args = append(container.Args, "--config", p.configPath)
+	}
+
 	// Add config from ConfigMap if specified
 	if p.configMap != "" {
-		pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args,
-			"--config", p.configPath,
-		)
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: "duckgres-config",
 			VolumeSource: corev1.VolumeSource{
@@ -448,58 +522,49 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 				},
 			},
 		})
-		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
 			Name:      "duckgres-config",
-			MountPath: "/etc/duckgres",
+			MountPath: configMountDir,
 			ReadOnly:  true,
 		})
 	}
 
-	// Delete stale pod with the same name if it exists (from a previous run)
-	_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
-		GracePeriodSeconds: int64Ptr(0),
-	})
-
-	// Create pod with exponential backoff on transient errors.
-	if err := p.createPodWithBackoff(ctx, pod); err != nil {
-		return err
-	}
-
-	// Wait for pod to get an IP via informer (no polling).
-	podIP, err := p.waitForPodReady(ctx, podName, 90*time.Second)
-	if err != nil {
-		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
-			GracePeriodSeconds: int64Ptr(0),
+	if p.configSecretName != "" {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: "duckgres-config-secret",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: p.configSecretName,
+					Items: []corev1.KeyToPath{
+						{
+							Key:  p.configSecretKey,
+							Path: configFileName,
+						},
+					},
+				},
+			},
 		})
-		return fmt.Errorf("worker pod %s failed to start: %w", podName, err)
-	}
-
-	// Connect gRPC client
-	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
-	client, err := waitForWorkerTCP(addr, token, 90*time.Second)
-	if err != nil {
-		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
-			GracePeriodSeconds: int64Ptr(0),
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      "duckgres-config-secret",
+			MountPath: configMountDir,
+			ReadOnly:  true,
 		})
-		return fmt.Errorf("worker %d gRPC connection failed: %w", id, err)
 	}
 
-	done := make(chan struct{})
-	w := &ManagedWorker{
-		ID:          id,
-		bearerToken: token,
-		client:      client,
-		done:        done,
+	if len(p.runtimeEnv) > 0 {
+		container.Env = append(container.Env, p.runtimeEnv...)
+	}
+	if len(p.runtimeEnvFrom) > 0 {
+		container.EnvFrom = append(container.EnvFrom, p.runtimeEnvFrom...)
+	}
+	if len(p.runtimeVolumes) > 0 {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, p.runtimeVolumes...)
+	}
+	if len(p.runtimeVolumeMounts) > 0 {
+		container.VolumeMounts = append(container.VolumeMounts, p.runtimeVolumeMounts...)
 	}
 
-	p.mu.Lock()
-	p.workers[id] = w
-	workerCount := len(p.workers)
-	p.mu.Unlock()
-	observeControlPlaneWorkers(workerCount)
-
-	slog.Info("K8s worker spawned.", "id", id, "pod", podName, "addr", addr)
-	return nil
+	return pod
 }
 
 // createPodWithBackoff creates a pod, retrying transient K8s API errors

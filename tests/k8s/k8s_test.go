@@ -11,12 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	_ "github.com/lib/pq"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -33,14 +33,11 @@ func TestMain(m *testing.M) {
 	namespace = envOr("DUCKGRES_K8S_TEST_NAMESPACE", "duckgres")
 	skipSetup := envOr("DUCKGRES_K8S_TEST_SKIP_SETUP", "") == "true"
 	if !skipSetup {
-		if err := buildImage(); err != nil {
-			log.Fatalf("Failed to build image: %v", err)
+		if namespace != "duckgres" {
+			log.Fatalf("Managed k8s integration setup requires namespace duckgres, got %q", namespace)
 		}
-		if err := applyManifests(); err != nil {
-			log.Fatalf("Failed to apply manifests: %v", err)
-		}
-		if err := waitForDeployment(namespace, "duckgres-control-plane", 180*time.Second); err != nil {
-			log.Fatalf("Deployment not ready: %v", err)
+		if err := setupMultiTenant(); err != nil {
+			log.Fatalf("Failed to set up multi-tenant environment: %v", err)
 		}
 	}
 
@@ -56,7 +53,11 @@ func TestMain(m *testing.M) {
 	}
 
 	// Start port-forward
-	pgPort, portFwdCmd, err = startPortForward(namespace, "svc/duckgres", 5432)
+	controlPlanePod, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second)
+	if err != nil {
+		log.Fatalf("Control-plane pod not ready: %v", err)
+	}
+	pgPort, portFwdCmd, err = startPortForward(namespace, "pod/"+controlPlanePod, 5432)
 	if err != nil {
 		log.Fatalf("Failed to start port-forward: %v", err)
 	}
@@ -64,6 +65,9 @@ func TestMain(m *testing.M) {
 	// Wait for port-forward to be ready
 	if err := waitForPort(pgPort, 30*time.Second); err != nil {
 		log.Fatalf("Port-forward not ready: %v", err)
+	}
+	if err := waitForDBReady(90 * time.Second); err != nil {
+		log.Fatalf("Database not ready: %v", err)
 	}
 
 	code := m.Run()
@@ -77,6 +81,7 @@ func TestMain(m *testing.M) {
 	// Cleanup K8s resources (unless skip_setup, meaning external management)
 	if !skipSetup {
 		_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found")
+		_ = runCmd("just", "multitenant-config-store-down")
 	}
 
 	os.Exit(code)
@@ -261,6 +266,44 @@ func TestK8sWorkerSecurityContext(t *testing.T) {
 	}
 }
 
+func TestK8sWorkerUsesRuntimeConfigSecret(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+
+	var tempDir string
+	if err := db.QueryRow("SELECT value FROM duckdb_settings() WHERE name = 'temp_directory'").Scan(&tempDir); err != nil {
+		t.Fatalf("failed to read temp_directory setting: %v", err)
+	}
+	if tempDir != "/data/runtime-secret/tmp" {
+		t.Fatalf("expected runtime config temp_directory=/data/runtime-secret/tmp, got %q", tempDir)
+	}
+
+	pod := latestWorkerPod(t)
+	container := pod.Spec.Containers[0]
+	if !hasWorkerConfigArg(container.Args, "/etc/duckgres/runtime/duckgres.yaml") {
+		t.Fatalf("expected worker args to include --config /etc/duckgres/runtime/duckgres.yaml, got %#v", container.Args)
+	}
+
+	volume := findWorkerVolume(t, pod, "duckgres-config-secret")
+	if volume.Secret == nil {
+		t.Fatalf("expected duckgres-config-secret volume to be secret-backed, got %#v", volume)
+	}
+	if volume.Secret.SecretName != "duckgres-local-runtime" {
+		t.Fatalf("expected runtime config secret duckgres-local-runtime, got %q", volume.Secret.SecretName)
+	}
+	if len(volume.Secret.Items) != 1 || volume.Secret.Items[0].Key != "duckgres.yaml" || volume.Secret.Items[0].Path != "duckgres.yaml" {
+		t.Fatalf("expected runtime config secret item duckgres.yaml, got %#v", volume.Secret.Items)
+	}
+
+	mount := findWorkerVolumeMount(t, container.VolumeMounts, "duckgres-config-secret")
+	if mount.MountPath != "/etc/duckgres/runtime" {
+		t.Fatalf("expected runtime config mount path /etc/duckgres/runtime, got %q", mount.MountPath)
+	}
+	if !mount.ReadOnly {
+		t.Fatalf("expected runtime config mount to be read-only")
+	}
+}
+
 func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 	// Ensure a worker exists
 	db := openDB(t)
@@ -348,7 +391,11 @@ func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 		_ = portFwdCmd.Wait()
 	}
 	var pfErr error
-	pgPort, portFwdCmd, pfErr = startPortForward(namespace, "svc/duckgres", 5432)
+	controlPlanePod, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second)
+	if err != nil {
+		t.Fatalf("control-plane pod not ready after restart: %v", err)
+	}
+	pgPort, portFwdCmd, pfErr = startPortForward(namespace, "pod/"+controlPlanePod, 5432)
 	if pfErr != nil {
 		t.Fatalf("failed to restart port-forward: %v", pfErr)
 	}
@@ -381,62 +428,17 @@ func runCmd(name string, args ...string) error {
 	return cmd.Run()
 }
 
-func buildImage() error {
+func setupMultiTenant() error {
 	projectRoot := findProjectRoot()
-	log.Println("Building duckgres Docker image with -tags kubernetes...")
-	cmd := exec.Command("docker", "build",
-		"--build-arg", "BUILD_TAGS=kubernetes",
-		"-t", "duckgres:test",
-		".")
+	log.Println("Setting up multi-tenant duckgres test environment...")
+	_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found", "--wait=true")
+	_ = runCmd("just", "multitenant-config-store-down")
+
+	cmd := exec.Command("just", "run-multitenant-local")
 	cmd.Dir = projectRoot
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
-}
-
-func applyManifests() error {
-	projectRoot := findProjectRoot()
-	k8sDir := filepath.Join(projectRoot, "k8s")
-
-	// Apply in order: namespace first, then everything else
-	orderedFiles := []string{
-		"namespace.yaml",
-		"rbac.yaml",
-		"configmap.yaml",
-		"secret.yaml",
-		"networkpolicy.yaml",
-	}
-
-	for _, f := range orderedFiles {
-		path := filepath.Join(k8sDir, f)
-		if err := runCmd("kubectl", "apply", "-f", path); err != nil {
-			return fmt.Errorf("apply %s: %w", f, err)
-		}
-	}
-
-	// Apply deployment with image override
-	deployPath := filepath.Join(k8sDir, "control-plane-deployment.yaml")
-	deployContent, err := os.ReadFile(deployPath)
-	if err != nil {
-		return fmt.Errorf("read deployment: %w", err)
-	}
-
-	// Replace image references to use test image
-	patched := strings.ReplaceAll(string(deployContent), "duckgres:latest", "duckgres:test")
-
-	// Write to temp file and apply
-	tmp, err := os.CreateTemp("", "deploy-*.yaml")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-
-	if _, err := tmp.WriteString(patched); err != nil {
-		return fmt.Errorf("write temp: %w", err)
-	}
-	tmp.Close()
-
-	return runCmd("kubectl", "apply", "-f", tmp.Name())
 }
 
 func waitForDeployment(ns, name string, timeout time.Duration) error {
@@ -491,8 +493,104 @@ func waitForPodGone(t *testing.T, ns, name string, timeout time.Duration) {
 	t.Logf("Warning: pod %s still exists after %s", name, timeout)
 }
 
+func waitForSingleReadyPod(ns, labelSelector string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		pods, err := clientset.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			return "", err
+		}
+
+		if len(pods.Items) != 1 {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					return pod.Name, nil
+				}
+			}
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return "", fmt.Errorf("expected one ready pod for %q within %s", labelSelector, timeout)
+}
+
+func latestWorkerPod(t *testing.T) corev1.Pod {
+	t.Helper()
+
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	if err != nil {
+		t.Fatalf("failed to list worker pods: %v", err)
+	}
+	if len(pods.Items) == 0 {
+		t.Fatal("expected at least one worker pod, found none")
+	}
+
+	latest := pods.Items[0]
+	for _, pod := range pods.Items[1:] {
+		if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+			latest = pod
+		}
+	}
+	return latest
+}
+
+func hasWorkerConfigArg(args []string, configPath string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--config" && args[i+1] == configPath {
+			return true
+		}
+	}
+	return false
+}
+
+func findWorkerVolume(t *testing.T, pod corev1.Pod, name string) corev1.VolumeSource {
+	t.Helper()
+
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == name {
+			return volume.VolumeSource
+		}
+	}
+	t.Fatalf("expected worker volume %q, got %#v", name, pod.Spec.Volumes)
+	return corev1.VolumeSource{}
+}
+
+func findWorkerVolumeMount(t *testing.T, mounts []corev1.VolumeMount, name string) corev1.VolumeMount {
+	t.Helper()
+
+	for _, mount := range mounts {
+		if mount.Name == name {
+			return mount
+		}
+	}
+	t.Fatalf("expected worker volume mount %q, got %#v", name, mounts)
+	return corev1.VolumeMount{}
+}
+
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
+	db, err := openDBConn()
+	if err != nil {
+		t.Fatalf("failed to open DB: %v", err)
+	}
+
+	return db
+}
+
+func openDBConn() (*sql.DB, error) {
 	// kubectl port-forward passes raw TCP bytes, so the client still needs
 	// SSL. lib/pq sslmode=require skips server cert verification by default,
 	// which works with self-signed certs.
@@ -500,13 +598,22 @@ func openDB(t *testing.T) *sql.DB {
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		t.Fatalf("failed to open DB: %v", err)
+		return nil, err
 	}
 
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(30 * time.Second)
+	return db, nil
+}
 
-	return db
+func waitForDBReady(timeout time.Duration) error {
+	db, err := openDBConn()
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	return retryQuery(db, "SELECT 1", timeout)
 }
 
 func retryQuery(db *sql.DB, query string, timeout time.Duration) error {

@@ -37,7 +37,7 @@ Separate from the end-user query path, operators use the admin API/dashboard to 
 
 ## Remaining Work
 
-- Add full managed-warehouse contract to the config store. It needs team-scoped warehouse metadata such as warehouse-database info, metadata-store info, S3 bucket info, worker identity, secret refs, and provisioning state.
+- [x] Add full managed-warehouse contract to the config store. It needs team-scoped warehouse metadata such as warehouse-database info, metadata-store info, S3 bucket info, worker identity, secret refs, and provisioning state.
 - Add end-to-end provisioning controller that turns a PostHog warehouse request into warehouse DB, metadata store, S3, IAM/Pod Identity, K8s Secret creation, and config-store updates.
 - Implement team-specific DuckLake/warehouse-db/metadata-store/S3 runtime wiring.
 - Change worker pod spec from global to be team-specific. 

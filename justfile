@@ -49,7 +49,7 @@ build-k8s-image tag="duckgres:test":
 # Start the local PostgreSQL config store used by the multi-tenant K8s flow
 [group('dev')]
 multitenant-config-store-up:
-    docker compose -f k8s/local-config-store.compose.yaml up -d
+    docker compose -f k8s/local-config-store.compose.yaml up -d --wait
 
 # Stop the local PostgreSQL config store used by the multi-tenant K8s flow
 [group('dev')]
@@ -68,6 +68,7 @@ deploy-multitenant-local:
     kubectl apply -f k8s/rbac.yaml
     kubectl apply -f k8s/configmap.yaml
     kubectl apply -f k8s/secret.yaml
+    kubectl apply -f k8s/multitenant-local-runtime.yaml
     kubectl apply -f k8s/networkpolicy.yaml
     kubectl apply -f k8s/control-plane-multitenant-local.yaml
     kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckgres-local-worker
+  namespace: duckgres
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duckgres-local-runtime
+  namespace: duckgres
+type: Opaque
+stringData:
+  duckgres.yaml: |
+    data_dir: "/data/runtime-secret"
+    threads: 7

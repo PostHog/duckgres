@@ -114,6 +114,129 @@ func TestK8sPool_ReadBearerToken(t *testing.T) {
 	}
 }
 
+func TestK8sPool_BuildWorkerPodAppliesRuntimeOverrides(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.serviceAccount = "team-analytics"
+	pool.runtimeEnv = []corev1.EnvVar{
+		{Name: "TEAM_NAME", Value: "analytics"},
+	}
+	pool.runtimeEnvFrom = []corev1.EnvFromSource{
+		{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "team-runtime-secret"},
+			},
+		},
+	}
+	pool.runtimeVolumes = []corev1.Volume{
+		{
+			Name: "team-runtime-secret",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: "team-runtime-secret",
+				},
+			},
+		},
+	}
+	pool.runtimeVolumeMounts = []corev1.VolumeMount{
+		{
+			Name:      "team-runtime-secret",
+			MountPath: "/etc/team-runtime",
+			ReadOnly:  true,
+		},
+	}
+
+	pod := pool.buildWorkerPod(7)
+
+	if pod.Spec.ServiceAccountName != "team-analytics" {
+		t.Fatalf("expected service account team-analytics, got %q", pod.Spec.ServiceAccountName)
+	}
+
+	c := pod.Spec.Containers[0]
+	foundTeamEnv := false
+	foundRuntimeSecretEnvFrom := false
+	for _, env := range c.Env {
+		if env.Name == "TEAM_NAME" && env.Value == "analytics" {
+			foundTeamEnv = true
+		}
+	}
+	for _, envFrom := range c.EnvFrom {
+		if envFrom.SecretRef != nil && envFrom.SecretRef.Name == "team-runtime-secret" {
+			foundRuntimeSecretEnvFrom = true
+		}
+	}
+	if !foundTeamEnv {
+		t.Fatal("expected TEAM_NAME env var to be present")
+	}
+	if !foundRuntimeSecretEnvFrom {
+		t.Fatal("expected runtime secret envFrom to be present")
+	}
+
+	foundRuntimeSecretVolume := false
+	foundRuntimeSecretMount := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == "team-runtime-secret" && volume.VolumeSource.Secret != nil &&
+			volume.VolumeSource.Secret.SecretName == "team-runtime-secret" {
+			foundRuntimeSecretVolume = true
+		}
+	}
+	for _, mount := range c.VolumeMounts {
+		if mount.Name == "team-runtime-secret" && mount.MountPath == "/etc/team-runtime" {
+			foundRuntimeSecretMount = true
+		}
+	}
+	if !foundRuntimeSecretVolume {
+		t.Fatal("expected runtime secret volume to be present")
+	}
+	if !foundRuntimeSecretMount {
+		t.Fatal("expected runtime secret volume mount to be present")
+	}
+}
+
+func TestK8sPool_BuildWorkerPodUsesConfigSecret(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.configMap = ""
+	pool.configSecretName = "analytics-runtime"
+	pool.configSecretKey = "duckgres.yaml"
+	pool.configPath = "/etc/duckgres/runtime/duckgres.yaml"
+
+	pod := pool.buildWorkerPod(3)
+
+	c := pod.Spec.Containers[0]
+	foundConfigArg := false
+	for i := 0; i+1 < len(c.Args); i++ {
+		if c.Args[i] == "--config" && c.Args[i+1] == "/etc/duckgres/runtime/duckgres.yaml" {
+			foundConfigArg = true
+		}
+	}
+	if !foundConfigArg {
+		t.Fatalf("expected --config /etc/duckgres/runtime/duckgres.yaml args, got %#v", c.Args)
+	}
+
+	foundConfigVolume := false
+	foundConfigMount := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == "duckgres-config-secret" &&
+			volume.VolumeSource.Secret != nil &&
+			volume.VolumeSource.Secret.SecretName == "analytics-runtime" &&
+			len(volume.VolumeSource.Secret.Items) == 1 &&
+			volume.VolumeSource.Secret.Items[0].Key == "duckgres.yaml" &&
+			volume.VolumeSource.Secret.Items[0].Path == "duckgres.yaml" {
+			foundConfigVolume = true
+		}
+	}
+	for _, mount := range c.VolumeMounts {
+		if mount.Name == "duckgres-config-secret" && mount.MountPath == "/etc/duckgres/runtime" && mount.ReadOnly {
+			foundConfigMount = true
+		}
+	}
+	if !foundConfigVolume {
+		t.Fatal("expected runtime config secret volume to be present")
+	}
+	if !foundConfigMount {
+		t.Fatal("expected runtime config secret mount to be present")
+	}
+}
+
 func TestK8sPool_WorkerLookup(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 

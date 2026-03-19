@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // WorkerPool abstracts the lifecycle and scheduling of Flight SQL workers.
@@ -47,19 +49,27 @@ type WorkerPool interface {
 // K8sWorkerPoolConfig holds the configuration for creating a K8sWorkerPool.
 type K8sWorkerPoolConfig struct {
 	Namespace         string
-	CPID              string        // Control plane pod name, used in labels
+	CPID              string // Control plane pod name, used in labels
 	WorkerImage       string
 	WorkerPort        int
-	SecretName        string        // K8s Secret name containing bearer token
-	ConfigMap         string        // ConfigMap name for duckgres.yaml
+	SecretName        string // K8s Secret name containing bearer token
+	ConfigMap         string // ConfigMap name for duckgres.yaml
+	ConfigSecretName  string // Secret name for duckgres.yaml
+	ConfigSecretKey   string // Secret key containing duckgres.yaml
 	MaxWorkers        int
 	IdleTimeout       time.Duration
-	ConfigPath        string        // Path inside worker pod where config is mounted
-	ImagePullPolicy   string        // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount    string        // ServiceAccount name for worker pods (default: "default")
-	MemoryBudget      int64         // Total memory budget in bytes; used to derive per-worker resource limits
-	TeamName          string        // Team name for pod labels (multi-tenant mode)
-	WorkerIDGenerator func() int    // Shared ID generator across teams (nil = internal counter)
+	ConfigPath        string     // Path inside worker pod where config is mounted
+	ImagePullPolicy   string     // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount    string     // ServiceAccount name for worker pods (default: "default")
+	MemoryBudget      int64      // Total memory budget in bytes; used to derive per-worker resource limits
+	TeamName          string     // Team name for pod labels (multi-tenant mode)
+	WorkerIDGenerator func() int // Shared ID generator across teams (nil = internal counter)
+
+	// Additive per-team worker runtime overrides.
+	RuntimeEnv          []corev1.EnvVar
+	RuntimeEnvFrom      []corev1.EnvFromSource
+	RuntimeVolumes      []corev1.Volume
+	RuntimeVolumeMounts []corev1.VolumeMount
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

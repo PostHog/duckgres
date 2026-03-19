@@ -13,6 +13,12 @@ import (
 	"github.com/posthog/duckgres/server"
 )
 
+// teamConfigStore is the small config-store view TeamRouter needs.
+type teamConfigStore interface {
+	Snapshot() *configstore.Snapshot
+	TeamForUser(username string) string
+}
+
 // TeamStack holds the isolated worker pool and session manager for a team.
 type TeamStack struct {
 	Config     *configstore.TeamConfig
@@ -26,7 +32,7 @@ type TeamStack struct {
 type TeamRouter struct {
 	mu           sync.RWMutex
 	teams        map[string]*TeamStack
-	configStore  *configstore.ConfigStore
+	configStore  teamConfigStore
 	baseCfg      K8sWorkerPoolConfig
 	globalCfg    ControlPlaneConfig
 	srv          *server.Server
@@ -34,7 +40,7 @@ type TeamRouter struct {
 }
 
 // NewTeamRouter creates a TeamRouter from the initial config snapshot.
-func NewTeamRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server) (*TeamRouter, error) {
+func NewTeamRouter(store teamConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server) (*TeamRouter, error) {
 	tr := &TeamRouter{
 		teams:       make(map[string]*TeamStack),
 		configStore: store,
@@ -54,8 +60,9 @@ func NewTeamRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, 
 	return tr, nil
 }
 
-// createTeamStack creates an isolated pool + session manager for a team.
-func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, error) {
+// buildTeamStack creates an isolated pool + session manager for a team without
+// mutating the router's team map.
+func (tr *TeamRouter) buildTeamStack(tc *configstore.TeamConfig) (*TeamStack, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	maxWorkers := tc.MaxWorkers
@@ -74,6 +81,14 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 	cfg.MemoryBudget = memoryBudget
 	cfg.WorkerIDGenerator = func() int {
 		return int(tr.nextWorkerID.Add(1))
+	}
+	if runtime, ok := ResolveTeamRuntime(tc); ok {
+		var err error
+		cfg, err = ApplyTeamRuntimeToPoolConfig(cfg, runtime)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
 	}
 
 	pool, err := CreateK8sPool(cfg)
@@ -130,13 +145,53 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 		cancel:     cancel,
 	}
 
+	_ = ctx // keep linter happy
+	return stack, nil
+}
+
+// createTeamStack creates an isolated pool + session manager for a team.
+func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, error) {
+	stack, err := tr.buildTeamStack(tc)
+	if err != nil {
+		return nil, err
+	}
+
 	tr.mu.Lock()
 	tr.teams[tc.Name] = stack
 	tr.mu.Unlock()
 
-	slog.Info("Team stack created.", "team", tc.Name, "max_workers", maxWorkers)
-	_ = ctx // keep linter happy
+	slog.Info("Team stack created.", "team", tc.Name, "max_workers", stack.Config.MaxWorkers)
 	return stack, nil
+}
+
+func warehouseRuntimeChanged(oldTC, newTC *configstore.TeamConfig) bool {
+	if oldTC == nil || newTC == nil {
+		return oldTC != newTC
+	}
+
+	oldRuntime, oldOK := ResolveTeamRuntime(oldTC)
+	newRuntime, newOK := ResolveTeamRuntime(newTC)
+	if oldOK != newOK {
+		return true
+	}
+	if !oldOK {
+		return false
+	}
+
+	return *oldRuntime != *newRuntime
+}
+
+func shutdownTeamStack(teamName string, stack *TeamStack) {
+	if stack == nil {
+		return
+	}
+
+	slog.Info("Destroying team stack.", "team", teamName)
+	stack.cancel()
+	stack.Pool.ShutdownAll()
+	if stack.Rebalancer != nil {
+		stack.Rebalancer.Stop()
+	}
 }
 
 // DestroyTeamStack drains and cleans up a team's resources.
@@ -150,12 +205,7 @@ func (tr *TeamRouter) DestroyTeamStack(teamName string) {
 	delete(tr.teams, teamName)
 	tr.mu.Unlock()
 
-	slog.Info("Destroying team stack.", "team", teamName)
-	stack.cancel()
-	stack.Pool.ShutdownAll()
-	if stack.Rebalancer != nil {
-		stack.Rebalancer.Stop()
-	}
+	shutdownTeamStack(teamName, stack)
 }
 
 // StackForUser resolves a username to its team stack.
@@ -195,6 +245,23 @@ func (tr *TeamRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 	for name, newTC := range new.Teams {
 		oldTC, existed := old.Teams[name]
 		if !existed {
+			continue
+		}
+		if warehouseRuntimeChanged(oldTC, newTC) {
+			slog.Info("Team warehouse config changed; recreating stack.", "team", name)
+			replacement, err := tr.buildTeamStack(newTC)
+			if err != nil {
+				slog.Error("Failed to recreate team stack after warehouse config change.", "team", name, "error", err)
+				continue
+			}
+
+			tr.mu.Lock()
+			oldStack := tr.teams[name]
+			tr.teams[name] = replacement
+			tr.mu.Unlock()
+
+			slog.Info("Team stack recreated.", "team", name, "max_workers", replacement.Config.MaxWorkers)
+			shutdownTeamStack(name, oldStack)
 			continue
 		}
 		if oldTC.MaxWorkers != newTC.MaxWorkers || oldTC.MemoryBudget != newTC.MemoryBudget {
