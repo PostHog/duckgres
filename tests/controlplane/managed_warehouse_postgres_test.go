@@ -210,7 +210,7 @@ func ensureIntegrationPostgres(t *testing.T) {
 func applyLocalConfigStoreSeed(t *testing.T, store *configstore.ConfigStore) error {
 	t.Helper()
 
-	seedPath := filepath.Join(findProjectRoot(), "k8s", "local-config-store.seed.sql")
+	seedPath := filepath.Join(findProjectRoot(), "k8s", "orbstack", "config-store-seed.sql")
 	seedSQL, err := os.ReadFile(seedPath)
 	if err != nil {
 		return fmt.Errorf("read seed sql: %w", err)

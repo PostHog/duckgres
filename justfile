@@ -46,22 +46,57 @@ run-control-plane: build
 build-k8s-image tag="duckgres:test":
     docker build --build-arg BUILD_TAGS=kubernetes -t {{tag}} .
 
+# Recreate the local kind cluster used by the portable K8s integration flow
+[group('dev')]
+kind-cluster-reset:
+    kind delete cluster --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}" || true
+    kind create cluster --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}" --wait 120s
+
+# Delete the local kind cluster used by the portable K8s integration flow
+[group('dev')]
+kind-cluster-down:
+    kind delete cluster --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}" || true
+
+# Load the local Kubernetes-enabled image into the kind cluster
+[group('dev')]
+kind-load-k8s-image tag="duckgres:test":
+    kind load docker-image {{tag}} --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}"
+
 # Start the local PostgreSQL config store used by the multi-tenant K8s flow
 [group('dev')]
 multitenant-config-store-up:
-    docker compose -f k8s/local-config-store.compose.yaml up -d --wait
+    docker compose -f k8s/shared/config-store.compose.yaml up -d --wait
+    go run ./cmd/init-config-store --config-store postgres://duckgres:duckgres@127.0.0.1:5434/duckgres_config?sslmode=disable
+    docker exec duckgres-local-minio mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+    docker exec duckgres-local-minio mc mb local/duckgres-local --ignore-existing
+
+# Start the local PostgreSQL config store used by the kind-backed multi-tenant K8s flow
+[group('dev')]
+multitenant-config-store-up-kind:
+    docker compose -f k8s/shared/config-store.compose.yaml -f k8s/kind/config-store.overlay.yaml up -d --wait
+    go run ./cmd/init-config-store --config-store postgres://duckgres:duckgres@127.0.0.1:5434/duckgres_config?sslmode=disable
     docker exec duckgres-local-minio mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
     docker exec duckgres-local-minio mc mb local/duckgres-local --ignore-existing
 
 # Stop the local PostgreSQL config store used by the multi-tenant K8s flow
 [group('dev')]
 multitenant-config-store-down:
-    docker compose -f k8s/local-config-store.compose.yaml down -v
+    docker compose -f k8s/shared/config-store.compose.yaml down -v
+
+# Stop the local PostgreSQL config store used by the kind-backed multi-tenant K8s flow
+[group('dev')]
+multitenant-config-store-down-kind:
+    docker compose -f k8s/shared/config-store.compose.yaml -f k8s/kind/config-store.overlay.yaml down -v
 
 # Seed a default local tenant/user into the config store for psql access
 [group('dev')]
 multitenant-seed-local:
-    docker exec -i duckgres-config-store psql -U duckgres -d duckgres_config < k8s/local-config-store.seed.sql
+    docker exec -i duckgres-config-store psql -U duckgres -d duckgres_config < k8s/orbstack/config-store-seed.sql
+
+# Seed a default local tenant/user into the config store for the kind-backed K8s flow
+[group('dev')]
+multitenant-seed-kind:
+    docker exec -i duckgres-config-store psql -U duckgres -d duckgres_config < k8s/kind/config-store-seed.sql
 
 # Render the local managed-warehouse runtime artifacts from the seeded config store
 [group('dev')]
@@ -81,15 +116,49 @@ multitenant-render-local-runtime output="/tmp/duckgres-multitenant-local-runtime
 # Deploy the local multi-tenant control plane to OrbStack Kubernetes
 [group('dev')]
 deploy-multitenant-local:
-    kubectl apply -f k8s/namespace.yaml
-    kubectl apply -f k8s/rbac.yaml
-    kubectl apply -f k8s/configmap.yaml
-    kubectl apply -f k8s/secret.yaml
-    kubectl apply -f k8s/multitenant-local-runtime.yaml
-    just multitenant-render-local-runtime output=/tmp/duckgres-multitenant-local-runtime.yaml
+    kubectl apply -f k8s/shared/namespace.yaml
+    kubectl apply -f k8s/shared/rbac.yaml
+    kubectl apply -f k8s/shared/configmap.yaml
+    kubectl apply -f k8s/shared/secret.yaml
+    kubectl apply -f k8s/shared/worker-identity.yaml
+    go run ./cmd/render-multitenant-local-runtime \
+      --config-store postgres://duckgres:duckgres@127.0.0.1:5434/duckgres_config?sslmode=disable \
+      --team local \
+      --namespace duckgres \
+      --data-dir /data/runtime-secret \
+      --extensions ducklake,httpfs \
+      --warehouse-db-password duckgres \
+      --metadata-store-password ducklake \
+      --s3-access-key minioadmin \
+      --s3-secret-key minioadmin \
+      --output /tmp/duckgres-multitenant-local-runtime.yaml
     kubectl apply -f /tmp/duckgres-multitenant-local-runtime.yaml
-    kubectl apply -f k8s/networkpolicy.yaml
-    kubectl apply -f k8s/control-plane-multitenant-local.yaml
+    kubectl apply -f k8s/shared/networkpolicy.yaml
+    kubectl apply -f k8s/orbstack/control-plane.yaml
+    kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
+
+# Deploy the local multi-tenant control plane to kind Kubernetes
+[group('dev')]
+deploy-multitenant-kind:
+    kubectl apply -f k8s/shared/namespace.yaml
+    kubectl apply -f k8s/shared/rbac.yaml
+    kubectl apply -f k8s/shared/configmap.yaml
+    kubectl apply -f k8s/shared/secret.yaml
+    kubectl apply -f k8s/shared/worker-identity.yaml
+    go run ./cmd/render-multitenant-local-runtime \
+      --config-store postgres://duckgres:duckgres@127.0.0.1:5434/duckgres_config?sslmode=disable \
+      --team local \
+      --namespace duckgres \
+      --data-dir /data/runtime-secret \
+      --extensions ducklake,httpfs \
+      --warehouse-db-password duckgres \
+      --metadata-store-password ducklake \
+      --s3-access-key minioadmin \
+      --s3-secret-key minioadmin \
+      --output /tmp/duckgres-multitenant-local-runtime.yaml
+    kubectl apply -f /tmp/duckgres-multitenant-local-runtime.yaml
+    kubectl apply -f k8s/shared/networkpolicy.yaml
+    kubectl apply -f k8s/kind/control-plane.yaml
     kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
 
 # End-to-end local multi-tenant setup: OrbStack K8s + config store + control plane
@@ -101,6 +170,13 @@ run-multitenant-local: multitenant-config-store-up build-k8s-image multitenant-s
     @echo "Default login: postgres / postgres"
     @echo "Fetch admin token with: kubectl -n duckgres logs deployment/duckgres-control-plane | rg 'Generated admin API token'"
     @echo "Run 'just multitenant-port-forward-pg' in one terminal and 'just multitenant-port-forward-admin' in another."
+
+# End-to-end local multi-tenant setup: kind K8s + config store + control plane
+[group('dev')]
+run-multitenant-kind: kind-cluster-reset multitenant-config-store-up-kind build-k8s-image kind-load-k8s-image multitenant-seed-kind deploy-multitenant-kind
+    kubectl -n duckgres rollout restart deployment/duckgres-control-plane
+    kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
+    @echo "Multi-tenant control plane ready on kind."
 
 # Port-forward PostgreSQL traffic from the local control plane
 [group('dev')]
@@ -165,8 +241,8 @@ test-controlplane: test-control-plane
 # Run Kubernetes integration tests
 [group('test')]
 test-k8s-integration:
-    go test -tags kubernetes ./controlplane -count=1
-    go test -v -tags k8s_integration -timeout 600s ./tests/k8s/...
+    DUCKGRES_K8S_TEST_SETUP="${DUCKGRES_K8S_TEST_SETUP:-kind}" go test -tags kubernetes ./controlplane -count=1
+    DUCKGRES_K8S_TEST_SETUP="${DUCKGRES_K8S_TEST_SETUP:-kind}" go test -v -count=1 -tags k8s_integration -timeout 600s ./tests/k8s/...
 
 # Run perf tests
 [group('test')]

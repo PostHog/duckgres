@@ -21,18 +21,21 @@ spec:
         runAsUser: 1000
       containers:
         - name: control-plane
-          # Replace with your duckgres image built with -tags kubernetes
-          image: duckgres:latest
+          image: duckgres:test
           imagePullPolicy: IfNotPresent
           args:
             - "--mode"
             - "control-plane"
             - "--worker-backend"
             - "remote"
+            - "--config-store"
+            - "postgres://duckgres:duckgres@duckgres-config-store:5432/duckgres_config?sslmode=disable"
+            - "--config-poll-interval"
+            - "2s"
             - "--k8s-worker-image"
-            - "duckgres:latest"
+            - "duckgres:test"
             - "--k8s-worker-image-pull-policy"
-            - "Never"
+            - "IfNotPresent"
             - "--k8s-worker-secret"
             - "duckgres-worker-token"
             - "--k8s-worker-configmap"
@@ -46,6 +49,9 @@ spec:
           ports:
             - name: pg
               containerPort: 5432
+              protocol: TCP
+            - name: admin
+              containerPort: 9090
               protocol: TCP
           volumeMounts:
             - name: config

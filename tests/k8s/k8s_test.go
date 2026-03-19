@@ -29,10 +29,16 @@ var (
 	namespace  string
 	pgPort     int
 	portFwdCmd *exec.Cmd
+	testEnv    k8sTestEnvironment
 )
 
 func TestMain(m *testing.M) {
-	namespace = envOr("DUCKGRES_K8S_TEST_NAMESPACE", "duckgres")
+	var err error
+	testEnv, err = loadK8sTestEnvironment(os.Getenv)
+	if err != nil {
+		log.Fatalf("Failed to load K8s test environment: %v", err)
+	}
+	namespace = testEnv.Namespace
 	skipSetup := envOr("DUCKGRES_K8S_TEST_SKIP_SETUP", "") == "true"
 	if !skipSetup {
 		if namespace != "duckgres" {
@@ -54,12 +60,14 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to create k8s client: %v", err)
 	}
 
-	// Start port-forward
-	controlPlanePod, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second)
-	if err != nil {
+	// Start port-forward against the service entrypoint so the suite tests the
+	// stable control-plane address rather than a single pod instance, but wait
+	// for the rollout to settle to one ready pod first so the service does not
+	// initially bind to a disappearing backend.
+	if _, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second); err != nil {
 		log.Fatalf("Control-plane pod not ready: %v", err)
 	}
-	pgPort, portFwdCmd, err = startPortForward(namespace, "pod/"+controlPlanePod, 5432)
+	pgPort, portFwdCmd, err = startPortForward(namespace, "svc/duckgres", 5432)
 	if err != nil {
 		log.Fatalf("Failed to start port-forward: %v", err)
 	}
@@ -83,7 +91,9 @@ func TestMain(m *testing.M) {
 	// Cleanup K8s resources (unless skip_setup, meaning external management)
 	if !skipSetup {
 		_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found")
-		_ = runCmd("just", "multitenant-config-store-down")
+		if testEnv.CleanupRecipe != "" {
+			_ = runCmd("just", testEnv.CleanupRecipe)
+		}
 	}
 
 	os.Exit(code)
@@ -302,7 +312,12 @@ func TestK8sWorkerUsesRuntimeConfigSecret(t *testing.T) {
 	if strings.Join(runtime.Extensions, ",") != "ducklake,httpfs" {
 		t.Fatalf("expected runtime extensions ducklake,httpfs, got %#v", runtime.Extensions)
 	}
-	if runtime.DuckLake.MetadataStore != "postgres:host=host.docker.internal port=35433 user=ducklake password=ducklake dbname=ducklake_metadata_local" {
+	expectedMetadataStore := fmt.Sprintf(
+		"postgres:host=%s port=%d user=ducklake password=ducklake dbname=ducklake_metadata_local",
+		testEnv.ExpectedMetadataStoreHost,
+		testEnv.ExpectedMetadataStorePort,
+	)
+	if runtime.DuckLake.MetadataStore != expectedMetadataStore {
 		t.Fatalf("unexpected metadata store %q", runtime.DuckLake.MetadataStore)
 	}
 	if runtime.DuckLake.ObjectStore != "s3://duckgres-local/teams/local/" {
@@ -311,7 +326,7 @@ func TestK8sWorkerUsesRuntimeConfigSecret(t *testing.T) {
 	if runtime.DuckLake.S3Provider != "config" {
 		t.Fatalf("expected s3_provider config, got %q", runtime.DuckLake.S3Provider)
 	}
-	if runtime.DuckLake.S3Endpoint != "host.docker.internal:39000" {
+	if runtime.DuckLake.S3Endpoint != testEnv.ExpectedS3Endpoint {
 		t.Fatalf("unexpected s3 endpoint %q", runtime.DuckLake.S3Endpoint)
 	}
 	if runtime.DuckLake.S3AccessKey != "minioadmin" || runtime.DuckLake.S3SecretKey != "minioadmin" {
@@ -481,11 +496,10 @@ func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 		_ = portFwdCmd.Wait()
 	}
 	var pfErr error
-	controlPlanePod, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second)
-	if err != nil {
-		t.Fatalf("control-plane pod not ready after restart: %v", err)
-	}
-	pgPort, portFwdCmd, pfErr = startPortForward(namespace, "pod/"+controlPlanePod, 5432)
+		if _, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second); err != nil {
+			t.Fatalf("control-plane pod not ready after restart: %v", err)
+		}
+		pgPort, portFwdCmd, pfErr = startPortForward(namespace, "svc/duckgres", 5432)
 	if pfErr != nil {
 		t.Fatalf("failed to restart port-forward: %v", pfErr)
 	}
@@ -522,9 +536,11 @@ func setupMultiTenant() error {
 	projectRoot := findProjectRoot()
 	log.Println("Setting up multi-tenant duckgres test environment...")
 	_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found", "--wait=true")
-	_ = runCmd("just", "multitenant-config-store-down")
+	if testEnv.CleanupRecipe != "" {
+		_ = runCmd("just", testEnv.CleanupRecipe)
+	}
 
-	cmd := exec.Command("just", "run-multitenant-local")
+	cmd := exec.Command("just", testEnv.SetupRecipe)
 	cmd.Dir = projectRoot
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -614,6 +630,7 @@ func waitForSingleReadyPod(ns, labelSelector string, timeout time.Duration) (str
 
 	return "", fmt.Errorf("expected one ready pod for %q within %s", labelSelector, timeout)
 }
+
 
 func latestWorkerPod(t *testing.T) corev1.Pod {
 	t.Helper()

@@ -135,3 +135,27 @@ jobs:
 
       - name: Run control-plane tests
         run: just test-control-plane
+
+  test-k8s-integration:
+    name: test-k8s-integration
+    needs: test-unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DUCKGRES_K8S_TEST_SETUP: kind
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up just
+        uses: extractions/setup-just@v3
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Set up kind
+        uses: engineerd/setup-kind@v0.6.2
+        with:
+          skipClusterCreation: true
+      - name: Run Kubernetes integration tests
+        run: just test-k8s-integration
