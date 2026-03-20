@@ -88,6 +88,9 @@ func defaultServerConfig() server.Config {
 			"postgres": "postgres",
 		},
 		Extensions: []string{"ducklake"},
+		DuckLake: server.DuckLakeConfig{
+			CheckpointInterval: 24 * time.Hour,
+		},
 		QueryLog: server.QueryLogConfig{
 			Enabled:              true,
 			FlushInterval:        5 * time.Second,
@@ -234,6 +237,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.DuckLake.S3Profile != "" {
 			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
+		}
+		if fileCfg.DuckLake.CheckpointInterval != "" {
+			if d, err := time.ParseDuration(fileCfg.DuckLake.CheckpointInterval); err == nil {
+				cfg.DuckLake.CheckpointInterval = d
+			} else {
+				warn("Invalid ducklake.checkpoint_interval duration: " + err.Error())
+			}
 		}
 
 		cfg.ProcessIsolation = fileCfg.ProcessIsolation
@@ -448,6 +458,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if v := getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
+	}
+	if v := getenv("DUCKGRES_DUCKLAKE_CHECKPOINT_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.DuckLake.CheckpointInterval = d
+		} else {
+			warn("Invalid DUCKGRES_DUCKLAKE_CHECKPOINT_INTERVAL duration: " + err.Error())
+		}
 	}
 	if v := getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {

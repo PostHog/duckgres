@@ -116,6 +116,9 @@ type DuckLakeFileConfig struct {
 	// Credential chain provider settings (AWS SDK credential chain)
 	S3Chain   string `yaml:"s3_chain"`   // e.g., "env;config" - which credential sources to check
 	S3Profile string `yaml:"s3_profile"` // AWS profile name for config chain
+
+	// Checkpoint interval for DuckLake maintenance (e.g., "24h", "6h")
+	CheckpointInterval string `yaml:"checkpoint_interval"`
 }
 
 // loadConfigFile loads configuration from a YAML file
