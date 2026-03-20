@@ -36,5 +36,8 @@ func validateControlPlaneSecurity(cfg ControlPlaneConfig) error {
 	if err := validateUsers(cfg.Users); err != nil {
 		return err
 	}
+	if cfg.WorkerBackend == "remote" && cfg.ConfigStoreConn == "" {
+		return fmt.Errorf("remote worker backend requires config-store in control-plane mode")
+	}
 	return nil
 }

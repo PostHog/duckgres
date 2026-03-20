@@ -61,7 +61,6 @@ type K8sFileConfig struct {
 	ControlPlaneID        string `yaml:"control_plane_id"`
 	WorkerPort            int    `yaml:"worker_port"`
 	WorkerSecret          string `yaml:"worker_secret"`
-	WorkerConfigMap       string `yaml:"worker_configmap"`
 	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
 	WorkerServiceAccount  string `yaml:"worker_service_account"`
 }
@@ -224,7 +223,6 @@ func main() {
 	k8sControlPlaneID := flag.String("k8s-control-plane-id", "", "Unique CP identifier for labeling worker pods (env: DUCKGRES_K8S_CONTROL_PLANE_ID)")
 	k8sWorkerPort := flag.Int("k8s-worker-port", 0, "gRPC port on K8s worker pods (default: 8816) (env: DUCKGRES_K8S_WORKER_PORT)")
 	k8sWorkerSecret := flag.String("k8s-worker-secret", "", "K8s Secret name for worker bearer token (env: DUCKGRES_K8S_WORKER_SECRET)")
-	k8sWorkerConfigMap := flag.String("k8s-worker-configmap", "", "ConfigMap name for worker duckgres.yaml (env: DUCKGRES_K8S_WORKER_CONFIGMAP)")
 	k8sWorkerImagePullPolicy := flag.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
 	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "ServiceAccount name for K8s worker pods (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 
@@ -389,7 +387,6 @@ func main() {
 		K8sControlPlaneID:         *k8sControlPlaneID,
 		K8sWorkerPort:             *k8sWorkerPort,
 		K8sWorkerSecret:           *k8sWorkerSecret,
-		K8sWorkerConfigMap:        *k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy:  *k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
 		QueryLog:                  *queryLog,
@@ -527,7 +524,6 @@ func main() {
 				ControlPlaneID:  resolved.K8sControlPlaneID,
 				WorkerPort:      resolved.K8sWorkerPort,
 				WorkerSecret:    resolved.K8sWorkerSecret,
-				WorkerConfigMap: resolved.K8sWorkerConfigMap,
 				ImagePullPolicy: resolved.K8sWorkerImagePullPolicy,
 				ServiceAccount:  resolved.K8sWorkerServiceAccount,
 			},

@@ -27,7 +27,7 @@ Separate from the end-user query path, operators use the admin API/dashboard to 
 
 ## Already In Place
 
-- A multi-tenant control-plane path exists behind `--config-store` with the remote worker backend.
+- A multi-tenant control-plane path exists behind `--worker-backend remote` plus `--config-store`.
 - The control plane can authenticate pgwire users against the config store and resolve each user to a team.
 - The config store persists teams, users, password hashes, and some per-team limits, and it supports polling plus in-memory snapshots for fast lookup.
 - The multi-tenant path creates separate per-team stacks, each with its own worker pool, session manager, and memory rebalancer.

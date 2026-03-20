@@ -39,16 +39,16 @@ type ControlPlaneConfig struct {
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
-	// "remote": workers are network-accessible pods/containers communicating over TCP.
-	//           Currently implemented via Kubernetes (requires -tags kubernetes build).
+	// "remote": workers are Kubernetes pods managed through the multi-tenant
+	//           config-store path (requires -tags kubernetes build).
 	WorkerBackend string
 
 	// K8s contains Kubernetes-specific configuration. Only used when WorkerBackend == "remote".
 	K8s K8sConfig
 
 	// ConfigStoreConn is the PostgreSQL connection string for the config store.
-	// When set in "remote" mode, enables multi-tenant operation with per-team
-	// worker pools and a Gin admin API. Empty = single-tenant (existing behavior).
+	// Required in "remote" mode; enables multi-tenant operation with per-team
+	// worker pools and a Gin admin API.
 	ConfigStoreConn string
 
 	// ConfigPollInterval is how often to poll the config store for changes.
@@ -67,7 +67,6 @@ type K8sConfig struct {
 	ControlPlaneID      string // Unique CP identifier for labeling worker pods (default: os.Hostname())
 	WorkerPort          int    // gRPC port on worker pods (default: 8816)
 	WorkerSecret        string // K8s Secret name containing bearer token
-	WorkerConfigMap     string // ConfigMap name for duckgres.yaml
 	ImagePullPolicy     string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
 	ServiceAccount      string // ServiceAccount name for worker pods (default: "default")
 }
@@ -283,7 +282,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 
 	// Multi-tenant mode: config store + per-team pools (K8s remote backend only)
-	if cfg.ConfigStoreConn != "" && cfg.WorkerBackend == "remote" {
+	if cfg.WorkerBackend == "remote" {
 		store, adapter, adminSrv, err := SetupMultiTenant(cfg, srv, memBudget, maxWorkers)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
@@ -305,26 +304,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		var pool WorkerPool
 
 		switch cfg.WorkerBackend {
-		case "remote":
-			k8sPool, err := CreateK8sPool(K8sWorkerPoolConfig{
-				Namespace:       cfg.K8s.WorkerNamespace,
-				CPID:            cfg.K8s.ControlPlaneID,
-				WorkerImage:     cfg.K8s.WorkerImage,
-				WorkerPort:      cfg.K8s.WorkerPort,
-				SecretName:      cfg.K8s.WorkerSecret,
-				ConfigMap:       cfg.K8s.WorkerConfigMap,
-				MaxWorkers:      maxWorkers,
-				IdleTimeout:     cfg.WorkerIdleTimeout,
-				ConfigPath:      cfg.ConfigPath,
-				ImagePullPolicy: cfg.K8s.ImagePullPolicy,
-				ServiceAccount:  cfg.K8s.ServiceAccount,
-				MemoryBudget:    int64(memBudget),
-			})
-			if err != nil {
-				slog.Error("Failed to create Kubernetes worker pool.", "error", err)
-				os.Exit(1)
-			}
-			pool = k8sPool
 		default: // "process" or empty
 			procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, minWorkers, maxWorkers)
 			procPool.idleTimeout = cfg.WorkerIdleTimeout

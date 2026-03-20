@@ -47,7 +47,6 @@ type configCLIInputs struct {
 	K8sControlPlaneID         string
 	K8sWorkerPort             int
 	K8sWorkerSecret           string
-	K8sWorkerConfigMap        string
 	K8sWorkerImagePullPolicy  string
 	K8sWorkerServiceAccount   string
 	QueryLog                  bool
@@ -64,7 +63,6 @@ type resolvedConfig struct {
 	K8sControlPlaneID    string
 	K8sWorkerPort        int
 	K8sWorkerSecret      string
-	K8sWorkerConfigMap   string
 	K8sWorkerImagePullPolicy string
 	K8sWorkerServiceAccount  string
 	ConfigStoreConn      string
@@ -117,7 +115,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var workerBackend string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
-	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
+	var k8sWorkerSecret, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
 	var configStoreConn string
 	var configPollInterval time.Duration
 	var adminToken string
@@ -349,9 +347,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.K8s.WorkerSecret != "" {
 			k8sWorkerSecret = fileCfg.K8s.WorkerSecret
 		}
-		if fileCfg.K8s.WorkerConfigMap != "" {
-			k8sWorkerConfigMap = fileCfg.K8s.WorkerConfigMap
-		}
 		if fileCfg.K8s.WorkerImagePullPolicy != "" {
 			k8sWorkerImagePullPolicy = fileCfg.K8s.WorkerImagePullPolicy
 		}
@@ -575,9 +570,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_K8S_WORKER_SECRET"); v != "" {
 		k8sWorkerSecret = v
 	}
-	if v := getenv("DUCKGRES_K8S_WORKER_CONFIGMAP"); v != "" {
-		k8sWorkerConfigMap = v
-	}
 	if v := getenv("DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY"); v != "" {
 		k8sWorkerImagePullPolicy = v
 	}
@@ -766,9 +758,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["k8s-worker-secret"] {
 		k8sWorkerSecret = cli.K8sWorkerSecret
 	}
-	if cli.Set["k8s-worker-configmap"] {
-		k8sWorkerConfigMap = cli.K8sWorkerConfigMap
-	}
 	if cli.Set["k8s-worker-image-pull-policy"] {
 		k8sWorkerImagePullPolicy = cli.K8sWorkerImagePullPolicy
 	}
@@ -837,7 +826,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sControlPlaneID:        k8sControlPlaneID,
 		K8sWorkerPort:            k8sWorkerPort,
 		K8sWorkerSecret:          k8sWorkerSecret,
-		K8sWorkerConfigMap:       k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy: k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
 		ConfigStoreConn:          configStoreConn,

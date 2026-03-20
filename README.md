@@ -597,7 +597,7 @@ kill -USR2 <control-plane-pid>
 
 ### Remote Worker Backend
 
-In Kubernetes environments, the control plane can spawn worker pods instead of local processes using `--worker-backend remote`. The control plane creates worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
+In Kubernetes environments, the control plane can spawn worker pods instead of local processes using `--worker-backend remote`. That mode is now the multitenant config-store path: `--worker-backend remote` requires `--config-store`, and the control plane creates per-team worker pods via the Kubernetes API and routes queries to them over gRPC (Arrow Flight SQL).
 
 ```bash
 # Build with Kubernetes support

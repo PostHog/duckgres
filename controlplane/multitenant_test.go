@@ -14,7 +14,6 @@ func TestBuildMultiTenantBasePoolConfigDoesNotUseSharedWorkerConfigMap(t *testin
 			WorkerImage:     "duckgres:test",
 			WorkerPort:      8816,
 			WorkerSecret:    "duckgres-worker-token",
-			WorkerConfigMap: "duckgres-config",
 			ImagePullPolicy: "IfNotPresent",
 			ServiceAccount:  "duckgres-control-plane",
 		},

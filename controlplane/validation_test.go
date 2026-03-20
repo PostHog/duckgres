@@ -95,6 +95,19 @@ func TestValidateControlPlaneSecurity(t *testing.T) {
 	if err := validateControlPlaneSecurity(noUsers); err == nil {
 		t.Fatalf("expected error for missing users")
 	}
+
+	remoteWithoutConfigStore := baseCfg
+	remoteWithoutConfigStore.WorkerBackend = "remote"
+	if err := validateControlPlaneSecurity(remoteWithoutConfigStore); err == nil {
+		t.Fatalf("expected error for remote worker backend without config store")
+	}
+
+	remoteWithConfigStore := baseCfg
+	remoteWithConfigStore.WorkerBackend = "remote"
+	remoteWithConfigStore.ConfigStoreConn = "postgres://duckgres:duckgres@localhost:5432/duckgres_config?sslmode=disable"
+	if err := validateControlPlaneSecurity(remoteWithConfigStore); err != nil {
+		t.Fatalf("expected valid remote worker config with config store, got: %v", err)
+	}
 }
 
 func TestCheckSocketDirWritable(t *testing.T) {
