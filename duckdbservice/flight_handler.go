@@ -217,7 +217,9 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
-	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
+	schema, err := retryOnTransient(func() (*arrow.Schema, error) {
+		return GetQuerySchema(ctx, session.Conn, query, tx)
+	})
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
@@ -292,13 +294,12 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 
 		session.progress.queryActive.Store(true)
 		defer session.progress.queryActive.Store(false)
-		var rows *sql.Rows
-		var qerr error
-		if tx != nil {
-			rows, qerr = tx.QueryContext(ctx, handle.Query)
-		} else {
-			rows, qerr = session.Conn.QueryContext(ctx, handle.Query)
-		}
+		rows, qerr := retryOnTransient(func() (*sql.Rows, error) {
+			if tx != nil {
+				return tx.QueryContext(ctx, handle.Query)
+			}
+			return session.Conn.QueryContext(ctx, handle.Query)
+		})
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
 			return
@@ -344,14 +345,15 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	}
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
-	var result sql.Result
-	if tx != nil {
-		result, err = tx.ExecContext(ctx, query)
-	} else {
-		result, err = session.Conn.ExecContext(ctx, query)
-	}
-	if err != nil {
-		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
+
+	result, execErr := retryOnTransient(func() (sql.Result, error) {
+		if tx != nil {
+			return tx.ExecContext(ctx, query)
+		}
+		return session.Conn.ExecContext(ctx, query)
+	})
+	if execErr != nil {
+		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
 
 	affected, err := result.RowsAffected()

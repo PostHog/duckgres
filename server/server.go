@@ -983,7 +983,10 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
-	if _, err := db.Exec(attachStmt); err != nil {
+	if err := retryOnTransientAttach(func() error {
+		_, err := db.Exec(attachStmt)
+		return err
+	}); err != nil {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
 
