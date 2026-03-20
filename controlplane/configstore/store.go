@@ -148,7 +148,6 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		tc := &TeamConfig{
 			Name:         t.Name,
 			MaxWorkers:   t.MaxWorkers,
-			MinWorkers:   t.MinWorkers,
 			MemoryBudget: t.MemoryBudget,
 			IdleTimeoutS: t.IdleTimeoutS,
 			Users:        make(map[string]string),

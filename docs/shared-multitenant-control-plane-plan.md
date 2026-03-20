@@ -41,6 +41,7 @@ Separate from the end-user query path, operators use the admin API/dashboard to 
 - Add end-to-end provisioning controller that turns a PostHog warehouse request into warehouse DB, metadata store, S3, IAM/Pod Identity, K8s Secret creation, and config-store updates.
 - Implement team-specific DuckLake/warehouse-db/metadata-store/S3 runtime wiring.
 - Change worker pod spec from global to be team-specific. 
+- Long-term allocator hardening: move per-team admission and reservation into the shared worker allocator so "check team capacity + reserve worker" is one atomic operation, with centrally tracked assigned and pending reservations per team instead of router-side counting.
 - Implement non-disruptive customer-initiated duckgres login rotation mechanism.
 - Enable Duckhog / Flight SQL in multi-tenant mode.
 - Dev Infra

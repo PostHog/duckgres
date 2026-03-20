@@ -373,6 +373,35 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigK8sSharedWarmTarget(t *testing.T) {
+	fileCfg := &FileConfig{
+		K8s: K8sFileConfig{
+			SharedWarmTarget: 3,
+		},
+	}
+
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.K8sSharedWarmTarget != 3 {
+		t.Fatalf("expected k8s shared warm target from file, got %d", resolved.K8sSharedWarmTarget)
+	}
+
+	env := map[string]string{
+		"DUCKGRES_K8S_SHARED_WARM_TARGET": "5",
+	}
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.K8sSharedWarmTarget != 5 {
+		t.Fatalf("expected k8s shared warm target from env, got %d", resolved.K8sSharedWarmTarget)
+	}
+
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set:                 map[string]bool{"k8s-shared-warm-target": true},
+		K8sSharedWarmTarget: 8,
+	}, envFromMap(env), nil)
+	if resolved.K8sSharedWarmTarget != 8 {
+		t.Fatalf("expected k8s shared warm target from CLI, got %d", resolved.K8sSharedWarmTarget)
+	}
+}
+
 func TestResolveEffectiveConfigInvalidMemoryBudget(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_MEMORY_BUDGET": "lots-of-memory",

@@ -50,26 +50,28 @@ type configCLIInputs struct {
 	K8sWorkerConfigMap        string
 	K8sWorkerImagePullPolicy  string
 	K8sWorkerServiceAccount   string
+	K8sSharedWarmTarget       int
 	QueryLog                  bool
 }
 
 type resolvedConfig struct {
-	Server               server.Config
-	WorkerQueueTimeout   time.Duration
-	WorkerIdleTimeout    time.Duration
-	HandoverDrainTimeout time.Duration
-	WorkerBackend        string
-	K8sWorkerImage       string
-	K8sWorkerNamespace   string
-	K8sControlPlaneID    string
-	K8sWorkerPort        int
-	K8sWorkerSecret      string
-	K8sWorkerConfigMap   string
+	Server                   server.Config
+	WorkerQueueTimeout       time.Duration
+	WorkerIdleTimeout        time.Duration
+	HandoverDrainTimeout     time.Duration
+	WorkerBackend            string
+	K8sWorkerImage           string
+	K8sWorkerNamespace       string
+	K8sControlPlaneID        string
+	K8sWorkerPort            int
+	K8sWorkerSecret          string
+	K8sWorkerConfigMap       string
 	K8sWorkerImagePullPolicy string
 	K8sWorkerServiceAccount  string
-	ConfigStoreConn      string
-	ConfigPollInterval   time.Duration
-	AdminToken           string
+	K8sSharedWarmTarget      int
+	ConfigStoreConn          string
+	ConfigPollInterval       time.Duration
+	AdminToken               string
 }
 
 func defaultServerConfig() server.Config {
@@ -118,6 +120,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
+	var k8sSharedWarmTarget int
 	var configStoreConn string
 	var configPollInterval time.Duration
 	var adminToken string
@@ -358,6 +361,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.K8s.WorkerServiceAccount != "" {
 			k8sWorkerServiceAccount = fileCfg.K8s.WorkerServiceAccount
 		}
+		if fileCfg.K8s.SharedWarmTarget != 0 {
+			k8sSharedWarmTarget = fileCfg.K8s.SharedWarmTarget
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -584,6 +590,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT"); v != "" {
 		k8sWorkerServiceAccount = v
 	}
+	if v := getenv("DUCKGRES_K8S_SHARED_WARM_TARGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sSharedWarmTarget = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_SHARED_WARM_TARGET: " + err.Error())
+		}
+	}
 
 	// Query log env vars
 	if v := getenv("DUCKGRES_QUERY_LOG_ENABLED"); v != "" {
@@ -775,6 +788,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["k8s-worker-service-account"] {
 		k8sWorkerServiceAccount = cli.K8sWorkerServiceAccount
 	}
+	if cli.Set["k8s-shared-warm-target"] {
+		k8sSharedWarmTarget = cli.K8sSharedWarmTarget
+	}
 	if cli.Set["query-log"] {
 		cfg.QueryLog.Enabled = cli.QueryLog
 	}
@@ -840,6 +856,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerConfigMap:       k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy: k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
+		K8sSharedWarmTarget:      k8sSharedWarmTarget,
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
 		AdminToken:               adminToken,

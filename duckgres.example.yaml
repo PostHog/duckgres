@@ -95,6 +95,12 @@ ducklake:
 # min_workers: 0
 # max_workers: 0
 
+# Kubernetes multi-tenant shared warm-pool settings
+# k8s:
+#   # Neutral shared warm-worker target. Separate from per-team limits and
+#   # generic control-plane min_workers. 0 disables shared prewarming.
+#   shared_warm_target: 0
+
 # Process isolation (default: true)
 # Each client connection spawns a separate OS process, so a DuckDB crash
 # (e.g., from a failed DuckLake metadata connection) only kills that session,

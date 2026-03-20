@@ -51,8 +51,8 @@ type FileConfig struct {
 	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`              // Query log configuration
 
 	// Worker backend configuration
-	WorkerBackend string          `yaml:"worker_backend"` // "process" (default) or "remote"
-	K8s           K8sFileConfig   `yaml:"k8s"`
+	WorkerBackend string        `yaml:"worker_backend"` // "process" (default) or "remote"
+	K8s           K8sFileConfig `yaml:"k8s"`
 }
 
 // K8sFileConfig holds Kubernetes worker configuration from YAML.
@@ -65,6 +65,7 @@ type K8sFileConfig struct {
 	WorkerConfigMap       string `yaml:"worker_configmap"`
 	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
 	WorkerServiceAccount  string `yaml:"worker_service_account"`
+	SharedWarmTarget      int    `yaml:"shared_warm_target"`
 }
 
 type QueryLogFileConfig struct {
@@ -228,6 +229,7 @@ func main() {
 	k8sWorkerConfigMap := flag.String("k8s-worker-configmap", "", "ConfigMap name for worker duckgres.yaml (env: DUCKGRES_K8S_WORKER_CONFIGMAP)")
 	k8sWorkerImagePullPolicy := flag.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
 	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "ServiceAccount name for K8s worker pods (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
+	k8sSharedWarmTarget := flag.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
 
 	// Config store flags (multi-tenant mode)
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
@@ -289,6 +291,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ADMIN_TOKEN        Bearer token for admin API authentication\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -399,6 +402,7 @@ func main() {
 		K8sWorkerConfigMap:        *k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy:  *k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
+		K8sSharedWarmTarget:       *k8sSharedWarmTarget,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
@@ -529,14 +533,15 @@ func main() {
 			ConfigPollInterval:   resolved.ConfigPollInterval,
 			AdminToken:           resolved.AdminToken,
 			K8s: controlplane.K8sConfig{
-				WorkerImage:     resolved.K8sWorkerImage,
-				WorkerNamespace: resolved.K8sWorkerNamespace,
-				ControlPlaneID:  resolved.K8sControlPlaneID,
-				WorkerPort:      resolved.K8sWorkerPort,
-				WorkerSecret:    resolved.K8sWorkerSecret,
-				WorkerConfigMap: resolved.K8sWorkerConfigMap,
-				ImagePullPolicy: resolved.K8sWorkerImagePullPolicy,
-				ServiceAccount:  resolved.K8sWorkerServiceAccount,
+				WorkerImage:      resolved.K8sWorkerImage,
+				WorkerNamespace:  resolved.K8sWorkerNamespace,
+				ControlPlaneID:   resolved.K8sControlPlaneID,
+				WorkerPort:       resolved.K8sWorkerPort,
+				WorkerSecret:     resolved.K8sWorkerSecret,
+				WorkerConfigMap:  resolved.K8sWorkerConfigMap,
+				ImagePullPolicy:  resolved.K8sWorkerImagePullPolicy,
+				ServiceAccount:   resolved.K8sWorkerServiceAccount,
+				SharedWarmTarget: resolved.K8sSharedWarmTarget,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

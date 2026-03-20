@@ -62,14 +62,15 @@ type ControlPlaneConfig struct {
 
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage         string // Container image for worker pods (required)
-	WorkerNamespace     string // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID      string // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort          int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret        string // K8s Secret name containing bearer token
-	WorkerConfigMap     string // ConfigMap name for duckgres.yaml
-	ImagePullPolicy     string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount      string // ServiceAccount name for worker pods (default: "default")
+	WorkerImage      string // Container image for worker pods (required)
+	WorkerNamespace  string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID   string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort       int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret     string // K8s Secret name containing bearer token
+	WorkerConfigMap  string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy  string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount   string // ServiceAccount name for worker pods (default: "default")
+	SharedWarmTarget int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -77,25 +78,25 @@ type K8sConfig struct {
 // PostgreSQL wire protocol, and SQL transpilation all happen here. Workers are
 // thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
-	cfg              ControlPlaneConfig
-	pool             WorkerPool         // non-nil in single-tenant mode
-	sessions         *SessionManager    // non-nil in single-tenant mode
-	flight           *FlightIngress
-	rebalancer       *MemoryRebalancer
-	srv              *server.Server // Minimal server for cancel request routing
-	rateLimiter      *server.RateLimiter
-	tlsConfig        *tls.Config
-	pgListener       net.Listener
-	upgrader         *tableflip.Upgrader
-	parentPID        int // tableflip parent PID (0 if first generation)
-	activeConns      int64
-	closed           bool
-	closeMu          sync.Mutex
-	wg               sync.WaitGroup
-	reloading        atomic.Bool         // guards against concurrent upgrade from double SIGUSR1
-	upgradeDraining  atomic.Bool         // true after upgrade succeeded; SIGTERM should exit immediately
-	acmeManager      *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
-	acmeDNSManager   *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
+	cfg             ControlPlaneConfig
+	pool            WorkerPool      // non-nil in single-tenant mode
+	sessions        *SessionManager // non-nil in single-tenant mode
+	flight          *FlightIngress
+	rebalancer      *MemoryRebalancer
+	srv             *server.Server // Minimal server for cancel request routing
+	rateLimiter     *server.RateLimiter
+	tlsConfig       *tls.Config
+	pgListener      net.Listener
+	upgrader        *tableflip.Upgrader
+	parentPID       int // tableflip parent PID (0 if first generation)
+	activeConns     int64
+	closed          bool
+	closeMu         sync.Mutex
+	wg              sync.WaitGroup
+	reloading       atomic.Bool            // guards against concurrent upgrade from double SIGUSR1
+	upgradeDraining atomic.Bool            // true after upgrade succeeded; SIGTERM should exit immediately
+	acmeManager     *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
+	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
 	// Multi-tenant fields (non-nil when --config-store is set with remote backend)
 	teamRouter  TeamRouterInterface

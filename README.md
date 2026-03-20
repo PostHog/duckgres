@@ -199,6 +199,7 @@ Run with config file:
 | `DUCKGRES_THREADS` | DuckDB threads per session | `runtime.NumCPU()` |
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
+| `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
