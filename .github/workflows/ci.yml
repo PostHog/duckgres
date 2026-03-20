@@ -142,6 +142,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      DUCKGRES_KIND_CLUSTER_NAME: duckgres
       DUCKGRES_K8S_TEST_SETUP: kind
 
     steps:
@@ -154,8 +155,9 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Set up kind
-        uses: engineerd/setup-kind@v0.6.2
+        uses: engineerd/setup-kind@71e45b960fc8dd50b4aeabf6eb6ef2ca0920b4c1 # v0.6.2
         with:
+          name: ${{ env.DUCKGRES_KIND_CLUSTER_NAME }}
           skipClusterCreation: true
       - name: Run Kubernetes integration tests
         run: just test-k8s-integration
