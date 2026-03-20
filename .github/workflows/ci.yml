@@ -154,10 +154,13 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Set up kind
-        uses: engineerd/setup-kind@71e45b960fc8dd50b4aeabf6eb6ef2ca0920b4c1 # v0.6.2
-        with:
-          name: ${{ env.DUCKGRES_KIND_CLUSTER_NAME }}
-          skipClusterCreation: true
+      - name: Install kind
+        env:
+          KIND_VERSION: v0.24.0
+        run: |
+          curl -sSL -o /tmp/kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x /tmp/kind
+          sudo mv /tmp/kind /usr/local/bin/kind
+          kind --version
       - name: Run Kubernetes integration tests
         run: just test-k8s-integration
