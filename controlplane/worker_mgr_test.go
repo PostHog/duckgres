@@ -1122,3 +1122,57 @@ func TestReapIdleWorkersPreservesIdleFloor(t *testing.T) {
 		t.Fatalf("expected at least %d idle workers to remain, got %d", pool.minWorkers, idleCount)
 	}
 }
+
+func TestManagedWorkerSharedStateNormalizesZeroValue(t *testing.T) {
+	var w ManagedWorker
+
+	state := w.SharedState()
+	if got := state.Lifecycle; got != WorkerLifecycleIdle {
+		t.Fatalf("expected shared state lifecycle %q, got %q", WorkerLifecycleIdle, got)
+	}
+	if state.Assignment != nil {
+		t.Fatalf("expected zero-value shared state to be unassigned, got %#v", state.Assignment)
+	}
+}
+
+func TestManagedWorkerSetSharedStateClonesAssignment(t *testing.T) {
+	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
+	input := SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			TeamName:       "analytics",
+			LeaseExpiresAt: leaseExpiry,
+		},
+	}
+
+	var w ManagedWorker
+	if err := w.SetSharedState(input); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+
+	input.Assignment.TeamName = "mutated"
+	input.Assignment.LeaseExpiresAt = leaseExpiry.Add(time.Hour)
+
+	got := w.SharedState()
+	if got.Assignment == nil {
+		t.Fatal("expected stored assignment")
+	}
+	if got.Assignment == input.Assignment {
+		t.Fatal("expected worker state assignment to be cloned")
+	}
+	if got.Assignment.TeamName != "analytics" {
+		t.Fatalf("expected stored team name analytics, got %q", got.Assignment.TeamName)
+	}
+	if !got.Assignment.LeaseExpiresAt.Equal(leaseExpiry) {
+		t.Fatalf("expected stored lease expiry %v, got %v", leaseExpiry, got.Assignment.LeaseExpiresAt)
+	}
+
+	got.Assignment.TeamName = "leaked"
+	fresh := w.SharedState()
+	if fresh.Assignment == nil {
+		t.Fatal("expected stored assignment on subsequent read")
+	}
+	if fresh.Assignment.TeamName != "analytics" {
+		t.Fatalf("expected readback clone to protect stored team name, got %q", fresh.Assignment.TeamName)
+	}
+}

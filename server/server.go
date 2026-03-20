@@ -240,6 +240,12 @@ type DuckLakeConfig struct {
 	// Default: checks all sources in AWS SDK order
 	S3Chain   string // e.g., "env;config" to check env vars then config files
 	S3Profile string // AWS profile name to use (for "config" chain)
+
+	// CheckpointInterval controls how often DuckLake CHECKPOINT runs.
+	// CHECKPOINT performs full catalog maintenance: expire snapshots,
+	// merge adjacent files, rewrite data files, and clean up orphaned files.
+	// Set to 0 to disable. Default: 24h.
+	CheckpointInterval time.Duration
 }
 
 type Server struct {
@@ -278,6 +284,9 @@ type Server struct {
 
 	// Query logger for DuckLake system.query_log
 	queryLogger *QueryLogger
+
+	// DuckLake checkpoint scheduler
+	checkpointer *DuckLakeCheckpointer
 
 	// Progress lookup function for pg_stat_activity.
 	// In control plane mode, returns cached progress from worker health checks.
@@ -386,6 +395,13 @@ func New(cfg Config) (*Server, error) {
 		s.queryLogger = ql
 	}
 
+	// Initialize DuckLake checkpoint scheduler (non-fatal on error)
+	if cp, err := NewDuckLakeCheckpointer(cfg); err != nil {
+		slog.Warn("Failed to initialize DuckLake checkpoint scheduler, continuing without it.", "error", err)
+	} else if cp != nil {
+		s.checkpointer = cp
+	}
+
 	return s, nil
 }
 
@@ -486,6 +502,11 @@ func (s *Server) Close() error {
 	// Stop query logger (drains remaining entries)
 	if s.queryLogger != nil {
 		s.queryLogger.Stop()
+	}
+
+	// Stop DuckLake checkpoint scheduler
+	if s.checkpointer != nil {
+		s.checkpointer.Stop()
 	}
 
 	// Database connections are now closed by each clientConn when it terminates

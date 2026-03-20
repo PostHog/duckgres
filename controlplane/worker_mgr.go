@@ -36,6 +36,23 @@ type ManagedWorker struct {
 	exitErr        error
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
+	sharedState    SharedWorkerState
+}
+
+// SharedState returns the additive shared warm-worker lifecycle metadata for
+// this worker. The zero value normalizes to an idle, unassigned worker.
+func (w *ManagedWorker) SharedState() SharedWorkerState {
+	return cloneSharedWorkerState(w.sharedState)
+}
+
+// SetSharedState updates the additive shared warm-worker lifecycle metadata
+// without changing existing session scheduling behavior.
+func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
+	if err := state.Validate(); err != nil {
+		return err
+	}
+	w.sharedState = cloneSharedWorkerState(state)
+	return nil
 }
 
 // preboundSocket is a Unix socket pre-bound at startup while the socket
