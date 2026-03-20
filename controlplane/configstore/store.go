@@ -19,7 +19,6 @@ type Snapshot struct {
 	UserTeam     map[string]string // username -> team name
 	UserPassword map[string]string // username -> password
 	Global       GlobalConfig
-	DuckLake     DuckLakeConfig
 	RateLimit    RateLimitConfig
 	QueryLog     QueryLogConfig
 }
@@ -53,7 +52,6 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 		&ManagedWarehouse{},
 		&TeamUser{},
 		&GlobalConfig{},
-		&DuckLakeConfig{},
 		&RateLimitConfig{},
 		&QueryLogConfig{},
 	); err != nil {
@@ -62,7 +60,6 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 
 	// Ensure singleton rows exist with defaults
 	db.FirstOrCreate(&GlobalConfig{}, GlobalConfig{ID: 1})
-	db.FirstOrCreate(&DuckLakeConfig{}, DuckLakeConfig{ID: 1})
 	db.FirstOrCreate(&RateLimitConfig{}, RateLimitConfig{ID: 1})
 	db.FirstOrCreate(&QueryLogConfig{}, QueryLogConfig{ID: 1})
 
@@ -125,9 +122,6 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	var global GlobalConfig
 	cs.db.First(&global, 1)
 
-	var duckLake DuckLakeConfig
-	cs.db.First(&duckLake, 1)
-
 	var rateLimit RateLimitConfig
 	cs.db.First(&rateLimit, 1)
 
@@ -139,7 +133,6 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		UserTeam:     make(map[string]string),
 		UserPassword: make(map[string]string),
 		Global:       global,
-		DuckLake:     duckLake,
 		RateLimit:    rateLimit,
 		QueryLog:     queryLog,
 	}

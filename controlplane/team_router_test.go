@@ -573,7 +573,7 @@ func TestNewTeamRouter_SkipsManagedWarehouseTeamsMissingRuntimeConfig(t *testing
 	}
 }
 
-func TestTeamRouter_HandleConfigChange_IgnoresDuckLakeSingletonChanges(t *testing.T) {
+func TestTeamRouter_HandleConfigChange_IgnoresGlobalSingletonChanges(t *testing.T) {
 	factory := installFakePoolFactory(t)
 
 	baseCfg := K8sWorkerPoolConfig{
@@ -600,16 +600,17 @@ func TestTeamRouter_HandleConfigChange_IgnoresDuckLakeSingletonChanges(t *testin
 
 	oldSnap := store.snap
 	newSnap := testSnapshot(testTeamConfig("analytics", 4, testWarehouse("warehouse-a.internal")))
-	newSnap.DuckLake = configstore.DuckLakeConfig{
-		ID:            1,
-		ObjectStore:   "s3://legacy/fallback/",
-		MetadataStore: "postgres:host=legacy.example port=5432 user=ducklake password=ducklake dbname=ducklake",
+	newSnap.Global = configstore.GlobalConfig{
+		ID:              1,
+		MemoryBudget:    "32GB",
+		MemoryRebalance: true,
+		MaxConnections:  200,
 	}
 
 	router.HandleConfigChange(oldSnap, newSnap)
 
 	if got := factory.poolCount(); got != 1 {
-		t.Fatalf("expected ducklake singleton changes to keep existing pool, got %d pools", got)
+		t.Fatalf("expected global singleton changes to keep existing pool, got %d pools", got)
 	}
 	pool := factory.lastPool()
 	if got := pool.shutdowns; got != 0 {

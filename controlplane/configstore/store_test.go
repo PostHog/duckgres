@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -202,7 +203,6 @@ func TestTableNames(t *testing.T) {
 		{TeamUser{}, "duckgres_team_users"},
 		{ManagedWarehouse{}, "duckgres_managed_warehouses"},
 		{GlobalConfig{}, "duckgres_global_config"},
-		{DuckLakeConfig{}, "duckgres_ducklake_config"},
 		{RateLimitConfig{}, "duckgres_rate_limit_config"},
 		{QueryLogConfig{}, "duckgres_query_log_config"},
 	}
@@ -211,5 +211,11 @@ func TestTableNames(t *testing.T) {
 		if got := tt.model.TableName(); got != tt.want {
 			t.Errorf("%T.TableName() = %q, want %q", tt.model, got, tt.want)
 		}
+	}
+}
+
+func TestSnapshotDoesNotExposeLegacyDuckLakeSingleton(t *testing.T) {
+	if _, ok := reflect.TypeOf(Snapshot{}).FieldByName("DuckLake"); ok {
+		t.Fatal("expected Snapshot to stop exposing legacy DuckLake singleton")
 	}
 }

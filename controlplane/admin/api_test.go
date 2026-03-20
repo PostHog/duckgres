@@ -156,14 +156,6 @@ func (s *fakeAPIStore) SaveGlobalConfig(cfg *configstore.GlobalConfig) error {
 	return nil
 }
 
-func (s *fakeAPIStore) GetDuckLakeConfig() (configstore.DuckLakeConfig, error) {
-	return configstore.DuckLakeConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error {
-	return nil
-}
-
 func (s *fakeAPIStore) GetRateLimitConfig() (configstore.RateLimitConfig, error) {
 	return configstore.RateLimitConfig{}, nil
 }

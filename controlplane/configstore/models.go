@@ -136,27 +136,6 @@ type GlobalConfig struct {
 
 func (GlobalConfig) TableName() string { return "duckgres_global_config" }
 
-// DuckLakeConfig is a singleton row (ID=1) for legacy cluster-wide DuckLake settings.
-// In multi-tenant mode, the managed-warehouse contract is the intended per-team source of truth.
-type DuckLakeConfig struct {
-	ID            uint      `gorm:"primaryKey" json:"-"`
-	MetadataStore string    `gorm:"size:1024" json:"metadata_store"`
-	ObjectStore   string    `gorm:"size:1024" json:"object_store"`
-	DataPath      string    `gorm:"size:1024" json:"data_path"`
-	S3Provider    string    `gorm:"size:64" json:"s3_provider"`
-	S3Endpoint    string    `gorm:"size:512" json:"s3_endpoint"`
-	S3AccessKey   string    `gorm:"size:255" json:"s3_access_key"`
-	S3SecretKey   string    `gorm:"size:255" json:"-"`
-	S3Region      string    `gorm:"size:64" json:"s3_region"`
-	S3UseSSL      bool      `json:"s3_use_ssl"`
-	S3URLStyle    string    `gorm:"size:16" json:"s3_url_style"`
-	S3Chain       string    `gorm:"size:255" json:"s3_chain"`
-	S3Profile     string    `gorm:"size:255" json:"s3_profile"`
-	UpdatedAt     time.Time `json:"updated_at"`
-}
-
-func (DuckLakeConfig) TableName() string { return "duckgres_ducklake_config" }
-
 // RateLimitConfig is a singleton row (ID=1) for rate limiting.
 type RateLimitConfig struct {
 	ID                   uint      `gorm:"primaryKey" json:"-"`
