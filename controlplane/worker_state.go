@@ -177,3 +177,10 @@ func cloneWorkerAssignment(assignment *WorkerAssignment) *WorkerAssignment {
 	cloned := *assignment
 	return &cloned
 }
+
+func cloneSharedWorkerState(state SharedWorkerState) SharedWorkerState {
+	return SharedWorkerState{
+		Lifecycle:  state.NormalizedLifecycle(),
+		Assignment: cloneWorkerAssignment(state.Assignment),
+	}
+}

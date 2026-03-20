@@ -42,7 +42,7 @@ type ManagedWorker struct {
 // SharedState returns the additive shared warm-worker lifecycle metadata for
 // this worker. The zero value normalizes to an idle, unassigned worker.
 func (w *ManagedWorker) SharedState() SharedWorkerState {
-	return w.sharedState
+	return cloneSharedWorkerState(w.sharedState)
 }
 
 // SetSharedState updates the additive shared warm-worker lifecycle metadata
@@ -51,7 +51,7 @@ func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
 	if err := state.Validate(); err != nil {
 		return err
 	}
-	w.sharedState = state
+	w.sharedState = cloneSharedWorkerState(state)
 	return nil
 }
 
