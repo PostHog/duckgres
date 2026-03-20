@@ -16,6 +16,7 @@ type DuckLakeCheckpointer struct {
 	db       *sql.DB
 	interval time.Duration
 	done     chan struct{}
+	loopDone chan struct{}
 	stopOnce sync.Once
 }
 
@@ -78,6 +79,7 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 		db:       db,
 		interval: cfg.DuckLake.CheckpointInterval,
 		done:     make(chan struct{}),
+		loopDone: make(chan struct{}),
 	}
 
 	go c.loop()
@@ -85,13 +87,15 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 	return c, nil
 }
 
-// Stop shuts down the checkpoint scheduler and closes the database connection.
+// Stop shuts down the checkpoint scheduler, waits for any in-progress
+// checkpoint to finish, and closes the database connection.
 func (c *DuckLakeCheckpointer) Stop() {
 	if c == nil {
 		return
 	}
 	c.stopOnce.Do(func() {
 		close(c.done)
+		<-c.loopDone
 		if c.db != nil {
 			_ = c.db.Close()
 		}
@@ -99,6 +103,8 @@ func (c *DuckLakeCheckpointer) Stop() {
 }
 
 func (c *DuckLakeCheckpointer) loop() {
+	defer close(c.loopDone)
+
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
