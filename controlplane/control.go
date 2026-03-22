@@ -29,6 +29,8 @@ import (
 type ControlPlaneConfig struct {
 	server.Config
 
+	Process ProcessConfig
+
 	SocketDir            string
 	ConfigPath           string // Path to config file, passed to workers
 	HealthCheckInterval  time.Duration
@@ -60,16 +62,23 @@ type ControlPlaneConfig struct {
 	AdminToken string
 }
 
+type ProcessConfig struct {
+	MinWorkers int
+	MaxWorkers int
+}
+
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage         string // Container image for worker pods (required)
-	WorkerNamespace     string // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID      string // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort          int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret        string // K8s Secret name containing bearer token
-	WorkerConfigMap     string // ConfigMap name for duckgres.yaml
-	ImagePullPolicy     string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount      string // ServiceAccount name for worker pods (default: "default")
+	WorkerImage      string // Container image for worker pods (required)
+	WorkerNamespace  string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID   string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort       int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret     string // K8s Secret name containing bearer token
+	WorkerConfigMap  string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy  string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount   string // ServiceAccount name for worker pods (default: "default")
+	MaxWorkers       int    // Global cap for the shared K8s worker pool (0 = auto-derived)
+	SharedWarmTarget int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -77,25 +86,25 @@ type K8sConfig struct {
 // PostgreSQL wire protocol, and SQL transpilation all happen here. Workers are
 // thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
-	cfg              ControlPlaneConfig
-	pool             WorkerPool         // non-nil in single-tenant mode
-	sessions         *SessionManager    // non-nil in single-tenant mode
-	flight           *FlightIngress
-	rebalancer       *MemoryRebalancer
-	srv              *server.Server // Minimal server for cancel request routing
-	rateLimiter      *server.RateLimiter
-	tlsConfig        *tls.Config
-	pgListener       net.Listener
-	upgrader         *tableflip.Upgrader
-	parentPID        int // tableflip parent PID (0 if first generation)
-	activeConns      int64
-	closed           bool
-	closeMu          sync.Mutex
-	wg               sync.WaitGroup
-	reloading        atomic.Bool         // guards against concurrent upgrade from double SIGUSR1
-	upgradeDraining  atomic.Bool         // true after upgrade succeeded; SIGTERM should exit immediately
-	acmeManager      *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
-	acmeDNSManager   *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
+	cfg             ControlPlaneConfig
+	pool            WorkerPool      // non-nil in single-tenant mode
+	sessions        *SessionManager // non-nil in single-tenant mode
+	flight          *FlightIngress
+	rebalancer      *MemoryRebalancer
+	srv             *server.Server // Minimal server for cancel request routing
+	rateLimiter     *server.RateLimiter
+	tlsConfig       *tls.Config
+	pgListener      net.Listener
+	upgrader        *tableflip.Upgrader
+	parentPID       int // tableflip parent PID (0 if first generation)
+	activeConns     int64
+	closed          bool
+	closeMu         sync.Mutex
+	wg              sync.WaitGroup
+	reloading       atomic.Bool            // guards against concurrent upgrade from double SIGUSR1
+	upgradeDraining atomic.Bool            // true after upgrade succeeded; SIGTERM should exit immediately
+	acmeManager     *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
+	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
 	// Multi-tenant fields (non-nil when --config-store is set with remote backend)
 	teamRouter  TeamRouterInterface
@@ -233,30 +242,49 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Initialize memory rebalancer. Every session gets the full memory budget
 	// (75% of system RAM by default). DuckDB spills to disk/swap if needed.
 	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
-	maxWorkers := cfg.MaxWorkers
 
 	// Use a temporary rebalancer to auto-detect the budget and derive
-	// a default max_workers if not explicitly set.
+	// backend-specific default max_workers if not explicitly set.
 	tempRebalancer := NewMemoryRebalancer(memBudget, 0, nil, false)
 	memBudget = tempRebalancer.memoryBudget // capture auto-detected value
 
-	// If max_workers is not set, derive a reasonable concurrency cap from
-	// the memory budget (budget / 256MB).
-	if maxWorkers == 0 {
-		maxWorkers = tempRebalancer.DefaultMaxWorkers()
-		slog.Info("Derived max_workers from memory budget.",
-			"max_workers", maxWorkers,
-			"memory_budget", formatBytes(memBudget))
+	processMaxWorkers := cfg.Process.MaxWorkers
+	if processMaxWorkers == 0 {
+		processMaxWorkers = tempRebalancer.DefaultMaxWorkers()
+	}
+	k8sMaxWorkers := cfg.K8s.MaxWorkers
+	if k8sMaxWorkers == 0 {
+		k8sMaxWorkers = tempRebalancer.DefaultMaxWorkers()
 	}
 
 	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance)
 
-	// Validate min_workers <= max_workers
-	minWorkers := cfg.MinWorkers
-	if minWorkers > maxWorkers {
-		slog.Warn("min_workers exceeds max_workers; capping to max_workers.",
-			"min_workers", minWorkers, "max_workers", maxWorkers)
-		minWorkers = maxWorkers
+	if !isK8s && cfg.Process.MaxWorkers == 0 {
+		slog.Info("Derived process.max_workers from memory budget.",
+			"process_max_workers", processMaxWorkers,
+			"memory_budget", formatBytes(memBudget))
+	}
+	if isK8s && cfg.K8s.MaxWorkers == 0 {
+		slog.Info("Derived k8s.max_workers from memory budget.",
+			"k8s_max_workers", k8sMaxWorkers,
+			"memory_budget", formatBytes(memBudget))
+	}
+
+	processMinWorkers := cfg.Process.MinWorkers
+	if processMinWorkers > processMaxWorkers {
+		slog.Warn("process.min_workers exceeds process.max_workers; capping to process.max_workers.",
+			"process_min_workers", processMinWorkers,
+			"process_max_workers", processMaxWorkers)
+		processMinWorkers = processMaxWorkers
+	}
+
+	k8sSharedWarmTarget := cfg.K8s.SharedWarmTarget
+	if isK8s && k8sSharedWarmTarget > k8sMaxWorkers {
+		slog.Warn("k8s.shared_warm_target exceeds k8s.max_workers; capping to k8s.max_workers.",
+			"k8s_shared_warm_target", k8sSharedWarmTarget,
+			"k8s_max_workers", k8sMaxWorkers)
+		k8sSharedWarmTarget = k8sMaxWorkers
+		cfg.K8s.SharedWarmTarget = k8sSharedWarmTarget
 	}
 
 	// Create a minimal server for cancel request routing
@@ -284,7 +312,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-team pools (K8s remote backend only)
 	if cfg.ConfigStoreConn != "" && cfg.WorkerBackend == "remote" {
-		store, adapter, adminSrv, err := SetupMultiTenant(cfg, srv, memBudget, maxWorkers)
+		store, adapter, adminSrv, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
@@ -313,7 +341,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 				WorkerPort:      cfg.K8s.WorkerPort,
 				SecretName:      cfg.K8s.WorkerSecret,
 				ConfigMap:       cfg.K8s.WorkerConfigMap,
-				MaxWorkers:      maxWorkers,
+				MaxWorkers:      k8sMaxWorkers,
 				IdleTimeout:     cfg.WorkerIdleTimeout,
 				ConfigPath:      cfg.ConfigPath,
 				ImagePullPolicy: cfg.K8s.ImagePullPolicy,
@@ -326,13 +354,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			}
 			pool = k8sPool
 		default: // "process" or empty
-			procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, minWorkers, maxWorkers)
+			procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, processMinWorkers, processMaxWorkers)
 			procPool.idleTimeout = cfg.WorkerIdleTimeout
 
 			// Pre-bind worker sockets. On upgrade with EROFS, this may fail —
 			// that's OK, workers will fall back to effectiveSocketDir (/tmp).
-			if maxWorkers > 0 {
-				if err := procPool.PreBindSockets(maxWorkers); err != nil {
+			if processMaxWorkers > 0 {
+				if err := procPool.PreBindSockets(processMaxWorkers); err != nil {
 					if upg.HasParent() {
 						slog.Warn("Failed to pre-bind worker sockets (will use dynamic sockets).", "error", err)
 					} else {
@@ -363,9 +391,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			return sp.Percentage, sp.Rows, sp.TotalRows, sp.Stalled
 		})
 
-		// Pre-warm workers if min_workers is set
-		if minWorkers > 0 {
-			if err := pool.SpawnMinWorkers(minWorkers); err != nil {
+		warmTarget := processMinWorkers
+		if cfg.WorkerBackend == "remote" {
+			warmTarget = k8sSharedWarmTarget
+		}
+		if warmTarget > 0 {
+			if err := pool.SpawnMinWorkers(warmTarget); err != nil {
 				slog.Error("Failed to spawn min workers.", "error", err)
 				os.Exit(1)
 			}
@@ -437,8 +468,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
 		"flight_addr", cp.flightAddr(),
-		"min_workers", minWorkers,
-		"max_workers", maxWorkers,
+		"worker_backend", cfg.WorkerBackend,
+		"process_min_workers", processMinWorkers,
+		"process_max_workers", processMaxWorkers,
+		"k8s_max_workers", k8sMaxWorkers,
+		"k8s_shared_warm_target", k8sSharedWarmTarget,
 		"worker_queue_timeout", cfg.WorkerQueueTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
 		"memory_rebalance", cfg.MemoryRebalance)

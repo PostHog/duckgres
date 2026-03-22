@@ -45,7 +45,6 @@ func (a *teamRouterAdapter) AllTeamStats() []admin.TeamStatus {
 			Name:           name,
 			ActiveSessions: sessionCount,
 			MaxWorkers:     stack.Config.MaxWorkers,
-			MinWorkers:     stack.Config.MinWorkers,
 			MemoryBudget:   stack.Config.MemoryBudget,
 		})
 		// Emit per-team Prometheus metrics

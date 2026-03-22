@@ -182,14 +182,6 @@ type Config struct {
 	// of budget/max_workers at creation time.
 	MemoryRebalance bool
 
-	// MaxWorkers is the maximum number of worker processes in control-plane mode.
-	// 0 means unlimited.
-	MaxWorkers int
-
-	// MinWorkers is the number of pre-warmed worker processes at startup in control-plane mode.
-	// 0 means no pre-warming (workers spawn on demand).
-	MinWorkers int
-
 	// PassthroughUsers are users that bypass the SQL transpiler and pg_catalog initialization.
 	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
 	PassthroughUsers map[string]bool

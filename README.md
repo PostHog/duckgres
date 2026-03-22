@@ -199,6 +199,7 @@ Run with config file:
 | `DUCKGRES_THREADS` | DuckDB threads per session | `runtime.NumCPU()` |
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
+| `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
@@ -246,8 +247,8 @@ Options:
   -process-isolation       Enable process isolation (spawn child process per connection)
   -idle-timeout string     Connection idle timeout (e.g., '30m', '1h', '-1' to disable)
   -mode string             Run mode: standalone (default), control-plane, or duckdb-service
-  -min-workers int         Pre-warm worker count at startup (control-plane mode, default 0)
-  -max-workers int         Max worker processes, 0=unlimited (control-plane mode)
+  -process-min-workers int Pre-warm process worker count at startup (control-plane mode, default 0)
+  -process-max-workers int Max process workers, 0=auto-derived (control-plane mode)
   -memory-budget string    Total memory for all DuckDB sessions (e.g., '24GB')
   -socket-dir string       Unix socket directory (control-plane mode)
   -handover-socket string  Handover socket for graceful deployment (control-plane mode)
@@ -566,8 +567,8 @@ Start in control-plane mode:
 # Enable Flight SQL ingress for Duckhog-compatible clients
 ./duckgres --mode control-plane --port 5432 --flight-port 8815
 
-# Pre-warm 2 workers and cap at 10
-./duckgres --mode control-plane --port 5432 --min-workers 2 --max-workers 10
+# Pre-warm 2 process workers and cap at 10
+./duckgres --mode control-plane --port 5432 --process-min-workers 2 --process-max-workers 10
 
 # Connect with psql (identical to standalone mode)
 PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"

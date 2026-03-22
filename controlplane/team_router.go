@@ -4,6 +4,7 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -28,9 +29,11 @@ type TeamRouter struct {
 	teams        map[string]*TeamStack
 	configStore  *configstore.ConfigStore
 	baseCfg      K8sWorkerPoolConfig
+	sharedPool   *K8sWorkerPool
 	globalCfg    ControlPlaneConfig
 	srv          *server.Server
 	nextWorkerID atomic.Int32
+	sharedCancel context.CancelFunc
 }
 
 // NewTeamRouter creates a TeamRouter from the initial config snapshot.
@@ -43,6 +46,26 @@ func NewTeamRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, 
 		srv:         srv,
 	}
 
+	sharedCfg := baseCfg
+	sharedCfg.TeamName = ""
+	sharedCfg.WorkerIDGenerator = func() int {
+		return int(tr.nextWorkerID.Add(1))
+	}
+
+	sharedPoolIface, err := CreateK8sPool(sharedCfg)
+	if err != nil {
+		return nil, err
+	}
+	sharedPool, ok := sharedPoolIface.(*K8sWorkerPool)
+	if !ok {
+		return nil, fmt.Errorf("expected shared K8s pool, got %T", sharedPoolIface)
+	}
+	tr.sharedPool = sharedPool
+
+	sharedCtx, sharedCancel := context.WithCancel(context.Background())
+	tr.sharedCancel = sharedCancel
+	go tr.sharedPool.HealthCheckLoop(sharedCtx, tr.globalCfg.HealthCheckInterval, tr.onSharedWorkerCrash, tr.onSharedWorkerProgress)
+
 	snap := store.Snapshot()
 	for _, tc := range snap.Teams {
 		if _, err := tr.createTeamStack(tc); err != nil {
@@ -50,6 +73,8 @@ func NewTeamRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, 
 			continue
 		}
 	}
+
+	tr.reconcileWarmCapacity(snap)
 
 	return tr, nil
 }
@@ -68,36 +93,14 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 		memoryBudget = int64(server.ParseMemoryBytes(tc.MemoryBudget))
 	}
 
-	cfg := tr.baseCfg
-	cfg.TeamName = tc.Name
-	cfg.MaxWorkers = maxWorkers
-	cfg.MemoryBudget = memoryBudget
-	cfg.WorkerIDGenerator = func() int {
-		return int(tr.nextWorkerID.Add(1))
-	}
-
-	pool, err := CreateK8sPool(cfg)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
+	pool := NewTeamReservedWorkerPool(tr.sharedPool, tc.Name, maxWorkers)
 
 	rebalancer := NewMemoryRebalancer(uint64(memoryBudget), 0, nil, tr.globalCfg.MemoryRebalance)
 	sessions := NewSessionManager(pool, rebalancer)
 	rebalancer.SetSessionLister(sessions)
 
-	// Start health check loop with per-team metrics
-	teamName := tc.Name
-	go pool.HealthCheckLoop(ctx, tr.globalCfg.HealthCheckInterval, func(workerID int) {
-		observeTeamWorkerCrash(teamName)
-		sessions.OnWorkerCrash(workerID, func(pid int32) {
-			slog.Warn("Session orphaned by worker crash.", "team", teamName, "pid", pid, "worker", workerID)
-		})
-	}, func(workerID int, progress map[string]*SessionProgress) {
-		sessions.UpdateProgress(workerID, progress)
-	})
-
 	// Periodic per-team metrics emission
+	teamName := tc.Name
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -111,16 +114,6 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 			}
 		}
 	}()
-
-	// Pre-warm workers
-	if tc.MinWorkers > 0 {
-		go func() {
-			observeTeamWorkerSpawn(teamName)
-			if err := pool.SpawnMinWorkers(tc.MinWorkers); err != nil {
-				slog.Warn("Failed to pre-warm workers for team.", "team", tc.Name, "error", err)
-			}
-		}()
-	}
 
 	stack := &TeamStack{
 		Config:     tc,
@@ -213,6 +206,8 @@ func (tr *TeamRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			tr.mu.Unlock()
 		}
 	}
+
+	tr.reconcileWarmCapacity(new)
 }
 
 // AllStacks returns a snapshot of all team stacks for admin API usage.
@@ -244,4 +239,62 @@ func (tr *TeamRouter) ShutdownAll() {
 			stack.Rebalancer.Stop()
 		}
 	}
+
+	if tr.sharedCancel != nil {
+		tr.sharedCancel()
+	}
+	if tr.sharedPool != nil {
+		tr.sharedPool.ShutdownAll()
+	}
+}
+
+func (tr *TeamRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
+	if tr.sharedPool == nil || snap == nil {
+		return
+	}
+
+	target := tr.globalCfg.K8s.SharedWarmTarget
+	if target < 0 {
+		target = 0
+	}
+
+	tr.sharedPool.SetWarmCapacityTarget(target)
+	if target > 0 {
+		observeTeamWorkerSpawn("shared")
+		if err := tr.sharedPool.SpawnMinWorkers(target); err != nil {
+			slog.Warn("Failed to reconcile shared warm capacity.", "target", target, "error", err)
+		}
+	}
+}
+
+func (tr *TeamRouter) onSharedWorkerCrash(workerID int) {
+	stack, teamName, ok := tr.stackForWorker(workerID)
+	if !ok {
+		return
+	}
+
+	observeTeamWorkerCrash(teamName)
+	stack.Sessions.OnWorkerCrash(workerID, func(pid int32) {
+		slog.Warn("Session orphaned by worker crash.", "team", teamName, "pid", pid, "worker", workerID)
+	})
+}
+
+func (tr *TeamRouter) onSharedWorkerProgress(workerID int, progress map[string]*SessionProgress) {
+	stack, _, ok := tr.stackForWorker(workerID)
+	if !ok {
+		return
+	}
+	stack.Sessions.UpdateProgress(workerID, progress)
+}
+
+func (tr *TeamRouter) stackForWorker(workerID int) (*TeamStack, string, bool) {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+
+	for teamName, stack := range tr.teams {
+		if stack.Sessions.SessionCountForWorker(workerID) > 0 {
+			return stack, teamName, true
+		}
+	}
+	return nil, "", false
 }

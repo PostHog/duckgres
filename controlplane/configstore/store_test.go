@@ -27,7 +27,6 @@ func TestSnapshotBuild(t *testing.T) {
 		{
 			Name:         "analytics",
 			MaxWorkers:   4,
-			MinWorkers:   1,
 			MemoryBudget: "8GB",
 			Warehouse: &ManagedWarehouse{
 				TeamName: "analytics",
@@ -114,7 +113,6 @@ func TestSnapshotBuild(t *testing.T) {
 		tc := &TeamConfig{
 			Name:         t2.Name,
 			MaxWorkers:   t2.MaxWorkers,
-			MinWorkers:   t2.MinWorkers,
 			MemoryBudget: t2.MemoryBudget,
 			IdleTimeoutS: t2.IdleTimeoutS,
 			Users:        make(map[string]string),

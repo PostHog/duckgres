@@ -45,7 +45,6 @@ type TeamStatus struct {
 	Workers        int    `json:"workers"`
 	ActiveSessions int    `json:"active_sessions"`
 	MaxWorkers     int    `json:"max_workers"`
-	MinWorkers     int    `json:"min_workers"`
 	MemoryBudget   string `json:"memory_budget"`
 }
 
@@ -166,7 +165,6 @@ func (s *gormAPIStore) GetTeam(name string) (*configstore.Team, error) {
 func (s *gormAPIStore) UpdateTeam(name string, updates configstore.Team) (*configstore.Team, bool, error) {
 	result := s.db().Model(&configstore.Team{}).Where("name = ?", name).Updates(map[string]interface{}{
 		"max_workers":    updates.MaxWorkers,
-		"min_workers":    updates.MinWorkers,
 		"memory_budget":  updates.MemoryBudget,
 		"idle_timeout_s": updates.IdleTimeoutS,
 	})

@@ -63,7 +63,6 @@ func (s *fakeAPIStore) UpdateTeam(name string, updates configstore.Team) (*confi
 		return nil, false, nil
 	}
 	team.MaxWorkers = updates.MaxWorkers
-	team.MinWorkers = updates.MinWorkers
 	team.MemoryBudget = updates.MemoryBudget
 	team.IdleTimeoutS = updates.IdleTimeoutS
 	return copyTeam(team), true, nil
@@ -555,6 +554,26 @@ func TestUpdateTeamRejectsNestedWarehousePayload(t *testing.T) {
 	}
 	if store.teams["analytics"].MaxWorkers != 2 {
 		t.Fatalf("expected team update to be rejected, max_workers = %d", store.teams["analytics"].MaxWorkers)
+	}
+}
+
+func TestGetTeamOmitsMinWorkers(t *testing.T) {
+	store := newFakeAPIStore()
+	store.teams["analytics"] = &configstore.Team{
+		Name:       "analytics",
+		MaxWorkers: 2,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/teams/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"min_workers"`)) {
+		t.Fatalf("expected team response to omit min_workers, got %s", rec.Body.String())
 	}
 }
 

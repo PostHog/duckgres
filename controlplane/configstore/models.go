@@ -6,7 +6,6 @@ import "time"
 type Team struct {
 	Name         string            `gorm:"primaryKey;size:255" json:"name"`
 	MaxWorkers   int               `gorm:"default:0" json:"max_workers"`
-	MinWorkers   int               `gorm:"default:0" json:"min_workers"`
 	MemoryBudget string            `gorm:"size:32" json:"memory_budget"`
 	IdleTimeoutS int               `gorm:"default:0" json:"idle_timeout_s"`
 	Users        []TeamUser        `gorm:"foreignKey:TeamName;references:Name" json:"users,omitempty"`
@@ -186,7 +185,6 @@ func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
 type TeamConfig struct {
 	Name         string
 	MaxWorkers   int
-	MinWorkers   int
 	MemoryBudget string
 	IdleTimeoutS int
 	Users        map[string]string // username -> password
