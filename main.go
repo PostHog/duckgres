@@ -35,14 +35,13 @@ type FileConfig struct {
 	RateLimit                 RateLimitFileConfig `yaml:"rate_limit"`
 	Extensions                []string            `yaml:"extensions"`
 	DuckLake                  DuckLakeFileConfig  `yaml:"ducklake"`
-	ProcessIsolation          bool                `yaml:"process_isolation"`      // Enable process isolation per connection
-	IdleTimeout               string              `yaml:"idle_timeout"`           // e.g., "24h", "1h", "-1" to disable
-	MemoryLimit               string              `yaml:"memory_limit"`           // DuckDB memory_limit per session (e.g., "4GB")
-	Threads                   int                 `yaml:"threads"`                // DuckDB threads per session
-	MemoryBudget              string              `yaml:"memory_budget"`          // Total memory for all sessions (e.g., "24GB")
-	MemoryRebalance           *bool               `yaml:"memory_rebalance"`       // Enable dynamic per-connection memory reallocation
-	MaxWorkers                int                 `yaml:"max_workers"`            // Max worker processes (control-plane mode)
-	MinWorkers                int                 `yaml:"min_workers"`            // Pre-warm worker count (control-plane mode)
+	ProcessIsolation          bool                `yaml:"process_isolation"` // Enable process isolation per connection
+	IdleTimeout               string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
+	MemoryLimit               string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
+	Threads                   int                 `yaml:"threads"`           // DuckDB threads per session
+	MemoryBudget              string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
+	MemoryRebalance           *bool               `yaml:"memory_rebalance"`  // Enable dynamic per-connection memory reallocation
+	Process                   ProcessFileConfig   `yaml:"process"`
 	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`   // e.g., "5m"
 	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`    // e.g., "5m"
 	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"` // e.g., "24h"
@@ -55,6 +54,11 @@ type FileConfig struct {
 	K8s           K8sFileConfig `yaml:"k8s"`
 }
 
+type ProcessFileConfig struct {
+	MinWorkers int `yaml:"min_workers"`
+	MaxWorkers int `yaml:"max_workers"`
+}
+
 // K8sFileConfig holds Kubernetes worker configuration from YAML.
 type K8sFileConfig struct {
 	WorkerImage           string `yaml:"worker_image"`
@@ -65,6 +69,7 @@ type K8sFileConfig struct {
 	WorkerConfigMap       string `yaml:"worker_configmap"`
 	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
 	WorkerServiceAccount  string `yaml:"worker_service_account"`
+	MaxWorkers            int    `yaml:"max_workers"`
 	SharedWarmTarget      int    `yaml:"shared_warm_target"`
 }
 
@@ -214,8 +219,8 @@ func main() {
 
 	// Control plane flags
 	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
-	minWorkers := flag.Int("min-workers", 0, "Pre-warm worker count at startup (control-plane mode) (env: DUCKGRES_MIN_WORKERS)")
-	maxWorkers := flag.Int("max-workers", 0, "Max worker processes, 0=unlimited (control-plane mode) (env: DUCKGRES_MAX_WORKERS)")
+	processMinWorkers := flag.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
+	processMaxWorkers := flag.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
 	workerQueueTimeout := flag.String("worker-queue-timeout", "", "How long to wait for an available worker slot (e.g., '5m') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
 	workerIdleTimeout := flag.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
 	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for connections to drain during handover (default: '24h') (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
@@ -229,6 +234,7 @@ func main() {
 	k8sWorkerConfigMap := flag.String("k8s-worker-configmap", "", "ConfigMap name for worker duckgres.yaml (env: DUCKGRES_K8S_WORKER_CONFIGMAP)")
 	k8sWorkerImagePullPolicy := flag.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
 	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "ServiceAccount name for K8s worker pods (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
+	k8sMaxWorkers := flag.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=auto-derived (env: DUCKGRES_K8S_MAX_WORKERS)")
 	k8sSharedWarmTarget := flag.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
 
 	// Config store flags (multi-tenant mode)
@@ -275,8 +281,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_THREADS            DuckDB threads per session\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_BUDGET      Total memory for all DuckDB sessions (e.g., 24GB)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_REBALANCE   Enable dynamic per-connection memory reallocation (1 or true)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_MIN_WORKERS        Pre-warm worker count (control-plane mode)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_MAX_WORKERS        Max worker processes (control-plane mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_MIN_WORKERS  Pre-warm worker count for process workers (control-plane mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_MAX_WORKERS  Max process workers (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_WORKER_QUEUE_TIMEOUT  Worker queue timeout (default: 5m)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_HANDOVER_DRAIN_TIMEOUT  Handover drain timeout (default: 24h)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DOMAIN        Domain for ACME/Let's Encrypt certificate\n")
@@ -291,6 +297,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ADMIN_TOKEN        Bearer token for admin API authentication\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
@@ -379,8 +386,8 @@ func main() {
 		Threads:                   *threads,
 		MemoryBudget:              *memoryBudget,
 		MemoryRebalance:           *memoryRebalance,
-		MinWorkers:                *minWorkers,
-		MaxWorkers:                *maxWorkers,
+		ProcessMinWorkers:         *processMinWorkers,
+		ProcessMaxWorkers:         *processMaxWorkers,
 		WorkerQueueTimeout:        *workerQueueTimeout,
 		WorkerIdleTimeout:         *workerIdleTimeout,
 		HandoverDrainTimeout:      *handoverDrainTimeout,
@@ -402,6 +409,7 @@ func main() {
 		K8sWorkerConfigMap:        *k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy:  *k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
+		K8sMaxWorkers:             *k8sMaxWorkers,
 		K8sSharedWarmTarget:       *k8sSharedWarmTarget,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
@@ -521,7 +529,11 @@ func main() {
 	// Handle control-plane mode
 	if *mode == "control-plane" {
 		cpCfg := controlplane.ControlPlaneConfig{
-			Config:               cfg,
+			Config: cfg,
+			Process: controlplane.ProcessConfig{
+				MinWorkers: resolved.ProcessMinWorkers,
+				MaxWorkers: resolved.ProcessMaxWorkers,
+			},
 			SocketDir:            *socketDir,
 			ConfigPath:           *configFile,
 			WorkerQueueTimeout:   resolved.WorkerQueueTimeout,
@@ -541,6 +553,7 @@ func main() {
 				WorkerConfigMap:  resolved.K8sWorkerConfigMap,
 				ImagePullPolicy:  resolved.K8sWorkerImagePullPolicy,
 				ServiceAccount:   resolved.K8sWorkerServiceAccount,
+				MaxWorkers:       resolved.K8sMaxWorkers,
 				SharedWarmTarget: resolved.K8sSharedWarmTarget,
 			},
 		}

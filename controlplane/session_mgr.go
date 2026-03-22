@@ -67,7 +67,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	memoryLimit, threads = sm.resolveSessionLimits(memoryLimit, threads)
 
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
-	// When max-workers is set, this blocks until a slot is available.
+	// When a backend-specific max worker cap is set, this blocks until a slot is available.
 	observeControlPlaneWorkerQueueDepthDelta(1)
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 

@@ -39,7 +39,7 @@ run: build
 # Run in control-plane mode
 [group('dev')]
 run-control-plane: build
-    ./duckgres --mode control-plane --min-workers {{num_cores}} --socket-dir ./sockets
+    ./duckgres --mode control-plane --process-min-workers {{num_cores}} --socket-dir ./sockets
 
 # Build a Kubernetes-enabled image for local cluster work
 [group('dev')]
