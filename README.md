@@ -598,14 +598,11 @@ kill -USR2 <control-plane-pid>
 
 ### Remote Worker Backend
 
-In Kubernetes environments, the control plane can spawn worker pods instead of local processes using `--worker-backend remote`. The control plane creates worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
+In Kubernetes environments, `--worker-backend remote` is now the multitenant path only. It requires `--config-store`, and the control plane then spawns worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
 
 ```bash
-# Build with Kubernetes support
-docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:latest .
-
-# Deploy
-kubectl apply -f k8s/
+# Local multitenant K8s workflow
+just run-multitenant-local
 ```
 
 See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and the default local OrbStack config-store workflow via `just run-multitenant-local`.

@@ -97,6 +97,57 @@ func TestValidateControlPlaneSecurity(t *testing.T) {
 	}
 }
 
+func TestValidateWorkerBackendConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     ControlPlaneConfig
+		wantErr string
+	}{
+		{
+			name: "process backend without config store is allowed",
+			cfg: ControlPlaneConfig{
+				WorkerBackend: "process",
+			},
+		},
+		{
+			name: "remote backend requires config store",
+			cfg: ControlPlaneConfig{
+				WorkerBackend: "remote",
+			},
+			wantErr: "worker_backend=remote requires config_store",
+		},
+		{
+			name: "remote backend with config store is allowed",
+			cfg: ControlPlaneConfig{
+				WorkerBackend:   "remote",
+				ConfigStoreConn: "postgres://config-store",
+			},
+		},
+		{
+			name: "config store requires remote backend",
+			cfg: ControlPlaneConfig{
+				WorkerBackend:   "process",
+				ConfigStoreConn: "postgres://config-store",
+			},
+			wantErr: "config_store requires worker_backend=remote",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateWorkerBackendConfig(tt.cfg)
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("expected no error, got %v", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Fatalf("expected error containing %q, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
 func TestCheckSocketDirWritable(t *testing.T) {
 	// Happy path: writable directory
 	tmpDir := t.TempDir()

@@ -1,6 +1,6 @@
 # Kubernetes Deployment
 
-This directory contains **development/reference manifests** for running duckgres in Kubernetes with the control plane spawning DuckDB worker pods on demand. These are intended for local development and testing — production deployments should adapt these to your cluster's requirements (resource limits, persistent storage, ingress, monitoring, etc.).
+This directory contains **development/reference manifests** for running duckgres in Kubernetes with the multitenant control plane spawning DuckDB worker pods on demand. The `remote` worker backend now requires a config store. These manifests are intended for local development and testing; production deployments should adapt them to your cluster's requirements (resource limits, persistent storage, ingress, monitoring, etc.).
 
 ## Architecture
 
@@ -12,6 +12,7 @@ This directory contains **development/reference manifests** for running duckgres
 │  │ Control Plane Pod              │                  │
 │  │  duckgres --mode control-plane │                  │
 │  │  --worker-backend remote       │                  │
+│  │  --config-store ...            │                  │
 │  │                                │                  │
 │  │  Creates worker pods via K8s   │                  │
 │  │  API, routes queries via gRPC  │                  │
@@ -33,7 +34,7 @@ This directory contains **development/reference manifests** for running duckgres
 └─────────────────────────────────────────────────────┘
 ```
 
-The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL transpilation. Workers are thin DuckDB execution engines exposed via Arrow Flight SQL. Workers are spawned on demand (one per connection) and reaped when idle.
+The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL transpilation. Workers are thin DuckDB execution engines exposed via Arrow Flight SQL. Workers are spawned on demand and reaped when idle.
 
 ## Manifests
 
@@ -44,15 +45,17 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | `configmap.yaml` | Shared duckgres config (users, extensions, data dir) |
 | `secret.yaml` | Bearer token secret (auto-populated by CP if empty) |
 | `networkpolicy.yaml` | Restricts worker ingress to CP pods only |
-| `control-plane-deployment.yaml` | CP Deployment + ClusterIP Service |
+| `control-plane-deployment.yaml` | Local multitenant CP Deployment + ClusterIP Service |
+| `control-plane-multitenant-local.yaml` | Alternate local multitenant CP manifest used by helper recipes |
 
 ## Configuration
 
-Key flags for Kubernetes mode:
+Key flags for Kubernetes multitenant mode:
 
 | Flag | Env Var | Description |
 |------|---------|-------------|
-| `--worker-backend remote` | - | Use remote workers (K8s pods) instead of local processes |
+| `--worker-backend remote` | - | Use K8s remote workers in config-store-backed multitenant mode |
+| `--config-store` | `DUCKGRES_CONFIG_STORE` | PostgreSQL config-store connection string required for remote mode |
 | `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
 | `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |
 | `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |
@@ -63,11 +66,14 @@ The bearer token secret is used to authenticate gRPC connections between the con
 
 ## Deploy (Dev)
 
-These manifests use permissive defaults suitable for local development (no resource limits, emptyDir volumes, self-signed TLS). For production, you should customize resource requests/limits, storage, TLS certificates, and network policies for your environment.
+These manifests use permissive defaults suitable for local development (no resource limits, emptyDir volumes, self-signed TLS, config store on `host.docker.internal:5434`). For production, you should customize resource requests/limits, storage, TLS certificates, network policies, and config-store connectivity for your environment.
 
 ```bash
 # Build with Kubernetes support
 docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:latest .
+
+# Start the local config store required by remote mode
+docker compose -f k8s/local-config-store.compose.yaml up -d
 
 # Apply all manifests
 kubectl apply -f k8s/namespace.yaml
@@ -79,6 +85,9 @@ kubectl apply -f k8s/control-plane-deployment.yaml
 
 # Wait for readiness
 kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
+
+# Seed one local team/user so logins work
+docker exec -i duckgres-config-store psql -U duckgres -d duckgres_config < k8s/local-config-store.seed.sql
 ```
 
 ## Local Development with OrbStack
@@ -140,4 +149,5 @@ Test environment variables:
 
 ```bash
 kubectl delete namespace duckgres
+docker compose -f k8s/local-config-store.compose.yaml down -v
 ```
