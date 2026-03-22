@@ -36,11 +36,17 @@ func TestMain(m *testing.M) {
 		if err := buildImage(); err != nil {
 			log.Fatalf("Failed to build image: %v", err)
 		}
+		if err := startConfigStore(); err != nil {
+			log.Fatalf("Failed to start config store: %v", err)
+		}
 		if err := applyManifests(); err != nil {
 			log.Fatalf("Failed to apply manifests: %v", err)
 		}
 		if err := waitForDeployment(namespace, "duckgres-control-plane", 180*time.Second); err != nil {
 			log.Fatalf("Deployment not ready: %v", err)
+		}
+		if err := seedConfigStore(); err != nil {
+			log.Fatalf("Failed to seed config store: %v", err)
 		}
 	}
 
@@ -77,6 +83,7 @@ func TestMain(m *testing.M) {
 	// Cleanup K8s resources (unless skip_setup, meaning external management)
 	if !skipSetup {
 		_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found")
+		_ = stopConfigStore()
 	}
 
 	os.Exit(code)
@@ -437,6 +444,50 @@ func applyManifests() error {
 	tmp.Close()
 
 	return runCmd("kubectl", "apply", "-f", tmp.Name())
+}
+
+func startConfigStore() error {
+	projectRoot := findProjectRoot()
+	composePath := filepath.Join(projectRoot, "k8s", "local-config-store.compose.yaml")
+	if err := runCmd("docker", "compose", "-f", composePath, "up", "-d"); err != nil {
+		return err
+	}
+	return waitForPort(5434, 60*time.Second)
+}
+
+func stopConfigStore() error {
+	projectRoot := findProjectRoot()
+	composePath := filepath.Join(projectRoot, "k8s", "local-config-store.compose.yaml")
+	return runCmd("docker", "compose", "-f", composePath, "down", "-v")
+}
+
+func seedConfigStore() error {
+	teamSQL := `
+INSERT INTO duckgres_teams (name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
+VALUES ('local', 0, '', 0, NOW(), NOW())
+ON CONFLICT (name) DO UPDATE
+SET updated_at = NOW();
+`
+	if err := runCmd("docker", "exec", "-i", "duckgres-config-store",
+		"psql", "-U", "duckgres", "-d", "duckgres_config", "-v", "ON_ERROR_STOP=1", "-c", teamSQL); err != nil {
+		return fmt.Errorf("seed team: %w", err)
+	}
+
+	userSQL := `
+INSERT INTO duckgres_team_users (username, password, team_name, created_at, updated_at)
+VALUES ('postgres', '$2a$10$TQyt73Vw91Q1d7YcE86EVuhms/0u4qBydMDyVvZYlqDwc3/VtQAbm', 'local', NOW(), NOW())
+ON CONFLICT (username) DO UPDATE
+SET password = EXCLUDED.password,
+    team_name = EXCLUDED.team_name,
+    updated_at = NOW();
+`
+	if err := runCmd("docker", "exec", "-i", "duckgres-config-store",
+		"psql", "-U", "duckgres", "-d", "duckgres_config", "-v", "ON_ERROR_STOP=1", "-c", userSQL); err != nil {
+		return fmt.Errorf("seed user: %w", err)
+	}
+
+	time.Sleep(3 * time.Second)
+	return nil
 }
 
 func waitForDeployment(ns, name string, timeout time.Duration) error {
