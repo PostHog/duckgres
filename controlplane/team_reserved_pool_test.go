@@ -6,6 +6,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 func TestTeamReservedWorkerPoolAcquireReservesTeamWorker(t *testing.T) {
@@ -89,5 +91,94 @@ func TestTeamReservedWorkerPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if _, ok := shared.Worker(worker.ID); ok {
 		t.Fatal("expected worker to be retired after last session release")
+	}
+}
+
+func TestTeamReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithTeamConfig(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 5)
+	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		shared.mu.Lock()
+		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		shared.mu.Unlock()
+		return nil
+	}
+
+	activated := false
+	pool := NewTeamReservedWorkerPool(shared, "analytics", 2)
+	pool.sharedWarmWorkers = true
+	pool.resolveTeamConfig = func() (*configstore.TeamConfig, error) {
+		return &configstore.TeamConfig{
+			Name: "analytics",
+			Users: map[string]string{
+				"alice": "ignored",
+			},
+		}, nil
+	}
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, team *configstore.TeamConfig) error {
+		if team == nil || team.Name != "analytics" {
+			t.Fatalf("expected analytics team config, got %#v", team)
+		}
+		activated = true
+		return nil
+	}
+
+	worker, err := pool.AcquireWorker(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireWorker: %v", err)
+	}
+	if !activated {
+		t.Fatal("expected reserved worker activation")
+	}
+	if got := worker.SharedState().Lifecycle; got != WorkerLifecycleHot {
+		t.Fatalf("expected hot lifecycle after activation, got %q", got)
+	}
+}
+
+func TestTeamReservedWorkerPoolAcquireActivatesUsingLatestResolvedTeamConfig(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 5)
+	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		shared.mu.Lock()
+		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		shared.mu.Unlock()
+		return nil
+	}
+
+	currentTeam := &configstore.TeamConfig{
+		Name: "analytics",
+		Users: map[string]string{
+			"alice": "ignored",
+		},
+	}
+
+	pool := NewTeamReservedWorkerPool(shared, "analytics", 2)
+	pool.sharedWarmWorkers = true
+	pool.resolveTeamConfig = func() (*configstore.TeamConfig, error) {
+		return currentTeam, nil
+	}
+	var capturedTeam *configstore.TeamConfig
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, team *configstore.TeamConfig) error {
+		capturedTeam = team
+		return nil
+	}
+
+	currentTeam = &configstore.TeamConfig{
+		Name: "analytics",
+		Users: map[string]string{
+			"bob": "ignored",
+		},
+	}
+
+	worker, err := pool.AcquireWorker(context.Background())
+	if err != nil {
+		t.Fatalf("AcquireWorker: %v", err)
+	}
+	if got := worker.SharedState().Lifecycle; got != WorkerLifecycleHot {
+		t.Fatalf("expected hot lifecycle after activation, got %q", got)
+	}
+	if capturedTeam == nil {
+		t.Fatal("expected activation to receive resolved team config")
+	}
+	if len(capturedTeam.Users) != 1 || capturedTeam.Users["bob"] != "ignored" {
+		t.Fatalf("expected latest resolved team config to be used, got %#v", capturedTeam.Users)
 	}
 }

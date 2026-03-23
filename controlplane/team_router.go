@@ -94,6 +94,18 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 	}
 
 	pool := NewTeamReservedWorkerPool(tr.sharedPool, tc.Name, maxWorkers)
+	pool.resolveTeamConfig = func() (*configstore.TeamConfig, error) {
+		snap := tr.configStore.Snapshot()
+		if snap == nil {
+			return nil, fmt.Errorf("config snapshot unavailable for team %s", tc.Name)
+		}
+		team, ok := snap.Teams[tc.Name]
+		if !ok {
+			return nil, fmt.Errorf("team %s not found in config snapshot", tc.Name)
+		}
+		return team, nil
+	}
+	pool.EnableSharedWarmActivation(tr.globalCfg.K8s.SharedWarmWorkers)
 
 	rebalancer := NewMemoryRebalancer(uint64(memoryBudget), 0, nil, tr.globalCfg.MemoryRebalance)
 	sessions := NewSessionManager(pool, rebalancer)
@@ -184,27 +196,31 @@ func (tr *TeamRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		}
 	}
 
-	// Detect changed team limits (update in-place)
+	// Refresh existing team stacks and update worker limits when needed.
 	for name, newTC := range new.Teams {
 		oldTC, existed := old.Teams[name]
 		if !existed {
 			continue
 		}
-		if oldTC.MaxWorkers != newTC.MaxWorkers || oldTC.MemoryBudget != newTC.MemoryBudget {
-			slog.Info("Team config changed.", "team", name,
-				"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)
-			tr.mu.Lock()
-			if stack, ok := tr.teams[name]; ok {
-				stack.Config = newTC
-				// Propagate MaxWorkers to the pool so it enforces the new limit
+		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers || oldTC.MemoryBudget != newTC.MemoryBudget
+
+		tr.mu.Lock()
+		if stack, ok := tr.teams[name]; ok {
+			stack.Config = newTC
+			if limitsChanged {
+				slog.Info("Team config changed.", "team", name,
+					"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)
 				maxWorkers := newTC.MaxWorkers
 				if maxWorkers == 0 {
 					maxWorkers = tr.baseCfg.MaxWorkers
 				}
 				stack.Pool.SetMaxWorkers(maxWorkers)
 			}
-			tr.mu.Unlock()
+			if reserved, ok := stack.Pool.(*TeamReservedWorkerPool); ok {
+				reserved.EnableSharedWarmActivation(tr.globalCfg.K8s.SharedWarmWorkers)
+			}
 		}
+		tr.mu.Unlock()
 	}
 
 	tr.reconcileWarmCapacity(new)

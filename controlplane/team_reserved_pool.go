@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 const defaultSharedWorkerReservationLease = 24 * time.Hour
@@ -14,19 +16,24 @@ const defaultSharedWorkerReservationLease = 24 * time.Hour
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
 // workers are reserved to a single team for their lifetime and retired after use.
 type TeamReservedWorkerPool struct {
-	shared        *K8sWorkerPool
-	teamName      string
-	maxWorkers    int
-	leaseDuration time.Duration
+	shared                 *K8sWorkerPool
+	teamName               string
+	maxWorkers             int
+	leaseDuration          time.Duration
+	sharedWarmWorkers      bool
+	resolveTeamConfig      func() (*configstore.TeamConfig, error)
+	activateReservedWorker func(context.Context, *ManagedWorker, *configstore.TeamConfig) error
 }
 
 func NewTeamReservedWorkerPool(shared *K8sWorkerPool, teamName string, maxWorkers int) *TeamReservedWorkerPool {
-	return &TeamReservedWorkerPool{
+	pool := &TeamReservedWorkerPool{
 		shared:        shared,
 		teamName:      teamName,
 		maxWorkers:    maxWorkers,
 		leaseDuration: defaultSharedWorkerReservationLease,
 	}
+	pool.activateReservedWorker = pool.activateReservedWorkerDefault
+	return pool
 }
 
 func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
@@ -61,6 +68,13 @@ func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWor
 			})
 			if err != nil {
 				return nil, err
+			}
+
+			if p.sharedWarmWorkers {
+				if err := p.activateWorkerForTeam(ctx, worker); err != nil {
+					p.shared.RetireWorker(worker.ID)
+					return nil, err
+				}
 			}
 
 			p.shared.mu.Lock()
@@ -129,6 +143,12 @@ func (p *TeamReservedWorkerPool) SetMaxWorkers(n int) {
 	p.maxWorkers = n
 }
 
+func (p *TeamReservedWorkerPool) EnableSharedWarmActivation(enabled bool) {
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	p.sharedWarmWorkers = enabled
+}
+
 func (p *TeamReservedWorkerPool) ShutdownAll() {
 	p.shared.mu.RLock()
 	workers := make([]int, 0, len(p.shared.workers))
@@ -151,7 +171,7 @@ func (p *TeamReservedWorkerPool) findIdleAssignedWorkerLocked() *ManagedWorker {
 			continue
 		default:
 		}
-		if w.activeSessions == 0 && p.workerBelongsToTeamLocked(w) {
+		if w.activeSessions == 0 && p.workerReadyForSchedulingLocked(w) {
 			return w
 		}
 	}
@@ -166,7 +186,7 @@ func (p *TeamReservedWorkerPool) leastLoadedAssignedWorkerLocked() *ManagedWorke
 			continue
 		default:
 		}
-		if !p.workerBelongsToTeamLocked(w) {
+		if !p.workerReadyForSchedulingLocked(w) {
 			continue
 		}
 		if best == nil || w.activeSessions < best.activeSessions {
@@ -194,4 +214,86 @@ func (p *TeamReservedWorkerPool) assignedWorkerCountLocked() int {
 func (p *TeamReservedWorkerPool) workerBelongsToTeamLocked(w *ManagedWorker) bool {
 	state := w.SharedState()
 	return state.Assignment != nil && state.Assignment.TeamName == p.teamName && state.NormalizedLifecycle() != WorkerLifecycleRetired
+}
+
+func (p *TeamReservedWorkerPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool {
+	if !p.workerBelongsToTeamLocked(w) {
+		return false
+	}
+	if !p.sharedWarmWorkers {
+		return true
+	}
+	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot
+}
+
+func (p *TeamReservedWorkerPool) activateWorkerForTeam(ctx context.Context, worker *ManagedWorker) error {
+	p.shared.mu.Lock()
+	state := worker.SharedState().NormalizedLifecycle()
+	if state == WorkerLifecycleReserved {
+		nextState, err := worker.SharedState().Transition(WorkerLifecycleActivating, nil)
+		if err != nil {
+			p.shared.mu.Unlock()
+			return err
+		}
+		if err := worker.SetSharedState(nextState); err != nil {
+			p.shared.mu.Unlock()
+			return err
+		}
+	}
+	p.shared.mu.Unlock()
+
+	team, err := p.lookupTeamConfig()
+	if err != nil {
+		return err
+	}
+
+	if err := p.activateReservedWorker(ctx, worker, team); err != nil {
+		return err
+	}
+
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	switch worker.SharedState().NormalizedLifecycle() {
+	case WorkerLifecycleActivating:
+		nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
+		if err != nil {
+			return err
+		}
+		return worker.SetSharedState(nextState)
+	case WorkerLifecycleHot:
+		return nil
+	default:
+		return fmt.Errorf("worker %d finished activation in unexpected lifecycle %q", worker.ID, worker.SharedState().NormalizedLifecycle())
+	}
+}
+
+func (p *TeamReservedWorkerPool) activateReservedWorkerDefault(ctx context.Context, worker *ManagedWorker, team *configstore.TeamConfig) error {
+	if !p.sharedWarmWorkers {
+		return nil
+	}
+	if team == nil {
+		return fmt.Errorf("team config is required for activation")
+	}
+	payload, err := BuildTenantActivationPayload(ctx, p.shared.clientset, p.shared.namespace, team)
+	if err != nil {
+		return err
+	}
+	if state := worker.SharedState(); state.Assignment != nil {
+		payload.LeaseExpiresAt = state.Assignment.LeaseExpiresAt
+	}
+	return p.shared.ActivateReservedWorker(ctx, worker, payload)
+}
+
+func (p *TeamReservedWorkerPool) lookupTeamConfig() (*configstore.TeamConfig, error) {
+	if p.resolveTeamConfig == nil {
+		return nil, fmt.Errorf("team config resolver is not configured for team %s", p.teamName)
+	}
+	team, err := p.resolveTeamConfig()
+	if err != nil {
+		return nil, err
+	}
+	if team == nil {
+		return nil, fmt.Errorf("team config resolver returned nil for team %s", p.teamName)
+	}
+	return team, nil
 }
