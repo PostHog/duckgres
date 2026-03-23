@@ -66,6 +66,93 @@ func TestSessionPoolActivateTenantConfiguresTenantRuntime(t *testing.T) {
 	}
 }
 
+func TestSessionPoolRejectsSessionWhenLeaseExpired(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		cfg:            server.Config{Users: map[string]string{"postgres": "postgres"}},
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
+		return sql.Open("duckdb", "")
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		return nil
+	}
+
+	leaseExpiry := time.Now().Add(time.Hour)
+	if err := pool.activateTenant(ActivationPayload{
+		OrgID:          "analytics",
+		LeaseExpiresAt: leaseExpiry,
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+		},
+	}); err != nil {
+		t.Fatalf("ActivateTenant: %v", err)
+	}
+
+	// Before expiry: session config should succeed.
+	oldTimeNow := timeNow
+	defer func() { timeNow = oldTimeNow }()
+
+	timeNow = func() time.Time { return leaseExpiry.Add(-time.Minute) }
+	if _, err := pool.currentSessionConfig(); err != nil {
+		t.Fatalf("expected session config to succeed before expiry, got: %v", err)
+	}
+	if db := pool.activeSharedDB(); db == nil {
+		t.Fatal("expected activeSharedDB to return non-nil before expiry")
+	}
+
+	// After expiry: session config should fail.
+	timeNow = func() time.Time { return leaseExpiry.Add(time.Minute) }
+	if _, err := pool.currentSessionConfig(); err != ErrLeaseExpired {
+		t.Fatalf("expected ErrLeaseExpired after expiry, got: %v", err)
+	}
+	if db := pool.activeSharedDB(); db != nil {
+		t.Fatal("expected activeSharedDB to return nil after expiry")
+	}
+}
+
+func TestSessionPoolAllowsSessionWhenLeaseNotSet(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		cfg:            server.Config{Users: map[string]string{"postgres": "postgres"}},
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
+		return sql.Open("duckdb", "")
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		return nil
+	}
+
+	// Activate without setting LeaseExpiresAt (zero value).
+	if err := pool.activateTenant(ActivationPayload{
+		OrgID: "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+		},
+	}); err != nil {
+		t.Fatalf("ActivateTenant: %v", err)
+	}
+
+	// Zero LeaseExpiresAt means no expiry — session config should always succeed.
+	if _, err := pool.currentSessionConfig(); err != nil {
+		t.Fatalf("expected session config to succeed with zero lease, got: %v", err)
+	}
+}
+
 func TestSessionPoolActivateTenantRejectsSecondActivation(t *testing.T) {
 	pool := &SessionPool{
 		sessions:       make(map[string]*Session),

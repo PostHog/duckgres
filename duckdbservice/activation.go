@@ -11,6 +11,13 @@ import (
 	"github.com/posthog/duckgres/server"
 )
 
+// ErrLeaseExpired is returned when a session is requested on a worker whose
+// activation lease has passed.
+var ErrLeaseExpired = fmt.Errorf("activation lease has expired")
+
+// timeNow is the clock used for lease checks; tests can override it.
+var timeNow = time.Now
+
 // ActivationPayload carries the tenant-specific runtime that is delivered to a
 // neutral shared warm worker over the control-plane RPC channel.
 type ActivationPayload struct {
@@ -93,6 +100,19 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	return nil
 }
 
+// isLeaseExpired reports whether the activation lease has passed. A zero
+// LeaseExpiresAt is treated as "no expiry" so that callers who omit the
+// field (e.g. non-shared-warm paths) are unaffected.
+func (a *activatedTenantRuntime) isLeaseExpired() bool {
+	if a == nil {
+		return false
+	}
+	if a.payload.LeaseExpiresAt.IsZero() {
+		return false
+	}
+	return timeNow().After(a.payload.LeaseExpiresAt)
+}
+
 func (p *SessionPool) currentSessionConfig() (server.Config, error) {
 	if !p.sharedWarmMode {
 		return p.cfg, nil
@@ -102,6 +122,9 @@ func (p *SessionPool) currentSessionConfig() (server.Config, error) {
 	defer p.mu.RUnlock()
 	if p.activation == nil {
 		return server.Config{}, fmt.Errorf("worker is not activated")
+	}
+	if p.activation.isLeaseExpired() {
+		return server.Config{}, ErrLeaseExpired
 	}
 
 	cfg := p.cfg
@@ -123,7 +146,7 @@ func (p *SessionPool) activeSharedDB() *sql.DB {
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if p.activation == nil {
+	if p.activation == nil || p.activation.isLeaseExpired() {
 		return nil
 	}
 	return p.activation.db
