@@ -75,6 +75,23 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 		return nil, fmt.Errorf("checkpoint: attach ducklake: %w", err)
 	}
 
+	// Create system.checkpoints table to record checkpoint history
+	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("checkpoint: create schema: %w", err)
+	}
+	createTable := `CREATE TABLE IF NOT EXISTS ducklake.system.checkpoints (
+		started_at  TIMESTAMPTZ NOT NULL,
+		finished_at TIMESTAMPTZ NOT NULL,
+		duration_ms BIGINT NOT NULL,
+		status      VARCHAR NOT NULL,
+		error       VARCHAR
+	)`
+	if _, err := db.Exec(createTable); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("checkpoint: create table: %w", err)
+	}
+
 	c := &DuckLakeCheckpointer{
 		db:       db,
 		interval: cfg.DuckLake.CheckpointInterval,
@@ -122,9 +139,24 @@ func (c *DuckLakeCheckpointer) run() {
 	slog.Info("DuckLake checkpoint starting.")
 	start := time.Now()
 	_, err := c.db.Exec("CHECKPOINT ducklake")
+	finished := time.Now()
+	duration := finished.Sub(start)
+
+	status := "success"
+	var errMsg *string
 	if err != nil {
+		status = "failed"
+		s := err.Error()
+		errMsg = &s
 		slog.Warn("DuckLake checkpoint failed.", "error", err)
-		return
+	} else {
+		slog.Info("DuckLake checkpoint complete.", "duration", duration.Round(time.Millisecond))
 	}
-	slog.Info("DuckLake checkpoint complete.", "duration", time.Since(start).Round(time.Millisecond))
+
+	if _, logErr := c.db.Exec(
+		"INSERT INTO ducklake.system.checkpoints (started_at, finished_at, duration_ms, status, error) VALUES ($1, $2, $3, $4, $5)",
+		start, finished, duration.Milliseconds(), status, errMsg,
+	); logErr != nil {
+		slog.Warn("Failed to log checkpoint to system.checkpoints.", "error", logErr)
+	}
 }
