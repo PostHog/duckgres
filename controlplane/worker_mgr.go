@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -36,6 +37,23 @@ type ManagedWorker struct {
 	exitErr        error
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
+	sharedState    SharedWorkerState
+}
+
+// SharedState returns the additive shared warm-worker lifecycle metadata for
+// this worker. The zero value normalizes to an idle, unassigned worker.
+func (w *ManagedWorker) SharedState() SharedWorkerState {
+	return cloneSharedWorkerState(w.sharedState)
+}
+
+// SetSharedState updates the additive shared warm-worker lifecycle metadata
+// without changing existing session scheduling behavior.
+func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
+	if err := state.Validate(); err != nil {
+		return err
+	}
+	w.sharedState = cloneSharedWorkerState(state)
+	return nil
 }
 
 // preboundSocket is a Unix socket pre-bound at startup while the socket
@@ -215,7 +233,6 @@ func (p *FlightWorkerPool) effectiveSocketDir() (string, error) {
 	return fallback, nil
 }
 
-
 // SpawnWorker starts a new duckdb-service worker process.
 // It uses a pre-bound socket from the pool if available, falling back to
 // binding a new socket (which may fail with EROFS under systemd's
@@ -369,7 +386,7 @@ func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flig
 			if err == nil {
 				// Verify with a health check
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				err = doHealthCheck(ctx, client)
+				_, err = doHealthCheck(ctx, client)
 				cancel()
 				if err == nil {
 					return client, nil
@@ -392,32 +409,60 @@ func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flig
 	return nil, fmt.Errorf("timeout waiting for worker socket %s (last error: %v, attempts: %d)", socketPath, lastErr, attempts)
 }
 
+// sessionProgressJSON is the wire format for per-session progress in health check responses.
+type sessionProgressJSON struct {
+	Pct     float64 `json:"pct"`
+	Rows    uint64  `json:"rows"`
+	Total   uint64  `json:"total"`
+	Stalled bool    `json:"stalled,omitempty"`
+}
+
+// healthCheckResult is the parsed health check response from a worker.
+type healthCheckResult struct {
+	Healthy         bool                            `json:"healthy"`
+	SessionProgress map[string]*sessionProgressJSON `json:"session_progress"`
+}
+
+// toSessionProgress converts wire-format progress data to SessionProgress values.
+func (r *healthCheckResult) toSessionProgress() map[string]*SessionProgress {
+	if len(r.SessionProgress) == 0 {
+		return nil
+	}
+	out := make(map[string]*SessionProgress, len(r.SessionProgress))
+	for token, sp := range r.SessionProgress {
+		out[token] = &SessionProgress{
+			Percentage: sp.Pct,
+			Rows:       sp.Rows,
+			TotalRows:  sp.Total,
+			Stalled:    sp.Stalled,
+		}
+	}
+	return out
+}
+
 // doHealthCheck performs a HealthCheck action on the worker.
 // The server sends exactly one Result message with {"healthy": true, ...}.
-func doHealthCheck(ctx context.Context, client *flightsql.Client) error {
+// Returns the parsed result (including per-session progress) and an error if
+// the worker is unreachable.
+func doHealthCheck(ctx context.Context, client *flightsql.Client) (*healthCheckResult, error) {
 	// Use the underlying flight client for custom actions.
 	// flightsql.Client.Client is a flight.Client interface which embeds
 	// FlightServiceClient, giving us access to DoAction directly.
 	stream, err := client.Client.DoAction(ctx, &flight.Action{Type: "HealthCheck"})
 	if err != nil {
-		return fmt.Errorf("health check action: %w", err)
+		return nil, fmt.Errorf("health check action: %w", err)
 	}
 
 	msg, err := stream.Recv()
 	if err != nil {
-		return fmt.Errorf("health check recv: %w", err)
+		return nil, fmt.Errorf("health check recv: %w", err)
 	}
 
-	var body struct {
-		Healthy bool `json:"healthy"`
+	var result healthCheckResult
+	if err := json.Unmarshal(msg.Body, &result); err != nil {
+		return nil, fmt.Errorf("health check unmarshal: %w", err)
 	}
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		return fmt.Errorf("health check unmarshal: %w", err)
-	}
-	if !body.Healthy {
-		return fmt.Errorf("worker reported unhealthy")
-	}
-	return nil
+	return &result, nil
 }
 
 // Worker returns a worker by ID.
@@ -773,6 +818,13 @@ func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 	p.releaseWorkerSocket(w)
 }
 
+// SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
+func (p *FlightWorkerPool) SetMaxWorkers(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.maxWorkers = n
+}
+
 // ShutdownAll stops all workers gracefully.
 func (p *FlightWorkerPool) ShutdownAll() {
 	p.mu.Lock()
@@ -830,6 +882,10 @@ func (p *FlightWorkerPool) ShutdownAll() {
 // WorkerCrashHandler is called when a worker crash is detected, before respawning.
 type WorkerCrashHandler func(workerID int)
 
+// ProgressHandler is called after a successful health check with per-session
+// progress data parsed from the worker's health check response.
+type ProgressHandler func(workerID int, progress map[string]*SessionProgress)
+
 // maxConsecutiveHealthFailures is the number of consecutive health check failures
 // before a worker is force-killed. With a typical 2s health check interval,
 // this means ~6s of unresponsiveness triggers retirement.
@@ -841,7 +897,7 @@ const maxConsecutiveHealthFailures = 3
 // Workers without sessions are simply retired.
 // Workers that fail maxConsecutiveHealthFailures health checks in a row are
 // force-killed and their sessions notified.
-func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash ...WorkerCrashHandler) {
+func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -895,8 +951,8 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						}
 						// Worker crashed — notify sessions, clean up
 						slog.Warn("Worker crashed.", "id", w.ID, "error", w.exitErr)
-						for _, h := range onCrash {
-							h(w.ID)
+						if onCrash != nil {
+							onCrash(w.ID)
 						}
 						if w.client != nil {
 							_ = w.client.Close()
@@ -908,10 +964,11 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 						// concurrent crash/retire) nils out FlightServiceClient,
 						// racing with the DoAction call inside doHealthCheck.
 						var healthErr error
+						var hcResult *healthCheckResult
 						func() {
 							defer recoverWorkerPanic(&healthErr)
 							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-							healthErr = doHealthCheck(hctx, w.client)
+							hcResult, healthErr = doHealthCheck(hctx, w.client)
 							cancel()
 						}()
 						err := healthErr
@@ -940,8 +997,8 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 								observeControlPlaneWorkers(workerCount)
 
 								if stillInPool {
-									for _, h := range onCrash {
-										h(w.ID)
+									if onCrash != nil {
+										onCrash(w.ID)
 									}
 									// Skip SIGINT (unlike retireWorkerProcess) since the worker
 									// has already proven unresponsive. Go straight to SIGKILL.
@@ -960,6 +1017,13 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 							mu.Lock()
 							delete(failures, w.ID)
 							mu.Unlock()
+
+							// Forward progress data to the control plane.
+							if onProgress != nil && hcResult != nil {
+								if sp := hcResult.toSessionProgress(); len(sp) > 0 {
+									onProgress(w.ID, sp)
+								}
+							}
 						}
 					}
 				}(w)
@@ -1013,6 +1077,29 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit
 	}
 
 	return resp.SessionToken, nil
+}
+
+// ActivateTenant delivers tenant runtime to a shared warm worker before it may serve sessions.
+func (w *ManagedWorker) ActivateTenant(ctx context.Context, payload server.WorkerActivationPayload) (err error) {
+	defer recoverWorkerPanic(&err)
+
+	body, _ := json.Marshal(payload)
+	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
+		Type: "ActivateTenant",
+		Body: body,
+	})
+	if err != nil {
+		return fmt.Errorf("activate tenant: %w", err)
+	}
+
+	for {
+		if _, err := stream.Recv(); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("activate tenant recv: %w", err)
+		}
+	}
 }
 
 // DestroySession destroys a session on the worker.

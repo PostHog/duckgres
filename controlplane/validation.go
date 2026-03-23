@@ -38,3 +38,13 @@ func validateControlPlaneSecurity(cfg ControlPlaneConfig) error {
 	}
 	return nil
 }
+
+func validateWorkerBackendConfig(cfg ControlPlaneConfig) error {
+	if cfg.WorkerBackend == "remote" && strings.TrimSpace(cfg.ConfigStoreConn) == "" {
+		return fmt.Errorf("worker_backend=remote requires config_store for multitenant K8s mode")
+	}
+	if cfg.WorkerBackend != "remote" && strings.TrimSpace(cfg.ConfigStoreConn) != "" {
+		return fmt.Errorf("config_store requires worker_backend=remote")
+	}
+	return nil
+}

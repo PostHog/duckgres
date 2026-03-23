@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -200,6 +201,73 @@ func TestK8sPool_RetireWorkerIfNoSessions_LastSession(t *testing.T) {
 	}
 }
 
+func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			OrgID:       "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		if got.ID != worker.ID {
+			t.Fatalf("expected worker %d, got %d", worker.ID, got.ID)
+		}
+		if payload.OrgID != "analytics" {
+			t.Fatalf("expected analytics payload, got %#v", payload)
+		}
+		return nil
+	}
+
+	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
+		OrgID:  "analytics",
+		Usernames: []string{"alice"},
+	})
+	if err != nil {
+		t.Fatalf("ActivateReservedWorker: %v", err)
+	}
+
+	if got := worker.SharedState().Lifecycle; got != WorkerLifecycleHot {
+		t.Fatalf("expected hot lifecycle, got %q", got)
+	}
+}
+
+func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			OrgID:       "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		return context.DeadlineExceeded
+	}
+
+	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
+		OrgID:  "analytics",
+		Usernames: []string{"alice"},
+	})
+	if err == nil {
+		t.Fatal("expected activation failure")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if _, ok := pool.Worker(worker.ID); ok {
+		t.Fatal("expected failed activation to retire worker")
+	}
+}
+
 func TestK8sPool_CleanDeadWorkers(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
@@ -248,6 +316,229 @@ func TestK8sPool_LiveWorkerCount(t *testing.T) {
 	count := pool.liveWorkerCountLocked()
 	if count != 3 { // 2 alive + 1 spawning
 		t.Fatalf("expected 3 live workers, got %d", count)
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersTracksWarmCapacityAndSpawnsMissingWorkers(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.workers[41] = &ManagedWorker{ID: 41, done: make(chan struct{})}
+
+	var spawned []int
+	var spawnedMu sync.Mutex
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		spawnedMu.Lock()
+		spawned = append(spawned, id)
+		spawnedMu.Unlock()
+		pool.mu.Lock()
+		pool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		pool.mu.Unlock()
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkers(3); err != nil {
+		t.Fatalf("SpawnMinWorkers: %v", err)
+	}
+
+	if pool.minWorkers != 3 {
+		t.Fatalf("expected minWorkers to track warm capacity target 3, got %d", pool.minWorkers)
+	}
+	if len(spawned) != 2 {
+		t.Fatalf("expected SpawnMinWorkers to spawn 2 missing workers, got %d", len(spawned))
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersCountsOnlyNeutralIdleWorkersAsWarmCapacity(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	for _, id := range []int{41, 42} {
+		worker := &ManagedWorker{ID: id, done: make(chan struct{})}
+		if err := worker.SetSharedState(SharedWorkerState{
+			Lifecycle: WorkerLifecycleReserved,
+			Assignment: &WorkerAssignment{
+				OrgID:          "analytics",
+				LeaseExpiresAt: time.Now().Add(time.Hour),
+			},
+		}); err != nil {
+			t.Fatalf("SetSharedState(reserved %d): %v", id, err)
+		}
+		pool.workers[id] = worker
+	}
+
+	var spawned []int
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		spawned = append(spawned, id)
+		pool.mu.Lock()
+		pool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		pool.mu.Unlock()
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkers(2); err != nil {
+		t.Fatalf("SpawnMinWorkers: %v", err)
+	}
+
+	if len(spawned) != 2 {
+		t.Fatalf("expected SpawnMinWorkers to spawn 2 neutral warm workers, got %d", len(spawned))
+	}
+}
+
+func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	reserved := &ManagedWorker{ID: 1, done: make(chan struct{})}
+	if err := reserved.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState(reserved): %v", err)
+	}
+
+	idle := &ManagedWorker{ID: 2, done: make(chan struct{})}
+	pool.workers[reserved.ID] = reserved
+	pool.workers[idle.ID] = idle
+
+	got := pool.findIdleWorkerLocked()
+	if got == nil || got.ID != idle.ID {
+		t.Fatalf("expected idle worker %d, got %#v", idle.ID, got)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.minWorkers = 1
+	idle := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	pool.workers[idle.ID] = idle
+
+	replacementSpawned := make(chan int, 1)
+	pool.spawnWarmWorkerBackgroundFunc = func(id int) {
+		replacementSpawned <- id
+		pool.mu.Lock()
+		if pool.spawning > 0 {
+			pool.spawning--
+		}
+		pool.mu.Unlock()
+	}
+
+	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: leaseExpiry,
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker.ID != idle.ID {
+		t.Fatalf("expected worker %d, got %d", idle.ID, worker.ID)
+	}
+
+	state := worker.SharedState()
+	if state.Lifecycle != WorkerLifecycleReserved {
+		t.Fatalf("expected reserved lifecycle, got %q", state.Lifecycle)
+	}
+	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
+		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
+	}
+	if !state.Assignment.LeaseExpiresAt.Equal(leaseExpiry) {
+		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, state.Assignment.LeaseExpiresAt)
+	}
+
+	select {
+	case <-replacementSpawned:
+	case <-time.After(time.Second):
+		t.Fatal("expected reserve to trigger warm-pool replenishment")
+	}
+}
+
+func TestK8sPoolHealthCheckLoopReplenishesWarmCapacityAfterIdleWorkerCrash(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.minWorkers = 1
+
+	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	pool.workers[worker.ID] = worker
+
+	replacementSpawned := make(chan int, 1)
+	pool.spawnWarmWorkerBackgroundFunc = func(id int) {
+		replacementSpawned <- id
+		pool.mu.Lock()
+		if pool.spawning > 0 {
+			pool.spawning--
+		}
+		pool.mu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, nil, nil)
+
+	close(worker.done)
+
+	select {
+	case <-replacementSpawned:
+	case <-time.After(time.Second):
+		t.Fatal("expected idle worker crash to trigger warm-pool replenishment")
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		pool.mu.Lock()
+		pool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		pool.mu.Unlock()
+		return nil
+	}
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:          "billing",
+		LeaseExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker == nil {
+		t.Fatal("expected reserved worker")
+	}
+	if got := worker.SharedState().Lifecycle; got != WorkerLifecycleReserved {
+		t.Fatalf("expected reserved lifecycle after cold start, got %q", got)
+	}
+}
+
+func TestK8sPoolIdleReaperSkipsReservedSharedWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.idleTimeout = time.Millisecond
+
+	reserved := &ManagedWorker{
+		ID:       1,
+		lastUsed: time.Now().Add(-time.Hour),
+		done:     make(chan struct{}),
+	}
+	if err := reserved.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState(reserved): %v", err)
+	}
+	idle := &ManagedWorker{
+		ID:       2,
+		lastUsed: time.Now().Add(-time.Hour),
+		done:     make(chan struct{}),
+	}
+	pool.workers[reserved.ID] = reserved
+	pool.workers[idle.ID] = idle
+
+	pool.reapIdleWorkers()
+
+	if _, ok := pool.workers[reserved.ID]; !ok {
+		t.Fatal("reserved worker should not be reaped")
+	}
+	if _, ok := pool.workers[idle.ID]; ok {
+		t.Fatal("idle worker should be reaped")
 	}
 }
 

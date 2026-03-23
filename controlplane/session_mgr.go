@@ -12,13 +12,25 @@ import (
 	"github.com/posthog/duckgres/server"
 )
 
+// SessionProgress holds cached query progress from a worker health check.
+type SessionProgress struct {
+	Percentage float64
+	Rows       uint64
+	TotalRows  uint64
+	Stalled    bool
+}
+
 // ManagedSession tracks a client session bound to a worker.
 type ManagedSession struct {
 	PID          int32
 	WorkerID     int
+	Protocol     string // "postgres" or "flight"
 	SessionToken string
 	Executor     *server.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
+
+	// Cached query progress from worker health checks.
+	queryProgress atomic.Value // stores *SessionProgress (or nil)
 }
 
 // SessionManager tracks all active sessions and their worker assignments.
@@ -56,7 +68,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	memoryLimit, threads = sm.resolveSessionLimits(memoryLimit, threads)
 
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
-	// When max-workers is set, this blocks until a slot is available.
+	// When a backend-specific max worker cap is set, this blocks until a slot is available.
 	observeControlPlaneWorkerQueueDepthDelta(1)
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 
@@ -87,6 +99,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	session := &ManagedSession{
 		PID:          pid,
 		WorkerID:     worker.ID,
+		Protocol:     "postgres",
 		SessionToken: sessionToken,
 		Executor:     executor,
 	}
@@ -258,6 +271,52 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 		return s.WorkerID
 	}
 	return -1
+}
+
+// GetProgress returns the cached query progress for a session, or nil.
+func (sm *SessionManager) GetProgress(pid int32) *SessionProgress {
+	sm.mu.RLock()
+	s, ok := sm.sessions[pid]
+	sm.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	v := s.queryProgress.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(*SessionProgress)
+}
+
+// UpdateProgress caches query progress data for sessions on the given worker.
+// Called from the health check loop after parsing the worker's health check response.
+// Progress keys are truncated session tokens (first 16 chars) to avoid leaking
+// full bearer tokens in health check JSON.
+func (sm *SessionManager) UpdateProgress(workerID int, progress map[string]*SessionProgress) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, pid := range sm.byWorker[workerID] {
+		s, ok := sm.sessions[pid]
+		if !ok {
+			continue
+		}
+		key := s.SessionToken
+		if len(key) > 16 {
+			key = key[:16]
+		}
+		if sp, ok := progress[key]; ok {
+			s.queryProgress.Store(sp)
+		}
+	}
+}
+
+// SetProtocol updates the protocol label for an active session.
+func (sm *SessionManager) SetProtocol(pid int32, protocol string) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[pid]; ok {
+		s.Protocol = protocol
+	}
 }
 
 // AllSessions returns a snapshot of all active sessions.

@@ -126,3 +126,9 @@ func SetQueryLogger(s *Server, ql *QueryLogger) {
 func (s *Server) QueryLogger() *QueryLogger {
 	return s.queryLogger
 }
+
+// SetProgressFn sets the progress lookup function on a Server.
+// Used by the control plane to provide cached query progress from worker health checks.
+func SetProgressFn(s *Server, fn func(pid int32) (pct float64, rows, totalRows uint64, stalled bool)) {
+	s.progressFn = fn
+}

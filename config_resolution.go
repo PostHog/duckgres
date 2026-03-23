@@ -27,8 +27,8 @@ type configCLIInputs struct {
 	Threads                   int
 	MemoryBudget              string
 	MemoryRebalance           bool
-	MaxWorkers                int
-	MinWorkers                int
+	ProcessMinWorkers         int
+	ProcessMaxWorkers         int
 	WorkerQueueTimeout        string
 	WorkerIdleTimeout         string
 	HandoverDrainTimeout      string
@@ -38,6 +38,9 @@ type configCLIInputs struct {
 	ACMEDNSProvider           string
 	ACMEDNSZoneID             string
 	MaxConnections            int
+	ConfigStoreConn           string
+	ConfigPollInterval        string
+	AdminToken                string
 	WorkerBackend             string
 	K8sWorkerImage            string
 	K8sWorkerNamespace        string
@@ -47,23 +50,34 @@ type configCLIInputs struct {
 	K8sWorkerConfigMap        string
 	K8sWorkerImagePullPolicy  string
 	K8sWorkerServiceAccount   string
+	K8sMaxWorkers             int
+	K8sSharedWarmTarget       int
+	K8sSharedWarmWorkers      bool
 	QueryLog                  bool
 }
 
 type resolvedConfig struct {
-	Server               server.Config
-	WorkerQueueTimeout   time.Duration
-	WorkerIdleTimeout    time.Duration
-	HandoverDrainTimeout time.Duration
-	WorkerBackend        string
-	K8sWorkerImage       string
-	K8sWorkerNamespace   string
-	K8sControlPlaneID    string
-	K8sWorkerPort        int
-	K8sWorkerSecret      string
-	K8sWorkerConfigMap   string
+	Server                   server.Config
+	ProcessMinWorkers        int
+	ProcessMaxWorkers        int
+	WorkerQueueTimeout       time.Duration
+	WorkerIdleTimeout        time.Duration
+	HandoverDrainTimeout     time.Duration
+	WorkerBackend            string
+	K8sWorkerImage           string
+	K8sWorkerNamespace       string
+	K8sControlPlaneID        string
+	K8sWorkerPort            int
+	K8sWorkerSecret          string
+	K8sWorkerConfigMap       string
 	K8sWorkerImagePullPolicy string
 	K8sWorkerServiceAccount  string
+	K8sMaxWorkers            int
+	K8sSharedWarmTarget      int
+	K8sSharedWarmWorkers     bool
+	ConfigStoreConn          string
+	ConfigPollInterval       time.Duration
+	AdminToken               string
 }
 
 func defaultServerConfig() server.Config {
@@ -82,6 +96,9 @@ func defaultServerConfig() server.Config {
 			"postgres": "postgres",
 		},
 		Extensions: []string{"ducklake"},
+		DuckLake: server.DuckLakeConfig{
+			CheckpointInterval: 24 * time.Hour,
+		},
 		QueryLog: server.QueryLogConfig{
 			Enabled:              true,
 			FlushInterval:        5 * time.Second,
@@ -108,10 +125,16 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var workerQueueTimeout time.Duration
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
+	var processMinWorkers, processMaxWorkers int
 	var workerBackend string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
+	var k8sMaxWorkers, k8sSharedWarmTarget int
+	var k8sSharedWarmWorkers bool
+	var configStoreConn string
+	var configPollInterval time.Duration
+	var adminToken string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -226,6 +249,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.DuckLake.S3Profile != "" {
 			cfg.DuckLake.S3Profile = fileCfg.DuckLake.S3Profile
 		}
+		if fileCfg.DuckLake.CheckpointInterval != "" {
+			if d, err := time.ParseDuration(fileCfg.DuckLake.CheckpointInterval); err == nil {
+				cfg.DuckLake.CheckpointInterval = d
+			} else {
+				warn("Invalid ducklake.checkpoint_interval duration: " + err.Error())
+			}
+		}
 
 		cfg.ProcessIsolation = fileCfg.ProcessIsolation
 		if fileCfg.IdleTimeout != "" {
@@ -247,11 +277,11 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.MemoryRebalance != nil {
 			cfg.MemoryRebalance = *fileCfg.MemoryRebalance
 		}
-		if fileCfg.MaxWorkers != 0 {
-			cfg.MaxWorkers = fileCfg.MaxWorkers
+		if fileCfg.Process.MinWorkers != 0 {
+			processMinWorkers = fileCfg.Process.MinWorkers
 		}
-		if fileCfg.MinWorkers != 0 {
-			cfg.MinWorkers = fileCfg.MinWorkers
+		if fileCfg.Process.MaxWorkers != 0 {
+			processMaxWorkers = fileCfg.Process.MaxWorkers
 		}
 		if fileCfg.WorkerQueueTimeout != "" {
 			if d, err := time.ParseDuration(fileCfg.WorkerQueueTimeout); err == nil {
@@ -349,6 +379,15 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.K8s.WorkerServiceAccount != "" {
 			k8sWorkerServiceAccount = fileCfg.K8s.WorkerServiceAccount
 		}
+		if fileCfg.K8s.MaxWorkers != 0 {
+			k8sMaxWorkers = fileCfg.K8s.MaxWorkers
+		}
+		if fileCfg.K8s.SharedWarmTarget != 0 {
+			k8sSharedWarmTarget = fileCfg.K8s.SharedWarmTarget
+		}
+		if fileCfg.K8s.SharedWarmWorkers {
+			k8sSharedWarmWorkers = true
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -440,6 +479,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
 	}
+	if v := getenv("DUCKGRES_DUCKLAKE_CHECKPOINT_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.DuckLake.CheckpointInterval = d
+		} else {
+			warn("Invalid DUCKGRES_DUCKLAKE_CHECKPOINT_INTERVAL duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.ProcessIsolation = b
@@ -474,18 +520,18 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_MEMORY_REBALANCE: " + err.Error())
 		}
 	}
-	if v := getenv("DUCKGRES_MIN_WORKERS"); v != "" {
+	if v := getenv("DUCKGRES_PROCESS_MIN_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			cfg.MinWorkers = n
+			processMinWorkers = n
 		} else {
-			warn("Invalid DUCKGRES_MIN_WORKERS: " + err.Error())
+			warn("Invalid DUCKGRES_PROCESS_MIN_WORKERS: " + err.Error())
 		}
 	}
-	if v := getenv("DUCKGRES_MAX_WORKERS"); v != "" {
+	if v := getenv("DUCKGRES_PROCESS_MAX_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			cfg.MaxWorkers = n
+			processMaxWorkers = n
 		} else {
-			warn("Invalid DUCKGRES_MAX_WORKERS: " + err.Error())
+			warn("Invalid DUCKGRES_PROCESS_MAX_WORKERS: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_WORKER_QUEUE_TIMEOUT"); v != "" {
@@ -531,6 +577,19 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_MAX_CONNECTIONS: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_CONFIG_STORE"); v != "" {
+		configStoreConn = v
+	}
+	if v := getenv("DUCKGRES_CONFIG_POLL_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			configPollInterval = d
+		} else {
+			warn("Invalid DUCKGRES_CONFIG_POLL_INTERVAL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_ADMIN_TOKEN"); v != "" {
+		adminToken = v
+	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
 	}
@@ -561,6 +620,27 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT"); v != "" {
 		k8sWorkerServiceAccount = v
+	}
+	if v := getenv("DUCKGRES_K8S_MAX_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sMaxWorkers = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_MAX_WORKERS: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_SHARED_WARM_TARGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sSharedWarmTarget = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_SHARED_WARM_TARGET: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_SHARED_WARM_WORKERS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			k8sSharedWarmWorkers = b
+		} else {
+			warn("Invalid DUCKGRES_K8S_SHARED_WARM_WORKERS: " + err.Error())
+		}
 	}
 
 	// Query log env vars
@@ -668,11 +748,11 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["memory-rebalance"] {
 		cfg.MemoryRebalance = cli.MemoryRebalance
 	}
-	if cli.Set["min-workers"] {
-		cfg.MinWorkers = cli.MinWorkers
+	if cli.Set["process-min-workers"] {
+		processMinWorkers = cli.ProcessMinWorkers
 	}
-	if cli.Set["max-workers"] {
-		cfg.MaxWorkers = cli.MaxWorkers
+	if cli.Set["process-max-workers"] {
+		processMaxWorkers = cli.ProcessMaxWorkers
 	}
 	if cli.Set["worker-queue-timeout"] {
 		if d, err := time.ParseDuration(cli.WorkerQueueTimeout); err == nil {
@@ -713,6 +793,19 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["max-connections"] {
 		cfg.RateLimit.MaxConnections = cli.MaxConnections
 	}
+	if cli.Set["config-store"] {
+		configStoreConn = cli.ConfigStoreConn
+	}
+	if cli.Set["config-poll-interval"] {
+		if d, err := time.ParseDuration(cli.ConfigPollInterval); err == nil {
+			configPollInterval = d
+		} else {
+			warn("Invalid --config-poll-interval duration: " + err.Error())
+		}
+	}
+	if cli.Set["admin-token"] {
+		adminToken = cli.AdminToken
+	}
 	if cli.Set["worker-backend"] {
 		workerBackend = cli.WorkerBackend
 	}
@@ -739,6 +832,15 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["k8s-worker-service-account"] {
 		k8sWorkerServiceAccount = cli.K8sWorkerServiceAccount
+	}
+	if cli.Set["k8s-max-workers"] {
+		k8sMaxWorkers = cli.K8sMaxWorkers
+	}
+	if cli.Set["k8s-shared-warm-target"] {
+		k8sSharedWarmTarget = cli.K8sSharedWarmTarget
+	}
+	if cli.Set["k8s-shared-warm-workers"] {
+		k8sSharedWarmWorkers = cli.K8sSharedWarmWorkers
 	}
 	if cli.Set["query-log"] {
 		cfg.QueryLog.Enabled = cli.QueryLog
@@ -793,6 +895,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 
 	return resolvedConfig{
 		Server:                   cfg,
+		ProcessMinWorkers:        processMinWorkers,
+		ProcessMaxWorkers:        processMaxWorkers,
 		WorkerQueueTimeout:       workerQueueTimeout,
 		WorkerIdleTimeout:        workerIdleTimeout,
 		HandoverDrainTimeout:     handoverDrainTimeout,
@@ -805,5 +909,11 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerConfigMap:       k8sWorkerConfigMap,
 		K8sWorkerImagePullPolicy: k8sWorkerImagePullPolicy,
 		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
+		K8sMaxWorkers:            k8sMaxWorkers,
+		K8sSharedWarmTarget:      k8sSharedWarmTarget,
+		K8sSharedWarmWorkers:     k8sSharedWarmWorkers,
+		ConfigStoreConn:          configStoreConn,
+		ConfigPollInterval:       configPollInterval,
+		AdminToken:               adminToken,
 	}
 }
