@@ -37,7 +37,7 @@ func APIAuthMiddleware(adminToken string) gin.HandlerFunc {
 // RegisterDashboard serves the admin dashboard on the Gin engine.
 func RegisterDashboard(r *gin.Engine, adminToken string) {
 	r.GET("/", dashboardPageHandler("index.html", adminToken))
-	r.GET("/teams", dashboardPageHandler("teams.html", adminToken))
+	r.GET("/orgs", dashboardPageHandler("orgs.html", adminToken))
 	r.GET("/workers", dashboardPageHandler("workers.html", adminToken))
 	r.GET("/sessions", dashboardPageHandler("sessions.html", adminToken))
 	r.GET("/settings", dashboardPageHandler("settings.html", adminToken))

@@ -15,8 +15,8 @@ import (
 
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
-	Teams        map[string]*TeamConfig
-	UserTeam     map[string]string // username -> team name
+	Orgs         map[string]*OrgConfig
+	UserOrg      map[string]string // username -> org name
 	UserPassword map[string]string // username -> password
 	Global       GlobalConfig
 	DuckLake     DuckLakeConfig
@@ -49,9 +49,9 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 
 	// Auto-migrate all models
 	if err := db.AutoMigrate(
-		&Team{},
+		&Org{},
 		&ManagedWarehouse{},
-		&TeamUser{},
+		&OrgUser{},
 		&GlobalConfig{},
 		&DuckLakeConfig{},
 		&RateLimitConfig{},
@@ -78,7 +78,7 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	}
 	cs.snapshot = snap
 
-	slog.Info("Config store connected.", "teams", len(snap.Teams), "users", len(snap.UserTeam))
+	slog.Info("Config store connected.", "orgs", len(snap.Orgs), "users", len(snap.UserOrg))
 	return cs, nil
 }
 
@@ -117,9 +117,9 @@ func (cs *ConfigStore) Start(ctx context.Context) {
 
 // load fetches all config from the database and builds a Snapshot.
 func (cs *ConfigStore) load() (*Snapshot, error) {
-	var teams []Team
-	if err := cs.db.Preload("Users").Preload("Warehouse").Find(&teams).Error; err != nil {
-		return nil, fmt.Errorf("load teams: %w", err)
+	var orgs []Org
+	if err := cs.db.Preload("Users").Preload("Warehouse").Find(&orgs).Error; err != nil {
+		return nil, fmt.Errorf("load orgs: %w", err)
 	}
 
 	var global GlobalConfig
@@ -135,8 +135,8 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	cs.db.First(&queryLog, 1)
 
 	snap := &Snapshot{
-		Teams:        make(map[string]*TeamConfig),
-		UserTeam:     make(map[string]string),
+		Orgs:         make(map[string]*OrgConfig),
+		UserOrg:      make(map[string]string),
 		UserPassword: make(map[string]string),
 		Global:       global,
 		DuckLake:     duckLake,
@@ -144,22 +144,21 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		QueryLog:     queryLog,
 	}
 
-	for _, t := range teams {
-		tc := &TeamConfig{
-			Name:         t.Name,
-			MaxWorkers:   t.MaxWorkers,
-			MinWorkers:   t.MinWorkers,
-			MemoryBudget: t.MemoryBudget,
-			IdleTimeoutS: t.IdleTimeoutS,
+	for _, o := range orgs {
+		oc := &OrgConfig{
+			Name:         o.Name,
+			MaxWorkers:   o.MaxWorkers,
+			MemoryBudget: o.MemoryBudget,
+			IdleTimeoutS: o.IdleTimeoutS,
 			Users:        make(map[string]string),
-			Warehouse:    copyManagedWarehouseConfig(t.Warehouse),
+			Warehouse:    copyManagedWarehouseConfig(o.Warehouse),
 		}
-		for _, u := range t.Users {
-			tc.Users[u.Username] = u.Password
-			snap.UserTeam[u.Username] = t.Name
+		for _, u := range o.Users {
+			oc.Users[u.Username] = u.Password
+			snap.UserOrg[u.Username] = o.Name
 			snap.UserPassword[u.Username] = u.Password
 		}
-		snap.Teams[t.Name] = tc
+		snap.Orgs[o.Name] = oc
 	}
 
 	return snap, nil
@@ -173,7 +172,7 @@ func (cs *ConfigStore) Snapshot() *Snapshot {
 }
 
 // ValidateUser checks username/password against the cached snapshot.
-// Passwords are compared using bcrypt. Returns the team name and whether auth succeeded.
+// Passwords are compared using bcrypt. Returns the org name and whether auth succeeded.
 func (cs *ConfigStore) ValidateUser(username, password string) (string, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -189,7 +188,7 @@ func (cs *ConfigStore) ValidateUser(username, password string) (string, bool) {
 	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)); err != nil {
 		return "", false
 	}
-	return cs.snapshot.UserTeam[username], true
+	return cs.snapshot.UserOrg[username], true
 }
 
 // HashPassword hashes a plaintext password using bcrypt.
@@ -201,14 +200,14 @@ func HashPassword(password string) (string, error) {
 	return string(hash), nil
 }
 
-// TeamForUser returns the team name for a user, or "" if not found.
-func (cs *ConfigStore) TeamForUser(username string) string {
+// OrgForUser returns the org name for a user, or "" if not found.
+func (cs *ConfigStore) OrgForUser(username string) string {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if cs.snapshot == nil {
 		return ""
 	}
-	return cs.snapshot.UserTeam[username]
+	return cs.snapshot.UserOrg[username]
 }
 
 // OnChange registers a callback that fires when the config snapshot changes.

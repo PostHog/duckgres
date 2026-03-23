@@ -44,20 +44,20 @@ func (p *flightSessionProvider) DestroySession(pid int32) {
 	p.sm.DestroySession(pid)
 }
 
-// teamRoutedSessionProvider routes Flight SQL session operations to the correct
-// team's SessionManager based on the username→team mapping in the config store.
-type teamRoutedSessionProvider struct {
-	teamRouter TeamRouterInterface
+// orgRoutedSessionProvider routes Flight SQL session operations to the correct
+// org's SessionManager based on the username→org mapping in the config store.
+type orgRoutedSessionProvider struct {
+	orgRouter OrgRouterInterface
 
 	mu         sync.RWMutex
 	pidSession map[int32]*SessionManager // pid → owning session manager
 }
 
-func (p *teamRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
-	_, sessions, _, ok := p.teamRouter.StackForUser(username)
+func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+	_, sessions, _, ok := p.orgRouter.StackForUser(username)
 	if !ok {
-		slog.Warn("Flight SQL session: no team stack for user.", "username", username)
-		return 0, nil, fmt.Errorf("no team configured for user %q", username)
+		slog.Warn("Flight SQL session: no org stack for user.", "username", username)
+		return 0, nil, fmt.Errorf("no org configured for user %q", username)
 	}
 
 	// SessionManager.resolveSessionLimits handles rebalancer defaults,
@@ -76,7 +76,7 @@ func (p *teamRoutedSessionProvider) CreateSession(ctx context.Context, username 
 	return workerPID, executor, nil
 }
 
-func (p *teamRoutedSessionProvider) DestroySession(pid int32) {
+func (p *orgRoutedSessionProvider) DestroySession(pid int32) {
 	p.mu.RLock()
 	sm, ok := p.pidSession[pid]
 	p.mu.RUnlock()

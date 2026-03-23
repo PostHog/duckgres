@@ -6,39 +6,39 @@ import (
 	"testing"
 )
 
-// mockTeamRouter implements TeamRouterInterface for testing.
-type mockTeamRouter struct {
+// mockOrgRouter implements OrgRouterInterface for testing.
+type mockOrgRouter struct {
 	sessions   *SessionManager
 	rebalancer *MemoryRebalancer
 	ok         bool
 }
 
-func (m *mockTeamRouter) StackForUser(_ string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
+func (m *mockOrgRouter) StackForUser(_ string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	return nil, m.sessions, m.rebalancer, m.ok
 }
 
-func (m *mockTeamRouter) ShutdownAll() {}
+func (m *mockOrgRouter) ShutdownAll() {}
 
-func TestTeamRoutedSessionProviderCreateSessionTeamNotFound(t *testing.T) {
-	provider := &teamRoutedSessionProvider{
-		teamRouter: &mockTeamRouter{ok: false},
+func TestOrgRoutedSessionProviderCreateSessionTeamNotFound(t *testing.T) {
+	provider := &orgRoutedSessionProvider{
+		orgRouter: &mockOrgRouter{ok: false},
 		pidSession: make(map[int32]*SessionManager),
 	}
 
 	_, _, err := provider.CreateSession(context.Background(), "unknown", 0, "", 0)
 	if err == nil {
-		t.Fatal("expected error for unknown team")
+		t.Fatal("expected error for unknown org")
 	}
-	if err.Error() != `no team configured for user "unknown"` {
+	if err.Error() != `no org configured for user "unknown"` {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 }
 
-func TestTeamRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
+func TestOrgRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
-	provider := &teamRoutedSessionProvider{
-		teamRouter: &mockTeamRouter{sessions: sm, ok: true},
+	provider := &orgRoutedSessionProvider{
+		orgRouter: &mockOrgRouter{sessions: sm, ok: true},
 		pidSession: map[int32]*SessionManager{
 			42: sm,
 		},
@@ -57,9 +57,9 @@ func TestTeamRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 	}
 }
 
-func TestTeamRoutedSessionProviderDestroyUnknownPidNoOp(t *testing.T) {
-	provider := &teamRoutedSessionProvider{
-		teamRouter: &mockTeamRouter{ok: true},
+func TestOrgRoutedSessionProviderDestroyUnknownPidNoOp(t *testing.T) {
+	provider := &orgRoutedSessionProvider{
+		orgRouter: &mockOrgRouter{ok: true},
 		pidSession: make(map[int32]*SessionManager),
 	}
 
@@ -67,11 +67,11 @@ func TestTeamRoutedSessionProviderDestroyUnknownPidNoOp(t *testing.T) {
 	provider.DestroySession(999)
 }
 
-func TestTeamRoutedSessionProviderConcurrentDestroys(t *testing.T) {
+func TestOrgRoutedSessionProviderConcurrentDestroys(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
-	provider := &teamRoutedSessionProvider{
-		teamRouter: &mockTeamRouter{sessions: sm, ok: true},
+	provider := &orgRoutedSessionProvider{
+		orgRouter: &mockOrgRouter{sessions: sm, ok: true},
 		pidSession: make(map[int32]*SessionManager),
 	}
 

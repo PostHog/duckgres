@@ -66,9 +66,17 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 		return status.Error(codes.InvalidArgument, "username is required")
 	}
 
+	if h.pool.sharedWarmMode {
+		if _, err := h.pool.currentSessionConfig(); err != nil {
+			return status.Error(codes.FailedPrecondition, "worker is not activated")
+		}
+	}
+
 	// Validate username against configured users
-	if _, ok := h.pool.cfg.Users[req.Username]; !ok {
-		return status.Error(codes.PermissionDenied, "unknown username")
+	if !h.pool.sharedWarmMode {
+		if _, ok := h.pool.cfg.Users[req.Username]; !ok {
+			return status.Error(codes.PermissionDenied, "unknown username")
+		}
 	}
 
 	session, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads)
@@ -79,6 +87,26 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	resp, _ := json.Marshal(map[string]string{
 		"session_token": session.ID,
 	})
+	return stream.Send(&flight.Result{Body: resp})
+}
+
+func (h *FlightSQLHandler) doActivateTenant(body []byte, stream flight.FlightService_DoActionServer) error {
+	var payload ActivationPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid ActivateTenant request: %v", err)
+	}
+	if strings.TrimSpace(payload.OrgID) == "" {
+		return status.Error(codes.InvalidArgument, "org_id is required")
+	}
+	if current := h.pool.currentActivation(); current != nil && current.payload.OrgID != payload.OrgID {
+		return status.Errorf(codes.FailedPrecondition, "activate tenant: worker already activated for org %q", current.payload.OrgID)
+	}
+
+	if err := h.pool.activateTenantFunc(payload); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "activate tenant: %v", err)
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
 	return stream.Send(&flight.Result{Body: resp})
 }
 
@@ -217,7 +245,9 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
-	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
+	schema, err := retryOnTransient(func() (*arrow.Schema, error) {
+		return GetQuerySchema(ctx, session.Conn, query, tx)
+	})
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
@@ -292,13 +322,12 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 
 		session.progress.queryActive.Store(true)
 		defer session.progress.queryActive.Store(false)
-		var rows *sql.Rows
-		var qerr error
-		if tx != nil {
-			rows, qerr = tx.QueryContext(ctx, handle.Query)
-		} else {
-			rows, qerr = session.Conn.QueryContext(ctx, handle.Query)
-		}
+		rows, qerr := retryOnTransient(func() (*sql.Rows, error) {
+			if tx != nil {
+				return tx.QueryContext(ctx, handle.Query)
+			}
+			return session.Conn.QueryContext(ctx, handle.Query)
+		})
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
 			return
@@ -344,14 +373,15 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	}
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
-	var result sql.Result
-	if tx != nil {
-		result, err = tx.ExecContext(ctx, query)
-	} else {
-		result, err = session.Conn.ExecContext(ctx, query)
-	}
-	if err != nil {
-		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
+
+	result, execErr := retryOnTransient(func() (sql.Result, error) {
+		if tx != nil {
+			return tx.ExecContext(ctx, query)
+		}
+		return session.Conn.ExecContext(ctx, query)
+	})
+	if execErr != nil {
+		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
 
 	affected, err := result.RowsAffected()

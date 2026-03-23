@@ -1,10 +1,10 @@
-INSERT INTO duckgres_teams (name, max_workers, min_workers, memory_budget, idle_timeout_s, created_at, updated_at)
-VALUES ('local', 0, 0, '', 0, NOW(), NOW())
+INSERT INTO duckgres_orgs (name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
+VALUES ('local', 0, '', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET updated_at = NOW();
 
 INSERT INTO duckgres_managed_warehouses (
-    team_name,
+    org_id,
     warehouse_database_region,
     warehouse_database_endpoint,
     warehouse_database_port,
@@ -59,21 +59,21 @@ INSERT INTO duckgres_managed_warehouses (
 VALUES (
     'local',
     'local-dev',
-    'local-warehouse-db.internal',
-    5432,
+    'host.docker.internal',
+    35434,
     'duckgres_local',
     'duckgres',
     'dedicated_rds',
     'postgres',
     'local-dev',
-    'local-metadata.internal',
-    5432,
+    'host.docker.internal',
+    35433,
     'ducklake_metadata_local',
     'ducklake',
     'minio',
     'us-east-1',
     'duckgres-local',
-    'teams/local/',
+    'orgs/local/',
     'host.docker.internal:39000',
     false,
     'path',
@@ -109,7 +109,7 @@ VALUES (
     NOW(),
     NOW()
 )
-ON CONFLICT (team_name) DO UPDATE
+ON CONFLICT (org_id) DO UPDATE
 SET warehouse_database_region = EXCLUDED.warehouse_database_region,
     warehouse_database_endpoint = EXCLUDED.warehouse_database_endpoint,
     warehouse_database_port = EXCLUDED.warehouse_database_port,
@@ -160,9 +160,9 @@ SET warehouse_database_region = EXCLUDED.warehouse_database_region,
     failed_at = EXCLUDED.failed_at,
     updated_at = NOW();
 
-INSERT INTO duckgres_team_users (username, password, team_name, created_at, updated_at)
+INSERT INTO duckgres_org_users (username, password, org_id, created_at, updated_at)
 VALUES ('postgres', '$2a$10$TQyt73Vw91Q1d7YcE86EVuhms/0u4qBydMDyVvZYlqDwc3/VtQAbm', 'local', NOW(), NOW())
 ON CONFLICT (username) DO UPDATE
 SET password = EXCLUDED.password,
-    team_name = EXCLUDED.team_name,
+    org_id = EXCLUDED.org_id,
     updated_at = NOW();

@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	_ "github.com/duckdb/duckdb-go/v2"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -181,14 +182,6 @@ type Config struct {
 	// of budget/max_workers at creation time.
 	MemoryRebalance bool
 
-	// MaxWorkers is the maximum number of worker processes in control-plane mode.
-	// 0 means unlimited.
-	MaxWorkers int
-
-	// MinWorkers is the number of pre-warmed worker processes at startup in control-plane mode.
-	// 0 means no pre-warming (workers spawn on demand).
-	MinWorkers int
-
 	// PassthroughUsers are users that bypass the SQL transpiler and pg_catalog initialization.
 	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
 	PassthroughUsers map[string]bool
@@ -239,6 +232,12 @@ type DuckLakeConfig struct {
 	// Default: checks all sources in AWS SDK order
 	S3Chain   string // e.g., "env;config" to check env vars then config files
 	S3Profile string // AWS profile name to use (for "config" chain)
+
+	// CheckpointInterval controls how often DuckLake CHECKPOINT runs.
+	// CHECKPOINT performs full catalog maintenance: expire snapshots,
+	// merge adjacent files, rewrite data files, and clean up orphaned files.
+	// Set to 0 to disable. Default: 24h.
+	CheckpointInterval time.Duration
 }
 
 type Server struct {
@@ -277,6 +276,9 @@ type Server struct {
 
 	// Query logger for DuckLake system.query_log
 	queryLogger *QueryLogger
+
+	// DuckLake checkpoint scheduler
+	checkpointer *DuckLakeCheckpointer
 
 	// Progress lookup function for pg_stat_activity.
 	// In control plane mode, returns cached progress from worker health checks.
@@ -385,6 +387,13 @@ func New(cfg Config) (*Server, error) {
 		s.queryLogger = ql
 	}
 
+	// Initialize DuckLake checkpoint scheduler (non-fatal on error)
+	if cp, err := NewDuckLakeCheckpointer(cfg); err != nil {
+		slog.Warn("Failed to initialize DuckLake checkpoint scheduler, continuing without it.", "error", err)
+	} else if cp != nil {
+		s.checkpointer = cp
+	}
+
 	return s, nil
 }
 
@@ -485,6 +494,11 @@ func (s *Server) Close() error {
 	// Stop query logger (drains remaining entries)
 	if s.queryLogger != nil {
 		s.queryLogger.Stop()
+	}
+
+	// Stop DuckLake checkpoint scheduler
+	if s.checkpointer != nil {
+		s.checkpointer.Stop()
 	}
 
 	// Database connections are now closed by each clientConn when it terminates
@@ -796,6 +810,33 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 	return nil
 }
 
+// ActivateDBConnection applies tenant-specific DuckLake runtime to an already
+// initialized generic DuckDB connection used by a shared warm worker.
+func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, username string) error {
+	if cfg.DuckLake.MetadataStore == "" {
+		return fmt.Errorf("tenant activation requires ducklake metadata_store")
+	}
+
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
+		return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+	}
+
+	if err := recreatePgClassForDuckLake(db); err != nil {
+		slog.Warn("Failed to recreate pg_class_full for DuckLake during activation.", "user", username, "error", err)
+	}
+	if err := recreatePgNamespaceForDuckLake(db); err != nil {
+		slog.Warn("Failed to recreate pg_namespace for DuckLake during activation.", "user", username, "error", err)
+	}
+	if err := initInformationSchema(db, true); err != nil {
+		slog.Warn("Failed to initialize information_schema during activation.", "user", username, "error", err)
+	}
+	if err := setDuckLakeDefault(db); err != nil {
+		return fmt.Errorf("failed to set DuckLake as default: %w", err)
+	}
+
+	return nil
+}
+
 // CreatePassthroughDBConnection creates a DuckDB connection without pg_catalog
 // or information_schema initialization. DuckLake is still attached if configured
 // so passthrough users can access the same data. This is used for passthrough users
@@ -961,7 +1002,10 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
-	if _, err := db.Exec(attachStmt); err != nil {
+	if err := retryOnTransientAttach(func() error {
+		_, err := db.Exec(attachStmt)
+		return err
+	}); err != nil {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
 
@@ -976,7 +1020,101 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
 
+	// Ensure performance indexes exist on the DuckLake metadata tables.
+	// Run in a goroutine so it doesn't block the DuckLake semaphore or
+	// delay connection setup. Uses atomic flag to retry on transient failures.
+	// See: https://github.com/duckdb/ducklake/issues/859
+	go ensureDuckLakeMetadataIndexes(dlCfg)
+
 	return nil
+}
+
+// duckLakeIndexDone tracks whether metadata indexes have been successfully created.
+// Uses atomic.Bool instead of sync.Once so transient failures can be retried.
+var duckLakeIndexDone atomic.Bool
+
+// duckLakeIndexMu serializes concurrent index creation attempts.
+var duckLakeIndexMu sync.Mutex
+
+// ensureDuckLakeMetadataIndexes connects directly to the DuckLake PostgreSQL
+// metadata store and creates indexes that dramatically improve query planning
+// performance. This is non-fatal — if it fails, DuckLake still works, just slower.
+// Retries on subsequent AttachDuckLake calls until it succeeds.
+func ensureDuckLakeMetadataIndexes(dlCfg DuckLakeConfig) {
+	if duckLakeIndexDone.Load() {
+		return
+	}
+
+	// Only relevant for PostgreSQL metadata stores.
+	if !strings.HasPrefix(dlCfg.MetadataStore, "postgres:") {
+		return
+	}
+
+	// Serialize concurrent attempts (multiple connections attaching simultaneously).
+	duckLakeIndexMu.Lock()
+	defer duckLakeIndexMu.Unlock()
+
+	// Double-check after acquiring the lock.
+	if duckLakeIndexDone.Load() {
+		return
+	}
+
+	// Strip the "postgres:" DuckLake protocol prefix to get a standard libpq connection string.
+	connStr := strings.TrimPrefix(dlCfg.MetadataStore, "postgres:")
+
+	// pgx/stdlib accepts libpq key=value format directly.
+	pgDB, err := sql.Open("pgx", connStr)
+	if err != nil {
+		slog.Warn("Failed to open connection for DuckLake metadata indexes.", "error", err)
+		return
+	}
+	defer func() { _ = pgDB.Close() }()
+
+	// Use a generous timeout — CREATE INDEX on large tables (e.g., ducklake_file_column_stats
+	// at 1.2 GB) can take minutes on first run. Subsequent runs are instant (IF NOT EXISTS).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if err := pgDB.PingContext(ctx); err != nil {
+		slog.Warn("Failed to connect to DuckLake metadata store for index creation.", "error", err)
+		return
+	}
+
+	// Indexes that improve DuckDB postgres scanner performance.
+	// The scanner uses COPY with ctid batches and pushes down filters,
+	// but without indexes each batch requires a sequential scan.
+	indexes := []string{
+		// Critical: ducklake_file_column_stats is often the largest table (millions of rows).
+		// Filter pushdown CTEs query by (table_id, column_id) on every query.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_file_col_stats_tbl_col ON ducklake_file_column_stats (table_id, column_id)",
+
+		// Catalog loading queries (GetCatalogForSnapshot) filter by snapshot ranges.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_tag_object_snap ON ducklake_tag (object_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_col_tag_tbl_col_snap ON ducklake_column_tag (table_id, column_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_snap ON ducklake_table (begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_column_tbl_snap ON ducklake_column (table_id, begin_snapshot, end_snapshot, column_order)",
+
+		// File and stats queries.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_tbl_snap ON ducklake_data_file (table_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_delete_file_tbl_snap ON ducklake_delete_file (table_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_stats_tbl ON ducklake_table_stats (table_id)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_col_stats_tbl ON ducklake_table_column_stats (table_id)",
+	}
+
+	created := 0
+	for _, stmt := range indexes {
+		if _, err := pgDB.ExecContext(ctx, stmt); err != nil {
+			slog.Warn("Failed to create DuckLake metadata index.", "statement", stmt, "error", err)
+			// Continue — create as many indexes as possible
+		} else {
+			created++
+		}
+	}
+
+	if created == len(indexes) {
+		duckLakeIndexDone.Store(true)
+	}
+	slog.Info("Ensured DuckLake metadata indexes.", "created_or_verified", created, "total", len(indexes))
 }
 
 // setDuckLakeDefault sets the DuckLake catalog as the default so all queries use it.

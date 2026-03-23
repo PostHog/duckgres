@@ -35,29 +35,35 @@ type K8sWorkerPool struct {
 	nextWorkerID int
 	spawning     int
 	maxWorkers   int
+	minWorkers   int
 	idleTimeout  time.Duration
 	shuttingDown bool
 	shutdownCh   chan struct{}
 
-	clientset       kubernetes.Interface
-	namespace       string
-	cpID            string
-	cpUID           types.UID
-	workerImage     string
-	workerPort      int
-	secretName      string
-	configMap       string
-	configPath      string
-	imagePullPolicy corev1.PullPolicy
-	serviceAccount  string
-	memoryBudget      int64  // total memory budget in bytes
-	teamName          string // team name for pod labels (multi-tenant mode)
-	workerIDGenerator func() int // shared ID generator across teams (nil = internal counter)
-	cachedToken       string // cached bearer token (immutable after setup)
-	informer          cache.SharedIndexInformer
-	stopInform      chan struct{}
-	spawnSem        chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
-	podReady        sync.Map     // podName -> chan string (pod IP); signaled by informer
+	clientset            kubernetes.Interface
+	namespace            string
+	cpID                 string
+	cpUID                types.UID
+	workerImage          string
+	workerPort           int
+	secretName           string
+	configMap            string
+	configPath           string
+	imagePullPolicy      corev1.PullPolicy
+	serviceAccount       string
+	memoryBudget         int64      // total memory budget in bytes
+	orgID                string     // org ID for pod labels (multi-tenant mode)
+	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
+	sharedWarmActivation bool
+	cachedToken          string // cached bearer token (immutable after setup)
+	informer             cache.SharedIndexInformer
+	stopInform           chan struct{}
+	spawnSem             chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
+	podReady             sync.Map      // podName -> chan string (pod IP); signaled by informer
+
+	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
+	spawnWarmWorkerBackgroundFunc func(id int)
+	activateTenantFunc            func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -104,25 +110,26 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
 	spawnConcurrency := 3
 	pool := &K8sWorkerPool{
-		workers:           make(map[int]*ManagedWorker),
-		maxWorkers:        cfg.MaxWorkers,
-		idleTimeout:       cfg.IdleTimeout,
-		shutdownCh:        make(chan struct{}),
-		stopInform:        make(chan struct{}),
-		clientset:         clientset,
-		namespace:         cfg.Namespace,
-		cpID:              cfg.CPID,
-		workerImage:       cfg.WorkerImage,
-		workerPort:        cfg.WorkerPort,
-		secretName:        cfg.SecretName,
-		configMap:         cfg.ConfigMap,
-		configPath:        cfg.ConfigPath,
-		imagePullPolicy:   corev1.PullPolicy(cfg.ImagePullPolicy),
-		serviceAccount:    cfg.ServiceAccount,
-		memoryBudget:      cfg.MemoryBudget,
-		teamName:          cfg.TeamName,
-		workerIDGenerator: cfg.WorkerIDGenerator,
-		spawnSem:          make(chan struct{}, spawnConcurrency),
+		workers:              make(map[int]*ManagedWorker),
+		maxWorkers:           cfg.MaxWorkers,
+		idleTimeout:          cfg.IdleTimeout,
+		shutdownCh:           make(chan struct{}),
+		stopInform:           make(chan struct{}),
+		clientset:            clientset,
+		namespace:            cfg.Namespace,
+		cpID:                 cfg.CPID,
+		workerImage:          cfg.WorkerImage,
+		workerPort:           cfg.WorkerPort,
+		secretName:           cfg.SecretName,
+		configMap:            cfg.ConfigMap,
+		configPath:           cfg.ConfigPath,
+		imagePullPolicy:      corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:       cfg.ServiceAccount,
+		memoryBudget:         cfg.MemoryBudget,
+		orgID:                cfg.OrgID,
+		workerIDGenerator:    cfg.WorkerIDGenerator,
+		sharedWarmActivation: cfg.SharedWarmActivation,
+		spawnSem:             make(chan struct{}, spawnConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
@@ -239,8 +246,8 @@ func (p *K8sWorkerPool) readBearerToken(ctx context.Context) (string, error) {
 // startInformer starts a SharedIndexInformer to watch worker pods.
 func (p *K8sWorkerPool) startInformer() {
 	labelSelector := fmt.Sprintf("duckgres/control-plane=%s", p.cpID)
-	if p.teamName != "" {
-		labelSelector += fmt.Sprintf(",duckgres/team=%s", p.teamName)
+	if p.orgID != "" {
+		labelSelector += fmt.Sprintf(",duckgres/org=%s", p.orgID)
 	}
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		p.clientset,
@@ -364,8 +371,8 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		"duckgres/control-plane": p.cpID,
 		"duckgres/worker-id":     strconv.Itoa(id),
 	}
-	if p.teamName != "" {
-		podLabels["duckgres/team"] = p.teamName
+	if p.orgID != "" {
+		podLabels["duckgres/org"] = p.orgID
 	}
 
 	// Build pod spec
@@ -421,6 +428,12 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 				},
 			},
 		},
+	}
+	if p.sharedWarmActivation {
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+			Name:  "DUCKGRES_SHARED_WARM_WORKER",
+			Value: "true",
+		})
 	}
 
 	// Add writable data directory for DuckDB databases
@@ -731,6 +744,7 @@ func (p *K8sWorkerPool) RetireWorker(id int) {
 		p.mu.Unlock()
 		return
 	}
+	p.markWorkerRetiredLocked(w)
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	p.mu.Unlock()
@@ -751,6 +765,7 @@ func (p *K8sWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 		w.activeSessions--
 	}
 	if w.activeSessions == 0 {
+		p.markWorkerRetiredLocked(w)
 		delete(p.workers, id)
 		workerCount := len(p.workers)
 		p.mu.Unlock()
@@ -770,36 +785,166 @@ func (p *K8sWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	return w, ok
 }
 
-// SpawnMinWorkers pre-warms the pool with count workers.
-func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
-	var wg sync.WaitGroup
-	errs := make(chan error, count)
-	ctx := context.Background()
-
-	for i := 0; i < count; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			if err := p.SpawnWorker(ctx, id); err != nil {
-				errs <- err
-			}
-		}(i)
+// ActivateReservedWorker transitions a reserved worker through activating to hot.
+// Failed activations retire the worker immediately.
+func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error {
+	p.mu.Lock()
+	var err error
+	switch worker.SharedState().NormalizedLifecycle() {
+	case WorkerLifecycleReserved:
+		nextState, transitionErr := worker.SharedState().Transition(WorkerLifecycleActivating, nil)
+		if transitionErr == nil {
+			transitionErr = worker.SetSharedState(nextState)
+		}
+		err = transitionErr
+	case WorkerLifecycleActivating:
+		err = nil
+	default:
+		err = fmt.Errorf("worker %d is not reserved for activation", worker.ID)
+	}
+	p.mu.Unlock()
+	if err != nil {
+		return err
 	}
 
-	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		if err != nil {
-			return err
+	activate := p.activateTenantFunc
+	if activate == nil {
+		activate = func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error {
+			return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
+				OrgID:          payload.OrgID,
+				LeaseExpiresAt: payload.LeaseExpiresAt,
+				DuckLake:       payload.DuckLake,
+			})
 		}
 	}
 
+	if err := activate(ctx, worker, payload); err != nil {
+		p.RetireWorker(worker.ID)
+		return err
+	}
+
 	p.mu.Lock()
-	if count > p.nextWorkerID {
-		p.nextWorkerID = count
+	defer p.mu.Unlock()
+	if worker.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
+		return nil
+	}
+	nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
+	if err != nil {
+		return err
+	}
+	return worker.SetSharedState(nextState)
+}
+
+// ReserveSharedWorker reserves a neutral warm worker for later tenant activation.
+func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
+	if err := validateWorkerAssignment(assignment); err != nil {
+		return nil, err
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		p.mu.Lock()
+		if p.shuttingDown {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("pool is shutting down")
+		}
+
+		p.cleanDeadWorkersLocked()
+
+		idle := p.findReservableWarmWorkerLocked()
+		if idle != nil {
+			nextState, err := idle.SharedState().Transition(WorkerLifecycleReserved, assignment)
+			if err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
+			if err := idle.SetSharedState(nextState); err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
+
+			if p.shouldReplenishWarmCapacityLocked() {
+				id := p.allocateWorkerIDLocked()
+				p.spawning++
+				p.mu.Unlock()
+				p.spawnWarmWorkerBackground(id)
+			} else {
+				p.mu.Unlock()
+			}
+			return idle, nil
+		}
+
+		liveCount := p.liveWorkerCountLocked()
+		if p.maxWorkers == 0 || liveCount < p.maxWorkers {
+			id := p.allocateWorkerIDLocked()
+			p.spawning++
+			p.mu.Unlock()
+
+			err := p.spawnWarmWorker(ctx, id)
+
+			p.mu.Lock()
+			p.spawning--
+			p.mu.Unlock()
+
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// SpawnMinWorkers pre-warms the pool with count workers.
+func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
+	if count <= 0 {
+		return nil
+	}
+
+	p.mu.Lock()
+	if count > p.minWorkers {
+		p.minWorkers = count
+	}
+	p.cleanDeadWorkersLocked()
+
+	idleWarmCount := p.idleWarmWorkerCountLocked()
+	missing := count - idleWarmCount
+	if missing <= 0 {
+		p.mu.Unlock()
+		return nil
+	}
+
+	ids := make([]int, 0, missing)
+	for i := 0; i < missing; i++ {
+		ids = append(ids, p.allocateWorkerIDLocked())
+		p.spawning++
 	}
 	p.mu.Unlock()
+
+	ctx := context.Background()
+
+	for _, id := range ids {
+		if err := p.spawnWarmWorker(ctx, id); err != nil {
+			p.mu.Lock()
+			p.spawning--
+			p.mu.Unlock()
+			return err
+		}
+		p.mu.Lock()
+		p.spawning--
+		p.mu.Unlock()
+	}
 	return nil
 }
 
@@ -843,16 +988,12 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						mu.Unlock()
 
 						p.mu.Lock()
-						_, stillInPool := p.workers[w.ID]
-						if stillInPool {
-							delete(p.workers, w.ID)
-						}
-						workerCount := len(p.workers)
+						removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerLocked(w.ID)
 						p.mu.Unlock()
-						observeControlPlaneWorkers(workerCount)
-						if !stillInPool {
+						if removedWorker == nil {
 							return
 						}
+						observeControlPlaneWorkers(workerCount)
 						slog.Warn("K8s worker crashed.", "id", w.ID)
 						if onCrash != nil {
 							onCrash(w.ID)
@@ -867,6 +1008,9 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							GracePeriodSeconds: int64Ptr(0),
 						})
 						delCancel()
+						if shouldReplenish {
+							p.spawnWarmWorkerBackground(replacementID)
+						}
 					default:
 						// Worker alive, do health check
 						var healthErr error
@@ -892,27 +1036,27 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 								mu.Unlock()
 
 								p.mu.Lock()
-								_, stillInPool := p.workers[w.ID]
-								if stillInPool {
-									delete(p.workers, w.ID)
-								}
-								workerCount := len(p.workers)
+								removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerLocked(w.ID)
 								p.mu.Unlock()
+								if removedWorker == nil {
+									return
+								}
 								observeControlPlaneWorkers(workerCount)
 
-								if stillInPool {
-									slog.Error("K8s worker unresponsive, deleting pod.", "id", w.ID, "consecutive_failures", count)
-									if onCrash != nil {
-										onCrash(w.ID)
-									}
-									// Delete the pod to force cleanup
-									podName := p.podNameForWorker(w.ID)
-									_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
-										GracePeriodSeconds: int64Ptr(10),
-									})
-									if w.client != nil {
-										_ = w.client.Close()
-									}
+								slog.Error("K8s worker unresponsive, deleting pod.", "id", w.ID, "consecutive_failures", count)
+								if onCrash != nil {
+									onCrash(w.ID)
+								}
+								// Delete the pod to force cleanup
+								podName := p.podNameForWorker(w.ID)
+								_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+									GracePeriodSeconds: int64Ptr(10),
+								})
+								if w.client != nil {
+									_ = w.client.Close()
+								}
+								if shouldReplenish {
+									p.spawnWarmWorkerBackground(replacementID)
 								}
 							}
 						} else {
@@ -1010,13 +1154,23 @@ func (p *K8sWorkerPool) reapIdleWorkers() {
 		w  *ManagedWorker
 	}
 	now := time.Now()
+	idleCount := 0
+	for _, w := range p.workers {
+		if p.isWarmIdleWorkerLocked(w) {
+			idleCount++
+		}
+	}
 	for id, w := range p.workers {
-		if w.activeSessions == 0 && !w.lastUsed.IsZero() && now.Sub(w.lastUsed) > p.idleTimeout {
+		if idleCount <= p.minWorkers {
+			break
+		}
+		if p.isWarmIdleWorkerLocked(w) && !w.lastUsed.IsZero() && now.Sub(w.lastUsed) > p.idleTimeout {
 			toRetire = append(toRetire, struct {
 				id int
 				w  *ManagedWorker
 			}{id, w})
 			delete(p.workers, id)
+			idleCount--
 		}
 	}
 	workerCount := len(p.workers)
@@ -1040,7 +1194,7 @@ func (p *K8sWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 			continue
 		default:
 		}
-		if w.activeSessions == 0 {
+		if p.isWarmIdleWorkerLocked(w) {
 			return w
 		}
 	}
@@ -1054,6 +1208,9 @@ func (p *K8sWorkerPool) leastLoadedWorkerLocked() *ManagedWorker {
 		case <-w.done:
 			continue
 		default:
+		}
+		if !p.isGenericSessionSchedulableWorkerLocked(w) {
+			continue
 		}
 		if best == nil || w.activeSessions < best.activeSessions {
 			best = w
@@ -1076,10 +1233,19 @@ func (p *K8sWorkerPool) liveWorkerCountLocked() int {
 }
 
 func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
+	var spawnIDs []int
+	removedAny := false
 	for id, w := range p.workers {
 		select {
 		case <-w.done:
-			delete(p.workers, id)
+			removedWorker, _, replacementID, shouldReplenish := p.removeWorkerLocked(id)
+			if removedWorker == nil {
+				continue
+			}
+			removedAny = true
+			if shouldReplenish {
+				spawnIDs = append(spawnIDs, replacementID)
+			}
 			if w.client != nil {
 				go func(c *flightsql.Client) { _ = c.Close() }(w.client)
 			}
@@ -1093,6 +1259,12 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 				})
 			}(id)
 		default:
+		}
+	}
+	if removedAny {
+		observeControlPlaneWorkers(len(p.workers))
+		for _, id := range spawnIDs {
+			go p.spawnWarmWorkerBackground(id)
 		}
 	}
 }
@@ -1134,11 +1306,97 @@ func (p *K8sWorkerPool) allocateWorkerIDLocked() int {
 	return id
 }
 
+func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bool) {
+	w, ok := p.workers[id]
+	if !ok {
+		return nil, len(p.workers), 0, false
+	}
+	delete(p.workers, id)
+	workerCount := len(p.workers)
+	if !p.shouldReplenishWarmCapacityLocked() {
+		return w, workerCount, 0, false
+	}
+	replacementID := p.allocateWorkerIDLocked()
+	p.spawning++
+	return w, workerCount, replacementID, true
+}
+
+func (p *K8sWorkerPool) isGenericSessionSchedulableWorkerLocked(w *ManagedWorker) bool {
+	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleIdle
+}
+
+func (p *K8sWorkerPool) isWarmIdleWorkerLocked(w *ManagedWorker) bool {
+	return w.activeSessions == 0 && p.isGenericSessionSchedulableWorkerLocked(w)
+}
+
+func (p *K8sWorkerPool) findReservableWarmWorkerLocked() *ManagedWorker {
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if p.isWarmIdleWorkerLocked(w) {
+			return w
+		}
+	}
+	return nil
+}
+
+func (p *K8sWorkerPool) idleWarmWorkerCountLocked() int {
+	count := 0
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if p.isWarmIdleWorkerLocked(w) {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
+	if p.minWorkers <= 0 {
+		return false
+	}
+	if p.idleWarmWorkerCountLocked() >= p.minWorkers {
+		return false
+	}
+	liveCount := p.liveWorkerCountLocked()
+	return p.maxWorkers == 0 || liveCount < p.maxWorkers
+}
+
+func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int) error {
+	if p.spawnWarmWorkerFunc != nil {
+		return p.spawnWarmWorkerFunc(ctx, id)
+	}
+	return p.SpawnWorker(ctx, id)
+}
+
+func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int) {
+	if p.spawnWarmWorkerBackgroundFunc != nil {
+		p.spawnWarmWorkerBackgroundFunc(id)
+		return
+	}
+	go p.spawnWorkerBackground(id)
+}
+
+func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker) {
+	nextState, err := w.SharedState().Transition(WorkerLifecycleRetired, nil)
+	if err != nil {
+		return
+	}
+	_ = w.SetSharedState(nextState)
+}
+
 // podNameForWorker returns the pod name for a given worker ID,
-// including the team name if set (multi-tenant mode).
+// including the org ID if set (multi-tenant mode).
 func (p *K8sWorkerPool) podNameForWorker(id int) string {
-	if p.teamName != "" {
-		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.teamName, id)
+	if p.orgID != "" {
+		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.orgID, id)
 	}
 	return fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
 }
@@ -1150,8 +1408,19 @@ func (p *K8sWorkerPool) SetMaxWorkers(n int) {
 	p.maxWorkers = n
 }
 
-func boolPtr(b bool) *bool       { return &b }
-func int64Ptr(i int64) *int64     { return &i }
+// SetWarmCapacityTarget updates the number of neutral idle workers the shared
+// pool should try to keep available. Scale-down is handled lazily by the idle reaper.
+func (p *K8sWorkerPool) SetWarmCapacityTarget(n int) {
+	if n < 0 {
+		n = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.minWorkers = n
+}
+
+func boolPtr(b bool) *bool    { return &b }
+func int64Ptr(i int64) *int64 { return &i }
 
 // Compile-time interface check.
 var _ WorkerPool = (*K8sWorkerPool)(nil)

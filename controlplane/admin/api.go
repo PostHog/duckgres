@@ -14,12 +14,12 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /teams/:name/warehouse")
+var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:name/warehouse")
 
 // WorkerStatus represents a worker's current status for the API.
 type WorkerStatus struct {
 	ID             int    `json:"id"`
-	Team           string `json:"team"`
+	Org            string `json:"org"`
 	ActiveSessions int    `json:"active_sessions"`
 	Status         string `json:"status"`
 }
@@ -28,55 +28,54 @@ type WorkerStatus struct {
 type SessionStatus struct {
 	PID      int32  `json:"pid"`
 	WorkerID int    `json:"worker_id"`
-	Team     string `json:"team"`
+	Org      string `json:"org"`
 	Protocol string `json:"protocol"`
 }
 
 // ClusterStatus aggregates cluster state for the dashboard.
 type ClusterStatus struct {
-	TotalTeams    int          `json:"total_teams"`
-	TotalWorkers  int          `json:"total_workers"`
-	TotalSessions int          `json:"total_sessions"`
-	Teams         []TeamStatus `json:"teams"`
+	TotalOrgs     int         `json:"total_orgs"`
+	TotalWorkers  int         `json:"total_workers"`
+	TotalSessions int         `json:"total_sessions"`
+	Orgs          []OrgStatus `json:"orgs"`
 }
 
-// TeamStatus is a per-team summary.
-type TeamStatus struct {
+// OrgStatus is a per-org summary.
+type OrgStatus struct {
 	Name           string `json:"name"`
 	Workers        int    `json:"workers"`
 	ActiveSessions int    `json:"active_sessions"`
 	MaxWorkers     int    `json:"max_workers"`
-	MinWorkers     int    `json:"min_workers"`
 	MemoryBudget   string `json:"memory_budget"`
 }
 
-// TeamStackInfo provides info about a team's live state.
-// Implemented by the controlplane.TeamRouter via adapter.
-type TeamStackInfo interface {
-	// AllTeamStats returns per-team worker and session counts.
-	AllTeamStats() []TeamStatus
-	// AllWorkerStatuses returns all workers across teams.
+// OrgStackInfo provides info about an org's live state.
+// Implemented by the controlplane.OrgRouter via adapter.
+type OrgStackInfo interface {
+	// AllOrgStats returns per-org worker and session counts.
+	AllOrgStats() []OrgStatus
+	// AllWorkerStatuses returns all workers across orgs.
 	AllWorkerStatuses() []WorkerStatus
-	// AllSessionStatuses returns all active sessions across teams.
+	// AllSessionStatuses returns all active sessions across orgs.
 	AllSessionStatuses() []SessionStatus
 }
 
 // RegisterAPI registers all admin REST endpoints on the given router group.
-func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info TeamStackInfo) {
+func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo) {
 	registerAPIWithStore(r, newGormAPIStore(store), info)
 }
 
-func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info TeamStackInfo) {
+func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo) {
 	h := &apiHandler{store: store, info: info}
 
-	// Teams CRUD
-	r.GET("/teams", h.listTeams)
-	r.POST("/teams", h.createTeam)
-	r.GET("/teams/:name", h.getTeam)
-	r.PUT("/teams/:name", h.updateTeam)
-	r.DELETE("/teams/:name", h.deleteTeam)
-	r.GET("/teams/:name/warehouse", h.getManagedWarehouse)
-	r.PUT("/teams/:name/warehouse", h.putManagedWarehouse)
+	// Orgs CRUD
+	r.GET("/orgs", h.listOrgs)
+	r.POST("/orgs", h.createOrg)
+	r.GET("/orgs/:name", h.getOrg)
+	r.PUT("/orgs/:name", h.updateOrg)
+	r.DELETE("/orgs/:name", h.deleteOrg)
+	r.GET("/orgs/:name/warehouse", h.getManagedWarehouse)
+	r.PUT("/orgs/:name/warehouse", h.putManagedWarehouse)
 
 	// Users CRUD
 	r.GET("/users", h.listUsers)
@@ -106,20 +105,20 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info TeamStackInfo
 }
 
 type apiStore interface {
-	ListTeams() ([]configstore.Team, error)
-	CreateTeam(team *configstore.Team) error
-	GetTeam(name string) (*configstore.Team, error)
-	UpdateTeam(name string, updates configstore.Team) (*configstore.Team, bool, error)
-	DeleteTeam(name string) (bool, error)
+	ListOrgs() ([]configstore.Org, error)
+	CreateOrg(org *configstore.Org) error
+	GetOrg(name string) (*configstore.Org, error)
+	UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error)
+	DeleteOrg(name string) (bool, error)
 
-	ListUsers() ([]configstore.TeamUser, error)
-	CreateUser(user *configstore.TeamUser) error
-	GetUser(username string) (*configstore.TeamUser, error)
-	UpdateUser(username, passwordHash, teamName string) (*configstore.TeamUser, bool, error)
+	ListUsers() ([]configstore.OrgUser, error)
+	CreateUser(user *configstore.OrgUser) error
+	GetUser(username string) (*configstore.OrgUser, error)
+	UpdateUser(username, passwordHash, orgID string) (*configstore.OrgUser, bool, error)
 	DeleteUser(username string) (bool, error)
 
-	GetManagedWarehouse(teamName string) (*configstore.ManagedWarehouse, error)
-	UpsertManagedWarehouse(teamName string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
+	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
+	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
 
 	GetGlobalConfig() (configstore.GlobalConfig, error)
 	SaveGlobalConfig(cfg *configstore.GlobalConfig) error
@@ -143,31 +142,30 @@ func (s *gormAPIStore) db() *gorm.DB {
 	return s.store.DB()
 }
 
-func (s *gormAPIStore) ListTeams() ([]configstore.Team, error) {
-	var teams []configstore.Team
-	if err := s.db().Preload("Users").Preload("Warehouse").Find(&teams).Error; err != nil {
+func (s *gormAPIStore) ListOrgs() ([]configstore.Org, error) {
+	var orgs []configstore.Org
+	if err := s.db().Preload("Users").Preload("Warehouse").Find(&orgs).Error; err != nil {
 		return nil, err
 	}
-	return teams, nil
+	return orgs, nil
 }
 
-func (s *gormAPIStore) CreateTeam(team *configstore.Team) error {
-	team.Warehouse = nil
-	return s.db().Omit("Warehouse").Create(team).Error
+func (s *gormAPIStore) CreateOrg(org *configstore.Org) error {
+	org.Warehouse = nil
+	return s.db().Omit("Warehouse").Create(org).Error
 }
 
-func (s *gormAPIStore) GetTeam(name string) (*configstore.Team, error) {
-	var team configstore.Team
-	if err := s.db().Preload("Users").Preload("Warehouse").First(&team, "name = ?", name).Error; err != nil {
+func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
+	var org configstore.Org
+	if err := s.db().Preload("Users").Preload("Warehouse").First(&org, "name = ?", name).Error; err != nil {
 		return nil, err
 	}
-	return &team, nil
+	return &org, nil
 }
 
-func (s *gormAPIStore) UpdateTeam(name string, updates configstore.Team) (*configstore.Team, bool, error) {
-	result := s.db().Model(&configstore.Team{}).Where("name = ?", name).Updates(map[string]interface{}{
+func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
+	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(map[string]interface{}{
 		"max_workers":    updates.MaxWorkers,
-		"min_workers":    updates.MinWorkers,
 		"memory_budget":  updates.MemoryBudget,
 		"idle_timeout_s": updates.IdleTimeoutS,
 	})
@@ -177,20 +175,20 @@ func (s *gormAPIStore) UpdateTeam(name string, updates configstore.Team) (*confi
 	if result.RowsAffected == 0 {
 		return nil, false, nil
 	}
-	team, err := s.GetTeam(name)
+	org, err := s.GetOrg(name)
 	if err != nil {
 		return nil, true, err
 	}
-	return team, true, nil
+	return org, true, nil
 }
 
-func (s *gormAPIStore) DeleteTeam(name string) (bool, error) {
+func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 	returnRows := int64(0)
 	err := s.db().Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("team_name = ?", name).Delete(&configstore.TeamUser{}).Error; err != nil {
+		if err := tx.Where("org_id = ?", name).Delete(&configstore.OrgUser{}).Error; err != nil {
 			return err
 		}
-		result := tx.Where("name = ?", name).Delete(&configstore.Team{})
+		result := tx.Where("name = ?", name).Delete(&configstore.Org{})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -203,35 +201,35 @@ func (s *gormAPIStore) DeleteTeam(name string) (bool, error) {
 	return returnRows > 0, nil
 }
 
-func (s *gormAPIStore) ListUsers() ([]configstore.TeamUser, error) {
-	var users []configstore.TeamUser
+func (s *gormAPIStore) ListUsers() ([]configstore.OrgUser, error) {
+	var users []configstore.OrgUser
 	if err := s.db().Find(&users).Error; err != nil {
 		return nil, err
 	}
 	return users, nil
 }
 
-func (s *gormAPIStore) CreateUser(user *configstore.TeamUser) error {
+func (s *gormAPIStore) CreateUser(user *configstore.OrgUser) error {
 	return s.db().Create(user).Error
 }
 
-func (s *gormAPIStore) GetUser(username string) (*configstore.TeamUser, error) {
-	var user configstore.TeamUser
+func (s *gormAPIStore) GetUser(username string) (*configstore.OrgUser, error) {
+	var user configstore.OrgUser
 	if err := s.db().First(&user, "username = ?", username).Error; err != nil {
 		return nil, err
 	}
 	return &user, nil
 }
 
-func (s *gormAPIStore) UpdateUser(username, passwordHash, teamName string) (*configstore.TeamUser, bool, error) {
+func (s *gormAPIStore) UpdateUser(username, passwordHash, orgID string) (*configstore.OrgUser, bool, error) {
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
 	}
-	if teamName != "" {
-		updates["team_name"] = teamName
+	if orgID != "" {
+		updates["org_id"] = orgID
 	}
-	result := s.db().Model(&configstore.TeamUser{}).Where("username = ?", username).Updates(updates)
+	result := s.db().Model(&configstore.OrgUser{}).Where("username = ?", username).Updates(updates)
 	if result.Error != nil {
 		return nil, false, result.Error
 	}
@@ -246,39 +244,39 @@ func (s *gormAPIStore) UpdateUser(username, passwordHash, teamName string) (*con
 }
 
 func (s *gormAPIStore) DeleteUser(username string) (bool, error) {
-	result := s.db().Where("username = ?", username).Delete(&configstore.TeamUser{})
+	result := s.db().Where("username = ?", username).Delete(&configstore.OrgUser{})
 	if result.Error != nil {
 		return false, result.Error
 	}
 	return result.RowsAffected > 0, nil
 }
 
-func (s *gormAPIStore) GetManagedWarehouse(teamName string) (*configstore.ManagedWarehouse, error) {
+func (s *gormAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
 	var warehouse configstore.ManagedWarehouse
-	if err := s.db().First(&warehouse, "team_name = ?", teamName).Error; err != nil {
+	if err := s.db().First(&warehouse, "org_id = ?", orgID).Error; err != nil {
 		return nil, err
 	}
 	return &warehouse, nil
 }
 
-func (s *gormAPIStore) UpsertManagedWarehouse(teamName string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error) {
+func (s *gormAPIStore) UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error) {
 	var count int64
-	if err := s.db().Model(&configstore.Team{}).Where("name = ?", teamName).Count(&count).Error; err != nil {
+	if err := s.db().Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
 		return nil, false, err
 	}
 	if count == 0 {
 		return nil, false, nil
 	}
 
-	warehouse.TeamName = teamName
+	warehouse.OrgID = orgID
 	warehouse.UpdatedAt = time.Now().UTC()
 	if err := s.db().Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "team_name"}},
+		Columns:   []clause.Column{{Name: "org_id"}},
 		DoUpdates: clause.AssignmentColumns(managedWarehouseUpsertColumns()),
 	}).Create(warehouse).Error; err != nil {
 		return nil, true, err
 	}
-	stored, err := s.GetManagedWarehouse(teamName)
+	stored, err := s.GetManagedWarehouse(orgID)
 	if err != nil {
 		return nil, true, err
 	}
@@ -389,7 +387,7 @@ func (s *gormAPIStore) SaveQueryLogConfig(cfg *configstore.QueryLogConfig) error
 
 type apiHandler struct {
 	store apiStore
-	info  TeamStackInfo
+	info  OrgStackInfo
 }
 
 type managedWarehouseRequest struct {
@@ -450,87 +448,87 @@ func decodeStrictWarehouseRequest(c *gin.Context, dst *managedWarehouseRequest) 
 	return dec.Decode(dst)
 }
 
-// --- Teams ---
+// --- Orgs ---
 
-func (h *apiHandler) listTeams(c *gin.Context) {
-	teams, err := h.store.ListTeams()
+func (h *apiHandler) listOrgs(c *gin.Context) {
+	orgs, err := h.store.ListOrgs()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, teams)
+	c.JSON(http.StatusOK, orgs)
 }
 
-func (h *apiHandler) createTeam(c *gin.Context) {
-	var team configstore.Team
-	if err := c.ShouldBindJSON(&team); err != nil {
+func (h *apiHandler) createOrg(c *gin.Context) {
+	var org configstore.Org
+	if err := c.ShouldBindJSON(&org); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := validateTeamMutationPayload(&team); err != nil {
+	if err := validateOrgMutationPayload(&org); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if team.Name == "" {
+	if org.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	if err := h.store.CreateTeam(&team); err != nil {
+	if err := h.store.CreateOrg(&org); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusCreated, team)
+	c.JSON(http.StatusCreated, org)
 }
 
-func (h *apiHandler) getTeam(c *gin.Context) {
+func (h *apiHandler) getOrg(c *gin.Context) {
 	name := c.Param("name")
-	team, err := h.store.GetTeam(name)
+	org, err := h.store.GetOrg(name)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "team not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
 	}
-	c.JSON(http.StatusOK, team)
+	c.JSON(http.StatusOK, org)
 }
 
-func (h *apiHandler) updateTeam(c *gin.Context) {
+func (h *apiHandler) updateOrg(c *gin.Context) {
 	name := c.Param("name")
-	var updates configstore.Team
+	var updates configstore.Org
 	if err := c.ShouldBindJSON(&updates); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := validateTeamMutationPayload(&updates); err != nil {
+	if err := validateOrgMutationPayload(&updates); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	team, ok, err := h.store.UpdateTeam(name, updates)
+	org, ok, err := h.store.UpdateOrg(name, updates)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "team not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
 	}
-	c.JSON(http.StatusOK, team)
+	c.JSON(http.StatusOK, org)
 }
 
-func (h *apiHandler) deleteTeam(c *gin.Context) {
+func (h *apiHandler) deleteOrg(c *gin.Context) {
 	name := c.Param("name")
-	ok, err := h.store.DeleteTeam(name)
+	ok, err := h.store.DeleteOrg(name)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "team not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": name})
 }
 
-func validateTeamMutationPayload(team *configstore.Team) error {
-	if team != nil && team.Warehouse != nil {
+func validateOrgMutationPayload(org *configstore.Org) error {
+	if org != nil && org.Warehouse != nil {
 		return errWarehousePayloadNotAllowed
 	}
 	return nil
@@ -550,20 +548,20 @@ func (h *apiHandler) getManagedWarehouse(c *gin.Context) {
 }
 
 func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
-	teamName := c.Param("name")
+	orgID := c.Param("name")
 	var req managedWarehouseRequest
 	if err := decodeStrictWarehouseRequest(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	warehouse := req.toManagedWarehouse()
-	stored, ok, err := h.store.UpsertManagedWarehouse(teamName, &warehouse)
+	stored, ok, err := h.store.UpsertManagedWarehouse(orgID, &warehouse)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "team not found"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
 	}
 	c.JSON(http.StatusOK, stored)
@@ -581,18 +579,18 @@ func (h *apiHandler) listUsers(c *gin.Context) {
 }
 
 func (h *apiHandler) createUser(c *gin.Context) {
-	// Use a raw struct because TeamUser.Password has json:"-"
+	// Use a raw struct because OrgUser.Password has json:"-"
 	var raw struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
-		TeamName string `json:"team_name"`
+		OrgID    string `json:"org_id"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if raw.Username == "" || raw.TeamName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "username and team_name are required"})
+	if raw.Username == "" || raw.OrgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "username and org_id are required"})
 		return
 	}
 	if raw.Password == "" {
@@ -604,10 +602,10 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
 		return
 	}
-	user := configstore.TeamUser{
+	user := configstore.OrgUser{
 		Username: raw.Username,
 		Password: hash,
-		TeamName: raw.TeamName,
+		OrgID:    raw.OrgID,
 	}
 	if err := h.store.CreateUser(&user); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -630,7 +628,7 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 	username := c.Param("username")
 	var raw struct {
 		Password string `json:"password"`
-		TeamName string `json:"team_name"`
+		OrgID    string `json:"org_id"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -645,7 +643,7 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		}
 		passwordHash = hash
 	}
-	user, ok, err := h.store.UpdateUser(username, passwordHash, raw.TeamName)
+	user, ok, err := h.store.UpdateUser(username, passwordHash, raw.OrgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -793,18 +791,18 @@ func (h *apiHandler) getClusterStatus(c *gin.Context) {
 		return
 	}
 
-	teamStats := h.info.AllTeamStats()
+	orgStats := h.info.AllOrgStats()
 	totalWorkers := 0
 	totalSessions := 0
-	for _, ts := range teamStats {
-		totalWorkers += ts.Workers
-		totalSessions += ts.ActiveSessions
+	for _, os := range orgStats {
+		totalWorkers += os.Workers
+		totalSessions += os.ActiveSessions
 	}
 
 	c.JSON(http.StatusOK, ClusterStatus{
-		TotalTeams:    len(teamStats),
+		TotalOrgs:     len(orgStats),
 		TotalWorkers:  totalWorkers,
 		TotalSessions: totalSessions,
-		Teams:         teamStats,
+		Orgs:          orgStats,
 	})
 }

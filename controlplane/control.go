@@ -30,6 +30,8 @@ import (
 type ControlPlaneConfig struct {
 	server.Config
 
+	Process ProcessConfig
+
 	SocketDir            string
 	ConfigPath           string // Path to config file, passed to workers
 	HealthCheckInterval  time.Duration
@@ -40,16 +42,16 @@ type ControlPlaneConfig struct {
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
-	// "remote": workers are network-accessible pods/containers communicating over TCP.
-	//           Currently implemented via Kubernetes (requires -tags kubernetes build).
+	// "remote": Kubernetes-backed multitenant workers communicating over TCP.
+	//           Requires ConfigStoreConn and a binary built with -tags kubernetes.
 	WorkerBackend string
 
-	// K8s contains Kubernetes-specific configuration. Only used when WorkerBackend == "remote".
+	// K8s contains Kubernetes-specific configuration. Only used for remote
+	// multitenant mode.
 	K8s K8sConfig
 
 	// ConfigStoreConn is the PostgreSQL connection string for the config store.
-	// When set in "remote" mode, enables multi-tenant operation with per-team
-	// worker pools and a Gin admin API. Empty = single-tenant (existing behavior).
+	// Required when WorkerBackend == "remote".
 	ConfigStoreConn string
 
 	// ConfigPollInterval is how often to poll the config store for changes.
@@ -61,16 +63,24 @@ type ControlPlaneConfig struct {
 	AdminToken string
 }
 
+type ProcessConfig struct {
+	MinWorkers int
+	MaxWorkers int
+}
+
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage         string // Container image for worker pods (required)
-	WorkerNamespace     string // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID      string // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort          int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret        string // K8s Secret name containing bearer token
-	WorkerConfigMap     string // ConfigMap name for duckgres.yaml
-	ImagePullPolicy     string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount      string // ServiceAccount name for worker pods (default: "default")
+	WorkerImage       string // Container image for worker pods (required)
+	WorkerNamespace   string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID    string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort        int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret      string // K8s Secret name containing bearer token
+	WorkerConfigMap   string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy   string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount    string // ServiceAccount name for worker pods (default: "default")
+	MaxWorkers        int    // Global cap for the shared K8s worker pool (0 = auto-derived)
+	SharedWarmTarget  int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	SharedWarmWorkers bool   // Enable reserve->activate->hot lifecycle on the shared warm pool
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -78,40 +88,40 @@ type K8sConfig struct {
 // PostgreSQL wire protocol, and SQL transpilation all happen here. Workers are
 // thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
-	cfg              ControlPlaneConfig
-	pool             WorkerPool         // non-nil in single-tenant mode
-	sessions         *SessionManager    // non-nil in single-tenant mode
-	flight           *FlightIngress
-	rebalancer       *MemoryRebalancer
-	srv              *server.Server // Minimal server for cancel request routing
-	rateLimiter      *server.RateLimiter
-	tlsConfig        *tls.Config
-	pgListener       net.Listener
-	upgrader         *tableflip.Upgrader
-	parentPID        int // tableflip parent PID (0 if first generation)
-	activeConns      int64
-	closed           bool
-	closeMu          sync.Mutex
-	wg               sync.WaitGroup
-	reloading        atomic.Bool         // guards against concurrent upgrade from double SIGUSR1
-	upgradeDraining  atomic.Bool         // true after upgrade succeeded; SIGTERM should exit immediately
-	acmeManager      *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
-	acmeDNSManager   *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
+	cfg             ControlPlaneConfig
+	pool            WorkerPool      // non-nil in single-tenant process mode
+	sessions        *SessionManager // non-nil in single-tenant process mode
+	flight          *FlightIngress
+	rebalancer      *MemoryRebalancer
+	srv             *server.Server // Minimal server for cancel request routing
+	rateLimiter     *server.RateLimiter
+	tlsConfig       *tls.Config
+	pgListener      net.Listener
+	upgrader        *tableflip.Upgrader
+	parentPID       int // tableflip parent PID (0 if first generation)
+	activeConns     int64
+	closed          bool
+	closeMu         sync.Mutex
+	wg              sync.WaitGroup
+	reloading       atomic.Bool            // guards against concurrent upgrade from double SIGUSR1
+	upgradeDraining atomic.Bool            // true after upgrade succeeded; SIGTERM should exit immediately
+	acmeManager     *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
+	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
-	// Multi-tenant fields (non-nil when --config-store is set with remote backend)
-	teamRouter  TeamRouterInterface
+	// Multi-tenant fields (non-nil in remote multitenant mode)
+	orgRouter   OrgRouterInterface
 	configStore ConfigStoreInterface
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
 // Defined here to avoid circular imports with the configstore package.
 type ConfigStoreInterface interface {
-	ValidateUser(username, password string) (teamName string, ok bool)
-	TeamForUser(username string) string
+	ValidateUser(username, password string) (orgID string, ok bool)
+	OrgForUser(username string) string
 }
 
-// TeamRouterInterface abstracts the team router for the control plane.
-type TeamRouterInterface interface {
+// OrgRouterInterface abstracts the org router for the control plane.
+type OrgRouterInterface interface {
 	StackForUser(username string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	ShutdownAll()
 }
@@ -138,6 +148,10 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Enforce secure defaults for control-plane mode.
 	if err := validateControlPlaneSecurity(cfg); err != nil {
 		slog.Error("Invalid control-plane security configuration.", "error", err)
+		os.Exit(1)
+	}
+	if err := validateWorkerBackendConfig(cfg); err != nil {
+		slog.Error("Invalid worker backend configuration.", "error", err)
 		os.Exit(1)
 	}
 
@@ -234,30 +248,49 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Initialize memory rebalancer. Every session gets the full memory budget
 	// (75% of system RAM by default). DuckDB spills to disk/swap if needed.
 	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
-	maxWorkers := cfg.MaxWorkers
 
 	// Use a temporary rebalancer to auto-detect the budget and derive
-	// a default max_workers if not explicitly set.
+	// backend-specific default max_workers if not explicitly set.
 	tempRebalancer := NewMemoryRebalancer(memBudget, 0, nil, false)
 	memBudget = tempRebalancer.memoryBudget // capture auto-detected value
 
-	// If max_workers is not set, derive a reasonable concurrency cap from
-	// the memory budget (budget / 256MB).
-	if maxWorkers == 0 {
-		maxWorkers = tempRebalancer.DefaultMaxWorkers()
-		slog.Info("Derived max_workers from memory budget.",
-			"max_workers", maxWorkers,
-			"memory_budget", formatBytes(memBudget))
+	processMaxWorkers := cfg.Process.MaxWorkers
+	if processMaxWorkers == 0 {
+		processMaxWorkers = tempRebalancer.DefaultMaxWorkers()
+	}
+	k8sMaxWorkers := cfg.K8s.MaxWorkers
+	if k8sMaxWorkers == 0 {
+		k8sMaxWorkers = tempRebalancer.DefaultMaxWorkers()
 	}
 
 	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance)
 
-	// Validate min_workers <= max_workers
-	minWorkers := cfg.MinWorkers
-	if minWorkers > maxWorkers {
-		slog.Warn("min_workers exceeds max_workers; capping to max_workers.",
-			"min_workers", minWorkers, "max_workers", maxWorkers)
-		minWorkers = maxWorkers
+	if !isK8s && cfg.Process.MaxWorkers == 0 {
+		slog.Info("Derived process.max_workers from memory budget.",
+			"process_max_workers", processMaxWorkers,
+			"memory_budget", formatBytes(memBudget))
+	}
+	if isK8s && cfg.K8s.MaxWorkers == 0 {
+		slog.Info("Derived k8s.max_workers from memory budget.",
+			"k8s_max_workers", k8sMaxWorkers,
+			"memory_budget", formatBytes(memBudget))
+	}
+
+	processMinWorkers := cfg.Process.MinWorkers
+	if processMinWorkers > processMaxWorkers {
+		slog.Warn("process.min_workers exceeds process.max_workers; capping to process.max_workers.",
+			"process_min_workers", processMinWorkers,
+			"process_max_workers", processMaxWorkers)
+		processMinWorkers = processMaxWorkers
+	}
+
+	k8sSharedWarmTarget := cfg.K8s.SharedWarmTarget
+	if isK8s && k8sSharedWarmTarget > k8sMaxWorkers {
+		slog.Warn("k8s.shared_warm_target exceeds k8s.max_workers; capping to k8s.max_workers.",
+			"k8s_shared_warm_target", k8sSharedWarmTarget,
+			"k8s_max_workers", k8sMaxWorkers)
+		k8sSharedWarmTarget = k8sMaxWorkers
+		cfg.K8s.SharedWarmTarget = k8sSharedWarmTarget
 	}
 
 	// Create a minimal server for cancel request routing
@@ -283,15 +316,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		acmeDNSManager: acmeDNSMgr,
 	}
 
-	// Multi-tenant mode: config store + per-team pools (K8s remote backend only)
-	if cfg.ConfigStoreConn != "" && cfg.WorkerBackend == "remote" {
-		store, adapter, adminSrv, err := SetupMultiTenant(cfg, srv, memBudget, maxWorkers)
+	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
+	if cfg.WorkerBackend == "remote" {
+		store, adapter, adminSrv, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
 		}
 		cp.configStore = store
-		cp.teamRouter = adapter
+		cp.orgRouter = adapter
 		// Replace the simple metrics server with the Gin admin server
 		if cfg.MetricsServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -302,48 +335,23 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.cfg = cfg
 		_ = store // keep linter happy
 	} else {
-		// Single-tenant mode: one shared pool + session manager
-		var pool WorkerPool
+		// Single-tenant mode: one shared process pool + session manager
+		procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, processMinWorkers, processMaxWorkers)
+		procPool.idleTimeout = cfg.WorkerIdleTimeout
 
-		switch cfg.WorkerBackend {
-		case "remote":
-			k8sPool, err := CreateK8sPool(K8sWorkerPoolConfig{
-				Namespace:       cfg.K8s.WorkerNamespace,
-				CPID:            cfg.K8s.ControlPlaneID,
-				WorkerImage:     cfg.K8s.WorkerImage,
-				WorkerPort:      cfg.K8s.WorkerPort,
-				SecretName:      cfg.K8s.WorkerSecret,
-				ConfigMap:       cfg.K8s.WorkerConfigMap,
-				MaxWorkers:      maxWorkers,
-				IdleTimeout:     cfg.WorkerIdleTimeout,
-				ConfigPath:      cfg.ConfigPath,
-				ImagePullPolicy: cfg.K8s.ImagePullPolicy,
-				ServiceAccount:  cfg.K8s.ServiceAccount,
-				MemoryBudget:    int64(memBudget),
-			})
-			if err != nil {
-				slog.Error("Failed to create Kubernetes worker pool.", "error", err)
-				os.Exit(1)
-			}
-			pool = k8sPool
-		default: // "process" or empty
-			procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, minWorkers, maxWorkers)
-			procPool.idleTimeout = cfg.WorkerIdleTimeout
-
-			// Pre-bind worker sockets. On upgrade with EROFS, this may fail —
-			// that's OK, workers will fall back to effectiveSocketDir (/tmp).
-			if maxWorkers > 0 {
-				if err := procPool.PreBindSockets(maxWorkers); err != nil {
-					if upg.HasParent() {
-						slog.Warn("Failed to pre-bind worker sockets (will use dynamic sockets).", "error", err)
-					} else {
-						slog.Error("Failed to pre-bind worker sockets.", "error", err)
-						os.Exit(1)
-					}
+		// Pre-bind worker sockets. On upgrade with EROFS, this may fail —
+		// that's OK, workers will fall back to effectiveSocketDir (/tmp).
+		if processMaxWorkers > 0 {
+			if err := procPool.PreBindSockets(processMaxWorkers); err != nil {
+				if upg.HasParent() {
+					slog.Warn("Failed to pre-bind worker sockets (will use dynamic sockets).", "error", err)
+				} else {
+					slog.Error("Failed to pre-bind worker sockets.", "error", err)
+					os.Exit(1)
 				}
 			}
-			pool = procPool
 		}
+		pool := WorkerPool(procPool)
 
 		sessions := NewSessionManager(pool, rebalancer)
 
@@ -364,9 +372,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			return sp.Percentage, sp.Rows, sp.TotalRows, sp.Stalled
 		})
 
-		// Pre-warm workers if min_workers is set
-		if minWorkers > 0 {
-			if err := pool.SpawnMinWorkers(minWorkers); err != nil {
+		warmTarget := processMinWorkers
+		if warmTarget > 0 {
+			if err := pool.SpawnMinWorkers(warmTarget); err != nil {
 				slog.Error("Failed to spawn min workers.", "error", err)
 				os.Exit(1)
 			}
@@ -438,8 +446,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
 		"flight_addr", cp.flightAddr(),
-		"min_workers", minWorkers,
-		"max_workers", maxWorkers,
+		"worker_backend", cfg.WorkerBackend,
+		"process_min_workers", processMinWorkers,
+		"process_max_workers", processMaxWorkers,
+		"k8s_max_workers", k8sMaxWorkers,
+		"k8s_shared_warm_target", k8sSharedWarmTarget,
 		"worker_queue_timeout", cfg.WorkerQueueTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
 		"memory_rebalance", cfg.MemoryRebalance)
@@ -649,7 +660,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Authenticate: use config store (multi-tenant) or YAML users (single-tenant)
 	if cp.configStore != nil {
-		teamName, ok := cp.configStore.ValidateUser(username, password)
+		orgID, ok := cp.configStore.ValidateUser(username, password)
 		if !ok {
 			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
@@ -660,7 +671,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
-		_ = teamName // used for routing below
+		_ = orgID // used for routing below
 	} else {
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
 			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
@@ -684,13 +695,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
 	// Resolve the session manager and rebalancer for this connection.
-	// In multi-tenant mode, each team has its own stack.
+	// In multi-tenant mode, each org has its own stack.
 	var sessions *SessionManager
 	var rebalancer *MemoryRebalancer
-	if cp.teamRouter != nil {
-		_, sess, rebal, ok := cp.teamRouter.StackForUser(username)
+	if cp.orgRouter != nil {
+		_, sess, rebal, ok := cp.orgRouter.StackForUser(username)
 		if !ok {
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no team configured for user")
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
 			_ = writer.Flush()
 			return
 		}
@@ -890,8 +901,8 @@ func (cp *ControlPlane) shutdown() {
 	cp.wg.Wait()
 
 	slog.Info("Shutting down workers...")
-	if cp.teamRouter != nil {
-		cp.teamRouter.ShutdownAll()
+	if cp.orgRouter != nil {
+		cp.orgRouter.ShutdownAll()
 	} else if cp.pool != nil {
 		cp.pool.ShutdownAll()
 	}
@@ -1068,8 +1079,8 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 	}
 
 	// Shut down workers
-	if cp.teamRouter != nil {
-		cp.teamRouter.ShutdownAll()
+	if cp.orgRouter != nil {
+		cp.orgRouter.ShutdownAll()
 	} else if cp.pool != nil {
 		cp.pool.ShutdownAll()
 	}
@@ -1096,14 +1107,14 @@ func (cp *ControlPlane) startFlightIngress() {
 	var provider flightsqlingress.SessionProvider
 
 	switch {
-	case cp.configStore != nil && cp.teamRouter != nil:
-		// Multi-tenant: auth via config store, sessions routed per-team.
+	case cp.configStore != nil && cp.orgRouter != nil:
+		// Multi-tenant: auth via config store, sessions routed per-org.
 		validator = flightsqlingress.FuncCredentialValidator(func(username, password string) bool {
 			_, ok := cp.configStore.ValidateUser(username, password)
 			return ok
 		})
-		provider = &teamRoutedSessionProvider{
-			teamRouter: cp.teamRouter,
+		provider = &orgRoutedSessionProvider{
+			orgRouter: cp.orgRouter,
 			pidSession: make(map[int32]*SessionManager),
 		}
 	case cp.sessions != nil:

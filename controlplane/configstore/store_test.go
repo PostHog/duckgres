@@ -17,20 +17,19 @@ func mustHash(t *testing.T, password string) string {
 }
 
 func TestSnapshotBuild(t *testing.T) {
-	// Verify TeamConfig construction from models
+	// Verify OrgConfig construction from models
 	hash1 := mustHash(t, "secret1")
 	hash2 := mustHash(t, "secret2")
 	hash3 := mustHash(t, "secret3")
 	readyAt := time.Date(2026, time.March, 17, 12, 0, 0, 0, time.UTC)
 
-	teams := []Team{
+	orgs := []Org{
 		{
 			Name:         "analytics",
 			MaxWorkers:   4,
-			MinWorkers:   1,
 			MemoryBudget: "8GB",
 			Warehouse: &ManagedWarehouse{
-				TeamName: "analytics",
+				OrgID: "analytics",
 				WarehouseDatabase: ManagedWarehouseDatabase{
 					Region:       "us-east-1",
 					Endpoint:     "analytics.cluster-xyz.us-east-1.rds.amazonaws.com",
@@ -51,15 +50,15 @@ func TestSnapshotBuild(t *testing.T) {
 					Provider:   "aws",
 					Region:     "us-east-1",
 					Bucket:     "analytics-bucket",
-					PathPrefix: "ducklake/team-analytics/",
+					PathPrefix: "ducklake/org-analytics/",
 					Endpoint:   "s3.us-east-1.amazonaws.com",
 					UseSSL:     true,
 					URLStyle:   "vhost",
 				},
 				WorkerIdentity: ManagedWarehouseWorkerIdentity{
 					Namespace:          "duckgres",
-					ServiceAccountName: "team-analytics-worker",
-					IAMRoleARN:         "arn:aws:iam::123456789012:role/team-analytics-worker",
+					ServiceAccountName: "org-analytics-worker",
+					IAMRoleARN:         "arn:aws:iam::123456789012:role/org-analytics-worker",
 				},
 				WarehouseDatabaseCredentials: SecretRef{
 					Namespace: "duckgres",
@@ -90,87 +89,86 @@ func TestSnapshotBuild(t *testing.T) {
 				SecretsState:           ManagedWarehouseStateReady,
 				ReadyAt:                &readyAt,
 			},
-			Users: []TeamUser{
-				{Username: "alice", Password: hash1, TeamName: "analytics"},
-				{Username: "bob", Password: hash2, TeamName: "analytics"},
+			Users: []OrgUser{
+				{Username: "alice", Password: hash1, OrgID: "analytics"},
+				{Username: "bob", Password: hash2, OrgID: "analytics"},
 			},
 		},
 		{
 			Name:       "ingestion",
 			MaxWorkers: 2,
-			Users: []TeamUser{
-				{Username: "charlie", Password: hash3, TeamName: "ingestion"},
+			Users: []OrgUser{
+				{Username: "charlie", Password: hash3, OrgID: "ingestion"},
 			},
 		},
 	}
 
 	snap := &Snapshot{
-		Teams:        make(map[string]*TeamConfig),
-		UserTeam:     make(map[string]string),
+		Orgs:         make(map[string]*OrgConfig),
+		UserOrg:      make(map[string]string),
 		UserPassword: make(map[string]string),
 	}
 
-	for _, t2 := range teams {
-		tc := &TeamConfig{
-			Name:         t2.Name,
-			MaxWorkers:   t2.MaxWorkers,
-			MinWorkers:   t2.MinWorkers,
-			MemoryBudget: t2.MemoryBudget,
-			IdleTimeoutS: t2.IdleTimeoutS,
+	for _, o := range orgs {
+		oc := &OrgConfig{
+			Name:         o.Name,
+			MaxWorkers:   o.MaxWorkers,
+			MemoryBudget: o.MemoryBudget,
+			IdleTimeoutS: o.IdleTimeoutS,
 			Users:        make(map[string]string),
 		}
-		if t2.Warehouse != nil {
-			tc.Warehouse = copyManagedWarehouseConfig(t2.Warehouse)
+		if o.Warehouse != nil {
+			oc.Warehouse = copyManagedWarehouseConfig(o.Warehouse)
 		}
-		for _, u := range t2.Users {
-			tc.Users[u.Username] = u.Password
-			snap.UserTeam[u.Username] = t2.Name
+		for _, u := range o.Users {
+			oc.Users[u.Username] = u.Password
+			snap.UserOrg[u.Username] = o.Name
 			snap.UserPassword[u.Username] = u.Password
 		}
-		snap.Teams[t2.Name] = tc
+		snap.Orgs[o.Name] = oc
 	}
 
-	// Verify team config
-	if len(snap.Teams) != 2 {
-		t.Fatalf("expected 2 teams, got %d", len(snap.Teams))
+	// Verify org config
+	if len(snap.Orgs) != 2 {
+		t.Fatalf("expected 2 orgs, got %d", len(snap.Orgs))
 	}
-	if snap.Teams["analytics"].MaxWorkers != 4 {
-		t.Errorf("expected analytics max_workers=4, got %d", snap.Teams["analytics"].MaxWorkers)
+	if snap.Orgs["analytics"].MaxWorkers != 4 {
+		t.Errorf("expected analytics max_workers=4, got %d", snap.Orgs["analytics"].MaxWorkers)
 	}
-	if snap.Teams["analytics"].MemoryBudget != "8GB" {
-		t.Errorf("expected analytics memory_budget=8GB, got %s", snap.Teams["analytics"].MemoryBudget)
+	if snap.Orgs["analytics"].MemoryBudget != "8GB" {
+		t.Errorf("expected analytics memory_budget=8GB, got %s", snap.Orgs["analytics"].MemoryBudget)
 	}
-	if len(snap.Teams["analytics"].Users) != 2 {
-		t.Errorf("expected 2 analytics users, got %d", len(snap.Teams["analytics"].Users))
+	if len(snap.Orgs["analytics"].Users) != 2 {
+		t.Errorf("expected 2 analytics users, got %d", len(snap.Orgs["analytics"].Users))
 	}
-	if snap.Teams["analytics"].Warehouse == nil {
+	if snap.Orgs["analytics"].Warehouse == nil {
 		t.Fatal("expected analytics warehouse to be present")
 	}
-	if snap.Teams["analytics"].Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
-		t.Fatalf("expected analytics warehouse db name analytics_wh, got %q", snap.Teams["analytics"].Warehouse.WarehouseDatabase.DatabaseName)
+	if snap.Orgs["analytics"].Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
+		t.Fatalf("expected analytics warehouse db name analytics_wh, got %q", snap.Orgs["analytics"].Warehouse.WarehouseDatabase.DatabaseName)
 	}
-	if snap.Teams["analytics"].Warehouse.MetadataStore.Kind != "dedicated_rds" {
-		t.Fatalf("expected metadata store kind dedicated_rds, got %q", snap.Teams["analytics"].Warehouse.MetadataStore.Kind)
+	if snap.Orgs["analytics"].Warehouse.MetadataStore.Kind != "dedicated_rds" {
+		t.Fatalf("expected metadata store kind dedicated_rds, got %q", snap.Orgs["analytics"].Warehouse.MetadataStore.Kind)
 	}
-	if snap.Teams["analytics"].Warehouse.MetadataStoreCredentials.Name != "analytics-metadata" {
-		t.Fatalf("expected metadata secret analytics-metadata, got %q", snap.Teams["analytics"].Warehouse.MetadataStoreCredentials.Name)
+	if snap.Orgs["analytics"].Warehouse.MetadataStoreCredentials.Name != "analytics-metadata" {
+		t.Fatalf("expected metadata secret analytics-metadata, got %q", snap.Orgs["analytics"].Warehouse.MetadataStoreCredentials.Name)
 	}
-	if snap.Teams["analytics"].Warehouse.RuntimeConfig.Name != "analytics-runtime" {
-		t.Fatalf("expected runtime config secret analytics-runtime, got %q", snap.Teams["analytics"].Warehouse.RuntimeConfig.Name)
+	if snap.Orgs["analytics"].Warehouse.RuntimeConfig.Name != "analytics-runtime" {
+		t.Fatalf("expected runtime config secret analytics-runtime, got %q", snap.Orgs["analytics"].Warehouse.RuntimeConfig.Name)
 	}
-	if snap.Teams["analytics"].Warehouse.ReadyAt == nil || !snap.Teams["analytics"].Warehouse.ReadyAt.Equal(readyAt) {
-		t.Fatalf("expected ready_at %v, got %v", readyAt, snap.Teams["analytics"].Warehouse.ReadyAt)
+	if snap.Orgs["analytics"].Warehouse.ReadyAt == nil || !snap.Orgs["analytics"].Warehouse.ReadyAt.Equal(readyAt) {
+		t.Fatalf("expected ready_at %v, got %v", readyAt, snap.Orgs["analytics"].Warehouse.ReadyAt)
 	}
-	if snap.Teams["ingestion"].Warehouse != nil {
+	if snap.Orgs["ingestion"].Warehouse != nil {
 		t.Fatal("expected ingestion warehouse to be nil")
 	}
 
-	// Verify user → team mapping
-	if snap.UserTeam["alice"] != "analytics" {
-		t.Errorf("expected alice in analytics, got %s", snap.UserTeam["alice"])
+	// Verify user -> org mapping
+	if snap.UserOrg["alice"] != "analytics" {
+		t.Errorf("expected alice in analytics, got %s", snap.UserOrg["alice"])
 	}
-	if snap.UserTeam["charlie"] != "ingestion" {
-		t.Errorf("expected charlie in ingestion, got %s", snap.UserTeam["charlie"])
+	if snap.UserOrg["charlie"] != "ingestion" {
+		t.Errorf("expected charlie in ingestion, got %s", snap.UserOrg["charlie"])
 	}
 
 	// Verify bcrypt password hashes are stored (not plaintext)
@@ -198,8 +196,8 @@ func TestTableNames(t *testing.T) {
 		model interface{ TableName() string }
 		want  string
 	}{
-		{Team{}, "duckgres_teams"},
-		{TeamUser{}, "duckgres_team_users"},
+		{Org{}, "duckgres_orgs"},
+		{OrgUser{}, "duckgres_org_users"},
 		{ManagedWarehouse{}, "duckgres_managed_warehouses"},
 		{GlobalConfig{}, "duckgres_global_config"},
 		{DuckLakeConfig{}, "duckgres_ducklake_config"},

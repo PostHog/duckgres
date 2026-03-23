@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -36,6 +37,23 @@ type ManagedWorker struct {
 	exitErr        error
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
+	sharedState    SharedWorkerState
+}
+
+// SharedState returns the additive shared warm-worker lifecycle metadata for
+// this worker. The zero value normalizes to an idle, unassigned worker.
+func (w *ManagedWorker) SharedState() SharedWorkerState {
+	return cloneSharedWorkerState(w.sharedState)
+}
+
+// SetSharedState updates the additive shared warm-worker lifecycle metadata
+// without changing existing session scheduling behavior.
+func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
+	if err := state.Validate(); err != nil {
+		return err
+	}
+	w.sharedState = cloneSharedWorkerState(state)
+	return nil
 }
 
 // preboundSocket is a Unix socket pre-bound at startup while the socket
@@ -214,7 +232,6 @@ func (p *FlightWorkerPool) effectiveSocketDir() (string, error) {
 	p.preboundMu.Unlock()
 	return fallback, nil
 }
-
 
 // SpawnWorker starts a new duckdb-service worker process.
 // It uses a pre-bound socket from the pool if available, falling back to
@@ -1104,6 +1121,29 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit
 	}
 
 	return resp.SessionToken, nil
+}
+
+// ActivateTenant delivers tenant runtime to a shared warm worker before it may serve sessions.
+func (w *ManagedWorker) ActivateTenant(ctx context.Context, payload server.WorkerActivationPayload) (err error) {
+	defer recoverWorkerPanic(&err)
+
+	body, _ := json.Marshal(payload)
+	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
+		Type: "ActivateTenant",
+		Body: body,
+	})
+	if err != nil {
+		return fmt.Errorf("activate tenant: %w", err)
+	}
+
+	for {
+		if _, err := stream.Recv(); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("activate tenant recv: %w", err)
+		}
+	}
 }
 
 // DestroySession destroys a session on the worker.

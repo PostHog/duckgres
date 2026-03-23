@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Duckgres - Teams</title>
+    <title>Duckgres - Orgs</title>
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
@@ -16,7 +16,7 @@
             </div>
             <div class="flex space-x-4">
                 <a href="/" class="text-gray-400 hover:text-gray-200">Overview</a>
-                <a href="/teams" class="text-yellow-400 hover:text-yellow-300 font-medium">Teams</a>
+                <a href="/orgs" class="text-yellow-400 hover:text-yellow-300 font-medium">Orgs</a>
                 <a href="/workers" class="text-gray-400 hover:text-gray-200">Ducklings</a>
                 <a href="/sessions" class="text-gray-400 hover:text-gray-200">Sessions</a>
                 <a href="/settings" class="text-gray-400 hover:text-gray-200">Settings</a>
@@ -26,25 +26,23 @@
 
     <main class="max-w-7xl mx-auto px-6 py-8">
         <div class="flex justify-between items-center mb-6">
-            <h1 class="text-2xl font-bold">Teams</h1>
+            <h1 class="text-2xl font-bold">Orgs</h1>
             <button onclick="document.getElementById('create-form').classList.toggle('hidden')"
                     class="bg-yellow-500 hover:bg-yellow-400 text-gray-900 px-4 py-2 rounded font-medium">
-                New Team
+                New Org
             </button>
         </div>
 
         <div id="create-form" class="hidden bg-gray-800 rounded-lg border border-gray-700 p-6 mb-6">
-            <h3 class="text-lg font-semibold mb-4">Create Team</h3>
-            <form hx-post="/api/v1/teams" hx-target="#team-table" hx-swap="innerHTML"
+            <h3 class="text-lg font-semibold mb-4">Create Org</h3>
+            <form hx-post="/api/v1/orgs" hx-target="#org-table" hx-swap="innerHTML"
                   hx-on::after-request="if(event.detail.successful) this.reset()">
                 <div class="grid grid-cols-2 gap-4">
-                    <input name="name" placeholder="Team name" required
+                    <input name="name" placeholder="Org name" required
                            class="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100">
                     <input name="max_workers" type="number" placeholder="Max workers (0=unlimited)"
                            class="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100">
                     <input name="memory_budget" placeholder="Memory budget (e.g. 8GB)"
-                           class="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100">
-                    <input name="min_workers" type="number" placeholder="Min workers (0=none)"
                            class="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100">
                 </div>
                 <button type="submit" class="mt-4 bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded">
@@ -53,7 +51,7 @@
             </form>
         </div>
 
-        <div id="team-table" hx-get="/api/v1/teams" hx-trigger="load, every 10s" hx-swap="innerHTML"
+        <div id="org-table" hx-get="/api/v1/orgs" hx-trigger="load, every 10s" hx-swap="innerHTML"
              class="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
             <div class="p-4 text-gray-400">Loading...</div>
         </div>
@@ -66,27 +64,26 @@
         return d.innerHTML;
     }
     document.body.addEventListener('htmx:beforeSwap', function(evt) {
-        if (evt.detail.target.id === 'team-table') {
+        if (evt.detail.target.id === 'org-table') {
             try {
-                const teams = JSON.parse(evt.detail.serverResponse);
-                if (!teams || teams.length === 0) {
-                    evt.detail.serverResponse = '<div class="p-4 text-gray-400">No teams configured</div>';
+                const orgs = JSON.parse(evt.detail.serverResponse);
+                if (!orgs || orgs.length === 0) {
+                    evt.detail.serverResponse = '<div class="p-4 text-gray-400">No orgs configured</div>';
                     return;
                 }
                 let html = '<table class="w-full"><thead><tr class="text-left text-gray-400 text-sm border-b border-gray-700">' +
-                    '<th class="p-3">Name</th><th class="p-3">Users</th><th class="p-3">Min Workers</th><th class="p-3">Max Workers</th>' +
+                    '<th class="p-3">Name</th><th class="p-3">Users</th><th class="p-3">Max Workers</th>' +
                     '<th class="p-3">Memory Budget</th><th class="p-3">Actions</th></tr></thead><tbody>';
-                teams.forEach(t => {
+                orgs.forEach(t => {
                     const safeName = esc(t.name);
                     html += `<tr class="border-b border-gray-700 hover:bg-gray-750">
                         <td class="p-3 font-medium">${safeName}</td>
                         <td class="p-3">${(t.users || []).length}</td>
-                        <td class="p-3">${t.min_workers}</td>
                         <td class="p-3">${t.max_workers || 'unlimited'}</td>
                         <td class="p-3">${esc(t.memory_budget || 'default')}</td>
                         <td class="p-3">
-                            <button hx-delete="/api/v1/teams/${encodeURIComponent(t.name)}" hx-target="#team-table" hx-swap="innerHTML"
-                                    hx-confirm="Delete team ${safeName}?"
+                            <button hx-delete="/api/v1/orgs/${encodeURIComponent(t.name)}" hx-target="#org-table" hx-swap="innerHTML"
+                                    hx-confirm="Delete org ${safeName}?"
                                     class="text-red-400 hover:text-red-300 text-sm">Delete</button>
                         </td></tr>`;
                 });

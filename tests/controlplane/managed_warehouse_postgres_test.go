@@ -5,7 +5,6 @@ package controlplane_test
 import (
 	"database/sql"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -30,18 +29,18 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 		t.Fatalf("hash password: %v", err)
 	}
 
-	if err := store.DB().Create(&configstore.Team{Name: "analytics"}).Error; err != nil {
-		t.Fatalf("create team: %v", err)
+	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
 	}
-	if err := store.DB().Create(&configstore.TeamUser{
+	if err := store.DB().Create(&configstore.OrgUser{
 		Username: "alice",
 		Password: passwordHash,
-		TeamName: "analytics",
+		OrgID:    "analytics",
 	}).Error; err != nil {
 		t.Fatalf("create user: %v", err)
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{
-		TeamName: "analytics",
+		OrgID: "analytics",
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			Region:       "us-east-1",
 			Endpoint:     "analytics.cluster.example",
@@ -73,42 +72,42 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 		t.Fatalf("reload store: %v", err)
 	}
 
-	teamCfg := store.Snapshot().Teams["analytics"]
-	if teamCfg == nil {
-		t.Fatal("expected analytics team in snapshot")
+	orgCfg := store.Snapshot().Orgs["analytics"]
+	if orgCfg == nil {
+		t.Fatal("expected analytics org in snapshot")
 	}
-	if teamCfg.Warehouse == nil {
+	if orgCfg.Warehouse == nil {
 		t.Fatal("expected warehouse to be preloaded into snapshot")
 	}
-	if teamCfg.Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
-		t.Fatalf("expected analytics_wh, got %q", teamCfg.Warehouse.WarehouseDatabase.DatabaseName)
+	if orgCfg.Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
+		t.Fatalf("expected analytics_wh, got %q", orgCfg.Warehouse.WarehouseDatabase.DatabaseName)
 	}
-	if teamCfg.Warehouse.MetadataStore.Kind != "dedicated_rds" {
-		t.Fatalf("expected metadata store kind dedicated_rds, got %q", teamCfg.Warehouse.MetadataStore.Kind)
+	if orgCfg.Warehouse.MetadataStore.Kind != "dedicated_rds" {
+		t.Fatalf("expected metadata store kind dedicated_rds, got %q", orgCfg.Warehouse.MetadataStore.Kind)
 	}
-	if teamCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata" {
-		t.Fatalf("expected ducklake_metadata, got %q", teamCfg.Warehouse.MetadataStore.DatabaseName)
+	if orgCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata" {
+		t.Fatalf("expected ducklake_metadata, got %q", orgCfg.Warehouse.MetadataStore.DatabaseName)
 	}
-	if teamCfg.Users["alice"] != passwordHash {
+	if orgCfg.Users["alice"] != passwordHash {
 		t.Fatal("expected user credentials to remain loaded in snapshot")
 	}
 
-	if err := store.DB().Create(&configstore.Team{Name: "cleanup"}).Error; err != nil {
-		t.Fatalf("create cleanup team: %v", err)
+	if err := store.DB().Create(&configstore.Org{Name: "cleanup"}).Error; err != nil {
+		t.Fatalf("create cleanup org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{
-		TeamName: "cleanup",
-		State:    configstore.ManagedWarehouseStateReady,
+		OrgID: "cleanup",
+		State: configstore.ManagedWarehouseStateReady,
 	}).Error; err != nil {
 		t.Fatalf("create cleanup warehouse: %v", err)
 	}
 
-	if err := store.DB().Delete(&configstore.Team{Name: "cleanup"}).Error; err != nil {
-		t.Fatalf("delete team: %v", err)
+	if err := store.DB().Delete(&configstore.Org{Name: "cleanup"}).Error; err != nil {
+		t.Fatalf("delete org: %v", err)
 	}
 
 	var count int64
-	if err := store.DB().Model(&configstore.ManagedWarehouse{}).Where("team_name = ?", "cleanup").Count(&count).Error; err != nil {
+	if err := store.DB().Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", "cleanup").Count(&count).Error; err != nil {
 		t.Fatalf("count warehouses: %v", err)
 	}
 	if count != 0 {
@@ -119,7 +118,7 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 func TestLocalConfigStoreSeedSQL(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	if err := applyLocalConfigStoreSeed(t, store); err != nil {
+	if err := applyConfigStoreSeed(t, store, filepath.Join(findProjectRoot(), "k8s", "local-config-store.seed.sql")); err != nil {
 		t.Fatalf("apply local seed: %v", err)
 	}
 
@@ -128,30 +127,30 @@ func TestLocalConfigStoreSeedSQL(t *testing.T) {
 	}
 
 	snap := store.Snapshot()
-	teamCfg := snap.Teams["local"]
-	if teamCfg == nil {
-		t.Fatal("expected local team from seed")
+	orgCfg := snap.Orgs["local"]
+	if orgCfg == nil {
+		t.Fatal("expected local org from seed")
 	}
-	if teamCfg.Warehouse == nil {
+	if orgCfg.Warehouse == nil {
 		t.Fatal("expected local warehouse from seed")
 	}
-	if teamCfg.Warehouse.WarehouseDatabase.DatabaseName != "duckgres_local" {
-		t.Fatalf("expected duckgres_local warehouse db, got %q", teamCfg.Warehouse.WarehouseDatabase.DatabaseName)
+	if orgCfg.Warehouse.WarehouseDatabase.DatabaseName != "duckgres_local" {
+		t.Fatalf("expected duckgres_local warehouse db, got %q", orgCfg.Warehouse.WarehouseDatabase.DatabaseName)
 	}
-	if teamCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata_local" {
-		t.Fatalf("expected ducklake_metadata_local metadata db, got %q", teamCfg.Warehouse.MetadataStore.DatabaseName)
+	if orgCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata_local" {
+		t.Fatalf("expected ducklake_metadata_local metadata db, got %q", orgCfg.Warehouse.MetadataStore.DatabaseName)
 	}
-	if teamCfg.Warehouse.WarehouseDatabaseCredentials.Name != "duckgres-local-warehouse-db" {
-		t.Fatalf("expected duckgres-local-warehouse-db secret ref, got %q", teamCfg.Warehouse.WarehouseDatabaseCredentials.Name)
+	if orgCfg.Warehouse.WarehouseDatabaseCredentials.Name != "duckgres-local-warehouse-db" {
+		t.Fatalf("expected duckgres-local-warehouse-db secret ref, got %q", orgCfg.Warehouse.WarehouseDatabaseCredentials.Name)
 	}
-	if teamCfg.Warehouse.State != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("expected ready warehouse state, got %q", teamCfg.Warehouse.State)
+	if orgCfg.Warehouse.State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected ready warehouse state, got %q", orgCfg.Warehouse.State)
 	}
-	if teamCfg.Warehouse.MetadataStoreState != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("expected ready metadata store state, got %q", teamCfg.Warehouse.MetadataStoreState)
+	if orgCfg.Warehouse.MetadataStoreState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected ready metadata store state, got %q", orgCfg.Warehouse.MetadataStoreState)
 	}
-	if _, ok := teamCfg.Users["postgres"]; !ok {
-		t.Fatal("expected seeded postgres user to belong to local team")
+	if _, ok := orgCfg.Users["postgres"]; !ok {
+		t.Fatal("expected seeded postgres user to belong to local org")
 	}
 }
 
@@ -205,23 +204,4 @@ func ensureIntegrationPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
 	}
-}
-
-func applyLocalConfigStoreSeed(t *testing.T, store *configstore.ConfigStore) error {
-	t.Helper()
-
-	seedPath := filepath.Join(findProjectRoot(), "k8s", "local-config-store.seed.sql")
-	seedSQL, err := os.ReadFile(seedPath)
-	if err != nil {
-		return fmt.Errorf("read seed sql: %w", err)
-	}
-
-	sqlDB, err := store.DB().DB()
-	if err != nil {
-		return fmt.Errorf("store sql db: %w", err)
-	}
-	if _, err := sqlDB.Exec(string(seedSQL)); err != nil {
-		return fmt.Errorf("exec seed sql: %w", err)
-	}
-	return nil
 }
