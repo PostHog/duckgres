@@ -20,9 +20,9 @@ const (
 )
 
 // WorkerAssignment carries tenant-specific metadata once a shared worker has
-// been reserved for a team.
+// been reserved for an org.
 type WorkerAssignment struct {
-	TeamName       string
+	OrgID          string
 	LeaseExpiresAt time.Time
 }
 
@@ -150,8 +150,8 @@ func resolveWorkerAssignment(current, proposed *WorkerAssignment) (*WorkerAssign
 		return cloneWorkerAssignment(proposed), nil
 	case proposed == nil:
 		return cloneWorkerAssignment(current), nil
-	case current.TeamName != proposed.TeamName:
-		return nil, fmt.Errorf("assignment team cannot change from %q to %q", current.TeamName, proposed.TeamName)
+	case current.OrgID != proposed.OrgID:
+		return nil, fmt.Errorf("assignment org cannot change from %q to %q", current.OrgID, proposed.OrgID)
 	default:
 		return cloneWorkerAssignment(proposed), nil
 	}
@@ -161,8 +161,8 @@ func validateWorkerAssignment(assignment *WorkerAssignment) error {
 	if assignment == nil {
 		return fmt.Errorf("missing assignment")
 	}
-	if assignment.TeamName == "" {
-		return fmt.Errorf("missing team name")
+	if assignment.OrgID == "" {
+		return fmt.Errorf("missing org ID")
 	}
 	if assignment.LeaseExpiresAt.IsZero() {
 		return fmt.Errorf("missing lease expiry")

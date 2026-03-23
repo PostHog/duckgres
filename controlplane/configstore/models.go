@@ -2,30 +2,30 @@ package configstore
 
 import "time"
 
-// Team represents a tenant with per-team resource limits.
-type Team struct {
+// Org represents a tenant with per-org resource limits.
+type Org struct {
 	Name         string            `gorm:"primaryKey;size:255" json:"name"`
 	MaxWorkers   int               `gorm:"default:0" json:"max_workers"`
 	MemoryBudget string            `gorm:"size:32" json:"memory_budget"`
 	IdleTimeoutS int               `gorm:"default:0" json:"idle_timeout_s"`
-	Users        []TeamUser        `gorm:"foreignKey:TeamName;references:Name" json:"users,omitempty"`
-	Warehouse    *ManagedWarehouse `gorm:"foreignKey:TeamName;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	Users        []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse    *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
 }
 
-func (Team) TableName() string { return "duckgres_teams" }
+func (Org) TableName() string { return "duckgres_orgs" }
 
-// TeamUser maps a username to a team with credentials.
-type TeamUser struct {
+// OrgUser maps a username to an org with credentials.
+type OrgUser struct {
 	Username  string    `gorm:"primaryKey;size:255" json:"username"`
 	Password  string    `gorm:"size:255;not null" json:"-"`
-	TeamName  string    `gorm:"size:255;not null;index" json:"team_name"`
+	OrgID     string    `gorm:"size:255;not null;index" json:"org_id"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-func (TeamUser) TableName() string { return "duckgres_team_users" }
+func (OrgUser) TableName() string { return "duckgres_org_users" }
 
 // ManagedWarehouseProvisioningState is an open string used for warehouse lifecycle status.
 // The constants below are the canonical values used by current tooling, but callers may
@@ -48,7 +48,7 @@ type SecretRef struct {
 	Key       string `gorm:"size:255" json:"key"`
 }
 
-// ManagedWarehouseDatabase stores primary warehouse DB metadata for a team.
+// ManagedWarehouseDatabase stores primary warehouse DB metadata for an org.
 type ManagedWarehouseDatabase struct {
 	Region       string `gorm:"size:64" json:"region"`
 	Endpoint     string `gorm:"size:512" json:"endpoint"`
@@ -57,7 +57,7 @@ type ManagedWarehouseDatabase struct {
 	Username     string `gorm:"size:255" json:"username"`
 }
 
-// ManagedWarehouseMetadataStore stores team-scoped DuckLake metadata DB info.
+// ManagedWarehouseMetadataStore stores org-scoped DuckLake metadata DB info.
 type ManagedWarehouseMetadataStore struct {
 	Kind         string `gorm:"size:64" json:"kind"`
 	Engine       string `gorm:"size:64" json:"engine"`
@@ -68,7 +68,7 @@ type ManagedWarehouseMetadataStore struct {
 	Username     string `gorm:"size:255" json:"username"`
 }
 
-// ManagedWarehouseS3 stores object-store metadata for a team's warehouse.
+// ManagedWarehouseS3 stores object-store metadata for an org's warehouse.
 type ManagedWarehouseS3 struct {
 	Provider   string `gorm:"size:64" json:"provider"`
 	Region     string `gorm:"size:64" json:"region"`
@@ -79,16 +79,16 @@ type ManagedWarehouseS3 struct {
 	URLStyle   string `gorm:"size:16" json:"url_style"`
 }
 
-// ManagedWarehouseWorkerIdentity stores team-scoped worker identity metadata.
+// ManagedWarehouseWorkerIdentity stores org-scoped worker identity metadata.
 type ManagedWarehouseWorkerIdentity struct {
 	Namespace          string `gorm:"size:255" json:"namespace"`
 	ServiceAccountName string `gorm:"size:255" json:"service_account_name"`
 	IAMRoleARN         string `gorm:"size:512" json:"iam_role_arn"`
 }
 
-// ManagedWarehouse is the config-store source of truth for a team's managed warehouse metadata.
+// ManagedWarehouse is the config-store source of truth for an org's managed warehouse metadata.
 type ManagedWarehouse struct {
-	TeamName string `gorm:"primaryKey;size:255" json:"team_name"`
+	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
 
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
@@ -136,7 +136,7 @@ type GlobalConfig struct {
 func (GlobalConfig) TableName() string { return "duckgres_global_config" }
 
 // DuckLakeConfig is a singleton row (ID=1) for legacy cluster-wide DuckLake settings.
-// In multi-tenant mode, the managed-warehouse contract is the intended per-team source of truth.
+// In multi-tenant mode, the managed-warehouse contract is the intended per-org source of truth.
 type DuckLakeConfig struct {
 	ID            uint      `gorm:"primaryKey" json:"-"`
 	MetadataStore string    `gorm:"size:1024" json:"metadata_store"`
@@ -181,8 +181,8 @@ type QueryLogConfig struct {
 
 func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
 
-// TeamConfig is a convenience view combining team metadata with resource limits.
-type TeamConfig struct {
+// OrgConfig is a convenience view combining org metadata with resource limits.
+type OrgConfig struct {
 	Name         string
 	MaxWorkers   int
 	MemoryBudget string
@@ -191,9 +191,9 @@ type TeamConfig struct {
 	Warehouse    *ManagedWarehouseConfig
 }
 
-// ManagedWarehouseConfig is the in-memory snapshot view of a team's warehouse metadata.
+// ManagedWarehouseConfig is the in-memory snapshot view of an org's warehouse metadata.
 type ManagedWarehouseConfig struct {
-	TeamName string
+	OrgID string
 
 	WarehouseDatabase ManagedWarehouseDatabase
 	MetadataStore     ManagedWarehouseMetadataStore
@@ -227,7 +227,7 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 	}
 
 	cfg := &ManagedWarehouseConfig{
-		TeamName:                       warehouse.TeamName,
+		OrgID:                          warehouse.OrgID,
 		WarehouseDatabase:              warehouse.WarehouseDatabase,
 		MetadataStore:                  warehouse.MetadataStore,
 		S3:                             warehouse.S3,

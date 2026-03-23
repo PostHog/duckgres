@@ -16,7 +16,7 @@
             </div>
             <div class="flex space-x-4">
                 <a href="/" class="text-gray-400 hover:text-gray-200">Overview</a>
-                <a href="/teams" class="text-gray-400 hover:text-gray-200">Teams</a>
+                <a href="/orgs" class="text-gray-400 hover:text-gray-200">Orgs</a>
                 <a href="/workers" class="text-gray-400 hover:text-gray-200">Ducklings</a>
                 <a href="/sessions" class="text-yellow-400 hover:text-yellow-300 font-medium">Sessions</a>
                 <a href="/settings" class="text-gray-400 hover:text-gray-200">Settings</a>
@@ -48,11 +48,11 @@
                     return;
                 }
                 let html = '<table class="w-full"><thead><tr class="text-left text-gray-400 text-sm border-b border-gray-700">' +
-                    '<th class="p-3">PID</th><th class="p-3">Team</th><th class="p-3">Worker</th></tr></thead><tbody>';
+                    '<th class="p-3">PID</th><th class="p-3">Org</th><th class="p-3">Worker</th></tr></thead><tbody>';
                 sessions.forEach(s => {
                     html += `<tr class="border-b border-gray-700">
                         <td class="p-3 font-mono">${s.pid}</td>
-                        <td class="p-3">${esc(s.team)}</td>
+                        <td class="p-3">${esc(s.org)}</td>
                         <td class="p-3">${s.worker_id}</td></tr>`;
                 });
                 html += '</tbody></table>';

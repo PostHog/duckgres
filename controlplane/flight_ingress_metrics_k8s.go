@@ -7,49 +7,49 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// --- Per-team metrics (multi-tenant mode) ---
+// --- Per-org metrics (multi-tenant mode) ---
 
-var teamWorkersActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_team_workers_active",
-	Help: "Number of active workers per team",
-}, []string{"team"})
+var orgWorkersActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_org_workers_active",
+	Help: "Number of active workers per org",
+}, []string{"org"})
 
-var teamWorkersIdleGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_team_workers_idle",
-	Help: "Number of idle workers per team",
-}, []string{"team"})
+var orgWorkersIdleGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_org_workers_idle",
+	Help: "Number of idle workers per org",
+}, []string{"org"})
 
-var teamSessionsActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_team_sessions_active",
-	Help: "Number of active sessions per team",
-}, []string{"team"})
+var orgSessionsActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_org_sessions_active",
+	Help: "Number of active sessions per org",
+}, []string{"org"})
 
-var teamWorkerSpawnsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_team_worker_spawns_total",
-	Help: "Total worker spawns per team",
-}, []string{"team"})
+var orgWorkerSpawnsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_org_worker_spawns_total",
+	Help: "Total worker spawns per org",
+}, []string{"org"})
 
-var teamWorkerCrashesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_team_worker_crashes_total",
-	Help: "Total worker crashes per team",
-}, []string{"team"})
+var orgWorkerCrashesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_org_worker_crashes_total",
+	Help: "Total worker crashes per org",
+}, []string{"org"})
 
-func observeTeamWorkersActive(team string, count int) {
-	teamWorkersActiveGauge.WithLabelValues(team).Set(float64(count))
+func observeOrgWorkersActive(org string, count int) {
+	orgWorkersActiveGauge.WithLabelValues(org).Set(float64(count))
 }
 
-func observeTeamWorkersIdle(team string, count int) {
-	teamWorkersIdleGauge.WithLabelValues(team).Set(float64(count))
+func observeOrgWorkersIdle(org string, count int) {
+	orgWorkersIdleGauge.WithLabelValues(org).Set(float64(count))
 }
 
-func observeTeamSessionsActive(team string, count int) {
-	teamSessionsActiveGauge.WithLabelValues(team).Set(float64(count))
+func observeOrgSessionsActive(org string, count int) {
+	orgSessionsActiveGauge.WithLabelValues(org).Set(float64(count))
 }
 
-func observeTeamWorkerSpawn(team string) {
-	teamWorkerSpawnsCounter.WithLabelValues(team).Inc()
+func observeOrgWorkerSpawn(org string) {
+	orgWorkerSpawnsCounter.WithLabelValues(org).Inc()
 }
 
-func observeTeamWorkerCrash(team string) {
-	teamWorkerCrashesCounter.WithLabelValues(team).Inc()
+func observeOrgWorkerCrash(org string) {
+	orgWorkerCrashesCounter.WithLabelValues(org).Inc()
 }

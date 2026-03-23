@@ -16,7 +16,7 @@
             </div>
             <div class="flex space-x-4">
                 <a href="/" class="text-gray-400 hover:text-gray-200">Overview</a>
-                <a href="/teams" class="text-gray-400 hover:text-gray-200">Teams</a>
+                <a href="/orgs" class="text-gray-400 hover:text-gray-200">Orgs</a>
                 <a href="/workers" class="text-yellow-400 hover:text-yellow-300 font-medium">Ducklings</a>
                 <a href="/sessions" class="text-gray-400 hover:text-gray-200">Sessions</a>
                 <a href="/settings" class="text-gray-400 hover:text-gray-200">Settings</a>
@@ -48,12 +48,12 @@
                     return;
                 }
                 let html = '<table class="w-full"><thead><tr class="text-left text-gray-400 text-sm border-b border-gray-700">' +
-                    '<th class="p-3">ID</th><th class="p-3">Team</th><th class="p-3">Status</th><th class="p-3">Sessions</th></tr></thead><tbody>';
+                    '<th class="p-3">ID</th><th class="p-3">Org</th><th class="p-3">Status</th><th class="p-3">Sessions</th></tr></thead><tbody>';
                 workers.forEach(w => {
                     const statusColor = w.status === 'active' ? 'text-green-400' : 'text-yellow-400';
                     html += `<tr class="border-b border-gray-700">
                         <td class="p-3 font-mono">${w.id}</td>
-                        <td class="p-3">${esc(w.team)}</td>
+                        <td class="p-3">${esc(w.org)}</td>
                         <td class="p-3 ${statusColor}">${esc(w.status)}</td>
                         <td class="p-3">${w.active_sessions}</td></tr>`;
                 });

@@ -52,8 +52,8 @@ type K8sWorkerPool struct {
 	imagePullPolicy   corev1.PullPolicy
 	serviceAccount    string
 	memoryBudget      int64      // total memory budget in bytes
-	teamName          string     // team name for pod labels (multi-tenant mode)
-	workerIDGenerator func() int // shared ID generator across teams (nil = internal counter)
+	orgID             string     // org ID for pod labels (multi-tenant mode)
+	workerIDGenerator func() int // shared ID generator across orgs (nil = internal counter)
 	cachedToken       string     // cached bearer token (immutable after setup)
 	informer          cache.SharedIndexInformer
 	stopInform        chan struct{}
@@ -124,7 +124,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		imagePullPolicy:   corev1.PullPolicy(cfg.ImagePullPolicy),
 		serviceAccount:    cfg.ServiceAccount,
 		memoryBudget:      cfg.MemoryBudget,
-		teamName:          cfg.TeamName,
+		orgID:             cfg.OrgID,
 		workerIDGenerator: cfg.WorkerIDGenerator,
 		spawnSem:          make(chan struct{}, spawnConcurrency),
 	}
@@ -243,8 +243,8 @@ func (p *K8sWorkerPool) readBearerToken(ctx context.Context) (string, error) {
 // startInformer starts a SharedIndexInformer to watch worker pods.
 func (p *K8sWorkerPool) startInformer() {
 	labelSelector := fmt.Sprintf("duckgres/control-plane=%s", p.cpID)
-	if p.teamName != "" {
-		labelSelector += fmt.Sprintf(",duckgres/team=%s", p.teamName)
+	if p.orgID != "" {
+		labelSelector += fmt.Sprintf(",duckgres/org=%s", p.orgID)
 	}
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		p.clientset,
@@ -368,8 +368,8 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		"duckgres/control-plane": p.cpID,
 		"duckgres/worker-id":     strconv.Itoa(id),
 	}
-	if p.teamName != "" {
-		podLabels["duckgres/team"] = p.teamName
+	if p.orgID != "" {
+		podLabels["duckgres/org"] = p.orgID
 	}
 
 	// Build pod spec
@@ -1348,10 +1348,10 @@ func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker) {
 }
 
 // podNameForWorker returns the pod name for a given worker ID,
-// including the team name if set (multi-tenant mode).
+// including the org ID if set (multi-tenant mode).
 func (p *K8sWorkerPool) podNameForWorker(id int) string {
-	if p.teamName != "" {
-		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.teamName, id)
+	if p.orgID != "" {
+		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.orgID, id)
 	}
 	return fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
 }

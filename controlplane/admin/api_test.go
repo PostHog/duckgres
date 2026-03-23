@@ -18,67 +18,67 @@ import (
 )
 
 type fakeAPIStore struct {
-	teams      map[string]*configstore.Team
-	users      map[string]*configstore.TeamUser
+	orgs       map[string]*configstore.Org
+	users      map[string]*configstore.OrgUser
 	warehouses map[string]*configstore.ManagedWarehouse
 }
 
 func newFakeAPIStore() *fakeAPIStore {
 	return &fakeAPIStore{
-		teams:      make(map[string]*configstore.Team),
-		users:      make(map[string]*configstore.TeamUser),
+		orgs:       make(map[string]*configstore.Org),
+		users:      make(map[string]*configstore.OrgUser),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
 	}
 }
 
-func (s *fakeAPIStore) ListTeams() ([]configstore.Team, error) {
-	teams := make([]configstore.Team, 0, len(s.teams))
-	for _, team := range s.teams {
-		teams = append(teams, *copyTeam(team))
+func (s *fakeAPIStore) ListOrgs() ([]configstore.Org, error) {
+	orgs := make([]configstore.Org, 0, len(s.orgs))
+	for _, org := range s.orgs {
+		orgs = append(orgs, *copyOrg(org))
 	}
-	return teams, nil
+	return orgs, nil
 }
 
-func (s *fakeAPIStore) CreateTeam(team *configstore.Team) error {
-	if _, ok := s.teams[team.Name]; ok {
-		return errors.New("duplicate team")
+func (s *fakeAPIStore) CreateOrg(org *configstore.Org) error {
+	if _, ok := s.orgs[org.Name]; ok {
+		return errors.New("duplicate org")
 	}
-	clone := copyTeam(team)
+	clone := copyOrg(org)
 	clone.Warehouse = nil
-	s.teams[team.Name] = clone
+	s.orgs[org.Name] = clone
 	return nil
 }
 
-func (s *fakeAPIStore) GetTeam(name string) (*configstore.Team, error) {
-	team, ok := s.teams[name]
+func (s *fakeAPIStore) GetOrg(name string) (*configstore.Org, error) {
+	org, ok := s.orgs[name]
 	if !ok {
 		return nil, gorm.ErrRecordNotFound
 	}
-	return copyTeam(team), nil
+	return copyOrg(org), nil
 }
 
-func (s *fakeAPIStore) UpdateTeam(name string, updates configstore.Team) (*configstore.Team, bool, error) {
-	team, ok := s.teams[name]
+func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
+	org, ok := s.orgs[name]
 	if !ok {
 		return nil, false, nil
 	}
-	team.MaxWorkers = updates.MaxWorkers
-	team.MemoryBudget = updates.MemoryBudget
-	team.IdleTimeoutS = updates.IdleTimeoutS
-	return copyTeam(team), true, nil
+	org.MaxWorkers = updates.MaxWorkers
+	org.MemoryBudget = updates.MemoryBudget
+	org.IdleTimeoutS = updates.IdleTimeoutS
+	return copyOrg(org), true, nil
 }
 
-func (s *fakeAPIStore) DeleteTeam(name string) (bool, error) {
-	if _, ok := s.teams[name]; !ok {
+func (s *fakeAPIStore) DeleteOrg(name string) (bool, error) {
+	if _, ok := s.orgs[name]; !ok {
 		return false, nil
 	}
-	delete(s.teams, name)
+	delete(s.orgs, name)
 	delete(s.warehouses, name)
 	return true, nil
 }
 
-func (s *fakeAPIStore) ListUsers() ([]configstore.TeamUser, error) {
-	users := make([]configstore.TeamUser, 0, len(s.users))
+func (s *fakeAPIStore) ListUsers() ([]configstore.OrgUser, error) {
+	users := make([]configstore.OrgUser, 0, len(s.users))
 	for _, user := range s.users {
 		clone := *user
 		users = append(users, clone)
@@ -86,7 +86,7 @@ func (s *fakeAPIStore) ListUsers() ([]configstore.TeamUser, error) {
 	return users, nil
 }
 
-func (s *fakeAPIStore) CreateUser(user *configstore.TeamUser) error {
+func (s *fakeAPIStore) CreateUser(user *configstore.OrgUser) error {
 	if _, ok := s.users[user.Username]; ok {
 		return errors.New("duplicate user")
 	}
@@ -95,7 +95,7 @@ func (s *fakeAPIStore) CreateUser(user *configstore.TeamUser) error {
 	return nil
 }
 
-func (s *fakeAPIStore) GetUser(username string) (*configstore.TeamUser, error) {
+func (s *fakeAPIStore) GetUser(username string) (*configstore.OrgUser, error) {
 	user, ok := s.users[username]
 	if !ok {
 		return nil, gorm.ErrRecordNotFound
@@ -104,7 +104,7 @@ func (s *fakeAPIStore) GetUser(username string) (*configstore.TeamUser, error) {
 	return &clone, nil
 }
 
-func (s *fakeAPIStore) UpdateUser(username, passwordHash, teamName string) (*configstore.TeamUser, bool, error) {
+func (s *fakeAPIStore) UpdateUser(username, passwordHash, orgID string) (*configstore.OrgUser, bool, error) {
 	user, ok := s.users[username]
 	if !ok {
 		return nil, false, nil
@@ -112,8 +112,8 @@ func (s *fakeAPIStore) UpdateUser(username, passwordHash, teamName string) (*con
 	if passwordHash != "" {
 		user.Password = passwordHash
 	}
-	if teamName != "" {
-		user.TeamName = teamName
+	if orgID != "" {
+		user.OrgID = orgID
 	}
 	clone := *user
 	return &clone, true, nil
@@ -127,23 +127,23 @@ func (s *fakeAPIStore) DeleteUser(username string) (bool, error) {
 	return true, nil
 }
 
-func (s *fakeAPIStore) GetManagedWarehouse(teamName string) (*configstore.ManagedWarehouse, error) {
-	warehouse, ok := s.warehouses[teamName]
+func (s *fakeAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
+	warehouse, ok := s.warehouses[orgID]
 	if !ok {
 		return nil, gorm.ErrRecordNotFound
 	}
 	return copyWarehouse(warehouse), nil
 }
 
-func (s *fakeAPIStore) UpsertManagedWarehouse(teamName string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error) {
-	team, ok := s.teams[teamName]
+func (s *fakeAPIStore) UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error) {
+	org, ok := s.orgs[orgID]
 	if !ok {
 		return nil, false, nil
 	}
 	clone := copyWarehouse(warehouse)
-	clone.TeamName = teamName
-	s.warehouses[teamName] = clone
-	team.Warehouse = copyWarehouse(clone)
+	clone.OrgID = orgID
+	s.warehouses[orgID] = clone
+	org.Warehouse = copyWarehouse(clone)
 	return copyWarehouse(clone), true, nil
 }
 
@@ -187,17 +187,17 @@ func copyWarehouse(warehouse *configstore.ManagedWarehouse) *configstore.Managed
 	return &clone
 }
 
-func copyTeam(team *configstore.Team) *configstore.Team {
-	if team == nil {
+func copyOrg(org *configstore.Org) *configstore.Org {
+	if org == nil {
 		return nil
 	}
-	clone := *team
-	if team.Warehouse != nil {
-		clone.Warehouse = copyWarehouse(team.Warehouse)
+	clone := *org
+	if org.Warehouse != nil {
+		clone.Warehouse = copyWarehouse(org.Warehouse)
 	}
-	if len(team.Users) > 0 {
-		clone.Users = make([]configstore.TeamUser, len(team.Users))
-		copy(clone.Users, team.Users)
+	if len(org.Users) > 0 {
+		clone.Users = make([]configstore.OrgUser, len(org.Users))
+		copy(clone.Users, org.Users)
 	}
 	return &clone
 }
@@ -209,9 +209,9 @@ func newTestAPIRouter(store apiStore) *gin.Engine {
 	return r
 }
 
-func seedTeamWithWarehouse(store *fakeAPIStore, name string) {
+func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 	warehouse := &configstore.ManagedWarehouse{
-		TeamName: name,
+		OrgID: name,
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
 			Region:       "us-east-1",
 			Endpoint:     fmt.Sprintf("%s.cluster.example", name),
@@ -266,19 +266,19 @@ func seedTeamWithWarehouse(store *fakeAPIStore, name string) {
 		IdentityState:          configstore.ManagedWarehouseStateReady,
 		SecretsState:           configstore.ManagedWarehouseStateReady,
 	}
-	store.teams[name] = &configstore.Team{
+	store.orgs[name] = &configstore.Org{
 		Name:      name,
 		Warehouse: copyWarehouse(warehouse),
 	}
 	store.warehouses[name] = warehouse
 }
 
-func TestGetTeamIncludesWarehouse(t *testing.T) {
+func TestGetOrgIncludesWarehouse(t *testing.T) {
 	store := newFakeAPIStore()
-	seedTeamWithWarehouse(store, "analytics")
+	seedOrgWithWarehouse(store, "analytics")
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/teams/analytics", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/analytics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -286,27 +286,27 @@ func TestGetTeamIncludesWarehouse(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var team configstore.Team
-	if err := json.Unmarshal(rec.Body.Bytes(), &team); err != nil {
-		t.Fatalf("unmarshal team: %v", err)
+	var org configstore.Org
+	if err := json.Unmarshal(rec.Body.Bytes(), &org); err != nil {
+		t.Fatalf("unmarshal org: %v", err)
 	}
-	if team.Warehouse == nil {
-		t.Fatal("expected warehouse in team response")
+	if org.Warehouse == nil {
+		t.Fatal("expected warehouse in org response")
 	}
-	if team.Warehouse.WarehouseDatabase.DatabaseName != "analytics_warehouse" {
-		t.Fatalf("expected analytics_warehouse, got %q", team.Warehouse.WarehouseDatabase.DatabaseName)
+	if org.Warehouse.WarehouseDatabase.DatabaseName != "analytics_warehouse" {
+		t.Fatalf("expected analytics_warehouse, got %q", org.Warehouse.WarehouseDatabase.DatabaseName)
 	}
-	if team.Warehouse.MetadataStore.Kind != "dedicated_rds" {
-		t.Fatalf("expected metadata store kind dedicated_rds, got %q", team.Warehouse.MetadataStore.Kind)
+	if org.Warehouse.MetadataStore.Kind != "dedicated_rds" {
+		t.Fatalf("expected metadata store kind dedicated_rds, got %q", org.Warehouse.MetadataStore.Kind)
 	}
 }
 
-func TestListTeamsIncludesWarehouse(t *testing.T) {
+func TestListOrgsIncludesWarehouse(t *testing.T) {
 	store := newFakeAPIStore()
-	seedTeamWithWarehouse(store, "analytics")
+	seedOrgWithWarehouse(store, "analytics")
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/teams", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -314,24 +314,24 @@ func TestListTeamsIncludesWarehouse(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var teams []configstore.Team
-	if err := json.Unmarshal(rec.Body.Bytes(), &teams); err != nil {
-		t.Fatalf("unmarshal teams: %v", err)
+	var orgs []configstore.Org
+	if err := json.Unmarshal(rec.Body.Bytes(), &orgs); err != nil {
+		t.Fatalf("unmarshal orgs: %v", err)
 	}
-	if len(teams) != 1 {
-		t.Fatalf("expected 1 team, got %d", len(teams))
+	if len(orgs) != 1 {
+		t.Fatalf("expected 1 org, got %d", len(orgs))
 	}
-	if teams[0].Warehouse == nil {
-		t.Fatal("expected nested warehouse in team list response")
+	if orgs[0].Warehouse == nil {
+		t.Fatal("expected nested warehouse in org list response")
 	}
 }
 
 func TestGetWarehouseReturnsNotFoundWhenMissing(t *testing.T) {
 	store := newFakeAPIStore()
-	store.teams["analytics"] = &configstore.Team{Name: "analytics"}
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/teams/analytics/warehouse", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/analytics/warehouse", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -340,9 +340,9 @@ func TestGetWarehouseReturnsNotFoundWhenMissing(t *testing.T) {
 	}
 }
 
-func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
+func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 	store := newFakeAPIStore()
-	store.teams["analytics"] = &configstore.Team{Name: "analytics"}
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
@@ -405,7 +405,7 @@ func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
 		"secrets_state": "ready"
 	}`)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/analytics/warehouse", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -418,8 +418,8 @@ func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
 	if warehouse == nil {
 		t.Fatal("expected stored warehouse")
 	}
-	if warehouse.TeamName != "analytics" {
-		t.Fatalf("expected team_name analytics, got %q", warehouse.TeamName)
+	if warehouse.OrgID != "analytics" {
+		t.Fatalf("expected org_id analytics, got %q", warehouse.OrgID)
 	}
 	if warehouse.RuntimeConfig.Name != "analytics-runtime" {
 		t.Fatalf("expected runtime secret analytics-runtime, got %q", warehouse.RuntimeConfig.Name)
@@ -432,11 +432,11 @@ func TestPutWarehouseUpsertsForExistingTeam(t *testing.T) {
 	}
 }
 
-func TestPutWarehouseRejectsUnknownTeam(t *testing.T) {
+func TestPutWarehouseRejectsUnknownOrg(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/unknown/warehouse", bytes.NewReader([]byte(`{"state":"ready"}`)))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/unknown/warehouse", bytes.NewReader([]byte(`{"state":"ready"}`)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -448,18 +448,18 @@ func TestPutWarehouseRejectsUnknownTeam(t *testing.T) {
 
 func TestPutWarehouseRejectsServerManagedFields(t *testing.T) {
 	store := newFakeAPIStore()
-	store.teams["analytics"] = &configstore.Team{Name: "analytics"}
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
-		"team_name": "wrong-team",
+		"org_id": "wrong-org",
 		"created_at": "2026-03-18T10:00:00Z",
 		"warehouse_database": {
 			"database_name": "analytics_warehouse"
 		}
 	}`)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/analytics/warehouse", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -471,7 +471,7 @@ func TestPutWarehouseRejectsServerManagedFields(t *testing.T) {
 
 func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	store := newFakeAPIStore()
-	store.teams["analytics"] = &configstore.Team{Name: "analytics"}
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
@@ -483,7 +483,7 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 		"secrets_state": "waiting-external-secret"
 	}`)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/analytics/warehouse", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -507,7 +507,7 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	}
 }
 
-func TestCreateTeamRejectsNestedWarehousePayload(t *testing.T) {
+func TestCreateOrgRejectsNestedWarehousePayload(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
@@ -519,7 +519,7 @@ func TestCreateTeamRejectsNestedWarehousePayload(t *testing.T) {
 		}
 	}`)
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/teams", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -527,14 +527,14 @@ func TestCreateTeamRejectsNestedWarehousePayload(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
-	if _, ok := store.teams["analytics"]; ok {
-		t.Fatal("expected team create to be rejected when warehouse payload is present")
+	if _, ok := store.orgs["analytics"]; ok {
+		t.Fatal("expected org create to be rejected when warehouse payload is present")
 	}
 }
 
-func TestUpdateTeamRejectsNestedWarehousePayload(t *testing.T) {
+func TestUpdateOrgRejectsNestedWarehousePayload(t *testing.T) {
 	store := newFakeAPIStore()
-	store.teams["analytics"] = &configstore.Team{Name: "analytics", MaxWorkers: 2}
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics", MaxWorkers: 2}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
@@ -544,7 +544,7 @@ func TestUpdateTeamRejectsNestedWarehousePayload(t *testing.T) {
 		}
 	}`)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/teams/analytics", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -552,20 +552,20 @@ func TestUpdateTeamRejectsNestedWarehousePayload(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
-	if store.teams["analytics"].MaxWorkers != 2 {
-		t.Fatalf("expected team update to be rejected, max_workers = %d", store.teams["analytics"].MaxWorkers)
+	if store.orgs["analytics"].MaxWorkers != 2 {
+		t.Fatalf("expected org update to be rejected, max_workers = %d", store.orgs["analytics"].MaxWorkers)
 	}
 }
 
-func TestGetTeamOmitsMinWorkers(t *testing.T) {
+func TestGetOrgOmitsMinWorkers(t *testing.T) {
 	store := newFakeAPIStore()
-	store.teams["analytics"] = &configstore.Team{
+	store.orgs["analytics"] = &configstore.Org{
 		Name:       "analytics",
 		MaxWorkers: 2,
 	}
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/teams/analytics", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/analytics", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -573,7 +573,7 @@ func TestGetTeamOmitsMinWorkers(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	if bytes.Contains(rec.Body.Bytes(), []byte(`"min_workers"`)) {
-		t.Fatalf("expected team response to omit min_workers, got %s", rec.Body.String())
+		t.Fatalf("expected org response to omit min_workers, got %s", rec.Body.String())
 	}
 }
 
@@ -583,8 +583,8 @@ func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	if slices.Contains(columns, "created_at") {
 		t.Fatal("expected created_at to be excluded from managed warehouse upserts")
 	}
-	if slices.Contains(columns, "team_name") {
-		t.Fatal("expected team_name to be excluded from managed warehouse upserts")
+	if slices.Contains(columns, "org_id") {
+		t.Fatal("expected org_id to be excluded from managed warehouse upserts")
 	}
 	if !slices.Contains(columns, "updated_at") {
 		t.Fatal("expected updated_at to be included in managed warehouse upserts")

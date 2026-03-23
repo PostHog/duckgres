@@ -462,23 +462,23 @@ func stopConfigStore() error {
 }
 
 func seedConfigStore() error {
-	teamSQL := `
-INSERT INTO duckgres_teams (name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
+	orgSQL := `
+INSERT INTO duckgres_orgs (name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
 VALUES ('local', 0, '', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET updated_at = NOW();
 `
 	if err := runCmd("docker", "exec", "-i", "duckgres-config-store",
-		"psql", "-U", "duckgres", "-d", "duckgres_config", "-v", "ON_ERROR_STOP=1", "-c", teamSQL); err != nil {
-		return fmt.Errorf("seed team: %w", err)
+		"psql", "-U", "duckgres", "-d", "duckgres_config", "-v", "ON_ERROR_STOP=1", "-c", orgSQL); err != nil {
+		return fmt.Errorf("seed org: %w", err)
 	}
 
 	userSQL := `
-INSERT INTO duckgres_team_users (username, password, team_name, created_at, updated_at)
+INSERT INTO duckgres_org_users (username, password, org_id, created_at, updated_at)
 VALUES ('postgres', '$2a$10$TQyt73Vw91Q1d7YcE86EVuhms/0u4qBydMDyVvZYlqDwc3/VtQAbm', 'local', NOW(), NOW())
 ON CONFLICT (username) DO UPDATE
 SET password = EXCLUDED.password,
-    team_name = EXCLUDED.team_name,
+    org_id = EXCLUDED.org_id,
     updated_at = NOW();
 `
 	if err := runCmd("docker", "exec", "-i", "duckgres-config-store",

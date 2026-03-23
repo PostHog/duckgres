@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestTeamReservedWorkerPoolAcquireReservesTeamWorker(t *testing.T) {
+func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
@@ -17,7 +17,7 @@ func TestTeamReservedWorkerPoolAcquireReservesTeamWorker(t *testing.T) {
 		return nil
 	}
 
-	pool := NewTeamReservedWorkerPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2)
 	worker, err := pool.AcquireWorker(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
@@ -27,7 +27,7 @@ func TestTeamReservedWorkerPoolAcquireReservesTeamWorker(t *testing.T) {
 	}
 
 	state := worker.SharedState()
-	if state.Assignment == nil || state.Assignment.TeamName != "analytics" {
+	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
 	}
 	if state.Lifecycle != WorkerLifecycleReserved {
@@ -35,13 +35,13 @@ func TestTeamReservedWorkerPoolAcquireReservesTeamWorker(t *testing.T) {
 	}
 }
 
-func TestTeamReservedWorkerPoolAcquireSkipsOtherTeamsWorkers(t *testing.T) {
+func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	other := &ManagedWorker{ID: 1, done: make(chan struct{})}
 	if err := other.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			TeamName:       "billing",
+			OrgID:          "billing",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -56,26 +56,26 @@ func TestTeamReservedWorkerPoolAcquireSkipsOtherTeamsWorkers(t *testing.T) {
 		return nil
 	}
 
-	pool := NewTeamReservedWorkerPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2)
 	worker, err := pool.AcquireWorker(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
 	if worker.ID == other.ID {
-		t.Fatal("expected analytics pool to reserve its own worker, not borrow another team's worker")
+		t.Fatal("expected analytics pool to reserve its own worker, not borrow another org's worker")
 	}
-	if state := worker.SharedState(); state.Assignment == nil || state.Assignment.TeamName != "analytics" {
+	if state := worker.SharedState(); state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
 	}
 }
 
-func TestTeamReservedWorkerPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
+func TestOrgReservedPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 9, activeSessions: 1, done: make(chan struct{})}
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			TeamName:       "analytics",
+			OrgID:          "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -83,7 +83,7 @@ func TestTeamReservedWorkerPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewTeamReservedWorkerPool(shared, "analytics", 1)
+	pool := NewOrgReservedPool(shared, "analytics", 1)
 	pool.ReleaseWorker(worker.ID)
 
 	time.Sleep(100 * time.Millisecond)

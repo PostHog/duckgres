@@ -18,13 +18,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// teamRouterAdapter wraps TeamRouter to implement both TeamRouterInterface
-// (for the control plane) and admin.TeamStackInfo (for the admin API).
-type teamRouterAdapter struct {
-	router *TeamRouter
+// orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
+// (for the control plane) and admin.OrgStackInfo (for the admin API).
+type orgRouterAdapter struct {
+	router *OrgRouter
 }
 
-func (a *teamRouterAdapter) StackForUser(username string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
+func (a *orgRouterAdapter) StackForUser(username string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForUser(username)
 	if !ok {
 		return nil, nil, nil, false
@@ -32,28 +32,28 @@ func (a *teamRouterAdapter) StackForUser(username string) (WorkerPool, *SessionM
 	return stack.Pool, stack.Sessions, stack.Rebalancer, true
 }
 
-func (a *teamRouterAdapter) ShutdownAll() {
+func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }
 
-func (a *teamRouterAdapter) AllTeamStats() []admin.TeamStatus {
+func (a *orgRouterAdapter) AllOrgStats() []admin.OrgStatus {
 	stacks := a.router.AllStacks()
-	stats := make([]admin.TeamStatus, 0, len(stacks))
+	stats := make([]admin.OrgStatus, 0, len(stacks))
 	for name, stack := range stacks {
 		sessionCount := stack.Sessions.SessionCount()
-		stats = append(stats, admin.TeamStatus{
+		stats = append(stats, admin.OrgStatus{
 			Name:           name,
 			ActiveSessions: sessionCount,
 			MaxWorkers:     stack.Config.MaxWorkers,
 			MemoryBudget:   stack.Config.MemoryBudget,
 		})
-		// Emit per-team Prometheus metrics
-		observeTeamSessionsActive(name, sessionCount)
+		// Emit per-org Prometheus metrics
+		observeOrgSessionsActive(name, sessionCount)
 	}
 	return stats
 }
 
-func (a *teamRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
+func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 	stacks := a.router.AllStacks()
 	var result []admin.WorkerStatus
 	for name, stack := range stacks {
@@ -74,19 +74,19 @@ func (a *teamRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 			}
 			result = append(result, admin.WorkerStatus{
 				ID:             wID,
-				Team:           name,
+				Org:            name,
 				ActiveSessions: count,
 				Status:         status,
 			})
 		}
-		// Emit per-team worker Prometheus metrics
-		observeTeamWorkersActive(name, activeCount)
-		observeTeamWorkersIdle(name, idleCount)
+		// Emit per-org worker Prometheus metrics
+		observeOrgWorkersActive(name, activeCount)
+		observeOrgWorkersIdle(name, idleCount)
 	}
 	return result
 }
 
-func (a *teamRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
+func (a *orgRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 	stacks := a.router.AllStacks()
 	var result []admin.SessionStatus
 	for name, stack := range stacks {
@@ -94,7 +94,7 @@ func (a *teamRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 			result = append(result, admin.SessionStatus{
 				PID:      s.PID,
 				WorkerID: s.WorkerID,
-				Team:     name,
+				Org:      name,
 			})
 		}
 	}
@@ -102,17 +102,17 @@ func (a *teamRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 }
 
 // Compile-time checks.
-var _ TeamRouterInterface = (*teamRouterAdapter)(nil)
-var _ admin.TeamStackInfo = (*teamRouterAdapter)(nil)
+var _ OrgRouterInterface = (*orgRouterAdapter)(nil)
+var _ admin.OrgStackInfo = (*orgRouterAdapter)(nil)
 
-// SetupMultiTenant initializes the config store, team router, and Gin admin server.
+// SetupMultiTenant initializes the config store, org router, and Gin admin server.
 // Called from RunControlPlane when --config-store is set with remote backend.
 func SetupMultiTenant(
 	cfg ControlPlaneConfig,
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
-) (ConfigStoreInterface, TeamRouterInterface, *http.Server, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -138,12 +138,12 @@ func SetupMultiTenant(
 		MemoryBudget:    int64(memBudget),
 	}
 
-	router, err := NewTeamRouter(store, baseCfg, cfg, srv)
+	router, err := NewOrgRouter(store, baseCfg, cfg, srv)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	adpt := &teamRouterAdapter{router: router}
+	adpt := &orgRouterAdapter{router: router}
 
 	// Register config change handler
 	store.OnChange(router.HandleConfigChange)

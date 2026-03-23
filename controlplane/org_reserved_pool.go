@@ -10,26 +10,26 @@ import (
 
 const defaultSharedWorkerReservationLease = 24 * time.Hour
 
-// TeamReservedWorkerPool presents one team's reserved slice of a shared K8s warm pool.
+// OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
-// workers are reserved to a single team for their lifetime and retired after use.
-type TeamReservedWorkerPool struct {
+// workers are reserved to a single org for their lifetime and retired after use.
+type OrgReservedPool struct {
 	shared        *K8sWorkerPool
-	teamName      string
+	orgID         string
 	maxWorkers    int
 	leaseDuration time.Duration
 }
 
-func NewTeamReservedWorkerPool(shared *K8sWorkerPool, teamName string, maxWorkers int) *TeamReservedWorkerPool {
-	return &TeamReservedWorkerPool{
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int) *OrgReservedPool {
+	return &OrgReservedPool{
 		shared:        shared,
-		teamName:      teamName,
+		orgID:         orgID,
 		maxWorkers:    maxWorkers,
 		leaseDuration: defaultSharedWorkerReservationLease,
 	}
 }
 
-func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -56,7 +56,7 @@ func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWor
 			p.shared.mu.Unlock()
 
 			worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-				TeamName:       p.teamName,
+				OrgID:          p.orgID,
 				LeaseExpiresAt: time.Now().Add(p.leaseDuration),
 			})
 			if err != nil {
@@ -64,7 +64,7 @@ func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWor
 			}
 
 			p.shared.mu.Lock()
-			if owned := p.workerBelongsToTeamLocked(worker); owned {
+			if owned := p.workerBelongsToOrgLocked(worker); owned {
 				worker.activeSessions++
 				p.shared.mu.Unlock()
 				return worker, nil
@@ -88,52 +88,52 @@ func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWor
 	}
 }
 
-func (p *TeamReservedWorkerPool) ReleaseWorker(id int) {
+func (p *OrgReservedPool) ReleaseWorker(id int) {
 	_ = p.RetireWorkerIfNoSessions(id)
 }
 
-func (p *TeamReservedWorkerPool) RetireWorker(id int) {
+func (p *OrgReservedPool) RetireWorker(id int) {
 	if _, ok := p.Worker(id); !ok {
 		return
 	}
 	p.shared.RetireWorker(id)
 }
 
-func (p *TeamReservedWorkerPool) RetireWorkerIfNoSessions(id int) bool {
+func (p *OrgReservedPool) RetireWorkerIfNoSessions(id int) bool {
 	if _, ok := p.Worker(id); !ok {
 		return false
 	}
 	return p.shared.RetireWorkerIfNoSessions(id)
 }
 
-func (p *TeamReservedWorkerPool) Worker(id int) (*ManagedWorker, bool) {
+func (p *OrgReservedPool) Worker(id int) (*ManagedWorker, bool) {
 	p.shared.mu.RLock()
 	defer p.shared.mu.RUnlock()
 	w, ok := p.shared.workers[id]
-	if !ok || !p.workerBelongsToTeamLocked(w) {
+	if !ok || !p.workerBelongsToOrgLocked(w) {
 		return nil, false
 	}
 	return w, true
 }
 
-func (p *TeamReservedWorkerPool) SpawnMinWorkers(count int) error {
+func (p *OrgReservedPool) SpawnMinWorkers(count int) error {
 	return nil
 }
 
-func (p *TeamReservedWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
+func (p *OrgReservedPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
 }
 
-func (p *TeamReservedWorkerPool) SetMaxWorkers(n int) {
+func (p *OrgReservedPool) SetMaxWorkers(n int) {
 	p.shared.mu.Lock()
 	defer p.shared.mu.Unlock()
 	p.maxWorkers = n
 }
 
-func (p *TeamReservedWorkerPool) ShutdownAll() {
+func (p *OrgReservedPool) ShutdownAll() {
 	p.shared.mu.RLock()
 	workers := make([]int, 0, len(p.shared.workers))
 	for id, w := range p.shared.workers {
-		if p.workerBelongsToTeamLocked(w) {
+		if p.workerBelongsToOrgLocked(w) {
 			workers = append(workers, id)
 		}
 	}
@@ -144,21 +144,21 @@ func (p *TeamReservedWorkerPool) ShutdownAll() {
 	}
 }
 
-func (p *TeamReservedWorkerPool) findIdleAssignedWorkerLocked() *ManagedWorker {
+func (p *OrgReservedPool) findIdleAssignedWorkerLocked() *ManagedWorker {
 	for _, w := range p.shared.workers {
 		select {
 		case <-w.done:
 			continue
 		default:
 		}
-		if w.activeSessions == 0 && p.workerBelongsToTeamLocked(w) {
+		if w.activeSessions == 0 && p.workerBelongsToOrgLocked(w) {
 			return w
 		}
 	}
 	return nil
 }
 
-func (p *TeamReservedWorkerPool) leastLoadedAssignedWorkerLocked() *ManagedWorker {
+func (p *OrgReservedPool) leastLoadedAssignedWorkerLocked() *ManagedWorker {
 	var best *ManagedWorker
 	for _, w := range p.shared.workers {
 		select {
@@ -166,7 +166,7 @@ func (p *TeamReservedWorkerPool) leastLoadedAssignedWorkerLocked() *ManagedWorke
 			continue
 		default:
 		}
-		if !p.workerBelongsToTeamLocked(w) {
+		if !p.workerBelongsToOrgLocked(w) {
 			continue
 		}
 		if best == nil || w.activeSessions < best.activeSessions {
@@ -176,7 +176,7 @@ func (p *TeamReservedWorkerPool) leastLoadedAssignedWorkerLocked() *ManagedWorke
 	return best
 }
 
-func (p *TeamReservedWorkerPool) assignedWorkerCountLocked() int {
+func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 	count := 0
 	for _, w := range p.shared.workers {
 		select {
@@ -184,14 +184,14 @@ func (p *TeamReservedWorkerPool) assignedWorkerCountLocked() int {
 			continue
 		default:
 		}
-		if p.workerBelongsToTeamLocked(w) {
+		if p.workerBelongsToOrgLocked(w) {
 			count++
 		}
 	}
 	return count
 }
 
-func (p *TeamReservedWorkerPool) workerBelongsToTeamLocked(w *ManagedWorker) bool {
+func (p *OrgReservedPool) workerBelongsToOrgLocked(w *ManagedWorker) bool {
 	state := w.SharedState()
-	return state.Assignment != nil && state.Assignment.TeamName == p.teamName && state.NormalizedLifecycle() != WorkerLifecycleRetired
+	return state.Assignment != nil && state.Assignment.OrgID == p.orgID && state.NormalizedLifecycle() != WorkerLifecycleRetired
 }

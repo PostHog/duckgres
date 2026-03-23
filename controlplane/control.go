@@ -107,19 +107,19 @@ type ControlPlane struct {
 	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
 	// Multi-tenant fields (non-nil in remote multitenant mode)
-	teamRouter  TeamRouterInterface
+	orgRouter   OrgRouterInterface
 	configStore ConfigStoreInterface
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
 // Defined here to avoid circular imports with the configstore package.
 type ConfigStoreInterface interface {
-	ValidateUser(username, password string) (teamName string, ok bool)
-	TeamForUser(username string) string
+	ValidateUser(username, password string) (orgID string, ok bool)
+	OrgForUser(username string) string
 }
 
-// TeamRouterInterface abstracts the team router for the control plane.
-type TeamRouterInterface interface {
+// OrgRouterInterface abstracts the org router for the control plane.
+type OrgRouterInterface interface {
 	StackForUser(username string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	ShutdownAll()
 }
@@ -314,7 +314,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		acmeDNSManager: acmeDNSMgr,
 	}
 
-	// Multi-tenant mode: config store + per-team pools (K8s remote backend only)
+	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
 		store, adapter, adminSrv, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
 		if err != nil {
@@ -322,7 +322,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			os.Exit(1)
 		}
 		cp.configStore = store
-		cp.teamRouter = adapter
+		cp.orgRouter = adapter
 		// Replace the simple metrics server with the Gin admin server
 		if cfg.MetricsServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -658,7 +658,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Authenticate: use config store (multi-tenant) or YAML users (single-tenant)
 	if cp.configStore != nil {
-		teamName, ok := cp.configStore.ValidateUser(username, password)
+		orgID, ok := cp.configStore.ValidateUser(username, password)
 		if !ok {
 			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
@@ -669,7 +669,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
-		_ = teamName // used for routing below
+		_ = orgID // used for routing below
 	} else {
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
 			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
@@ -693,13 +693,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
 	// Resolve the session manager and rebalancer for this connection.
-	// In multi-tenant mode, each team has its own stack.
+	// In multi-tenant mode, each org has its own stack.
 	var sessions *SessionManager
 	var rebalancer *MemoryRebalancer
-	if cp.teamRouter != nil {
-		_, sess, rebal, ok := cp.teamRouter.StackForUser(username)
+	if cp.orgRouter != nil {
+		_, sess, rebal, ok := cp.orgRouter.StackForUser(username)
 		if !ok {
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no team configured for user")
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
 			_ = writer.Flush()
 			return
 		}
@@ -899,8 +899,8 @@ func (cp *ControlPlane) shutdown() {
 	cp.wg.Wait()
 
 	slog.Info("Shutting down workers...")
-	if cp.teamRouter != nil {
-		cp.teamRouter.ShutdownAll()
+	if cp.orgRouter != nil {
+		cp.orgRouter.ShutdownAll()
 	} else if cp.pool != nil {
 		cp.pool.ShutdownAll()
 	}
@@ -1077,8 +1077,8 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 	}
 
 	// Shut down workers
-	if cp.teamRouter != nil {
-		cp.teamRouter.ShutdownAll()
+	if cp.orgRouter != nil {
+		cp.orgRouter.ShutdownAll()
 	} else if cp.pool != nil {
 		cp.pool.ShutdownAll()
 	}

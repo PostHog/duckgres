@@ -87,8 +87,8 @@ func resetConfigStoreTables(t *testing.T, db *gorm.DB) {
 
 	for _, model := range []any{
 		&configstore.ManagedWarehouse{},
-		&configstore.TeamUser{},
-		&configstore.Team{},
+		&configstore.OrgUser{},
+		&configstore.Org{},
 	} {
 		if err := db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(model).Error; err != nil {
 			t.Fatalf("delete %T: %v", model, err)
@@ -100,13 +100,13 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	apiStore := newGormAPIStore(store).(*gormAPIStore)
 
-	if err := store.DB().Create(&configstore.Team{Name: "analytics"}).Error; err != nil {
-		t.Fatalf("create team: %v", err)
+	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
 	}
 
 	createdAt := time.Date(2024, time.January, 2, 3, 4, 5, 0, time.UTC)
 	original := &configstore.ManagedWarehouse{
-		TeamName:  "analytics",
+		OrgID:     "analytics",
 		State:     configstore.ManagedWarehouseStatePending,
 		CreatedAt: createdAt,
 		UpdatedAt: createdAt,
