@@ -95,6 +95,7 @@ func (a *orgRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 				PID:      s.PID,
 				WorkerID: s.WorkerID,
 				Org:      name,
+				Protocol: s.Protocol,
 			})
 		}
 	}

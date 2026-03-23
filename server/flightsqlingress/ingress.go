@@ -57,6 +57,27 @@ type SessionProvider interface {
 	DestroySession(int32)
 }
 
+// CredentialValidator abstracts username/password authentication.
+type CredentialValidator interface {
+	ValidateCredentials(username, password string) bool
+}
+
+// MapCredentialValidator wraps a static users map (single-tenant / tests).
+type MapCredentialValidator struct {
+	Users map[string]string
+}
+
+func (v *MapCredentialValidator) ValidateCredentials(username, password string) bool {
+	return server.ValidateUserPassword(v.Users, username, password)
+}
+
+// FuncCredentialValidator wraps a function (multi-tenant config store).
+type FuncCredentialValidator func(username, password string) bool
+
+func (f FuncCredentialValidator) ValidateCredentials(username, password string) bool {
+	return f(username, password)
+}
+
 type Hooks struct {
 	OnSessionCountChanged func(int)
 	OnSessionsReaped      func(trigger string, count int)
@@ -79,7 +100,7 @@ type FlightIngress struct {
 	wg            sync.WaitGroup
 }
 
-func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[string]string, provider SessionProvider, cfg Config, opts Options) (*FlightIngress, error) {
+func NewFlightIngress(host string, port int, tlsConfig *tls.Config, validator CredentialValidator, provider SessionProvider, cfg Config, opts Options) (*FlightIngress, error) {
 	if port <= 0 {
 		return nil, fmt.Errorf("invalid flight port: %d", port)
 	}
@@ -113,7 +134,7 @@ func NewFlightIngress(host string, port int, tlsConfig *tls.Config, users map[st
 	}
 
 	store := newFlightAuthSessionStore(provider, cfg.SessionIdleTTL, cfg.SessionReapTick, cfg.HandleIdleTTL, cfg.SessionTokenTTL, cfg.WorkerQueueTimeout, opts)
-	handler, err := NewControlPlaneFlightSQLHandler(store, users)
+	handler, err := NewControlPlaneFlightSQLHandler(store, validator)
 	if err != nil {
 		_ = ln.Close()
 		return nil, err
@@ -176,17 +197,17 @@ func (fi *FlightIngress) Shutdown() {
 // ControlPlaneFlightSQLHandler implements Flight SQL over control-plane sessions.
 type ControlPlaneFlightSQLHandler struct {
 	flightsql.BaseServer
-	users       map[string]string
+	validator   CredentialValidator
 	sessions    *flightAuthSessionStore
 	rateLimiter *server.RateLimiter
 	alloc       memory.Allocator
 }
 
-func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, users map[string]string) (*ControlPlaneFlightSQLHandler, error) {
+func NewControlPlaneFlightSQLHandler(sessions *flightAuthSessionStore, validator CredentialValidator) (*ControlPlaneFlightSQLHandler, error) {
 	h := &ControlPlaneFlightSQLHandler{
-		users:    users,
-		sessions: sessions,
-		alloc:    memory.DefaultAllocator,
+		validator: validator,
+		sessions:  sessions,
+		alloc:     memory.DefaultAllocator,
 	}
 	if err := h.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerName, "duckgres-control-plane"); err != nil {
 		return nil, fmt.Errorf("register sql info server name: %w", err)
@@ -294,7 +315,7 @@ func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(md metadata.
 		return "", status.Error(codes.Unauthenticated, err.Error())
 	}
 
-	if !server.ValidateUserPassword(h.users, username, password) {
+	if !h.validator.ValidateCredentials(username, password) {
 		banned := server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
 		if banned {
 			slog.Warn("Flight client IP banned after auth failures.", "remote_addr", remoteAddr)

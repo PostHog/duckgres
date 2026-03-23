@@ -50,9 +50,18 @@ spec:
             - "/certs/server.key"
             - "--config"
             - "/etc/duckgres/duckgres.yaml"
+            - "--flight-port"
+            - "8815"
+            - "--flight-session-idle-ttl"
+            - "30s"
+            - "--flight-session-reap-interval"
+            - "10s"
           ports:
             - name: pg
               containerPort: 5432
+              protocol: TCP
+            - name: flight
+              containerPort: 8815
               protocol: TCP
             - name: admin
               containerPort: 9090
@@ -96,6 +105,10 @@ spec:
     - name: pg
       port: 5432
       targetPort: pg
+      protocol: TCP
+    - name: flight
+      port: 8815
+      targetPort: flight
       protocol: TCP
   selector:
     app: duckgres-control-plane
