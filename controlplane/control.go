@@ -69,16 +69,17 @@ type ProcessConfig struct {
 
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage      string // Container image for worker pods (required)
-	WorkerNamespace  string // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID   string // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort       int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret     string // K8s Secret name containing bearer token
-	WorkerConfigMap  string // ConfigMap name for duckgres.yaml
-	ImagePullPolicy  string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount   string // ServiceAccount name for worker pods (default: "default")
-	MaxWorkers       int    // Global cap for the shared K8s worker pool (0 = auto-derived)
-	SharedWarmTarget int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	WorkerImage       string // Container image for worker pods (required)
+	WorkerNamespace   string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID    string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort        int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret      string // K8s Secret name containing bearer token
+	WorkerConfigMap   string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy   string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount    string // ServiceAccount name for worker pods (default: "default")
+	MaxWorkers        int    // Global cap for the shared K8s worker pool (0 = auto-derived)
+	SharedWarmTarget  int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	SharedWarmWorkers bool   // Enable reserve->activate->hot lifecycle on the shared warm pool
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.

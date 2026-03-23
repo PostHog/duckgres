@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -231,7 +232,6 @@ func (p *FlightWorkerPool) effectiveSocketDir() (string, error) {
 	p.preboundMu.Unlock()
 	return fallback, nil
 }
-
 
 // SpawnWorker starts a new duckdb-service worker process.
 // It uses a pre-bound socket from the pool if available, falling back to
@@ -1121,6 +1121,29 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit
 	}
 
 	return resp.SessionToken, nil
+}
+
+// ActivateTenant delivers tenant runtime to a shared warm worker before it may serve sessions.
+func (w *ManagedWorker) ActivateTenant(ctx context.Context, payload server.WorkerActivationPayload) (err error) {
+	defer recoverWorkerPanic(&err)
+
+	body, _ := json.Marshal(payload)
+	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
+		Type: "ActivateTenant",
+		Body: body,
+	})
+	if err != nil {
+		return fmt.Errorf("activate tenant: %w", err)
+	}
+
+	for {
+		if _, err := stream.Recv(); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("activate tenant recv: %w", err)
+		}
+	}
 }
 
 // DestroySession destroys a session on the worker.

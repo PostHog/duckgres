@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -200,6 +201,73 @@ func TestK8sPool_RetireWorkerIfNoSessions_LastSession(t *testing.T) {
 	}
 }
 
+func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			TeamName:       "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		if got.ID != worker.ID {
+			t.Fatalf("expected worker %d, got %d", worker.ID, got.ID)
+		}
+		if payload.TeamName != "analytics" {
+			t.Fatalf("expected analytics payload, got %#v", payload)
+		}
+		return nil
+	}
+
+	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
+		TeamName:  "analytics",
+		Usernames: []string{"alice"},
+	})
+	if err != nil {
+		t.Fatalf("ActivateReservedWorker: %v", err)
+	}
+
+	if got := worker.SharedState().Lifecycle; got != WorkerLifecycleHot {
+		t.Fatalf("expected hot lifecycle, got %q", got)
+	}
+}
+
+func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			TeamName:       "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		return context.DeadlineExceeded
+	}
+
+	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
+		TeamName:  "analytics",
+		Usernames: []string{"alice"},
+	})
+	if err == nil {
+		t.Fatal("expected activation failure")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if _, ok := pool.Worker(worker.ID); ok {
+		t.Fatal("expected failed activation to retire worker")
+	}
+}
+
 func TestK8sPool_CleanDeadWorkers(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
@@ -270,8 +338,11 @@ func TestK8sPoolSpawnMinWorkersTracksWarmCapacityAndSpawnsMissingWorkers(t *test
 	pool.workers[41] = &ManagedWorker{ID: 41, done: make(chan struct{})}
 
 	var spawned []int
+	var spawnedMu sync.Mutex
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		spawnedMu.Lock()
 		spawned = append(spawned, id)
+		spawnedMu.Unlock()
 		pool.mu.Lock()
 		pool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
 		pool.mu.Unlock()

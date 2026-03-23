@@ -1,13 +1,17 @@
 package duckdbservice
 
 import (
+	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // mockDoActionStream implements flight.FlightService_DoActionServer for testing.
@@ -100,5 +104,77 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("health check blocked even though warmup was already done")
+	}
+}
+
+func TestCreateSessionRequiresActivationForSharedWarmWorkers(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		warmupDone:     make(chan struct{}),
+		startTime:      time.Now(),
+		cfg:            server.Config{},
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	handler := &FlightSQLHandler{pool: pool}
+	stream := &mockDoActionStream{}
+
+	body, err := json.Marshal(map[string]any{
+		"username": "alice",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	err = handler.doCreateSession(body, stream)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		warmupDone:     make(chan struct{}),
+		startTime:      time.Now(),
+		cfg:            server.Config{},
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	pool.createDBConnection = func(server.Config, chan struct{}, string, time.Time, string) (*sql.DB, error) {
+		return &sql.DB{}, nil
+	}
+	pool.activateDBConnection = func(*sql.DB, server.Config, chan struct{}, string) error {
+		return nil
+	}
+	pool.activateTenantFunc = pool.activateTenant
+
+	handler := &FlightSQLHandler{pool: pool}
+	stream := &mockDoActionStream{}
+
+	firstBody, err := json.Marshal(ActivationPayload{
+		TeamName: "analytics",
+	})
+	if err != nil {
+		t.Fatalf("marshal first request: %v", err)
+	}
+	if err := handler.doActivateTenant(firstBody, stream); err != nil {
+		t.Fatalf("first activation: %v", err)
+	}
+
+	secondBody, err := json.Marshal(ActivationPayload{
+		TeamName: "billing",
+	})
+	if err != nil {
+		t.Fatalf("marshal second request: %v", err)
+	}
+
+	err = handler.doActivateTenant(secondBody, stream)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
 	}
 }
