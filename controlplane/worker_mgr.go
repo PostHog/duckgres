@@ -38,6 +38,8 @@ type ManagedWorker struct {
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
 	sharedState    SharedWorkerState
+	reservedAt     time.Time // When this worker was reserved for an org (for activation latency)
+	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
 }
 
 // SharedState returns the additive shared warm-worker lifecycle metadata for

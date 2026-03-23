@@ -28,6 +28,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+const defaultActivatingTimeout = 2 * time.Minute
+
 // K8sWorkerPool manages worker pods in Kubernetes.
 type K8sWorkerPool struct {
 	mu           sync.RWMutex
@@ -64,6 +66,8 @@ type K8sWorkerPool struct {
 	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
 	spawnWarmWorkerBackgroundFunc func(id int)
 	activateTenantFunc            func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error
+
+	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -638,6 +642,9 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 		idle := p.findIdleWorkerLocked()
 		if idle != nil {
 			idle.activeSessions++
+			if idle.activeSessions > idle.peakSessions {
+				idle.peakSessions = idle.activeSessions
+			}
 			p.mu.Unlock()
 			slog.Debug("Reusing idle worker.", "worker", idle.ID, "active_sessions", idle.activeSessions)
 			return idle, nil
@@ -653,6 +660,9 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 			w := p.leastLoadedWorkerLocked()
 			if w != nil {
 				w.activeSessions++
+				if w.activeSessions > w.peakSessions {
+					w.peakSessions = w.activeSessions
+				}
 				if canSpawn {
 					id := p.allocateWorkerIDLocked()
 					p.spawning++
@@ -692,6 +702,9 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 			}
 			p.mu.Lock()
 			w.activeSessions++
+			if w.activeSessions > w.peakSessions {
+				w.peakSessions = w.activeSessions
+			}
 			p.mu.Unlock()
 			return w, nil
 		}
@@ -738,13 +751,17 @@ func (p *K8sWorkerPool) ReleaseWorker(id int) {
 
 // RetireWorker removes a worker from the pool and deletes its pod.
 func (p *K8sWorkerPool) RetireWorker(id int) {
+	p.retireWorkerWithReason(id, RetireReasonNormal)
+}
+
+func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) {
 	p.mu.Lock()
 	w, ok := p.workers[id]
 	if !ok {
 		p.mu.Unlock()
 		return
 	}
-	p.markWorkerRetiredLocked(w)
+	p.markWorkerRetiredLocked(w, reason)
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	p.mu.Unlock()
@@ -755,6 +772,10 @@ func (p *K8sWorkerPool) RetireWorker(id int) {
 
 // RetireWorkerIfNoSessions retires a worker only if it has no active sessions.
 func (p *K8sWorkerPool) RetireWorkerIfNoSessions(id int) bool {
+	return p.retireWorkerIfNoSessionsWithReason(id, RetireReasonNormal)
+}
+
+func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string) bool {
 	p.mu.Lock()
 	w, ok := p.workers[id]
 	if !ok {
@@ -765,7 +786,7 @@ func (p *K8sWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 		w.activeSessions--
 	}
 	if w.activeSessions == 0 {
-		p.markWorkerRetiredLocked(w)
+		p.markWorkerRetiredLocked(w, reason)
 		delete(p.workers, id)
 		workerCount := len(p.workers)
 		p.mu.Unlock()
@@ -819,7 +840,7 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	}
 
 	if err := activate(ctx, worker, payload); err != nil {
-		p.RetireWorker(worker.ID)
+		p.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
 		return err
 	}
 
@@ -832,7 +853,11 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	if err != nil {
 		return err
 	}
-	return worker.SetSharedState(nextState)
+	if setErr := worker.SetSharedState(nextState); setErr != nil {
+		return setErr
+	}
+	observeWarmPoolLifecycleGauges(p.workers)
+	return nil
 }
 
 // ReserveSharedWorker reserves a neutral warm worker for later tenant activation.
@@ -867,6 +892,8 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				p.mu.Unlock()
 				return nil, err
 			}
+			idle.reservedAt = time.Now()
+			observeWarmPoolLifecycleGauges(p.workers)
 
 			if p.shouldReplenishWarmCapacityLocked() {
 				id := p.allocateWorkerIDLocked()
@@ -1089,6 +1116,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	p.shuttingDown = true
 	workers := make([]*ManagedWorker, 0, len(p.workers))
 	for _, w := range p.workers {
+		p.markWorkerRetiredLocked(w, RetireReasonShutdown)
 		workers = append(workers, w)
 	}
 	p.mu.Unlock()
@@ -1129,11 +1157,9 @@ func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
 	})
 }
 
-// idleReaper periodically retires workers that have been idle too long.
+// idleReaper periodically retires workers that have been idle too long and
+// reaps stuck activating/reserved workers.
 func (p *K8sWorkerPool) idleReaper() {
-	if p.idleTimeout <= 0 {
-		return
-	}
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
@@ -1142,7 +1168,10 @@ func (p *K8sWorkerPool) idleReaper() {
 		case <-p.shutdownCh:
 			return
 		case <-ticker.C:
-			p.reapIdleWorkers()
+			if p.idleTimeout > 0 {
+				p.reapIdleWorkers()
+			}
+			p.reapStuckActivatingWorkers()
 		}
 	}
 }
@@ -1165,6 +1194,7 @@ func (p *K8sWorkerPool) reapIdleWorkers() {
 			break
 		}
 		if p.isWarmIdleWorkerLocked(w) && !w.lastUsed.IsZero() && now.Sub(w.lastUsed) > p.idleTimeout {
+			p.markWorkerRetiredLocked(w, RetireReasonIdleTimeout)
 			toRetire = append(toRetire, struct {
 				id int
 				w  *ManagedWorker
@@ -1181,6 +1211,61 @@ func (p *K8sWorkerPool) reapIdleWorkers() {
 		observeControlPlaneWorkers(workerCount)
 		for _, entry := range toRetire {
 			go p.retireWorkerPod(entry.id, entry.w)
+		}
+	}
+}
+
+// reapStuckActivatingWorkers retires workers that have been in reserved or
+// activating state for longer than the activating timeout.
+func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
+	timeout := p.activatingTimeout
+	if timeout <= 0 {
+		timeout = defaultActivatingTimeout
+	}
+
+	p.mu.Lock()
+	var toRetire []struct {
+		id int
+		w  *ManagedWorker
+	}
+	now := time.Now()
+	for id, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		lifecycle := w.SharedState().NormalizedLifecycle()
+		if (lifecycle == WorkerLifecycleReserved || lifecycle == WorkerLifecycleActivating) &&
+			!w.reservedAt.IsZero() && now.Sub(w.reservedAt) > timeout {
+			p.markWorkerRetiredLocked(w, RetireReasonStuckActivating)
+			toRetire = append(toRetire, struct {
+				id int
+				w  *ManagedWorker
+			}{id, w})
+			delete(p.workers, id)
+		}
+	}
+
+	var spawnIDs []int
+	for range toRetire {
+		if p.shouldReplenishWarmCapacityLocked() {
+			id := p.allocateWorkerIDLocked()
+			p.spawning++
+			spawnIDs = append(spawnIDs, id)
+		}
+	}
+	workerCount := len(p.workers)
+	p.mu.Unlock()
+
+	if len(toRetire) > 0 {
+		slog.Warn("Reaping stuck activating workers.", "count", len(toRetire))
+		observeControlPlaneWorkers(workerCount)
+		for _, entry := range toRetire {
+			go p.retireWorkerPod(entry.id, entry.w)
+		}
+		for _, id := range spawnIDs {
+			p.spawnWarmWorkerBackground(id)
 		}
 	}
 }
@@ -1311,6 +1396,7 @@ func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bo
 	if !ok {
 		return nil, len(p.workers), 0, false
 	}
+	p.markWorkerRetiredLocked(w, RetireReasonCrash)
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	if !p.shouldReplenishWarmCapacityLocked() {
@@ -1384,12 +1470,17 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int) {
 	go p.spawnWorkerBackground(id)
 }
 
-func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker) {
+func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
+	if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
+		observeHotWorkerSessions(w.peakSessions)
+	}
 	nextState, err := w.SharedState().Transition(WorkerLifecycleRetired, nil)
 	if err != nil {
 		return
 	}
 	_ = w.SetSharedState(nextState)
+	observeWorkerRetirement(reason)
+	observeWarmPoolLifecycleGauges(p.workers)
 }
 
 // podNameForWorker returns the pod name for a given worker ID,

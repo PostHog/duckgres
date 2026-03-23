@@ -54,6 +54,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 
 		if idle := p.findIdleAssignedWorkerLocked(); idle != nil {
 			idle.activeSessions++
+			if idle.activeSessions > idle.peakSessions {
+				idle.peakSessions = idle.activeSessions
+			}
 			p.shared.mu.Unlock()
 			return idle, nil
 		}
@@ -72,7 +75,8 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 
 			if p.sharedWarmWorkers {
 				if err := p.activateWorkerForOrg(ctx, worker); err != nil {
-					p.shared.RetireWorker(worker.ID)
+					observeActivationFailure(err.Error())
+					p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
 					return nil, err
 				}
 			}
@@ -80,6 +84,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			p.shared.mu.Lock()
 			if owned := p.workerBelongsToOrgLocked(worker); owned {
 				worker.activeSessions++
+				if worker.activeSessions > worker.peakSessions {
+					worker.peakSessions = worker.activeSessions
+				}
 				p.shared.mu.Unlock()
 				return worker, nil
 			}
@@ -89,6 +96,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 
 		if w := p.leastLoadedAssignedWorkerLocked(); w != nil {
 			w.activeSessions++
+			if w.activeSessions > w.peakSessions {
+				w.peakSessions = w.activeSessions
+			}
 			p.shared.mu.Unlock()
 			return w, nil
 		}
@@ -160,7 +170,7 @@ func (p *OrgReservedPool) ShutdownAll() {
 	p.shared.mu.RUnlock()
 
 	for _, id := range workers {
-		p.shared.RetireWorker(id)
+		p.shared.retireWorkerWithReason(id, RetireReasonShutdown)
 	}
 }
 
@@ -259,7 +269,14 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 		if err != nil {
 			return err
 		}
-		return worker.SetSharedState(nextState)
+		if err := worker.SetSharedState(nextState); err != nil {
+			return err
+		}
+		if !worker.reservedAt.IsZero() {
+			observeActivationDuration(time.Since(worker.reservedAt))
+		}
+		observeWarmPoolLifecycleGauges(p.shared.workers)
+		return nil
 	case WorkerLifecycleHot:
 		return nil
 	default:
