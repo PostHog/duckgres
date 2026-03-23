@@ -14,19 +14,19 @@ import (
 	"github.com/posthog/duckgres/server"
 )
 
-// TeamStack holds the isolated worker pool and session manager for a team.
-type TeamStack struct {
-	Config     *configstore.TeamConfig
+// OrgStack holds the isolated worker pool and session manager for an org.
+type OrgStack struct {
+	Config     *configstore.OrgConfig
 	Pool       WorkerPool
 	Sessions   *SessionManager
 	Rebalancer *MemoryRebalancer
 	cancel     context.CancelFunc
 }
 
-// TeamRouter manages per-team stacks, creating/destroying them as config changes.
-type TeamRouter struct {
+// OrgRouter manages per-org stacks, creating/destroying them as config changes.
+type OrgRouter struct {
 	mu           sync.RWMutex
-	teams        map[string]*TeamStack
+	orgs         map[string]*OrgStack
 	configStore  *configstore.ConfigStore
 	baseCfg      K8sWorkerPoolConfig
 	sharedPool   *K8sWorkerPool
@@ -36,10 +36,10 @@ type TeamRouter struct {
 	sharedCancel context.CancelFunc
 }
 
-// NewTeamRouter creates a TeamRouter from the initial config snapshot.
-func NewTeamRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server) (*TeamRouter, error) {
-	tr := &TeamRouter{
-		teams:       make(map[string]*TeamStack),
+// NewOrgRouter creates an OrgRouter from the initial config snapshot.
+func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server) (*OrgRouter, error) {
+	tr := &OrgRouter{
+		orgs:        make(map[string]*OrgStack),
 		configStore: store,
 		baseCfg:     baseCfg,
 		globalCfg:   globalCfg,
@@ -47,7 +47,7 @@ func NewTeamRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, 
 	}
 
 	sharedCfg := baseCfg
-	sharedCfg.TeamName = ""
+	sharedCfg.OrgID = ""
 	sharedCfg.WorkerIDGenerator = func() int {
 		return int(tr.nextWorkerID.Add(1))
 	}
@@ -67,9 +67,9 @@ func NewTeamRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, 
 	go tr.sharedPool.HealthCheckLoop(sharedCtx, tr.globalCfg.HealthCheckInterval, tr.onSharedWorkerCrash, tr.onSharedWorkerProgress)
 
 	snap := store.Snapshot()
-	for _, tc := range snap.Teams {
-		if _, err := tr.createTeamStack(tc); err != nil {
-			slog.Error("Failed to create team stack.", "team", tc.Name, "error", err)
+	for _, tc := range snap.Orgs {
+		if _, err := tr.createOrgStack(tc); err != nil {
+			slog.Error("Failed to create org stack.", "org", tc.Name, "error", err)
 			continue
 		}
 	}
@@ -79,8 +79,8 @@ func NewTeamRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, 
 	return tr, nil
 }
 
-// createTeamStack creates an isolated pool + session manager for a team.
-func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, error) {
+// createOrgStack creates an isolated pool + session manager for an org.
+func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	maxWorkers := tc.MaxWorkers
@@ -93,17 +93,17 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 		memoryBudget = int64(server.ParseMemoryBytes(tc.MemoryBudget))
 	}
 
-	pool := NewTeamReservedWorkerPool(tr.sharedPool, tc.Name, maxWorkers)
-	pool.resolveTeamConfig = func() (*configstore.TeamConfig, error) {
+	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers)
+	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {
-			return nil, fmt.Errorf("config snapshot unavailable for team %s", tc.Name)
+			return nil, fmt.Errorf("config snapshot unavailable for org %s", tc.Name)
 		}
-		team, ok := snap.Teams[tc.Name]
+		org, ok := snap.Orgs[tc.Name]
 		if !ok {
-			return nil, fmt.Errorf("team %s not found in config snapshot", tc.Name)
+			return nil, fmt.Errorf("org %s not found in config snapshot", tc.Name)
 		}
-		return team, nil
+		return org, nil
 	}
 	pool.EnableSharedWarmActivation(tr.globalCfg.K8s.SharedWarmWorkers)
 
@@ -111,8 +111,8 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 	sessions := NewSessionManager(pool, rebalancer)
 	rebalancer.SetSessionLister(sessions)
 
-	// Periodic per-team metrics emission
-	teamName := tc.Name
+	// Periodic per-org metrics emission
+	orgID := tc.Name
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -122,12 +122,12 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 				return
 			case <-ticker.C:
 				sessionCount := sessions.SessionCount()
-				observeTeamSessionsActive(teamName, sessionCount)
+				observeOrgSessionsActive(orgID, sessionCount)
 			}
 		}
 	}()
 
-	stack := &TeamStack{
+	stack := &OrgStack{
 		Config:     tc,
 		Pool:       pool,
 		Sessions:   sessions,
@@ -136,26 +136,26 @@ func (tr *TeamRouter) createTeamStack(tc *configstore.TeamConfig) (*TeamStack, e
 	}
 
 	tr.mu.Lock()
-	tr.teams[tc.Name] = stack
+	tr.orgs[tc.Name] = stack
 	tr.mu.Unlock()
 
-	slog.Info("Team stack created.", "team", tc.Name, "max_workers", maxWorkers)
+	slog.Info("Org stack created.", "org", tc.Name, "max_workers", maxWorkers)
 	_ = ctx // keep linter happy
 	return stack, nil
 }
 
-// DestroyTeamStack drains and cleans up a team's resources.
-func (tr *TeamRouter) DestroyTeamStack(teamName string) {
+// DestroyOrgStack drains and cleans up an org's resources.
+func (tr *OrgRouter) DestroyOrgStack(orgID string) {
 	tr.mu.Lock()
-	stack, ok := tr.teams[teamName]
+	stack, ok := tr.orgs[orgID]
 	if !ok {
 		tr.mu.Unlock()
 		return
 	}
-	delete(tr.teams, teamName)
+	delete(tr.orgs, orgID)
 	tr.mu.Unlock()
 
-	slog.Info("Destroying team stack.", "team", teamName)
+	slog.Info("Destroying org stack.", "org", orgID)
 	stack.cancel()
 	stack.Pool.ShutdownAll()
 	if stack.Rebalancer != nil {
@@ -163,52 +163,52 @@ func (tr *TeamRouter) DestroyTeamStack(teamName string) {
 	}
 }
 
-// StackForUser resolves a username to its team stack.
-func (tr *TeamRouter) StackForUser(username string) (*TeamStack, bool) {
-	teamName := tr.configStore.TeamForUser(username)
-	if teamName == "" {
+// StackForUser resolves a username to its org stack.
+func (tr *OrgRouter) StackForUser(username string) (*OrgStack, bool) {
+	orgID := tr.configStore.OrgForUser(username)
+	if orgID == "" {
 		return nil, false
 	}
 
 	tr.mu.RLock()
-	stack, ok := tr.teams[teamName]
+	stack, ok := tr.orgs[orgID]
 	tr.mu.RUnlock()
 	return stack, ok
 }
 
-// HandleConfigChange reconciles team stacks when the config snapshot changes.
-func (tr *TeamRouter) HandleConfigChange(old, new *configstore.Snapshot) {
-	// Detect new teams
-	for name, tc := range new.Teams {
-		if _, existed := old.Teams[name]; !existed {
-			slog.Info("New team detected, creating stack.", "team", name)
-			if _, err := tr.createTeamStack(tc); err != nil {
-				slog.Error("Failed to create team stack on config change.", "team", name, "error", err)
+// HandleConfigChange reconciles org stacks when the config snapshot changes.
+func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
+	// Detect new orgs
+	for name, tc := range new.Orgs {
+		if _, existed := old.Orgs[name]; !existed {
+			slog.Info("New org detected, creating stack.", "org", name)
+			if _, err := tr.createOrgStack(tc); err != nil {
+				slog.Error("Failed to create org stack on config change.", "org", name, "error", err)
 			}
 		}
 	}
 
-	// Detect removed teams
-	for name := range old.Teams {
-		if _, exists := new.Teams[name]; !exists {
-			slog.Info("Team removed, destroying stack.", "team", name)
-			tr.DestroyTeamStack(name)
+	// Detect removed orgs
+	for name := range old.Orgs {
+		if _, exists := new.Orgs[name]; !exists {
+			slog.Info("Org removed, destroying stack.", "org", name)
+			tr.DestroyOrgStack(name)
 		}
 	}
 
-	// Refresh existing team stacks and update worker limits when needed.
-	for name, newTC := range new.Teams {
-		oldTC, existed := old.Teams[name]
+	// Refresh existing org stacks and update worker limits when needed.
+	for name, newTC := range new.Orgs {
+		oldTC, existed := old.Orgs[name]
 		if !existed {
 			continue
 		}
 		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers || oldTC.MemoryBudget != newTC.MemoryBudget
 
 		tr.mu.Lock()
-		if stack, ok := tr.teams[name]; ok {
+		if stack, ok := tr.orgs[name]; ok {
 			stack.Config = newTC
 			if limitsChanged {
-				slog.Info("Team config changed.", "team", name,
+				slog.Info("Org config changed.", "org", name,
 					"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)
 				maxWorkers := newTC.MaxWorkers
 				if maxWorkers == 0 {
@@ -216,7 +216,7 @@ func (tr *TeamRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 				}
 				stack.Pool.SetMaxWorkers(maxWorkers)
 			}
-			if reserved, ok := stack.Pool.(*TeamReservedWorkerPool); ok {
+			if reserved, ok := stack.Pool.(*OrgReservedPool); ok {
 				reserved.EnableSharedWarmActivation(tr.globalCfg.K8s.SharedWarmWorkers)
 			}
 		}
@@ -226,29 +226,29 @@ func (tr *TeamRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 	tr.reconcileWarmCapacity(new)
 }
 
-// AllStacks returns a snapshot of all team stacks for admin API usage.
-func (tr *TeamRouter) AllStacks() map[string]*TeamStack {
+// AllStacks returns a snapshot of all org stacks for admin API usage.
+func (tr *OrgRouter) AllStacks() map[string]*OrgStack {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
-	result := make(map[string]*TeamStack, len(tr.teams))
-	for k, v := range tr.teams {
+	result := make(map[string]*OrgStack, len(tr.orgs))
+	for k, v := range tr.orgs {
 		result[k] = v
 	}
 	return result
 }
 
-// ShutdownAll shuts down all team stacks.
-func (tr *TeamRouter) ShutdownAll() {
+// ShutdownAll shuts down all org stacks.
+func (tr *OrgRouter) ShutdownAll() {
 	tr.mu.Lock()
-	teams := make(map[string]*TeamStack, len(tr.teams))
-	for k, v := range tr.teams {
-		teams[k] = v
+	orgs := make(map[string]*OrgStack, len(tr.orgs))
+	for k, v := range tr.orgs {
+		orgs[k] = v
 	}
-	tr.teams = make(map[string]*TeamStack)
+	tr.orgs = make(map[string]*OrgStack)
 	tr.mu.Unlock()
 
-	for name, stack := range teams {
-		slog.Info("Shutting down team stack.", "team", name)
+	for name, stack := range orgs {
+		slog.Info("Shutting down org stack.", "org", name)
 		stack.cancel()
 		stack.Pool.ShutdownAll()
 		if stack.Rebalancer != nil {
@@ -264,7 +264,7 @@ func (tr *TeamRouter) ShutdownAll() {
 	}
 }
 
-func (tr *TeamRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
+func (tr *OrgRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
 	if tr.sharedPool == nil || snap == nil {
 		return
 	}
@@ -276,26 +276,26 @@ func (tr *TeamRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
 
 	tr.sharedPool.SetWarmCapacityTarget(target)
 	if target > 0 {
-		observeTeamWorkerSpawn("shared")
+		observeOrgWorkerSpawn("shared")
 		if err := tr.sharedPool.SpawnMinWorkers(target); err != nil {
 			slog.Warn("Failed to reconcile shared warm capacity.", "target", target, "error", err)
 		}
 	}
 }
 
-func (tr *TeamRouter) onSharedWorkerCrash(workerID int) {
-	stack, teamName, ok := tr.stackForWorker(workerID)
+func (tr *OrgRouter) onSharedWorkerCrash(workerID int) {
+	stack, orgID, ok := tr.stackForWorker(workerID)
 	if !ok {
 		return
 	}
 
-	observeTeamWorkerCrash(teamName)
+	observeOrgWorkerCrash(orgID)
 	stack.Sessions.OnWorkerCrash(workerID, func(pid int32) {
-		slog.Warn("Session orphaned by worker crash.", "team", teamName, "pid", pid, "worker", workerID)
+		slog.Warn("Session orphaned by worker crash.", "org", orgID, "pid", pid, "worker", workerID)
 	})
 }
 
-func (tr *TeamRouter) onSharedWorkerProgress(workerID int, progress map[string]*SessionProgress) {
+func (tr *OrgRouter) onSharedWorkerProgress(workerID int, progress map[string]*SessionProgress) {
 	stack, _, ok := tr.stackForWorker(workerID)
 	if !ok {
 		return
@@ -303,13 +303,13 @@ func (tr *TeamRouter) onSharedWorkerProgress(workerID int, progress map[string]*
 	stack.Sessions.UpdateProgress(workerID, progress)
 }
 
-func (tr *TeamRouter) stackForWorker(workerID int) (*TeamStack, string, bool) {
+func (tr *OrgRouter) stackForWorker(workerID int) (*OrgStack, string, bool) {
 	tr.mu.RLock()
 	defer tr.mu.RUnlock()
 
-	for teamName, stack := range tr.teams {
+	for orgID, stack := range tr.orgs {
 		if stack.Sessions.SessionCountForWorker(workerID) > 0 {
-			return stack, teamName, true
+			return stack, orgID, true
 		}
 	}
 	return nil, "", false

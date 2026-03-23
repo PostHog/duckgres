@@ -157,7 +157,7 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	stream := &mockDoActionStream{}
 
 	firstBody, err := json.Marshal(ActivationPayload{
-		TeamName: "analytics",
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("marshal first request: %v", err)
@@ -167,7 +167,7 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	}
 
 	secondBody, err := json.Marshal(ActivationPayload{
-		TeamName: "billing",
+		OrgID: "billing",
 	})
 	if err != nil {
 		t.Fatalf("marshal second request: %v", err)

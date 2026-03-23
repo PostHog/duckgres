@@ -44,7 +44,7 @@ func TestSessionPoolActivateTenantConfiguresTenantRuntime(t *testing.T) {
 	}()
 
 	err := pool.activateTenant(ActivationPayload{
-		TeamName: "analytics",
+		OrgID: "analytics",
 		DuckLake: server.DuckLakeConfig{
 			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
 			ObjectStore:   "s3://analytics/warehouse/",
@@ -55,8 +55,8 @@ func TestSessionPoolActivateTenantConfiguresTenantRuntime(t *testing.T) {
 	}
 
 	current := pool.currentActivation()
-	if current == nil || current.payload.TeamName != "analytics" {
-		t.Fatalf("expected activated team analytics, got %#v", current)
+	if current == nil || current.payload.OrgID != "analytics" {
+		t.Fatalf("expected activated org analytics, got %#v", current)
 	}
 	if captured.DuckLake.MetadataStore == "" || captured.DuckLake.ObjectStore == "" {
 		t.Fatalf("expected activated DuckLake config to be applied, got %#v", captured.DuckLake)
@@ -86,7 +86,7 @@ func TestSessionPoolActivateTenantRejectsSecondActivation(t *testing.T) {
 	}
 
 	if err := pool.activateTenant(ActivationPayload{
-		TeamName: "analytics",
+		OrgID: "analytics",
 		DuckLake: server.DuckLakeConfig{
 			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
 		},
@@ -95,7 +95,7 @@ func TestSessionPoolActivateTenantRejectsSecondActivation(t *testing.T) {
 	}
 
 	if err := pool.activateTenant(ActivationPayload{
-		TeamName: "billing",
+		OrgID: "billing",
 		DuckLake: server.DuckLakeConfig{
 			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
 		},

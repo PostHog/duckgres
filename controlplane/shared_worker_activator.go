@@ -22,7 +22,7 @@ type SharedWorkerActivator struct {
 }
 
 type TenantActivationPayload struct {
-	TeamName       string                `json:"team_name"`
+	OrgID          string                `json:"org_id"`
 	Usernames      []string              `json:"usernames,omitempty"`
 	LeaseExpiresAt time.Time             `json:"lease_expires_at,omitempty"`
 	DuckLake       server.DuckLakeConfig `json:"ducklake"`
@@ -38,35 +38,35 @@ func NewSharedWorkerActivator(shared *K8sWorkerPool) *SharedWorkerActivator {
 	}
 }
 
-func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, worker *ManagedWorker, team *configstore.TeamConfig) error {
-	if team == nil {
-		return fmt.Errorf("team config is required for activation")
+func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+	if org == nil {
+		return fmt.Errorf("org config is required for activation")
 	}
 	state := worker.SharedState()
 	if state.Assignment == nil {
-		return fmt.Errorf("worker %d has no team assignment", worker.ID)
+		return fmt.Errorf("worker %d has no org assignment", worker.ID)
 	}
 
-	payload, err := a.BuildActivationRequest(ctx, team, state.Assignment)
+	payload, err := a.BuildActivationRequest(ctx, org, state.Assignment)
 	if err != nil {
 		return err
 	}
 	return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
-		TeamName:       payload.TeamName,
+		OrgID:          payload.OrgID,
 		LeaseExpiresAt: payload.LeaseExpiresAt,
 		DuckLake:       payload.DuckLake,
 	})
 }
 
-func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, team *configstore.TeamConfig, assignment *WorkerAssignment) (TenantActivationPayload, error) {
-	if team == nil || team.Warehouse == nil {
-		return TenantActivationPayload{}, fmt.Errorf("team %q has no managed warehouse runtime", teamName(team))
+func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org *configstore.OrgConfig, assignment *WorkerAssignment) (TenantActivationPayload, error) {
+	if org == nil || org.Warehouse == nil {
+		return TenantActivationPayload{}, fmt.Errorf("org %q has no managed warehouse runtime", orgName(org))
 	}
 	if assignment == nil {
 		return TenantActivationPayload{}, fmt.Errorf("worker assignment is required")
 	}
 
-	warehouse := team.Warehouse
+	warehouse := org.Warehouse
 	metadataPassword, err := a.readSecretValue(ctx, warehouse.MetadataStoreCredentials)
 	if err != nil {
 		return TenantActivationPayload{}, fmt.Errorf("metadata store credentials: %w", err)
@@ -100,29 +100,29 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, team
 		dl.S3Provider = "aws_sdk"
 	}
 
-	usernames := make([]string, 0, len(team.Users))
-	for username := range team.Users {
+	usernames := make([]string, 0, len(org.Users))
+	for username := range org.Users {
 		usernames = append(usernames, username)
 	}
 	slices.Sort(usernames)
 
 	return TenantActivationPayload{
-		TeamName:       assignment.TeamName,
+		OrgID:          assignment.OrgID,
 		Usernames:      usernames,
 		LeaseExpiresAt: assignment.LeaseExpiresAt,
 		DuckLake:       dl,
 	}, nil
 }
 
-func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Interface, defaultNamespace string, team *configstore.TeamConfig) (TenantActivationPayload, error) {
+func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Interface, defaultNamespace string, org *configstore.OrgConfig) (TenantActivationPayload, error) {
 	activator := &SharedWorkerActivator{
 		clientset:        clientset,
 		defaultNamespace: defaultNamespace,
 	}
 	assignment := &WorkerAssignment{
-		TeamName: teamName(team),
+		OrgID: orgName(org),
 	}
-	return activator.BuildActivationRequest(ctx, team, assignment)
+	return activator.BuildActivationRequest(ctx, org, assignment)
 }
 
 func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configstore.SecretRef) (string, error) {
@@ -204,9 +204,9 @@ func secretNamespace(ref configstore.SecretRef, fallback string) string {
 	return fallback
 }
 
-func teamName(team *configstore.TeamConfig) string {
-	if team == nil {
+func orgName(org *configstore.OrgConfig) string {
+	if org == nil {
 		return ""
 	}
-	return team.Name
+	return org.Name
 }

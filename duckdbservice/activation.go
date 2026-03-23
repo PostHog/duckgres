@@ -14,7 +14,7 @@ import (
 // ActivationPayload carries the tenant-specific runtime that is delivered to a
 // neutral shared warm worker over the control-plane RPC channel.
 type ActivationPayload struct {
-	TeamName       string                `json:"team_name"`
+	OrgID          string                `json:"org_id"`
 	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
 	DuckLake       server.DuckLakeConfig `json:"ducklake"`
 }
@@ -38,8 +38,8 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	if !p.sharedWarmMode {
 		return fmt.Errorf("tenant activation is not enabled for this worker")
 	}
-	if strings.TrimSpace(payload.TeamName) == "" {
-		return fmt.Errorf("team_name is required")
+	if strings.TrimSpace(payload.OrgID) == "" {
+		return fmt.Errorf("org_id is required")
 	}
 
 	p.mu.RLock()
@@ -49,7 +49,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 		if reflect.DeepEqual(current.payload, payload) {
 			return nil
 		}
-		return fmt.Errorf("worker already activated for team %q", current.payload.TeamName)
+		return fmt.Errorf("worker already activated for org %q", current.payload.OrgID)
 	}
 
 	cfg := p.cfg
@@ -83,7 +83,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 		if reflect.DeepEqual(p.activation.payload, payload) {
 			return nil
 		}
-		return fmt.Errorf("worker already activated for team %q", p.activation.payload.TeamName)
+		return fmt.Errorf("worker already activated for org %q", p.activation.payload.OrgID)
 	}
 
 	p.activation = &activatedTenantRuntime{

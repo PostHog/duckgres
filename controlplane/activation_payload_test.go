@@ -30,7 +30,7 @@ func TestBuildTenantActivationPayloadBuildsDuckLakeRuntimeFromWarehouseSecrets(t
 		t.Fatalf("create s3 secret: %v", err)
 	}
 
-	team := &configstore.TeamConfig{
+	org := &configstore.OrgConfig{
 		Name: "analytics",
 		Users: map[string]string{
 			"alice": "ignored",
@@ -62,13 +62,13 @@ func TestBuildTenantActivationPayloadBuildsDuckLakeRuntimeFromWarehouseSecrets(t
 		},
 	}
 
-	payload, err := BuildTenantActivationPayload(context.Background(), pool.clientset, pool.namespace, team)
+	payload, err := BuildTenantActivationPayload(context.Background(), pool.clientset, pool.namespace, org)
 	if err != nil {
 		t.Fatalf("BuildTenantActivationPayload: %v", err)
 	}
 
-	if payload.TeamName != "analytics" {
-		t.Fatalf("expected team analytics, got %q", payload.TeamName)
+	if payload.OrgID != "analytics" {
+		t.Fatalf("expected org analytics, got %q", payload.OrgID)
 	}
 	if len(payload.Usernames) != 2 {
 		t.Fatalf("expected two users, got %v", payload.Usernames)

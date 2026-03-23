@@ -9,7 +9,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-func TestTeamRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.T) {
+func TestOrgRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
 	sharedPool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		sharedPool.mu.Lock()
@@ -17,7 +17,7 @@ func TestTeamRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.
 		sharedPool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
 		return nil
 	}
-	tr := &TeamRouter{
+	tr := &OrgRouter{
 		sharedPool: sharedPool,
 		globalCfg: ControlPlaneConfig{
 			K8s: K8sConfig{
@@ -27,7 +27,7 @@ func TestTeamRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.
 	}
 
 	snap := &configstore.Snapshot{
-		Teams: map[string]*configstore.TeamConfig{
+		Orgs: map[string]*configstore.OrgConfig{
 			"analytics": {Name: "analytics"},
 			"billing":   {Name: "billing"},
 		},
@@ -40,11 +40,11 @@ func TestTeamRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.
 	}
 }
 
-func TestTeamRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
+func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
-	pool := NewTeamReservedWorkerPool(sharedPool, "analytics", 2)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2)
 
-	oldTC := &configstore.TeamConfig{
+	oldTC := &configstore.OrgConfig{
 		Name: "analytics",
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
@@ -52,7 +52,7 @@ func TestTeamRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 			},
 		},
 	}
-	newTC := &configstore.TeamConfig{
+	newTC := &configstore.OrgConfig{
 		Name: "analytics",
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
@@ -61,8 +61,8 @@ func TestTeamRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 		},
 	}
 
-	tr := &TeamRouter{
-		teams: map[string]*TeamStack{
+	tr := &OrgRouter{
+		orgs: map[string]*OrgStack{
 			"analytics": {
 				Config: oldTC,
 				Pool:   pool,
@@ -73,11 +73,11 @@ func TestTeamRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	}
 
 	tr.HandleConfigChange(
-		&configstore.Snapshot{Teams: map[string]*configstore.TeamConfig{"analytics": oldTC}},
-		&configstore.Snapshot{Teams: map[string]*configstore.TeamConfig{"analytics": newTC}},
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": oldTC}},
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": newTC}},
 	)
 
-	if got := tr.teams["analytics"].Config.Warehouse.MetadataStore.Endpoint; got != "new-metadata.internal" {
+	if got := tr.orgs["analytics"].Config.Warehouse.MetadataStore.Endpoint; got != "new-metadata.internal" {
 		t.Fatalf("expected runtime-only update to refresh stack config, got %q", got)
 	}
 }

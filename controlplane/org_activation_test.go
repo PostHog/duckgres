@@ -40,7 +40,7 @@ func TestSharedWorkerActivatorBuildsActivationRequestFromManagedWarehouse(t *tes
 		defaultNamespace: "duckgres-workers",
 	}
 
-	team := &configstore.TeamConfig{
+	org := &configstore.OrgConfig{
 		Name: "analytics",
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
@@ -72,17 +72,17 @@ func TestSharedWorkerActivatorBuildsActivationRequestFromManagedWarehouse(t *tes
 	}
 
 	assignment := &WorkerAssignment{
-		TeamName:       "analytics",
+		OrgID:          "analytics",
 		LeaseExpiresAt: time.Date(2026, time.March, 22, 12, 0, 0, 0, time.UTC),
 	}
 
-	req, err := activator.BuildActivationRequest(context.Background(), team, assignment)
+	req, err := activator.BuildActivationRequest(context.Background(), org, assignment)
 	if err != nil {
 		t.Fatalf("BuildActivationRequest: %v", err)
 	}
 
-	if req.TeamName != "analytics" {
-		t.Fatalf("expected team analytics, got %q", req.TeamName)
+	if req.OrgID != "analytics" {
+		t.Fatalf("expected org analytics, got %q", req.OrgID)
 	}
 	if !req.LeaseExpiresAt.Equal(assignment.LeaseExpiresAt) {
 		t.Fatalf("expected lease expiry %v, got %v", assignment.LeaseExpiresAt, req.LeaseExpiresAt)
@@ -107,8 +107,8 @@ func TestSharedWorkerActivatorRequiresManagedWarehouse(t *testing.T) {
 		defaultNamespace: "duckgres-workers",
 	}
 
-	_, err := activator.BuildActivationRequest(context.Background(), &configstore.TeamConfig{Name: "analytics"}, &WorkerAssignment{
-		TeamName:       "analytics",
+	_, err := activator.BuildActivationRequest(context.Background(), &configstore.OrgConfig{Name: "analytics"}, &WorkerAssignment{
+		OrgID:          "analytics",
 		LeaseExpiresAt: time.Now().Add(time.Hour),
 	})
 	if err == nil {

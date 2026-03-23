@@ -12,23 +12,23 @@ import (
 
 const defaultSharedWorkerReservationLease = 24 * time.Hour
 
-// TeamReservedWorkerPool presents one team's reserved slice of a shared K8s warm pool.
+// OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
-// workers are reserved to a single team for their lifetime and retired after use.
-type TeamReservedWorkerPool struct {
+// workers are reserved to a single org for their lifetime and retired after use.
+type OrgReservedPool struct {
 	shared                 *K8sWorkerPool
-	teamName               string
+	orgID                  string
 	maxWorkers             int
 	leaseDuration          time.Duration
 	sharedWarmWorkers      bool
-	resolveTeamConfig      func() (*configstore.TeamConfig, error)
-	activateReservedWorker func(context.Context, *ManagedWorker, *configstore.TeamConfig) error
+	resolveOrgConfig       func() (*configstore.OrgConfig, error)
+	activateReservedWorker func(context.Context, *ManagedWorker, *configstore.OrgConfig) error
 }
 
-func NewTeamReservedWorkerPool(shared *K8sWorkerPool, teamName string, maxWorkers int) *TeamReservedWorkerPool {
-	pool := &TeamReservedWorkerPool{
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int) *OrgReservedPool {
+	pool := &OrgReservedPool{
 		shared:        shared,
-		teamName:      teamName,
+		orgID:         orgID,
 		maxWorkers:    maxWorkers,
 		leaseDuration: defaultSharedWorkerReservationLease,
 	}
@@ -36,7 +36,7 @@ func NewTeamReservedWorkerPool(shared *K8sWorkerPool, teamName string, maxWorker
 	return pool
 }
 
-func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -63,7 +63,7 @@ func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWor
 			p.shared.mu.Unlock()
 
 			worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-				TeamName:       p.teamName,
+				OrgID:          p.orgID,
 				LeaseExpiresAt: time.Now().Add(p.leaseDuration),
 			})
 			if err != nil {
@@ -71,14 +71,14 @@ func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWor
 			}
 
 			if p.sharedWarmWorkers {
-				if err := p.activateWorkerForTeam(ctx, worker); err != nil {
+				if err := p.activateWorkerForOrg(ctx, worker); err != nil {
 					p.shared.RetireWorker(worker.ID)
 					return nil, err
 				}
 			}
 
 			p.shared.mu.Lock()
-			if owned := p.workerBelongsToTeamLocked(worker); owned {
+			if owned := p.workerBelongsToOrgLocked(worker); owned {
 				worker.activeSessions++
 				p.shared.mu.Unlock()
 				return worker, nil
@@ -102,58 +102,58 @@ func (p *TeamReservedWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWor
 	}
 }
 
-func (p *TeamReservedWorkerPool) ReleaseWorker(id int) {
+func (p *OrgReservedPool) ReleaseWorker(id int) {
 	_ = p.RetireWorkerIfNoSessions(id)
 }
 
-func (p *TeamReservedWorkerPool) RetireWorker(id int) {
+func (p *OrgReservedPool) RetireWorker(id int) {
 	if _, ok := p.Worker(id); !ok {
 		return
 	}
 	p.shared.RetireWorker(id)
 }
 
-func (p *TeamReservedWorkerPool) RetireWorkerIfNoSessions(id int) bool {
+func (p *OrgReservedPool) RetireWorkerIfNoSessions(id int) bool {
 	if _, ok := p.Worker(id); !ok {
 		return false
 	}
 	return p.shared.RetireWorkerIfNoSessions(id)
 }
 
-func (p *TeamReservedWorkerPool) Worker(id int) (*ManagedWorker, bool) {
+func (p *OrgReservedPool) Worker(id int) (*ManagedWorker, bool) {
 	p.shared.mu.RLock()
 	defer p.shared.mu.RUnlock()
 	w, ok := p.shared.workers[id]
-	if !ok || !p.workerBelongsToTeamLocked(w) {
+	if !ok || !p.workerBelongsToOrgLocked(w) {
 		return nil, false
 	}
 	return w, true
 }
 
-func (p *TeamReservedWorkerPool) SpawnMinWorkers(count int) error {
+func (p *OrgReservedPool) SpawnMinWorkers(count int) error {
 	return nil
 }
 
-func (p *TeamReservedWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
+func (p *OrgReservedPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
 }
 
-func (p *TeamReservedWorkerPool) SetMaxWorkers(n int) {
+func (p *OrgReservedPool) SetMaxWorkers(n int) {
 	p.shared.mu.Lock()
 	defer p.shared.mu.Unlock()
 	p.maxWorkers = n
 }
 
-func (p *TeamReservedWorkerPool) EnableSharedWarmActivation(enabled bool) {
+func (p *OrgReservedPool) EnableSharedWarmActivation(enabled bool) {
 	p.shared.mu.Lock()
 	defer p.shared.mu.Unlock()
 	p.sharedWarmWorkers = enabled
 }
 
-func (p *TeamReservedWorkerPool) ShutdownAll() {
+func (p *OrgReservedPool) ShutdownAll() {
 	p.shared.mu.RLock()
 	workers := make([]int, 0, len(p.shared.workers))
 	for id, w := range p.shared.workers {
-		if p.workerBelongsToTeamLocked(w) {
+		if p.workerBelongsToOrgLocked(w) {
 			workers = append(workers, id)
 		}
 	}
@@ -164,7 +164,7 @@ func (p *TeamReservedWorkerPool) ShutdownAll() {
 	}
 }
 
-func (p *TeamReservedWorkerPool) findIdleAssignedWorkerLocked() *ManagedWorker {
+func (p *OrgReservedPool) findIdleAssignedWorkerLocked() *ManagedWorker {
 	for _, w := range p.shared.workers {
 		select {
 		case <-w.done:
@@ -178,7 +178,7 @@ func (p *TeamReservedWorkerPool) findIdleAssignedWorkerLocked() *ManagedWorker {
 	return nil
 }
 
-func (p *TeamReservedWorkerPool) leastLoadedAssignedWorkerLocked() *ManagedWorker {
+func (p *OrgReservedPool) leastLoadedAssignedWorkerLocked() *ManagedWorker {
 	var best *ManagedWorker
 	for _, w := range p.shared.workers {
 		select {
@@ -196,7 +196,7 @@ func (p *TeamReservedWorkerPool) leastLoadedAssignedWorkerLocked() *ManagedWorke
 	return best
 }
 
-func (p *TeamReservedWorkerPool) assignedWorkerCountLocked() int {
+func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 	count := 0
 	for _, w := range p.shared.workers {
 		select {
@@ -204,20 +204,20 @@ func (p *TeamReservedWorkerPool) assignedWorkerCountLocked() int {
 			continue
 		default:
 		}
-		if p.workerBelongsToTeamLocked(w) {
+		if p.workerBelongsToOrgLocked(w) {
 			count++
 		}
 	}
 	return count
 }
 
-func (p *TeamReservedWorkerPool) workerBelongsToTeamLocked(w *ManagedWorker) bool {
+func (p *OrgReservedPool) workerBelongsToOrgLocked(w *ManagedWorker) bool {
 	state := w.SharedState()
-	return state.Assignment != nil && state.Assignment.TeamName == p.teamName && state.NormalizedLifecycle() != WorkerLifecycleRetired
+	return state.Assignment != nil && state.Assignment.OrgID == p.orgID && state.NormalizedLifecycle() != WorkerLifecycleRetired
 }
 
-func (p *TeamReservedWorkerPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool {
-	if !p.workerBelongsToTeamLocked(w) {
+func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool {
+	if !p.workerBelongsToOrgLocked(w) {
 		return false
 	}
 	if !p.sharedWarmWorkers {
@@ -226,7 +226,7 @@ func (p *TeamReservedWorkerPool) workerReadyForSchedulingLocked(w *ManagedWorker
 	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot
 }
 
-func (p *TeamReservedWorkerPool) activateWorkerForTeam(ctx context.Context, worker *ManagedWorker) error {
+func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) error {
 	p.shared.mu.Lock()
 	state := worker.SharedState().NormalizedLifecycle()
 	if state == WorkerLifecycleReserved {
@@ -242,12 +242,12 @@ func (p *TeamReservedWorkerPool) activateWorkerForTeam(ctx context.Context, work
 	}
 	p.shared.mu.Unlock()
 
-	team, err := p.lookupTeamConfig()
+	org, err := p.lookupOrgConfig()
 	if err != nil {
 		return err
 	}
 
-	if err := p.activateReservedWorker(ctx, worker, team); err != nil {
+	if err := p.activateReservedWorker(ctx, worker, org); err != nil {
 		return err
 	}
 
@@ -267,14 +267,14 @@ func (p *TeamReservedWorkerPool) activateWorkerForTeam(ctx context.Context, work
 	}
 }
 
-func (p *TeamReservedWorkerPool) activateReservedWorkerDefault(ctx context.Context, worker *ManagedWorker, team *configstore.TeamConfig) error {
+func (p *OrgReservedPool) activateReservedWorkerDefault(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
 	if !p.sharedWarmWorkers {
 		return nil
 	}
-	if team == nil {
-		return fmt.Errorf("team config is required for activation")
+	if org == nil {
+		return fmt.Errorf("org config is required for activation")
 	}
-	payload, err := BuildTenantActivationPayload(ctx, p.shared.clientset, p.shared.namespace, team)
+	payload, err := BuildTenantActivationPayload(ctx, p.shared.clientset, p.shared.namespace, org)
 	if err != nil {
 		return err
 	}
@@ -284,16 +284,16 @@ func (p *TeamReservedWorkerPool) activateReservedWorkerDefault(ctx context.Conte
 	return p.shared.ActivateReservedWorker(ctx, worker, payload)
 }
 
-func (p *TeamReservedWorkerPool) lookupTeamConfig() (*configstore.TeamConfig, error) {
-	if p.resolveTeamConfig == nil {
-		return nil, fmt.Errorf("team config resolver is not configured for team %s", p.teamName)
+func (p *OrgReservedPool) lookupOrgConfig() (*configstore.OrgConfig, error) {
+	if p.resolveOrgConfig == nil {
+		return nil, fmt.Errorf("org config resolver is not configured for org %s", p.orgID)
 	}
-	team, err := p.resolveTeamConfig()
+	org, err := p.resolveOrgConfig()
 	if err != nil {
 		return nil, err
 	}
-	if team == nil {
-		return nil, fmt.Errorf("team config resolver returned nil for team %s", p.teamName)
+	if org == nil {
+		return nil, fmt.Errorf("org config resolver returned nil for org %s", p.orgID)
 	}
-	return team, nil
+	return org, nil
 }

@@ -23,29 +23,29 @@ func TestKindConfigStoreSeedSQL(t *testing.T) {
 	}
 
 	snap := store.Snapshot()
-	teamCfg := snap.Teams["local"]
-	if teamCfg == nil {
-		t.Fatal("expected local team from kind seed")
+	orgCfg := snap.Orgs["local"]
+	if orgCfg == nil {
+		t.Fatal("expected local org from kind seed")
 	}
-	if teamCfg.Warehouse == nil {
+	if orgCfg.Warehouse == nil {
 		t.Fatal("expected local warehouse from kind seed")
 	}
-	if got := teamCfg.Warehouse.MetadataStore.Endpoint; got != "duckgres-local-ducklake-metadata" {
+	if got := orgCfg.Warehouse.MetadataStore.Endpoint; got != "duckgres-local-ducklake-metadata" {
 		t.Fatalf("expected kind metadata endpoint, got %q", got)
 	}
-	if got := teamCfg.Warehouse.MetadataStore.Port; got != 5432 {
+	if got := orgCfg.Warehouse.MetadataStore.Port; got != 5432 {
 		t.Fatalf("expected kind metadata port 5432, got %d", got)
 	}
-	if got := teamCfg.Warehouse.S3.Endpoint; got != "duckgres-local-minio:9000" {
+	if got := orgCfg.Warehouse.S3.Endpoint; got != "duckgres-local-minio:9000" {
 		t.Fatalf("expected kind s3 endpoint, got %q", got)
 	}
-	if got := teamCfg.Warehouse.S3.Bucket; got != "duckgres-local" {
+	if got := orgCfg.Warehouse.S3.Bucket; got != "duckgres-local" {
 		t.Fatalf("expected duckgres-local bucket, got %q", got)
 	}
-	if got := teamCfg.Warehouse.MetadataStoreCredentials.Name; got != "duckgres-local-metadata" {
+	if got := orgCfg.Warehouse.MetadataStoreCredentials.Name; got != "duckgres-local-metadata" {
 		t.Fatalf("expected kind metadata secret ref, got %q", got)
 	}
-	if got := teamCfg.Warehouse.S3Credentials.Name; got != "duckgres-local-s3" {
+	if got := orgCfg.Warehouse.S3Credentials.Name; got != "duckgres-local-s3" {
 		t.Fatalf("expected kind s3 secret ref, got %q", got)
 	}
 }

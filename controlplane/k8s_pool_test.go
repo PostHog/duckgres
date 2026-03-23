@@ -207,7 +207,7 @@ func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			TeamName:       "analytics",
+			OrgID:       "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -218,14 +218,14 @@ func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 		if got.ID != worker.ID {
 			t.Fatalf("expected worker %d, got %d", worker.ID, got.ID)
 		}
-		if payload.TeamName != "analytics" {
+		if payload.OrgID != "analytics" {
 			t.Fatalf("expected analytics payload, got %#v", payload)
 		}
 		return nil
 	}
 
 	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
-		TeamName:  "analytics",
+		OrgID:  "analytics",
 		Usernames: []string{"alice"},
 	})
 	if err != nil {
@@ -243,7 +243,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			TeamName:       "analytics",
+			OrgID:       "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -255,7 +255,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	}
 
 	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
-		TeamName:  "analytics",
+		OrgID:  "analytics",
 		Usernames: []string{"alice"},
 	})
 	if err == nil {
@@ -369,7 +369,7 @@ func TestK8sPoolSpawnMinWorkersCountsOnlyNeutralIdleWorkersAsWarmCapacity(t *tes
 		if err := worker.SetSharedState(SharedWorkerState{
 			Lifecycle: WorkerLifecycleReserved,
 			Assignment: &WorkerAssignment{
-				TeamName:       "analytics",
+				OrgID:          "analytics",
 				LeaseExpiresAt: time.Now().Add(time.Hour),
 			},
 		}); err != nil {
@@ -403,7 +403,7 @@ func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 	if err := reserved.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			TeamName:       "analytics",
+			OrgID:          "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -438,7 +438,7 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 
 	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		TeamName:       "analytics",
+		OrgID:          "analytics",
 		LeaseExpiresAt: leaseExpiry,
 	})
 	if err != nil {
@@ -452,7 +452,7 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 	if state.Lifecycle != WorkerLifecycleReserved {
 		t.Fatalf("expected reserved lifecycle, got %q", state.Lifecycle)
 	}
-	if state.Assignment == nil || state.Assignment.TeamName != "analytics" {
+	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
 	}
 	if !state.Assignment.LeaseExpiresAt.Equal(leaseExpiry) {
@@ -506,7 +506,7 @@ func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
 	}
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		TeamName:       "billing",
+		OrgID:          "billing",
 		LeaseExpiresAt: time.Now().Add(time.Hour),
 	})
 	if err != nil {
@@ -532,7 +532,7 @@ func TestK8sPoolIdleReaperSkipsReservedSharedWorker(t *testing.T) {
 	if err := reserved.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			TeamName:       "analytics",
+			OrgID:          "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {

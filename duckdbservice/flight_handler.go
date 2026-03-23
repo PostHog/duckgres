@@ -95,11 +95,11 @@ func (h *FlightSQLHandler) doActivateTenant(body []byte, stream flight.FlightSer
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return status.Errorf(codes.InvalidArgument, "invalid ActivateTenant request: %v", err)
 	}
-	if strings.TrimSpace(payload.TeamName) == "" {
-		return status.Error(codes.InvalidArgument, "team_name is required")
+	if strings.TrimSpace(payload.OrgID) == "" {
+		return status.Error(codes.InvalidArgument, "org_id is required")
 	}
-	if current := h.pool.currentActivation(); current != nil && current.payload.TeamName != payload.TeamName {
-		return status.Errorf(codes.FailedPrecondition, "activate tenant: worker already activated for team %q", current.payload.TeamName)
+	if current := h.pool.currentActivation(); current != nil && current.payload.OrgID != payload.OrgID {
+		return status.Errorf(codes.FailedPrecondition, "activate tenant: worker already activated for org %q", current.payload.OrgID)
 	}
 
 	if err := h.pool.activateTenantFunc(payload); err != nil {

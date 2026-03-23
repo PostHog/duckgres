@@ -58,8 +58,8 @@ type K8sWorkerPoolConfig struct {
 	ImagePullPolicy      string     // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
 	ServiceAccount       string     // ServiceAccount name for worker pods (default: "default")
 	MemoryBudget         int64      // Total memory budget in bytes; used to derive per-worker resource limits
-	TeamName             string     // Team name for pod labels (multi-tenant mode)
-	WorkerIDGenerator    func() int // Shared ID generator across teams (nil = internal counter)
+	OrgID                string     // Org ID for pod labels (multi-tenant mode)
+	WorkerIDGenerator    func() int // Shared ID generator across orgs (nil = internal counter)
 	SharedWarmActivation bool
 }
 
