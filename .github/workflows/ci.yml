@@ -174,8 +174,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install just
-        uses: taiki-e/install-action@just
+      - name: Set up just
+        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
 
       - name: Set up kind
         uses: helm/kind-action@v1.10.0
