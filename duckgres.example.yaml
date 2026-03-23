@@ -103,6 +103,12 @@ ducklake:
 #   # Neutral shared warm-worker target. Separate from per-team limits and
 #   # process.min_workers. 0 disables shared prewarming.
 #   shared_warm_target: 0
+#   # Enable the reserve -> activate -> hot shared warm-worker path.
+#   # Default false for rollout safety.
+#   shared_warm_workers: false
+#   # Enable reserve -> activate -> hot lifecycle for shared warm workers.
+#   # Default: false
+#   shared_warm_workers: false
 
 # Process isolation (default: true)
 # Each client connection spawns a separate OS process, so a DuckDB crash

@@ -66,9 +66,17 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 		return status.Error(codes.InvalidArgument, "username is required")
 	}
 
+	if h.pool.sharedWarmMode {
+		if _, err := h.pool.currentSessionConfig(); err != nil {
+			return status.Error(codes.FailedPrecondition, "worker is not activated")
+		}
+	}
+
 	// Validate username against configured users
-	if _, ok := h.pool.cfg.Users[req.Username]; !ok {
-		return status.Error(codes.PermissionDenied, "unknown username")
+	if !h.pool.sharedWarmMode {
+		if _, ok := h.pool.cfg.Users[req.Username]; !ok {
+			return status.Error(codes.PermissionDenied, "unknown username")
+		}
 	}
 
 	session, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads)
@@ -79,6 +87,26 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	resp, _ := json.Marshal(map[string]string{
 		"session_token": session.ID,
 	})
+	return stream.Send(&flight.Result{Body: resp})
+}
+
+func (h *FlightSQLHandler) doActivateTenant(body []byte, stream flight.FlightService_DoActionServer) error {
+	var payload ActivationPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid ActivateTenant request: %v", err)
+	}
+	if strings.TrimSpace(payload.OrgID) == "" {
+		return status.Error(codes.InvalidArgument, "org_id is required")
+	}
+	if current := h.pool.currentActivation(); current != nil && current.payload.OrgID != payload.OrgID {
+		return status.Errorf(codes.FailedPrecondition, "activate tenant: worker already activated for org %q", current.payload.OrgID)
+	}
+
+	if err := h.pool.activateTenantFunc(payload); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "activate tenant: %v", err)
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
 	return stream.Send(&flight.Result{Body: resp})
 }
 

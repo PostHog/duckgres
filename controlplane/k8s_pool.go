@@ -40,28 +40,30 @@ type K8sWorkerPool struct {
 	shuttingDown bool
 	shutdownCh   chan struct{}
 
-	clientset         kubernetes.Interface
-	namespace         string
-	cpID              string
-	cpUID             types.UID
-	workerImage       string
-	workerPort        int
-	secretName        string
-	configMap         string
-	configPath        string
-	imagePullPolicy   corev1.PullPolicy
-	serviceAccount    string
-	memoryBudget      int64      // total memory budget in bytes
-	orgID             string     // org ID for pod labels (multi-tenant mode)
-	workerIDGenerator func() int // shared ID generator across orgs (nil = internal counter)
-	cachedToken       string     // cached bearer token (immutable after setup)
-	informer          cache.SharedIndexInformer
-	stopInform        chan struct{}
-	spawnSem          chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
-	podReady          sync.Map      // podName -> chan string (pod IP); signaled by informer
+	clientset            kubernetes.Interface
+	namespace            string
+	cpID                 string
+	cpUID                types.UID
+	workerImage          string
+	workerPort           int
+	secretName           string
+	configMap            string
+	configPath           string
+	imagePullPolicy      corev1.PullPolicy
+	serviceAccount       string
+	memoryBudget         int64      // total memory budget in bytes
+	orgID                string     // org ID for pod labels (multi-tenant mode)
+	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
+	sharedWarmActivation bool
+	cachedToken          string // cached bearer token (immutable after setup)
+	informer             cache.SharedIndexInformer
+	stopInform           chan struct{}
+	spawnSem             chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
+	podReady             sync.Map      // podName -> chan string (pod IP); signaled by informer
 
 	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
 	spawnWarmWorkerBackgroundFunc func(id int)
+	activateTenantFunc            func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -108,25 +110,26 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
 	spawnConcurrency := 3
 	pool := &K8sWorkerPool{
-		workers:           make(map[int]*ManagedWorker),
-		maxWorkers:        cfg.MaxWorkers,
-		idleTimeout:       cfg.IdleTimeout,
-		shutdownCh:        make(chan struct{}),
-		stopInform:        make(chan struct{}),
-		clientset:         clientset,
-		namespace:         cfg.Namespace,
-		cpID:              cfg.CPID,
-		workerImage:       cfg.WorkerImage,
-		workerPort:        cfg.WorkerPort,
-		secretName:        cfg.SecretName,
-		configMap:         cfg.ConfigMap,
-		configPath:        cfg.ConfigPath,
-		imagePullPolicy:   corev1.PullPolicy(cfg.ImagePullPolicy),
-		serviceAccount:    cfg.ServiceAccount,
-		memoryBudget:      cfg.MemoryBudget,
-		orgID:             cfg.OrgID,
-		workerIDGenerator: cfg.WorkerIDGenerator,
-		spawnSem:          make(chan struct{}, spawnConcurrency),
+		workers:              make(map[int]*ManagedWorker),
+		maxWorkers:           cfg.MaxWorkers,
+		idleTimeout:          cfg.IdleTimeout,
+		shutdownCh:           make(chan struct{}),
+		stopInform:           make(chan struct{}),
+		clientset:            clientset,
+		namespace:            cfg.Namespace,
+		cpID:                 cfg.CPID,
+		workerImage:          cfg.WorkerImage,
+		workerPort:           cfg.WorkerPort,
+		secretName:           cfg.SecretName,
+		configMap:            cfg.ConfigMap,
+		configPath:           cfg.ConfigPath,
+		imagePullPolicy:      corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:       cfg.ServiceAccount,
+		memoryBudget:         cfg.MemoryBudget,
+		orgID:                cfg.OrgID,
+		workerIDGenerator:    cfg.WorkerIDGenerator,
+		sharedWarmActivation: cfg.SharedWarmActivation,
+		spawnSem:             make(chan struct{}, spawnConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
@@ -425,6 +428,12 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 				},
 			},
 		},
+	}
+	if p.sharedWarmActivation {
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+			Name:  "DUCKGRES_SHARED_WARM_WORKER",
+			Value: "true",
+		})
 	}
 
 	// Add writable data directory for DuckDB databases
@@ -776,6 +785,56 @@ func (p *K8sWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	return w, ok
 }
 
+// ActivateReservedWorker transitions a reserved worker through activating to hot.
+// Failed activations retire the worker immediately.
+func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error {
+	p.mu.Lock()
+	var err error
+	switch worker.SharedState().NormalizedLifecycle() {
+	case WorkerLifecycleReserved:
+		nextState, transitionErr := worker.SharedState().Transition(WorkerLifecycleActivating, nil)
+		if transitionErr == nil {
+			transitionErr = worker.SetSharedState(nextState)
+		}
+		err = transitionErr
+	case WorkerLifecycleActivating:
+		err = nil
+	default:
+		err = fmt.Errorf("worker %d is not reserved for activation", worker.ID)
+	}
+	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	activate := p.activateTenantFunc
+	if activate == nil {
+		activate = func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error {
+			return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
+				OrgID:          payload.OrgID,
+				LeaseExpiresAt: payload.LeaseExpiresAt,
+				DuckLake:       payload.DuckLake,
+			})
+		}
+	}
+
+	if err := activate(ctx, worker, payload); err != nil {
+		p.RetireWorker(worker.ID)
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if worker.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
+		return nil
+	}
+	nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
+	if err != nil {
+		return err
+	}
+	return worker.SetSharedState(nextState)
+}
+
 // ReserveSharedWorker reserves a neutral warm worker for later tenant activation.
 func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *WorkerAssignment) (*ManagedWorker, error) {
 	if err := validateWorkerAssignment(assignment); err != nil {
@@ -873,32 +932,18 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 	}
 	p.mu.Unlock()
 
-	var wg sync.WaitGroup
-	errs := make(chan error, missing)
 	ctx := context.Background()
 
 	for _, id := range ids {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			defer func() {
-				p.mu.Lock()
-				p.spawning--
-				p.mu.Unlock()
-			}()
-			if err := p.spawnWarmWorker(ctx, id); err != nil {
-				errs <- err
-			}
-		}(id)
-	}
-
-	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		if err != nil {
+		if err := p.spawnWarmWorker(ctx, id); err != nil {
+			p.mu.Lock()
+			p.spawning--
+			p.mu.Unlock()
 			return err
 		}
+		p.mu.Lock()
+		p.spawning--
+		p.mu.Unlock()
 	}
 	return nil
 }

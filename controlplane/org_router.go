@@ -108,6 +108,18 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	}
 
 	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers)
+	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
+		snap := tr.configStore.Snapshot()
+		if snap == nil {
+			return nil, fmt.Errorf("config snapshot unavailable for org %s", tc.Name)
+		}
+		org, ok := snap.Orgs[tc.Name]
+		if !ok {
+			return nil, fmt.Errorf("org %s not found in config snapshot", tc.Name)
+		}
+		return org, nil
+	}
+	pool.EnableSharedWarmActivation(tr.globalCfg.K8s.SharedWarmWorkers)
 
 	rebalancer := NewMemoryRebalancer(uint64(memoryBudget), 0, nil, tr.globalCfg.MemoryRebalance)
 	sessions := NewSessionManager(pool, rebalancer)
@@ -235,27 +247,31 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		}
 	}
 
-	// Detect changed org limits (update in-place)
+	// Refresh existing org stacks and update worker limits when needed.
 	for name, newTC := range new.Orgs {
 		oldTC, existed := old.Orgs[name]
 		if !existed {
 			continue
 		}
-		if oldTC.MaxWorkers != newTC.MaxWorkers || oldTC.MemoryBudget != newTC.MemoryBudget {
-			slog.Info("Org config changed.", "org", name,
-				"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)
-			tr.mu.Lock()
-			if stack, ok := tr.orgs[name]; ok {
-				stack.Config = newTC
-				// Propagate MaxWorkers to the pool so it enforces the new limit
+		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers || oldTC.MemoryBudget != newTC.MemoryBudget
+
+		tr.mu.Lock()
+		if stack, ok := tr.orgs[name]; ok {
+			stack.Config = newTC
+			if limitsChanged {
+				slog.Info("Org config changed.", "org", name,
+					"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)
 				maxWorkers := newTC.MaxWorkers
 				if maxWorkers == 0 {
 					maxWorkers = tr.baseCfg.MaxWorkers
 				}
 				stack.Pool.SetMaxWorkers(maxWorkers)
 			}
-			tr.mu.Unlock()
+			if reserved, ok := stack.Pool.(*OrgReservedPool); ok {
+				reserved.EnableSharedWarmActivation(tr.globalCfg.K8s.SharedWarmWorkers)
+			}
 		}
+		tr.mu.Unlock()
 	}
 
 	tr.reconcileWarmCapacity(new)

@@ -810,6 +810,33 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 	return nil
 }
 
+// ActivateDBConnection applies tenant-specific DuckLake runtime to an already
+// initialized generic DuckDB connection used by a shared warm worker.
+func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, username string) error {
+	if cfg.DuckLake.MetadataStore == "" {
+		return fmt.Errorf("tenant activation requires ducklake metadata_store")
+	}
+
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
+		return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+	}
+
+	if err := recreatePgClassForDuckLake(db); err != nil {
+		slog.Warn("Failed to recreate pg_class_full for DuckLake during activation.", "user", username, "error", err)
+	}
+	if err := recreatePgNamespaceForDuckLake(db); err != nil {
+		slog.Warn("Failed to recreate pg_namespace for DuckLake during activation.", "user", username, "error", err)
+	}
+	if err := initInformationSchema(db, true); err != nil {
+		slog.Warn("Failed to initialize information_schema during activation.", "user", username, "error", err)
+	}
+	if err := setDuckLakeDefault(db); err != nil {
+		return fmt.Errorf("failed to set DuckLake as default: %w", err)
+	}
+
+	return nil
+}
+
 // CreatePassthroughDBConnection creates a DuckDB connection without pg_catalog
 // or information_schema initialization. DuckLake is still attached if configured
 // so passthrough users can access the same data. This is used for passthrough users
