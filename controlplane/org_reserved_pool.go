@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 const defaultSharedWorkerReservationLease = 24 * time.Hour
@@ -14,19 +16,24 @@ const defaultSharedWorkerReservationLease = 24 * time.Hour
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
 // workers are reserved to a single org for their lifetime and retired after use.
 type OrgReservedPool struct {
-	shared        *K8sWorkerPool
-	orgID         string
-	maxWorkers    int
-	leaseDuration time.Duration
+	shared                 *K8sWorkerPool
+	orgID                  string
+	maxWorkers             int
+	leaseDuration          time.Duration
+	sharedWarmWorkers      bool
+	resolveOrgConfig       func() (*configstore.OrgConfig, error)
+	activateReservedWorker func(context.Context, *ManagedWorker, *configstore.OrgConfig) error
 }
 
 func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int) *OrgReservedPool {
-	return &OrgReservedPool{
+	pool := &OrgReservedPool{
 		shared:        shared,
 		orgID:         orgID,
 		maxWorkers:    maxWorkers,
 		leaseDuration: defaultSharedWorkerReservationLease,
 	}
+	pool.activateReservedWorker = pool.activateReservedWorkerDefault
+	return pool
 }
 
 func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
@@ -61,6 +68,13 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			})
 			if err != nil {
 				return nil, err
+			}
+
+			if p.sharedWarmWorkers {
+				if err := p.activateWorkerForOrg(ctx, worker); err != nil {
+					p.shared.RetireWorker(worker.ID)
+					return nil, err
+				}
 			}
 
 			p.shared.mu.Lock()
@@ -129,6 +143,12 @@ func (p *OrgReservedPool) SetMaxWorkers(n int) {
 	p.maxWorkers = n
 }
 
+func (p *OrgReservedPool) EnableSharedWarmActivation(enabled bool) {
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	p.sharedWarmWorkers = enabled
+}
+
 func (p *OrgReservedPool) ShutdownAll() {
 	p.shared.mu.RLock()
 	workers := make([]int, 0, len(p.shared.workers))
@@ -151,7 +171,7 @@ func (p *OrgReservedPool) findIdleAssignedWorkerLocked() *ManagedWorker {
 			continue
 		default:
 		}
-		if w.activeSessions == 0 && p.workerBelongsToOrgLocked(w) {
+		if w.activeSessions == 0 && p.workerReadyForSchedulingLocked(w) {
 			return w
 		}
 	}
@@ -166,7 +186,7 @@ func (p *OrgReservedPool) leastLoadedAssignedWorkerLocked() *ManagedWorker {
 			continue
 		default:
 		}
-		if !p.workerBelongsToOrgLocked(w) {
+		if !p.workerReadyForSchedulingLocked(w) {
 			continue
 		}
 		if best == nil || w.activeSessions < best.activeSessions {
@@ -194,4 +214,86 @@ func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 func (p *OrgReservedPool) workerBelongsToOrgLocked(w *ManagedWorker) bool {
 	state := w.SharedState()
 	return state.Assignment != nil && state.Assignment.OrgID == p.orgID && state.NormalizedLifecycle() != WorkerLifecycleRetired
+}
+
+func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool {
+	if !p.workerBelongsToOrgLocked(w) {
+		return false
+	}
+	if !p.sharedWarmWorkers {
+		return true
+	}
+	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot
+}
+
+func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) error {
+	p.shared.mu.Lock()
+	state := worker.SharedState().NormalizedLifecycle()
+	if state == WorkerLifecycleReserved {
+		nextState, err := worker.SharedState().Transition(WorkerLifecycleActivating, nil)
+		if err != nil {
+			p.shared.mu.Unlock()
+			return err
+		}
+		if err := worker.SetSharedState(nextState); err != nil {
+			p.shared.mu.Unlock()
+			return err
+		}
+	}
+	p.shared.mu.Unlock()
+
+	org, err := p.lookupOrgConfig()
+	if err != nil {
+		return err
+	}
+
+	if err := p.activateReservedWorker(ctx, worker, org); err != nil {
+		return err
+	}
+
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	switch worker.SharedState().NormalizedLifecycle() {
+	case WorkerLifecycleActivating:
+		nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
+		if err != nil {
+			return err
+		}
+		return worker.SetSharedState(nextState)
+	case WorkerLifecycleHot:
+		return nil
+	default:
+		return fmt.Errorf("worker %d finished activation in unexpected lifecycle %q", worker.ID, worker.SharedState().NormalizedLifecycle())
+	}
+}
+
+func (p *OrgReservedPool) activateReservedWorkerDefault(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+	if !p.sharedWarmWorkers {
+		return nil
+	}
+	if org == nil {
+		return fmt.Errorf("org config is required for activation")
+	}
+	payload, err := BuildTenantActivationPayload(ctx, p.shared.clientset, p.shared.namespace, org)
+	if err != nil {
+		return err
+	}
+	if state := worker.SharedState(); state.Assignment != nil {
+		payload.LeaseExpiresAt = state.Assignment.LeaseExpiresAt
+	}
+	return p.shared.ActivateReservedWorker(ctx, worker, payload)
+}
+
+func (p *OrgReservedPool) lookupOrgConfig() (*configstore.OrgConfig, error) {
+	if p.resolveOrgConfig == nil {
+		return nil, fmt.Errorf("org config resolver is not configured for org %s", p.orgID)
+	}
+	org, err := p.resolveOrgConfig()
+	if err != nil {
+		return nil, err
+	}
+	if org == nil {
+		return nil, fmt.Errorf("org config resolver returned nil for org %s", p.orgID)
+	}
+	return org, nil
 }

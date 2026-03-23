@@ -5,7 +5,6 @@ package controlplane_test
 import (
 	"database/sql"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -119,7 +118,7 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 func TestLocalConfigStoreSeedSQL(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	if err := applyLocalConfigStoreSeed(t, store); err != nil {
+	if err := applyConfigStoreSeed(t, store, filepath.Join(findProjectRoot(), "k8s", "local-config-store.seed.sql")); err != nil {
 		t.Fatalf("apply local seed: %v", err)
 	}
 
@@ -205,23 +204,4 @@ func ensureIntegrationPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
 	}
-}
-
-func applyLocalConfigStoreSeed(t *testing.T, store *configstore.ConfigStore) error {
-	t.Helper()
-
-	seedPath := filepath.Join(findProjectRoot(), "k8s", "local-config-store.seed.sql")
-	seedSQL, err := os.ReadFile(seedPath)
-	if err != nil {
-		return fmt.Errorf("read seed sql: %w", err)
-	}
-
-	sqlDB, err := store.DB().DB()
-	if err != nil {
-		return fmt.Errorf("store sql db: %w", err)
-	}
-	if _, err := sqlDB.Exec(string(seedSQL)); err != nil {
-		return fmt.Errorf("exec seed sql: %w", err)
-	}
-	return nil
 }

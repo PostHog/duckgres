@@ -39,3 +39,45 @@ func TestOrgRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.T
 		t.Fatalf("expected shared warm target 4, got %d", got)
 	}
 }
+
+func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2)
+
+	oldTC := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "old-metadata.internal",
+			},
+		},
+	}
+	newTC := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "new-metadata.internal",
+			},
+		},
+	}
+
+	tr := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {
+				Config: oldTC,
+				Pool:   pool,
+			},
+		},
+		baseCfg:   K8sWorkerPoolConfig{MaxWorkers: 2},
+		globalCfg: ControlPlaneConfig{},
+	}
+
+	tr.HandleConfigChange(
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": oldTC}},
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": newTC}},
+	)
+
+	if got := tr.orgs["analytics"].Config.Warehouse.MetadataStore.Endpoint; got != "new-metadata.internal" {
+		t.Fatalf("expected runtime-only update to refresh stack config, got %q", got)
+	}
+}

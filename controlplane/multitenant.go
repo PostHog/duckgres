@@ -124,18 +124,19 @@ func SetupMultiTenant(
 	}
 
 	baseCfg := K8sWorkerPoolConfig{
-		Namespace:       cfg.K8s.WorkerNamespace,
-		CPID:            cfg.K8s.ControlPlaneID,
-		WorkerImage:     cfg.K8s.WorkerImage,
-		WorkerPort:      cfg.K8s.WorkerPort,
-		SecretName:      cfg.K8s.WorkerSecret,
-		ConfigMap:       cfg.K8s.WorkerConfigMap,
-		MaxWorkers:      maxWorkers,
-		IdleTimeout:     cfg.WorkerIdleTimeout,
-		ConfigPath:      cfg.ConfigPath,
-		ImagePullPolicy: cfg.K8s.ImagePullPolicy,
-		ServiceAccount:  cfg.K8s.ServiceAccount,
-		MemoryBudget:    int64(memBudget),
+		Namespace:            cfg.K8s.WorkerNamespace,
+		CPID:                 cfg.K8s.ControlPlaneID,
+		WorkerImage:          cfg.K8s.WorkerImage,
+		WorkerPort:           cfg.K8s.WorkerPort,
+		SecretName:           cfg.K8s.WorkerSecret,
+		ConfigMap:            cfg.K8s.WorkerConfigMap,
+		MaxWorkers:           maxWorkers,
+		IdleTimeout:          cfg.WorkerIdleTimeout,
+		ConfigPath:           cfg.ConfigPath,
+		ImagePullPolicy:      cfg.K8s.ImagePullPolicy,
+		ServiceAccount:       cfg.K8s.ServiceAccount,
+		MemoryBudget:         int64(memBudget),
+		SharedWarmActivation: cfg.K8s.SharedWarmWorkers,
 	}
 
 	router, err := NewOrgRouter(store, baseCfg, cfg, srv)
