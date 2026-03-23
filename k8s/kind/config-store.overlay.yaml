@@ -1,0 +1,28 @@
+services:
+  config-store-postgres:
+    networks:
+      kind:
+        aliases:
+          - duckgres-config-store
+
+  warehouse-postgres:
+    networks:
+      kind:
+        aliases:
+          - duckgres-local-warehouse-db
+
+  ducklake-metadata:
+    networks:
+      kind:
+        aliases:
+          - duckgres-local-ducklake-metadata
+
+  minio:
+    networks:
+      kind:
+        aliases:
+          - duckgres-local-minio
+
+networks:
+  kind:
+    external: true
