@@ -605,10 +605,10 @@ The shared warm-worker activation path is gated by `--k8s-shared-warm-workers` /
 
 ```bash
 # Local multitenant K8s workflow
-just run-multitenant-local
+just run-multitenant-kind
 ```
 
-See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and the default local OrbStack config-store workflow via `just run-multitenant-local`.
+See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and the default local kind workflow via `just run-multitenant-kind`. The older OrbStack path remains available through `just run-multitenant-local` for manual macOS iteration.
 
 On the multi-tenant path, the config store now keeps per-team managed-warehouse metadata in addition to team/user auth and limits. That team-scoped contract is intended to become the source of truth for the tenant warehouse DB, the tenant DuckLake metadata store (which may live on shared Aurora or a dedicated RDS instance), object-store settings, worker identity, secret references, and provisioning state. The older config-store `DuckLakeConfig` singleton remains only as a legacy cluster-wide setting and should not be treated as authoritative for multi-tenant runtime wiring.
 

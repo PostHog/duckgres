@@ -11,12 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	_ "github.com/lib/pq"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -27,26 +27,23 @@ var (
 	namespace  string
 	pgPort     int
 	portFwdCmd *exec.Cmd
+	testEnv    k8sTestEnvironment
 )
 
 func TestMain(m *testing.M) {
-	namespace = envOr("DUCKGRES_K8S_TEST_NAMESPACE", "duckgres")
+	var err error
+	testEnv, err = loadK8sTestEnvironment(os.Getenv)
+	if err != nil {
+		log.Fatalf("Failed to load K8s test environment: %v", err)
+	}
+	namespace = testEnv.Namespace
 	skipSetup := envOr("DUCKGRES_K8S_TEST_SKIP_SETUP", "") == "true"
 	if !skipSetup {
-		if err := buildImage(); err != nil {
-			log.Fatalf("Failed to build image: %v", err)
+		if namespace != "duckgres" {
+			log.Fatalf("Managed k8s integration setup requires namespace duckgres, got %q", namespace)
 		}
-		if err := startConfigStore(); err != nil {
-			log.Fatalf("Failed to start config store: %v", err)
-		}
-		if err := applyManifests(); err != nil {
-			log.Fatalf("Failed to apply manifests: %v", err)
-		}
-		if err := waitForDeployment(namespace, "duckgres-control-plane", 180*time.Second); err != nil {
-			log.Fatalf("Deployment not ready: %v", err)
-		}
-		if err := seedConfigStore(); err != nil {
-			log.Fatalf("Failed to seed config store: %v", err)
+		if err := setupMultiTenant(); err != nil {
+			log.Fatalf("Failed to set up multi-tenant environment: %v", err)
 		}
 	}
 
@@ -61,15 +58,20 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to create k8s client: %v", err)
 	}
 
-	// Start port-forward
+	if _, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second); err != nil {
+		log.Fatalf("Control-plane pod not ready: %v", err)
+	}
+
 	pgPort, portFwdCmd, err = startPortForward(namespace, "svc/duckgres", 5432)
 	if err != nil {
 		log.Fatalf("Failed to start port-forward: %v", err)
 	}
 
-	// Wait for port-forward to be ready
 	if err := waitForPort(pgPort, 30*time.Second); err != nil {
 		log.Fatalf("Port-forward not ready: %v", err)
+	}
+	if err := waitForDBReady(90 * time.Second); err != nil {
+		log.Fatalf("Database not ready: %v", err)
 	}
 
 	code := m.Run()
@@ -82,8 +84,10 @@ func TestMain(m *testing.M) {
 
 	// Cleanup K8s resources (unless skip_setup, meaning external management)
 	if !skipSetup {
-		_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found")
-		_ = stopConfigStore()
+		_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found", "--wait=true")
+		if testEnv.CleanupRecipe != "" {
+			_ = runProjectCmd("just", testEnv.CleanupRecipe)
+		}
 	}
 
 	os.Exit(code)
@@ -139,6 +143,23 @@ func TestK8sWorkerPodCreation(t *testing.T) {
 		if len(pod.OwnerReferences) == 0 {
 			t.Errorf("worker pod %s has no owner references", pod.Name)
 		}
+	}
+}
+
+func TestK8sSharedWarmWorkerActivation(t *testing.T) {
+	if _, err := latestWorkerPodBeforeQuery(60 * time.Second); err != nil {
+		t.Fatalf("expected prewarmed worker before first query: %v", err)
+	}
+
+	db := openDB(t)
+	defer db.Close()
+
+	var attached int
+	if err := retryScanInt(db, "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'", 90*time.Second, &attached); err != nil {
+		t.Fatalf("shared warm worker activation did not attach ducklake: %v", err)
+	}
+	if attached != 1 {
+		t.Fatalf("expected one attached ducklake catalog after activation, got %d", attached)
 	}
 }
 
@@ -388,106 +409,22 @@ func runCmd(name string, args ...string) error {
 	return cmd.Run()
 }
 
-func buildImage() error {
+func runProjectCmd(name string, args ...string) error {
 	projectRoot := findProjectRoot()
-	log.Println("Building duckgres Docker image with -tags kubernetes...")
-	cmd := exec.Command("docker", "build",
-		"--build-arg", "BUILD_TAGS=kubernetes",
-		"-t", "duckgres:test",
-		".")
+	cmd := exec.Command(name, args...)
 	cmd.Dir = projectRoot
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func applyManifests() error {
-	projectRoot := findProjectRoot()
-	k8sDir := filepath.Join(projectRoot, "k8s")
-
-	// Apply in order: namespace first, then everything else
-	orderedFiles := []string{
-		"namespace.yaml",
-		"rbac.yaml",
-		"configmap.yaml",
-		"secret.yaml",
-		"networkpolicy.yaml",
+func setupMultiTenant() error {
+	log.Println("Setting up multi-tenant duckgres test environment...")
+	_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found", "--wait=true")
+	if testEnv.CleanupRecipe != "" {
+		_ = runProjectCmd("just", testEnv.CleanupRecipe)
 	}
-
-	for _, f := range orderedFiles {
-		path := filepath.Join(k8sDir, f)
-		if err := runCmd("kubectl", "apply", "-f", path); err != nil {
-			return fmt.Errorf("apply %s: %w", f, err)
-		}
-	}
-
-	// Apply deployment with image override
-	deployPath := filepath.Join(k8sDir, "control-plane-deployment.yaml")
-	deployContent, err := os.ReadFile(deployPath)
-	if err != nil {
-		return fmt.Errorf("read deployment: %w", err)
-	}
-
-	// Replace image references to use test image
-	patched := strings.ReplaceAll(string(deployContent), "duckgres:latest", "duckgres:test")
-
-	// Write to temp file and apply
-	tmp, err := os.CreateTemp("", "deploy-*.yaml")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-
-	if _, err := tmp.WriteString(patched); err != nil {
-		return fmt.Errorf("write temp: %w", err)
-	}
-	tmp.Close()
-
-	return runCmd("kubectl", "apply", "-f", tmp.Name())
-}
-
-func startConfigStore() error {
-	projectRoot := findProjectRoot()
-	composePath := filepath.Join(projectRoot, "k8s", "local-config-store.compose.yaml")
-	if err := runCmd("docker", "compose", "-f", composePath, "up", "-d"); err != nil {
-		return err
-	}
-	return waitForPort(5434, 60*time.Second)
-}
-
-func stopConfigStore() error {
-	projectRoot := findProjectRoot()
-	composePath := filepath.Join(projectRoot, "k8s", "local-config-store.compose.yaml")
-	return runCmd("docker", "compose", "-f", composePath, "down", "-v")
-}
-
-func seedConfigStore() error {
-	teamSQL := `
-INSERT INTO duckgres_teams (name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
-VALUES ('local', 0, '', 0, NOW(), NOW())
-ON CONFLICT (name) DO UPDATE
-SET updated_at = NOW();
-`
-	if err := runCmd("docker", "exec", "-i", "duckgres-config-store",
-		"psql", "-U", "duckgres", "-d", "duckgres_config", "-v", "ON_ERROR_STOP=1", "-c", teamSQL); err != nil {
-		return fmt.Errorf("seed team: %w", err)
-	}
-
-	userSQL := `
-INSERT INTO duckgres_team_users (username, password, team_name, created_at, updated_at)
-VALUES ('postgres', '$2a$10$TQyt73Vw91Q1d7YcE86EVuhms/0u4qBydMDyVvZYlqDwc3/VtQAbm', 'local', NOW(), NOW())
-ON CONFLICT (username) DO UPDATE
-SET password = EXCLUDED.password,
-    team_name = EXCLUDED.team_name,
-    updated_at = NOW();
-`
-	if err := runCmd("docker", "exec", "-i", "duckgres-config-store",
-		"psql", "-U", "duckgres", "-d", "duckgres_config", "-v", "ON_ERROR_STOP=1", "-c", userSQL); err != nil {
-		return fmt.Errorf("seed user: %w", err)
-	}
-
-	time.Sleep(3 * time.Second)
-	return nil
+	return runProjectCmd("just", testEnv.SetupRecipe)
 }
 
 func waitForDeployment(ns, name string, timeout time.Duration) error {
@@ -542,8 +479,94 @@ func waitForPodGone(t *testing.T, ns, name string, timeout time.Duration) {
 	t.Logf("Warning: pod %s still exists after %s", name, timeout)
 }
 
+func waitForSingleReadyPod(ns, labelSelector string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		pods, err := clientset.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			return "", err
+		}
+
+		if len(pods.Items) != 1 {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+				continue
+			}
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					return pod.Name, nil
+				}
+			}
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return "", fmt.Errorf("expected one ready pod for %q within %s", labelSelector, timeout)
+}
+
+func latestWorkerPod(t *testing.T) corev1.Pod {
+	t.Helper()
+
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	if err != nil {
+		t.Fatalf("failed to list worker pods: %v", err)
+	}
+	if len(pods.Items) == 0 {
+		t.Fatal("expected at least one worker pod, found none")
+	}
+
+	latest := pods.Items[0]
+	for _, pod := range pods.Items[1:] {
+		if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+			latest = pod
+		}
+	}
+	return latest
+}
+
+func latestWorkerPodBeforeQuery(timeout time.Duration) (corev1.Pod, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+			LabelSelector: "app=duckgres-worker",
+		})
+		if err != nil {
+			return corev1.Pod{}, err
+		}
+		if len(pods.Items) > 0 {
+			latest := pods.Items[0]
+			for _, pod := range pods.Items[1:] {
+				if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+					latest = pod
+				}
+			}
+			return latest, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return corev1.Pod{}, fmt.Errorf("no worker pods appeared within %s", timeout)
+}
+
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
+	db, err := openDBConn()
+	if err != nil {
+		t.Fatalf("failed to open DB: %v", err)
+	}
+
+	return db
+}
+
+func openDBConn() (*sql.DB, error) {
 	// kubectl port-forward passes raw TCP bytes, so the client still needs
 	// SSL. lib/pq sslmode=require skips server cert verification by default,
 	// which works with self-signed certs.
@@ -551,13 +574,22 @@ func openDB(t *testing.T) *sql.DB {
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
-		t.Fatalf("failed to open DB: %v", err)
+		return nil, err
 	}
 
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(30 * time.Second)
+	return db, nil
+}
 
-	return db
+func waitForDBReady(timeout time.Duration) error {
+	db, err := openDBConn()
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	return retryQuery(db, "SELECT 1", timeout)
 }
 
 func retryQuery(db *sql.DB, query string, timeout time.Duration) error {
@@ -566,6 +598,19 @@ func retryQuery(db *sql.DB, query string, timeout time.Duration) error {
 	for time.Now().Before(deadline) {
 		var result int
 		lastErr = db.QueryRow(query).Scan(&result)
+		if lastErr == nil {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("query %q failed after %s: %w", query, timeout, lastErr)
+}
+
+func retryScanInt(db *sql.DB, query string, timeout time.Duration, dest *int) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = db.QueryRow(query).Scan(dest)
 		if lastErr == nil {
 			return nil
 		}
