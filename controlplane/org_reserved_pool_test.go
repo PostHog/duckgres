@@ -6,8 +6,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
@@ -20,10 +18,7 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	}
 
 	pool := NewOrgReservedPool(shared, "analytics", 2)
-	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
-		return &configstore.OrgConfig{Name: "analytics"}, nil
-	}
-	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
 	worker, err := pool.AcquireWorker(context.Background())
@@ -65,10 +60,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	}
 
 	pool := NewOrgReservedPool(shared, "analytics", 2)
-	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
-		return &configstore.OrgConfig{Name: "analytics"}, nil
-	}
-	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
 	worker, err := pool.AcquireWorker(context.Background())
@@ -117,18 +109,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 
 	activated := false
 	pool := NewOrgReservedPool(shared, "analytics", 2)
-	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
-		return &configstore.OrgConfig{
-			Name: "analytics",
-			Users: map[string]string{
-				"alice": "ignored",
-			},
-		}, nil
-	}
-	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
-		if org == nil || org.Name != "analytics" {
-			t.Fatalf("expected analytics org config, got %#v", org)
-		}
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated = true
 		return nil
 	}
@@ -145,7 +126,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	}
 }
 
-func TestOrgReservedWorkerPoolAcquireActivatesUsingLatestResolvedOrgConfig(t *testing.T) {
+func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRuntime(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
@@ -154,28 +135,14 @@ func TestOrgReservedWorkerPoolAcquireActivatesUsingLatestResolvedOrgConfig(t *te
 		return nil
 	}
 
-	currentOrg := &configstore.OrgConfig{
-		Name: "analytics",
-		Users: map[string]string{
-			"alice": "ignored",
-		},
-	}
-
 	pool := NewOrgReservedPool(shared, "analytics", 2)
-	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
-		return currentOrg, nil
-	}
-	var capturedOrg *configstore.OrgConfig
-	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
-		capturedOrg = org
+	activated := 0
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
+		activated++
+		if state := worker.SharedState(); state.Assignment == nil || state.Assignment.OrgID != "analytics" {
+			t.Fatalf("expected delegated activation to use worker assignment only, got %#v", state.Assignment)
+		}
 		return nil
-	}
-
-	currentOrg = &configstore.OrgConfig{
-		Name: "analytics",
-		Users: map[string]string{
-			"bob": "ignored",
-		},
 	}
 
 	worker, err := pool.AcquireWorker(context.Background())
@@ -185,11 +152,8 @@ func TestOrgReservedWorkerPoolAcquireActivatesUsingLatestResolvedOrgConfig(t *te
 	if got := worker.SharedState().Lifecycle; got != WorkerLifecycleHot {
 		t.Fatalf("expected hot lifecycle after activation, got %q", got)
 	}
-	if capturedOrg == nil {
-		t.Fatal("expected activation to receive resolved org config")
-	}
-	if len(capturedOrg.Users) != 1 || capturedOrg.Users["bob"] != "ignored" {
-		t.Fatalf("expected latest resolved org config to be used, got %#v", capturedOrg.Users)
+	if activated != 1 {
+		t.Fatalf("expected delegated activation to run once, got %d", activated)
 	}
 }
 

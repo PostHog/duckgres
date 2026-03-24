@@ -17,8 +17,10 @@ import (
 )
 
 type SharedWorkerActivator struct {
-	clientset        kubernetes.Interface
-	defaultNamespace string
+	clientset              kubernetes.Interface
+	defaultNamespace       string
+	resolveOrgConfig       func(string) (*configstore.OrgConfig, error)
+	activateReservedWorker func(context.Context, *ManagedWorker, TenantActivationPayload) error
 }
 
 type TenantActivationPayload struct {
@@ -28,28 +30,39 @@ type TenantActivationPayload struct {
 	DuckLake       server.DuckLakeConfig `json:"ducklake"`
 }
 
-func NewSharedWorkerActivator(shared *K8sWorkerPool) *SharedWorkerActivator {
+func NewSharedWorkerActivator(shared *K8sWorkerPool, resolveOrgConfig func(string) (*configstore.OrgConfig, error)) *SharedWorkerActivator {
 	if shared == nil {
 		return nil
 	}
 	return &SharedWorkerActivator{
-		clientset:        shared.clientset,
-		defaultNamespace: shared.namespace,
+		clientset:              shared.clientset,
+		defaultNamespace:       shared.namespace,
+		resolveOrgConfig:       resolveOrgConfig,
+		activateReservedWorker: shared.ActivateReservedWorker,
 	}
 }
 
-func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
-	if org == nil {
-		return fmt.Errorf("org config is required for activation")
+func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, worker *ManagedWorker) error {
+	if worker == nil {
+		return fmt.Errorf("worker is required for activation")
 	}
 	state := worker.SharedState()
 	if state.Assignment == nil {
 		return fmt.Errorf("worker %d has no org assignment", worker.ID)
 	}
 
+	org, err := a.lookupOrgConfig(state.Assignment.OrgID)
+	if err != nil {
+		return err
+	}
+
 	payload, err := a.BuildActivationRequest(ctx, org, state.Assignment)
 	if err != nil {
 		return err
+	}
+
+	if a.activateReservedWorker != nil {
+		return a.activateReservedWorker(ctx, worker, payload)
 	}
 	return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
 		OrgID:          payload.OrgID,
@@ -202,6 +215,20 @@ func secretNamespace(ref configstore.SecretRef, fallback string) string {
 		return ref.Namespace
 	}
 	return fallback
+}
+
+func (a *SharedWorkerActivator) lookupOrgConfig(orgID string) (*configstore.OrgConfig, error) {
+	if a.resolveOrgConfig == nil {
+		return nil, fmt.Errorf("org config resolver is not configured for org %s", orgID)
+	}
+	org, err := a.resolveOrgConfig(orgID)
+	if err != nil {
+		return nil, err
+	}
+	if org == nil {
+		return nil, fmt.Errorf("org config resolver returned nil for org %s", orgID)
+	}
+	return org, nil
 }
 
 func orgName(org *configstore.OrgConfig) string {

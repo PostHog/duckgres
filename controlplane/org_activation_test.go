@@ -115,3 +115,114 @@ func TestSharedWorkerActivatorRequiresManagedWarehouse(t *testing.T) {
 		t.Fatal("expected missing warehouse to fail")
 	}
 }
+
+func TestSharedWorkerActivatorActivateReservedWorkerUsesLatestResolvedOrgConfig(t *testing.T) {
+	clientset := fake.NewSimpleClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "tenant-a",
+				Name:      "analytics-metadata-old",
+			},
+			Data: map[string][]byte{
+				"dsn": []byte("old-password"),
+			},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "tenant-a",
+				Name:      "analytics-metadata-new",
+			},
+			Data: map[string][]byte{
+				"dsn": []byte("new-password"),
+			},
+		},
+	)
+
+	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	leaseExpiry := time.Date(2026, time.March, 22, 12, 0, 0, 0, time.UTC)
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: leaseExpiry,
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+
+	currentOrg := &configstore.OrgConfig{
+		Name: "analytics",
+		Users: map[string]string{
+			"alice": "ignored",
+		},
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint:     "old-metadata.example.internal",
+				Port:         5432,
+				Username:     "ducklake_user",
+				DatabaseName: "ducklake_metadata",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Namespace: "tenant-a",
+				Name:      "analytics-metadata-old",
+				Key:       "dsn",
+			},
+		},
+	}
+
+	var captured TenantActivationPayload
+	activator := &SharedWorkerActivator{
+		clientset:        clientset,
+		defaultNamespace: "duckgres-workers",
+		resolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
+			if orgID != "analytics" {
+				t.Fatalf("expected analytics org lookup, got %q", orgID)
+			}
+			return currentOrg, nil
+		},
+		activateReservedWorker: func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+			if got.ID != worker.ID {
+				t.Fatalf("expected worker %d, got %d", worker.ID, got.ID)
+			}
+			captured = payload
+			return nil
+		},
+	}
+
+	currentOrg = &configstore.OrgConfig{
+		Name: "analytics",
+		Users: map[string]string{
+			"bob": "ignored",
+		},
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint:     "new-metadata.example.internal",
+				Port:         5432,
+				Username:     "ducklake_user",
+				DatabaseName: "ducklake_metadata",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Namespace: "tenant-a",
+				Name:      "analytics-metadata-new",
+				Key:       "dsn",
+			},
+		},
+	}
+
+	if err := activator.ActivateReservedWorker(context.Background(), worker); err != nil {
+		t.Fatalf("ActivateReservedWorker: %v", err)
+	}
+
+	if captured.OrgID != "analytics" {
+		t.Fatalf("expected org analytics, got %q", captured.OrgID)
+	}
+	if !captured.LeaseExpiresAt.Equal(leaseExpiry) {
+		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, captured.LeaseExpiresAt)
+	}
+	if len(captured.Usernames) != 1 || captured.Usernames[0] != "bob" {
+		t.Fatalf("expected latest users to be captured, got %#v", captured.Usernames)
+	}
+	if got := captured.DuckLake.MetadataStore; got != "postgres:host=new-metadata.example.internal port=5432 user=ducklake_user password=new-password dbname=ducklake_metadata" {
+		t.Fatalf("expected latest warehouse runtime in activation payload, got %q", got)
+	}
+}

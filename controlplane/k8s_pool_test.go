@@ -11,7 +11,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
@@ -44,6 +46,7 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 		workerImage: "duckgres:test",
 		workerPort:  8816,
 		secretName:  "test-secret",
+		spawnSem:    make(chan struct{}, 1),
 	}
 
 	return pool, cs
@@ -207,7 +210,7 @@ func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:       "analytics",
+			OrgID:          "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -225,7 +228,7 @@ func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	}
 
 	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
-		OrgID:  "analytics",
+		OrgID:     "analytics",
 		Usernames: []string{"alice"},
 	})
 	if err != nil {
@@ -243,7 +246,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:       "analytics",
+			OrgID:          "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -255,7 +258,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	}
 
 	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
-		OrgID:  "analytics",
+		OrgID:     "analytics",
 		Usernames: []string{"alice"},
 	})
 	if err == nil {
@@ -559,6 +562,21 @@ func TestK8sPoolIdleReaperSkipsReservedSharedWorker(t *testing.T) {
 func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	pool.configMap = "my-config"
+	var createdWorkerPod *corev1.Pod
+	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		pod, ok := createAction.GetObject().(*corev1.Pod)
+		if !ok {
+			return false, nil, nil
+		}
+		if pod.Labels["app"] == "duckgres-worker" {
+			createdWorkerPod = pod.DeepCopy()
+		}
+		return false, nil, nil
+	})
 
 	// Create the bearer token secret
 	_, err := cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
@@ -583,68 +601,79 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 	}
 
 	// Find the worker pod (may have been deleted on spawn failure, check actions)
-	// With fake clientset, the pod exists even after delete sometimes, so check create actions
 	found := false
 	for _, pod := range pods.Items {
 		if pod.Labels["duckgres/worker-id"] == "0" {
 			found = true
-
-			// Verify labels
-			if pod.Labels["app"] != "duckgres-worker" {
-				t.Fatalf("expected app=duckgres-worker label, got %s", pod.Labels["app"])
-			}
-			if pod.Labels["duckgres/control-plane"] != "test-cp" {
-				t.Fatalf("expected control-plane label test-cp, got %s", pod.Labels["duckgres/control-plane"])
-			}
-
-			// Verify owner references
-			if len(pod.OwnerReferences) != 1 {
-				t.Fatalf("expected 1 owner reference, got %d", len(pod.OwnerReferences))
-			}
-			if pod.OwnerReferences[0].Name != "test-cp" {
-				t.Fatalf("expected owner ref to test-cp, got %s", pod.OwnerReferences[0].Name)
-			}
-
-			// Verify security context
-			if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
-				t.Fatal("expected runAsNonRoot=true")
-			}
-
-			// Verify container
-			if len(pod.Spec.Containers) != 1 {
-				t.Fatalf("expected 1 container, got %d", len(pod.Spec.Containers))
-			}
-			c := pod.Spec.Containers[0]
-			if c.Image != "duckgres:test" {
-				t.Fatalf("expected image duckgres:test, got %s", c.Image)
-			}
-
-			// Verify bearer token env var
-			foundEnv := false
-			for _, env := range c.Env {
-				if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
-					env.ValueFrom.SecretKeyRef != nil &&
-					env.ValueFrom.SecretKeyRef.Name == "test-secret" {
-					foundEnv = true
-				}
-			}
-			if !foundEnv {
-				t.Fatal("bearer token env var not found or incorrect")
-			}
-
-			// Verify configmap volume mount
-			if len(pod.Spec.Volumes) == 0 {
-				t.Fatal("expected configmap volume")
-			}
-
+			assertSpawnedWorkerPod(t, &pod)
 			break
 		}
 	}
 
 	if !found {
-		// This is expected since the pod gets deleted after spawn failure
-		// Let's just check that the create was attempted by looking at actions
-		t.Log("Pod was cleaned up after spawn failure (expected in unit test without real K8s)")
+		if createdWorkerPod == nil {
+			t.Fatal("expected worker pod create to be attempted before cleanup")
+		}
+		assertSpawnedWorkerPod(t, createdWorkerPod)
+	}
+}
+
+func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
+	t.Helper()
+
+	if pod.Labels["duckgres/worker-id"] != "0" {
+		t.Fatalf("expected worker-id label 0, got %q", pod.Labels["duckgres/worker-id"])
+	}
+	if pod.Labels["app"] != "duckgres-worker" {
+		t.Fatalf("expected app=duckgres-worker label, got %s", pod.Labels["app"])
+	}
+	if pod.Labels["duckgres/control-plane"] != "test-cp" {
+		t.Fatalf("expected control-plane label test-cp, got %s", pod.Labels["duckgres/control-plane"])
+	}
+	if _, ok := pod.Labels["duckgres/org"]; ok {
+		t.Fatalf("expected shared warm worker startup to stay org-neutral, got labels %#v", pod.Labels)
+	}
+
+	if len(pod.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 owner reference, got %d", len(pod.OwnerReferences))
+	}
+	if pod.OwnerReferences[0].Name != "test-cp" {
+		t.Fatalf("expected owner ref to test-cp, got %s", pod.OwnerReferences[0].Name)
+	}
+
+	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
+		t.Fatal("expected runAsNonRoot=true")
+	}
+
+	if len(pod.Spec.Containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(pod.Spec.Containers))
+	}
+	c := pod.Spec.Containers[0]
+	if c.Image != "duckgres:test" {
+		t.Fatalf("expected image duckgres:test, got %s", c.Image)
+	}
+
+	foundEnv := false
+	foundSharedWarmWorkerEnv := false
+	for _, env := range c.Env {
+		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
+			env.ValueFrom.SecretKeyRef != nil &&
+			env.ValueFrom.SecretKeyRef.Name == "test-secret" {
+			foundEnv = true
+		}
+		if env.Name == "DUCKGRES_SHARED_WARM_WORKER" && env.Value == "true" {
+			foundSharedWarmWorkerEnv = true
+		}
+	}
+	if !foundEnv {
+		t.Fatal("bearer token env var not found or incorrect")
+	}
+	if !foundSharedWarmWorkerEnv {
+		t.Fatal("expected shared warm worker startup env to be present")
+	}
+
+	if len(pod.Spec.Volumes) == 0 {
+		t.Fatal("expected configmap volume")
 	}
 }
 
