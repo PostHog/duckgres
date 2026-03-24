@@ -219,12 +219,13 @@ type DuckLakeConfig struct {
 	S3Provider string
 
 	// S3 configuration for "config" provider (explicit credentials for MinIO or S3)
-	S3Endpoint  string // e.g., "localhost:9000" for MinIO
-	S3AccessKey string // S3 access key ID
-	S3SecretKey string // S3 secret access key
-	S3Region    string // S3 region (default: us-east-1)
-	S3UseSSL    bool   // Use HTTPS for S3 connections (default: false for MinIO)
-	S3URLStyle  string // "path" or "vhost" (default: "path" for MinIO compatibility)
+	S3Endpoint     string // e.g., "localhost:9000" for MinIO
+	S3AccessKey    string // S3 access key ID
+	S3SecretKey    string // S3 secret access key
+	S3SessionToken string // STS session token for temporary credentials
+	S3Region       string // S3 region (default: us-east-1)
+	S3UseSSL       bool   // Use HTTPS for S3 connections (default: false for MinIO)
+	S3URLStyle     string // "path" or "vhost" (default: "path" for MinIO compatibility)
 
 	// S3 configuration for "credential_chain" provider (AWS SDK credential chain)
 	// Chain specifies which credential sources to check, semicolon-separated
@@ -1215,6 +1216,10 @@ func buildConfigSecret(dlCfg DuckLakeConfig) string {
 		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
 	}
 
+	if dlCfg.S3SessionToken != "" {
+		secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", dlCfg.S3SessionToken)
+	}
+
 	secret += "\n\t\t)"
 	return secret
 }
@@ -1357,7 +1362,7 @@ func needsCredentialRefresh(dlCfg DuckLakeConfig) bool {
 		return false
 	}
 	p := s3ProviderForConfig(dlCfg)
-	return p == "credential_chain" || p == "aws_sdk"
+	return p == "credential_chain" || p == "aws_sdk" || dlCfg.S3SessionToken != ""
 }
 
 // isTransactionAborted returns true if the error indicates DuckDB's connection

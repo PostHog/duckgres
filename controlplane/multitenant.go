@@ -143,7 +143,17 @@ func SetupMultiTenant(
 		SharedWarmActivation: cfg.K8s.SharedWarmWorkers,
 	}
 
-	router, err := NewOrgRouter(store, baseCfg, cfg, srv)
+	// Initialize STS broker for credential brokering (best-effort)
+	var stsBroker *STSBroker
+	if cfg.K8s.AWSAccountID != "" {
+		var err error
+		stsBroker, err = NewSTSBroker(context.Background(), cfg.K8s.AWSRegion, cfg.K8s.AWSAccountID)
+		if err != nil {
+			slog.Warn("STS broker unavailable, workers will use pod identity for S3.", "error", err)
+		}
+	}
+
+	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker)
 	if err != nil {
 		return nil, nil, nil, err
 	}

@@ -241,6 +241,8 @@ func main() {
 	k8sMaxWorkers := flag.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=auto-derived (env: DUCKGRES_K8S_MAX_WORKERS)")
 	k8sSharedWarmTarget := flag.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
 	k8sSharedWarmWorkers := flag.Bool("k8s-shared-warm-workers", false, "Enable shared warm-worker activation path in K8s multi-tenant mode (env: DUCKGRES_K8S_SHARED_WARM_WORKERS)")
+	awsAccountID := flag.String("aws-account-id", "", "AWS account ID for STS credential brokering (env: DUCKGRES_AWS_ACCOUNT_ID)")
+	awsRegion := flag.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
 
 	// Config store flags (multi-tenant mode)
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
@@ -305,6 +307,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_WORKERS  Enable shared warm-worker activation path for K8s multi-tenant mode\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_ACCOUNT_ID     AWS account ID for STS credential brokering\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -418,6 +422,8 @@ func main() {
 		K8sMaxWorkers:             *k8sMaxWorkers,
 		K8sSharedWarmTarget:       *k8sSharedWarmTarget,
 		K8sSharedWarmWorkers:      *k8sSharedWarmWorkers,
+		AWSAccountID:              *awsAccountID,
+		AWSRegion:                 *awsRegion,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
@@ -563,6 +569,8 @@ func main() {
 				MaxWorkers:        resolved.K8sMaxWorkers,
 				SharedWarmTarget:  resolved.K8sSharedWarmTarget,
 				SharedWarmWorkers: resolved.K8sSharedWarmWorkers,
+				AWSAccountID:      resolved.AWSAccountID,
+				AWSRegion:         resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

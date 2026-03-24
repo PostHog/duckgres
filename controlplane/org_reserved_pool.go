@@ -21,16 +21,18 @@ type OrgReservedPool struct {
 	maxWorkers             int
 	leaseDuration          time.Duration
 	sharedWarmWorkers      bool
+	stsBroker              *STSBroker
 	resolveOrgConfig       func() (*configstore.OrgConfig, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, *configstore.OrgConfig) error
 }
 
-func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int) *OrgReservedPool {
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, stsBroker *STSBroker) *OrgReservedPool {
 	pool := &OrgReservedPool{
 		shared:        shared,
 		orgID:         orgID,
 		maxWorkers:    maxWorkers,
 		leaseDuration: defaultSharedWorkerReservationLease,
+		stsBroker:     stsBroker,
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
 	return pool
@@ -274,7 +276,7 @@ func (p *OrgReservedPool) activateReservedWorkerDefault(ctx context.Context, wor
 	if org == nil {
 		return fmt.Errorf("org config is required for activation")
 	}
-	payload, err := BuildTenantActivationPayload(ctx, p.shared.clientset, p.shared.namespace, org)
+	payload, err := BuildTenantActivationPayload(ctx, p.shared.clientset, p.shared.namespace, org, p.stsBroker)
 	if err != nil {
 		return err
 	}

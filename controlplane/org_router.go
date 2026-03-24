@@ -32,18 +32,20 @@ type OrgRouter struct {
 	sharedPool   *K8sWorkerPool
 	globalCfg    ControlPlaneConfig
 	srv          *server.Server
+	stsBroker    *STSBroker
 	nextWorkerID atomic.Int32
 	sharedCancel context.CancelFunc
 }
 
 // NewOrgRouter creates an OrgRouter from the initial config snapshot.
-func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server) (*OrgRouter, error) {
+func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server, stsBroker *STSBroker) (*OrgRouter, error) {
 	tr := &OrgRouter{
 		orgs:        make(map[string]*OrgStack),
 		configStore: store,
 		baseCfg:     baseCfg,
 		globalCfg:   globalCfg,
 		srv:         srv,
+		stsBroker:   stsBroker,
 	}
 
 	sharedCfg := baseCfg
@@ -107,7 +109,7 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		}
 	}
 
-	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers)
+	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, tr.stsBroker)
 	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {

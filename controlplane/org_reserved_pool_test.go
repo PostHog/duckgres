@@ -19,7 +19,7 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
 	worker, err := pool.AcquireWorker(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
@@ -58,7 +58,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
 	worker, err := pool.AcquireWorker(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
@@ -85,7 +85,7 @@ func TestOrgReservedPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1)
+	pool := NewOrgReservedPool(shared, "analytics", 1, nil)
 	pool.ReleaseWorker(worker.ID)
 
 	time.Sleep(100 * time.Millisecond)
@@ -104,7 +104,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	}
 
 	activated := false
-	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
 	pool.sharedWarmWorkers = true
 	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
 		return &configstore.OrgConfig{
@@ -150,7 +150,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesUsingLatestResolvedOrgConfig(t *te
 		},
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
 	pool.sharedWarmWorkers = true
 	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
 		return currentOrg, nil
