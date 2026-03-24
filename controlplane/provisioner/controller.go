@@ -101,14 +101,17 @@ func (c *Controller) reconcile(ctx context.Context) {
 func (c *Controller) reconcilePending(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "pending")
 
+	now := time.Now().UTC()
+
 	// Check if a Duckling CR already exists (e.g., controller restart)
 	_, err := c.duckling.Get(ctx, w.OrgID)
 	if err == nil {
 		// CR exists — transition directly to provisioning
 		log.Info("Duckling CR already exists, transitioning to provisioning.")
 		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
-			"state":          configstore.ManagedWarehouseStateProvisioning,
-			"status_message": "Duckling CR exists, polling status",
+			"state":                   configstore.ManagedWarehouseStateProvisioning,
+			"status_message":          "Duckling CR exists, polling status",
+			"provisioning_started_at": now,
 		}); err != nil {
 			log.Warn("Failed to update state to provisioning.", "error", err)
 		}
@@ -122,14 +125,15 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,
 			"status_message": fmt.Sprintf("Failed to create Duckling CR: %v", err),
-			"failed_at":      time.Now().UTC(),
+			"failed_at":      now,
 		})
 		return
 	}
 
 	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
-		"state":          configstore.ManagedWarehouseStateProvisioning,
-		"status_message": "Duckling CR created, waiting for resources",
+		"state":                   configstore.ManagedWarehouseStateProvisioning,
+		"status_message":          "Duckling CR created, waiting for resources",
+		"provisioning_started_at": now,
 	}); err != nil {
 		log.Warn("Failed to update state to provisioning.", "error", err)
 	}
@@ -138,8 +142,15 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "provisioning")
 
+	// Use ProvisioningStartedAt if set (tracks when we entered provisioning state),
+	// fall back to CreatedAt for warehouses created before this field existed.
+	startedAt := w.CreatedAt
+	if w.ProvisioningStartedAt != nil {
+		startedAt = *w.ProvisioningStartedAt
+	}
+
 	// Check for timeout (30 minutes)
-	if time.Since(w.CreatedAt) > 30*time.Minute {
+	if time.Since(startedAt) > 30*time.Minute {
 		log.Warn("Provisioning timed out.")
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,
@@ -157,9 +168,9 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 
 	// Check for Crossplane failure — only fail on persistent sync errors.
 	// Crossplane resources commonly flap Synced=False transiently (e.g., IAM
-	// eventual consistency), so we only transition to failed if 5+ minutes
-	// have passed since creation, giving transient errors time to resolve.
-	if status.SyncedFalseMessage != "" && time.Since(w.CreatedAt) > 5*time.Minute {
+	// eventual consistency, Aurora cold start delays), so we only transition
+	// to failed if 10+ minutes have passed, giving transient errors time to resolve.
+	if status.SyncedFalseMessage != "" && time.Since(startedAt) > 10*time.Minute {
 		log.Warn("Crossplane sync failure.", "message", status.SyncedFalseMessage)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,

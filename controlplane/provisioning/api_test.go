@@ -132,6 +132,36 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	}
 }
 
+func TestProvisionRejectsEmptyBody(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestProvisionRejectsZeroMaxACU(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"min_acu": 0.5, "max_acu": 0}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
 func TestProvisionRejectsExistingNonTerminal(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
@@ -217,12 +247,33 @@ func TestDeprovisionFailedWarehouse(t *testing.T) {
 	}
 }
 
-func TestDeprovisionRejectsProvisioningWarehouse(t *testing.T) {
+func TestDeprovisionProvisioningWarehouse(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
 		OrgID: "analytics",
 		State: configstore.ManagedWarehouseStateProvisioning,
+	}
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/deprovision", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if store.warehouses["analytics"].State != configstore.ManagedWarehouseStateDeleting {
+		t.Fatalf("expected deleting state, got %q", store.warehouses["analytics"].State)
+	}
+}
+
+func TestDeprovisionRejectsPendingWarehouse(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
+		OrgID: "analytics",
+		State: configstore.ManagedWarehouseStatePending,
 	}
 	router := newTestRouter(store)
 
@@ -254,15 +305,15 @@ func TestGetWarehouseStatus(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	var w configstore.ManagedWarehouse
-	if err := json.Unmarshal(rec.Body.Bytes(), &w); err != nil {
+	var resp warehouseStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if w.State != configstore.ManagedWarehouseStateProvisioning {
-		t.Fatalf("expected provisioning state, got %q", w.State)
+	if resp.State != configstore.ManagedWarehouseStateProvisioning {
+		t.Fatalf("expected provisioning state, got %q", resp.State)
 	}
-	if w.S3State != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("expected s3 ready, got %q", w.S3State)
+	if resp.S3State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected s3 ready, got %q", resp.S3State)
 	}
 }
 

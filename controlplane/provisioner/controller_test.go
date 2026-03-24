@@ -60,6 +60,12 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 			w.MetadataStoreState = v.(configstore.ManagedWarehouseProvisioningState)
 		case "metadata_store_endpoint":
 			w.MetadataStore.Endpoint = v.(string)
+		case "metadata_store_port":
+			w.MetadataStore.Port = v.(int)
+		case "metadata_store_kind":
+			w.MetadataStore.Kind = v.(string)
+		case "metadata_store_engine":
+			w.MetadataStore.Engine = v.(string)
 		case "identity_state":
 			w.IdentityState = v.(configstore.ManagedWarehouseProvisioningState)
 		case "worker_identity_namespace":
@@ -74,6 +80,9 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 		case "failed_at":
 			t := v.(time.Time)
 			w.FailedAt = &t
+		case "provisioning_started_at":
+			t := v.(time.Time)
+			w.ProvisioningStartedAt = &t
 		}
 	}
 	return nil
@@ -145,6 +154,9 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	// Verify state transitioned to provisioning
 	if fs.warehouses["org-a"].State != configstore.ManagedWarehouseStateProvisioning {
 		t.Fatalf("expected provisioning state, got %q", fs.warehouses["org-a"].State)
+	}
+	if fs.warehouses["org-a"].ProvisioningStartedAt == nil {
+		t.Fatal("expected provisioning_started_at to be set")
 	}
 }
 

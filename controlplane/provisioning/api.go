@@ -3,6 +3,7 @@ package provisioning
 import (
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -28,6 +29,20 @@ type handler struct {
 	store Store
 }
 
+// warehouseStatusResponse is the public-facing view of warehouse state.
+// Only exposes lifecycle status — no infrastructure secrets or internal config.
+type warehouseStatusResponse struct {
+	OrgID              string                                    `json:"org_id"`
+	State              configstore.ManagedWarehouseProvisioningState `json:"state"`
+	StatusMessage      string                                    `json:"status_message"`
+	S3State            configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
+	MetadataStoreState configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
+	IdentityState      configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
+	SecretsState       configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
+	ReadyAt            *time.Time                                `json:"ready_at,omitempty"`
+	FailedAt           *time.Time                                `json:"failed_at,omitempty"`
+}
+
 type provisionRequest struct {
 	MetadataStore *provisionMetadataReq `json:"metadata_store,omitempty"`
 }
@@ -51,10 +66,14 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	warehouse := &configstore.ManagedWarehouse{}
-	if req.MetadataStore != nil && req.MetadataStore.Aurora != nil {
-		warehouse.AuroraMinACU = req.MetadataStore.Aurora.MinACU
-		warehouse.AuroraMaxACU = req.MetadataStore.Aurora.MaxACU
+	if req.MetadataStore == nil || req.MetadataStore.Aurora == nil || req.MetadataStore.Aurora.MaxACU <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.aurora.max_acu must be greater than 0"})
+		return
+	}
+
+	warehouse := &configstore.ManagedWarehouse{
+		AuroraMinACU: req.MetadataStore.Aurora.MinACU,
+		AuroraMaxACU: req.MetadataStore.Aurora.MaxACU,
 	}
 
 	if err := h.store.CreatePendingWarehouse(orgID, warehouse); err != nil {
@@ -68,22 +87,27 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 func (h *handler) deprovisionWarehouse(c *gin.Context) {
 	orgID := c.Param("id")
 
-	// Try CAS from ready -> deleting, then from failed -> deleting.
-	// This avoids a read-then-write TOCTOU race.
-	err := h.store.SetWarehouseDeleting(orgID, configstore.ManagedWarehouseStateReady)
-	if err != nil {
-		err = h.store.SetWarehouseDeleting(orgID, configstore.ManagedWarehouseStateFailed)
-	}
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "warehouse not found"})
-			return
-		}
-		c.JSON(http.StatusConflict, gin.H{"error": "warehouse must be in ready or failed state to deprovision"})
-		return
+	// Try CAS from each deprovisionable state. Order doesn't matter —
+	// only one will match. This avoids a read-then-write TOCTOU race.
+	deprovisionableStates := []configstore.ManagedWarehouseProvisioningState{
+		configstore.ManagedWarehouseStateReady,
+		configstore.ManagedWarehouseStateFailed,
+		configstore.ManagedWarehouseStateProvisioning,
 	}
 
-	c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
+	var err error
+	for _, state := range deprovisionableStates {
+		if err = h.store.SetWarehouseDeleting(orgID, state); err == nil {
+			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
+			return
+		}
+	}
+
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "warehouse not found"})
+		return
+	}
+	c.JSON(http.StatusConflict, gin.H{"error": "warehouse must be in ready, failed, or provisioning state to deprovision"})
 }
 
 func (h *handler) getWarehouseStatus(c *gin.Context) {
@@ -99,5 +123,15 @@ func (h *handler) getWarehouseStatus(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, warehouse)
+	c.JSON(http.StatusOK, warehouseStatusResponse{
+		OrgID:              warehouse.OrgID,
+		State:              warehouse.State,
+		StatusMessage:      warehouse.StatusMessage,
+		S3State:            warehouse.S3State,
+		MetadataStoreState: warehouse.MetadataStoreState,
+		IdentityState:      warehouse.IdentityState,
+		SecretsState:       warehouse.SecretsState,
+		ReadyAt:            warehouse.ReadyAt,
+		FailedAt:           warehouse.FailedAt,
+	})
 }

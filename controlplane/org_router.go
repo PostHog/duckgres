@@ -100,15 +100,6 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		memoryBudget = int64(server.ParseMemoryBytes(tc.MemoryBudget))
 	}
 
-	// Use per-org namespace and service account from warehouse config
-	if tc.Warehouse != nil && tc.Warehouse.State == configstore.ManagedWarehouseStateReady {
-		if tc.Warehouse.WorkerIdentity.Namespace != "" {
-			// Note: OrgReservedPool inherits from the shared pool, so namespace
-			// overrides are propagated via label selectors, not pool config.
-			_ = tc.Warehouse.WorkerIdentity.Namespace // used for future per-org pool config
-		}
-	}
-
 	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, tr.stsBroker)
 	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()

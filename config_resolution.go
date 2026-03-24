@@ -40,7 +40,7 @@ type configCLIInputs struct {
 	MaxConnections            int
 	ConfigStoreConn           string
 	ConfigPollInterval        string
-	InternalSecret                string
+	InternalSecret            string
 	WorkerBackend             string
 	K8sWorkerImage            string
 	K8sWorkerNamespace        string
@@ -81,7 +81,7 @@ type resolvedConfig struct {
 	AWSRegion                string
 	ConfigStoreConn          string
 	ConfigPollInterval       time.Duration
-	InternalSecret               string
+	InternalSecret           string
 }
 
 func defaultServerConfig() server.Config {
@@ -934,6 +934,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		AWSRegion:                awsRegion,
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
-		InternalSecret:               internalSecret,
+		InternalSecret:           internalSecret,
 	}
 }

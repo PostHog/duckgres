@@ -53,8 +53,8 @@ spec:
             - name: pg
               containerPort: 5432
               protocol: TCP
-            - name: admin
-              containerPort: 9090
+            - name: api
+              containerPort: 8080
               protocol: TCP
           volumeMounts:
             - name: config
@@ -95,6 +95,10 @@ spec:
     - name: pg
       port: 5432
       targetPort: pg
+      protocol: TCP
+    - name: api
+      port: 8080
+      targetPort: api
       protocol: TCP
   selector:
     app: duckgres-control-plane
