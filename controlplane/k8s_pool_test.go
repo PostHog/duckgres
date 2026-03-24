@@ -207,7 +207,7 @@ func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:       "analytics",
+			OrgID:          "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -225,7 +225,7 @@ func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	}
 
 	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
-		OrgID:  "analytics",
+		OrgID:     "analytics",
 		Usernames: []string{"alice"},
 	})
 	if err != nil {
@@ -243,7 +243,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:       "analytics",
+			OrgID:          "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
 		},
 	}); err != nil {
@@ -255,7 +255,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	}
 
 	err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
-		OrgID:  "analytics",
+		OrgID:     "analytics",
 		Usernames: []string{"alice"},
 	})
 	if err == nil {
@@ -596,6 +596,9 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 			if pod.Labels["duckgres/control-plane"] != "test-cp" {
 				t.Fatalf("expected control-plane label test-cp, got %s", pod.Labels["duckgres/control-plane"])
 			}
+			if _, ok := pod.Labels["duckgres/org"]; ok {
+				t.Fatalf("expected shared warm worker startup to stay org-neutral, got labels %#v", pod.Labels)
+			}
 
 			// Verify owner references
 			if len(pod.OwnerReferences) != 1 {
@@ -621,15 +624,22 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 
 			// Verify bearer token env var
 			foundEnv := false
+			foundSharedWarmWorkerEnv := false
 			for _, env := range c.Env {
 				if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 					env.ValueFrom.SecretKeyRef != nil &&
 					env.ValueFrom.SecretKeyRef.Name == "test-secret" {
 					foundEnv = true
 				}
+				if env.Name == "DUCKGRES_SHARED_WARM_WORKER" && env.Value == "true" {
+					foundSharedWarmWorkerEnv = true
+				}
 			}
 			if !foundEnv {
 				t.Fatal("bearer token env var not found or incorrect")
+			}
+			if !foundSharedWarmWorkerEnv {
+				t.Fatal("expected shared warm worker startup env to be present")
 			}
 
 			// Verify configmap volume mount
