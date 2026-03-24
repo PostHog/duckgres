@@ -56,7 +56,6 @@ type K8sWorkerPool struct {
 	memoryBudget         int64      // total memory budget in bytes
 	orgID                string     // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
-	sharedWarmActivation bool
 	cachedToken          string // cached bearer token (immutable after setup)
 	informer             cache.SharedIndexInformer
 	stopInform           chan struct{}
@@ -132,7 +131,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		memoryBudget:         cfg.MemoryBudget,
 		orgID:                cfg.OrgID,
 		workerIDGenerator:    cfg.WorkerIDGenerator,
-		sharedWarmActivation: cfg.SharedWarmActivation,
 		spawnSem:             make(chan struct{}, spawnConcurrency),
 	}
 
@@ -433,12 +431,10 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 			},
 		},
 	}
-	if p.sharedWarmActivation {
-		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
-			Name:  "DUCKGRES_SHARED_WARM_WORKER",
-			Value: "true",
-		})
-	}
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+		Name:  "DUCKGRES_SHARED_WARM_WORKER",
+		Value: "true",
+	})
 
 	// Add writable data directory for DuckDB databases
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{

@@ -418,35 +418,6 @@ func TestResolveEffectiveConfigK8sSharedWarmTarget(t *testing.T) {
 	}
 }
 
-func TestResolveEffectiveConfigK8sSharedWarmWorkers(t *testing.T) {
-	fileCfg := &FileConfig{
-		K8s: K8sFileConfig{
-			SharedWarmWorkers: true,
-		},
-	}
-
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
-	if !resolved.K8sSharedWarmWorkers {
-		t.Fatal("expected k8s shared warm workers from file")
-	}
-
-	env := map[string]string{
-		"DUCKGRES_K8S_SHARED_WARM_WORKERS": "false",
-	}
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
-	if resolved.K8sSharedWarmWorkers {
-		t.Fatal("expected env to disable k8s shared warm workers")
-	}
-
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
-		Set:                  map[string]bool{"k8s-shared-warm-workers": true},
-		K8sSharedWarmWorkers: true,
-	}, envFromMap(env), nil)
-	if !resolved.K8sSharedWarmWorkers {
-		t.Fatal("expected CLI to enable k8s shared warm workers")
-	}
-}
-
 func TestResolveEffectiveConfigInvalidMemoryBudget(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_MEMORY_BUDGET": "lots-of-memory",

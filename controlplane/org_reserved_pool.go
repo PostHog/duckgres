@@ -20,7 +20,6 @@ type OrgReservedPool struct {
 	orgID                  string
 	maxWorkers             int
 	leaseDuration          time.Duration
-	sharedWarmWorkers      bool
 	resolveOrgConfig       func() (*configstore.OrgConfig, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, *configstore.OrgConfig) error
 }
@@ -73,12 +72,10 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 				return nil, err
 			}
 
-			if p.sharedWarmWorkers {
-				if err := p.activateWorkerForOrg(ctx, worker); err != nil {
-					observeActivationFailure(err.Error())
-					p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
-					return nil, err
-				}
+			if err := p.activateWorkerForOrg(ctx, worker); err != nil {
+				observeActivationFailure(err.Error())
+				p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
+				return nil, err
 			}
 
 			p.shared.mu.Lock()
@@ -153,12 +150,6 @@ func (p *OrgReservedPool) SetMaxWorkers(n int) {
 	p.maxWorkers = n
 }
 
-func (p *OrgReservedPool) EnableSharedWarmActivation(enabled bool) {
-	p.shared.mu.Lock()
-	defer p.shared.mu.Unlock()
-	p.sharedWarmWorkers = enabled
-}
-
 func (p *OrgReservedPool) ShutdownAll() {
 	p.shared.mu.RLock()
 	workers := make([]int, 0, len(p.shared.workers))
@@ -230,9 +221,6 @@ func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool 
 	if !p.workerBelongsToOrgLocked(w) {
 		return false
 	}
-	if !p.sharedWarmWorkers {
-		return true
-	}
 	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot
 }
 
@@ -285,9 +273,6 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 }
 
 func (p *OrgReservedPool) activateReservedWorkerDefault(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
-	if !p.sharedWarmWorkers {
-		return nil
-	}
 	if org == nil {
 		return fmt.Errorf("org config is required for activation")
 	}
