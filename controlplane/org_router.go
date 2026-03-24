@@ -101,17 +101,18 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	}
 
 	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, tr.stsBroker)
-	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
+	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {
-			return nil, fmt.Errorf("config snapshot unavailable for org %s", tc.Name)
+			return nil, fmt.Errorf("config snapshot unavailable for org %s", orgID)
 		}
-		org, ok := snap.Orgs[tc.Name]
+		org, ok := snap.Orgs[orgID]
 		if !ok {
-			return nil, fmt.Errorf("org %s not found in config snapshot", tc.Name)
+			return nil, fmt.Errorf("org %s not found in config snapshot", orgID)
 		}
 		return org, nil
-	}
+	})
+	pool.activateReservedWorker = activator.ActivateReservedWorker
 	rebalancer := NewMemoryRebalancer(uint64(memoryBudget), 0, nil, tr.globalCfg.MemoryRebalance)
 	sessions := NewSessionManager(pool, rebalancer)
 	rebalancer.SetSessionLister(sessions)

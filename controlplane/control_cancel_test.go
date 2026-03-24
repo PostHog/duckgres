@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -55,4 +56,36 @@ func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) 
 	if srv.CancelQuery(key) {
 		t.Fatal("expected query to be unregistered after return")
 	}
+}
+
+func TestSessionCreationErrorResponse(t *testing.T) {
+	t.Run("cancelled", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(context.Canceled)
+		if code != "57014" {
+			t.Fatalf("code = %q, want 57014", code)
+		}
+		if message != "canceling authentication due to user request" {
+			t.Fatalf("message = %q", message)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(context.DeadlineExceeded)
+		if code != "53300" {
+			t.Fatalf("code = %q, want 53300", code)
+		}
+		if message != "timed out waiting for an available worker" {
+			t.Fatalf("message = %q", message)
+		}
+	})
+
+	t.Run("generic error", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(errors.New("worker activation failed"))
+		if code != "58000" {
+			t.Fatalf("code = %q, want 58000", code)
+		}
+		if message != "failed to create session: worker activation failed" {
+			t.Fatalf("message = %q", message)
+		}
+	})
 }

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
-
-	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 const defaultSharedWorkerReservationLease = 24 * time.Hour
@@ -22,8 +20,7 @@ type OrgReservedPool struct {
 	maxWorkers             int
 	leaseDuration          time.Duration
 	stsBroker              *STSBroker
-	resolveOrgConfig       func() (*configstore.OrgConfig, error)
-	activateReservedWorker func(context.Context, *ManagedWorker, *configstore.OrgConfig) error
+	activateReservedWorker func(context.Context, *ManagedWorker) error
 }
 
 func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, stsBroker *STSBroker) *OrgReservedPool {
@@ -93,15 +90,6 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			}
 			p.shared.mu.Unlock()
 			continue
-		}
-
-		if w := p.leastLoadedAssignedWorkerLocked(); w != nil {
-			w.activeSessions++
-			if w.activeSessions > w.peakSessions {
-				w.peakSessions = w.activeSessions
-			}
-			p.shared.mu.Unlock()
-			return w, nil
 		}
 
 		p.shared.mu.Unlock()
@@ -245,12 +233,7 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 	}
 	p.shared.mu.Unlock()
 
-	org, err := p.lookupOrgConfig()
-	if err != nil {
-		return err
-	}
-
-	if err := p.activateReservedWorker(ctx, worker, org); err != nil {
+	if err := p.activateReservedWorker(ctx, worker); err != nil {
 		return err
 	}
 
@@ -280,30 +263,6 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 	}
 }
 
-func (p *OrgReservedPool) activateReservedWorkerDefault(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
-	if org == nil {
-		return fmt.Errorf("org config is required for activation")
-	}
-	payload, err := BuildTenantActivationPayload(ctx, p.shared.clientset, p.shared.namespace, org, p.stsBroker)
-	if err != nil {
-		return err
-	}
-	if state := worker.SharedState(); state.Assignment != nil {
-		payload.LeaseExpiresAt = state.Assignment.LeaseExpiresAt
-	}
-	return p.shared.ActivateReservedWorker(ctx, worker, payload)
-}
-
-func (p *OrgReservedPool) lookupOrgConfig() (*configstore.OrgConfig, error) {
-	if p.resolveOrgConfig == nil {
-		return nil, fmt.Errorf("org config resolver is not configured for org %s", p.orgID)
-	}
-	org, err := p.resolveOrgConfig()
-	if err != nil {
-		return nil, err
-	}
-	if org == nil {
-		return nil, fmt.Errorf("org config resolver returned nil for org %s", p.orgID)
-	}
-	return org, nil
+func (p *OrgReservedPool) activateReservedWorkerDefault(_ context.Context, _ *ManagedWorker) error {
+	return fmt.Errorf("reserved worker activator is not configured for org %s", p.orgID)
 }

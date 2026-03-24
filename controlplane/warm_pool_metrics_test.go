@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -159,10 +158,7 @@ func TestActivateWorkerForOrgUpdatesActivatingGauge(t *testing.T) {
 	observeWarmPoolLifecycleGauges(pool.workers)
 
 	orgPool := NewOrgReservedPool(pool, "org-1", 1, nil)
-	orgPool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
-		return &configstore.OrgConfig{Name: "org-1"}, nil
-	}
-	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		assertGaugeValue(t, reservedWorkersGauge, 0)
 		assertGaugeValue(t, activatingWorkersGauge, 1)
 		return nil
@@ -184,10 +180,7 @@ func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *te
 	pool.workers[1] = worker
 
 	orgPool := NewOrgReservedPool(pool, "org-1", 1, nil)
-	orgPool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
-		return &configstore.OrgConfig{Name: "org-1"}, nil
-	}
-	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
 		if err != nil {
 			return err
