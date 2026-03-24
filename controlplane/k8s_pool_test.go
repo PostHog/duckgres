@@ -301,20 +301,6 @@ func TestK8sPool_FindIdleWorker(t *testing.T) {
 	}
 }
 
-func TestK8sPool_LeastLoadedWorker(t *testing.T) {
-	pool, _ := newTestK8sPool(t, 5)
-
-	done := make(chan struct{})
-	pool.workers[1] = &ManagedWorker{ID: 1, activeSessions: 5, done: done}
-	pool.workers[2] = &ManagedWorker{ID: 2, activeSessions: 2, done: done}
-	pool.workers[3] = &ManagedWorker{ID: 3, activeSessions: 3, done: done}
-
-	w := pool.leastLoadedWorkerLocked()
-	if w == nil || w.ID != 2 {
-		t.Fatalf("expected least loaded worker 2, got %v", w)
-	}
-}
-
 func TestK8sPool_LiveWorkerCount(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 

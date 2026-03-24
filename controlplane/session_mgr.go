@@ -169,7 +169,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		case <-worker.done:
 			// Worker already dead, skip RPC
 		default:
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			_ = worker.DestroySession(ctx, session.SessionToken)
 			cancel()
 		}
@@ -178,7 +178,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	// Release the worker for reuse after cleanup is complete.
 	sm.pool.ReleaseWorker(session.WorkerID)
 
-	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
+	slog.Info("Session destroyed, worker recycled.", "pid", pid, "worker", session.WorkerID)
 
 	// Rebalance remaining sessions
 	if sm.rebalancer != nil {

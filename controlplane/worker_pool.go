@@ -11,8 +11,9 @@ import (
 //   - FlightWorkerPool: spawns workers as local child processes (default)
 //   - K8sWorkerPool:    creates workers as Kubernetes pods (build tag: kubernetes)
 type WorkerPool interface {
-	// AcquireWorker returns a worker for a new session. It may reuse an idle
-	// worker, spawn a new one, or assign to the least-loaded worker.
+	// AcquireWorker returns a worker for a new session (1:1 model).
+	// It reuses an idle worker or spawns a new one. If at capacity, it waits
+	// until a worker becomes idle.
 	AcquireWorker(ctx context.Context) (*ManagedWorker, error)
 
 	// ReleaseWorker decrements the active session count for a worker.
