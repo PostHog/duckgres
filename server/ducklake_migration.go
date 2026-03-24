@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,16 +19,24 @@ const duckLakeSpecVersion = "0.4"
 
 // dlMigration holds the result of the one-time migration check.
 // The check runs at most once per process (sync.Once).
+//
+// In multitenant control-plane mode, each worker process serves a single tenant
+// with its own metadata store, so the per-process sync.Once is correct.
+// If this changes (multiple metadata stores per process), this must be replaced
+// with a sync.Map keyed by metadata store connection string.
 var dlMigration struct {
 	once     sync.Once
-	needed   bool  // true if metadata store version < duckLakeSpecVersion
-	err      error // non-nil if the check or backup failed
+	needed   bool   // true if metadata store version < duckLakeSpecVersion
+	err      error  // non-nil if the check or backup failed
 	checkedV string // the version found in the metadata store
 }
 
 // ensureDuckLakeMigrationCheck runs the migration check exactly once.
 // If migration is needed, it backs up the metadata store before returning.
 // The backup file is written to dataDir.
+//
+// This should be called BEFORE acquiring the DuckLake attachment semaphore,
+// since the backup can take minutes for large metadata stores.
 func ensureDuckLakeMigrationCheck(dlCfg DuckLakeConfig, dataDir string) {
 	dlMigration.once.Do(func() {
 		dlMigration.needed, dlMigration.checkedV, dlMigration.err = checkAndBackupIfNeeded(dlCfg, dataDir)
@@ -38,6 +47,39 @@ func ensureDuckLakeMigrationCheck(dlCfg DuckLakeConfig, dataDir string) {
 // AUTOMATIC_MIGRATION TRUE. Safe to call after ensureDuckLakeMigrationCheck.
 func duckLakeMigrationNeeded() bool {
 	return dlMigration.needed && dlMigration.err == nil
+}
+
+// parseDuckLakeVersion parses a DuckLake version string like "0.3" into
+// (major, minor) integers for reliable numeric comparison.
+// Returns (0, 0, err) if the string cannot be parsed.
+func parseDuckLakeVersion(ver string) (major, minor int, err error) {
+	parts := strings.SplitN(ver, ".", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid version format: %q", ver)
+	}
+	major, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid major version in %q: %w", ver, err)
+	}
+	minor, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid minor version in %q: %w", ver, err)
+	}
+	return major, minor, nil
+}
+
+// versionLessThan returns true if version a is strictly less than version b.
+// Both must be in "major.minor" format (e.g., "0.3", "0.4", "0.10").
+func versionLessThan(a, b string) (bool, error) {
+	aMaj, aMin, err := parseDuckLakeVersion(a)
+	if err != nil {
+		return false, err
+	}
+	bMaj, bMin, err := parseDuckLakeVersion(b)
+	if err != nil {
+		return false, err
+	}
+	return aMaj < bMaj || (aMaj == bMaj && aMin < bMin), nil
 }
 
 // checkAndBackupIfNeeded connects to the metadata PostgreSQL store, checks the
@@ -78,14 +120,18 @@ func checkAndBackupIfNeeded(dlCfg DuckLakeConfig, dataDir string) (needed bool, 
 	// Read current spec version.
 	var ver string
 	err = pgDB.QueryRowContext(ctx,
-		"SELECT value FROM ducklake_metadata WHERE key = 'version'").Scan(&ver)
+		`SELECT "value" FROM ducklake_metadata WHERE "key" = 'version'`).Scan(&ver)
 	if err != nil {
 		return false, "", fmt.Errorf("read DuckLake spec version: %w", err)
 	}
 
 	slog.Info("DuckLake metadata store version detected.", "version", ver, "expected", duckLakeSpecVersion)
 
-	if ver >= duckLakeSpecVersion {
+	less, err := versionLessThan(ver, duckLakeSpecVersion)
+	if err != nil {
+		return false, ver, fmt.Errorf("compare DuckLake versions: %w", err)
+	}
+	if !less {
 		return false, ver, nil
 	}
 
@@ -137,11 +183,18 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
 	backupPath := filepath.Join(dataDir, fmt.Sprintf("ducklake-backup-%s-v%s.sql", timestamp, version))
 
+	slog.Info("Starting DuckLake metadata backup.", "path", backupPath, "tables", len(tables))
+
 	f, err := os.Create(backupPath)
 	if err != nil {
 		return fmt.Errorf("create backup file %s: %w", backupPath, err)
 	}
-	defer func() { _ = f.Close() }()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+	}()
 
 	// Write header.
 	fmt.Fprintf(f, "-- DuckLake metadata backup before migration (v%s → v%s)\n", version, duckLakeSpecVersion)
@@ -160,9 +213,15 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 
 	fmt.Fprintln(f, "\nCOMMIT;")
 
+	// Flush to disk before closing — this is a critical safety net file.
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("fsync backup file: %w", err)
+	}
+
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close backup file: %w", err)
 	}
+	closed = true
 
 	info, _ := os.Stat(backupPath)
 	sizeMB := float64(0)
@@ -177,6 +236,12 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 		"size_mb", fmt.Sprintf("%.1f", sizeMB))
 
 	return nil
+}
+
+// quoteIdent quotes a PostgreSQL identifier with double quotes.
+// Any embedded double quotes are doubled per SQL standard.
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // backupTable writes CREATE TABLE and INSERT statements for a single table.
@@ -212,9 +277,10 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 		return 0, nil
 	}
 
-	// Write CREATE TABLE.
+	// Write CREATE TABLE with quoted identifiers.
+	quotedTable := quoteIdent(table)
 	fmt.Fprintf(f, "\n-- Table: %s\n", table)
-	fmt.Fprintf(f, "CREATE TABLE IF NOT EXISTS %s (\n", table)
+	fmt.Fprintf(f, "CREATE TABLE IF NOT EXISTS %s (\n", quotedTable)
 	for i, c := range cols {
 		nullStr := ""
 		if c.nullable == "NO" {
@@ -224,19 +290,20 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 		if i == len(cols)-1 {
 			comma = ""
 		}
-		fmt.Fprintf(f, "  %s %s%s%s\n", c.name, c.dataType, nullStr, comma)
+		fmt.Fprintf(f, "  %s %s%s%s\n", quoteIdent(c.name), c.dataType, nullStr, comma)
 	}
 	fmt.Fprintln(f, ");")
 
-	// Build column name list for SELECT and INSERT.
-	colNames := make([]string, len(cols))
+	// Build quoted column name list for SELECT and INSERT.
+	quotedColNames := make([]string, len(cols))
 	for i, c := range cols {
-		colNames[i] = c.name
+		quotedColNames[i] = quoteIdent(c.name)
 	}
-	colList := strings.Join(colNames, ", ")
+	quotedColList := strings.Join(quotedColNames, ", ")
 
 	// Query all rows.
-	dataRows, err := pgDB.QueryContext(ctx, fmt.Sprintf("SELECT %s FROM %s", colList, table))
+	dataRows, err := pgDB.QueryContext(ctx,
+		fmt.Sprintf("SELECT %s FROM %s", quotedColList, quotedTable))
 	if err != nil {
 		return 0, fmt.Errorf("select data: %w", err)
 	}
@@ -260,7 +327,7 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 		}
 
 		fmt.Fprintf(f, "INSERT INTO %s (%s) VALUES (%s);\n",
-			table, colList, strings.Join(vals, ", "))
+			quotedTable, quotedColList, strings.Join(vals, ", "))
 		count++
 	}
 	if err := dataRows.Err(); err != nil {
@@ -271,6 +338,8 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 }
 
 // formatSQLValue formats a Go value as a SQL literal for INSERT statements.
+// Note: []byte is treated as UTF-8 text (fine for DuckLake metadata which stores
+// only text, integers, and booleans — no bytea columns).
 func formatSQLValue(v any) string {
 	if v == nil {
 		return "NULL"

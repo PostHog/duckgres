@@ -935,6 +935,15 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		return nil // DuckLake not configured
 	}
 
+	// Check if DuckLake metadata needs migration (runs once per process).
+	// If migration is needed, backs up all metadata tables before proceeding.
+	// This runs BEFORE the semaphore because the backup can take minutes for
+	// large metadata stores, and we don't want to block other connections.
+	ensureDuckLakeMigrationCheck(dlCfg, dataDir)
+	if dlMigration.err != nil {
+		return fmt.Errorf("DuckLake migration check failed: %w", dlMigration.err)
+	}
+
 	// Serialize DuckLake attachment to avoid race conditions where multiple
 	// connections try to attach simultaneously, causing errors like
 	// "database with name '__ducklake_metadata_ducklake' already exists".
@@ -983,13 +992,6 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		slog.Warn("DuckLake metadata store appears to connect via pgbouncer (port 6432). " +
 			"This can cause connection drops during long queries. " +
 			"Consider connecting directly to PostgreSQL instead.")
-	}
-
-	// Check if DuckLake metadata needs migration (runs once per process).
-	// If migration is needed, backs up all metadata tables before proceeding.
-	ensureDuckLakeMigrationCheck(dlCfg, dataDir)
-	if dlMigration.err != nil {
-		return fmt.Errorf("DuckLake migration check failed: %w", dlMigration.err)
 	}
 
 	// Build the ATTACH statement.
