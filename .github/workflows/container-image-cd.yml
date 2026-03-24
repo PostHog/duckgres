@@ -49,6 +49,7 @@ jobs:
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Build and push container image
+              id: build
               uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
               with:
                   context: .
@@ -63,3 +64,30 @@ jobs:
                       COMMIT=${{ github.sha }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
+
+            - name: Get deployer token
+              id: deployer
+              uses: getsentry/action-github-app-token@d4b5da6c5e37703f8c3b3e43abb5705b46e159cc # v3.0.0
+              with:
+                  app_id: ${{ secrets.GH_APP_CHARTS_DEPLOYER_APP_ID }}
+                  private_key: ${{ secrets.GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY }}
+
+            - name: Trigger deployment via Charts repo
+              uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+              with:
+                  token: ${{ steps.deployer.outputs.token }}
+                  repository: PostHog/charts
+                  event-type: commit_state_update
+                  client-payload: |
+                      {
+                        "values": {
+                          "image": {
+                            "sha": "${{ github.sha }}@${{ steps.build.outputs.digest }}"
+                          }
+                        },
+                        "release": "duckgres",
+                        "commit": ${{ toJson(github.event.head_commit) }},
+                        "repository": ${{ toJson(github.repository) }},
+                        "labels": [],
+                        "timestamp": "${{ github.event.head_commit.timestamp }}"
+                      }
