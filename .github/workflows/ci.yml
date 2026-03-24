@@ -138,7 +138,6 @@ jobs:
     timeout-minutes: 30
     env:
       DUCKGRES_KIND_CLUSTER_NAME: duckgres
-      DUCKGRES_K8S_TEST_SETUP: kind
 
     steps:
       - name: Checkout code
@@ -158,31 +157,4 @@ jobs:
           sudo mv /tmp/kind /usr/local/bin/kind
           kind --version
       - name: Run Kubernetes integration tests
-        run: just test-k8s-integration
-
-  k8s-kind-tests:
-    needs: unit-tests
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Set up just
-        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
-
-      - name: Set up kind
-        uses: helm/kind-action@0025e74a8c7512023d06dc019c617aa3cf561fde # v1.10.0
-        with:
-          cluster_name: duckgres
-
-      - name: Run kind shared warm-worker tests
-        env:
-          DUCKGRES_KIND_CLUSTER_NAME: duckgres
         run: just test-k8s-integration
