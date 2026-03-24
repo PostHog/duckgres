@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -73,7 +74,8 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			}
 
 			if err := p.activateWorkerForOrg(ctx, worker); err != nil {
-				observeActivationFailure(err.Error())
+				slog.Warn("Worker activation failed.", "worker", worker.ID, "org", p.orgID, "error", err)
+				observeActivationFailure()
 				p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
 				return nil, err
 			}

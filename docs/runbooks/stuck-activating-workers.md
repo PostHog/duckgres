@@ -18,14 +18,14 @@ The automatic stuck-worker reaper runs every minute and retires workers that hav
 |--------|---------------|
 | `duckgres_activating_workers` | Workers currently activating (should be 0 or briefly 1-2) |
 | `duckgres_reserved_workers` | Workers reserved but not yet activating |
-| `duckgres_activation_failures_total{reason=...}` | Why activations are failing |
+| `duckgres_activation_failures_total` | Total failed activations; use control-plane logs for failure details |
 | `duckgres_worker_retirements_total{reason="stuck_activating"}` | How many workers have been auto-reaped |
 
 ## Procedure
 
 1. **Check if the reaper is working.** Look for `duckgres_worker_retirements_total{reason="stuck_activating"}` increasing. If it is, the system is self-healing — focus on why activations are failing.
 
-2. **Diagnose activation failures.** Check `duckgres_activation_failures_total` labels. Common causes:
+2. **Diagnose activation failures.** Check control-plane logs for activation errors. Common causes:
    - Org config resolver failing (missing config in configstore)
    - DuckLake catalog unreachable (S3/Postgres connectivity)
    - Worker pod OOMKilled during activation

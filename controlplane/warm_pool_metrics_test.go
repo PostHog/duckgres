@@ -13,7 +13,6 @@ import (
 
 // resetMetrics resets all warm pool counters/histograms for test isolation.
 func resetMetrics() {
-	activationFailuresCounter.Reset()
 	workerRetirementsCounter.Reset()
 }
 

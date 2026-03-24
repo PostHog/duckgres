@@ -44,10 +44,10 @@ var activationDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts
 	Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 })
 
-var activationFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+var activationFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_activation_failures_total",
 	Help: "Total number of failed worker activations",
-}, []string{"reason"})
+})
 
 // --- Retirement metrics ---
 
@@ -107,8 +107,8 @@ func observeActivationDuration(d time.Duration) {
 	activationDurationHistogram.Observe(d.Seconds())
 }
 
-func observeActivationFailure(reason string) {
-	activationFailuresCounter.WithLabelValues(reason).Inc()
+func observeActivationFailure() {
+	activationFailuresCounter.Inc()
 }
 
 func observeWorkerRetirement(reason string) {
