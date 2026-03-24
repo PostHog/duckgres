@@ -95,17 +95,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	}
 
 	// Attach DuckLake
-	dataPath := dlCfg.ObjectStore
-	if dataPath == "" {
-		dataPath = dlCfg.DataPath
-	}
-	var attachStmt string
-	if dataPath != "" {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
-			escapeSQLStringLiteral(dlCfg.MetadataStore), escapeSQLStringLiteral(dataPath))
-	} else {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", escapeSQLStringLiteral(dlCfg.MetadataStore))
-	}
+	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded())
 	if _, err := db.Exec(attachStmt); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("querylog: attach ducklake: %w", err)

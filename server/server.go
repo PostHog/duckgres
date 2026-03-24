@@ -766,7 +766,7 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 
 	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
-	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
 		if cfg.DuckLake.MetadataStore != "" {
@@ -817,7 +817,7 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 		return fmt.Errorf("tenant activation requires ducklake metadata_store")
 	}
 
-	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 	}
 
@@ -854,7 +854,7 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 	initClickHouseMacros(db)
 
 	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
-	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		if cfg.DuckLake.MetadataStore != "" {
 			_ = db.Close()
 			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
@@ -929,7 +929,8 @@ func hasCacheHTTPFS(extensions []string) bool {
 // AttachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
 // Call setDuckLakeDefault after creating per-connection views in memory.main.
 // This is a standalone function so it can be reused by control plane workers.
-func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
+// dataDir is used for writing migration backup files if a schema upgrade is needed.
+func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir string) error {
 	if dlCfg.MetadataStore == "" {
 		return nil // DuckLake not configured
 	}
@@ -984,21 +985,22 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 			"Consider connecting directly to PostgreSQL instead.")
 	}
 
-	// Build the ATTACH statement
-	// Format without data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake
-	// Format with data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake (DATA_PATH '<path>')
-	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
-	var attachStmt string
-	dataPath := dlCfg.ObjectStore
-	if dataPath == "" {
-		dataPath = dlCfg.DataPath
+	// Check if DuckLake metadata needs migration (runs once per process).
+	// If migration is needed, backs up all metadata tables before proceeding.
+	ensureDuckLakeMigrationCheck(dlCfg, dataDir)
+	if dlMigration.err != nil {
+		return fmt.Errorf("DuckLake migration check failed: %w", dlMigration.err)
 	}
-	if dataPath != "" {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
-			dlCfg.MetadataStore, dataPath)
-		slog.Info("Attaching DuckLake catalog with data path.", "metadata", redactConnectionString(dlCfg.MetadataStore), "data", dataPath)
+
+	// Build the ATTACH statement.
+	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
+	migrate := duckLakeMigrationNeeded()
+	attachStmt := buildDuckLakeAttachStmt(dlCfg, migrate)
+	if migrate {
+		slog.Info("Attaching DuckLake catalog with automatic migration.",
+			"from", dlMigration.checkedV, "to", duckLakeSpecVersion,
+			"metadata", redactConnectionString(dlCfg.MetadataStore))
 	} else {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", dlCfg.MetadataStore)
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
