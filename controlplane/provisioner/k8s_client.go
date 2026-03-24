@@ -74,11 +74,13 @@ func (d *DucklingClient) Create(ctx context.Context, orgID, image string, minACU
 				"namespace": ducklingNamespace,
 			},
 			"spec": map[string]interface{}{
-				"orgID": orgID,
 				"image": image,
-				"aurora": map[string]interface{}{
-					"minACU": minACU,
-					"maxACU": maxACU,
+				"metadataStore": map[string]interface{}{
+					"type": "aurora",
+					"aurora": map[string]interface{}{
+						"minACU": minACU,
+						"maxACU": maxACU,
+					},
 				},
 			},
 		},

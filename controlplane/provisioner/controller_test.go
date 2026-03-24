@@ -125,11 +125,25 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	if !ok {
 		t.Fatal("expected spec in CR")
 	}
-	if spec["orgID"] != "org-a" {
-		t.Fatalf("expected orgID org-a, got %v", spec["orgID"])
-	}
 	if spec["image"] != "ghcr.io/posthog/duckgres:latest" {
 		t.Fatalf("expected image ghcr.io/posthog/duckgres:latest, got %v", spec["image"])
+	}
+	metadataStore, ok := spec["metadataStore"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected metadataStore in spec")
+	}
+	if metadataStore["type"] != "aurora" {
+		t.Fatalf("expected metadataStore type aurora, got %v", metadataStore["type"])
+	}
+	aurora, ok := metadataStore["aurora"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected aurora in metadataStore")
+	}
+	if aurora["minACU"] != 0.5 {
+		t.Fatalf("expected minACU 0.5, got %v", aurora["minACU"])
+	}
+	if aurora["maxACU"] != 2.0 {
+		t.Fatalf("expected maxACU 2, got %v", aurora["maxACU"])
 	}
 
 	// Verify state transitioned to provisioning
