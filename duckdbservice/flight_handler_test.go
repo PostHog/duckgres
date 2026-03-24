@@ -107,7 +107,7 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 	}
 }
 
-func TestCreateSessionRequiresActivationForSharedWarmWorkers(t *testing.T) {
+func TestCreateSessionRequiresActivationForSharedWarmMode(t *testing.T) {
 	pool := &SessionPool{
 		sessions:       make(map[string]*Session),
 		stopRefresh:    make(map[string]func()),

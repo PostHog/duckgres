@@ -67,7 +67,6 @@ Key flags for Kubernetes multitenant mode:
 | `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |
 | `--k8s-worker-configmap` | `DUCKGRES_K8S_WORKER_CONFIGMAP` | ConfigMap name for worker config |
 | `--k8s-shared-warm-target` | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for multi-tenant K8s mode (`0` disables prewarm) |
-| `--k8s-shared-warm-workers` | `DUCKGRES_K8S_SHARED_WARM_WORKERS` | Enable reserve -> activate -> hot lifecycle for shared warm workers |
 
 The bearer token secret is used to authenticate gRPC connections between the control plane and workers. If the secret exists but is empty, the CP auto-generates a random token and populates it.
 

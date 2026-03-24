@@ -38,6 +38,8 @@ type ManagedWorker struct {
 	activeSessions int       // Number of sessions currently assigned to this worker
 	lastUsed       time.Time // Last time a session was destroyed on this worker
 	sharedState    SharedWorkerState
+	reservedAt     time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
+	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
 }
 
 // SharedState returns the additive shared warm-worker lifecycle metadata for
@@ -541,6 +543,9 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 	idle := p.findIdleWorkerLocked()
 	if idle != nil {
 		idle.activeSessions++
+		if idle.activeSessions > idle.peakSessions {
+			idle.peakSessions = idle.activeSessions
+		}
 		p.mu.Unlock()
 		return idle, nil
 	}
@@ -570,6 +575,9 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 
 		p.mu.Lock()
 		w.activeSessions++
+		if w.activeSessions > w.peakSessions {
+			w.peakSessions = w.activeSessions
+		}
 		p.mu.Unlock()
 		return w, nil
 	}
@@ -578,6 +586,9 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 	w := p.leastLoadedWorkerLocked()
 	if w != nil {
 		w.activeSessions++
+		if w.activeSessions > w.peakSessions {
+			w.peakSessions = w.activeSessions
+		}
 		p.mu.Unlock()
 		return w, nil
 	}
@@ -614,6 +625,9 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 
 	p.mu.Lock()
 	w.activeSessions++
+	if w.activeSessions > w.peakSessions {
+		w.peakSessions = w.activeSessions
+	}
 	p.mu.Unlock()
 	return w, nil
 }

@@ -112,8 +112,6 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		}
 		return org, nil
 	}
-	pool.EnableSharedWarmActivation(tr.globalCfg.K8s.SharedWarmWorkers)
-
 	rebalancer := NewMemoryRebalancer(uint64(memoryBudget), 0, nil, tr.globalCfg.MemoryRebalance)
 	sessions := NewSessionManager(pool, rebalancer)
 	rebalancer.SetSessionLister(sessions)
@@ -259,9 +257,6 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 					maxWorkers = tr.baseCfg.MaxWorkers
 				}
 				stack.Pool.SetMaxWorkers(maxWorkers)
-			}
-			if reserved, ok := stack.Pool.(*OrgReservedPool); ok {
-				reserved.EnableSharedWarmActivation(tr.globalCfg.K8s.SharedWarmWorkers)
 			}
 		}
 		tr.mu.Unlock()

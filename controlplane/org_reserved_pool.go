@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -20,7 +21,6 @@ type OrgReservedPool struct {
 	orgID                  string
 	maxWorkers             int
 	leaseDuration          time.Duration
-	sharedWarmWorkers      bool
 	stsBroker              *STSBroker
 	resolveOrgConfig       func() (*configstore.OrgConfig, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, *configstore.OrgConfig) error
@@ -56,6 +56,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 
 		if idle := p.findIdleAssignedWorkerLocked(); idle != nil {
 			idle.activeSessions++
+			if idle.activeSessions > idle.peakSessions {
+				idle.peakSessions = idle.activeSessions
+			}
 			p.shared.mu.Unlock()
 			return idle, nil
 		}
@@ -72,16 +75,19 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 				return nil, err
 			}
 
-			if p.sharedWarmWorkers {
-				if err := p.activateWorkerForOrg(ctx, worker); err != nil {
-					p.shared.RetireWorker(worker.ID)
-					return nil, err
-				}
+			if err := p.activateWorkerForOrg(ctx, worker); err != nil {
+				slog.Warn("Worker activation failed.", "worker", worker.ID, "org", p.orgID, "error", err)
+				observeActivationFailure()
+				p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
+				return nil, err
 			}
 
 			p.shared.mu.Lock()
 			if owned := p.workerBelongsToOrgLocked(worker); owned {
 				worker.activeSessions++
+				if worker.activeSessions > worker.peakSessions {
+					worker.peakSessions = worker.activeSessions
+				}
 				p.shared.mu.Unlock()
 				return worker, nil
 			}
@@ -91,6 +97,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 
 		if w := p.leastLoadedAssignedWorkerLocked(); w != nil {
 			w.activeSessions++
+			if w.activeSessions > w.peakSessions {
+				w.peakSessions = w.activeSessions
+			}
 			p.shared.mu.Unlock()
 			return w, nil
 		}
@@ -145,12 +154,6 @@ func (p *OrgReservedPool) SetMaxWorkers(n int) {
 	p.maxWorkers = n
 }
 
-func (p *OrgReservedPool) EnableSharedWarmActivation(enabled bool) {
-	p.shared.mu.Lock()
-	defer p.shared.mu.Unlock()
-	p.sharedWarmWorkers = enabled
-}
-
 func (p *OrgReservedPool) ShutdownAll() {
 	p.shared.mu.RLock()
 	workers := make([]int, 0, len(p.shared.workers))
@@ -162,7 +165,7 @@ func (p *OrgReservedPool) ShutdownAll() {
 	p.shared.mu.RUnlock()
 
 	for _, id := range workers {
-		p.shared.RetireWorker(id)
+		p.shared.retireWorkerWithReason(id, RetireReasonShutdown)
 	}
 }
 
@@ -222,9 +225,6 @@ func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool 
 	if !p.workerBelongsToOrgLocked(w) {
 		return false
 	}
-	if !p.sharedWarmWorkers {
-		return true
-	}
 	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot
 }
 
@@ -241,6 +241,7 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 			p.shared.mu.Unlock()
 			return err
 		}
+		observeWarmPoolLifecycleGauges(p.shared.workers)
 	}
 	p.shared.mu.Unlock()
 
@@ -261,8 +262,18 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 		if err != nil {
 			return err
 		}
-		return worker.SetSharedState(nextState)
+		if err := worker.SetSharedState(nextState); err != nil {
+			return err
+		}
+		if !worker.reservedAt.IsZero() {
+			observeActivationDuration(time.Since(worker.reservedAt))
+		}
+		observeWarmPoolLifecycleGauges(p.shared.workers)
+		return nil
 	case WorkerLifecycleHot:
+		if !worker.reservedAt.IsZero() {
+			observeActivationDuration(time.Since(worker.reservedAt))
+		}
 		return nil
 	default:
 		return fmt.Errorf("worker %d finished activation in unexpected lifecycle %q", worker.ID, worker.SharedState().NormalizedLifecycle())
@@ -270,9 +281,6 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 }
 
 func (p *OrgReservedPool) activateReservedWorkerDefault(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
-	if !p.sharedWarmWorkers {
-		return nil
-	}
 	if org == nil {
 		return fmt.Errorf("org config is required for activation")
 	}

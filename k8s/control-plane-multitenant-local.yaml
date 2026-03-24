@@ -42,8 +42,6 @@ spec:
             - "duckgres-config"
             - "--k8s-shared-warm-target"
             - "1"
-            - "--k8s-shared-warm-workers"
-            - "true"
             - "--cert"
             - "/certs/server.crt"
             - "--key"
