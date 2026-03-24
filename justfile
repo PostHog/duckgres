@@ -135,9 +135,20 @@ multitenant-config-store-down-kind:
 multitenant-seed-local:
     docker exec -i duckgres-config-store psql -v ON_ERROR_STOP=1 -U duckgres -d duckgres_config < k8s/local-config-store.seed.sql
 
-# Seed a default local tenant/user into the config store for the kind-backed K8s flow
+# Seed a default local tenant/user into the config store for the kind-backed K8s flow.
+# Retries up to 30 seconds waiting for the control plane to finish migrating the schema.
 [group('dev')]
 multitenant-seed-kind:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for i in $(seq 1 30); do
+        if docker exec -i duckgres-config-store psql -v ON_ERROR_STOP=1 -U duckgres -d duckgres_config < k8s/kind/config-store.seed.sql 2>/dev/null; then
+            exit 0
+        fi
+        echo "Waiting for config store schema (attempt $i/30)..."
+        sleep 1
+    done
+    echo "Config store schema not ready after 30s, final attempt:"
     docker exec -i duckgres-config-store psql -v ON_ERROR_STOP=1 -U duckgres -d duckgres_config < k8s/kind/config-store.seed.sql
 
 # Deploy the local multi-tenant control plane to the optional OrbStack Kubernetes workflow
