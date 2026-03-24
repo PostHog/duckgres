@@ -62,6 +62,7 @@ jobs:
                   build-args: |
                       VERSION=build-${{ github.sha }}
                       COMMIT=${{ github.sha }}
+                      BUILD_TAGS=kubernetes
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
 
