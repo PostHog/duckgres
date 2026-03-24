@@ -61,7 +61,7 @@ func TestCheckpointerRunRecordsSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Attach an in-memory database as "ducklake" so CHECKPOINT succeeds
 	if _, err := db.Exec("ATTACH ':memory:' AS ducklake"); err != nil {
@@ -122,7 +122,7 @@ func TestCheckpointerRunRecordsFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Attach an in-memory database as "ducklake" and create the table,
 	// then detach and reattach as read-only so CHECKPOINT fails.
