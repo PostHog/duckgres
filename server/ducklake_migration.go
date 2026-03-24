@@ -164,12 +164,12 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return fmt.Errorf("scan table name: %w", err)
 		}
 		tables = append(tables, name)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate table names: %w", err)
 	}
@@ -197,10 +197,18 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 	}()
 
 	// Write header.
-	fmt.Fprintf(f, "-- DuckLake metadata backup before migration (v%s → v%s)\n", version, duckLakeSpecVersion)
-	fmt.Fprintf(f, "-- Generated: %s\n", time.Now().UTC().Format(time.RFC3339))
-	fmt.Fprintf(f, "-- Tables: %d\n\n", len(tables))
-	fmt.Fprintln(f, "BEGIN;")
+	if _, err := fmt.Fprintf(f, "-- DuckLake metadata backup before migration (v%s → v%s)\n", version, duckLakeSpecVersion); err != nil {
+		return fmt.Errorf("write backup header: %w", err)
+	}
+	if _, err := fmt.Fprintf(f, "-- Generated: %s\n", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return fmt.Errorf("write backup header: %w", err)
+	}
+	if _, err := fmt.Fprintf(f, "-- Tables: %d\n\n", len(tables)); err != nil {
+		return fmt.Errorf("write backup header: %w", err)
+	}
+	if _, err := fmt.Fprintln(f, "BEGIN;"); err != nil {
+		return fmt.Errorf("write backup header: %w", err)
+	}
 
 	totalRows := 0
 	for _, table := range tables {
@@ -211,7 +219,9 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 		totalRows += count
 	}
 
-	fmt.Fprintln(f, "\nCOMMIT;")
+	if _, err := fmt.Fprintln(f, "\nCOMMIT;"); err != nil {
+		return fmt.Errorf("write backup footer: %w", err)
+	}
 
 	// Flush to disk before closing — this is a critical safety net file.
 	if err := f.Sync(); err != nil {
@@ -263,12 +273,12 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 	for colRows.Next() {
 		var c colDef
 		if err := colRows.Scan(&c.name, &c.dataType, &c.nullable); err != nil {
-			colRows.Close()
+			_ = colRows.Close()
 			return 0, fmt.Errorf("scan column: %w", err)
 		}
 		cols = append(cols, c)
 	}
-	colRows.Close()
+	_ = colRows.Close()
 	if err := colRows.Err(); err != nil {
 		return 0, fmt.Errorf("iterate columns: %w", err)
 	}
@@ -279,8 +289,12 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 
 	// Write CREATE TABLE with quoted identifiers.
 	quotedTable := quoteIdent(table)
-	fmt.Fprintf(f, "\n-- Table: %s\n", table)
-	fmt.Fprintf(f, "CREATE TABLE IF NOT EXISTS %s (\n", quotedTable)
+	if _, err := fmt.Fprintf(f, "\n-- Table: %s\n", table); err != nil {
+		return 0, fmt.Errorf("write: %w", err)
+	}
+	if _, err := fmt.Fprintf(f, "CREATE TABLE IF NOT EXISTS %s (\n", quotedTable); err != nil {
+		return 0, fmt.Errorf("write: %w", err)
+	}
 	for i, c := range cols {
 		nullStr := ""
 		if c.nullable == "NO" {
@@ -290,9 +304,13 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 		if i == len(cols)-1 {
 			comma = ""
 		}
-		fmt.Fprintf(f, "  %s %s%s%s\n", quoteIdent(c.name), c.dataType, nullStr, comma)
+		if _, err := fmt.Fprintf(f, "  %s %s%s%s\n", quoteIdent(c.name), c.dataType, nullStr, comma); err != nil {
+			return 0, fmt.Errorf("write: %w", err)
+		}
 	}
-	fmt.Fprintln(f, ");")
+	if _, err := fmt.Fprintln(f, ");"); err != nil {
+		return 0, fmt.Errorf("write: %w", err)
+	}
 
 	// Build quoted column name list for SELECT and INSERT.
 	quotedColNames := make([]string, len(cols))
@@ -307,7 +325,7 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 	if err != nil {
 		return 0, fmt.Errorf("select data: %w", err)
 	}
-	defer dataRows.Close()
+	defer func() { _ = dataRows.Close() }()
 
 	count := 0
 	scanDest := make([]any, len(cols))
@@ -326,8 +344,10 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 			vals[i] = formatSQLValue(v)
 		}
 
-		fmt.Fprintf(f, "INSERT INTO %s (%s) VALUES (%s);\n",
-			quotedTable, quotedColList, strings.Join(vals, ", "))
+		if _, err := fmt.Fprintf(f, "INSERT INTO %s (%s) VALUES (%s);\n",
+			quotedTable, quotedColList, strings.Join(vals, ", ")); err != nil {
+			return count, fmt.Errorf("write: %w", err)
+		}
 		count++
 	}
 	if err := dataRows.Err(); err != nil {
