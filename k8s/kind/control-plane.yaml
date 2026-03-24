@@ -68,8 +68,9 @@ spec:
             httpGet:
               path: /health
               port: api
-            initialDelaySeconds: 5
-            periodSeconds: 5
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 15
           securityContext:
             allowPrivilegeEscalation: false
           resources:

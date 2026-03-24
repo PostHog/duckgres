@@ -15,7 +15,7 @@ jobs:
     build:
         name: Build and push duckgres
         if: github.repository == 'PostHog/duckgres'
-        runs-on: ubuntu-latest
+        runs-on: ubuntu-24.04-arm
         permissions:
             id-token: write
             contents: read
@@ -27,9 +27,6 @@ jobs:
 
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-            - name: Set up QEMU
-              uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
             - name: Configure AWS credentials
               uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
@@ -49,11 +46,12 @@ jobs:
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Build and push container image
+              id: build
               uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
               with:
                   context: .
                   push: true
-                  platforms: linux/amd64,linux/arm64
+                  platforms: linux/arm64
                   tags: |
                       ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
                       ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}
@@ -61,5 +59,33 @@ jobs:
                   build-args: |
                       VERSION=build-${{ github.sha }}
                       COMMIT=${{ github.sha }}
+                      BUILD_TAGS=kubernetes
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
+
+            - name: Get deployer token
+              id: deployer
+              uses: getsentry/action-github-app-token@d4b5da6c5e37703f8c3b3e43abb5705b46e159cc # v3.0.0
+              with:
+                  app_id: ${{ secrets.GH_APP_CHARTS_DEPLOYER_APP_ID }}
+                  private_key: ${{ secrets.GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY }}
+
+            - name: Trigger deployment via Charts repo
+              uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+              with:
+                  token: ${{ steps.deployer.outputs.token }}
+                  repository: PostHog/charts
+                  event-type: commit_state_update
+                  client-payload: |
+                      {
+                        "values": {
+                          "image": {
+                            "sha": "${{ github.sha }}@${{ steps.build.outputs.digest }}"
+                          }
+                        },
+                        "release": "duckgres",
+                        "commit": ${{ toJson(github.event.head_commit) }},
+                        "repository": ${{ toJson(github.repository) }},
+                        "labels": [],
+                        "timestamp": "${{ github.event.head_commit.timestamp }}"
+                      }

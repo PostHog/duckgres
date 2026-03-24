@@ -55,6 +55,16 @@ spec:
             - name: pg
               containerPort: 5432
               protocol: TCP
+            - name: admin
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 15
           volumeMounts:
             - name: config
               mountPath: /etc/duckgres
