@@ -113,6 +113,7 @@ type ControlPlane struct {
 	// Multi-tenant fields (non-nil in remote multitenant mode)
 	orgRouter   OrgRouterInterface
 	configStore ConfigStoreInterface
+	apiServer   *http.Server // API server on :8080 (shut down on graceful exit)
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -327,13 +328,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 		cp.configStore = store
 		cp.orgRouter = adapter
-		// Replace the simple metrics server with the unified API server
-		if cfg.MetricsServer != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = cfg.MetricsServer.Shutdown(ctx)
-			cancel()
-		}
-		cfg.MetricsServer = apiServer
+		cp.apiServer = apiServer
 		cp.cfg = cfg
 		_ = store // keep linter happy
 	} else {
@@ -953,6 +948,13 @@ func (cp *ControlPlane) handleUpgrade() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := cp.cfg.MetricsServer.Shutdown(ctx); err != nil {
 			slog.Warn("Metrics server shutdown failed.", "error", err)
+		}
+		cancel()
+	}
+	if cp.apiServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := cp.apiServer.Shutdown(ctx); err != nil {
+			slog.Warn("API server shutdown failed.", "error", err)
 		}
 		cancel()
 	}

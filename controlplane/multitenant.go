@@ -17,7 +17,6 @@ import (
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
@@ -184,13 +183,13 @@ func SetupMultiTenant(
 		slog.Info("Generated internal secret (pass via --internal-secret or DUCKGRES_INTERNAL_SECRET to set explicitly).", "secret", internalSecret)
 	}
 
-	// Set up unified API server (admin + provisioning on single port)
+	// Set up API server (admin + provisioning + dashboard on :8080).
+	// The existing metrics server on :9090 stays running separately.
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 
-	// Unauthenticated endpoints
-	engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	// Health endpoint (also available on :9090 via metrics server)
 	engine.GET("/health", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
