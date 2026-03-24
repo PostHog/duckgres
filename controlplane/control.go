@@ -58,9 +58,9 @@ type ControlPlaneConfig struct {
 	// Default: 30s.
 	ConfigPollInterval time.Duration
 
-	// AdminToken is the bearer token required for admin API requests.
-	// When empty, a random token is generated and logged at startup.
-	AdminToken string
+	// InternalSecret is the shared secret for API authentication.
+	// When empty, a random secret is generated and logged at startup.
+	InternalSecret string
 
 }
 

@@ -90,10 +90,11 @@ func renderLoginPage(c *gin.Context, next, errMsg string) {
 }
 
 func requestAdminToken(c *gin.Context) string {
-	auth := c.GetHeader("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimPrefix(auth, "Bearer ")
+	// Primary: X-Duckgres-Internal-Secret header (service-to-service)
+	if secret := c.GetHeader("X-Duckgres-Internal-Secret"); secret != "" {
+		return secret
 	}
+	// Fallback: cookie (dashboard UI)
 	if cookie, err := c.Cookie(adminTokenCookieName); err == nil {
 		return cookie
 	}

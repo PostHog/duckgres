@@ -165,14 +165,14 @@ func SetupMultiTenant(
 	store.Start(context.Background())
 
 	// Resolve admin bearer token
-	adminToken := cfg.AdminToken
-	if adminToken == "" {
+	internalSecret := cfg.InternalSecret
+	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, fmt.Errorf("generate admin token: %w", err)
+			return nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
-		adminToken = hex.EncodeToString(tokenBytes)
-		slog.Info("Generated admin API token (pass via --admin-token or DUCKGRES_ADMIN_TOKEN to set explicitly).", "token", adminToken)
+		internalSecret = hex.EncodeToString(tokenBytes)
+		slog.Info("Generated internal secret (pass via --internal-secret or DUCKGRES_INTERNAL_SECRET to set explicitly).", "secret", internalSecret)
 	}
 
 	// Set up unified API server (admin + provisioning on single port)
@@ -186,15 +186,13 @@ func SetupMultiTenant(
 		c.String(http.StatusOK, "ok")
 	})
 
-	// Admin API (authenticated)
-	api := engine.Group("/api/v1", admin.APIAuthMiddleware(adminToken))
+	// Authenticated API
+	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
 	admin.RegisterAPI(api, store, adpt)
-
-	// Provisioning API (same auth, same /api/v1 group)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store))
 
 	// Dashboard
-	admin.RegisterDashboard(engine, adminToken)
+	admin.RegisterDashboard(engine, internalSecret)
 
 	apiServer := &http.Server{
 		Addr:    ":8080",

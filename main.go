@@ -245,7 +245,7 @@ func main() {
 	// Config store flags (multi-tenant mode)
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := flag.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
-	adminToken := flag.String("admin-token", "", "Bearer token for admin API authentication (env: DUCKGRES_ADMIN_TOKEN)")
+	internalSecret := flag.String("internal-secret", "", "Shared secret for API authentication (env: DUCKGRES_INTERNAL_SECRET)")
 
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -301,7 +301,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_ADMIN_TOKEN        Bearer token for admin API authentication\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_WORKERS  Enable shared warm-worker activation path for K8s multi-tenant mode\n")
@@ -405,7 +405,7 @@ func main() {
 		MaxConnections:            *maxConnections,
 		ConfigStoreConn:           *configStore,
 		ConfigPollInterval:        *configPollInterval,
-		AdminToken:                *adminToken,
+		InternalSecret:            *internalSecret,
 		WorkerBackend:             *workerBackend,
 		K8sWorkerImage:            *k8sWorkerImage,
 		K8sWorkerNamespace:        *k8sWorkerNamespace,
@@ -550,7 +550,7 @@ func main() {
 			WorkerBackend:        resolved.WorkerBackend,
 			ConfigStoreConn:      resolved.ConfigStoreConn,
 			ConfigPollInterval:   resolved.ConfigPollInterval,
-			AdminToken:           resolved.AdminToken,
+			InternalSecret:       resolved.InternalSecret,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:       resolved.K8sWorkerImage,
 				WorkerNamespace:   resolved.K8sWorkerNamespace,

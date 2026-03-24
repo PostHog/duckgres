@@ -40,7 +40,7 @@ type configCLIInputs struct {
 	MaxConnections            int
 	ConfigStoreConn           string
 	ConfigPollInterval        string
-	AdminToken                string
+	InternalSecret                string
 	WorkerBackend             string
 	K8sWorkerImage            string
 	K8sWorkerNamespace        string
@@ -77,7 +77,7 @@ type resolvedConfig struct {
 	K8sSharedWarmWorkers     bool
 	ConfigStoreConn          string
 	ConfigPollInterval       time.Duration
-	AdminToken               string
+	InternalSecret               string
 }
 
 func defaultServerConfig() server.Config {
@@ -134,7 +134,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var k8sSharedWarmWorkers bool
 	var configStoreConn string
 	var configPollInterval time.Duration
-	var adminToken string
+	var internalSecret string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -587,8 +587,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_CONFIG_POLL_INTERVAL duration: " + err.Error())
 		}
 	}
-	if v := getenv("DUCKGRES_ADMIN_TOKEN"); v != "" {
-		adminToken = v
+	if v := getenv("DUCKGRES_INTERNAL_SECRET"); v != "" {
+		internalSecret = v
 	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
@@ -803,8 +803,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid --config-poll-interval duration: " + err.Error())
 		}
 	}
-	if cli.Set["admin-token"] {
-		adminToken = cli.AdminToken
+	if cli.Set["internal-secret"] {
+		internalSecret = cli.InternalSecret
 	}
 	if cli.Set["worker-backend"] {
 		workerBackend = cli.WorkerBackend
@@ -914,6 +914,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sSharedWarmWorkers:     k8sSharedWarmWorkers,
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
-		AdminToken:               adminToken,
+		InternalSecret:               internalSecret,
 	}
 }
