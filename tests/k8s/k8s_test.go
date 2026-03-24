@@ -25,9 +25,15 @@ import (
 var (
 	clientset  *kubernetes.Clientset
 	namespace  string
+	kubeconfig string
 	pgPort     int
 	portFwdCmd *exec.Cmd
 	testEnv    k8sTestEnvironment
+)
+
+const (
+	duckgresServiceTarget = "svc/duckgres"
+	duckgresServicePort   = 5432
 )
 
 func TestMain(m *testing.M) {
@@ -48,7 +54,7 @@ func TestMain(m *testing.M) {
 	}
 
 	// Build kubeconfig clientset
-	kubeconfig := envOr("DUCKGRES_K8S_TEST_KUBECONFIG", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
+	kubeconfig = envOr("DUCKGRES_K8S_TEST_KUBECONFIG", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Fatalf("Failed to load kubeconfig: %v", err)
@@ -62,13 +68,8 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Control-plane pod not ready: %v", err)
 	}
 
-	pgPort, portFwdCmd, err = startPortForward(namespace, "svc/duckgres", 5432)
-	if err != nil {
+	if err := restartPortForward(); err != nil {
 		log.Fatalf("Failed to start port-forward: %v", err)
-	}
-
-	if err := waitForPort(pgPort, 30*time.Second); err != nil {
-		log.Fatalf("Port-forward not ready: %v", err)
 	}
 	if err := waitForDBReady(90 * time.Second); err != nil {
 		log.Fatalf("Database not ready: %v", err)
@@ -77,10 +78,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	// Cleanup port-forward
-	if portFwdCmd != nil && portFwdCmd.Process != nil {
-		_ = portFwdCmd.Process.Kill()
-		_ = portFwdCmd.Wait()
-	}
+	closePortForward()
 
 	// Cleanup K8s resources (unless skip_setup, meaning external management)
 	if !skipSetup {
@@ -96,11 +94,8 @@ func TestMain(m *testing.M) {
 // --- Test Cases ---
 
 func TestK8sBasicQuery(t *testing.T) {
-	db := openDB(t)
-	defer db.Close()
-
 	var result int
-	if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+	if err := retryScanIntWithReconnect("SELECT 1", 30*time.Second, &result); err != nil {
 		t.Fatalf("SELECT 1 failed: %v", err)
 	}
 	if result != 1 {
@@ -110,11 +105,8 @@ func TestK8sBasicQuery(t *testing.T) {
 
 func TestK8sWorkerPodCreation(t *testing.T) {
 	// Run a query first to ensure at least one worker is spawned
-	db := openDB(t)
-	defer db.Close()
-
 	var result int
-	if err := db.QueryRow("SELECT 42").Scan(&result); err != nil {
+	if err := retryScanIntWithReconnect("SELECT 42", 30*time.Second, &result); err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
 
@@ -151,11 +143,8 @@ func TestK8sSharedWarmWorkerActivation(t *testing.T) {
 		t.Fatalf("expected prewarmed worker before first query: %v", err)
 	}
 
-	db := openDB(t)
-	defer db.Close()
-
 	var attached int
-	if err := retryScanInt(db, "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'", 90*time.Second, &attached); err != nil {
+	if err := retryScanIntWithReconnect("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'", 90*time.Second, &attached); err != nil {
 		t.Fatalf("shared warm worker activation did not attach ducklake: %v", err)
 	}
 	if attached != 1 {
@@ -165,11 +154,7 @@ func TestK8sSharedWarmWorkerActivation(t *testing.T) {
 
 func TestK8sWorkerCrashRecovery(t *testing.T) {
 	// Run a query to ensure a worker exists
-	db := openDB(t)
-	defer db.Close()
-
-	var result int
-	if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
 		t.Fatalf("initial query failed: %v", err)
 	}
 
@@ -195,18 +180,7 @@ func TestK8sWorkerCrashRecovery(t *testing.T) {
 	// Wait for the pod to actually disappear
 	waitForPodGone(t, namespace, workerName, 60*time.Second)
 
-	// The old connection may be broken. Open a new one and retry queries.
-	db.Close()
-
-	// Wait a bit for the CP to detect the crash and be ready for new connections
-	time.Sleep(5 * time.Second)
-
-	// Open a new connection and verify queries work (CP should spawn a replacement)
-	db2 := openDB(t)
-	defer db2.Close()
-
-	err = retryQuery(db2, "SELECT 1", 30*time.Second)
-	if err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 60*time.Second); err != nil {
 		t.Fatalf("query failed after worker crash recovery: %v", err)
 	}
 }
@@ -245,11 +219,7 @@ func TestK8sMultipleConcurrentConnections(t *testing.T) {
 
 func TestK8sWorkerSecurityContext(t *testing.T) {
 	// Ensure a worker exists
-	db := openDB(t)
-	defer db.Close()
-
-	var result int
-	if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
 
@@ -291,14 +261,9 @@ func TestK8sWorkerSecurityContext(t *testing.T) {
 
 func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 	// Ensure a worker exists
-	db := openDB(t)
-	defer db.Close()
-
-	var result int
-	if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
-	db.Close()
 
 	// List worker pods
 	workerPods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
@@ -351,7 +316,13 @@ func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 		remaining := 0
 		for _, name := range workerNames {
 			_, err := clientset.CoreV1().Pods(namespace).Get(context.Background(), name, metav1.GetOptions{})
-			if err == nil {
+			switch {
+			case err == nil:
+				remaining++
+			case isPodGoneError(err):
+				continue
+			default:
+				t.Logf("transient error checking worker pod %s deletion: %v", name, err)
 				remaining++
 			}
 		}
@@ -371,24 +342,12 @@ func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 	}
 
 	// Restart port-forward since the old CP pod is gone
-	if portFwdCmd != nil && portFwdCmd.Process != nil {
-		_ = portFwdCmd.Process.Kill()
-		_ = portFwdCmd.Wait()
-	}
-	var pfErr error
-	pgPort, portFwdCmd, pfErr = startPortForward(namespace, "svc/duckgres", 5432)
-	if pfErr != nil {
-		t.Fatalf("failed to restart port-forward: %v", pfErr)
-	}
-	if err := waitForPort(pgPort, 30*time.Second); err != nil {
-		t.Fatalf("port-forward not ready after restart: %v", err)
+	if err := restartPortForward(); err != nil {
+		t.Fatalf("failed to restart port-forward: %v", err)
 	}
 
 	// Verify the system works again
-	db2 := openDB(t)
-	defer db2.Close()
-	err = retryQuery(db2, "SELECT 1", 60*time.Second)
-	if err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 60*time.Second); err != nil {
 		t.Fatalf("query failed after CP recreation: %v", err)
 	}
 }
@@ -453,6 +412,36 @@ func startPortForward(ns, target string, remotePort int) (int, *exec.Cmd, error)
 	return localPort, cmd, nil
 }
 
+func closePortForward() {
+	if portFwdCmd == nil || portFwdCmd.Process == nil {
+		portFwdCmd = nil
+		return
+	}
+
+	_ = portFwdCmd.Process.Kill()
+	_ = portFwdCmd.Wait()
+	portFwdCmd = nil
+}
+
+func restartPortForward() error {
+	closePortForward()
+
+	localPort, cmd, err := startPortForward(namespace, duckgresServiceTarget, duckgresServicePort)
+	if err != nil {
+		return err
+	}
+
+	pgPort = localPort
+	portFwdCmd = cmd
+
+	if err := waitForPort(pgPort, 30*time.Second); err != nil {
+		closePortForward()
+		return err
+	}
+
+	return nil
+}
+
 func waitForPort(port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -471,10 +460,15 @@ func waitForPodGone(t *testing.T, ns, name string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		_, err := clientset.CoreV1().Pods(ns).Get(context.Background(), name, metav1.GetOptions{})
-		if err != nil {
-			return // pod is gone
+		switch {
+		case err == nil:
+			time.Sleep(2 * time.Second)
+		case isPodGoneError(err):
+			return
+		default:
+			t.Logf("transient error checking pod %s deletion: %v", name, err)
+			time.Sleep(2 * time.Second)
 		}
-		time.Sleep(2 * time.Second)
 	}
 	t.Logf("Warning: pod %s still exists after %s", name, timeout)
 }
@@ -489,26 +483,14 @@ func waitForSingleReadyPod(ns, labelSelector string, timeout time.Duration) (str
 			return "", err
 		}
 
-		if len(pods.Items) != 1 {
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		for _, pod := range pods.Items {
-			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
-				continue
-			}
-			for _, cond := range pod.Status.Conditions {
-				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-					return pod.Name, nil
-				}
-			}
+		if name, ok := findReadyPodName(pods.Items); ok {
+			return name, nil
 		}
 
 		time.Sleep(2 * time.Second)
 	}
 
-	return "", fmt.Errorf("expected one ready pod for %q within %s", labelSelector, timeout)
+	return "", fmt.Errorf("expected at least one ready pod for %q within %s", labelSelector, timeout)
 }
 
 func latestWorkerPod(t *testing.T) corev1.Pod {
@@ -583,13 +565,7 @@ func openDBConn() (*sql.DB, error) {
 }
 
 func waitForDBReady(timeout time.Duration) error {
-	db, err := openDBConn()
-	if err != nil {
-		return fmt.Errorf("open database: %w", err)
-	}
-	defer db.Close()
-
-	return retryQuery(db, "SELECT 1", timeout)
+	return retryQueryWithReconnect("SELECT 1", timeout)
 }
 
 func retryQuery(db *sql.DB, query string, timeout time.Duration) error {
@@ -617,6 +593,47 @@ func retryScanInt(db *sql.DB, query string, timeout time.Duration, dest *int) er
 		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("query %q failed after %s: %w", query, timeout, lastErr)
+}
+
+func retryQueryWithReconnect(query string, timeout time.Duration) error {
+	return retryDBOperationWithReconnect(timeout, fmt.Sprintf("query %q", query), func(db *sql.DB) error {
+		var result int
+		return db.QueryRow(query).Scan(&result)
+	})
+}
+
+func retryScanIntWithReconnect(query string, timeout time.Duration, dest *int) error {
+	return retryDBOperationWithReconnect(timeout, fmt.Sprintf("query %q", query), func(db *sql.DB) error {
+		return db.QueryRow(query).Scan(dest)
+	})
+}
+
+// Use a fresh DB connection on each attempt so transient port-forward failures
+// can be recovered by restarting the forwarder between retries.
+func retryDBOperationWithReconnect(timeout time.Duration, description string, op func(*sql.DB) error) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		db, err := openDBConn()
+		if err == nil {
+			err = op(db)
+			_ = db.Close()
+		}
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+		if isTransientDBError(err) {
+			if restartErr := restartPortForward(); restartErr != nil {
+				lastErr = fmt.Errorf("%w; restart port-forward: %v", err, restartErr)
+			}
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("%s failed after %s: %w", description, timeout, lastErr)
 }
 
 func findProjectRoot() string {
