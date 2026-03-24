@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -125,6 +126,83 @@ func TestPeakSessionsTracking(t *testing.T) {
 
 	if w.peakSessions != 3 {
 		t.Fatalf("expected peakSessions=3, got %d", w.peakSessions)
+	}
+}
+
+func TestSpawnMinWorkersUpdatesWarmWorkersGauge(t *testing.T) {
+	observeWarmPoolLifecycleGauges(map[int]*ManagedWorker{})
+	pool, _ := newTestK8sPool(t, 5)
+
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		pool.mu.Lock()
+		pool.workers[id] = makeTestWorker(WorkerLifecycleIdle, nil)
+		pool.mu.Unlock()
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkers(1); err != nil {
+		t.Fatalf("SpawnMinWorkers failed: %v", err)
+	}
+
+	assertGaugeValue(t, warmWorkersGauge, 1)
+}
+
+func TestActivateWorkerForOrgUpdatesActivatingGauge(t *testing.T) {
+	observeWarmPoolLifecycleGauges(map[int]*ManagedWorker{})
+	pool, _ := newTestK8sPool(t, 5)
+	worker := makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{
+		OrgID:          "org-1",
+		LeaseExpiresAt: time.Now().Add(time.Hour),
+	})
+	worker.reservedAt = time.Now()
+	pool.workers[1] = worker
+	observeWarmPoolLifecycleGauges(pool.workers)
+
+	orgPool := NewOrgReservedPool(pool, "org-1", 1)
+	orgPool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
+		return &configstore.OrgConfig{Name: "org-1"}, nil
+	}
+	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+		assertGaugeValue(t, reservedWorkersGauge, 0)
+		assertGaugeValue(t, activatingWorkersGauge, 1)
+		return nil
+	}
+
+	if err := orgPool.activateWorkerForOrg(context.Background(), worker); err != nil {
+		t.Fatalf("activateWorkerForOrg failed: %v", err)
+	}
+}
+
+func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *testing.T) {
+	observeWarmPoolLifecycleGauges(map[int]*ManagedWorker{})
+	pool, _ := newTestK8sPool(t, 5)
+	worker := makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{
+		OrgID:          "org-1",
+		LeaseExpiresAt: time.Now().Add(time.Hour),
+	})
+	worker.reservedAt = time.Now().Add(-2 * time.Second)
+	pool.workers[1] = worker
+
+	orgPool := NewOrgReservedPool(pool, "org-1", 1)
+	orgPool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
+		return &configstore.OrgConfig{Name: "org-1"}, nil
+	}
+	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+		nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
+		if err != nil {
+			return err
+		}
+		return worker.SetSharedState(nextState)
+	}
+
+	before := metricHistogramCount(t, "duckgres_activation_duration_seconds")
+	if err := orgPool.activateWorkerForOrg(context.Background(), worker); err != nil {
+		t.Fatalf("activateWorkerForOrg failed: %v", err)
+	}
+	after := metricHistogramCount(t, "duckgres_activation_duration_seconds")
+
+	if after-before != 1 {
+		t.Fatalf("expected activation duration histogram sample count delta 1, got %d", after-before)
 	}
 }
 

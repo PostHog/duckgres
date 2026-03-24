@@ -508,6 +508,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	p.mu.Lock()
 	p.workers[id] = w
 	workerCount := len(p.workers)
+	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
 
@@ -912,6 +913,9 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 			p.mu.Lock()
 			p.spawning--
+			if err == nil {
+				observeWarmPoolLifecycleGauges(p.workers)
+			}
 			p.mu.Unlock()
 
 			if err != nil {
@@ -957,17 +961,18 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 	ctx := context.Background()
 
-	for _, id := range ids {
-		if err := p.spawnWarmWorker(ctx, id); err != nil {
+		for _, id := range ids {
+			if err := p.spawnWarmWorker(ctx, id); err != nil {
+				p.mu.Lock()
+				p.spawning--
+				p.mu.Unlock()
+				return err
+			}
 			p.mu.Lock()
 			p.spawning--
+			observeWarmPoolLifecycleGauges(p.workers)
 			p.mu.Unlock()
-			return err
 		}
-		p.mu.Lock()
-		p.spawning--
-		p.mu.Unlock()
-	}
 	return nil
 }
 

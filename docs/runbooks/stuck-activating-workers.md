@@ -10,7 +10,7 @@
 
 When an org requests a session and no hot worker is available, the control plane reserves an idle warm worker and activates it (loads the org's DuckLake catalog, configures tenant settings, etc.). If activation fails or hangs, the worker stays in `reserved` or `activating` state indefinitely.
 
-The automatic stuck-worker reaper runs every minute and retires workers that have been in `reserved` or `activating` state for longer than 2 minutes (configurable via `activatingTimeout`). Reaped workers are replaced automatically if the pool is below `minWorkers`.
+The automatic stuck-worker reaper runs every minute and retires workers that have been in `reserved` or `activating` state for longer than 2 minutes. Reaped workers are replaced automatically if the pool is below `minWorkers`.
 
 ## Metrics to watch
 
@@ -41,5 +41,4 @@ The automatic stuck-worker reaper runs every minute and retires workers that hav
 ## Prevention
 
 - Ensure org configs are pre-validated before allowing session creation
-- Set `activatingTimeout` to a value appropriate for your DuckLake catalog size
 - Monitor `duckgres_activation_duration_seconds` p99 to detect slow activations before they time out

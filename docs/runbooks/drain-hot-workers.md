@@ -16,11 +16,11 @@
 
 ## Procedure
 
-1. **Identify the worker(s) to drain.** Use pod labels or the `/debug/workers` endpoint on the control plane.
+1. **Identify the worker(s) to drain.** Use pod labels and the control-plane logs to identify the worker pod serving the sessions you want to replace.
 
-2. **Transition the worker to draining state.** The control plane stops assigning new sessions to draining workers. Existing sessions continue until they disconnect or are terminated.
+2. **Delete the worker pod.** The control plane treats the worker as retired/crashed and replaces it if the pool is below `minWorkers`.
 
-3. **Wait for sessions to finish.** Monitor `duckgres_hot_worker_sessions_total` to see how many sessions each worker handled at retirement.
+3. **Watch replacement capacity.** Monitor `duckgres_warm_workers` and `duckgres_hot_workers` while the replacement comes up.
 
 4. **Verify replacement capacity.** After the worker retires, confirm that `duckgres_warm_workers` returns to the expected level. The pool auto-replenishes when idle count drops below `minWorkers`.
 
