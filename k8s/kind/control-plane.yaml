@@ -64,6 +64,12 @@ spec:
               mountPath: /certs
             - name: data
               mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 5
           securityContext:
             allowPrivilegeEscalation: false
           resources:
