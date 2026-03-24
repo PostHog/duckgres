@@ -134,7 +134,7 @@ jobs:
 
   k8s-integration-tests:
     needs: unit-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     env:
       DUCKGRES_KIND_CLUSTER_NAME: duckgres
@@ -153,7 +153,7 @@ jobs:
         env:
           KIND_VERSION: v0.24.0
         run: |
-          curl -sSL -o /tmp/kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          curl -sSL -o /tmp/kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-arm64"
           chmod +x /tmp/kind
           sudo mv /tmp/kind /usr/local/bin/kind
           kind --version
@@ -162,7 +162,7 @@ jobs:
 
   k8s-kind-tests:
     needs: unit-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
 
     steps:
