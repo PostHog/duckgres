@@ -208,7 +208,6 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 	shared.workers[worker.ID] = worker
 
 	pool := NewOrgReservedPool(shared, "analytics", 1)
-	pool.sharedWarmWorkers = true
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
