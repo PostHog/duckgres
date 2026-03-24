@@ -60,7 +60,6 @@ type K8sWorkerPoolConfig struct {
 	MemoryBudget         int64      // Total memory budget in bytes; used to derive per-worker resource limits
 	OrgID                string     // Org ID for pod labels (multi-tenant mode)
 	WorkerIDGenerator    func() int // Shared ID generator across orgs (nil = internal counter)
-	SharedWarmActivation bool
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

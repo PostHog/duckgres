@@ -20,6 +20,12 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	}
 
 	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
+		return &configstore.OrgConfig{Name: "analytics"}, nil
+	}
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+		return nil
+	}
 	worker, err := pool.AcquireWorker(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
@@ -32,8 +38,8 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
 	}
-	if state.Lifecycle != WorkerLifecycleReserved {
-		t.Fatalf("expected reserved lifecycle, got %q", state.Lifecycle)
+	if state.Lifecycle != WorkerLifecycleHot {
+		t.Fatalf("expected hot lifecycle after activation, got %q", state.Lifecycle)
 	}
 }
 
@@ -59,6 +65,12 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	}
 
 	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
+		return &configstore.OrgConfig{Name: "analytics"}, nil
+	}
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker, org *configstore.OrgConfig) error {
+		return nil
+	}
 	worker, err := pool.AcquireWorker(context.Background())
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
@@ -75,7 +87,7 @@ func TestOrgReservedPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 9, activeSessions: 1, done: make(chan struct{})}
 	if err := worker.SetSharedState(SharedWorkerState{
-		Lifecycle: WorkerLifecycleReserved,
+		Lifecycle: WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{
 			OrgID:          "analytics",
 			LeaseExpiresAt: time.Now().Add(time.Hour),
@@ -105,7 +117,6 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 
 	activated := false
 	pool := NewOrgReservedPool(shared, "analytics", 2)
-	pool.sharedWarmWorkers = true
 	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
 		return &configstore.OrgConfig{
 			Name: "analytics",
@@ -151,7 +162,6 @@ func TestOrgReservedWorkerPoolAcquireActivatesUsingLatestResolvedOrgConfig(t *te
 	}
 
 	pool := NewOrgReservedPool(shared, "analytics", 2)
-	pool.sharedWarmWorkers = true
 	pool.resolveOrgConfig = func() (*configstore.OrgConfig, error) {
 		return currentOrg, nil
 	}

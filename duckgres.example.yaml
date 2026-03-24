@@ -100,15 +100,10 @@ ducklake:
 # k8s:
 #   # Global cap for shared K8s workers. 0 auto-derives from memory_budget.
 #   max_workers: 0
-#   # Neutral shared warm-worker target. Separate from per-team limits and
-#   # process.min_workers. 0 disables shared prewarming.
+#   # Neutral shared warm-worker target. Separate from per-org limits and
+#   # process.min_workers. 0 disables shared prewarming. When > 0, the pool
+#   # maintains this many idle workers and activates them on-demand per org.
 #   shared_warm_target: 0
-#   # Enable the reserve -> activate -> hot shared warm-worker path.
-#   # Default false for rollout safety.
-#   shared_warm_workers: false
-#   # Enable reserve -> activate -> hot lifecycle for shared warm workers.
-#   # Default: false
-#   shared_warm_workers: false
 
 # Process isolation (default: true)
 # Each client connection spawns a separate OS process, so a DuckDB crash

@@ -72,7 +72,7 @@ func TestLoadK8sTestEnvironmentRejectsUnknownSetupMode(t *testing.T) {
 	}
 }
 
-func TestKindSetupArtifactsEnableSharedWarmWorkers(t *testing.T) {
+func TestKindSetupArtifactsEnableSharedWarmTarget(t *testing.T) {
 	root := findProjectRootForUnitTest(t)
 
 	manifestPath := filepath.Join(root, "k8s", "kind", "control-plane.yaml")
@@ -86,7 +86,6 @@ func TestKindSetupArtifactsEnableSharedWarmWorkers(t *testing.T) {
 		"postgres://duckgres:duckgres@duckgres-config-store:5432/duckgres_config?sslmode=disable",
 		"--k8s-shared-warm-target",
 		"1",
-		"--k8s-shared-warm-workers",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("expected %q in %s", want, manifestPath)

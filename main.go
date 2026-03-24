@@ -71,7 +71,6 @@ type K8sFileConfig struct {
 	WorkerServiceAccount  string `yaml:"worker_service_account"`
 	MaxWorkers            int    `yaml:"max_workers"`
 	SharedWarmTarget      int    `yaml:"shared_warm_target"`
-	SharedWarmWorkers     bool   `yaml:"shared_warm_workers"`
 }
 
 type QueryLogFileConfig struct {
@@ -240,7 +239,6 @@ func main() {
 	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "ServiceAccount name for K8s worker pods (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 	k8sMaxWorkers := flag.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=auto-derived (env: DUCKGRES_K8S_MAX_WORKERS)")
 	k8sSharedWarmTarget := flag.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
-	k8sSharedWarmWorkers := flag.Bool("k8s-shared-warm-workers", false, "Enable shared warm-worker activation path in K8s multi-tenant mode (env: DUCKGRES_K8S_SHARED_WARM_WORKERS)")
 
 	// Config store flags (multi-tenant mode)
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
@@ -304,7 +302,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ADMIN_TOKEN        Bearer token for admin API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_WORKERS  Enable shared warm-worker activation path for K8s multi-tenant mode\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -417,7 +414,6 @@ func main() {
 		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
 		K8sMaxWorkers:             *k8sMaxWorkers,
 		K8sSharedWarmTarget:       *k8sSharedWarmTarget,
-		K8sSharedWarmWorkers:      *k8sSharedWarmWorkers,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
@@ -562,7 +558,6 @@ func main() {
 				ServiceAccount:    resolved.K8sWorkerServiceAccount,
 				MaxWorkers:        resolved.K8sMaxWorkers,
 				SharedWarmTarget:  resolved.K8sSharedWarmTarget,
-				SharedWarmWorkers: resolved.K8sSharedWarmWorkers,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

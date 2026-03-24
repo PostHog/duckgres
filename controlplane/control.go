@@ -80,7 +80,6 @@ type K8sConfig struct {
 	ServiceAccount    string // ServiceAccount name for worker pods (default: "default")
 	MaxWorkers        int    // Global cap for the shared K8s worker pool (0 = auto-derived)
 	SharedWarmTarget  int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
-	SharedWarmWorkers bool   // Enable reserve->activate->hot lifecycle on the shared warm pool
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
