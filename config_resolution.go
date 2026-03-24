@@ -41,8 +41,6 @@ type configCLIInputs struct {
 	ConfigStoreConn           string
 	ConfigPollInterval        string
 	AdminToken                string
-	ProvisioningToken         string
-	ProvisioningPort          int
 	WorkerBackend             string
 	K8sWorkerImage            string
 	K8sWorkerNamespace        string
@@ -80,8 +78,6 @@ type resolvedConfig struct {
 	ConfigStoreConn          string
 	ConfigPollInterval       time.Duration
 	AdminToken               string
-	ProvisioningToken        string
-	ProvisioningPort         int
 }
 
 func defaultServerConfig() server.Config {
@@ -139,8 +135,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var configStoreConn string
 	var configPollInterval time.Duration
 	var adminToken string
-	var provisioningToken string
-	var provisioningPort int
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -596,14 +590,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_ADMIN_TOKEN"); v != "" {
 		adminToken = v
 	}
-	if v := getenv("DUCKGRES_PROVISIONING_TOKEN"); v != "" {
-		provisioningToken = v
-	}
-	if v := getenv("DUCKGRES_PROVISIONING_PORT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			provisioningPort = n
-		}
-	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
 	}
@@ -820,12 +806,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["admin-token"] {
 		adminToken = cli.AdminToken
 	}
-	if cli.Set["provisioning-token"] {
-		provisioningToken = cli.ProvisioningToken
-	}
-	if cli.Set["provisioning-port"] {
-		provisioningPort = cli.ProvisioningPort
-	}
 	if cli.Set["worker-backend"] {
 		workerBackend = cli.WorkerBackend
 	}
@@ -935,7 +915,5 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
 		AdminToken:               adminToken,
-		ProvisioningToken:        provisioningToken,
-		ProvisioningPort:         provisioningPort,
 	}
 }

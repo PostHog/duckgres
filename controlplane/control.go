@@ -62,13 +62,6 @@ type ControlPlaneConfig struct {
 	// When empty, a random token is generated and logged at startup.
 	AdminToken string
 
-	// ProvisioningToken is the bearer token required for provisioning API requests.
-	// When empty, falls back to AdminToken.
-	ProvisioningToken string
-
-	// ProvisioningPort is the listen port for the provisioning API server.
-	// Default: 9091.
-	ProvisioningPort int
 }
 
 type ProcessConfig struct {
@@ -117,9 +110,8 @@ type ControlPlane struct {
 	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
 	// Multi-tenant fields (non-nil in remote multitenant mode)
-	orgRouter          OrgRouterInterface
-	configStore        ConfigStoreInterface
-	provisioningServer *http.Server // provisioning API server (shut down on graceful exit)
+	orgRouter   OrgRouterInterface
+	configStore ConfigStoreInterface
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -327,21 +319,20 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, servers, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
+		store, adapter, apiServer, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
 		}
 		cp.configStore = store
 		cp.orgRouter = adapter
-		// Replace the simple metrics server with the Gin admin server
+		// Replace the simple metrics server with the unified API server
 		if cfg.MetricsServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = cfg.MetricsServer.Shutdown(ctx)
 			cancel()
 		}
-		cfg.MetricsServer = servers[0] // admin server
-		cp.provisioningServer = servers[1]
+		cfg.MetricsServer = apiServer
 		cp.cfg = cfg
 		_ = store // keep linter happy
 	} else {
@@ -961,13 +952,6 @@ func (cp *ControlPlane) handleUpgrade() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := cp.cfg.MetricsServer.Shutdown(ctx); err != nil {
 			slog.Warn("Metrics server shutdown failed.", "error", err)
-		}
-		cancel()
-	}
-	if cp.provisioningServer != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := cp.provisioningServer.Shutdown(ctx); err != nil {
-			slog.Warn("Provisioning server shutdown failed.", "error", err)
 		}
 		cancel()
 	}

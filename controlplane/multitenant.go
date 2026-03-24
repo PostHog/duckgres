@@ -108,15 +108,15 @@ func (a *orgRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 var _ OrgRouterInterface = (*orgRouterAdapter)(nil)
 var _ admin.OrgStackInfo = (*orgRouterAdapter)(nil)
 
-// SetupMultiTenant initializes the config store, org router, admin server, and provisioning server.
+// SetupMultiTenant initializes the config store, org router, and API server.
 // Called from RunControlPlane when --config-store is set with remote backend.
-// Returns the admin server and provisioning server for graceful shutdown.
+// Returns the API server for graceful shutdown.
 func SetupMultiTenant(
 	cfg ControlPlaneConfig,
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
-) (ConfigStoreInterface, OrgRouterInterface, []*http.Server, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -125,11 +125,6 @@ func SetupMultiTenant(
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-
-	provisioningPort := cfg.ProvisioningPort
-	if provisioningPort == 0 {
-		provisioningPort = 9091
 	}
 
 	baseCfg := K8sWorkerPoolConfig{
@@ -180,12 +175,12 @@ func SetupMultiTenant(
 		slog.Info("Generated admin API token (pass via --admin-token or DUCKGRES_ADMIN_TOKEN to set explicitly).", "token", adminToken)
 	}
 
-	// Set up Gin admin server (replaces the simple metrics server)
+	// Set up unified API server (admin + provisioning on single port)
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 
-	// Existing endpoints (unauthenticated)
+	// Unauthenticated endpoints
 	engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
 	engine.GET("/health", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
@@ -195,44 +190,22 @@ func SetupMultiTenant(
 	api := engine.Group("/api/v1", admin.APIAuthMiddleware(adminToken))
 	admin.RegisterAPI(api, store, adpt)
 
+	// Provisioning API (same auth, same /api/v1 group)
+	provisioning.RegisterAPI(api, provisioning.NewGormStore(store))
+
 	// Dashboard
 	admin.RegisterDashboard(engine, adminToken)
 
-	adminServer := &http.Server{
-		Addr:    ":9090",
+	apiServer := &http.Server{
+		Addr:    ":8080",
 		Handler: engine,
 	}
 	go func() {
-		slog.Info("Starting admin server with dashboard.", "addr", adminServer.Addr)
-		if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Warn("Admin server error.", "error", err)
+		slog.Info("Starting API server.", "addr", apiServer.Addr)
+		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Warn("API server error.", "error", err)
 		}
 	}()
 
-	// Set up provisioning API server (separate from admin — production-facing)
-	provToken := cfg.ProvisioningToken
-	if provToken == "" {
-		provToken = adminToken // fall back to admin token if not set
-	}
-
-	provEngine := gin.New()
-	provEngine.Use(gin.Recovery())
-	provEngine.GET("/health", func(c *gin.Context) {
-		c.String(http.StatusOK, "ok")
-	})
-	provAPI := provEngine.Group("/api/v1", admin.APIAuthMiddleware(provToken))
-	provisioning.RegisterAPI(provAPI, provisioning.NewGormStore(store))
-
-	provServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", provisioningPort),
-		Handler: provEngine,
-	}
-	go func() {
-		slog.Info("Starting provisioning API server.", "addr", provServer.Addr)
-		if err := provServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Warn("Provisioning API server error.", "error", err)
-		}
-	}()
-
-	return store, adpt, []*http.Server{adminServer, provServer}, nil
+	return store, adpt, apiServer, nil
 }
