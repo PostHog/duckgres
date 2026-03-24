@@ -103,9 +103,8 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()
 	fs.warehouses["org-a"] = &configstore.ManagedWarehouse{
-		OrgID:     "org-a",
+		OrgID:        "org-a",
 		State:        configstore.ManagedWarehouseStatePending,
-		Image:        "ghcr.io/posthog/duckgres:latest",
 		AuroraMinACU: 0.5,
 		AuroraMaxACU: 2,
 	}
@@ -124,9 +123,6 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	spec, ok := cr.Object["spec"].(map[string]interface{})
 	if !ok {
 		t.Fatal("expected spec in CR")
-	}
-	if spec["image"] != "ghcr.io/posthog/duckgres:latest" {
-		t.Fatalf("expected image ghcr.io/posthog/duckgres:latest, got %v", spec["image"])
 	}
 	metadataStore, ok := spec["metadataStore"].(map[string]interface{})
 	if !ok {
@@ -171,15 +167,9 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 				"namespace": ducklingNamespace,
 			},
 			"status": map[string]interface{}{
-				"bucketName":             "org-b-bucket",
-				"auroraEndpoint":         "org-b.cluster.us-east-1.rds.amazonaws.com",
-				"auroraPort":             int64(5432),
-				"region":                 "us-east-1",
-				"namespace":              "duckling-org-b",
-				"serviceAccountName":     "duckgres",
-				"iamRoleArn":             "arn:aws:iam::123456789012:role/org-b",
-				"auroraPasswordSecret":   "org-b-aurora-password",
-				"duckgresPasswordSecret": "org-b-duckgres-password",
+				"bucketName":     "org-b-bucket",
+				"auroraEndpoint": "org-b.cluster.us-east-1.rds.amazonaws.com",
+				"auroraPassword": "supersecret123",
 				"conditions": []interface{}{
 					map[string]interface{}{
 						"type":   "Ready",
@@ -214,8 +204,8 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	if w.MetadataStore.Endpoint != "org-b.cluster.us-east-1.rds.amazonaws.com" {
 		t.Fatalf("expected aurora endpoint, got %q", w.MetadataStore.Endpoint)
 	}
-	if w.WorkerIdentity.Namespace != "duckling-org-b" {
-		t.Fatalf("expected namespace duckling-org-b, got %q", w.WorkerIdentity.Namespace)
+	if w.MetadataStore.Port != 5432 {
+		t.Fatalf("expected aurora port 5432, got %d", w.MetadataStore.Port)
 	}
 	if w.ReadyAt == nil {
 		t.Fatal("expected ready_at to be set")
@@ -319,7 +309,7 @@ func TestParseDucklingStatusEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if status.BucketName != "" || status.AuroraEndpoint != "" || status.Namespace != "" {
+	if status.BucketName != "" || status.AuroraEndpoint != "" || status.AuroraPassword != "" {
 		t.Fatal("expected empty status for CR without status field")
 	}
 }

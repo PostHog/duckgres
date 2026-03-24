@@ -117,7 +117,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 
 	// Create the Duckling CR
 	log.Info("Creating Duckling CR.")
-	if err := c.duckling.Create(ctx, w.OrgID, w.Image, w.AuroraMinACU, w.AuroraMaxACU); err != nil {
+	if err := c.duckling.Create(ctx, w.OrgID, w.AuroraMinACU, w.AuroraMaxACU); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,
@@ -169,81 +169,46 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		return
 	}
 
-	// Update per-component states based on Duckling CR status fields
+	// Update per-component states based on Duckling CR status fields.
+	// The Duckling composition provisions AWS infrastructure only (Aurora, S3, IAM).
+	// K8s workloads (namespace, deployment, service) are managed by the duckgres Helm chart.
 	updates := map[string]interface{}{}
 
 	if status.BucketName != "" && w.S3State != configstore.ManagedWarehouseStateReady {
 		updates["s3_state"] = configstore.ManagedWarehouseStateReady
 		updates["s3_bucket"] = status.BucketName
-		if status.Region != "" {
-			updates["s3_region"] = status.Region
-		}
 	}
 
 	if status.AuroraEndpoint != "" && w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
 		updates["metadata_store_state"] = configstore.ManagedWarehouseStateReady
 		updates["metadata_store_endpoint"] = status.AuroraEndpoint
-		updates["metadata_store_port"] = status.AuroraPort
+		updates["metadata_store_port"] = 5432
 		updates["metadata_store_kind"] = "aurora"
 		updates["metadata_store_engine"] = "postgres"
-		if status.Region != "" {
-			updates["metadata_store_region"] = status.Region
-		}
 	}
 
-	if status.Namespace != "" && w.IdentityState != configstore.ManagedWarehouseStateReady {
-		updates["identity_state"] = configstore.ManagedWarehouseStateReady
-		updates["worker_identity_namespace"] = status.Namespace
-		if status.ServiceAccountName != "" {
-			updates["worker_identity_service_account_name"] = status.ServiceAccountName
-		}
-		if status.IAMRoleARN != "" {
-			updates["worker_identity_iam_role_arn"] = status.IAMRoleARN
-		}
-	}
-
-	if status.AuroraPasswordSecret != "" && status.DuckgresPasswordSecret != "" && w.SecretsState != configstore.ManagedWarehouseStateReady {
+	if status.AuroraPassword != "" && w.SecretsState != configstore.ManagedWarehouseStateReady {
 		updates["secrets_state"] = configstore.ManagedWarehouseStateReady
-		updates["metadata_store_credentials_namespace"] = status.Namespace
-		updates["metadata_store_credentials_name"] = status.AuroraPasswordSecret
-		updates["metadata_store_credentials_key"] = "password"
-		updates["runtime_config_namespace"] = status.Namespace
-		updates["runtime_config_name"] = status.DuckgresPasswordSecret
-		updates["runtime_config_key"] = "duckgres.yaml"
 	}
 
-	if status.ReadyCondition && w.WarehouseDatabaseState != configstore.ManagedWarehouseStateReady {
-		updates["warehouse_database_state"] = configstore.ManagedWarehouseStateReady
-		if status.DuckgresEndpoint != "" {
-			updates["warehouse_database_endpoint"] = status.DuckgresEndpoint
-		}
-		if status.DuckgresPort > 0 {
-			updates["warehouse_database_port"] = status.DuckgresPort
-		}
-		if status.DuckgresDatabase != "" {
-			updates["warehouse_database_database_name"] = status.DuckgresDatabase
-		}
-		if status.DuckgresUsername != "" {
-			updates["warehouse_database_username"] = status.DuckgresUsername
-		}
-		if status.Region != "" {
-			updates["warehouse_database_region"] = status.Region
-		}
+	// Crossplane Ready condition means all composed resources (Aurora, S3, IAM) are reconciled.
+	// We use this for the identity component (IAM role + pod identity association).
+	if status.ReadyCondition && w.IdentityState != configstore.ManagedWarehouseStateReady {
+		updates["identity_state"] = configstore.ManagedWarehouseStateReady
 	}
 
-	// Check if all components are ready
+	// Infrastructure is ready when S3, Aurora, secrets, and IAM are all provisioned.
 	s3Ready := w.S3State == configstore.ManagedWarehouseStateReady || updates["s3_state"] == configstore.ManagedWarehouseStateReady
 	metaReady := w.MetadataStoreState == configstore.ManagedWarehouseStateReady || updates["metadata_store_state"] == configstore.ManagedWarehouseStateReady
-	identReady := w.IdentityState == configstore.ManagedWarehouseStateReady || updates["identity_state"] == configstore.ManagedWarehouseStateReady
 	secretsReady := w.SecretsState == configstore.ManagedWarehouseStateReady || updates["secrets_state"] == configstore.ManagedWarehouseStateReady
-	dbReady := w.WarehouseDatabaseState == configstore.ManagedWarehouseStateReady || updates["warehouse_database_state"] == configstore.ManagedWarehouseStateReady
+	identReady := w.IdentityState == configstore.ManagedWarehouseStateReady || updates["identity_state"] == configstore.ManagedWarehouseStateReady
 
-	if s3Ready && metaReady && identReady && secretsReady && dbReady {
+	if s3Ready && metaReady && secretsReady && identReady {
 		now := time.Now().UTC()
 		updates["state"] = configstore.ManagedWarehouseStateReady
-		updates["status_message"] = "All components ready"
+		updates["status_message"] = "Infrastructure ready"
 		updates["ready_at"] = now
-		log.Info("All components ready, transitioning to ready.")
+		log.Info("Infrastructure ready, transitioning to ready.")
 	}
 
 	if len(updates) > 0 {

@@ -29,7 +29,6 @@ type handler struct {
 }
 
 type provisionRequest struct {
-	Image         string                `json:"image"`
 	MetadataStore *provisionMetadataReq `json:"metadata_store,omitempty"`
 }
 
@@ -52,9 +51,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	warehouse := &configstore.ManagedWarehouse{
-		Image: req.Image,
-	}
+	warehouse := &configstore.ManagedWarehouse{}
 	if req.MetadataStore != nil && req.MetadataStore.Aurora != nil {
 		warehouse.AuroraMinACU = req.MetadataStore.Aurora.MinACU
 		warehouse.AuroraMaxACU = req.MetadataStore.Aurora.MaxACU

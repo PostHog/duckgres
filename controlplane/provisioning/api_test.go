@@ -81,7 +81,6 @@ func TestProvisionCreatesWarehouse(t *testing.T) {
 	router := newTestRouter(store)
 
 	body := []byte(`{
-		"image": "ghcr.io/posthog/duckgres:latest",
 		"metadata_store": {
 			"type": "aurora",
 			"aurora": {"min_acu": 0.5, "max_acu": 2}
@@ -104,9 +103,6 @@ func TestProvisionCreatesWarehouse(t *testing.T) {
 	if w.State != configstore.ManagedWarehouseStatePending {
 		t.Fatalf("expected state pending, got %q", w.State)
 	}
-	if w.Image != "ghcr.io/posthog/duckgres:latest" {
-		t.Fatalf("expected image, got %q", w.Image)
-	}
 	if w.AuroraMinACU != 0.5 {
 		t.Fatalf("expected min_acu 0.5, got %f", w.AuroraMinACU)
 	}
@@ -119,7 +115,7 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"image": "ghcr.io/posthog/duckgres:latest"}`)
+	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/new-org/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -145,7 +141,7 @@ func TestProvisionRejectsExistingNonTerminal(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"image": "ghcr.io/posthog/duckgres:latest"}`)
+	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -165,7 +161,7 @@ func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"image": "ghcr.io/posthog/duckgres:v2"}`)
+	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"min_acu": 0, "max_acu": 2}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -174,8 +170,8 @@ func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	if store.warehouses["analytics"].Image != "ghcr.io/posthog/duckgres:v2" {
-		t.Fatalf("expected new image, got %q", store.warehouses["analytics"].Image)
+	if store.warehouses["analytics"].AuroraMaxACU != 2 {
+		t.Fatalf("expected max_acu 2, got %f", store.warehouses["analytics"].AuroraMaxACU)
 	}
 }
 

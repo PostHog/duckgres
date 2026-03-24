@@ -22,22 +22,14 @@ var ducklingGVR = schema.GroupVersionResource{
 const ducklingNamespace = "crossplane-system"
 
 // DucklingStatus holds the parsed status from a Duckling CR.
+// The Duckling composition provisions AWS infrastructure (Aurora, S3, IAM)
+// but not K8s workloads — those are managed by the duckgres Helm chart.
 type DucklingStatus struct {
-	BucketName             string
-	AuroraEndpoint         string
-	AuroraPort             int
-	Region                 string
-	Namespace              string
-	ServiceAccountName     string
-	IAMRoleARN             string
-	AuroraPasswordSecret   string
-	DuckgresPasswordSecret string
-	DuckgresEndpoint       string
-	DuckgresPort           int
-	DuckgresDatabase       string
-	DuckgresUsername       string
-	ReadyCondition         bool
-	SyncedFalseMessage     string
+	BucketName         string
+	AuroraEndpoint     string
+	AuroraPassword     string
+	ReadyCondition     bool
+	SyncedFalseMessage string
 }
 
 // DucklingClient wraps a Kubernetes dynamic client for Duckling CR operations.
@@ -64,7 +56,7 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 }
 
 // Create creates a Duckling CR for the given org.
-func (d *DucklingClient) Create(ctx context.Context, orgID, image string, minACU, maxACU float64) error {
+func (d *DucklingClient) Create(ctx context.Context, orgID string, minACU, maxACU float64) error {
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "k8s.posthog.com/v1alpha1",
@@ -74,7 +66,6 @@ func (d *DucklingClient) Create(ctx context.Context, orgID, image string, minACU
 				"namespace": ducklingNamespace,
 			},
 			"spec": map[string]interface{}{
-				"image": image,
 				"metadataStore": map[string]interface{}{
 					"type": "aurora",
 					"aurora": map[string]interface{}{
@@ -118,19 +109,9 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 	}
 
 	ds := &DucklingStatus{
-		BucketName:             getNestedString(status, "bucketName"),
-		AuroraEndpoint:         getNestedString(status, "auroraEndpoint"),
-		AuroraPort:             getNestedInt(status, "auroraPort"),
-		Region:                 getNestedString(status, "region"),
-		Namespace:              getNestedString(status, "namespace"),
-		ServiceAccountName:    getNestedString(status, "serviceAccountName"),
-		IAMRoleARN:             getNestedString(status, "iamRoleArn"),
-		AuroraPasswordSecret:   getNestedString(status, "auroraPasswordSecret"),
-		DuckgresPasswordSecret: getNestedString(status, "duckgresPasswordSecret"),
-		DuckgresEndpoint:       getNestedString(status, "duckgresEndpoint"),
-		DuckgresPort:           getNestedInt(status, "duckgresPort"),
-		DuckgresDatabase:       getNestedString(status, "duckgresDatabase"),
-		DuckgresUsername:       getNestedString(status, "duckgresUsername"),
+		BucketName:     getNestedString(status, "bucketName"),
+		AuroraEndpoint: getNestedString(status, "auroraEndpoint"),
+		AuroraPassword: getNestedString(status, "auroraPassword"),
 	}
 
 	// Parse conditions
@@ -159,17 +140,4 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 func getNestedString(obj map[string]interface{}, key string) string {
 	v, _ := obj[key].(string)
 	return v
-}
-
-func getNestedInt(obj map[string]interface{}, key string) int {
-	switch v := obj[key].(type) {
-	case int64:
-		return int(v)
-	case float64:
-		return int(v)
-	case int:
-		return v
-	default:
-		return 0
-	}
 }
