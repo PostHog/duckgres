@@ -93,6 +93,16 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			continue
 		}
 
+		if p.sharedWarmWorkers {
+			p.shared.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+
 		if w := p.leastLoadedAssignedWorkerLocked(); w != nil {
 			w.activeSessions++
 			if w.activeSessions > w.peakSessions {
