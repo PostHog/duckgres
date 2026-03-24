@@ -164,7 +164,7 @@ deploy-multitenant-kind:
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl apply -f k8s/managed-warehouse-secrets.yaml
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl apply -f k8s/networkpolicy.yaml
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl apply -f k8s/kind/control-plane.yaml
-    KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
+    KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s || { echo "=== Pod status ==="; KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres get pods -o wide; echo "=== Pod describe ==="; KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres describe pod -l app=duckgres-control-plane; echo "=== Pod logs ==="; KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres logs -l app=duckgres-control-plane --tail=100 --all-containers; exit 1; }
 
 # End-to-end local multi-tenant setup: optional OrbStack K8s + config store + control plane
 [group('dev')]
