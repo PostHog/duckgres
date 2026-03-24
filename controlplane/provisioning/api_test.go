@@ -297,7 +297,7 @@ func TestGetWarehouseStatus(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/analytics/warehouse", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/analytics/warehouse/status", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -321,7 +321,7 @@ func TestGetWarehouseNotFound(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/unknown/warehouse", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/unknown/warehouse/status", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 

@@ -22,7 +22,7 @@ func RegisterAPI(r *gin.RouterGroup, store Store) {
 	h := &handler{store: store}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
-	r.GET("/orgs/:id/warehouse", h.getWarehouseStatus)
+	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
 }
 
 type handler struct {
