@@ -192,3 +192,37 @@ func TestOrgReservedWorkerPoolAcquireActivatesUsingLatestResolvedOrgConfig(t *te
 		t.Fatalf("expected latest resolved org config to be used, got %#v", capturedOrg.Users)
 	}
 }
+
+func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 3, activeSessions: 1, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState(worker): %v", err)
+	}
+	shared.workers[worker.ID] = worker
+
+	pool := NewOrgReservedPool(shared, "analytics", 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	got, err := pool.AcquireWorker(ctx)
+	if err == nil {
+		t.Fatalf("expected AcquireWorker to wait instead of reusing busy worker, got worker %d", got.ID)
+	}
+	if got != nil {
+		t.Fatalf("expected no worker on timeout, got %v", got)
+	}
+	if err != context.DeadlineExceeded {
+		t.Fatalf("expected context deadline exceeded, got %v", err)
+	}
+	if worker.activeSessions != 1 {
+		t.Fatalf("expected busy worker session count to stay at 1, got %d", worker.activeSessions)
+	}
+}

@@ -93,15 +93,6 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			continue
 		}
 
-		if w := p.leastLoadedAssignedWorkerLocked(); w != nil {
-			w.activeSessions++
-			if w.activeSessions > w.peakSessions {
-				w.peakSessions = w.activeSessions
-			}
-			p.shared.mu.Unlock()
-			return w, nil
-		}
-
 		p.shared.mu.Unlock()
 		select {
 		case <-ctx.Done():

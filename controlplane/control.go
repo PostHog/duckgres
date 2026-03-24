@@ -524,6 +524,17 @@ func createSessionWithRegisteredCancel(
 	return createFn(ctx)
 }
 
+func sessionCreationErrorResponse(err error) (code string, message string) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "57014", "canceling authentication due to user request"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "53300", "timed out waiting for an available worker"
+	default:
+		return "58000", fmt.Sprintf("failed to create session: %v", err)
+	}
+}
+
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
@@ -747,11 +758,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	)
 	if err != nil {
 		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
-		if errors.Is(err, context.Canceled) {
-			_ = server.WriteErrorResponse(writer, "FATAL", "57014", "canceling authentication due to user request")
-		} else {
-			_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
-		}
+		code, message := sessionCreationErrorResponse(err)
+		_ = server.WriteErrorResponse(writer, "FATAL", code, message)
 		_ = writer.Flush()
 		return
 	}
