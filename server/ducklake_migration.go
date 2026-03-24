@@ -17,30 +17,48 @@ import (
 // When the metadata store is at an older version, we backup and migrate automatically.
 const duckLakeSpecVersion = "0.4"
 
-// dlMigration holds the result of the one-time migration check.
-// The check runs at most once per process (sync.Once).
+// dlMigration holds the result of the migration check.
+// The check retries on transient errors (e.g., metadata store not reachable yet)
+// but locks in the result once it succeeds.
 //
 // In multitenant control-plane mode, each worker process serves a single tenant
-// with its own metadata store, so the per-process sync.Once is correct.
+// with its own metadata store, so the per-process state is correct.
 // If this changes (multiple metadata stores per process), this must be replaced
 // with a sync.Map keyed by metadata store connection string.
 var dlMigration struct {
-	once     sync.Once
+	mu       sync.Mutex
+	done     bool   // true once the check has completed successfully
 	needed   bool   // true if metadata store version < duckLakeSpecVersion
-	err      error  // non-nil if the check or backup failed
+	err      error  // non-nil if the most recent check or backup failed
 	checkedV string // the version found in the metadata store
 }
 
-// ensureDuckLakeMigrationCheck runs the migration check exactly once.
-// If migration is needed, it backs up the metadata store before returning.
-// The backup file is written to dataDir.
+// ensureDuckLakeMigrationCheck runs the migration check, retrying on transient errors.
+// Once the check succeeds (regardless of whether migration is needed), the result
+// is locked in and subsequent calls are no-ops. If the check fails, the error is
+// stored but the next call will retry — this prevents a transient failure (e.g.,
+// metadata store not yet reachable during pod startup) from permanently blocking
+// all connections.
 //
+// The backup file is written to dataDir.
 // This should be called BEFORE acquiring the DuckLake attachment semaphore,
 // since the backup can take minutes for large metadata stores.
 func ensureDuckLakeMigrationCheck(dlCfg DuckLakeConfig, dataDir string) {
-	dlMigration.once.Do(func() {
-		dlMigration.needed, dlMigration.checkedV, dlMigration.err = checkAndBackupIfNeeded(dlCfg, dataDir)
-	})
+	dlMigration.mu.Lock()
+	defer dlMigration.mu.Unlock()
+
+	if dlMigration.done {
+		return
+	}
+
+	needed, ver, err := checkAndBackupIfNeeded(dlCfg, dataDir)
+	dlMigration.needed = needed
+	dlMigration.checkedV = ver
+	dlMigration.err = err
+
+	if err == nil {
+		dlMigration.done = true
+	}
 }
 
 // duckLakeMigrationNeeded returns whether the ATTACH statement should include
