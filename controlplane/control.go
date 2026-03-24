@@ -22,6 +22,7 @@ import (
 
 	"github.com/cloudflare/tableflip"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightsqlingress"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -1119,9 +1120,26 @@ func (cp *ControlPlane) startFlightIngress() {
 		return
 	}
 
-	// Flight ingress requires a single session manager (not multi-tenant).
-	if cp.sessions == nil {
-		slog.Info("Flight ingress disabled in multi-tenant mode.")
+	var validator flightsqlingress.CredentialValidator
+	var provider flightsqlingress.SessionProvider
+
+	switch {
+	case cp.configStore != nil && cp.orgRouter != nil:
+		// Multi-tenant: auth via config store, sessions routed per-org.
+		validator = flightsqlingress.FuncCredentialValidator(func(username, password string) bool {
+			_, ok := cp.configStore.ValidateUser(username, password)
+			return ok
+		})
+		provider = &orgRoutedSessionProvider{
+			orgRouter: cp.orgRouter,
+			pidSession: make(map[int32]*SessionManager),
+		}
+	case cp.sessions != nil:
+		// Single-tenant: static users map, single session manager.
+		validator = &flightsqlingress.MapCredentialValidator{Users: cp.cfg.Users}
+		provider = &flightSessionProvider{sm: cp.sessions}
+	default:
+		slog.Warn("Flight ingress disabled: no session manager or config store available.")
 		return
 	}
 
@@ -1136,7 +1154,7 @@ func (cp *ControlPlane) startFlightIngress() {
 	var flightIngress *FlightIngress
 	var err error
 	for attempt := 0; attempt < 10; attempt++ {
-		flightIngress, err = NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions, cp.rateLimiter, flightCfg)
+		flightIngress, err = NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
 		if err == nil {
 			break
 		}

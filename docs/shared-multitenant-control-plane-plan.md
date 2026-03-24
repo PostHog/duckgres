@@ -43,7 +43,6 @@ Separate from the end-user query path, operators use the admin API/dashboard to 
 - Change worker pod spec from global to be team-specific. 
 - Long-term allocator hardening: move per-team admission and reservation into the shared worker allocator so "check team capacity + reserve worker" is one atomic operation, with centrally tracked assigned and pending reservations per team instead of router-side counting.
 - Implement non-disruptive customer-initiated duckgres login rotation mechanism.
-- Enable Duckhog / Flight SQL in multi-tenant mode.
 - Dev Infra
   - Aurora cluster
   - Deploy control plane in k8
