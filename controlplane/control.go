@@ -457,6 +457,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Require SSL
 	if !params.sslRequest {
+		if params.startupMessage {
+			// Client sent a v3.0 startup without negotiating SSL (e.g. sslmode=disable).
+			// Send a PostgreSQL error so the client sees a clear message.
+			_ = server.WriteErrorResponse(conn, "FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
+		}
 		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
 		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 		_ = conn.Close()
@@ -636,6 +641,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 type startupResult struct {
 	sslRequest      bool
 	gssRequest      bool
+	startupMessage  bool // true when the client sent a v3.0 startup (no SSL negotiation)
 	cancelRequest   bool
 	cancelPid       int32
 	cancelSecretKey int32
@@ -688,6 +694,12 @@ func readStartupFromRaw(conn net.Conn) (startupResult, error) {
 				return startupResult{}, fmt.Errorf("write GSSENC decline: %w", err)
 			}
 			continue
+		}
+
+		// Protocol version 3.0 — client sent a startup message without
+		// negotiating SSL first (e.g. sslmode=disable).
+		if protocolVersion == 196608 {
+			return startupResult{startupMessage: true}, nil
 		}
 
 		return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
