@@ -220,28 +220,22 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	ctrl.reconcile(ctx)
 
-	// Verify state transitioned to ready
+	// Verify state transitioned to ready with component states set
 	w := fs.warehouses["org-b"]
 	if w.State != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("expected ready state, got %q", w.State)
 	}
-	if w.S3.Bucket != "org-b-bucket" {
-		t.Fatalf("expected bucket org-b-bucket, got %q", w.S3.Bucket)
+	if w.S3State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected s3_state ready, got %q", w.S3State)
 	}
-	if w.MetadataStore.Endpoint != "org-b.cluster.us-east-1.rds.amazonaws.com" {
-		t.Fatalf("expected aurora endpoint, got %q", w.MetadataStore.Endpoint)
+	if w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected metadata_store_state ready, got %q", w.MetadataStoreState)
 	}
-	if w.MetadataStore.Port != 5432 {
-		t.Fatalf("expected aurora port 5432, got %d", w.MetadataStore.Port)
+	if w.SecretsState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected secrets_state ready, got %q", w.SecretsState)
 	}
-	if w.MetadataStore.Username != "postgres" {
-		t.Fatalf("expected username postgres, got %q", w.MetadataStore.Username)
-	}
-	if w.MetadataStore.DatabaseName != "postgres" {
-		t.Fatalf("expected database_name postgres, got %q", w.MetadataStore.DatabaseName)
-	}
-	if w.WorkerIdentity.IAMRoleARN != "arn:aws:iam::123456789012:role/duckling-org-b" {
-		t.Fatalf("expected IAM role ARN, got %q", w.WorkerIdentity.IAMRoleARN)
+	if w.IdentityState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected identity_state ready, got %q", w.IdentityState)
 	}
 	if w.ReadyAt == nil {
 		t.Fatal("expected ready_at to be set")

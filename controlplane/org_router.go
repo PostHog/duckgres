@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -25,27 +26,29 @@ type OrgStack struct {
 
 // OrgRouter manages per-org stacks, creating/destroying them as config changes.
 type OrgRouter struct {
-	mu           sync.RWMutex
-	orgs         map[string]*OrgStack
-	configStore  *configstore.ConfigStore
-	baseCfg      K8sWorkerPoolConfig
-	sharedPool   *K8sWorkerPool
-	globalCfg    ControlPlaneConfig
-	srv          *server.Server
-	stsBroker    *STSBroker
-	nextWorkerID atomic.Int32
-	sharedCancel context.CancelFunc
+	mu                    sync.RWMutex
+	orgs                  map[string]*OrgStack
+	configStore           *configstore.ConfigStore
+	baseCfg               K8sWorkerPoolConfig
+	sharedPool            *K8sWorkerPool
+	globalCfg             ControlPlaneConfig
+	srv                   *server.Server
+	stsBroker             *STSBroker
+	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
+	nextWorkerID          atomic.Int32
+	sharedCancel          context.CancelFunc
 }
 
 // NewOrgRouter creates an OrgRouter from the initial config snapshot.
-func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server, stsBroker *STSBroker) (*OrgRouter, error) {
+func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server, stsBroker *STSBroker, resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)) (*OrgRouter, error) {
 	tr := &OrgRouter{
-		orgs:        make(map[string]*OrgStack),
-		configStore: store,
-		baseCfg:     baseCfg,
-		globalCfg:   globalCfg,
-		srv:         srv,
-		stsBroker:   stsBroker,
+		orgs:                  make(map[string]*OrgStack),
+		configStore:           store,
+		baseCfg:               baseCfg,
+		globalCfg:             globalCfg,
+		srv:                   srv,
+		stsBroker:             stsBroker,
+		resolveDucklingStatus: resolveDucklingStatus,
 	}
 
 	sharedCfg := baseCfg
@@ -112,6 +115,7 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		}
 		return org, nil
 	})
+	activator.resolveDucklingStatus = tr.resolveDucklingStatus
 	pool.activateReservedWorker = activator.ActivateReservedWorker
 	rebalancer := NewMemoryRebalancer(uint64(memoryBudget), 0, nil, tr.globalCfg.MemoryRebalance)
 	sessions := NewSessionManager(pool, rebalancer)

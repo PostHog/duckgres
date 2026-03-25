@@ -35,6 +35,7 @@ type DucklingStatus struct {
 	DataStore struct {
 		Type       string
 		BucketName string
+		S3Region   string
 	}
 	IAMRoleARN         string
 	ReadyCondition     bool
@@ -137,6 +138,7 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 	if store, ok := status["dataStore"].(map[string]interface{}); ok {
 		ds.DataStore.Type = getNestedString(store, "type")
 		ds.DataStore.BucketName = getNestedString(store, "bucketName")
+		ds.DataStore.S3Region = getNestedString(store, "s3Region")
 	}
 
 	// Parse conditions
