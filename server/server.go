@@ -239,6 +239,12 @@ type DuckLakeConfig struct {
 	// merge adjacent files, rewrite data files, and clean up orphaned files.
 	// Set to 0 to disable. Default: 24h.
 	CheckpointInterval time.Duration
+
+	// Migrate is set by the control plane after running the migration check.
+	// When true, AttachDuckLake uses AUTOMATIC_MIGRATION TRUE without
+	// re-running the version check. This avoids redundant backups and
+	// long-running checks in worker processes.
+	Migrate bool `json:"migrate,omitempty" yaml:"-"`
 }
 
 type Server struct {
@@ -942,13 +948,16 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		return nil // DuckLake not configured
 	}
 
-	// Check if DuckLake metadata needs migration (runs once per process).
-	// If migration is needed, backs up all metadata tables before proceeding.
-	// This runs BEFORE the semaphore because the backup can take minutes for
-	// large metadata stores, and we don't want to block other connections.
-	ensureDuckLakeMigrationCheck(dlCfg, dataDir)
-	if dlMigration.err != nil {
-		return fmt.Errorf("DuckLake migration check failed: %w", dlMigration.err)
+	// In control-plane mode, the CP runs the migration check and sets
+	// dlCfg.Migrate=true before sending the activation payload to workers.
+	// Workers skip the check entirely to avoid redundant backups and
+	// health-check timeouts during long backup operations.
+	// In standalone mode, the check runs here (once per process).
+	if !dlCfg.Migrate {
+		ensureDuckLakeMigrationCheck(dlCfg, dataDir)
+		if dlMigration.err != nil {
+			return fmt.Errorf("DuckLake migration check failed: %w", dlMigration.err)
+		}
 	}
 
 	// Serialize DuckLake attachment to avoid race conditions where multiple
@@ -1003,7 +1012,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 
 	// Build the ATTACH statement.
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
-	migrate := duckLakeMigrationNeeded()
+	migrate := dlCfg.Migrate || duckLakeMigrationNeeded()
 	attachStmt := buildDuckLakeAttachStmt(dlCfg, migrate)
 
 	dataPath := dlCfg.ObjectStore

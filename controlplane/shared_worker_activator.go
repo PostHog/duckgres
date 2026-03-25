@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -25,6 +27,14 @@ type SharedWorkerActivator struct {
 	resolveOrgConfig       func(string) (*configstore.OrgConfig, error)
 	resolveDucklingStatus  func(context.Context, string) (*provisioner.DucklingStatus, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, TenantActivationPayload) error
+	setMigrating           func(orgID string)
+	clearMigrating         func(orgID string)
+
+	// migrationChecked caches per-org migration check results to avoid
+	// redundant pgx roundtrips on every worker activation.
+	// After the first check, the metadata store version is known and
+	// won't change (migration is irreversible).
+	migrationChecked sync.Map // orgID (string) → bool (needed)
 }
 
 type TenantActivationPayload struct {
@@ -66,14 +76,63 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 		return err
 	}
 
-	if a.activateReservedWorker != nil {
-		return a.activateReservedWorker(ctx, worker, payload)
+	// Check if this org needs DuckLake migration. The result is cached per org
+	// to avoid redundant pgx roundtrips on every worker activation — once the
+	// metadata store is checked, its version won't change (migration is
+	// irreversible, and the first migrating worker upgrades it).
+	if cached, ok := a.migrationChecked.Load(payload.OrgID); ok {
+		if cached.(bool) {
+			payload.DuckLake.Migrate = true
+		}
+	} else {
+		// First activation for this org — run the check in the control plane.
+		// The backup file is written to os.TempDir() since the CP may not have
+		// a persistent /data mount.
+		if needed, err := server.CheckAndBackupDuckLakeMigration(payload.DuckLake, os.TempDir()); err != nil {
+			slog.Warn("DuckLake migration check failed, proceeding without migration.",
+				"org", payload.OrgID, "error", err)
+		} else {
+			a.migrationChecked.Store(payload.OrgID, needed)
+			if needed {
+				payload.DuckLake.Migrate = true
+			}
+		}
 	}
-	return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
-		OrgID:          payload.OrgID,
-		LeaseExpiresAt: payload.LeaseExpiresAt,
-		DuckLake:       payload.DuckLake,
-	})
+
+	// Block new connections for this org while the migration runs.
+	// The first worker to activate will perform the schema upgrade;
+	// subsequent connections would fail against a partially-migrated catalog.
+	if payload.DuckLake.Migrate && a.setMigrating != nil {
+		a.setMigrating(payload.OrgID)
+	}
+
+	activate := func() error {
+		if a.activateReservedWorker != nil {
+			return a.activateReservedWorker(ctx, worker, payload)
+		}
+		return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
+			OrgID:          payload.OrgID,
+			LeaseExpiresAt: payload.LeaseExpiresAt,
+			DuckLake:       payload.DuckLake,
+		})
+	}
+
+	err = activate()
+
+	// Clear the migration lock after the worker finishes activation
+	// (whether it succeeded or failed). New connections can proceed.
+	if payload.DuckLake.Migrate {
+		if a.clearMigrating != nil {
+			a.clearMigrating(payload.OrgID)
+		}
+		if err == nil {
+			// Migration succeeded — update cache so future workers for this
+			// org skip the check and don't set AUTOMATIC_MIGRATION.
+			a.migrationChecked.Store(payload.OrgID, false)
+		}
+	}
+
+	return err
 }
 
 func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org *configstore.OrgConfig, assignment *WorkerAssignment) (TenantActivationPayload, error) {
