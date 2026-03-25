@@ -143,9 +143,9 @@ func SetupMultiTenant(
 
 	// Initialize STS broker for credential brokering (best-effort)
 	var stsBroker *STSBroker
-	if cfg.K8s.AWSAccountID != "" {
+	if cfg.K8s.AWSRegion != "" {
 		var err error
-		stsBroker, err = NewSTSBroker(context.Background(), cfg.K8s.AWSRegion, cfg.K8s.AWSAccountID)
+		stsBroker, err = NewSTSBroker(context.Background(), cfg.K8s.AWSRegion)
 		if err != nil {
 			slog.Warn("STS broker unavailable, workers will use pod identity for S3.", "error", err)
 		}

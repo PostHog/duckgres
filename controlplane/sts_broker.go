@@ -19,8 +19,7 @@ const (
 
 // STSBroker brokers short-lived AWS credentials by assuming per-org IAM roles.
 type STSBroker struct {
-	client    *sts.Client
-	accountID string
+	client *sts.Client
 }
 
 // AssumedCredentials holds the temporary credentials from STS AssumeRole.
@@ -32,8 +31,7 @@ type AssumedCredentials struct {
 }
 
 // NewSTSBroker creates an STS broker using the control plane's own credentials.
-// accountID is the AWS account ID used to construct deterministic role ARNs.
-func NewSTSBroker(ctx context.Context, region, accountID string) (*STSBroker, error) {
+func NewSTSBroker(ctx context.Context, region string) (*STSBroker, error) {
 	opts := []func(*awsconfig.LoadOptions) error{}
 	if region != "" {
 		opts = append(opts, awsconfig.WithRegion(region))
@@ -43,14 +41,8 @@ func NewSTSBroker(ctx context.Context, region, accountID string) (*STSBroker, er
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
 	return &STSBroker{
-		client:    sts.NewFromConfig(cfg),
-		accountID: accountID,
+		client: sts.NewFromConfig(cfg),
 	}, nil
-}
-
-// RoleARNForOrg returns the deterministic IAM role ARN for an org.
-func (b *STSBroker) RoleARNForOrg(orgID string) string {
-	return fmt.Sprintf("arn:aws:iam::%s:role/duckling-%s", b.accountID, orgID)
 }
 
 // AssumeRole mints short-lived credentials for the given IAM role ARN.

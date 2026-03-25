@@ -239,7 +239,6 @@ func main() {
 	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "ServiceAccount name for K8s worker pods (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 	k8sMaxWorkers := flag.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=auto-derived (env: DUCKGRES_K8S_MAX_WORKERS)")
 	k8sSharedWarmTarget := flag.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
-	awsAccountID := flag.String("aws-account-id", "", "AWS account ID for STS credential brokering (env: DUCKGRES_AWS_ACCOUNT_ID)")
 	awsRegion := flag.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
 
 	// Config store flags (multi-tenant mode)
@@ -304,7 +303,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_ACCOUNT_ID     AWS account ID for STS credential brokering\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
@@ -418,7 +416,6 @@ func main() {
 		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
 		K8sMaxWorkers:             *k8sMaxWorkers,
 		K8sSharedWarmTarget:       *k8sSharedWarmTarget,
-		AWSAccountID:              *awsAccountID,
 		AWSRegion:                 *awsRegion,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
@@ -564,8 +561,7 @@ func main() {
 				ServiceAccount:    resolved.K8sWorkerServiceAccount,
 				MaxWorkers:        resolved.K8sMaxWorkers,
 				SharedWarmTarget:  resolved.K8sSharedWarmTarget,
-				AWSAccountID:      resolved.AWSAccountID,
-				AWSRegion:         resolved.AWSRegion,
+				AWSRegion: resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

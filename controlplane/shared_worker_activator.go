@@ -113,9 +113,6 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 		dl.S3SecretKey = secretKey
 	case strings.EqualFold(warehouse.S3.Provider, "aws"):
 		roleARN := warehouse.WorkerIdentity.IAMRoleARN
-		if roleARN == "" && a.stsBroker != nil {
-			roleARN = a.stsBroker.RoleARNForOrg(orgName(org))
-		}
 		if roleARN != "" && a.stsBroker != nil {
 			creds, err := a.stsBroker.AssumeRole(ctx, roleARN)
 			if err != nil {

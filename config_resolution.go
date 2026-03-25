@@ -52,7 +52,6 @@ type configCLIInputs struct {
 	K8sWorkerServiceAccount   string
 	K8sMaxWorkers             int
 	K8sSharedWarmTarget       int
-	AWSAccountID              string
 	AWSRegion                 string
 	QueryLog                  bool
 }
@@ -75,7 +74,6 @@ type resolvedConfig struct {
 	K8sWorkerServiceAccount  string
 	K8sMaxWorkers            int
 	K8sSharedWarmTarget      int
-	AWSAccountID             string
 	AWSRegion                string
 	ConfigStoreConn          string
 	ConfigPollInterval       time.Duration
@@ -133,7 +131,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
 	var k8sMaxWorkers, k8sSharedWarmTarget int
-	var awsAccountID string
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -635,9 +632,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_K8S_SHARED_WARM_TARGET: " + err.Error())
 		}
 	}
-	if v := getenv("DUCKGRES_AWS_ACCOUNT_ID"); v != "" {
-		awsAccountID = v
-	}
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
 		awsRegion = v
 	}
@@ -838,9 +832,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["k8s-shared-warm-target"] {
 		k8sSharedWarmTarget = cli.K8sSharedWarmTarget
 	}
-	if cli.Set["aws-account-id"] {
-		awsAccountID = cli.AWSAccountID
-	}
 	if cli.Set["aws-region"] {
 		awsRegion = cli.AWSRegion
 	}
@@ -913,7 +904,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
 		K8sMaxWorkers:            k8sMaxWorkers,
 		K8sSharedWarmTarget:      k8sSharedWarmTarget,
-		AWSAccountID:             awsAccountID,
 		AWSRegion:                awsRegion,
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
