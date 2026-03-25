@@ -33,6 +33,10 @@ func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManage
 	return stack.Pool, stack.Sessions, stack.Rebalancer, true
 }
 
+func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
+	return a.router.IsMigrating(orgID)
+}
+
 func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }

@@ -17,7 +17,8 @@ func (m *mockOrgRouter) StackForOrg(_ string) (WorkerPool, *SessionManager, *Mem
 	return nil, m.sessions, m.rebalancer, m.ok
 }
 
-func (m *mockOrgRouter) ShutdownAll() {}
+func (m *mockOrgRouter) IsMigratingForOrg(_ string) bool { return false }
+func (m *mockOrgRouter) ShutdownAll()                              {}
 
 func TestOrgRoutedSessionProviderCreateSessionTeamNotFound(t *testing.T) {
 	provider := &orgRoutedSessionProvider{

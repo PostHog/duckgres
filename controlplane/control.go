@@ -129,6 +129,7 @@ type ConfigStoreInterface interface {
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
+	IsMigratingForOrg(orgID string) bool
 	ShutdownAll()
 }
 
@@ -603,6 +604,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Require SSL
 	if !params.sslRequest {
+		if params.startupMessage {
+			// Client sent a v3.0 startup without negotiating SSL (e.g. sslmode=disable).
+			// Send a PostgreSQL error so the client sees a clear message.
+			_ = server.WriteErrorResponse(conn, "FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
+		}
 		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
 		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 		_ = conn.Close()
@@ -738,6 +744,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	var sessions *SessionManager
 	var rebalancer *MemoryRebalancer
 	if cp.orgRouter != nil {
+		// Reject connections during DuckLake migration to prevent queries from
+		// hitting a partially-migrated catalog. The client gets a clear error
+		// and can retry after the migration completes.
+		if cp.orgRouter.IsMigratingForOrg(sniOrgID) {
+			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", sniOrgID, "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+				"DuckLake catalog upgrade in progress for your organization, please retry in a few moments")
+			_ = writer.Flush()
+			return
+		}
+
 		_, sess, rebal, ok := cp.orgRouter.StackForOrg(sniOrgID)
 		if !ok {
 			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
@@ -825,6 +842,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 type startupResult struct {
 	sslRequest      bool
 	gssRequest      bool
+	startupMessage  bool // true when the client sent a v3.0 startup (no SSL negotiation)
 	cancelRequest   bool
 	cancelPid       int32
 	cancelSecretKey int32
@@ -877,6 +895,12 @@ func readStartupFromRaw(conn net.Conn) (startupResult, error) {
 				return startupResult{}, fmt.Errorf("write GSSENC decline: %w", err)
 			}
 			continue
+		}
+
+		// Protocol version 3.0 — client sent a startup message without
+		// negotiating SSL first (e.g. sslmode=disable).
+		if protocolVersion == 196608 {
+			return startupResult{startupMessage: true}, nil
 		}
 
 		return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)

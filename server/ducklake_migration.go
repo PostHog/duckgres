@@ -79,6 +79,18 @@ func duckLakeMigrationCheckedVersion() string {
 	return dlMigration.checkedV
 }
 
+// CheckAndBackupDuckLakeMigration runs the migration check for the given
+// DuckLake config and returns whether migration is needed. If migration is
+// needed, it backs up the metadata store first. This is exported for use by
+// the control plane, which runs the check once before activating workers.
+func CheckAndBackupDuckLakeMigration(dlCfg DuckLakeConfig, dataDir string) (bool, error) {
+	if dlCfg.MetadataStore == "" {
+		return false, nil
+	}
+	needed, _, err := checkAndBackupIfNeeded(dlCfg, dataDir)
+	return needed, err
+}
+
 // parseDuckLakeVersion parses a DuckLake version string like "0.3" into
 // (major, minor) integers for reliable numeric comparison.
 // Returns (0, 0, err) if the string cannot be parsed.

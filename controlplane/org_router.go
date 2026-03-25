@@ -37,6 +37,11 @@ type OrgRouter struct {
 	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
 	nextWorkerID          atomic.Int32
 	sharedCancel          context.CancelFunc
+
+	// migrating tracks which orgs have a DuckLake migration in progress.
+	// During migration, new connections for the org are rejected with a
+	// retry-friendly error instead of timing out waiting for a worker.
+	migrating sync.Map // orgID (string) → struct{}
 }
 
 // NewOrgRouter creates an OrgRouter from the initial config snapshot.
@@ -116,6 +121,8 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		return org, nil
 	})
 	activator.resolveDucklingStatus = tr.resolveDucklingStatus
+	activator.setMigrating = tr.SetMigrating
+	activator.clearMigrating = tr.ClearMigrating
 	pool.activateReservedWorker = activator.ActivateReservedWorker
 	rebalancer := NewMemoryRebalancer(uint64(memoryBudget), 0, nil, tr.globalCfg.MemoryRebalance)
 	sessions := NewSessionManager(pool, rebalancer)
@@ -180,6 +187,25 @@ func (tr *OrgRouter) StackForOrg(orgID string) (*OrgStack, bool) {
 	tr.mu.RUnlock()
 	return stack, ok
 }
+
+// SetMigrating marks an org as having a DuckLake migration in progress.
+func (tr *OrgRouter) SetMigrating(orgID string) {
+	tr.migrating.Store(orgID, struct{}{})
+	slog.Info("DuckLake migration started for org.", "org", orgID)
+}
+
+// ClearMigrating marks an org's DuckLake migration as complete.
+func (tr *OrgRouter) ClearMigrating(orgID string) {
+	tr.migrating.Delete(orgID)
+	slog.Info("DuckLake migration completed for org.", "org", orgID)
+}
+
+// IsMigrating returns true if the org has a DuckLake migration in progress.
+func (tr *OrgRouter) IsMigrating(orgID string) bool {
+	_, ok := tr.migrating.Load(orgID)
+	return ok
+}
+
 
 // HandleConfigChange reconciles org stacks when the config snapshot changes.
 func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
