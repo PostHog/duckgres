@@ -15,7 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/duckdb/duckdb-go/mapping"
+	bindings "github.com/duckdb/duckdb-go-bindings"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -151,8 +151,8 @@ func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionSer
 			continue
 		}
 
-		qp := mapping.QueryProgress(session.duckdbConn)
-		pct, rows, total := mapping.QueryProgressTypeMembers(&qp)
+		qp := bindings.QueryProgress(session.duckdbConn)
+		pct, rows, total := bindings.QueryProgressTypeMembers(&qp)
 
 		// Use truncated token as key to avoid leaking full bearer tokens
 		// in the health check JSON response. 16 hex chars = 8 bytes of entropy,

@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/duckdb/duckdb-go/mapping"
+	bindings "github.com/duckdb/duckdb-go-bindings"
 	_ "github.com/duckdb/duckdb-go/v2"
 )
 
@@ -31,8 +31,8 @@ func TestExtractDuckDBConnection(t *testing.T) {
 	}
 
 	// QueryProgress should return -1 percentage when no query is running.
-	qp := mapping.QueryProgress(duckConn)
-	pct, _, _ := mapping.QueryProgressTypeMembers(&qp)
+	qp := bindings.QueryProgress(duckConn)
+	pct, _, _ := bindings.QueryProgressTypeMembers(&qp)
 	if pct != -1 {
 		t.Errorf("expected percentage -1 when idle, got %f", pct)
 	}
