@@ -681,7 +681,7 @@ func (c *clientConn) handleStartup() error {
 
 		// Reject non-TLS connections
 		if !tlsUpgraded {
-			c.sendError("FATAL", "28000", "SSL/TLS connection required")
+			c.sendError("FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
 			return fmt.Errorf("client did not request SSL")
 		}
 
