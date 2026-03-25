@@ -13,6 +13,7 @@ RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VER
 
 FROM debian:bookworm-slim
 
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
 
 WORKDIR /app
