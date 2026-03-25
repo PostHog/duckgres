@@ -185,27 +185,28 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	// K8s workloads (namespace, deployment, service) are managed by the duckgres Helm chart.
 	updates := map[string]interface{}{}
 
-	if status.BucketName != "" && w.S3State != configstore.ManagedWarehouseStateReady {
+	if status.DataStore.BucketName != "" && w.S3State != configstore.ManagedWarehouseStateReady {
 		updates["s3_state"] = configstore.ManagedWarehouseStateReady
-		updates["s3_bucket"] = status.BucketName
+		updates["s3_bucket"] = status.DataStore.BucketName
 	}
 
-	if status.AuroraEndpoint != "" && w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
+	if status.MetadataStore.Endpoint != "" && w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
 		updates["metadata_store_state"] = configstore.ManagedWarehouseStateReady
-		updates["metadata_store_endpoint"] = status.AuroraEndpoint
+		updates["metadata_store_endpoint"] = status.MetadataStore.Endpoint
 		updates["metadata_store_port"] = 5432
-		updates["metadata_store_kind"] = "aurora"
+		updates["metadata_store_kind"] = status.MetadataStore.Type
 		updates["metadata_store_engine"] = "postgres"
+		updates["metadata_store_username"] = status.MetadataStore.User
+		updates["metadata_store_database_name"] = status.MetadataStore.Database
 	}
 
-	if status.AuroraPassword != "" && w.SecretsState != configstore.ManagedWarehouseStateReady {
+	if status.MetadataStore.Password != "" && w.SecretsState != configstore.ManagedWarehouseStateReady {
 		updates["secrets_state"] = configstore.ManagedWarehouseStateReady
 	}
 
-	// Crossplane Ready condition means all composed resources (Aurora, S3, IAM) are reconciled.
-	// We use this for the identity component (IAM role + pod identity association).
-	if status.ReadyCondition && w.IdentityState != configstore.ManagedWarehouseStateReady {
+	if status.IAMRoleARN != "" && w.IdentityState != configstore.ManagedWarehouseStateReady {
 		updates["identity_state"] = configstore.ManagedWarehouseStateReady
+		updates["worker_identity_iam_role_arn"] = status.IAMRoleARN
 	}
 
 	// Infrastructure is ready when S3, Aurora, secrets, and IAM are all provisioned.

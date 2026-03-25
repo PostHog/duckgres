@@ -25,9 +25,18 @@ const ducklingNamespace = "crossplane-system"
 // The Duckling composition provisions AWS infrastructure (Aurora, S3, IAM)
 // but not K8s workloads — those are managed by the duckgres Helm chart.
 type DucklingStatus struct {
-	BucketName         string
-	AuroraEndpoint     string
-	AuroraPassword     string
+	MetadataStore struct {
+		Type     string
+		Endpoint string
+		Password string
+		User     string
+		Database string
+	}
+	DataStore struct {
+		Type       string
+		BucketName string
+	}
+	IAMRoleARN         string
 	ReadyCondition     bool
 	SyncedFalseMessage string
 }
@@ -73,6 +82,9 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, minACU, maxAC
 						"maxACU": maxACU,
 					},
 				},
+				"dataStore": map[string]interface{}{
+					"type": "s3bucket",
+				},
 			},
 		},
 	}
@@ -109,9 +121,22 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 	}
 
 	ds := &DucklingStatus{
-		BucketName:     getNestedString(status, "bucketName"),
-		AuroraEndpoint: getNestedString(status, "auroraEndpoint"),
-		AuroraPassword: getNestedString(status, "auroraPassword"),
+		IAMRoleARN: getNestedString(status, "iamRoleArn"),
+	}
+
+	// Parse status.metadataStore
+	if md, ok := status["metadataStore"].(map[string]interface{}); ok {
+		ds.MetadataStore.Type = getNestedString(md, "type")
+		ds.MetadataStore.Endpoint = getNestedString(md, "endpoint")
+		ds.MetadataStore.Password = getNestedString(md, "password")
+		ds.MetadataStore.User = getNestedString(md, "user")
+		ds.MetadataStore.Database = getNestedString(md, "database")
+	}
+
+	// Parse status.dataStore
+	if store, ok := status["dataStore"].(map[string]interface{}); ok {
+		ds.DataStore.Type = getNestedString(store, "type")
+		ds.DataStore.BucketName = getNestedString(store, "bucketName")
 	}
 
 	// Parse conditions

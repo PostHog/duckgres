@@ -68,8 +68,14 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 			w.MetadataStore.Engine = v.(string)
 		case "identity_state":
 			w.IdentityState = v.(configstore.ManagedWarehouseProvisioningState)
+		case "worker_identity_iam_role_arn":
+			w.WorkerIdentity.IAMRoleARN = v.(string)
 		case "worker_identity_namespace":
 			w.WorkerIdentity.Namespace = v.(string)
+		case "metadata_store_username":
+			w.MetadataStore.Username = v.(string)
+		case "metadata_store_database_name":
+			w.MetadataStore.DatabaseName = v.(string)
 		case "secrets_state":
 			w.SecretsState = v.(configstore.ManagedWarehouseProvisioningState)
 		case "warehouse_database_state":
@@ -179,9 +185,18 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 				"namespace": ducklingNamespace,
 			},
 			"status": map[string]interface{}{
-				"bucketName":     "org-b-bucket",
-				"auroraEndpoint": "org-b.cluster.us-east-1.rds.amazonaws.com",
-				"auroraPassword": "supersecret123",
+				"metadataStore": map[string]interface{}{
+					"type":     "aurora",
+					"endpoint": "org-b.cluster.us-east-1.rds.amazonaws.com",
+					"password": "supersecret123",
+					"user":     "postgres",
+					"database": "postgres",
+				},
+				"dataStore": map[string]interface{}{
+					"type":       "s3bucket",
+					"bucketName": "org-b-bucket",
+				},
+				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-b",
 				"conditions": []interface{}{
 					map[string]interface{}{
 						"type":   "Ready",
@@ -218,6 +233,15 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	}
 	if w.MetadataStore.Port != 5432 {
 		t.Fatalf("expected aurora port 5432, got %d", w.MetadataStore.Port)
+	}
+	if w.MetadataStore.Username != "postgres" {
+		t.Fatalf("expected username postgres, got %q", w.MetadataStore.Username)
+	}
+	if w.MetadataStore.DatabaseName != "postgres" {
+		t.Fatalf("expected database_name postgres, got %q", w.MetadataStore.DatabaseName)
+	}
+	if w.WorkerIdentity.IAMRoleARN != "arn:aws:iam::123456789012:role/duckling-org-b" {
+		t.Fatalf("expected IAM role ARN, got %q", w.WorkerIdentity.IAMRoleARN)
 	}
 	if w.ReadyAt == nil {
 		t.Fatal("expected ready_at to be set")
@@ -321,7 +345,7 @@ func TestParseDucklingStatusEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if status.BucketName != "" || status.AuroraEndpoint != "" || status.AuroraPassword != "" {
+	if status.DataStore.BucketName != "" || status.MetadataStore.Endpoint != "" || status.MetadataStore.Password != "" {
 		t.Fatal("expected empty status for CR without status field")
 	}
 }
