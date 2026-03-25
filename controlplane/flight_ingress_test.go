@@ -19,20 +19,6 @@ func (m *mockOrgRouter) StackForOrg(_ string) (WorkerPool, *SessionManager, *Mem
 
 func (m *mockOrgRouter) ShutdownAll() {}
 
-// mockConfigStore implements ConfigStoreInterface for testing.
-type mockConfigStore struct {
-	orgID string
-	ok    bool
-}
-
-func (m *mockConfigStore) ValidateOrgUser(_, _, _ string) bool {
-	return m.ok
-}
-
-func (m *mockConfigStore) FindAndValidateUser(_, _ string) (string, bool) {
-	return m.orgID, m.ok
-}
-
 func TestOrgRoutedSessionProviderCreateSessionTeamNotFound(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{ok: false},
