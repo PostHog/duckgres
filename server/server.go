@@ -380,6 +380,12 @@ func New(cfg Config) (*Server, error) {
 		slog.Info("Idle timeout disabled.")
 	}
 
+	// Run DuckLake migration check before initializing query logger and checkpointer,
+	// since they both attach DuckLake and need to know if migration is required.
+	if cfg.DuckLake.MetadataStore != "" {
+		ensureDuckLakeMigrationCheck(cfg.DuckLake, cfg.DataDir)
+	}
+
 	// Initialize query logger (non-fatal on error)
 	if ql, err := NewQueryLogger(cfg); err != nil {
 		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)

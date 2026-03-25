@@ -67,6 +67,8 @@ func ensureDuckLakeMigrationCheck(dlCfg DuckLakeConfig, dataDir string) {
 // duckLakeMigrationNeeded returns whether the ATTACH statement should include
 // AUTOMATIC_MIGRATION TRUE. Safe to call after ensureDuckLakeMigrationCheck.
 func duckLakeMigrationNeeded() bool {
+	dlMigration.mu.Lock()
+	defer dlMigration.mu.Unlock()
 	return dlMigration.needed && dlMigration.err == nil
 }
 
@@ -174,8 +176,17 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
+	// Use a REPEATABLE READ transaction to guarantee a consistent snapshot
+	// across all tables. Without this, concurrent writes could produce an
+	// inconsistent backup.
+	tx, err := pgDB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin backup transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	// Discover all ducklake_* tables.
-	rows, err := pgDB.QueryContext(ctx,
+	rows, err := tx.QueryContext(ctx,
 		"SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'ducklake_%' ORDER BY table_name")
 	if err != nil {
 		return fmt.Errorf("list ducklake tables: %w", err)
@@ -210,10 +221,13 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 	if err != nil {
 		return fmt.Errorf("create backup file %s: %w", backupPath, err)
 	}
-	closed := false
+	success := false
 	defer func() {
-		if !closed {
-			_ = f.Close()
+		_ = f.Close()
+		if !success {
+			// Remove partial backup file on error to avoid confusion about
+			// whether the backup is complete.
+			_ = os.Remove(backupPath)
 		}
 	}()
 
@@ -233,7 +247,7 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 
 	totalRows := 0
 	for _, table := range tables {
-		count, err := backupTable(ctx, pgDB, f, table)
+		count, err := backupTable(ctx, tx, f, table)
 		if err != nil {
 			return fmt.Errorf("backup table %s: %w", table, err)
 		}
@@ -249,10 +263,7 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 		return fmt.Errorf("fsync backup file: %w", err)
 	}
 
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close backup file: %w", err)
-	}
-	closed = true
+	success = true
 
 	info, _ := os.Stat(backupPath)
 	sizeMB := float64(0)
@@ -277,9 +288,9 @@ func quoteIdent(name string) string {
 
 // backupTable writes CREATE TABLE and INSERT statements for a single table.
 // Returns the number of rows backed up.
-func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (int, error) {
+func backupTable(ctx context.Context, tx *sql.Tx, f *os.File, table string) (int, error) {
 	// Get column definitions.
-	colRows, err := pgDB.QueryContext(ctx,
+	colRows, err := tx.QueryContext(ctx,
 		"SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position", table)
 	if err != nil {
 		return 0, fmt.Errorf("get columns: %w", err)
@@ -341,7 +352,7 @@ func backupTable(ctx context.Context, pgDB *sql.DB, f *os.File, table string) (i
 	quotedColList := strings.Join(quotedColNames, ", ")
 
 	// Query all rows.
-	dataRows, err := pgDB.QueryContext(ctx,
+	dataRows, err := tx.QueryContext(ctx,
 		fmt.Sprintf("SELECT %s FROM %s", quotedColList, quotedTable))
 	if err != nil {
 		return 0, fmt.Errorf("select data: %w", err)
