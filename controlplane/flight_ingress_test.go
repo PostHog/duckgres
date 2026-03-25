@@ -13,16 +13,31 @@ type mockOrgRouter struct {
 	ok         bool
 }
 
-func (m *mockOrgRouter) StackForUser(_ string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
+func (m *mockOrgRouter) StackForOrg(_ string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	return nil, m.sessions, m.rebalancer, m.ok
 }
 
 func (m *mockOrgRouter) ShutdownAll() {}
 
+// mockConfigStore implements ConfigStoreInterface for testing.
+type mockConfigStore struct {
+	orgID string
+	ok    bool
+}
+
+func (m *mockConfigStore) ValidateOrgUser(_, _, _ string) bool {
+	return m.ok
+}
+
+func (m *mockConfigStore) FindAndValidateUser(_, _ string) (string, bool) {
+	return m.orgID, m.ok
+}
+
 func TestOrgRoutedSessionProviderCreateSessionTeamNotFound(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
-		orgRouter: &mockOrgRouter{ok: false},
+		orgRouter:  &mockOrgRouter{ok: false},
 		pidSession: make(map[int32]*SessionManager),
+		userOrg:    make(map[string]string),
 	}
 
 	_, _, err := provider.CreateSession(context.Background(), "unknown", 0, "", 0)
@@ -38,10 +53,9 @@ func TestOrgRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
 	provider := &orgRoutedSessionProvider{
-		orgRouter: &mockOrgRouter{sessions: sm, ok: true},
-		pidSession: map[int32]*SessionManager{
-			42: sm,
-		},
+		orgRouter:  &mockOrgRouter{sessions: sm, ok: true},
+		pidSession: map[int32]*SessionManager{42: sm},
+		userOrg:    make(map[string]string),
 	}
 
 	// Destroy known pid — should remove from map.
@@ -59,8 +73,9 @@ func TestOrgRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 
 func TestOrgRoutedSessionProviderDestroyUnknownPidNoOp(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
-		orgRouter: &mockOrgRouter{ok: true},
+		orgRouter:  &mockOrgRouter{ok: true},
 		pidSession: make(map[int32]*SessionManager),
+		userOrg:    make(map[string]string),
 	}
 
 	// Should not panic.
@@ -71,8 +86,9 @@ func TestOrgRoutedSessionProviderConcurrentDestroys(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
 	provider := &orgRoutedSessionProvider{
-		orgRouter: &mockOrgRouter{sessions: sm, ok: true},
+		orgRouter:  &mockOrgRouter{sessions: sm, ok: true},
 		pidSession: make(map[int32]*SessionManager),
+		userOrg:    make(map[string]string),
 	}
 
 	// Pre-populate

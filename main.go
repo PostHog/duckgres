@@ -242,6 +242,7 @@ func main() {
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := flag.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
 	internalSecret := flag.String("internal-secret", "", "Shared secret for API authentication (env: DUCKGRES_INTERNAL_SECRET)")
+	warehouseDomain := flag.String("warehouse-domain", "", "Base domain for SNI-based per-org routing, e.g. warehouse.posthog.com (env: DUCKGRES_WAREHOUSE_DOMAIN)")
 
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -298,6 +299,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_WAREHOUSE_DOMAIN   Base domain for SNI per-org routing (e.g. warehouse.posthog.com)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
@@ -402,6 +404,7 @@ func main() {
 		ConfigStoreConn:           *configStore,
 		ConfigPollInterval:        *configPollInterval,
 		InternalSecret:            *internalSecret,
+		WarehouseDomain:           *warehouseDomain,
 		WorkerBackend:             *workerBackend,
 		K8sWorkerImage:            *k8sWorkerImage,
 		K8sWorkerNamespace:        *k8sWorkerNamespace,
@@ -547,6 +550,7 @@ func main() {
 			ConfigStoreConn:      resolved.ConfigStoreConn,
 			ConfigPollInterval:   resolved.ConfigPollInterval,
 			InternalSecret:       resolved.InternalSecret,
+			WarehouseDomain:     resolved.WarehouseDomain,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:       resolved.K8sWorkerImage,
 				WorkerNamespace:   resolved.K8sWorkerNamespace,

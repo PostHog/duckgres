@@ -173,13 +173,8 @@ func (tr *OrgRouter) DestroyOrgStack(orgID string) {
 	}
 }
 
-// StackForUser resolves a username to its org stack.
-func (tr *OrgRouter) StackForUser(username string) (*OrgStack, bool) {
-	orgID := tr.configStore.OrgForUser(username)
-	if orgID == "" {
-		return nil, false
-	}
-
+// StackForOrg resolves an orgID directly to its org stack.
+func (tr *OrgRouter) StackForOrg(orgID string) (*OrgStack, bool) {
 	tr.mu.RLock()
 	stack, ok := tr.orgs[orgID]
 	tr.mu.RUnlock()

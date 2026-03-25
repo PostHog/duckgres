@@ -168,7 +168,6 @@ SET warehouse_database_region = EXCLUDED.warehouse_database_region,
 
 INSERT INTO duckgres_org_users (username, password, org_id, created_at, updated_at)
 VALUES ('postgres', '$2a$10$TQyt73Vw91Q1d7YcE86EVuhms/0u4qBydMDyVvZYlqDwc3/VtQAbm', 'local', NOW(), NOW())
-ON CONFLICT (username) DO UPDATE
+ON CONFLICT (org_id, username) DO UPDATE
 SET password = EXCLUDED.password,
-    org_id = EXCLUDED.org_id,
     updated_at = NOW();

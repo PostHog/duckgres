@@ -62,6 +62,10 @@ type ControlPlaneConfig struct {
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
 
+	// WarehouseDomain is the base domain for SNI-based per-org routing.
+	// Connections to {orgID}.{WarehouseDomain} are routed to that org.
+	// Required for multi-tenant mode.
+	WarehouseDomain string
 }
 
 type ProcessConfig struct {
@@ -118,13 +122,13 @@ type ControlPlane struct {
 // ConfigStoreInterface abstracts the config store for the control plane.
 // Defined here to avoid circular imports with the configstore package.
 type ConfigStoreInterface interface {
-	ValidateUser(username, password string) (orgID string, ok bool)
-	OrgForUser(username string) string
+	ValidateOrgUser(orgID, username, password string) bool
+	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no SNI)
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
-	StackForUser(username string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
+	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	ShutdownAll()
 }
 
@@ -532,6 +536,23 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 	}
 }
 
+// extractOrgFromSNI parses the org identifier from the TLS ServerName.
+// "acme.warehouse.posthog.com" with base "warehouse.posthog.com" returns ("acme", true).
+func extractOrgFromSNI(serverName, baseDomain string) (string, bool) {
+	if baseDomain == "" || serverName == "" {
+		return "", false
+	}
+	suffix := "." + baseDomain
+	if !strings.HasSuffix(serverName, suffix) {
+		return "", false
+	}
+	orgID := strings.TrimSuffix(serverName, suffix)
+	if orgID == "" || strings.Contains(orgID, ".") {
+		return "", false
+	}
+	return orgID, true
+}
+
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
@@ -613,6 +634,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("TLS connection established.", "remote_addr", remoteAddr)
 	defer func() { _ = tlsConn.Close() }()
 
+	// Extract org from SNI hostname
+	var sniOrgID string
+	if cp.cfg.WarehouseDomain != "" {
+		sniOrgID, _ = extractOrgFromSNI(tlsConn.ConnectionState().ServerName, cp.cfg.WarehouseDomain)
+	}
+
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
 		slog.Error("Failed to clear TLS deadline.", "remote_addr", remoteAddr, "error", err)
 		return
@@ -665,11 +692,16 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	password := string(bytes.TrimRight(body, "\x00"))
 
-	// Authenticate: use config store (multi-tenant) or YAML users (single-tenant)
+	// Authenticate
 	if cp.configStore != nil {
-		orgID, ok := cp.configStore.ValidateUser(username, password)
-		if !ok {
-			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
+		if sniOrgID == "" {
+			slog.Warn("Connection rejected: no org in SNI hostname.", "server_name", tlsConn.ConnectionState().ServerName, "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "connection requires a valid org hostname")
+			_ = writer.Flush()
+			return
+		}
+		if !cp.configStore.ValidateOrgUser(sniOrgID, username, password) {
+			slog.Warn("Authentication failed.", "user", username, "org", sniOrgID, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
 				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
@@ -678,8 +710,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
-		_ = orgID // used for routing below
 	} else {
+		// Single-tenant: static users map
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
 			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
@@ -706,7 +738,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	var sessions *SessionManager
 	var rebalancer *MemoryRebalancer
 	if cp.orgRouter != nil {
-		_, sess, rebal, ok := cp.orgRouter.StackForUser(username)
+		_, sess, rebal, ok := cp.orgRouter.StackForOrg(sniOrgID)
 		if !ok {
 			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
 			_ = writer.Flush()
@@ -1120,14 +1152,23 @@ func (cp *ControlPlane) startFlightIngress() {
 	switch {
 	case cp.configStore != nil && cp.orgRouter != nil:
 		// Multi-tenant: auth via config store, sessions routed per-org.
+		// Flight SQL doesn't have SNI, so we scan orgs to find the user.
+		orgProvider := &orgRoutedSessionProvider{
+			orgRouter:   cp.orgRouter,
+			configStore: cp.configStore,
+			pidSession:  make(map[int32]*SessionManager),
+			userOrg:     make(map[string]string),
+		}
 		validator = flightsqlingress.FuncCredentialValidator(func(username, password string) bool {
-			_, ok := cp.configStore.ValidateUser(username, password)
+			orgID, ok := cp.configStore.FindAndValidateUser(username, password)
+			if ok {
+				orgProvider.mu.Lock()
+				orgProvider.userOrg[username] = orgID
+				orgProvider.mu.Unlock()
+			}
 			return ok
 		})
-		provider = &orgRoutedSessionProvider{
-			orgRouter: cp.orgRouter,
-			pidSession: make(map[int32]*SessionManager),
-		}
+		provider = orgProvider
 	case cp.sessions != nil:
 		// Single-tenant: static users map, single session manager.
 		validator = &flightsqlingress.MapCredentialValidator{Users: cp.cfg.Users}

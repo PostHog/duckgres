@@ -18,9 +18,9 @@ func (Org) TableName() string { return "duckgres_orgs" }
 
 // OrgUser maps a username to an org with credentials.
 type OrgUser struct {
+	OrgID     string    `gorm:"primaryKey;size:255" json:"org_id"`
 	Username  string    `gorm:"primaryKey;size:255" json:"username"`
 	Password  string    `gorm:"size:255;not null" json:"-"`
-	OrgID     string    `gorm:"size:255;not null;index" json:"org_id"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

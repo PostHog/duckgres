@@ -13,15 +13,20 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+// OrgUserKey is the composite key for org-scoped user lookups.
+type OrgUserKey struct {
+	OrgID    string
+	Username string
+}
+
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
-	Orgs         map[string]*OrgConfig
-	UserOrg      map[string]string // username -> org name
-	UserPassword map[string]string // username -> password
-	Global       GlobalConfig
-	DuckLake     DuckLakeConfig
-	RateLimit    RateLimitConfig
-	QueryLog     QueryLogConfig
+	Orgs            map[string]*OrgConfig
+	OrgUserPassword map[OrgUserKey]string // (orgID, username) -> bcrypt hash
+	Global          GlobalConfig
+	DuckLake        DuckLakeConfig
+	RateLimit       RateLimitConfig
+	QueryLog        QueryLogConfig
 }
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
@@ -45,6 +50,12 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	})
 	if err != nil {
 		return nil, fmt.Errorf("connect to config store: %w", err)
+	}
+
+	// Migrate OrgUser PK from (username) to (org_id, username) if needed.
+	// GORM AutoMigrate cannot alter primary keys, so we do it manually.
+	if err := migrateOrgUserPK(db); err != nil {
+		return nil, fmt.Errorf("migrate org user PK: %w", err)
 	}
 
 	// Auto-migrate all models
@@ -78,7 +89,7 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	}
 	cs.snapshot = snap
 
-	slog.Info("Config store connected.", "orgs", len(snap.Orgs), "users", len(snap.UserOrg))
+	slog.Info("Config store connected.", "orgs", len(snap.Orgs), "users", len(snap.OrgUserPassword))
 	return cs, nil
 }
 
@@ -135,13 +146,12 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	cs.db.First(&queryLog, 1)
 
 	snap := &Snapshot{
-		Orgs:         make(map[string]*OrgConfig),
-		UserOrg:      make(map[string]string),
-		UserPassword: make(map[string]string),
-		Global:       global,
-		DuckLake:     duckLake,
-		RateLimit:    rateLimit,
-		QueryLog:     queryLog,
+		Orgs:            make(map[string]*OrgConfig),
+		OrgUserPassword: make(map[OrgUserKey]string),
+		Global:          global,
+		DuckLake:        duckLake,
+		RateLimit:       rateLimit,
+		QueryLog:        queryLog,
 	}
 
 	for _, o := range orgs {
@@ -155,8 +165,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		}
 		for _, u := range o.Users {
 			oc.Users[u.Username] = u.Password
-			snap.UserOrg[u.Username] = o.Name
-			snap.UserPassword[u.Username] = u.Password
+			snap.OrgUserPassword[OrgUserKey{OrgID: o.Name, Username: u.Username}] = u.Password
 		}
 		snap.Orgs[o.Name] = oc
 	}
@@ -171,24 +180,40 @@ func (cs *ConfigStore) Snapshot() *Snapshot {
 	return cs.snapshot
 }
 
-// ValidateUser checks username/password against the cached snapshot.
-// Passwords are compared using bcrypt. Returns the org name and whether auth succeeded.
-func (cs *ConfigStore) ValidateUser(username, password string) (string, bool) {
+// ValidateOrgUser checks username/password scoped to a specific org.
+func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return false
+	}
+	storedHash, ok := cs.snapshot.OrgUserPassword[OrgUserKey{OrgID: orgID, Username: username}]
+	if !ok {
+		// Spend time on a dummy bcrypt compare to avoid timing leaks on username enumeration.
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil
+}
+
+// FindAndValidateUser scans all orgs to find and authenticate a user by username/password.
+// This is used for Flight SQL which doesn't have SNI-based org routing.
+func (cs *ConfigStore) FindAndValidateUser(username, password string) (string, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if cs.snapshot == nil {
 		return "", false
 	}
-	storedHash, ok := cs.snapshot.UserPassword[username]
-	if !ok {
-		// Spend time on a dummy bcrypt compare to avoid timing leaks on username enumeration.
-		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
-		return "", false
+	for key, storedHash := range cs.snapshot.OrgUserPassword {
+		if key.Username == username {
+			if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil {
+				return key.OrgID, true
+			}
+			return "", false
+		}
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)); err != nil {
-		return "", false
-	}
-	return cs.snapshot.UserOrg[username], true
+	_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+	return "", false
 }
 
 // HashPassword hashes a plaintext password using bcrypt.
@@ -198,16 +223,6 @@ func HashPassword(password string) (string, error) {
 		return "", fmt.Errorf("hash password: %w", err)
 	}
 	return string(hash), nil
-}
-
-// OrgForUser returns the org name for a user, or "" if not found.
-func (cs *ConfigStore) OrgForUser(username string) string {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	if cs.snapshot == nil {
-		return ""
-	}
-	return cs.snapshot.UserOrg[username]
 }
 
 // OnChange registers a callback that fires when the config snapshot changes.
@@ -240,6 +255,27 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
 	}
 	return nil
+}
+
+func migrateOrgUserPK(db *gorm.DB) error {
+	// Check if the PK already has 2 columns (idempotent)
+	var count int64
+	db.Raw(`
+		SELECT COUNT(*) FROM information_schema.key_column_usage
+		WHERE table_name = 'duckgres_org_users'
+		AND constraint_name = 'duckgres_org_users_pkey'
+	`).Scan(&count)
+	if count >= 2 {
+		return nil // Already migrated
+	}
+	if count == 0 {
+		return nil // Table doesn't exist yet, AutoMigrate will create it
+	}
+	// Migrate: drop old single-column PK, add composite PK
+	return db.Exec(`
+		ALTER TABLE duckgres_org_users DROP CONSTRAINT duckgres_org_users_pkey;
+		ALTER TABLE duckgres_org_users ADD PRIMARY KEY (org_id, username);
+	`).Error
 }
 
 // DB exposes the GORM database for direct CRUD operations (used by admin API).

@@ -25,8 +25,8 @@ type orgRouterAdapter struct {
 	router *OrgRouter
 }
 
-func (a *orgRouterAdapter) StackForUser(username string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
-	stack, ok := a.router.StackForUser(username)
+func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
+	stack, ok := a.router.StackForOrg(orgID)
 	if !ok {
 		return nil, nil, nil, false
 	}
