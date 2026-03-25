@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -90,6 +91,9 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	// Fall back to the config store path for non-Crossplane warehouses (manual seed, MinIO, etc.).
 	if a.resolveDucklingStatus != nil {
 		dl, err = a.buildDuckLakeConfigFromDuckling(ctx, assignment.OrgID)
+		if err != nil {
+			slog.Warn("Duckling CR activation failed, falling back to config store.", "org", assignment.OrgID, "error", err)
+		}
 	}
 	if a.resolveDucklingStatus == nil || err != nil {
 		dl, err = a.buildDuckLakeConfigFromConfigStore(ctx, org.Warehouse)
