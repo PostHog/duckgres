@@ -17,7 +17,7 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -59,7 +59,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -89,7 +89,7 @@ func TestOrgReservedPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1)
+	pool := NewOrgReservedPool(shared, "analytics", 1, nil)
 	pool.ReleaseWorker(worker.ID)
 
 	time.Sleep(100 * time.Millisecond)
@@ -108,7 +108,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	}
 
 	activated := false
-	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated = true
 		return nil
@@ -135,7 +135,7 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2)
+	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
 	activated := 0
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated++
@@ -171,7 +171,7 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1)
+	pool := NewOrgReservedPool(shared, "analytics", 1, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()

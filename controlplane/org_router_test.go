@@ -47,7 +47,7 @@ func TestOrgRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.T
 
 func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
-	pool := NewOrgReservedPool(sharedPool, "analytics", 2)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2, nil)
 
 	oldTC := &configstore.OrgConfig{
 		Name: "analytics",

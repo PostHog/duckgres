@@ -62,7 +62,7 @@ func TestBuildTenantActivationPayloadBuildsDuckLakeRuntimeFromWarehouseSecrets(t
 		},
 	}
 
-	payload, err := BuildTenantActivationPayload(context.Background(), pool.clientset, pool.namespace, org)
+	payload, err := BuildTenantActivationPayload(context.Background(), pool.clientset, pool.namespace, org, nil)
 	if err != nil {
 		t.Fatalf("BuildTenantActivationPayload: %v", err)
 	}

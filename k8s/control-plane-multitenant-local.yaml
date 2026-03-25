@@ -61,8 +61,8 @@ spec:
             - name: flight
               containerPort: 8815
               protocol: TCP
-            - name: admin
-              containerPort: 9090
+            - name: api
+              containerPort: 8080
               protocol: TCP
           volumeMounts:
             - name: config
@@ -75,7 +75,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: admin
+              port: api
             initialDelaySeconds: 2
             periodSeconds: 2
             failureThreshold: 15

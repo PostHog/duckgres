@@ -14,8 +14,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/provisioner"
+	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
@@ -106,8 +107,9 @@ func (a *orgRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 var _ OrgRouterInterface = (*orgRouterAdapter)(nil)
 var _ admin.OrgStackInfo = (*orgRouterAdapter)(nil)
 
-// SetupMultiTenant initializes the config store, org router, and Gin admin server.
+// SetupMultiTenant initializes the config store, org router, and API server.
 // Called from RunControlPlane when --config-store is set with remote backend.
+// Returns the API server for graceful shutdown.
 func SetupMultiTenant(
 	cfg ControlPlaneConfig,
 	srv *server.Server,
@@ -139,12 +141,30 @@ func SetupMultiTenant(
 		MemoryBudget:         int64(memBudget),
 	}
 
-	router, err := NewOrgRouter(store, baseCfg, cfg, srv)
+	// Initialize STS broker for credential brokering (best-effort)
+	var stsBroker *STSBroker
+	if cfg.K8s.AWSRegion != "" {
+		var err error
+		stsBroker, err = NewSTSBroker(context.Background(), cfg.K8s.AWSRegion)
+		if err != nil {
+			slog.Warn("STS broker unavailable, workers will use pod identity for S3.", "error", err)
+		}
+	}
+
+	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
 	adpt := &orgRouterAdapter{router: router}
+
+	// Start provisioning controller (best-effort — K8s API may not be available locally)
+	provCtrl, err := provisioner.NewController(store, 10*time.Second)
+	if err != nil {
+		slog.Warn("Provisioning controller unavailable.", "error", err)
+	} else {
+		go provCtrl.Run(context.Background())
+	}
 
 	// Register config change handler
 	store.OnChange(router.HandleConfigChange)
@@ -153,44 +173,45 @@ func SetupMultiTenant(
 	store.Start(context.Background())
 
 	// Resolve admin bearer token
-	adminToken := cfg.AdminToken
-	if adminToken == "" {
+	internalSecret := cfg.InternalSecret
+	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, fmt.Errorf("generate admin token: %w", err)
+			return nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
-		adminToken = hex.EncodeToString(tokenBytes)
-		slog.Info("Generated admin API token (pass via --admin-token or DUCKGRES_ADMIN_TOKEN to set explicitly).", "token", adminToken)
+		internalSecret = hex.EncodeToString(tokenBytes)
+		slog.Info("Generated internal secret (pass via --internal-secret or DUCKGRES_INTERNAL_SECRET to set explicitly).", "secret", internalSecret)
 	}
 
-	// Set up Gin admin server (replaces the simple metrics server)
+	// Set up API server (admin + provisioning + dashboard on :8080).
+	// The existing metrics server on :9090 stays running separately.
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 
-	// Existing endpoints (unauthenticated)
-	engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// Admin API (authenticated)
-	api := engine.Group("/api/v1", admin.APIAuthMiddleware(adminToken))
+	// Authenticated API
+	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
 	admin.RegisterAPI(api, store, adpt)
+	provisioning.RegisterAPI(api, provisioning.NewGormStore(store))
 
 	// Dashboard
-	admin.RegisterDashboard(engine, adminToken)
+	admin.RegisterDashboard(engine, internalSecret)
 
-	adminServer := &http.Server{
-		Addr:    ":9090",
+	apiServer := &http.Server{
+		Addr:    ":8080",
 		Handler: engine,
 	}
 	go func() {
-		slog.Info("Starting admin server with dashboard.", "addr", adminServer.Addr)
-		if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Warn("Admin server error.", "error", err)
+		slog.Info("Starting API server.", "addr", apiServer.Addr)
+		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Warn("API server error.", "error", err)
 		}
 	}()
 
-	return store, adpt, adminServer, nil
+	return store, adpt, apiServer, nil
 }

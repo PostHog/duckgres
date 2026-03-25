@@ -19,15 +19,17 @@ type OrgReservedPool struct {
 	orgID                  string
 	maxWorkers             int
 	leaseDuration          time.Duration
+	stsBroker              *STSBroker
 	activateReservedWorker func(context.Context, *ManagedWorker) error
 }
 
-func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int) *OrgReservedPool {
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, stsBroker *STSBroker) *OrgReservedPool {
 	pool := &OrgReservedPool{
 		shared:        shared,
 		orgID:         orgID,
 		maxWorkers:    maxWorkers,
 		leaseDuration: defaultSharedWorkerReservationLease,
+		stsBroker:     stsBroker,
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
 	return pool

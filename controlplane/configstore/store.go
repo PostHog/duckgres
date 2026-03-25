@@ -217,6 +217,31 @@ func (cs *ConfigStore) OnChange(fn func(old, new *Snapshot)) {
 	cs.onChange = append(cs.onChange, fn)
 }
 
+// ListWarehousesByStates returns all warehouses with a state matching one of the given values.
+// This is a direct DB query, not snapshot-based, for use by the provisioning controller.
+func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvisioningState) ([]ManagedWarehouse, error) {
+	var warehouses []ManagedWarehouse
+	if err := cs.db.Where("state IN ?", states).Find(&warehouses).Error; err != nil {
+		return nil, fmt.Errorf("list warehouses by states: %w", err)
+	}
+	return warehouses, nil
+}
+
+// UpdateWarehouseState performs a compare-and-swap update on a warehouse row.
+// Only updates if the current state matches expectedState, preventing races.
+func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
+	result := cs.db.Model(&ManagedWarehouse{}).
+		Where("org_id = ? AND state = ?", orgID, expectedState).
+		Updates(updates)
+	if result.Error != nil {
+		return fmt.Errorf("update warehouse state: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
+	}
+	return nil
+}
+
 // DB exposes the GORM database for direct CRUD operations (used by admin API).
 func (cs *ConfigStore) DB() *gorm.DB {
 	return cs.db

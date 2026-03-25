@@ -40,7 +40,7 @@ type configCLIInputs struct {
 	MaxConnections            int
 	ConfigStoreConn           string
 	ConfigPollInterval        string
-	AdminToken                string
+	InternalSecret            string
 	WorkerBackend             string
 	K8sWorkerImage            string
 	K8sWorkerNamespace        string
@@ -52,6 +52,7 @@ type configCLIInputs struct {
 	K8sWorkerServiceAccount   string
 	K8sMaxWorkers             int
 	K8sSharedWarmTarget       int
+	AWSRegion                 string
 	QueryLog                  bool
 }
 
@@ -73,9 +74,10 @@ type resolvedConfig struct {
 	K8sWorkerServiceAccount  string
 	K8sMaxWorkers            int
 	K8sSharedWarmTarget      int
+	AWSRegion                string
 	ConfigStoreConn          string
 	ConfigPollInterval       time.Duration
-	AdminToken               string
+	InternalSecret           string
 }
 
 func defaultServerConfig() server.Config {
@@ -129,9 +131,10 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
 	var k8sMaxWorkers, k8sSharedWarmTarget int
+	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
-	var adminToken string
+	var internalSecret string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -581,8 +584,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_CONFIG_POLL_INTERVAL duration: " + err.Error())
 		}
 	}
-	if v := getenv("DUCKGRES_ADMIN_TOKEN"); v != "" {
-		adminToken = v
+	if v := getenv("DUCKGRES_INTERNAL_SECRET"); v != "" {
+		internalSecret = v
 	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
@@ -629,6 +632,10 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_K8S_SHARED_WARM_TARGET: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
+		awsRegion = v
+	}
+
 	// Query log env vars
 	if v := getenv("DUCKGRES_QUERY_LOG_ENABLED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -789,8 +796,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid --config-poll-interval duration: " + err.Error())
 		}
 	}
-	if cli.Set["admin-token"] {
-		adminToken = cli.AdminToken
+	if cli.Set["internal-secret"] {
+		internalSecret = cli.InternalSecret
 	}
 	if cli.Set["worker-backend"] {
 		workerBackend = cli.WorkerBackend
@@ -824,6 +831,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["k8s-shared-warm-target"] {
 		k8sSharedWarmTarget = cli.K8sSharedWarmTarget
+	}
+	if cli.Set["aws-region"] {
+		awsRegion = cli.AWSRegion
 	}
 	if cli.Set["query-log"] {
 		cfg.QueryLog.Enabled = cli.QueryLog
@@ -894,8 +904,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
 		K8sMaxWorkers:            k8sMaxWorkers,
 		K8sSharedWarmTarget:      k8sSharedWarmTarget,
+		AWSRegion:                awsRegion,
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
-		AdminToken:               adminToken,
+		InternalSecret:           internalSecret,
 	}
 }

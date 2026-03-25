@@ -153,9 +153,6 @@ func env(key, defaultVal string) string {
 func initMetrics() *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
 	srv := &http.Server{
 		Addr:    ":9090",
 		Handler: mux,
@@ -239,11 +236,12 @@ func main() {
 	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "ServiceAccount name for K8s worker pods (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 	k8sMaxWorkers := flag.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=auto-derived (env: DUCKGRES_K8S_MAX_WORKERS)")
 	k8sSharedWarmTarget := flag.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
+	awsRegion := flag.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
 
 	// Config store flags (multi-tenant mode)
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := flag.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
-	adminToken := flag.String("admin-token", "", "Bearer token for admin API authentication (env: DUCKGRES_ADMIN_TOKEN)")
+	internalSecret := flag.String("internal-secret", "", "Shared secret for API authentication (env: DUCKGRES_INTERNAL_SECRET)")
 
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -299,9 +297,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DUCKDB_MAX_SESSIONS  DuckDB service max sessions (duckdb-service mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_ADMIN_TOKEN        Bearer token for admin API authentication\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -402,7 +401,7 @@ func main() {
 		MaxConnections:            *maxConnections,
 		ConfigStoreConn:           *configStore,
 		ConfigPollInterval:        *configPollInterval,
-		AdminToken:                *adminToken,
+		InternalSecret:            *internalSecret,
 		WorkerBackend:             *workerBackend,
 		K8sWorkerImage:            *k8sWorkerImage,
 		K8sWorkerNamespace:        *k8sWorkerNamespace,
@@ -414,6 +413,7 @@ func main() {
 		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
 		K8sMaxWorkers:             *k8sMaxWorkers,
 		K8sSharedWarmTarget:       *k8sSharedWarmTarget,
+		AWSRegion:                 *awsRegion,
 		QueryLog:                  *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
@@ -546,7 +546,7 @@ func main() {
 			WorkerBackend:        resolved.WorkerBackend,
 			ConfigStoreConn:      resolved.ConfigStoreConn,
 			ConfigPollInterval:   resolved.ConfigPollInterval,
-			AdminToken:           resolved.AdminToken,
+			InternalSecret:       resolved.InternalSecret,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:       resolved.K8sWorkerImage,
 				WorkerNamespace:   resolved.K8sWorkerNamespace,
@@ -558,6 +558,7 @@ func main() {
 				ServiceAccount:    resolved.K8sWorkerServiceAccount,
 				MaxWorkers:        resolved.K8sMaxWorkers,
 				SharedWarmTarget:  resolved.K8sSharedWarmTarget,
+				AWSRegion: resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

@@ -14,7 +14,7 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:name/warehouse")
+var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:id/warehouse")
 
 // WorkerStatus represents a worker's current status for the API.
 type WorkerStatus struct {
@@ -71,11 +71,11 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo)
 	// Orgs CRUD
 	r.GET("/orgs", h.listOrgs)
 	r.POST("/orgs", h.createOrg)
-	r.GET("/orgs/:name", h.getOrg)
-	r.PUT("/orgs/:name", h.updateOrg)
-	r.DELETE("/orgs/:name", h.deleteOrg)
-	r.GET("/orgs/:name/warehouse", h.getManagedWarehouse)
-	r.PUT("/orgs/:name/warehouse", h.putManagedWarehouse)
+	r.GET("/orgs/:id", h.getOrg)
+	r.PUT("/orgs/:id", h.updateOrg)
+	r.DELETE("/orgs/:id", h.deleteOrg)
+	r.GET("/orgs/:id/warehouse", h.getManagedWarehouse)
+	r.PUT("/orgs/:id/warehouse", h.putManagedWarehouse)
 
 	// Users CRUD
 	r.GET("/users", h.listUsers)
@@ -285,6 +285,9 @@ func (s *gormAPIStore) UpsertManagedWarehouse(orgID string, warehouse *configsto
 
 func managedWarehouseUpsertColumns() []string {
 	return []string{
+		"image",
+		"aurora_min_acu",
+		"aurora_max_acu",
 		"warehouse_database_region",
 		"warehouse_database_endpoint",
 		"warehouse_database_port",
@@ -481,7 +484,7 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 }
 
 func (h *apiHandler) getOrg(c *gin.Context) {
-	name := c.Param("name")
+	name := c.Param("id")
 	org, err := h.store.GetOrg(name)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
@@ -491,7 +494,7 @@ func (h *apiHandler) getOrg(c *gin.Context) {
 }
 
 func (h *apiHandler) updateOrg(c *gin.Context) {
-	name := c.Param("name")
+	name := c.Param("id")
 	var updates configstore.Org
 	if err := c.ShouldBindJSON(&updates); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -514,7 +517,7 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 }
 
 func (h *apiHandler) deleteOrg(c *gin.Context) {
-	name := c.Param("name")
+	name := c.Param("id")
 	ok, err := h.store.DeleteOrg(name)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -535,7 +538,7 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 }
 
 func (h *apiHandler) getManagedWarehouse(c *gin.Context) {
-	warehouse, err := h.store.GetManagedWarehouse(c.Param("name"))
+	warehouse, err := h.store.GetManagedWarehouse(c.Param("id"))
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "managed warehouse not found"})
@@ -548,7 +551,7 @@ func (h *apiHandler) getManagedWarehouse(c *gin.Context) {
 }
 
 func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
-	orgID := c.Param("name")
+	orgID := c.Param("id")
 	var req managedWarehouseRequest
 	if err := decodeStrictWarehouseRequest(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

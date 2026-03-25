@@ -19,6 +19,7 @@ import (
 type SharedWorkerActivator struct {
 	clientset              kubernetes.Interface
 	defaultNamespace       string
+	stsBroker              *STSBroker
 	resolveOrgConfig       func(string) (*configstore.OrgConfig, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, TenantActivationPayload) error
 }
@@ -30,13 +31,14 @@ type TenantActivationPayload struct {
 	DuckLake       server.DuckLakeConfig `json:"ducklake"`
 }
 
-func NewSharedWorkerActivator(shared *K8sWorkerPool, resolveOrgConfig func(string) (*configstore.OrgConfig, error)) *SharedWorkerActivator {
+func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, resolveOrgConfig func(string) (*configstore.OrgConfig, error)) *SharedWorkerActivator {
 	if shared == nil {
 		return nil
 	}
 	return &SharedWorkerActivator{
 		clientset:              shared.clientset,
 		defaultNamespace:       shared.namespace,
+		stsBroker:              stsBroker,
 		resolveOrgConfig:       resolveOrgConfig,
 		activateReservedWorker: shared.ActivateReservedWorker,
 	}
@@ -110,7 +112,19 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 		dl.S3AccessKey = accessKey
 		dl.S3SecretKey = secretKey
 	case strings.EqualFold(warehouse.S3.Provider, "aws"):
-		dl.S3Provider = "aws_sdk"
+		roleARN := warehouse.WorkerIdentity.IAMRoleARN
+		if roleARN != "" && a.stsBroker != nil {
+			creds, err := a.stsBroker.AssumeRole(ctx, roleARN)
+			if err != nil {
+				return TenantActivationPayload{}, fmt.Errorf("STS AssumeRole for org %q: %w", orgName(org), err)
+			}
+			dl.S3Provider = "config"
+			dl.S3AccessKey = creds.AccessKeyID
+			dl.S3SecretKey = creds.SecretAccessKey
+			dl.S3SessionToken = creds.SessionToken
+		} else {
+			dl.S3Provider = "aws_sdk"
+		}
 	}
 
 	usernames := make([]string, 0, len(org.Users))
@@ -127,10 +141,11 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}, nil
 }
 
-func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Interface, defaultNamespace string, org *configstore.OrgConfig) (TenantActivationPayload, error) {
+func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Interface, defaultNamespace string, org *configstore.OrgConfig, stsBroker *STSBroker) (TenantActivationPayload, error) {
 	activator := &SharedWorkerActivator{
 		clientset:        clientset,
 		defaultNamespace: defaultNamespace,
+		stsBroker:        stsBroker,
 	}
 	assignment := &WorkerAssignment{
 		OrgID: orgName(org),

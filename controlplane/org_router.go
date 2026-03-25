@@ -32,18 +32,20 @@ type OrgRouter struct {
 	sharedPool   *K8sWorkerPool
 	globalCfg    ControlPlaneConfig
 	srv          *server.Server
+	stsBroker    *STSBroker
 	nextWorkerID atomic.Int32
 	sharedCancel context.CancelFunc
 }
 
 // NewOrgRouter creates an OrgRouter from the initial config snapshot.
-func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server) (*OrgRouter, error) {
+func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server, stsBroker *STSBroker) (*OrgRouter, error) {
 	tr := &OrgRouter{
 		orgs:        make(map[string]*OrgStack),
 		configStore: store,
 		baseCfg:     baseCfg,
 		globalCfg:   globalCfg,
 		srv:         srv,
+		stsBroker:   stsBroker,
 	}
 
 	sharedCfg := baseCfg
@@ -68,6 +70,11 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 
 	snap := store.Snapshot()
 	for _, tc := range snap.Orgs {
+		// Only create stacks for orgs with ready warehouses (or no warehouse at all for backwards compat)
+		if tc.Warehouse != nil && tc.Warehouse.State != configstore.ManagedWarehouseStateReady {
+			slog.Info("Skipping org stack creation (warehouse not ready).", "org", tc.Name, "state", tc.Warehouse.State)
+			continue
+		}
 		if _, err := tr.createOrgStack(tc); err != nil {
 			slog.Error("Failed to create org stack.", "org", tc.Name, "error", err)
 			continue
@@ -93,8 +100,8 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		memoryBudget = int64(server.ParseMemoryBytes(tc.MemoryBudget))
 	}
 
-	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers)
-	activator := NewSharedWorkerActivator(tr.sharedPool, func(orgID string) (*configstore.OrgConfig, error) {
+	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, tr.stsBroker)
+	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {
 			return nil, fmt.Errorf("config snapshot unavailable for org %s", orgID)
@@ -177,12 +184,49 @@ func (tr *OrgRouter) StackForUser(username string) (*OrgStack, bool) {
 
 // HandleConfigChange reconciles org stacks when the config snapshot changes.
 func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
-	// Detect new orgs
+	// Detect new orgs or orgs whose warehouse just became ready
 	for name, tc := range new.Orgs {
-		if _, existed := old.Orgs[name]; !existed {
+		oldTC, existed := old.Orgs[name]
+
+		// Skip orgs with warehouses that aren't ready
+		if tc.Warehouse != nil && tc.Warehouse.State != configstore.ManagedWarehouseStateReady {
+			// If warehouse is being deleted, destroy existing stack
+			if tc.Warehouse.State == configstore.ManagedWarehouseStateDeleting ||
+				tc.Warehouse.State == configstore.ManagedWarehouseStateDeleted {
+				tr.mu.RLock()
+				_, hasStack := tr.orgs[name]
+				tr.mu.RUnlock()
+				if hasStack {
+					slog.Info("Warehouse deprovisioning, destroying stack.", "org", name)
+					tr.DestroyOrgStack(name)
+				}
+			}
+			continue
+		}
+
+		tr.mu.RLock()
+		_, hasStack := tr.orgs[name]
+		tr.mu.RUnlock()
+
+		if !existed && !hasStack {
+			// Brand new org -- create stack
 			slog.Info("New org detected, creating stack.", "org", name)
 			if _, err := tr.createOrgStack(tc); err != nil {
 				slog.Error("Failed to create org stack on config change.", "org", name, "error", err)
+			}
+		} else if existed && !hasStack {
+			// Existing org whose warehouse just became ready
+			warehouseJustReady := oldTC.Warehouse != nil &&
+				oldTC.Warehouse.State != configstore.ManagedWarehouseStateReady &&
+				tc.Warehouse != nil &&
+				tc.Warehouse.State == configstore.ManagedWarehouseStateReady
+			noWarehouse := tc.Warehouse == nil
+
+			if warehouseJustReady || noWarehouse {
+				slog.Info("Org warehouse ready, creating stack.", "org", name)
+				if _, err := tr.createOrgStack(tc); err != nil {
+					slog.Error("Failed to create org stack on config change.", "org", name, "error", err)
+				}
 			}
 		}
 	}

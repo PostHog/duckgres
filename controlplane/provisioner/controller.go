@@ -1,0 +1,253 @@
+//go:build kubernetes
+
+package provisioner
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+)
+
+// WarehouseStore is the subset of configstore.ConfigStore that the controller needs.
+type WarehouseStore interface {
+	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
+	UpdateWarehouseState(orgID string, expectedState configstore.ManagedWarehouseProvisioningState, updates map[string]interface{}) error
+}
+
+// Controller polls the config store for actionable warehouses and reconciles
+// their state against Duckling CRs in Kubernetes.
+type Controller struct {
+	store        WarehouseStore
+	duckling     *DucklingClient
+	pollInterval time.Duration
+}
+
+// NewController creates a provisioning controller. Returns an error if the
+// Kubernetes client cannot be initialized (e.g., not running in-cluster).
+func NewController(store WarehouseStore, pollInterval time.Duration) (*Controller, error) {
+	dc, err := NewDucklingClient()
+	if err != nil {
+		return nil, fmt.Errorf("create duckling client: %w", err)
+	}
+	return &Controller{
+		store:        store,
+		duckling:     dc,
+		pollInterval: pollInterval,
+	}, nil
+}
+
+// NewControllerWithClient creates a Controller with a pre-built DucklingClient (for testing).
+func NewControllerWithClient(store WarehouseStore, dc *DucklingClient, pollInterval time.Duration) *Controller {
+	return &Controller{
+		store:        store,
+		duckling:     dc,
+		pollInterval: pollInterval,
+	}
+}
+
+// Run starts the reconciliation loop. Blocks until ctx is cancelled.
+func (c *Controller) Run(ctx context.Context) {
+	slog.Info("Provisioning controller started.", "poll_interval", c.pollInterval)
+	ticker := time.NewTicker(c.pollInterval)
+	defer ticker.Stop()
+
+	// Run once immediately at startup
+	c.reconcile(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Provisioning controller stopped.")
+			return
+		case <-ticker.C:
+			c.reconcile(ctx)
+		}
+	}
+}
+
+// actionableStates are the warehouse states the controller acts on.
+var actionableStates = []configstore.ManagedWarehouseProvisioningState{
+	configstore.ManagedWarehouseStatePending,
+	configstore.ManagedWarehouseStateProvisioning,
+	configstore.ManagedWarehouseStateDeleting,
+}
+
+func (c *Controller) reconcile(ctx context.Context) {
+	warehouses, err := c.store.ListWarehousesByStates(actionableStates)
+	if err != nil {
+		slog.Warn("Provisioning controller: failed to list warehouses.", "error", err)
+		return
+	}
+
+	for _, w := range warehouses {
+		if ctx.Err() != nil {
+			return
+		}
+		switch w.State {
+		case configstore.ManagedWarehouseStatePending:
+			c.reconcilePending(ctx, &w)
+		case configstore.ManagedWarehouseStateProvisioning:
+			c.reconcileProvisioning(ctx, &w)
+		case configstore.ManagedWarehouseStateDeleting:
+			c.reconcileDeleting(ctx, &w)
+		}
+	}
+}
+
+func (c *Controller) reconcilePending(ctx context.Context, w *configstore.ManagedWarehouse) {
+	log := slog.With("org", w.OrgID, "phase", "pending")
+
+	now := time.Now().UTC()
+
+	// Check if a Duckling CR already exists (e.g., controller restart)
+	_, err := c.duckling.Get(ctx, w.OrgID)
+	if err == nil {
+		// CR exists — transition directly to provisioning
+		log.Info("Duckling CR already exists, transitioning to provisioning.")
+		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
+			"state":                   configstore.ManagedWarehouseStateProvisioning,
+			"status_message":          "Duckling CR exists, polling status",
+			"provisioning_started_at": now,
+		}); err != nil {
+			log.Warn("Failed to update state to provisioning.", "error", err)
+		}
+		return
+	}
+
+	// Create the Duckling CR
+	log.Info("Creating Duckling CR.")
+	if err := c.duckling.Create(ctx, w.OrgID, w.AuroraMinACU, w.AuroraMaxACU); err != nil {
+		log.Error("Failed to create Duckling CR.", "error", err)
+		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
+			"state":          configstore.ManagedWarehouseStateFailed,
+			"status_message": fmt.Sprintf("Failed to create Duckling CR: %v", err),
+			"failed_at":      now,
+		})
+		return
+	}
+
+	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
+		"state":                   configstore.ManagedWarehouseStateProvisioning,
+		"status_message":          "Duckling CR created, waiting for resources",
+		"provisioning_started_at": now,
+	}); err != nil {
+		log.Warn("Failed to update state to provisioning.", "error", err)
+	}
+}
+
+func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.ManagedWarehouse) {
+	log := slog.With("org", w.OrgID, "phase", "provisioning")
+
+	// Use ProvisioningStartedAt if set (tracks when we entered provisioning state),
+	// fall back to CreatedAt for warehouses created before this field existed.
+	startedAt := w.CreatedAt
+	if w.ProvisioningStartedAt != nil {
+		startedAt = *w.ProvisioningStartedAt
+	}
+
+	// Check for timeout (30 minutes)
+	if time.Since(startedAt) > 30*time.Minute {
+		log.Warn("Provisioning timed out.")
+		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
+			"state":          configstore.ManagedWarehouseStateFailed,
+			"status_message": "Provisioning timed out after 30 minutes",
+			"failed_at":      time.Now().UTC(),
+		})
+		return
+	}
+
+	status, err := c.duckling.Get(ctx, w.OrgID)
+	if err != nil {
+		log.Warn("Failed to get Duckling CR status.", "error", err)
+		return
+	}
+
+	// Check for Crossplane failure — only fail on persistent sync errors.
+	// Crossplane resources commonly flap Synced=False transiently (e.g., IAM
+	// eventual consistency, Aurora cold start delays), so we only transition
+	// to failed if 10+ minutes have passed, giving transient errors time to resolve.
+	if status.SyncedFalseMessage != "" && time.Since(startedAt) > 10*time.Minute {
+		log.Warn("Crossplane sync failure.", "message", status.SyncedFalseMessage)
+		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
+			"state":          configstore.ManagedWarehouseStateFailed,
+			"status_message": fmt.Sprintf("Crossplane error: %s", status.SyncedFalseMessage),
+			"failed_at":      time.Now().UTC(),
+		})
+		return
+	}
+
+	// Update per-component states based on Duckling CR status fields.
+	// The Duckling composition provisions AWS infrastructure only (Aurora, S3, IAM).
+	// K8s workloads (namespace, deployment, service) are managed by the duckgres Helm chart.
+	updates := map[string]interface{}{}
+
+	if status.DataStore.BucketName != "" && w.S3State != configstore.ManagedWarehouseStateReady {
+		updates["s3_state"] = configstore.ManagedWarehouseStateReady
+		updates["s3_bucket"] = status.DataStore.BucketName
+	}
+
+	if status.MetadataStore.Endpoint != "" && w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
+		updates["metadata_store_state"] = configstore.ManagedWarehouseStateReady
+		updates["metadata_store_endpoint"] = status.MetadataStore.Endpoint
+		updates["metadata_store_port"] = 5432
+		updates["metadata_store_kind"] = status.MetadataStore.Type
+		updates["metadata_store_engine"] = "postgres"
+		updates["metadata_store_username"] = status.MetadataStore.User
+		updates["metadata_store_database_name"] = status.MetadataStore.Database
+	}
+
+	if status.MetadataStore.Password != "" && w.SecretsState != configstore.ManagedWarehouseStateReady {
+		updates["secrets_state"] = configstore.ManagedWarehouseStateReady
+	}
+
+	if status.IAMRoleARN != "" && w.IdentityState != configstore.ManagedWarehouseStateReady {
+		updates["identity_state"] = configstore.ManagedWarehouseStateReady
+		updates["worker_identity_iam_role_arn"] = status.IAMRoleARN
+	}
+
+	// Infrastructure is ready when S3, Aurora, secrets, and IAM are all provisioned.
+	s3Ready := w.S3State == configstore.ManagedWarehouseStateReady || updates["s3_state"] == configstore.ManagedWarehouseStateReady
+	metaReady := w.MetadataStoreState == configstore.ManagedWarehouseStateReady || updates["metadata_store_state"] == configstore.ManagedWarehouseStateReady
+	secretsReady := w.SecretsState == configstore.ManagedWarehouseStateReady || updates["secrets_state"] == configstore.ManagedWarehouseStateReady
+	identReady := w.IdentityState == configstore.ManagedWarehouseStateReady || updates["identity_state"] == configstore.ManagedWarehouseStateReady
+
+	if s3Ready && metaReady && secretsReady && identReady {
+		now := time.Now().UTC()
+		updates["state"] = configstore.ManagedWarehouseStateReady
+		updates["status_message"] = "Infrastructure ready"
+		updates["ready_at"] = now
+		log.Info("Infrastructure ready, transitioning to ready.")
+	}
+
+	if len(updates) > 0 {
+		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, updates); err != nil {
+			log.Warn("Failed to update warehouse state.", "error", err)
+		}
+	}
+}
+
+func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.ManagedWarehouse) {
+	log := slog.With("org", w.OrgID, "phase", "deleting")
+
+	log.Info("Deleting Duckling CR.")
+	if err := c.duckling.Delete(ctx, w.OrgID); err != nil {
+		// Only proceed if the CR is already gone (NotFound). For other errors
+		// (network, RBAC, etc.) we retry on the next reconcile pass to avoid
+		// marking as deleted while AWS resources still exist.
+		if !apierrors.IsNotFound(err) {
+			log.Warn("Failed to delete Duckling CR, will retry.", "error", err)
+			return
+		}
+	}
+
+	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateDeleting, map[string]interface{}{
+		"state":          configstore.ManagedWarehouseStateDeleted,
+		"status_message": "Resources deleted",
+	}); err != nil {
+		log.Warn("Failed to update state to deleted.", "error", err)
+	}
+}

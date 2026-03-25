@@ -58,9 +58,10 @@ type ControlPlaneConfig struct {
 	// Default: 30s.
 	ConfigPollInterval time.Duration
 
-	// AdminToken is the bearer token required for admin API requests.
-	// When empty, a random token is generated and logged at startup.
-	AdminToken string
+	// InternalSecret is the shared secret for API authentication.
+	// When empty, a random secret is generated and logged at startup.
+	InternalSecret string
+
 }
 
 type ProcessConfig struct {
@@ -80,6 +81,7 @@ type K8sConfig struct {
 	ServiceAccount    string // ServiceAccount name for worker pods (default: "default")
 	MaxWorkers        int    // Global cap for the shared K8s worker pool (0 = auto-derived)
 	SharedWarmTarget  int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	AWSRegion string // AWS region for STS client
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -110,6 +112,7 @@ type ControlPlane struct {
 	// Multi-tenant fields (non-nil in remote multitenant mode)
 	orgRouter   OrgRouterInterface
 	configStore ConfigStoreInterface
+	apiServer   *http.Server // API server on :8080 (shut down on graceful exit)
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -317,20 +320,14 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, adminSrv, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
+		store, adapter, apiServer, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
 		}
 		cp.configStore = store
 		cp.orgRouter = adapter
-		// Replace the simple metrics server with the Gin admin server
-		if cfg.MetricsServer != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = cfg.MetricsServer.Shutdown(ctx)
-			cancel()
-		}
-		cfg.MetricsServer = adminSrv
+		cp.apiServer = apiServer
 		cp.cfg = cfg
 		_ = store // keep linter happy
 	} else {
@@ -961,6 +958,13 @@ func (cp *ControlPlane) handleUpgrade() {
 		}
 		cancel()
 	}
+	if cp.apiServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := cp.apiServer.Shutdown(ctx); err != nil {
+			slog.Warn("API server shutdown failed.", "error", err)
+		}
+		cancel()
+	}
 
 	// Stop ACME managers so the new CP can bind port 80 (HTTP-01) or
 	// manage DNS records. Nil out after close so drainAfterUpgrade
@@ -1181,9 +1185,6 @@ func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
 	addr := cp.cfg.MetricsServer.Addr
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
 	newSrv := &http.Server{Addr: addr, Handler: mux}
 	cp.cfg.MetricsServer = newSrv
 	go func() {

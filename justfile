@@ -175,7 +175,7 @@ deploy-multitenant-kind:
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl apply -f k8s/managed-warehouse-secrets.yaml
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl apply -f k8s/networkpolicy.yaml
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl apply -f k8s/kind/control-plane.yaml
-    KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
+    KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s || { echo "=== Pod status ==="; KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres get pods -o wide; echo "=== Pod describe ==="; KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres describe pod -l app=duckgres-control-plane; echo "=== Pod logs ==="; KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres logs -l app=duckgres-control-plane --tail=100 --all-containers; exit 1; }
 
 # End-to-end local multi-tenant setup: optional OrbStack K8s + config store + control plane
 [group('dev')]
@@ -185,7 +185,7 @@ run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multit
     @echo "Multi-tenant control plane ready."
     @echo "Default login: postgres / postgres"
     @echo "Fetch admin token with: kubectl -n duckgres logs deployment/duckgres-control-plane | rg 'Generated admin API token'"
-    @echo "Run 'just multitenant-port-forward-pg' in one terminal and 'just multitenant-port-forward-admin' in another."
+    @echo "Run 'just multitenant-port-forward-pg' and 'just multitenant-port-forward-api' in separate terminals."
 
 # End-to-end local multi-tenant setup: kind K8s + config store + control plane
 [group('dev')]
@@ -215,10 +215,10 @@ cleanup-multitenant-kind:
 multitenant-port-forward-pg:
     kubectl -n duckgres port-forward svc/duckgres 5432:5432
 
-# Port-forward the admin dashboard and API from the local control plane
+# Port-forward the API server (admin + provisioning) from the local control plane
 [group('dev')]
-multitenant-port-forward-admin:
-    kubectl -n duckgres port-forward deployment/duckgres-control-plane 9090:9090
+multitenant-port-forward-api:
+    kubectl -n duckgres port-forward deployment/duckgres-control-plane 8080:8080
 
 # Run with DuckLake config
 [group('dev')]

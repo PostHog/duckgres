@@ -90,6 +90,10 @@ type ManagedWarehouseWorkerIdentity struct {
 type ManagedWarehouse struct {
 	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
 
+	Image        string  `gorm:"size:512" json:"image"`
+	AuroraMinACU float64 `json:"aurora_min_acu"`
+	AuroraMaxACU float64 `json:"aurora_max_acu"`
+
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
 	S3                ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
@@ -112,6 +116,7 @@ type ManagedWarehouse struct {
 	IdentityStatusMessage          string                            `gorm:"size:1024" json:"identity_status_message"`
 	SecretsState                   ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
 	SecretsStatusMessage           string                            `gorm:"size:1024" json:"secrets_status_message"`
+	ProvisioningStartedAt          *time.Time                        `json:"provisioning_started_at"`
 	ReadyAt                        *time.Time                        `json:"ready_at"`
 	FailedAt                       *time.Time                        `json:"failed_at"`
 	CreatedAt                      time.Time                         `json:"created_at"`
@@ -195,6 +200,10 @@ type OrgConfig struct {
 type ManagedWarehouseConfig struct {
 	OrgID string
 
+	Image        string
+	AuroraMinACU float64
+	AuroraMaxACU float64
+
 	WarehouseDatabase ManagedWarehouseDatabase
 	MetadataStore     ManagedWarehouseMetadataStore
 	S3                ManagedWarehouseS3
@@ -228,6 +237,9 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 
 	cfg := &ManagedWarehouseConfig{
 		OrgID:                          warehouse.OrgID,
+		Image:                          warehouse.Image,
+		AuroraMinACU:                   warehouse.AuroraMinACU,
+		AuroraMaxACU:                   warehouse.AuroraMaxACU,
 		WarehouseDatabase:              warehouse.WarehouseDatabase,
 		MetadataStore:                  warehouse.MetadataStore,
 		S3:                             warehouse.S3,
