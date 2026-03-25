@@ -72,6 +72,14 @@ func duckLakeMigrationNeeded() bool {
 	return dlMigration.needed && dlMigration.err == nil
 }
 
+// duckLakeMigrationCheckedVersion returns the version found in the metadata store.
+// Returns "" if the check has not run or the metadata store had no version.
+func duckLakeMigrationCheckedVersion() string {
+	dlMigration.mu.Lock()
+	defer dlMigration.mu.Unlock()
+	return dlMigration.checkedV
+}
+
 // parseDuckLakeVersion parses a DuckLake version string like "0.3" into
 // (major, minor) integers for reliable numeric comparison.
 // Returns (0, 0, err) if the string cannot be parsed.

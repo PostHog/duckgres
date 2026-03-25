@@ -1004,10 +1004,18 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
 	migrate := duckLakeMigrationNeeded()
 	attachStmt := buildDuckLakeAttachStmt(dlCfg, migrate)
+
+	dataPath := dlCfg.ObjectStore
+	if dataPath == "" {
+		dataPath = dlCfg.DataPath
+	}
 	if migrate {
 		slog.Info("Attaching DuckLake catalog with automatic migration.",
-			"from", dlMigration.checkedV, "to", duckLakeSpecVersion,
+			"from", duckLakeMigrationCheckedVersion(), "to", duckLakeSpecVersion,
 			"metadata", redactConnectionString(dlCfg.MetadataStore))
+	} else if dataPath != "" {
+		slog.Info("Attaching DuckLake catalog with data path.",
+			"metadata", redactConnectionString(dlCfg.MetadataStore), "data", dataPath)
 	} else {
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}

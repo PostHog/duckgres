@@ -1,9 +1,14 @@
 package server
 
 import (
+	"database/sql"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func TestBuildDuckLakeAttachStmt(t *testing.T) {
@@ -210,4 +215,115 @@ func TestDuckLakeMigrationNeeded_FalseWhenError(t *testing.T) {
 	if duckLakeMigrationNeeded() {
 		t.Error("duckLakeMigrationNeeded() should return false when err is set")
 	}
+}
+
+// TestBackupDuckLakeMetadata_Integration verifies the backup path end-to-end
+// against a real PostgreSQL instance. Skipped when DUCKGRES_TEST_POSTGRES_DSN
+// is not set (e.g., in CI without a local PostgreSQL).
+//
+// Run locally:
+//
+//	DUCKGRES_TEST_POSTGRES_DSN="host=localhost user=postgres dbname=postgres sslmode=disable" go test ./server/ -run TestBackupDuckLakeMetadata_Integration -v
+func TestBackupDuckLakeMetadata_Integration(t *testing.T) {
+	dsn := os.Getenv("DUCKGRES_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("DUCKGRES_TEST_POSTGRES_DSN not set, skipping integration test")
+	}
+
+	pgDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	defer func() { _ = pgDB.Close() }()
+
+	// Create ducklake-like tables in a unique schema to avoid collisions.
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano()%1_000_000)
+	metaTable := "ducklake_metadata_test_" + suffix
+	dataTable := "ducklake_data_test_" + suffix
+
+	cleanup := func() {
+		_, _ = pgDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", quoteIdent(metaTable)))
+		_, _ = pgDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", quoteIdent(dataTable)))
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	// Create tables.
+	_, err = pgDB.Exec(fmt.Sprintf(`CREATE TABLE %s ("key" VARCHAR NOT NULL, "value" VARCHAR NOT NULL)`, quoteIdent(metaTable)))
+	if err != nil {
+		t.Fatalf("create metadata table: %v", err)
+	}
+	_, err = pgDB.Exec(fmt.Sprintf(`CREATE TABLE %s (id BIGINT NOT NULL, name VARCHAR, active BOOLEAN)`, quoteIdent(dataTable)))
+	if err != nil {
+		t.Fatalf("create data table: %v", err)
+	}
+
+	// Insert test data.
+	_, err = pgDB.Exec(fmt.Sprintf(`INSERT INTO %s ("key", "value") VALUES ('version', '0.3'), ('name', 'test catalog')`, quoteIdent(metaTable)))
+	if err != nil {
+		t.Fatalf("insert metadata: %v", err)
+	}
+	_, err = pgDB.Exec(fmt.Sprintf(`INSERT INTO %s (id, name, active) VALUES (1, 'hello', TRUE), (2, 'it''s a test', FALSE), (3, NULL, NULL)`, quoteIdent(dataTable)))
+	if err != nil {
+		t.Fatalf("insert data: %v", err)
+	}
+
+	// Run backup to a temp directory.
+	tmpDir := t.TempDir()
+
+	// backupDuckLakeMetadata discovers tables matching "ducklake_%" — our test
+	// tables match that pattern. We can call it directly.
+	err = backupDuckLakeMetadata(pgDB, tmpDir, "0.3")
+	if err != nil {
+		t.Fatalf("backupDuckLakeMetadata: %v", err)
+	}
+
+	// Find the backup file.
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 backup file, got %d", len(entries))
+	}
+
+	content, err := os.ReadFile(tmpDir + "/" + entries[0].Name())
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+
+	sql := string(content)
+
+	// Verify structure.
+	if !strings.Contains(sql, "BEGIN;") {
+		t.Error("backup missing BEGIN")
+	}
+	if !strings.Contains(sql, "COMMIT;") {
+		t.Error("backup missing COMMIT")
+	}
+	if !strings.Contains(sql, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s", quoteIdent(metaTable))) {
+		t.Errorf("backup missing CREATE TABLE for %s", metaTable)
+	}
+	if !strings.Contains(sql, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s", quoteIdent(dataTable))) {
+		t.Errorf("backup missing CREATE TABLE for %s", dataTable)
+	}
+
+	// Verify data rows.
+	if !strings.Contains(sql, "'0.3'") {
+		t.Error("backup missing version value '0.3'")
+	}
+	if !strings.Contains(sql, "'it''s a test'") {
+		t.Error("backup missing escaped quote in 'it''s a test'")
+	}
+	if !strings.Contains(sql, "NULL") {
+		t.Error("backup missing NULL values")
+	}
+
+	// Verify row counts — 2 metadata rows + 3 data rows = at least 5 INSERT statements.
+	insertCount := strings.Count(sql, "INSERT INTO")
+	if insertCount < 5 {
+		t.Errorf("expected at least 5 INSERT statements, got %d", insertCount)
+	}
+
+	t.Logf("Backup file: %s (%d bytes, %d INSERTs)", entries[0].Name(), len(content), insertCount)
 }
