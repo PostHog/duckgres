@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -64,6 +65,18 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 	payload, err := a.BuildActivationRequest(ctx, org, state.Assignment)
 	if err != nil {
 		return err
+	}
+
+	// Run the migration check in the control plane, not in workers.
+	// Workers would block on the backup, causing health-check timeouts.
+	// The backup file is written to os.TempDir() since the CP may not have
+	// a persistent /data mount — the backup is a safety net for manual
+	// restore and doesn't need to persist across CP restarts.
+	if needed, err := server.CheckAndBackupDuckLakeMigration(payload.DuckLake, os.TempDir()); err != nil {
+		slog.Warn("DuckLake migration check failed, proceeding without migration.",
+			"org", payload.OrgID, "error", err)
+	} else if needed {
+		payload.DuckLake.Migrate = true
 	}
 
 	if a.activateReservedWorker != nil {
