@@ -180,24 +180,18 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		return
 	}
 
-	// Update per-component states based on Duckling CR status fields.
-	// The Duckling composition provisions AWS infrastructure only (Aurora, S3, IAM).
-	// K8s workloads (namespace, deployment, service) are managed by the duckgres Helm chart.
+	// Track per-component readiness based on Duckling CR status fields.
+	// Infrastructure details (endpoint, password, bucket, etc.) are read directly
+	// from the Duckling CR by the worker activator at activation time — only
+	// state transitions are stored in the config store.
 	updates := map[string]interface{}{}
 
 	if status.DataStore.BucketName != "" && w.S3State != configstore.ManagedWarehouseStateReady {
 		updates["s3_state"] = configstore.ManagedWarehouseStateReady
-		updates["s3_bucket"] = status.DataStore.BucketName
 	}
 
 	if status.MetadataStore.Endpoint != "" && w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
 		updates["metadata_store_state"] = configstore.ManagedWarehouseStateReady
-		updates["metadata_store_endpoint"] = status.MetadataStore.Endpoint
-		updates["metadata_store_port"] = 5432
-		updates["metadata_store_kind"] = status.MetadataStore.Type
-		updates["metadata_store_engine"] = "postgres"
-		updates["metadata_store_username"] = status.MetadataStore.User
-		updates["metadata_store_database_name"] = status.MetadataStore.Database
 	}
 
 	if status.MetadataStore.Password != "" && w.SecretsState != configstore.ManagedWarehouseStateReady {
@@ -206,7 +200,6 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 
 	if status.IAMRoleARN != "" && w.IdentityState != configstore.ManagedWarehouseStateReady {
 		updates["identity_state"] = configstore.ManagedWarehouseStateReady
-		updates["worker_identity_iam_role_arn"] = status.IAMRoleARN
 	}
 
 	// Infrastructure is ready when S3, Aurora, secrets, and IAM are all provisioned.

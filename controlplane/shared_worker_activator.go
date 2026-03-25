@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/server"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -21,6 +22,7 @@ type SharedWorkerActivator struct {
 	defaultNamespace       string
 	stsBroker              *STSBroker
 	resolveOrgConfig       func(string) (*configstore.OrgConfig, error)
+	resolveDucklingStatus  func(context.Context, string) (*provisioner.DucklingStatus, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, TenantActivationPayload) error
 }
 
@@ -81,10 +83,86 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 		return TenantActivationPayload{}, fmt.Errorf("worker assignment is required")
 	}
 
-	warehouse := org.Warehouse
+	var dl server.DuckLakeConfig
+	var err error
+
+	// Try reading infrastructure details from the Duckling CR first (Crossplane-provisioned).
+	// Fall back to the config store path for non-Crossplane warehouses (manual seed, MinIO, etc.).
+	if a.resolveDucklingStatus != nil {
+		dl, err = a.buildDuckLakeConfigFromDuckling(ctx, assignment.OrgID)
+	}
+	if a.resolveDucklingStatus == nil || err != nil {
+		dl, err = a.buildDuckLakeConfigFromConfigStore(ctx, org.Warehouse)
+	}
+	if err != nil {
+		return TenantActivationPayload{}, err
+	}
+
+	usernames := make([]string, 0, len(org.Users))
+	for username := range org.Users {
+		usernames = append(usernames, username)
+	}
+	slices.Sort(usernames)
+
+	return TenantActivationPayload{
+		OrgID:          assignment.OrgID,
+		Usernames:      usernames,
+		LeaseExpiresAt: assignment.LeaseExpiresAt,
+		DuckLake:       dl,
+	}, nil
+}
+
+// buildDuckLakeConfigFromDuckling reads all infrastructure details from the Duckling CR
+// and uses STS to broker S3 credentials. Used for Crossplane-provisioned ducklings.
+func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Context, orgID string) (server.DuckLakeConfig, error) {
+	status, err := a.resolveDucklingStatus(ctx, orgID)
+	if err != nil {
+		return server.DuckLakeConfig{}, fmt.Errorf("resolve duckling CR %q: %w", orgID, err)
+	}
+	if status.MetadataStore.Password == "" {
+		return server.DuckLakeConfig{}, fmt.Errorf("duckling CR %q has no metadata store password", orgID)
+	}
+	if status.DataStore.BucketName == "" {
+		return server.DuckLakeConfig{}, fmt.Errorf("duckling CR %q has no data store bucket", orgID)
+	}
+
+	dl := server.DuckLakeConfig{
+		MetadataStore: buildDuckLakeMetadataStoreDSN(
+			status.MetadataStore.Endpoint,
+			5432, // Aurora always uses 5432
+			status.MetadataStore.User,
+			status.MetadataStore.Password,
+			status.MetadataStore.Database,
+		),
+		ObjectStore: fmt.Sprintf("s3://%s/", status.DataStore.BucketName),
+		S3Region:    status.DataStore.S3Region,
+		S3UseSSL:    true,
+		S3URLStyle:  "vhost",
+	}
+
+	// Broker S3 credentials via STS AssumeRole
+	if status.IAMRoleARN != "" && a.stsBroker != nil {
+		creds, err := a.stsBroker.AssumeRole(ctx, status.IAMRoleARN)
+		if err != nil {
+			return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", orgID, err)
+		}
+		dl.S3Provider = "config"
+		dl.S3AccessKey = creds.AccessKeyID
+		dl.S3SecretKey = creds.SecretAccessKey
+		dl.S3SessionToken = creds.SessionToken
+	} else {
+		dl.S3Provider = "aws_sdk"
+	}
+
+	return dl, nil
+}
+
+// buildDuckLakeConfigFromConfigStore reads infrastructure details from the config store
+// and K8s Secrets. Used for non-Crossplane warehouses (manual seed, MinIO, etc.).
+func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.Context, warehouse *configstore.ManagedWarehouseConfig) (server.DuckLakeConfig, error) {
 	metadataPassword, err := a.readSecretValue(ctx, warehouse.MetadataStoreCredentials)
 	if err != nil {
-		return TenantActivationPayload{}, fmt.Errorf("metadata store credentials: %w", err)
+		return server.DuckLakeConfig{}, fmt.Errorf("metadata store credentials: %w", err)
 	}
 
 	dl := server.DuckLakeConfig{
@@ -106,7 +184,7 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	case warehouse.S3Credentials.Name != "":
 		accessKey, secretKey, err := a.readS3Credentials(ctx, warehouse.S3Credentials)
 		if err != nil {
-			return TenantActivationPayload{}, fmt.Errorf("s3 credentials: %w", err)
+			return server.DuckLakeConfig{}, fmt.Errorf("s3 credentials: %w", err)
 		}
 		dl.S3Provider = "config"
 		dl.S3AccessKey = accessKey
@@ -116,7 +194,7 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 		if roleARN != "" && a.stsBroker != nil {
 			creds, err := a.stsBroker.AssumeRole(ctx, roleARN)
 			if err != nil {
-				return TenantActivationPayload{}, fmt.Errorf("STS AssumeRole for org %q: %w", orgName(org), err)
+				return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", warehouse.OrgID, err)
 			}
 			dl.S3Provider = "config"
 			dl.S3AccessKey = creds.AccessKeyID
@@ -127,18 +205,7 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 		}
 	}
 
-	usernames := make([]string, 0, len(org.Users))
-	for username := range org.Users {
-		usernames = append(usernames, username)
-	}
-	slices.Sort(usernames)
-
-	return TenantActivationPayload{
-		OrgID:          assignment.OrgID,
-		Usernames:      usernames,
-		LeaseExpiresAt: assignment.LeaseExpiresAt,
-		DuckLake:       dl,
-	}, nil
+	return dl, nil
 }
 
 func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Interface, defaultNamespace string, org *configstore.OrgConfig, stsBroker *STSBroker) (TenantActivationPayload, error) {

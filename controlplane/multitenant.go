@@ -151,7 +151,18 @@ func SetupMultiTenant(
 		}
 	}
 
-	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker)
+	// Initialize Duckling CR resolver for reading infrastructure details from Crossplane CRs (best-effort)
+	var resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
+	dc, dcErr := provisioner.NewDucklingClient()
+	if dcErr != nil {
+		slog.Warn("Duckling client unavailable, will use config store for infrastructure details.", "error", dcErr)
+	} else {
+		resolveDucklingStatus = func(ctx context.Context, orgID string) (*provisioner.DucklingStatus, error) {
+			return dc.Get(ctx, orgID)
+		}
+	}
+
+	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, resolveDucklingStatus)
 	if err != nil {
 		return nil, nil, nil, err
 	}
