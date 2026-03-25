@@ -202,6 +202,11 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 
 	if status.MetadataStore.Password != "" && w.SecretsState != configstore.ManagedWarehouseStateReady {
 		updates["secrets_state"] = configstore.ManagedWarehouseStateReady
+		// The Crossplane composition stores the Aurora password in a K8s Secret
+		// named aurora-password-duckling-{orgID} in the crossplane-system namespace.
+		updates["metadata_store_credentials_namespace"] = "crossplane-system"
+		updates["metadata_store_credentials_name"] = fmt.Sprintf("aurora-password-duckling-%s", w.OrgID)
+		updates["metadata_store_credentials_key"] = "password"
 	}
 
 	if status.IAMRoleARN != "" && w.IdentityState != configstore.ManagedWarehouseStateReady {
