@@ -26,6 +26,8 @@ type SharedWorkerActivator struct {
 	resolveOrgConfig       func(string) (*configstore.OrgConfig, error)
 	resolveDucklingStatus  func(context.Context, string) (*provisioner.DucklingStatus, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, TenantActivationPayload) error
+	setMigrating           func(orgID string)
+	clearMigrating         func(orgID string)
 }
 
 type TenantActivationPayload struct {
@@ -77,16 +79,34 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 			"org", payload.OrgID, "error", err)
 	} else if needed {
 		payload.DuckLake.Migrate = true
+		// Block new connections for this org while the migration runs.
+		// The first worker to activate will perform the schema upgrade;
+		// subsequent connections would fail against a partially-migrated catalog.
+		if a.setMigrating != nil {
+			a.setMigrating(payload.OrgID)
+		}
 	}
 
-	if a.activateReservedWorker != nil {
-		return a.activateReservedWorker(ctx, worker, payload)
+	activate := func() error {
+		if a.activateReservedWorker != nil {
+			return a.activateReservedWorker(ctx, worker, payload)
+		}
+		return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
+			OrgID:          payload.OrgID,
+			LeaseExpiresAt: payload.LeaseExpiresAt,
+			DuckLake:       payload.DuckLake,
+		})
 	}
-	return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
-		OrgID:          payload.OrgID,
-		LeaseExpiresAt: payload.LeaseExpiresAt,
-		DuckLake:       payload.DuckLake,
-	})
+
+	err = activate()
+
+	// Clear the migration lock after the worker finishes activation
+	// (whether it succeeded or failed). New connections can proceed.
+	if payload.DuckLake.Migrate && a.clearMigrating != nil {
+		a.clearMigrating(payload.OrgID)
+	}
+
+	return err
 }
 
 func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org *configstore.OrgConfig, assignment *WorkerAssignment) (TenantActivationPayload, error) {

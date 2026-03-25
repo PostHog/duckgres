@@ -125,6 +125,7 @@ type ConfigStoreInterface interface {
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
 	StackForUser(username string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
+	IsMigratingForUser(username string) (migrating bool, orgID string)
 	ShutdownAll()
 }
 
@@ -706,6 +707,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	var sessions *SessionManager
 	var rebalancer *MemoryRebalancer
 	if cp.orgRouter != nil {
+		// Reject connections during DuckLake migration to prevent queries from
+		// hitting a partially-migrated catalog. The client gets a clear error
+		// and can retry after the migration completes.
+		if migrating, orgID := cp.orgRouter.IsMigratingForUser(username); migrating {
+			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", orgID, "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+				"DuckLake catalog upgrade in progress for your organization, please retry in a few moments")
+			_ = writer.Flush()
+			return
+		}
+
 		_, sess, rebal, ok := cp.orgRouter.StackForUser(username)
 		if !ok {
 			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
