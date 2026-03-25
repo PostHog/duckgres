@@ -15,10 +15,9 @@ import (
 
 // duckLakeSpecVersion is the DuckLake spec version that this build of duckgres expects.
 // When the metadata store is at an older version, we backup and migrate automatically.
-// IMPORTANT: This must match the DuckLake version bundled with the current DuckDB driver.
-// Bump this to "0.4" only after upgrading duckdb-go to a version that ships DuckLake 0.4
-// (DuckDB 1.5.x), since AUTOMATIC_MIGRATION is not supported by older DuckLake extensions.
-const duckLakeSpecVersion = "0.3"
+// This must match the DuckLake version bundled with the current DuckDB driver.
+// DuckDB 1.5.x ships DuckLake 0.4 which supports AUTOMATIC_MIGRATION.
+const duckLakeSpecVersion = "0.4"
 
 // dlMigration holds the result of the migration check.
 // The check retries on transient errors (e.g., metadata store not reachable yet)
