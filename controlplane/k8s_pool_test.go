@@ -271,6 +271,55 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	}
 }
 
+func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 2)
+	stale := &ManagedWorker{ID: 1, done: make(chan struct{})}
+	if err := stale.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleIdle}); err != nil {
+		t.Fatalf("SetSharedState(stale): %v", err)
+	}
+	pool.workers[stale.ID] = stale
+
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		worker := &ManagedWorker{ID: id, done: make(chan struct{})}
+		if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleIdle}); err != nil {
+			return err
+		}
+		pool.workers[id] = worker
+		return nil
+	}
+
+	checks := 0
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		checks++
+		if worker.ID == stale.ID {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+
+	got, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if got.ID == stale.ID {
+		t.Fatalf("expected stale worker to be skipped, got %d", got.ID)
+	}
+	if checks == 0 {
+		t.Fatal("expected liveness recheck before reservation")
+	}
+	if _, ok := pool.Worker(stale.ID); ok {
+		t.Fatal("expected stale worker to be retired")
+	}
+	if got.SharedState().Assignment == nil || got.SharedState().Assignment.OrgID != "analytics" {
+		t.Fatalf("expected returned worker reserved for analytics, got %#v", got.SharedState().Assignment)
+	}
+}
+
 func TestK8sPool_CleanDeadWorkers(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
@@ -428,6 +477,12 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 	pool.minWorkers = 1
 	idle := &ManagedWorker{ID: 7, done: make(chan struct{})}
 	pool.workers[idle.ID] = idle
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		if worker != idle {
+			t.Fatalf("expected liveness check for idle worker %d, got %#v", idle.ID, worker)
+		}
+		return nil
+	}
 
 	replacementSpawned := make(chan int, 1)
 	pool.spawnWarmWorkerBackgroundFunc = func(id int) {
@@ -440,7 +495,10 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 	}
 
 	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
-	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	worker, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
 		OrgID:          "analytics",
 		LeaseExpiresAt: leaseExpiry,
 	})
@@ -501,6 +559,9 @@ func TestK8sPoolHealthCheckLoopReplenishesWarmCapacityAfterIdleWorkerCrash(t *te
 
 func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		pool.mu.Lock()
 		pool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
@@ -508,7 +569,10 @@ func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
 		return nil
 	}
 
-	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	worker, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
 		OrgID:          "billing",
 		LeaseExpiresAt: time.Now().Add(time.Hour),
 	})

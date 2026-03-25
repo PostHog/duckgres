@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+func setInvalidWorkerBinary(pool *FlightWorkerPool) {
+	pool.binaryPath = "/nonexistent/duckgres-test-worker"
+}
+
 func TestHealthCheckFailureCountingResetsOnSuccess(t *testing.T) {
 	// Simulate 2 consecutive failures followed by a success.
 	// The counter should reset, requiring another 3 failures to trigger force-kill.
@@ -324,6 +328,7 @@ func TestAcquireWorkerLeastLoadedAtCapacity(t *testing.T) {
 
 func TestAcquireWorkerSpawnsWhenBelowCapacity(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 3)
+	setInvalidWorkerBinary(pool)
 
 	// Pre-populate 1 busy worker (below capacity of 3).
 	w0, cleanup0 := makeFakeWorker(t, 0)
@@ -349,6 +354,7 @@ func TestAcquireWorkerSpawnsWhenBelowCapacity(t *testing.T) {
 
 func TestAcquireWorkerCleansDeadWorkersWhenAllDead(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
+	setInvalidWorkerBinary(pool)
 
 	// Pre-populate 2 dead workers.
 	cmd0 := exec.Command("true")
@@ -389,6 +395,7 @@ func TestAcquireWorkerCleansDeadWorkersWhenAllDead(t *testing.T) {
 
 func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 0)
+	setInvalidWorkerBinary(pool)
 
 	// AcquireWorker should not block (it will fail trying to
 	// spawn a worker with a fake binary, but should get past any checks).

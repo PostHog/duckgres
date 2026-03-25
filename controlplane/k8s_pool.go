@@ -65,6 +65,7 @@ type K8sWorkerPool struct {
 	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
 	spawnWarmWorkerBackgroundFunc func(id int)
 	activateTenantFunc            func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error
+	healthCheckFunc               func(context.Context, *ManagedWorker) error
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 }
@@ -891,14 +892,27 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			}
 			idle.reservedAt = time.Now()
 			observeWarmPoolLifecycleGauges(p.workers)
-
-			if p.shouldReplenishWarmCapacityLocked() {
-				id := p.allocateWorkerIDLocked()
+			shouldReplenish := p.shouldReplenishWarmCapacityLocked()
+			var replenishID int
+			if shouldReplenish {
+				replenishID = p.allocateWorkerIDLocked()
 				p.spawning++
+			}
+			p.mu.Unlock()
+
+			if err := p.checkReservedWorkerLiveness(ctx, idle); err != nil {
+				slog.Warn("Reserved warm worker failed liveness recheck.", "worker", idle.ID, "error", err)
+				p.retireWorkerWithReason(idle.ID, RetireReasonCrash)
+				p.mu.Lock()
+				if shouldReplenish {
+					p.spawning--
+				}
 				p.mu.Unlock()
-				p.spawnWarmWorkerBackground(id)
-			} else {
-				p.mu.Unlock()
+				continue
+			}
+
+			if shouldReplenish {
+				p.spawnWarmWorkerBackground(replenishID)
 			}
 			return idle, nil
 		}
@@ -931,6 +945,22 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker *ManagedWorker) error {
+	check := p.healthCheckFunc
+	if check == nil {
+		check = func(ctx context.Context, worker *ManagedWorker) error {
+			if worker == nil || worker.client == nil {
+				return fmt.Errorf("worker client is not available")
+			}
+			hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			_, err := doHealthCheck(hctx, worker.client)
+			return err
+		}
+	}
+	return check(ctx, worker)
 }
 
 // SpawnMinWorkers pre-warms the pool with count workers.
