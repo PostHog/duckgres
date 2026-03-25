@@ -19,7 +19,7 @@ var ducklingGVR = schema.GroupVersionResource{
 	Resource: "ducklings",
 }
 
-const ducklingNamespace = "crossplane-system"
+const ducklingNamespace = "ducklings"
 
 // DucklingStatus holds the parsed status from a Duckling CR.
 // The Duckling composition provisions AWS infrastructure (Aurora, S3, IAM)
