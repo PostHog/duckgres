@@ -490,6 +490,14 @@ func AppendValue(builder array.Builder, val interface{}) {
 		}
 	case *array.MapBuilder:
 		switch v := val.(type) {
+		case duckdb.OrderedMap:
+			b.Append(true)
+			kb, ib := b.KeyBuilder(), b.ItemBuilder()
+			keys, values := v.Keys(), v.Values()
+			for i, k := range keys {
+				AppendValue(kb, k)
+				AppendValue(ib, values[i])
+			}
 		case duckdb.Map:
 			b.Append(true)
 			kb, ib := b.KeyBuilder(), b.ItemBuilder()
