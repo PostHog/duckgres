@@ -89,6 +89,9 @@ func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 
 func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerActivator(t *testing.T) {
 	sharedPool, cs := newTestK8sPool(t, 10)
+	sharedPool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
 	sharedPool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		sharedPool.mu.Lock()
 		sharedPool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
@@ -173,7 +176,10 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 		},
 	})
 
-	worker, err := stack.Pool.AcquireWorker(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	worker, err := stack.Pool.AcquireWorker(ctx)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}

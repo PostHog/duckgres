@@ -86,12 +86,18 @@ func TestMarkWorkerRetiredLocked_RecordsHotWorkerSessions(t *testing.T) {
 
 func TestReservedAtTracking(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
 
 	w := makeTestWorker(WorkerLifecycleIdle, nil)
 	pool.workers[1] = w
 
 	before := time.Now()
-	_, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	_, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
 		OrgID:          "org-1",
 		LeaseExpiresAt: time.Now().Add(time.Hour),
 	})

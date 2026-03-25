@@ -10,6 +10,9 @@ import (
 
 func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
+	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
 		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
@@ -21,7 +24,10 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-	worker, err := pool.AcquireWorker(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	worker, err := pool.AcquireWorker(ctx)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
@@ -40,6 +46,9 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 
 func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
+	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
 	other := &ManagedWorker{ID: 1, done: make(chan struct{})}
 	if err := other.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
@@ -63,7 +72,10 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-	worker, err := pool.AcquireWorker(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	worker, err := pool.AcquireWorker(ctx)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
@@ -100,6 +112,9 @@ func TestOrgReservedPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
 
 func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgConfig(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
+	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
 		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
@@ -114,7 +129,10 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 		return nil
 	}
 
-	worker, err := pool.AcquireWorker(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	worker, err := pool.AcquireWorker(ctx)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
@@ -128,6 +146,9 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 
 func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRuntime(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
+	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
 		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
@@ -145,7 +166,10 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 		return nil
 	}
 
-	worker, err := pool.AcquireWorker(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	worker, err := pool.AcquireWorker(ctx)
 	if err != nil {
 		t.Fatalf("AcquireWorker: %v", err)
 	}
