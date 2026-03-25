@@ -189,7 +189,7 @@ func SetupMultiTenant(
 	engine := gin.New()
 	engine.Use(gin.Recovery())
 
-	// Health endpoint (also available on :9090 via metrics server)
+	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
