@@ -92,6 +92,8 @@ type resolvedConfig struct {
 	InternalSecret           string
 }
 
+func intPtr(n int) *int { return &n }
+
 func defaultServerConfig() server.Config {
 	return server.Config{
 		Host:                      "0.0.0.0",
@@ -109,7 +111,8 @@ func defaultServerConfig() server.Config {
 		},
 		Extensions: []string{"ducklake"},
 		DuckLake: server.DuckLakeConfig{
-			CheckpointInterval: 24 * time.Hour,
+			CheckpointInterval:  24 * time.Hour,
+			DataInliningRowLimit: intPtr(0),
 		},
 		QueryLog: server.QueryLogConfig{
 			Enabled:              true,
