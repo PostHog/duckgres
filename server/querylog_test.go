@@ -180,6 +180,61 @@ func TestQueryLoggerStopIsIdempotent(t *testing.T) {
 	ql.Stop()
 }
 
+func TestHighBitHashInsertIntoBigint(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = db.Exec("CREATE TABLE test_hash (h BIGINT)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// FNV-1a produces uint64 values; ~50% have the high bit set, which
+	// becomes negative when stored as int64. Verify BIGINT accepts these.
+	var highBitHash int64 = -0x2900_0000_0000_0000 // equivalent to uint64(0xD700_0000_0000_0000)
+
+	_, err = db.Exec("INSERT INTO test_hash VALUES ($1)", highBitHash)
+	if err != nil {
+		t.Fatalf("insert failed (this was the original bug): %v", err)
+	}
+
+	var stored int64
+	err = db.QueryRow("SELECT h FROM test_hash").Scan(&stored)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if stored != highBitHash {
+		t.Errorf("hash round-trip mismatch: got %d, want %d", stored, highBitHash)
+	}
+}
+
+// TestHighBitHashRejectsUbigint documents that DuckDB's UBIGINT column rejects
+// negative int64 values — this is the DuckDB behavior that motivated switching
+// the query_log column to BIGINT. If a future DuckDB version changes this
+// behavior (e.g., bitwise reinterpretation), this test failing means the column
+// type choice should be re-evaluated, not that duckgres has regressed.
+func TestHighBitHashRejectsUbigint(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = db.Exec("CREATE TABLE test_hash_u (h UBIGINT)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	var highBitHash int64 = -0x2900_0000_0000_0000
+	_, err = db.Exec("INSERT INTO test_hash_u VALUES ($1)", highBitHash)
+	if err == nil {
+		t.Fatal("expected error inserting negative int64 into UBIGINT, but insert succeeded")
+	}
+}
+
 func TestSplitHostPort(t *testing.T) {
 	host, port, err := splitHostPort("192.168.1.1:5432")
 	if err != nil {
