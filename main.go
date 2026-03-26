@@ -125,6 +125,10 @@ type DuckLakeFileConfig struct {
 
 	// Checkpoint interval for DuckLake maintenance (e.g., "24h", "6h")
 	CheckpointInterval string `yaml:"checkpoint_interval"`
+
+	// DataInliningRowLimit controls max rows inlined in metadata per insert.
+	// Set to 0 to disable inlining. Omit to use DuckLake default (10).
+	DataInliningRowLimit *int `yaml:"data_inlining_row_limit"`
 }
 
 // loadConfigFile loads configuration from a YAML file
