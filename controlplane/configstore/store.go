@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -26,11 +28,12 @@ type Snapshot struct {
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
 type ConfigStore struct {
-	db           *gorm.DB
-	mu           sync.RWMutex
-	snapshot     *Snapshot
-	pollInterval time.Duration
-	onChange     []func(old, new *Snapshot)
+	db            *gorm.DB
+	runtimeSchema string
+	mu            sync.RWMutex
+	snapshot      *Snapshot
+	pollInterval  time.Duration
+	onChange      []func(old, new *Snapshot)
 }
 
 // NewConfigStore connects to the PostgreSQL config store, runs migrations,
@@ -60,6 +63,17 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 		return nil, fmt.Errorf("auto-migrate config store: %w", err)
 	}
 
+	runtimeSchema, err := resolveRuntimeSchema(db)
+	if err != nil {
+		return nil, fmt.Errorf("resolve runtime schema: %w", err)
+	}
+	if err := ensureRuntimeSchema(db, runtimeSchema); err != nil {
+		return nil, fmt.Errorf("ensure runtime schema: %w", err)
+	}
+	if err := autoMigrateRuntimeTables(db, runtimeSchema); err != nil {
+		return nil, fmt.Errorf("auto-migrate runtime schema: %w", err)
+	}
+
 	// Ensure singleton rows exist with defaults
 	db.FirstOrCreate(&GlobalConfig{}, GlobalConfig{ID: 1})
 	db.FirstOrCreate(&DuckLakeConfig{}, DuckLakeConfig{ID: 1})
@@ -67,8 +81,9 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	db.FirstOrCreate(&QueryLogConfig{}, QueryLogConfig{ID: 1})
 
 	cs := &ConfigStore{
-		db:           db,
-		pollInterval: pollInterval,
+		db:            db,
+		runtimeSchema: runtimeSchema,
+		pollInterval:  pollInterval,
 	}
 
 	// Load initial snapshot
@@ -242,9 +257,113 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 	return nil
 }
 
+func resolveRuntimeSchema(db *gorm.DB) (string, error) {
+	var currentSchema string
+	if err := db.Raw("SELECT current_schema()").Scan(&currentSchema).Error; err != nil {
+		return "", err
+	}
+	if currentSchema == "" || currentSchema == "public" {
+		return "cp_runtime", nil
+	}
+	return currentSchema + "_runtime", nil
+}
+
+func ensureRuntimeSchema(db *gorm.DB, runtimeSchema string) error {
+	return db.Exec(`CREATE SCHEMA IF NOT EXISTS "` + quoteIdentifier(runtimeSchema) + `"`).Error
+}
+
+func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
+	for _, spec := range []struct {
+		table string
+		model any
+	}{
+		{table: runtimeSchema + ".cp_instances", model: &ControlPlaneInstance{}},
+		{table: runtimeSchema + ".worker_records", model: &WorkerRecord{}},
+		{table: runtimeSchema + ".flight_session_records", model: &FlightSessionRecord{}},
+	} {
+		if err := db.Table(spec.table).AutoMigrate(spec.model); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func quoteIdentifier(v string) string {
+	return strings.ReplaceAll(v, `"`, `""`)
+}
+
 // DB exposes the GORM database for direct CRUD operations (used by admin API).
 func (cs *ConfigStore) DB() *gorm.DB {
 	return cs.db
+}
+
+// RuntimeSchema returns the dedicated runtime coordination schema name.
+func (cs *ConfigStore) RuntimeSchema() string {
+	return cs.runtimeSchema
+}
+
+func (cs *ConfigStore) runtimeTable(base string) string {
+	return cs.runtimeSchema + "." + base
+}
+
+// UpsertControlPlaneInstance inserts or updates a runtime control-plane instance row.
+func (cs *ConfigStore) UpsertControlPlaneInstance(instance *ControlPlaneInstance) error {
+	if err := cs.db.Table(cs.runtimeTable(instance.TableName())).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "pod_uid", "boot_id", "state", "started_at", "last_heartbeat_at", "draining_at", "expired_at", "updated_at"}),
+	}).Create(instance).Error; err != nil {
+		return fmt.Errorf("upsert control plane instance: %w", err)
+	}
+	return nil
+}
+
+// GetControlPlaneInstance returns a runtime control-plane instance row by id.
+func (cs *ConfigStore) GetControlPlaneInstance(id string) (*ControlPlaneInstance, error) {
+	var instance ControlPlaneInstance
+	if err := cs.db.Table(cs.runtimeTable(instance.TableName())).First(&instance, "id = ?", id).Error; err != nil {
+		return nil, fmt.Errorf("get control plane instance: %w", err)
+	}
+	return &instance, nil
+}
+
+// UpsertWorkerRecord inserts or updates a runtime worker row.
+func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
+	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "worker_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "pod_uid", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "lease_expires_at", "activation_started_at", "last_heartbeat_at", "retire_reason", "updated_at"}),
+	}).Create(record).Error; err != nil {
+		return fmt.Errorf("upsert worker record: %w", err)
+	}
+	return nil
+}
+
+// GetWorkerRecord returns a runtime worker row by worker id.
+func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
+	var record WorkerRecord
+	if err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "worker_id = ?", workerID).Error; err != nil {
+		return nil, fmt.Errorf("get worker record: %w", err)
+	}
+	return &record, nil
+}
+
+// UpsertFlightSessionRecord inserts or updates a durable Flight reconnect row.
+func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) error {
+	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "session_token"}},
+		DoUpdates: clause.AssignmentColumns([]string{"org_id", "worker_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
+	}).Create(record).Error; err != nil {
+		return fmt.Errorf("upsert flight session record: %w", err)
+	}
+	return nil
+}
+
+// GetFlightSessionRecord returns a durable Flight reconnect row by session token.
+func (cs *ConfigStore) GetFlightSessionRecord(sessionToken string) (*FlightSessionRecord, error) {
+	var record FlightSessionRecord
+	if err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "session_token = ?", sessionToken).Error; err != nil {
+		return nil, fmt.Errorf("get flight session record: %w", err)
+	}
+	return &record, nil
 }
 
 // Reload forces an immediate config reload from the database.
