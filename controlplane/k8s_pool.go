@@ -53,9 +53,11 @@ type K8sWorkerPool struct {
 	configPath           string
 	imagePullPolicy      corev1.PullPolicy
 	serviceAccount       string
-	workerCPURequest     string     // CPU request for worker pods (e.g., "500m")
-	workerMemoryRequest  string     // memory request for worker pods (e.g., "1Gi")
-	orgID                string     // org ID for pod labels (multi-tenant mode)
+	workerCPURequest     string            // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest  string            // memory request for worker pods (e.g., "1Gi")
+	workerNodeSelector   map[string]string // node selector for worker pods
+	workerTolerationKey  string            // taint key for NoSchedule toleration
+	orgID                string            // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
 	cachedToken          string // cached bearer token (immutable after setup)
 	informer             cache.SharedIndexInformer
@@ -132,6 +134,8 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		serviceAccount:       cfg.ServiceAccount,
 		workerCPURequest:     cfg.WorkerCPURequest,
 		workerMemoryRequest:  cfg.WorkerMemoryRequest,
+		workerNodeSelector:   cfg.WorkerNodeSelector,
+		workerTolerationKey:  cfg.WorkerTolerationKey,
 		orgID:                cfg.OrgID,
 		workerIDGenerator:    cfg.WorkerIDGenerator,
 		spawnSem:             make(chan struct{}, spawnConcurrency),
@@ -391,6 +395,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Spec: corev1.PodSpec{
 			RestartPolicy:      corev1.RestartPolicyNever,
 			ServiceAccountName: p.serviceAccount,
+			NodeSelector:       p.workerNodeSelector,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),
@@ -438,6 +443,26 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Name:  "DUCKGRES_SHARED_WARM_WORKER",
 		Value: "true",
 	})
+
+	// Add toleration if configured
+	if p.workerTolerationKey != "" {
+		pod.Spec.Tolerations = []corev1.Toleration{{
+			Key:    p.workerTolerationKey,
+			Effect: corev1.TaintEffectNoSchedule,
+		}}
+	}
+
+	// One worker per instance
+	pod.Spec.Affinity = &corev1.Affinity{
+		PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "duckgres-worker"},
+				},
+				TopologyKey: "kubernetes.io/hostname",
+			}},
+		},
+	}
 
 	// Add writable data directory for DuckDB databases
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{

@@ -560,6 +560,8 @@ func main() {
 				SharedWarmTarget:    resolved.K8sSharedWarmTarget,
 				WorkerCPURequest:    resolved.K8sWorkerCPURequest,
 				WorkerMemoryRequest: resolved.K8sWorkerMemoryRequest,
+				WorkerNodeSelector:  resolved.K8sWorkerNodeSelector,
+				WorkerTolerationKey: resolved.K8sWorkerTolerationKey,
 				AWSRegion:           resolved.AWSRegion,
 			},
 		}
