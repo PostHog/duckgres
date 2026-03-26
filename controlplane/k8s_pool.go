@@ -939,7 +939,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		}
 
 		if p.runtimeStore != nil {
-			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.LeaseExpiresAt)
+			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.LeaseExpiresAt, assignment.MaxWorkers)
 			if err != nil {
 				return nil, err
 			}

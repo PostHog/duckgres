@@ -27,6 +27,7 @@ type captureRuntimeWorkerStore struct {
 	claimOwnerCPID string
 	claimOrgID     string
 	claimLease     time.Time
+	claimMaxOrgWorkers int
 	spawned             *configstore.WorkerRecord
 	spawnErr            error
 	spawnCalls          int
@@ -61,13 +62,14 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	return out
 }
 
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
 	s.claimOwnerCPID = ownerCPInstanceID
 	s.claimOrgID = orgID
 	s.claimLease = leaseExpiresAt
+	s.claimMaxOrgWorkers = maxOrgWorkers
 	if s.claimErr != nil {
 		return nil, s.claimErr
 	}
@@ -824,6 +826,9 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 	if !store.claimLease.Equal(leaseExpiry) {
 		t.Fatalf("expected claim lease expiry %v, got %v", leaseExpiry, store.claimLease)
 	}
+	if store.claimMaxOrgWorkers != 0 {
+		t.Fatalf("expected default max org workers 0, got %d", store.claimMaxOrgWorkers)
+	}
 
 	state := worker.SharedState()
 	if state.Lifecycle != WorkerLifecycleReserved {
@@ -856,6 +861,27 @@ func TestK8sPoolReserveSharedWorkerFallsBackWhenRuntimeClaimReturnsNil(t *testin
 	}
 	if store.claimCalls != 1 {
 		t.Fatalf("expected one claim attempt before fallback, got %d", store.claimCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerPassesOrgCapToRuntimeClaim(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	idle := &ManagedWorker{ID: 12, done: make(chan struct{})}
+	pool.workers[idle.ID] = idle
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error { return nil }
+
+	_, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: time.Date(2026, time.March, 20, 19, 0, 0, 0, time.UTC),
+		MaxWorkers:     3,
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if store.claimMaxOrgWorkers != 3 {
+		t.Fatalf("expected claim max org workers 3, got %d", store.claimMaxOrgWorkers)
 	}
 }
 

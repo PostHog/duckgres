@@ -127,7 +127,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 	}
 
 	leaseExpiry := startedAt.Add(24 * time.Hour)
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", leaseExpiry)
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", leaseExpiry, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -168,12 +168,59 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", time.Date(2026, time.March, 27, 0, 0, 0, 0, time.UTC))
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", time.Date(2026, time.March, 27, 0, 0, 0, 0, time.UTC), 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
 	if claimed != nil {
 		t.Fatalf("expected no claim, got %#v", claimed)
+	}
+}
+
+func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 13, 30, 0, 0, time.UTC)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7,
+		PodName:           "duckgres-worker-7",
+		State:             configstore.WorkerStateIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          8,
+		PodName:           "duckgres-worker-8",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        4,
+		LeaseExpiresAt:    now.Add(time.Hour),
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
+	}
+
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", now.Add(24*time.Hour), 1)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected org cap to block claim, got %#v", claimed)
+	}
+
+	persisted, err := store.GetWorkerRecord(7)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateIdle {
+		t.Fatalf("expected worker to remain idle, got %q", persisted.State)
+	}
+	if persisted.OrgID != "" {
+		t.Fatalf("expected idle worker org to remain empty, got %q", persisted.OrgID)
 	}
 }
 

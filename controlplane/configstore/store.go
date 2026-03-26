@@ -365,10 +365,26 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 
 // ClaimIdleWorker atomically claims one idle worker row for a control-plane instance.
 // The selected row is locked with SKIP LOCKED and transitioned to reserved while
-// incrementing owner_epoch.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time) (*WorkerRecord, error) {
+// incrementing owner_epoch. When maxOrgWorkers is set, org claims are serialized
+// under the same advisory lock used for spawn-slot allocation.
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time, maxOrgWorkers int) (*WorkerRecord, error) {
 	var claimed *WorkerRecord
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		if orgID != "" {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:org:"+orgID)).Error; err != nil {
+				return err
+			}
+		}
+		if maxOrgWorkers > 0 && orgID != "" {
+			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
+			if err != nil {
+				return err
+			}
+			if count >= int64(maxOrgWorkers) {
+				return nil
+			}
+		}
+
 		var current WorkerRecord
 		err := tx.Table(cs.runtimeTable(current.TableName())).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
