@@ -49,15 +49,33 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	p.mu.RLock()
 	current := p.activation
 	currentOwnerEpoch := p.ownerEpoch
+	currentOwnerCPInstanceID := p.ownerCPInstanceID
+	currentWorkerID := p.workerID
 	p.mu.RUnlock()
-	if payload.OwnerEpoch < currentOwnerEpoch {
-		return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, currentOwnerEpoch)
+	if currentWorkerID > 0 && payload.WorkerID != currentWorkerID {
+		return fmt.Errorf("stale worker_id %d (current %d)", payload.WorkerID, currentWorkerID)
 	}
 	if current != nil {
+		if !sameTenantActivationRuntime(current.payload, payload) {
+			return fmt.Errorf("worker already activated for org %q", current.payload.OrgID)
+		}
+		if reflect.DeepEqual(current.payload, payload) {
+			return nil
+		}
+		if payload.OwnerEpoch <= currentOwnerEpoch {
+			return fmt.Errorf("same-tenant takeover requires newer owner epoch %d (current %d)", payload.OwnerEpoch, currentOwnerEpoch)
+		}
 		if p.reuseExistingActivation(payload) {
 			return nil
 		}
 		return fmt.Errorf("worker already activated for org %q", current.payload.OrgID)
+	}
+	if currentOwnerCPInstanceID == "" {
+		if payload.OwnerEpoch <= currentOwnerEpoch {
+			return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, currentOwnerEpoch)
+		}
+	} else if payload.OwnerEpoch <= currentOwnerEpoch {
+		return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, currentOwnerEpoch)
 	}
 
 	cfg := p.cfg
@@ -87,11 +105,14 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if payload.OwnerEpoch < p.ownerEpoch {
+	if p.workerID > 0 && payload.WorkerID != p.workerID {
+		return fmt.Errorf("stale worker_id %d (current %d)", payload.WorkerID, p.workerID)
+	}
+	if payload.OwnerEpoch <= p.ownerEpoch {
 		return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, p.ownerEpoch)
 	}
 	if p.activation != nil {
-		if p.reuseExistingActivationLocked(payload) {
+		if sameTenantActivationRuntime(p.activation.payload, payload) && reflect.DeepEqual(p.activation.payload, payload) {
 			return nil
 		}
 		return fmt.Errorf("worker already activated for org %q", p.activation.payload.OrgID)
@@ -121,8 +142,8 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 	if !sameTenantActivationRuntime(current, payload) {
 		return false
 	}
-	if reflect.DeepEqual(current, payload) {
-		return true
+	if !reflect.DeepEqual(current, payload) && payload.OwnerEpoch <= current.OwnerEpoch {
+		return false
 	}
 	p.activation.payload = payload
 	p.ownerEpoch = payload.OwnerEpoch
@@ -145,6 +166,12 @@ func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata)
 
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if p.workerID > 0 && meta.WorkerID != 0 && meta.WorkerID != p.workerID {
+		return fmt.Errorf("stale worker_id %d (current %d)", meta.WorkerID, p.workerID)
+	}
+	if p.activation == nil && p.ownerCPInstanceID == "" {
+		return nil
+	}
 	if meta.OwnerEpoch != p.ownerEpoch {
 		return fmt.Errorf("stale owner epoch %d (current %d)", meta.OwnerEpoch, p.ownerEpoch)
 	}
@@ -153,6 +180,59 @@ func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata)
 	}
 	if p.workerID > 0 && meta.WorkerID != p.workerID {
 		return fmt.Errorf("stale worker_id %d (current %d)", meta.WorkerID, p.workerID)
+	}
+	return nil
+}
+
+func (p *SessionPool) resetTenant(meta server.WorkerControlMetadata) error {
+	if !p.sharedWarmMode {
+		return fmt.Errorf("tenant reset is not enabled for this worker")
+	}
+	if err := p.validateControlMetadata(meta); err != nil {
+		return err
+	}
+
+	p.mu.RLock()
+	current := p.activation
+	sessionCount := len(p.sessions)
+	p.mu.RUnlock()
+	if sessionCount > 0 {
+		return fmt.Errorf("cannot reset tenant while %d sessions remain active", sessionCount)
+	}
+	if current == nil {
+		p.mu.Lock()
+		p.ownerCPInstanceID = ""
+		if p.workerID == 0 {
+			p.workerID = meta.WorkerID
+		}
+		p.mu.Unlock()
+		return nil
+	}
+	if p.resetDBConnection == nil {
+		return fmt.Errorf("tenant reset is not configured")
+	}
+	if err := p.resetDBConnection(current.db, p.startTime, server.ProcessVersion()); err != nil {
+		return fmt.Errorf("reset tenant runtime: %w", err)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.sessions) > 0 {
+		return fmt.Errorf("cannot reset tenant while %d sessions remain active", len(p.sessions))
+	}
+	if p.workerID > 0 && meta.WorkerID != 0 && meta.WorkerID != p.workerID {
+		return fmt.Errorf("stale worker_id %d (current %d)", meta.WorkerID, p.workerID)
+	}
+	if meta.OwnerEpoch != p.ownerEpoch {
+		return fmt.Errorf("stale owner epoch %d (current %d)", meta.OwnerEpoch, p.ownerEpoch)
+	}
+	if p.ownerCPInstanceID != "" && meta.CPInstanceID != p.ownerCPInstanceID {
+		return fmt.Errorf("stale cp_instance_id %q (current %q)", meta.CPInstanceID, p.ownerCPInstanceID)
+	}
+	p.activation = nil
+	p.ownerCPInstanceID = ""
+	if p.workerID == 0 {
+		p.workerID = meta.WorkerID
 	}
 	return nil
 }

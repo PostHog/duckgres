@@ -180,6 +180,11 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	stream := &mockDoActionStream{}
 
 	firstBody, err := json.Marshal(ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			OwnerEpoch:   1,
+			CPInstanceID: "cp-live:boot-a",
+			WorkerID:     17,
+		},
 		OrgID: "analytics",
 	})
 	if err != nil {
@@ -190,6 +195,11 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	}
 
 	secondBody, err := json.Marshal(ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			OwnerEpoch:   2,
+			CPInstanceID: "cp-live:boot-a",
+			WorkerID:     17,
+		},
 		OrgID: "billing",
 	})
 	if err != nil {
@@ -247,6 +257,8 @@ func TestSessionFromContextRejectsStaleOwnerEpoch(t *testing.T) {
 		startTime:      time.Now(),
 		sharedWarmMode: true,
 		ownerEpoch:     5,
+		ownerCPInstanceID: "cp-live:boot-a",
+		workerID:          17,
 	}
 	close(pool.warmupDone)
 	pool.sessions["session-1"] = &Session{ID: "session-1"}

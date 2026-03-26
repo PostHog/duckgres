@@ -850,6 +850,25 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 	return nil
 }
 
+// ResetActivatedDBConnection returns an activated shared warm worker connection
+// to its neutral baseline runtime by detaching DuckLake and restoring the
+// default compatibility views in memory.
+func ResetActivatedDBConnection(db *sql.DB, serverStartTime time.Time, serverVersion string) error {
+	if _, err := db.Exec("USE memory"); err != nil {
+		return fmt.Errorf("switch to memory catalog: %w", err)
+	}
+	if _, err := db.Exec("DETACH ducklake"); err != nil {
+		return fmt.Errorf("detach ducklake: %w", err)
+	}
+	if err := initPgCatalog(db, serverStartTime, processStartTime, serverVersion, processVersion); err != nil {
+		return fmt.Errorf("reset pg_catalog compatibility views: %w", err)
+	}
+	if err := initInformationSchema(db, false); err != nil {
+		return fmt.Errorf("reset information_schema compatibility views: %w", err)
+	}
+	return nil
+}
+
 // CreatePassthroughDBConnection creates a DuckDB connection without pg_catalog
 // or information_schema initialization. DuckLake is still attached if configured
 // so passthrough users can access the same data. This is used for passthrough users

@@ -294,6 +294,102 @@ func TestK8sPool_ReleaseWorker(t *testing.T) {
 	}
 }
 
+func TestK8sPoolReleaseWorkerReturnsSharedHotWorkerToNeutralIdle(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	resetCalls := 0
+	pool.resetTenantFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		resetCalls++
+		return nil
+	}
+
+	worker := &ManagedWorker{ID: 7, activeSessions: 1, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: time.Date(2026, time.March, 20, 19, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	pool.ReleaseWorker(worker.ID)
+
+	got, ok := pool.Worker(worker.ID)
+	if !ok {
+		t.Fatal("expected shared hot worker to remain in pool")
+	}
+	if resetCalls != 1 {
+		t.Fatalf("expected one reset call, got %d", resetCalls)
+	}
+	if got.activeSessions != 0 {
+		t.Fatalf("expected no active sessions, got %d", got.activeSessions)
+	}
+	if got.SharedState().NormalizedLifecycle() != WorkerLifecycleIdle {
+		t.Fatalf("expected worker to return to idle, got %q", got.SharedState().NormalizedLifecycle())
+	}
+	if got.SharedState().Assignment != nil {
+		t.Fatalf("expected idle assignment cleared, got %#v", got.SharedState().Assignment)
+	}
+	if got.OwnerCPInstanceID() != "" {
+		t.Fatalf("expected owner cp instance id to be cleared, got %q", got.OwnerCPInstanceID())
+	}
+	if got.OwnerEpoch() != 4 {
+		t.Fatalf("expected owner epoch to remain 4, got %d", got.OwnerEpoch())
+	}
+
+	records := store.snapshot()
+	if len(records) == 0 {
+		t.Fatal("expected idle release to persist a worker record")
+	}
+	last := records[len(records)-1]
+	if last.State != configstore.WorkerStateIdle {
+		t.Fatalf("expected idle worker record, got %q", last.State)
+	}
+	if last.OwnerCPInstanceID != "" {
+		t.Fatalf("expected idle worker record owner cp instance id to be cleared, got %q", last.OwnerCPInstanceID)
+	}
+	if last.OrgID != "" {
+		t.Fatalf("expected idle worker record org to be cleared, got %q", last.OrgID)
+	}
+	if !last.LeaseExpiresAt.IsZero() {
+		t.Fatalf("expected idle worker record lease expiry to be cleared, got %v", last.LeaseExpiresAt)
+	}
+}
+
+func TestK8sPoolReleaseWorkerRetiresSharedHotWorkerWhenResetFails(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.resetTenantFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return context.DeadlineExceeded
+	}
+
+	worker := &ManagedWorker{ID: 8, activeSessions: 1, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(2)
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	pool.ReleaseWorker(worker.ID)
+
+	time.Sleep(100 * time.Millisecond)
+	if _, ok := pool.Worker(worker.ID); ok {
+		t.Fatal("expected reset failure to retire worker")
+	}
+}
+
 func TestK8sPool_RetireWorker(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
@@ -1091,6 +1187,7 @@ func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *t
 	store := &captureRuntimeWorkerStore{}
 	pool.runtimeStore = store
 	worker := &ManagedWorker{ID: 9, done: make(chan struct{}), ownerEpoch: 4}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
@@ -1140,6 +1237,7 @@ func TestK8sPoolRetireWorkerPersistsRetiredWorkerRecord(t *testing.T) {
 	store := &captureRuntimeWorkerStore{}
 	pool.runtimeStore = store
 	worker := &ManagedWorker{ID: 5, done: make(chan struct{}), ownerEpoch: 2}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{

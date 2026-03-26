@@ -140,6 +140,19 @@ func (h *FlightSQLHandler) doActivateTenant(body []byte, stream flight.FlightSer
 	return stream.Send(&flight.Result{Body: resp})
 }
 
+func (h *FlightSQLHandler) doResetTenant(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerResetPayload
+	if err := json.Unmarshal(body, &req); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid ResetTenant request: %v", err)
+	}
+	if err := h.pool.resetTenant(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "reset tenant: %v", err)
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
+	return stream.Send(&flight.Result{Body: resp})
+}
+
 func (h *FlightSQLHandler) doDestroySession(body []byte, stream flight.FlightService_DoActionServer) error {
 	var req server.WorkerDestroySessionPayload
 	if err := json.Unmarshal(body, &req); err != nil {

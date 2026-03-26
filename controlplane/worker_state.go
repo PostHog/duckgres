@@ -124,7 +124,7 @@ func isAllowedWorkerLifecycleTransition(current, next WorkerLifecycleState) bool
 	case WorkerLifecycleHot:
 		return next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleDraining:
-		return next == WorkerLifecycleRetired
+		return next == WorkerLifecycleIdle || next == WorkerLifecycleRetired
 	case WorkerLifecycleRetired:
 		return false
 	default:
