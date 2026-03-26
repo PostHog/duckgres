@@ -37,6 +37,13 @@ type captureRuntimeWorkerStore struct {
 	spawnPodNamePrefix  string
 	spawnMaxOrgWorkers  int
 	spawnMaxGlobalWorks int
+	takenOver           *configstore.WorkerRecord
+	takeOverErr         error
+	takeOverWorkerID    int
+	takeOverOwnerCPID   string
+	takeOverOrgID       string
+	takeOverExpectedEpoch int64
+	takeOverLease       time.Time
 }
 
 func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
@@ -90,6 +97,42 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 	}
 	spawned := *s.spawned
 	return &spawned, nil
+}
+
+func (s *captureRuntimeWorkerStore) GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimed != nil && s.claimed.WorkerID == workerID {
+		record := *s.claimed
+		return &record, nil
+	}
+	if s.spawned != nil && s.spawned.WorkerID == workerID {
+		record := *s.spawned
+		return &record, nil
+	}
+	if s.takenOver != nil && s.takenOver.WorkerID == workerID {
+		record := *s.takenOver
+		return &record, nil
+	}
+	return nil, nil
+}
+
+func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64, leaseExpiresAt time.Time) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.takeOverWorkerID = workerID
+	s.takeOverOwnerCPID = ownerCPInstanceID
+	s.takeOverOrgID = orgID
+	s.takeOverExpectedEpoch = expectedOwnerEpoch
+	s.takeOverLease = leaseExpiresAt
+	if s.takeOverErr != nil {
+		return nil, s.takeOverErr
+	}
+	if s.takenOver == nil {
+		return nil, nil
+	}
+	record := *s.takenOver
+	return &record, nil
 }
 
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
@@ -772,6 +815,62 @@ func TestK8sPoolReserveSharedWorkerFallsBackWhenRuntimeClaimReturnsNil(t *testin
 	}
 	if store.claimCalls != 1 {
 		t.Fatalf("expected one claim attempt before fallback, got %d", store.claimCalls)
+	}
+}
+
+func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	leaseExpiry := time.Date(2026, time.March, 20, 19, 30, 0, 0, time.UTC)
+	store := &captureRuntimeWorkerStore{
+		takenOver: &configstore.WorkerRecord{
+			WorkerID:          44,
+			PodName:           "duckgres-worker-test-cp-44",
+			State:             configstore.WorkerStateReserved,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        8,
+			LeaseExpiresAt:    leaseExpiry,
+		},
+	}
+	pool.runtimeStore = store
+	worker := &ManagedWorker{ID: 44, done: make(chan struct{})}
+	pool.workers[worker.ID] = worker
+
+	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: leaseExpiry,
+		MaxWorkers:     3,
+	})
+	if err != nil {
+		t.Fatalf("claimSpecificWorker: %v", err)
+	}
+	if claimed.ID != 44 {
+		t.Fatalf("expected claimed worker 44, got %d", claimed.ID)
+	}
+	if store.takeOverWorkerID != 44 {
+		t.Fatalf("expected takeover worker id 44, got %d", store.takeOverWorkerID)
+	}
+	if store.takeOverOwnerCPID != pool.cpInstanceID {
+		t.Fatalf("expected takeover owner cp id %q, got %q", pool.cpInstanceID, store.takeOverOwnerCPID)
+	}
+	if store.takeOverOrgID != "analytics" {
+		t.Fatalf("expected takeover org analytics, got %q", store.takeOverOrgID)
+	}
+	if store.takeOverExpectedEpoch != 7 {
+		t.Fatalf("expected takeover expected epoch 7, got %d", store.takeOverExpectedEpoch)
+	}
+	if !store.takeOverLease.Equal(leaseExpiry) {
+		t.Fatalf("expected takeover lease %v, got %v", leaseExpiry, store.takeOverLease)
+	}
+	if claimed.OwnerEpoch() != 8 {
+		t.Fatalf("expected owner epoch 8, got %d", claimed.OwnerEpoch())
+	}
+	state := claimed.SharedState()
+	if state.Lifecycle != WorkerLifecycleReserved {
+		t.Fatalf("expected reserved lifecycle, got %q", state.Lifecycle)
+	}
+	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
+		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
 	}
 }
 

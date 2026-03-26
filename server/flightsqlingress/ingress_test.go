@@ -29,6 +29,91 @@ type testExecResult struct {
 	err      error
 }
 
+type captureDurableSessionStore struct {
+	mu      sync.Mutex
+	records map[string]DurableSessionRecord
+	closed  []string
+	touched []string
+}
+
+func (s *captureDurableSessionStore) UpsertSession(record DurableSessionRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.records == nil {
+		s.records = make(map[string]DurableSessionRecord)
+	}
+	s.records[record.SessionToken] = record
+	return nil
+}
+
+func (s *captureDurableSessionStore) GetSession(sessionToken string) (*DurableSessionRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.records[sessionToken]
+	if !ok {
+		return nil, nil
+	}
+	copy := record
+	return &copy, nil
+}
+
+func (s *captureDurableSessionStore) TouchSession(sessionToken string, lastSeenAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.records[sessionToken]
+	if !ok {
+		return nil
+	}
+	record.LastSeenAt = lastSeenAt
+	s.records[sessionToken] = record
+	s.touched = append(s.touched, sessionToken)
+	return nil
+}
+
+func (s *captureDurableSessionStore) CloseSession(sessionToken string, closedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.records[sessionToken]
+	if !ok {
+		return nil
+	}
+	record.State = DurableSessionStateClosed
+	record.LastSeenAt = closedAt
+	s.records[sessionToken] = record
+	s.closed = append(s.closed, sessionToken)
+	return nil
+}
+
+type testDurableSessionProvider struct {
+	createSessionFn    func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error)
+	destroySessionFn   func(int32)
+	metadataFn         func(pid int32, username string) (DurableSessionMetadata, error)
+	reconnectSessionFn func(context.Context, DurableSessionRecord) (int32, *server.FlightExecutor, error)
+	durableStore       DurableSessionStore
+}
+
+func (p *testDurableSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+	return p.createSessionFn(ctx, username, pid, memoryLimit, threads)
+}
+
+func (p *testDurableSessionProvider) DestroySession(pid int32) {
+	if p.destroySessionFn != nil {
+		p.destroySessionFn(pid)
+	}
+}
+
+func (p *testDurableSessionProvider) DurableSessionMetadata(pid int32, username string) (DurableSessionMetadata, error) {
+	return p.metadataFn(pid, username)
+}
+
+func (p *testDurableSessionProvider) ReconnectSession(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+	return p.reconnectSessionFn(ctx, record)
+}
+
+func (p *testDurableSessionProvider) DurableSessionStore() DurableSessionStore {
+	return p.durableStore
+}
+
 type testServerTransportStream struct {
 	header  metadata.MD
 	trailer metadata.MD
@@ -650,6 +735,111 @@ func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T
 			t.Fatalf("expected expiry path to prune bootstrap key mapping")
 		}
 	})
+}
+
+func TestFlightAuthSessionStorePersistsDurableSessionRecordOnCreate(t *testing.T) {
+	durable := &captureDurableSessionStore{}
+	provider := &testDurableSessionProvider{
+		durableStore: durable,
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+			return 4321, nil, nil
+		},
+		metadataFn: func(pid int32, username string) (DurableSessionMetadata, error) {
+			return DurableSessionMetadata{
+				Username:     username,
+				OrgID:        "analytics",
+				WorkerID:     17,
+				OwnerEpoch:   3,
+				CPInstanceID: "cp-new:boot-a",
+			}, nil
+		},
+	}
+	store := newFlightAuthSessionStore(provider, time.Minute, time.Hour, time.Minute, time.Hour, 0, Options{})
+
+	session, err := store.Create(context.Background(), "postgres")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	record, err := durable.GetSession(session.token)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if record == nil {
+		t.Fatal("expected durable session record to be persisted")
+	}
+	if record.Username != "postgres" {
+		t.Fatalf("expected username postgres, got %q", record.Username)
+	}
+	if record.OrgID != "analytics" {
+		t.Fatalf("expected org analytics, got %q", record.OrgID)
+	}
+	if record.WorkerID != 17 {
+		t.Fatalf("expected worker id 17, got %d", record.WorkerID)
+	}
+	if record.OwnerEpoch != 3 {
+		t.Fatalf("expected owner epoch 3, got %d", record.OwnerEpoch)
+	}
+	if record.CPInstanceID != "cp-new:boot-a" {
+		t.Fatalf("expected cp_instance_id cp-new:boot-a, got %q", record.CPInstanceID)
+	}
+	if record.State != DurableSessionStateActive {
+		t.Fatalf("expected active durable session state, got %q", record.State)
+	}
+	if record.ExpiresAt.IsZero() {
+		t.Fatal("expected durable session expiry to be set")
+	}
+}
+
+func TestFlightAuthSessionStoreReconnectsDurableSessionByToken(t *testing.T) {
+	durable := &captureDurableSessionStore{
+		records: map[string]DurableSessionRecord{
+			"durable-token": {
+				SessionToken: "durable-token",
+				Username:     "postgres",
+				OrgID:        "analytics",
+				WorkerID:     17,
+				OwnerEpoch:   4,
+				CPInstanceID: "cp-old:boot-a",
+				State:        DurableSessionStateActive,
+				ExpiresAt:    time.Now().Add(time.Hour),
+				LastSeenAt:   time.Now().Add(-time.Minute),
+			},
+		},
+	}
+	var reconnected DurableSessionRecord
+	provider := &testDurableSessionProvider{
+		durableStore: durable,
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+			return 0, nil, fmt.Errorf("unexpected create path")
+		},
+		reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+			reconnected = record
+			return 9876, nil, nil
+		},
+	}
+	store := newFlightAuthSessionStore(provider, time.Minute, time.Hour, time.Minute, time.Hour, 0, Options{})
+
+	session, ok := store.GetByTokenContext(context.Background(), "durable-token")
+	if !ok {
+		t.Fatal("expected durable token reconnect to succeed")
+	}
+	if session.pid != 9876 {
+		t.Fatalf("expected reconnected pid 9876, got %d", session.pid)
+	}
+	if reconnected.SessionToken != "durable-token" {
+		t.Fatalf("expected reconnect to receive durable-token, got %q", reconnected.SessionToken)
+	}
+	if reconnected.WorkerID != 17 || reconnected.OwnerEpoch != 4 {
+		t.Fatalf("unexpected reconnect record %+v", reconnected)
+	}
+	durable.mu.Lock()
+	_, touched := durable.records["durable-token"]
+	touchCount := len(durable.touched)
+	durable.mu.Unlock()
+	if !touched || touchCount == 0 {
+		t.Fatal("expected reconnect to touch durable session record")
+	}
 }
 
 func TestCloseSessionRevokesTokenAndDestroysWorker(t *testing.T) {

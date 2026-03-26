@@ -84,6 +84,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 	sessionExpiry := startedAt.Add(5 * time.Minute)
 	if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
 		SessionToken: "flight-token-1",
+		Username:     "postgres",
 		OrgID:        "analytics",
 		WorkerID:     42,
 		OwnerEpoch:   7,
@@ -100,6 +101,9 @@ func TestRuntimeStorePostgres(t *testing.T) {
 	}
 	if session.WorkerID != 42 {
 		t.Fatalf("expected worker id 42, got %d", session.WorkerID)
+	}
+	if session.Username != "postgres" {
+		t.Fatalf("expected username postgres, got %q", session.Username)
 	}
 	if session.State != configstore.FlightSessionStateActive {
 		t.Fatalf("expected session state active, got %q", session.State)
@@ -376,6 +380,7 @@ func TestExpireFlightSessionRecordsPostgres(t *testing.T) {
 
 	if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
 		SessionToken: "flight-expire-me",
+		Username:     "postgres",
 		OrgID:        "analytics",
 		WorkerID:     42,
 		OwnerEpoch:   7,
@@ -400,6 +405,102 @@ func TestExpireFlightSessionRecordsPostgres(t *testing.T) {
 	}
 	if record.State != configstore.FlightSessionStateExpired {
 		t.Fatalf("expected expired flight session state, got %q", record.State)
+	}
+}
+
+func TestFindTouchAndCloseFlightSessionRecordPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 16, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
+		SessionToken: "flight-touch-close",
+		Username:     "postgres",
+		OrgID:        "analytics",
+		WorkerID:     42,
+		OwnerEpoch:   8,
+		State:        configstore.FlightSessionStateActive,
+		ExpiresAt:    now.Add(time.Hour),
+		LastSeenAt:   now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord: %v", err)
+	}
+
+	record, err := store.FindFlightSessionRecord("flight-touch-close")
+	if err != nil {
+		t.Fatalf("FindFlightSessionRecord: %v", err)
+	}
+	if record == nil || record.Username != "postgres" {
+		t.Fatalf("expected durable record with username postgres, got %#v", record)
+	}
+
+	touchedAt := now.Add(2 * time.Minute)
+	if err := store.TouchFlightSessionRecord("flight-touch-close", touchedAt); err != nil {
+		t.Fatalf("TouchFlightSessionRecord: %v", err)
+	}
+	record, err = store.GetFlightSessionRecord("flight-touch-close")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord: %v", err)
+	}
+	if !record.LastSeenAt.Equal(touchedAt) {
+		t.Fatalf("expected last_seen_at %v, got %v", touchedAt, record.LastSeenAt)
+	}
+
+	closedAt := now.Add(3 * time.Minute)
+	if err := store.CloseFlightSessionRecord("flight-touch-close", closedAt); err != nil {
+		t.Fatalf("CloseFlightSessionRecord: %v", err)
+	}
+	record, err = store.GetFlightSessionRecord("flight-touch-close")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord: %v", err)
+	}
+	if record.State != configstore.FlightSessionStateClosed {
+		t.Fatalf("expected closed state, got %q", record.State)
+	}
+	if !record.LastSeenAt.Equal(closedAt) {
+		t.Fatalf("expected close timestamp %v, got %v", closedAt, record.LastSeenAt)
+	}
+}
+
+func TestTakeOverWorkerPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 17, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          71,
+		PodName:           "duckgres-worker-71",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        5,
+		LeaseExpiresAt:    now.Add(time.Hour),
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	claimed, err := store.TakeOverWorker(71, "cp-new:boot-b", "analytics", 5, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("TakeOverWorker: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected takeover to succeed")
+	}
+	if claimed.OwnerCPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected owner cp-instance cp-new:boot-b, got %q", claimed.OwnerCPInstanceID)
+	}
+	if claimed.OwnerEpoch != 6 {
+		t.Fatalf("expected owner epoch 6, got %d", claimed.OwnerEpoch)
+	}
+	if claimed.State != configstore.WorkerStateReserved {
+		t.Fatalf("expected reserved state, got %q", claimed.State)
+	}
+
+	missed, err := store.TakeOverWorker(71, "cp-third:boot-c", "analytics", 5, now.Add(3*time.Hour))
+	if err != nil {
+		t.Fatalf("TakeOverWorker(stale epoch): %v", err)
+	}
+	if missed != nil {
+		t.Fatalf("expected stale takeover attempt to fail, got %#v", missed)
 	}
 }
 

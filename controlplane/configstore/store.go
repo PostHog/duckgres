@@ -409,6 +409,51 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExp
 	return claimed, nil
 }
 
+// TakeOverWorker transfers durable worker ownership to a new control-plane
+// instance when the caller still has the expected prior owner_epoch.
+func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64, leaseExpiresAt time.Time) (*WorkerRecord, error) {
+	var claimed *WorkerRecord
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		var current WorkerRecord
+		err := tx.Table(cs.runtimeTable(current.TableName())).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("worker_id = ?", workerID).
+			Take(&current).Error
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil
+			}
+			return err
+		}
+		if current.OwnerEpoch != expectedOwnerEpoch {
+			return nil
+		}
+		now := time.Now()
+		if err := tx.Table(cs.runtimeTable(current.TableName())).
+			Where("worker_id = ?", current.WorkerID).
+			Updates(map[string]any{
+				"state":                WorkerStateReserved,
+				"org_id":               orgID,
+				"owner_cp_instance_id": ownerCPInstanceID,
+				"owner_epoch":          gorm.Expr("owner_epoch + 1"),
+				"lease_expires_at":     leaseExpiresAt,
+				"updated_at":           now,
+			}).Error; err != nil {
+			return err
+		}
+		if err := tx.Table(cs.runtimeTable(current.TableName())).
+			First(&current, "worker_id = ?", current.WorkerID).Error; err != nil {
+			return err
+		}
+		claimed = &current
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("take over worker: %w", err)
+	}
+	return claimed, nil
+}
+
 // CreateSpawningWorkerSlot creates a durable spawning worker row under advisory-lock
 // protected org/global capacity checks. A nil result means capacity blocked the spawn.
 func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, leaseExpiresAt time.Time, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
@@ -572,7 +617,7 @@ func advisoryLockKey(s string) int64 {
 func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "session_token"}},
-		DoUpdates: clause.AssignmentColumns([]string{"org_id", "worker_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert flight session record: %w", err)
 	}
@@ -586,6 +631,45 @@ func (cs *ConfigStore) GetFlightSessionRecord(sessionToken string) (*FlightSessi
 		return nil, fmt.Errorf("get flight session record: %w", err)
 	}
 	return &record, nil
+}
+
+func (cs *ConfigStore) FindFlightSessionRecord(sessionToken string) (*FlightSessionRecord, error) {
+	var record FlightSessionRecord
+	err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "session_token = ?", sessionToken).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("find flight session record: %w", err)
+	}
+	return &record, nil
+}
+
+func (cs *ConfigStore) TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error {
+	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
+		Where("session_token = ?", sessionToken).
+		Updates(map[string]any{
+			"last_seen_at": lastSeenAt,
+			"updated_at":   time.Now(),
+		})
+	if result.Error != nil {
+		return fmt.Errorf("touch flight session record: %w", result.Error)
+	}
+	return nil
+}
+
+func (cs *ConfigStore) CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error {
+	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
+		Where("session_token = ?", sessionToken).
+		Updates(map[string]any{
+			"state":        FlightSessionStateClosed,
+			"last_seen_at": closedAt,
+			"updated_at":   time.Now(),
+		})
+	if result.Error != nil {
+		return fmt.Errorf("close flight session record: %w", result.Error)
+	}
+	return nil
 }
 
 // Reload forces an immediate config reload from the database.

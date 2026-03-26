@@ -11,7 +11,7 @@ import (
 func TestOrgRoutedSessionProviderCreateSessionTeamNotFound(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{ok: false},
-		pidSession: make(map[int32]*SessionManager),
+		pidSession: make(map[int32]flightOwnedSession),
 	}
 
 	_, _, err := provider.CreateSession(context.Background(), "unknown", 0, "", 0)
@@ -28,8 +28,8 @@ func TestOrgRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 
 	provider := &orgRoutedSessionProvider{
 		orgRouter: &mockOrgRouter{sessions: sm, ok: true},
-		pidSession: map[int32]*SessionManager{
-			42: sm,
+		pidSession: map[int32]flightOwnedSession{
+			42: {sessions: sm},
 		},
 	}
 
@@ -49,7 +49,7 @@ func TestOrgRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 func TestOrgRoutedSessionProviderDestroyUnknownPidNoOp(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{ok: true},
-		pidSession: make(map[int32]*SessionManager),
+		pidSession: make(map[int32]flightOwnedSession),
 	}
 
 	// Should not panic.
@@ -61,12 +61,12 @@ func TestOrgRoutedSessionProviderConcurrentDestroys(t *testing.T) {
 
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{sessions: sm, ok: true},
-		pidSession: make(map[int32]*SessionManager),
+		pidSession: make(map[int32]flightOwnedSession),
 	}
 
 	// Pre-populate
 	for i := int32(0); i < 100; i++ {
-		provider.pidSession[i] = sm
+		provider.pidSession[i] = flightOwnedSession{sessions: sm}
 	}
 
 	// Concurrent destroys should not race.

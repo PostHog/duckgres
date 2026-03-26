@@ -143,3 +143,69 @@ func TestSessionPoolActivateTenantRejectsStaleOwnerEpoch(t *testing.T) {
 		t.Fatal("expected stale owner epoch to be rejected")
 	}
 }
+
+func TestSessionPoolActivateTenantAllowsSameOrgTakeover(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		cfg:            server.Config{Users: map[string]string{"postgres": "postgres"}},
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	var activateCalls int
+	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
+		return sql.Open("duckdb", "")
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		activateCalls++
+		return nil
+	}
+
+	first := ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			OwnerEpoch:   2,
+			CPInstanceID: "cp-old:boot-a",
+			WorkerID:     17,
+		},
+		OrgID: "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+			ObjectStore:   "s3://analytics/warehouse/",
+		},
+	}
+	if err := pool.activateTenant(first); err != nil {
+		t.Fatalf("first ActivateTenant: %v", err)
+	}
+
+	second := first
+	second.OwnerEpoch = 3
+	second.CPInstanceID = "cp-new:boot-b"
+	second.LeaseExpiresAt = time.Now().Add(time.Hour)
+	if err := pool.activateTenant(second); err != nil {
+		t.Fatalf("takeover ActivateTenant: %v", err)
+	}
+
+	if activateCalls != 1 {
+		t.Fatalf("expected same-tenant takeover to reuse existing activation, got %d activation calls", activateCalls)
+	}
+	current := pool.currentActivation()
+	if current == nil {
+		t.Fatal("expected activation to remain present")
+	}
+	if current.payload.OwnerEpoch != 3 {
+		t.Fatalf("expected owner epoch 3, got %d", current.payload.OwnerEpoch)
+	}
+	if current.payload.CPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected cp instance id cp-new:boot-b, got %q", current.payload.CPInstanceID)
+	}
+	if pool.ownerEpoch != 3 {
+		t.Fatalf("expected pool owner epoch 3, got %d", pool.ownerEpoch)
+	}
+	if pool.ownerCPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected pool owner cp instance id cp-new:boot-b, got %q", pool.ownerCPInstanceID)
+	}
+}

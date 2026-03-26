@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/tableflip"
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightsqlingress"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -127,6 +128,10 @@ type ControlPlane struct {
 type ConfigStoreInterface interface {
 	ValidateUser(username, password string) (orgID string, ok bool)
 	OrgForUser(username string) string
+	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
+	FindFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
+	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
+	CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.
@@ -1203,8 +1208,9 @@ func (cp *ControlPlane) startFlightIngress() {
 			return ok
 		})
 		provider = &orgRoutedSessionProvider{
-			orgRouter:  cp.orgRouter,
-			pidSession: make(map[int32]*SessionManager),
+			orgRouter:   cp.orgRouter,
+			configStore: cp.configStore,
+			pidSession:  make(map[int32]flightOwnedSession),
 		}
 	case cp.sessions != nil:
 		// Single-tenant: static users map, single session manager.

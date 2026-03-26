@@ -54,7 +54,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 		return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, currentOwnerEpoch)
 	}
 	if current != nil {
-		if reflect.DeepEqual(current.payload, payload) {
+		if p.reuseExistingActivation(payload) {
 			return nil
 		}
 		return fmt.Errorf("worker already activated for org %q", current.payload.OrgID)
@@ -91,7 +91,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 		return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, p.ownerEpoch)
 	}
 	if p.activation != nil {
-		if reflect.DeepEqual(p.activation.payload, payload) {
+		if p.reuseExistingActivationLocked(payload) {
 			return nil
 		}
 		return fmt.Errorf("worker already activated for org %q", p.activation.payload.OrgID)
@@ -105,6 +105,34 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	p.ownerCPInstanceID = payload.CPInstanceID
 	p.workerID = payload.WorkerID
 	return nil
+}
+
+func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reuseExistingActivationLocked(payload)
+}
+
+func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) bool {
+	if p.activation == nil {
+		return false
+	}
+	current := p.activation.payload
+	if !sameTenantActivationRuntime(current, payload) {
+		return false
+	}
+	if reflect.DeepEqual(current, payload) {
+		return true
+	}
+	p.activation.payload = payload
+	p.ownerEpoch = payload.OwnerEpoch
+	p.ownerCPInstanceID = payload.CPInstanceID
+	p.workerID = payload.WorkerID
+	return true
+}
+
+func sameTenantActivationRuntime(current, next ActivationPayload) bool {
+	return current.OrgID == next.OrgID && reflect.DeepEqual(current.DuckLake, next.DuckLake)
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {

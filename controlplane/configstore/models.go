@@ -259,6 +259,7 @@ const (
 // FlightSessionRecord is the durable reconnect record for Flight sessions.
 type FlightSessionRecord struct {
 	SessionToken string             `gorm:"primaryKey;size:255" json:"session_token"`
+	Username     string             `gorm:"size:255;not null" json:"username"`
 	OrgID        string             `gorm:"size:255;not null" json:"org_id"`
 	WorkerID     int                `gorm:"not null;index" json:"worker_id"`
 	OwnerEpoch   int64              `gorm:"not null" json:"owner_epoch"`

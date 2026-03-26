@@ -263,6 +263,22 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 	}
 }
 
+func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error) {
+	worker, err := p.shared.claimSpecificWorker(ctx, workerID, ownerEpoch, &WorkerAssignment{
+		OrgID:          p.orgID,
+		LeaseExpiresAt: time.Now().Add(p.leaseDuration),
+		MaxWorkers:     p.maxWorkers,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := p.activateWorkerForOrg(ctx, worker); err != nil {
+		p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
+		return nil, err
+	}
+	return worker, nil
+}
+
 func (p *OrgReservedPool) activateReservedWorkerDefault(_ context.Context, _ *ManagedWorker) error {
 	return fmt.Errorf("reserved worker activator is not configured for org %s", p.orgID)
 }

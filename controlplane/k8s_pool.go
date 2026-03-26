@@ -1135,6 +1135,23 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	return worker, nil
 }
 
+func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, expectedOwnerEpoch int64, assignment *WorkerAssignment) (*ManagedWorker, error) {
+	if p.runtimeStore == nil {
+		return nil, fmt.Errorf("runtime worker store is not configured")
+	}
+	if err := validateWorkerAssignment(assignment); err != nil {
+		return nil, err
+	}
+	record, err := p.runtimeStore.TakeOverWorker(workerID, p.cpInstanceID, assignment.OrgID, expectedOwnerEpoch, assignment.LeaseExpiresAt)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil {
+		return nil, fmt.Errorf("worker %d could not be claimed", workerID)
+	}
+	return p.reserveClaimedWorker(ctx, record, assignment)
+}
+
 func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord) (*ManagedWorker, error) {
 	token, err := p.readBearerToken(ctx)
 	if err != nil {

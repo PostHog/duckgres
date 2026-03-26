@@ -75,6 +75,8 @@ type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
 	ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time) (*configstore.WorkerRecord, error)
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, leaseExpiresAt time.Time, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
+	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
+	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64, leaseExpiresAt time.Time) (*configstore.WorkerRecord, error)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the
