@@ -552,7 +552,7 @@ func openDBConn() (*sql.DB, error) {
 	// kubectl port-forward passes raw TCP bytes, so the client still needs
 	// SSL. lib/pq sslmode=require skips server cert verification by default,
 	// which works with self-signed certs.
-	connStr := fmt.Sprintf("host=127.0.0.1 port=%d user=postgres password=postgres sslmode=require", pgPort)
+	connStr := fmt.Sprintf("host=127.0.0.1 port=%d user=postgres password=postgres dbname=duckgres sslmode=require", pgPort)
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
