@@ -3,6 +3,7 @@ package configstore
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"strings"
 	"sync"
@@ -406,6 +407,99 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExp
 		return nil, fmt.Errorf("claim idle worker: %w", err)
 	}
 	return claimed, nil
+}
+
+// CreateSpawningWorkerSlot creates a durable spawning worker row under advisory-lock
+// protected org/global capacity checks. A nil result means capacity blocked the spawn.
+func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, leaseExpiresAt time.Time, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+	if strings.TrimSpace(podNamePrefix) == "" {
+		return nil, fmt.Errorf("pod name prefix is required")
+	}
+
+	var created *WorkerRecord
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		if orgID != "" {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:org:"+orgID)).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:global-worker-capacity")).Error; err != nil {
+			return err
+		}
+
+		if maxOrgWorkers > 0 && orgID != "" {
+			count, err := cs.countActiveWorkers(tx, "org_id = ?", orgID)
+			if err != nil {
+				return err
+			}
+			if count >= int64(maxOrgWorkers) {
+				return nil
+			}
+		}
+
+		if maxGlobalWorkers > 0 {
+			count, err := cs.countActiveWorkers(tx)
+			if err != nil {
+				return err
+			}
+			if count >= int64(maxGlobalWorkers) {
+				return nil
+			}
+		}
+
+		var workerID int64
+		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM "+cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		record := &WorkerRecord{
+			WorkerID:          int(workerID),
+			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
+			State:             WorkerStateSpawning,
+			OrgID:             orgID,
+			OwnerCPInstanceID: ownerCPInstanceID,
+			OwnerEpoch:        ownerEpoch,
+			LeaseExpiresAt:    leaseExpiresAt,
+			LastHeartbeatAt:   now,
+		}
+		if err := tx.Table(cs.runtimeTable(record.TableName())).Create(record).Error; err != nil {
+			return err
+		}
+		created = record
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create spawning worker slot: %w", err)
+	}
+	return created, nil
+}
+
+func (cs *ConfigStore) countActiveWorkers(tx *gorm.DB, where ...any) (int64, error) {
+	var count int64
+	activeStates := []WorkerState{
+		WorkerStateSpawning,
+		WorkerStateIdle,
+		WorkerStateReserved,
+		WorkerStateActivating,
+		WorkerStateHot,
+		WorkerStateDraining,
+	}
+	query := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).Where("state IN ?", activeStates)
+	if len(where) > 0 {
+		if clauseStr, ok := where[0].(string); ok {
+			query = query.Where(clauseStr, where[1:]...)
+		}
+	}
+	if err := query.Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func advisoryLockKey(s string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	return int64(h.Sum64() & 0x7fffffffffffffff)
 }
 
 // UpsertFlightSessionRecord inserts or updates a durable Flight reconnect row.

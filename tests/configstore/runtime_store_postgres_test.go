@@ -3,6 +3,7 @@
 package configstore_test
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -229,5 +230,81 @@ func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	}
 	if fresh.ExpiredAt != nil {
 		t.Fatalf("expected fresh instance expired_at to stay nil, got %v", fresh.ExpiredAt)
+	}
+}
+
+func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	leaseExpiry := time.Date(2026, time.March, 27, 12, 0, 0, 0, time.UTC)
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", 1, leaseExpiry, "duckgres-worker-test-cp", 3, 5)
+	if err != nil {
+		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
+	}
+	if slot == nil {
+		t.Fatal("expected spawning worker slot to be created")
+	}
+	if slot.WorkerID <= 0 {
+		t.Fatalf("expected positive worker id, got %d", slot.WorkerID)
+	}
+	if slot.State != configstore.WorkerStateSpawning {
+		t.Fatalf("expected spawning state, got %q", slot.State)
+	}
+	if slot.PodName != "duckgres-worker-test-cp-"+strconv.Itoa(slot.WorkerID) {
+		t.Fatalf("unexpected pod name %q for worker id %d", slot.PodName, slot.WorkerID)
+	}
+	if slot.OwnerCPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected owner cp-instance cp-new:boot-b, got %q", slot.OwnerCPInstanceID)
+	}
+	if slot.OwnerEpoch != 1 {
+		t.Fatalf("expected owner epoch 1, got %d", slot.OwnerEpoch)
+	}
+	if slot.OrgID != "analytics" {
+		t.Fatalf("expected org analytics, got %q", slot.OrgID)
+	}
+	if !slot.LeaseExpiresAt.Equal(leaseExpiry) {
+		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, slot.LeaseExpiresAt)
+	}
+
+	persisted, err := store.GetWorkerRecord(slot.WorkerID)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateSpawning {
+		t.Fatalf("expected persisted spawning state, got %q", persisted.State)
+	}
+}
+
+func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 13, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          9,
+		PodName:           "duckgres-worker-existing-9",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        4,
+		LeaseExpiresAt:    now.Add(24 * time.Hour),
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(existing): %v", err)
+	}
+
+	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", 1, now.Add(2*time.Hour), "duckgres-worker-test-cp", 1, 5)
+	if err != nil {
+		t.Fatalf("CreateSpawningWorkerSlot(org cap): %v", err)
+	}
+	if orgLimited != nil {
+		t.Fatalf("expected org cap to block spawning, got %#v", orgLimited)
+	}
+
+	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", 1, now.Add(2*time.Hour), "duckgres-worker-test-cp", 2, 1)
+	if err != nil {
+		t.Fatalf("CreateSpawningWorkerSlot(global cap): %v", err)
+	}
+	if globalLimited != nil {
+		t.Fatalf("expected global cap to block spawning, got %#v", globalLimited)
 	}
 }
