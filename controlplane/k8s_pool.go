@@ -42,30 +42,30 @@ type K8sWorkerPool struct {
 	shuttingDown bool
 	shutdownCh   chan struct{}
 
-	clientset            kubernetes.Interface
-	namespace            string
-	cpID                 string
-	cpUID                types.UID
-	workerImage          string
-	workerPort           int
-	secretName           string
-	configMap            string
-	configPath           string
-	imagePullPolicy      corev1.PullPolicy
-	serviceAccount       string
-	workerCPURequest     string            // CPU request for worker pods (e.g., "500m")
-	workerMemoryRequest  string            // memory request for worker pods (e.g., "1Gi")
+	clientset             kubernetes.Interface
+	namespace             string
+	cpID                  string
+	cpUID                 types.UID
+	workerImage           string
+	workerPort            int
+	secretName            string
+	configMap             string
+	configPath            string
+	imagePullPolicy       corev1.PullPolicy
+	serviceAccount        string
+	workerCPURequest      string            // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest   string            // memory request for worker pods (e.g., "1Gi")
 	workerNodeSelector    map[string]string // node selector for worker pods
 	workerTolerationKey   string            // taint key for NoSchedule toleration
 	workerTolerationValue string            // taint value for NoSchedule toleration
-	workerExclusiveNode  bool              // one worker per node via anti-affinity
-	orgID                string            // org ID for pod labels (multi-tenant mode)
-	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
-	cachedToken          string // cached bearer token (immutable after setup)
-	informer             cache.SharedIndexInformer
-	stopInform           chan struct{}
-	spawnSem             chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
-	podReady             sync.Map      // podName -> chan string (pod IP); signaled by informer
+	workerExclusiveNode   bool              // one worker per node via anti-affinity
+	orgID                 string            // org ID for pod labels (multi-tenant mode)
+	workerIDGenerator     func() int        // shared ID generator across orgs (nil = internal counter)
+	cachedToken           string            // cached bearer token (immutable after setup)
+	informer              cache.SharedIndexInformer
+	stopInform            chan struct{}
+	spawnSem              chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
+	podReady              sync.Map      // podName -> chan string (pod IP); signaled by informer
 
 	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
 	spawnWarmWorkerBackgroundFunc func(id int)
@@ -119,30 +119,30 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
 	spawnConcurrency := 3
 	pool := &K8sWorkerPool{
-		workers:              make(map[int]*ManagedWorker),
-		maxWorkers:           cfg.MaxWorkers,
-		idleTimeout:          cfg.IdleTimeout,
-		shutdownCh:           make(chan struct{}),
-		stopInform:           make(chan struct{}),
-		clientset:            clientset,
-		namespace:            cfg.Namespace,
-		cpID:                 cfg.CPID,
-		workerImage:          cfg.WorkerImage,
-		workerPort:           cfg.WorkerPort,
-		secretName:           cfg.SecretName,
-		configMap:            cfg.ConfigMap,
-		configPath:           cfg.ConfigPath,
-		imagePullPolicy:      corev1.PullPolicy(cfg.ImagePullPolicy),
-		serviceAccount:       cfg.ServiceAccount,
-		workerCPURequest:     cfg.WorkerCPURequest,
-		workerMemoryRequest:  cfg.WorkerMemoryRequest,
+		workers:               make(map[int]*ManagedWorker),
+		maxWorkers:            cfg.MaxWorkers,
+		idleTimeout:           cfg.IdleTimeout,
+		shutdownCh:            make(chan struct{}),
+		stopInform:            make(chan struct{}),
+		clientset:             clientset,
+		namespace:             cfg.Namespace,
+		cpID:                  cfg.CPID,
+		workerImage:           cfg.WorkerImage,
+		workerPort:            cfg.WorkerPort,
+		secretName:            cfg.SecretName,
+		configMap:             cfg.ConfigMap,
+		configPath:            cfg.ConfigPath,
+		imagePullPolicy:       corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:        cfg.ServiceAccount,
+		workerCPURequest:      cfg.WorkerCPURequest,
+		workerMemoryRequest:   cfg.WorkerMemoryRequest,
 		workerNodeSelector:    cfg.WorkerNodeSelector,
 		workerTolerationKey:   cfg.WorkerTolerationKey,
 		workerTolerationValue: cfg.WorkerTolerationValue,
-		workerExclusiveNode:  cfg.WorkerExclusiveNode,
-		orgID:                cfg.OrgID,
-		workerIDGenerator:    cfg.WorkerIDGenerator,
-		spawnSem:             make(chan struct{}, spawnConcurrency),
+		workerExclusiveNode:   cfg.WorkerExclusiveNode,
+		orgID:                 cfg.OrgID,
+		workerIDGenerator:     cfg.WorkerIDGenerator,
+		spawnSem:              make(chan struct{}, spawnConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
@@ -365,24 +365,13 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 
 	podName := p.podNameForWorker(id)
 
-	// Build owner references for GC on CP deletion
-	var ownerRefs []metav1.OwnerReference
-	if p.cpUID != "" {
-		ownerRefs = []metav1.OwnerReference{
-			{
-				APIVersion: "v1",
-				Kind:       "Pod",
-				Name:       p.cpID,
-				UID:        p.cpUID,
-			},
-		}
-	}
-
 	// Build pod labels
 	podLabels := map[string]string{
-		"app":                    "duckgres-worker",
-		"duckgres/control-plane": p.cpID,
-		"duckgres/worker-id":     strconv.Itoa(id),
+		"app":                     "duckgres-worker",
+		"duckgres/control-plane":  p.cpID,
+		"duckgres/cp-instance-id": p.cpID,
+		"duckgres/worker-id":      strconv.Itoa(id),
+		"duckgres/owner-epoch":    "0",
 	}
 	if p.orgID != "" {
 		podLabels["duckgres/org"] = p.orgID
@@ -391,10 +380,9 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	// Build pod spec
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            podName,
-			Namespace:       p.namespace,
-			Labels:          podLabels,
-			OwnerReferences: ownerRefs,
+			Name:      podName,
+			Namespace: p.namespace,
+			Labels:    podLabels,
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:      corev1.RestartPolicyNever,
@@ -1029,18 +1017,18 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 	ctx := context.Background()
 
-		for _, id := range ids {
-			if err := p.spawnWarmWorker(ctx, id); err != nil {
-				p.mu.Lock()
-				p.spawning--
-				p.mu.Unlock()
-				return err
-			}
+	for _, id := range ids {
+		if err := p.spawnWarmWorker(ctx, id); err != nil {
 			p.mu.Lock()
 			p.spawning--
-			observeWarmPoolLifecycleGauges(p.workers)
 			p.mu.Unlock()
+			return err
 		}
+		p.mu.Lock()
+		p.spawning--
+		observeWarmPoolLifecycleGauges(p.workers)
+		p.mu.Unlock()
+	}
 	return nil
 }
 

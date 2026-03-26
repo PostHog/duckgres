@@ -694,15 +694,18 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	if pod.Labels["duckgres/control-plane"] != "test-cp" {
 		t.Fatalf("expected control-plane label test-cp, got %s", pod.Labels["duckgres/control-plane"])
 	}
+	if pod.Labels["duckgres/cp-instance-id"] != "test-cp" {
+		t.Fatalf("expected cp-instance-id label test-cp, got %s", pod.Labels["duckgres/cp-instance-id"])
+	}
+	if pod.Labels["duckgres/owner-epoch"] != "0" {
+		t.Fatalf("expected owner-epoch label 0, got %s", pod.Labels["duckgres/owner-epoch"])
+	}
 	if _, ok := pod.Labels["duckgres/org"]; ok {
 		t.Fatalf("expected shared warm worker startup to stay org-neutral, got labels %#v", pod.Labels)
 	}
 
-	if len(pod.OwnerReferences) != 1 {
-		t.Fatalf("expected 1 owner reference, got %d", len(pod.OwnerReferences))
-	}
-	if pod.OwnerReferences[0].Name != "test-cp" {
-		t.Fatalf("expected owner ref to test-cp, got %s", pod.OwnerReferences[0].Name)
+	if len(pod.OwnerReferences) != 0 {
+		t.Fatalf("expected no owner references, got %d", len(pod.OwnerReferences))
 	}
 
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
