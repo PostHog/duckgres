@@ -53,7 +53,8 @@ type K8sWorkerPool struct {
 	configPath           string
 	imagePullPolicy      corev1.PullPolicy
 	serviceAccount       string
-	memoryBudget         int64      // total memory budget in bytes
+	workerCPURequest     string     // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest  string     // memory request for worker pods (e.g., "1Gi")
 	orgID                string     // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
 	cachedToken          string // cached bearer token (immutable after setup)
@@ -129,7 +130,8 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		configPath:           cfg.ConfigPath,
 		imagePullPolicy:      corev1.PullPolicy(cfg.ImagePullPolicy),
 		serviceAccount:       cfg.ServiceAccount,
-		memoryBudget:         cfg.MemoryBudget,
+		workerCPURequest:     cfg.WorkerCPURequest,
+		workerMemoryRequest:  cfg.WorkerMemoryRequest,
 		orgID:                cfg.OrgID,
 		workerIDGenerator:    cfg.WorkerIDGenerator,
 		spawnSem:             make(chan struct{}, spawnConcurrency),
@@ -1385,27 +1387,21 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	}
 }
 
-// workerResources computes resource requests/limits for a worker pod.
-// If a memory budget is configured, each worker gets budget/maxWorkers as
-// memory limit (request = 50% of limit for Burstable QoS). If no budget
-// is set, returns an empty ResourceRequirements (BestEffort).
+// workerResources returns resource requests for a worker pod.
+// Set via DUCKGRES_K8S_WORKER_CPU_REQUEST / DUCKGRES_K8S_WORKER_MEMORY_REQUEST.
+// Returns empty (BestEffort) if neither is set.
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
-	if p.memoryBudget <= 0 || p.maxWorkers <= 0 {
+	requests := corev1.ResourceList{}
+	if p.workerCPURequest != "" {
+		requests[corev1.ResourceCPU] = resource.MustParse(p.workerCPURequest)
+	}
+	if p.workerMemoryRequest != "" {
+		requests[corev1.ResourceMemory] = resource.MustParse(p.workerMemoryRequest)
+	}
+	if len(requests) == 0 {
 		return corev1.ResourceRequirements{}
 	}
-	perWorkerBytes := p.memoryBudget / int64(p.maxWorkers)
-	memLimit := resource.NewQuantity(perWorkerBytes, resource.BinarySI)
-	memRequest := resource.NewQuantity(perWorkerBytes/2, resource.BinarySI)
-
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("100m"),
-			corev1.ResourceMemory: *memRequest,
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceMemory: *memLimit,
-		},
-	}
+	return corev1.ResourceRequirements{Requests: requests}
 }
 
 // --- Helpers ---
