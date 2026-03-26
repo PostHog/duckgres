@@ -73,6 +73,7 @@ type K8sWorkerPoolConfig struct {
 
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
+	ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time) (*configstore.WorkerRecord, error)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

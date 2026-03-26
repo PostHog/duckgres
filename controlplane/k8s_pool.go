@@ -73,6 +73,7 @@ type K8sWorkerPool struct {
 	spawnWarmWorkerBackgroundFunc func(id int)
 	activateTenantFunc            func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error
 	healthCheckFunc               func(context.Context, *ManagedWorker) error
+	connectWorkerFunc             func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error)
 	runtimeStore                  RuntimeWorkerStore
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
@@ -937,6 +938,22 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		default:
 		}
 
+		if p.runtimeStore != nil {
+			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.LeaseExpiresAt)
+			if err != nil {
+				return nil, err
+			}
+			if claimed != nil {
+				worker, reserveErr := p.reserveClaimedWorker(ctx, claimed, assignment)
+				if reserveErr == nil {
+					return worker, nil
+				}
+				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "pod", claimed.PodName, "error", reserveErr)
+				p.retireClaimedWorker(claimed, RetireReasonCrash)
+				continue
+			}
+		}
+
 		p.mu.Lock()
 		if p.shuttingDown {
 			p.mu.Unlock()
@@ -1014,6 +1031,111 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord, assignment *WorkerAssignment) (*ManagedWorker, error) {
+	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool is shutting down")
+	}
+	p.cleanDeadWorkersLocked()
+	worker, ok := p.workers[claimed.WorkerID]
+	p.mu.Unlock()
+
+	if !ok {
+		adopted, err := p.adoptClaimedWorker(ctx, claimed)
+		if err != nil {
+			return nil, err
+		}
+		p.mu.Lock()
+		if existing, exists := p.workers[claimed.WorkerID]; exists {
+			p.mu.Unlock()
+			if adopted.client != nil {
+				_ = adopted.client.Close()
+			}
+			worker = existing
+		} else {
+			p.workers[claimed.WorkerID] = adopted
+			p.mu.Unlock()
+			worker = adopted
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.shuttingDown {
+		return nil, fmt.Errorf("pool is shutting down")
+	}
+	if claimed.PodName != "" {
+		worker.podName = claimed.PodName
+	}
+	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
+	worker.SetOwnerEpoch(claimed.OwnerEpoch)
+	nextState, err := worker.SharedState().Transition(WorkerLifecycleReserved, assignment)
+	if err != nil {
+		return nil, err
+	}
+	if err := worker.SetSharedState(nextState); err != nil {
+		return nil, err
+	}
+	worker.reservedAt = time.Now()
+	observeWarmPoolLifecycleGauges(p.workers)
+	return worker, nil
+}
+
+func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord) (*ManagedWorker, error) {
+	token, err := p.readBearerToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read bearer token: %w", err)
+	}
+	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, claimed.PodName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
+	}
+	client, err := p.connectWorker(ctx, claimed.PodName, pod.Status.PodIP, token)
+	if err != nil {
+		return nil, err
+	}
+	worker := &ManagedWorker{
+		ID:          claimed.WorkerID,
+		podName:     claimed.PodName,
+		bearerToken: token,
+		client:      client,
+		done:        make(chan struct{}),
+	}
+	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
+	worker.SetOwnerEpoch(claimed.OwnerEpoch)
+	return worker, nil
+}
+
+func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+	if p.connectWorkerFunc != nil {
+		return p.connectWorkerFunc(ctx, podName, podIP, bearerToken)
+	}
+	if podIP == "" {
+		return nil, fmt.Errorf("worker pod %s has no IP", podName)
+	}
+	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
+	client, err := waitForWorkerTCP(addr, bearerToken, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("connect to claimed worker %s: %w", podName, err)
+	}
+	return client, nil
+}
+
+func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string) {
+	worker := &ManagedWorker{
+		ID:      claimed.WorkerID,
+		podName: claimed.PodName,
+		done:    make(chan struct{}),
+	}
+	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
+	worker.SetOwnerEpoch(claimed.OwnerEpoch)
+	p.mu.Lock()
+	p.markWorkerRetiredLocked(worker, reason)
+	p.mu.Unlock()
+	go p.retireWorkerPod(worker.ID, worker)
 }
 
 func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker *ManagedWorker) error {

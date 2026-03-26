@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,8 +19,14 @@ import (
 )
 
 type captureRuntimeWorkerStore struct {
-	mu      sync.Mutex
-	records []configstore.WorkerRecord
+	mu             sync.Mutex
+	records        []configstore.WorkerRecord
+	claimed        *configstore.WorkerRecord
+	claimErr       error
+	claimCalls     int
+	claimOwnerCPID string
+	claimOrgID     string
+	claimLease     time.Time
 }
 
 func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
@@ -35,6 +42,23 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	out := make([]configstore.WorkerRecord, len(s.records))
 	copy(out, s.records)
 	return out
+}
+
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimCalls++
+	s.claimOwnerCPID = ownerCPInstanceID
+	s.claimOrgID = orgID
+	s.claimLease = leaseExpiresAt
+	if s.claimErr != nil {
+		return nil, s.claimErr
+	}
+	if s.claimed == nil {
+		return nil, nil
+	}
+	claimed := *s.claimed
+	return &claimed, nil
 }
 
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
@@ -595,6 +619,128 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 	case <-replacementSpawned:
 	case <-time.After(time.Second):
 		t.Fatal("expected reserve to trigger warm-pool replenishment")
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.minWorkers = 0
+	leaseExpiry := time.Date(2026, time.March, 20, 18, 0, 0, 0, time.UTC)
+	store := &captureRuntimeWorkerStore{
+		claimed: &configstore.WorkerRecord{
+			WorkerID:          21,
+			PodName:           "duckgres-worker-other-cp-21",
+			State:             configstore.WorkerStateReserved,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        3,
+			LeaseExpiresAt:    leaseExpiry,
+		},
+	}
+	pool.runtimeStore = store
+
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "duckgres-worker-other-cp-21",
+			Namespace: "default",
+			Labels: map[string]string{
+				"duckgres/control-plane": "other-cp",
+				"duckgres/worker-id":     "21",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.0.0.21",
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create adopted worker pod: %v", err)
+	}
+
+	var connectedPodName string
+	var connectedPodIP string
+	pool.connectWorkerFunc = func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+		connectedPodName = podName
+		connectedPodIP = podIP
+		return nil, nil
+	}
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		if worker == nil {
+			t.Fatal("expected claimed worker for liveness check")
+		}
+		if worker.ID != 21 {
+			t.Fatalf("expected claimed worker id 21, got %d", worker.ID)
+		}
+		return nil
+	}
+	pool.cachedToken = "shared-token"
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: leaseExpiry,
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker.ID != 21 {
+		t.Fatalf("expected claimed worker 21, got %d", worker.ID)
+	}
+	if worker.PodName() != "duckgres-worker-other-cp-21" {
+		t.Fatalf("expected tracked pod name duckgres-worker-other-cp-21, got %q", worker.PodName())
+	}
+	if worker.OwnerEpoch() != 3 {
+		t.Fatalf("expected claimed owner epoch 3, got %d", worker.OwnerEpoch())
+	}
+	if worker.OwnerCPInstanceID() != pool.cpInstanceID {
+		t.Fatalf("expected owner cp instance id %q, got %q", pool.cpInstanceID, worker.OwnerCPInstanceID())
+	}
+	if connectedPodName != "duckgres-worker-other-cp-21" || connectedPodIP != "10.0.0.21" {
+		t.Fatalf("expected connection to claimed pod, got name=%q ip=%q", connectedPodName, connectedPodIP)
+	}
+	if store.claimCalls != 1 {
+		t.Fatalf("expected one claim call, got %d", store.claimCalls)
+	}
+	if store.claimOwnerCPID != pool.cpInstanceID {
+		t.Fatalf("expected claim owner cp instance id %q, got %q", pool.cpInstanceID, store.claimOwnerCPID)
+	}
+	if store.claimOrgID != "analytics" {
+		t.Fatalf("expected claim org analytics, got %q", store.claimOrgID)
+	}
+	if !store.claimLease.Equal(leaseExpiry) {
+		t.Fatalf("expected claim lease expiry %v, got %v", leaseExpiry, store.claimLease)
+	}
+
+	state := worker.SharedState()
+	if state.Lifecycle != WorkerLifecycleReserved {
+		t.Fatalf("expected reserved lifecycle, got %q", state.Lifecycle)
+	}
+	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
+		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerFallsBackWhenRuntimeClaimReturnsNil(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	idle := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	pool.workers[idle.ID] = idle
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: time.Date(2026, time.March, 20, 19, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker.ID != idle.ID {
+		t.Fatalf("expected fallback idle worker %d, got %d", idle.ID, worker.ID)
+	}
+	if store.claimCalls != 1 {
+		t.Fatalf("expected one claim attempt before fallback, got %d", store.claimCalls)
 	}
 }
 
