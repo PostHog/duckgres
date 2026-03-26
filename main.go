@@ -557,8 +557,10 @@ func main() {
 				ImagePullPolicy:   resolved.K8sWorkerImagePullPolicy,
 				ServiceAccount:    resolved.K8sWorkerServiceAccount,
 				MaxWorkers:        resolved.K8sMaxWorkers,
-				SharedWarmTarget:  resolved.K8sSharedWarmTarget,
-				AWSRegion: resolved.AWSRegion,
+				SharedWarmTarget:    resolved.K8sSharedWarmTarget,
+				WorkerCPURequest:    resolved.K8sWorkerCPURequest,
+				WorkerMemoryRequest: resolved.K8sWorkerMemoryRequest,
+				AWSRegion:           resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

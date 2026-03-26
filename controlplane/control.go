@@ -80,8 +80,10 @@ type K8sConfig struct {
 	ImagePullPolicy   string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
 	ServiceAccount    string // ServiceAccount name for worker pods (default: "default")
 	MaxWorkers        int    // Global cap for the shared K8s worker pool (0 = auto-derived)
-	SharedWarmTarget  int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
-	AWSRegion string // AWS region for STS client
+	SharedWarmTarget    int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	WorkerCPURequest    string // CPU request for worker pods (e.g., "500m")
+	WorkerMemoryRequest string // Memory request for worker pods (e.g., "1Gi")
+	AWSRegion           string // AWS region for STS client
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.

@@ -828,3 +828,62 @@ func TestK8sPool_IdleReaper(t *testing.T) {
 		t.Fatal("idle worker should have been reaped")
 	}
 }
+
+func TestWorkerResources_BothSet(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerCPURequest:    "500m",
+		workerMemoryRequest: "2Gi",
+	}
+	res := pool.workerResources()
+	if res.Requests == nil {
+		t.Fatal("expected requests to be set")
+	}
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != "500m" {
+		t.Fatalf("expected CPU request 500m, got %s", cpu.String())
+	}
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != "2Gi" {
+		t.Fatalf("expected memory request 2Gi, got %s", mem.String())
+	}
+	if res.Limits != nil {
+		t.Fatal("expected no limits to be set")
+	}
+}
+
+func TestWorkerResources_CPUOnly(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerCPURequest: "1",
+	}
+	res := pool.workerResources()
+	if _, ok := res.Requests[corev1.ResourceCPU]; !ok {
+		t.Fatal("expected CPU request")
+	}
+	if _, ok := res.Requests[corev1.ResourceMemory]; ok {
+		t.Fatal("expected no memory request")
+	}
+}
+
+func TestWorkerResources_MemoryOnly(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerMemoryRequest: "4Gi",
+	}
+	res := pool.workerResources()
+	if _, ok := res.Requests[corev1.ResourceMemory]; !ok {
+		t.Fatal("expected memory request")
+	}
+	if _, ok := res.Requests[corev1.ResourceCPU]; ok {
+		t.Fatal("expected no CPU request")
+	}
+}
+
+func TestWorkerResources_NeitherSet(t *testing.T) {
+	pool := &K8sWorkerPool{}
+	res := pool.workerResources()
+	if res.Requests != nil {
+		t.Fatal("expected empty requests (BestEffort)")
+	}
+	if res.Limits != nil {
+		t.Fatal("expected empty limits")
+	}
+}

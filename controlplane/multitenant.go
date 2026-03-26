@@ -142,7 +142,8 @@ func SetupMultiTenant(
 		ConfigPath:           cfg.ConfigPath,
 		ImagePullPolicy:      cfg.K8s.ImagePullPolicy,
 		ServiceAccount:       cfg.K8s.ServiceAccount,
-		MemoryBudget:         int64(memBudget),
+		WorkerCPURequest:     cfg.K8s.WorkerCPURequest,
+		WorkerMemoryRequest:  cfg.K8s.WorkerMemoryRequest,
 	}
 
 	// Initialize STS broker for credential brokering (best-effort)

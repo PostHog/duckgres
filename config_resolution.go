@@ -52,6 +52,8 @@ type configCLIInputs struct {
 	K8sWorkerServiceAccount   string
 	K8sMaxWorkers             int
 	K8sSharedWarmTarget       int
+	K8sWorkerCPURequest       string
+	K8sWorkerMemoryRequest    string
 	AWSRegion                 string
 	QueryLog                  bool
 }
@@ -74,6 +76,8 @@ type resolvedConfig struct {
 	K8sWorkerServiceAccount  string
 	K8sMaxWorkers            int
 	K8sSharedWarmTarget      int
+	K8sWorkerCPURequest      string
+	K8sWorkerMemoryRequest   string
 	AWSRegion                string
 	ConfigStoreConn          string
 	ConfigPollInterval       time.Duration
@@ -131,6 +135,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
 	var k8sMaxWorkers, k8sSharedWarmTarget int
+	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -632,6 +637,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_K8S_SHARED_WARM_TARGET: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_K8S_WORKER_CPU_REQUEST"); v != "" {
+		k8sWorkerCPURequest = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST"); v != "" {
+		k8sWorkerMemoryRequest = v
+	}
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
 		awsRegion = v
 	}
@@ -904,6 +915,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
 		K8sMaxWorkers:            k8sMaxWorkers,
 		K8sSharedWarmTarget:      k8sSharedWarmTarget,
+		K8sWorkerCPURequest:     k8sWorkerCPURequest,
+		K8sWorkerMemoryRequest:  k8sWorkerMemoryRequest,
 		AWSRegion:                awsRegion,
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
