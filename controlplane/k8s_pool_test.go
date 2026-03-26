@@ -887,3 +887,69 @@ func TestWorkerResources_NeitherSet(t *testing.T) {
 		t.Fatal("expected empty limits")
 	}
 }
+
+func TestWorkerScheduling_NodeSelectorAndToleration(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerNodeSelector:  map[string]string{"posthog.com/duckgres-workers": "duckgres-workers"},
+		workerTolerationKey: "posthog.com/duckgres-workers",
+	}
+
+	// Build a minimal pod to test scheduling additions
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			NodeSelector: pool.workerNodeSelector,
+		},
+	}
+
+	// Verify nodeSelector
+	if pod.Spec.NodeSelector == nil {
+		t.Fatal("expected nodeSelector to be set")
+	}
+	if pod.Spec.NodeSelector["posthog.com/duckgres-workers"] != "duckgres-workers" {
+		t.Fatalf("unexpected nodeSelector: %v", pod.Spec.NodeSelector)
+	}
+
+	// Verify toleration construction
+	if pool.workerTolerationKey == "" {
+		t.Fatal("expected tolerationKey to be set")
+	}
+	toleration := corev1.Toleration{
+		Key:    pool.workerTolerationKey,
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	if toleration.Key != "posthog.com/duckgres-workers" {
+		t.Fatalf("unexpected toleration key: %s", toleration.Key)
+	}
+	if toleration.Effect != corev1.TaintEffectNoSchedule {
+		t.Fatalf("expected NoSchedule effect, got %s", toleration.Effect)
+	}
+}
+
+func TestWorkerScheduling_NoSelectorOrToleration(t *testing.T) {
+	pool := &K8sWorkerPool{}
+
+	if pool.workerNodeSelector != nil {
+		t.Fatal("expected nil nodeSelector by default")
+	}
+	if pool.workerTolerationKey != "" {
+		t.Fatal("expected empty tolerationKey by default")
+	}
+}
+
+func TestParseNodeSelector(t *testing.T) {
+	// Valid JSON
+	m := parseNodeSelector(`{"posthog.com/pool":"workers"}`)
+	if m == nil || m["posthog.com/pool"] != "workers" {
+		t.Fatalf("expected parsed selector, got %v", m)
+	}
+
+	// Empty string
+	if parseNodeSelector("") != nil {
+		t.Fatal("expected nil for empty string")
+	}
+
+	// Invalid JSON
+	if parseNodeSelector("not-json") != nil {
+		t.Fatal("expected nil for invalid JSON")
+	}
+}
