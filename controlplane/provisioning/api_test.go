@@ -81,6 +81,7 @@ func TestProvisionCreatesWarehouse(t *testing.T) {
 	router := newTestRouter(store)
 
 	body := []byte(`{
+		"database_name": "analytics-db",
 		"metadata_store": {
 			"type": "aurora",
 			"aurora": {"min_acu": 0.5, "max_acu": 2}
@@ -115,7 +116,7 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
+	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/new-org/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -171,7 +172,7 @@ func TestProvisionRejectsExistingNonTerminal(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
+	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -191,7 +192,7 @@ func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"min_acu": 0, "max_acu": 2}}}`)
+	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "aurora", "aurora": {"min_acu": 0, "max_acu": 2}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
