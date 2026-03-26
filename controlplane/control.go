@@ -157,7 +157,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.WorkerIdleTimeout = 5 * time.Minute
 	}
 	if cfg.HandoverDrainTimeout == 0 {
-		cfg.HandoverDrainTimeout = 24 * time.Hour
+		if cfg.WorkerBackend == "remote" {
+			cfg.HandoverDrainTimeout = 15 * time.Minute
+		} else {
+			cfg.HandoverDrainTimeout = 24 * time.Hour
+		}
 	}
 
 	// Enforce secure defaults for control-plane mode.
@@ -474,7 +478,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		if cp.janitorLeader != nil {
 			cp.janitorLeader.Stop()
 		}
-		cp.shutdown()
+		if isK8s {
+			cp.drainAndShutdown(cp.cfg.HandoverDrainTimeout)
+		} else {
+			cp.shutdown()
+		}
 		os.Exit(0)
 	}()
 
@@ -791,6 +799,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		sessions = cp.sessions
 		rebalancer = cp.rebalancer
 	}
+	if cp.isDraining() {
+		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
+		_ = writer.Flush()
+		return
+	}
 
 	// Feed initial parameters and backend key data to the client IMMEDIATELY.
 	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
@@ -968,13 +981,7 @@ func fullRead(conn net.Conn, buf []byte) (int, error) {
 }
 
 func (cp *ControlPlane) shutdown() {
-	cp.closeMu.Lock()
-	cp.closed = true
-	cp.closeMu.Unlock()
-
-	if cp.pgListener != nil {
-		_ = cp.pgListener.Close()
-	}
+	cp.stopAcceptingPGConnections()
 	if cp.flight != nil {
 		cp.flight.Shutdown()
 		cp.flight = nil
@@ -987,6 +994,75 @@ func (cp *ControlPlane) shutdown() {
 	slog.Info("Waiting for connections to drain...")
 	cp.wg.Wait()
 
+	cp.shutdownRuntimeResources()
+}
+
+func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
+	cp.stopAcceptingPGConnections()
+	if cp.flight != nil {
+		cp.flight.BeginDrain()
+	}
+	slog.Info("Waiting for planned shutdown drain.", "timeout", timeout)
+	if cp.waitForDrain(timeout) {
+		slog.Info("All pgwire connections and Flight sessions drained before shutdown.")
+	} else {
+		slog.Warn("Planned shutdown drain timeout exceeded, forcing shutdown.", "timeout", timeout)
+	}
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
+	}
+	cp.shutdownRuntimeResources()
+}
+
+func (cp *ControlPlane) stopAcceptingPGConnections() {
+	cp.closeMu.Lock()
+	cp.closed = true
+	cp.closeMu.Unlock()
+
+	if cp.pgListener != nil {
+		_ = cp.pgListener.Close()
+	}
+}
+
+func (cp *ControlPlane) waitForDrain(timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	pgDone := make(chan struct{})
+	go func() {
+		cp.wg.Wait()
+		close(pgDone)
+	}()
+
+	flightDone := make(chan bool, 1)
+	go func() {
+		if cp.flight != nil {
+			flightDone <- cp.flight.WaitForZeroSessions(ctx)
+			return
+		}
+		flightDone <- true
+	}()
+
+	pgClosed := false
+	flightClosed := false
+	for !pgClosed || !flightClosed {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-pgDone:
+			pgClosed = true
+		case drained := <-flightDone:
+			if !drained {
+				return false
+			}
+			flightClosed = true
+		}
+	}
+	return true
+}
+
+func (cp *ControlPlane) shutdownRuntimeResources() {
 	slog.Info("Shutting down workers...")
 	if cp.orgRouter != nil {
 		cp.orgRouter.ShutdownAll()
@@ -1013,6 +1089,10 @@ func (cp *ControlPlane) shutdown() {
 	cp.stopQueryLogger()
 
 	slog.Info("Control plane shutdown complete.")
+}
+
+func (cp *ControlPlane) isDraining() bool {
+	return cp.runtimeTracker != nil && cp.runtimeTracker.Draining()
 }
 
 func (cp *ControlPlane) stopQueryLogger() {

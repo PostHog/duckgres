@@ -842,6 +842,71 @@ func TestFlightAuthSessionStoreReconnectsDurableSessionByToken(t *testing.T) {
 	}
 }
 
+func TestFlightAuthSessionStoreRejectsNewSessionsWhileDraining(t *testing.T) {
+	provider := &testDurableSessionProvider{
+		createSessionFn: func(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+			return 321, nil, nil
+		},
+	}
+	store := newFlightAuthSessionStore(provider, time.Minute, time.Hour, time.Hour, time.Hour, 0, Options{})
+	defer store.Close()
+
+	existing, err := store.Create(context.Background(), "postgres")
+	if err != nil {
+		t.Fatalf("Create(initial): %v", err)
+	}
+
+	store.SetDraining(true)
+	if _, err := store.Create(context.Background(), "postgres"); err == nil {
+		t.Fatal("expected Create to reject new sessions while draining")
+	}
+
+	reused, ok := store.GetByToken(existing.token)
+	if !ok {
+		t.Fatal("expected existing token to remain usable while draining")
+	}
+	if reused.pid != existing.pid {
+		t.Fatalf("expected reused pid %d, got %d", existing.pid, reused.pid)
+	}
+}
+
+func TestFlightAuthSessionStoreWaitForZeroSessions(t *testing.T) {
+	provider := &testDurableSessionProvider{
+		createSessionFn: func(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+			return 654, nil, nil
+		},
+	}
+	store := newFlightAuthSessionStore(provider, time.Minute, time.Hour, time.Hour, time.Hour, 0, Options{})
+	defer store.Close()
+
+	session, err := store.Create(context.Background(), "postgres")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- store.WaitForZeroSessions(ctx)
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	if closed := store.CloseByToken(session.token); !closed {
+		t.Fatal("expected CloseByToken to close the created session")
+	}
+
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("expected WaitForZeroSessions to report success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForZeroSessions did not return")
+	}
+}
+
 func TestCloseSessionRevokesTokenAndDestroysWorker(t *testing.T) {
 	s := newFlightClientSession(1234, "postgres", nil)
 	s.token = "issued-token"

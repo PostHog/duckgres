@@ -221,6 +221,20 @@ func (fi *FlightIngress) Start() {
 	}()
 }
 
+func (fi *FlightIngress) BeginDrain() {
+	if fi == nil || fi.sessionStore == nil {
+		return
+	}
+	fi.sessionStore.SetDraining(true)
+}
+
+func (fi *FlightIngress) WaitForZeroSessions(ctx context.Context) bool {
+	if fi == nil || fi.sessionStore == nil {
+		return true
+	}
+	return fi.sessionStore.WaitForZeroSessions(ctx)
+}
+
 // Shutdown stops accepting new Flight connections and cleans up sessions.
 func (fi *FlightIngress) Shutdown() {
 	if fi == nil {
@@ -228,6 +242,7 @@ func (fi *FlightIngress) Shutdown() {
 	}
 	fi.shutdownOnce.Do(func() {
 		fi.shutdownState.Store(true)
+		fi.BeginDrain()
 		if fi.listener != nil {
 			_ = fi.listener.Close()
 		}
@@ -1236,6 +1251,8 @@ type flightAuthSessionStore struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+
+	draining atomic.Bool
 }
 
 type lockedRowSet struct {
@@ -1295,6 +1312,9 @@ func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, 
 }
 
 func (s *flightAuthSessionStore) Create(ctx context.Context, username string) (*flightClientSession, error) {
+	if s.Draining() {
+		return nil, fmt.Errorf("flight ingress is draining")
+	}
 	bootstrapNonce, err := generateSessionIdentityToken()
 	if err != nil {
 		return nil, fmt.Errorf("generate bootstrap nonce: %w", err)
@@ -1575,6 +1595,50 @@ func (s *flightAuthSessionStore) Close() {
 			}
 		}
 	})
+}
+
+func (s *flightAuthSessionStore) SetDraining(draining bool) {
+	if s == nil {
+		return
+	}
+	s.draining.Store(draining)
+}
+
+func (s *flightAuthSessionStore) Draining() bool {
+	if s == nil {
+		return false
+	}
+	return s.draining.Load()
+}
+
+func (s *flightAuthSessionStore) ActiveSessionCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sessions)
+}
+
+func (s *flightAuthSessionStore) WaitForZeroSessions(ctx context.Context) bool {
+	if s == nil {
+		return true
+	}
+	if s.ActiveSessionCount() == 0 {
+		return true
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return s.ActiveSessionCount() == 0
+		case <-ticker.C:
+			if s.ActiveSessionCount() == 0 {
+				return true
+			}
+		}
+	}
 }
 
 func (s *flightAuthSessionStore) ReapIdleNow() int {
