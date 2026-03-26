@@ -1,5 +1,5 @@
-INSERT INTO duckgres_orgs (name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
-VALUES ('local', 0, '', 0, NOW(), NOW())
+INSERT INTO duckgres_orgs (name, database_name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
+VALUES ('local', 'duckgres', 0, '', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET updated_at = NOW();
 

@@ -5,6 +5,7 @@ import "time"
 // Org represents a tenant with per-org resource limits.
 type Org struct {
 	Name         string            `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName string            `gorm:"size:255;uniqueIndex" json:"database_name"`
 	MaxWorkers   int               `gorm:"default:0" json:"max_workers"`
 	MemoryBudget string            `gorm:"size:32" json:"memory_budget"`
 	IdleTimeoutS int               `gorm:"default:0" json:"idle_timeout_s"`
@@ -189,6 +190,7 @@ func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
 // OrgConfig is a convenience view combining org metadata with resource limits.
 type OrgConfig struct {
 	Name         string
+	DatabaseName string
 	MaxWorkers   int
 	MemoryBudget string
 	IdleTimeoutS int

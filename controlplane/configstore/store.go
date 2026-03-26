@@ -22,6 +22,7 @@ type OrgUserKey struct {
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
 	Orgs            map[string]*OrgConfig
+	DatabaseOrg     map[string]string     // database name -> org ID
 	OrgUserPassword map[OrgUserKey]string // (orgID, username) -> bcrypt hash
 	Global          GlobalConfig
 	DuckLake        DuckLakeConfig
@@ -147,6 +148,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 
 	snap := &Snapshot{
 		Orgs:            make(map[string]*OrgConfig),
+		DatabaseOrg:     make(map[string]string),
 		OrgUserPassword: make(map[OrgUserKey]string),
 		Global:          global,
 		DuckLake:        duckLake,
@@ -157,11 +159,15 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	for _, o := range orgs {
 		oc := &OrgConfig{
 			Name:         o.Name,
+			DatabaseName: o.DatabaseName,
 			MaxWorkers:   o.MaxWorkers,
 			MemoryBudget: o.MemoryBudget,
 			IdleTimeoutS: o.IdleTimeoutS,
 			Users:        make(map[string]string),
 			Warehouse:    copyManagedWarehouseConfig(o.Warehouse),
+		}
+		if o.DatabaseName != "" {
+			snap.DatabaseOrg[o.DatabaseName] = o.Name
 		}
 		for _, u := range o.Users {
 			oc.Users[u.Username] = u.Password
@@ -178,6 +184,16 @@ func (cs *ConfigStore) Snapshot() *Snapshot {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	return cs.snapshot
+}
+
+// ResolveDatabase maps a database name to an org ID. Returns "" if not found.
+func (cs *ConfigStore) ResolveDatabase(database string) string {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return ""
+	}
+	return cs.snapshot.DatabaseOrg[database]
 }
 
 // ValidateOrgUser checks username/password scoped to a specific org.

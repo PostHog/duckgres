@@ -13,7 +13,7 @@ import (
 // Store defines the config store operations needed by the provisioning API.
 type Store interface {
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
-	CreatePendingWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) error
+	CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
 }
 
@@ -44,6 +44,7 @@ type warehouseStatusResponse struct {
 }
 
 type provisionRequest struct {
+	DatabaseName  string                `json:"database_name,omitempty"`
 	MetadataStore *provisionMetadataReq `json:"metadata_store,omitempty"`
 }
 
@@ -71,12 +72,18 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
+	// Default database name to org ID if not specified
+	databaseName := req.DatabaseName
+	if databaseName == "" {
+		databaseName = orgID
+	}
+
 	warehouse := &configstore.ManagedWarehouse{
 		AuroraMinACU: req.MetadataStore.Aurora.MinACU,
 		AuroraMaxACU: req.MetadataStore.Aurora.MaxACU,
 	}
 
-	if err := h.store.CreatePendingWarehouse(orgID, warehouse); err != nil {
+	if err := h.store.CreatePendingWarehouse(orgID, databaseName, warehouse); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}

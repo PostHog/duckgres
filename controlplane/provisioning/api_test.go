@@ -35,10 +35,10 @@ func (s *fakeStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWareh
 	return &clone, nil
 }
 
-func (s *fakeStore) CreatePendingWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) error {
+func (s *fakeStore) CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
 	// Auto-create org if needed (mirrors production behavior)
 	if _, ok := s.orgs[orgID]; !ok {
-		s.orgs[orgID] = &configstore.Org{Name: orgID}
+		s.orgs[orgID] = &configstore.Org{Name: orgID, DatabaseName: databaseName}
 	}
 	existing, ok := s.warehouses[orgID]
 	if ok && existing.State != configstore.ManagedWarehouseStateFailed && existing.State != configstore.ManagedWarehouseStateDeleted {

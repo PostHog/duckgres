@@ -117,8 +117,9 @@ type ControlPlane struct {
 // ConfigStoreInterface abstracts the config store for the control plane.
 // Defined here to avoid circular imports with the configstore package.
 type ConfigStoreInterface interface {
+	ResolveDatabase(database string) (orgID string)
 	ValidateOrgUser(orgID, username, password string) bool
-	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no SNI)
+	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no database param)
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.
@@ -673,8 +674,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	password := string(bytes.TrimRight(body, "\x00"))
 
 	// Authenticate
-	// In multi-tenant mode, the database name identifies the org.
-	// User uniqueness is scoped to the database (org).
+	// In multi-tenant mode, the database name maps to an org.
+	// User uniqueness is scoped to the org.
+	var orgID string
 	if cp.configStore != nil {
 		if database == "" {
 			slog.Warn("Connection rejected: no database specified.", "remote_addr", remoteAddr)
@@ -682,8 +684,15 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
-		if !cp.configStore.ValidateOrgUser(database, username, password) {
-			slog.Warn("Authentication failed.", "user", username, "org", database, "remote_addr", remoteAddr)
+		orgID = cp.configStore.ResolveDatabase(database)
+		if orgID == "" {
+			slog.Warn("Unknown database.", "database", database, "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", fmt.Sprintf("database %q does not exist", database))
+			_ = writer.Flush()
+			return
+		}
+		if !cp.configStore.ValidateOrgUser(orgID, username, password) {
+			slog.Warn("Authentication failed.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
 				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
@@ -723,15 +732,15 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// Reject connections during DuckLake migration to prevent queries from
 		// hitting a partially-migrated catalog. The client gets a clear error
 		// and can retry after the migration completes.
-		if cp.orgRouter.IsMigratingForOrg(database) {
-			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", database, "remote_addr", remoteAddr)
+		if cp.orgRouter.IsMigratingForOrg(orgID) {
+			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", orgID, "remote_addr", remoteAddr)
 			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
 				"DuckLake catalog upgrade in progress for your organization, please retry in a few moments")
 			_ = writer.Flush()
 			return
 		}
 
-		_, sess, rebal, ok := cp.orgRouter.StackForOrg(database)
+		_, sess, rebal, ok := cp.orgRouter.StackForOrg(orgID)
 		if !ok {
 			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
 			_ = writer.Flush()

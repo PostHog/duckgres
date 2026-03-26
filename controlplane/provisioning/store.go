@@ -26,12 +26,18 @@ func (s *gormStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWareh
 	return &warehouse, nil
 }
 
-func (s *gormStore) CreatePendingWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) error {
+func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
 	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
 		// Auto-create org if it doesn't exist (PostHog calls provision, duckgres creates everything)
-		org := configstore.Org{Name: orgID}
+		org := configstore.Org{Name: orgID, DatabaseName: databaseName}
 		if err := tx.Where("name = ?", orgID).FirstOrCreate(&org).Error; err != nil {
 			return err
+		}
+		// Update database name if org already existed with a different one
+		if org.DatabaseName != databaseName {
+			if err := tx.Model(&org).Update("database_name", databaseName).Error; err != nil {
+				return err
+			}
 		}
 
 		// Check for existing warehouse in non-terminal state
