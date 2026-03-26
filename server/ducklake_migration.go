@@ -79,6 +79,12 @@ func duckLakeMigrationCheckedVersion() string {
 	return dlMigration.checkedV
 }
 
+// DuckLakeMigrationCheckedVersion is an exported accessor for the control plane.
+func DuckLakeMigrationCheckedVersion() string { return duckLakeMigrationCheckedVersion() }
+
+// DuckLakeSpecVersion returns the expected DuckLake spec version.
+func DuckLakeSpecVersion() string { return duckLakeSpecVersion }
+
 // CheckAndBackupDuckLakeMigration runs the migration check for the given
 // DuckLake config and returns whether migration is needed. If migration is
 // needed, it backs up the metadata store first. This is exported for use by
@@ -89,6 +95,78 @@ func CheckAndBackupDuckLakeMigration(dlCfg DuckLakeConfig, dataDir string) (bool
 	}
 	needed, _, err := checkAndBackupIfNeeded(dlCfg, dataDir)
 	return needed, err
+}
+
+// CheckDuckLakeMigrationVersion checks only whether a DuckLake metadata store
+// needs migration, without performing the backup. This is fast (<1s) and safe
+// to call during startup without risking timeouts.
+func CheckDuckLakeMigrationVersion(dlCfg DuckLakeConfig) (needed bool, version string, err error) {
+	if dlCfg.MetadataStore == "" || !strings.HasPrefix(dlCfg.MetadataStore, "postgres:") {
+		return false, "", nil
+	}
+
+	connStr := strings.TrimPrefix(dlCfg.MetadataStore, "postgres:")
+	pgDB, err := sql.Open("pgx", connStr)
+	if err != nil {
+		return false, "", fmt.Errorf("open metadata store: %w", err)
+	}
+	defer func() { _ = pgDB.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := pgDB.PingContext(ctx); err != nil {
+		return false, "", fmt.Errorf("connect to metadata store: %w", err)
+	}
+
+	var exists bool
+	err = pgDB.QueryRowContext(ctx,
+		"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'ducklake_metadata')").Scan(&exists)
+	if err != nil {
+		return false, "", fmt.Errorf("check ducklake_metadata existence: %w", err)
+	}
+	if !exists {
+		return false, "", nil
+	}
+
+	var ver string
+	err = pgDB.QueryRowContext(ctx,
+		`SELECT "value" FROM ducklake_metadata WHERE "key" = 'version'`).Scan(&ver)
+	if err != nil {
+		return false, "", fmt.Errorf("read DuckLake spec version: %w", err)
+	}
+
+	less, err := versionLessThan(ver, duckLakeSpecVersion)
+	if err != nil {
+		return false, ver, fmt.Errorf("compare DuckLake versions: %w", err)
+	}
+	return less, ver, nil
+}
+
+// BackupDuckLakeMetadata runs only the metadata backup (no version check).
+// Exported for use by the control plane to run the backup asynchronously.
+func BackupDuckLakeMetadata(dlCfg DuckLakeConfig, dataDir string) error {
+	if dlCfg.MetadataStore == "" || !strings.HasPrefix(dlCfg.MetadataStore, "postgres:") {
+		return nil
+	}
+
+	connStr := strings.TrimPrefix(dlCfg.MetadataStore, "postgres:")
+	pgDB, err := sql.Open("pgx", connStr)
+	if err != nil {
+		return fmt.Errorf("open metadata store: %w", err)
+	}
+	defer func() { _ = pgDB.Close() }()
+
+	var ver string
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = pgDB.QueryRowContext(ctx,
+		`SELECT "value" FROM ducklake_metadata WHERE "key" = 'version'`).Scan(&ver)
+	if err != nil {
+		return fmt.Errorf("read DuckLake spec version for backup: %w", err)
+	}
+
+	return backupDuckLakeMetadata(pgDB, dataDir, ver)
 }
 
 // parseDuckLakeVersion parses a DuckLake version string like "0.3" into
