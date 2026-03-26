@@ -910,7 +910,7 @@ func TestK8sPool_ShutdownAll(t *testing.T) {
 	// Add some workers
 	for i := 0; i < 3; i++ {
 		done := make(chan struct{})
-		pool.workers[i] = &ManagedWorker{ID: i, done: done}
+		pool.workers[i] = &ManagedWorker{ID: i, podName: "duckgres-worker-test-cp-" + strconv.Itoa(i), done: done}
 
 		// Create corresponding pods
 		_, _ = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
@@ -932,6 +932,35 @@ func TestK8sPool_ShutdownAll(t *testing.T) {
 	pool.mu.RUnlock()
 	if count != 0 {
 		t.Fatalf("expected 0 workers after shutdown, got %d", count)
+	}
+}
+
+func TestK8sPoolRetireWorkerUsesTrackedPodName(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+
+	done := make(chan struct{})
+	worker := &ManagedWorker{
+		ID:      11,
+		podName: "duckgres-worker-other-cp-11",
+		done:    done,
+	}
+	pool.workers[worker.ID] = worker
+
+	var deletedPodName string
+	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		deleteAction, ok := action.(k8stesting.DeleteAction)
+		if !ok {
+			return false, nil, nil
+		}
+		deletedPodName = deleteAction.GetName()
+		return false, nil, nil
+	})
+
+	pool.RetireWorker(worker.ID)
+	time.Sleep(100 * time.Millisecond)
+
+	if deletedPodName != "duckgres-worker-other-cp-11" {
+		t.Fatalf("expected retire to delete tracked pod name duckgres-worker-other-cp-11, got %q", deletedPodName)
 	}
 }
 

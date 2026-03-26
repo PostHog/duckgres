@@ -26,6 +26,7 @@ import (
 // ManagedWorker represents a duckdb-service worker process.
 type ManagedWorker struct {
 	ID             int
+	podName        string
 	cmd            *exec.Cmd
 	socketPath     string
 	bearerToken    string
@@ -79,6 +80,10 @@ func (w *ManagedWorker) OwnerCPInstanceID() string {
 
 func (w *ManagedWorker) SetOwnerCPInstanceID(cpInstanceID string) {
 	w.ownerCPInstanceID = cpInstanceID
+}
+
+func (w *ManagedWorker) PodName() string {
+	return w.podName
 }
 
 // preboundSocket is a Unix socket pre-bound at startup while the socket

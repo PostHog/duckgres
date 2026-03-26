@@ -537,6 +537,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	done := make(chan struct{})
 	w := &ManagedWorker{
 		ID:          id,
+		podName:     podName,
 		bearerToken: token,
 		client:      client,
 		done:        done,
@@ -1225,7 +1226,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 
 	ctx := context.Background()
 	for _, w := range workers {
-		podName := p.podNameForWorker(w.ID)
+		podName := p.workerPodName(w)
 		gracePeriod := int64(10)
 		slog.Info("Shutting down K8s worker.", "id", w.ID, "pod", podName)
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
@@ -1248,7 +1249,7 @@ func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
 	if w.client != nil {
 		_ = w.client.Close()
 	}
-	podName := p.podNameForWorker(id)
+	podName := p.workerPodName(w)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
@@ -1434,14 +1435,14 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 				go func(c *flightsql.Client) { _ = c.Close() }(w.client)
 			}
 			// Delete the failed pod from K8s to avoid accumulating terminated pods
-			go func(workerID int) {
-				podName := p.podNameForWorker(workerID)
+			go func(worker *ManagedWorker) {
+				podName := p.workerPodName(worker)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 					GracePeriodSeconds: int64Ptr(0),
 				})
-			}(id)
+			}(w)
 		default:
 		}
 	}
@@ -1607,6 +1608,7 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	if worker == nil {
 		return record
 	}
+	record.PodName = p.workerPodName(worker)
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID
 		record.LeaseExpiresAt = assignment.LeaseExpiresAt
@@ -1634,6 +1636,16 @@ func (p *K8sWorkerPool) podNameForWorker(id int) string {
 		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.orgID, id)
 	}
 	return fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
+}
+
+func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
+	if worker != nil && worker.PodName() != "" {
+		return worker.PodName()
+	}
+	if worker == nil {
+		return ""
+	}
+	return p.podNameForWorker(worker.ID)
 }
 
 // SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
