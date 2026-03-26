@@ -119,6 +119,7 @@ type ControlPlane struct {
 	configStore    ConfigStoreInterface
 	apiServer      *http.Server // API server on :8080 (shut down on graceful exit)
 	runtimeTracker *ControlPlaneRuntimeTracker
+	janitorLeader  *JanitorLeaderManager
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -327,7 +328,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, apiServer, runtimeTracker, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
+		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
@@ -336,11 +337,18 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.orgRouter = adapter
 		cp.apiServer = apiServer
 		cp.runtimeTracker = runtimeTracker
+		cp.janitorLeader = janitorLeader
 		cp.cfg = cfg
 		_ = store // keep linter happy
 		if cp.runtimeTracker != nil {
 			if err := cp.runtimeTracker.Start(context.Background()); err != nil {
 				slog.Error("Failed to start control-plane runtime tracker.", "error", err)
+				os.Exit(1)
+			}
+		}
+		if cp.janitorLeader != nil {
+			if err := cp.janitorLeader.Start(context.Background()); err != nil {
+				slog.Error("Failed to start janitor leader election.", "error", err)
 				os.Exit(1)
 			}
 		}
@@ -457,6 +465,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			if err := cp.runtimeTracker.MarkDraining(); err != nil {
 				slog.Warn("Failed to mark control plane draining.", "error", err)
 			}
+		}
+		if cp.janitorLeader != nil {
+			cp.janitorLeader.Stop()
 		}
 		cp.shutdown()
 		os.Exit(0)
@@ -962,6 +973,9 @@ func (cp *ControlPlane) shutdown() {
 	if cp.flight != nil {
 		cp.flight.Shutdown()
 		cp.flight = nil
+	}
+	if cp.janitorLeader != nil {
+		cp.janitorLeader.Stop()
 	}
 
 	// Wait for in-flight connections to finish

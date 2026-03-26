@@ -326,6 +326,22 @@ func (cs *ConfigStore) GetControlPlaneInstance(id string) (*ControlPlaneInstance
 	return &instance, nil
 }
 
+// ExpireControlPlaneInstances marks stale control-plane instance rows as expired.
+func (cs *ConfigStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
+	now := time.Now()
+	result := cs.db.Table(cs.runtimeTable((&ControlPlaneInstance{}).TableName())).
+		Where("state <> ? AND last_heartbeat_at < ?", ControlPlaneInstanceStateExpired, cutoff).
+		Updates(map[string]any{
+			"state":      ControlPlaneInstanceStateExpired,
+			"expired_at": now,
+			"updated_at": now,
+		})
+	if result.Error != nil {
+		return 0, fmt.Errorf("expire control plane instances: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
 // UpsertWorkerRecord inserts or updates a runtime worker row.
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{

@@ -171,3 +171,63 @@ func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 		t.Fatalf("expected no claim, got %#v", claimed)
 	}
 }
+
+func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	startedAt := time.Date(2026, time.March, 26, 14, 0, 0, 0, time.UTC)
+	staleHeartbeat := startedAt.Add(5 * time.Second)
+	freshHeartbeat := startedAt.Add(40 * time.Second)
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-stale:boot-a",
+		PodName:         "duckgres-stale",
+		PodUID:          "pod-stale",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateActive,
+		StartedAt:       startedAt,
+		LastHeartbeatAt: staleHeartbeat,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(stale): %v", err)
+	}
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-fresh:boot-b",
+		PodName:         "duckgres-fresh",
+		PodUID:          "pod-fresh",
+		BootID:          "boot-b",
+		State:           configstore.ControlPlaneInstanceStateActive,
+		StartedAt:       startedAt,
+		LastHeartbeatAt: freshHeartbeat,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(fresh): %v", err)
+	}
+
+	expired, err := store.ExpireControlPlaneInstances(startedAt.Add(20 * time.Second))
+	if err != nil {
+		t.Fatalf("ExpireControlPlaneInstances: %v", err)
+	}
+	if expired != 1 {
+		t.Fatalf("expected 1 expired instance, got %d", expired)
+	}
+
+	stale, err := store.GetControlPlaneInstance("cp-stale:boot-a")
+	if err != nil {
+		t.Fatalf("GetControlPlaneInstance(stale): %v", err)
+	}
+	if stale.State != configstore.ControlPlaneInstanceStateExpired {
+		t.Fatalf("expected stale instance to be expired, got %q", stale.State)
+	}
+	if stale.ExpiredAt == nil {
+		t.Fatal("expected expired_at to be set for stale instance")
+	}
+
+	fresh, err := store.GetControlPlaneInstance("cp-fresh:boot-b")
+	if err != nil {
+		t.Fatalf("GetControlPlaneInstance(fresh): %v", err)
+	}
+	if fresh.State != configstore.ControlPlaneInstanceStateActive {
+		t.Fatalf("expected fresh instance to stay active, got %q", fresh.State)
+	}
+	if fresh.ExpiredAt != nil {
+		t.Fatalf("expected fresh instance expired_at to stay nil, got %v", fresh.ExpiredAt)
+	}
+}

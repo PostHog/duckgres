@@ -121,7 +121,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -129,7 +129,12 @@ func SetupMultiTenant(
 
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
+	}
+
+	namespace, err := resolveK8sNamespace(cfg.K8s.WorkerNamespace)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
 	}
 
 	cpID := cfg.K8s.ControlPlaneID
@@ -142,13 +147,13 @@ func SetupMultiTenant(
 	}
 	bootID := make([]byte, 16)
 	if _, err := rand.Read(bootID); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
 	}
 	bootIDHex := hex.EncodeToString(bootID)
 	cpInstanceID := podUID + ":" + bootIDHex
 
 	baseCfg := K8sWorkerPoolConfig{
-		Namespace:             cfg.K8s.WorkerNamespace,
+		Namespace:             namespace,
 		CPID:                  cpID,
 		CPInstanceID:          cpInstanceID,
 		WorkerImage:           cfg.K8s.WorkerImage,
@@ -191,7 +196,7 @@ func SetupMultiTenant(
 
 	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, resolveDucklingStatus)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	adpt := &orgRouterAdapter{router: router}
@@ -203,6 +208,11 @@ func SetupMultiTenant(
 		bootIDHex,
 		5*time.Second,
 	)
+	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
+	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
@@ -223,7 +233,7 @@ func SetupMultiTenant(
 	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret (pass via --internal-secret or DUCKGRES_INTERNAL_SECRET to set explicitly).", "secret", internalSecret)
@@ -257,7 +267,18 @@ func SetupMultiTenant(
 		}
 	}()
 
-	return store, adpt, apiServer, runtimeTracker, nil
+	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
+}
+
+func resolveK8sNamespace(namespace string) (string, error) {
+	if namespace != "" {
+		return namespace, nil
+	}
+	ns, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return "", fmt.Errorf("k8s namespace not set and auto-detection failed: %w", err)
+	}
+	return string(ns), nil
 }
 
 func newHealthHandler(isDraining func() bool) gin.HandlerFunc {
