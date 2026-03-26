@@ -93,6 +93,26 @@ func TestK8sPool_EnsureBearerTokenSecret_CreatesNew(t *testing.T) {
 	}
 }
 
+func TestK8sPool_EnsureBearerTokenSecret_DefaultsToSharedSecretName(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.secretName = ""
+
+	if err := pool.ensureBearerTokenSecret(context.Background()); err != nil {
+		t.Fatalf("ensureBearerTokenSecret failed: %v", err)
+	}
+	if pool.secretName != "duckgres-worker-token" {
+		t.Fatalf("expected shared default secret name duckgres-worker-token, got %q", pool.secretName)
+	}
+
+	secret, err := cs.CoreV1().Secrets("default").Get(context.Background(), "duckgres-worker-token", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("shared default secret not found: %v", err)
+	}
+	if _, ok := secret.Data["bearer-token"]; !ok {
+		t.Fatal("shared default secret missing bearer-token key")
+	}
+}
+
 func TestK8sPool_EnsureBearerTokenSecret_ExistingIsPreserved(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 

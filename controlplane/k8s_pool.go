@@ -182,11 +182,11 @@ func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
 }
 
 // ensureBearerTokenSecret ensures the bearer token K8s Secret exists.
-// If no secret name is configured, it generates one named "duckgres-worker-token-<cpID>".
+// If no secret name is configured, it uses the shared default "duckgres-worker-token".
 // If the secret doesn't exist, it creates one with a random 32-byte hex token.
 func (p *K8sWorkerPool) ensureBearerTokenSecret(ctx context.Context) error {
 	if p.secretName == "" {
-		p.secretName = "duckgres-worker-token-" + p.cpID
+		p.secretName = "duckgres-worker-token"
 	}
 
 	existing, err := p.clientset.CoreV1().Secrets(p.namespace).Get(ctx, p.secretName, metav1.GetOptions{})
