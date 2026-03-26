@@ -72,7 +72,6 @@ type K8sWorkerPool struct {
 	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
 	spawnWarmWorkerBackgroundFunc func(id int)
 	activateTenantFunc            func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error
-	resetTenantFunc               func(context.Context, *ManagedWorker) error
 	healthCheckFunc               func(context.Context, *ManagedWorker) error
 	connectWorkerFunc             func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error)
 	runtimeStore                  RuntimeWorkerStore
@@ -786,59 +785,7 @@ func (p *K8sWorkerPool) ReleaseWorker(id int) {
 		w.activeSessions--
 	}
 	w.lastUsed = time.Now()
-	if w.activeSessions != 0 || w.SharedState().NormalizedLifecycle() != WorkerLifecycleHot {
-		p.mu.Unlock()
-		return
-	}
-	nextState, err := w.SharedState().Transition(WorkerLifecycleDraining, nil)
-	if err != nil {
-		p.mu.Unlock()
-		return
-	}
-	if err := w.SetSharedState(nextState); err != nil {
-		p.mu.Unlock()
-		return
-	}
-	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
-
-	reset := p.resetTenantFunc
-	if reset == nil {
-		reset = func(ctx context.Context, worker *ManagedWorker) error {
-			return worker.ResetTenant(ctx)
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	err = reset(ctx, w)
-	cancel()
-	if err != nil {
-		slog.Warn("Resetting shared warm worker failed, retiring worker.", "worker", id, "error", err)
-		p.retireWorkerWithReason(id, RetireReasonResetFailure)
-		return
-	}
-
-	p.mu.Lock()
-	current, ok := p.workers[id]
-	if !ok || current != w || w.activeSessions != 0 || w.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
-		p.mu.Unlock()
-		return
-	}
-	idleState, err := w.SharedState().Transition(WorkerLifecycleIdle, nil)
-	if err != nil {
-		p.mu.Unlock()
-		p.retireWorkerWithReason(id, RetireReasonResetFailure)
-		return
-	}
-	if err := w.SetSharedState(idleState); err != nil {
-		p.mu.Unlock()
-		p.retireWorkerWithReason(id, RetireReasonResetFailure)
-		return
-	}
-	w.SetOwnerCPInstanceID("")
-	idleRecord := p.workerRecordFor(w.ID, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil)
-	observeWarmPoolLifecycleGauges(p.workers)
-	p.mu.Unlock()
-	p.persistWorkerRecord(idleRecord)
 }
 
 // RetireWorker removes a worker from the pool and deletes its pod.

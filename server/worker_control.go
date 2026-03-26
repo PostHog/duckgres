@@ -29,9 +29,3 @@ type WorkerDestroySessionPayload struct {
 type WorkerHealthCheckPayload struct {
 	WorkerControlMetadata
 }
-
-// WorkerResetPayload is the control-plane request body for returning a shared
-// warm worker to its neutral idle runtime.
-type WorkerResetPayload struct {
-	WorkerControlMetadata
-}

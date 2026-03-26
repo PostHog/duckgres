@@ -87,11 +87,8 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	}
 }
 
-func TestOrgReservedPoolReleaseWorkerReturnsWorkerToNeutralIdleOnLastSession(t *testing.T) {
+func TestOrgReservedPoolReleaseWorkerRetiresWorkerOnLastSession(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
-	shared.resetTenantFunc = func(ctx context.Context, worker *ManagedWorker) error {
-		return nil
-	}
 	worker := &ManagedWorker{ID: 9, activeSessions: 1, done: make(chan struct{})}
 	worker.SetOwnerCPInstanceID(shared.cpInstanceID)
 	worker.SetOwnerEpoch(3)
@@ -109,18 +106,8 @@ func TestOrgReservedPoolReleaseWorkerReturnsWorkerToNeutralIdleOnLastSession(t *
 	pool := NewOrgReservedPool(shared, "analytics", 1, nil)
 	pool.ReleaseWorker(worker.ID)
 
-	got, ok := shared.Worker(worker.ID)
-	if !ok {
-		t.Fatal("expected worker to remain in pool after last session release")
-	}
-	if got.SharedState().NormalizedLifecycle() != WorkerLifecycleIdle {
-		t.Fatalf("expected worker to return to idle, got %q", got.SharedState().NormalizedLifecycle())
-	}
-	if got.SharedState().Assignment != nil {
-		t.Fatalf("expected idle worker assignment to be cleared, got %#v", got.SharedState().Assignment)
-	}
-	if got.OwnerCPInstanceID() != "" {
-		t.Fatalf("expected idle worker owner cp instance id to be cleared, got %q", got.OwnerCPInstanceID())
+	if _, ok := shared.Worker(worker.ID); ok {
+		t.Fatal("expected worker to be retired after last session release")
 	}
 }
 

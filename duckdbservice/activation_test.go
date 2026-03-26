@@ -266,57 +266,6 @@ func TestSessionPoolActivateTenantRejectsSameEpochOwnerChange(t *testing.T) {
 	}
 }
 
-func TestSessionPoolResetTenantClearsActivationAndOwner(t *testing.T) {
-	pool := &SessionPool{
-		sessions:          make(map[string]*Session),
-		stopRefresh:       make(map[string]func()),
-		duckLakeSem:       make(chan struct{}, 1),
-		cfg:               server.Config{Users: map[string]string{"postgres": "postgres"}},
-		startTime:         time.Now(),
-		warmupDone:        make(chan struct{}),
-		sharedWarmMode:    true,
-		ownerEpoch:        4,
-		ownerCPInstanceID: "cp-live:boot-a",
-		workerID:          17,
-		resetDBConnection: func(*sql.DB, time.Time, string) error { return nil },
-		activation: &activatedTenantRuntime{
-			payload: ActivationPayload{
-				WorkerControlMetadata: server.WorkerControlMetadata{
-					OwnerEpoch:   4,
-					CPInstanceID: "cp-live:boot-a",
-					WorkerID:     17,
-				},
-				OrgID: "analytics",
-				DuckLake: server.DuckLakeConfig{
-					MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
-				},
-			},
-			db: &sql.DB{},
-		},
-	}
-	close(pool.warmupDone)
-
-	if err := pool.resetTenant(server.WorkerControlMetadata{
-		WorkerID:     17,
-		OwnerEpoch:   4,
-		CPInstanceID: "cp-live:boot-a",
-	}); err != nil {
-		t.Fatalf("resetTenant: %v", err)
-	}
-	if pool.currentActivation() != nil {
-		t.Fatal("expected activation to be cleared")
-	}
-	if pool.ownerCPInstanceID != "" {
-		t.Fatalf("expected owner cp instance id to be cleared, got %q", pool.ownerCPInstanceID)
-	}
-	if pool.ownerEpoch != 4 {
-		t.Fatalf("expected owner epoch to remain 4, got %d", pool.ownerEpoch)
-	}
-	if pool.workerID != 17 {
-		t.Fatalf("expected worker id to remain 17, got %d", pool.workerID)
-	}
-}
-
 func TestSessionPoolValidateControlMetadataRejectsMismatchedCPInstanceID(t *testing.T) {
 	pool := &SessionPool{
 		sharedWarmMode:    true,

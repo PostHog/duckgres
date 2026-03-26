@@ -53,7 +53,6 @@ type SessionPool struct {
 	ownerCPInstanceID    string
 	workerID             int
 	activateTenantFunc   func(ActivationPayload) error
-	resetDBConnection    func(*sql.DB, time.Time, string) error
 	createDBConnection   func(server.Config, chan struct{}, string, time.Time, string) (*sql.DB, error)
 	activateDBConnection func(*sql.DB, server.Config, chan struct{}, string) error
 }
@@ -103,7 +102,6 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		sharedWarmMode:       cfg.RequireActivation || sharedWarmWorkerEnabled(),
 		createDBConnection:   server.CreateDBConnection,
 		activateDBConnection: server.ActivateDBConnection,
-		resetDBConnection:    server.ResetActivatedDBConnection,
 	}
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
@@ -638,8 +636,6 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 		return s.handler.doCreateSession(cmd.Body, stream)
 	case "ActivateTenant":
 		return s.handler.doActivateTenant(cmd.Body, stream)
-	case "ResetTenant":
-		return s.handler.doResetTenant(cmd.Body, stream)
 	case "DestroySession":
 		return s.handler.doDestroySession(cmd.Body, stream)
 	case "HealthCheck":

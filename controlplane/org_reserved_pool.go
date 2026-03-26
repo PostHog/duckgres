@@ -102,7 +102,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 }
 
 func (p *OrgReservedPool) ReleaseWorker(id int) {
-	p.shared.ReleaseWorker(id)
+	p.shared.RetireWorkerIfNoSessions(id)
 }
 
 func (p *OrgReservedPool) RetireWorker(id int) {

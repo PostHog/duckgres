@@ -1244,35 +1244,6 @@ func (w *ManagedWorker) ActivateTenant(ctx context.Context, payload server.Worke
 	}
 }
 
-// ResetTenant returns a shared warm worker to its neutral idle runtime.
-func (w *ManagedWorker) ResetTenant(ctx context.Context) (err error) {
-	defer recoverWorkerPanic(&err)
-
-	body, _ := json.Marshal(server.WorkerResetPayload{
-		WorkerControlMetadata: server.WorkerControlMetadata{
-			WorkerID:     w.ID,
-			OwnerEpoch:   w.OwnerEpoch(),
-			CPInstanceID: w.OwnerCPInstanceID(),
-		},
-	})
-	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
-		Type: "ResetTenant",
-		Body: body,
-	})
-	if err != nil {
-		return fmt.Errorf("reset tenant: %w", err)
-	}
-
-	for {
-		if _, err := stream.Recv(); err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return fmt.Errorf("reset tenant recv: %w", err)
-		}
-	}
-}
-
 // DestroySession destroys a session on the worker.
 func (w *ManagedWorker) DestroySession(ctx context.Context, sessionToken string) (err error) {
 	defer recoverWorkerPanic(&err)

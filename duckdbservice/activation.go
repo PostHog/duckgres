@@ -184,59 +184,6 @@ func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata)
 	return nil
 }
 
-func (p *SessionPool) resetTenant(meta server.WorkerControlMetadata) error {
-	if !p.sharedWarmMode {
-		return fmt.Errorf("tenant reset is not enabled for this worker")
-	}
-	if err := p.validateControlMetadata(meta); err != nil {
-		return err
-	}
-
-	p.mu.RLock()
-	current := p.activation
-	sessionCount := len(p.sessions)
-	p.mu.RUnlock()
-	if sessionCount > 0 {
-		return fmt.Errorf("cannot reset tenant while %d sessions remain active", sessionCount)
-	}
-	if current == nil {
-		p.mu.Lock()
-		p.ownerCPInstanceID = ""
-		if p.workerID == 0 {
-			p.workerID = meta.WorkerID
-		}
-		p.mu.Unlock()
-		return nil
-	}
-	if p.resetDBConnection == nil {
-		return fmt.Errorf("tenant reset is not configured")
-	}
-	if err := p.resetDBConnection(current.db, p.startTime, server.ProcessVersion()); err != nil {
-		return fmt.Errorf("reset tenant runtime: %w", err)
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.sessions) > 0 {
-		return fmt.Errorf("cannot reset tenant while %d sessions remain active", len(p.sessions))
-	}
-	if p.workerID > 0 && meta.WorkerID != 0 && meta.WorkerID != p.workerID {
-		return fmt.Errorf("stale worker_id %d (current %d)", meta.WorkerID, p.workerID)
-	}
-	if meta.OwnerEpoch != p.ownerEpoch {
-		return fmt.Errorf("stale owner epoch %d (current %d)", meta.OwnerEpoch, p.ownerEpoch)
-	}
-	if p.ownerCPInstanceID != "" && meta.CPInstanceID != p.ownerCPInstanceID {
-		return fmt.Errorf("stale cp_instance_id %q (current %q)", meta.CPInstanceID, p.ownerCPInstanceID)
-	}
-	p.activation = nil
-	p.ownerCPInstanceID = ""
-	if p.workerID == 0 {
-		p.workerID = meta.WorkerID
-	}
-	return nil
-}
-
 func (p *SessionPool) currentSessionConfig() (server.Config, error) {
 	if !p.sharedWarmMode {
 		return p.cfg, nil
