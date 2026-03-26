@@ -61,7 +61,6 @@ type ControlPlaneConfig struct {
 	// InternalSecret is the shared secret for API authentication.
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
-
 }
 
 type ProcessConfig struct {
@@ -71,23 +70,23 @@ type ProcessConfig struct {
 
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage       string // Container image for worker pods (required)
-	WorkerNamespace   string // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID    string // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort        int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret      string // K8s Secret name containing bearer token
-	WorkerConfigMap   string // ConfigMap name for duckgres.yaml
-	ImagePullPolicy   string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount    string // ServiceAccount name for worker pods (default: "default")
-	MaxWorkers        int    // Global cap for the shared K8s worker pool (0 = auto-derived)
-	SharedWarmTarget    int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
-	WorkerCPURequest    string // CPU request for worker pods (e.g., "500m")
-	WorkerMemoryRequest string // Memory request for worker pods (e.g., "1Gi")
+	WorkerImage           string // Container image for worker pods (required)
+	WorkerNamespace       string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID        string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort            int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret          string // K8s Secret name containing bearer token
+	WorkerConfigMap       string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy       string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount        string // ServiceAccount name for worker pods (default: "default")
+	MaxWorkers            int    // Global cap for the shared K8s worker pool (0 = auto-derived)
+	SharedWarmTarget      int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	WorkerCPURequest      string // CPU request for worker pods (e.g., "500m")
+	WorkerMemoryRequest   string // Memory request for worker pods (e.g., "1Gi")
 	WorkerNodeSelector    string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
 	WorkerTolerationKey   string // Taint key for worker pod NoSchedule toleration
 	WorkerTolerationValue string // Taint value for worker pod NoSchedule toleration
-	WorkerExclusiveNode  bool   // One worker per node via pod anti-affinity
-	AWSRegion           string // AWS region for STS client
+	WorkerExclusiveNode   bool   // One worker per node via pod anti-affinity
+	AWSRegion             string // AWS region for STS client
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -116,9 +115,10 @@ type ControlPlane struct {
 	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
 	// Multi-tenant fields (non-nil in remote multitenant mode)
-	orgRouter   OrgRouterInterface
-	configStore ConfigStoreInterface
-	apiServer   *http.Server // API server on :8080 (shut down on graceful exit)
+	orgRouter      OrgRouterInterface
+	configStore    ConfigStoreInterface
+	apiServer      *http.Server // API server on :8080 (shut down on graceful exit)
+	runtimeTracker *ControlPlaneRuntimeTracker
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -327,7 +327,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, apiServer, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
+		store, adapter, apiServer, runtimeTracker, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
@@ -335,8 +335,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.configStore = store
 		cp.orgRouter = adapter
 		cp.apiServer = apiServer
+		cp.runtimeTracker = runtimeTracker
 		cp.cfg = cfg
 		_ = store // keep linter happy
+		if cp.runtimeTracker != nil {
+			if err := cp.runtimeTracker.Start(context.Background()); err != nil {
+				slog.Error("Failed to start control-plane runtime tracker.", "error", err)
+				os.Exit(1)
+			}
+		}
 	} else {
 		// Single-tenant mode: one shared process pool + session manager
 		procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, processMinWorkers, processMaxWorkers)
@@ -446,6 +453,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			os.Exit(0)
 		}
 		slog.Info("Received shutdown signal.", "signal", s)
+		if cp.runtimeTracker != nil {
+			if err := cp.runtimeTracker.MarkDraining(); err != nil {
+				slog.Warn("Failed to mark control plane draining.", "error", err)
+			}
+		}
 		cp.shutdown()
 		os.Exit(0)
 	}()
@@ -1177,7 +1189,7 @@ func (cp *ControlPlane) startFlightIngress() {
 			return ok
 		})
 		provider = &orgRoutedSessionProvider{
-			orgRouter: cp.orgRouter,
+			orgRouter:  cp.orgRouter,
 			pidSession: make(map[int32]*SessionManager),
 		}
 	case cp.sessions != nil:

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -120,7 +121,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -128,27 +129,27 @@ func SetupMultiTenant(
 
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	baseCfg := K8sWorkerPoolConfig{
-		Namespace:            cfg.K8s.WorkerNamespace,
-		CPID:                 cfg.K8s.ControlPlaneID,
-		WorkerImage:          cfg.K8s.WorkerImage,
-		WorkerPort:           cfg.K8s.WorkerPort,
-		SecretName:           cfg.K8s.WorkerSecret,
-		ConfigMap:            cfg.K8s.WorkerConfigMap,
-		MaxWorkers:           maxWorkers,
-		IdleTimeout:          cfg.WorkerIdleTimeout,
-		ConfigPath:           cfg.ConfigPath,
-		ImagePullPolicy:      cfg.K8s.ImagePullPolicy,
-		ServiceAccount:       cfg.K8s.ServiceAccount,
-		WorkerCPURequest:     cfg.K8s.WorkerCPURequest,
-		WorkerMemoryRequest:  cfg.K8s.WorkerMemoryRequest,
-		WorkerNodeSelector:   parseNodeSelector(cfg.K8s.WorkerNodeSelector),
+		Namespace:             cfg.K8s.WorkerNamespace,
+		CPID:                  cfg.K8s.ControlPlaneID,
+		WorkerImage:           cfg.K8s.WorkerImage,
+		WorkerPort:            cfg.K8s.WorkerPort,
+		SecretName:            cfg.K8s.WorkerSecret,
+		ConfigMap:             cfg.K8s.WorkerConfigMap,
+		MaxWorkers:            maxWorkers,
+		IdleTimeout:           cfg.WorkerIdleTimeout,
+		ConfigPath:            cfg.ConfigPath,
+		ImagePullPolicy:       cfg.K8s.ImagePullPolicy,
+		ServiceAccount:        cfg.K8s.ServiceAccount,
+		WorkerCPURequest:      cfg.K8s.WorkerCPURequest,
+		WorkerMemoryRequest:   cfg.K8s.WorkerMemoryRequest,
+		WorkerNodeSelector:    parseNodeSelector(cfg.K8s.WorkerNodeSelector),
 		WorkerTolerationKey:   cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue: cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:  cfg.K8s.WorkerExclusiveNode,
+		WorkerExclusiveNode:   cfg.K8s.WorkerExclusiveNode,
 	}
 
 	// Initialize STS broker for credential brokering (best-effort)
@@ -174,10 +175,30 @@ func SetupMultiTenant(
 
 	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, resolveDucklingStatus)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	adpt := &orgRouterAdapter{router: router}
+	cpID := baseCfg.CPID
+	if cpID == "" {
+		cpID, _ = os.Hostname()
+	}
+	podUID := os.Getenv("POD_UID")
+	if podUID == "" {
+		podUID = cpID
+	}
+	bootID := make([]byte, 16)
+	if _, err := rand.Read(bootID); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+	}
+	runtimeTracker := NewControlPlaneRuntimeTracker(
+		store,
+		cpID+":"+hex.EncodeToString(bootID),
+		cpID,
+		podUID,
+		hex.EncodeToString(bootID),
+		5*time.Second,
+	)
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
@@ -198,7 +219,7 @@ func SetupMultiTenant(
 	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret (pass via --internal-secret or DUCKGRES_INTERNAL_SECRET to set explicitly).", "secret", internalSecret)
@@ -211,9 +232,7 @@ func SetupMultiTenant(
 	engine.Use(gin.Recovery())
 
 	// Health endpoint (unauthenticated, used by K8s probes)
-	engine.GET("/health", func(c *gin.Context) {
-		c.String(http.StatusOK, "ok")
-	})
+	engine.GET("/health", newHealthHandler(runtimeTracker.Draining))
 
 	// Authenticated API
 	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
@@ -234,7 +253,17 @@ func SetupMultiTenant(
 		}
 	}()
 
-	return store, adpt, apiServer, nil
+	return store, adpt, apiServer, runtimeTracker, nil
+}
+
+func newHealthHandler(isDraining func() bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isDraining != nil && isDraining() {
+			c.String(http.StatusServiceUnavailable, "draining")
+			return
+		}
+		c.String(http.StatusOK, "ok")
+	}
 }
 
 // parseNodeSelector parses a JSON string into a map[string]string.
