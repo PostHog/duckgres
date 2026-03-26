@@ -1,3 +1,5 @@
+//go:build !kubernetes
+
 package controlplane
 
 import (
@@ -6,23 +8,9 @@ import (
 	"testing"
 )
 
-// mockOrgRouter implements OrgRouterInterface for testing.
-type mockOrgRouter struct {
-	sessions   *SessionManager
-	rebalancer *MemoryRebalancer
-	ok         bool
-}
-
-func (m *mockOrgRouter) StackForUser(_ string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
-	return nil, m.sessions, m.rebalancer, m.ok
-}
-
-func (m *mockOrgRouter) IsMigratingForUser(_ string) (bool, string) { return false, "" }
-func (m *mockOrgRouter) ShutdownAll()                              {}
-
 func TestOrgRoutedSessionProviderCreateSessionTeamNotFound(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
-		orgRouter: &mockOrgRouter{ok: false},
+		orgRouter:  &mockOrgRouter{ok: false},
 		pidSession: make(map[int32]*SessionManager),
 	}
 
@@ -60,7 +48,7 @@ func TestOrgRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 
 func TestOrgRoutedSessionProviderDestroyUnknownPidNoOp(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
-		orgRouter: &mockOrgRouter{ok: true},
+		orgRouter:  &mockOrgRouter{ok: true},
 		pidSession: make(map[int32]*SessionManager),
 	}
 
@@ -72,7 +60,7 @@ func TestOrgRoutedSessionProviderConcurrentDestroys(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
 	provider := &orgRoutedSessionProvider{
-		orgRouter: &mockOrgRouter{sessions: sm, ok: true},
+		orgRouter:  &mockOrgRouter{sessions: sm, ok: true},
 		pidSession: make(map[int32]*SessionManager),
 	}
 

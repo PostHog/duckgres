@@ -276,7 +276,15 @@ func TestMain(m *testing.M) {
 	// Check and wait for DuckLake infrastructure if DuckLake mode is enabled
 	if cfg.UseDuckLake {
 		if !IsDuckLakeInfraRunning(cfg.DuckLakeMetadataPort, cfg.MinIOPort) {
-			fmt.Println("DuckLake infrastructure not running. Waiting for it...")
+			fmt.Println("DuckLake infrastructure not running. Starting it...")
+			if err := StartDuckLakeInfraContainers(); err != nil {
+				fmt.Printf("Failed to start DuckLake infrastructure: %v\n", err)
+				fmt.Println("Falling back to vanilla DuckDB mode (set DUCKGRES_TEST_NO_DUCKLAKE=1 to suppress this)")
+				cfg.UseDuckLake = false
+			}
+		}
+		if cfg.UseDuckLake && !IsDuckLakeInfraRunning(cfg.DuckLakeMetadataPort, cfg.MinIOPort) {
+			fmt.Println("DuckLake infrastructure not ready yet. Waiting for it...")
 			if err := WaitForDuckLakeInfra(cfg.DuckLakeMetadataPort, cfg.MinIOPort, 30*time.Second); err != nil {
 				fmt.Printf("DuckLake infrastructure not available: %v\n", err)
 				fmt.Println("Falling back to vanilla DuckDB mode (set DUCKGRES_TEST_NO_DUCKLAKE=1 to suppress this)")

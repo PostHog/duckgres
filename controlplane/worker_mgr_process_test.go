@@ -1,3 +1,5 @@
+//go:build !kubernetes
+
 package controlplane
 
 import (

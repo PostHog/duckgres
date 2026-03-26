@@ -26,12 +26,10 @@ func TestOrgRouterMigrationLock(t *testing.T) {
 		t.Fatal("expected org-1 to be migrating after SetMigrating")
 	}
 
-	// Other orgs unaffected
 	if router.IsMigrating("org-2") {
 		t.Fatal("expected org-2 to not be migrating")
 	}
 
-	// Clear
 	router.ClearMigrating("org-1")
 	if router.IsMigrating("org-1") {
 		t.Fatal("expected org-1 to not be migrating after ClearMigrating")
@@ -178,15 +176,5 @@ func TestActivatorSkipsCheckWhenCachedFalse(t *testing.T) {
 	}
 	if *setOrg != "" {
 		t.Errorf("expected setMigrating not called, got %q", *setOrg)
-	}
-}
-
-func TestMockOrgRouterSatisfiesInterface(t *testing.T) {
-	mock := &mockOrgRouter{ok: true}
-	var _ OrgRouterInterface = mock
-
-	migrating, _ := mock.IsMigratingForUser("anyuser")
-	if migrating {
-		t.Fatal("expected default mock to return not migrating")
 	}
 }
