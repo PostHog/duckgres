@@ -561,7 +561,8 @@ func main() {
 				WorkerCPURequest:    resolved.K8sWorkerCPURequest,
 				WorkerMemoryRequest: resolved.K8sWorkerMemoryRequest,
 				WorkerNodeSelector:  resolved.K8sWorkerNodeSelector,
-				WorkerTolerationKey: resolved.K8sWorkerTolerationKey,
+				WorkerTolerationKey:   resolved.K8sWorkerTolerationKey,
+				WorkerTolerationValue: resolved.K8sWorkerTolerationValue,
 				AWSRegion:           resolved.AWSRegion,
 			},
 		}

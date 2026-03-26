@@ -59,8 +59,9 @@ type K8sWorkerPoolConfig struct {
 	ServiceAccount       string     // ServiceAccount name for worker pods (default: "default")
 	WorkerCPURequest     string            // CPU request for worker pods (e.g., "500m"). Empty = BestEffort.
 	WorkerMemoryRequest  string            // Memory request for worker pods (e.g., "1Gi"). Empty = BestEffort.
-	WorkerNodeSelector   map[string]string // Node selector for worker pods. Nil = no selector.
-	WorkerTolerationKey  string            // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
+	WorkerNodeSelector    map[string]string // Node selector for worker pods. Nil = no selector.
+	WorkerTolerationKey   string            // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
+	WorkerTolerationValue string            // Taint value for worker pod NoSchedule toleration.
 	OrgID                string            // Org ID for pod labels (multi-tenant mode)
 	WorkerIDGenerator    func() int // Shared ID generator across orgs (nil = internal counter)
 }

@@ -55,8 +55,9 @@ type K8sWorkerPool struct {
 	serviceAccount       string
 	workerCPURequest     string            // CPU request for worker pods (e.g., "500m")
 	workerMemoryRequest  string            // memory request for worker pods (e.g., "1Gi")
-	workerNodeSelector   map[string]string // node selector for worker pods
-	workerTolerationKey  string            // taint key for NoSchedule toleration
+	workerNodeSelector    map[string]string // node selector for worker pods
+	workerTolerationKey   string            // taint key for NoSchedule toleration
+	workerTolerationValue string            // taint value for NoSchedule toleration
 	orgID                string            // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
 	cachedToken          string // cached bearer token (immutable after setup)
@@ -134,8 +135,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		serviceAccount:       cfg.ServiceAccount,
 		workerCPURequest:     cfg.WorkerCPURequest,
 		workerMemoryRequest:  cfg.WorkerMemoryRequest,
-		workerNodeSelector:   cfg.WorkerNodeSelector,
-		workerTolerationKey:  cfg.WorkerTolerationKey,
+		workerNodeSelector:    cfg.WorkerNodeSelector,
+		workerTolerationKey:   cfg.WorkerTolerationKey,
+		workerTolerationValue: cfg.WorkerTolerationValue,
 		orgID:                cfg.OrgID,
 		workerIDGenerator:    cfg.WorkerIDGenerator,
 		spawnSem:             make(chan struct{}, spawnConcurrency),
@@ -446,10 +448,15 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 
 	// Add toleration if configured
 	if p.workerTolerationKey != "" {
-		pod.Spec.Tolerations = []corev1.Toleration{{
+		tol := corev1.Toleration{
 			Key:    p.workerTolerationKey,
 			Effect: corev1.TaintEffectNoSchedule,
-		}}
+		}
+		if p.workerTolerationValue != "" {
+			tol.Operator = corev1.TolerationOpEqual
+			tol.Value = p.workerTolerationValue
+		}
+		pod.Spec.Tolerations = []corev1.Toleration{tol}
 	}
 
 	// One worker per instance

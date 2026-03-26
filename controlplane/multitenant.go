@@ -146,7 +146,8 @@ func SetupMultiTenant(
 		WorkerCPURequest:     cfg.K8s.WorkerCPURequest,
 		WorkerMemoryRequest:  cfg.K8s.WorkerMemoryRequest,
 		WorkerNodeSelector:   parseNodeSelector(cfg.K8s.WorkerNodeSelector),
-		WorkerTolerationKey:  cfg.K8s.WorkerTolerationKey,
+		WorkerTolerationKey:   cfg.K8s.WorkerTolerationKey,
+		WorkerTolerationValue: cfg.K8s.WorkerTolerationValue,
 	}
 
 	// Initialize STS broker for credential brokering (best-effort)

@@ -56,6 +56,7 @@ type configCLIInputs struct {
 	K8sWorkerMemoryRequest    string
 	K8sWorkerNodeSelector     string
 	K8sWorkerTolerationKey    string
+	K8sWorkerTolerationValue  string
 	AWSRegion                 string
 	QueryLog                  bool
 }
@@ -82,6 +83,7 @@ type resolvedConfig struct {
 	K8sWorkerMemoryRequest   string
 	K8sWorkerNodeSelector    string
 	K8sWorkerTolerationKey   string
+	K8sWorkerTolerationValue string
 	AWSRegion                string
 	ConfigStoreConn          string
 	ConfigPollInterval       time.Duration
@@ -140,7 +142,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
 	var k8sMaxWorkers, k8sSharedWarmTarget int
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
-	var k8sWorkerNodeSelector, k8sWorkerTolerationKey string
+	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -654,6 +656,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_K8S_WORKER_TOLERATION_KEY"); v != "" {
 		k8sWorkerTolerationKey = v
 	}
+	if v := getenv("DUCKGRES_K8S_WORKER_TOLERATION_VALUE"); v != "" {
+		k8sWorkerTolerationValue = v
+	}
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
 		awsRegion = v
 	}
@@ -929,7 +934,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		K8sWorkerCPURequest:     k8sWorkerCPURequest,
 		K8sWorkerMemoryRequest:  k8sWorkerMemoryRequest,
 		K8sWorkerNodeSelector:   k8sWorkerNodeSelector,
-		K8sWorkerTolerationKey:  k8sWorkerTolerationKey,
+		K8sWorkerTolerationKey:   k8sWorkerTolerationKey,
+		K8sWorkerTolerationValue: k8sWorkerTolerationValue,
 		AWSRegion:                awsRegion,
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,

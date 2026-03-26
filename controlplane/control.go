@@ -83,8 +83,9 @@ type K8sConfig struct {
 	SharedWarmTarget    int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
 	WorkerCPURequest    string // CPU request for worker pods (e.g., "500m")
 	WorkerMemoryRequest string // Memory request for worker pods (e.g., "1Gi")
-	WorkerNodeSelector  string // JSON map for worker pod nodeSelector (e.g., '{"key":"value"}')
-	WorkerTolerationKey string // Taint key for worker pod NoSchedule toleration
+	WorkerNodeSelector    string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
+	WorkerTolerationKey   string // Taint key for worker pod NoSchedule toleration
+	WorkerTolerationValue string // Taint value for worker pod NoSchedule toleration
 	AWSRegion           string // AWS region for STS client
 }
 
