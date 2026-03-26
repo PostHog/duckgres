@@ -192,12 +192,11 @@ func TestHighBitHashInsertIntoBigint(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
-	// Use a hash with the high bit set — this is the scenario that caused the
-	// "INT64 value can't be cast to UINT64" error when the column was UBIGINT.
-	var highBitHash uint64 = 0xD700_0000_0000_0000
+	// FNV-1a produces uint64 values; ~50% have the high bit set, which
+	// becomes negative when stored as int64. Verify BIGINT accepts these.
+	var highBitHash int64 = -0x2900_0000_0000_0000 // equivalent to uint64(0xD700_0000_0000_0000)
 
-	// This is the same cast used in flushBatch: int64(uint64_value)
-	_, err = db.Exec("INSERT INTO test_hash VALUES ($1)", int64(highBitHash))
+	_, err = db.Exec("INSERT INTO test_hash VALUES ($1)", highBitHash)
 	if err != nil {
 		t.Fatalf("insert failed (this was the original bug): %v", err)
 	}
@@ -207,13 +206,16 @@ func TestHighBitHashInsertIntoBigint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
-	if uint64(stored) != highBitHash {
-		t.Errorf("hash round-trip mismatch: got uint64(%d) = %d, want %d", stored, uint64(stored), highBitHash)
+	if stored != highBitHash {
+		t.Errorf("hash round-trip mismatch: got %d, want %d", stored, highBitHash)
 	}
 }
 
-// TestHighBitHashRejectsUbigint confirms that UBIGINT rejects negative int64
-// values — this is the bug we fixed by switching to BIGINT.
+// TestHighBitHashRejectsUbigint documents that DuckDB's UBIGINT column rejects
+// negative int64 values — this is the DuckDB behavior that motivated switching
+// the query_log column to BIGINT. If a future DuckDB version changes this
+// behavior (e.g., bitwise reinterpretation), this test failing means the column
+// type choice should be re-evaluated, not that duckgres has regressed.
 func TestHighBitHashRejectsUbigint(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
@@ -226,8 +228,8 @@ func TestHighBitHashRejectsUbigint(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
-	var highBitHash uint64 = 0xD700_0000_0000_0000
-	_, err = db.Exec("INSERT INTO test_hash_u VALUES ($1)", int64(highBitHash))
+	var highBitHash int64 = -0x2900_0000_0000_0000
+	_, err = db.Exec("INSERT INTO test_hash_u VALUES ($1)", highBitHash)
 	if err == nil {
 		t.Fatal("expected error inserting negative int64 into UBIGINT, but insert succeeded")
 	}

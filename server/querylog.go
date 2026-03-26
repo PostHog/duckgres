@@ -22,7 +22,7 @@ type QueryLogEntry struct {
 	Query           string
 	TranspiledQuery *string // nil if unchanged
 	QueryKind       string  // "Select","Insert","Update","Delete","DDL","Utility","Copy","Cursor"
-	NormalizedHash  uint64
+	NormalizedHash  int64
 	ResultRows      int64
 	WrittenRows     int64
 	ExceptionCode   string
@@ -136,12 +136,15 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 
 	// Migrate normalized_query_hash from UBIGINT to BIGINT for existing tables.
 	// The Go database/sql driver cannot bind uint64 values with the high bit set,
-	// so we cast to int64 before inserting. A BIGINT column accepts negative int64
-	// values without a conversion error.
-	if _, err := db.Exec("ALTER TABLE ducklake.system.query_log ALTER COLUMN normalized_query_hash SET DATA TYPE BIGINT"); err != nil {
-		// Ignore error — column may already be BIGINT (new table) or DuckLake
-		// may not support ALTER TYPE. Either way, this is best-effort.
-		slog.Debug("querylog: ALTER normalized_query_hash to BIGINT (may already be correct).", "error", err)
+	// so we store hashes as int64/BIGINT. The bit pattern is preserved.
+	var colType string
+	err = db.QueryRow("SELECT data_type FROM information_schema.columns WHERE table_schema = 'system' AND table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
+	if err == nil && strings.ToUpper(colType) != "BIGINT" {
+		if _, alterErr := db.Exec("ALTER TABLE ducklake.system.query_log ALTER COLUMN normalized_query_hash SET DATA TYPE BIGINT"); alterErr != nil {
+			slog.Warn("querylog: failed to migrate normalized_query_hash to BIGINT.", "error", alterErr)
+		} else {
+			slog.Info("querylog: migrated normalized_query_hash from UBIGINT to BIGINT.")
+		}
 	}
 
 	// Configure data inlining
@@ -258,7 +261,7 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			truncateQuery(e.Query),
 			truncateNullableQuery(e.TranspiledQuery),
 			e.QueryKind,
-			int64(e.NormalizedHash), // cast to int64: database/sql rejects uint64 with high bit set
+			e.NormalizedHash,
 			e.ResultRows,
 			e.WrittenRows,
 			e.ExceptionCode,
@@ -338,7 +341,7 @@ var comparisonBoolNullRegexp = regexp.MustCompile(`(=|<>|!=|<=|>=|<|>)\s*(TRUE|F
 // normalizeQueryHash computes a FNV-1a hash of a query after collapsing
 // whitespace and replacing literals with placeholders. This groups queries
 // that differ only in parameter values.
-func normalizeQueryHash(query string) uint64 {
+func normalizeQueryHash(query string) int64 {
 	// Collapse whitespace
 	var sb strings.Builder
 	inSpace := false
@@ -361,7 +364,7 @@ func normalizeQueryHash(query string) uint64 {
 
 	h := fnv.New64a()
 	h.Write([]byte(normalized))
-	return h.Sum64()
+	return int64(h.Sum64())
 }
 
 // isQueryLogSelfReferential returns true if the query targets system.query_log,
