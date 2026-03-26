@@ -132,9 +132,25 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, err
 	}
 
+	cpID := cfg.K8s.ControlPlaneID
+	if cpID == "" {
+		cpID, _ = os.Hostname()
+	}
+	podUID := os.Getenv("POD_UID")
+	if podUID == "" {
+		podUID = cpID
+	}
+	bootID := make([]byte, 16)
+	if _, err := rand.Read(bootID); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+	}
+	bootIDHex := hex.EncodeToString(bootID)
+	cpInstanceID := podUID + ":" + bootIDHex
+
 	baseCfg := K8sWorkerPoolConfig{
 		Namespace:             cfg.K8s.WorkerNamespace,
-		CPID:                  cfg.K8s.ControlPlaneID,
+		CPID:                  cpID,
+		CPInstanceID:          cpInstanceID,
 		WorkerImage:           cfg.K8s.WorkerImage,
 		WorkerPort:            cfg.K8s.WorkerPort,
 		SecretName:            cfg.K8s.WorkerSecret,
@@ -179,24 +195,12 @@ func SetupMultiTenant(
 	}
 
 	adpt := &orgRouterAdapter{router: router}
-	cpID := baseCfg.CPID
-	if cpID == "" {
-		cpID, _ = os.Hostname()
-	}
-	podUID := os.Getenv("POD_UID")
-	if podUID == "" {
-		podUID = cpID
-	}
-	bootID := make([]byte, 16)
-	if _, err := rand.Read(bootID); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
-	}
 	runtimeTracker := NewControlPlaneRuntimeTracker(
 		store,
-		cpID+":"+hex.EncodeToString(bootID),
+		cpInstanceID,
 		cpID,
 		podUID,
-		hex.EncodeToString(bootID),
+		bootIDHex,
 		5*time.Second,
 	)
 

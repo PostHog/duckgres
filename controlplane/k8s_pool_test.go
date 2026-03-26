@@ -42,6 +42,7 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 		clientset:   cs,
 		namespace:   "default",
 		cpID:        "test-cp",
+		cpInstanceID:"cp-uid-123:boot-abc",
 		cpUID:       "cp-uid-123",
 		workerImage: "duckgres:test",
 		workerPort:  8816,
@@ -694,8 +695,8 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	if pod.Labels["duckgres/control-plane"] != "test-cp" {
 		t.Fatalf("expected control-plane label test-cp, got %s", pod.Labels["duckgres/control-plane"])
 	}
-	if pod.Labels["duckgres/cp-instance-id"] != "test-cp" {
-		t.Fatalf("expected cp-instance-id label test-cp, got %s", pod.Labels["duckgres/cp-instance-id"])
+	if pod.Labels["duckgres/cp-instance-id"] != "cp-uid-123:boot-abc" {
+		t.Fatalf("expected cp-instance-id label cp-uid-123:boot-abc, got %s", pod.Labels["duckgres/cp-instance-id"])
 	}
 	if pod.Labels["duckgres/owner-epoch"] != "0" {
 		t.Fatalf("expected owner-epoch label 0, got %s", pod.Labels["duckgres/owner-epoch"])

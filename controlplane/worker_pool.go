@@ -48,6 +48,7 @@ type WorkerPool interface {
 type K8sWorkerPoolConfig struct {
 	Namespace            string
 	CPID                 string // Control plane pod name, used in labels
+	CPInstanceID         string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
 	WorkerImage          string
 	WorkerPort           int
 	SecretName           string // K8s Secret name containing bearer token

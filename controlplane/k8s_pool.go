@@ -45,6 +45,7 @@ type K8sWorkerPool struct {
 	clientset             kubernetes.Interface
 	namespace             string
 	cpID                  string
+	cpInstanceID          string
 	cpUID                 types.UID
 	workerImage           string
 	workerPort            int
@@ -127,6 +128,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		clientset:             clientset,
 		namespace:             cfg.Namespace,
 		cpID:                  cfg.CPID,
+		cpInstanceID:          cfg.CPInstanceID,
 		workerImage:           cfg.WorkerImage,
 		workerPort:            cfg.WorkerPort,
 		secretName:            cfg.SecretName,
@@ -148,6 +150,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	// Resolve CP pod UID for owner references
 	if err := pool.resolveCPUID(context.Background()); err != nil {
 		slog.Warn("Could not resolve CP pod UID for owner references. Worker pods will not be garbage-collected if CP is deleted.", "error", err)
+	}
+	if pool.cpInstanceID == "" {
+		pool.cpInstanceID = pool.cpID
 	}
 
 	// Ensure bearer token secret exists
@@ -369,7 +374,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	podLabels := map[string]string{
 		"app":                     "duckgres-worker",
 		"duckgres/control-plane":  p.cpID,
-		"duckgres/cp-instance-id": p.cpID,
+		"duckgres/cp-instance-id": p.cpInstanceID,
 		"duckgres/worker-id":      strconv.Itoa(id),
 		"duckgres/owner-epoch":    "0",
 	}
