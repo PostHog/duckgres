@@ -185,7 +185,7 @@ func TestHighBitHashInsertIntoBigint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_, err = db.Exec("CREATE TABLE test_hash (h BIGINT)")
 	if err != nil {
@@ -221,7 +221,7 @@ func TestHighBitHashRejectsUbigint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	_, err = db.Exec("CREATE TABLE test_hash_u (h UBIGINT)")
 	if err != nil {
