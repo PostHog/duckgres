@@ -1,6 +1,7 @@
 package duckdbservice
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"testing"
@@ -42,7 +43,7 @@ func TestHealthCheckBlocksUntilWarmup(t *testing.T) {
 	// Health check in a goroutine — should block until warmup completes
 	done := make(chan error, 1)
 	go func() {
-		done <- handler.doHealthCheck(stream)
+		done <- handler.doHealthCheck([]byte(`{}`), stream)
 	}()
 
 	// Verify it hasn't returned after 100ms
@@ -94,7 +95,7 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- handler.doHealthCheck(stream)
+		done <- handler.doHealthCheck([]byte(`{}`), stream)
 	}()
 
 	select {
@@ -104,6 +105,26 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("health check blocked even though warmup was already done")
+	}
+}
+
+func TestHealthCheckRejectsMissingOwnerEpochInSharedWarmMode(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		warmupDone:     make(chan struct{}),
+		startTime:      time.Now(),
+		sharedWarmMode: true,
+		ownerEpoch:     5,
+	}
+	close(pool.warmupDone)
+
+	handler := &FlightSQLHandler{pool: pool}
+	stream := &mockDoActionStream{}
+
+	err := handler.doHealthCheck([]byte(`{}`), stream)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
 	}
 }
 
@@ -174,6 +195,67 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	}
 
 	err = handler.doActivateTenant(secondBody, stream)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+func TestCreateSessionRejectsStaleOwnerEpochInSharedWarmMode(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		warmupDone:     make(chan struct{}),
+		startTime:      time.Now(),
+		cfg:            server.Config{},
+		sharedWarmMode: true,
+		ownerEpoch:     4,
+		activation: &activatedTenantRuntime{
+			payload: ActivationPayload{
+				WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 4},
+				OrgID:                 "analytics",
+			},
+		},
+	}
+	close(pool.warmupDone)
+
+	handler := &FlightSQLHandler{pool: pool}
+	stream := &mockDoActionStream{}
+
+	body, err := json.Marshal(server.WorkerCreateSessionPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			OwnerEpoch: 3,
+		},
+		Username: "alice",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	err = handler.doCreateSession(body, stream)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+func TestSessionFromContextRejectsStaleOwnerEpoch(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		warmupDone:     make(chan struct{}),
+		startTime:      time.Now(),
+		sharedWarmMode: true,
+		ownerEpoch:     5,
+	}
+	close(pool.warmupDone)
+	pool.sessions["session-1"] = &Session{ID: "session-1"}
+
+	handler := &FlightSQLHandler{pool: pool}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
+		"x-duckgres-session", "session-1",
+		"x-duckgres-owner-epoch", "4",
+	))
+
+	_, err := handler.sessionFromContext(ctx)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got %v", err)
 	}

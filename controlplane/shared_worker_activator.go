@@ -111,6 +111,11 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 			return a.activateReservedWorker(ctx, worker, payload)
 		}
 		return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
+			WorkerControlMetadata: server.WorkerControlMetadata{
+				WorkerID:     worker.ID,
+				OwnerEpoch:   worker.OwnerEpoch(),
+				CPInstanceID: worker.OwnerCPInstanceID(),
+			},
 			OrgID:          payload.OrgID,
 			LeaseExpiresAt: payload.LeaseExpiresAt,
 			DuckLake:       payload.DuckLake,

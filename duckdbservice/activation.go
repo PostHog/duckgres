@@ -14,6 +14,7 @@ import (
 // ActivationPayload carries the tenant-specific runtime that is delivered to a
 // neutral shared warm worker over the control-plane RPC channel.
 type ActivationPayload struct {
+	server.WorkerControlMetadata
 	OrgID          string                `json:"org_id"`
 	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
 	DuckLake       server.DuckLakeConfig `json:"ducklake"`
@@ -41,10 +42,17 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	if strings.TrimSpace(payload.OrgID) == "" {
 		return fmt.Errorf("org_id is required")
 	}
+	if payload.OwnerEpoch < 0 {
+		return fmt.Errorf("owner_epoch must be non-negative")
+	}
 
 	p.mu.RLock()
 	current := p.activation
+	currentOwnerEpoch := p.ownerEpoch
 	p.mu.RUnlock()
+	if payload.OwnerEpoch < currentOwnerEpoch {
+		return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, currentOwnerEpoch)
+	}
 	if current != nil {
 		if reflect.DeepEqual(current.payload, payload) {
 			return nil
@@ -79,6 +87,9 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if payload.OwnerEpoch < p.ownerEpoch {
+		return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, p.ownerEpoch)
+	}
 	if p.activation != nil {
 		if reflect.DeepEqual(p.activation.payload, payload) {
 			return nil
@@ -89,6 +100,25 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	p.activation = &activatedTenantRuntime{
 		payload: payload,
 		db:      db,
+	}
+	p.ownerEpoch = payload.OwnerEpoch
+	p.ownerCPInstanceID = payload.CPInstanceID
+	p.workerID = payload.WorkerID
+	return nil
+}
+
+func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {
+	if !p.sharedWarmMode {
+		return nil
+	}
+	if meta.OwnerEpoch < 0 {
+		return fmt.Errorf("owner_epoch must be non-negative")
+	}
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if meta.OwnerEpoch != p.ownerEpoch {
+		return fmt.Errorf("stale owner epoch %d (current %d)", meta.OwnerEpoch, p.ownerEpoch)
 	}
 	return nil
 }

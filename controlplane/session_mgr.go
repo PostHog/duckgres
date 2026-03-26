@@ -91,6 +91,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 
 	// Create FlightExecutor sharing the worker's existing gRPC connection
 	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
+	executor.SetOwnerEpoch(worker.OwnerEpoch())
 
 	if pid == 0 {
 		pid = sm.nextPID.Add(1)

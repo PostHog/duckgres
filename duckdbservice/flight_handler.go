@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	bindings "github.com/duckdb/duckdb-go-bindings"
+	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -46,6 +48,19 @@ func (h *FlightSQLHandler) sessionFromContext(ctx context.Context) (*Session, er
 	if !ok {
 		return nil, status.Error(codes.Unauthenticated, "session not found")
 	}
+	if h.pool.sharedWarmMode {
+		epochs := md.Get("x-duckgres-owner-epoch")
+		if len(epochs) == 0 {
+			return nil, status.Error(codes.Unauthenticated, "missing x-duckgres-owner-epoch header")
+		}
+		ownerEpoch, err := strconv.ParseInt(epochs[0], 10, 64)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid x-duckgres-owner-epoch header")
+		}
+		if err := h.pool.validateControlMetadata(server.WorkerControlMetadata{OwnerEpoch: ownerEpoch}); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+		}
+	}
 	session.lastUsed.Store(time.Now().UnixNano())
 
 	return session, nil
@@ -54,16 +69,15 @@ func (h *FlightSQLHandler) sessionFromContext(ctx context.Context) (*Session, er
 // Custom action handlers (called via customActionServer.DoAction)
 
 func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightService_DoActionServer) error {
-	var req struct {
-		Username    string `json:"username"`
-		MemoryLimit string `json:"memory_limit"`
-		Threads     int    `json:"threads"`
-	}
+	var req server.WorkerCreateSessionPayload
 	if err := json.Unmarshal(body, &req); err != nil {
 		return status.Errorf(codes.InvalidArgument, "invalid CreateSession request: %v", err)
 	}
 	if req.Username == "" {
 		return status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
 	}
 
 	if h.pool.sharedWarmMode {
@@ -111,14 +125,15 @@ func (h *FlightSQLHandler) doActivateTenant(body []byte, stream flight.FlightSer
 }
 
 func (h *FlightSQLHandler) doDestroySession(body []byte, stream flight.FlightService_DoActionServer) error {
-	var req struct {
-		SessionToken string `json:"session_token"`
-	}
+	var req server.WorkerDestroySessionPayload
 	if err := json.Unmarshal(body, &req); err != nil {
 		return status.Errorf(codes.InvalidArgument, "invalid DestroySession request: %v", err)
 	}
 	if req.SessionToken == "" {
 		return status.Error(codes.InvalidArgument, "session_token is required")
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
 	}
 
 	if err := h.pool.DestroySession(req.SessionToken); err != nil {
@@ -129,7 +144,15 @@ func (h *FlightSQLHandler) doDestroySession(body []byte, stream flight.FlightSer
 	return stream.Send(&flight.Result{Body: resp})
 }
 
-func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionServer) error {
+func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerHealthCheckPayload
+	if err := json.Unmarshal(body, &req); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid HealthCheck request: %v", err)
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+	}
+
 	// Block until warmup (extension loading + DuckLake attachment) completes.
 	// Without this, the control plane's waitForWorkerTCP health check passes
 	// as soon as the gRPC server starts, and clients get routed to a worker

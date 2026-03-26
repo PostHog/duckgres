@@ -541,13 +541,14 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		client:      client,
 		done:        done,
 	}
+	w.SetOwnerCPInstanceID(p.cpInstanceID)
 
 	p.mu.Lock()
 	p.workers[id] = w
 	workerCount := len(p.workers)
 	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
-	p.persistWorkerRecord(p.workerRecordFor(id, w, w.ownerEpoch, configstore.WorkerStateIdle, "", nil))
+	p.persistWorkerRecord(p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil))
 	observeControlPlaneWorkers(workerCount)
 
 	slog.Info("K8s worker spawned.", "id", id, "pod", podName, "addr", addr)
@@ -859,13 +860,13 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		}
 		if transitionErr == nil {
 			now := time.Now()
-			activatingRecord = p.workerRecordFor(worker.ID, worker, worker.ownerEpoch, configstore.WorkerStateActivating, "", &now)
+			activatingRecord = p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateActivating, "", &now)
 		}
 		err = transitionErr
 	case WorkerLifecycleActivating:
 		err = nil
 		now := time.Now()
-		activatingRecord = p.workerRecordFor(worker.ID, worker, worker.ownerEpoch, configstore.WorkerStateActivating, "", &now)
+		activatingRecord = p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateActivating, "", &now)
 	default:
 		err = fmt.Errorf("worker %d is not reserved for activation", worker.ID)
 	}
@@ -879,6 +880,11 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	if activate == nil {
 		activate = func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error {
 			return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
+				WorkerControlMetadata: server.WorkerControlMetadata{
+					WorkerID:     worker.ID,
+					OwnerEpoch:   worker.OwnerEpoch(),
+					CPInstanceID: worker.OwnerCPInstanceID(),
+				},
 				OrgID:          payload.OrgID,
 				LeaseExpiresAt: payload.LeaseExpiresAt,
 				DuckLake:       payload.DuckLake,
@@ -910,7 +916,7 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		p.mu.Unlock()
 		return setErr
 	}
-	hotRecord := p.workerRecordFor(worker.ID, worker, worker.ownerEpoch, configstore.WorkerStateHot, "", nil)
+	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
 	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
 	p.persistWorkerRecord(hotRecord)
@@ -949,9 +955,9 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				p.mu.Unlock()
 				return nil, err
 			}
-			idle.ownerEpoch++
+			idle.IncrementOwnerEpoch()
 			idle.reservedAt = time.Now()
-			reservedRecord := p.workerRecordFor(idle.ID, idle, idle.ownerEpoch, configstore.WorkerStateReserved, "", nil)
+			reservedRecord := p.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
 			observeWarmPoolLifecycleGauges(p.workers)
 			shouldReplenish := p.shouldReplenishWarmCapacityLocked()
 			var replenishID int
@@ -1018,7 +1024,7 @@ func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker 
 			}
 			hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
-			_, err := doHealthCheck(hctx, worker.client)
+			_, err := doHealthCheckWithMetadata(hctx, worker.client, p.healthCheckPayloadForWorker(worker))
 			return err
 		}
 	}
@@ -1138,7 +1144,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						func() {
 							defer recoverWorkerPanic(&healthErr)
 							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-							hcResult, healthErr = doHealthCheck(hctx, w.client)
+							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForWorker(w))
 							cancel()
 						}()
 
@@ -1570,7 +1576,7 @@ func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string)
 	if reason == RetireReasonCrash {
 		workerState = configstore.WorkerStateLost
 	}
-	p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.ownerEpoch, workerState, reason, nil))
+	p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil))
 	observeWorkerRetirement(reason)
 	observeWarmPoolLifecycleGauges(p.workers)
 }
@@ -1606,6 +1612,19 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 		record.LeaseExpiresAt = assignment.LeaseExpiresAt
 	}
 	return record
+}
+
+func (p *K8sWorkerPool) healthCheckPayloadForWorker(worker *ManagedWorker) server.WorkerHealthCheckPayload {
+	payload := server.WorkerHealthCheckPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			WorkerID:     worker.ID,
+			CPInstanceID: worker.OwnerCPInstanceID(),
+		},
+	}
+	if worker.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
+		payload.OwnerEpoch = worker.OwnerEpoch()
+	}
+	return payload
 }
 
 // podNameForWorker returns the pod name for a given worker ID,

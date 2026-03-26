@@ -41,6 +41,7 @@ type ManagedWorker struct {
 	reservedAt     time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
 	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
 	ownerEpoch     int64
+	ownerCPInstanceID string
 }
 
 // SharedState returns the additive shared warm-worker lifecycle metadata for
@@ -70,6 +71,14 @@ func (w *ManagedWorker) SetOwnerEpoch(epoch int64) {
 func (w *ManagedWorker) IncrementOwnerEpoch() int64 {
 	w.ownerEpoch++
 	return w.ownerEpoch
+}
+
+func (w *ManagedWorker) OwnerCPInstanceID() string {
+	return w.ownerCPInstanceID
+}
+
+func (w *ManagedWorker) SetOwnerCPInstanceID(cpInstanceID string) {
+	w.ownerCPInstanceID = cpInstanceID
 }
 
 // preboundSocket is a Unix socket pre-bound at startup while the socket
@@ -506,10 +515,16 @@ func (r *healthCheckResult) toSessionProgress() map[string]*SessionProgress {
 // Returns the parsed result (including per-session progress) and an error if
 // the worker is unreachable.
 func doHealthCheck(ctx context.Context, client *flightsql.Client) (*healthCheckResult, error) {
+	return doHealthCheckWithMetadata(ctx, client, server.WorkerHealthCheckPayload{})
+}
+
+func doHealthCheckWithMetadata(ctx context.Context, client *flightsql.Client, payload server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+	body, _ := json.Marshal(payload)
+
 	// Use the underlying flight client for custom actions.
 	// flightsql.Client.Client is a flight.Client interface which embeds
 	// FlightServiceClient, giving us access to DoAction directly.
-	stream, err := client.Client.DoAction(ctx, &flight.Action{Type: "HealthCheck"})
+	stream, err := client.Client.DoAction(ctx, &flight.Action{Type: "HealthCheck", Body: body})
 	if err != nil {
 		return nil, fmt.Errorf("health check action: %w", err)
 	}
@@ -1167,10 +1182,15 @@ func recoverWorkerPanic(err *error) {
 func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit string, threads int) (token string, err error) {
 	defer recoverWorkerPanic(&err)
 
-	body, _ := json.Marshal(map[string]interface{}{
-		"username":     username,
-		"memory_limit": memoryLimit,
-		"threads":      threads,
+	body, _ := json.Marshal(server.WorkerCreateSessionPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			WorkerID:     w.ID,
+			OwnerEpoch:   w.OwnerEpoch(),
+			CPInstanceID: w.OwnerCPInstanceID(),
+		},
+		Username:    username,
+		MemoryLimit: memoryLimit,
+		Threads:     threads,
 	})
 
 	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
@@ -1223,7 +1243,14 @@ func (w *ManagedWorker) ActivateTenant(ctx context.Context, payload server.Worke
 func (w *ManagedWorker) DestroySession(ctx context.Context, sessionToken string) (err error) {
 	defer recoverWorkerPanic(&err)
 
-	body, _ := json.Marshal(map[string]string{"session_token": sessionToken})
+	body, _ := json.Marshal(server.WorkerDestroySessionPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			WorkerID:     w.ID,
+			OwnerEpoch:   w.OwnerEpoch(),
+			CPInstanceID: w.OwnerCPInstanceID(),
+		},
+		SessionToken: sessionToken,
+	})
 
 	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
 		Type: "DestroySession",

@@ -103,3 +103,43 @@ func TestSessionPoolActivateTenantRejectsSecondActivation(t *testing.T) {
 		t.Fatal("expected second activation to fail")
 	}
 }
+
+func TestSessionPoolActivateTenantRejectsStaleOwnerEpoch(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		cfg:            server.Config{Users: map[string]string{"postgres": "postgres"}},
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
+		return sql.Open("duckdb", "")
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		return nil
+	}
+
+	if err := pool.activateTenant(ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 2},
+		OrgID:                 "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+		},
+	}); err != nil {
+		t.Fatalf("first ActivateTenant: %v", err)
+	}
+
+	if err := pool.activateTenant(ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 1},
+		OrgID:                 "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+		},
+	}); err == nil {
+		t.Fatal("expected stale owner epoch to be rejected")
+	}
+}
