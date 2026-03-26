@@ -702,7 +702,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 					w.peakSessions = w.activeSessions
 				}
 				if canSpawn {
-					id := p.allocateWorkerIDLocked()
+					id := p.allocateBackgroundSpawnIDLocked()
 					p.spawning++
 					p.mu.Unlock()
 					slog.Debug("Assigned to least-loaded worker, spawning new worker in background.",
@@ -719,7 +719,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 
 		// 3. No live workers at all (cold start or all dead) — must block on spawn
 		if canSpawn {
-			id := p.allocateWorkerIDLocked()
+			id := p.allocateBackgroundSpawnIDLocked()
 			p.spawning++
 			p.mu.Unlock()
 
@@ -763,7 +763,7 @@ func (p *K8sWorkerPool) spawnWorkerBackground(id int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	err := p.SpawnWorker(ctx, id)
+	err := p.spawnWarmWorker(ctx, id)
 
 	p.mu.Lock()
 	p.spawning--
@@ -980,7 +980,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			shouldReplenish := p.shouldReplenishWarmCapacityLocked()
 			var replenishID int
 			if shouldReplenish {
-				replenishID = p.allocateWorkerIDLocked()
+				replenishID = p.allocateBackgroundSpawnIDLocked()
 				p.spawning++
 			}
 			p.mu.Unlock()
@@ -1226,7 +1226,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 	ids := make([]int, 0, missing)
 	for i := 0; i < missing; i++ {
-		ids = append(ids, p.allocateWorkerIDLocked())
+		ids = append(ids, p.allocateBackgroundSpawnIDLocked())
 		p.spawning++
 	}
 	p.mu.Unlock()
@@ -1523,7 +1523,7 @@ func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
 	var spawnIDs []int
 	for range toRetire {
 		if p.shouldReplenishWarmCapacityLocked() {
-			id := p.allocateWorkerIDLocked()
+			id := p.allocateBackgroundSpawnIDLocked()
 			p.spawning++
 			spawnIDs = append(spawnIDs, id)
 		}
@@ -1658,6 +1658,13 @@ func (p *K8sWorkerPool) allocateWorkerIDLocked() int {
 	return id
 }
 
+func (p *K8sWorkerPool) allocateBackgroundSpawnIDLocked() int {
+	if p.runtimeStore != nil {
+		return 0
+	}
+	return p.allocateWorkerIDLocked()
+}
+
 func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bool) {
 	w, ok := p.workers[id]
 	if !ok {
@@ -1669,7 +1676,7 @@ func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bo
 	if !p.shouldReplenishWarmCapacityLocked() {
 		return w, workerCount, 0, false
 	}
-	replacementID := p.allocateWorkerIDLocked()
+	replacementID := p.allocateBackgroundSpawnIDLocked()
 	p.spawning++
 	return w, workerCount, replacementID, true
 }
@@ -1723,6 +1730,24 @@ func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
 }
 
 func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int) error {
+	if id <= 0 && p.runtimeStore != nil {
+		slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
+			p.cpInstanceID,
+			"",
+			0,
+			time.Time{},
+			p.workerPodNamePrefix(),
+			0,
+			p.maxWorkers,
+		)
+		if err != nil {
+			return err
+		}
+		if slot == nil {
+			return nil
+		}
+		id = slot.WorkerID
+	}
 	if p.spawnWarmWorkerFunc != nil {
 		return p.spawnWarmWorkerFunc(ctx, id)
 	}
