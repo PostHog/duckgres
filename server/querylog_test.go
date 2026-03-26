@@ -180,6 +180,59 @@ func TestQueryLoggerStopIsIdempotent(t *testing.T) {
 	ql.Stop()
 }
 
+func TestHighBitHashInsertIntoBigint(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE test_hash (h BIGINT)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Use a hash with the high bit set — this is the scenario that caused the
+	// "INT64 value can't be cast to UINT64" error when the column was UBIGINT.
+	var highBitHash uint64 = 0xD700_0000_0000_0000
+
+	// This is the same cast used in flushBatch: int64(uint64_value)
+	_, err = db.Exec("INSERT INTO test_hash VALUES ($1)", int64(highBitHash))
+	if err != nil {
+		t.Fatalf("insert failed (this was the original bug): %v", err)
+	}
+
+	var stored int64
+	err = db.QueryRow("SELECT h FROM test_hash").Scan(&stored)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if uint64(stored) != highBitHash {
+		t.Errorf("hash round-trip mismatch: got uint64(%d) = %d, want %d", stored, uint64(stored), highBitHash)
+	}
+}
+
+// TestHighBitHashRejectsUbigint confirms that UBIGINT rejects negative int64
+// values — this is the bug we fixed by switching to BIGINT.
+func TestHighBitHashRejectsUbigint(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE test_hash_u (h UBIGINT)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	var highBitHash uint64 = 0xD700_0000_0000_0000
+	_, err = db.Exec("INSERT INTO test_hash_u VALUES ($1)", int64(highBitHash))
+	if err == nil {
+		t.Fatal("expected error inserting negative int64 into UBIGINT, but insert succeeded")
+	}
+}
+
 func TestSplitHostPort(t *testing.T) {
 	host, port, err := splitHostPort("192.168.1.1:5432")
 	if err != nil {

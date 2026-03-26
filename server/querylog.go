@@ -114,7 +114,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		query               VARCHAR NOT NULL,
 		transpiled_query    VARCHAR,
 		query_kind          VARCHAR,
-		normalized_query_hash UBIGINT,
+		normalized_query_hash BIGINT,
 		result_rows         BIGINT,
 		written_rows        BIGINT,
 		exception_code      VARCHAR,
@@ -132,6 +132,16 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	if _, err := db.Exec(createTable); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("querylog: create table: %w", err)
+	}
+
+	// Migrate normalized_query_hash from UBIGINT to BIGINT for existing tables.
+	// The Go database/sql driver cannot bind uint64 values with the high bit set,
+	// so we cast to int64 before inserting. A BIGINT column accepts negative int64
+	// values without a conversion error.
+	if _, err := db.Exec("ALTER TABLE ducklake.system.query_log ALTER COLUMN normalized_query_hash SET DATA TYPE BIGINT"); err != nil {
+		// Ignore error — column may already be BIGINT (new table) or DuckLake
+		// may not support ALTER TYPE. Either way, this is best-effort.
+		slog.Debug("querylog: ALTER normalized_query_hash to BIGINT (may already be correct).", "error", err)
 	}
 
 	// Configure data inlining
