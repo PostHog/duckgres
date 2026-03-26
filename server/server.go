@@ -242,7 +242,7 @@ type DuckLakeConfig struct {
 
 	// DataInliningRowLimit controls the maximum number of rows to inline
 	// in DuckLake metadata instead of writing to Parquet files.
-	// Set to pointer-to-0 to disable inlining. nil uses DuckLake default (10).
+	// Default: 0 (disabled). Set to a positive value to enable inlining.
 	DataInliningRowLimit *int
 
 	// Migrate is set by the control plane after running the migration check.

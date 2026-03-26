@@ -127,7 +127,7 @@ type DuckLakeFileConfig struct {
 	CheckpointInterval string `yaml:"checkpoint_interval"`
 
 	// DataInliningRowLimit controls max rows inlined in metadata per insert.
-	// Set to 0 to disable inlining. Omit to use DuckLake default (10).
+	// Default: 0 (disabled). Set to a positive value to enable inlining.
 	DataInliningRowLimit *int `yaml:"data_inlining_row_limit"`
 }
 
