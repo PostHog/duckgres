@@ -61,11 +61,6 @@ type ControlPlaneConfig struct {
 	// InternalSecret is the shared secret for API authentication.
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
-
-	// WarehouseDomain is the base domain for SNI-based per-org routing.
-	// Connections to {orgID}.{WarehouseDomain} are routed to that org.
-	// Required for multi-tenant mode.
-	WarehouseDomain string
 }
 
 type ProcessConfig struct {
@@ -539,21 +534,6 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 
 // extractOrgFromSNI parses the org identifier from the TLS ServerName.
 // "acme.warehouse.posthog.com" with base "warehouse.posthog.com" returns ("acme", true).
-func extractOrgFromSNI(serverName, baseDomain string) (string, bool) {
-	if baseDomain == "" || serverName == "" {
-		return "", false
-	}
-	suffix := "." + baseDomain
-	if !strings.HasSuffix(serverName, suffix) {
-		return "", false
-	}
-	orgID := strings.TrimSuffix(serverName, suffix)
-	if orgID == "" || strings.Contains(orgID, ".") {
-		return "", false
-	}
-	return orgID, true
-}
-
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
@@ -640,12 +620,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("TLS connection established.", "remote_addr", remoteAddr)
 	defer func() { _ = tlsConn.Close() }()
 
-	// Extract org from SNI hostname
-	var sniOrgID string
-	if cp.cfg.WarehouseDomain != "" {
-		sniOrgID, _ = extractOrgFromSNI(tlsConn.ConnectionState().ServerName, cp.cfg.WarehouseDomain)
-	}
-
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
 		slog.Error("Failed to clear TLS deadline.", "remote_addr", remoteAddr, "error", err)
 		return
@@ -699,15 +673,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	password := string(bytes.TrimRight(body, "\x00"))
 
 	// Authenticate
+	// In multi-tenant mode, the database name identifies the org.
+	// User uniqueness is scoped to the database (org).
 	if cp.configStore != nil {
-		if sniOrgID == "" {
-			slog.Warn("Connection rejected: no org in SNI hostname.", "server_name", tlsConn.ConnectionState().ServerName, "remote_addr", remoteAddr)
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "connection requires a valid org hostname")
+		if database == "" {
+			slog.Warn("Connection rejected: no database specified.", "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "database name is required")
 			_ = writer.Flush()
 			return
 		}
-		if !cp.configStore.ValidateOrgUser(sniOrgID, username, password) {
-			slog.Warn("Authentication failed.", "user", username, "org", sniOrgID, "remote_addr", remoteAddr)
+		if !cp.configStore.ValidateOrgUser(database, username, password) {
+			slog.Warn("Authentication failed.", "user", username, "org", database, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
 				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
@@ -747,15 +723,15 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// Reject connections during DuckLake migration to prevent queries from
 		// hitting a partially-migrated catalog. The client gets a clear error
 		// and can retry after the migration completes.
-		if cp.orgRouter.IsMigratingForOrg(sniOrgID) {
-			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", sniOrgID, "remote_addr", remoteAddr)
+		if cp.orgRouter.IsMigratingForOrg(database) {
+			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", database, "remote_addr", remoteAddr)
 			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
 				"DuckLake catalog upgrade in progress for your organization, please retry in a few moments")
 			_ = writer.Flush()
 			return
 		}
 
-		_, sess, rebal, ok := cp.orgRouter.StackForOrg(sniOrgID)
+		_, sess, rebal, ok := cp.orgRouter.StackForOrg(database)
 		if !ok {
 			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
 			_ = writer.Flush()

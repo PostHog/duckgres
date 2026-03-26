@@ -41,7 +41,6 @@ type configCLIInputs struct {
 	ConfigStoreConn           string
 	ConfigPollInterval        string
 	InternalSecret            string
-	WarehouseDomain           string
 	WorkerBackend             string
 	K8sWorkerImage            string
 	K8sWorkerNamespace        string
@@ -79,7 +78,6 @@ type resolvedConfig struct {
 	ConfigStoreConn          string
 	ConfigPollInterval       time.Duration
 	InternalSecret           string
-	WarehouseDomain          string
 }
 
 func defaultServerConfig() server.Config {
@@ -137,7 +135,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var configStoreConn string
 	var configPollInterval time.Duration
 	var internalSecret string
-	var warehouseDomain string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -590,9 +587,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_INTERNAL_SECRET"); v != "" {
 		internalSecret = v
 	}
-	if v := getenv("DUCKGRES_WAREHOUSE_DOMAIN"); v != "" {
-		warehouseDomain = v
-	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
 	}
@@ -805,9 +799,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["internal-secret"] {
 		internalSecret = cli.InternalSecret
 	}
-	if cli.Set["warehouse-domain"] {
-		warehouseDomain = cli.WarehouseDomain
-	}
 	if cli.Set["worker-backend"] {
 		workerBackend = cli.WorkerBackend
 	}
@@ -917,6 +908,5 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		ConfigStoreConn:          configStoreConn,
 		ConfigPollInterval:       configPollInterval,
 		InternalSecret:           internalSecret,
-		WarehouseDomain:          warehouseDomain,
 	}
 }
