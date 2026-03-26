@@ -346,6 +346,52 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 	return &record, nil
 }
 
+// ClaimIdleWorker atomically claims one idle worker row for a control-plane instance.
+// The selected row is locked with SKIP LOCKED and transitioned to reserved while
+// incrementing owner_epoch.
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time) (*WorkerRecord, error) {
+	var claimed *WorkerRecord
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		var current WorkerRecord
+		err := tx.Table(cs.runtimeTable(current.TableName())).
+			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("state = ?", WorkerStateIdle).
+			Order("worker_id ASC").
+			Take(&current).Error
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil
+			}
+			return err
+		}
+
+		now := time.Now()
+		if err := tx.Table(cs.runtimeTable(current.TableName())).
+			Where("worker_id = ?", current.WorkerID).
+			Updates(map[string]any{
+				"state":                WorkerStateReserved,
+				"org_id":               orgID,
+				"owner_cp_instance_id": ownerCPInstanceID,
+				"owner_epoch":          gorm.Expr("owner_epoch + 1"),
+				"lease_expires_at":     leaseExpiresAt,
+				"updated_at":           now,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Table(cs.runtimeTable(current.TableName())).
+			First(&current, "worker_id = ?", current.WorkerID).Error; err != nil {
+			return err
+		}
+		claimed = &current
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("claim idle worker: %w", err)
+	}
+	return claimed, nil
+}
+
 // UpsertFlightSessionRecord inserts or updates a durable Flight reconnect row.
 func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{

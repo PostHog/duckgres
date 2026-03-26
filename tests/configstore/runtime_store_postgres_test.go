@@ -104,3 +104,70 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatalf("expected session state active, got %q", session.State)
 	}
 }
+
+func TestClaimIdleWorkerPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	startedAt := time.Date(2026, time.March, 26, 13, 0, 0, 0, time.UTC)
+	heartbeatAt := startedAt.Add(5 * time.Second)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7,
+		PodName:           "duckgres-worker-7",
+		State:             configstore.WorkerStateIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   heartbeatAt,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	leaseExpiry := startedAt.Add(24 * time.Hour)
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", leaseExpiry)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected idle worker claim to succeed")
+	}
+	if claimed.WorkerID != 7 {
+		t.Fatalf("expected worker id 7, got %d", claimed.WorkerID)
+	}
+	if claimed.State != configstore.WorkerStateReserved {
+		t.Fatalf("expected reserved state, got %q", claimed.State)
+	}
+	if claimed.OwnerCPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected owner cp-instance cp-new:boot-b, got %q", claimed.OwnerCPInstanceID)
+	}
+	if claimed.OwnerEpoch != 3 {
+		t.Fatalf("expected owner epoch 3, got %d", claimed.OwnerEpoch)
+	}
+	if claimed.OrgID != "analytics" {
+		t.Fatalf("expected org analytics, got %q", claimed.OrgID)
+	}
+	if !claimed.LeaseExpiresAt.Equal(leaseExpiry) {
+		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, claimed.LeaseExpiresAt)
+	}
+
+	persisted, err := store.GetWorkerRecord(7)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateReserved {
+		t.Fatalf("expected persisted reserved state, got %q", persisted.State)
+	}
+	if persisted.OwnerEpoch != 3 {
+		t.Fatalf("expected persisted owner epoch 3, got %d", persisted.OwnerEpoch)
+	}
+}
+
+func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", time.Date(2026, time.March, 27, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claim, got %#v", claimed)
+	}
+}
