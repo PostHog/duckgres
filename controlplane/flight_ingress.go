@@ -45,18 +45,24 @@ func (p *flightSessionProvider) DestroySession(pid int32) {
 }
 
 // orgRoutedSessionProvider routes Flight SQL session operations to the correct
-// org's SessionManager based on the username→org mapping in the config store.
+// org's SessionManager based on the username→org mapping resolved during auth.
 type orgRoutedSessionProvider struct {
-	orgRouter OrgRouterInterface
+	orgRouter   OrgRouterInterface
+	configStore ConfigStoreInterface
 
 	mu         sync.RWMutex
 	pidSession map[int32]*SessionManager // pid → owning session manager
+	userOrg    map[string]string         // username → orgID (populated during auth)
 }
 
 func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
-	_, sessions, _, ok := p.orgRouter.StackForUser(username)
+	p.mu.RLock()
+	orgID := p.userOrg[username]
+	p.mu.RUnlock()
+
+	_, sessions, _, ok := p.orgRouter.StackForOrg(orgID)
 	if !ok {
-		slog.Warn("Flight SQL session: no org stack for user.", "username", username)
+		slog.Warn("Flight SQL session: no org stack for user.", "username", username, "org", orgID)
 		return 0, nil, fmt.Errorf("no org configured for user %q", username)
 	}
 

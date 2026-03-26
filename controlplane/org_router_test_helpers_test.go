@@ -7,9 +7,9 @@ type mockOrgRouter struct {
 	ok         bool
 }
 
-func (m *mockOrgRouter) StackForUser(_ string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
+func (m *mockOrgRouter) StackForOrg(_ string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	return nil, m.sessions, m.rebalancer, m.ok
 }
 
-func (m *mockOrgRouter) IsMigratingForUser(_ string) (bool, string) { return false, "" }
-func (m *mockOrgRouter) ShutdownAll()                              {}
+func (m *mockOrgRouter) IsMigratingForOrg(_ string) bool { return false }
+func (m *mockOrgRouter) ShutdownAll()                    {}

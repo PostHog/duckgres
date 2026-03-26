@@ -35,10 +35,10 @@ func (s *fakeStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWareh
 	return &clone, nil
 }
 
-func (s *fakeStore) CreatePendingWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) error {
+func (s *fakeStore) CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
 	// Auto-create org if needed (mirrors production behavior)
 	if _, ok := s.orgs[orgID]; !ok {
-		s.orgs[orgID] = &configstore.Org{Name: orgID}
+		s.orgs[orgID] = &configstore.Org{Name: orgID, DatabaseName: databaseName}
 	}
 	existing, ok := s.warehouses[orgID]
 	if ok && existing.State != configstore.ManagedWarehouseStateFailed && existing.State != configstore.ManagedWarehouseStateDeleted {
@@ -54,6 +54,15 @@ func (s *fakeStore) CreatePendingWarehouse(orgID string, warehouse *configstore.
 	clone.SecretsState = configstore.ManagedWarehouseStatePending
 	s.warehouses[orgID] = &clone
 	return nil
+}
+
+func (s *fakeStore) IsDatabaseNameAvailable(name string) (bool, error) {
+	for _, org := range s.orgs {
+		if org.DatabaseName == name {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error {
@@ -81,6 +90,7 @@ func TestProvisionCreatesWarehouse(t *testing.T) {
 	router := newTestRouter(store)
 
 	body := []byte(`{
+		"database_name": "analytics-db",
 		"metadata_store": {
 			"type": "aurora",
 			"aurora": {"min_acu": 0.5, "max_acu": 2}
@@ -115,7 +125,7 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
+	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/new-org/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -171,7 +181,7 @@ func TestProvisionRejectsExistingNonTerminal(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
+	body := []byte(`{"database_name": "test-db", "metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -191,7 +201,7 @@ func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	}
 	router := newTestRouter(store)
 
-	body := []byte(`{"metadata_store": {"type": "aurora", "aurora": {"min_acu": 0, "max_acu": 2}}}`)
+	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "aurora", "aurora": {"min_acu": 0, "max_acu": 2}}}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

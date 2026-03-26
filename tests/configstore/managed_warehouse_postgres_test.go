@@ -20,7 +20,7 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 		t.Fatalf("hash password: %v", err)
 	}
 
-	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "analytics", DatabaseName: "analytics"}).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.OrgUser{
@@ -83,7 +83,7 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 		t.Fatal("expected user credentials to remain loaded in snapshot")
 	}
 
-	if err := store.DB().Create(&configstore.Org{Name: "cleanup"}).Error; err != nil {
+	if err := store.DB().Create(&configstore.Org{Name: "cleanup", DatabaseName: "cleanup"}).Error; err != nil {
 		t.Fatalf("create cleanup org: %v", err)
 	}
 	if err := store.DB().Create(&configstore.ManagedWarehouse{

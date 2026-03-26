@@ -12,6 +12,7 @@ func TestOrgRoutedSessionProviderCreateSessionTeamNotFound(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{ok: false},
 		pidSession: make(map[int32]*SessionManager),
+		userOrg:    make(map[string]string),
 	}
 
 	_, _, err := provider.CreateSession(context.Background(), "unknown", 0, "", 0)
@@ -27,10 +28,9 @@ func TestOrgRoutedSessionProviderDestroySessionRemovesPid(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 
 	provider := &orgRoutedSessionProvider{
-		orgRouter: &mockOrgRouter{sessions: sm, ok: true},
-		pidSession: map[int32]*SessionManager{
-			42: sm,
-		},
+		orgRouter:  &mockOrgRouter{sessions: sm, ok: true},
+		pidSession: map[int32]*SessionManager{42: sm},
+		userOrg:    make(map[string]string),
 	}
 
 	// Destroy known pid — should remove from map.
@@ -50,6 +50,7 @@ func TestOrgRoutedSessionProviderDestroyUnknownPidNoOp(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{ok: true},
 		pidSession: make(map[int32]*SessionManager),
+		userOrg:    make(map[string]string),
 	}
 
 	// Should not panic.
@@ -62,6 +63,7 @@ func TestOrgRoutedSessionProviderConcurrentDestroys(t *testing.T) {
 	provider := &orgRoutedSessionProvider{
 		orgRouter:  &mockOrgRouter{sessions: sm, ok: true},
 		pidSession: make(map[int32]*SessionManager),
+		userOrg:    make(map[string]string),
 	}
 
 	// Pre-populate

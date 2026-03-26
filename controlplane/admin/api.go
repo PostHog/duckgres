@@ -80,9 +80,9 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo)
 	// Users CRUD
 	r.GET("/users", h.listUsers)
 	r.POST("/users", h.createUser)
-	r.GET("/users/:username", h.getUser)
-	r.PUT("/users/:username", h.updateUser)
-	r.DELETE("/users/:username", h.deleteUser)
+	r.GET("/orgs/:id/users/:username", h.getUser)
+	r.PUT("/orgs/:id/users/:username", h.updateUser)
+	r.DELETE("/orgs/:id/users/:username", h.deleteUser)
 
 	// Workers (read-only)
 	r.GET("/workers", h.listWorkers)
@@ -113,9 +113,9 @@ type apiStore interface {
 
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
-	GetUser(username string) (*configstore.OrgUser, error)
-	UpdateUser(username, passwordHash, orgID string) (*configstore.OrgUser, bool, error)
-	DeleteUser(username string) (bool, error)
+	GetUser(orgID, username string) (*configstore.OrgUser, error)
+	UpdateUser(orgID, username, passwordHash string) (*configstore.OrgUser, bool, error)
+	DeleteUser(orgID, username string) (bool, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
@@ -213,38 +213,35 @@ func (s *gormAPIStore) CreateUser(user *configstore.OrgUser) error {
 	return s.db().Create(user).Error
 }
 
-func (s *gormAPIStore) GetUser(username string) (*configstore.OrgUser, error) {
+func (s *gormAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, error) {
 	var user configstore.OrgUser
-	if err := s.db().First(&user, "username = ?", username).Error; err != nil {
+	if err := s.db().First(&user, "org_id = ? AND username = ?", orgID, username).Error; err != nil {
 		return nil, err
 	}
 	return &user, nil
 }
 
-func (s *gormAPIStore) UpdateUser(username, passwordHash, orgID string) (*configstore.OrgUser, bool, error) {
+func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string) (*configstore.OrgUser, bool, error) {
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
 	}
-	if orgID != "" {
-		updates["org_id"] = orgID
-	}
-	result := s.db().Model(&configstore.OrgUser{}).Where("username = ?", username).Updates(updates)
+	result := s.db().Model(&configstore.OrgUser{}).Where("org_id = ? AND username = ?", orgID, username).Updates(updates)
 	if result.Error != nil {
 		return nil, false, result.Error
 	}
 	if result.RowsAffected == 0 {
 		return nil, false, nil
 	}
-	user, err := s.GetUser(username)
+	user, err := s.GetUser(orgID, username)
 	if err != nil {
 		return nil, true, err
 	}
 	return user, true, nil
 }
 
-func (s *gormAPIStore) DeleteUser(username string) (bool, error) {
-	result := s.db().Where("username = ?", username).Delete(&configstore.OrgUser{})
+func (s *gormAPIStore) DeleteUser(orgID, username string) (bool, error) {
+	result := s.db().Where("org_id = ? AND username = ?", orgID, username).Delete(&configstore.OrgUser{})
 	if result.Error != nil {
 		return false, result.Error
 	}
@@ -618,8 +615,9 @@ func (h *apiHandler) createUser(c *gin.Context) {
 }
 
 func (h *apiHandler) getUser(c *gin.Context) {
+	orgID := c.Param("id")
 	username := c.Param("username")
-	user, err := h.store.GetUser(username)
+	user, err := h.store.GetUser(orgID, username)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
@@ -628,10 +626,10 @@ func (h *apiHandler) getUser(c *gin.Context) {
 }
 
 func (h *apiHandler) updateUser(c *gin.Context) {
+	orgID := c.Param("id")
 	username := c.Param("username")
 	var raw struct {
 		Password string `json:"password"`
-		OrgID    string `json:"org_id"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -646,7 +644,7 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		}
 		passwordHash = hash
 	}
-	user, ok, err := h.store.UpdateUser(username, passwordHash, raw.OrgID)
+	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -659,8 +657,9 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 }
 
 func (h *apiHandler) deleteUser(c *gin.Context) {
+	orgID := c.Param("id")
 	username := c.Param("username")
-	ok, err := h.store.DeleteUser(username)
+	ok, err := h.store.DeleteUser(orgID, username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

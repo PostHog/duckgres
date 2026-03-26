@@ -178,3 +178,12 @@ func TestActivatorSkipsCheckWhenCachedFalse(t *testing.T) {
 		t.Errorf("expected setMigrating not called, got %q", *setOrg)
 	}
 }
+
+func TestMockOrgRouterSatisfiesInterface(t *testing.T) {
+	mock := &mockOrgRouter{ok: true}
+	var _ OrgRouterInterface = mock
+
+	if mock.IsMigratingForOrg("anyorg") {
+		t.Fatal("expected default mock to return not migrating")
+	}
+}
