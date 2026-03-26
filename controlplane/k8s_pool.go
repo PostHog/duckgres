@@ -1005,6 +1005,48 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 		liveCount := p.liveWorkerCountLocked()
 		if p.maxWorkers == 0 || liveCount < p.maxWorkers {
+			if p.runtimeStore != nil {
+				slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
+					p.cpInstanceID,
+					assignment.OrgID,
+					1,
+					assignment.LeaseExpiresAt,
+					p.workerPodNamePrefix(),
+					assignment.MaxWorkers,
+					p.maxWorkers,
+				)
+				if err != nil {
+					p.mu.Unlock()
+					return nil, err
+				}
+				if slot == nil {
+					p.mu.Unlock()
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(100 * time.Millisecond):
+					}
+					continue
+				}
+				p.spawning++
+				p.mu.Unlock()
+
+				err = p.spawnWarmWorker(ctx, slot.WorkerID)
+
+				p.mu.Lock()
+				p.spawning--
+				if err == nil {
+					observeWarmPoolLifecycleGauges(p.workers)
+				}
+				p.mu.Unlock()
+
+				if err != nil {
+					p.retireClaimedWorker(slot, RetireReasonCrash)
+					return nil, err
+				}
+				return p.reserveClaimedWorker(ctx, slot, assignment)
+			}
+
 			id := p.allocateWorkerIDLocked()
 			p.spawning++
 			p.mu.Unlock()
@@ -1063,8 +1105,9 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	var reservedRecord *configstore.WorkerRecord
 	if p.shuttingDown {
+		p.mu.Unlock()
 		return nil, fmt.Errorf("pool is shutting down")
 	}
 	if claimed.PodName != "" {
@@ -1077,10 +1120,18 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 		return nil, err
 	}
 	if err := worker.SetSharedState(nextState); err != nil {
+		p.mu.Unlock()
 		return nil, err
 	}
 	worker.reservedAt = time.Now()
 	observeWarmPoolLifecycleGauges(p.workers)
+	if claimed.State != configstore.WorkerStateReserved {
+		reservedRecord = p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
+	}
+	p.mu.Unlock()
+	if reservedRecord != nil {
+		p.persistWorkerRecord(reservedRecord)
+	}
 	return worker, nil
 }
 
@@ -1768,6 +1819,13 @@ func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
 		return ""
 	}
 	return p.podNameForWorker(worker.ID)
+}
+
+func (p *K8sWorkerPool) workerPodNamePrefix() string {
+	if p.orgID != "" {
+		return fmt.Sprintf("duckgres-worker-%s-%s", p.cpID, p.orgID)
+	}
+	return fmt.Sprintf("duckgres-worker-%s", p.cpID)
 }
 
 // SetMaxWorkers updates the maximum number of workers. 0 means unlimited.

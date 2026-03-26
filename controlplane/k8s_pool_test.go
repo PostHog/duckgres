@@ -27,6 +27,16 @@ type captureRuntimeWorkerStore struct {
 	claimOwnerCPID string
 	claimOrgID     string
 	claimLease     time.Time
+	spawned             *configstore.WorkerRecord
+	spawnErr            error
+	spawnCalls          int
+	spawnOwnerCPID      string
+	spawnOrgID          string
+	spawnOwnerEpoch     int64
+	spawnLease          time.Time
+	spawnPodNamePrefix  string
+	spawnMaxOrgWorkers  int
+	spawnMaxGlobalWorks int
 }
 
 func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
@@ -59,6 +69,27 @@ func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID str
 	}
 	claimed := *s.claimed
 	return &claimed, nil
+}
+
+func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, leaseExpiresAt time.Time, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.spawnCalls++
+	s.spawnOwnerCPID = ownerCPInstanceID
+	s.spawnOrgID = orgID
+	s.spawnOwnerEpoch = ownerEpoch
+	s.spawnLease = leaseExpiresAt
+	s.spawnPodNamePrefix = podNamePrefix
+	s.spawnMaxOrgWorkers = maxOrgWorkers
+	s.spawnMaxGlobalWorks = maxGlobalWorkers
+	if s.spawnErr != nil {
+		return nil, s.spawnErr
+	}
+	if s.spawned == nil {
+		return nil, nil
+	}
+	spawned := *s.spawned
+	return &spawned, nil
 }
 
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
@@ -741,6 +772,76 @@ func TestK8sPoolReserveSharedWorkerFallsBackWhenRuntimeClaimReturnsNil(t *testin
 	}
 	if store.claimCalls != 1 {
 		t.Fatalf("expected one claim attempt before fallback, got %d", store.claimCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	leaseExpiry := time.Date(2026, time.March, 20, 20, 0, 0, 0, time.UTC)
+	store := &captureRuntimeWorkerStore{
+		spawned: &configstore.WorkerRecord{
+			WorkerID:          31,
+			PodName:           "duckgres-worker-test-cp-31",
+			State:             configstore.WorkerStateSpawning,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        1,
+			LeaseExpiresAt:    leaseExpiry,
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		worker := &ManagedWorker{ID: id, podName: "duckgres-worker-test-cp-31", done: make(chan struct{})}
+		pool.workers[id] = worker
+		return nil
+	}
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		if worker == nil || worker.ID != 31 {
+			t.Fatalf("expected spawned runtime worker 31, got %#v", worker)
+		}
+		return nil
+	}
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: leaseExpiry,
+		MaxWorkers:     2,
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker.ID != 31 {
+		t.Fatalf("expected spawned worker 31, got %d", worker.ID)
+	}
+	if store.spawnCalls != 1 {
+		t.Fatalf("expected one spawning slot allocation, got %d", store.spawnCalls)
+	}
+	if store.spawnOwnerCPID != pool.cpInstanceID {
+		t.Fatalf("expected spawn owner cp-instance %q, got %q", pool.cpInstanceID, store.spawnOwnerCPID)
+	}
+	if store.spawnOrgID != "analytics" {
+		t.Fatalf("expected spawn org analytics, got %q", store.spawnOrgID)
+	}
+	if store.spawnOwnerEpoch != 1 {
+		t.Fatalf("expected spawn owner epoch 1, got %d", store.spawnOwnerEpoch)
+	}
+	if !store.spawnLease.Equal(leaseExpiry) {
+		t.Fatalf("expected spawn lease %v, got %v", leaseExpiry, store.spawnLease)
+	}
+	if store.spawnPodNamePrefix != "duckgres-worker-test-cp" {
+		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.spawnPodNamePrefix)
+	}
+	if store.spawnMaxOrgWorkers != 2 {
+		t.Fatalf("expected max org workers 2, got %d", store.spawnMaxOrgWorkers)
+	}
+	if store.spawnMaxGlobalWorks != 5 {
+		t.Fatalf("expected max global workers 5, got %d", store.spawnMaxGlobalWorks)
+	}
+	if worker.OwnerEpoch() != 1 {
+		t.Fatalf("expected owner epoch 1, got %d", worker.OwnerEpoch())
+	}
+	if worker.SharedState().Lifecycle != WorkerLifecycleReserved {
+		t.Fatalf("expected reserved lifecycle, got %q", worker.SharedState().Lifecycle)
 	}
 }
 

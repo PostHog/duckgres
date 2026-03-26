@@ -24,6 +24,7 @@ const (
 type WorkerAssignment struct {
 	OrgID          string
 	LeaseExpiresAt time.Time
+	MaxWorkers     int
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared
