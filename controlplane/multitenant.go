@@ -209,6 +209,9 @@ func SetupMultiTenant(
 		5*time.Second,
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
+	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
+		router.sharedPool.retireClaimedWorker(&record, reason)
+	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err

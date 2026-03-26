@@ -474,6 +474,72 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string,
 	return created, nil
 }
 
+// ListOrphanedWorkers returns active workers whose owning control-plane instance
+// has already been marked expired long enough ago to pass the orphan grace cutoff.
+func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
+	var workers []WorkerRecord
+	activeStates := []WorkerState{
+		WorkerStateSpawning,
+		WorkerStateIdle,
+		WorkerStateReserved,
+		WorkerStateActivating,
+		WorkerStateHot,
+		WorkerStateDraining,
+	}
+	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
+	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	err := cs.db.Table(workerTable+" AS w").
+		Select("w.*").
+		Joins("JOIN "+cpTable+" AS cp ON cp.id = w.owner_cp_instance_id").
+		Where("w.state IN ?", activeStates).
+		Where("cp.state = ?", ControlPlaneInstanceStateExpired).
+		Where("cp.expired_at IS NOT NULL AND cp.expired_at <= ?", before).
+		Find(&workers).Error
+	if err != nil {
+		return nil, fmt.Errorf("list orphaned workers: %w", err)
+	}
+	return workers, nil
+}
+
+// ListStuckWorkers returns workers stuck in spawning, reserved, or activating
+// beyond their respective cutoffs.
+func (cs *ConfigStore) ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]WorkerRecord, error) {
+	var workers []WorkerRecord
+	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
+	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	err := cs.db.Table(workerTable+" AS w").
+		Select("w.*").
+		Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = w.owner_cp_instance_id").
+		Where("(w.state = ? AND w.updated_at <= ?) OR (w.state IN ? AND w.updated_at <= ?)",
+			WorkerStateSpawning,
+			spawningBefore,
+			[]WorkerState{WorkerStateReserved, WorkerStateActivating},
+			activatingBefore,
+		).
+		Where("cp.id IS NULL OR cp.state <> ?", ControlPlaneInstanceStateExpired).
+		Find(&workers).Error
+	if err != nil {
+		return nil, fmt.Errorf("list stuck workers: %w", err)
+	}
+	return workers, nil
+}
+
+// ExpireFlightSessionRecords marks reconnectable Flight sessions expired when
+// their reconnect deadline has passed.
+func (cs *ConfigStore) ExpireFlightSessionRecords(before time.Time) (int64, error) {
+	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
+		Where("state NOT IN ?", []FlightSessionState{FlightSessionStateExpired, FlightSessionStateClosed}).
+		Where("expires_at <= ?", before).
+		Updates(map[string]any{
+			"state":      FlightSessionStateExpired,
+			"updated_at": time.Now(),
+		})
+	if result.Error != nil {
+		return 0, fmt.Errorf("expire flight session records: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
 func (cs *ConfigStore) countActiveWorkers(tx *gorm.DB, where ...any) (int64, error) {
 	var count int64
 	activeStates := []WorkerState{

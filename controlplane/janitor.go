@@ -4,17 +4,31 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
+)
+
+const (
+	janitorRetireReasonLeaseExpiry     = "lease_expiry"
+	janitorRetireReasonStuckActivating = "stuck_activating"
 )
 
 type controlPlaneExpiryStore interface {
 	ExpireControlPlaneInstances(cutoff time.Time) (int64, error)
+	ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error)
+	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
+	ExpireFlightSessionRecords(before time.Time) (int64, error)
 }
 
 type ControlPlaneJanitor struct {
 	store         controlPlaneExpiryStore
 	interval      time.Duration
 	expiryTimeout time.Duration
+	orphanGrace   time.Duration
+	spawnTimeout  time.Duration
+	activateTimeout time.Duration
 	now           func() time.Time
+	retireWorker  func(record configstore.WorkerRecord, reason string)
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -25,10 +39,13 @@ func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeo
 		expiryTimeout = 20 * time.Second
 	}
 	return &ControlPlaneJanitor{
-		store:         store,
-		interval:      interval,
-		expiryTimeout: expiryTimeout,
-		now:           time.Now,
+		store:           store,
+		interval:        interval,
+		expiryTimeout:   expiryTimeout,
+		orphanGrace:     30 * time.Second,
+		spawnTimeout:    2 * time.Minute,
+		activateTimeout: 2 * time.Minute,
+		now:             time.Now,
 	}
 }
 
@@ -62,4 +79,36 @@ func (j *ControlPlaneJanitor) runOnce() {
 	if expired > 0 {
 		slog.Info("Janitor expired stale control-plane instances.", "count", expired, "cutoff", cutoff)
 	}
+
+	orphanedBefore := j.now().Add(-(j.expiryTimeout + j.orphanGrace))
+	orphaned, err := j.store.ListOrphanedWorkers(orphanedBefore)
+	if err != nil {
+		slog.Warn("Janitor failed to list orphaned workers.", "error", err)
+	} else {
+		for _, worker := range orphaned {
+			j.retireRuntimeWorker(worker, janitorRetireReasonLeaseExpiry)
+		}
+	}
+
+	spawningBefore := j.now().Add(-j.spawnTimeout)
+	activatingBefore := j.now().Add(-j.activateTimeout)
+	stuckWorkers, err := j.store.ListStuckWorkers(spawningBefore, activatingBefore)
+	if err != nil {
+		slog.Warn("Janitor failed to list stuck workers.", "error", err)
+	} else {
+		for _, worker := range stuckWorkers {
+			j.retireRuntimeWorker(worker, janitorRetireReasonStuckActivating)
+		}
+	}
+
+	if _, err := j.store.ExpireFlightSessionRecords(j.now()); err != nil {
+		slog.Warn("Janitor failed to expire stale Flight sessions.", "error", err)
+	}
+}
+
+func (j *ControlPlaneJanitor) retireRuntimeWorker(record configstore.WorkerRecord, reason string) {
+	if j == nil || j.retireWorker == nil {
+		return
+	}
+	j.retireWorker(record, reason)
 }

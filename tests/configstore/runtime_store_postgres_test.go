@@ -308,3 +308,101 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("expected global cap to block spawning, got %#v", globalLimited)
 	}
 }
+
+func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-expired:boot-a",
+		PodName:         "duckgres-old",
+		PodUID:          "pod-old",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now.Add(-time.Minute),
+		ExpiredAt:       ptrTime(now.Add(-time.Minute)),
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(expired): %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          61,
+		PodName:           "duckgres-worker-61",
+		State:             configstore.WorkerStateReserved,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-expired:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(orphaned): %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          62,
+		PodName:           "duckgres-worker-62",
+		State:             configstore.WorkerStateActivating,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-live:boot-b",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(stuck): %v", err)
+	}
+	if err := store.DB().Table(store.RuntimeSchema()+".worker_records").
+		Where("worker_id = ?", 62).
+		Update("updated_at", now.Add(-3*time.Minute)).Error; err != nil {
+		t.Fatalf("age stuck worker: %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	if len(orphaned) != 1 || orphaned[0].WorkerID != 61 {
+		t.Fatalf("expected orphaned worker 61, got %#v", orphaned)
+	}
+
+	stuck, err := store.ListStuckWorkers(now.Add(-2*time.Minute), now.Add(-2*time.Minute))
+	if err != nil {
+		t.Fatalf("ListStuckWorkers: %v", err)
+	}
+	if len(stuck) != 1 || stuck[0].WorkerID != 62 {
+		t.Fatalf("expected stuck worker 62, got %#v", stuck)
+	}
+}
+
+func TestExpireFlightSessionRecordsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 15, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
+		SessionToken: "flight-expire-me",
+		OrgID:        "analytics",
+		WorkerID:     42,
+		OwnerEpoch:   7,
+		State:        configstore.FlightSessionStateActive,
+		ExpiresAt:    now.Add(-time.Minute),
+		LastSeenAt:   now.Add(-2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord: %v", err)
+	}
+
+	expired, err := store.ExpireFlightSessionRecords(now)
+	if err != nil {
+		t.Fatalf("ExpireFlightSessionRecords: %v", err)
+	}
+	if expired != 1 {
+		t.Fatalf("expected one expired session record, got %d", expired)
+	}
+
+	record, err := store.GetFlightSessionRecord("flight-expire-me")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord: %v", err)
+	}
+	if record.State != configstore.FlightSessionStateExpired {
+		t.Fatalf("expected expired flight session state, got %q", record.State)
+	}
+}
+
+func ptrTime(t time.Time) *time.Time {
+	return &t
+}
