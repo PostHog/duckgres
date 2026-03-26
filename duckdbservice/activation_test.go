@@ -209,3 +209,39 @@ func TestSessionPoolActivateTenantAllowsSameOrgTakeover(t *testing.T) {
 		t.Fatalf("expected pool owner cp instance id cp-new:boot-b, got %q", pool.ownerCPInstanceID)
 	}
 }
+
+func TestSessionPoolValidateControlMetadataRejectsMismatchedCPInstanceID(t *testing.T) {
+	pool := &SessionPool{
+		sharedWarmMode:    true,
+		ownerEpoch:        4,
+		ownerCPInstanceID: "cp-live:boot-a",
+		workerID:          17,
+	}
+
+	err := pool.validateControlMetadata(server.WorkerControlMetadata{
+		WorkerID:     17,
+		OwnerEpoch:   4,
+		CPInstanceID: "cp-other:boot-b",
+	})
+	if err == nil {
+		t.Fatal("expected mismatched cp_instance_id to be rejected")
+	}
+}
+
+func TestSessionPoolValidateControlMetadataRejectsMismatchedWorkerID(t *testing.T) {
+	pool := &SessionPool{
+		sharedWarmMode:    true,
+		ownerEpoch:        4,
+		ownerCPInstanceID: "cp-live:boot-a",
+		workerID:          17,
+	}
+
+	err := pool.validateControlMetadata(server.WorkerControlMetadata{
+		WorkerID:     18,
+		OwnerEpoch:   4,
+		CPInstanceID: "cp-live:boot-a",
+	})
+	if err == nil {
+		t.Fatal("expected mismatched worker_id to be rejected")
+	}
+}

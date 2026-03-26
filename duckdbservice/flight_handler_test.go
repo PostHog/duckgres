@@ -116,6 +116,8 @@ func TestHealthCheckRejectsMissingOwnerEpochInSharedWarmMode(t *testing.T) {
 		startTime:      time.Now(),
 		sharedWarmMode: true,
 		ownerEpoch:     5,
+		ownerCPInstanceID: "cp-live:boot-a",
+		workerID:          17,
 	}
 	close(pool.warmupDone)
 
@@ -253,6 +255,36 @@ func TestSessionFromContextRejectsStaleOwnerEpoch(t *testing.T) {
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
 		"x-duckgres-session", "session-1",
 		"x-duckgres-owner-epoch", "4",
+		"x-duckgres-worker-id", "17",
+		"x-duckgres-cp-instance-id", "cp-live:boot-a",
+	))
+
+	_, err := handler.sessionFromContext(ctx)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+func TestSessionFromContextRejectsMismatchedControlIdentity(t *testing.T) {
+	pool := &SessionPool{
+		sessions:           make(map[string]*Session),
+		stopRefresh:        make(map[string]func()),
+		warmupDone:         make(chan struct{}),
+		startTime:          time.Now(),
+		sharedWarmMode:     true,
+		ownerEpoch:         5,
+		ownerCPInstanceID:  "cp-live:boot-a",
+		workerID:           17,
+	}
+	close(pool.warmupDone)
+	pool.sessions["session-1"] = &Session{ID: "session-1"}
+
+	handler := &FlightSQLHandler{pool: pool}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
+		"x-duckgres-session", "session-1",
+		"x-duckgres-owner-epoch", "5",
+		"x-duckgres-worker-id", "18",
+		"x-duckgres-cp-instance-id", "cp-other:boot-b",
 	))
 
 	_, err := handler.sessionFromContext(ctx)

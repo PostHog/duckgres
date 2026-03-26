@@ -411,6 +411,47 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	}
 }
 
+func TestK8sPoolReserveClaimedWorkerUnlocksPoolOnTransitionError(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 9, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: time.Now().Add(time.Hour),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	_, err := pool.reserveClaimedWorker(context.Background(), &configstore.WorkerRecord{
+		WorkerID:          worker.ID,
+		OwnerCPInstanceID: "cp-2:boot-b",
+		OwnerEpoch:        7,
+		State:             configstore.WorkerStateReserved,
+	}, &WorkerAssignment{
+		OrgID:          "billing",
+		LeaseExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err == nil {
+		t.Fatal("expected transition error")
+	}
+
+	locked := make(chan struct{})
+	go func() {
+		pool.mu.Lock()
+		pool.mu.Unlock()
+		close(locked)
+	}()
+
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("expected reserveClaimedWorker to unlock pool mutex on error")
+	}
+}
+
 func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 2)
 	stale := &ManagedWorker{ID: 1, done: make(chan struct{})}

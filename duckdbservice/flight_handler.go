@@ -57,7 +57,23 @@ func (h *FlightSQLHandler) sessionFromContext(ctx context.Context) (*Session, er
 		if err != nil {
 			return nil, status.Error(codes.InvalidArgument, "invalid x-duckgres-owner-epoch header")
 		}
-		if err := h.pool.validateControlMetadata(server.WorkerControlMetadata{OwnerEpoch: ownerEpoch}); err != nil {
+		workerIDs := md.Get("x-duckgres-worker-id")
+		if len(workerIDs) == 0 {
+			return nil, status.Error(codes.Unauthenticated, "missing x-duckgres-worker-id header")
+		}
+		workerID, err := strconv.Atoi(workerIDs[0])
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid x-duckgres-worker-id header")
+		}
+		cpInstanceIDs := md.Get("x-duckgres-cp-instance-id")
+		if len(cpInstanceIDs) == 0 {
+			return nil, status.Error(codes.Unauthenticated, "missing x-duckgres-cp-instance-id header")
+		}
+		if err := h.pool.validateControlMetadata(server.WorkerControlMetadata{
+			WorkerID:     workerID,
+			OwnerEpoch:   ownerEpoch,
+			CPInstanceID: cpInstanceIDs[0],
+		}); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
 		}
 	}

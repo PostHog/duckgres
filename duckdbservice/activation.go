@@ -148,6 +148,12 @@ func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata)
 	if meta.OwnerEpoch != p.ownerEpoch {
 		return fmt.Errorf("stale owner epoch %d (current %d)", meta.OwnerEpoch, p.ownerEpoch)
 	}
+	if p.ownerCPInstanceID != "" && meta.CPInstanceID != p.ownerCPInstanceID {
+		return fmt.Errorf("stale cp_instance_id %q (current %q)", meta.CPInstanceID, p.ownerCPInstanceID)
+	}
+	if p.workerID > 0 && meta.WorkerID != p.workerID {
+		return fmt.Errorf("stale worker_id %d (current %d)", meta.WorkerID, p.workerID)
+	}
 	return nil
 }
 

@@ -1117,6 +1117,7 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	worker.SetOwnerEpoch(claimed.OwnerEpoch)
 	nextState, err := worker.SharedState().Transition(WorkerLifecycleReserved, assignment)
 	if err != nil {
+		p.mu.Unlock()
 		return nil, err
 	}
 	if err := worker.SetSharedState(nextState); err != nil {

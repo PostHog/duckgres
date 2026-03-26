@@ -123,7 +123,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	}
 
 	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
-	executor.SetOwnerEpoch(worker.OwnerEpoch())
+	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
 
 	if pid == 0 {
 		pid = sm.nextPID.Add(1)

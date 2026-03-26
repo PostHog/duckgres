@@ -45,6 +45,8 @@ type OrderedMapValue struct {
 type FlightExecutor struct {
 	client       *flightsql.Client
 	sessionToken string
+	workerID     int
+	cpInstanceID string
 	ownerEpoch   int64
 	alloc        memory.Allocator
 	ownsClient   bool // if true, Close() closes the client
@@ -122,11 +124,19 @@ func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
 	return metadata.AppendToOutgoingContext(
 		ctx,
 		"x-duckgres-session", e.sessionToken,
+		"x-duckgres-worker-id", strconv.Itoa(e.workerID),
+		"x-duckgres-cp-instance-id", e.cpInstanceID,
 		"x-duckgres-owner-epoch", strconv.FormatInt(e.ownerEpoch, 10),
 	)
 }
 
 func (e *FlightExecutor) SetOwnerEpoch(ownerEpoch int64) {
+	e.ownerEpoch = ownerEpoch
+}
+
+func (e *FlightExecutor) SetControlMetadata(workerID int, cpInstanceID string, ownerEpoch int64) {
+	e.workerID = workerID
+	e.cpInstanceID = cpInstanceID
 	e.ownerEpoch = ownerEpoch
 }
 
