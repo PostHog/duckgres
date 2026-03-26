@@ -531,6 +531,9 @@ func buildDuckLakeAttachStmt(dlCfg DuckLakeConfig, migrate bool) string {
 	if migrate {
 		options = append(options, "AUTOMATIC_MIGRATION TRUE")
 	}
+	if dlCfg.DataInliningRowLimit != nil {
+		options = append(options, fmt.Sprintf("DATA_INLINING_ROW_LIMIT %d", *dlCfg.DataInliningRowLimit))
+	}
 
 	if len(options) > 0 {
 		return fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (%s)",

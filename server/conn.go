@@ -1252,6 +1252,8 @@ func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error
 // client (so the caller can stop processing a batch), or (false, err) for
 // fatal connection errors.
 func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
+	start := time.Now()
+
 	// Check for cursor operations before transpilation
 	tree, parseErr := pg_query.Parse(query)
 	if parseErr == nil && len(tree.Stmts) == 1 {
@@ -1466,20 +1468,29 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				}
 			}
 			if err != nil {
+				errCode := "42000"
+				errMsg := err.Error()
 				if isQueryCancelled(err) {
-					c.sendError("ERROR", "57014", "canceling statement due to user request")
+					errCode = "57014"
+					errMsg = "canceling statement due to user request"
 				} else {
 					slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
-					c.sendError("ERROR", "42000", err.Error())
 				}
+				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
+				c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
 				return true, nil
 			}
 		}
 
+		var writtenRows int64
+		if execResult != nil {
+			writtenRows, _ = execResult.RowsAffected()
+		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = writeCommandComplete(c.writer, tag)
+		c.logQuery(start, query, executedQuery, cmdType, 0, writtenRows, "", "", "simple-batch")
 		return false, nil
 	}
 
@@ -1489,13 +1500,17 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	rows, err := c.executor.QueryContext(ctx, executedQuery)
 	if err != nil {
+		errCode := "42000"
+		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
 		} else {
 			slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
 		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
+		c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
 		return true, nil
 	}
 	defer func() { _ = rows.Close() }()
@@ -1546,6 +1561,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
+	c.logQuery(start, query, executedQuery, cmdType, int64(rowCount), 0, "", "", "simple-batch")
 	return false, nil
 }
 

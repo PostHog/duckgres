@@ -271,6 +271,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 				warn("Invalid ducklake.checkpoint_interval duration: " + err.Error())
 			}
 		}
+		if fileCfg.DuckLake.DataInliningRowLimit != nil {
+			if *fileCfg.DuckLake.DataInliningRowLimit < 0 {
+				warn("ducklake.data_inlining_row_limit must be >= 0")
+			} else {
+				cfg.DuckLake.DataInliningRowLimit = fileCfg.DuckLake.DataInliningRowLimit
+			}
+		}
 
 		cfg.ProcessIsolation = fileCfg.ProcessIsolation
 		if fileCfg.IdleTimeout != "" {
@@ -501,6 +508,17 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			cfg.DuckLake.CheckpointInterval = d
 		} else {
 			warn("Invalid DUCKGRES_DUCKLAKE_CHECKPOINT_INTERVAL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_DUCKLAKE_DATA_INLINING_ROW_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n < 0 {
+				warn("DUCKGRES_DUCKLAKE_DATA_INLINING_ROW_LIMIT must be >= 0")
+			} else {
+				cfg.DuckLake.DataInliningRowLimit = &n
+			}
+		} else {
+			warn("Invalid DUCKGRES_DUCKLAKE_DATA_INLINING_ROW_LIMIT: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {
