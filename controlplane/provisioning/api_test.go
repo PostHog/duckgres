@@ -56,6 +56,15 @@ func (s *fakeStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 	return nil
 }
 
+func (s *fakeStore) IsDatabaseNameAvailable(name string) (bool, error) {
+	for _, org := range s.orgs {
+		if org.DatabaseName == name {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error {
 	w, ok := s.warehouses[orgID]
 	if !ok {

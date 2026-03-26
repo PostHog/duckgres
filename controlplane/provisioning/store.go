@@ -66,6 +66,14 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 	})
 }
 
+func (s *gormStore) IsDatabaseNameAvailable(name string) (bool, error) {
+	var count int64
+	if err := s.cs.DB().Model(&configstore.Org{}).Where("database_name = ?", name).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count == 0, nil
+}
+
 // SetWarehouseDeleting atomically transitions a warehouse from expectedState to deleting.
 // Returns gorm.ErrRecordNotFound if no warehouse exists, or an error if the CAS fails.
 func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error {
