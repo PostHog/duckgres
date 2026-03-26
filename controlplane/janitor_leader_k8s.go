@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -26,6 +27,8 @@ type leaderElectorRunner interface {
 type JanitorLeaderManager struct {
 	elector    leaderElectorRunner
 	leaderLoop *leaderOnlyLoop
+	mu         sync.Mutex
+	cancel     context.CancelFunc
 }
 
 func NewJanitorLeaderManager(namespace, identity string, janitor *ControlPlaneJanitor) (*JanitorLeaderManager, error) {
@@ -112,12 +115,29 @@ func (m *JanitorLeaderManager) Start(ctx context.Context) error {
 	if m == nil || m.elector == nil {
 		return nil
 	}
-	go m.elector.Run(ctx)
+	runCtx, cancel := context.WithCancel(ctx)
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+	}
+	m.cancel = cancel
+	m.mu.Unlock()
+	go m.elector.Run(runCtx)
 	return nil
 }
 
 func (m *JanitorLeaderManager) Stop() {
-	if m == nil || m.leaderLoop == nil {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	cancel := m.cancel
+	m.cancel = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if m.leaderLoop == nil {
 		return
 	}
 	m.leaderLoop.onStoppedLeading()
