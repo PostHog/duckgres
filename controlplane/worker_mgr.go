@@ -84,6 +84,9 @@ type FlightWorkerPool struct {
 
 	preboundMu sync.Mutex
 	prebound   []*preboundSocket // available pre-bound socket slots
+
+	ducklakeMigrateMu sync.Mutex  // serializes worker spawns during migration
+	ducklakeMigrate   bool        // when true, pass DUCKGRES_DUCKLAKE_MIGRATE=true to workers
 }
 
 // NewFlightWorkerPool creates a new worker pool.
@@ -304,9 +307,33 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	cmd.Stderr = os.Stderr
 	// Build env with DUCKGRES_MODE=duckdb-service, filtering any existing
 	// value to avoid duplicates (glibc getenv returns the first match).
+	migrating := p.ducklakeMigrate
 	cmd.Env = appendOrReplaceEnv(os.Environ(), "DUCKGRES_MODE=duckdb-service")
+	if migrating {
+		cmd.Env = appendOrReplaceEnv(cmd.Env, "DUCKGRES_DUCKLAKE_MIGRATE=true")
+	}
+
+	// Serialize worker spawns during DuckLake migration. Without this, multiple
+	// workers race to ALTER the same PG metadata tables, causing duplicate-key
+	// errors. The first worker performs the schema upgrade; subsequent workers
+	// see the already-migrated schema and start instantly.
+	if migrating {
+		p.ducklakeMigrateMu.Lock()
+		// Re-check: another goroutine may have completed the migration while
+		// we were waiting on the mutex.
+		migrating = p.ducklakeMigrate
+		if !migrating {
+			p.ducklakeMigrateMu.Unlock()
+			// Migration completed while we waited — remove the env var so this
+			// worker doesn't attempt AUTOMATIC_MIGRATION unnecessarily.
+			cmd.Env = appendOrReplaceEnv(cmd.Env, "DUCKGRES_DUCKLAKE_MIGRATE=false")
+		}
+	}
 
 	if err := cmd.Start(); err != nil {
+		if migrating {
+			p.ducklakeMigrateMu.Unlock()
+		}
 		_ = file.Close()
 		if ps != nil {
 			p.returnPrebound(ps)
@@ -339,7 +366,25 @@ func (p *FlightWorkerPool) SpawnWorker(id int) error {
 	// Wait for the worker's gRPC server to become healthy.
 	// The socket file already exists (we created it above), so waitForWorker
 	// will immediately try connecting and rely on the health check.
-	client, err := waitForWorker(socketPath, token, 20*time.Second)
+	// Use a longer timeout when DuckLake migration is pending, since the first
+	// worker to ATTACH with AUTOMATIC_MIGRATION performs the actual schema
+	// upgrade against the PostgreSQL metadata store, which can take minutes.
+	spawnTimeout := 20 * time.Second
+	if migrating {
+		spawnTimeout = 20 * time.Minute
+	}
+	client, err := waitForWorker(socketPath, token, spawnTimeout)
+
+	if migrating {
+		if err == nil {
+			// Migration succeeded — clear the flag so future workers use the
+			// normal 20s timeout and don't set AUTOMATIC_MIGRATION.
+			p.ducklakeMigrate = false
+			slog.Info("DuckLake migration completed, subsequent workers will use normal startup.")
+		}
+		p.ducklakeMigrateMu.Unlock()
+	}
+
 	if err != nil {
 		// Kill the process if we can't connect
 		_ = cmd.Process.Kill()

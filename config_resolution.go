@@ -491,6 +491,11 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
 	}
+	if v := getenv("DUCKGRES_DUCKLAKE_MIGRATE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.DuckLake.Migrate = b
+		}
+	}
 	if v := getenv("DUCKGRES_DUCKLAKE_CHECKPOINT_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.DuckLake.CheckpointInterval = d
