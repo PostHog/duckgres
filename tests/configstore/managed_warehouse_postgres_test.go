@@ -1,21 +1,12 @@
-//go:build kubernetes && (linux || darwin)
+//go:build linux || darwin
 
-package controlplane_test
+package configstore_test
 
 import (
-	"database/sql"
-	"fmt"
-	"path/filepath"
-	"sync"
 	"testing"
-	"time"
 
-	_ "github.com/lib/pq"
 	"github.com/posthog/duckgres/controlplane/configstore"
-	integrationtest "github.com/posthog/duckgres/tests/integration"
 )
-
-var ensureIntegrationPostgresOnce sync.Once
 
 func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
@@ -112,96 +103,5 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected warehouse to be deleted via cascade, count=%d", count)
-	}
-}
-
-func TestLocalConfigStoreSeedSQL(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	if err := applyConfigStoreSeed(t, store, filepath.Join(findProjectRoot(), "k8s", "local-config-store.seed.sql")); err != nil {
-		t.Fatalf("apply local seed: %v", err)
-	}
-
-	if err := store.Reload(); err != nil {
-		t.Fatalf("reload store: %v", err)
-	}
-
-	snap := store.Snapshot()
-	orgCfg := snap.Orgs["local"]
-	if orgCfg == nil {
-		t.Fatal("expected local org from seed")
-	}
-	if orgCfg.Warehouse == nil {
-		t.Fatal("expected local warehouse from seed")
-	}
-	if orgCfg.Warehouse.WarehouseDatabase.DatabaseName != "duckgres_local" {
-		t.Fatalf("expected duckgres_local warehouse db, got %q", orgCfg.Warehouse.WarehouseDatabase.DatabaseName)
-	}
-	if orgCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata_local" {
-		t.Fatalf("expected ducklake_metadata_local metadata db, got %q", orgCfg.Warehouse.MetadataStore.DatabaseName)
-	}
-	if orgCfg.Warehouse.WarehouseDatabaseCredentials.Name != "duckgres-local-warehouse-db" {
-		t.Fatalf("expected duckgres-local-warehouse-db secret ref, got %q", orgCfg.Warehouse.WarehouseDatabaseCredentials.Name)
-	}
-	if orgCfg.Warehouse.State != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("expected ready warehouse state, got %q", orgCfg.Warehouse.State)
-	}
-	if orgCfg.Warehouse.MetadataStoreState != configstore.ManagedWarehouseStateReady {
-		t.Fatalf("expected ready metadata store state, got %q", orgCfg.Warehouse.MetadataStoreState)
-	}
-	if _, ok := orgCfg.Users["postgres"]; !ok {
-		t.Fatal("expected seeded postgres user to belong to local org")
-	}
-}
-
-func newIsolatedConfigStore(t *testing.T) *configstore.ConfigStore {
-	t.Helper()
-
-	ensureIntegrationPostgres(t)
-
-	schema := fmt.Sprintf("managed_warehouse_%d", time.Now().UnixNano())
-	adminDB, err := sql.Open("postgres", "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable")
-	if err != nil {
-		t.Fatalf("open postgres admin db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = adminDB.Close()
-	})
-
-	if _, err := adminDB.Exec(`CREATE SCHEMA ` + schema); err != nil {
-		t.Fatalf("create schema: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = adminDB.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
-	})
-
-	store, err := configstore.NewConfigStore("host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable search_path="+schema, time.Hour)
-	if err != nil {
-		t.Fatalf("new config store: %v", err)
-	}
-
-	sqlDB, err := store.DB().DB()
-	if err != nil {
-		t.Fatalf("store sql db: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = sqlDB.Close()
-	})
-
-	return store
-}
-
-func ensureIntegrationPostgres(t *testing.T) {
-	t.Helper()
-
-	var err error
-	ensureIntegrationPostgresOnce.Do(func() {
-		if integrationtest.IsPostgresRunning(35432) {
-			return
-		}
-		err = integrationtest.StartPostgresContainer()
-	})
-	if err != nil {
-		t.Fatalf("start postgres container: %v", err)
 	}
 }
