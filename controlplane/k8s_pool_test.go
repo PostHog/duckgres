@@ -9,12 +9,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
+
+type captureRuntimeWorkerStore struct {
+	mu      sync.Mutex
+	records []configstore.WorkerRecord
+}
+
+func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records = append(s.records, *record)
+	return nil
+}
+
+func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]configstore.WorkerRecord, len(s.records))
+	copy(out, s.records)
+	return out
+}
 
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
 	t.Helper()
@@ -476,6 +497,8 @@ func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	pool.minWorkers = 1
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
 	idle := &ManagedWorker{ID: 7, done: make(chan struct{})}
 	pool.workers[idle.ID] = idle
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
@@ -520,11 +543,127 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 	if !state.Assignment.LeaseExpiresAt.Equal(leaseExpiry) {
 		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, state.Assignment.LeaseExpiresAt)
 	}
+	if worker.ownerEpoch != 1 {
+		t.Fatalf("expected owner epoch 1 after reservation, got %d", worker.ownerEpoch)
+	}
+
+	records := store.snapshot()
+	if len(records) == 0 {
+		t.Fatal("expected reservation to persist a worker record")
+	}
+	last := records[len(records)-1]
+	if last.WorkerID != worker.ID {
+		t.Fatalf("expected worker_id %d, got %d", worker.ID, last.WorkerID)
+	}
+	if last.State != configstore.WorkerStateReserved {
+		t.Fatalf("expected reserved worker record, got %q", last.State)
+	}
+	if last.OwnerCPInstanceID != pool.cpInstanceID {
+		t.Fatalf("expected owner_cp_instance_id %q, got %q", pool.cpInstanceID, last.OwnerCPInstanceID)
+	}
+	if last.OwnerEpoch != 1 {
+		t.Fatalf("expected owner_epoch 1, got %d", last.OwnerEpoch)
+	}
+	if last.OrgID != "analytics" {
+		t.Fatalf("expected org_id analytics, got %q", last.OrgID)
+	}
+	if !last.LeaseExpiresAt.Equal(leaseExpiry) {
+		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, last.LeaseExpiresAt)
+	}
 
 	select {
 	case <-replacementSpawned:
 	case <-time.After(time.Second):
 		t.Fatal("expected reserve to trigger warm-pool replenishment")
+	}
+}
+
+func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	worker := &ManagedWorker{ID: 9, done: make(chan struct{}), ownerEpoch: 4}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: time.Date(2026, time.March, 20, 17, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		return nil
+	}
+
+	if err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
+		OrgID:          "analytics",
+		LeaseExpiresAt: worker.SharedState().Assignment.LeaseExpiresAt,
+	}); err != nil {
+		t.Fatalf("ActivateReservedWorker: %v", err)
+	}
+
+	records := store.snapshot()
+	if len(records) != 2 {
+		t.Fatalf("expected 2 persisted records, got %d", len(records))
+	}
+	if records[0].State != configstore.WorkerStateActivating {
+		t.Fatalf("expected activating record first, got %q", records[0].State)
+	}
+	if records[1].State != configstore.WorkerStateHot {
+		t.Fatalf("expected hot record second, got %q", records[1].State)
+	}
+	for i, record := range records {
+		if record.OwnerEpoch != 4 {
+			t.Fatalf("record %d expected owner epoch 4, got %d", i, record.OwnerEpoch)
+		}
+		if record.OwnerCPInstanceID != pool.cpInstanceID {
+			t.Fatalf("record %d expected owner_cp_instance_id %q, got %q", i, pool.cpInstanceID, record.OwnerCPInstanceID)
+		}
+		if record.OrgID != "analytics" {
+			t.Fatalf("record %d expected org_id analytics, got %q", i, record.OrgID)
+		}
+	}
+}
+
+func TestK8sPoolRetireWorkerPersistsRetiredWorkerRecord(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	worker := &ManagedWorker{ID: 5, done: make(chan struct{}), ownerEpoch: 2}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{
+			OrgID:          "analytics",
+			LeaseExpiresAt: time.Date(2026, time.March, 20, 18, 0, 0, 0, time.UTC),
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	pool.RetireWorker(worker.ID)
+
+	records := store.snapshot()
+	if len(records) == 0 {
+		t.Fatal("expected retirement to persist a worker record")
+	}
+	last := records[len(records)-1]
+	if last.State != configstore.WorkerStateRetired {
+		t.Fatalf("expected retired worker record, got %q", last.State)
+	}
+	if last.OwnerEpoch != 2 {
+		t.Fatalf("expected owner epoch 2, got %d", last.OwnerEpoch)
+	}
+	if last.OwnerCPInstanceID != pool.cpInstanceID {
+		t.Fatalf("expected owner_cp_instance_id %q, got %q", pool.cpInstanceID, last.OwnerCPInstanceID)
+	}
+	if last.OrgID != "analytics" {
+		t.Fatalf("expected org_id analytics, got %q", last.OrgID)
+	}
+	if last.RetireReason != RetireReasonNormal {
+		t.Fatalf("expected retire reason %q, got %q", RetireReasonNormal, last.RetireReason)
 	}
 }
 

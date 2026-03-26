@@ -61,6 +61,7 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 	sharedCfg.WorkerIDGenerator = func() int {
 		return int(tr.nextWorkerID.Add(1))
 	}
+	sharedCfg.RuntimeStore = store
 
 	sharedPoolIface, err := CreateK8sPool(sharedCfg)
 	if err != nil {

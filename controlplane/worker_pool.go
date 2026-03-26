@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 // WorkerPool abstracts the lifecycle and scheduling of Flight SQL workers.
@@ -65,7 +67,12 @@ type K8sWorkerPoolConfig struct {
 	WorkerTolerationValue string            // Taint value for worker pod NoSchedule toleration.
 	WorkerExclusiveNode  bool              // One worker per node via pod anti-affinity.
 	OrgID                string            // Org ID for pod labels (multi-tenant mode)
-	WorkerIDGenerator    func() int // Shared ID generator across orgs (nil = internal counter)
+	WorkerIDGenerator    func() int        // Shared ID generator across orgs (nil = internal counter)
+	RuntimeStore         RuntimeWorkerStore
+}
+
+type RuntimeWorkerStore interface {
+	UpsertWorkerRecord(record *configstore.WorkerRecord) error
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

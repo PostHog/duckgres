@@ -40,6 +40,7 @@ type ManagedWorker struct {
 	sharedState    SharedWorkerState
 	reservedAt     time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
 	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
+	ownerEpoch     int64
 }
 
 // SharedState returns the additive shared warm-worker lifecycle metadata for
@@ -56,6 +57,19 @@ func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
 	}
 	w.sharedState = cloneSharedWorkerState(state)
 	return nil
+}
+
+func (w *ManagedWorker) OwnerEpoch() int64 {
+	return w.ownerEpoch
+}
+
+func (w *ManagedWorker) SetOwnerEpoch(epoch int64) {
+	w.ownerEpoch = epoch
+}
+
+func (w *ManagedWorker) IncrementOwnerEpoch() int64 {
+	w.ownerEpoch++
+	return w.ownerEpoch
 }
 
 // preboundSocket is a Unix socket pre-bound at startup while the socket
