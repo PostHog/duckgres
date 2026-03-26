@@ -44,7 +44,7 @@ type warehouseStatusResponse struct {
 }
 
 type provisionRequest struct {
-	DatabaseName  string                `json:"database_name,omitempty"`
+	DatabaseName  string                `json:"database_name"`
 	MetadataStore *provisionMetadataReq `json:"metadata_store,omitempty"`
 }
 
@@ -67,15 +67,14 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if req.MetadataStore == nil || req.MetadataStore.Aurora == nil || req.MetadataStore.Aurora.MaxACU <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.aurora.max_acu must be greater than 0"})
+	if req.DatabaseName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "database_name is required"})
 		return
 	}
 
-	// Default database name to org ID if not specified
-	databaseName := req.DatabaseName
-	if databaseName == "" {
-		databaseName = orgID
+	if req.MetadataStore == nil || req.MetadataStore.Aurora == nil || req.MetadataStore.Aurora.MaxACU <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.aurora.max_acu must be greater than 0"})
+		return
 	}
 
 	warehouse := &configstore.ManagedWarehouse{
@@ -83,7 +82,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		AuroraMaxACU: req.MetadataStore.Aurora.MaxACU,
 	}
 
-	if err := h.store.CreatePendingWarehouse(orgID, databaseName, warehouse); err != nil {
+	if err := h.store.CreatePendingWarehouse(orgID, req.DatabaseName, warehouse); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
