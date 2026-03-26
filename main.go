@@ -563,6 +563,7 @@ func main() {
 				WorkerNodeSelector:  resolved.K8sWorkerNodeSelector,
 				WorkerTolerationKey:   resolved.K8sWorkerTolerationKey,
 				WorkerTolerationValue: resolved.K8sWorkerTolerationValue,
+				WorkerExclusiveNode:  resolved.K8sWorkerExclusiveNode,
 				AWSRegion:           resolved.AWSRegion,
 			},
 		}

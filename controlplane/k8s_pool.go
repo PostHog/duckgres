@@ -58,6 +58,7 @@ type K8sWorkerPool struct {
 	workerNodeSelector    map[string]string // node selector for worker pods
 	workerTolerationKey   string            // taint key for NoSchedule toleration
 	workerTolerationValue string            // taint value for NoSchedule toleration
+	workerExclusiveNode  bool              // one worker per node via anti-affinity
 	orgID                string            // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
 	cachedToken          string // cached bearer token (immutable after setup)
@@ -138,6 +139,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerNodeSelector:    cfg.WorkerNodeSelector,
 		workerTolerationKey:   cfg.WorkerTolerationKey,
 		workerTolerationValue: cfg.WorkerTolerationValue,
+		workerExclusiveNode:  cfg.WorkerExclusiveNode,
 		orgID:                cfg.OrgID,
 		workerIDGenerator:    cfg.WorkerIDGenerator,
 		spawnSem:             make(chan struct{}, spawnConcurrency),
@@ -459,16 +461,18 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		pod.Spec.Tolerations = []corev1.Toleration{tol}
 	}
 
-	// One worker per instance
-	pod.Spec.Affinity = &corev1.Affinity{
-		PodAntiAffinity: &corev1.PodAntiAffinity{
-			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
-				LabelSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{"app": "duckgres-worker"},
-				},
-				TopologyKey: "kubernetes.io/hostname",
-			}},
-		},
+	// One worker per instance (only when dedicated node pool is configured)
+	if p.workerExclusiveNode {
+		pod.Spec.Affinity = &corev1.Affinity{
+			PodAntiAffinity: &corev1.PodAntiAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "duckgres-worker"},
+					},
+					TopologyKey: "kubernetes.io/hostname",
+				}},
+			},
+		}
 	}
 
 	// Add writable data directory for DuckDB databases

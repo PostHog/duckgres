@@ -86,6 +86,7 @@ type K8sConfig struct {
 	WorkerNodeSelector    string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
 	WorkerTolerationKey   string // Taint key for worker pod NoSchedule toleration
 	WorkerTolerationValue string // Taint value for worker pod NoSchedule toleration
+	WorkerExclusiveNode  bool   // One worker per node via pod anti-affinity
 	AWSRegion           string // AWS region for STS client
 }
 

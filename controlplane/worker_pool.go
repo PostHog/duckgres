@@ -62,6 +62,7 @@ type K8sWorkerPoolConfig struct {
 	WorkerNodeSelector    map[string]string // Node selector for worker pods. Nil = no selector.
 	WorkerTolerationKey   string            // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
 	WorkerTolerationValue string            // Taint value for worker pod NoSchedule toleration.
+	WorkerExclusiveNode  bool              // One worker per node via pod anti-affinity.
 	OrgID                string            // Org ID for pod labels (multi-tenant mode)
 	WorkerIDGenerator    func() int // Shared ID generator across orgs (nil = internal counter)
 }
