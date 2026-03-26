@@ -1725,6 +1725,9 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 	if record == nil {
 		return nil, false
 	}
+	if record.State != DurableSessionStateActive {
+		return nil, false
+	}
 	if !record.ExpiresAt.IsZero() && time.Now().After(record.ExpiresAt) {
 		_ = s.durableStore.CloseSession(token, time.Now())
 		return nil, false
@@ -1748,7 +1751,7 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 	sessionCount := len(s.sessions)
 	s.mu.Unlock()
 	s.notifySessionCountChanged(sessionCount)
-	_ = s.durableStore.TouchSession(token, time.Now())
+	s.persistSession(session, record.Username)
 	return session, true
 }
 
