@@ -242,30 +242,44 @@ format:
 
 # === Test ===
 
-# Run all tests
+# Run the default local test suite
 [group('test')]
 test:
-    go test ./...
+    just test-unit
+    just test-integration
+    just test-controlplane
+    just test-configstore-integration
+    just test-controlplane-k8s
 
-# Run unit tests only (server + transpiler)
+# Run unit tests only
 [group('test')]
 test-unit:
-    go test -v ./server/... ./transpiler/...
+    go test -v -p 1 . ./duckdbservice/... ./server/... ./transpiler/...
 
 # Run integration tests
 [group('test')]
 test-integration:
     go test -v ./tests/integration/...
 
-# Run control plane tests
+# Run shared/process control plane tests
 [group('test')]
 test-controlplane:
+    go test -v -count=1 ./controlplane ./controlplane/configstore ./controlplane/provisioning
     go test -v -timeout 300s ./tests/controlplane/...
+
+# Run Postgres-backed config store integration tests
+[group('test')]
+test-configstore-integration:
+    go test -v -count=1 ./tests/configstore/...
+
+# Run Kubernetes-only control plane package tests
+[group('test')]
+test-controlplane-k8s:
+    go test -v -count=1 -tags kubernetes ./controlplane ./controlplane/admin ./controlplane/provisioner
 
 # Run Kubernetes integration tests against the default kind-backed multitenant setup
 [group('test')]
 test-k8s-integration:
-    DUCKGRES_K8S_TEST_SETUP="${DUCKGRES_K8S_TEST_SETUP:-kind}" go test -count=1 -tags kubernetes ./controlplane
     DUCKGRES_K8S_TEST_SETUP="${DUCKGRES_K8S_TEST_SETUP:-kind}" DUCKGRES_K8S_TEST_KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" go test -v -count=1 -tags k8s_integration -timeout 600s ./tests/k8s/...
 
 # Run perf tests
@@ -308,9 +322,9 @@ perf-nightly:
 lint:
     golangci-lint run
 
-# Run what CI runs: lint + unit + integration + controlplane tests
+# Run what CI runs locally (excluding kind-backed K8s integration)
 [group('test')]
-ci: lint test-unit test-integration test-controlplane
+ci: lint test-unit test-integration test-controlplane test-configstore-integration test-controlplane-k8s
 
 # === Metrics ===
 

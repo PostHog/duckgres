@@ -103,11 +103,6 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		maxWorkers = tr.baseCfg.MaxWorkers
 	}
 
-	memoryBudget := tr.baseCfg.MemoryBudget
-	if tc.MemoryBudget != "" {
-		memoryBudget = int64(server.ParseMemoryBytes(tc.MemoryBudget))
-	}
-
 	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, tr.stsBroker)
 	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
@@ -124,7 +119,9 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	activator.setMigrating = tr.SetMigrating
 	activator.clearMigrating = tr.ClearMigrating
 	pool.activateReservedWorker = activator.ActivateReservedWorker
-	rebalancer := NewMemoryRebalancer(uint64(memoryBudget), 0, nil, tr.globalCfg.MemoryRebalance)
+	// In K8s mode, DuckDB auto-detects memory from the container's cgroup limits.
+	// Pass 0/false to disable budget-based rebalancing.
+	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
 	sessions := NewSessionManager(pool, rebalancer)
 	rebalancer.SetSessionLister(sessions)
 
@@ -270,7 +267,7 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		if !existed {
 			continue
 		}
-		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers || oldTC.MemoryBudget != newTC.MemoryBudget
+		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers
 
 		tr.mu.Lock()
 		if stack, ok := tr.orgs[name]; ok {

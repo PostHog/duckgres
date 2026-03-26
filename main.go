@@ -557,8 +557,14 @@ func main() {
 				ImagePullPolicy:   resolved.K8sWorkerImagePullPolicy,
 				ServiceAccount:    resolved.K8sWorkerServiceAccount,
 				MaxWorkers:        resolved.K8sMaxWorkers,
-				SharedWarmTarget:  resolved.K8sSharedWarmTarget,
-				AWSRegion: resolved.AWSRegion,
+				SharedWarmTarget:    resolved.K8sSharedWarmTarget,
+				WorkerCPURequest:    resolved.K8sWorkerCPURequest,
+				WorkerMemoryRequest: resolved.K8sWorkerMemoryRequest,
+				WorkerNodeSelector:  resolved.K8sWorkerNodeSelector,
+				WorkerTolerationKey:   resolved.K8sWorkerTolerationKey,
+				WorkerTolerationValue: resolved.K8sWorkerTolerationValue,
+				WorkerExclusiveNode:  resolved.K8sWorkerExclusiveNode,
+				AWSRegion:           resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

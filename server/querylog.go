@@ -248,7 +248,7 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			truncateQuery(e.Query),
 			truncateNullableQuery(e.TranspiledQuery),
 			e.QueryKind,
-			e.NormalizedHash,
+			int64(e.NormalizedHash), // cast to int64: database/sql rejects uint64 with high bit set
 			e.ResultRows,
 			e.WrittenRows,
 			e.ExceptionCode,

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -142,7 +143,12 @@ func SetupMultiTenant(
 		ConfigPath:           cfg.ConfigPath,
 		ImagePullPolicy:      cfg.K8s.ImagePullPolicy,
 		ServiceAccount:       cfg.K8s.ServiceAccount,
-		MemoryBudget:         int64(memBudget),
+		WorkerCPURequest:     cfg.K8s.WorkerCPURequest,
+		WorkerMemoryRequest:  cfg.K8s.WorkerMemoryRequest,
+		WorkerNodeSelector:   parseNodeSelector(cfg.K8s.WorkerNodeSelector),
+		WorkerTolerationKey:   cfg.K8s.WorkerTolerationKey,
+		WorkerTolerationValue: cfg.K8s.WorkerTolerationValue,
+		WorkerExclusiveNode:  cfg.K8s.WorkerExclusiveNode,
 	}
 
 	// Initialize STS broker for credential brokering (best-effort)
@@ -229,4 +235,18 @@ func SetupMultiTenant(
 	}()
 
 	return store, adpt, apiServer, nil
+}
+
+// parseNodeSelector parses a JSON string into a map[string]string.
+// Returns nil if the input is empty or invalid.
+func parseNodeSelector(s string) map[string]string {
+	if s == "" {
+		return nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		slog.Warn("Invalid DUCKGRES_K8S_WORKER_NODE_SELECTOR JSON, ignoring.", "error", err)
+		return nil
+	}
+	return m
 }

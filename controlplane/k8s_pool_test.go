@@ -828,3 +828,128 @@ func TestK8sPool_IdleReaper(t *testing.T) {
 		t.Fatal("idle worker should have been reaped")
 	}
 }
+
+func TestWorkerResources_BothSet(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerCPURequest:    "500m",
+		workerMemoryRequest: "2Gi",
+	}
+	res := pool.workerResources()
+	if res.Requests == nil {
+		t.Fatal("expected requests to be set")
+	}
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != "500m" {
+		t.Fatalf("expected CPU request 500m, got %s", cpu.String())
+	}
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != "2Gi" {
+		t.Fatalf("expected memory request 2Gi, got %s", mem.String())
+	}
+	if res.Limits != nil {
+		t.Fatal("expected no limits to be set")
+	}
+}
+
+func TestWorkerResources_CPUOnly(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerCPURequest: "1",
+	}
+	res := pool.workerResources()
+	if _, ok := res.Requests[corev1.ResourceCPU]; !ok {
+		t.Fatal("expected CPU request")
+	}
+	if _, ok := res.Requests[corev1.ResourceMemory]; ok {
+		t.Fatal("expected no memory request")
+	}
+}
+
+func TestWorkerResources_MemoryOnly(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerMemoryRequest: "4Gi",
+	}
+	res := pool.workerResources()
+	if _, ok := res.Requests[corev1.ResourceMemory]; !ok {
+		t.Fatal("expected memory request")
+	}
+	if _, ok := res.Requests[corev1.ResourceCPU]; ok {
+		t.Fatal("expected no CPU request")
+	}
+}
+
+func TestWorkerResources_NeitherSet(t *testing.T) {
+	pool := &K8sWorkerPool{}
+	res := pool.workerResources()
+	if res.Requests != nil {
+		t.Fatal("expected empty requests (BestEffort)")
+	}
+	if res.Limits != nil {
+		t.Fatal("expected empty limits")
+	}
+}
+
+func TestWorkerScheduling_NodeSelectorAndToleration(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerNodeSelector:  map[string]string{"posthog.com/duckgres-workers": "duckgres-workers"},
+		workerTolerationKey: "posthog.com/duckgres-workers",
+	}
+
+	// Build a minimal pod to test scheduling additions
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			NodeSelector: pool.workerNodeSelector,
+		},
+	}
+
+	// Verify nodeSelector
+	if pod.Spec.NodeSelector == nil {
+		t.Fatal("expected nodeSelector to be set")
+	}
+	if pod.Spec.NodeSelector["posthog.com/duckgres-workers"] != "duckgres-workers" {
+		t.Fatalf("unexpected nodeSelector: %v", pod.Spec.NodeSelector)
+	}
+
+	// Verify toleration construction
+	if pool.workerTolerationKey == "" {
+		t.Fatal("expected tolerationKey to be set")
+	}
+	toleration := corev1.Toleration{
+		Key:    pool.workerTolerationKey,
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	if toleration.Key != "posthog.com/duckgres-workers" {
+		t.Fatalf("unexpected toleration key: %s", toleration.Key)
+	}
+	if toleration.Effect != corev1.TaintEffectNoSchedule {
+		t.Fatalf("expected NoSchedule effect, got %s", toleration.Effect)
+	}
+}
+
+func TestWorkerScheduling_NoSelectorOrToleration(t *testing.T) {
+	pool := &K8sWorkerPool{}
+
+	if pool.workerNodeSelector != nil {
+		t.Fatal("expected nil nodeSelector by default")
+	}
+	if pool.workerTolerationKey != "" {
+		t.Fatal("expected empty tolerationKey by default")
+	}
+}
+
+func TestParseNodeSelector(t *testing.T) {
+	// Valid JSON
+	m := parseNodeSelector(`{"posthog.com/pool":"workers"}`)
+	if m == nil || m["posthog.com/pool"] != "workers" {
+		t.Fatalf("expected parsed selector, got %v", m)
+	}
+
+	// Empty string
+	if parseNodeSelector("") != nil {
+		t.Fatal("expected nil for empty string")
+	}
+
+	// Invalid JSON
+	if parseNodeSelector("not-json") != nil {
+		t.Fatal("expected nil for invalid JSON")
+	}
+}

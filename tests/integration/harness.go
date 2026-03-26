@@ -18,6 +18,8 @@ import (
 	_ "github.com/lib/pq"
 )
 
+var duckLakeInfraServices = []string{"ducklake-metadata", "minio", "minio-init"}
+
 // TestHarness manages PostgreSQL and Duckgres instances for side-by-side testing
 type TestHarness struct {
 	PostgresDB  *sql.DB
@@ -501,13 +503,26 @@ func (h *TestHarness) Close() error {
 	return nil
 }
 
-// StartPostgresContainer starts the PostgreSQL Docker container
-func StartPostgresContainer() error {
+func dockerComposeArgs(composeFile string, command string, args ...string) []string {
+	composeArgs := []string{"-f", composeFile, command}
+	return append(composeArgs, args...)
+}
+
+func runDockerCompose(command string, args ...string) error {
 	testDir := getTestDir()
-	cmd := exec.Command("docker-compose", "-f", filepath.Join(testDir, "docker-compose.yml"), "up", "-d")
+	composeFile := filepath.Join(testDir, "docker-compose.yml")
+	cmd := exec.Command("docker-compose", dockerComposeArgs(composeFile, command, args...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker-compose %s %s: %w", command, strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+// StartPostgresContainer starts only the PostgreSQL comparison container.
+func StartPostgresContainer() error {
+	if err := runDockerCompose("up", "-d", "postgres"); err != nil {
 		return fmt.Errorf("failed to start PostgreSQL container: %w", err)
 	}
 
@@ -516,10 +531,18 @@ func StartPostgresContainer() error {
 	return nil
 }
 
+// StartDuckLakeInfraContainers starts the local DuckLake metadata/object-store services.
+func StartDuckLakeInfraContainers() error {
+	if err := runDockerCompose("up", append([]string{"-d"}, duckLakeInfraServices...)...); err != nil {
+		return fmt.Errorf("failed to start DuckLake infrastructure: %w", err)
+	}
+	return nil
+}
+
 // StopPostgresContainer stops the PostgreSQL Docker container
 func StopPostgresContainer() error {
 	testDir := getTestDir()
-	cmd := exec.Command("docker-compose", "-f", filepath.Join(testDir, "docker-compose.yml"), "down", "-v")
+	cmd := exec.Command("docker-compose", dockerComposeArgs(filepath.Join(testDir, "docker-compose.yml"), "down", "-v")...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Run()

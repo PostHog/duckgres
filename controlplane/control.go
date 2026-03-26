@@ -79,8 +79,14 @@ type K8sConfig struct {
 	ImagePullPolicy   string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
 	ServiceAccount    string // ServiceAccount name for worker pods (default: "default")
 	MaxWorkers        int    // Global cap for the shared K8s worker pool (0 = auto-derived)
-	SharedWarmTarget  int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
-	AWSRegion string // AWS region for STS client
+	SharedWarmTarget    int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	WorkerCPURequest    string // CPU request for worker pods (e.g., "500m")
+	WorkerMemoryRequest string // Memory request for worker pods (e.g., "1Gi")
+	WorkerNodeSelector    string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
+	WorkerTolerationKey   string // Taint key for worker pod NoSchedule toleration
+	WorkerTolerationValue string // Taint value for worker pod NoSchedule toleration
+	WorkerExclusiveNode  bool   // One worker per node via pod anti-affinity
+	AWSRegion           string // AWS region for STS client
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -348,6 +354,28 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 				}
 			}
 		}
+		// Check if DuckLake migration is needed (fast PG version query, <1s).
+		// If so, set the migrate flag immediately so workers use AUTOMATIC_MIGRATION
+		// TRUE and skip their own slow backup+check. The backup runs asynchronously
+		// as a safety net — it must not block startup or systemd will kill us
+		// (TimeoutStartSec=180 is shorter than the backup of large metadata stores).
+		if cfg.DuckLake.MetadataStore != "" {
+			if needed, ver, err := server.CheckDuckLakeMigrationVersion(cfg.DuckLake); err != nil {
+				slog.Warn("DuckLake migration version check failed, workers will check independently.", "error", err)
+			} else if needed {
+				slog.Info("DuckLake migration needed, workers will use AUTOMATIC_MIGRATION.", "from", ver, "to", server.DuckLakeSpecVersion())
+				procPool.ducklakeMigrate = true
+				// Run backup asynchronously — it's a safety net, not a gate.
+				go func() {
+					if err := server.BackupDuckLakeMetadata(cfg.DuckLake, cfg.DataDir); err != nil {
+						slog.Warn("DuckLake metadata backup failed (migration will still proceed).", "error", err)
+					} else {
+						slog.Info("DuckLake metadata backup completed.")
+					}
+				}()
+			}
+		}
+
 		pool := WorkerPool(procPool)
 
 		sessions := NewSessionManager(pool, rebalancer)

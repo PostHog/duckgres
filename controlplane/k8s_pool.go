@@ -53,8 +53,13 @@ type K8sWorkerPool struct {
 	configPath           string
 	imagePullPolicy      corev1.PullPolicy
 	serviceAccount       string
-	memoryBudget         int64      // total memory budget in bytes
-	orgID                string     // org ID for pod labels (multi-tenant mode)
+	workerCPURequest     string            // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest  string            // memory request for worker pods (e.g., "1Gi")
+	workerNodeSelector    map[string]string // node selector for worker pods
+	workerTolerationKey   string            // taint key for NoSchedule toleration
+	workerTolerationValue string            // taint value for NoSchedule toleration
+	workerExclusiveNode  bool              // one worker per node via anti-affinity
+	orgID                string            // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
 	cachedToken          string // cached bearer token (immutable after setup)
 	informer             cache.SharedIndexInformer
@@ -129,7 +134,12 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		configPath:           cfg.ConfigPath,
 		imagePullPolicy:      corev1.PullPolicy(cfg.ImagePullPolicy),
 		serviceAccount:       cfg.ServiceAccount,
-		memoryBudget:         cfg.MemoryBudget,
+		workerCPURequest:     cfg.WorkerCPURequest,
+		workerMemoryRequest:  cfg.WorkerMemoryRequest,
+		workerNodeSelector:    cfg.WorkerNodeSelector,
+		workerTolerationKey:   cfg.WorkerTolerationKey,
+		workerTolerationValue: cfg.WorkerTolerationValue,
+		workerExclusiveNode:  cfg.WorkerExclusiveNode,
 		orgID:                cfg.OrgID,
 		workerIDGenerator:    cfg.WorkerIDGenerator,
 		spawnSem:             make(chan struct{}, spawnConcurrency),
@@ -389,6 +399,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Spec: corev1.PodSpec{
 			RestartPolicy:      corev1.RestartPolicyNever,
 			ServiceAccountName: p.serviceAccount,
+			NodeSelector:       p.workerNodeSelector,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),
@@ -436,6 +447,33 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Name:  "DUCKGRES_SHARED_WARM_WORKER",
 		Value: "true",
 	})
+
+	// Add toleration if configured
+	if p.workerTolerationKey != "" {
+		tol := corev1.Toleration{
+			Key:    p.workerTolerationKey,
+			Effect: corev1.TaintEffectNoSchedule,
+		}
+		if p.workerTolerationValue != "" {
+			tol.Operator = corev1.TolerationOpEqual
+			tol.Value = p.workerTolerationValue
+		}
+		pod.Spec.Tolerations = []corev1.Toleration{tol}
+	}
+
+	// One worker per instance (only when dedicated node pool is configured)
+	if p.workerExclusiveNode {
+		pod.Spec.Affinity = &corev1.Affinity{
+			PodAntiAffinity: &corev1.PodAntiAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "duckgres-worker"},
+					},
+					TopologyKey: "kubernetes.io/hostname",
+				}},
+			},
+		}
+	}
 
 	// Add writable data directory for DuckDB databases
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
@@ -1385,27 +1423,21 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	}
 }
 
-// workerResources computes resource requests/limits for a worker pod.
-// If a memory budget is configured, each worker gets budget/maxWorkers as
-// memory limit (request = 50% of limit for Burstable QoS). If no budget
-// is set, returns an empty ResourceRequirements (BestEffort).
+// workerResources returns resource requests for a worker pod.
+// Set via DUCKGRES_K8S_WORKER_CPU_REQUEST / DUCKGRES_K8S_WORKER_MEMORY_REQUEST.
+// Returns empty (BestEffort) if neither is set.
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
-	if p.memoryBudget <= 0 || p.maxWorkers <= 0 {
+	requests := corev1.ResourceList{}
+	if p.workerCPURequest != "" {
+		requests[corev1.ResourceCPU] = resource.MustParse(p.workerCPURequest)
+	}
+	if p.workerMemoryRequest != "" {
+		requests[corev1.ResourceMemory] = resource.MustParse(p.workerMemoryRequest)
+	}
+	if len(requests) == 0 {
 		return corev1.ResourceRequirements{}
 	}
-	perWorkerBytes := p.memoryBudget / int64(p.maxWorkers)
-	memLimit := resource.NewQuantity(perWorkerBytes, resource.BinarySI)
-	memRequest := resource.NewQuantity(perWorkerBytes/2, resource.BinarySI)
-
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("100m"),
-			corev1.ResourceMemory: *memRequest,
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceMemory: *memLimit,
-		},
-	}
+	return corev1.ResourceRequirements{Requests: requests}
 }
 
 // --- Helpers ---

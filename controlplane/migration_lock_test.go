@@ -26,12 +26,10 @@ func TestOrgRouterMigrationLock(t *testing.T) {
 		t.Fatal("expected org-1 to be migrating after SetMigrating")
 	}
 
-	// Other orgs unaffected
 	if router.IsMigrating("org-2") {
 		t.Fatal("expected org-2 to not be migrating")
 	}
 
-	// Clear
 	router.ClearMigrating("org-1")
 	if router.IsMigrating("org-1") {
 		t.Fatal("expected org-1 to not be migrating after ClearMigrating")
