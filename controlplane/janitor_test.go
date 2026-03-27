@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ type captureControlPlaneExpiryStore struct {
 	mu                    sync.Mutex
 	cutoffs               []time.Time
 	count                 int64
+	expireErr             error
 	drainingCutoffs       []time.Time
 	drainingCount         int64
 	orphanedBefore        []time.Time
@@ -27,7 +29,7 @@ func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cutoffs = append(s.cutoffs, cutoff)
-	return s.count, nil
+	return s.count, s.expireErr
 }
 
 func (s *captureControlPlaneExpiryStore) ExpireDrainingControlPlaneInstances(before time.Time) (int64, error) {
@@ -220,5 +222,64 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 	defer mu.Unlock()
 	if calls == 0 {
 		t.Fatal("expected janitor to reconcile warm capacity")
+	}
+}
+
+func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
+	store := &captureControlPlaneExpiryStore{
+		expireErr: errors.New("boom"),
+		orphanedWorkers: []configstore.WorkerRecord{
+			{WorkerID: 7, PodName: "duckgres-worker-7"},
+		},
+		stuckWorkers: []configstore.WorkerRecord{
+			{WorkerID: 9, PodName: "duckgres-worker-9", State: configstore.WorkerStateActivating},
+		},
+	}
+	now := time.Date(2026, time.March, 27, 18, 0, 0, 0, time.UTC)
+	janitor := NewControlPlaneJanitor(store, time.Second, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+
+	var mu sync.Mutex
+	var retired []struct {
+		id     int
+		reason string
+	}
+	reconciled := 0
+	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
+		mu.Lock()
+		defer mu.Unlock()
+		retired = append(retired, struct {
+			id     int
+			reason string
+		}{id: record.WorkerID, reason: reason})
+	}
+	janitor.reconcileWarmCapacity = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		reconciled++
+	}
+
+	janitor.runOnce()
+
+	if len(store.cutoffs) != 1 {
+		t.Fatalf("expected stale control-plane expiry to run once, got %d", len(store.cutoffs))
+	}
+	if len(store.orphanedBefore) != 1 {
+		t.Fatalf("expected orphaned worker lookup despite expiry error, got %d", len(store.orphanedBefore))
+	}
+	if len(store.stuckSpawningBefore) != 1 || len(store.stuckActivatingBefore) != 1 {
+		t.Fatalf("expected stuck worker lookup despite expiry error, got spawning=%d activating=%d", len(store.stuckSpawningBefore), len(store.stuckActivatingBefore))
+	}
+	if len(store.expiredSessionsBefore) != 1 {
+		t.Fatalf("expected flight session expiry despite expiry error, got %d", len(store.expiredSessionsBefore))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(retired) != 2 {
+		t.Fatalf("expected orphaned and stuck workers to be retired, got %+v", retired)
+	}
+	if reconciled != 1 {
+		t.Fatalf("expected warm capacity reconciliation despite expiry error, got %d", reconciled)
 	}
 }

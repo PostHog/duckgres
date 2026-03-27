@@ -78,9 +78,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 	expired, err := j.store.ExpireControlPlaneInstances(cutoff)
 	if err != nil {
 		slog.Warn("Janitor failed to expire stale control-plane instances.", "error", err)
-		return
-	}
-	if expired > 0 {
+	} else if expired > 0 {
 		slog.Info("Janitor expired stale control-plane instances.", "count", expired, "cutoff", cutoff)
 	}
 
