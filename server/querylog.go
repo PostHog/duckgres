@@ -138,7 +138,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	// The Go database/sql driver cannot bind uint64 values with the high bit set,
 	// so we store hashes as int64/BIGINT. The bit pattern is preserved.
 	var colType string
-	err = db.QueryRow("SELECT data_type FROM information_schema.columns WHERE table_schema = 'system' AND table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
+	err = db.QueryRow("SELECT data_type FROM ducklake.information_schema.columns WHERE table_schema = 'system' AND table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
 	if err == nil && strings.ToUpper(colType) != "BIGINT" {
 		if _, alterErr := db.Exec("ALTER TABLE ducklake.system.query_log ALTER COLUMN normalized_query_hash SET DATA TYPE BIGINT"); alterErr != nil {
 			slog.Warn("querylog: failed to migrate normalized_query_hash to BIGINT.", "error", alterErr)
