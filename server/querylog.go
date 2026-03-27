@@ -107,6 +107,17 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		return nil, fmt.Errorf("querylog: create schema: %w", err)
 	}
 
+	// Migrate normalized_query_hash from UBIGINT to BIGINT for existing tables.
+	// DuckLake doesn't support narrowing ALTER COLUMN, so drop and recreate.
+	var colType string
+	err = db.QueryRow("SELECT data_type FROM ducklake.information_schema.columns WHERE table_schema = 'system' AND table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
+	if err == nil && strings.ToUpper(colType) != "BIGINT" {
+		slog.Info("querylog: dropping query_log to migrate normalized_query_hash from UBIGINT to BIGINT.")
+		if _, dropErr := db.Exec("DROP TABLE ducklake.system.query_log"); dropErr != nil {
+			slog.Warn("querylog: failed to drop query_log for migration.", "error", dropErr)
+		}
+	}
+
 	createTable := `CREATE TABLE IF NOT EXISTS ducklake.system.query_log (
 		event_time          TIMESTAMPTZ NOT NULL,
 		query_duration_ms   BIGINT NOT NULL,
@@ -132,19 +143,6 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	if _, err := db.Exec(createTable); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("querylog: create table: %w", err)
-	}
-
-	// Migrate normalized_query_hash from UBIGINT to BIGINT for existing tables.
-	// The Go database/sql driver cannot bind uint64 values with the high bit set,
-	// so we store hashes as int64/BIGINT. The bit pattern is preserved.
-	var colType string
-	err = db.QueryRow("SELECT data_type FROM ducklake.information_schema.columns WHERE table_schema = 'system' AND table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
-	if err == nil && strings.ToUpper(colType) != "BIGINT" {
-		if _, alterErr := db.Exec("ALTER TABLE ducklake.system.query_log ALTER COLUMN normalized_query_hash SET DATA TYPE BIGINT"); alterErr != nil {
-			slog.Warn("querylog: failed to migrate normalized_query_hash to BIGINT.", "error", alterErr)
-		} else {
-			slog.Info("querylog: migrated normalized_query_hash from UBIGINT to BIGINT.")
-		}
 	}
 
 	// Configure data inlining
