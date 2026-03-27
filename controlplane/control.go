@@ -129,7 +129,7 @@ type ConfigStoreInterface interface {
 	ValidateUser(username, password string) (orgID string, ok bool)
 	OrgForUser(username string) string
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
-	FindFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
+	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
 	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
 	CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error
 }

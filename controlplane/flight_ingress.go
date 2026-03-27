@@ -175,7 +175,7 @@ func (s *configStoreFlightSessionStore) UpsertSession(record flightsqlingress.Du
 }
 
 func (s *configStoreFlightSessionStore) GetSession(sessionToken string) (*flightsqlingress.DurableSessionRecord, error) {
-	record, err := s.store.FindFlightSessionRecord(sessionToken)
+	record, err := s.store.GetFlightSessionRecord(sessionToken)
 	if err != nil || record == nil {
 		return nil, err
 	}

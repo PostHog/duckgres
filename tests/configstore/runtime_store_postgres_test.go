@@ -559,7 +559,7 @@ func TestExpireFlightSessionRecordsPostgres(t *testing.T) {
 	}
 }
 
-func TestFindTouchAndCloseFlightSessionRecordPostgres(t *testing.T) {
+func TestGetTouchAndCloseFlightSessionRecordPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 16, 0, 0, 0, time.UTC)
 
@@ -576,9 +576,9 @@ func TestFindTouchAndCloseFlightSessionRecordPostgres(t *testing.T) {
 		t.Fatalf("UpsertFlightSessionRecord: %v", err)
 	}
 
-	record, err := store.FindFlightSessionRecord("flight-touch-close")
+	record, err := store.GetFlightSessionRecord("flight-touch-close")
 	if err != nil {
-		t.Fatalf("FindFlightSessionRecord: %v", err)
+		t.Fatalf("GetFlightSessionRecord: %v", err)
 	}
 	if record == nil || record.Username != "postgres" {
 		t.Fatalf("expected durable record with username postgres, got %#v", record)
@@ -609,6 +609,18 @@ func TestFindTouchAndCloseFlightSessionRecordPostgres(t *testing.T) {
 	}
 	if !record.LastSeenAt.Equal(closedAt) {
 		t.Fatalf("expected close timestamp %v, got %v", closedAt, record.LastSeenAt)
+	}
+}
+
+func TestGetFlightSessionRecordReturnsNilWhenMissing(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	record, err := store.GetFlightSessionRecord("missing-flight-session")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord: %v", err)
+	}
+	if record != nil {
+		t.Fatalf("expected nil record for missing session, got %#v", record)
 	}
 }
 

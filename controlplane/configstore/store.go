@@ -741,20 +741,12 @@ func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) er
 // GetFlightSessionRecord returns a durable Flight reconnect row by session token.
 func (cs *ConfigStore) GetFlightSessionRecord(sessionToken string) (*FlightSessionRecord, error) {
 	var record FlightSessionRecord
-	if err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "session_token = ?", sessionToken).Error; err != nil {
-		return nil, fmt.Errorf("get flight session record: %w", err)
-	}
-	return &record, nil
-}
-
-func (cs *ConfigStore) FindFlightSessionRecord(sessionToken string) (*FlightSessionRecord, error) {
-	var record FlightSessionRecord
 	err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "session_token = ?", sessionToken).Error
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("find flight session record: %w", err)
+		return nil, fmt.Errorf("get flight session record: %w", err)
 	}
 	return &record, nil
 }
