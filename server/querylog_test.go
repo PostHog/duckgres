@@ -235,6 +235,65 @@ func TestHighBitHashRejectsUbigint(t *testing.T) {
 	}
 }
 
+// TestUbigintToBigintMigrationViaDrop simulates the migration path: an existing
+// table with a UBIGINT column is dropped and recreated as BIGINT, after which
+// negative int64 hash values insert successfully.
+func TestUbigintToBigintMigrationViaDrop(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Start with the old schema (UBIGINT)
+	_, err = db.Exec("CREATE TABLE query_log (normalized_query_hash UBIGINT)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Verify negative int64 fails with UBIGINT (the bug)
+	var highBitHash int64 = -2949375574818077459
+	_, err = db.Exec("INSERT INTO query_log VALUES ($1)", highBitHash)
+	if err == nil {
+		t.Fatal("expected UBIGINT to reject negative int64")
+	}
+
+	// Check column type via information_schema (simulates the migration check)
+	var colType string
+	err = db.QueryRow("SELECT data_type FROM information_schema.columns WHERE table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
+	if err != nil {
+		t.Fatalf("query information_schema: %v", err)
+	}
+	if colType != "UBIGINT" {
+		t.Fatalf("expected UBIGINT, got %s", colType)
+	}
+
+	// Simulate migration: drop and recreate with BIGINT
+	_, err = db.Exec("DROP TABLE query_log")
+	if err != nil {
+		t.Fatalf("drop table: %v", err)
+	}
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS query_log (normalized_query_hash BIGINT)")
+	if err != nil {
+		t.Fatalf("recreate table: %v", err)
+	}
+
+	// Now the insert should succeed
+	_, err = db.Exec("INSERT INTO query_log VALUES ($1)", highBitHash)
+	if err != nil {
+		t.Fatalf("insert after migration failed: %v", err)
+	}
+
+	var stored int64
+	err = db.QueryRow("SELECT normalized_query_hash FROM query_log").Scan(&stored)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if stored != highBitHash {
+		t.Errorf("round-trip mismatch: got %d, want %d", stored, highBitHash)
+	}
+}
+
 func TestSplitHostPort(t *testing.T) {
 	host, port, err := splitHostPort("192.168.1.1:5432")
 	if err != nil {

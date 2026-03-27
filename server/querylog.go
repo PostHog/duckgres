@@ -114,7 +114,9 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	if err == nil && strings.ToUpper(colType) != "BIGINT" {
 		slog.Info("querylog: dropping query_log to migrate normalized_query_hash from UBIGINT to BIGINT.")
 		if _, dropErr := db.Exec("DROP TABLE ducklake.system.query_log"); dropErr != nil {
-			slog.Warn("querylog: failed to drop query_log for migration.", "error", dropErr)
+			slog.Error("querylog: cannot migrate normalized_query_hash; disabling query log.", "error", dropErr)
+			_ = db.Close()
+			return nil, nil
 		}
 	}
 
