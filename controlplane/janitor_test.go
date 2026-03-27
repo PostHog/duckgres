@@ -160,3 +160,40 @@ func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 		t.Fatal("expected expired flight session cleanup")
 	}
 }
+
+func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
+	store := &captureControlPlaneExpiryStore{}
+	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+
+	var mu sync.Mutex
+	calls := 0
+	janitor.reconcileWarmCapacity = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		janitor.Run(ctx)
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("janitor did not stop after context cancellation")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls == 0 {
+		t.Fatal("expected janitor to reconcile warm capacity")
+	}
+}

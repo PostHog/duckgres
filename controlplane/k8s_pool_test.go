@@ -38,6 +38,13 @@ type captureRuntimeWorkerStore struct {
 	spawnPodNamePrefix  string
 	spawnMaxOrgWorkers  int
 	spawnMaxGlobalWorks int
+	neutralSpawned          *configstore.WorkerRecord
+	neutralSpawnErr         error
+	neutralSpawnCalls       int
+	neutralSpawnOwnerCPID   string
+	neutralSpawnPodPrefix   string
+	neutralSpawnTarget      int
+	neutralSpawnMaxGlobal   int
 	takenOver           *configstore.WorkerRecord
 	takeOverErr         error
 	takeOverWorkerID    int
@@ -98,6 +105,24 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 		return nil, nil
 	}
 	spawned := *s.spawned
+	return &spawned, nil
+}
+
+func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.neutralSpawnCalls++
+	s.neutralSpawnOwnerCPID = ownerCPInstanceID
+	s.neutralSpawnPodPrefix = podNamePrefix
+	s.neutralSpawnTarget = targetWarmWorkers
+	s.neutralSpawnMaxGlobal = maxGlobalWorkers
+	if s.neutralSpawnErr != nil {
+		return nil, s.neutralSpawnErr
+	}
+	if s.neutralSpawned == nil {
+		return nil, nil
+	}
+	spawned := *s.neutralSpawned
 	return &spawned, nil
 }
 
@@ -655,7 +680,7 @@ func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 	}
 }
 
-func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(t *testing.T) {
+func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentInRuntimeMode(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	pool.minWorkers = 1
 	store := &captureRuntimeWorkerStore{}
@@ -733,9 +758,9 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 	}
 
 	select {
-	case <-replacementSpawned:
-	case <-time.After(time.Second):
-		t.Fatal("expected reserve to trigger warm-pool replenishment")
+	case id := <-replacementSpawned:
+		t.Fatalf("did not expect local warm-pool replenishment in runtime mode, got background spawn %d", id)
+	default:
 	}
 }
 
@@ -1014,7 +1039,7 @@ func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *t
 func TestK8sPoolSpawnWarmWorkerAllocatesRuntimeSlotWhenIDZero(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{
-		spawned: &configstore.WorkerRecord{
+		neutralSpawned: &configstore.WorkerRecord{
 			WorkerID:          41,
 			PodName:           "duckgres-worker-test-cp-41",
 			State:             configstore.WorkerStateSpawning,
@@ -1035,11 +1060,11 @@ func TestK8sPoolSpawnWarmWorkerAllocatesRuntimeSlotWhenIDZero(t *testing.T) {
 	if spawnedID != 41 {
 		t.Fatalf("expected runtime-allocated worker id 41, got %d", spawnedID)
 	}
-	if store.spawnCalls != 1 {
-		t.Fatalf("expected one runtime spawn slot allocation, got %d", store.spawnCalls)
+	if store.neutralSpawnCalls != 1 {
+		t.Fatalf("expected one runtime neutral spawn slot allocation, got %d", store.neutralSpawnCalls)
 	}
-	if store.spawnPodNamePrefix != "duckgres-worker-test-cp" {
-		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.spawnPodNamePrefix)
+	if store.neutralSpawnPodPrefix != "duckgres-worker-test-cp" {
+		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.neutralSpawnPodPrefix)
 	}
 }
 
@@ -1050,7 +1075,7 @@ func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
 
 	var mu sync.Mutex
 	var slots int
-	store.spawned = &configstore.WorkerRecord{
+	store.neutralSpawned = &configstore.WorkerRecord{
 		WorkerID:          51,
 		PodName:           "duckgres-worker-test-cp-51",
 		State:             configstore.WorkerStateSpawning,
@@ -1064,7 +1089,7 @@ func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
 			if id != 51 {
 				t.Fatalf("expected first runtime worker id 51, got %d", id)
 			}
-			store.spawned = &configstore.WorkerRecord{
+			store.neutralSpawned = &configstore.WorkerRecord{
 				WorkerID:          52,
 				PodName:           "duckgres-worker-test-cp-52",
 				State:             configstore.WorkerStateSpawning,
@@ -1081,8 +1106,11 @@ func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
 	if err := pool.SpawnMinWorkers(2); err != nil {
 		t.Fatalf("SpawnMinWorkers: %v", err)
 	}
-	if store.spawnCalls != 2 {
-		t.Fatalf("expected two runtime spawn slot allocations, got %d", store.spawnCalls)
+	if store.neutralSpawnCalls != 2 {
+		t.Fatalf("expected two runtime neutral spawn slot allocations, got %d", store.neutralSpawnCalls)
+	}
+	if store.neutralSpawnTarget != 2 {
+		t.Fatalf("expected neutral warm target 2, got %d", store.neutralSpawnTarget)
 	}
 }
 

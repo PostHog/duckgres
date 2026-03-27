@@ -535,6 +535,70 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string,
 	return created, nil
 }
 
+// CreateNeutralWarmWorkerSlot creates a durable spawning worker row for the shared
+// neutral warm pool under advisory-lock protected cluster-wide warm-target and
+// global capacity checks. A nil result means capacity already satisfies the target
+// or the global worker cap blocked the spawn.
+func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+	if strings.TrimSpace(podNamePrefix) == "" {
+		return nil, fmt.Errorf("pod name prefix is required")
+	}
+
+	var created *WorkerRecord
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:shared-warm-target")).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:global-worker-capacity")).Error; err != nil {
+			return err
+		}
+
+		if targetWarmWorkers > 0 {
+			count, err := cs.countNeutralWarmWorkers(tx)
+			if err != nil {
+				return err
+			}
+			if count >= int64(targetWarmWorkers) {
+				return nil
+			}
+		}
+
+		if maxGlobalWorkers > 0 {
+			count, err := cs.countActiveWorkers(tx)
+			if err != nil {
+				return err
+			}
+			if count >= int64(maxGlobalWorkers) {
+				return nil
+			}
+		}
+
+		var workerID int64
+		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM "+cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		record := &WorkerRecord{
+			WorkerID:          int(workerID),
+			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
+			State:             WorkerStateSpawning,
+			OrgID:             "",
+			OwnerCPInstanceID: ownerCPInstanceID,
+			OwnerEpoch:        0,
+			LastHeartbeatAt:   now,
+		}
+		if err := tx.Table(cs.runtimeTable(record.TableName())).Create(record).Error; err != nil {
+			return err
+		}
+		created = record
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create neutral warm worker slot: %w", err)
+	}
+	return created, nil
+}
+
 // ListOrphanedWorkers returns active workers whose owning control-plane instance
 // has already been marked expired long enough ago to pass the orphan grace cutoff.
 func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
@@ -618,6 +682,17 @@ func (cs *ConfigStore) countActiveWorkers(tx *gorm.DB, where ...any) (int64, err
 		}
 	}
 	if err := query.Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB) (int64, error) {
+	var count int64
+	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("org_id = ''").
+		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
+		Count(&count).Error; err != nil {
 		return 0, err
 	}
 	return count, nil

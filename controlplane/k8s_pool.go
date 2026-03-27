@@ -1231,6 +1231,49 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 		return nil
 	}
 
+	if p.runtimeStore != nil {
+		p.mu.Lock()
+		if count > p.minWorkers {
+			p.minWorkers = count
+		}
+		p.mu.Unlock()
+
+		ctx := context.Background()
+		for i := 0; i < count; i++ {
+			slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
+				p.cpInstanceID,
+				p.workerPodNamePrefix(),
+				count,
+				p.maxWorkers,
+			)
+			if err != nil {
+				return err
+			}
+			if slot == nil {
+				break
+			}
+
+			p.mu.Lock()
+			p.spawning++
+			p.mu.Unlock()
+
+			err = p.spawnWarmWorker(ctx, slot.WorkerID)
+
+			p.mu.Lock()
+			p.spawning--
+			if err == nil {
+				observeWarmPoolLifecycleGauges(p.workers)
+			}
+			p.mu.Unlock()
+
+			if err != nil {
+				p.retireClaimedWorker(slot, RetireReasonCrash)
+				return err
+			}
+		}
+		return nil
+	}
+
 	p.mu.Lock()
 	if count > p.minWorkers {
 		p.minWorkers = count
@@ -1739,6 +1782,9 @@ func (p *K8sWorkerPool) idleWarmWorkerCountLocked() int {
 }
 
 func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
+	if p.runtimeStore != nil {
+		return false
+	}
 	if p.minWorkers <= 0 {
 		return false
 	}
@@ -1751,13 +1797,10 @@ func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
 
 func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int) error {
 	if id <= 0 && p.runtimeStore != nil {
-		slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
+		slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
 			p.cpInstanceID,
-			"",
-			0,
-			time.Time{},
 			p.workerPodNamePrefix(),
-			0,
+			p.minWorkers,
 			p.maxWorkers,
 		)
 		if err != nil {
@@ -1896,6 +1939,12 @@ func (p *K8sWorkerPool) SetWarmCapacityTarget(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.minWorkers = n
+}
+
+func (p *K8sWorkerPool) WarmCapacityTarget() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.minWorkers
 }
 
 func boolPtr(b bool) *bool    { return &b }

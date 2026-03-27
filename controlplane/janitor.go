@@ -24,11 +24,12 @@ type ControlPlaneJanitor struct {
 	store         controlPlaneExpiryStore
 	interval      time.Duration
 	expiryTimeout time.Duration
-	orphanGrace   time.Duration
-	spawnTimeout  time.Duration
+	orphanGrace     time.Duration
+	spawnTimeout    time.Duration
 	activateTimeout time.Duration
-	now           func() time.Time
-	retireWorker  func(record configstore.WorkerRecord, reason string)
+	now              func() time.Time
+	retireWorker     func(record configstore.WorkerRecord, reason string)
+	reconcileWarmCapacity func()
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -103,6 +104,10 @@ func (j *ControlPlaneJanitor) runOnce() {
 
 	if _, err := j.store.ExpireFlightSessionRecords(j.now()); err != nil {
 		slog.Warn("Janitor failed to expire stale Flight sessions.", "error", err)
+	}
+
+	if j.reconcileWarmCapacity != nil {
+		j.reconcileWarmCapacity()
 	}
 }
 

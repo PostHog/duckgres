@@ -351,12 +351,6 @@ func (tr *OrgRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
 	}
 
 	tr.sharedPool.SetWarmCapacityTarget(target)
-	if target > 0 {
-		observeOrgWorkerSpawn("shared")
-		if err := tr.sharedPool.SpawnMinWorkers(target); err != nil {
-			slog.Warn("Failed to reconcile shared warm capacity.", "target", target, "error", err)
-		}
-	}
 }
 
 func (tr *OrgRouter) onSharedWorkerCrash(workerID int) {

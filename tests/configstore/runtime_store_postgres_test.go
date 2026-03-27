@@ -360,6 +360,45 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 	}
 }
 
+func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 13, 30, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          10,
+		PodName:           "duckgres-worker-existing-10",
+		State:             configstore.WorkerStateIdle,
+		OrgID:             "",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        0,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(existing neutral): %v", err)
+	}
+
+	blocked, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", 1, 5)
+	if err != nil {
+		t.Fatalf("CreateNeutralWarmWorkerSlot(shared target): %v", err)
+	}
+	if blocked != nil {
+		t.Fatalf("expected shared warm target to block spawning, got %#v", blocked)
+	}
+
+	slot, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", 2, 5)
+	if err != nil {
+		t.Fatalf("CreateNeutralWarmWorkerSlot(expand target): %v", err)
+	}
+	if slot == nil {
+		t.Fatal("expected neutral warm slot to be created")
+	}
+	if slot.OrgID != "" {
+		t.Fatalf("expected neutral warm slot org to be empty, got %q", slot.OrgID)
+	}
+	if slot.State != configstore.WorkerStateSpawning {
+		t.Fatalf("expected spawning state, got %q", slot.State)
+	}
+}
+
 func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)

@@ -212,6 +212,16 @@ func SetupMultiTenant(
 	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
 		router.sharedPool.retireClaimedWorker(&record, reason)
 	}
+	janitor.reconcileWarmCapacity = func() {
+		target := router.sharedPool.WarmCapacityTarget()
+		if target <= 0 {
+			return
+		}
+		observeOrgWorkerSpawn("shared")
+		if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
+			slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
+		}
+	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
