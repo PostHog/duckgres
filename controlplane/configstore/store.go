@@ -343,6 +343,23 @@ func (cs *ConfigStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, err
 	return result.RowsAffected, nil
 }
 
+// ExpireDrainingControlPlaneInstances marks draining control-plane rows expired
+// once their draining_at timestamp exceeds the configured handover timeout.
+func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (int64, error) {
+	now := time.Now()
+	result := cs.db.Table(cs.runtimeTable((&ControlPlaneInstance{}).TableName())).
+		Where("state = ? AND draining_at IS NOT NULL AND draining_at <= ?", ControlPlaneInstanceStateDraining, before).
+		Updates(map[string]any{
+			"state":      ControlPlaneInstanceStateExpired,
+			"expired_at": now,
+			"updated_at": now,
+		})
+	if result.Error != nil {
+		return 0, fmt.Errorf("expire draining control plane instances: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
 // UpsertWorkerRecord inserts or updates a runtime worker row.
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{

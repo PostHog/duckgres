@@ -209,6 +209,7 @@ func SetupMultiTenant(
 		5*time.Second,
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
+	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
 	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
 		router.sharedPool.retireClaimedWorker(&record, reason)
 	}

@@ -13,6 +13,8 @@ type captureControlPlaneExpiryStore struct {
 	mu                    sync.Mutex
 	cutoffs               []time.Time
 	count                 int64
+	drainingCutoffs       []time.Time
+	drainingCount         int64
 	orphanedBefore        []time.Time
 	orphanedWorkers       []configstore.WorkerRecord
 	stuckSpawningBefore   []time.Time
@@ -26,6 +28,13 @@ func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time
 	defer s.mu.Unlock()
 	s.cutoffs = append(s.cutoffs, cutoff)
 	return s.count, nil
+}
+
+func (s *captureControlPlaneExpiryStore) ExpireDrainingControlPlaneInstances(before time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.drainingCutoffs = append(s.drainingCutoffs, before)
+	return s.drainingCount, nil
 }
 
 func (s *captureControlPlaneExpiryStore) snapshot() []time.Time {
@@ -67,6 +76,7 @@ func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 15, 0, 0, 0, time.UTC)
 	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
 	janitor.now = func() time.Time { return now }
+	janitor.maxDrainTimeout = 15 * time.Minute
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -92,6 +102,15 @@ func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 	for i, cutoff := range calls {
 		if !cutoff.Equal(wantCutoff) {
 			t.Fatalf("call %d expected cutoff %v, got %v", i, wantCutoff, cutoff)
+		}
+	}
+	wantDrainCutoff := now.Add(-15 * time.Minute)
+	if len(store.drainingCutoffs) < 2 {
+		t.Fatalf("expected janitor to expire overdue draining instances at least twice, got %d", len(store.drainingCutoffs))
+	}
+	for i, cutoff := range store.drainingCutoffs {
+		if !cutoff.Equal(wantDrainCutoff) {
+			t.Fatalf("draining call %d expected cutoff %v, got %v", i, wantDrainCutoff, cutoff)
 		}
 	}
 }

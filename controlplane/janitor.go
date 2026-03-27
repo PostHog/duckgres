@@ -15,6 +15,7 @@ const (
 
 type controlPlaneExpiryStore interface {
 	ExpireControlPlaneInstances(cutoff time.Time) (int64, error)
+	ExpireDrainingControlPlaneInstances(before time.Time) (int64, error)
 	ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error)
 	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
@@ -27,6 +28,7 @@ type ControlPlaneJanitor struct {
 	orphanGrace     time.Duration
 	spawnTimeout    time.Duration
 	activateTimeout time.Duration
+	maxDrainTimeout time.Duration
 	now              func() time.Time
 	retireWorker     func(record configstore.WorkerRecord, reason string)
 	reconcileWarmCapacity func()
@@ -46,6 +48,7 @@ func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeo
 		orphanGrace:     30 * time.Second,
 		spawnTimeout:    2 * time.Minute,
 		activateTimeout: 2 * time.Minute,
+		maxDrainTimeout: 15 * time.Minute,
 		now:             time.Now,
 	}
 }
@@ -79,6 +82,16 @@ func (j *ControlPlaneJanitor) runOnce() {
 	}
 	if expired > 0 {
 		slog.Info("Janitor expired stale control-plane instances.", "count", expired, "cutoff", cutoff)
+	}
+
+	if j.maxDrainTimeout > 0 {
+		drainingBefore := j.now().Add(-j.maxDrainTimeout)
+		expiredDraining, err := j.store.ExpireDrainingControlPlaneInstances(drainingBefore)
+		if err != nil {
+			slog.Warn("Janitor failed to expire overdue draining control-plane instances.", "error", err)
+		} else if expiredDraining > 0 {
+			slog.Info("Janitor expired overdue draining control-plane instances.", "count", expiredDraining, "cutoff", drainingBefore)
+		}
 	}
 
 	orphanedBefore := j.now().Add(-(j.expiryTimeout + j.orphanGrace))

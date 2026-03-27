@@ -284,6 +284,68 @@ func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	}
 }
 
+func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	startedAt := time.Date(2026, time.March, 26, 14, 0, 0, 0, time.UTC)
+	oldDrain := startedAt.Add(5 * time.Minute)
+	recentDrain := startedAt.Add(20 * time.Minute)
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-draining-old:boot-a",
+		PodName:         "duckgres-old",
+		PodUID:          "pod-old",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateDraining,
+		StartedAt:       startedAt,
+		LastHeartbeatAt: recentDrain,
+		DrainingAt:      &oldDrain,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(old draining): %v", err)
+	}
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-draining-recent:boot-b",
+		PodName:         "duckgres-recent",
+		PodUID:          "pod-recent",
+		BootID:          "boot-b",
+		State:           configstore.ControlPlaneInstanceStateDraining,
+		StartedAt:       startedAt,
+		LastHeartbeatAt: recentDrain,
+		DrainingAt:      &recentDrain,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(recent draining): %v", err)
+	}
+
+	expired, err := store.ExpireDrainingControlPlaneInstances(startedAt.Add(15 * time.Minute))
+	if err != nil {
+		t.Fatalf("ExpireDrainingControlPlaneInstances: %v", err)
+	}
+	if expired != 1 {
+		t.Fatalf("expected 1 overdue draining instance, got %d", expired)
+	}
+
+	old, err := store.GetControlPlaneInstance("cp-draining-old:boot-a")
+	if err != nil {
+		t.Fatalf("GetControlPlaneInstance(old draining): %v", err)
+	}
+	if old.State != configstore.ControlPlaneInstanceStateExpired {
+		t.Fatalf("expected old draining instance to be expired, got %q", old.State)
+	}
+	if old.ExpiredAt == nil {
+		t.Fatal("expected expired_at to be set for old draining instance")
+	}
+
+	recent, err := store.GetControlPlaneInstance("cp-draining-recent:boot-b")
+	if err != nil {
+		t.Fatalf("GetControlPlaneInstance(recent draining): %v", err)
+	}
+	if recent.State != configstore.ControlPlaneInstanceStateDraining {
+		t.Fatalf("expected recent draining instance to remain draining, got %q", recent.State)
+	}
+	if recent.ExpiredAt != nil {
+		t.Fatalf("expected recent draining instance expired_at to stay nil, got %v", recent.ExpiredAt)
+	}
+}
+
 func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
