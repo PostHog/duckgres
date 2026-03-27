@@ -14,6 +14,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch"]
+  # Coordinate leader election for janitor work
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   # Read bearer token secret; create if auto-generating; update if key missing
   - apiGroups: [""]
     resources: ["secrets"]

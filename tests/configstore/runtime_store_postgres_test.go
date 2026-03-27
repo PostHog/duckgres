@@ -489,6 +489,18 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(orphaned): %v", err)
 	}
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          63,
+		PodName:           "duckgres-worker-63",
+		State:             configstore.WorkerStateRetired,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-expired:boot-a",
+		OwnerEpoch:        3,
+		LastHeartbeatAt:   now.Add(-time.Minute),
+		RetireReason:      "normal",
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(retired orphan): %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          62,
 		PodName:           "duckgres-worker-62",
 		State:             configstore.WorkerStateActivating,
@@ -509,8 +521,11 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
-	if len(orphaned) != 1 || orphaned[0].WorkerID != 61 {
+	if len(orphaned) != 2 {
 		t.Fatalf("expected orphaned worker 61, got %#v", orphaned)
+	}
+	if orphaned[0].WorkerID != 61 || orphaned[1].WorkerID != 63 {
+		t.Fatalf("expected orphaned workers 61 and 63, got %#v", orphaned)
 	}
 
 	stuck, err := store.ListStuckWorkers(now.Add(-2*time.Minute), now.Add(-2*time.Minute))

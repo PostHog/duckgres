@@ -616,26 +616,32 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 	return created, nil
 }
 
-// ListOrphanedWorkers returns active workers whose owning control-plane instance
-// has already been marked expired long enough ago to pass the orphan grace cutoff.
+// ListOrphanedWorkers returns workers whose owning control-plane instance has
+// already been marked expired long enough ago to pass the orphan grace cutoff.
+// Retired/lost rows are included so a replacement janitor can finish deleting
+// worker pods when the original control plane died after persisting retirement
+// but before the Kubernetes delete completed.
 func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
-	activeStates := []WorkerState{
+	cleanupStates := []WorkerState{
 		WorkerStateSpawning,
 		WorkerStateIdle,
 		WorkerStateReserved,
 		WorkerStateActivating,
 		WorkerStateHot,
 		WorkerStateDraining,
+		WorkerStateRetired,
+		WorkerStateLost,
 	}
 	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
 	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
 	err := cs.db.Table(workerTable+" AS w").
 		Select("w.*").
 		Joins("JOIN "+cpTable+" AS cp ON cp.id = w.owner_cp_instance_id").
-		Where("w.state IN ?", activeStates).
+		Where("w.state IN ?", cleanupStates).
 		Where("cp.state = ?", ControlPlaneInstanceStateExpired).
 		Where("cp.expired_at IS NOT NULL AND cp.expired_at <= ?", before).
+		Order("w.worker_id ASC").
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list orphaned workers: %w", err)

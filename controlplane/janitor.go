@@ -94,7 +94,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 		}
 	}
 
-	orphanedBefore := j.now().Add(-(j.expiryTimeout + j.orphanGrace))
+	orphanedBefore := j.now().Add(-j.orphanGrace)
 	orphaned, err := j.store.ListOrphanedWorkers(orphanedBefore)
 	if err != nil {
 		slog.Warn("Janitor failed to list orphaned workers.", "error", err)

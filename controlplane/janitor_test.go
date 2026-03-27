@@ -172,6 +172,12 @@ func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	if len(store.orphanedBefore) == 0 {
 		t.Fatal("expected orphaned worker cutoff lookup")
 	}
+	wantOrphanedBefore := now.Add(-30 * time.Second)
+	for i, cutoff := range store.orphanedBefore {
+		if !cutoff.Equal(wantOrphanedBefore) {
+			t.Fatalf("orphaned cutoff call %d expected %v, got %v", i, wantOrphanedBefore, cutoff)
+		}
+	}
 	if len(store.stuckSpawningBefore) == 0 || len(store.stuckActivatingBefore) == 0 {
 		t.Fatal("expected stuck worker cutoff lookup")
 	}
