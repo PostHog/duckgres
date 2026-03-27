@@ -309,8 +309,11 @@ func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 	if !foundCP {
 		t.Skipf("control-plane pod %s no longer exists", cpName)
 	}
-	t.Logf("Deleting CP pod %s to test garbage collection", cpName)
-	err = clientset.CoreV1().Pods(namespace).Delete(context.Background(), cpName, metav1.DeleteOptions{})
+	gracePeriodSeconds := int64(0)
+	t.Logf("Force deleting CP pod %s to test crash-style garbage collection", cpName)
+	err = clientset.CoreV1().Pods(namespace).Delete(context.Background(), cpName, metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriodSeconds,
+	})
 	if err != nil {
 		t.Fatalf("failed to delete CP pod: %v", err)
 	}
