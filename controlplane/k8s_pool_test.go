@@ -929,6 +929,11 @@ func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 	pool.runtimeStore = store
 	worker := &ManagedWorker{ID: 44, done: make(chan struct{})}
 	pool.workers[worker.ID] = worker
+	livenessChecked := false
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		livenessChecked = true
+		return nil
+	}
 
 	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
 		OrgID:          "analytics",
@@ -966,6 +971,9 @@ func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
 	}
+	if !livenessChecked {
+		t.Fatal("expected claimSpecificWorker to recheck worker liveness")
+	}
 }
 
 func TestK8sPoolClaimSpecificWorkerReturnsEpochMismatchError(t *testing.T) {
@@ -989,6 +997,42 @@ func TestK8sPoolClaimSpecificWorkerReturnsEpochMismatchError(t *testing.T) {
 	}
 	if claimed != nil {
 		t.Fatalf("expected no claimed worker, got %#v", claimed)
+	}
+}
+
+func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	leaseExpiry := time.Date(2026, time.March, 20, 19, 30, 0, 0, time.UTC)
+	store := &captureRuntimeWorkerStore{
+		takenOver: &configstore.WorkerRecord{
+			WorkerID:          44,
+			PodName:           "duckgres-worker-test-cp-44",
+			State:             configstore.WorkerStateReserved,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        8,
+			LeaseExpiresAt:    leaseExpiry,
+		},
+	}
+	pool.runtimeStore = store
+	pool.workers[44] = &ManagedWorker{ID: 44, done: make(chan struct{})}
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return errors.New("dead worker")
+	}
+
+	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: leaseExpiry,
+		MaxWorkers:     3,
+	})
+	if err == nil {
+		t.Fatal("expected unhealthy claimed worker to fail liveness recheck")
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claimed worker, got %#v", claimed)
+	}
+	if _, ok := pool.Worker(44); ok {
+		t.Fatal("expected unhealthy worker to be retired from the pool")
 	}
 }
 

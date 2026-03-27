@@ -1180,6 +1180,11 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	if reservedRecord != nil {
 		p.persistWorkerRecord(reservedRecord)
 	}
+	if err := p.checkReservedWorkerLiveness(ctx, worker); err != nil {
+		slog.Warn("Claimed worker failed liveness recheck.", "worker", worker.ID, "pod", worker.PodName(), "error", err)
+		p.retireWorkerWithReason(worker.ID, RetireReasonCrash)
+		return nil, err
+	}
 	return worker, nil
 }
 

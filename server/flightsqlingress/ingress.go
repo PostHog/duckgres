@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -38,6 +39,15 @@ const (
 	defaultFlightSessionTokenTTL  = 1 * time.Hour
 	defaultFlightSessionHeaderKey = "x-duckgres-session"
 )
+
+var ErrDurableReconnectTerminal = errors.New("durable reconnect terminal")
+
+func MarkDurableReconnectTerminal(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrDurableReconnectTerminal, err)
+}
 
 const (
 	ReapTriggerPeriodic = "periodic"
@@ -1735,6 +1745,9 @@ func (s *flightAuthSessionStore) reconnectByToken(ctx context.Context, token str
 	pid, executor, err := s.reconnector.ReconnectSession(ctx, *record)
 	if err != nil {
 		slog.Warn("Reconnecting durable Flight session failed.", "token", token, "error", err)
+		if errors.Is(err, ErrDurableReconnectTerminal) {
+			_ = s.durableStore.CloseSession(token, time.Now())
+		}
 		return nil, false
 	}
 

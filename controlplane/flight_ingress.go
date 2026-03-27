@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -136,6 +137,9 @@ func (p *orgRoutedSessionProvider) ReconnectSession(ctx context.Context, record 
 
 	pid, executor, err := sessions.ReconnectFlightSession(ctx, record.Username, record.WorkerID, record.OwnerEpoch)
 	if err != nil {
+		if errors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
+			return 0, nil, flightsqlingress.MarkDurableReconnectTerminal(err)
+		}
 		return 0, nil, err
 	}
 

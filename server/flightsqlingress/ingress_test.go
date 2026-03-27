@@ -956,6 +956,78 @@ func TestFlightAuthSessionStoreReconnectRefreshesDurableSessionMetadata(t *testi
 	}
 }
 
+func TestFlightAuthSessionStoreReconnectFailureUpdatesDurableSessionState(t *testing.T) {
+	tests := []struct {
+		name              string
+		reconnectErr      error
+		wantState         DurableSessionState
+		wantReconnectCall int
+	}{
+		{
+			name:              "terminal stale ownership closes durable session",
+			reconnectErr:      MarkDurableReconnectTerminal(errors.New("stale owner")),
+			wantState:         DurableSessionStateClosed,
+			wantReconnectCall: 1,
+		},
+		{
+			name:              "transient reconnect failure leaves durable session active",
+			reconnectErr:      context.DeadlineExceeded,
+			wantState:         DurableSessionStateActive,
+			wantReconnectCall: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			durable := &captureDurableSessionStore{
+				records: map[string]DurableSessionRecord{
+					"durable-token": {
+						SessionToken: "durable-token",
+						Username:     "postgres",
+						OrgID:        "analytics",
+						WorkerID:     17,
+						OwnerEpoch:   4,
+						CPInstanceID: "cp-old:boot-a",
+						State:        DurableSessionStateActive,
+						ExpiresAt:    time.Now().Add(time.Hour),
+						LastSeenAt:   time.Now().Add(-time.Minute),
+					},
+				},
+			}
+			reconnectCalls := 0
+			provider := &testDurableSessionProvider{
+				durableStore: durable,
+				reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+					reconnectCalls++
+					return 0, nil, tt.reconnectErr
+				},
+			}
+			store := newFlightAuthSessionStore(provider, time.Minute, time.Hour, time.Minute, time.Hour, 0, Options{})
+
+			if session, ok := store.GetByTokenContext(context.Background(), "durable-token"); ok || session != nil {
+				t.Fatal("expected durable token reconnect to fail")
+			}
+			record, err := durable.GetSession("durable-token")
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if record == nil {
+				t.Fatal("expected durable session record to remain present")
+			}
+			if record.State != tt.wantState {
+				t.Fatalf("expected durable session state %q, got %q", tt.wantState, record.State)
+			}
+
+			if session, ok := store.GetByTokenContext(context.Background(), "durable-token"); ok || session != nil {
+				t.Fatal("expected second durable token lookup to fail")
+			}
+			if reconnectCalls != tt.wantReconnectCall {
+				t.Fatalf("expected %d reconnect attempts, got %d", tt.wantReconnectCall, reconnectCalls)
+			}
+		})
+	}
+}
+
 func TestFlightAuthSessionStoreRejectsNewSessionsWhileDraining(t *testing.T) {
 	provider := &testDurableSessionProvider{
 		createSessionFn: func(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
