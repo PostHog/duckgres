@@ -130,10 +130,8 @@ func TestK8sWorkerPodCreation(t *testing.T) {
 		if cpLabel == "" {
 			t.Errorf("worker pod %s missing duckgres/control-plane label", pod.Name)
 		}
-
-		// Verify owner references
-		if len(pod.OwnerReferences) == 0 {
-			t.Errorf("worker pod %s has no owner references", pod.Name)
+		if pod.Labels["duckgres/worker-id"] == "" {
+			t.Errorf("worker pod %s missing duckgres/worker-id label", pod.Name)
 		}
 	}
 }
@@ -276,40 +274,48 @@ func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 		t.Skip("no worker pods found — cannot test GC")
 	}
 
-	// Verify worker pods have owner references pointing to the CP pod
-	for _, wp := range workerPods.Items {
-		hasOwner := false
-		for _, ref := range wp.OwnerReferences {
-			if ref.Kind == "Pod" {
-				hasOwner = true
-				t.Logf("Worker %s owned by %s (UID %s)", wp.Name, ref.Name, ref.UID)
-			}
-		}
-		if !hasOwner {
-			t.Errorf("worker pod %s has no Pod owner reference — GC will not work", wp.Name)
-		}
+	ownedWorkers := workerPodsByControlPlaneLabel(workerPods.Items)
+	if len(ownedWorkers) == 0 {
+		t.Skip("no worker pods with duckgres/control-plane label found")
 	}
 
-	// Delete the CP pod (the deployment will recreate it)
+	// Delete a CP pod that currently owns at least one worker.
+	var cpName string
+	var workerNames []string
+	for ownerName, owned := range ownedWorkers {
+		if len(owned) > 0 {
+			cpName = ownerName
+			workerNames = append([]string(nil), owned...)
+			break
+		}
+	}
+	if cpName == "" {
+		t.Skip("no control-plane-owned worker pods found")
+	}
+
 	cpPods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: "app=duckgres-control-plane",
 	})
 	if err != nil || len(cpPods.Items) == 0 {
 		t.Fatalf("failed to find CP pod: %v", err)
 	}
-	cpName := cpPods.Items[0].Name
+	foundCP := false
+	for _, pod := range cpPods.Items {
+		if pod.Name == cpName {
+			foundCP = true
+			break
+		}
+	}
+	if !foundCP {
+		t.Skipf("control-plane pod %s no longer exists", cpName)
+	}
 	t.Logf("Deleting CP pod %s to test garbage collection", cpName)
 	err = clientset.CoreV1().Pods(namespace).Delete(context.Background(), cpName, metav1.DeleteOptions{})
 	if err != nil {
 		t.Fatalf("failed to delete CP pod: %v", err)
 	}
 
-	// Wait for old worker pods to be garbage collected
-	workerNames := make([]string, len(workerPods.Items))
-	for i, wp := range workerPods.Items {
-		workerNames[i] = wp.Name
-	}
-
+	// Wait for the deleted control plane's worker pods to be retired.
 	allGone := false
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
