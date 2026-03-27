@@ -636,6 +636,130 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 	}
 }
 
+func TestTranspile_DDL_AlterTableMultiColumn(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true})
+
+	t.Run("multi-column ADD COLUMN splits into transaction", func(t *testing.T) {
+		result, err := tr.Transpile("ALTER TABLE users ADD COLUMN x INT, ADD COLUMN y TEXT")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if len(result.Statements) == 0 {
+			t.Fatal("expected multi-statement result")
+		}
+		// BEGIN + 2 individual ALTERs
+		if len(result.Statements) != 3 {
+			t.Errorf("got %d statements, want 3: %v", len(result.Statements), result.Statements)
+		}
+		if result.Statements[0] != "BEGIN" {
+			t.Errorf("first statement = %q, want BEGIN", result.Statements[0])
+		}
+		if len(result.CleanupStatements) != 1 || result.CleanupStatements[0] != "COMMIT" {
+			t.Errorf("cleanup = %v, want [COMMIT]", result.CleanupStatements)
+		}
+		// Each ALTER should be a single-column ALTER with IF NOT EXISTS
+		for _, stmt := range result.Statements[1:] {
+			if !strings.Contains(strings.ToUpper(stmt), "ALTER TABLE") {
+				t.Errorf("statement %q should be ALTER TABLE", stmt)
+			}
+			if !strings.Contains(strings.ToUpper(stmt), "IF NOT EXISTS") {
+				t.Errorf("statement %q should contain IF NOT EXISTS", stmt)
+			}
+		}
+	})
+
+	t.Run("multi-column with unsupported commands filters them out", func(t *testing.T) {
+		result, err := tr.Transpile("ALTER TABLE users ADD COLUMN x INT, ADD CONSTRAINT pk PRIMARY KEY (id), ADD COLUMN y TEXT")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		// 2 supported commands → BEGIN + 2 ALTERs
+		if len(result.Statements) != 3 {
+			t.Errorf("got %d statements, want 3: %v", len(result.Statements), result.Statements)
+		}
+		// None of the statements should mention PRIMARY KEY
+		for _, stmt := range result.Statements {
+			if strings.Contains(strings.ToUpper(stmt), "PRIMARY KEY") {
+				t.Errorf("statement %q should not contain PRIMARY KEY", stmt)
+			}
+		}
+	})
+
+	t.Run("multi-column all unsupported is no-op", func(t *testing.T) {
+		result, err := tr.Transpile("ALTER TABLE users ADD CONSTRAINT pk PRIMARY KEY (id), ALTER COLUMN name SET NOT NULL")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if !result.IsNoOp {
+			t.Error("expected no-op for all-unsupported multi-column ALTER")
+		}
+		if result.NoOpTag != "ALTER TABLE" {
+			t.Errorf("NoOpTag = %q, want ALTER TABLE", result.NoOpTag)
+		}
+	})
+
+	t.Run("single command ALTER TABLE unchanged", func(t *testing.T) {
+		result, err := tr.Transpile("ALTER TABLE users ADD COLUMN x INT")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if len(result.Statements) > 0 {
+			t.Errorf("single-command ALTER should not produce multi-statement result: %v", result.Statements)
+		}
+		if result.IsNoOp {
+			t.Error("ADD COLUMN should not be a no-op")
+		}
+		// Should have IF NOT EXISTS added
+		if !strings.Contains(strings.ToUpper(result.SQL), "IF NOT EXISTS") {
+			t.Errorf("SQL %q should contain IF NOT EXISTS", result.SQL)
+		}
+	})
+
+	t.Run("multi-column with one supported reduces to single", func(t *testing.T) {
+		result, err := tr.Transpile("ALTER TABLE users ADD COLUMN x INT, ADD CONSTRAINT pk PRIMARY KEY (id)")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		// Only 1 supported command → no multi-statement, just modified AST
+		if len(result.Statements) > 0 {
+			t.Errorf("single-supported command should not produce multi-statement: %v", result.Statements)
+		}
+		if result.IsNoOp {
+			t.Error("should not be no-op when there's a supported command")
+		}
+	})
+
+	t.Run("schema-qualified table name preserved", func(t *testing.T) {
+		result, err := tr.Transpile("ALTER TABLE myschema.users ADD COLUMN x INT, ADD COLUMN y TEXT")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if len(result.Statements) != 3 {
+			t.Fatalf("got %d statements, want 3: %v", len(result.Statements), result.Statements)
+		}
+		for _, stmt := range result.Statements[1:] {
+			if !strings.Contains(stmt, "myschema") {
+				t.Errorf("statement %q should preserve schema name", stmt)
+			}
+		}
+	})
+
+	t.Run("ALTER TABLE IF EXISTS preserved", func(t *testing.T) {
+		result, err := tr.Transpile("ALTER TABLE IF EXISTS users ADD COLUMN x INT, ADD COLUMN y TEXT")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if len(result.Statements) != 3 {
+			t.Fatalf("got %d statements, want 3: %v", len(result.Statements), result.Statements)
+		}
+		for _, stmt := range result.Statements[1:] {
+			if !strings.Contains(strings.ToUpper(stmt), "IF EXISTS") {
+				t.Errorf("statement %q should contain IF EXISTS", stmt)
+			}
+		}
+	})
+}
+
 func TestTranspile_Placeholders(t *testing.T) {
 	tests := []struct {
 		name       string
