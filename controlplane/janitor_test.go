@@ -165,8 +165,8 @@ func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	if len(retired) < 2 {
 		t.Fatalf("expected janitor to retire at least two workers, got %d", len(retired))
 	}
-	if retired[0].id != 7 || retired[0].reason != janitorRetireReasonLeaseExpiry {
-		t.Fatalf("expected orphaned worker 7 with lease_expiry, got %+v", retired[0])
+	if retired[0].id != 7 || retired[0].reason != janitorRetireReasonOrphaned {
+		t.Fatalf("expected orphaned worker 7 with orphaned reason, got %+v", retired[0])
 	}
 	if retired[1].id != 9 || retired[1].reason != janitorRetireReasonStuckActivating {
 		t.Fatalf("expected stuck worker 9 with stuck_activating, got %+v", retired[1])

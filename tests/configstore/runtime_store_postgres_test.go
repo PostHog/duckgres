@@ -58,14 +58,12 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatalf("expected heartbeat %v, got %v", heartbeatAt, cp.LastHeartbeatAt)
 	}
 
-	leaseExpiry := startedAt.Add(24 * time.Hour)
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          42,
 		PodName:           "duckgres-worker-42",
 		State:             configstore.WorkerStateIdle,
 		OwnerCPInstanceID: "cp-1:boot-a",
 		OwnerEpoch:        7,
-		LeaseExpiresAt:    leaseExpiry,
 		LastHeartbeatAt:   heartbeatAt,
 	}); err != nil {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
@@ -127,8 +125,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	leaseExpiry := startedAt.Add(24 * time.Hour)
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", leaseExpiry, 0)
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -150,10 +147,6 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 	if claimed.OrgID != "analytics" {
 		t.Fatalf("expected org analytics, got %q", claimed.OrgID)
 	}
-	if !claimed.LeaseExpiresAt.Equal(leaseExpiry) {
-		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, claimed.LeaseExpiresAt)
-	}
-
 	persisted, err := store.GetWorkerRecord(7)
 	if err != nil {
 		t.Fatalf("GetWorkerRecord: %v", err)
@@ -169,7 +162,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", time.Date(2026, time.March, 27, 0, 0, 0, 0, time.UTC), 0)
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -199,13 +192,12 @@ func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		OrgID:             "analytics",
 		OwnerCPInstanceID: "cp-old:boot-a",
 		OwnerEpoch:        4,
-		LeaseExpiresAt:    now.Add(time.Hour),
 		LastHeartbeatAt:   now,
 	}); err != nil {
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", now.Add(24*time.Hour), 1)
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", 1)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -350,8 +342,7 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	leaseExpiry := time.Date(2026, time.March, 27, 12, 0, 0, 0, time.UTC)
-	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", 1, leaseExpiry, "duckgres-worker-test-cp", 3, 5)
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", 1, "duckgres-worker-test-cp", 3, 5)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
 	}
@@ -376,9 +367,6 @@ func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	if slot.OrgID != "analytics" {
 		t.Fatalf("expected org analytics, got %q", slot.OrgID)
 	}
-	if !slot.LeaseExpiresAt.Equal(leaseExpiry) {
-		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, slot.LeaseExpiresAt)
-	}
 
 	persisted, err := store.GetWorkerRecord(slot.WorkerID)
 	if err != nil {
@@ -400,13 +388,12 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		OrgID:             "analytics",
 		OwnerCPInstanceID: "cp-old:boot-a",
 		OwnerEpoch:        4,
-		LeaseExpiresAt:    now.Add(24 * time.Hour),
 		LastHeartbeatAt:   now,
 	}); err != nil {
 		t.Fatalf("UpsertWorkerRecord(existing): %v", err)
 	}
 
-	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", 1, now.Add(2*time.Hour), "duckgres-worker-test-cp", 1, 5)
+	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", 1, "duckgres-worker-test-cp", 1, 5)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(org cap): %v", err)
 	}
@@ -414,7 +401,7 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("expected org cap to block spawning, got %#v", orgLimited)
 	}
 
-	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", 1, now.Add(2*time.Hour), "duckgres-worker-test-cp", 2, 1)
+	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", 1, "duckgres-worker-test-cp", 2, 1)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(global cap): %v", err)
 	}
@@ -636,13 +623,12 @@ func TestTakeOverWorkerPostgres(t *testing.T) {
 		OrgID:             "analytics",
 		OwnerCPInstanceID: "cp-old:boot-a",
 		OwnerEpoch:        5,
-		LeaseExpiresAt:    now.Add(time.Hour),
 		LastHeartbeatAt:   now,
 	}); err != nil {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, err := store.TakeOverWorker(71, "cp-new:boot-b", "analytics", 5, now.Add(2*time.Hour))
+	claimed, err := store.TakeOverWorker(71, "cp-new:boot-b", "analytics", 5)
 	if err != nil {
 		t.Fatalf("TakeOverWorker: %v", err)
 	}
@@ -659,7 +645,7 @@ func TestTakeOverWorkerPostgres(t *testing.T) {
 		t.Fatalf("expected reserved state, got %q", claimed.State)
 	}
 
-	missed, err := store.TakeOverWorker(71, "cp-third:boot-c", "analytics", 5, now.Add(3*time.Hour))
+	missed, err := store.TakeOverWorker(71, "cp-third:boot-c", "analytics", 5)
 	if err == nil {
 		t.Fatal("expected stale takeover attempt to return an epoch mismatch error")
 	}

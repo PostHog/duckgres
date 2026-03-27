@@ -367,7 +367,7 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "worker_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "pod_uid", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "lease_expires_at", "activation_started_at", "last_heartbeat_at", "retire_reason", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "pod_uid", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert worker record: %w", err)
 	}
@@ -387,7 +387,7 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // The selected row is locked with SKIP LOCKED and transitioned to reserved while
 // incrementing owner_epoch. When maxOrgWorkers is set, org claims are serialized
 // under the same advisory lock used for spawn-slot allocation.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time, maxOrgWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*WorkerRecord, error) {
 	var claimed *WorkerRecord
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
 		if orgID != "" {
@@ -426,7 +426,6 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExp
 				"org_id":               orgID,
 				"owner_cp_instance_id": ownerCPInstanceID,
 				"owner_epoch":          gorm.Expr("owner_epoch + 1"),
-				"lease_expires_at":     leaseExpiresAt,
 				"updated_at":           now,
 			}).Error; err != nil {
 			return err
@@ -447,7 +446,7 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExp
 
 // TakeOverWorker transfers durable worker ownership to a new control-plane
 // instance when the caller still has the expected prior owner_epoch.
-func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64, leaseExpiresAt time.Time) (*WorkerRecord, error) {
+func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*WorkerRecord, error) {
 	var claimed *WorkerRecord
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
 		var current WorkerRecord
@@ -472,7 +471,6 @@ func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID str
 				"org_id":               orgID,
 				"owner_cp_instance_id": ownerCPInstanceID,
 				"owner_epoch":          gorm.Expr("owner_epoch + 1"),
-				"lease_expires_at":     leaseExpiresAt,
 				"updated_at":           now,
 			}).Error; err != nil {
 			return err
@@ -492,7 +490,7 @@ func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID str
 
 // CreateSpawningWorkerSlot creates a durable spawning worker row under advisory-lock
 // protected org/global capacity checks. A nil result means capacity blocked the spawn.
-func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, leaseExpiresAt time.Time, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
 	if strings.TrimSpace(podNamePrefix) == "" {
 		return nil, fmt.Errorf("pod name prefix is required")
 	}
@@ -529,7 +527,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string,
 		}
 
 		var workerID int64
-		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM "+cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
+		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM " + cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
 			return err
 		}
 		now := time.Now()
@@ -540,7 +538,6 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string,
 			OrgID:             orgID,
 			OwnerCPInstanceID: ownerCPInstanceID,
 			OwnerEpoch:        ownerEpoch,
-			LeaseExpiresAt:    leaseExpiresAt,
 			LastHeartbeatAt:   now,
 		}
 		if err := tx.Table(cs.runtimeTable(record.TableName())).Create(record).Error; err != nil {
@@ -594,7 +591,7 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 		}
 
 		var workerID int64
-		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM "+cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
+		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM " + cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
 			return err
 		}
 		now := time.Now()

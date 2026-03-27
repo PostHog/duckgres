@@ -21,39 +21,36 @@ import (
 )
 
 type captureRuntimeWorkerStore struct {
-	mu             sync.Mutex
-	records        []configstore.WorkerRecord
-	claimed        *configstore.WorkerRecord
-	claimErr       error
-	claimCalls     int
-	claimOwnerCPID string
-	claimOrgID     string
-	claimLease     time.Time
-	claimMaxOrgWorkers int
-	spawned             *configstore.WorkerRecord
-	spawnErr            error
-	spawnCalls          int
-	spawnOwnerCPID      string
-	spawnOrgID          string
-	spawnOwnerEpoch     int64
-	spawnLease          time.Time
-	spawnPodNamePrefix  string
-	spawnMaxOrgWorkers  int
-	spawnMaxGlobalWorks int
-	neutralSpawned          *configstore.WorkerRecord
-	neutralSpawnErr         error
-	neutralSpawnCalls       int
-	neutralSpawnOwnerCPID   string
-	neutralSpawnPodPrefix   string
-	neutralSpawnTarget      int
-	neutralSpawnMaxGlobal   int
-	takenOver           *configstore.WorkerRecord
-	takeOverErr         error
-	takeOverWorkerID    int
-	takeOverOwnerCPID   string
-	takeOverOrgID       string
+	mu                    sync.Mutex
+	records               []configstore.WorkerRecord
+	claimed               *configstore.WorkerRecord
+	claimErr              error
+	claimCalls            int
+	claimOwnerCPID        string
+	claimOrgID            string
+	claimMaxOrgWorkers    int
+	spawned               *configstore.WorkerRecord
+	spawnErr              error
+	spawnCalls            int
+	spawnOwnerCPID        string
+	spawnOrgID            string
+	spawnOwnerEpoch       int64
+	spawnPodNamePrefix    string
+	spawnMaxOrgWorkers    int
+	spawnMaxGlobalWorks   int
+	neutralSpawned        *configstore.WorkerRecord
+	neutralSpawnErr       error
+	neutralSpawnCalls     int
+	neutralSpawnOwnerCPID string
+	neutralSpawnPodPrefix string
+	neutralSpawnTarget    int
+	neutralSpawnMaxGlobal int
+	takenOver             *configstore.WorkerRecord
+	takeOverErr           error
+	takeOverWorkerID      int
+	takeOverOwnerCPID     string
+	takeOverOrgID         string
 	takeOverExpectedEpoch int64
-	takeOverLease       time.Time
 }
 
 func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
@@ -71,13 +68,12 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	return out
 }
 
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, leaseExpiresAt time.Time, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
 	s.claimOwnerCPID = ownerCPInstanceID
 	s.claimOrgID = orgID
-	s.claimLease = leaseExpiresAt
 	s.claimMaxOrgWorkers = maxOrgWorkers
 	if s.claimErr != nil {
 		return nil, s.claimErr
@@ -89,14 +85,13 @@ func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID str
 	return &claimed, nil
 }
 
-func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, leaseExpiresAt time.Time, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.spawnCalls++
 	s.spawnOwnerCPID = ownerCPInstanceID
 	s.spawnOrgID = orgID
 	s.spawnOwnerEpoch = ownerEpoch
-	s.spawnLease = leaseExpiresAt
 	s.spawnPodNamePrefix = podNamePrefix
 	s.spawnMaxOrgWorkers = maxOrgWorkers
 	s.spawnMaxGlobalWorks = maxGlobalWorkers
@@ -146,14 +141,13 @@ func (s *captureRuntimeWorkerStore) GetWorkerRecord(workerID int) (*configstore.
 	return nil, nil
 }
 
-func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64, leaseExpiresAt time.Time) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.takeOverWorkerID = workerID
 	s.takeOverOwnerCPID = ownerCPInstanceID
 	s.takeOverOrgID = orgID
 	s.takeOverExpectedEpoch = expectedOwnerEpoch
-	s.takeOverLease = leaseExpiresAt
 	if s.takeOverErr != nil {
 		return nil, s.takeOverErr
 	}
@@ -182,20 +176,20 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 	}
 
 	pool := &K8sWorkerPool{
-		workers:     make(map[int]*ManagedWorker),
-		maxWorkers:  maxWorkers,
-		idleTimeout: 5 * time.Minute,
-		shutdownCh:  make(chan struct{}),
-		stopInform:  make(chan struct{}),
-		clientset:   cs,
-		namespace:   "default",
-		cpID:        "test-cp",
-		cpInstanceID:"cp-uid-123:boot-abc",
-		cpUID:       "cp-uid-123",
-		workerImage: "duckgres:test",
-		workerPort:  8816,
-		secretName:  "test-secret",
-		spawnSem:    make(chan struct{}, 1),
+		workers:      make(map[int]*ManagedWorker),
+		maxWorkers:   maxWorkers,
+		idleTimeout:  5 * time.Minute,
+		shutdownCh:   make(chan struct{}),
+		stopInform:   make(chan struct{}),
+		clientset:    cs,
+		namespace:    "default",
+		cpID:         "test-cp",
+		cpInstanceID: "cp-uid-123:boot-abc",
+		cpUID:        "cp-uid-123",
+		workerImage:  "duckgres:test",
+		workerPort:   8816,
+		secretName:   "test-secret",
+		spawnSem:     make(chan struct{}, 1),
 	}
 
 	return pool, cs
@@ -379,8 +373,7 @@ func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
@@ -415,8 +408,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
@@ -446,8 +438,7 @@ func TestK8sPoolReserveClaimedWorkerUnlocksPoolOnTransitionError(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
@@ -460,8 +451,7 @@ func TestK8sPoolReserveClaimedWorkerUnlocksPoolOnTransitionError(t *testing.T) {
 		OwnerEpoch:        7,
 		State:             configstore.WorkerStateReserved,
 	}, &WorkerAssignment{
-		OrgID:          "billing",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "billing",
 	})
 	if err == nil {
 		t.Fatal("expected transition error")
@@ -510,8 +500,7 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	}
 
 	got, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -631,8 +620,7 @@ func TestK8sPoolSpawnMinWorkersCountsOnlyNeutralIdleWorkersAsWarmCapacity(t *tes
 		if err := worker.SetSharedState(SharedWorkerState{
 			Lifecycle: WorkerLifecycleReserved,
 			Assignment: &WorkerAssignment{
-				OrgID:          "analytics",
-				LeaseExpiresAt: time.Now().Add(time.Hour),
+				OrgID: "analytics",
 			},
 		}); err != nil {
 			t.Fatalf("SetSharedState(reserved %d): %v", id, err)
@@ -665,8 +653,7 @@ func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 	if err := reserved.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(reserved): %v", err)
@@ -706,13 +693,11 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentIn
 		pool.mu.Unlock()
 	}
 
-	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	worker, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -727,9 +712,6 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentIn
 	}
 	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
-	}
-	if !state.Assignment.LeaseExpiresAt.Equal(leaseExpiry) {
-		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, state.Assignment.LeaseExpiresAt)
 	}
 	if worker.ownerEpoch != 1 {
 		t.Fatalf("expected owner epoch 1 after reservation, got %d", worker.ownerEpoch)
@@ -755,9 +737,6 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentIn
 	if last.OrgID != "analytics" {
 		t.Fatalf("expected org_id analytics, got %q", last.OrgID)
 	}
-	if !last.LeaseExpiresAt.Equal(leaseExpiry) {
-		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, last.LeaseExpiresAt)
-	}
 
 	select {
 	case id := <-replacementSpawned:
@@ -769,7 +748,6 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentIn
 func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	pool.minWorkers = 0
-	leaseExpiry := time.Date(2026, time.March, 20, 18, 0, 0, 0, time.UTC)
 	store := &captureRuntimeWorkerStore{
 		claimed: &configstore.WorkerRecord{
 			WorkerID:          21,
@@ -778,7 +756,6 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 			OrgID:             "analytics",
 			OwnerCPInstanceID: pool.cpInstanceID,
 			OwnerEpoch:        3,
-			LeaseExpiresAt:    leaseExpiry,
 		},
 	}
 	pool.runtimeStore = store
@@ -820,8 +797,7 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 	pool.cachedToken = "shared-token"
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -850,9 +826,6 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 	if store.claimOrgID != "analytics" {
 		t.Fatalf("expected claim org analytics, got %q", store.claimOrgID)
 	}
-	if !store.claimLease.Equal(leaseExpiry) {
-		t.Fatalf("expected claim lease expiry %v, got %v", leaseExpiry, store.claimLease)
-	}
 	if store.claimMaxOrgWorkers != 0 {
 		t.Fatalf("expected default max org workers 0, got %d", store.claimMaxOrgWorkers)
 	}
@@ -877,8 +850,7 @@ func TestK8sPoolReserveSharedWorkerFallsBackWhenRuntimeClaimReturnsNil(t *testin
 	}
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: time.Date(2026, time.March, 20, 19, 0, 0, 0, time.UTC),
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -900,9 +872,8 @@ func TestK8sPoolReserveSharedWorkerPassesOrgCapToRuntimeClaim(t *testing.T) {
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error { return nil }
 
 	_, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: time.Date(2026, time.March, 20, 19, 0, 0, 0, time.UTC),
-		MaxWorkers:     3,
+		OrgID:      "analytics",
+		MaxWorkers: 3,
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -914,7 +885,6 @@ func TestK8sPoolReserveSharedWorkerPassesOrgCapToRuntimeClaim(t *testing.T) {
 
 func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	leaseExpiry := time.Date(2026, time.March, 20, 19, 30, 0, 0, time.UTC)
 	store := &captureRuntimeWorkerStore{
 		takenOver: &configstore.WorkerRecord{
 			WorkerID:          44,
@@ -923,7 +893,6 @@ func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 			OrgID:             "analytics",
 			OwnerCPInstanceID: pool.cpInstanceID,
 			OwnerEpoch:        8,
-			LeaseExpiresAt:    leaseExpiry,
 		},
 	}
 	pool.runtimeStore = store
@@ -936,9 +905,8 @@ func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 	}
 
 	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
-		MaxWorkers:     3,
+		OrgID:      "analytics",
+		MaxWorkers: 3,
 	})
 	if err != nil {
 		t.Fatalf("claimSpecificWorker: %v", err)
@@ -958,9 +926,6 @@ func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 	if store.takeOverExpectedEpoch != 7 {
 		t.Fatalf("expected takeover expected epoch 7, got %d", store.takeOverExpectedEpoch)
 	}
-	if !store.takeOverLease.Equal(leaseExpiry) {
-		t.Fatalf("expected takeover lease %v, got %v", leaseExpiry, store.takeOverLease)
-	}
 	if claimed.OwnerEpoch() != 8 {
 		t.Fatalf("expected owner epoch 8, got %d", claimed.OwnerEpoch())
 	}
@@ -978,16 +943,14 @@ func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 
 func TestK8sPoolClaimSpecificWorkerReturnsEpochMismatchError(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	leaseExpiry := time.Date(2026, time.March, 20, 19, 30, 0, 0, time.UTC)
 	store := &captureRuntimeWorkerStore{
 		takeOverErr: configstore.ErrWorkerOwnerEpochMismatch,
 	}
 	pool.runtimeStore = store
 
 	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
-		MaxWorkers:     3,
+		OrgID:      "analytics",
+		MaxWorkers: 3,
 	})
 	if err == nil {
 		t.Fatal("expected stale takeover to return an error")
@@ -1002,7 +965,6 @@ func TestK8sPoolClaimSpecificWorkerReturnsEpochMismatchError(t *testing.T) {
 
 func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	leaseExpiry := time.Date(2026, time.March, 20, 19, 30, 0, 0, time.UTC)
 	store := &captureRuntimeWorkerStore{
 		takenOver: &configstore.WorkerRecord{
 			WorkerID:          44,
@@ -1011,7 +973,6 @@ func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
 			OrgID:             "analytics",
 			OwnerCPInstanceID: pool.cpInstanceID,
 			OwnerEpoch:        8,
-			LeaseExpiresAt:    leaseExpiry,
 		},
 	}
 	pool.runtimeStore = store
@@ -1021,9 +982,8 @@ func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
 	}
 
 	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
-		MaxWorkers:     3,
+		OrgID:      "analytics",
+		MaxWorkers: 3,
 	})
 	if err == nil {
 		t.Fatal("expected unhealthy claimed worker to fail liveness recheck")
@@ -1038,7 +998,6 @@ func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
 
 func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	leaseExpiry := time.Date(2026, time.March, 20, 20, 0, 0, 0, time.UTC)
 	store := &captureRuntimeWorkerStore{
 		spawned: &configstore.WorkerRecord{
 			WorkerID:          31,
@@ -1047,7 +1006,6 @@ func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *t
 			OrgID:             "analytics",
 			OwnerCPInstanceID: pool.cpInstanceID,
 			OwnerEpoch:        1,
-			LeaseExpiresAt:    leaseExpiry,
 		},
 	}
 	pool.runtimeStore = store
@@ -1064,9 +1022,8 @@ func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *t
 	}
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
-		MaxWorkers:     2,
+		OrgID:      "analytics",
+		MaxWorkers: 2,
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -1085,9 +1042,6 @@ func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *t
 	}
 	if store.spawnOwnerEpoch != 1 {
 		t.Fatalf("expected spawn owner epoch 1, got %d", store.spawnOwnerEpoch)
-	}
-	if !store.spawnLease.Equal(leaseExpiry) {
-		t.Fatalf("expected spawn lease %v, got %v", leaseExpiry, store.spawnLease)
 	}
 	if store.spawnPodNamePrefix != "duckgres-worker-test-cp" {
 		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.spawnPodNamePrefix)
@@ -1193,8 +1147,7 @@ func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *t
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Date(2026, time.March, 20, 17, 0, 0, 0, time.UTC),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
@@ -1205,8 +1158,7 @@ func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *t
 	}
 
 	if err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
-		OrgID:          "analytics",
-		LeaseExpiresAt: worker.SharedState().Assignment.LeaseExpiresAt,
+		OrgID: "analytics",
 	}); err != nil {
 		t.Fatalf("ActivateReservedWorker: %v", err)
 	}
@@ -1243,8 +1195,7 @@ func TestK8sPoolRetireWorkerPersistsRetiredWorkerRecord(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Date(2026, time.March, 20, 18, 0, 0, 0, time.UTC),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
@@ -1321,8 +1272,7 @@ func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
 	defer cancel()
 
 	worker, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
-		OrgID:          "billing",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "billing",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -1347,8 +1297,7 @@ func TestK8sPoolIdleReaperSkipsReservedSharedWorker(t *testing.T) {
 	if err := reserved.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(reserved): %v", err)

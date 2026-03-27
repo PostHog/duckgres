@@ -6,7 +6,6 @@ import (
 	"os"
 	"reflect"
 	"strings"
-	"time"
 
 	"github.com/posthog/duckgres/server"
 )
@@ -15,9 +14,8 @@ import (
 // neutral shared warm worker over the control-plane RPC channel.
 type ActivationPayload struct {
 	server.WorkerControlMetadata
-	OrgID          string                `json:"org_id"`
-	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
-	DuckLake       server.DuckLakeConfig `json:"ducklake"`
+	OrgID    string                `json:"org_id"`
+	DuckLake server.DuckLakeConfig `json:"ducklake"`
 }
 
 type activatedTenantRuntime struct {

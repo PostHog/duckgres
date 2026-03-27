@@ -199,7 +199,6 @@ func TestSessionPoolActivateTenantAllowsSameOrgTakeover(t *testing.T) {
 	second := first
 	second.OwnerEpoch = 3
 	second.CPInstanceID = "cp-new:boot-b"
-	second.LeaseExpiresAt = time.Now().Add(time.Hour)
 	if err := pool.activateTenant(second); err != nil {
 		t.Fatalf("takeover ActivateTenant: %v", err)
 	}

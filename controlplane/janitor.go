@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	janitorRetireReasonLeaseExpiry     = "lease_expiry"
+	janitorRetireReasonOrphaned        = "orphaned"
 	janitorRetireReasonStuckActivating = "stuck_activating"
 )
 
@@ -22,15 +22,15 @@ type controlPlaneExpiryStore interface {
 }
 
 type ControlPlaneJanitor struct {
-	store         controlPlaneExpiryStore
-	interval      time.Duration
-	expiryTimeout time.Duration
-	orphanGrace     time.Duration
-	spawnTimeout    time.Duration
-	activateTimeout time.Duration
-	maxDrainTimeout time.Duration
-	now              func() time.Time
-	retireWorker     func(record configstore.WorkerRecord, reason string)
+	store                 controlPlaneExpiryStore
+	interval              time.Duration
+	expiryTimeout         time.Duration
+	orphanGrace           time.Duration
+	spawnTimeout          time.Duration
+	activateTimeout       time.Duration
+	maxDrainTimeout       time.Duration
+	now                   func() time.Time
+	retireWorker          func(record configstore.WorkerRecord, reason string)
 	reconcileWarmCapacity func()
 }
 
@@ -98,7 +98,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 		slog.Warn("Janitor failed to list orphaned workers.", "error", err)
 	} else {
 		for _, worker := range orphaned {
-			j.retireRuntimeWorker(worker, janitorRetireReasonLeaseExpiry)
+			j.retireRuntimeWorker(worker, janitorRetireReasonOrphaned)
 		}
 	}
 

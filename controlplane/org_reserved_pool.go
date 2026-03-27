@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-const defaultSharedWorkerReservationLease = 24 * time.Hour
-
 // OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
 // workers are reserved to a single org for their lifetime and retired after use.
@@ -18,18 +16,16 @@ type OrgReservedPool struct {
 	shared                 *K8sWorkerPool
 	orgID                  string
 	maxWorkers             int
-	leaseDuration          time.Duration
 	stsBroker              *STSBroker
 	activateReservedWorker func(context.Context, *ManagedWorker) error
 }
 
 func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, stsBroker *STSBroker) *OrgReservedPool {
 	pool := &OrgReservedPool{
-		shared:        shared,
-		orgID:         orgID,
-		maxWorkers:    maxWorkers,
-		leaseDuration: defaultSharedWorkerReservationLease,
-		stsBroker:     stsBroker,
+		shared:     shared,
+		orgID:      orgID,
+		maxWorkers: maxWorkers,
+		stsBroker:  stsBroker,
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
 	return pool
@@ -65,8 +61,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			p.shared.mu.Unlock()
 
 			worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-				OrgID:          p.orgID,
-				LeaseExpiresAt: time.Now().Add(p.leaseDuration),
+				OrgID: p.orgID,
 			})
 			if err != nil {
 				return nil, err
@@ -265,9 +260,8 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 
 func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error) {
 	worker, err := p.shared.claimSpecificWorker(ctx, workerID, ownerEpoch, &WorkerAssignment{
-		OrgID:          p.orgID,
-		LeaseExpiresAt: time.Now().Add(p.leaseDuration),
-		MaxWorkers:     p.maxWorkers,
+		OrgID:      p.orgID,
+		MaxWorkers: p.maxWorkers,
 	})
 	if err != nil {
 		return nil, err

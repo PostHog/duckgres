@@ -1145,12 +1145,10 @@ func TestManagedWorkerSharedStateNormalizesZeroValue(t *testing.T) {
 }
 
 func TestManagedWorkerSetSharedStateClonesAssignment(t *testing.T) {
-	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
 	input := SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: leaseExpiry,
+			OrgID: "analytics",
 		},
 	}
 
@@ -1160,7 +1158,6 @@ func TestManagedWorkerSetSharedStateClonesAssignment(t *testing.T) {
 	}
 
 	input.Assignment.OrgID = "mutated"
-	input.Assignment.LeaseExpiresAt = leaseExpiry.Add(time.Hour)
 
 	got := w.SharedState()
 	if got.Assignment == nil {
@@ -1171,9 +1168,6 @@ func TestManagedWorkerSetSharedStateClonesAssignment(t *testing.T) {
 	}
 	if got.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected stored org ID analytics, got %q", got.Assignment.OrgID)
-	}
-	if !got.Assignment.LeaseExpiresAt.Equal(leaseExpiry) {
-		t.Fatalf("expected stored lease expiry %v, got %v", leaseExpiry, got.Assignment.LeaseExpiresAt)
 	}
 
 	got.Assignment.OrgID = "leaked"

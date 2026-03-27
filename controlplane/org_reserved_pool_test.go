@@ -53,8 +53,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	if err := other.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "billing",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "billing",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(other): %v", err)
@@ -95,8 +94,7 @@ func TestOrgReservedPoolReleaseWorkerRetiresWorkerOnLastSession(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(worker): %v", err)
@@ -188,8 +186,7 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(worker): %v", err)

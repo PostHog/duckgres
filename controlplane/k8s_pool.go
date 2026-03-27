@@ -933,9 +933,8 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 					OwnerEpoch:   worker.OwnerEpoch(),
 					CPInstanceID: worker.OwnerCPInstanceID(),
 				},
-				OrgID:          payload.OrgID,
-				LeaseExpiresAt: payload.LeaseExpiresAt,
-				DuckLake:       payload.DuckLake,
+				OrgID:    payload.OrgID,
+				DuckLake: payload.DuckLake,
 			})
 		}
 	}
@@ -985,7 +984,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		}
 
 		if p.runtimeStore != nil {
-			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.LeaseExpiresAt, assignment.MaxWorkers)
+			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.MaxWorkers)
 			if err != nil {
 				return nil, err
 			}
@@ -1057,7 +1056,6 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					p.cpInstanceID,
 					assignment.OrgID,
 					1,
-					assignment.LeaseExpiresAt,
 					p.workerPodNamePrefix(),
 					assignment.MaxWorkers,
 					p.maxWorkers,
@@ -1195,7 +1193,7 @@ func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, e
 	if err := validateWorkerAssignment(assignment); err != nil {
 		return nil, err
 	}
-	record, err := p.runtimeStore.TakeOverWorker(workerID, p.cpInstanceID, assignment.OrgID, expectedOwnerEpoch, assignment.LeaseExpiresAt)
+	record, err := p.runtimeStore.TakeOverWorker(workerID, p.cpInstanceID, assignment.OrgID, expectedOwnerEpoch)
 	if err != nil {
 		if stderrors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
 			return nil, fmt.Errorf("worker %d ownership changed before takeover: %w", workerID, err)
@@ -1929,12 +1927,10 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	record.OwnerCPInstanceID = worker.OwnerCPInstanceID()
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID
-		record.LeaseExpiresAt = assignment.LeaseExpiresAt
 	}
 	if state == configstore.WorkerStateIdle {
 		record.OwnerCPInstanceID = ""
 		record.OrgID = ""
-		record.LeaseExpiresAt = time.Time{}
 	}
 	return record
 }

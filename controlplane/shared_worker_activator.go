@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
@@ -38,10 +37,9 @@ type SharedWorkerActivator struct {
 }
 
 type TenantActivationPayload struct {
-	OrgID          string                `json:"org_id"`
-	Usernames      []string              `json:"usernames,omitempty"`
-	LeaseExpiresAt time.Time             `json:"lease_expires_at,omitempty"`
-	DuckLake       server.DuckLakeConfig `json:"ducklake"`
+	OrgID     string                `json:"org_id"`
+	Usernames []string              `json:"usernames,omitempty"`
+	DuckLake  server.DuckLakeConfig `json:"ducklake"`
 }
 
 func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, resolveOrgConfig func(string) (*configstore.OrgConfig, error)) *SharedWorkerActivator {
@@ -116,9 +114,8 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 				OwnerEpoch:   worker.OwnerEpoch(),
 				CPInstanceID: worker.OwnerCPInstanceID(),
 			},
-			OrgID:          payload.OrgID,
-			LeaseExpiresAt: payload.LeaseExpiresAt,
-			DuckLake:       payload.DuckLake,
+			OrgID:    payload.OrgID,
+			DuckLake: payload.DuckLake,
 		})
 	}
 
@@ -173,10 +170,9 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	slices.Sort(usernames)
 
 	return TenantActivationPayload{
-		OrgID:          assignment.OrgID,
-		Usernames:      usernames,
-		LeaseExpiresAt: assignment.LeaseExpiresAt,
-		DuckLake:       dl,
+		OrgID:     assignment.OrgID,
+		Usernames: usernames,
+		DuckLake:  dl,
 	}, nil
 }
 

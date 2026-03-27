@@ -236,7 +236,6 @@ type WorkerRecord struct {
 	OrgID               string      `gorm:"size:255;index" json:"org_id"`
 	OwnerCPInstanceID   string      `gorm:"size:255;index" json:"owner_cp_instance_id"`
 	OwnerEpoch          int64       `gorm:"not null" json:"owner_epoch"`
-	LeaseExpiresAt      time.Time   `gorm:"index" json:"lease_expires_at"`
 	ActivationStartedAt *time.Time  `json:"activation_started_at,omitempty"`
 	LastHeartbeatAt     time.Time   `json:"last_heartbeat_at"`
 	RetireReason        string      `gorm:"size:64" json:"retire_reason"`
