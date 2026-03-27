@@ -10,14 +10,21 @@ import (
 )
 
 type fakeRuntimeInstanceStore struct {
-	mu      sync.Mutex
-	records []configstore.ControlPlaneInstance
+	mu       sync.Mutex
+	records  []configstore.ControlPlaneInstance
+	upsertCh chan struct{}
 }
 
 func (f *fakeRuntimeInstanceStore) UpsertControlPlaneInstance(instance *configstore.ControlPlaneInstance) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.records = append(f.records, *instance)
+	f.mu.Unlock()
+	if f.upsertCh != nil {
+		select {
+		case f.upsertCh <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 
@@ -29,8 +36,19 @@ func (f *fakeRuntimeInstanceStore) snapshot() []configstore.ControlPlaneInstance
 	return out
 }
 
+func (f *fakeRuntimeInstanceStore) waitForUpserts(t *testing.T, count int, timeout time.Duration) {
+	t.Helper()
+	for i := 0; i < count; i++ {
+		select {
+		case <-f.upsertCh:
+		case <-time.After(timeout):
+			t.Fatalf("timed out waiting for %d runtime upserts; saw %d", count, len(f.snapshot()))
+		}
+	}
+}
+
 func TestControlPlaneRuntimeTrackerStartHeartbeats(t *testing.T) {
-	store := &fakeRuntimeInstanceStore{}
+	store := &fakeRuntimeInstanceStore{upsertCh: make(chan struct{}, 8)}
 	tracker := NewControlPlaneRuntimeTracker(store, "cp-1:boot-a", "duckgres-0", "pod-uid-1", "boot-a", 10*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -40,10 +58,7 @@ func TestControlPlaneRuntimeTrackerStartHeartbeats(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for len(store.snapshot()) < 2 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
+	store.waitForUpserts(t, 2, time.Second)
 
 	records := store.snapshot()
 	if len(records) < 2 {

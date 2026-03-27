@@ -1,7 +1,6 @@
 package controlplane
 
 import (
-	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -80,25 +79,12 @@ func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 	janitor.now = func() time.Time { return now }
 	janitor.maxDrainTimeout = 15 * time.Minute
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		janitor.Run(ctx)
-	}()
-
-	time.Sleep(25 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("janitor did not stop after context cancellation")
-	}
+	janitor.runOnce()
+	janitor.runOnce()
 
 	calls := store.snapshot()
-	if len(calls) < 2 {
-		t.Fatalf("expected janitor to run at least twice, got %d", len(calls))
+	if len(calls) != 2 {
+		t.Fatalf("expected janitor to run exactly twice, got %d", len(calls))
 	}
 	wantCutoff := now.Add(-20 * time.Second)
 	for i, cutoff := range calls {
@@ -107,8 +93,8 @@ func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 		}
 	}
 	wantDrainCutoff := now.Add(-15 * time.Minute)
-	if len(store.drainingCutoffs) < 2 {
-		t.Fatalf("expected janitor to expire overdue draining instances at least twice, got %d", len(store.drainingCutoffs))
+	if len(store.drainingCutoffs) != 2 {
+		t.Fatalf("expected janitor to expire overdue draining instances exactly twice, got %d", len(store.drainingCutoffs))
 	}
 	for i, cutoff := range store.drainingCutoffs {
 		if !cutoff.Equal(wantDrainCutoff) {
@@ -144,26 +130,12 @@ func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 		}{id: record.WorkerID, reason: reason})
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		janitor.Run(ctx)
-	}()
-
-	time.Sleep(25 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("janitor did not stop after context cancellation")
-	}
+	janitor.runOnce()
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(retired) < 2 {
-		t.Fatalf("expected janitor to retire at least two workers, got %d", len(retired))
+	if len(retired) != 2 {
+		t.Fatalf("expected janitor to retire exactly two workers, got %d", len(retired))
 	}
 	if retired[0].id != 7 || retired[0].reason != janitorRetireReasonOrphaned {
 		t.Fatalf("expected orphaned worker 7 with orphaned reason, got %+v", retired[0])
@@ -202,26 +174,12 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 		calls++
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		janitor.Run(ctx)
-	}()
-
-	time.Sleep(25 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("janitor did not stop after context cancellation")
-	}
+	janitor.runOnce()
 
 	mu.Lock()
 	defer mu.Unlock()
-	if calls == 0 {
-		t.Fatal("expected janitor to reconcile warm capacity")
+	if calls != 1 {
+		t.Fatalf("expected janitor to reconcile warm capacity exactly once, got %d", calls)
 	}
 }
 
