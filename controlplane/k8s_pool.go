@@ -5,11 +5,13 @@ package controlplane
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -378,7 +380,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	podLabels := map[string]string{
 		"app":                     "duckgres-worker",
 		"duckgres/control-plane":  p.cpID,
-		"duckgres/cp-instance-id": p.cpInstanceID,
+		"duckgres/cp-instance-id": controlPlaneIDLabelValue(p.cpInstanceID),
 		"duckgres/worker-id":      strconv.Itoa(id),
 		"duckgres/owner-epoch":    "0",
 	}
@@ -554,6 +556,48 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 
 	slog.Info("K8s worker spawned.", "id", id, "pod", podName, "addr", addr)
 	return nil
+}
+
+func controlPlaneIDLabelValue(cpInstanceID string) string {
+	sanitized := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-' || r == '_' || r == '.':
+			return r
+		default:
+			return '-'
+		}
+	}, cpInstanceID)
+
+	sanitized = strings.TrimFunc(sanitized, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	})
+	if sanitized == "" {
+		sum := sha1.Sum([]byte(cpInstanceID))
+		return hex.EncodeToString(sum[:])[:12]
+	}
+	if len(sanitized) <= 63 {
+		return sanitized
+	}
+
+	sum := sha1.Sum([]byte(cpInstanceID))
+	suffix := hex.EncodeToString(sum[:])[:12]
+	prefixLen := 63 - len(suffix) - 1
+	if prefixLen < 1 {
+		prefixLen = 1
+	}
+	prefix := strings.TrimRightFunc(sanitized[:prefixLen], func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	})
+	if prefix == "" {
+		return suffix
+	}
+	return prefix + "-" + suffix
 }
 
 // createPodWithBackoff creates a pod, retrying transient K8s API errors

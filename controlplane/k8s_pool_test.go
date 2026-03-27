@@ -4,6 +4,7 @@ package controlplane
 
 import (
 	"context"
+	"regexp"
 	"strconv"
 	"sync"
 	"testing"
@@ -1372,8 +1373,8 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	if pod.Labels["duckgres/control-plane"] != "test-cp" {
 		t.Fatalf("expected control-plane label test-cp, got %s", pod.Labels["duckgres/control-plane"])
 	}
-	if pod.Labels["duckgres/cp-instance-id"] != "cp-uid-123:boot-abc" {
-		t.Fatalf("expected cp-instance-id label cp-uid-123:boot-abc, got %s", pod.Labels["duckgres/cp-instance-id"])
+	if pod.Labels["duckgres/cp-instance-id"] != "cp-uid-123-boot-abc" {
+		t.Fatalf("expected cp-instance-id label cp-uid-123-boot-abc, got %s", pod.Labels["duckgres/cp-instance-id"])
 	}
 	if pod.Labels["duckgres/owner-epoch"] != "0" {
 		t.Fatalf("expected owner-epoch label 0, got %s", pod.Labels["duckgres/owner-epoch"])
@@ -1419,6 +1420,25 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 
 	if len(pod.Spec.Volumes) == 0 {
 		t.Fatal("expected configmap volume")
+	}
+}
+
+func TestControlPlaneIDLabelValue_StaysKubernetesSafe(t *testing.T) {
+	t.Parallel()
+
+	label := controlPlaneIDLabelValue("duckgres-control-plane-7fb9dd69c6-dcgzw:14cd8dd9eb353e609c7a4387a594a418")
+	if len(label) > 63 {
+		t.Fatalf("expected label length <= 63, got %d (%q)", len(label), label)
+	}
+	matched, err := regexp.MatchString(`^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$`, label)
+	if err != nil {
+		t.Fatalf("failed to compile label regex: %v", err)
+	}
+	if !matched {
+		t.Fatalf("expected Kubernetes-safe label, got %q", label)
+	}
+	if label == "duckgres-control-plane-7fb9dd69c6-dcgzw:14cd8dd9eb353e609c7a4387a594a418" {
+		t.Fatalf("expected sanitized label, got original %q", label)
 	}
 }
 
