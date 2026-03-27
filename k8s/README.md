@@ -26,15 +26,17 @@ This directory contains **development/reference manifests** for running duckgres
 │  │  Bearer auth │ │  Bearer auth │ │  Bearer auth │  │
 │  └──────────────┘ └──────────────┘ └──────────────┘  │
 │                                                      │
+│  Runtime coordination lives in config-store Postgres │
+│  (`cp_instances`, `worker_records`, Flight sessions) │
+│                                                      │
 │  Worker pods have:                                   │
-│  - Owner references → CP pod (GC on CP deletion)    │
 │  - SecurityContext: non-root (UID 1000)              │
 │  - Bearer token from K8s Secret                      │
 │  - ConfigMap mount for shared config                 │
 └─────────────────────────────────────────────────────┘
 ```
 
-The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL transpilation. Workers are thin DuckDB execution engines exposed via Arrow Flight SQL. Workers are spawned on demand and reaped when idle.
+The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL transpilation. Workers are thin DuckDB execution engines exposed via Arrow Flight SQL. Workers are spawned on demand and reaped when idle. Planned rolling replacements mark old replicas draining and fail readiness before termination; unplanned control-plane failure still drops existing pgwire connections.
 
 ## Manifests
 
@@ -47,7 +49,6 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | `managed-warehouse-secrets.yaml` | Local secret payloads referenced by the seeded managed-warehouse contract |
 | `worker-identity.yaml` | Local worker ServiceAccount referenced by the seeded managed-warehouse contract |
 | `networkpolicy.yaml` | Restricts worker ingress to CP pods only |
-| `control-plane-deployment.yaml` | Local multitenant CP Deployment + ClusterIP Service |
 | `control-plane-multitenant-local.yaml` | Optional OrbStack-oriented shared warm-worker control-plane manifest |
 | `kind/config-store.overlay.yaml` | Compose overlay that attaches local dependency containers to the external Docker `kind` network |
 | `kind/config-store.seed.sql` | Kind-oriented managed-warehouse seed for the shared warm-worker flow |
@@ -62,6 +63,7 @@ Key flags for Kubernetes multitenant mode:
 |------|---------|-------------|
 | `--worker-backend remote` | - | Use K8s remote workers in config-store-backed multitenant mode |
 | `--config-store` | `DUCKGRES_CONFIG_STORE` | PostgreSQL config-store connection string required for remote mode |
+| `--handover-drain-timeout` | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns/upgrades before forced exit (`15m` default in remote mode) |
 | `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
 | `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |
 | `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |
@@ -69,6 +71,15 @@ Key flags for Kubernetes multitenant mode:
 | `--k8s-shared-warm-target` | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for multi-tenant K8s mode (`0` disables prewarm) |
 
 The bearer token secret is used to authenticate gRPC connections between the control plane and workers. If the secret exists but is empty, the CP auto-generates a random token and populates it.
+
+For seamless planned deployments, use a rolling strategy with overlap and enough termination grace period for drain completion. The provided control-plane manifests now set:
+
+- `strategy.rollingUpdate.maxUnavailable: 0`
+- `strategy.rollingUpdate.maxSurge: 1`
+- `terminationGracePeriodSeconds: 900`
+- `--handover-drain-timeout 15m`
+
+That gives the old replica time to fail readiness, stop taking new pgwire sessions, keep existing pgwire and Flight sessions alive during the drain window, and then force shutdown at the timeout boundary if sessions remain.
 
 ## Local Development with kind
 

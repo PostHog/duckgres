@@ -66,7 +66,7 @@ var hotWorkerSessionsHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
 const (
 	RetireReasonNormal            = "normal"
 	RetireReasonActivationFailure = "activation_failure"
-	RetireReasonLeaseExpiry       = "lease_expiry"
+	RetireReasonOrphaned          = "orphaned"
 	RetireReasonCrash             = "crash"
 	RetireReasonShutdown          = "shutdown"
 	RetireReasonIdleTimeout       = "idle_timeout"

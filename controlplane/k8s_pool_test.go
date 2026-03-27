@@ -4,17 +4,159 @@ package controlplane
 
 import (
 	"context"
+	"errors"
+	"regexp"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/posthog/duckgres/controlplane/configstore"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
+
+type captureRuntimeWorkerStore struct {
+	mu                    sync.Mutex
+	records               []configstore.WorkerRecord
+	claimed               *configstore.WorkerRecord
+	claimErr              error
+	claimCalls            int
+	claimOwnerCPID        string
+	claimOrgID            string
+	claimMaxOrgWorkers    int
+	spawned               *configstore.WorkerRecord
+	spawnErr              error
+	spawnCalls            int
+	spawnOwnerCPID        string
+	spawnOrgID            string
+	spawnOwnerEpoch       int64
+	spawnPodNamePrefix    string
+	spawnMaxOrgWorkers    int
+	spawnMaxGlobalWorks   int
+	neutralSpawned        *configstore.WorkerRecord
+	neutralSpawnErr       error
+	neutralSpawnCalls     int
+	neutralSpawnOwnerCPID string
+	neutralSpawnPodPrefix string
+	neutralSpawnTarget    int
+	neutralSpawnMaxGlobal int
+	takenOver             *configstore.WorkerRecord
+	takeOverErr           error
+	takeOverWorkerID      int
+	takeOverOwnerCPID     string
+	takeOverOrgID         string
+	takeOverExpectedEpoch int64
+}
+
+func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records = append(s.records, *record)
+	return nil
+}
+
+func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]configstore.WorkerRecord, len(s.records))
+	copy(out, s.records)
+	return out
+}
+
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimCalls++
+	s.claimOwnerCPID = ownerCPInstanceID
+	s.claimOrgID = orgID
+	s.claimMaxOrgWorkers = maxOrgWorkers
+	if s.claimErr != nil {
+		return nil, s.claimErr
+	}
+	if s.claimed == nil {
+		return nil, nil
+	}
+	claimed := *s.claimed
+	return &claimed, nil
+}
+
+func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.spawnCalls++
+	s.spawnOwnerCPID = ownerCPInstanceID
+	s.spawnOrgID = orgID
+	s.spawnOwnerEpoch = ownerEpoch
+	s.spawnPodNamePrefix = podNamePrefix
+	s.spawnMaxOrgWorkers = maxOrgWorkers
+	s.spawnMaxGlobalWorks = maxGlobalWorkers
+	if s.spawnErr != nil {
+		return nil, s.spawnErr
+	}
+	if s.spawned == nil {
+		return nil, nil
+	}
+	spawned := *s.spawned
+	return &spawned, nil
+}
+
+func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.neutralSpawnCalls++
+	s.neutralSpawnOwnerCPID = ownerCPInstanceID
+	s.neutralSpawnPodPrefix = podNamePrefix
+	s.neutralSpawnTarget = targetWarmWorkers
+	s.neutralSpawnMaxGlobal = maxGlobalWorkers
+	if s.neutralSpawnErr != nil {
+		return nil, s.neutralSpawnErr
+	}
+	if s.neutralSpawned == nil {
+		return nil, nil
+	}
+	spawned := *s.neutralSpawned
+	return &spawned, nil
+}
+
+func (s *captureRuntimeWorkerStore) GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimed != nil && s.claimed.WorkerID == workerID {
+		record := *s.claimed
+		return &record, nil
+	}
+	if s.spawned != nil && s.spawned.WorkerID == workerID {
+		record := *s.spawned
+		return &record, nil
+	}
+	if s.takenOver != nil && s.takenOver.WorkerID == workerID {
+		record := *s.takenOver
+		return &record, nil
+	}
+	return nil, nil
+}
+
+func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.takeOverWorkerID = workerID
+	s.takeOverOwnerCPID = ownerCPInstanceID
+	s.takeOverOrgID = orgID
+	s.takeOverExpectedEpoch = expectedOwnerEpoch
+	if s.takeOverErr != nil {
+		return nil, s.takeOverErr
+	}
+	if s.takenOver == nil {
+		return nil, nil
+	}
+	record := *s.takenOver
+	return &record, nil
+}
 
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
 	t.Helper()
@@ -34,19 +176,20 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 	}
 
 	pool := &K8sWorkerPool{
-		workers:     make(map[int]*ManagedWorker),
-		maxWorkers:  maxWorkers,
-		idleTimeout: 5 * time.Minute,
-		shutdownCh:  make(chan struct{}),
-		stopInform:  make(chan struct{}),
-		clientset:   cs,
-		namespace:   "default",
-		cpID:        "test-cp",
-		cpUID:       "cp-uid-123",
-		workerImage: "duckgres:test",
-		workerPort:  8816,
-		secretName:  "test-secret",
-		spawnSem:    make(chan struct{}, 1),
+		workers:      make(map[int]*ManagedWorker),
+		maxWorkers:   maxWorkers,
+		idleTimeout:  5 * time.Minute,
+		shutdownCh:   make(chan struct{}),
+		stopInform:   make(chan struct{}),
+		clientset:    cs,
+		namespace:    "default",
+		cpID:         "test-cp",
+		cpInstanceID: "cp-uid-123:boot-abc",
+		cpUID:        "cp-uid-123",
+		workerImage:  "duckgres:test",
+		workerPort:   8816,
+		secretName:   "test-secret",
+		spawnSem:     make(chan struct{}, 1),
 	}
 
 	return pool, cs
@@ -68,6 +211,26 @@ func TestK8sPool_EnsureBearerTokenSecret_CreatesNew(t *testing.T) {
 	token, ok := secret.Data["bearer-token"]
 	if !ok || len(token) == 0 {
 		t.Fatal("secret missing bearer-token key or empty")
+	}
+}
+
+func TestK8sPool_EnsureBearerTokenSecret_DefaultsToSharedSecretName(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.secretName = ""
+
+	if err := pool.ensureBearerTokenSecret(context.Background()); err != nil {
+		t.Fatalf("ensureBearerTokenSecret failed: %v", err)
+	}
+	if pool.secretName != "duckgres-worker-token" {
+		t.Fatalf("expected shared default secret name duckgres-worker-token, got %q", pool.secretName)
+	}
+
+	secret, err := cs.CoreV1().Secrets("default").Get(context.Background(), "duckgres-worker-token", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("shared default secret not found: %v", err)
+	}
+	if _, ok := secret.Data["bearer-token"]; !ok {
+		t.Fatal("shared default secret missing bearer-token key")
 	}
 }
 
@@ -210,8 +373,7 @@ func TestK8sPoolActivateReservedWorkerTransitionsToHot(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
@@ -246,8 +408,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
@@ -268,6 +429,45 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if _, ok := pool.Worker(worker.ID); ok {
 		t.Fatal("expected failed activation to retire worker")
+	}
+}
+
+func TestK8sPoolReserveClaimedWorkerUnlocksPoolOnTransitionError(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 9, done: make(chan struct{})}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{
+			OrgID: "analytics",
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	_, err := pool.reserveClaimedWorker(context.Background(), &configstore.WorkerRecord{
+		WorkerID:          worker.ID,
+		OwnerCPInstanceID: "cp-2:boot-b",
+		OwnerEpoch:        7,
+		State:             configstore.WorkerStateReserved,
+	}, &WorkerAssignment{
+		OrgID: "billing",
+	})
+	if err == nil {
+		t.Fatal("expected transition error")
+	}
+
+	locked := make(chan struct{})
+	go func() {
+		pool.mu.Lock()
+		pool.mu.Unlock()
+		close(locked)
+	}()
+
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("expected reserveClaimedWorker to unlock pool mutex on error")
 	}
 }
 
@@ -300,8 +500,7 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	}
 
 	got, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -421,8 +620,7 @@ func TestK8sPoolSpawnMinWorkersCountsOnlyNeutralIdleWorkersAsWarmCapacity(t *tes
 		if err := worker.SetSharedState(SharedWorkerState{
 			Lifecycle: WorkerLifecycleReserved,
 			Assignment: &WorkerAssignment{
-				OrgID:          "analytics",
-				LeaseExpiresAt: time.Now().Add(time.Hour),
+				OrgID: "analytics",
 			},
 		}); err != nil {
 			t.Fatalf("SetSharedState(reserved %d): %v", id, err)
@@ -455,8 +653,7 @@ func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 	if err := reserved.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(reserved): %v", err)
@@ -472,9 +669,11 @@ func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 	}
 }
 
-func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(t *testing.T) {
+func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentInRuntimeMode(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	pool.minWorkers = 1
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
 	idle := &ManagedWorker{ID: 7, done: make(chan struct{})}
 	pool.workers[idle.ID] = idle
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
@@ -494,13 +693,11 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 		pool.mu.Unlock()
 	}
 
-	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
 	worker, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -516,14 +713,516 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerAndReplenishesWarmCapacity(
 	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
 	}
-	if !state.Assignment.LeaseExpiresAt.Equal(leaseExpiry) {
-		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, state.Assignment.LeaseExpiresAt)
+	if worker.ownerEpoch != 1 {
+		t.Fatalf("expected owner epoch 1 after reservation, got %d", worker.ownerEpoch)
+	}
+
+	records := store.snapshot()
+	if len(records) == 0 {
+		t.Fatal("expected reservation to persist a worker record")
+	}
+	last := records[len(records)-1]
+	if last.WorkerID != worker.ID {
+		t.Fatalf("expected worker_id %d, got %d", worker.ID, last.WorkerID)
+	}
+	if last.State != configstore.WorkerStateReserved {
+		t.Fatalf("expected reserved worker record, got %q", last.State)
+	}
+	if last.OwnerCPInstanceID != pool.cpInstanceID {
+		t.Fatalf("expected owner_cp_instance_id %q, got %q", pool.cpInstanceID, last.OwnerCPInstanceID)
+	}
+	if last.OwnerEpoch != 1 {
+		t.Fatalf("expected owner_epoch 1, got %d", last.OwnerEpoch)
+	}
+	if last.OrgID != "analytics" {
+		t.Fatalf("expected org_id analytics, got %q", last.OrgID)
 	}
 
 	select {
-	case <-replacementSpawned:
-	case <-time.After(time.Second):
-		t.Fatal("expected reserve to trigger warm-pool replenishment")
+	case id := <-replacementSpawned:
+		t.Fatalf("did not expect local warm-pool replenishment in runtime mode, got background spawn %d", id)
+	default:
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.minWorkers = 0
+	store := &captureRuntimeWorkerStore{
+		claimed: &configstore.WorkerRecord{
+			WorkerID:          21,
+			PodName:           "duckgres-worker-other-cp-21",
+			State:             configstore.WorkerStateReserved,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        3,
+		},
+	}
+	pool.runtimeStore = store
+
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "duckgres-worker-other-cp-21",
+			Namespace: "default",
+			Labels: map[string]string{
+				"duckgres/control-plane": "other-cp",
+				"duckgres/worker-id":     "21",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.0.0.21",
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create adopted worker pod: %v", err)
+	}
+
+	var connectedPodName string
+	var connectedPodIP string
+	pool.connectWorkerFunc = func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+		connectedPodName = podName
+		connectedPodIP = podIP
+		return nil, nil
+	}
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		if worker == nil {
+			t.Fatal("expected claimed worker for liveness check")
+		}
+		if worker.ID != 21 {
+			t.Fatalf("expected claimed worker id 21, got %d", worker.ID)
+		}
+		return nil
+	}
+	pool.cachedToken = "shared-token"
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker.ID != 21 {
+		t.Fatalf("expected claimed worker 21, got %d", worker.ID)
+	}
+	if worker.PodName() != "duckgres-worker-other-cp-21" {
+		t.Fatalf("expected tracked pod name duckgres-worker-other-cp-21, got %q", worker.PodName())
+	}
+	if worker.OwnerEpoch() != 3 {
+		t.Fatalf("expected claimed owner epoch 3, got %d", worker.OwnerEpoch())
+	}
+	if worker.OwnerCPInstanceID() != pool.cpInstanceID {
+		t.Fatalf("expected owner cp instance id %q, got %q", pool.cpInstanceID, worker.OwnerCPInstanceID())
+	}
+	if connectedPodName != "duckgres-worker-other-cp-21" || connectedPodIP != "10.0.0.21" {
+		t.Fatalf("expected connection to claimed pod, got name=%q ip=%q", connectedPodName, connectedPodIP)
+	}
+	if store.claimCalls != 1 {
+		t.Fatalf("expected one claim call, got %d", store.claimCalls)
+	}
+	if store.claimOwnerCPID != pool.cpInstanceID {
+		t.Fatalf("expected claim owner cp instance id %q, got %q", pool.cpInstanceID, store.claimOwnerCPID)
+	}
+	if store.claimOrgID != "analytics" {
+		t.Fatalf("expected claim org analytics, got %q", store.claimOrgID)
+	}
+	if store.claimMaxOrgWorkers != 0 {
+		t.Fatalf("expected default max org workers 0, got %d", store.claimMaxOrgWorkers)
+	}
+
+	state := worker.SharedState()
+	if state.Lifecycle != WorkerLifecycleReserved {
+		t.Fatalf("expected reserved lifecycle, got %q", state.Lifecycle)
+	}
+	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
+		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerFallsBackWhenRuntimeClaimReturnsNil(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	idle := &ManagedWorker{ID: 8, done: make(chan struct{})}
+	pool.workers[idle.ID] = idle
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker.ID != idle.ID {
+		t.Fatalf("expected fallback idle worker %d, got %d", idle.ID, worker.ID)
+	}
+	if store.claimCalls != 1 {
+		t.Fatalf("expected one claim attempt before fallback, got %d", store.claimCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerPassesOrgCapToRuntimeClaim(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	idle := &ManagedWorker{ID: 12, done: make(chan struct{})}
+	pool.workers[idle.ID] = idle
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error { return nil }
+
+	_, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 3,
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if store.claimMaxOrgWorkers != 3 {
+		t.Fatalf("expected claim max org workers 3, got %d", store.claimMaxOrgWorkers)
+	}
+}
+
+func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		takenOver: &configstore.WorkerRecord{
+			WorkerID:          44,
+			PodName:           "duckgres-worker-test-cp-44",
+			State:             configstore.WorkerStateReserved,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        8,
+		},
+	}
+	pool.runtimeStore = store
+	worker := &ManagedWorker{ID: 44, done: make(chan struct{})}
+	pool.workers[worker.ID] = worker
+	livenessChecked := false
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		livenessChecked = true
+		return nil
+	}
+
+	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 3,
+	})
+	if err != nil {
+		t.Fatalf("claimSpecificWorker: %v", err)
+	}
+	if claimed.ID != 44 {
+		t.Fatalf("expected claimed worker 44, got %d", claimed.ID)
+	}
+	if store.takeOverWorkerID != 44 {
+		t.Fatalf("expected takeover worker id 44, got %d", store.takeOverWorkerID)
+	}
+	if store.takeOverOwnerCPID != pool.cpInstanceID {
+		t.Fatalf("expected takeover owner cp id %q, got %q", pool.cpInstanceID, store.takeOverOwnerCPID)
+	}
+	if store.takeOverOrgID != "analytics" {
+		t.Fatalf("expected takeover org analytics, got %q", store.takeOverOrgID)
+	}
+	if store.takeOverExpectedEpoch != 7 {
+		t.Fatalf("expected takeover expected epoch 7, got %d", store.takeOverExpectedEpoch)
+	}
+	if claimed.OwnerEpoch() != 8 {
+		t.Fatalf("expected owner epoch 8, got %d", claimed.OwnerEpoch())
+	}
+	state := claimed.SharedState()
+	if state.Lifecycle != WorkerLifecycleReserved {
+		t.Fatalf("expected reserved lifecycle, got %q", state.Lifecycle)
+	}
+	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
+		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
+	}
+	if !livenessChecked {
+		t.Fatal("expected claimSpecificWorker to recheck worker liveness")
+	}
+}
+
+func TestK8sPoolClaimSpecificWorkerReturnsEpochMismatchError(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		takeOverErr: configstore.ErrWorkerOwnerEpochMismatch,
+	}
+	pool.runtimeStore = store
+
+	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 3,
+	})
+	if err == nil {
+		t.Fatal("expected stale takeover to return an error")
+	}
+	if !errors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
+		t.Fatalf("expected ErrWorkerOwnerEpochMismatch, got %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claimed worker, got %#v", claimed)
+	}
+}
+
+func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		takenOver: &configstore.WorkerRecord{
+			WorkerID:          44,
+			PodName:           "duckgres-worker-test-cp-44",
+			State:             configstore.WorkerStateReserved,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        8,
+		},
+	}
+	pool.runtimeStore = store
+	pool.workers[44] = &ManagedWorker{ID: 44, done: make(chan struct{})}
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return errors.New("dead worker")
+	}
+
+	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 3,
+	})
+	if err == nil {
+		t.Fatal("expected unhealthy claimed worker to fail liveness recheck")
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claimed worker, got %#v", claimed)
+	}
+	if _, ok := pool.Worker(44); ok {
+		t.Fatal("expected unhealthy worker to be retired from the pool")
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		spawned: &configstore.WorkerRecord{
+			WorkerID:          31,
+			PodName:           "duckgres-worker-test-cp-31",
+			State:             configstore.WorkerStateSpawning,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        1,
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		worker := &ManagedWorker{ID: id, podName: "duckgres-worker-test-cp-31", done: make(chan struct{})}
+		pool.workers[id] = worker
+		return nil
+	}
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		if worker == nil || worker.ID != 31 {
+			t.Fatalf("expected spawned runtime worker 31, got %#v", worker)
+		}
+		return nil
+	}
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 2,
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+	if worker.ID != 31 {
+		t.Fatalf("expected spawned worker 31, got %d", worker.ID)
+	}
+	if store.spawnCalls != 1 {
+		t.Fatalf("expected one spawning slot allocation, got %d", store.spawnCalls)
+	}
+	if store.spawnOwnerCPID != pool.cpInstanceID {
+		t.Fatalf("expected spawn owner cp-instance %q, got %q", pool.cpInstanceID, store.spawnOwnerCPID)
+	}
+	if store.spawnOrgID != "analytics" {
+		t.Fatalf("expected spawn org analytics, got %q", store.spawnOrgID)
+	}
+	if store.spawnOwnerEpoch != 1 {
+		t.Fatalf("expected spawn owner epoch 1, got %d", store.spawnOwnerEpoch)
+	}
+	if store.spawnPodNamePrefix != "duckgres-worker-test-cp" {
+		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.spawnPodNamePrefix)
+	}
+	if store.spawnMaxOrgWorkers != 2 {
+		t.Fatalf("expected max org workers 2, got %d", store.spawnMaxOrgWorkers)
+	}
+	if store.spawnMaxGlobalWorks != 5 {
+		t.Fatalf("expected max global workers 5, got %d", store.spawnMaxGlobalWorks)
+	}
+	if worker.OwnerEpoch() != 1 {
+		t.Fatalf("expected owner epoch 1, got %d", worker.OwnerEpoch())
+	}
+	if worker.SharedState().Lifecycle != WorkerLifecycleReserved {
+		t.Fatalf("expected reserved lifecycle, got %q", worker.SharedState().Lifecycle)
+	}
+}
+
+func TestK8sPoolSpawnWarmWorkerAllocatesRuntimeSlotWhenIDZero(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		neutralSpawned: &configstore.WorkerRecord{
+			WorkerID:          41,
+			PodName:           "duckgres-worker-test-cp-41",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+		},
+	}
+	pool.runtimeStore = store
+
+	var spawnedID int
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		spawnedID = id
+		return nil
+	}
+
+	if err := pool.spawnWarmWorker(context.Background(), 0); err != nil {
+		t.Fatalf("spawnWarmWorker: %v", err)
+	}
+	if spawnedID != 41 {
+		t.Fatalf("expected runtime-allocated worker id 41, got %d", spawnedID)
+	}
+	if store.neutralSpawnCalls != 1 {
+		t.Fatalf("expected one runtime neutral spawn slot allocation, got %d", store.neutralSpawnCalls)
+	}
+	if store.neutralSpawnPodPrefix != "duckgres-worker-test-cp" {
+		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.neutralSpawnPodPrefix)
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+
+	var mu sync.Mutex
+	var slots int
+	store.neutralSpawned = &configstore.WorkerRecord{
+		WorkerID:          51,
+		PodName:           "duckgres-worker-test-cp-51",
+		State:             configstore.WorkerStateSpawning,
+		OwnerCPInstanceID: pool.cpInstanceID,
+	}
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		mu.Lock()
+		defer mu.Unlock()
+		slots++
+		if slots == 1 {
+			if id != 51 {
+				t.Fatalf("expected first runtime worker id 51, got %d", id)
+			}
+			store.neutralSpawned = &configstore.WorkerRecord{
+				WorkerID:          52,
+				PodName:           "duckgres-worker-test-cp-52",
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: pool.cpInstanceID,
+			}
+			return nil
+		}
+		if id != 52 {
+			t.Fatalf("expected second runtime worker id 52, got %d", id)
+		}
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkers(2); err != nil {
+		t.Fatalf("SpawnMinWorkers: %v", err)
+	}
+	if store.neutralSpawnCalls != 2 {
+		t.Fatalf("expected two runtime neutral spawn slot allocations, got %d", store.neutralSpawnCalls)
+	}
+	if store.neutralSpawnTarget != 2 {
+		t.Fatalf("expected neutral warm target 2, got %d", store.neutralSpawnTarget)
+	}
+}
+
+func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	worker := &ManagedWorker{ID: 9, done: make(chan struct{}), ownerEpoch: 4}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{
+			OrgID: "analytics",
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.activateTenantFunc = func(ctx context.Context, got *ManagedWorker, payload TenantActivationPayload) error {
+		return nil
+	}
+
+	if err := pool.ActivateReservedWorker(context.Background(), worker, TenantActivationPayload{
+		OrgID: "analytics",
+	}); err != nil {
+		t.Fatalf("ActivateReservedWorker: %v", err)
+	}
+
+	records := store.snapshot()
+	if len(records) != 2 {
+		t.Fatalf("expected 2 persisted records, got %d", len(records))
+	}
+	if records[0].State != configstore.WorkerStateActivating {
+		t.Fatalf("expected activating record first, got %q", records[0].State)
+	}
+	if records[1].State != configstore.WorkerStateHot {
+		t.Fatalf("expected hot record second, got %q", records[1].State)
+	}
+	for i, record := range records {
+		if record.OwnerEpoch != 4 {
+			t.Fatalf("record %d expected owner epoch 4, got %d", i, record.OwnerEpoch)
+		}
+		if record.OwnerCPInstanceID != pool.cpInstanceID {
+			t.Fatalf("record %d expected owner_cp_instance_id %q, got %q", i, pool.cpInstanceID, record.OwnerCPInstanceID)
+		}
+		if record.OrgID != "analytics" {
+			t.Fatalf("record %d expected org_id analytics, got %q", i, record.OrgID)
+		}
+	}
+}
+
+func TestK8sPoolRetireWorkerPersistsRetiredWorkerRecord(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	worker := &ManagedWorker{ID: 5, done: make(chan struct{}), ownerEpoch: 2}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle: WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{
+			OrgID: "analytics",
+		},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	pool.RetireWorker(worker.ID)
+
+	records := store.snapshot()
+	if len(records) == 0 {
+		t.Fatal("expected retirement to persist a worker record")
+	}
+	last := records[len(records)-1]
+	if last.State != configstore.WorkerStateRetired {
+		t.Fatalf("expected retired worker record, got %q", last.State)
+	}
+	if last.OwnerEpoch != 2 {
+		t.Fatalf("expected owner epoch 2, got %d", last.OwnerEpoch)
+	}
+	if last.OwnerCPInstanceID != pool.cpInstanceID {
+		t.Fatalf("expected owner_cp_instance_id %q, got %q", pool.cpInstanceID, last.OwnerCPInstanceID)
+	}
+	if last.OrgID != "analytics" {
+		t.Fatalf("expected org_id analytics, got %q", last.OrgID)
+	}
+	if last.RetireReason != RetireReasonNormal {
+		t.Fatalf("expected retire reason %q, got %q", RetireReasonNormal, last.RetireReason)
 	}
 }
 
@@ -573,8 +1272,7 @@ func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
 	defer cancel()
 
 	worker, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
-		OrgID:          "billing",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "billing",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker: %v", err)
@@ -599,8 +1297,7 @@ func TestK8sPoolIdleReaperSkipsReservedSharedWorker(t *testing.T) {
 	if err := reserved.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(reserved): %v", err)
@@ -694,15 +1391,18 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	if pod.Labels["duckgres/control-plane"] != "test-cp" {
 		t.Fatalf("expected control-plane label test-cp, got %s", pod.Labels["duckgres/control-plane"])
 	}
+	if pod.Labels["duckgres/cp-instance-id"] != "cp-uid-123-boot-abc" {
+		t.Fatalf("expected cp-instance-id label cp-uid-123-boot-abc, got %s", pod.Labels["duckgres/cp-instance-id"])
+	}
+	if pod.Labels["duckgres/owner-epoch"] != "0" {
+		t.Fatalf("expected owner-epoch label 0, got %s", pod.Labels["duckgres/owner-epoch"])
+	}
 	if _, ok := pod.Labels["duckgres/org"]; ok {
 		t.Fatalf("expected shared warm worker startup to stay org-neutral, got labels %#v", pod.Labels)
 	}
 
-	if len(pod.OwnerReferences) != 1 {
-		t.Fatalf("expected 1 owner reference, got %d", len(pod.OwnerReferences))
-	}
-	if pod.OwnerReferences[0].Name != "test-cp" {
-		t.Fatalf("expected owner ref to test-cp, got %s", pod.OwnerReferences[0].Name)
+	if len(pod.OwnerReferences) != 0 {
+		t.Fatalf("expected no owner references, got %d", len(pod.OwnerReferences))
 	}
 
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
@@ -741,13 +1441,32 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	}
 }
 
+func TestControlPlaneIDLabelValue_StaysKubernetesSafe(t *testing.T) {
+	t.Parallel()
+
+	label := controlPlaneIDLabelValue("duckgres-control-plane-7fb9dd69c6-dcgzw:14cd8dd9eb353e609c7a4387a594a418")
+	if len(label) > 63 {
+		t.Fatalf("expected label length <= 63, got %d (%q)", len(label), label)
+	}
+	matched, err := regexp.MatchString(`^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$`, label)
+	if err != nil {
+		t.Fatalf("failed to compile label regex: %v", err)
+	}
+	if !matched {
+		t.Fatalf("expected Kubernetes-safe label, got %q", label)
+	}
+	if label == "duckgres-control-plane-7fb9dd69c6-dcgzw:14cd8dd9eb353e609c7a4387a594a418" {
+		t.Fatalf("expected sanitized label, got original %q", label)
+	}
+}
+
 func TestK8sPool_ShutdownAll(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 
 	// Add some workers
 	for i := 0; i < 3; i++ {
 		done := make(chan struct{})
-		pool.workers[i] = &ManagedWorker{ID: i, done: done}
+		pool.workers[i] = &ManagedWorker{ID: i, podName: "duckgres-worker-test-cp-" + strconv.Itoa(i), done: done}
 
 		// Create corresponding pods
 		_, _ = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
@@ -769,6 +1488,35 @@ func TestK8sPool_ShutdownAll(t *testing.T) {
 	pool.mu.RUnlock()
 	if count != 0 {
 		t.Fatalf("expected 0 workers after shutdown, got %d", count)
+	}
+}
+
+func TestK8sPoolRetireWorkerUsesTrackedPodName(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+
+	done := make(chan struct{})
+	worker := &ManagedWorker{
+		ID:      11,
+		podName: "duckgres-worker-other-cp-11",
+		done:    done,
+	}
+	pool.workers[worker.ID] = worker
+
+	var deletedPodName string
+	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		deleteAction, ok := action.(k8stesting.DeleteAction)
+		if !ok {
+			return false, nil, nil
+		}
+		deletedPodName = deleteAction.GetName()
+		return false, nil, nil
+	})
+
+	pool.RetireWorker(worker.ID)
+	time.Sleep(100 * time.Millisecond)
+
+	if deletedPodName != "duckgres-worker-other-cp-11" {
+		t.Fatalf("expected retire to delete tracked pod name duckgres-worker-other-cp-11, got %q", deletedPodName)
 	}
 }
 

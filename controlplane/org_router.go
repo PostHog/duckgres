@@ -61,6 +61,7 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 	sharedCfg.WorkerIDGenerator = func() int {
 		return int(tr.nextWorkerID.Add(1))
 	}
+	sharedCfg.RuntimeStore = store
 
 	sharedPoolIface, err := CreateK8sPool(sharedCfg)
 	if err != nil {
@@ -184,6 +185,11 @@ func (tr *OrgRouter) StackForUser(username string) (*OrgStack, bool) {
 		return nil, false
 	}
 
+	return tr.StackForOrg(orgID)
+}
+
+// StackForOrg resolves an org id to its org stack.
+func (tr *OrgRouter) StackForOrg(orgID string) (*OrgStack, bool) {
 	tr.mu.RLock()
 	stack, ok := tr.orgs[orgID]
 	tr.mu.RUnlock()
@@ -350,12 +356,6 @@ func (tr *OrgRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
 	}
 
 	tr.sharedPool.SetWarmCapacityTarget(target)
-	if target > 0 {
-		observeOrgWorkerSpawn("shared")
-		if err := tr.sharedPool.SpawnMinWorkers(target); err != nil {
-			slog.Warn("Failed to reconcile shared warm capacity.", "target", target, "error", err)
-		}
-	}
 }
 
 func (tr *OrgRouter) onSharedWorkerCrash(workerID int) {

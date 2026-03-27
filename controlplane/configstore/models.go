@@ -186,6 +186,92 @@ type QueryLogConfig struct {
 
 func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
 
+// ControlPlaneInstanceState describes the liveness state of a control-plane instance.
+type ControlPlaneInstanceState string
+
+const (
+	ControlPlaneInstanceStateActive   ControlPlaneInstanceState = "active"
+	ControlPlaneInstanceStateDraining ControlPlaneInstanceState = "draining"
+	ControlPlaneInstanceStateExpired  ControlPlaneInstanceState = "expired"
+)
+
+// ControlPlaneInstance is a runtime coordination record for one control-plane process.
+// These rows live in the runtime schema, not the snapshot-backed config tables.
+type ControlPlaneInstance struct {
+	ID              string                    `gorm:"primaryKey;size:255" json:"id"`
+	PodName         string                    `gorm:"size:255;not null" json:"pod_name"`
+	PodUID          string                    `gorm:"size:255;not null" json:"pod_uid"`
+	BootID          string                    `gorm:"size:255;not null" json:"boot_id"`
+	State           ControlPlaneInstanceState `gorm:"size:32;not null" json:"state"`
+	StartedAt       time.Time                 `json:"started_at"`
+	LastHeartbeatAt time.Time                 `gorm:"index" json:"last_heartbeat_at"`
+	DrainingAt      *time.Time                `json:"draining_at,omitempty"`
+	ExpiredAt       *time.Time                `json:"expired_at,omitempty"`
+	CreatedAt       time.Time                 `json:"created_at"`
+	UpdatedAt       time.Time                 `json:"updated_at"`
+}
+
+func (ControlPlaneInstance) TableName() string { return "cp_instances" }
+
+// WorkerState is the durable lifecycle state for a worker pod.
+type WorkerState string
+
+const (
+	WorkerStateSpawning   WorkerState = "spawning"
+	WorkerStateIdle       WorkerState = "idle"
+	WorkerStateReserved   WorkerState = "reserved"
+	WorkerStateActivating WorkerState = "activating"
+	WorkerStateHot        WorkerState = "hot"
+	WorkerStateDraining   WorkerState = "draining"
+	WorkerStateRetired    WorkerState = "retired"
+	WorkerStateLost       WorkerState = "lost"
+)
+
+// WorkerRecord is the durable runtime coordination record for one worker pod.
+type WorkerRecord struct {
+	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`
+	PodName             string      `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
+	PodUID              string      `gorm:"size:255" json:"pod_uid"`
+	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
+	OrgID               string      `gorm:"size:255;index" json:"org_id"`
+	OwnerCPInstanceID   string      `gorm:"size:255;index" json:"owner_cp_instance_id"`
+	OwnerEpoch          int64       `gorm:"not null" json:"owner_epoch"`
+	ActivationStartedAt *time.Time  `json:"activation_started_at,omitempty"`
+	LastHeartbeatAt     time.Time   `json:"last_heartbeat_at"`
+	RetireReason        string      `gorm:"size:64" json:"retire_reason"`
+	CreatedAt           time.Time   `json:"created_at"`
+	UpdatedAt           time.Time   `json:"updated_at"`
+}
+
+func (WorkerRecord) TableName() string { return "worker_records" }
+
+// FlightSessionState is the durable reconnect state for Flight-only sessions.
+type FlightSessionState string
+
+const (
+	FlightSessionStateActive       FlightSessionState = "active"
+	FlightSessionStateReconnecting FlightSessionState = "reconnecting"
+	FlightSessionStateExpired      FlightSessionState = "expired"
+	FlightSessionStateClosed       FlightSessionState = "closed"
+)
+
+// FlightSessionRecord is the durable reconnect record for Flight sessions.
+type FlightSessionRecord struct {
+	SessionToken string             `gorm:"primaryKey;size:255" json:"session_token"`
+	Username     string             `gorm:"size:255;not null" json:"username"`
+	OrgID        string             `gorm:"size:255;not null" json:"org_id"`
+	WorkerID     int                `gorm:"not null;index" json:"worker_id"`
+	OwnerEpoch   int64              `gorm:"not null" json:"owner_epoch"`
+	CPInstanceID string             `gorm:"size:255" json:"cp_instance_id"`
+	State        FlightSessionState `gorm:"size:32;not null" json:"state"`
+	ExpiresAt    time.Time          `gorm:"index" json:"expires_at"`
+	LastSeenAt   time.Time          `json:"last_seen_at"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+}
+
+func (FlightSessionRecord) TableName() string { return "flight_session_records" }
+
 // OrgConfig is a convenience view combining org metadata with resource limits.
 type OrgConfig struct {
 	Name         string

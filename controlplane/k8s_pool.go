@@ -5,15 +5,19 @@ package controlplane
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/hex"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -42,35 +46,38 @@ type K8sWorkerPool struct {
 	shuttingDown bool
 	shutdownCh   chan struct{}
 
-	clientset            kubernetes.Interface
-	namespace            string
-	cpID                 string
-	cpUID                types.UID
-	workerImage          string
-	workerPort           int
-	secretName           string
-	configMap            string
-	configPath           string
-	imagePullPolicy      corev1.PullPolicy
-	serviceAccount       string
-	workerCPURequest     string            // CPU request for worker pods (e.g., "500m")
-	workerMemoryRequest  string            // memory request for worker pods (e.g., "1Gi")
+	clientset             kubernetes.Interface
+	namespace             string
+	cpID                  string
+	cpInstanceID          string
+	cpUID                 types.UID
+	workerImage           string
+	workerPort            int
+	secretName            string
+	configMap             string
+	configPath            string
+	imagePullPolicy       corev1.PullPolicy
+	serviceAccount        string
+	workerCPURequest      string            // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest   string            // memory request for worker pods (e.g., "1Gi")
 	workerNodeSelector    map[string]string // node selector for worker pods
 	workerTolerationKey   string            // taint key for NoSchedule toleration
 	workerTolerationValue string            // taint value for NoSchedule toleration
-	workerExclusiveNode  bool              // one worker per node via anti-affinity
-	orgID                string            // org ID for pod labels (multi-tenant mode)
-	workerIDGenerator    func() int // shared ID generator across orgs (nil = internal counter)
-	cachedToken          string // cached bearer token (immutable after setup)
-	informer             cache.SharedIndexInformer
-	stopInform           chan struct{}
-	spawnSem             chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
-	podReady             sync.Map      // podName -> chan string (pod IP); signaled by informer
+	workerExclusiveNode   bool              // one worker per node via anti-affinity
+	orgID                 string            // org ID for pod labels (multi-tenant mode)
+	workerIDGenerator     func() int        // shared ID generator across orgs (nil = internal counter)
+	cachedToken           string            // cached bearer token (immutable after setup)
+	informer              cache.SharedIndexInformer
+	stopInform            chan struct{}
+	spawnSem              chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
+	podReady              sync.Map      // podName -> chan string (pod IP); signaled by informer
 
 	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
 	spawnWarmWorkerBackgroundFunc func(id int)
 	activateTenantFunc            func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error
 	healthCheckFunc               func(context.Context, *ManagedWorker) error
+	connectWorkerFunc             func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error)
+	runtimeStore                  RuntimeWorkerStore
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 }
@@ -119,35 +126,40 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
 	spawnConcurrency := 3
 	pool := &K8sWorkerPool{
-		workers:              make(map[int]*ManagedWorker),
-		maxWorkers:           cfg.MaxWorkers,
-		idleTimeout:          cfg.IdleTimeout,
-		shutdownCh:           make(chan struct{}),
-		stopInform:           make(chan struct{}),
-		clientset:            clientset,
-		namespace:            cfg.Namespace,
-		cpID:                 cfg.CPID,
-		workerImage:          cfg.WorkerImage,
-		workerPort:           cfg.WorkerPort,
-		secretName:           cfg.SecretName,
-		configMap:            cfg.ConfigMap,
-		configPath:           cfg.ConfigPath,
-		imagePullPolicy:      corev1.PullPolicy(cfg.ImagePullPolicy),
-		serviceAccount:       cfg.ServiceAccount,
-		workerCPURequest:     cfg.WorkerCPURequest,
-		workerMemoryRequest:  cfg.WorkerMemoryRequest,
+		workers:               make(map[int]*ManagedWorker),
+		maxWorkers:            cfg.MaxWorkers,
+		idleTimeout:           cfg.IdleTimeout,
+		shutdownCh:            make(chan struct{}),
+		stopInform:            make(chan struct{}),
+		clientset:             clientset,
+		namespace:             cfg.Namespace,
+		cpID:                  cfg.CPID,
+		cpInstanceID:          cfg.CPInstanceID,
+		workerImage:           cfg.WorkerImage,
+		workerPort:            cfg.WorkerPort,
+		secretName:            cfg.SecretName,
+		configMap:             cfg.ConfigMap,
+		configPath:            cfg.ConfigPath,
+		imagePullPolicy:       corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:        cfg.ServiceAccount,
+		workerCPURequest:      cfg.WorkerCPURequest,
+		workerMemoryRequest:   cfg.WorkerMemoryRequest,
 		workerNodeSelector:    cfg.WorkerNodeSelector,
 		workerTolerationKey:   cfg.WorkerTolerationKey,
 		workerTolerationValue: cfg.WorkerTolerationValue,
-		workerExclusiveNode:  cfg.WorkerExclusiveNode,
-		orgID:                cfg.OrgID,
-		workerIDGenerator:    cfg.WorkerIDGenerator,
-		spawnSem:             make(chan struct{}, spawnConcurrency),
+		workerExclusiveNode:   cfg.WorkerExclusiveNode,
+		orgID:                 cfg.OrgID,
+		workerIDGenerator:     cfg.WorkerIDGenerator,
+		runtimeStore:          cfg.RuntimeStore,
+		spawnSem:              make(chan struct{}, spawnConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
 	if err := pool.resolveCPUID(context.Background()); err != nil {
 		slog.Warn("Could not resolve CP pod UID for owner references. Worker pods will not be garbage-collected if CP is deleted.", "error", err)
+	}
+	if pool.cpInstanceID == "" {
+		pool.cpInstanceID = pool.cpID
 	}
 
 	// Ensure bearer token secret exists
@@ -174,11 +186,11 @@ func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
 }
 
 // ensureBearerTokenSecret ensures the bearer token K8s Secret exists.
-// If no secret name is configured, it generates one named "duckgres-worker-token-<cpID>".
+// If no secret name is configured, it uses the shared default "duckgres-worker-token".
 // If the secret doesn't exist, it creates one with a random 32-byte hex token.
 func (p *K8sWorkerPool) ensureBearerTokenSecret(ctx context.Context) error {
 	if p.secretName == "" {
-		p.secretName = "duckgres-worker-token-" + p.cpID
+		p.secretName = "duckgres-worker-token"
 	}
 
 	existing, err := p.clientset.CoreV1().Secrets(p.namespace).Get(ctx, p.secretName, metav1.GetOptions{})
@@ -365,24 +377,13 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 
 	podName := p.podNameForWorker(id)
 
-	// Build owner references for GC on CP deletion
-	var ownerRefs []metav1.OwnerReference
-	if p.cpUID != "" {
-		ownerRefs = []metav1.OwnerReference{
-			{
-				APIVersion: "v1",
-				Kind:       "Pod",
-				Name:       p.cpID,
-				UID:        p.cpUID,
-			},
-		}
-	}
-
 	// Build pod labels
 	podLabels := map[string]string{
-		"app":                    "duckgres-worker",
-		"duckgres/control-plane": p.cpID,
-		"duckgres/worker-id":     strconv.Itoa(id),
+		"app":                     "duckgres-worker",
+		"duckgres/control-plane":  p.cpID,
+		"duckgres/cp-instance-id": controlPlaneIDLabelValue(p.cpInstanceID),
+		"duckgres/worker-id":      strconv.Itoa(id),
+		"duckgres/owner-epoch":    "0",
 	}
 	if p.orgID != "" {
 		podLabels["duckgres/org"] = p.orgID
@@ -391,10 +392,9 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	// Build pod spec
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            podName,
-			Namespace:       p.namespace,
-			Labels:          podLabels,
-			OwnerReferences: ownerRefs,
+			Name:      podName,
+			Namespace: p.namespace,
+			Labels:    podLabels,
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:      corev1.RestartPolicyNever,
@@ -512,6 +512,8 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		GracePeriodSeconds: int64Ptr(0),
 	})
 
+	p.persistWorkerRecord(p.workerRecordFor(id, nil, 0, configstore.WorkerStateSpawning, "", nil))
+
 	// Create pod with exponential backoff on transient errors.
 	if err := p.createPodWithBackoff(ctx, pod); err != nil {
 		return err
@@ -539,6 +541,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	done := make(chan struct{})
 	w := &ManagedWorker{
 		ID:          id,
+		podName:     podName,
 		bearerToken: token,
 		client:      client,
 		done:        done,
@@ -549,10 +552,53 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	workerCount := len(p.workers)
 	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
+	p.persistWorkerRecord(p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil))
 	observeControlPlaneWorkers(workerCount)
 
 	slog.Info("K8s worker spawned.", "id", id, "pod", podName, "addr", addr)
 	return nil
+}
+
+func controlPlaneIDLabelValue(cpInstanceID string) string {
+	sanitized := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-' || r == '_' || r == '.':
+			return r
+		default:
+			return '-'
+		}
+	}, cpInstanceID)
+
+	sanitized = strings.TrimFunc(sanitized, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	})
+	if sanitized == "" {
+		sum := sha1.Sum([]byte(cpInstanceID))
+		return hex.EncodeToString(sum[:])[:12]
+	}
+	if len(sanitized) <= 63 {
+		return sanitized
+	}
+
+	sum := sha1.Sum([]byte(cpInstanceID))
+	suffix := hex.EncodeToString(sum[:])[:12]
+	prefixLen := 63 - len(suffix) - 1
+	if prefixLen < 1 {
+		prefixLen = 1
+	}
+	prefix := strings.TrimRightFunc(sanitized[:prefixLen], func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	})
+	if prefix == "" {
+		return suffix
+	}
+	return prefix + "-" + suffix
 }
 
 // createPodWithBackoff creates a pod, retrying transient K8s API errors
@@ -700,7 +746,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 					w.peakSessions = w.activeSessions
 				}
 				if canSpawn {
-					id := p.allocateWorkerIDLocked()
+					id := p.allocateBackgroundSpawnIDLocked()
 					p.spawning++
 					p.mu.Unlock()
 					slog.Debug("Assigned to least-loaded worker, spawning new worker in background.",
@@ -717,7 +763,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 
 		// 3. No live workers at all (cold start or all dead) — must block on spawn
 		if canSpawn {
-			id := p.allocateWorkerIDLocked()
+			id := p.allocateBackgroundSpawnIDLocked()
 			p.spawning++
 			p.mu.Unlock()
 
@@ -761,7 +807,7 @@ func (p *K8sWorkerPool) spawnWorkerBackground(id int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	err := p.SpawnWorker(ctx, id)
+	err := p.spawnWarmWorker(ctx, id)
 
 	p.mu.Lock()
 	p.spawning--
@@ -775,14 +821,16 @@ func (p *K8sWorkerPool) spawnWorkerBackground(id int) {
 // ReleaseWorker decrements the active session count for a worker.
 func (p *K8sWorkerPool) ReleaseWorker(id int) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	w, ok := p.workers[id]
-	if ok {
-		if w.activeSessions > 0 {
-			w.activeSessions--
-		}
-		w.lastUsed = time.Now()
+	if !ok {
+		p.mu.Unlock()
+		return
 	}
+	if w.activeSessions > 0 {
+		w.activeSessions--
+	}
+	w.lastUsed = time.Now()
+	p.mu.Unlock()
 }
 
 // RetireWorker removes a worker from the pool and deletes its pod.
@@ -847,15 +895,26 @@ func (p *K8sWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error {
 	p.mu.Lock()
 	var err error
+	var prevState SharedWorkerState
+	hadPrevState := false
+	var activatingRecord *configstore.WorkerRecord
 	switch worker.SharedState().NormalizedLifecycle() {
 	case WorkerLifecycleReserved:
+		prevState = worker.SharedState()
+		hadPrevState = true
 		nextState, transitionErr := worker.SharedState().Transition(WorkerLifecycleActivating, nil)
 		if transitionErr == nil {
 			transitionErr = worker.SetSharedState(nextState)
 		}
+		if transitionErr == nil {
+			now := time.Now()
+			activatingRecord = p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateActivating, "", &now)
+		}
 		err = transitionErr
 	case WorkerLifecycleActivating:
 		err = nil
+		now := time.Now()
+		activatingRecord = p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateActivating, "", &now)
 	default:
 		err = fmt.Errorf("worker %d is not reserved for activation", worker.ID)
 	}
@@ -863,36 +922,51 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	if err != nil {
 		return err
 	}
+	p.persistWorkerRecord(activatingRecord)
 
 	activate := p.activateTenantFunc
 	if activate == nil {
 		activate = func(ctx context.Context, worker *ManagedWorker, payload TenantActivationPayload) error {
 			return worker.ActivateTenant(ctx, server.WorkerActivationPayload{
-				OrgID:          payload.OrgID,
-				LeaseExpiresAt: payload.LeaseExpiresAt,
-				DuckLake:       payload.DuckLake,
+				WorkerControlMetadata: server.WorkerControlMetadata{
+					WorkerID:     worker.ID,
+					OwnerEpoch:   worker.OwnerEpoch(),
+					CPInstanceID: worker.OwnerCPInstanceID(),
+				},
+				OrgID:    payload.OrgID,
+				DuckLake: payload.DuckLake,
 			})
 		}
 	}
 
 	if err := activate(ctx, worker, payload); err != nil {
+		if hadPrevState {
+			p.mu.Lock()
+			_ = worker.SetSharedState(prevState)
+			p.mu.Unlock()
+		}
 		p.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
 		return err
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if worker.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
+		p.mu.Unlock()
 		return nil
 	}
 	nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
 	if err != nil {
+		p.mu.Unlock()
 		return err
 	}
 	if setErr := worker.SetSharedState(nextState); setErr != nil {
+		p.mu.Unlock()
 		return setErr
 	}
+	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
 	observeWarmPoolLifecycleGauges(p.workers)
+	p.mu.Unlock()
+	p.persistWorkerRecord(hotRecord)
 	return nil
 }
 
@@ -907,6 +981,22 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
+		}
+
+		if p.runtimeStore != nil {
+			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.MaxWorkers)
+			if err != nil {
+				return nil, err
+			}
+			if claimed != nil {
+				worker, reserveErr := p.reserveClaimedWorker(ctx, claimed, assignment)
+				if reserveErr == nil {
+					return worker, nil
+				}
+				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "pod", claimed.PodName, "error", reserveErr)
+				p.retireClaimedWorker(claimed, RetireReasonCrash)
+				continue
+			}
 		}
 
 		p.mu.Lock()
@@ -928,15 +1018,19 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				p.mu.Unlock()
 				return nil, err
 			}
+			idle.SetOwnerCPInstanceID(p.cpInstanceID)
+			idle.IncrementOwnerEpoch()
 			idle.reservedAt = time.Now()
+			reservedRecord := p.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
 			observeWarmPoolLifecycleGauges(p.workers)
 			shouldReplenish := p.shouldReplenishWarmCapacityLocked()
 			var replenishID int
 			if shouldReplenish {
-				replenishID = p.allocateWorkerIDLocked()
+				replenishID = p.allocateBackgroundSpawnIDLocked()
 				p.spawning++
 			}
 			p.mu.Unlock()
+			p.persistWorkerRecord(reservedRecord)
 
 			if err := p.checkReservedWorkerLiveness(ctx, idle); err != nil {
 				slog.Warn("Reserved warm worker failed liveness recheck.", "worker", idle.ID, "error", err)
@@ -957,6 +1051,47 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 		liveCount := p.liveWorkerCountLocked()
 		if p.maxWorkers == 0 || liveCount < p.maxWorkers {
+			if p.runtimeStore != nil {
+				slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
+					p.cpInstanceID,
+					assignment.OrgID,
+					1,
+					p.workerPodNamePrefix(),
+					assignment.MaxWorkers,
+					p.maxWorkers,
+				)
+				if err != nil {
+					p.mu.Unlock()
+					return nil, err
+				}
+				if slot == nil {
+					p.mu.Unlock()
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(100 * time.Millisecond):
+					}
+					continue
+				}
+				p.spawning++
+				p.mu.Unlock()
+
+				err = p.spawnWarmWorker(ctx, slot.WorkerID)
+
+				p.mu.Lock()
+				p.spawning--
+				if err == nil {
+					observeWarmPoolLifecycleGauges(p.workers)
+				}
+				p.mu.Unlock()
+
+				if err != nil {
+					p.retireClaimedWorker(slot, RetireReasonCrash)
+					return nil, err
+				}
+				return p.reserveClaimedWorker(ctx, slot, assignment)
+			}
+
 			id := p.allocateWorkerIDLocked()
 			p.spawning++
 			p.mu.Unlock()
@@ -985,6 +1120,146 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 	}
 }
 
+func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord, assignment *WorkerAssignment) (*ManagedWorker, error) {
+	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool is shutting down")
+	}
+	p.cleanDeadWorkersLocked()
+	worker, ok := p.workers[claimed.WorkerID]
+	p.mu.Unlock()
+
+	if !ok {
+		adopted, err := p.adoptClaimedWorker(ctx, claimed)
+		if err != nil {
+			return nil, err
+		}
+		p.mu.Lock()
+		if existing, exists := p.workers[claimed.WorkerID]; exists {
+			p.mu.Unlock()
+			if adopted.client != nil {
+				_ = adopted.client.Close()
+			}
+			worker = existing
+		} else {
+			p.workers[claimed.WorkerID] = adopted
+			p.mu.Unlock()
+			worker = adopted
+		}
+	}
+
+	p.mu.Lock()
+	var reservedRecord *configstore.WorkerRecord
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool is shutting down")
+	}
+	if claimed.PodName != "" {
+		worker.podName = claimed.PodName
+	}
+	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
+	worker.SetOwnerEpoch(claimed.OwnerEpoch)
+	nextState, err := worker.SharedState().Transition(WorkerLifecycleReserved, assignment)
+	if err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
+	if err := worker.SetSharedState(nextState); err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
+	worker.reservedAt = time.Now()
+	observeWarmPoolLifecycleGauges(p.workers)
+	if claimed.State != configstore.WorkerStateReserved {
+		reservedRecord = p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
+	}
+	p.mu.Unlock()
+	if reservedRecord != nil {
+		p.persistWorkerRecord(reservedRecord)
+	}
+	if err := p.checkReservedWorkerLiveness(ctx, worker); err != nil {
+		slog.Warn("Claimed worker failed liveness recheck.", "worker", worker.ID, "pod", worker.PodName(), "error", err)
+		p.retireWorkerWithReason(worker.ID, RetireReasonCrash)
+		return nil, err
+	}
+	return worker, nil
+}
+
+func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, expectedOwnerEpoch int64, assignment *WorkerAssignment) (*ManagedWorker, error) {
+	if p.runtimeStore == nil {
+		return nil, fmt.Errorf("runtime worker store is not configured")
+	}
+	if err := validateWorkerAssignment(assignment); err != nil {
+		return nil, err
+	}
+	record, err := p.runtimeStore.TakeOverWorker(workerID, p.cpInstanceID, assignment.OrgID, expectedOwnerEpoch)
+	if err != nil {
+		if stderrors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
+			return nil, fmt.Errorf("worker %d ownership changed before takeover: %w", workerID, err)
+		}
+		return nil, err
+	}
+	if record == nil {
+		return nil, fmt.Errorf("worker %d could not be claimed", workerID)
+	}
+	return p.reserveClaimedWorker(ctx, record, assignment)
+}
+
+func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord) (*ManagedWorker, error) {
+	token, err := p.readBearerToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read bearer token: %w", err)
+	}
+	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, claimed.PodName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
+	}
+	client, err := p.connectWorker(ctx, claimed.PodName, pod.Status.PodIP, token)
+	if err != nil {
+		return nil, err
+	}
+	worker := &ManagedWorker{
+		ID:          claimed.WorkerID,
+		podName:     claimed.PodName,
+		bearerToken: token,
+		client:      client,
+		done:        make(chan struct{}),
+	}
+	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
+	worker.SetOwnerEpoch(claimed.OwnerEpoch)
+	return worker, nil
+}
+
+func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+	if p.connectWorkerFunc != nil {
+		return p.connectWorkerFunc(ctx, podName, podIP, bearerToken)
+	}
+	if podIP == "" {
+		return nil, fmt.Errorf("worker pod %s has no IP", podName)
+	}
+	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
+	client, err := waitForWorkerTCP(addr, bearerToken, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("connect to claimed worker %s: %w", podName, err)
+	}
+	return client, nil
+}
+
+func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string) {
+	worker := &ManagedWorker{
+		ID:      claimed.WorkerID,
+		podName: claimed.PodName,
+		done:    make(chan struct{}),
+	}
+	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
+	worker.SetOwnerEpoch(claimed.OwnerEpoch)
+	p.mu.Lock()
+	p.markWorkerRetiredLocked(worker, reason)
+	p.mu.Unlock()
+	go p.retireWorkerPod(worker.ID, worker)
+}
+
 func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker *ManagedWorker) error {
 	check := p.healthCheckFunc
 	if check == nil {
@@ -994,7 +1269,7 @@ func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker 
 			}
 			hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
-			_, err := doHealthCheck(hctx, worker.client)
+			_, err := doHealthCheckWithMetadata(hctx, worker.client, p.healthCheckPayloadForWorker(worker))
 			return err
 		}
 	}
@@ -1004,6 +1279,49 @@ func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker 
 // SpawnMinWorkers pre-warms the pool with count workers.
 func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 	if count <= 0 {
+		return nil
+	}
+
+	if p.runtimeStore != nil {
+		p.mu.Lock()
+		if count > p.minWorkers {
+			p.minWorkers = count
+		}
+		p.mu.Unlock()
+
+		ctx := context.Background()
+		for i := 0; i < count; i++ {
+			slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
+				p.cpInstanceID,
+				p.workerPodNamePrefix(),
+				count,
+				p.maxWorkers,
+			)
+			if err != nil {
+				return err
+			}
+			if slot == nil {
+				break
+			}
+
+			p.mu.Lock()
+			p.spawning++
+			p.mu.Unlock()
+
+			err = p.spawnWarmWorker(ctx, slot.WorkerID)
+
+			p.mu.Lock()
+			p.spawning--
+			if err == nil {
+				observeWarmPoolLifecycleGauges(p.workers)
+			}
+			p.mu.Unlock()
+
+			if err != nil {
+				p.retireClaimedWorker(slot, RetireReasonCrash)
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -1022,25 +1340,25 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 	ids := make([]int, 0, missing)
 	for i := 0; i < missing; i++ {
-		ids = append(ids, p.allocateWorkerIDLocked())
+		ids = append(ids, p.allocateBackgroundSpawnIDLocked())
 		p.spawning++
 	}
 	p.mu.Unlock()
 
 	ctx := context.Background()
 
-		for _, id := range ids {
-			if err := p.spawnWarmWorker(ctx, id); err != nil {
-				p.mu.Lock()
-				p.spawning--
-				p.mu.Unlock()
-				return err
-			}
+	for _, id := range ids {
+		if err := p.spawnWarmWorker(ctx, id); err != nil {
 			p.mu.Lock()
 			p.spawning--
-			observeWarmPoolLifecycleGauges(p.workers)
 			p.mu.Unlock()
+			return err
 		}
+		p.mu.Lock()
+		p.spawning--
+		observeWarmPoolLifecycleGauges(p.workers)
+		p.mu.Unlock()
+	}
 	return nil
 }
 
@@ -1114,7 +1432,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						func() {
 							defer recoverWorkerPanic(&healthErr)
 							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-							hcResult, healthErr = doHealthCheck(hctx, w.client)
+							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForWorker(w))
 							cancel()
 						}()
 
@@ -1195,7 +1513,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 
 	ctx := context.Background()
 	for _, w := range workers {
-		podName := p.podNameForWorker(w.ID)
+		podName := p.workerPodName(w)
 		gracePeriod := int64(10)
 		slog.Info("Shutting down K8s worker.", "id", w.ID, "pod", podName)
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
@@ -1218,7 +1536,7 @@ func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
 	if w.client != nil {
 		_ = w.client.Close()
 	}
-	podName := p.podNameForWorker(id)
+	podName := p.workerPodName(w)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
@@ -1319,7 +1637,7 @@ func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
 	var spawnIDs []int
 	for range toRetire {
 		if p.shouldReplenishWarmCapacityLocked() {
-			id := p.allocateWorkerIDLocked()
+			id := p.allocateBackgroundSpawnIDLocked()
 			p.spawning++
 			spawnIDs = append(spawnIDs, id)
 		}
@@ -1404,14 +1722,14 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 				go func(c *flightsql.Client) { _ = c.Close() }(w.client)
 			}
 			// Delete the failed pod from K8s to avoid accumulating terminated pods
-			go func(workerID int) {
-				podName := p.podNameForWorker(workerID)
+			go func(worker *ManagedWorker) {
+				podName := p.workerPodName(worker)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 					GracePeriodSeconds: int64Ptr(0),
 				})
-			}(id)
+			}(w)
 		default:
 		}
 	}
@@ -1454,6 +1772,13 @@ func (p *K8sWorkerPool) allocateWorkerIDLocked() int {
 	return id
 }
 
+func (p *K8sWorkerPool) allocateBackgroundSpawnIDLocked() int {
+	if p.runtimeStore != nil {
+		return 0
+	}
+	return p.allocateWorkerIDLocked()
+}
+
 func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bool) {
 	w, ok := p.workers[id]
 	if !ok {
@@ -1465,7 +1790,7 @@ func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bo
 	if !p.shouldReplenishWarmCapacityLocked() {
 		return w, workerCount, 0, false
 	}
-	replacementID := p.allocateWorkerIDLocked()
+	replacementID := p.allocateBackgroundSpawnIDLocked()
 	p.spawning++
 	return w, workerCount, replacementID, true
 }
@@ -1508,6 +1833,9 @@ func (p *K8sWorkerPool) idleWarmWorkerCountLocked() int {
 }
 
 func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
+	if p.runtimeStore != nil {
+		return false
+	}
 	if p.minWorkers <= 0 {
 		return false
 	}
@@ -1519,6 +1847,21 @@ func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
 }
 
 func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int) error {
+	if id <= 0 && p.runtimeStore != nil {
+		slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
+			p.cpInstanceID,
+			p.workerPodNamePrefix(),
+			p.minWorkers,
+			p.maxWorkers,
+		)
+		if err != nil {
+			return err
+		}
+		if slot == nil {
+			return nil
+		}
+		id = slot.WorkerID
+	}
 	if p.spawnWarmWorkerFunc != nil {
 		return p.spawnWarmWorkerFunc(ctx, id)
 	}
@@ -1542,8 +1885,65 @@ func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string)
 		return
 	}
 	_ = w.SetSharedState(nextState)
+	workerState := configstore.WorkerStateRetired
+	if reason == RetireReasonCrash {
+		workerState = configstore.WorkerStateLost
+	}
+	p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil))
 	observeWorkerRetirement(reason)
 	observeWarmPoolLifecycleGauges(p.workers)
+}
+
+func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) {
+	if p.runtimeStore == nil || record == nil {
+		return
+	}
+	if err := p.runtimeStore.UpsertWorkerRecord(record); err != nil {
+		slog.Warn("Persisting worker runtime record failed.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+	}
+}
+
+func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoch int64, state configstore.WorkerState, retireReason string, activationStartedAt *time.Time) *configstore.WorkerRecord {
+	record := &configstore.WorkerRecord{
+		WorkerID:          id,
+		PodName:           p.podNameForWorker(id),
+		State:             state,
+		OwnerCPInstanceID: p.cpInstanceID,
+		OwnerEpoch:        ownerEpoch,
+		LastHeartbeatAt:   time.Now(),
+		RetireReason:      retireReason,
+	}
+	if activationStartedAt != nil {
+		startedAt := *activationStartedAt
+		record.ActivationStartedAt = &startedAt
+	}
+	if worker == nil {
+		if state == configstore.WorkerStateIdle {
+			record.OwnerCPInstanceID = ""
+		}
+		return record
+	}
+	record.PodName = p.workerPodName(worker)
+	record.OwnerCPInstanceID = worker.OwnerCPInstanceID()
+	if assignment := worker.SharedState().Assignment; assignment != nil {
+		record.OrgID = assignment.OrgID
+	}
+	if state == configstore.WorkerStateIdle {
+		record.OwnerCPInstanceID = ""
+		record.OrgID = ""
+	}
+	return record
+}
+
+func (p *K8sWorkerPool) healthCheckPayloadForWorker(worker *ManagedWorker) server.WorkerHealthCheckPayload {
+	payload := server.WorkerHealthCheckPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			WorkerID:     worker.ID,
+			OwnerEpoch:   worker.OwnerEpoch(),
+			CPInstanceID: worker.OwnerCPInstanceID(),
+		},
+	}
+	return payload
 }
 
 // podNameForWorker returns the pod name for a given worker ID,
@@ -1553,6 +1953,23 @@ func (p *K8sWorkerPool) podNameForWorker(id int) string {
 		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.orgID, id)
 	}
 	return fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
+}
+
+func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
+	if worker != nil && worker.PodName() != "" {
+		return worker.PodName()
+	}
+	if worker == nil {
+		return ""
+	}
+	return p.podNameForWorker(worker.ID)
+}
+
+func (p *K8sWorkerPool) workerPodNamePrefix() string {
+	if p.orgID != "" {
+		return fmt.Sprintf("duckgres-worker-%s-%s", p.cpID, p.orgID)
+	}
+	return fmt.Sprintf("duckgres-worker-%s", p.cpID)
 }
 
 // SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
@@ -1571,6 +1988,12 @@ func (p *K8sWorkerPool) SetWarmCapacityTarget(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.minWorkers = n
+}
+
+func (p *K8sWorkerPool) WarmCapacityTarget() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.minWorkers
 }
 
 func boolPtr(b bool) *bool    { return &b }

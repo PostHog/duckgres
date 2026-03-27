@@ -7,6 +7,11 @@ metadata:
     app: duckgres-control-plane
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: duckgres-control-plane
@@ -15,6 +20,7 @@ spec:
       labels:
         app: duckgres-control-plane
     spec:
+      terminationGracePeriodSeconds: 900
       serviceAccountName: duckgres-control-plane
       securityContext:
         runAsNonRoot: true
@@ -23,6 +29,15 @@ spec:
         - name: control-plane
           image: duckgres:test
           imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
           args:
             - "--mode"
             - "control-plane"
@@ -32,6 +47,8 @@ spec:
             - "postgres://duckgres:duckgres@duckgres-config-store:5432/duckgres_config?sslmode=disable"
             - "--config-poll-interval"
             - "2s"
+            - "--handover-drain-timeout"
+            - "15m"
             - "--k8s-worker-image"
             - "duckgres:test"
             - "--k8s-worker-image-pull-policy"

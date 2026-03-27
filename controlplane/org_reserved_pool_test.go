@@ -53,8 +53,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	if err := other.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "billing",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "billing",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(other): %v", err)
@@ -87,14 +86,15 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	}
 }
 
-func TestOrgReservedPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
+func TestOrgReservedPoolReleaseWorkerRetiresWorkerOnLastSession(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 9, activeSessions: 1, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(shared.cpInstanceID)
+	worker.SetOwnerEpoch(3)
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(worker): %v", err)
@@ -104,7 +104,6 @@ func TestOrgReservedPoolReleaseWorkerRetiresOnLastSession(t *testing.T) {
 	pool := NewOrgReservedPool(shared, "analytics", 1, nil)
 	pool.ReleaseWorker(worker.ID)
 
-	time.Sleep(100 * time.Millisecond)
 	if _, ok := shared.Worker(worker.ID); ok {
 		t.Fatal("expected worker to be retired after last session release")
 	}
@@ -187,8 +186,7 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: time.Now().Add(time.Hour),
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState(worker): %v", err)

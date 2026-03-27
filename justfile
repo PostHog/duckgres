@@ -50,7 +50,11 @@ build-k8s-image tag="duckgres:test":
 [group('dev')]
 kind-cluster-reset:
     kind delete cluster --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}" || true
-    kind create cluster --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}" --wait 120s
+    if [ -n "${DUCKGRES_KIND_NODE_IMAGE:-}" ]; then \
+      kind create cluster --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}" --image "${DUCKGRES_KIND_NODE_IMAGE}" --wait 120s; \
+    else \
+      kind create cluster --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}" --wait 120s; \
+    fi
     kind export kubeconfig --name "${DUCKGRES_KIND_CLUSTER_NAME:-duckgres}" --kubeconfig "${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}"
 
 # Delete the local kind cluster used by the portable K8s integration flow

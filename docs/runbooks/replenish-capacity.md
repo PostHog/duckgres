@@ -3,7 +3,7 @@
 ## When to use
 
 - `duckgres_warm_workers` is 0 and sessions are queuing
-- After a mass retirement event (rolling update, crash storm)
+- After a mass retirement event (planned control-plane rollout, crash storm)
 - Scaling up for anticipated traffic
 
 ## Background

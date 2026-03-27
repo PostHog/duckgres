@@ -44,6 +44,10 @@ type SessionManager struct {
 	nextPID atomic.Int32
 }
 
+type flightReconnectPool interface {
+	ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error)
+}
+
 // NewSessionManager creates a new session manager.
 func NewSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer) *SessionManager {
 	sm := &SessionManager{
@@ -80,43 +84,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	}
 	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
-	createStart := time.Now()
-	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
-	if err != nil {
-		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker
-		// that has sessions from other concurrent requests).
-		sm.pool.RetireWorkerIfNoSessions(worker.ID)
-		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
-	}
-
-	// Create FlightExecutor sharing the worker's existing gRPC connection
-	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
-
-	if pid == 0 {
-		pid = sm.nextPID.Add(1)
-	}
-
-	session := &ManagedSession{
-		PID:          pid,
-		WorkerID:     worker.ID,
-		Protocol:     "postgres",
-		SessionToken: sessionToken,
-		Executor:     executor,
-	}
-
-	sm.mu.Lock()
-	sm.sessions[pid] = session
-	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
-	sm.mu.Unlock()
-
-	slog.Debug("Session created on worker.", "pid", pid, "worker", worker.ID, "user", username, "create_duration", time.Since(createStart))
-
-	// Update other sessions if rebalancing is enabled.
-	if sm.rebalancer != nil {
-		sm.rebalancer.RequestRebalance()
-	}
-
-	return pid, executor, nil
+	return sm.createSessionOnWorker(ctx, username, pid, memoryLimit, threads, worker, "postgres", true)
 }
 
 func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) (string, int) {
@@ -130,6 +98,55 @@ func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) 
 		threads = sm.rebalancer.PerSessionThreads()
 	}
 	return memoryLimit, threads
+}
+
+func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (int32, *server.FlightExecutor, error) {
+	reconnector, ok := sm.pool.(flightReconnectPool)
+	if !ok {
+		return 0, nil, fmt.Errorf("worker pool does not support flight reconnect")
+	}
+	worker, err := reconnector.ReconnectFlightWorker(ctx, workerID, ownerEpoch)
+	if err != nil {
+		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
+	}
+	return sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false)
+}
+
+func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *server.FlightExecutor, error) {
+	createStart := time.Now()
+	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
+	if err != nil {
+		if retireOnFailure {
+			sm.pool.RetireWorkerIfNoSessions(worker.ID)
+		}
+		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
+	}
+
+	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
+	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
+
+	if pid == 0 {
+		pid = sm.nextPID.Add(1)
+	}
+
+	session := &ManagedSession{
+		PID:          pid,
+		WorkerID:     worker.ID,
+		Protocol:     protocol,
+		SessionToken: sessionToken,
+		Executor:     executor,
+	}
+
+	sm.mu.Lock()
+	sm.sessions[pid] = session
+	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
+	sm.mu.Unlock()
+
+	slog.Debug("Session created on worker.", "pid", pid, "worker", worker.ID, "user", username, "create_duration", time.Since(createStart))
+	if sm.rebalancer != nil {
+		sm.rebalancer.RequestRebalance()
+	}
+	return pid, executor, nil
 }
 
 // DestroySession destroys a session, retires its dedicated worker, and rebalances

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cloudflare/tableflip"
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightsqlingress"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -61,7 +62,6 @@ type ControlPlaneConfig struct {
 	// InternalSecret is the shared secret for API authentication.
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
-
 }
 
 type ProcessConfig struct {
@@ -71,23 +71,23 @@ type ProcessConfig struct {
 
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage       string // Container image for worker pods (required)
-	WorkerNamespace   string // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID    string // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort        int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret      string // K8s Secret name containing bearer token
-	WorkerConfigMap   string // ConfigMap name for duckgres.yaml
-	ImagePullPolicy   string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount    string // ServiceAccount name for worker pods (default: "default")
-	MaxWorkers        int    // Global cap for the shared K8s worker pool (0 = auto-derived)
-	SharedWarmTarget    int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
-	WorkerCPURequest    string // CPU request for worker pods (e.g., "500m")
-	WorkerMemoryRequest string // Memory request for worker pods (e.g., "1Gi")
+	WorkerImage           string // Container image for worker pods (required)
+	WorkerNamespace       string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID        string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort            int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret          string // K8s Secret name containing bearer token
+	WorkerConfigMap       string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy       string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount        string // ServiceAccount name for worker pods (default: "default")
+	MaxWorkers            int    // Global cap for the shared K8s worker pool (0 = auto-derived)
+	SharedWarmTarget      int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	WorkerCPURequest      string // CPU request for worker pods (e.g., "500m")
+	WorkerMemoryRequest   string // Memory request for worker pods (e.g., "1Gi")
 	WorkerNodeSelector    string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
 	WorkerTolerationKey   string // Taint key for worker pod NoSchedule toleration
 	WorkerTolerationValue string // Taint value for worker pod NoSchedule toleration
-	WorkerExclusiveNode  bool   // One worker per node via pod anti-affinity
-	AWSRegion           string // AWS region for STS client
+	WorkerExclusiveNode   bool   // One worker per node via pod anti-affinity
+	AWSRegion             string // AWS region for STS client
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -116,9 +116,11 @@ type ControlPlane struct {
 	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
 	// Multi-tenant fields (non-nil in remote multitenant mode)
-	orgRouter   OrgRouterInterface
-	configStore ConfigStoreInterface
-	apiServer   *http.Server // API server on :8080 (shut down on graceful exit)
+	orgRouter      OrgRouterInterface
+	configStore    ConfigStoreInterface
+	apiServer      *http.Server // API server on :8080 (shut down on graceful exit)
+	runtimeTracker *ControlPlaneRuntimeTracker
+	janitorLeader  *JanitorLeaderManager
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -126,11 +128,16 @@ type ControlPlane struct {
 type ConfigStoreInterface interface {
 	ValidateUser(username, password string) (orgID string, ok bool)
 	OrgForUser(username string) string
+	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
+	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
+	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
+	CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
 	StackForUser(username string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
+	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	IsMigratingForUser(username string) (migrating bool, orgID string)
 	ShutdownAll()
 }
@@ -151,7 +158,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.WorkerIdleTimeout = 5 * time.Minute
 	}
 	if cfg.HandoverDrainTimeout == 0 {
-		cfg.HandoverDrainTimeout = 24 * time.Hour
+		if cfg.WorkerBackend == "remote" {
+			cfg.HandoverDrainTimeout = 15 * time.Minute
+		} else {
+			cfg.HandoverDrainTimeout = 24 * time.Hour
+		}
 	}
 
 	// Enforce secure defaults for control-plane mode.
@@ -327,7 +338,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, apiServer, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
+		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
@@ -335,8 +346,22 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cp.configStore = store
 		cp.orgRouter = adapter
 		cp.apiServer = apiServer
+		cp.runtimeTracker = runtimeTracker
+		cp.janitorLeader = janitorLeader
 		cp.cfg = cfg
 		_ = store // keep linter happy
+		if cp.runtimeTracker != nil {
+			if err := cp.runtimeTracker.Start(context.Background()); err != nil {
+				slog.Error("Failed to start control-plane runtime tracker.", "error", err)
+				os.Exit(1)
+			}
+		}
+		if cp.janitorLeader != nil {
+			if err := cp.janitorLeader.Start(context.Background()); err != nil {
+				slog.Error("Failed to start janitor leader election.", "error", err)
+				os.Exit(1)
+			}
+		}
 	} else {
 		// Single-tenant mode: one shared process pool + session manager
 		procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, processMinWorkers, processMaxWorkers)
@@ -446,7 +471,19 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			os.Exit(0)
 		}
 		slog.Info("Received shutdown signal.", "signal", s)
-		cp.shutdown()
+		if cp.runtimeTracker != nil {
+			if err := cp.runtimeTracker.MarkDraining(); err != nil {
+				slog.Warn("Failed to mark control plane draining.", "error", err)
+			}
+		}
+		if cp.janitorLeader != nil {
+			cp.janitorLeader.Stop()
+		}
+		if isK8s {
+			cp.drainAndShutdown(cp.cfg.HandoverDrainTimeout)
+		} else {
+			cp.shutdown()
+		}
 		os.Exit(0)
 	}()
 
@@ -763,6 +800,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		sessions = cp.sessions
 		rebalancer = cp.rebalancer
 	}
+	if cp.isDraining() {
+		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
+		_ = writer.Flush()
+		return
+	}
 
 	// Feed initial parameters and backend key data to the client IMMEDIATELY.
 	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
@@ -940,6 +982,41 @@ func fullRead(conn net.Conn, buf []byte) (int, error) {
 }
 
 func (cp *ControlPlane) shutdown() {
+	cp.stopAcceptingPGConnections()
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
+	}
+	if cp.janitorLeader != nil {
+		cp.janitorLeader.Stop()
+	}
+
+	// Wait for in-flight connections to finish
+	slog.Info("Waiting for connections to drain...")
+	cp.wg.Wait()
+
+	cp.shutdownRuntimeResources()
+}
+
+func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
+	cp.stopAcceptingPGConnections()
+	if cp.flight != nil {
+		cp.flight.BeginDrain()
+	}
+	slog.Info("Waiting for planned shutdown drain.", "timeout", timeout)
+	if cp.waitForDrain(timeout) {
+		slog.Info("All pgwire connections and Flight sessions drained before shutdown.")
+	} else {
+		slog.Warn("Planned shutdown drain timeout exceeded, forcing shutdown.", "timeout", timeout)
+	}
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
+	}
+	cp.shutdownRuntimeResources()
+}
+
+func (cp *ControlPlane) stopAcceptingPGConnections() {
 	cp.closeMu.Lock()
 	cp.closed = true
 	cp.closeMu.Unlock()
@@ -947,15 +1024,46 @@ func (cp *ControlPlane) shutdown() {
 	if cp.pgListener != nil {
 		_ = cp.pgListener.Close()
 	}
-	if cp.flight != nil {
-		cp.flight.Shutdown()
-		cp.flight = nil
+}
+
+func (cp *ControlPlane) waitForDrain(timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	pgDone := make(chan struct{})
+	go func() {
+		cp.wg.Wait()
+		close(pgDone)
+	}()
+
+	flightDone := make(chan bool, 1)
+	go func() {
+		if cp.flight != nil {
+			flightDone <- cp.flight.WaitForZeroSessions(ctx)
+			return
+		}
+		flightDone <- true
+	}()
+
+	pgClosed := false
+	flightClosed := false
+	for !pgClosed || !flightClosed {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-pgDone:
+			pgClosed = true
+		case drained := <-flightDone:
+			if !drained {
+				return false
+			}
+			flightClosed = true
+		}
 	}
+	return true
+}
 
-	// Wait for in-flight connections to finish
-	slog.Info("Waiting for connections to drain...")
-	cp.wg.Wait()
-
+func (cp *ControlPlane) shutdownRuntimeResources() {
 	slog.Info("Shutting down workers...")
 	if cp.orgRouter != nil {
 		cp.orgRouter.ShutdownAll()
@@ -982,6 +1090,10 @@ func (cp *ControlPlane) shutdown() {
 	cp.stopQueryLogger()
 
 	slog.Info("Control plane shutdown complete.")
+}
+
+func (cp *ControlPlane) isDraining() bool {
+	return cp.runtimeTracker != nil && cp.runtimeTracker.Draining()
 }
 
 func (cp *ControlPlane) stopQueryLogger() {
@@ -1177,8 +1289,9 @@ func (cp *ControlPlane) startFlightIngress() {
 			return ok
 		})
 		provider = &orgRoutedSessionProvider{
-			orgRouter: cp.orgRouter,
-			pidSession: make(map[int32]*SessionManager),
+			orgRouter:   cp.orgRouter,
+			configStore: cp.configStore,
+			pidSession:  make(map[int32]flightOwnedSession),
 		}
 	case cp.sessions != nil:
 		// Single-tenant: static users map, single session manager.

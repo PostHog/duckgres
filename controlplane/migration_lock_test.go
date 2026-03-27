@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	corev1 "k8s.io/api/core/v1"
@@ -91,7 +90,7 @@ func newTestWorker(t *testing.T, id int, orgID string) *ManagedWorker {
 	worker := &ManagedWorker{ID: id}
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle:  WorkerLifecycleReserved,
-		Assignment: &WorkerAssignment{OrgID: orgID, LeaseExpiresAt: time.Now().Add(time.Hour)},
+		Assignment: &WorkerAssignment{OrgID: orgID},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
 	}

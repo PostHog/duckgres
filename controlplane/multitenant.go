@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +29,14 @@ type orgRouterAdapter struct {
 
 func (a *orgRouterAdapter) StackForUser(username string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForUser(username)
+	if !ok {
+		return nil, nil, nil, false
+	}
+	return stack.Pool, stack.Sessions, stack.Rebalancer, true
+}
+
+func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
+	stack, ok := a.router.StackForOrg(orgID)
 	if !ok {
 		return nil, nil, nil, false
 	}
@@ -120,7 +129,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -128,27 +137,51 @@ func SetupMultiTenant(
 
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
+	namespace, err := resolveK8sNamespace(cfg.K8s.WorkerNamespace)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+
+	cpID := cfg.K8s.ControlPlaneID
+	if cpID == "" {
+		cpID = os.Getenv("POD_NAME")
+	}
+	if cpID == "" {
+		cpID, _ = os.Hostname()
+	}
+	podUID := os.Getenv("POD_UID")
+	if podUID == "" {
+		podUID = cpID
+	}
+	bootID := make([]byte, 16)
+	if _, err := rand.Read(bootID); err != nil {
+		return nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+	}
+	bootIDHex := hex.EncodeToString(bootID)
+	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
+
 	baseCfg := K8sWorkerPoolConfig{
-		Namespace:            cfg.K8s.WorkerNamespace,
-		CPID:                 cfg.K8s.ControlPlaneID,
-		WorkerImage:          cfg.K8s.WorkerImage,
-		WorkerPort:           cfg.K8s.WorkerPort,
-		SecretName:           cfg.K8s.WorkerSecret,
-		ConfigMap:            cfg.K8s.WorkerConfigMap,
-		MaxWorkers:           maxWorkers,
-		IdleTimeout:          cfg.WorkerIdleTimeout,
-		ConfigPath:           cfg.ConfigPath,
-		ImagePullPolicy:      cfg.K8s.ImagePullPolicy,
-		ServiceAccount:       cfg.K8s.ServiceAccount,
-		WorkerCPURequest:     cfg.K8s.WorkerCPURequest,
-		WorkerMemoryRequest:  cfg.K8s.WorkerMemoryRequest,
-		WorkerNodeSelector:   parseNodeSelector(cfg.K8s.WorkerNodeSelector),
+		Namespace:             namespace,
+		CPID:                  cpID,
+		CPInstanceID:          cpInstanceID,
+		WorkerImage:           cfg.K8s.WorkerImage,
+		WorkerPort:            cfg.K8s.WorkerPort,
+		SecretName:            cfg.K8s.WorkerSecret,
+		ConfigMap:             cfg.K8s.WorkerConfigMap,
+		MaxWorkers:            maxWorkers,
+		IdleTimeout:           cfg.WorkerIdleTimeout,
+		ConfigPath:            cfg.ConfigPath,
+		ImagePullPolicy:       cfg.K8s.ImagePullPolicy,
+		ServiceAccount:        cfg.K8s.ServiceAccount,
+		WorkerCPURequest:      cfg.K8s.WorkerCPURequest,
+		WorkerMemoryRequest:   cfg.K8s.WorkerMemoryRequest,
+		WorkerNodeSelector:    parseNodeSelector(cfg.K8s.WorkerNodeSelector),
 		WorkerTolerationKey:   cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue: cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:  cfg.K8s.WorkerExclusiveNode,
+		WorkerExclusiveNode:   cfg.K8s.WorkerExclusiveNode,
 	}
 
 	// Initialize STS broker for credential brokering (best-effort)
@@ -174,10 +207,37 @@ func SetupMultiTenant(
 
 	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, resolveDucklingStatus)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	adpt := &orgRouterAdapter{router: router}
+	runtimeTracker := NewControlPlaneRuntimeTracker(
+		store,
+		cpInstanceID,
+		cpID,
+		podUID,
+		bootIDHex,
+		5*time.Second,
+	)
+	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
+	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
+	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
+		router.sharedPool.retireClaimedWorker(&record, reason)
+	}
+	janitor.reconcileWarmCapacity = func() {
+		target := router.sharedPool.WarmCapacityTarget()
+		if target <= 0 {
+			return
+		}
+		observeOrgWorkerSpawn("shared")
+		if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
+			slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
+		}
+	}
+	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
@@ -198,7 +258,7 @@ func SetupMultiTenant(
 	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret (pass via --internal-secret or DUCKGRES_INTERNAL_SECRET to set explicitly).", "secret", internalSecret)
@@ -211,9 +271,7 @@ func SetupMultiTenant(
 	engine.Use(gin.Recovery())
 
 	// Health endpoint (unauthenticated, used by K8s probes)
-	engine.GET("/health", func(c *gin.Context) {
-		c.String(http.StatusOK, "ok")
-	})
+	engine.GET("/health", newHealthHandler(runtimeTracker.Draining))
 
 	// Authenticated API
 	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
@@ -234,7 +292,28 @@ func SetupMultiTenant(
 		}
 	}()
 
-	return store, adpt, apiServer, nil
+	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
+}
+
+func resolveK8sNamespace(namespace string) (string, error) {
+	if namespace != "" {
+		return namespace, nil
+	}
+	ns, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return "", fmt.Errorf("k8s namespace not set and auto-detection failed: %w", err)
+	}
+	return string(ns), nil
+}
+
+func newHealthHandler(isDraining func() bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isDraining != nil && isDraining() {
+			c.String(http.StatusServiceUnavailable, "draining")
+			return
+		}
+		c.String(http.StatusOK, "ok")
+	}
 }
 
 // parseNodeSelector parses a JSON string into a map[string]string.
@@ -249,4 +328,14 @@ func parseNodeSelector(s string) map[string]string {
 		return nil
 	}
 	return m
+}
+
+func makeControlPlaneInstanceID(podUID, bootIDHex string) string {
+	if podUID == "" {
+		podUID = "cp"
+	}
+	if len(bootIDHex) > 16 {
+		bootIDHex = bootIDHex[:16]
+	}
+	return controlPlaneIDLabelValue(podUID + "-" + bootIDHex)
 }
