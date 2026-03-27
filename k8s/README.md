@@ -49,7 +49,6 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | `managed-warehouse-secrets.yaml` | Local secret payloads referenced by the seeded managed-warehouse contract |
 | `worker-identity.yaml` | Local worker ServiceAccount referenced by the seeded managed-warehouse contract |
 | `networkpolicy.yaml` | Restricts worker ingress to CP pods only |
-| `control-plane-deployment.yaml` | Local multitenant CP Deployment + ClusterIP Service |
 | `control-plane-multitenant-local.yaml` | Optional OrbStack-oriented shared warm-worker control-plane manifest |
 | `kind/config-store.overlay.yaml` | Compose overlay that attaches local dependency containers to the external Docker `kind` network |
 | `kind/config-store.seed.sql` | Kind-oriented managed-warehouse seed for the shared warm-worker flow |
