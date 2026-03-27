@@ -30,6 +30,15 @@ spec:
           # Replace with your duckgres image built with -tags kubernetes
           image: duckgres:latest
           imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
           args:
             - "--mode"
             - "control-plane"

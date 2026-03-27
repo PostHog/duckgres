@@ -147,6 +147,9 @@ func SetupMultiTenant(
 
 	cpID := cfg.K8s.ControlPlaneID
 	if cpID == "" {
+		cpID = os.Getenv("POD_NAME")
+	}
+	if cpID == "" {
 		cpID, _ = os.Hostname()
 	}
 	podUID := os.Getenv("POD_UID")
@@ -158,7 +161,7 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
 	}
 	bootIDHex := hex.EncodeToString(bootID)
-	cpInstanceID := podUID + ":" + bootIDHex
+	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
 
 	baseCfg := K8sWorkerPoolConfig{
 		Namespace:             namespace,
@@ -325,4 +328,14 @@ func parseNodeSelector(s string) map[string]string {
 		return nil
 	}
 	return m
+}
+
+func makeControlPlaneInstanceID(podUID, bootIDHex string) string {
+	if podUID == "" {
+		podUID = "cp"
+	}
+	if len(bootIDHex) > 16 {
+		bootIDHex = bootIDHex[:16]
+	}
+	return controlPlaneIDLabelValue(podUID + "-" + bootIDHex)
 }
