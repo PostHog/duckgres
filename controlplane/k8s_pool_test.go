@@ -4,6 +4,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"strconv"
 	"sync"
@@ -964,6 +965,30 @@ func TestK8sPoolClaimSpecificWorkerTakesOverRuntimeWorker(t *testing.T) {
 	}
 	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
+	}
+}
+
+func TestK8sPoolClaimSpecificWorkerReturnsEpochMismatchError(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	leaseExpiry := time.Date(2026, time.March, 20, 19, 30, 0, 0, time.UTC)
+	store := &captureRuntimeWorkerStore{
+		takeOverErr: configstore.ErrWorkerOwnerEpochMismatch,
+	}
+	pool.runtimeStore = store
+
+	claimed, err := pool.claimSpecificWorker(context.Background(), 44, 7, &WorkerAssignment{
+		OrgID:          "analytics",
+		LeaseExpiresAt: leaseExpiry,
+		MaxWorkers:     3,
+	})
+	if err == nil {
+		t.Fatal("expected stale takeover to return an error")
+	}
+	if !errors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
+		t.Fatalf("expected ErrWorkerOwnerEpochMismatch, got %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claimed worker, got %#v", claimed)
 	}
 }
 

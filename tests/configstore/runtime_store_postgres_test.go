@@ -3,6 +3,7 @@
 package configstore_test
 
 import (
+	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -659,8 +660,11 @@ func TestTakeOverWorkerPostgres(t *testing.T) {
 	}
 
 	missed, err := store.TakeOverWorker(71, "cp-third:boot-c", "analytics", 5, now.Add(3*time.Hour))
-	if err != nil {
-		t.Fatalf("TakeOverWorker(stale epoch): %v", err)
+	if err == nil {
+		t.Fatal("expected stale takeover attempt to return an epoch mismatch error")
+	}
+	if !errors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
+		t.Fatalf("expected ErrWorkerOwnerEpochMismatch, got %v", err)
 	}
 	if missed != nil {
 		t.Fatalf("expected stale takeover attempt to fail, got %#v", missed)

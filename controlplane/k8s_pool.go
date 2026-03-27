@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -1191,6 +1192,9 @@ func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, e
 	}
 	record, err := p.runtimeStore.TakeOverWorker(workerID, p.cpInstanceID, assignment.OrgID, expectedOwnerEpoch, assignment.LeaseExpiresAt)
 	if err != nil {
+		if stderrors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
+			return nil, fmt.Errorf("worker %d ownership changed before takeover: %w", workerID, err)
+		}
 		return nil, err
 	}
 	if record == nil {

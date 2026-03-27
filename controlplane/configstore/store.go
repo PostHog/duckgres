@@ -2,6 +2,7 @@ package configstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -15,6 +16,8 @@ import (
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
+
+var ErrWorkerOwnerEpochMismatch = errors.New("worker owner epoch mismatch")
 
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
@@ -459,7 +462,7 @@ func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID str
 			return err
 		}
 		if current.OwnerEpoch != expectedOwnerEpoch {
-			return nil
+			return ErrWorkerOwnerEpochMismatch
 		}
 		now := time.Now()
 		if err := tx.Table(cs.runtimeTable(current.TableName())).
