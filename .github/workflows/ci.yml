@@ -204,6 +204,7 @@ jobs:
     timeout-minutes: 30
     env:
       DUCKGRES_KIND_CLUSTER_NAME: duckgres
+      DUCKGRES_KIND_NODE_IMAGE: kindest/node:v1.31.0@sha256:53df588e04085fd41ae12de0c3fe4c72f7013bba32a20e7325357a1ac94ba865
 
     services:
       postgres:
@@ -237,5 +238,19 @@ jobs:
           chmod +x /tmp/kind
           sudo mv /tmp/kind /usr/local/bin/kind
           kind --version
+      - name: Clear Docker Hub credentials for kind pulls
+        run: |
+          docker logout registry-1.docker.io || true
+          docker logout docker.io || true
+          docker logout https://index.docker.io/v1/ || true
+      - name: Pre-pull kind node image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull "${DUCKGRES_KIND_NODE_IMAGE}"; then
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          exit 1
       - name: Run Kubernetes integration tests
         run: just test-k8s-integration
