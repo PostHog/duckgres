@@ -4161,6 +4161,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 	} else if severity == "ERROR" {
 		queryErrorsCounter.Inc()
 	}
+	slog.Debug("Sending error to client.", "user", c.username, "severity", severity, "code", code, "message", message)
 	_ = writeErrorResponse(c.writer, severity, code, message)
 	_ = c.writer.Flush()
 }
