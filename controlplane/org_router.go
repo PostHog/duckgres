@@ -185,6 +185,11 @@ func (tr *OrgRouter) StackForUser(username string) (*OrgStack, bool) {
 		return nil, false
 	}
 
+	return tr.StackForOrg(orgID)
+}
+
+// StackForOrg resolves an org id to its org stack.
+func (tr *OrgRouter) StackForOrg(orgID string) (*OrgStack, bool) {
 	tr.mu.RLock()
 	stack, ok := tr.orgs[orgID]
 	tr.mu.RUnlock()

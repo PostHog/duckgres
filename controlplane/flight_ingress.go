@@ -129,9 +129,9 @@ func (p *orgRoutedSessionProvider) DurableSessionMetadata(pid int32, username st
 }
 
 func (p *orgRoutedSessionProvider) ReconnectSession(ctx context.Context, record flightsqlingress.DurableSessionRecord) (int32, *server.FlightExecutor, error) {
-	_, sessions, _, ok := p.orgRouter.StackForUser(record.Username)
+	_, sessions, _, ok := p.orgRouter.StackForOrg(record.OrgID)
 	if !ok {
-		return 0, nil, fmt.Errorf("no org configured for user %q", record.Username)
+		return 0, nil, fmt.Errorf("no org stack for org %q", record.OrgID)
 	}
 
 	pid, executor, err := sessions.ReconnectFlightSession(ctx, record.Username, record.WorkerID, record.OwnerEpoch)

@@ -137,6 +137,7 @@ type ConfigStoreInterface interface {
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
 	StackForUser(username string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
+	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	IsMigratingForUser(username string) (migrating bool, orgID string)
 	ShutdownAll()
 }

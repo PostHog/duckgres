@@ -35,6 +35,14 @@ func (a *orgRouterAdapter) StackForUser(username string) (WorkerPool, *SessionMa
 	return stack.Pool, stack.Sessions, stack.Rebalancer, true
 }
 
+func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
+	stack, ok := a.router.StackForOrg(orgID)
+	if !ok {
+		return nil, nil, nil, false
+	}
+	return stack.Pool, stack.Sessions, stack.Rebalancer, true
+}
+
 func (a *orgRouterAdapter) IsMigratingForUser(username string) (bool, string) {
 	return a.router.IsMigratingForUser(username)
 }
