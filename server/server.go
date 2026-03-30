@@ -1209,6 +1209,24 @@ func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 	return nil
 }
 
+// RefreshS3Secret replaces the DuckDB S3 secret with updated credentials.
+// Used when a hot-idle worker is reclaimed and STS credentials have rotated.
+func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}) error {
+	if dlCfg.ObjectStore == "" {
+		return nil
+	}
+	if duckLakeSem != nil {
+		duckLakeSem <- struct{}{}
+		defer func() { <-duckLakeSem }()
+	}
+	secretStmt := buildConfigSecret(dlCfg)
+	if _, err := db.Exec(secretStmt); err != nil {
+		return fmt.Errorf("refresh S3 secret: %w", err)
+	}
+	slog.Debug("Refreshed S3 secret for hot-idle reuse.")
+	return nil
+}
+
 // buildConfigSecret builds a CREATE SECRET statement with explicit credentials
 func buildConfigSecret(dlCfg DuckLakeConfig) string {
 	region := dlCfg.S3Region

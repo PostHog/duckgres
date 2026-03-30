@@ -3,6 +3,7 @@ package duckdbservice
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 	"strings"
@@ -143,11 +144,28 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 	if !reflect.DeepEqual(current, payload) && payload.OwnerEpoch <= current.OwnerEpoch {
 		return false
 	}
+
+	// If S3 credentials changed (STS rotation), refresh the DuckDB secret
+	// so the worker uses the new credentials for subsequent queries.
+	if s3CredentialsChanged(current.DuckLake, payload.DuckLake) && p.activation.db != nil {
+		if err := server.RefreshS3Secret(p.activation.db, payload.DuckLake, p.duckLakeSem); err != nil {
+			slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
+			return false
+		}
+	}
+
 	p.activation.payload = payload
 	p.ownerEpoch = payload.OwnerEpoch
 	p.ownerCPInstanceID = payload.CPInstanceID
 	p.workerID = payload.WorkerID
 	return true
+}
+
+// s3CredentialsChanged returns true if S3 credentials differ between configs.
+func s3CredentialsChanged(a, b server.DuckLakeConfig) bool {
+	return a.S3AccessKey != b.S3AccessKey ||
+		a.S3SecretKey != b.S3SecretKey ||
+		a.S3SessionToken != b.S3SessionToken
 }
 
 // sameTenantActivationRuntime compares all structural DuckLake fields except

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
-
-	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 // OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
@@ -50,8 +48,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 		p.shared.cleanDeadWorkersLocked()
 
 		if idle := p.findIdleAssignedWorkerLocked(); idle != nil {
-			// If the worker is in hot_idle, transition back to hot via
-			// reserved (hot_idle -> reserved -> hot carries the assignment).
+			// If the worker is in hot_idle, transition to reserved and
+			// re-activate. This refreshes STS credentials and ensures
+			// the DuckLake config is current.
 			if idle.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
 				nextState, err := idle.SharedState().Transition(WorkerLifecycleReserved, nil)
 				if err != nil {
@@ -60,23 +59,23 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 					continue
 				}
 				_ = idle.SetSharedState(nextState)
-				nextState, err = idle.SharedState().Transition(WorkerLifecycleActivating, nil)
-				if err != nil {
-					slog.Warn("Hot-idle transition to activating failed.", "worker", idle.ID, "error", err)
-					p.shared.mu.Unlock()
-					continue
+				p.shared.mu.Unlock()
+
+				// Re-activate with fresh credentials (same path as fresh workers).
+				if err := p.activateWorkerForOrg(ctx, idle); err != nil {
+					slog.Warn("Hot-idle re-activation failed.", "worker", idle.ID, "org", p.orgID, "error", err)
+					observeActivationFailure()
+					p.shared.retireWorkerWithReason(idle.ID, RetireReasonActivationFailure)
+					return nil, err
 				}
-				_ = idle.SetSharedState(nextState)
-				nextState, err = idle.SharedState().Transition(WorkerLifecycleHot, nil)
-				if err != nil {
-					slog.Warn("Hot-idle transition to hot failed.", "worker", idle.ID, "error", err)
-					p.shared.mu.Unlock()
-					continue
+
+				p.shared.mu.Lock()
+				idle.activeSessions++
+				if idle.activeSessions > idle.peakSessions {
+					idle.peakSessions = idle.activeSessions
 				}
-				_ = idle.SetSharedState(nextState)
-				hotRecord := p.shared.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
-				observeWarmPoolLifecycleGauges(p.shared.workers)
-				p.shared.persistWorkerRecord(hotRecord)
+				p.shared.mu.Unlock()
+				return idle, nil
 			}
 			idle.activeSessions++
 			if idle.activeSessions > idle.peakSessions {
