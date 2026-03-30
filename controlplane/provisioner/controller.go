@@ -202,13 +202,16 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		updates["identity_state"] = configstore.ManagedWarehouseStateReady
 	}
 
-	// Infrastructure is ready when S3, Aurora, secrets, and IAM are all provisioned.
+	// Infrastructure is ready when all components are provisioned AND the
+	// Crossplane Ready condition is True. The Ready condition ensures all
+	// composed resources (including the Aurora instance) are fully reconciled,
+	// not just that individual status fields are populated.
 	s3Ready := w.S3State == configstore.ManagedWarehouseStateReady || updates["s3_state"] == configstore.ManagedWarehouseStateReady
 	metaReady := w.MetadataStoreState == configstore.ManagedWarehouseStateReady || updates["metadata_store_state"] == configstore.ManagedWarehouseStateReady
 	secretsReady := w.SecretsState == configstore.ManagedWarehouseStateReady || updates["secrets_state"] == configstore.ManagedWarehouseStateReady
 	identReady := w.IdentityState == configstore.ManagedWarehouseStateReady || updates["identity_state"] == configstore.ManagedWarehouseStateReady
 
-	if s3Ready && metaReady && secretsReady && identReady {
+	if s3Ready && metaReady && secretsReady && identReady && status.ReadyCondition {
 		now := time.Now().UTC()
 		updates["state"] = configstore.ManagedWarehouseStateReady
 		updates["status_message"] = "Infrastructure ready"
