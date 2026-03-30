@@ -882,10 +882,11 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 	return false
 }
 
-// TransitionToHotIdleIfNoSessions transitions a hot worker to hot_idle when its
-// last session ends. The worker keeps its org assignment and DuckLake attachment
-// so it can be quickly reclaimed for the same org. Returns true if the worker
-// transitioned to hot_idle.
+// TransitionToHotIdleIfNoSessions decrements the worker's active session count
+// and transitions a hot worker to hot_idle when its last session ends. The worker
+// keeps its org assignment and DuckLake attachment so it can be quickly reclaimed
+// for the same org. Returns true if the worker transitioned to hot_idle.
+// The session decrement always happens regardless of the return value.
 func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	p.mu.Lock()
 	w, ok := p.workers[id]

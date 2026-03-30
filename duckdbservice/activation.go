@@ -150,10 +150,26 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 	return true
 }
 
+// sameTenantActivationRuntime compares all structural DuckLake fields except
+// short-lived credentials (S3AccessKey, S3SecretKey, S3SessionToken) which
+// rotate on every STS AssumeRole call. This allows hot-idle reclaim to match
+// even when credentials have been refreshed, while still catching actual
+// config changes (endpoint, region, object store, etc.).
 func sameTenantActivationRuntime(current, next ActivationPayload) bool {
-	return current.OrgID == next.OrgID &&
-		current.DuckLake.MetadataStore == next.DuckLake.MetadataStore &&
-		current.DuckLake.ObjectStore == next.DuckLake.ObjectStore
+	if current.OrgID != next.OrgID {
+		return false
+	}
+	a, b := current.DuckLake, next.DuckLake
+	return a.MetadataStore == b.MetadataStore &&
+		a.ObjectStore == b.ObjectStore &&
+		a.DataPath == b.DataPath &&
+		a.S3Provider == b.S3Provider &&
+		a.S3Endpoint == b.S3Endpoint &&
+		a.S3Region == b.S3Region &&
+		a.S3UseSSL == b.S3UseSSL &&
+		a.S3URLStyle == b.S3URLStyle &&
+		a.S3Chain == b.S3Chain &&
+		a.S3Profile == b.S3Profile
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {

@@ -54,17 +54,26 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			// reserved (hot_idle -> reserved -> hot carries the assignment).
 			if idle.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
 				nextState, err := idle.SharedState().Transition(WorkerLifecycleReserved, nil)
-				if err == nil {
-					_ = idle.SetSharedState(nextState)
-					nextState, err = idle.SharedState().Transition(WorkerLifecycleActivating, nil)
-					if err == nil {
-						_ = idle.SetSharedState(nextState)
-						nextState, err = idle.SharedState().Transition(WorkerLifecycleHot, nil)
-						if err == nil {
-							_ = idle.SetSharedState(nextState)
-						}
-					}
+				if err != nil {
+					slog.Warn("Hot-idle transition to reserved failed.", "worker", idle.ID, "error", err)
+					p.shared.mu.Unlock()
+					continue
 				}
+				_ = idle.SetSharedState(nextState)
+				nextState, err = idle.SharedState().Transition(WorkerLifecycleActivating, nil)
+				if err != nil {
+					slog.Warn("Hot-idle transition to activating failed.", "worker", idle.ID, "error", err)
+					p.shared.mu.Unlock()
+					continue
+				}
+				_ = idle.SetSharedState(nextState)
+				nextState, err = idle.SharedState().Transition(WorkerLifecycleHot, nil)
+				if err != nil {
+					slog.Warn("Hot-idle transition to hot failed.", "worker", idle.ID, "error", err)
+					p.shared.mu.Unlock()
+					continue
+				}
+				_ = idle.SetSharedState(nextState)
 				hotRecord := p.shared.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
 				observeWarmPoolLifecycleGauges(p.shared.workers)
 				p.shared.persistWorkerRecord(hotRecord)
