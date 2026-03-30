@@ -38,6 +38,7 @@ type ControlPlaneJanitor struct {
 	hotIdleTTL            time.Duration
 	now                   func() time.Time
 	retireWorker          func(record configstore.WorkerRecord, reason string)
+	retireLocalWorker     func(workerID int, reason string) // retires from in-memory pool + pod
 	reconcileWarmCapacity func()
 }
 
@@ -127,7 +128,15 @@ func (j *ControlPlaneJanitor) runOnce() {
 			slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 		}
 		for _, record := range expired {
-			j.retireRuntimeWorker(record, "hot_idle_ttl_expired")
+			// Use retireLocalWorker for workers in our in-memory pool to
+			// remove the stale ManagedWorker entry. retireClaimedWorker
+			// only handles the DB record and pod deletion, leaving the
+			// in-memory worker schedulable.
+			if j.retireLocalWorker != nil {
+				j.retireLocalWorker(record.WorkerID, "hot_idle_ttl_expired")
+			} else {
+				j.retireRuntimeWorker(record, "hot_idle_ttl_expired")
+			}
 		}
 	}
 
