@@ -187,7 +187,10 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		a.S3UseSSL == b.S3UseSSL &&
 		a.S3URLStyle == b.S3URLStyle &&
 		a.S3Chain == b.S3Chain &&
-		a.S3Profile == b.S3Profile
+		a.S3Profile == b.S3Profile &&
+		a.Migrate == b.Migrate &&
+		reflect.DeepEqual(a.DataInliningRowLimit, b.DataInliningRowLimit) &&
+		a.CheckpointInterval == b.CheckpointInterval
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {

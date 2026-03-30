@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 // OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
@@ -59,6 +61,14 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 					continue
 				}
 				_ = idle.SetSharedState(nextState)
+				// Bump epoch so activateTenant accepts the new payload
+				// (it requires OwnerEpoch > current for same-tenant reactivation).
+				idle.IncrementOwnerEpoch()
+				// Persist the reserved state to the DB before releasing the lock.
+				// This prevents another CP pod from claiming the same worker
+				// via ClaimHotIdleWorker while we're reactivating it.
+				reservedRecord := p.shared.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
+				p.shared.persistWorkerRecord(reservedRecord)
 				p.shared.mu.Unlock()
 
 				// Re-activate with fresh credentials (same path as fresh workers).
