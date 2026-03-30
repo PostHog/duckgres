@@ -49,6 +49,9 @@ type SessionPool struct {
 
 	sharedWarmMode       bool
 	activation           *activatedTenantRuntime
+	ownerEpoch           int64
+	ownerCPInstanceID    string
+	workerID             int
 	activateTenantFunc   func(ActivationPayload) error
 	createDBConnection   func(server.Config, chan struct{}, string, time.Time, string) (*sql.DB, error)
 	activateDBConnection func(*sql.DB, server.Config, chan struct{}, string) error
@@ -636,7 +639,7 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 	case "DestroySession":
 		return s.handler.doDestroySession(cmd.Body, stream)
 	case "HealthCheck":
-		return s.handler.doHealthCheck(stream)
+		return s.handler.doHealthCheck(cmd.Body, stream)
 	default:
 		// Fall through to standard flightsql action router (BeginTransaction, etc.)
 		return s.FlightServer.DoAction(cmd, stream)

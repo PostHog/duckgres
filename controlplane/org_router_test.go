@@ -195,9 +195,6 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 	if got := captured.DuckLake.MetadataStore; got != "postgres:host=new-metadata.internal port=5432 user=ducklake_user password=new-password dbname=ducklake_metadata" {
 		t.Fatalf("expected latest warehouse runtime from router snapshot, got %q", got)
 	}
-	if captured.LeaseExpiresAt.Before(time.Now()) {
-		t.Fatalf("expected lease expiry to be set, got %v", captured.LeaseExpiresAt)
-	}
 }
 
 func newStringSecret(namespace, name, key, value string) *corev1.Secret {

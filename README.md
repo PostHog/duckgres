@@ -199,6 +199,7 @@ Run with config file:
 | `DUCKGRES_THREADS` | DuckDB threads per session | `runtime.NumCPU()` |
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
+| `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
@@ -598,7 +599,7 @@ kill -USR2 <control-plane-pid>
 
 ### Remote Worker Backend
 
-In Kubernetes environments, `--worker-backend remote` is now the multitenant path only. It requires `--config-store`, and the control plane then spawns worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
+In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may reconnect with a durable session token if the worker survives and the token is still valid.
 
 When a shared warm-worker target is configured (`--k8s-shared-warm-target`), the pool keeps workers neutral at startup, reserves them per org, activates tenant runtime over the activation RPC, and retires them after use. The full lifecycle is: idle → reserved → activating → hot → draining → retired.
 

@@ -1,9 +1,6 @@
 package controlplane
 
-import (
-	"fmt"
-	"time"
-)
+import "fmt"
 
 // WorkerLifecycleState models the shared warm-worker lifecycle introduced for
 // late tenant binding. The current production worker pools do not act on this
@@ -22,8 +19,8 @@ const (
 // WorkerAssignment carries tenant-specific metadata once a shared worker has
 // been reserved for an org.
 type WorkerAssignment struct {
-	OrgID          string
-	LeaseExpiresAt time.Time
+	OrgID      string
+	MaxWorkers int
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared
@@ -163,9 +160,6 @@ func validateWorkerAssignment(assignment *WorkerAssignment) error {
 	}
 	if assignment.OrgID == "" {
 		return fmt.Errorf("missing org ID")
-	}
-	if assignment.LeaseExpiresAt.IsZero() {
-		return fmt.Errorf("missing lease expiry")
 	}
 	return nil
 }

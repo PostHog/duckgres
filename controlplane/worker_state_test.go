@@ -4,7 +4,6 @@ package controlplane
 
 import (
 	"testing"
-	"time"
 )
 
 func TestSharedWorkerStateZeroValueDefaultsToIdle(t *testing.T) {
@@ -22,11 +21,8 @@ func TestSharedWorkerStateZeroValueDefaultsToIdle(t *testing.T) {
 }
 
 func TestSharedWorkerStateTransitionLifecycle(t *testing.T) {
-	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
-
 	state, err := (SharedWorkerState{}).Transition(WorkerLifecycleReserved, &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("reserve worker: %v", err)
@@ -36,9 +32,6 @@ func TestSharedWorkerStateTransitionLifecycle(t *testing.T) {
 	}
 	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
 		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
-	}
-	if !state.Assignment.LeaseExpiresAt.Equal(leaseExpiry) {
-		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, state.Assignment.LeaseExpiresAt)
 	}
 
 	for _, next := range []WorkerLifecycleState{
@@ -66,24 +59,20 @@ func TestSharedWorkerStateTransitionRejectsMissingOrInvalidAssignment(t *testing
 		t.Fatal("expected reserve transition without assignment to fail")
 	}
 
-	if _, err := (SharedWorkerState{}).Transition(WorkerLifecycleReserved, &WorkerAssignment{
-		LeaseExpiresAt: time.Now().Add(time.Hour),
-	}); err == nil {
+	if _, err := (SharedWorkerState{}).Transition(WorkerLifecycleReserved, &WorkerAssignment{}); err == nil {
 		t.Fatal("expected reserve transition without org ID to fail")
 	}
 
 	if _, err := (SharedWorkerState{}).Transition(WorkerLifecycleReserved, &WorkerAssignment{
 		OrgID: "analytics",
-	}); err == nil {
-		t.Fatal("expected reserve transition without lease expiry to fail")
+	}); err != nil {
+		t.Fatalf("expected reserve transition with org ID only to succeed: %v", err)
 	}
 }
 
 func TestSharedWorkerStateTransitionRejectsInvalidLifecycleMoves(t *testing.T) {
-	leaseExpiry := time.Date(2026, time.March, 20, 16, 0, 0, 0, time.UTC)
 	state, err := (SharedWorkerState{}).Transition(WorkerLifecycleReserved, &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: leaseExpiry,
+		OrgID: "analytics",
 	})
 	if err != nil {
 		t.Fatalf("reserve worker: %v", err)
@@ -99,8 +88,7 @@ func TestSharedWorkerStateTransitionRejectsInvalidLifecycleMoves(t *testing.T) {
 	}
 
 	if _, err := state.Transition(WorkerLifecycleHot, &WorkerAssignment{
-		OrgID:          "billing",
-		LeaseExpiresAt: leaseExpiry.Add(time.Hour),
+		OrgID: "billing",
 	}); err == nil {
 		t.Fatal("expected activating -> hot transition to reject assignment changes")
 	}

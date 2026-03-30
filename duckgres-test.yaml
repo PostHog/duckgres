@@ -1,0 +1,15 @@
+host: "0.0.0.0"
+port: 5434
+data_dir: "./data-test"
+tls:
+  cert: "./certs/server.crt"
+  key: "./certs/server.key"
+users:
+  postgres: "postgres"
+extensions:
+  - ducklake
+  - json
+process_isolation: false
+ducklake:
+  metadata_store: "postgres:host=192.168.147.2 port=5432 user=ducklake password=ducklake dbname=ducklake"
+  data_path: "./data-test/ducklake-files"

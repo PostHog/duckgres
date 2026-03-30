@@ -163,6 +163,27 @@ func TestLocalDependencyPortsStayFixedAndPreflighted(t *testing.T) {
 	}
 }
 
+func TestControlPlaneRBACIncludesLeaseAccess(t *testing.T) {
+	root := findProjectRootForUnitTest(t)
+
+	rbacPath := filepath.Join(root, "k8s", "rbac.yaml")
+	manifest, err := os.ReadFile(rbacPath)
+	if err != nil {
+		t.Fatalf("read rbac manifest: %v", err)
+	}
+
+	content := string(manifest)
+	for _, want := range []string{
+		`apiGroups: ["coordination.k8s.io"]`,
+		`resources: ["leases"]`,
+		`verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in %s", want, rbacPath)
+		}
+	}
+}
+
 func findProjectRootForUnitTest(t *testing.T) string {
 	t.Helper()
 

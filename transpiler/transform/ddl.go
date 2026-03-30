@@ -97,22 +97,13 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 
 		case *pg_query.Node_AlterTableStmt:
 			if n.AlterTableStmt != nil {
-				for _, cmd := range n.AlterTableStmt.Cmds {
-					if alterCmd := cmd.GetAlterTableCmd(); alterCmd != nil {
-						// Check for unsupported ALTER TABLE commands (constraints, NOT NULL, DEFAULT, etc.)
-						if t.isUnsupportedAlterCommand(alterCmd) {
-							result.IsNoOp = true
-							result.NoOpTag = "ALTER TABLE"
-							return true, nil
-						}
-						// Make ADD COLUMN idempotent by adding IF NOT EXISTS.
-						// DuckLake reuses physical tables across sqlmesh snapshots, so
-						// columns may already exist when sqlmesh issues ALTER TABLE ADD COLUMN.
-						if alterCmd.Subtype == pg_query.AlterTableType_AT_AddColumn && !alterCmd.MissingOk {
-							alterCmd.MissingOk = true
-							changed = true
-						}
-					}
+				if didChange, err := t.transformAlterTableStmt(n.AlterTableStmt, result); err != nil {
+					return false, err
+				} else if didChange {
+					changed = true
+				}
+				if result.IsNoOp || len(result.Statements) > 0 {
+					return true, nil
 				}
 			}
 
@@ -317,6 +308,75 @@ func (t *DDLTransform) isUnsupportedDefault(expr *pg_query.Node) bool {
 
 	// Column references, expressions, etc. are not supported
 	return true
+}
+
+// transformAlterTableStmt handles ALTER TABLE statements for DuckLake compatibility.
+// DuckDB only supports one ALTER command per statement, so multi-command ALTER TABLE
+// statements (e.g., ADD COLUMN x, ADD COLUMN y) are split into individual statements
+// wrapped in a transaction. Unsupported commands (constraints, NOT NULL, DEFAULT) are
+// silently dropped.
+func (t *DDLTransform) transformAlterTableStmt(stmt *pg_query.AlterTableStmt, result *Result) (bool, error) {
+	// Partition commands into supported and unsupported
+	var supported []*pg_query.Node
+	for _, cmd := range stmt.Cmds {
+		alterCmd := cmd.GetAlterTableCmd()
+		if alterCmd == nil {
+			continue
+		}
+		if t.isUnsupportedAlterCommand(alterCmd) {
+			continue
+		}
+		// Make ADD COLUMN idempotent by adding IF NOT EXISTS.
+		// DuckLake reuses physical tables across sqlmesh snapshots, so
+		// columns may already exist when sqlmesh issues ALTER TABLE ADD COLUMN.
+		if alterCmd.Subtype == pg_query.AlterTableType_AT_AddColumn && !alterCmd.MissingOk {
+			alterCmd.MissingOk = true
+		}
+		supported = append(supported, cmd)
+	}
+
+	// All commands unsupported → no-op
+	if len(supported) == 0 {
+		result.IsNoOp = true
+		result.NoOpTag = "ALTER TABLE"
+		return true, nil
+	}
+
+	// Single supported command → modify AST in place, let normal deparse handle it
+	if len(supported) == 1 {
+		stmt.Cmds = supported
+		return true, nil
+	}
+
+	// Multiple supported commands → split into individual ALTER TABLE statements.
+	// DuckDB only supports one ALTER command per statement, so we wrap the
+	// individual statements in a transaction for atomicity.
+	stmts := make([]string, 0, len(supported)+1)
+	stmts = append(stmts, "BEGIN")
+	for _, cmd := range supported {
+		singleTree := &pg_query.ParseResult{
+			Stmts: []*pg_query.RawStmt{{
+				Stmt: &pg_query.Node{
+					Node: &pg_query.Node_AlterTableStmt{
+						AlterTableStmt: &pg_query.AlterTableStmt{
+							Relation:  stmt.Relation,
+							Cmds:      []*pg_query.Node{cmd},
+							Objtype:   stmt.Objtype,
+							MissingOk: stmt.MissingOk,
+						},
+					},
+				},
+			}},
+		}
+		deparsed, err := pg_query.Deparse(singleTree)
+		if err != nil {
+			return false, err
+		}
+		stmts = append(stmts, deparsed)
+	}
+	result.Statements = stmts
+	result.CleanupStatements = []string{"COMMIT"}
+	return true, nil
 }
 
 // isUnsupportedAlterCommand checks if an ALTER TABLE command is unsupported by DuckLake

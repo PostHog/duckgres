@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
@@ -73,10 +72,7 @@ func TestSharedWorkerActivatorBuildsActivationRequestFromManagedWarehouse(t *tes
 		},
 	}
 
-	assignment := &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: time.Date(2026, time.March, 22, 12, 0, 0, 0, time.UTC),
-	}
+	assignment := &WorkerAssignment{OrgID: "analytics"}
 
 	req, err := activator.BuildActivationRequest(context.Background(), org, assignment)
 	if err != nil {
@@ -85,9 +81,6 @@ func TestSharedWorkerActivatorBuildsActivationRequestFromManagedWarehouse(t *tes
 
 	if req.OrgID != "analytics" {
 		t.Fatalf("expected org analytics, got %q", req.OrgID)
-	}
-	if !req.LeaseExpiresAt.Equal(assignment.LeaseExpiresAt) {
-		t.Fatalf("expected lease expiry %v, got %v", assignment.LeaseExpiresAt, req.LeaseExpiresAt)
 	}
 	if got := req.DuckLake.MetadataStore; got != "postgres:host=metadata.example.internal port=5432 user=ducklake_user password=metadata-password dbname=ducklake_metadata" {
 		t.Fatalf("unexpected metadata store dsn: %q", got)
@@ -110,8 +103,7 @@ func TestSharedWorkerActivatorRequiresManagedWarehouse(t *testing.T) {
 	}
 
 	_, err := activator.BuildActivationRequest(context.Background(), &configstore.OrgConfig{Name: "analytics"}, &WorkerAssignment{
-		OrgID:          "analytics",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "analytics",
 	})
 	if err == nil {
 		t.Fatal("expected missing warehouse to fail")
@@ -141,12 +133,10 @@ func TestSharedWorkerActivatorActivateReservedWorkerUsesLatestResolvedOrgConfig(
 	)
 
 	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}
-	leaseExpiry := time.Date(2026, time.March, 22, 12, 0, 0, 0, time.UTC)
 	if err := worker.SetSharedState(SharedWorkerState{
 		Lifecycle: WorkerLifecycleReserved,
 		Assignment: &WorkerAssignment{
-			OrgID:          "analytics",
-			LeaseExpiresAt: leaseExpiry,
+			OrgID: "analytics",
 		},
 	}); err != nil {
 		t.Fatalf("SetSharedState: %v", err)
@@ -218,9 +208,6 @@ func TestSharedWorkerActivatorActivateReservedWorkerUsesLatestResolvedOrgConfig(
 	if captured.OrgID != "analytics" {
 		t.Fatalf("expected org analytics, got %q", captured.OrgID)
 	}
-	if !captured.LeaseExpiresAt.Equal(leaseExpiry) {
-		t.Fatalf("expected lease expiry %v, got %v", leaseExpiry, captured.LeaseExpiresAt)
-	}
 	if len(captured.Usernames) != 1 || captured.Usernames[0] != "bob" {
 		t.Fatalf("expected latest users to be captured, got %#v", captured.Usernames)
 	}
@@ -265,8 +252,8 @@ func TestSharedWorkerActivatorDucklingCRFallback(t *testing.T) {
 	}
 
 	org := &configstore.OrgConfig{
-		Name:  "test-org",
-		Users: map[string]string{"testuser": "hash"},
+		Name:      "test-org",
+		Users:     map[string]string{"testuser": "hash"},
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			// SecretRef intentionally empty — simulates Crossplane-provisioned duckling
 		},

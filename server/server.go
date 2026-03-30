@@ -240,6 +240,11 @@ type DuckLakeConfig struct {
 	// Set to 0 to disable. Default: 24h.
 	CheckpointInterval time.Duration
 
+	// DataInliningRowLimit controls the maximum number of rows to inline
+	// in DuckLake metadata instead of writing to Parquet files.
+	// Default: 0 (disabled). Set to a positive value to enable inlining.
+	DataInliningRowLimit *int
+
 	// Migrate is set by the control plane after running the migration check.
 	// When true, AttachDuckLake uses AUTOMATIC_MIGRATION TRUE without
 	// re-running the version check. This avoids redundant backups and

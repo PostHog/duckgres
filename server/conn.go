@@ -320,8 +320,49 @@ func isQueryCancelled(err error) bool {
 	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
 }
 
+// isDuckLakeTransactionConflict returns true if the error is a DuckLake
+// transaction conflict. These occur when concurrent DuckLake transactions
+// try to commit overlapping changes. DuckLake uses global snapshot IDs, so
+// even writes to unrelated tables can conflict under concurrency.
+func isDuckLakeTransactionConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Transaction conflict")
+}
+
+// isDuckLakeMetadataConnectionLost returns true if the error indicates the
+// DuckLake metadata store connection was lost during a transaction. This
+// typically happens when long-running queries leave the metadata connection
+// idle long enough for RDS or a network layer to drop it.
+func isDuckLakeMetadataConnectionLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "DuckLake transaction") &&
+		strings.Contains(msg, "SSL connection has been closed unexpectedly")
+}
+
+// logQueryError logs a query execution failure with additional context for
+// DuckLake-specific errors (transaction conflicts and metadata connection loss).
+func logQueryError(user, query string, err error) {
+	if isDuckLakeTransactionConflict(err) {
+		slog.Warn("DuckLake transaction conflict.",
+			"user", user, "query", query, "error", err)
+		return
+	}
+	if isDuckLakeMetadataConnectionLost(err) {
+		slog.Warn("DuckLake metadata connection lost during transaction.",
+			"user", user, "query", query, "error", err)
+		return
+	}
+	slog.Error("Query execution failed.", "user", user, "query", query, "error", err)
+}
+
 // isConnectionBroken checks if an error indicates a broken connection
-// (e.g., SSL connection closed, network error)
+// (e.g., SSL connection closed, network error).
 func isConnectionBroken(err error) bool {
 	if err == nil {
 		return false
@@ -1032,7 +1073,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 					errMsg = "canceling statement due to user request"
 					c.sendError("ERROR", errCode, errMsg)
 				} else {
-					slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+					logQueryError(c.username, query, err)
 					c.sendError("ERROR", errCode, errMsg)
 				}
 				c.setTxError()
@@ -1085,7 +1126,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			if isQueryCancelled(err) {
 				c.sendError("ERROR", "57014", "canceling statement due to user request")
 			} else {
-				slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+				logQueryError(c.username, query, err)
 				c.sendError("ERROR", "42000", err.Error())
 			}
 			c.setTxError()
@@ -1123,7 +1164,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			errMsg = "canceling statement due to user request"
 			c.sendError("ERROR", errCode, errMsg)
 		} else {
-			slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+			logQueryError(c.username, query, err)
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
@@ -1252,6 +1293,8 @@ func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error
 // client (so the caller can stop processing a batch), or (false, err) for
 // fatal connection errors.
 func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
+	start := time.Now()
+
 	// Check for cursor operations before transpilation
 	tree, parseErr := pg_query.Parse(query)
 	if parseErr == nil && len(tree.Stmts) == 1 {
@@ -1466,20 +1509,29 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				}
 			}
 			if err != nil {
+				errCode := "42000"
+				errMsg := err.Error()
 				if isQueryCancelled(err) {
-					c.sendError("ERROR", "57014", "canceling statement due to user request")
+					errCode = "57014"
+					errMsg = "canceling statement due to user request"
 				} else {
-					slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
-					c.sendError("ERROR", "42000", err.Error())
+					logQueryError(c.username, executedQuery, err)
 				}
+				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
+				c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
 				return true, nil
 			}
 		}
 
+		var writtenRows int64
+		if execResult != nil {
+			writtenRows, _ = execResult.RowsAffected()
+		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = writeCommandComplete(c.writer, tag)
+		c.logQuery(start, query, executedQuery, cmdType, 0, writtenRows, "", "", "simple-batch")
 		return false, nil
 	}
 
@@ -1489,13 +1541,17 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	rows, err := c.executor.QueryContext(ctx, executedQuery)
 	if err != nil {
+		errCode := "42000"
+		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
 		} else {
-			slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			logQueryError(c.username, executedQuery, err)
 		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
+		c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
 		return true, nil
 	}
 	defer func() { _ = rows.Close() }()
@@ -1546,6 +1602,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
+	c.logQuery(start, query, executedQuery, cmdType, int64(rowCount), 0, "", "", "simple-batch")
 	return false, nil
 }
 
@@ -4104,6 +4161,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 	} else if severity == "ERROR" {
 		queryErrorsCounter.Inc()
 	}
+	slog.Debug("Sending error to client.", "user", c.username, "severity", severity, "code", code, "message", message)
 	_ = writeErrorResponse(c.writer, severity, code, message)
 	_ = c.writer.Flush()
 }
@@ -4767,7 +4825,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				}
 			}
 			if err != nil {
-				slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
+				logQueryError(c.username, convertedQuery, err)
 				c.sendError("ERROR", "42000", err.Error())
 				c.setTxError()
 				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
@@ -4788,7 +4846,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Result-returning query: use Query with converted query
 	rows, err := c.executor.Query(convertedQuery, args...)
 	if err != nil {
-		slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
+		logQueryError(c.username, convertedQuery, err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")

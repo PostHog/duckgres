@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"strconv"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -44,6 +45,9 @@ type OrderedMapValue struct {
 type FlightExecutor struct {
 	client       *flightsql.Client
 	sessionToken string
+	workerID     int
+	cpInstanceID string
+	ownerEpoch   int64
 	alloc        memory.Allocator
 	ownsClient   bool // if true, Close() closes the client
 
@@ -80,6 +84,7 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 	return &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
+		ownerEpoch:   0,
 		alloc:        memory.DefaultAllocator,
 		ownsClient:   true,
 		ctx:          ctx,
@@ -95,6 +100,7 @@ func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) 
 	return &FlightExecutor{
 		client:       client,
 		sessionToken: sessionToken,
+		ownerEpoch:   0,
 		alloc:        memory.DefaultAllocator,
 		ownsClient:   false,
 		ctx:          ctx,
@@ -115,7 +121,23 @@ func (e *FlightExecutor) IsDead() bool {
 
 // withSession adds the session token to the gRPC context.
 func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
-	return metadata.AppendToOutgoingContext(ctx, "x-duckgres-session", e.sessionToken)
+	return metadata.AppendToOutgoingContext(
+		ctx,
+		"x-duckgres-session", e.sessionToken,
+		"x-duckgres-worker-id", strconv.Itoa(e.workerID),
+		"x-duckgres-cp-instance-id", e.cpInstanceID,
+		"x-duckgres-owner-epoch", strconv.FormatInt(e.ownerEpoch, 10),
+	)
+}
+
+func (e *FlightExecutor) SetOwnerEpoch(ownerEpoch int64) {
+	e.ownerEpoch = ownerEpoch
+}
+
+func (e *FlightExecutor) SetControlMetadata(workerID int, cpInstanceID string, ownerEpoch int64) {
+	e.workerID = workerID
+	e.cpInstanceID = cpInstanceID
+	e.ownerEpoch = ownerEpoch
 }
 
 // recoverClientPanic converts a nil-pointer panic from a closed Flight SQL

@@ -20,11 +20,11 @@ func TestObserveWarmPoolLifecycleGauges(t *testing.T) {
 	workers := map[int]*ManagedWorker{
 		1: makeTestWorker(WorkerLifecycleIdle, nil),
 		2: makeTestWorker(WorkerLifecycleIdle, nil),
-		3: makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{OrgID: "org-1", LeaseExpiresAt: time.Now().Add(time.Hour)}),
-		4: makeTestWorker(WorkerLifecycleActivating, &WorkerAssignment{OrgID: "org-1", LeaseExpiresAt: time.Now().Add(time.Hour)}),
-		5: makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-2", LeaseExpiresAt: time.Now().Add(time.Hour)}),
-		6: makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-2", LeaseExpiresAt: time.Now().Add(time.Hour)}),
-		7: makeTestWorker(WorkerLifecycleDraining, &WorkerAssignment{OrgID: "org-3", LeaseExpiresAt: time.Now().Add(time.Hour)}),
+		3: makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{OrgID: "org-1"}),
+		4: makeTestWorker(WorkerLifecycleActivating, &WorkerAssignment{OrgID: "org-1"}),
+		5: makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-2"}),
+		6: makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-2"}),
+		7: makeTestWorker(WorkerLifecycleDraining, &WorkerAssignment{OrgID: "org-3"}),
 	}
 
 	observeWarmPoolLifecycleGauges(workers)
@@ -73,7 +73,7 @@ func TestMarkWorkerRetiredLocked_RecordsHotWorkerSessions(t *testing.T) {
 	resetMetrics()
 	pool, _ := newTestK8sPool(t, 5)
 
-	w := makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-1", LeaseExpiresAt: time.Now().Add(time.Hour)})
+	w := makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-1"})
 	w.peakSessions = 5
 	pool.workers[1] = w
 
@@ -98,8 +98,7 @@ func TestReservedAtTracking(t *testing.T) {
 	defer cancel()
 
 	_, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
-		OrgID:          "org-1",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "org-1",
 	})
 	if err != nil {
 		t.Fatalf("ReserveSharedWorker failed: %v", err)
@@ -156,8 +155,7 @@ func TestActivateWorkerForOrgUpdatesActivatingGauge(t *testing.T) {
 	observeWarmPoolLifecycleGauges(map[int]*ManagedWorker{})
 	pool, _ := newTestK8sPool(t, 5)
 	worker := makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{
-		OrgID:          "org-1",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "org-1",
 	})
 	worker.reservedAt = time.Now()
 	pool.workers[1] = worker
@@ -179,8 +177,7 @@ func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *te
 	observeWarmPoolLifecycleGauges(map[int]*ManagedWorker{})
 	pool, _ := newTestK8sPool(t, 5)
 	worker := makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{
-		OrgID:          "org-1",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "org-1",
 	})
 	worker.reservedAt = time.Now().Add(-2 * time.Second)
 	pool.workers[1] = worker
@@ -220,8 +217,7 @@ func TestReapStuckActivatingWorkers(t *testing.T) {
 	pool.workers[1] = idle
 
 	stuck := makeTestWorker(WorkerLifecycleActivating, &WorkerAssignment{
-		OrgID:          "org-1",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "org-1",
 	})
 	stuck.reservedAt = time.Now().Add(-time.Minute) // reserved 1 minute ago
 	pool.workers[2] = stuck
@@ -255,8 +251,7 @@ func TestReapStuckActivatingWorkers_RecentlyReservedNotReaped(t *testing.T) {
 	pool.activatingTimeout = 2 * time.Minute
 
 	w := makeTestWorker(WorkerLifecycleActivating, &WorkerAssignment{
-		OrgID:          "org-1",
-		LeaseExpiresAt: time.Now().Add(time.Hour),
+		OrgID: "org-1",
 	})
 	w.reservedAt = time.Now() // just reserved
 	pool.workers[1] = w

@@ -92,6 +92,8 @@ type resolvedConfig struct {
 	InternalSecret           string
 }
 
+func intPtr(n int) *int { return &n }
+
 func defaultServerConfig() server.Config {
 	return server.Config{
 		Host:                      "0.0.0.0",
@@ -109,7 +111,8 @@ func defaultServerConfig() server.Config {
 		},
 		Extensions: []string{"ducklake"},
 		DuckLake: server.DuckLakeConfig{
-			CheckpointInterval: 24 * time.Hour,
+			CheckpointInterval:  24 * time.Hour,
+			DataInliningRowLimit: intPtr(0),
 		},
 		QueryLog: server.QueryLogConfig{
 			Enabled:              true,
@@ -269,6 +272,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 				cfg.DuckLake.CheckpointInterval = d
 			} else {
 				warn("Invalid ducklake.checkpoint_interval duration: " + err.Error())
+			}
+		}
+		if fileCfg.DuckLake.DataInliningRowLimit != nil {
+			if *fileCfg.DuckLake.DataInliningRowLimit < 0 {
+				warn("ducklake.data_inlining_row_limit must be >= 0")
+			} else {
+				cfg.DuckLake.DataInliningRowLimit = fileCfg.DuckLake.DataInliningRowLimit
 			}
 		}
 
@@ -501,6 +511,17 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			cfg.DuckLake.CheckpointInterval = d
 		} else {
 			warn("Invalid DUCKGRES_DUCKLAKE_CHECKPOINT_INTERVAL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_DUCKLAKE_DATA_INLINING_ROW_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n < 0 {
+				warn("DUCKGRES_DUCKLAKE_DATA_INLINING_ROW_LIMIT must be >= 0")
+			} else {
+				cfg.DuckLake.DataInliningRowLimit = &n
+			}
+		} else {
+			warn("Invalid DUCKGRES_DUCKLAKE_DATA_INLINING_ROW_LIMIT: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {

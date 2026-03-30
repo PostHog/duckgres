@@ -79,6 +79,33 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 			migrate: false,
 			want:    "ATTACH 'ducklake:postgres:host=localhost password=it''s_secret' AS ducklake",
 		},
+		{
+			name: "with data inlining disabled",
+			dlCfg: DuckLakeConfig{
+				MetadataStore:        "postgres:host=localhost dbname=dl",
+				DataInliningRowLimit: intPtr(0),
+			},
+			migrate: false,
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (DATA_INLINING_ROW_LIMIT 0)",
+		},
+		{
+			name: "with data inlining custom limit",
+			dlCfg: DuckLakeConfig{
+				MetadataStore:        "postgres:host=localhost dbname=dl",
+				ObjectStore:          "s3://bucket/path",
+				DataInliningRowLimit: intPtr(100),
+			},
+			migrate: false,
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (DATA_PATH 's3://bucket/path', DATA_INLINING_ROW_LIMIT 100)",
+		},
+		{
+			name: "nil data inlining uses default",
+			dlCfg: DuckLakeConfig{
+				MetadataStore: "postgres:host=localhost dbname=dl",
+			},
+			migrate: false,
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake",
+		},
 	}
 
 	for _, tt := range tests {
@@ -90,6 +117,8 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		})
 	}
 }
+
+func intPtr(n int) *int { return &n }
 
 func TestFormatSQLValue(t *testing.T) {
 	tests := []struct {
