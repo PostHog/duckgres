@@ -139,9 +139,10 @@ func (p *OrgReservedPool) ReleaseWorker(id int) {
 	if p.shared.TransitionToHotIdleIfNoSessions(id) {
 		return
 	}
-	// Worker still has sessions; the decrement already happened inside
-	// TransitionToHotIdleIfNoSessions. Nothing more to do until the
-	// last session ends.
+	// TransitionToHotIdleIfNoSessions already decremented activeSessions.
+	// If the worker is not hot (e.g. draining during shutdown) and has no
+	// remaining sessions, retire it so the org slot is freed immediately.
+	p.shared.RetireIfDrainingAndEmpty(id)
 }
 
 func (p *OrgReservedPool) RetireWorker(id int) {

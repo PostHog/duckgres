@@ -882,6 +882,28 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 	return false
 }
 
+// RetireIfDrainingAndEmpty retires a worker that is draining and has no active
+// sessions. Does NOT decrement activeSessions (caller must have already done so).
+// Used by ReleaseWorker when TransitionToHotIdleIfNoSessions skips a non-hot worker.
+func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int) {
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok || w.activeSessions > 0 {
+		p.mu.Unlock()
+		return
+	}
+	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
+		p.mu.Unlock()
+		return
+	}
+	p.markWorkerRetiredLocked(w, RetireReasonNormal)
+	delete(p.workers, id)
+	workerCount := len(p.workers)
+	p.mu.Unlock()
+	observeControlPlaneWorkers(workerCount)
+	go p.retireWorkerPod(id, w)
+}
+
 // TransitionToHotIdleIfNoSessions decrements the worker's active session count
 // and transitions a hot worker to hot_idle when its last session ends. The worker
 // keeps its org assignment and DuckLake attachment so it can be quickly reclaimed

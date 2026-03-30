@@ -145,12 +145,19 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 		return false
 	}
 
-	// If S3 credentials changed (STS rotation), refresh the DuckDB secret
-	// so the worker uses the new credentials for subsequent queries.
-	if s3CredentialsChanged(current.DuckLake, payload.DuckLake) && p.activation.db != nil {
-		if err := server.RefreshS3Secret(p.activation.db, payload.DuckLake, p.duckLakeSem); err != nil {
-			slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
-			return false
+	// Refresh the DuckDB S3 secret when credentials may have changed.
+	// For "config" provider: check if explicit key/token fields differ.
+	// For "aws_sdk"/"credential_chain": always refresh since the underlying
+	// credentials (e.g. IMDS role) may have expired during hot_idle.
+	if p.activation.db != nil && payload.DuckLake.ObjectStore != "" {
+		needsRefresh := s3CredentialsChanged(current.DuckLake, payload.DuckLake) ||
+			payload.DuckLake.S3Provider == "aws_sdk" ||
+			payload.DuckLake.S3Provider == "credential_chain"
+		if needsRefresh {
+			if err := server.RefreshS3Secret(p.activation.db, payload.DuckLake, p.duckLakeSem); err != nil {
+				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
+				return false
+			}
 		}
 	}
 
