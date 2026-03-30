@@ -43,8 +43,8 @@ type ManagedWorker struct {
 	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
 	ownerEpoch     int64
 	ownerCPInstanceID      string
-	hotIdleReclaimed        bool // true when reclaimed from hot_idle state
-	cachedActivationPayload any  // *TenantActivationPayload, cached after successful activation for hot-idle reuse
+	hotIdleReclaimed        bool //nolint:unused // only set in kubernetes hot-idle reclaim path
+	cachedActivationPayload any  //nolint:unused // *TenantActivationPayload, cached in kubernetes activation path
 }
 
 // SharedState returns the additive shared warm-worker lifecycle metadata for
