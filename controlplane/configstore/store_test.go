@@ -104,9 +104,8 @@ func TestSnapshotBuild(t *testing.T) {
 	}
 
 	snap := &Snapshot{
-		Orgs:         make(map[string]*OrgConfig),
-		UserOrg:      make(map[string]string),
-		UserPassword: make(map[string]string),
+		Orgs:            make(map[string]*OrgConfig),
+		OrgUserPassword: make(map[OrgUserKey]string),
 	}
 
 	for _, o := range orgs {
@@ -122,8 +121,7 @@ func TestSnapshotBuild(t *testing.T) {
 		}
 		for _, u := range o.Users {
 			oc.Users[u.Username] = u.Password
-			snap.UserOrg[u.Username] = o.Name
-			snap.UserPassword[u.Username] = u.Password
+			snap.OrgUserPassword[OrgUserKey{OrgID: o.Name, Username: u.Username}] = u.Password
 		}
 		snap.Orgs[o.Name] = oc
 	}
@@ -163,16 +161,18 @@ func TestSnapshotBuild(t *testing.T) {
 		t.Fatal("expected ingestion warehouse to be nil")
 	}
 
-	// Verify user -> org mapping
-	if snap.UserOrg["alice"] != "analytics" {
-		t.Errorf("expected alice in analytics, got %s", snap.UserOrg["alice"])
+	// Verify org-scoped user -> password mapping
+	aliceKey := OrgUserKey{OrgID: "analytics", Username: "alice"}
+	charlieKey := OrgUserKey{OrgID: "ingestion", Username: "charlie"}
+	if _, ok := snap.OrgUserPassword[aliceKey]; !ok {
+		t.Error("expected alice in analytics OrgUserPassword")
 	}
-	if snap.UserOrg["charlie"] != "ingestion" {
-		t.Errorf("expected charlie in ingestion, got %s", snap.UserOrg["charlie"])
+	if _, ok := snap.OrgUserPassword[charlieKey]; !ok {
+		t.Error("expected charlie in ingestion OrgUserPassword")
 	}
 
 	// Verify bcrypt password hashes are stored (not plaintext)
-	if err := bcrypt.CompareHashAndPassword([]byte(snap.UserPassword["alice"]), []byte("secret1")); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(snap.OrgUserPassword[aliceKey]), []byte("secret1")); err != nil {
 		t.Errorf("expected alice password hash to match 'secret1': %v", err)
 	}
 }

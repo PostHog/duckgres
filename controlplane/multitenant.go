@@ -27,14 +27,6 @@ type orgRouterAdapter struct {
 	router *OrgRouter
 }
 
-func (a *orgRouterAdapter) StackForUser(username string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
-	stack, ok := a.router.StackForUser(username)
-	if !ok {
-		return nil, nil, nil, false
-	}
-	return stack.Pool, stack.Sessions, stack.Rebalancer, true
-}
-
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForOrg(orgID)
 	if !ok {
@@ -43,8 +35,8 @@ func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManage
 	return stack.Pool, stack.Sessions, stack.Rebalancer, true
 }
 
-func (a *orgRouterAdapter) IsMigratingForUser(username string) (bool, string) {
-	return a.router.IsMigratingForUser(username)
+func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
+	return a.router.IsMigrating(orgID)
 }
 
 func (a *orgRouterAdapter) ShutdownAll() {

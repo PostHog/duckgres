@@ -1,5 +1,5 @@
-INSERT INTO duckgres_orgs (name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
-VALUES ('local', 0, '', 0, NOW(), NOW())
+INSERT INTO duckgres_orgs (name, database_name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
+VALUES ('local', 'duckgres', 0, '', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
 SET updated_at = NOW();
 
@@ -168,7 +168,6 @@ SET warehouse_database_region = EXCLUDED.warehouse_database_region,
 
 INSERT INTO duckgres_org_users (username, password, org_id, created_at, updated_at)
 VALUES ('postgres', '$2a$10$TQyt73Vw91Q1d7YcE86EVuhms/0u4qBydMDyVvZYlqDwc3/VtQAbm', 'local', NOW(), NOW())
-ON CONFLICT (username) DO UPDATE
+ON CONFLICT (org_id, username) DO UPDATE
 SET password = EXCLUDED.password,
-    org_id = EXCLUDED.org_id,
     updated_at = NOW();

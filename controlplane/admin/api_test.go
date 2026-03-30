@@ -87,16 +87,18 @@ func (s *fakeAPIStore) ListUsers() ([]configstore.OrgUser, error) {
 }
 
 func (s *fakeAPIStore) CreateUser(user *configstore.OrgUser) error {
-	if _, ok := s.users[user.Username]; ok {
+	key := user.OrgID + "/" + user.Username
+	if _, ok := s.users[key]; ok {
 		return errors.New("duplicate user")
 	}
 	clone := *user
-	s.users[user.Username] = &clone
+	s.users[key] = &clone
 	return nil
 }
 
-func (s *fakeAPIStore) GetUser(username string) (*configstore.OrgUser, error) {
-	user, ok := s.users[username]
+func (s *fakeAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, error) {
+	key := orgID + "/" + username
+	user, ok := s.users[key]
 	if !ok {
 		return nil, gorm.ErrRecordNotFound
 	}
@@ -104,26 +106,25 @@ func (s *fakeAPIStore) GetUser(username string) (*configstore.OrgUser, error) {
 	return &clone, nil
 }
 
-func (s *fakeAPIStore) UpdateUser(username, passwordHash, orgID string) (*configstore.OrgUser, bool, error) {
-	user, ok := s.users[username]
+func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string) (*configstore.OrgUser, bool, error) {
+	key := orgID + "/" + username
+	user, ok := s.users[key]
 	if !ok {
 		return nil, false, nil
 	}
 	if passwordHash != "" {
 		user.Password = passwordHash
 	}
-	if orgID != "" {
-		user.OrgID = orgID
-	}
 	clone := *user
 	return &clone, true, nil
 }
 
-func (s *fakeAPIStore) DeleteUser(username string) (bool, error) {
-	if _, ok := s.users[username]; !ok {
+func (s *fakeAPIStore) DeleteUser(orgID, username string) (bool, error) {
+	key := orgID + "/" + username
+	if _, ok := s.users[key]; !ok {
 		return false, nil
 	}
-	delete(s.users, username)
+	delete(s.users, key)
 	return true, nil
 }
 

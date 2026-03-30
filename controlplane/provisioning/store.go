@@ -26,12 +26,18 @@ func (s *gormStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWareh
 	return &warehouse, nil
 }
 
-func (s *gormStore) CreatePendingWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) error {
+func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
 	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
 		// Auto-create org if it doesn't exist (PostHog calls provision, duckgres creates everything)
-		org := configstore.Org{Name: orgID}
+		org := configstore.Org{Name: orgID, DatabaseName: databaseName}
 		if err := tx.Where("name = ?", orgID).FirstOrCreate(&org).Error; err != nil {
 			return err
+		}
+		// Update database name if org already existed with a different one
+		if org.DatabaseName != databaseName {
+			if err := tx.Model(&org).Update("database_name", databaseName).Error; err != nil {
+				return err
+			}
 		}
 
 		// Check for existing warehouse in non-terminal state
@@ -58,6 +64,14 @@ func (s *gormStore) CreatePendingWarehouse(orgID string, warehouse *configstore.
 		warehouse.SecretsState = configstore.ManagedWarehouseStatePending
 		return tx.Create(warehouse).Error
 	})
+}
+
+func (s *gormStore) IsDatabaseNameAvailable(name string) (bool, error) {
+	var count int64
+	if err := s.cs.DB().Model(&configstore.Org{}).Where("database_name = ?", name).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count == 0, nil
 }
 
 // SetWarehouseDeleting atomically transitions a warehouse from expectedState to deleting.

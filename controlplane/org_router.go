@@ -178,17 +178,7 @@ func (tr *OrgRouter) DestroyOrgStack(orgID string) {
 	}
 }
 
-// StackForUser resolves a username to its org stack.
-func (tr *OrgRouter) StackForUser(username string) (*OrgStack, bool) {
-	orgID := tr.configStore.OrgForUser(username)
-	if orgID == "" {
-		return nil, false
-	}
-
-	return tr.StackForOrg(orgID)
-}
-
-// StackForOrg resolves an org id to its org stack.
+// StackForOrg resolves an orgID directly to its org stack.
 func (tr *OrgRouter) StackForOrg(orgID string) (*OrgStack, bool) {
 	tr.mu.RLock()
 	stack, ok := tr.orgs[orgID]
@@ -214,14 +204,6 @@ func (tr *OrgRouter) IsMigrating(orgID string) bool {
 	return ok
 }
 
-// IsMigratingForUser resolves a username to its org and checks migration state.
-func (tr *OrgRouter) IsMigratingForUser(username string) (bool, string) {
-	orgID := tr.configStore.OrgForUser(username)
-	if orgID == "" {
-		return false, ""
-	}
-	return tr.IsMigrating(orgID), orgID
-}
 
 // HandleConfigChange reconciles org stacks when the config snapshot changes.
 func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {

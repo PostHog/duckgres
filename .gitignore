@@ -32,3 +32,4 @@ artifacts/perf/
 
 .gemini/
 gha-creds-*.json
+data-test/

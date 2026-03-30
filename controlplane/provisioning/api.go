@@ -13,8 +13,9 @@ import (
 // Store defines the config store operations needed by the provisioning API.
 type Store interface {
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
-	CreatePendingWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) error
+	CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
+	IsDatabaseNameAvailable(name string) (bool, error)
 }
 
 // RegisterAPI registers provisioning endpoints on the given router group.
@@ -23,6 +24,7 @@ func RegisterAPI(r *gin.RouterGroup, store Store) {
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
+	r.GET("/database-name/check", h.checkDatabaseName)
 }
 
 type handler struct {
@@ -44,6 +46,7 @@ type warehouseStatusResponse struct {
 }
 
 type provisionRequest struct {
+	DatabaseName  string                `json:"database_name"`
 	MetadataStore *provisionMetadataReq `json:"metadata_store,omitempty"`
 }
 
@@ -66,6 +69,11 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
+	if req.DatabaseName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "database_name is required"})
+		return
+	}
+
 	if req.MetadataStore == nil || req.MetadataStore.Aurora == nil || req.MetadataStore.Aurora.MaxACU <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.aurora.max_acu must be greater than 0"})
 		return
@@ -76,7 +84,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		AuroraMaxACU: req.MetadataStore.Aurora.MaxACU,
 	}
 
-	if err := h.store.CreatePendingWarehouse(orgID, warehouse); err != nil {
+	if err := h.store.CreatePendingWarehouse(orgID, req.DatabaseName, warehouse); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
@@ -134,4 +142,20 @@ func (h *handler) getWarehouseStatus(c *gin.Context) {
 		ReadyAt:            warehouse.ReadyAt,
 		FailedAt:           warehouse.FailedAt,
 	})
+}
+
+func (h *handler) checkDatabaseName(c *gin.Context) {
+	name := c.Query("name")
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name query parameter is required"})
+		return
+	}
+
+	available, err := h.store.IsDatabaseNameAvailable(name)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check database name"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"name": name, "available": available})
 }
