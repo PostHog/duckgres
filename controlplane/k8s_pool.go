@@ -882,6 +882,45 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 	return false
 }
 
+// TransitionToHotIdleIfNoSessions transitions a hot worker to hot_idle when its
+// last session ends. The worker keeps its org assignment and DuckLake attachment
+// so it can be quickly reclaimed for the same org. Returns true if the worker
+// transitioned to hot_idle.
+func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok {
+		p.mu.Unlock()
+		return false
+	}
+	if w.activeSessions > 0 {
+		w.activeSessions--
+	}
+	if w.activeSessions != 0 {
+		p.mu.Unlock()
+		return false
+	}
+	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleHot {
+		p.mu.Unlock()
+		return false
+	}
+	nextState, err := w.SharedState().Transition(WorkerLifecycleHotIdle, nil)
+	if err != nil {
+		p.mu.Unlock()
+		return false
+	}
+	if err := w.SetSharedState(nextState); err != nil {
+		p.mu.Unlock()
+		return false
+	}
+	w.lastUsed = time.Now()
+	hotIdleRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateHotIdle, "", nil)
+	observeWarmPoolLifecycleGauges(p.workers)
+	p.mu.Unlock()
+	p.persistWorkerRecord(hotIdleRecord)
+	return true
+}
+
 // Worker returns a worker by ID.
 func (p *K8sWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	p.mu.RLock()
@@ -950,6 +989,10 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	}
 
 	p.mu.Lock()
+	// Cache the activation payload for potential hot-idle reuse.
+	cached := payload
+	worker.cachedActivationPayload = &cached
+
 	if worker.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
 		p.mu.Unlock()
 		return nil
@@ -984,6 +1027,25 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		}
 
 		if p.runtimeStore != nil {
+			// Try reclaiming a hot-idle worker for the same org first (fast path:
+			// DuckLake is already attached, only needs epoch bump).
+			if assignment.OrgID != "" {
+				hotClaimed, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID)
+				if err != nil {
+					return nil, err
+				}
+				if hotClaimed != nil {
+					worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)
+					if reserveErr == nil {
+						worker.hotIdleReclaimed = true
+						return worker, nil
+					}
+					slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
+					p.retireClaimedWorker(hotClaimed, RetireReasonCrash)
+					// Fall through to neutral idle claim
+				}
+			}
+
 			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.MaxWorkers)
 			if err != nil {
 				return nil, err
@@ -1877,7 +1939,8 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int) {
 }
 
 func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
-	if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
+	lifecycle := w.SharedState().NormalizedLifecycle()
+	if lifecycle == WorkerLifecycleHot || lifecycle == WorkerLifecycleHotIdle {
 		observeHotWorkerSessions(w.peakSessions)
 	}
 	nextState, err := w.SharedState().Transition(WorkerLifecycleRetired, nil)

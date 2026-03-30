@@ -223,6 +223,7 @@ const (
 	WorkerStateReserved   WorkerState = "reserved"
 	WorkerStateActivating WorkerState = "activating"
 	WorkerStateHot        WorkerState = "hot"
+	WorkerStateHotIdle    WorkerState = "hot_idle"
 	WorkerStateDraining   WorkerState = "draining"
 	WorkerStateRetired    WorkerState = "retired"
 	WorkerStateLost       WorkerState = "lost"

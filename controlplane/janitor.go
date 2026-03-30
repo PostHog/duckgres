@@ -19,6 +19,7 @@ type controlPlaneExpiryStore interface {
 	ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error)
 	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
+	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
 }
 
 type ControlPlaneJanitor struct {
@@ -29,6 +30,7 @@ type ControlPlaneJanitor struct {
 	spawnTimeout          time.Duration
 	activateTimeout       time.Duration
 	maxDrainTimeout       time.Duration
+	hotIdleTTL            time.Duration
 	now                   func() time.Time
 	retireWorker          func(record configstore.WorkerRecord, reason string)
 	reconcileWarmCapacity func()
@@ -110,6 +112,17 @@ func (j *ControlPlaneJanitor) runOnce() {
 	} else {
 		for _, worker := range stuckWorkers {
 			j.retireRuntimeWorker(worker, janitorRetireReasonStuckActivating)
+		}
+	}
+
+	if j.hotIdleTTL > 0 {
+		cutoff := j.now().Add(-j.hotIdleTTL)
+		expired, err := j.store.ListExpiredHotIdleWorkers(cutoff)
+		if err != nil {
+			slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
+		}
+		for _, record := range expired {
+			j.retireRuntimeWorker(record, "hot_idle_ttl_expired")
 		}
 	}
 

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
 // OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
@@ -48,6 +50,25 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 		p.shared.cleanDeadWorkersLocked()
 
 		if idle := p.findIdleAssignedWorkerLocked(); idle != nil {
+			// If the worker is in hot_idle, transition back to hot via
+			// reserved (hot_idle -> reserved -> hot carries the assignment).
+			if idle.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
+				nextState, err := idle.SharedState().Transition(WorkerLifecycleReserved, nil)
+				if err == nil {
+					_ = idle.SetSharedState(nextState)
+					nextState, err = idle.SharedState().Transition(WorkerLifecycleActivating, nil)
+					if err == nil {
+						_ = idle.SetSharedState(nextState)
+						nextState, err = idle.SharedState().Transition(WorkerLifecycleHot, nil)
+						if err == nil {
+							_ = idle.SetSharedState(nextState)
+						}
+					}
+				}
+				hotRecord := p.shared.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
+				observeWarmPoolLifecycleGauges(p.shared.workers)
+				p.shared.persistWorkerRecord(hotRecord)
+			}
 			idle.activeSessions++
 			if idle.activeSessions > idle.peakSessions {
 				idle.peakSessions = idle.activeSessions
@@ -97,7 +118,12 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 }
 
 func (p *OrgReservedPool) ReleaseWorker(id int) {
-	p.shared.RetireWorkerIfNoSessions(id)
+	if p.shared.TransitionToHotIdleIfNoSessions(id) {
+		return
+	}
+	// Worker still has sessions; the decrement already happened inside
+	// TransitionToHotIdleIfNoSessions. Nothing more to do until the
+	// last session ends.
 }
 
 func (p *OrgReservedPool) RetireWorker(id int) {
@@ -208,7 +234,8 @@ func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool 
 	if !p.workerBelongsToOrgLocked(w) {
 		return false
 	}
-	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot
+	lifecycle := w.SharedState().NormalizedLifecycle()
+	return lifecycle == WorkerLifecycleHot || lifecycle == WorkerLifecycleHotIdle
 }
 
 func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) error {

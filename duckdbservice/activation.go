@@ -151,7 +151,9 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 }
 
 func sameTenantActivationRuntime(current, next ActivationPayload) bool {
-	return current.OrgID == next.OrgID && reflect.DeepEqual(current.DuckLake, next.DuckLake)
+	return current.OrgID == next.OrgID &&
+		current.DuckLake.MetadataStore == next.DuckLake.MetadataStore &&
+		current.DuckLake.ObjectStore == next.DuckLake.ObjectStore
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {

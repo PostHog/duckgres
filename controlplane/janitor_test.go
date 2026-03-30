@@ -72,6 +72,12 @@ func (s *captureControlPlaneExpiryStore) ExpireFlightSessionRecords(before time.
 	return 0, nil
 }
 
+func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return nil, nil
+}
+
 func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{}
 	now := time.Date(2026, time.March, 26, 15, 0, 0, 0, time.UTC)
