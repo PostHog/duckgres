@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -44,6 +45,7 @@ func TestSharedWorkerActivatorBuildsActivationRequestFromManagedWarehouse(t *tes
 	org := &configstore.OrgConfig{
 		Name: "analytics",
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
 				Endpoint:     "metadata.example.internal",
 				Port:         5432,
@@ -58,6 +60,9 @@ func TestSharedWorkerActivatorBuildsActivationRequestFromManagedWarehouse(t *tes
 				Endpoint:   "s3.us-east-2.amazonaws.com",
 				UseSSL:     true,
 				URLStyle:   "path",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
 			},
 			MetadataStoreCredentials: configstore.SecretRef{
 				Namespace: "tenant-a",
@@ -148,11 +153,15 @@ func TestSharedWorkerActivatorActivateReservedWorkerUsesLatestResolvedOrgConfig(
 			"alice": "ignored",
 		},
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
 				Endpoint:     "old-metadata.example.internal",
 				Port:         5432,
 				Username:     "ducklake_user",
 				DatabaseName: "ducklake_metadata",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
 			},
 			MetadataStoreCredentials: configstore.SecretRef{
 				Namespace: "tenant-a",
@@ -187,11 +196,15 @@ func TestSharedWorkerActivatorActivateReservedWorkerUsesLatestResolvedOrgConfig(
 			"bob": "ignored",
 		},
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
 				Endpoint:     "new-metadata.example.internal",
 				Port:         5432,
 				Username:     "ducklake_user",
 				DatabaseName: "ducklake_metadata",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
 			},
 			MetadataStoreCredentials: configstore.SecretRef{
 				Namespace: "tenant-a",
@@ -216,7 +229,7 @@ func TestSharedWorkerActivatorActivateReservedWorkerUsesLatestResolvedOrgConfig(
 	}
 }
 
-func TestSharedWorkerActivatorDucklingCRFallback(t *testing.T) {
+func TestSharedWorkerActivatorDucklingCRRequiresSTSBroker(t *testing.T) {
 	activator := &SharedWorkerActivator{
 		clientset:        fake.NewSimpleClientset(),
 		defaultNamespace: "duckgres-workers",
@@ -248,7 +261,6 @@ func TestSharedWorkerActivatorDucklingCRFallback(t *testing.T) {
 				IAMRoleARN: "arn:aws:iam::123:role/duckling-test-org",
 			}, nil
 		},
-		stsBroker: nil, // no STS broker — should fall back to aws_sdk
 	}
 
 	org := &configstore.OrgConfig{
@@ -259,32 +271,16 @@ func TestSharedWorkerActivatorDucklingCRFallback(t *testing.T) {
 		},
 	}
 
-	req, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "test-org"})
-	if err != nil {
-		t.Fatalf("BuildActivationRequest: %v", err)
-	}
-
-	if req.DuckLake.MetadataStore != "postgres:host=test-org.cluster.rds.amazonaws.com port=5432 user=postgres password=duckling-password-123 dbname=postgres" {
-		t.Fatalf("unexpected metadata store DSN: %q", req.DuckLake.MetadataStore)
-	}
-	if req.DuckLake.ObjectStore != "s3://posthog-duckling-test-org/" {
-		t.Fatalf("unexpected object store: %q", req.DuckLake.ObjectStore)
-	}
-	if req.DuckLake.S3Region != "us-east-1" {
-		t.Fatalf("expected s3 region us-east-1, got %q", req.DuckLake.S3Region)
-	}
-	if req.DuckLake.S3Provider != "aws_sdk" {
-		t.Fatalf("expected aws_sdk provider, got %q", req.DuckLake.S3Provider)
-	}
-	if !req.DuckLake.S3UseSSL {
-		t.Fatal("expected s3 use_ssl to be true")
+	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "test-org"})
+	if err == nil {
+		t.Fatal("expected shared warm activation to fail without an STS broker")
 	}
 }
 
 func TestSharedWorkerActivatorPrefersSecretRefOverDucklingCR(t *testing.T) {
 	clientset := fake.NewSimpleClientset(
 		&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "md-secret"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "org-with-secretref-metadata"},
 			Data:       map[string][]byte{"pw": []byte("secret-ref-password")},
 		},
 	)
@@ -310,10 +306,14 @@ func TestSharedWorkerActivatorPrefersSecretRefOverDucklingCR(t *testing.T) {
 	org := &configstore.OrgConfig{
 		Name: "org-with-secretref",
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "org-with-secretref",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
 				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
 			},
-			MetadataStoreCredentials: configstore.SecretRef{Namespace: "ns", Name: "md-secret", Key: "pw"},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "ns",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{Namespace: "ns", Name: "org-with-secretref-metadata", Key: "pw"},
 		},
 	}
 
@@ -334,7 +334,7 @@ func TestSharedWorkerActivatorPrefersSecretRefOverDucklingCR(t *testing.T) {
 func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T) {
 	clientset := fake.NewSimpleClientset(
 		&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "md-secret"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "fallback-org-metadata"},
 			Data:       map[string][]byte{"pw": []byte("fallback-password")},
 		},
 	)
@@ -350,10 +350,14 @@ func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T
 	org := &configstore.OrgConfig{
 		Name: "fallback-org",
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "fallback-org",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
 				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
 			},
-			MetadataStoreCredentials: configstore.SecretRef{Namespace: "ns", Name: "md-secret", Key: "pw"},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "ns",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{Namespace: "ns", Name: "fallback-org-metadata", Key: "pw"},
 		},
 	}
 
@@ -364,5 +368,171 @@ func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T
 
 	if got := req.DuckLake.MetadataStore; got != "postgres:host=host port=5432 user=u password=fallback-password dbname=db" {
 		t.Fatalf("expected fallback password in DSN, got %q", got)
+	}
+}
+
+func TestSharedWorkerActivatorRejectsSecretRefOutsideTenantScope(t *testing.T) {
+	activator := &SharedWorkerActivator{
+		clientset:        fake.NewSimpleClientset(),
+		defaultNamespace: "duckgres-workers",
+	}
+
+	org := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Namespace: "tenant-b",
+				Name:      "billing-metadata",
+				Key:       "dsn",
+			},
+		},
+	}
+
+	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
+	if err == nil {
+		t.Fatal("expected cross-tenant secret ref to be rejected")
+	}
+}
+
+func TestSharedWorkerActivatorRejectsSecretRefOutsideTenantPrefix(t *testing.T) {
+	activator := &SharedWorkerActivator{
+		clientset:        fake.NewSimpleClientset(),
+		defaultNamespace: "duckgres-workers",
+	}
+
+	org := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Namespace: "tenant-a",
+				Name:      "shared-metadata",
+				Key:       "dsn",
+			},
+		},
+	}
+
+	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
+	if err == nil {
+		t.Fatal("expected non-org-prefixed secret ref to be rejected")
+	}
+}
+
+func TestSharedWorkerActivatorRejectsSecretRefWithoutTenantNamespace(t *testing.T) {
+	activator := &SharedWorkerActivator{
+		clientset:        fake.NewSimpleClientset(),
+		defaultNamespace: "",
+	}
+
+	org := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Name: "analytics-metadata",
+				Key:  "dsn",
+			},
+		},
+	}
+
+	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
+	if err == nil {
+		t.Fatal("expected secret ref without tenant namespace to be rejected")
+	}
+}
+
+func TestSharedWorkerActivatorRejectsSecretRefWithoutExplicitNamespace(t *testing.T) {
+	activator := &SharedWorkerActivator{
+		clientset:        fake.NewSimpleClientset(),
+		defaultNamespace: "duckgres-workers",
+	}
+
+	org := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Name: "analytics-metadata",
+				Key:  "dsn",
+			},
+		},
+	}
+
+	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
+	if err == nil {
+		t.Fatal("expected secret ref without explicit namespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "SecretRef.Namespace") {
+		t.Fatalf("expected explicit namespace guidance, got %v", err)
+	}
+}
+
+func TestSharedWorkerActivatorReadSecretValueRejectsBlankNamespace(t *testing.T) {
+	activator := &SharedWorkerActivator{
+		clientset:        fake.NewSimpleClientset(),
+		defaultNamespace: "duckgres-workers",
+	}
+
+	_, err := activator.readSecretValue(context.Background(), configstore.SecretRef{
+		Name: "analytics-metadata",
+		Key:  "dsn",
+	})
+	if err == nil {
+		t.Fatal("expected blank secret namespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "SecretRef.Namespace") {
+		t.Fatalf("expected explicit namespace guidance, got %v", err)
+	}
+}
+
+func TestSharedWorkerActivatorRejectsSecretRefWithOnlySubstringOrgMatch(t *testing.T) {
+	activator := &SharedWorkerActivator{
+		clientset:        fake.NewSimpleClientset(),
+		defaultNamespace: "duckgres-workers",
+	}
+
+	org := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Namespace: "tenant-a",
+				Name:      "shared-analytics-metadata",
+				Key:       "dsn",
+			},
+		},
+	}
+
+	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
+	if err == nil {
+		t.Fatal("expected substring-only org match to be rejected")
 	}
 }

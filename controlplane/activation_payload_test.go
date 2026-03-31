@@ -44,8 +44,9 @@ func TestBuildTenantActivationPayloadBuildsDuckLakeRuntimeFromWarehouseSecrets(t
 				Username:     "ducklake",
 			},
 			MetadataStoreCredentials: configstore.SecretRef{
-				Name: "analytics-metadata",
-				Key:  "dsn",
+				Namespace: "default",
+				Name:      "analytics-metadata",
+				Key:       "dsn",
 			},
 			S3: configstore.ManagedWarehouseS3{
 				Provider:   "minio",
@@ -55,9 +56,13 @@ func TestBuildTenantActivationPayloadBuildsDuckLakeRuntimeFromWarehouseSecrets(t
 				Endpoint:   "minio.internal:9000",
 				URLStyle:   "path",
 			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "default",
+			},
 			S3Credentials: configstore.SecretRef{
-				Name: "analytics-s3",
-				Key:  "credentials",
+				Namespace: "default",
+				Name:      "analytics-s3",
+				Key:       "credentials",
 			},
 		},
 	}

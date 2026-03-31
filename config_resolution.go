@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -144,7 +145,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var workerBackend string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
-	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy, k8sWorkerServiceAccount string
+	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
+	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
 	var k8sMaxWorkers, k8sSharedWarmTarget int
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string

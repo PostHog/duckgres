@@ -4,6 +4,13 @@ metadata:
   name: duckgres-control-plane
   namespace: duckgres
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckgres-worker
+  namespace: duckgres
+automountServiceAccountToken: false
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -14,11 +21,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch"]
+  # Validate the shared neutral worker startup config before spawn
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
   # Coordinate leader election for janitor work
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
-  # Read bearer token secret; create if auto-generating; update if key missing
+  # Read/create/update the worker RPC secret (bearer token + TLS material)
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "create", "update"]

@@ -555,6 +555,21 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		return
 	}
 	warehouse := req.toManagedWarehouse()
+	cfgView := &configstore.ManagedWarehouseConfig{
+		OrgID:                        orgID,
+		WarehouseDatabase:            warehouse.WarehouseDatabase,
+		MetadataStore:                warehouse.MetadataStore,
+		S3:                           warehouse.S3,
+		WorkerIdentity:               warehouse.WorkerIdentity,
+		WarehouseDatabaseCredentials: warehouse.WarehouseDatabaseCredentials,
+		MetadataStoreCredentials:     warehouse.MetadataStoreCredentials,
+		S3Credentials:                warehouse.S3Credentials,
+		RuntimeConfig:                warehouse.RuntimeConfig,
+	}
+	if err := configstore.ValidateManagedWarehouseSecretRefs(orgID, "", cfgView); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	stored, ok, err := h.store.UpsertManagedWarehouse(orgID, &warehouse)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

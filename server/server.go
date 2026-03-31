@@ -37,6 +37,8 @@ var processVersion = "dev"
 // clients pinning connection goroutines indefinitely.
 var startupReadTimeout = 30 * time.Second
 
+const bundledDuckDBExtensionsDir = "/app/extensions"
+
 // SetProcessVersion sets the version string for this process. Called from main().
 func SetProcessVersion(v string) { processVersion = v }
 
@@ -720,6 +722,9 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
 	// for autoloading/installing extensions.
 	extDir := filepath.Join(cfg.DataDir, "extensions")
+	if err := seedBundledExtensions(bundledDuckDBExtensionsDir, extDir); err != nil {
+		slog.Warn("Failed to seed bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", extDir, "error", err)
+	}
 	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
 		slog.Warn("Failed to set DuckDB extension_directory.", "extension_directory", extDir, "error", err)
 	} else {
@@ -746,6 +751,83 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func seedBundledExtensions(srcRoot, dstRoot string) error {
+	srcRoot = filepath.Clean(srcRoot)
+	dstRoot = filepath.Clean(dstRoot)
+
+	info, err := os.Stat(srcRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat bundled extensions dir: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("bundled extensions path %s is not a directory", srcRoot)
+	}
+	if err := os.MkdirAll(dstRoot, 0o750); err != nil {
+		return fmt.Errorf("mkdir extension directory %s: %w", dstRoot, err)
+	}
+
+	return filepath.Walk(srcRoot, func(path string, walkInfo os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == srcRoot {
+			return nil
+		}
+
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dstRoot, rel)
+
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if walkInfo != nil {
+			info = walkInfo
+		}
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, 0o750)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if _, err := os.Stat(dstPath); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		srcFile, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+
+		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+		if err != nil {
+			_ = srcFile.Close()
+			return err
+		}
+		if _, err := io.Copy(dstFile, srcFile); err != nil {
+			_ = srcFile.Close()
+			_ = dstFile.Close()
+			return err
+		}
+		if err := srcFile.Close(); err != nil {
+			_ = dstFile.Close()
+			return err
+		}
+		if err := dstFile.Close(); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // CreateDBConnection creates a DuckDB connection for a client session.

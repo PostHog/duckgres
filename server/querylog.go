@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -28,6 +29,7 @@ type QueryLogEntry struct {
 	ExceptionCode   string
 	Exception       string
 	UserName        string
+	OrgID           string
 	CurrentDatabase string
 	ClientAddress   string
 	ClientPort      int
@@ -42,6 +44,7 @@ type QueryLogEntry struct {
 type QueryLogger struct {
 	db       *sql.DB
 	cfg      QueryLogConfig
+	table    string
 	ch       chan QueryLogEntry
 	done     chan struct{}
 	stopOnce sync.Once
@@ -107,44 +110,9 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		return nil, fmt.Errorf("querylog: create schema: %w", err)
 	}
 
-	// Migrate normalized_query_hash from UBIGINT to BIGINT for existing tables.
-	// DuckLake doesn't support narrowing ALTER COLUMN, so drop and recreate.
-	var colType string
-	err = db.QueryRow("SELECT data_type FROM ducklake.information_schema.columns WHERE table_schema = 'system' AND table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
-	if err == nil && strings.ToUpper(colType) != "BIGINT" {
-		slog.Info("querylog: dropping query_log to migrate normalized_query_hash from UBIGINT to BIGINT.")
-		if _, dropErr := db.Exec("DROP TABLE ducklake.system.query_log"); dropErr != nil {
-			slog.Error("querylog: cannot migrate normalized_query_hash; disabling query log.", "error", dropErr)
-			_ = db.Close()
-			return nil, nil
-		}
-	}
-
-	createTable := `CREATE TABLE IF NOT EXISTS ducklake.system.query_log (
-		event_time          TIMESTAMPTZ NOT NULL,
-		query_duration_ms   BIGINT NOT NULL,
-		type                VARCHAR NOT NULL,
-		query               VARCHAR NOT NULL,
-		transpiled_query    VARCHAR,
-		query_kind          VARCHAR,
-		normalized_query_hash BIGINT,
-		result_rows         BIGINT,
-		written_rows        BIGINT,
-		exception_code      VARCHAR,
-		exception           VARCHAR,
-		user_name           VARCHAR NOT NULL,
-		current_database    VARCHAR,
-		client_address      VARCHAR,
-		client_port         INTEGER,
-		application_name    VARCHAR,
-		pid                 INTEGER,
-		worker_id           INTEGER,
-		is_transpiled       BOOLEAN,
-		protocol            VARCHAR
-	)`
-	if _, err := db.Exec(createTable); err != nil {
+	if err := ensureQueryLogTable(db, "system", "query_log", "ducklake.system.query_log"); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("querylog: create table: %w", err)
+		return nil, fmt.Errorf("querylog: ensure table: %w", err)
 	}
 
 	// Configure data inlining
@@ -156,10 +124,11 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	}
 
 	ql := &QueryLogger{
-		db:   db,
-		cfg:  cfg.QueryLog,
-		ch:   make(chan QueryLogEntry, queryLogChannelSize),
-		done: make(chan struct{}),
+		db:    db,
+		cfg:   cfg.QueryLog,
+		table: "ducklake.system.query_log",
+		ch:    make(chan QueryLogEntry, queryLogChannelSize),
+		done:  make(chan struct{}),
 	}
 
 	go ql.flushLoop()
@@ -242,17 +211,23 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 
 	// Build multi-row INSERT with placeholders
 	var sb strings.Builder
-	sb.WriteString("INSERT INTO ducklake.system.query_log (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol) VALUES ")
+	table := ql.table
+	if table == "" {
+		table = "query_log"
+	}
+	sb.WriteString("INSERT INTO ")
+	sb.WriteString(table)
+	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol) VALUES ")
 
-	args := make([]any, 0, len(batch)*20)
+	args := make([]any, 0, len(batch)*21)
 	for i, e := range batch {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		base := i * 20
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+		base := i * 21
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20)
+			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21)
 
 		args = append(args,
 			e.EventTime,
@@ -267,6 +242,7 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			e.ExceptionCode,
 			e.Exception,
 			e.UserName,
+			e.OrgID,
 			e.CurrentDatabase,
 			e.ClientAddress,
 			e.ClientPort,
@@ -304,6 +280,92 @@ func truncateNullableQuery(q *string) *string {
 	}
 	truncated := truncateQuery(*q)
 	return &truncated
+}
+
+func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName string) error {
+	colType, err := queryLogColumnType(db, fullTableName, tableSchema, tableName, "normalized_query_hash")
+	if err == nil && strings.ToUpper(colType) != "BIGINT" {
+		slog.Info("querylog: dropping query_log to migrate normalized_query_hash from UBIGINT to BIGINT.")
+		if _, dropErr := db.Exec("DROP TABLE " + fullTableName); dropErr != nil {
+			return fmt.Errorf("drop query_log for normalized_query_hash migration: %w", dropErr)
+		}
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect normalized_query_hash column: %w", err)
+	}
+
+	if _, err := db.Exec(queryLogCreateTableSQL(fullTableName)); err != nil {
+		return fmt.Errorf("create query_log table: %w", err)
+	}
+
+	hasOrgID, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, "org_id")
+	if err != nil {
+		return fmt.Errorf("inspect org_id column: %w", err)
+	}
+	if !hasOrgID {
+		if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN org_id VARCHAR"); err != nil {
+			return fmt.Errorf("add org_id column: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func queryLogCreateTableSQL(fullTableName string) string {
+	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+		event_time          TIMESTAMPTZ NOT NULL,
+		query_duration_ms   BIGINT NOT NULL,
+		type                VARCHAR NOT NULL,
+		query               VARCHAR NOT NULL,
+		transpiled_query    VARCHAR,
+		query_kind          VARCHAR,
+		normalized_query_hash BIGINT,
+		result_rows         BIGINT,
+		written_rows        BIGINT,
+		exception_code      VARCHAR,
+		exception           VARCHAR,
+		user_name           VARCHAR NOT NULL,
+		org_id              VARCHAR,
+		current_database    VARCHAR,
+		client_address      VARCHAR,
+		client_port         INTEGER,
+		application_name    VARCHAR,
+		pid                 INTEGER,
+		worker_id           INTEGER,
+		is_transpiled       BOOLEAN,
+		protocol            VARCHAR
+	)`, fullTableName)
+}
+
+func queryLogColumnExists(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (bool, error) {
+	_, err := queryLogColumnType(db, fullTableName, tableSchema, tableName, columnName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func queryLogColumnType(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (string, error) {
+	query := fmt.Sprintf("SELECT data_type FROM %s WHERE table_name = $1 AND column_name = $2", queryLogColumnsTable(fullTableName))
+	args := []any{tableName, columnName}
+	if strings.TrimSpace(tableSchema) != "" {
+		query += " AND table_schema = $3"
+		args = append(args, tableSchema)
+	}
+
+	var colType string
+	err := db.QueryRow(query, args...).Scan(&colType)
+	return colType, err
+}
+
+func queryLogColumnsTable(fullTableName string) string {
+	parts := strings.Split(fullTableName, ".")
+	if len(parts) == 3 {
+		return parts[0] + ".information_schema.columns"
+	}
+	return "information_schema.columns"
 }
 
 func escapeSQLStringLiteral(s string) string {
@@ -424,6 +486,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		ExceptionCode:   errCode,
 		Exception:       errMsg,
 		UserName:        c.username,
+		OrgID:           c.orgID,
 		CurrentDatabase: c.database,
 		ClientAddress:   clientAddr,
 		ClientPort:      clientPort,

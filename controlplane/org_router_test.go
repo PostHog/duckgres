@@ -112,6 +112,9 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 	oldOrg := &configstore.OrgConfig{
 		Name: "analytics",
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
 				Endpoint:     "old-metadata.internal",
 				Port:         5432,
@@ -131,6 +134,9 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 			"bob": "ignored",
 		},
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
 				Endpoint:     "new-metadata.internal",
 				Port:         5432,

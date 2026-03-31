@@ -42,11 +42,27 @@ func newTestActivator(t *testing.T, activateFn func(ctx context.Context, w *Mana
 
 	clientset := fake.NewSimpleClientset(
 		&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "meta-secret"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "test-org-metadata"},
 			Data:       map[string][]byte{"dsn": []byte("meta-pass")},
 		},
 		&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "s3-secret"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "fail-org-metadata"},
+			Data:       map[string][]byte{"dsn": []byte("meta-pass")},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "org-ok-metadata"},
+			Data:       map[string][]byte{"dsn": []byte("meta-pass")},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "test-org-s3"},
+			Data:       map[string][]byte{"creds": []byte(`{"access_key_id":"a","secret_access_key":"b"}`)},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "fail-org-s3"},
+			Data:       map[string][]byte{"creds": []byte(`{"access_key_id":"a","secret_access_key":"b"}`)},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "org-ok-s3"},
 			Data:       map[string][]byte{"creds": []byte(`{"access_key_id":"a","secret_access_key":"b"}`)},
 		},
 	)
@@ -59,6 +75,7 @@ func newTestActivator(t *testing.T, activateFn func(ctx context.Context, w *Mana
 			return &configstore.OrgConfig{
 				Name: orgID,
 				Warehouse: &configstore.ManagedWarehouseConfig{
+					OrgID: orgID,
 					MetadataStore: configstore.ManagedWarehouseMetadataStore{
 						Endpoint: "meta-host", Port: 5432,
 						Username: "user", DatabaseName: "db",
@@ -68,11 +85,14 @@ func newTestActivator(t *testing.T, activateFn func(ctx context.Context, w *Mana
 						Bucket: "bucket", PathPrefix: "data",
 						Endpoint: "s3.amazonaws.com", UseSSL: true, URLStyle: "path",
 					},
+					WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+						Namespace: "ns",
+					},
 					MetadataStoreCredentials: configstore.SecretRef{
-						Namespace: "ns", Name: "meta-secret", Key: "dsn",
+						Namespace: "ns", Name: orgID + "-metadata", Key: "dsn",
 					},
 					S3Credentials: configstore.SecretRef{
-						Namespace: "ns", Name: "s3-secret", Key: "creds",
+						Namespace: "ns", Name: orgID + "-s3", Key: "creds",
 					},
 				},
 			}, nil

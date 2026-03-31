@@ -3,7 +3,9 @@
 package configstore_test
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -34,8 +36,8 @@ func TestLocalConfigStoreSeedSQL(t *testing.T) {
 	if orgCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata_local" {
 		t.Fatalf("expected ducklake_metadata_local metadata db, got %q", orgCfg.Warehouse.MetadataStore.DatabaseName)
 	}
-	if orgCfg.Warehouse.WarehouseDatabaseCredentials.Name != "duckgres-local-warehouse-db" {
-		t.Fatalf("expected duckgres-local-warehouse-db secret ref, got %q", orgCfg.Warehouse.WarehouseDatabaseCredentials.Name)
+	if orgCfg.Warehouse.WarehouseDatabaseCredentials.Name != "local-warehouse-db" {
+		t.Fatalf("expected local-warehouse-db secret ref, got %q", orgCfg.Warehouse.WarehouseDatabaseCredentials.Name)
 	}
 	if orgCfg.Warehouse.State != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("expected ready warehouse state, got %q", orgCfg.Warehouse.State)
@@ -79,10 +81,62 @@ func TestKindConfigStoreSeedSQL(t *testing.T) {
 	if got := orgCfg.Warehouse.S3.Bucket; got != "duckgres-local" {
 		t.Fatalf("expected duckgres-local bucket, got %q", got)
 	}
-	if got := orgCfg.Warehouse.MetadataStoreCredentials.Name; got != "duckgres-local-metadata" {
+	if got := orgCfg.Warehouse.MetadataStoreCredentials.Name; got != "local-metadata" {
 		t.Fatalf("expected kind metadata secret ref, got %q", got)
 	}
-	if got := orgCfg.Warehouse.S3Credentials.Name; got != "duckgres-local-s3" {
+	if got := orgCfg.Warehouse.S3Credentials.Name; got != "local-s3" {
 		t.Fatalf("expected kind s3 secret ref, got %q", got)
+	}
+}
+
+func TestTenantIsolationConfigStoreSeedSQL(t *testing.T) {
+	seedPath := filepath.Join(findProjectRoot(t), "tests", "k8s", "testdata", "tenant-isolation.seed.sql")
+	seedSQL, err := os.ReadFile(seedPath)
+	if err != nil {
+		t.Fatalf("read tenant isolation seed: %v", err)
+	}
+	if !strings.Contains(string(seedSQL), "ON CONFLICT (org_id, username) DO UPDATE") {
+		t.Fatalf("expected composite org user upsert target in %s", seedPath)
+	}
+	if strings.Contains(string(seedSQL), "ON CONFLICT (username) DO UPDATE") {
+		t.Fatalf("expected tenant isolation seed to avoid username-only org user upserts in %s", seedPath)
+	}
+
+	store := newIsolatedConfigStore(t)
+
+	if err := applyConfigStoreSeed(t, store, seedPath); err != nil {
+		t.Fatalf("apply tenant isolation seed: %v", err)
+	}
+
+	if err := store.Reload(); err != nil {
+		t.Fatalf("reload store: %v", err)
+	}
+
+	snap := store.Snapshot()
+	for _, tc := range []struct {
+		orgID         string
+		databaseName  string
+		metadataDB    string
+		warehouseUser string
+	}{
+		{orgID: "analytics", databaseName: "analytics", metadataDB: "ducklake_metadata_analytics", warehouseUser: "analytics"},
+		{orgID: "billing", databaseName: "billing", metadataDB: "ducklake_metadata_billing", warehouseUser: "billing"},
+	} {
+		orgCfg := snap.Orgs[tc.orgID]
+		if orgCfg == nil {
+			t.Fatalf("expected %s org from tenant isolation seed", tc.orgID)
+		}
+		if orgCfg.DatabaseName != tc.databaseName {
+			t.Fatalf("expected %s database name %q, got %q", tc.orgID, tc.databaseName, orgCfg.DatabaseName)
+		}
+		if orgCfg.Warehouse == nil {
+			t.Fatalf("expected %s warehouse from tenant isolation seed", tc.orgID)
+		}
+		if orgCfg.Warehouse.MetadataStore.DatabaseName != tc.metadataDB {
+			t.Fatalf("expected %s metadata db %q, got %q", tc.orgID, tc.metadataDB, orgCfg.Warehouse.MetadataStore.DatabaseName)
+		}
+		if _, ok := orgCfg.Users[tc.warehouseUser]; !ok {
+			t.Fatalf("expected seeded user %q for org %s", tc.warehouseUser, tc.orgID)
+		}
 	}
 }
