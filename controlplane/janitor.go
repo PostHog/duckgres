@@ -25,6 +25,7 @@ type controlPlaneExpiryStore interface {
 	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
+	RetireHotIdleWorker(workerID int) (bool, error)
 }
 
 type ControlPlaneJanitor struct {
@@ -128,10 +129,18 @@ func (j *ControlPlaneJanitor) runOnce() {
 			slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 		}
 		for _, record := range expired {
-			// Use retireLocalWorker for workers in our in-memory pool to
-			// remove the stale ManagedWorker entry. retireClaimedWorker
-			// only handles the DB record and pod deletion, leaving the
-			// in-memory worker schedulable.
+			// Atomically transition from hot_idle to retired in the DB.
+			// If the worker was concurrently reclaimed (no longer hot_idle),
+			// the conditional update returns false and we skip retirement.
+			retired, err := j.store.RetireHotIdleWorker(record.WorkerID)
+			if err != nil {
+				slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", record.WorkerID, "error", err)
+				continue
+			}
+			if !retired {
+				continue // Worker was reclaimed concurrently
+			}
+			// Remove from local in-memory pool and delete the pod.
 			if j.retireLocalWorker != nil {
 				j.retireLocalWorker(record.WorkerID, "hot_idle_ttl_expired")
 			} else {
