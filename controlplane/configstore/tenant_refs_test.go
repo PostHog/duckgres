@@ -1,6 +1,9 @@
 package configstore
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidateTenantSecretRefRequiresTenantNamespace(t *testing.T) {
 	err := ValidateTenantSecretRef("analytics", "", "", "metadata_store_credentials", SecretRef{
@@ -20,6 +23,19 @@ func TestValidateTenantSecretRefRejectsNamespaceMismatch(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected namespace mismatch to be rejected")
+	}
+}
+
+func TestValidateTenantSecretRefRequiresExplicitSecretNamespace(t *testing.T) {
+	err := ValidateTenantSecretRef("analytics", "tenant-a", "", "metadata_store_credentials", SecretRef{
+		Name: "analytics-metadata",
+		Key:  "dsn",
+	})
+	if err == nil {
+		t.Fatal("expected blank secret namespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "SecretRef.Namespace") {
+		t.Fatalf("expected explicit namespace guidance, got %v", err)
 	}
 }
 

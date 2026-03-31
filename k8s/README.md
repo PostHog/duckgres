@@ -91,8 +91,8 @@ The primary shared warm-worker workflow now uses [`kind`](https://kind.sigs.k8s.
 ```bash
 just run-multitenant-kind
 just multitenant-port-forward-pg
-just multitenant-port-forward-admin
-PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres sslmode=require"
+just multitenant-port-forward-api
+PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres dbname=duckgres sslmode=require"
 ```
 
 `just run-multitenant-kind` recreates a local kind cluster, starts the config store plus the local warehouse DB, DuckLake metadata DB, and MinIO backing the seeded managed-warehouse contract, attaches those dependency containers to the Docker `kind` network, loads the locally built image into kind, and deploys the shared warm-worker control plane.
@@ -117,7 +117,7 @@ The admin dashboard requires the admin token printed in the control-plane logs. 
 kubectl -n duckgres logs deployment/duckgres-control-plane | rg "Generated admin API token"
 ```
 
-The local seed populates one managed-warehouse contract for the `local` team. That row includes separate `warehouse_database` and `metadata_store` sections plus secret references only, not secret values.
+The local seed populates one managed-warehouse contract for the `local` team. That row includes separate `warehouse_database` and `metadata_store` sections plus secret references only, not secret values. Every non-empty managed-warehouse secret ref stores an explicit namespace, and that namespace must match `worker_identity.namespace`.
 
 Seeded warehouse contract notes:
 

@@ -603,6 +603,34 @@ func TestPutWarehouseRejectsCrossTenantSecretRefs(t *testing.T) {
 	}
 }
 
+func TestPutWarehouseRejectsSecretRefWithoutExplicitNamespace(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"worker_identity": {
+			"namespace": "tenant-analytics"
+		},
+		"metadata_store_credentials": {
+			"name": "analytics-metadata",
+			"key": "dsn"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "SecretRef.Namespace") {
+		t.Fatalf("expected explicit namespace validation error, got %s", rec.Body.String())
+	}
+}
+
 func TestPutWarehouseRejectsCrossTenantSecretReference(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}

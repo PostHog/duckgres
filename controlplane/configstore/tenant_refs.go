@@ -36,12 +36,15 @@ func ValidateTenantSecretRef(orgID, tenantNamespace, defaultNamespace, field str
 	}
 	if effectiveTenantNamespace == "" {
 		if strings.TrimSpace(defaultNamespace) != "" {
-			return fmt.Errorf("%s secret ref requires worker_identity.namespace; refusing shared fallback namespace %q", field, strings.TrimSpace(defaultNamespace))
+			return fmt.Errorf("%s secret ref requires worker_identity.namespace and explicit SecretRef.Namespace; refusing shared fallback namespace %q", field, strings.TrimSpace(defaultNamespace))
 		}
-		return fmt.Errorf("%s secret ref requires worker_identity.namespace to keep secret lookups tenant-owned", field)
+		return fmt.Errorf("%s secret ref requires worker_identity.namespace and explicit SecretRef.Namespace to keep secret lookups tenant-owned", field)
 	}
 	if refNamespace == "" {
-		refNamespace = effectiveTenantNamespace
+		if strings.TrimSpace(defaultNamespace) != "" {
+			return fmt.Errorf("%s secret ref requires explicit SecretRef.Namespace matching worker_identity.namespace %q; refusing shared fallback namespace %q", field, effectiveTenantNamespace, strings.TrimSpace(defaultNamespace))
+		}
+		return fmt.Errorf("%s secret ref requires explicit SecretRef.Namespace matching worker_identity.namespace %q", field, effectiveTenantNamespace)
 	}
 	if refNamespace != effectiveTenantNamespace {
 		return fmt.Errorf("%s secret ref must stay tenant-owned: namespace %q must match tenant namespace %q", field, refNamespace, effectiveTenantNamespace)

@@ -292,23 +292,27 @@ func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Inte
 }
 
 func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configstore.SecretRef) (string, error) {
-	if ref.Name == "" || ref.Key == "" {
+	if strings.TrimSpace(ref.Name) == "" || strings.TrimSpace(ref.Key) == "" {
 		return "", fmt.Errorf("secret ref requires name and key")
 	}
-	namespace := ref.Namespace
+	namespace := strings.TrimSpace(ref.Namespace)
 	if namespace == "" {
-		namespace = a.defaultNamespace
+		if strings.TrimSpace(a.defaultNamespace) != "" {
+			return "", fmt.Errorf("secret ref requires explicit SecretRef.Namespace; set worker_identity.namespace and store the same namespace on the SecretRef instead of relying on shared fallback namespace %q", strings.TrimSpace(a.defaultNamespace))
+		}
+		return "", fmt.Errorf("secret ref requires explicit SecretRef.Namespace; set worker_identity.namespace and store the same namespace on the SecretRef")
 	}
-	secret, err := a.clientset.CoreV1().Secrets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	secret, err := a.clientset.CoreV1().Secrets(namespace).Get(ctx, strings.TrimSpace(ref.Name), metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
-	if value, ok := secret.StringData[ref.Key]; ok && value != "" {
+	key := strings.TrimSpace(ref.Key)
+	if value, ok := secret.StringData[key]; ok && value != "" {
 		return value, nil
 	}
-	raw, ok := secret.Data[ref.Key]
+	raw, ok := secret.Data[key]
 	if !ok {
-		return "", fmt.Errorf("secret %s/%s missing key %q", secret.Namespace, secret.Name, ref.Key)
+		return "", fmt.Errorf("secret %s/%s missing key %q", secret.Namespace, secret.Name, key)
 	}
 	return string(raw), nil
 }

@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -453,6 +454,56 @@ func TestSharedWorkerActivatorRejectsSecretRefWithoutTenantNamespace(t *testing.
 	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
 	if err == nil {
 		t.Fatal("expected secret ref without tenant namespace to be rejected")
+	}
+}
+
+func TestSharedWorkerActivatorRejectsSecretRefWithoutExplicitNamespace(t *testing.T) {
+	activator := &SharedWorkerActivator{
+		clientset:        fake.NewSimpleClientset(),
+		defaultNamespace: "duckgres-workers",
+	}
+
+	org := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "analytics",
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Name: "analytics-metadata",
+				Key:  "dsn",
+			},
+		},
+	}
+
+	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
+	if err == nil {
+		t.Fatal("expected secret ref without explicit namespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "SecretRef.Namespace") {
+		t.Fatalf("expected explicit namespace guidance, got %v", err)
+	}
+}
+
+func TestSharedWorkerActivatorReadSecretValueRejectsBlankNamespace(t *testing.T) {
+	activator := &SharedWorkerActivator{
+		clientset:        fake.NewSimpleClientset(),
+		defaultNamespace: "duckgres-workers",
+	}
+
+	_, err := activator.readSecretValue(context.Background(), configstore.SecretRef{
+		Name: "analytics-metadata",
+		Key:  "dsn",
+	})
+	if err == nil {
+		t.Fatal("expected blank secret namespace to be rejected")
+	}
+	if !strings.Contains(err.Error(), "SecretRef.Namespace") {
+		t.Fatalf("expected explicit namespace guidance, got %v", err)
 	}
 }
 
