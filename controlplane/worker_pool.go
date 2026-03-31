@@ -76,6 +76,7 @@ type K8sWorkerPoolConfig struct {
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
 	ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, error)
+	ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, error)
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)

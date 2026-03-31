@@ -3,6 +3,7 @@ package duckdbservice
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 	"strings"
@@ -143,6 +144,27 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 	if !reflect.DeepEqual(current, payload) && payload.OwnerEpoch <= current.OwnerEpoch {
 		return false
 	}
+
+	// Refresh the DuckDB S3 secret when credentials may have changed.
+	// Skip when the entire DuckLake config is identical (pure control metadata
+	// change like epoch bump), since credentials can't have changed.
+	if p.activation.db != nil && payload.DuckLake.ObjectStore != "" &&
+		!reflect.DeepEqual(current.DuckLake, payload.DuckLake) {
+		needsRefresh := s3CredentialsChanged(current.DuckLake, payload.DuckLake)
+		if !needsRefresh {
+			// For aws_sdk/credential_chain, the underlying IAM credentials
+			// may have expired even though the payload fields haven't changed.
+			provider := server.S3ProviderForConfig(payload.DuckLake)
+			needsRefresh = provider == "aws_sdk" || provider == "credential_chain"
+		}
+		if needsRefresh {
+			if err := server.RefreshS3Secret(p.activation.db, payload.DuckLake, p.duckLakeSem); err != nil {
+				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
+				return false
+			}
+		}
+	}
+
 	p.activation.payload = payload
 	p.ownerEpoch = payload.OwnerEpoch
 	p.ownerCPInstanceID = payload.CPInstanceID
@@ -150,8 +172,36 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 	return true
 }
 
+// s3CredentialsChanged returns true if S3 credentials differ between configs.
+func s3CredentialsChanged(a, b server.DuckLakeConfig) bool {
+	return a.S3AccessKey != b.S3AccessKey ||
+		a.S3SecretKey != b.S3SecretKey ||
+		a.S3SessionToken != b.S3SessionToken
+}
+
+// sameTenantActivationRuntime compares all structural DuckLake fields except
+// short-lived credentials (S3AccessKey, S3SecretKey, S3SessionToken) which
+// rotate on every STS AssumeRole call. This allows hot-idle reclaim to match
+// even when credentials have been refreshed, while still catching actual
+// config changes (endpoint, region, object store, etc.).
 func sameTenantActivationRuntime(current, next ActivationPayload) bool {
-	return current.OrgID == next.OrgID && reflect.DeepEqual(current.DuckLake, next.DuckLake)
+	if current.OrgID != next.OrgID {
+		return false
+	}
+	a, b := current.DuckLake, next.DuckLake
+	return a.MetadataStore == b.MetadataStore &&
+		a.ObjectStore == b.ObjectStore &&
+		a.DataPath == b.DataPath &&
+		a.S3Provider == b.S3Provider &&
+		a.S3Endpoint == b.S3Endpoint &&
+		a.S3Region == b.S3Region &&
+		a.S3UseSSL == b.S3UseSSL &&
+		a.S3URLStyle == b.S3URLStyle &&
+		a.S3Chain == b.S3Chain &&
+		a.S3Profile == b.S3Profile &&
+		a.Migrate == b.Migrate &&
+		reflect.DeepEqual(a.DataInliningRowLimit, b.DataInliningRowLimit) &&
+		a.CheckpointInterval == b.CheckpointInterval
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {

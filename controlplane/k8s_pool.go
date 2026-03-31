@@ -625,6 +625,14 @@ func (p *K8sWorkerPool) waitForPodReady(ctx context.Context, podName string, tim
 
 // waitForWorkerTCP connects to a worker over TCP and verifies its health.
 func waitForWorkerTCP(addr, bearerToken string, serverCertPEM []byte, timeout time.Duration) (*flightsql.Client, error) {
+	return waitForWorkerTCPWithMetadata(addr, bearerToken, serverCertPEM, timeout, server.WorkerHealthCheckPayload{})
+}
+
+// waitForWorkerTCPWithMetadata connects to a worker over TCP and verifies its
+// health using the provided metadata payload. For adopted hot-idle workers,
+// the payload must include the claimed epoch so the worker doesn't reject the
+// health check with "stale owner epoch".
+func waitForWorkerTCPWithMetadata(addr, bearerToken string, serverCertPEM []byte, timeout time.Duration, hcPayload server.WorkerHealthCheckPayload) (*flightsql.Client, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	attempts := 0
@@ -652,7 +660,7 @@ func waitForWorkerTCP(addr, bearerToken string, serverCertPEM []byte, timeout ti
 		client, err := flightsql.NewClient(addr, nil, nil, dialOpts...)
 		if err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_, err = doHealthCheck(ctx, client)
+			_, err = doHealthCheckWithMetadata(ctx, client, hcPayload)
 			cancel()
 			if err == nil {
 				return client, nil
@@ -850,6 +858,68 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 	return false
 }
 
+// RetireIfDrainingAndEmpty retires a worker that is draining and has no active
+// sessions. Does NOT decrement activeSessions (caller must have already done so).
+// Used by ReleaseWorker when TransitionToHotIdleIfNoSessions skips a non-hot worker.
+func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int) {
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok || w.activeSessions > 0 {
+		p.mu.Unlock()
+		return
+	}
+	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleDraining {
+		p.mu.Unlock()
+		return
+	}
+	p.markWorkerRetiredLocked(w, RetireReasonNormal)
+	delete(p.workers, id)
+	workerCount := len(p.workers)
+	p.mu.Unlock()
+	observeControlPlaneWorkers(workerCount)
+	go p.retireWorkerPod(id, w)
+}
+
+// TransitionToHotIdleIfNoSessions decrements the worker's active session count
+// and transitions a hot worker to hot_idle when its last session ends. The worker
+// keeps its org assignment and DuckLake attachment so it can be quickly reclaimed
+// for the same org. Returns true if the worker transitioned to hot_idle.
+// The session decrement always happens regardless of the return value.
+func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
+	p.mu.Lock()
+	w, ok := p.workers[id]
+	if !ok {
+		p.mu.Unlock()
+		return false
+	}
+	if w.activeSessions > 0 {
+		w.activeSessions--
+	}
+	if w.activeSessions != 0 {
+		p.mu.Unlock()
+		return false
+	}
+	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleHot {
+		p.mu.Unlock()
+		return false
+	}
+	nextState, err := w.SharedState().Transition(WorkerLifecycleHotIdle, nil)
+	if err != nil {
+		p.mu.Unlock()
+		return false
+	}
+	if err := w.SetSharedState(nextState); err != nil {
+		p.mu.Unlock()
+		return false
+	}
+	w.lastUsed = time.Now()
+	hotIdleRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateHotIdle, "", nil)
+	observeWarmPoolLifecycleGauges(p.workers)
+	p.mu.Unlock()
+	p.persistWorkerRecord(hotIdleRecord)
+	return true
+}
+
 // Worker returns a worker by ID.
 func (p *K8sWorkerPool) Worker(id int) (*ManagedWorker, bool) {
 	p.mu.RLock()
@@ -918,6 +988,10 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	}
 
 	p.mu.Lock()
+	// Cache the activation payload for potential hot-idle reuse.
+	cached := payload
+	worker.cachedActivationPayload = &cached
+
 	if worker.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
 		p.mu.Unlock()
 		return nil
@@ -952,6 +1026,25 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		}
 
 		if p.runtimeStore != nil {
+			// Try reclaiming a hot-idle worker for the same org first (fast path:
+			// DuckLake is already attached, only needs epoch bump).
+			if assignment.OrgID != "" {
+				hotClaimed, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID)
+				if err != nil {
+					return nil, err
+				}
+				if hotClaimed != nil {
+					worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)
+					if reserveErr == nil {
+						worker.hotIdleReclaimed = true
+						return worker, nil
+					}
+					slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
+					p.retireClaimedWorker(hotClaimed, RetireReasonCrash)
+					// Fall through to neutral idle claim
+				}
+			}
+
 			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.MaxWorkers)
 			if err != nil {
 				return nil, err
@@ -1183,7 +1276,17 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	if err != nil {
 		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
 	}
-	client, err := p.connectWorker(ctx, claimed.PodName, pod.Status.PodIP, token)
+
+	// For workers that already have an activation (hot_idle reclaim), pass the
+	// claimed epoch in the health check so the worker doesn't reject epoch 0.
+	hcPayload := server.WorkerHealthCheckPayload{}
+	if claimed.OwnerEpoch > 0 {
+		hcPayload.WorkerID = claimed.WorkerID
+		hcPayload.OwnerEpoch = claimed.OwnerEpoch
+		hcPayload.CPInstanceID = claimed.OwnerCPInstanceID
+	}
+
+	client, err := p.connectWorkerWithHealthCheck(ctx, claimed.PodName, pod.Status.PodIP, token, hcPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -1200,6 +1303,10 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 }
 
 func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+	return p.connectWorkerWithHealthCheck(ctx, podName, podIP, bearerToken, server.WorkerHealthCheckPayload{})
+}
+
+func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podName, podIP, bearerToken string, hcPayload server.WorkerHealthCheckPayload) (*flightsql.Client, error) {
 	if p.connectWorkerFunc != nil {
 		return p.connectWorkerFunc(ctx, podName, podIP, bearerToken)
 	}
@@ -1211,7 +1318,7 @@ func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, beare
 	if err != nil {
 		return nil, fmt.Errorf("read worker RPC security: %w", err)
 	}
-	client, err := waitForWorkerTCP(addr, bearerToken, serverCertPEM, 30*time.Second)
+	client, err := waitForWorkerTCPWithMetadata(addr, bearerToken, serverCertPEM, 30*time.Second, hcPayload)
 	if err != nil {
 		return nil, fmt.Errorf("connect to claimed worker %s: %w", podName, err)
 	}
@@ -1851,7 +1958,8 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int) {
 }
 
 func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
-	if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot {
+	lifecycle := w.SharedState().NormalizedLifecycle()
+	if lifecycle == WorkerLifecycleHot || lifecycle == WorkerLifecycleHotIdle {
 		observeHotWorkerSessions(w.peakSessions)
 	}
 	nextState, err := w.SharedState().Transition(WorkerLifecycleRetired, nil)

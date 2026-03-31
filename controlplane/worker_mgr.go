@@ -42,7 +42,9 @@ type ManagedWorker struct {
 	reservedAt     time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
 	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
 	ownerEpoch     int64
-	ownerCPInstanceID string
+	ownerCPInstanceID      string
+	hotIdleReclaimed        bool //nolint:unused // only set in kubernetes hot-idle reclaim path
+	cachedActivationPayload any  //nolint:unused // *TenantActivationPayload, cached in kubernetes activation path
 }
 
 // SharedState returns the additive shared warm-worker lifecycle metadata for

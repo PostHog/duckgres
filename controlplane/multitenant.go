@@ -27,6 +27,11 @@ type orgRouterAdapter struct {
 	router *OrgRouter
 }
 
+// defaultHotIdleTTL is how long a hot-idle worker retains its org assignment
+// before being retired. During this window, any CP pod can reclaim it for the
+// same org without re-activation.
+const defaultHotIdleTTL = 5 * time.Minute
+
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForOrg(orgID)
 	if !ok {
@@ -213,8 +218,19 @@ func SetupMultiTenant(
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
+	janitor.hotIdleTTL = defaultHotIdleTTL
 	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
 		router.sharedPool.retireClaimedWorker(&record, reason)
+	}
+	janitor.retireLocalWorker = func(workerID int, reason string) bool {
+		router.sharedPool.mu.Lock()
+		_, local := router.sharedPool.workers[workerID]
+		router.sharedPool.mu.Unlock()
+		if !local {
+			return false
+		}
+		router.sharedPool.retireWorkerWithReason(workerID, reason)
+		return true
 	}
 	janitor.reconcileWarmCapacity = func() {
 		target := router.sharedPool.WarmCapacityTarget()

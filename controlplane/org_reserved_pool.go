@@ -97,7 +97,13 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 }
 
 func (p *OrgReservedPool) ReleaseWorker(id int) {
-	p.shared.RetireWorkerIfNoSessions(id)
+	if p.shared.TransitionToHotIdleIfNoSessions(id) {
+		return
+	}
+	// TransitionToHotIdleIfNoSessions already decremented activeSessions.
+	// If the worker is not hot (e.g. draining during shutdown) and has no
+	// remaining sessions, retire it so the org slot is freed immediately.
+	p.shared.RetireIfDrainingAndEmpty(id)
 }
 
 func (p *OrgReservedPool) RetireWorker(id int) {
@@ -192,6 +198,13 @@ func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 			continue
 		default:
 		}
+		// Hot-idle workers have released their slot and are waiting to be
+		// reclaimed via the DB or retired by the janitor. Don't count them
+		// against maxWorkers so AcquireWorker can reach ReserveSharedWorker
+		// and ClaimHotIdleWorker.
+		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
+			continue
+		}
 		if p.workerBelongsToOrgLocked(w) {
 			count++
 		}
@@ -208,7 +221,8 @@ func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool 
 	if !p.workerBelongsToOrgLocked(w) {
 		return false
 	}
-	return w.SharedState().NormalizedLifecycle() == WorkerLifecycleHot
+	lifecycle := w.SharedState().NormalizedLifecycle()
+	return lifecycle == WorkerLifecycleHot
 }
 
 func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) error {
