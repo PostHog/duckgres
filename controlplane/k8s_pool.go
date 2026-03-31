@@ -666,6 +666,14 @@ func (p *K8sWorkerPool) waitForPodReady(ctx context.Context, podName string, tim
 
 // waitForWorkerTCP connects to a worker over TCP and verifies its health.
 func waitForWorkerTCP(addr, bearerToken string, timeout time.Duration) (*flightsql.Client, error) {
+	return waitForWorkerTCPWithMetadata(addr, bearerToken, timeout, server.WorkerHealthCheckPayload{})
+}
+
+// waitForWorkerTCPWithMetadata connects to a worker over TCP and verifies its
+// health using the provided metadata payload. For adopted hot-idle workers,
+// the payload must include the claimed epoch so the worker doesn't reject the
+// health check with "stale owner epoch".
+func waitForWorkerTCPWithMetadata(addr, bearerToken string, timeout time.Duration, hcPayload server.WorkerHealthCheckPayload) (*flightsql.Client, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	attempts := 0
@@ -684,7 +692,7 @@ func waitForWorkerTCP(addr, bearerToken string, timeout time.Duration) (*flights
 		client, err := flightsql.NewClient(addr, nil, nil, dialOpts...)
 		if err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_, err = doHealthCheck(ctx, client)
+			_, err = doHealthCheckWithMetadata(ctx, client, hcPayload)
 			cancel()
 			if err == nil {
 				return client, nil
@@ -1300,7 +1308,17 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	if err != nil {
 		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
 	}
-	client, err := p.connectWorker(ctx, claimed.PodName, pod.Status.PodIP, token)
+
+	// For workers that already have an activation (hot_idle reclaim), pass the
+	// claimed epoch in the health check so the worker doesn't reject epoch 0.
+	hcPayload := server.WorkerHealthCheckPayload{}
+	if claimed.OwnerEpoch > 0 {
+		hcPayload.WorkerID = claimed.WorkerID
+		hcPayload.OwnerEpoch = claimed.OwnerEpoch
+		hcPayload.CPInstanceID = claimed.OwnerCPInstanceID
+	}
+
+	client, err := p.connectWorkerWithHealthCheck(ctx, claimed.PodName, pod.Status.PodIP, token, hcPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -1317,6 +1335,10 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 }
 
 func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+	return p.connectWorkerWithHealthCheck(ctx, podName, podIP, bearerToken, server.WorkerHealthCheckPayload{})
+}
+
+func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podName, podIP, bearerToken string, hcPayload server.WorkerHealthCheckPayload) (*flightsql.Client, error) {
 	if p.connectWorkerFunc != nil {
 		return p.connectWorkerFunc(ctx, podName, podIP, bearerToken)
 	}
@@ -1324,7 +1346,7 @@ func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, beare
 		return nil, fmt.Errorf("worker pod %s has no IP", podName)
 	}
 	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
-	client, err := waitForWorkerTCP(addr, bearerToken, 30*time.Second)
+	client, err := waitForWorkerTCPWithMetadata(addr, bearerToken, 30*time.Second, hcPayload)
 	if err != nil {
 		return nil, fmt.Errorf("connect to claimed worker %s: %w", podName, err)
 	}
