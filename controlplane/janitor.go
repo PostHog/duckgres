@@ -8,10 +8,6 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-// defaultHotIdleTTL is how long a hot-idle worker retains its org assignment
-// before being retired. During this window, any CP pod can reclaim it for the
-// same org without re-activation.
-const defaultHotIdleTTL = 5 * time.Minute
 
 const (
 	janitorRetireReasonOrphaned        = "orphaned"
