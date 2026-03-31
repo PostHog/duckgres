@@ -146,16 +146,17 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 	}
 
 	// Refresh the DuckDB S3 secret when credentials may have changed.
-	// For "config" provider: check if explicit key/token fields differ.
-	// For "aws_sdk"/"credential_chain": always refresh since the underlying
-	// credentials (e.g. IMDS role) may have expired during hot_idle.
-	if p.activation.db != nil && payload.DuckLake.ObjectStore != "" {
-		// Use s3ProviderForConfig to resolve the effective provider, since
-		// an empty S3Provider defaults to "credential_chain" at runtime.
-		provider := server.S3ProviderForConfig(payload.DuckLake)
-		needsRefresh := s3CredentialsChanged(current.DuckLake, payload.DuckLake) ||
-			provider == "aws_sdk" ||
-			provider == "credential_chain"
+	// Skip when the entire DuckLake config is identical (pure control metadata
+	// change like epoch bump), since credentials can't have changed.
+	if p.activation.db != nil && payload.DuckLake.ObjectStore != "" &&
+		!reflect.DeepEqual(current.DuckLake, payload.DuckLake) {
+		needsRefresh := s3CredentialsChanged(current.DuckLake, payload.DuckLake)
+		if !needsRefresh {
+			// For aws_sdk/credential_chain, the underlying IAM credentials
+			// may have expired even though the payload fields haven't changed.
+			provider := server.S3ProviderForConfig(payload.DuckLake)
+			needsRefresh = provider == "aws_sdk" || provider == "credential_chain"
+		}
 		if needsRefresh {
 			if err := server.RefreshS3Secret(p.activation.db, payload.DuckLake, p.duckLakeSem); err != nil {
 				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
