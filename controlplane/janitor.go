@@ -39,7 +39,7 @@ type ControlPlaneJanitor struct {
 	hotIdleTTL            time.Duration
 	now                   func() time.Time
 	retireWorker          func(record configstore.WorkerRecord, reason string)
-	retireLocalWorker     func(workerID int, reason string) // retires from in-memory pool + pod
+	retireLocalWorker     func(workerID int, reason string) bool // retires from in-memory pool + pod, returns false if not local
 	reconcileWarmCapacity func()
 }
 
@@ -140,10 +140,10 @@ func (j *ControlPlaneJanitor) runOnce() {
 			if !retired {
 				continue // Worker was reclaimed concurrently
 			}
-			// Remove from local in-memory pool and delete the pod.
-			if j.retireLocalWorker != nil {
-				j.retireLocalWorker(record.WorkerID, "hot_idle_ttl_expired")
-			} else {
+			// Try local retire first (removes from in-memory pool + deletes pod).
+			// Falls back to remote retire if the worker isn't in our local pool.
+			localRetired := j.retireLocalWorker != nil && j.retireLocalWorker(record.WorkerID, "hot_idle_ttl_expired")
+			if !localRetired {
 				j.retireRuntimeWorker(record, "hot_idle_ttl_expired")
 			}
 		}

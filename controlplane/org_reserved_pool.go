@@ -198,6 +198,13 @@ func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 			continue
 		default:
 		}
+		// Hot-idle workers have released their slot and are waiting to be
+		// reclaimed via the DB or retired by the janitor. Don't count them
+		// against maxWorkers so AcquireWorker can reach ReserveSharedWorker
+		// and ClaimHotIdleWorker.
+		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
+			continue
+		}
 		if p.workerBelongsToOrgLocked(w) {
 			count++
 		}
