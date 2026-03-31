@@ -75,10 +75,10 @@ type K8sConfig struct {
 	WorkerNamespace       string // K8s namespace (default: auto-detect from service account)
 	ControlPlaneID        string // Unique CP identifier for labeling worker pods (default: os.Hostname())
 	WorkerPort            int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret          string // K8s Secret name containing bearer token
+	WorkerSecret          string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
 	WorkerConfigMap       string // ConfigMap name for duckgres.yaml
 	ImagePullPolicy       string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount        string // ServiceAccount name for worker pods (default: "default")
+	ServiceAccount        string // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
 	MaxWorkers            int    // Global cap for the shared K8s worker pool (0 = auto-derived)
 	SharedWarmTarget      int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
 	WorkerCPURequest      string // CPU request for worker pods (e.g., "500m")
@@ -829,7 +829,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	secretKey := server.GenerateSecretKey()
 
 	// Use a temporary clientConn just to send initial params
-	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, database, applicationName, nil, pid, secretKey, -1)
+	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, orgID, database, applicationName, nil, pid, secretKey, -1)
 	defer server.CancelClientConn(tmpCC)
 	server.SendInitialParams(tmpCC)
 	if err := writer.Flush(); err != nil {
@@ -872,7 +872,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Create real clientConn with FlightExecutor and worker assignment
 	workerID := sessions.WorkerIDForPID(pid)
-	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, database, applicationName, executor, pid, secretKey, workerID)
+	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID)
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {

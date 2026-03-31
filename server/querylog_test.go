@@ -366,3 +366,134 @@ func TestEscapeSQLStringLiteral(t *testing.T) {
 		t.Fatalf("escapeSQLStringLiteral() = %q, want %q", got, want)
 	}
 }
+
+func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = db.Exec(`CREATE TABLE query_log (
+		event_time TIMESTAMPTZ,
+		query_duration_ms BIGINT,
+		type VARCHAR,
+		query VARCHAR,
+		transpiled_query VARCHAR,
+		query_kind VARCHAR,
+		normalized_query_hash BIGINT,
+		result_rows BIGINT,
+		written_rows BIGINT,
+		exception_code VARCHAR,
+		exception VARCHAR,
+		user_name VARCHAR,
+		org_id VARCHAR,
+		current_database VARCHAR,
+		client_address VARCHAR,
+		client_port INTEGER,
+		application_name VARCHAR,
+		pid INTEGER,
+		worker_id INTEGER,
+		is_transpiled BOOLEAN,
+		protocol VARCHAR
+	)`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	ql := &QueryLogger{db: db}
+	ql.flushBatch([]QueryLogEntry{{
+		EventTime:       time.Unix(1700000000, 0).UTC(),
+		QueryDurationMs: 42,
+		Type:            "QueryFinish",
+		Query:           "SELECT 1",
+		QueryKind:       "Select",
+		NormalizedHash:  17,
+		ResultRows:      1,
+		UserName:        "alice",
+		OrgID:           "analytics",
+		CurrentDatabase: "analytics_db",
+		ClientAddress:   "127.0.0.1",
+		ClientPort:      5432,
+		ApplicationName: "psql",
+		PID:             99,
+		WorkerID:        7,
+		Protocol:        "simple",
+	}})
+
+	var got string
+	err = db.QueryRow("SELECT org_id FROM query_log").Scan(&got)
+	if err != nil {
+		t.Fatalf("query org_id: %v", err)
+	}
+	if got != "analytics" {
+		t.Fatalf("expected org_id analytics, got %q", got)
+	}
+}
+
+func TestEnsureQueryLogTableAddsOrgIDToExistingTable(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = db.Exec(`CREATE TABLE query_log (
+		event_time TIMESTAMPTZ,
+		query_duration_ms BIGINT,
+		type VARCHAR,
+		query VARCHAR,
+		transpiled_query VARCHAR,
+		query_kind VARCHAR,
+		normalized_query_hash BIGINT,
+		result_rows BIGINT,
+		written_rows BIGINT,
+		exception_code VARCHAR,
+		exception VARCHAR,
+		user_name VARCHAR,
+		current_database VARCHAR,
+		client_address VARCHAR,
+		client_port INTEGER,
+		application_name VARCHAR,
+		pid INTEGER,
+		worker_id INTEGER,
+		is_transpiled BOOLEAN,
+		protocol VARCHAR
+	)`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
+		t.Fatalf("ensureQueryLogTable: %v", err)
+	}
+
+	ql := &QueryLogger{db: db}
+	ql.flushBatch([]QueryLogEntry{{
+		EventTime:       time.Unix(1700000000, 0).UTC(),
+		QueryDurationMs: 42,
+		Type:            "QueryFinish",
+		Query:           "SELECT 1",
+		QueryKind:       "Select",
+		NormalizedHash:  17,
+		ResultRows:      1,
+		UserName:        "alice",
+		OrgID:           "analytics",
+		CurrentDatabase: "analytics_db",
+		ClientAddress:   "127.0.0.1",
+		ClientPort:      5432,
+		ApplicationName: "psql",
+		PID:             99,
+		WorkerID:        7,
+		Protocol:        "simple",
+	}})
+
+	var got string
+	err = db.QueryRow("SELECT org_id FROM query_log").Scan(&got)
+	if err != nil {
+		t.Fatalf("query org_id: %v", err)
+	}
+	if got != "analytics" {
+		t.Fatalf("expected org_id analytics, got %q", got)
+	}
+}

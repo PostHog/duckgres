@@ -154,6 +154,7 @@ type clientConn struct {
 	reader      *bufio.Reader
 	writer      *bufio.Writer
 	username    string
+	orgID       string
 	database    string
 	executor    QueryExecutor
 	pid         int32
@@ -197,6 +198,18 @@ func (c *clientConn) backendKey() BackendKey {
 	return BackendKey{Pid: c.pid, SecretKey: c.secretKey}
 }
 
+func (c *clientConn) ensureConnectionContext() {
+	if c.ctx != nil && c.cancel != nil {
+		return
+	}
+
+	parent := c.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	c.ctx, c.cancel = context.WithCancel(parent)
+}
+
 // queryContext returns a cancellable context for query execution.
 // The cancel function is registered with the server so it can be invoked
 // via a cancel request from another connection.
@@ -224,6 +237,7 @@ func (c *clientConn) queryContextForCursor() (context.Context, func()) {
 }
 
 func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
+	c.ensureConnectionContext()
 	ctx, cancel := context.WithCancel(c.ctx)
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
@@ -569,7 +583,7 @@ func hasCommandPrefix(query, prefix string) bool {
 }
 
 func (c *clientConn) serve() error {
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.ensureConnectionContext()
 	defer c.cancel()
 
 	c.reader = bufio.NewReader(c.conn)

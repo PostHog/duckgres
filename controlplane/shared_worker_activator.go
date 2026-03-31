@@ -144,6 +144,9 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	if assignment == nil {
 		return TenantActivationPayload{}, fmt.Errorf("worker assignment is required")
 	}
+	if err := configstore.ValidateManagedWarehouseSecretRefs(assignment.OrgID, a.defaultNamespace, org.Warehouse); err != nil {
+		return TenantActivationPayload{}, err
+	}
 
 	var dl server.DuckLakeConfig
 	var err error
@@ -205,18 +208,20 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 	}
 
 	// Broker S3 credentials via STS AssumeRole
-	if status.IAMRoleARN != "" && a.stsBroker != nil {
-		creds, err := a.stsBroker.AssumeRole(ctx, status.IAMRoleARN)
-		if err != nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", orgID, err)
-		}
-		dl.S3Provider = "config"
-		dl.S3AccessKey = creds.AccessKeyID
-		dl.S3SecretKey = creds.SecretAccessKey
-		dl.S3SessionToken = creds.SessionToken
-	} else {
-		dl.S3Provider = "aws_sdk"
+	if status.IAMRoleARN == "" {
+		return server.DuckLakeConfig{}, fmt.Errorf("duckling CR %q has no IAM role ARN for shared warm activation", orgID)
 	}
+	if a.stsBroker == nil {
+		return server.DuckLakeConfig{}, fmt.Errorf("STS broker is required for shared warm activation for org %q", orgID)
+	}
+	creds, err := a.stsBroker.AssumeRole(ctx, status.IAMRoleARN)
+	if err != nil {
+		return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", orgID, err)
+	}
+	dl.S3Provider = "config"
+	dl.S3AccessKey = creds.AccessKeyID
+	dl.S3SecretKey = creds.SecretAccessKey
+	dl.S3SessionToken = creds.SessionToken
 
 	return dl, nil
 }
@@ -255,18 +260,20 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 		dl.S3SecretKey = secretKey
 	case strings.EqualFold(warehouse.S3.Provider, "aws"):
 		roleARN := warehouse.WorkerIdentity.IAMRoleARN
-		if roleARN != "" && a.stsBroker != nil {
-			creds, err := a.stsBroker.AssumeRole(ctx, roleARN)
-			if err != nil {
-				return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", warehouse.OrgID, err)
-			}
-			dl.S3Provider = "config"
-			dl.S3AccessKey = creds.AccessKeyID
-			dl.S3SecretKey = creds.SecretAccessKey
-			dl.S3SessionToken = creds.SessionToken
-		} else {
-			dl.S3Provider = "aws_sdk"
+		if roleARN == "" {
+			return server.DuckLakeConfig{}, fmt.Errorf("managed warehouse %q requires worker_identity.iam_role_arn for shared warm activation", warehouse.OrgID)
 		}
+		if a.stsBroker == nil {
+			return server.DuckLakeConfig{}, fmt.Errorf("STS broker is required for shared warm activation for org %q", warehouse.OrgID)
+		}
+		creds, err := a.stsBroker.AssumeRole(ctx, roleARN)
+		if err != nil {
+			return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", warehouse.OrgID, err)
+		}
+		dl.S3Provider = "config"
+		dl.S3AccessKey = creds.AccessKeyID
+		dl.S3SecretKey = creds.SecretAccessKey
+		dl.S3SessionToken = creds.SessionToken
 	}
 
 	return dl, nil
@@ -288,7 +295,11 @@ func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configs
 	if ref.Name == "" || ref.Key == "" {
 		return "", fmt.Errorf("secret ref requires name and key")
 	}
-	secret, err := a.clientset.CoreV1().Secrets(secretNamespace(ref, a.defaultNamespace)).Get(ctx, ref.Name, metav1.GetOptions{})
+	namespace := ref.Namespace
+	if namespace == "" {
+		namespace = a.defaultNamespace
+	}
+	secret, err := a.clientset.CoreV1().Secrets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
 		return "", err
 	}
@@ -354,13 +365,6 @@ func escapeDuckLakeConnStringValue(value string) string {
 		"\r", `\r`,
 	)
 	return replacer.Replace(value)
-}
-
-func secretNamespace(ref configstore.SecretRef, fallback string) string {
-	if ref.Namespace != "" {
-		return ref.Namespace
-	}
-	return fallback
 }
 
 func (a *SharedWorkerActivator) lookupOrgConfig(orgID string) (*configstore.OrgConfig, error) {

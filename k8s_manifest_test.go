@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,5 +58,58 @@ func TestLiveControlPlaneManifestsReadinessProbeTargetsAPIHealthEndpoint(t *test
 		if port, ok := probe.Port.(string); !ok || port != "api" {
 			t.Fatalf("%s: expected readiness probe port api, got %#v", path, probe.Port)
 		}
+	}
+}
+
+func TestNetworkPolicyManifestRestrictsWorkerIngressAndEgressAndProtectsControlPlane(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("k8s", "networkpolicy.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile(networkpolicy.yaml): %v", err)
+	}
+
+	var docs []map[string]any
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	for {
+		var doc map[string]any
+		if err := dec.Decode(&doc); err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("Decode(networkpolicy.yaml): %v", err)
+		}
+		if len(doc) != 0 {
+			docs = append(docs, doc)
+		}
+	}
+
+	if len(docs) < 2 {
+		t.Fatalf("expected worker and control-plane NetworkPolicy documents, got %d", len(docs))
+	}
+
+	var sawWorkerPort80 bool
+	for _, doc := range docs {
+		metadata, _ := doc["metadata"].(map[string]any)
+		if metadata == nil || metadata["name"] != "duckgres-worker-ingress" {
+			continue
+		}
+
+		spec, _ := doc["spec"].(map[string]any)
+		if spec == nil {
+			t.Fatal("worker network policy missing spec")
+		}
+		egress, _ := spec["egress"].([]any)
+		for _, rule := range egress {
+			ruleMap, _ := rule.(map[string]any)
+			ports, _ := ruleMap["ports"].([]any)
+			for _, entry := range ports {
+				portMap, _ := entry.(map[string]any)
+				if port, ok := portMap["port"].(int); ok && port == 80 {
+					sawWorkerPort80 = true
+				}
+			}
+		}
+	}
+	if !sawWorkerPort80 {
+		t.Fatal("expected worker network policy to allow outbound TCP port 80 for DuckDB extension bootstrap")
 	}
 }

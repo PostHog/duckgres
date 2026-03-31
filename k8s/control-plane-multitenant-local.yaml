@@ -53,6 +53,8 @@ spec:
             - "duckgres:test"
             - "--k8s-worker-image-pull-policy"
             - "Never"
+            - "--k8s-worker-service-account"
+            - "duckgres-worker"
             - "--k8s-worker-secret"
             - "duckgres-worker-token"
             - "--k8s-worker-configmap"

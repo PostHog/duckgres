@@ -14,6 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -195,16 +196,16 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 	return pool, cs
 }
 
-func TestK8sPool_EnsureBearerTokenSecret_CreatesNew(t *testing.T) {
+func TestK8sPool_EnsureWorkerRPCSecret_CreatesNew(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 
-	err := pool.ensureBearerTokenSecret(context.Background())
+	secretName, err := pool.ensureWorkerRPCSecret(context.Background(), "duckgres-worker-test-cp-0")
 	if err != nil {
-		t.Fatalf("ensureBearerTokenSecret failed: %v", err)
+		t.Fatalf("ensureWorkerRPCSecret failed: %v", err)
 	}
 
 	// Verify the secret exists
-	secret, err := cs.CoreV1().Secrets("default").Get(context.Background(), "test-secret", metav1.GetOptions{})
+	secret, err := cs.CoreV1().Secrets("default").Get(context.Background(), secretName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("secret not found: %v", err)
 	}
@@ -212,47 +213,58 @@ func TestK8sPool_EnsureBearerTokenSecret_CreatesNew(t *testing.T) {
 	if !ok || len(token) == 0 {
 		t.Fatal("secret missing bearer-token key or empty")
 	}
+	if len(secret.Data["tls.crt"]) == 0 {
+		t.Fatal("secret missing tls.crt key or empty")
+	}
+	if len(secret.Data["tls.key"]) == 0 {
+		t.Fatal("secret missing tls.key key or empty")
+	}
 }
 
-func TestK8sPool_EnsureBearerTokenSecret_DefaultsToSharedSecretName(t *testing.T) {
+func TestK8sPool_EnsureWorkerRPCSecret_DefaultsToPerWorkerPrefix(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	pool.secretName = ""
 
-	if err := pool.ensureBearerTokenSecret(context.Background()); err != nil {
-		t.Fatalf("ensureBearerTokenSecret failed: %v", err)
+	secretName, err := pool.ensureWorkerRPCSecret(context.Background(), "duckgres-worker-test-cp-0")
+	if err != nil {
+		t.Fatalf("ensureWorkerRPCSecret failed: %v", err)
 	}
-	if pool.secretName != "duckgres-worker-token" {
-		t.Fatalf("expected shared default secret name duckgres-worker-token, got %q", pool.secretName)
+	if secretName != "duckgres-worker-token-duckgres-worker-test-cp-0" {
+		t.Fatalf("unexpected worker RPC secret name: %q", secretName)
 	}
 
-	secret, err := cs.CoreV1().Secrets("default").Get(context.Background(), "duckgres-worker-token", metav1.GetOptions{})
+	secret, err := cs.CoreV1().Secrets("default").Get(context.Background(), secretName, metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("shared default secret not found: %v", err)
+		t.Fatalf("worker RPC secret not found: %v", err)
 	}
 	if _, ok := secret.Data["bearer-token"]; !ok {
-		t.Fatal("shared default secret missing bearer-token key")
+		t.Fatal("worker RPC secret missing bearer-token key")
 	}
 }
 
-func TestK8sPool_EnsureBearerTokenSecret_ExistingIsPreserved(t *testing.T) {
+func TestK8sPool_EnsureWorkerRPCSecret_ExistingIsPreserved(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
+	secretName := "test-secret-duckgres-worker-test-cp-0"
 
 	// Pre-create the secret
 	_, err := cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-secret", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: "default"},
 		Data:       map[string][]byte{"bearer-token": []byte("existing-token")},
 	}, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = pool.ensureBearerTokenSecret(context.Background())
+	gotSecretName, err := pool.ensureWorkerRPCSecret(context.Background(), "duckgres-worker-test-cp-0")
 	if err != nil {
-		t.Fatalf("ensureBearerTokenSecret failed: %v", err)
+		t.Fatalf("ensureWorkerRPCSecret failed: %v", err)
+	}
+	if gotSecretName != secretName {
+		t.Fatalf("expected secret name %q, got %q", secretName, gotSecretName)
 	}
 
 	// Verify the original token is preserved
-	secret, err := cs.CoreV1().Secrets("default").Get(context.Background(), "test-secret", metav1.GetOptions{})
+	secret, err := cs.CoreV1().Secrets("default").Get(context.Background(), secretName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,23 +273,62 @@ func TestK8sPool_EnsureBearerTokenSecret_ExistingIsPreserved(t *testing.T) {
 	}
 }
 
-func TestK8sPool_ReadBearerToken(t *testing.T) {
+func TestK8sPool_EnsureWorkerRPCSecret_UsesDistinctCredentialsPerWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	firstSecretName, err := pool.ensureWorkerRPCSecret(context.Background(), "duckgres-worker-test-cp-0")
+	if err != nil {
+		t.Fatalf("ensureWorkerRPCSecret first worker failed: %v", err)
+	}
+	secondSecretName, err := pool.ensureWorkerRPCSecret(context.Background(), "duckgres-worker-test-cp-1")
+	if err != nil {
+		t.Fatalf("ensureWorkerRPCSecret second worker failed: %v", err)
+	}
+
+	firstToken, firstCert, err := pool.readWorkerRPCSecurity(context.Background(), "duckgres-worker-test-cp-0")
+	if err != nil {
+		t.Fatalf("readWorkerRPCSecurity first worker failed: %v", err)
+	}
+	secondToken, secondCert, err := pool.readWorkerRPCSecurity(context.Background(), "duckgres-worker-test-cp-1")
+	if err != nil {
+		t.Fatalf("readWorkerRPCSecurity second worker failed: %v", err)
+	}
+
+	if firstSecretName == secondSecretName {
+		t.Fatal("expected distinct worker RPC secret names")
+	}
+	if firstToken == secondToken {
+		t.Fatal("expected distinct worker RPC bearer tokens")
+	}
+	if string(firstCert) == string(secondCert) {
+		t.Fatal("expected distinct worker RPC certificates")
+	}
+}
+
+func TestK8sPool_ReadWorkerRPCSecurity(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
+	secretName := "test-secret-duckgres-worker-test-cp-0"
 
 	_, err := cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-secret", Namespace: "default"},
-		Data:       map[string][]byte{"bearer-token": []byte("my-token-123")},
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: "default"},
+		Data: map[string][]byte{
+			"bearer-token": []byte("my-token-123"),
+			"tls.crt":      []byte("my-cert"),
+		},
 	}, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	token, err := pool.readBearerToken(context.Background())
+	token, certPEM, err := pool.readWorkerRPCSecurity(context.Background(), "duckgres-worker-test-cp-0")
 	if err != nil {
-		t.Fatalf("readBearerToken failed: %v", err)
+		t.Fatalf("readWorkerRPCSecurity failed: %v", err)
 	}
 	if token != "my-token-123" {
 		t.Fatalf("unexpected token: %s", token)
+	}
+	if string(certPEM) != "my-cert" {
+		t.Fatalf("unexpected cert: %s", certPEM)
 	}
 }
 
@@ -794,7 +845,17 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 		}
 		return nil
 	}
-	pool.cachedToken = "shared-token"
+	_, err = cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-secret-duckgres-worker-other-cp-21", Namespace: "default"},
+		Data: map[string][]byte{
+			"bearer-token": []byte("worker-21-token"),
+			"tls.crt":      []byte("worker-21-cert"),
+			"tls.key":      []byte("worker-21-key"),
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create adopted worker RPC secret: %v", err)
+	}
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
 		OrgID: "analytics",
@@ -1339,10 +1400,11 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 		return false, nil, nil
 	})
 
-	// Create the bearer token secret
-	_, err := cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-secret", Namespace: "default"},
-		Data:       map[string][]byte{"bearer-token": []byte("test-token")},
+	_, err := cs.CoreV1().ConfigMaps("default").Create(context.Background(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-config", Namespace: "default"},
+		Data: map[string]string{
+			"duckgres.yaml": "data_dir: /data\nextensions:\n  - ducklake\n",
+		},
 	}, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -1404,6 +1466,12 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	if len(pod.OwnerReferences) != 0 {
 		t.Fatalf("expected no owner references, got %d", len(pod.OwnerReferences))
 	}
+	if pod.Spec.ServiceAccountName != "duckgres-worker" {
+		t.Fatalf("expected neutral worker service account duckgres-worker, got %q", pod.Spec.ServiceAccountName)
+	}
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Fatal("expected automountServiceAccountToken=false for shared warm worker pods")
+	}
 
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsNonRoot == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
 		t.Fatal("expected runAsNonRoot=true")
@@ -1419,14 +1487,22 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 
 	foundEnv := false
 	foundSharedWarmWorkerEnv := false
+	foundTLSCertEnv := false
+	foundTLSKeyEnv := false
 	for _, env := range c.Env {
 		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 			env.ValueFrom.SecretKeyRef != nil &&
-			env.ValueFrom.SecretKeyRef.Name == "test-secret" {
+			env.ValueFrom.SecretKeyRef.Name == "test-secret-duckgres-worker-test-cp-0" {
 			foundEnv = true
 		}
 		if env.Name == "DUCKGRES_SHARED_WARM_WORKER" && env.Value == "true" {
 			foundSharedWarmWorkerEnv = true
+		}
+		if env.Name == "DUCKGRES_CERT" && env.Value == "/etc/duckgres/worker-rpc/tls.crt" {
+			foundTLSCertEnv = true
+		}
+		if env.Name == "DUCKGRES_KEY" && env.Value == "/etc/duckgres/worker-rpc/tls.key" {
+			foundTLSKeyEnv = true
 		}
 	}
 	if !foundEnv {
@@ -1435,9 +1511,66 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	if !foundSharedWarmWorkerEnv {
 		t.Fatal("expected shared warm worker startup env to be present")
 	}
+	if !foundTLSCertEnv || !foundTLSKeyEnv {
+		t.Fatal("expected worker RPC TLS env vars to be present")
+	}
 
 	if len(pod.Spec.Volumes) == 0 {
 		t.Fatal("expected configmap volume")
+	}
+	foundWorkerRPCSecret := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == "worker-rpc-tls" && volume.Secret != nil &&
+			volume.Secret.SecretName == "test-secret-duckgres-worker-test-cp-0" {
+			foundWorkerRPCSecret = true
+		}
+	}
+	if !foundWorkerRPCSecret {
+		t.Fatal("expected worker RPC volume to reference per-worker secret")
+	}
+}
+
+func TestK8sPool_RetireWorkerDeletesWorkerRPCSecret(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 1, podName: "duckgres-worker-test-cp-1", done: make(chan struct{})}
+	pool.workers[1] = worker
+
+	_, err := cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-secret-duckgres-worker-test-cp-1", Namespace: "default"},
+		Data:       map[string][]byte{"bearer-token": []byte("test-token"), "tls.crt": []byte("test-cert"), "tls.key": []byte("test-key")},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool.RetireWorker(1)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err := cs.CoreV1().Secrets("default").Get(context.Background(), "test-secret-duckgres-worker-test-cp-1", metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("get worker rpc secret: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected worker RPC secret to be deleted on retire")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestValidateSharedStartupConfigRejectsTenantRuntimeFields(t *testing.T) {
+	err := validateSharedStartupConfig([]byte(`
+data_dir: /data
+users:
+  postgres: postgres
+ducklake:
+  object_store: s3://tenant-a/private/
+`))
+	if err == nil {
+		t.Fatal("expected tenant runtime fields to be rejected in shared startup config")
 	}
 }
 
@@ -1457,6 +1590,19 @@ func TestControlPlaneIDLabelValue_StaysKubernetesSafe(t *testing.T) {
 	}
 	if label == "duckgres-control-plane-7fb9dd69c6-dcgzw:14cd8dd9eb353e609c7a4387a594a418" {
 		t.Fatalf("expected sanitized label, got original %q", label)
+	}
+}
+
+func TestValidateSharedWorkerConfigRejectsTenantRuntimeFields(t *testing.T) {
+	err := validateSharedWorkerConfig([]byte(`
+data_dir: /data
+extensions:
+  - ducklake
+ducklake:
+  object_store: s3://tenant-a/private/
+`))
+	if err == nil {
+		t.Fatal("expected tenant runtime fields to be rejected")
 	}
 }
 

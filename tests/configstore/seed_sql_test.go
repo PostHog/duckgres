@@ -34,8 +34,8 @@ func TestLocalConfigStoreSeedSQL(t *testing.T) {
 	if orgCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata_local" {
 		t.Fatalf("expected ducklake_metadata_local metadata db, got %q", orgCfg.Warehouse.MetadataStore.DatabaseName)
 	}
-	if orgCfg.Warehouse.WarehouseDatabaseCredentials.Name != "duckgres-local-warehouse-db" {
-		t.Fatalf("expected duckgres-local-warehouse-db secret ref, got %q", orgCfg.Warehouse.WarehouseDatabaseCredentials.Name)
+	if orgCfg.Warehouse.WarehouseDatabaseCredentials.Name != "local-warehouse-db" {
+		t.Fatalf("expected local-warehouse-db secret ref, got %q", orgCfg.Warehouse.WarehouseDatabaseCredentials.Name)
 	}
 	if orgCfg.Warehouse.State != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("expected ready warehouse state, got %q", orgCfg.Warehouse.State)
@@ -79,10 +79,10 @@ func TestKindConfigStoreSeedSQL(t *testing.T) {
 	if got := orgCfg.Warehouse.S3.Bucket; got != "duckgres-local" {
 		t.Fatalf("expected duckgres-local bucket, got %q", got)
 	}
-	if got := orgCfg.Warehouse.MetadataStoreCredentials.Name; got != "duckgres-local-metadata" {
+	if got := orgCfg.Warehouse.MetadataStoreCredentials.Name; got != "local-metadata" {
 		t.Fatalf("expected kind metadata secret ref, got %q", got)
 	}
-	if got := orgCfg.Warehouse.S3Credentials.Name; got != "duckgres-local-s3" {
+	if got := orgCfg.Warehouse.S3Credentials.Name; got != "local-s3" {
 		t.Fatalf("expected kind s3 secret ref, got %q", got)
 	}
 }

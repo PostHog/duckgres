@@ -3,6 +3,7 @@ package duckdbservice
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // DuckDBService is a standalone Arrow Flight SQL service backed by DuckDB.
@@ -268,6 +270,17 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 			grpc.ChainUnaryInterceptor(BearerTokenUnaryInterceptor(svc.cfg.BearerToken)),
 			grpc.ChainStreamInterceptor(BearerTokenStreamInterceptor(svc.cfg.BearerToken)),
 		)
+	}
+	if listener.Addr() != nil && listener.Addr().Network() == "tcp" &&
+		svc.cfg.ServerConfig.TLSCertFile != "" && svc.cfg.ServerConfig.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(svc.cfg.ServerConfig.TLSCertFile, svc.cfg.ServerConfig.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("load worker RPC TLS certificates: %w", err)
+		}
+		opts = append(opts, grpc.Creds(credentials.NewTLS(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})))
 	}
 
 	// Wrap the flightsql server with custom action handling.

@@ -4,8 +4,8 @@ package controlplane
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/hex"
 	stderrors "errors"
 	"fmt"
@@ -16,11 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"crypto/x509"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -66,7 +67,6 @@ type K8sWorkerPool struct {
 	workerExclusiveNode   bool              // one worker per node via anti-affinity
 	orgID                 string            // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator     func() int        // shared ID generator across orgs (nil = internal counter)
-	cachedToken           string            // cached bearer token (immutable after setup)
 	informer              cache.SharedIndexInformer
 	stopInform            chan struct{}
 	spawnSem              chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
@@ -122,6 +122,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	if cfg.ConfigPath == "" {
 		cfg.ConfigPath = "/etc/duckgres/duckgres.yaml"
 	}
+	if strings.TrimSpace(cfg.ServiceAccount) == "" {
+		cfg.ServiceAccount = DefaultK8sWorkerServiceAccount
+	}
 
 	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
 	spawnConcurrency := 3
@@ -162,11 +165,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		pool.cpInstanceID = pool.cpID
 	}
 
-	// Ensure bearer token secret exists
-	if err := pool.ensureBearerTokenSecret(context.Background()); err != nil {
-		return nil, fmt.Errorf("ensure bearer token secret: %w", err)
-	}
-
 	// Start SharedInformer for watching worker pods
 	pool.startInformer()
 
@@ -185,87 +183,11 @@ func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
 	return nil
 }
 
-// ensureBearerTokenSecret ensures the bearer token K8s Secret exists.
-// If no secret name is configured, it uses the shared default "duckgres-worker-token".
-// If the secret doesn't exist, it creates one with a random 32-byte hex token.
-func (p *K8sWorkerPool) ensureBearerTokenSecret(ctx context.Context) error {
-	if p.secretName == "" {
-		p.secretName = "duckgres-worker-token"
+func (p *K8sWorkerPool) workerServiceAccountName() string {
+	if strings.TrimSpace(p.serviceAccount) == "" {
+		return DefaultK8sWorkerServiceAccount
 	}
-
-	existing, err := p.clientset.CoreV1().Secrets(p.namespace).Get(ctx, p.secretName, metav1.GetOptions{})
-	if err == nil {
-		// Secret exists — verify it has the bearer-token key
-		if _, ok := existing.Data["bearer-token"]; ok {
-			return nil
-		}
-		// Secret exists but missing bearer-token key — populate it
-		slog.Info("Bearer token secret exists but missing bearer-token key, populating.", "name", p.secretName)
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			return fmt.Errorf("generate bearer token: %w", err)
-		}
-		if existing.Data == nil {
-			existing.Data = make(map[string][]byte)
-		}
-		existing.Data["bearer-token"] = []byte(hex.EncodeToString(b))
-		_, err = p.clientset.CoreV1().Secrets(p.namespace).Update(ctx, existing, metav1.UpdateOptions{})
-		if err != nil {
-			return fmt.Errorf("update secret %s with bearer token: %w", p.secretName, err)
-		}
-		slog.Info("Populated bearer token in existing secret.", "name", p.secretName)
-		return nil
-	}
-	if !errors.IsNotFound(err) {
-		return fmt.Errorf("get secret %s: %w", p.secretName, err)
-	}
-
-	// Generate a random bearer token
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Errorf("generate bearer token: %w", err)
-	}
-	token := hex.EncodeToString(b)
-
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      p.secretName,
-			Namespace: p.namespace,
-			Labels: map[string]string{
-				"app":                    "duckgres",
-				"duckgres/control-plane": p.cpID,
-			},
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{
-			"bearer-token": []byte(token),
-		},
-	}
-
-	_, err = p.clientset.CoreV1().Secrets(p.namespace).Create(ctx, secret, metav1.CreateOptions{})
-	if err != nil {
-		return fmt.Errorf("create secret %s: %w", p.secretName, err)
-	}
-	slog.Info("Created bearer token secret.", "name", p.secretName)
-	return nil
-}
-
-// readBearerToken returns the bearer token, using a cached value after the first read.
-// The token is immutable after ensureBearerTokenSecret sets it up at pool creation.
-func (p *K8sWorkerPool) readBearerToken(ctx context.Context) (string, error) {
-	if p.cachedToken != "" {
-		return p.cachedToken, nil
-	}
-	secret, err := p.clientset.CoreV1().Secrets(p.namespace).Get(ctx, p.secretName, metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("get secret %s: %w", p.secretName, err)
-	}
-	token, ok := secret.Data["bearer-token"]
-	if !ok {
-		return "", fmt.Errorf("secret %s missing 'bearer-token' key", p.secretName)
-	}
-	p.cachedToken = string(token)
-	return p.cachedToken, nil
+	return p.serviceAccount
 }
 
 // startInformer starts a SharedIndexInformer to watch worker pods.
@@ -370,12 +292,16 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		return ctx.Err()
 	}
 
-	token, err := p.readBearerToken(ctx)
-	if err != nil {
-		return fmt.Errorf("read bearer token: %w", err)
+	if err := p.validateSharedStartupConfigMap(ctx); err != nil {
+		return err
 	}
 
 	podName := p.podNameForWorker(id)
+	_ = p.deleteWorkerRPCSecret(ctx, podName)
+	secretName, err := p.ensureWorkerRPCSecret(ctx, podName)
+	if err != nil {
+		return fmt.Errorf("ensure worker RPC secret: %w", err)
+	}
 
 	// Build pod labels
 	podLabels := map[string]string{
@@ -397,9 +323,10 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 			Labels:    podLabels,
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:      corev1.RestartPolicyNever,
-			ServiceAccountName: p.serviceAccount,
-			NodeSelector:       p.workerNodeSelector,
+			RestartPolicy:                corev1.RestartPolicyNever,
+			ServiceAccountName:           p.workerServiceAccountName(),
+			AutomountServiceAccountToken: boolPtr(false),
+			NodeSelector:                 p.workerNodeSelector,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot: boolPtr(true),
 				RunAsUser:    int64Ptr(1000),
@@ -425,7 +352,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 							Name: "DUCKGRES_DUCKDB_TOKEN",
 							ValueFrom: &corev1.EnvVarSource{
 								SecretKeyRef: &corev1.SecretKeySelector{
-									LocalObjectReference: corev1.LocalObjectReference{Name: p.secretName},
+									LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
 									Key:                  "bearer-token",
 								},
 							},
@@ -433,6 +360,14 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 						{
 							Name:  "DUCKGRES_MODE",
 							Value: "duckdb-service",
+						},
+						{
+							Name:  "DUCKGRES_CERT",
+							Value: workerRPCMountDir + "/" + workerRPCCertKey,
+						},
+						{
+							Name:  "DUCKGRES_KEY",
+							Value: workerRPCMountDir + "/" + workerRPCKeyKey,
 						},
 					},
 					SecurityContext: &corev1.SecurityContext{
@@ -486,6 +421,23 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Name:      "data",
 		MountPath: "/data",
 	})
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name: "worker-rpc-tls",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: secretName,
+				Items: []corev1.KeyToPath{
+					{Key: workerRPCCertKey, Path: workerRPCCertKey},
+					{Key: workerRPCKeyKey, Path: workerRPCKeyKey},
+				},
+			},
+		},
+	})
+	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+		Name:      "worker-rpc-tls",
+		MountPath: workerRPCMountDir,
+		ReadOnly:  true,
+	})
 
 	// Add config from ConfigMap if specified
 	if p.configMap != "" {
@@ -516,6 +468,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 
 	// Create pod with exponential backoff on transient errors.
 	if err := p.createPodWithBackoff(ctx, pod); err != nil {
+		_ = p.deleteWorkerRPCSecret(ctx, podName)
 		return err
 	}
 
@@ -525,16 +478,22 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
 		})
+		_ = p.deleteWorkerRPCSecret(ctx, podName)
 		return fmt.Errorf("worker pod %s failed to start: %w", podName, err)
 	}
 
 	// Connect gRPC client
 	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
-	client, err := waitForWorkerTCP(addr, token, 90*time.Second)
+	token, serverCertPEM, err := p.readWorkerRPCSecurity(ctx, podName)
+	if err != nil {
+		return fmt.Errorf("read worker RPC security: %w", err)
+	}
+	client, err := waitForWorkerTCP(addr, token, serverCertPEM, 90*time.Second)
 	if err != nil {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
 		})
+		_ = p.deleteWorkerRPCSecret(ctx, podName)
 		return fmt.Errorf("worker %d gRPC connection failed: %w", id, err)
 	}
 
@@ -665,20 +624,29 @@ func (p *K8sWorkerPool) waitForPodReady(ctx context.Context, podName string, tim
 }
 
 // waitForWorkerTCP connects to a worker over TCP and verifies its health.
-func waitForWorkerTCP(addr, bearerToken string, timeout time.Duration) (*flightsql.Client, error) {
+func waitForWorkerTCP(addr, bearerToken string, serverCertPEM []byte, timeout time.Duration) (*flightsql.Client, error) {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	attempts := 0
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(serverCertPEM) {
+		return nil, fmt.Errorf("parse worker RPC server certificate")
+	}
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    roots,
+		ServerName: workerRPCDNSName,
+	}
 
 	for time.Now().Before(deadline) {
 		var dialOpts []grpc.DialOption
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
 		))
 		if bearerToken != "" {
-			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerBearerCreds{token: bearerToken}))
+			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerTLSBearerCreds{token: bearerToken}))
 		}
 
 		client, err := flightsql.NewClient(addr, nil, nil, dialOpts...)
@@ -1207,9 +1175,9 @@ func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, e
 }
 
 func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord) (*ManagedWorker, error) {
-	token, err := p.readBearerToken(ctx)
+	token, _, err := p.readWorkerRPCSecurity(ctx, claimed.PodName)
 	if err != nil {
-		return nil, fmt.Errorf("read bearer token: %w", err)
+		return nil, fmt.Errorf("read worker RPC security: %w", err)
 	}
 	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, claimed.PodName, metav1.GetOptions{})
 	if err != nil {
@@ -1239,7 +1207,11 @@ func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, beare
 		return nil, fmt.Errorf("worker pod %s has no IP", podName)
 	}
 	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
-	client, err := waitForWorkerTCP(addr, bearerToken, 30*time.Second)
+	_, serverCertPEM, err := p.readWorkerRPCSecurity(ctx, podName)
+	if err != nil {
+		return nil, fmt.Errorf("read worker RPC security: %w", err)
+	}
+	client, err := waitForWorkerTCP(addr, bearerToken, serverCertPEM, 30*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect to claimed worker %s: %w", podName, err)
 	}
@@ -1519,6 +1491,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
 		})
+		_ = p.deleteWorkerRPCSecret(ctx, podName)
 		if w.client != nil {
 			_ = w.client.Close()
 		}
@@ -1542,6 +1515,7 @@ func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
 	_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 		GracePeriodSeconds: int64Ptr(10),
 	})
+	_ = p.deleteWorkerRPCSecret(ctx, podName)
 }
 
 // idleReaper periodically retires workers that have been idle too long and

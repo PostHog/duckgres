@@ -10,6 +10,7 @@ spec:
       app: duckgres-worker
   policyTypes:
     - Ingress
+    - Egress
   ingress:
     # Only allow traffic from control plane pods on gRPC port
     - from:
@@ -17,5 +18,64 @@ spec:
             matchLabels:
               app: duckgres-control-plane
       ports:
+        - port: 8816
+          protocol: TCP
+  egress:
+    # Allow DNS resolution for object-store and metadata-store endpoints.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Allow outbound extension bootstrap, HTTPS/object-store, and metadata-store
+    # traffic, but block broad lateral pod-to-pod communication on arbitrary
+    # ports by default.
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        - port: 5432
+          protocol: TCP
+        - port: 9000
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: duckgres-control-plane-boundaries
+  namespace: duckgres
+spec:
+  podSelector:
+    matchLabels:
+      app: duckgres-control-plane
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Permit PostgreSQL traffic from in-cluster clients and the admin/control APIs
+    # from same-namespace workloads (port-forward bypasses NetworkPolicy).
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 5432
+          protocol: TCP
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 8815
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        - port: 5432
+          protocol: TCP
         - port: 8816
           protocol: TCP

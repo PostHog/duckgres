@@ -253,7 +253,7 @@ func SetupMultiTenant(
 			return nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
-		slog.Info("Generated internal secret (pass via --internal-secret or DUCKGRES_INTERNAL_SECRET to set explicitly).", "secret", internalSecret)
+		slog.Info("Generated internal secret; set --internal-secret or DUCKGRES_INTERNAL_SECRET explicitly to avoid rotation on restart.")
 	}
 
 	// Set up API server (admin + provisioning + dashboard on :8080).

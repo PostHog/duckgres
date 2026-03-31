@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -433,6 +434,71 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 	}
 }
 
+func TestPutWarehouseRejectsSecretRefsOutsideTenantScope(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"metadata_store": {
+			"kind": "dedicated_rds",
+			"engine": "postgres",
+			"region": "us-east-1",
+			"endpoint": "analytics-metadata.cluster.example",
+			"port": 5432,
+			"database_name": "ducklake_metadata",
+			"username": "metadata_user"
+		},
+		"worker_identity": {
+			"namespace": "tenant-a",
+			"service_account_name": "analytics-worker"
+		},
+		"metadata_store_credentials": {
+			"namespace": "tenant-b",
+			"name": "billing-metadata",
+			"key": "dsn"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestPutWarehouseRejectsSecretRefsWithoutWorkerNamespace(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"worker_identity": {
+			"service_account_name": "analytics-worker"
+		},
+		"metadata_store_credentials": {
+			"namespace": "tenant-b",
+			"name": "analytics-metadata",
+			"key": "dsn"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "worker_identity.namespace") {
+		t.Fatalf("expected worker namespace validation error, got %s", rec.Body.String())
+	}
+}
+
 func TestPutWarehouseRejectsUnknownOrg(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
@@ -505,6 +571,122 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	}
 	if warehouse.MetadataStoreState != "vendor-pending" {
 		t.Fatalf("expected custom metadata state, got %q", warehouse.MetadataStoreState)
+	}
+}
+
+func TestPutWarehouseRejectsCrossTenantSecretRefs(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"worker_identity": {
+			"namespace": "tenant-analytics"
+		},
+		"metadata_store_credentials": {
+			"namespace": "tenant-billing",
+			"name": "analytics-metadata",
+			"key": "dsn"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "tenant-owned") {
+		t.Fatalf("expected tenant-owned secret ref validation error, got %s", rec.Body.String())
+	}
+}
+
+func TestPutWarehouseRejectsCrossTenantSecretReference(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"worker_identity": {
+			"namespace": "tenant-a"
+		},
+		"metadata_store_credentials": {
+			"namespace": "tenant-b",
+			"name": "analytics-metadata",
+			"key": "dsn"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.warehouses["analytics"]; ok {
+		t.Fatal("expected invalid warehouse payload to be rejected")
+	}
+}
+
+func TestPutWarehouseRejectsSecretReferenceOutsideOrgPrefix(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"worker_identity": {
+			"namespace": "tenant-a"
+		},
+		"metadata_store_credentials": {
+			"namespace": "tenant-a",
+			"name": "shared-metadata",
+			"key": "dsn"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.warehouses["analytics"]; ok {
+		t.Fatal("expected invalid warehouse payload to be rejected")
+	}
+}
+
+func TestPutWarehouseRejectsSecretReferenceWithoutOrgPrefix(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"worker_identity": {
+			"namespace": "tenant-a"
+		},
+		"metadata_store_credentials": {
+			"namespace": "tenant-a",
+			"name": "shared-analytics-metadata",
+			"key": "dsn"
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "must start with") {
+		t.Fatalf("expected org prefix validation error, got %s", rec.Body.String())
 	}
 }
 

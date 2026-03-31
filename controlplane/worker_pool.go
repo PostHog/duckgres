@@ -8,6 +8,8 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
+const DefaultK8sWorkerServiceAccount = "duckgres-worker"
+
 // WorkerPool abstracts the lifecycle and scheduling of Flight SQL workers.
 // Two implementations exist:
 //   - FlightWorkerPool: spawns workers as local child processes (default)
@@ -53,13 +55,13 @@ type K8sWorkerPoolConfig struct {
 	CPInstanceID          string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
 	WorkerImage           string
 	WorkerPort            int
-	SecretName            string // K8s Secret name containing bearer token
+	SecretName            string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
 	ConfigMap             string // ConfigMap name for duckgres.yaml
 	MaxWorkers            int
 	IdleTimeout           time.Duration
 	ConfigPath            string            // Path inside worker pod where config is mounted
 	ImagePullPolicy       string            // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount        string            // ServiceAccount name for worker pods (default: "default")
+	ServiceAccount        string            // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
 	WorkerCPURequest      string            // CPU request for worker pods (e.g., "500m"). Empty = BestEffort.
 	WorkerMemoryRequest   string            // Memory request for worker pods (e.g., "1Gi"). Empty = BestEffort.
 	WorkerNodeSelector    map[string]string // Node selector for worker pods. Nil = no selector.

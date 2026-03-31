@@ -47,7 +47,7 @@ func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
 // the control plane worker. The returned value is opaque (*clientConn) but
 // can be used with SendInitialParams and RunMessageLoop.
 func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio.Writer,
-	username, database, applicationName string, executor QueryExecutor, pid, secretKey int32, workerID int) *clientConn {
+	username, orgID, database, applicationName string, executor QueryExecutor, pid, secretKey int32, workerID int) *clientConn {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &clientConn{
@@ -56,6 +56,7 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 		reader:          reader,
 		writer:          writer,
 		username:        username,
+		orgID:           orgID,
 		database:        database,
 		applicationName: applicationName,
 		executor:        executor,
@@ -89,6 +90,7 @@ func SendInitialParams(cc *clientConn) {
 // It cancels the connection context when the loop exits, ensuring in-flight
 // query contexts (and any gRPC calls derived from them) are cancelled promptly.
 func RunMessageLoop(cc *clientConn) error {
+	cc.ensureConnectionContext()
 	defer cc.cancel()
 	cc.server.registerConn(cc)
 	defer cc.server.unregisterConn(cc.pid)

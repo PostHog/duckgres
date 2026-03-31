@@ -34,6 +34,8 @@ var (
 const (
 	duckgresServiceTarget = "svc/duckgres"
 	duckgresServicePort   = 5432
+	initialDBReadyTimeout = 4 * time.Minute
+	dbAttemptTimeout      = 30 * time.Second
 )
 
 func TestMain(m *testing.M) {
@@ -71,8 +73,17 @@ func TestMain(m *testing.M) {
 	if err := restartPortForward(); err != nil {
 		log.Fatalf("Failed to start port-forward: %v", err)
 	}
-	if err := waitForDBReady(90 * time.Second); err != nil {
+	if err := waitForDBReady(initialDBReadyTimeout); err != nil {
 		log.Fatalf("Database not ready: %v", err)
+	}
+	if err := seedTenantIsolationFixtures(); err != nil {
+		log.Fatalf("Failed to seed tenant isolation fixtures: %v", err)
+	}
+	if err := waitForTenantDBReady("analytics", "postgres", initialDBReadyTimeout); err != nil {
+		log.Fatalf("Analytics tenant login not ready: %v", err)
+	}
+	if err := waitForTenantDBReady("billing", "postgres", initialDBReadyTimeout); err != nil {
+		log.Fatalf("Billing tenant login not ready: %v", err)
 	}
 
 	code := m.Run()
@@ -558,10 +569,19 @@ func openDB(t *testing.T) *sql.DB {
 }
 
 func openDBConn() (*sql.DB, error) {
+	return openDBConnAs("postgres", "postgres")
+}
+
+func openDBConnAs(username, password string) (*sql.DB, error) {
 	// kubectl port-forward passes raw TCP bytes, so the client still needs
 	// SSL. lib/pq sslmode=require skips server cert verification by default,
 	// which works with self-signed certs.
-	connStr := fmt.Sprintf("host=127.0.0.1 port=%d user=postgres password=postgres dbname=duckgres sslmode=require", pgPort)
+	connStr := fmt.Sprintf(
+		"host=127.0.0.1 port=%d user=%s password=%s dbname=duckgres sslmode=require connect_timeout=5",
+		pgPort,
+		username,
+		password,
+	)
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
@@ -577,12 +597,15 @@ func waitForDBReady(timeout time.Duration) error {
 	return retryQueryWithReconnect("SELECT 1", timeout)
 }
 
+func waitForTenantDBReady(username, password string, timeout time.Duration) error {
+	return retryQueryWithReconnectAs(username, password, "SELECT 1", timeout)
+}
+
 func retryQuery(db *sql.DB, query string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		var result int
-		lastErr = db.QueryRow(query).Scan(&result)
+		lastErr = scanIntQueryWithTimeout(db, query, nil)
 		if lastErr == nil {
 			return nil
 		}
@@ -595,7 +618,7 @@ func retryScanInt(db *sql.DB, query string, timeout time.Duration, dest *int) er
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		lastErr = db.QueryRow(query).Scan(dest)
+		lastErr = scanIntQueryWithTimeout(db, query, dest)
 		if lastErr == nil {
 			return nil
 		}
@@ -605,27 +628,40 @@ func retryScanInt(db *sql.DB, query string, timeout time.Duration, dest *int) er
 }
 
 func retryQueryWithReconnect(query string, timeout time.Duration) error {
-	return retryDBOperationWithReconnect(timeout, fmt.Sprintf("query %q", query), func(db *sql.DB) error {
+	return retryDBOperationWithReconnectAs("postgres", "postgres", timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
 		var result int
-		return db.QueryRow(query).Scan(&result)
+		return db.QueryRowContext(ctx, query).Scan(&result)
 	})
 }
 
 func retryScanIntWithReconnect(query string, timeout time.Duration, dest *int) error {
-	return retryDBOperationWithReconnect(timeout, fmt.Sprintf("query %q", query), func(db *sql.DB) error {
-		return db.QueryRow(query).Scan(dest)
+	return retryDBOperationWithReconnectAs("postgres", "postgres", timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
+		return db.QueryRowContext(ctx, query).Scan(dest)
+	})
+}
+
+func retryQueryWithReconnectAs(username, password, query string, timeout time.Duration) error {
+	return retryDBOperationWithReconnectAs(username, password, timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
+		var result int
+		return db.QueryRowContext(ctx, query).Scan(&result)
 	})
 }
 
 // Use a fresh DB connection on each attempt so transient port-forward failures
 // can be recovered by restarting the forwarder between retries.
-func retryDBOperationWithReconnect(timeout time.Duration, description string, op func(*sql.DB) error) error {
+func retryDBOperationWithReconnect(timeout time.Duration, description string, op func(context.Context, *sql.DB) error) error {
+	return retryDBOperationWithReconnectAs("postgres", "postgres", timeout, description, op)
+}
+
+func retryDBOperationWithReconnectAs(username, password string, timeout time.Duration, description string, op func(context.Context, *sql.DB) error) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		db, err := openDBConn()
+		db, err := openDBConnAs(username, password)
 		if err == nil {
-			err = op(db)
+			attemptCtx, cancel := context.WithTimeout(context.Background(), dbAttemptTimeout)
+			err = op(attemptCtx, db)
+			cancel()
 			_ = db.Close()
 		}
 		if err == nil {
@@ -643,6 +679,18 @@ func retryDBOperationWithReconnect(timeout time.Duration, description string, op
 	}
 
 	return fmt.Errorf("%s failed after %s: %w", description, timeout, lastErr)
+}
+
+func scanIntQueryWithTimeout(db *sql.DB, query string, dest *int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dbAttemptTimeout)
+	defer cancel()
+
+	var result int
+	target := &result
+	if dest != nil {
+		target = dest
+	}
+	return db.QueryRowContext(ctx, query).Scan(target)
 }
 
 func findProjectRoot() string {
