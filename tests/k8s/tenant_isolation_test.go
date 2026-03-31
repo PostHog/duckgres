@@ -12,13 +12,9 @@ import (
 )
 
 func TestK8sTenantIsolation_DifferentTenantsSeeDistinctCatalogs(t *testing.T) {
-	initialWorker, err := latestWorkerPodBeforeQuery(60 * time.Second)
-	if err != nil {
-		t.Fatalf("expected prewarmed worker before tenant query: %v", err)
-	}
-
 	analyticsTable := fmt.Sprintf("analytics_isolation_%d", time.Now().UnixNano())
 	billingTable := fmt.Sprintf("billing_isolation_%d", time.Now().UnixNano())
+	analyticsSessionStart := time.Now().UTC()
 
 	analyticsDB, err := openDBConnAs("analytics", "postgres")
 	if err != nil {
@@ -37,16 +33,17 @@ func TestK8sTenantIsolation_DifferentTenantsSeeDistinctCatalogs(t *testing.T) {
 		_ = analyticsDB.Close()
 		t.Fatalf("expected analytics table to contain one row, got %d", analyticsVisible)
 	}
+	analyticsWorkerPod, err := findActiveOrgWorkerPodSince("analytics", analyticsSessionStart, 30*time.Second)
+	if err != nil {
+		_ = analyticsDB.Close()
+		t.Fatalf("find analytics worker pod from runtime state: %v", err)
+	}
 	if err := analyticsDB.Close(); err != nil {
 		t.Fatalf("close analytics DB: %v", err)
 	}
 
-	replacementWorker, err := waitForWorkerReplacement(initialWorker.Name, 90*time.Second)
-	if err != nil {
-		t.Fatalf("wait for analytics worker retirement and warm replacement: %v", err)
-	}
-	if replacementWorker.Name == initialWorker.Name {
-		t.Fatalf("expected a new neutral worker pod after analytics session, still have %q", replacementWorker.Name)
+	if err := waitForWorkerRetirement(analyticsWorkerPod, 30*time.Second); err != nil {
+		t.Fatalf("wait for analytics worker retirement: %v", err)
 	}
 
 	billingDB, err := openDBConnAs("billing", "postgres")

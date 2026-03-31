@@ -189,6 +189,64 @@ func waitForWorkerReplacement(oldPodName string, timeout time.Duration) (corev1.
 	return corev1.Pod{}, fmt.Errorf("worker pod %s was not replaced within %s", oldPodName, timeout)
 }
 
+func findActiveOrgWorkerPodSince(orgID string, since time.Time, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		row, err := queryRuntimeStoreRow(fmt.Sprintf(
+			"SELECT pod_name, state FROM cp_runtime.worker_records WHERE org_id = '%s' AND updated_at >= TIMESTAMPTZ '%s' AND state IN ('reserved', 'activating', 'hot', 'draining') ORDER BY updated_at DESC LIMIT 1",
+			psqlLiteral(orgID),
+			since.UTC().Format(time.RFC3339Nano),
+		))
+		if err != nil {
+			return "", err
+		}
+		if len(row) == 2 && row[0] != "" {
+			return row[0], nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return "", fmt.Errorf("no active worker record for org %q appeared within %s", orgID, timeout)
+}
+
+func waitForWorkerRetirement(podName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		row, err := queryRuntimeStoreRow(fmt.Sprintf(
+			"SELECT state FROM cp_runtime.worker_records WHERE pod_name = '%s' ORDER BY updated_at DESC LIMIT 1",
+			psqlLiteral(podName),
+		))
+		if err != nil {
+			return err
+		}
+		if len(row) == 1 && row[0] == "retired" {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("worker pod %s did not reach retired state within %s", podName, timeout)
+}
+
+func queryRuntimeStoreRow(query string) ([]string, error) {
+	cmd := exec.Command(
+		"docker", "exec", configStoreContainer,
+		"psql", "-v", "ON_ERROR_STOP=1", "-U", "duckgres", "-d", "duckgres_config",
+		"-tA", "-F", "|", "-c", query,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("query runtime store: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return nil, nil
+	}
+	return strings.Split(line, "|"), nil
+}
+
+func psqlLiteral(value string) string {
+	return strings.ReplaceAll(value, "'", "''")
+}
+
 func minioPrefixFileCount(prefix string) (int, error) {
 	cmd := exec.Command(
 		"docker", "exec", "duckgres-local-minio",
