@@ -150,9 +150,12 @@ func (p *SessionPool) reuseExistingActivationLocked(payload ActivationPayload) b
 	// For "aws_sdk"/"credential_chain": always refresh since the underlying
 	// credentials (e.g. IMDS role) may have expired during hot_idle.
 	if p.activation.db != nil && payload.DuckLake.ObjectStore != "" {
+		// Use s3ProviderForConfig to resolve the effective provider, since
+		// an empty S3Provider defaults to "credential_chain" at runtime.
+		provider := server.S3ProviderForConfig(payload.DuckLake)
 		needsRefresh := s3CredentialsChanged(current.DuckLake, payload.DuckLake) ||
-			payload.DuckLake.S3Provider == "aws_sdk" ||
-			payload.DuckLake.S3Provider == "credential_chain"
+			provider == "aws_sdk" ||
+			provider == "credential_chain"
 		if needsRefresh {
 			if err := server.RefreshS3Secret(p.activation.db, payload.DuckLake, p.duckLakeSem); err != nil {
 				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
