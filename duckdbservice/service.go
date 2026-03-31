@@ -3,6 +3,7 @@ package duckdbservice
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // DuckDBService is a standalone Arrow Flight SQL service backed by DuckDB.
@@ -46,6 +48,15 @@ type SessionPool struct {
 	dbInitOnce  sync.Once     // Serializes fallback CreateDBConnection when warmup fails
 	fallbackDB  *sql.DB       // Lazily created if warmup fails
 	fallbackErr error         // Cached error from fallback creation
+
+	sharedWarmMode       bool
+	activation           *activatedTenantRuntime
+	ownerEpoch           int64
+	ownerCPInstanceID    string
+	workerID             int
+	activateTenantFunc   func(ActivationPayload) error
+	createDBConnection   func(server.Config, chan struct{}, string, time.Time, string) (*sql.DB, error)
+	activateDBConnection func(*sql.DB, server.Config, chan struct{}, string) error
 }
 
 type trackedTx struct {
@@ -67,6 +78,9 @@ type Session struct {
 	txns          map[string]*trackedTx
 	txnOwner      map[string]string
 	handleCounter atomic.Uint64
+
+	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
+	progress   progressState    // stall detection state
 }
 
 // QueryHandle stores a prepared or ad-hoc query for later execution.
@@ -79,15 +93,19 @@ type QueryHandle struct {
 // NewDuckDBService creates a new DuckDB service with the given config.
 func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 	pool := &SessionPool{
-		sessions:    make(map[string]*Session),
-		stopRefresh: make(map[string]func()),
-		duckLakeSem: make(chan struct{}, 1),
-		cfg:         cfg.ServerConfig,
-		startTime:   time.Now(),
-		maxSessions: cfg.MaxSessions,
-		stopCh:      make(chan struct{}),
-		warmupDone:  make(chan struct{}),
+		sessions:             make(map[string]*Session),
+		stopRefresh:          make(map[string]func()),
+		duckLakeSem:          make(chan struct{}, 1),
+		cfg:                  cfg.ServerConfig,
+		startTime:            time.Now(),
+		maxSessions:          cfg.MaxSessions,
+		stopCh:               make(chan struct{}),
+		warmupDone:           make(chan struct{}),
+		sharedWarmMode:       cfg.RequireActivation || sharedWarmWorkerEnabled(),
+		createDBConnection:   server.CreateDBConnection,
+		activateDBConnection: server.ActivateDBConnection,
 	}
+	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
 
 	return &DuckDBService{
@@ -109,7 +127,7 @@ func (p *SessionPool) Warmup() error {
 	start := time.Now()
 	slog.Info("Pre-warming worker DuckDB instance...")
 	// Use a system-level username for warmup
-	db, err := server.CreateDBConnection(p.cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
+	db, err := p.createDBConnection(p.sharedWarmupConfig(), p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
 	if err != nil {
 		return fmt.Errorf("warmup failed after %v: %w", time.Since(start), err)
 	}
@@ -253,6 +271,17 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 			grpc.ChainStreamInterceptor(BearerTokenStreamInterceptor(svc.cfg.BearerToken)),
 		)
 	}
+	if listener.Addr() != nil && listener.Addr().Network() == "tcp" &&
+		svc.cfg.ServerConfig.TLSCertFile != "" && svc.cfg.ServerConfig.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(svc.cfg.ServerConfig.TLSCertFile, svc.cfg.ServerConfig.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("load worker RPC TLS certificates: %w", err)
+		}
+		opts = append(opts, grpc.Creds(credentials.NewTLS(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})))
+	}
 
 	// Wrap the flightsql server with custom action handling.
 	// flightsql.NewFlightServer routes standard Flight SQL actions but rejects
@@ -305,17 +334,28 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 	}
 
 	// Use shared warmupDB if available (highly preferred for performance)
-	p.mu.RLock()
-	db = p.warmupDB
-	p.mu.RUnlock()
+	db = p.activeSharedDB()
+	if db == nil {
+		p.mu.RLock()
+		db = p.warmupDB
+		p.mu.RUnlock()
+	}
 
 	if db == nil {
+		cfg, cfgErr := p.currentSessionConfig()
+		if cfgErr != nil {
+			p.mu.Lock()
+			p.reserved--
+			p.mu.Unlock()
+			return nil, cfgErr
+		}
+
 		// Fallback: create a shared DB if warmup failed or wasn't run.
 		// Uses sync.Once to ensure only one goroutine loads native extensions;
 		// concurrent LOAD of the same C++ extension corrupts the heap.
 		fallbackStart := time.Now()
 		p.dbInitOnce.Do(func() {
-			p.fallbackDB, p.fallbackErr = server.CreateDBConnection(p.cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
+			p.fallbackDB, p.fallbackErr = p.createDBConnection(cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
 		})
 		if p.fallbackErr != nil {
 			p.mu.Lock()
@@ -329,13 +369,19 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 
 	// Obtain a dedicated connection for this session to ensure isolation
 	// and consistent session settings (search_path, etc.)
-	conn, err = db.Conn(context.Background())
+	// Use a timeout to prevent indefinite blocking when a previous session's
+	// cleanup hasn't returned its connection to the pool yet.
+	slog.Debug("Acquiring DB connection from pool.", "user", username)
+	connCtx, connCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	conn, err = db.Conn(connCtx)
+	connCancel()
 	if err != nil {
 		p.mu.Lock()
 		p.reserved--
 		p.mu.Unlock()
-		return nil, fmt.Errorf("failed to obtain connection from pool: %w", err)
+		return nil, fmt.Errorf("failed to obtain connection from pool (timeout after 30s): %w", err)
 	}
+	slog.Debug("Acquired DB connection from pool.", "user", username, "duration", time.Since(start))
 
 	// Initialize the session connection with username-specific state if needed.
 	// Since the DB is shared, we must set session-local parameters here.
@@ -354,20 +400,40 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		}
 	}
 
+	// Extract the raw DuckDB connection handle for progress polling.
+	// Non-fatal if extraction fails — progress monitoring will be unavailable
+	// for this session but everything else works normally.
+	var duckConn duckdbConnHandle
+	if dc, err := extractDuckDBConnection(conn); err != nil {
+		slog.Debug("Could not extract DuckDB connection for progress polling.", "user", username, "error", err)
+	} else {
+		duckConn = dc
+	}
+
 	token := generateSessionToken()
 	session := &Session{
-		ID:        token,
-		DB:        db,
-		Conn:      conn,
-		Username:  username,
-		CreatedAt: time.Now(),
-		queries:   make(map[string]*QueryHandle),
-		txns:      make(map[string]*trackedTx),
-		txnOwner:  make(map[string]string),
+		ID:         token,
+		DB:         db,
+		Conn:       conn,
+		Username:   username,
+		CreatedAt:  time.Now(),
+		queries:    make(map[string]*QueryHandle),
+		txns:       make(map[string]*trackedTx),
+		txnOwner:   make(map[string]string),
+		duckdbConn: duckConn,
 	}
 	session.lastUsed.Store(time.Now().UnixNano())
 
-	stop := server.StartCredentialRefresh(conn, p.cfg.DuckLake, func() bool {
+	cfg, cfgErr := p.currentSessionConfig()
+	if cfgErr != nil {
+		_ = conn.Close()
+		p.mu.Lock()
+		p.reserved--
+		p.mu.Unlock()
+		return nil, cfgErr
+	}
+
+	stop := server.StartCredentialRefresh(conn, cfg.DuckLake, func() bool {
 		session.mu.Lock()
 		defer session.mu.Unlock()
 		return len(session.txns) > 0
@@ -423,8 +489,13 @@ func (p *SessionPool) DestroySession(token string) error {
 		// sql.Conn.Close() returns the underlying driver connection to sql.DB's
 		// pool rather than closing it. DuckDB temp tables are connection-scoped,
 		// so they'd leak into the next session that gets the same connection.
+		cleanupStart := time.Now()
+		slog.Debug("Cleaning up session state.", "user", session.Username)
 		cleanupSessionState(session.Conn)
+		slog.Debug("Session state cleaned up.", "user", session.Username, "duration", time.Since(cleanupStart))
+		connCloseStart := time.Now()
 		_ = session.Conn.Close()
+		slog.Debug("Session connection closed (returned to pool).", "user", session.Username, "duration", time.Since(connCloseStart))
 	}
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
 	p.mu.RLock()
@@ -491,6 +562,9 @@ func (p *SessionPool) CloseAll() {
 	}
 	if p.fallbackDB != nil && p.fallbackDB != p.warmupDB {
 		_ = p.fallbackDB.Close()
+	}
+	if p.activation != nil && p.activation.db != nil && p.activation.db != p.warmupDB && p.activation.db != p.fallbackDB {
+		_ = p.activation.db.Close()
 	}
 }
 
@@ -573,10 +647,12 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 	switch cmd.Type {
 	case "CreateSession":
 		return s.handler.doCreateSession(cmd.Body, stream)
+	case "ActivateTenant":
+		return s.handler.doActivateTenant(cmd.Body, stream)
 	case "DestroySession":
 		return s.handler.doDestroySession(cmd.Body, stream)
 	case "HealthCheck":
-		return s.handler.doHealthCheck(stream)
+		return s.handler.doHealthCheck(cmd.Body, stream)
 	default:
 		// Fall through to standard flightsql action router (BeginTransaction, etc.)
 		return s.FlightServer.DoAction(cmd, stream)

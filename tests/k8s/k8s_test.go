@@ -17,6 +17,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -25,27 +26,38 @@ import (
 var (
 	clientset  *kubernetes.Clientset
 	namespace  string
+	kubeconfig string
 	pgPort     int
 	portFwdCmd *exec.Cmd
+	testEnv    k8sTestEnvironment
+)
+
+const (
+	duckgresServiceTarget = "svc/duckgres"
+	duckgresServicePort   = 5432
+	initialDBReadyTimeout = 4 * time.Minute
+	dbAttemptTimeout      = 30 * time.Second
 )
 
 func TestMain(m *testing.M) {
-	namespace = envOr("DUCKGRES_K8S_TEST_NAMESPACE", "duckgres")
+	var err error
+	testEnv, err = loadK8sTestEnvironment(os.Getenv)
+	if err != nil {
+		log.Fatalf("Failed to load K8s test environment: %v", err)
+	}
+	namespace = testEnv.Namespace
 	skipSetup := envOr("DUCKGRES_K8S_TEST_SKIP_SETUP", "") == "true"
 	if !skipSetup {
-		if err := buildImage(); err != nil {
-			log.Fatalf("Failed to build image: %v", err)
+		if namespace != "duckgres" {
+			log.Fatalf("Managed k8s integration setup requires namespace duckgres, got %q", namespace)
 		}
-		if err := applyManifests(); err != nil {
-			log.Fatalf("Failed to apply manifests: %v", err)
-		}
-		if err := waitForDeployment(namespace, "duckgres-control-plane", 180*time.Second); err != nil {
-			log.Fatalf("Deployment not ready: %v", err)
+		if err := setupMultiTenant(); err != nil {
+			log.Fatalf("Failed to set up multi-tenant environment: %v", err)
 		}
 	}
 
 	// Build kubeconfig clientset
-	kubeconfig := envOr("DUCKGRES_K8S_TEST_KUBECONFIG", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
+	kubeconfig = envOr("DUCKGRES_K8S_TEST_KUBECONFIG", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Fatalf("Failed to load kubeconfig: %v", err)
@@ -55,28 +67,37 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to create k8s client: %v", err)
 	}
 
-	// Start port-forward
-	pgPort, portFwdCmd, err = startPortForward(namespace, "svc/duckgres", 5432)
-	if err != nil {
-		log.Fatalf("Failed to start port-forward: %v", err)
+	if _, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second); err != nil {
+		log.Fatalf("Control-plane pod not ready: %v", err)
 	}
 
-	// Wait for port-forward to be ready
-	if err := waitForPort(pgPort, 30*time.Second); err != nil {
-		log.Fatalf("Port-forward not ready: %v", err)
+	if err := restartPortForward(); err != nil {
+		log.Fatalf("Failed to start port-forward: %v", err)
+	}
+	if err := waitForDBReady(initialDBReadyTimeout); err != nil {
+		log.Fatalf("Database not ready: %v", err)
+	}
+	if err := seedTenantIsolationFixtures(); err != nil {
+		log.Fatalf("Failed to seed tenant isolation fixtures: %v", err)
+	}
+	if err := waitForTenantDBReady("analytics", "postgres", initialDBReadyTimeout); err != nil {
+		log.Fatalf("Analytics tenant login not ready: %v", err)
+	}
+	if err := waitForTenantDBReady("billing", "postgres", initialDBReadyTimeout); err != nil {
+		log.Fatalf("Billing tenant login not ready: %v", err)
 	}
 
 	code := m.Run()
 
 	// Cleanup port-forward
-	if portFwdCmd != nil && portFwdCmd.Process != nil {
-		_ = portFwdCmd.Process.Kill()
-		_ = portFwdCmd.Wait()
-	}
+	closePortForward()
 
 	// Cleanup K8s resources (unless skip_setup, meaning external management)
 	if !skipSetup {
-		_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found")
+		_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found", "--wait=true")
+		if testEnv.CleanupRecipe != "" {
+			_ = runProjectCmd("just", testEnv.CleanupRecipe)
+		}
 	}
 
 	os.Exit(code)
@@ -85,11 +106,8 @@ func TestMain(m *testing.M) {
 // --- Test Cases ---
 
 func TestK8sBasicQuery(t *testing.T) {
-	db := openDB(t)
-	defer db.Close()
-
 	var result int
-	if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+	if err := retryScanIntWithReconnect("SELECT 1", 30*time.Second, &result); err != nil {
 		t.Fatalf("SELECT 1 failed: %v", err)
 	}
 	if result != 1 {
@@ -99,11 +117,8 @@ func TestK8sBasicQuery(t *testing.T) {
 
 func TestK8sWorkerPodCreation(t *testing.T) {
 	// Run a query first to ensure at least one worker is spawned
-	db := openDB(t)
-	defer db.Close()
-
 	var result int
-	if err := db.QueryRow("SELECT 42").Scan(&result); err != nil {
+	if err := retryScanIntWithReconnect("SELECT 42", 30*time.Second, &result); err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
 
@@ -127,21 +142,29 @@ func TestK8sWorkerPodCreation(t *testing.T) {
 		if cpLabel == "" {
 			t.Errorf("worker pod %s missing duckgres/control-plane label", pod.Name)
 		}
-
-		// Verify owner references
-		if len(pod.OwnerReferences) == 0 {
-			t.Errorf("worker pod %s has no owner references", pod.Name)
+		if pod.Labels["duckgres/worker-id"] == "" {
+			t.Errorf("worker pod %s missing duckgres/worker-id label", pod.Name)
 		}
+	}
+}
+
+func TestK8sSharedWarmWorkerActivation(t *testing.T) {
+	if _, err := latestWorkerPodBeforeQuery(60 * time.Second); err != nil {
+		t.Fatalf("expected prewarmed worker before first query: %v", err)
+	}
+
+	var attached int
+	if err := retryScanIntWithReconnect("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'", 90*time.Second, &attached); err != nil {
+		t.Fatalf("shared warm worker activation did not attach ducklake: %v", err)
+	}
+	if attached != 1 {
+		t.Fatalf("expected one attached ducklake catalog after activation, got %d", attached)
 	}
 }
 
 func TestK8sWorkerCrashRecovery(t *testing.T) {
 	// Run a query to ensure a worker exists
-	db := openDB(t)
-	defer db.Close()
-
-	var result int
-	if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
 		t.Fatalf("initial query failed: %v", err)
 	}
 
@@ -167,18 +190,7 @@ func TestK8sWorkerCrashRecovery(t *testing.T) {
 	// Wait for the pod to actually disappear
 	waitForPodGone(t, namespace, workerName, 60*time.Second)
 
-	// The old connection may be broken. Open a new one and retry queries.
-	db.Close()
-
-	// Wait a bit for the CP to detect the crash and be ready for new connections
-	time.Sleep(5 * time.Second)
-
-	// Open a new connection and verify queries work (CP should spawn a replacement)
-	db2 := openDB(t)
-	defer db2.Close()
-
-	err = retryQuery(db2, "SELECT 1", 30*time.Second)
-	if err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 60*time.Second); err != nil {
 		t.Fatalf("query failed after worker crash recovery: %v", err)
 	}
 }
@@ -192,16 +204,18 @@ func TestK8sMultipleConcurrentConnections(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			db := openDB(t)
-			defer db.Close()
-
-			var result int
-			if err := db.QueryRow(fmt.Sprintf("SELECT %d", id)).Scan(&result); err != nil {
+			query := fmt.Sprintf("SELECT %d", id)
+			if err := retryDBOperationWithReconnect(30*time.Second, fmt.Sprintf("concurrent query %q", query), func(ctx context.Context, db *sql.DB) error {
+				var result int
+				if err := db.QueryRowContext(ctx, query).Scan(&result); err != nil {
+					return err
+				}
+				if result != id {
+					return fmt.Errorf("expected %d, got %d", id, result)
+				}
+				return nil
+			}); err != nil {
 				errs <- fmt.Errorf("connection %d: query failed: %w", id, err)
-				return
-			}
-			if result != id {
-				errs <- fmt.Errorf("connection %d: expected %d, got %d", id, id, result)
 				return
 			}
 		}(i)
@@ -217,11 +231,7 @@ func TestK8sMultipleConcurrentConnections(t *testing.T) {
 
 func TestK8sWorkerSecurityContext(t *testing.T) {
 	// Ensure a worker exists
-	db := openDB(t)
-	defer db.Close()
-
-	var result int
-	if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
 
@@ -263,14 +273,9 @@ func TestK8sWorkerSecurityContext(t *testing.T) {
 
 func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 	// Ensure a worker exists
-	db := openDB(t)
-	defer db.Close()
-
-	var result int
-	if err := db.QueryRow("SELECT 1").Scan(&result); err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
-	db.Close()
 
 	// List worker pods
 	workerPods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
@@ -283,47 +288,64 @@ func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 		t.Skip("no worker pods found — cannot test GC")
 	}
 
-	// Verify worker pods have owner references pointing to the CP pod
-	for _, wp := range workerPods.Items {
-		hasOwner := false
-		for _, ref := range wp.OwnerReferences {
-			if ref.Kind == "Pod" {
-				hasOwner = true
-				t.Logf("Worker %s owned by %s (UID %s)", wp.Name, ref.Name, ref.UID)
-			}
-		}
-		if !hasOwner {
-			t.Errorf("worker pod %s has no Pod owner reference — GC will not work", wp.Name)
-		}
+	ownedWorkers := workerPodsByControlPlaneLabel(workerPods.Items)
+	if len(ownedWorkers) == 0 {
+		t.Skip("no worker pods with duckgres/control-plane label found")
 	}
 
-	// Delete the CP pod (the deployment will recreate it)
+	// Delete a CP pod that currently owns at least one worker.
+	var cpName string
+	var workerNames []string
+	for ownerName, owned := range ownedWorkers {
+		if len(owned) > 0 {
+			cpName = ownerName
+			workerNames = append([]string(nil), owned...)
+			break
+		}
+	}
+	if cpName == "" {
+		t.Skip("no control-plane-owned worker pods found")
+	}
+
 	cpPods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: "app=duckgres-control-plane",
 	})
 	if err != nil || len(cpPods.Items) == 0 {
 		t.Fatalf("failed to find CP pod: %v", err)
 	}
-	cpName := cpPods.Items[0].Name
-	t.Logf("Deleting CP pod %s to test garbage collection", cpName)
-	err = clientset.CoreV1().Pods(namespace).Delete(context.Background(), cpName, metav1.DeleteOptions{})
+	foundCP := false
+	for _, pod := range cpPods.Items {
+		if pod.Name == cpName {
+			foundCP = true
+			break
+		}
+	}
+	if !foundCP {
+		t.Skipf("control-plane pod %s no longer exists", cpName)
+	}
+	gracePeriodSeconds := int64(0)
+	t.Logf("Force deleting CP pod %s to test crash-style garbage collection", cpName)
+	err = clientset.CoreV1().Pods(namespace).Delete(context.Background(), cpName, metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriodSeconds,
+	})
 	if err != nil {
 		t.Fatalf("failed to delete CP pod: %v", err)
 	}
 
-	// Wait for old worker pods to be garbage collected
-	workerNames := make([]string, len(workerPods.Items))
-	for i, wp := range workerPods.Items {
-		workerNames[i] = wp.Name
-	}
-
+	// Wait for the deleted control plane's worker pods to be retired.
 	allGone := false
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		remaining := 0
 		for _, name := range workerNames {
 			_, err := clientset.CoreV1().Pods(namespace).Get(context.Background(), name, metav1.GetOptions{})
-			if err == nil {
+			switch {
+			case err == nil:
+				remaining++
+			case isPodGoneError(err):
+				continue
+			default:
+				t.Logf("transient error checking worker pod %s deletion: %v", name, err)
 				remaining++
 			}
 		}
@@ -343,24 +365,12 @@ func TestK8sCPDeletionGarbageCollects(t *testing.T) {
 	}
 
 	// Restart port-forward since the old CP pod is gone
-	if portFwdCmd != nil && portFwdCmd.Process != nil {
-		_ = portFwdCmd.Process.Kill()
-		_ = portFwdCmd.Wait()
-	}
-	var pfErr error
-	pgPort, portFwdCmd, pfErr = startPortForward(namespace, "svc/duckgres", 5432)
-	if pfErr != nil {
-		t.Fatalf("failed to restart port-forward: %v", pfErr)
-	}
-	if err := waitForPort(pgPort, 30*time.Second); err != nil {
-		t.Fatalf("port-forward not ready after restart: %v", err)
+	if err := restartPortForward(); err != nil {
+		t.Fatalf("failed to restart port-forward: %v", err)
 	}
 
 	// Verify the system works again
-	db2 := openDB(t)
-	defer db2.Close()
-	err = retryQuery(db2, "SELECT 1", 60*time.Second)
-	if err != nil {
+	if err := retryQueryWithReconnect("SELECT 1", 60*time.Second); err != nil {
 		t.Fatalf("query failed after CP recreation: %v", err)
 	}
 }
@@ -376,67 +386,29 @@ func envOr(key, fallback string) string {
 
 func runCmd(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
+	cmd.Env = commandEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func buildImage() error {
+func runProjectCmd(name string, args ...string) error {
 	projectRoot := findProjectRoot()
-	log.Println("Building duckgres Docker image with -tags kubernetes...")
-	cmd := exec.Command("docker", "build",
-		"--build-arg", "BUILD_TAGS=kubernetes",
-		"-t", "duckgres:test",
-		".")
+	cmd := exec.Command(name, args...)
 	cmd.Dir = projectRoot
+	cmd.Env = commandEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func applyManifests() error {
-	projectRoot := findProjectRoot()
-	k8sDir := filepath.Join(projectRoot, "k8s")
-
-	// Apply in order: namespace first, then everything else
-	orderedFiles := []string{
-		"namespace.yaml",
-		"rbac.yaml",
-		"configmap.yaml",
-		"secret.yaml",
-		"networkpolicy.yaml",
+func setupMultiTenant() error {
+	log.Println("Setting up multi-tenant duckgres test environment...")
+	_ = runCmd("kubectl", "delete", "namespace", namespace, "--ignore-not-found", "--wait=true")
+	if testEnv.CleanupRecipe != "" {
+		_ = runProjectCmd("just", testEnv.CleanupRecipe)
 	}
-
-	for _, f := range orderedFiles {
-		path := filepath.Join(k8sDir, f)
-		if err := runCmd("kubectl", "apply", "-f", path); err != nil {
-			return fmt.Errorf("apply %s: %w", f, err)
-		}
-	}
-
-	// Apply deployment with image override
-	deployPath := filepath.Join(k8sDir, "control-plane-deployment.yaml")
-	deployContent, err := os.ReadFile(deployPath)
-	if err != nil {
-		return fmt.Errorf("read deployment: %w", err)
-	}
-
-	// Replace image references to use test image
-	patched := strings.ReplaceAll(string(deployContent), "duckgres:latest", "duckgres:test")
-
-	// Write to temp file and apply
-	tmp, err := os.CreateTemp("", "deploy-*.yaml")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-
-	if _, err := tmp.WriteString(patched); err != nil {
-		return fmt.Errorf("write temp: %w", err)
-	}
-	tmp.Close()
-
-	return runCmd("kubectl", "apply", "-f", tmp.Name())
+	return runProjectCmd("just", testEnv.SetupRecipe)
 }
 
 func waitForDeployment(ns, name string, timeout time.Duration) error {
@@ -456,6 +428,7 @@ func startPortForward(ns, target string, remotePort int) (int, *exec.Cmd, error)
 
 	cmd := exec.Command("kubectl", "-n", ns, "port-forward", target,
 		fmt.Sprintf("%d:%d", localPort, remotePort))
+	cmd.Env = commandEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -463,6 +436,36 @@ func startPortForward(ns, target string, remotePort int) (int, *exec.Cmd, error)
 	}
 
 	return localPort, cmd, nil
+}
+
+func closePortForward() {
+	if portFwdCmd == nil || portFwdCmd.Process == nil {
+		portFwdCmd = nil
+		return
+	}
+
+	_ = portFwdCmd.Process.Kill()
+	_ = portFwdCmd.Wait()
+	portFwdCmd = nil
+}
+
+func restartPortForward() error {
+	closePortForward()
+
+	localPort, cmd, err := startPortForward(namespace, duckgresServiceTarget, duckgresServicePort)
+	if err != nil {
+		return err
+	}
+
+	pgPort = localPort
+	portFwdCmd = cmd
+
+	if err := waitForPort(pgPort, 30*time.Second); err != nil {
+		closePortForward()
+		return err
+	}
+
+	return nil
 }
 
 func waitForPort(port int, timeout time.Duration) error {
@@ -478,49 +481,251 @@ func waitForPort(port int, timeout time.Duration) error {
 	return fmt.Errorf("port %d not reachable after %s", port, timeout)
 }
 
+func commandEnv() []string {
+	env := os.Environ()
+	cfg := kubeconfig
+	if cfg == "" {
+		cfg = envOr("DUCKGRES_K8S_TEST_KUBECONFIG", "")
+		if cfg == "" {
+			cfg = envOr("DUCKGRES_KIND_KUBECONFIG", "")
+		}
+	}
+	if cfg == "" {
+		return env
+	}
+
+	filtered := env[:0]
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "KUBECONFIG=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return append(filtered, "KUBECONFIG="+cfg)
+}
+
 func waitForPodGone(t *testing.T, ns, name string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		_, err := clientset.CoreV1().Pods(ns).Get(context.Background(), name, metav1.GetOptions{})
-		if err != nil {
-			return // pod is gone
+		switch {
+		case err == nil:
+			time.Sleep(2 * time.Second)
+		case isPodGoneError(err):
+			return
+		default:
+			t.Logf("transient error checking pod %s deletion: %v", name, err)
+			time.Sleep(2 * time.Second)
 		}
-		time.Sleep(2 * time.Second)
 	}
 	t.Logf("Warning: pod %s still exists after %s", name, timeout)
 }
 
+func waitForSingleReadyPod(ns, labelSelector string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		pods, err := clientset.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			return "", err
+		}
+
+		if name, ok := findReadyPodName(pods.Items); ok {
+			return name, nil
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return "", fmt.Errorf("expected at least one ready pod for %q within %s", labelSelector, timeout)
+}
+
+func latestWorkerPod(t *testing.T) corev1.Pod {
+	t.Helper()
+
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	if err != nil {
+		t.Fatalf("failed to list worker pods: %v", err)
+	}
+	if len(pods.Items) == 0 {
+		t.Fatal("expected at least one worker pod, found none")
+	}
+
+	latest := pods.Items[0]
+	for _, pod := range pods.Items[1:] {
+		if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+			latest = pod
+		}
+	}
+	return latest
+}
+
+func latestWorkerPodBeforeQuery(timeout time.Duration) (corev1.Pod, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+			LabelSelector: "app=duckgres-worker",
+		})
+		if err != nil {
+			return corev1.Pod{}, err
+		}
+		if len(pods.Items) > 0 {
+			latest := pods.Items[0]
+			for _, pod := range pods.Items[1:] {
+				if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+					latest = pod
+				}
+			}
+			return latest, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return corev1.Pod{}, fmt.Errorf("no worker pods appeared within %s", timeout)
+}
+
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	// kubectl port-forward passes raw TCP bytes, so the client still needs
-	// SSL. lib/pq sslmode=require skips server cert verification by default,
-	// which works with self-signed certs.
-	connStr := fmt.Sprintf("host=127.0.0.1 port=%d user=postgres password=postgres sslmode=require", pgPort)
-
-	db, err := sql.Open("postgres", connStr)
+	db, err := openDBConn()
 	if err != nil {
 		t.Fatalf("failed to open DB: %v", err)
 	}
 
+	return db
+}
+
+func openDBConn() (*sql.DB, error) {
+	return openDBConnAs("postgres", "postgres")
+}
+
+func openDBConnAs(username, password string) (*sql.DB, error) {
+	databaseName := username
+	if username == "postgres" {
+		databaseName = "duckgres"
+	}
+
+	// kubectl port-forward passes raw TCP bytes, so the client still needs
+	// SSL. lib/pq sslmode=require skips server cert verification by default,
+	// which works with self-signed certs.
+	connStr := fmt.Sprintf(
+		"host=127.0.0.1 port=%d user=%s password=%s dbname=%s sslmode=require connect_timeout=30",
+		pgPort,
+		username,
+		password,
+		databaseName,
+	)
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, err
+	}
+
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(30 * time.Second)
+	return db, nil
+}
 
-	return db
+func waitForDBReady(timeout time.Duration) error {
+	return retryQueryWithReconnect("SELECT 1", timeout)
+}
+
+func waitForTenantDBReady(username, password string, timeout time.Duration) error {
+	return retryQueryWithReconnectAs(username, password, "SELECT 1", timeout)
 }
 
 func retryQuery(db *sql.DB, query string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		var result int
-		lastErr = db.QueryRow(query).Scan(&result)
+		lastErr = scanIntQueryWithTimeout(db, query, nil)
 		if lastErr == nil {
 			return nil
 		}
 		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("query %q failed after %s: %w", query, timeout, lastErr)
+}
+
+func retryScanInt(db *sql.DB, query string, timeout time.Duration, dest *int) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = scanIntQueryWithTimeout(db, query, dest)
+		if lastErr == nil {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("query %q failed after %s: %w", query, timeout, lastErr)
+}
+
+func retryQueryWithReconnect(query string, timeout time.Duration) error {
+	return retryDBOperationWithReconnectAs("postgres", "postgres", timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
+		var result int
+		return db.QueryRowContext(ctx, query).Scan(&result)
+	})
+}
+
+func retryScanIntWithReconnect(query string, timeout time.Duration, dest *int) error {
+	return retryDBOperationWithReconnectAs("postgres", "postgres", timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
+		return db.QueryRowContext(ctx, query).Scan(dest)
+	})
+}
+
+func retryQueryWithReconnectAs(username, password, query string, timeout time.Duration) error {
+	return retryDBOperationWithReconnectAs(username, password, timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
+		var result int
+		return db.QueryRowContext(ctx, query).Scan(&result)
+	})
+}
+
+// Use a fresh DB connection on each attempt so transient port-forward failures
+// can be recovered by restarting the forwarder between retries.
+func retryDBOperationWithReconnect(timeout time.Duration, description string, op func(context.Context, *sql.DB) error) error {
+	return retryDBOperationWithReconnectAs("postgres", "postgres", timeout, description, op)
+}
+
+func retryDBOperationWithReconnectAs(username, password string, timeout time.Duration, description string, op func(context.Context, *sql.DB) error) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		db, err := openDBConnAs(username, password)
+		if err == nil {
+			attemptCtx, cancel := context.WithTimeout(context.Background(), dbAttemptTimeout)
+			err = op(attemptCtx, db)
+			cancel()
+			_ = db.Close()
+		}
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+		if isTransientDBError(err) {
+			if restartErr := restartPortForward(); restartErr != nil {
+				lastErr = fmt.Errorf("%w; restart port-forward: %v", err, restartErr)
+			}
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("%s failed after %s: %w", description, timeout, lastErr)
+}
+
+func scanIntQueryWithTimeout(db *sql.DB, query string, dest *int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dbAttemptTimeout)
+	defer cancel()
+
+	var result int
+	target := &result
+	if dest != nil {
+		target = dest
+	}
+	return db.QueryRowContext(ctx, query).Scan(target)
 }
 
 func findProjectRoot() string {

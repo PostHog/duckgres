@@ -401,6 +401,20 @@ func TestCatalogSystemFunctions(t *testing.T) {
 			Query:        "SELECT pg_is_in_recovery()",
 			DuckgresOnly: true,
 		},
+
+		// pg_get_partkeydef (stub, returns empty string - DuckDB has no partitioning)
+		{
+			Name:         "pg_get_partkeydef",
+			Query:        "SELECT pg_catalog.pg_get_partkeydef(c.oid) FROM pg_catalog.pg_class c LIMIT 1",
+			DuckgresOnly: true,
+		},
+
+		// pg_stat_get_numscans (stub, returns 0 - DuckDB doesn't track scan statistics)
+		{
+			Name:         "pg_stat_get_numscans",
+			Query:        "SELECT pg_catalog.pg_stat_get_numscans(c.oid) FROM pg_catalog.pg_class c LIMIT 1",
+			DuckgresOnly: true,
+		},
 	}
 	runQueryTests(t, tests)
 }
@@ -525,6 +539,11 @@ func TestCatalogStubs(t *testing.T) {
 		{
 			Name:         "pg_partitioned_table",
 			Query:        "SELECT * FROM pg_catalog.pg_partitioned_table LIMIT 5",
+			DuckgresOnly: true,
+		},
+		{
+			Name:         "pg_rewrite",
+			Query:        "SELECT * FROM pg_catalog.pg_rewrite LIMIT 5",
 			DuckgresOnly: true,
 		},
 	}

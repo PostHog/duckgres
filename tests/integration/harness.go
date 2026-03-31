@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"github.com/posthog/duckgres/server"
 	_ "github.com/lib/pq"
 )
+
+var duckLakeInfraServices = []string{"ducklake-metadata", "minio", "minio-init"}
 
 // TestHarness manages PostgreSQL and Duckgres instances for side-by-side testing
 type TestHarness struct {
@@ -500,13 +503,26 @@ func (h *TestHarness) Close() error {
 	return nil
 }
 
-// StartPostgresContainer starts the PostgreSQL Docker container
-func StartPostgresContainer() error {
+func dockerComposeArgs(composeFile string, command string, args ...string) []string {
+	composeArgs := []string{"-f", composeFile, command}
+	return append(composeArgs, args...)
+}
+
+func runDockerCompose(command string, args ...string) error {
 	testDir := getTestDir()
-	cmd := exec.Command("docker-compose", "-f", filepath.Join(testDir, "docker-compose.yml"), "up", "-d")
+	composeFile := filepath.Join(testDir, "docker-compose.yml")
+	cmd := exec.Command("docker-compose", dockerComposeArgs(composeFile, command, args...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker-compose %s %s: %w", command, strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+// StartPostgresContainer starts only the PostgreSQL comparison container.
+func StartPostgresContainer() error {
+	if err := runDockerCompose("up", "-d", "postgres"); err != nil {
 		return fmt.Errorf("failed to start PostgreSQL container: %w", err)
 	}
 
@@ -515,10 +531,18 @@ func StartPostgresContainer() error {
 	return nil
 }
 
+// StartDuckLakeInfraContainers starts the local DuckLake metadata/object-store services.
+func StartDuckLakeInfraContainers() error {
+	if err := runDockerCompose("up", append([]string{"-d"}, duckLakeInfraServices...)...); err != nil {
+		return fmt.Errorf("failed to start DuckLake infrastructure: %w", err)
+	}
+	return nil
+}
+
 // StopPostgresContainer stops the PostgreSQL Docker container
 func StopPostgresContainer() error {
 	testDir := getTestDir()
-	cmd := exec.Command("docker-compose", "-f", filepath.Join(testDir, "docker-compose.yml"), "down", "-v")
+	cmd := exec.Command("docker-compose", dockerComposeArgs(filepath.Join(testDir, "docker-compose.yml"), "down", "-v")...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Run()
@@ -580,27 +604,11 @@ func findAvailablePort() int {
 }
 
 func getTestDir() string {
-	// Get the directory of this source file
-	_, filename, _, ok := getCallerInfo()
+	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		return "tests/integration"
 	}
 	return filepath.Dir(filename)
-}
-
-func getCallerInfo() (pc uintptr, file string, line int, ok bool) {
-	// This is a placeholder - in real code we'd use runtime.Caller
-	// For now, we'll use a relative path approach
-	cwd, _ := os.Getwd()
-	// Check if we're in the integration directory
-	if _, err := os.Stat(filepath.Join(cwd, "docker-compose.yml")); err == nil {
-		return 0, filepath.Join(cwd, "harness.go"), 0, true
-	}
-	// Check if we're in the project root
-	if _, err := os.Stat(filepath.Join(cwd, "tests", "integration", "docker-compose.yml")); err == nil {
-		return 0, filepath.Join(cwd, "tests", "integration", "harness.go"), 0, true
-	}
-	return 0, "", 0, false
 }
 
 func splitSQLStatements(sql string) []string {

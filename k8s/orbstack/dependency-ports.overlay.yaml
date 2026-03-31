@@ -1,0 +1,13 @@
+services:
+  warehouse-postgres:
+    ports:
+      - "35434:5432"
+
+  ducklake-metadata:
+    ports:
+      - "35433:5432"
+
+  minio:
+    ports:
+      - "39000:9000"
+      - "39001:9001"

@@ -19,7 +19,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	_ "github.com/duckdb/duckdb-go/v2"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -33,6 +36,8 @@ var processVersion = "dev"
 // startupReadTimeout bounds pre-TLS startup negotiation reads to avoid stalled
 // clients pinning connection goroutines indefinitely.
 var startupReadTimeout = 30 * time.Second
+
+const bundledDuckDBExtensionsDir = "/app/extensions"
 
 // SetProcessVersion sets the version string for this process. Called from main().
 func SetProcessVersion(v string) { processVersion = v }
@@ -184,14 +189,6 @@ type Config struct {
 	// of budget/max_workers at creation time.
 	MemoryRebalance bool
 
-	// MaxWorkers is the maximum number of worker processes in control-plane mode.
-	// 0 means unlimited.
-	MaxWorkers int
-
-	// MinWorkers is the number of pre-warmed worker processes at startup in control-plane mode.
-	// 0 means no pre-warming (workers spawn on demand).
-	MinWorkers int
-
 	// PassthroughUsers are users that bypass the SQL transpiler and pg_catalog initialization.
 	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
 	PassthroughUsers map[string]bool
@@ -229,12 +226,13 @@ type DuckLakeConfig struct {
 	S3Provider string
 
 	// S3 configuration for "config" provider (explicit credentials for MinIO or S3)
-	S3Endpoint  string // e.g., "localhost:9000" for MinIO
-	S3AccessKey string // S3 access key ID
-	S3SecretKey string // S3 secret access key
-	S3Region    string // S3 region (default: us-east-1)
-	S3UseSSL    bool   // Use HTTPS for S3 connections (default: false for MinIO)
-	S3URLStyle  string // "path" or "vhost" (default: "path" for MinIO compatibility)
+	S3Endpoint     string // e.g., "localhost:9000" for MinIO
+	S3AccessKey    string // S3 access key ID
+	S3SecretKey    string // S3 secret access key
+	S3SessionToken string // STS session token for temporary credentials
+	S3Region       string // S3 region (default: us-east-1)
+	S3UseSSL       bool   // Use HTTPS for S3 connections (default: false for MinIO)
+	S3URLStyle     string // "path" or "vhost" (default: "path" for MinIO compatibility)
 
 	// S3 configuration for "credential_chain" provider (AWS SDK credential chain)
 	// Chain specifies which credential sources to check, semicolon-separated
@@ -242,6 +240,23 @@ type DuckLakeConfig struct {
 	// Default: checks all sources in AWS SDK order
 	S3Chain   string // e.g., "env;config" to check env vars then config files
 	S3Profile string // AWS profile name to use (for "config" chain)
+
+	// CheckpointInterval controls how often DuckLake CHECKPOINT runs.
+	// CHECKPOINT performs full catalog maintenance: expire snapshots,
+	// merge adjacent files, rewrite data files, and clean up orphaned files.
+	// Set to 0 to disable. Default: 24h.
+	CheckpointInterval time.Duration
+
+	// DataInliningRowLimit controls the maximum number of rows to inline
+	// in DuckLake metadata instead of writing to Parquet files.
+	// Default: 0 (disabled). Set to a positive value to enable inlining.
+	DataInliningRowLimit *int
+
+	// Migrate is set by the control plane after running the migration check.
+	// When true, AttachDuckLake uses AUTOMATIC_MIGRATION TRUE without
+	// re-running the version check. This avoids redundant backups and
+	// long-running checks in worker processes.
+	Migrate bool `json:"migrate,omitempty" yaml:"-"`
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.
@@ -288,6 +303,14 @@ type Server struct {
 
 	// Query logger for DuckLake system.query_log
 	queryLogger *QueryLogger
+
+	// DuckLake checkpoint scheduler
+	checkpointer *DuckLakeCheckpointer
+
+	// Progress lookup function for pg_stat_activity.
+	// In control plane mode, returns cached progress from worker health checks.
+	// Nil in standalone mode.
+	progressFn func(pid int32) (pct float64, rows, totalRows uint64, stalled bool)
 
 	// Per-user shared DB pool for file persistence mode.
 	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
@@ -390,11 +413,24 @@ func New(cfg Config) (*Server, error) {
 		slog.Info("Idle timeout disabled.")
 	}
 
+	// Run DuckLake migration check before initializing query logger and checkpointer,
+	// since they both attach DuckLake and need to know if migration is required.
+	if cfg.DuckLake.MetadataStore != "" {
+		ensureDuckLakeMigrationCheck(cfg.DuckLake, cfg.DataDir)
+	}
+
 	// Initialize query logger (non-fatal on error)
 	if ql, err := NewQueryLogger(cfg); err != nil {
 		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
 	} else if ql != nil {
 		s.queryLogger = ql
+	}
+
+	// Initialize DuckLake checkpoint scheduler (non-fatal on error)
+	if cp, err := NewDuckLakeCheckpointer(cfg); err != nil {
+		slog.Warn("Failed to initialize DuckLake checkpoint scheduler, continuing without it.", "error", err)
+	} else if cp != nil {
+		s.checkpointer = cp
 	}
 
 	return s, nil
@@ -497,6 +533,11 @@ func (s *Server) Close() error {
 	// Stop query logger (drains remaining entries)
 	if s.queryLogger != nil {
 		s.queryLogger.Stop()
+	}
+
+	// Stop DuckLake checkpoint scheduler
+	if s.checkpointer != nil {
+		s.checkpointer.Stop()
 	}
 
 	// Database connections are now closed by each clientConn when it terminates
@@ -725,7 +766,9 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
 
-	// Single connection per client session
+	// Single connection per client session. This is the isolation boundary:
+	// DuckDB connections share a single catalog (tables, views, credentials),
+	// so concurrent sessions on the same DB would see each other's data.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
@@ -770,6 +813,9 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
 	// for autoloading/installing extensions.
 	extDir := filepath.Join(cfg.DataDir, "extensions")
+	if err := seedBundledExtensions(bundledDuckDBExtensionsDir, extDir); err != nil {
+		slog.Warn("Failed to seed bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", extDir, "error", err)
+	}
 	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
 		slog.Warn("Failed to set DuckDB extension_directory.", "extension_directory", extDir, "error", err)
 	} else {
@@ -796,6 +842,83 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+func seedBundledExtensions(srcRoot, dstRoot string) error {
+	srcRoot = filepath.Clean(srcRoot)
+	dstRoot = filepath.Clean(dstRoot)
+
+	info, err := os.Stat(srcRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat bundled extensions dir: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("bundled extensions path %s is not a directory", srcRoot)
+	}
+	if err := os.MkdirAll(dstRoot, 0o750); err != nil {
+		return fmt.Errorf("mkdir extension directory %s: %w", dstRoot, err)
+	}
+
+	return filepath.Walk(srcRoot, func(path string, walkInfo os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == srcRoot {
+			return nil
+		}
+
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dstRoot, rel)
+
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if walkInfo != nil {
+			info = walkInfo
+		}
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, 0o750)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if _, err := os.Stat(dstPath); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		srcFile, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+
+		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+		if err != nil {
+			_ = srcFile.Close()
+			return err
+		}
+		if _, err := io.Copy(dstFile, srcFile); err != nil {
+			_ = srcFile.Close()
+			_ = dstFile.Close()
+			return err
+		}
+		if err := srcFile.Close(); err != nil {
+			_ = dstFile.Close()
+			return err
+		}
+		if err := dstFile.Close(); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // CreateDBConnection creates a DuckDB connection for a client session.
@@ -829,9 +952,12 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		// Continue anyway - basic queries will still work
 	}
 
+	// Register ClickHouse SQL macros (chsql compat)
+	initClickHouseMacros(db)
+
 	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
-	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
 		if cfg.DuckLake.MetadataStore != "" {
@@ -875,6 +1001,33 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 	return nil
 }
 
+// ActivateDBConnection applies tenant-specific DuckLake runtime to an already
+// initialized generic DuckDB connection used by a shared warm worker.
+func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, username string) error {
+	if cfg.DuckLake.MetadataStore == "" {
+		return fmt.Errorf("tenant activation requires ducklake metadata_store")
+	}
+
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
+		return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+	}
+
+	if err := recreatePgClassForDuckLake(db); err != nil {
+		slog.Warn("Failed to recreate pg_class_full for DuckLake during activation.", "user", username, "error", err)
+	}
+	if err := recreatePgNamespaceForDuckLake(db); err != nil {
+		slog.Warn("Failed to recreate pg_namespace for DuckLake during activation.", "user", username, "error", err)
+	}
+	if err := initInformationSchema(db, true); err != nil {
+		slog.Warn("Failed to initialize information_schema during activation.", "user", username, "error", err)
+	}
+	if err := setDuckLakeDefault(db); err != nil {
+		return fmt.Errorf("failed to set DuckLake as default: %w", err)
+	}
+
+	return nil
+}
+
 // CreatePassthroughDBConnection creates a DuckDB connection without pg_catalog
 // or information_schema initialization. DuckLake is still attached if configured
 // so passthrough users can access the same data. This is used for passthrough users
@@ -888,8 +1041,11 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 	// Utility macros (uptime, version) are useful for all connections.
 	initUtilityMacros(db, serverStartTime, processStartTime, serverVersion, processVersion)
 
+	// Register ClickHouse SQL macros (chsql compat)
+	initClickHouseMacros(db)
+
 	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
-	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem); err != nil {
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		if cfg.DuckLake.MetadataStore != "" {
 			_ = db.Close()
 			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
@@ -964,9 +1120,22 @@ func hasCacheHTTPFS(extensions []string) bool {
 // AttachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
 // Call setDuckLakeDefault after creating per-connection views in memory.main.
 // This is a standalone function so it can be reused by control plane workers.
-func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
+// dataDir is used for writing migration backup files if a schema upgrade is needed.
+func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir string) error {
 	if dlCfg.MetadataStore == "" {
 		return nil // DuckLake not configured
+	}
+
+	// In control-plane mode, the CP runs the migration check and sets
+	// dlCfg.Migrate=true before sending the activation payload to workers.
+	// Workers skip the check entirely to avoid redundant backups and
+	// health-check timeouts during long backup operations.
+	// In standalone mode, the check runs here (once per process).
+	if !dlCfg.Migrate {
+		ensureDuckLakeMigrationCheck(dlCfg, dataDir)
+		if dlMigration.err != nil {
+			return fmt.Errorf("DuckLake migration check failed: %w", dlMigration.err)
+		}
 	}
 
 	// Serialize DuckLake attachment to avoid race conditions where multiple
@@ -991,11 +1160,12 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 
 	// Create S3 secret if using object store
 	// - With explicit credentials (S3AccessKey set) or custom endpoint
-	// - With credential_chain provider (for AWS S3)
+	// - With credential_chain or aws_sdk provider (for AWS S3)
 	if dlCfg.ObjectStore != "" {
 		needsSecret := dlCfg.S3Endpoint != "" ||
 			dlCfg.S3AccessKey != "" ||
 			dlCfg.S3Provider == "credential_chain" ||
+			dlCfg.S3Provider == "aws_sdk" ||
 			dlCfg.S3Chain != "" ||
 			dlCfg.S3Profile != ""
 
@@ -1018,25 +1188,30 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 			"Consider connecting directly to PostgreSQL instead.")
 	}
 
-	// Build the ATTACH statement
-	// Format without data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake
-	// Format with data path: ATTACH 'ducklake:<metadata_connection>' AS ducklake (DATA_PATH '<path>')
+	// Build the ATTACH statement.
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
-	var attachStmt string
+	migrate := dlCfg.Migrate || duckLakeMigrationNeeded()
+	attachStmt := buildDuckLakeAttachStmt(dlCfg, migrate)
+
 	dataPath := dlCfg.ObjectStore
 	if dataPath == "" {
 		dataPath = dlCfg.DataPath
 	}
-	if dataPath != "" {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake (DATA_PATH '%s')",
-			dlCfg.MetadataStore, dataPath)
-		slog.Info("Attaching DuckLake catalog with data path.", "metadata", redactConnectionString(dlCfg.MetadataStore), "data", dataPath)
+	if migrate {
+		slog.Info("Attaching DuckLake catalog with automatic migration.",
+			"from", duckLakeMigrationCheckedVersion(), "to", duckLakeSpecVersion,
+			"metadata", redactConnectionString(dlCfg.MetadataStore))
+	} else if dataPath != "" {
+		slog.Info("Attaching DuckLake catalog with data path.",
+			"metadata", redactConnectionString(dlCfg.MetadataStore), "data", dataPath)
 	} else {
-		attachStmt = fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", dlCfg.MetadataStore)
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
-	if _, err := db.Exec(attachStmt); err != nil {
+	if err := retryOnTransientAttach(func() error {
+		_, err := db.Exec(attachStmt)
+		return err
+	}); err != nil {
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
 
@@ -1051,7 +1226,101 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
 
+	// Ensure performance indexes exist on the DuckLake metadata tables.
+	// Run in a goroutine so it doesn't block the DuckLake semaphore or
+	// delay connection setup. Uses atomic flag to retry on transient failures.
+	// See: https://github.com/duckdb/ducklake/issues/859
+	go ensureDuckLakeMetadataIndexes(dlCfg)
+
 	return nil
+}
+
+// duckLakeIndexDone tracks whether metadata indexes have been successfully created.
+// Uses atomic.Bool instead of sync.Once so transient failures can be retried.
+var duckLakeIndexDone atomic.Bool
+
+// duckLakeIndexMu serializes concurrent index creation attempts.
+var duckLakeIndexMu sync.Mutex
+
+// ensureDuckLakeMetadataIndexes connects directly to the DuckLake PostgreSQL
+// metadata store and creates indexes that dramatically improve query planning
+// performance. This is non-fatal — if it fails, DuckLake still works, just slower.
+// Retries on subsequent AttachDuckLake calls until it succeeds.
+func ensureDuckLakeMetadataIndexes(dlCfg DuckLakeConfig) {
+	if duckLakeIndexDone.Load() {
+		return
+	}
+
+	// Only relevant for PostgreSQL metadata stores.
+	if !strings.HasPrefix(dlCfg.MetadataStore, "postgres:") {
+		return
+	}
+
+	// Serialize concurrent attempts (multiple connections attaching simultaneously).
+	duckLakeIndexMu.Lock()
+	defer duckLakeIndexMu.Unlock()
+
+	// Double-check after acquiring the lock.
+	if duckLakeIndexDone.Load() {
+		return
+	}
+
+	// Strip the "postgres:" DuckLake protocol prefix to get a standard libpq connection string.
+	connStr := strings.TrimPrefix(dlCfg.MetadataStore, "postgres:")
+
+	// pgx/stdlib accepts libpq key=value format directly.
+	pgDB, err := sql.Open("pgx", connStr)
+	if err != nil {
+		slog.Warn("Failed to open connection for DuckLake metadata indexes.", "error", err)
+		return
+	}
+	defer func() { _ = pgDB.Close() }()
+
+	// Use a generous timeout — CREATE INDEX on large tables (e.g., ducklake_file_column_stats
+	// at 1.2 GB) can take minutes on first run. Subsequent runs are instant (IF NOT EXISTS).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if err := pgDB.PingContext(ctx); err != nil {
+		slog.Warn("Failed to connect to DuckLake metadata store for index creation.", "error", err)
+		return
+	}
+
+	// Indexes that improve DuckDB postgres scanner performance.
+	// The scanner uses COPY with ctid batches and pushes down filters,
+	// but without indexes each batch requires a sequential scan.
+	indexes := []string{
+		// Critical: ducklake_file_column_stats is often the largest table (millions of rows).
+		// Filter pushdown CTEs query by (table_id, column_id) on every query.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_file_col_stats_tbl_col ON ducklake_file_column_stats (table_id, column_id)",
+
+		// Catalog loading queries (GetCatalogForSnapshot) filter by snapshot ranges.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_tag_object_snap ON ducklake_tag (object_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_col_tag_tbl_col_snap ON ducklake_column_tag (table_id, column_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_snap ON ducklake_table (begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_column_tbl_snap ON ducklake_column (table_id, begin_snapshot, end_snapshot, column_order)",
+
+		// File and stats queries.
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_tbl_snap ON ducklake_data_file (table_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_delete_file_tbl_snap ON ducklake_delete_file (table_id, begin_snapshot, end_snapshot)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_stats_tbl ON ducklake_table_stats (table_id)",
+		"CREATE INDEX IF NOT EXISTS idx_ducklake_table_col_stats_tbl ON ducklake_table_column_stats (table_id)",
+	}
+
+	created := 0
+	for _, stmt := range indexes {
+		if _, err := pgDB.ExecContext(ctx, stmt); err != nil {
+			slog.Warn("Failed to create DuckLake metadata index.", "statement", stmt, "error", err)
+			// Continue — create as many indexes as possible
+		} else {
+			created++
+		}
+	}
+
+	if created == len(indexes) {
+		duckLakeIndexDone.Store(true)
+	}
+	slog.Info("Ensured DuckLake metadata indexes.", "created_or_verified", created, "total", len(indexes))
 }
 
 // setDuckLakeDefault sets the DuckLake catalog as the default so all queries use it.
@@ -1066,9 +1335,10 @@ func setDuckLakeDefault(db *sql.DB) error {
 
 // createS3Secret creates a DuckDB secret for S3/MinIO access.
 // This is a standalone function so it can be reused by control plane workers.
-// Supports two providers:
+// Supports three providers:
 //   - "config": explicit credentials (for MinIO or when you have access keys)
-//   - "credential_chain": AWS SDK credential chain (env vars, config files, instance metadata, etc.)
+//   - "credential_chain": DuckDB's built-in credential chain (does NOT support EKS Pod Identity)
+//   - "aws_sdk": Go AWS SDK credential fetch → explicit config secret (supports EKS Pod Identity)
 //
 // Note: Caller must hold duckLakeSem to avoid race conditions.
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
@@ -1081,15 +1351,24 @@ func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 	}
 
 	// Determine provider: use credential_chain if explicitly set or if no access key provided
-	provider := s3ProviderForConfig(dlCfg)
+	provider := S3ProviderForConfig(dlCfg)
 
 	var secretStmt string
 
-	if provider == "credential_chain" {
-		// Use AWS SDK credential chain
+	switch provider {
+	case "aws_sdk":
+		// Use Go AWS SDK to fetch credentials (supports EKS Pod Identity, IRSA, etc.)
+		var err error
+		secretStmt, err = buildAWSSdkSecret(context.Background(), dlCfg)
+		if err != nil {
+			return fmt.Errorf("aws_sdk credential fetch failed: %w", err)
+		}
+		slog.Info("Creating S3 secret with aws_sdk provider (Go SDK credentials).")
+	case "credential_chain":
+		// Use DuckDB's built-in credential chain (does NOT support EKS Pod Identity)
 		secretStmt = buildCredentialChainSecret(dlCfg)
 		slog.Info("Creating S3 secret with credential_chain provider.")
-	} else {
+	default:
 		// Use explicit credentials (config provider)
 		secretStmt = buildConfigSecret(dlCfg)
 		slog.Info("Creating S3 secret with config provider.", "endpoint", dlCfg.S3Endpoint)
@@ -1100,6 +1379,50 @@ func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 	}
 
 	slog.Info("Created S3 secret successfully.")
+	return nil
+}
+
+// RefreshS3Secret replaces the DuckDB S3 secret with updated credentials.
+// Used when a hot-idle worker is reclaimed and STS credentials have rotated.
+// Respects the configured S3 provider (config, aws_sdk, credential_chain).
+func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}) error {
+	if dlCfg.ObjectStore == "" {
+		return nil
+	}
+	if duckLakeSem != nil {
+		duckLakeSem <- struct{}{}
+		defer func() { <-duckLakeSem }()
+	}
+
+	provider := S3ProviderForConfig(dlCfg)
+	var secretStmt string
+	switch provider {
+	case "aws_sdk":
+		var err error
+		secretStmt, err = buildAWSSdkSecret(context.Background(), dlCfg)
+		if err != nil {
+			return fmt.Errorf("refresh aws_sdk S3 secret: %w", err)
+		}
+	case "credential_chain":
+		secretStmt = buildCredentialChainSecret(dlCfg)
+	default:
+		secretStmt = buildConfigSecret(dlCfg)
+	}
+
+	// If the previous session left the connection in DuckDB's "Current
+	// transaction is aborted" state, the exec will always fail. Issue a
+	// ROLLBACK to recover, matching the pattern in StartCredentialRefresh.
+	if _, err := db.Exec(secretStmt); err != nil {
+		if isTransactionAborted(err) {
+			_, _ = db.Exec("ROLLBACK")
+			if _, retryErr := db.Exec(secretStmt); retryErr != nil {
+				return fmt.Errorf("refresh S3 secret after rollback: %w", retryErr)
+			}
+		} else {
+			return fmt.Errorf("refresh S3 secret: %w", err)
+		}
+	}
+	slog.Debug("Refreshed S3 secret for hot-idle reuse.", "provider", provider)
 	return nil
 }
 
@@ -1140,6 +1463,10 @@ func buildConfigSecret(dlCfg DuckLakeConfig) string {
 	// Add endpoint if specified (for MinIO or custom S3-compatible storage)
 	if dlCfg.S3Endpoint != "" {
 		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
+	}
+
+	if dlCfg.S3SessionToken != "" {
+		secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", dlCfg.S3SessionToken)
 	}
 
 	secret += "\n\t\t)"
@@ -1191,13 +1518,81 @@ func buildCredentialChainSecret(dlCfg DuckLakeConfig) string {
 	return secret
 }
 
+// fetchAWSSDKCredentials uses the Go AWS SDK's default credential chain to retrieve
+// temporary credentials. This supports all credential sources that the Go SDK supports,
+// including EKS Pod Identity (AWS_CONTAINER_CREDENTIALS_FULL_URI), IRSA, instance
+// metadata, environment variables, and config files — unlike DuckDB's built-in
+// credential_chain which does not support EKS Pod Identity.
+func fetchAWSSDKCredentials(ctx context.Context, region string) (aws.Credentials, error) {
+	var opts []func(*awsconfig.LoadOptions) error
+	if region != "" {
+		opts = append(opts, awsconfig.WithRegion(region))
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+	creds, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("failed to retrieve AWS credentials: %w", err)
+	}
+	return creds, nil
+}
+
+// buildAWSSdkSecret fetches credentials via the Go AWS SDK and builds a
+// CREATE SECRET statement with PROVIDER config using the explicit temporary credentials.
+func buildAWSSdkSecret(ctx context.Context, dlCfg DuckLakeConfig) (string, error) {
+	creds, err := fetchAWSSDKCredentials(ctx, dlCfg.S3Region)
+	if err != nil {
+		return "", err
+	}
+
+	region := dlCfg.S3Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	secret := fmt.Sprintf(`
+		CREATE OR REPLACE SECRET ducklake_s3 (
+			TYPE s3,
+			PROVIDER config,
+			KEY_ID '%s',
+			SECRET '%s',
+			REGION '%s'`,
+		creds.AccessKeyID,
+		creds.SecretAccessKey,
+		region,
+	)
+
+	if creds.SessionToken != "" {
+		secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", creds.SessionToken)
+	}
+
+	if dlCfg.S3Endpoint != "" {
+		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
+		urlStyle := dlCfg.S3URLStyle
+		if urlStyle == "" {
+			urlStyle = "path"
+		}
+		secret += fmt.Sprintf(",\n\t\t\tURL_STYLE '%s'", urlStyle)
+		useSSL := "false"
+		if dlCfg.S3UseSSL {
+			useSSL = "true"
+		}
+		secret += fmt.Sprintf(",\n\t\t\tUSE_SSL %s", useSSL)
+	}
+
+	secret += "\n\t\t)"
+	return secret, nil
+}
+
 // credentialRefreshInterval is how often to refresh S3 credentials for long-lived connections.
 // EC2 instance role credentials typically expire after 6 hours. Refreshing every 5 minutes
 // ensures fresh credentials are always available without excessive IMDS calls.
 var credentialRefreshInterval = 5 * time.Minute
 
-// s3ProviderForConfig returns the effective S3 provider for the given DuckLake config.
-func s3ProviderForConfig(dlCfg DuckLakeConfig) string {
+// S3ProviderForConfig returns the effective S3 provider for the given DuckLake config.
+func S3ProviderForConfig(dlCfg DuckLakeConfig) string {
 	provider := dlCfg.S3Provider
 	if provider == "" {
 		if dlCfg.S3AccessKey != "" {
@@ -1210,12 +1605,13 @@ func s3ProviderForConfig(dlCfg DuckLakeConfig) string {
 }
 
 // needsCredentialRefresh returns true if the DuckLake config uses temporary credentials
-// that need periodic refresh (credential_chain provider with an S3 object store).
+// that need periodic refresh (credential_chain or aws_sdk provider with an S3 object store).
 func needsCredentialRefresh(dlCfg DuckLakeConfig) bool {
 	if dlCfg.ObjectStore == "" {
 		return false
 	}
-	return s3ProviderForConfig(dlCfg) == "credential_chain"
+	p := S3ProviderForConfig(dlCfg)
+	return p == "credential_chain" || p == "aws_sdk" || dlCfg.S3SessionToken != ""
 }
 
 // isTransactionAborted returns true if the error indicates DuckDB's connection
@@ -1267,10 +1663,21 @@ func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig, isTxActive .
 		ticker := time.NewTicker(credentialRefreshInterval)
 		defer ticker.Stop()
 		var consecutiveFailures int
+		provider := S3ProviderForConfig(dlCfg)
 		for {
 			select {
 			case <-ticker.C:
-				secretStmt := buildCredentialChainSecret(dlCfg)
+				var secretStmt string
+				var buildErr error
+				if provider == "aws_sdk" {
+					secretStmt, buildErr = buildAWSSdkSecret(context.Background(), dlCfg)
+					if buildErr != nil {
+						slog.Warn("Failed to fetch AWS SDK credentials for refresh.", "error", buildErr)
+						continue
+					}
+				} else {
+					secretStmt = buildCredentialChainSecret(dlCfg)
+				}
 				_, err := execer.ExecContext(context.Background(), secretStmt)
 
 				// If stuck in aborted transaction, only auto-rollback when caller

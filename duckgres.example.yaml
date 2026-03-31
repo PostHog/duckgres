@@ -90,10 +90,20 @@ ducklake:
 # memory_budget: "24GB"
 
 # Worker process limits (control-plane mode only)
-# min_workers: pre-warm workers at startup for instant connection handling.
-# max_workers: cap on total workers (0 = unlimited).
-# min_workers: 0
-# max_workers: 0
+# process:
+#   # min_workers: pre-warm process workers at startup for instant connection handling.
+#   # max_workers: cap on total process workers (0 = auto-derived).
+#   min_workers: 0
+#   max_workers: 0
+
+# Kubernetes multi-tenant shared warm-pool settings
+# k8s:
+#   # Global cap for shared K8s workers. 0 auto-derives from memory_budget.
+#   max_workers: 0
+#   # Neutral shared warm-worker target. Separate from per-org limits and
+#   # process.min_workers. 0 disables shared prewarming. When > 0, the pool
+#   # maintains this many idle workers and activates them on-demand per org.
+#   shared_warm_target: 0
 
 # Process isolation (default: true)
 # Each client connection spawns a separate OS process, so a DuckDB crash

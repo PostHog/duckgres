@@ -154,6 +154,7 @@ type clientConn struct {
 	reader      *bufio.Reader
 	writer      *bufio.Writer
 	username    string
+	orgID       string
 	database    string
 	executor    QueryExecutor
 	pid         int32
@@ -174,6 +175,7 @@ type clientConn struct {
 	backendStart    time.Time    // when this connection started
 	applicationName string       // from startup params
 	currentQuery    atomic.Value // stores string — current/last query (lock-free)
+	queryStart      atomic.Value // stores time.Time — when current query started (lock-free)
 	workerID        int          // control plane worker ID, -1 for standalone
 }
 
@@ -198,6 +200,18 @@ func generateSecretKey() int32 {
 // backendKey returns the backend key for this connection, used for cancel requests.
 func (c *clientConn) backendKey() BackendKey {
 	return BackendKey{Pid: c.pid, SecretKey: c.secretKey}
+}
+
+func (c *clientConn) ensureConnectionContext() {
+	if c.ctx != nil && c.cancel != nil {
+		return
+	}
+
+	parent := c.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	c.ctx, c.cancel = context.WithCancel(parent)
 }
 
 // queryContext returns a cancellable context for query execution.
@@ -227,6 +241,7 @@ func (c *clientConn) queryContextForCursor() (context.Context, func()) {
 }
 
 func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
+	c.ensureConnectionContext()
 	ctx, cancel := context.WithCancel(c.ctx)
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
@@ -323,8 +338,49 @@ func isQueryCancelled(err error) bool {
 	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
 }
 
+// isDuckLakeTransactionConflict returns true if the error is a DuckLake
+// transaction conflict. These occur when concurrent DuckLake transactions
+// try to commit overlapping changes. DuckLake uses global snapshot IDs, so
+// even writes to unrelated tables can conflict under concurrency.
+func isDuckLakeTransactionConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Transaction conflict")
+}
+
+// isDuckLakeMetadataConnectionLost returns true if the error indicates the
+// DuckLake metadata store connection was lost during a transaction. This
+// typically happens when long-running queries leave the metadata connection
+// idle long enough for RDS or a network layer to drop it.
+func isDuckLakeMetadataConnectionLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "DuckLake transaction") &&
+		strings.Contains(msg, "SSL connection has been closed unexpectedly")
+}
+
+// logQueryError logs a query execution failure with additional context for
+// DuckLake-specific errors (transaction conflicts and metadata connection loss).
+func logQueryError(user, query string, err error) {
+	if isDuckLakeTransactionConflict(err) {
+		slog.Warn("DuckLake transaction conflict.",
+			"user", user, "query", query, "error", err)
+		return
+	}
+	if isDuckLakeMetadataConnectionLost(err) {
+		slog.Warn("DuckLake metadata connection lost during transaction.",
+			"user", user, "query", query, "error", err)
+		return
+	}
+	slog.Error("Query execution failed.", "user", user, "query", query, "error", err)
+}
+
 // isConnectionBroken checks if an error indicates a broken connection
-// (e.g., SSL connection closed, network error)
+// (e.g., SSL connection closed, network error).
 func isConnectionBroken(err error) bool {
 	if err == nil {
 		return false
@@ -553,7 +609,7 @@ func hasCommandPrefix(query, prefix string) bool {
 }
 
 func (c *clientConn) serve() error {
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.ensureConnectionContext()
 	defer c.cancel()
 
 	c.reader = bufio.NewReader(c.conn)
@@ -723,7 +779,7 @@ func (c *clientConn) handleStartup() error {
 
 		// Reject non-TLS connections
 		if !tlsUpgraded {
-			c.sendError("FATAL", "28000", "SSL/TLS connection required")
+			c.sendError("FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
 			return fmt.Errorf("client did not request SSL")
 		}
 
@@ -894,7 +950,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	c.currentQuery.Store(query)
-	defer c.currentQuery.Store("")
+	c.queryStart.Store(time.Now())
+	defer func() {
+		c.currentQuery.Store("")
+		c.queryStart.Store(time.Time{})
+	}()
 
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
@@ -1070,7 +1130,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 					errMsg = "canceling statement due to user request"
 					c.sendError("ERROR", errCode, errMsg)
 				} else {
-					slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+					logQueryError(c.username, query, err)
 					c.sendError("ERROR", errCode, errMsg)
 				}
 				c.setTxError()
@@ -1123,7 +1183,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			if isQueryCancelled(err) {
 				c.sendError("ERROR", "57014", "canceling statement due to user request")
 			} else {
-				slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+				logQueryError(c.username, query, err)
 				c.sendError("ERROR", "42000", err.Error())
 			}
 			c.setTxError()
@@ -1161,7 +1221,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			errMsg = "canceling statement due to user request"
 			c.sendError("ERROR", errCode, errMsg)
 		} else {
-			slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
+			logQueryError(c.username, query, err)
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
@@ -1290,6 +1350,8 @@ func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error
 // client (so the caller can stop processing a batch), or (false, err) for
 // fatal connection errors.
 func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
+	start := time.Now()
+
 	// Check for cursor operations before transpilation
 	tree, parseErr := pg_query.Parse(query)
 	if parseErr == nil && len(tree.Stmts) == 1 {
@@ -1504,20 +1566,29 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				}
 			}
 			if err != nil {
+				errCode := "42000"
+				errMsg := err.Error()
 				if isQueryCancelled(err) {
-					c.sendError("ERROR", "57014", "canceling statement due to user request")
+					errCode = "57014"
+					errMsg = "canceling statement due to user request"
 				} else {
-					slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
-					c.sendError("ERROR", "42000", err.Error())
+					logQueryError(c.username, executedQuery, err)
 				}
+				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
+				c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
 				return true, nil
 			}
 		}
 
+		var writtenRows int64
+		if execResult != nil {
+			writtenRows, _ = execResult.RowsAffected()
+		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = writeCommandComplete(c.writer, tag)
+		c.logQuery(start, query, executedQuery, cmdType, 0, writtenRows, "", "", "simple-batch")
 		return false, nil
 	}
 
@@ -1527,13 +1598,17 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	rows, err := c.executor.QueryContext(ctx, executedQuery)
 	if err != nil {
+		errCode := "42000"
+		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
 		} else {
-			slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			logQueryError(c.username, executedQuery, err)
 		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
+		c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
 		return true, nil
 	}
 	defer func() { _ = rows.Close() }()
@@ -1584,6 +1659,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
+	c.logQuery(start, query, executedQuery, cmdType, int64(rowCount), 0, "", "", "simple-batch")
 	return false, nil
 }
 
@@ -2750,7 +2826,7 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 	// STRICT_MODE FALSE allows reading rows that don't strictly comply with CSV standard
 	// PARALLEL FALSE avoids "Parallel CSV Reader does not support full read" errors
 	// on files streamed from COPY FROM STDIN (temp files with no seek support for sniffing)
-	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE", "PARALLEL FALSE"}
+	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE", "PARALLEL FALSE", "MAX_LINE_SIZE 10485760"}
 	if opts.HasHeader {
 		copyOptions = append(copyOptions, "HEADER")
 	}
@@ -3141,6 +3217,20 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return c.handleCopyInBinary(query, opts, cols, colTypes)
 	}
 
+	// Check for BLOB columns. DuckDB's CSV parser cannot handle raw binary data
+	// in BLOB columns — it auto-detects the type but fails to parse the bytes.
+	// Fall back to in-process CSV parsing with batched INSERT for these tables.
+	var blobColIndices []int
+	for i, ct := range colTypes {
+		if ct.DatabaseTypeName() == "BLOB" {
+			blobColIndices = append(blobColIndices, i)
+		}
+	}
+	if len(blobColIndices) > 0 {
+		slog.Debug("COPY FROM STDIN: table has BLOB columns, using CSV parse fallback.", "user", c.username, "blob_columns", len(blobColIndices))
+		return c.handleCopyInCSVWithBlob(query, opts, cols, colTypes, blobColIndices)
+	}
+
 	// Send CopyInResponse
 	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
@@ -3257,6 +3347,141 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "08P01", errMsg, "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+	}
+}
+
+// handleCopyInCSVWithBlob handles COPY FROM STDIN for tables that contain BLOB columns.
+// DuckDB's native CSV COPY cannot handle raw binary data in BLOB columns because it
+// auto-detects the type and fails to parse the bytes. This method parses the CSV in Go,
+// converts BLOB column values to []byte, and uses batched INSERT statements.
+func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions, cols []string, colTypes []ColumnTyper, blobColIndices []int) error {
+	copyStartTime := time.Now()
+
+	// Build a set for O(1) BLOB column index lookup
+	isBlobCol := make(map[int]bool, len(blobColIndices))
+	for _, idx := range blobColIndices {
+		isBlobCol[idx] = true
+	}
+
+	// Send CopyInResponse (text format)
+	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
+		return err
+	}
+	_ = c.writer.Flush()
+
+	// Buffer all CopyData messages into memory (we need to parse CSV, not stream to file)
+	var buf bytes.Buffer
+	for {
+		msgType, body, err := readMessage(c.reader)
+		if err != nil {
+			return err
+		}
+
+		switch msgType {
+		case msgCopyData:
+			// Skip end-of-data marker
+			if (len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
+				(len(body) == 2 && body[0] == '\\' && body[1] == '.') {
+				continue
+			}
+			buf.Write(body)
+
+		case msgCopyDone:
+			dataReceiveElapsed := time.Since(copyStartTime)
+			slog.Debug("COPY FROM STDIN (BLOB fallback) CopyDone received.", "user", c.username, "bytes", buf.Len(), "duration", dataReceiveElapsed)
+
+			// Parse CSV from the buffered data
+			csvReader := csv.NewReader(&buf)
+			csvReader.Comma = rune(opts.Delimiter[0])
+			csvReader.LazyQuotes = true
+
+			// Skip header row if present
+			if opts.HasHeader {
+				if _, err := csvReader.Read(); err != nil {
+					errMsg := fmt.Sprintf("COPY failed: error reading CSV header: %v", err)
+					c.sendError("ERROR", "22P02", errMsg)
+					c.setTxError()
+					c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
+					_ = writeReadyForQuery(c.writer, c.txStatus)
+					_ = c.writer.Flush()
+					return nil
+				}
+			}
+
+			// Parse all rows and convert BLOB columns to []byte
+			var rows [][]interface{}
+			for {
+				record, err := csvReader.Read()
+				if err != nil {
+					break // EOF or error — stop reading
+				}
+				if len(record) != len(cols) {
+					slog.Warn("COPY FROM STDIN (BLOB fallback) skipping row with wrong field count.", "expected", len(cols), "got", len(record))
+					continue
+				}
+				row := make([]interface{}, len(cols))
+				for j, field := range record {
+					if field == opts.NullString {
+						row[j] = nil
+					} else if isBlobCol[j] {
+						row[j] = []byte(field)
+					} else {
+						row[j] = field
+					}
+				}
+				rows = append(rows, row)
+			}
+
+			if len(rows) == 0 {
+				_ = writeCommandComplete(c.writer, "COPY 0")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "", "", "simple")
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
+				return nil
+			}
+
+			loadStart := time.Now()
+			rowCount, err := c.batchInsertRows(opts.TableName, opts.ColumnList, cols, rows)
+			if err != nil {
+				slog.Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "user", c.username, "error", err)
+				errMsg := fmt.Sprintf("COPY failed: %v", err)
+				c.sendError("ERROR", "22P02", errMsg)
+				c.setTxError()
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
+				return nil
+			}
+
+			totalElapsed := time.Since(copyStartTime)
+			loadElapsed := time.Since(loadStart)
+			slog.Info("COPY FROM STDIN (BLOB fallback) completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
+
+			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		case msgCopyFail:
+			errMsg := string(bytes.TrimRight(body, "\x00"))
+			exception := fmt.Sprintf("COPY failed: %s", errMsg)
+			c.sendError("ERROR", "57014", exception)
+			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		default:
+			errMsg := fmt.Sprintf("unexpected message type during COPY: %c", msgType)
+			c.sendError("ERROR", "08P01", errMsg)
+			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3993,6 +4218,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 	} else if severity == "ERROR" {
 		queryErrorsCounter.Inc()
 	}
+	slog.Debug("Sending error to client.", "user", c.username, "severity", severity, "code", code, "message", message)
 	_ = writeErrorResponse(c.writer, severity, code, message)
 	_ = c.writer.Flush()
 }
@@ -4556,7 +4782,11 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	c.currentQuery.Store(p.stmt.query)
-	defer c.currentQuery.Store("")
+	c.queryStart.Store(time.Now())
+	defer func() {
+		c.currentQuery.Store("")
+		c.queryStart.Store(time.Time{})
+	}()
 
 	// Handle cursor operations before normal execution
 	switch p.stmt.cursorOp {
@@ -4652,7 +4882,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				}
 			}
 			if err != nil {
-				slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
+				logQueryError(c.username, convertedQuery, err)
 				c.sendError("ERROR", "42000", err.Error())
 				c.setTxError()
 				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
@@ -4673,7 +4903,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Result-returning query: use Query with converted query
 	rows, err := c.executor.Query(convertedQuery, args...)
 	if err != nil {
-		slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
+		logQueryError(c.username, convertedQuery, err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
@@ -5052,7 +5282,10 @@ var pgStatActivityColumns = []struct {
 	{"query", 25, -1},            // text
 	{"backend_type", 25, -1},     // text
 	{"leader_pid", 23, 4},        // int4 (NULL)
-	{"worker_id", 23, 4},         // int4 (duckgres extension)
+	{"worker_id", 23, 4},             // int4 (duckgres extension)
+	{"query_progress", 701, 8},       // float8 (percentage, -1 if not tracked)
+	{"rows_processed", 20, 8},        // int8
+	{"total_rows_to_process", 20, 8}, // int8
 }
 
 // pgStatActivityTypeOIDs is precomputed from pgStatActivityColumns to avoid per-row allocation.
@@ -5156,6 +5389,30 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		}
 	}
 
+	// query_start: populated from atomic.Value when a query is active.
+	var queryStart interface{}
+	if qs, ok := conn.queryStart.Load().(time.Time); ok && !qs.IsZero() {
+		queryStart = qs
+	}
+
+	// Query progress columns: populated from cached worker health check data
+	// (control plane mode) or nil (standalone mode).
+	var queryProgress, rowsProcessed, totalRowsToProcess interface{}
+	if c.server.progressFn != nil {
+		pct, rows, total, stalled := c.server.progressFn(conn.pid)
+		queryProgress = pct
+		rowsProcessed = int64(rows)
+		totalRowsToProcess = int64(total)
+		// Override state to "active (stuck)" when the worker detects no progress.
+		if stalled && state == "active" {
+			state = "active (stuck)"
+		}
+	} else {
+		queryProgress = float64(-1)
+		rowsProcessed = int64(0)
+		totalRowsToProcess = int64(0)
+	}
+
 	values := []interface{}{
 		int32(0),             // datid
 		conn.database,        // datname
@@ -5167,7 +5424,7 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		clientPort,           // client_port
 		conn.backendStart,    // backend_start
 		nil,                  // xact_start (NULL)
-		nil,                  // query_start (NULL)
+		queryStart,           // query_start
 		nil,                  // state_change (NULL)
 		nil,                  // wait_event_type (NULL)
 		nil,                  // wait_event (NULL)
@@ -5178,6 +5435,9 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		"client backend",     // backend_type
 		nil,                  // leader_pid (NULL)
 		int32(conn.workerID), // worker_id
+		queryProgress,        // query_progress (float8)
+		rowsProcessed,        // rows_processed (int8)
+		totalRowsToProcess,   // total_rows_to_process (int8)
 	}
 
 	return c.sendDataRowWithFormats(values, formatCodes, pgStatActivityTypeOIDs)

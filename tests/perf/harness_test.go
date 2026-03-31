@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/posthog/duckgres/tests/perf/datasets"
 	flightdriver "github.com/posthog/duckgres/tests/perf/drivers/flight"
 	pgdriver "github.com/posthog/duckgres/tests/perf/drivers/pgwire"
+	"github.com/posthog/duckgres/tests/perf/publisher"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -35,7 +37,14 @@ var (
 	perfUsername              = flag.String("perf-username", "perfuser", "username for harness-created duckgres")
 	perfPassword              = flag.String("perf-password", "perfpass", "password for harness-created duckgres")
 	perfFlightInsecureSkipTLS = flag.Bool("perf-flight-insecure-skip-verify", true, "skip TLS cert verification for Flight client")
+	perfDatasetManifestTable  = flag.String("perf-dataset-manifest-table", envOrDefault("DUCKGRES_PERF_DATASET_MANIFEST_TABLE", defaultDatasetManifestTable), "manifest table associated with frozen dataset runs")
+	perfPublishDSN            = flag.String("perf-publish-dsn", os.Getenv("DUCKGRES_PERF_PUBLISH_DSN"), "optional Duckgres DSN for publishing perf artifacts")
+	perfPublishPassword       = flag.String("perf-publish-password", os.Getenv("DUCKGRES_PERF_PUBLISH_PASSWORD"), "optional password override for the perf artifact publisher")
+	perfPublishSchema         = flag.String("perf-publish-schema", envOrDefault("DUCKGRES_PERF_PUBLISH_SCHEMA", "duckgres_perf"), "target schema for published perf artifacts")
+	perfPublishBootstrap      = flag.Bool("perf-publish-bootstrap-schema", envBoolOrDefault("DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA", true), "bootstrap publisher schema/table definitions before inserting rows")
 )
+
+var publishRunDir = publisher.PublishRunDir
 
 func TestGoldenQueryPerformanceHarness(t *testing.T) {
 	if !*perfRun {
@@ -84,6 +93,10 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 		pgwireDSN = h.pgwireDSN
 		flightAddr = h.flightAddr
 	}
+	pgwireDSN, err = pgwireDSNForHarness(pgwireDSN, *perfPassword)
+	if err != nil {
+		t.Fatalf("resolve pgwire dsn: %v", err)
+	}
 
 	pg, err := pgdriver.NewFromDSN(pgwireDSN)
 	if err != nil {
@@ -98,6 +111,7 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 	t.Cleanup(func() { _ = flight.Close() })
 
 	runner := core.NewQueryRunner(core.RunnerConfig{
+		RunID:          runID,
 		Catalog:        catalog,
 		DatasetVersion: runtimeContract.DatasetVersion,
 		Drivers: map[core.Protocol]core.ProtocolDriver{
@@ -161,11 +175,62 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 			t.Fatalf("expected artifact %s: %v", artifact, err)
 		}
 	}
+
+	publishCfg := currentPublisherConfig()
+	if err := finalizeRunArtifacts(
+		context.Background(),
+		publishCfg,
+		runtimeContract,
+		outputDir,
+		*perfCatalog,
+		*perfDatasetManifestTable,
+		time.Now,
+	); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func defaultManifestPath(catalogPath string) string {
 	catalogDir := filepath.Dir(filepath.Clean(catalogPath))
 	return filepath.Join(filepath.Dir(catalogDir), "datasets", "manifest.yaml")
+}
+
+func currentPublisherConfig() publisher.Config {
+	return publisher.Config{
+		DSN:             *perfPublishDSN,
+		Password:        *perfPublishPassword,
+		Schema:          *perfPublishSchema,
+		BootstrapSchema: *perfPublishBootstrap,
+	}
+}
+
+func publishArtifactsIfConfigured(ctx context.Context, cfg publisher.Config, runDir string) error {
+	if !cfg.Enabled() {
+		return nil
+	}
+	if err := publishRunDir(ctx, cfg, runDir); err != nil {
+		return fmt.Errorf("publish perf artifacts: %w", err)
+	}
+	return nil
+}
+
+func envOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func seedDatasetViaDriver(ctx context.Context, driver core.ProtocolDriver, records []datasets.Record) error {

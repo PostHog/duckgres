@@ -141,6 +141,12 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 		return &Result{SQL: sql}, nil
 	}
 
+	// Pre-parse interceptions for SQL that isn't valid PostgreSQL syntax
+	// but has well-defined duckgres semantics (e.g., SHOW CREATE TABLE).
+	if rewritten, ok := interceptShowCreate(sql, t.config.DuckLakeMode); ok {
+		return &Result{SQL: rewritten}, nil
+	}
+
 	// Tier 0: Pre-parse classification
 	cls := Classify(sql, t.config)
 	if cls.Direct {
@@ -289,7 +295,8 @@ func Classify(sql string, cfg Config) Classification {
 		"PG_GET_STATISTICSOBJDEF_COLUMNS",
 		"PG_RULES", "PG_AUTH_MEMBERS", "PG_OPCLASS", "PG_CONVERSION",
 		"PG_LANGUAGE", "PG_FOREIGN_SERVER", "PG_FOREIGN_DATA_WRAPPER",
-		"PG_FOREIGN_TABLE", "PG_TRIGGER", "PG_LOCKS",
+		"PG_FOREIGN_TABLE", "PG_TRIGGER", "PG_LOCKS", "PG_REWRITE",
+		"PG_STAT_GET_NUMSCANS(",
 		"HAS_SCHEMA_PRIVILEGE(", "HAS_TABLE_PRIVILEGE(", "HAS_DATABASE_PRIVILEGE(", "HAS_ANY_COLUMN_PRIVILEGE(",
 		"SIMILAR_TO_ESCAPE", "CURRENT_SETTING(",
 		"UPTIME(", "WORKER_UPTIME(", "WORKER_VERSION(",
@@ -429,6 +436,28 @@ func Classify(sql string, cfg Config) Classification {
 			"CHECK ", "CHECK(",
 			"REINDEX", "CLUSTER", "COMMENT ON", "REFRESH ") {
 			flags |= FlagDDL
+		}
+	}
+
+	// ClickHouse SQL macros (DuckLake mode only).
+	// These are created in memory.main and need explicit qualification.
+	if cfg.DuckLakeMode {
+		if containsAny(upper,
+			"TOSTRING(", "TOINT32(", "TOINT64(", "TOFLOAT(",
+			"TOINT32ORNULL(", "TOINT32ORZERO(",
+			"INTDIV(", "MODULO(",
+			"EMPTY(", "NOTEMPTY(",
+			"SPLITBYCHAR(", "LENGTHUTF8(",
+			"TOYEAR(", "TOMONTH(", "TODAYOFMONTH(",
+			"TOYYYYMMDD(", "TOYYYYMM(",
+			"PROTOCOL(", "DOMAIN(",
+			"TOPLEVELDOMAIN(",
+			"IPV4NUMTOSTRING(",
+			"JSONEXTRACTSTRING(", "JSONHAS(",
+			"GENERATEUUIDV4(",
+			"IFNULL(",
+		) {
+			flags |= FlagPgCatalog
 		}
 	}
 

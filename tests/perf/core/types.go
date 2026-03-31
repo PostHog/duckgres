@@ -35,15 +35,16 @@ type ExecutionResult struct {
 }
 
 type QueryResult struct {
-	QueryID    string        `json:"query_id"`
-	IntentID   string        `json:"intent_id"`
-	Protocol   Protocol      `json:"protocol"`
-	Status     string        `json:"status"`
-	Error      string        `json:"error,omitempty"`
-	ErrorClass string        `json:"error_class,omitempty"`
-	Rows       int64         `json:"rows"`
-	Duration   time.Duration `json:"duration_ns"`
-	StartedAt  time.Time     `json:"started_at"`
+	QueryID          string        `json:"query_id"`
+	IntentID         string        `json:"intent_id"`
+	MeasureIteration int           `json:"measure_iteration"`
+	Protocol         Protocol      `json:"protocol"`
+	Status           string        `json:"status"`
+	Error            string        `json:"error,omitempty"`
+	ErrorClass       string        `json:"error_class,omitempty"`
+	Rows             int64         `json:"rows"`
+	Duration         time.Duration `json:"duration_ns"`
+	StartedAt        time.Time     `json:"started_at"`
 }
 
 type RunSummary struct {

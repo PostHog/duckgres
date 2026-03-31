@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	bindings "github.com/duckdb/duckdb-go-bindings"
+	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -44,6 +48,35 @@ func (h *FlightSQLHandler) sessionFromContext(ctx context.Context) (*Session, er
 	if !ok {
 		return nil, status.Error(codes.Unauthenticated, "session not found")
 	}
+	if h.pool.sharedWarmMode {
+		epochs := md.Get("x-duckgres-owner-epoch")
+		if len(epochs) == 0 {
+			return nil, status.Error(codes.Unauthenticated, "missing x-duckgres-owner-epoch header")
+		}
+		ownerEpoch, err := strconv.ParseInt(epochs[0], 10, 64)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid x-duckgres-owner-epoch header")
+		}
+		workerIDs := md.Get("x-duckgres-worker-id")
+		if len(workerIDs) == 0 {
+			return nil, status.Error(codes.Unauthenticated, "missing x-duckgres-worker-id header")
+		}
+		workerID, err := strconv.Atoi(workerIDs[0])
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid x-duckgres-worker-id header")
+		}
+		cpInstanceIDs := md.Get("x-duckgres-cp-instance-id")
+		if len(cpInstanceIDs) == 0 {
+			return nil, status.Error(codes.Unauthenticated, "missing x-duckgres-cp-instance-id header")
+		}
+		if err := h.pool.validateControlMetadata(server.WorkerControlMetadata{
+			WorkerID:     workerID,
+			OwnerEpoch:   ownerEpoch,
+			CPInstanceID: cpInstanceIDs[0],
+		}); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+		}
+	}
 	session.lastUsed.Store(time.Now().UnixNano())
 
 	return session, nil
@@ -52,21 +85,28 @@ func (h *FlightSQLHandler) sessionFromContext(ctx context.Context) (*Session, er
 // Custom action handlers (called via customActionServer.DoAction)
 
 func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightService_DoActionServer) error {
-	var req struct {
-		Username    string `json:"username"`
-		MemoryLimit string `json:"memory_limit"`
-		Threads     int    `json:"threads"`
-	}
+	var req server.WorkerCreateSessionPayload
 	if err := json.Unmarshal(body, &req); err != nil {
 		return status.Errorf(codes.InvalidArgument, "invalid CreateSession request: %v", err)
 	}
 	if req.Username == "" {
 		return status.Error(codes.InvalidArgument, "username is required")
 	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+	}
+
+	if h.pool.sharedWarmMode {
+		if _, err := h.pool.currentSessionConfig(); err != nil {
+			return status.Error(codes.FailedPrecondition, "worker is not activated")
+		}
+	}
 
 	// Validate username against configured users
-	if _, ok := h.pool.cfg.Users[req.Username]; !ok {
-		return status.Error(codes.PermissionDenied, "unknown username")
+	if !h.pool.sharedWarmMode {
+		if _, ok := h.pool.cfg.Users[req.Username]; !ok {
+			return status.Error(codes.PermissionDenied, "unknown username")
+		}
 	}
 
 	session, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads)
@@ -80,15 +120,36 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	return stream.Send(&flight.Result{Body: resp})
 }
 
-func (h *FlightSQLHandler) doDestroySession(body []byte, stream flight.FlightService_DoActionServer) error {
-	var req struct {
-		SessionToken string `json:"session_token"`
+func (h *FlightSQLHandler) doActivateTenant(body []byte, stream flight.FlightService_DoActionServer) error {
+	var payload ActivationPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid ActivateTenant request: %v", err)
 	}
+	if strings.TrimSpace(payload.OrgID) == "" {
+		return status.Error(codes.InvalidArgument, "org_id is required")
+	}
+	if current := h.pool.currentActivation(); current != nil && current.payload.OrgID != payload.OrgID {
+		return status.Errorf(codes.FailedPrecondition, "activate tenant: worker already activated for org %q", current.payload.OrgID)
+	}
+
+	if err := h.pool.activateTenantFunc(payload); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "activate tenant: %v", err)
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
+	return stream.Send(&flight.Result{Body: resp})
+}
+
+func (h *FlightSQLHandler) doDestroySession(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerDestroySessionPayload
 	if err := json.Unmarshal(body, &req); err != nil {
 		return status.Errorf(codes.InvalidArgument, "invalid DestroySession request: %v", err)
 	}
 	if req.SessionToken == "" {
 		return status.Error(codes.InvalidArgument, "session_token is required")
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
 	}
 
 	if err := h.pool.DestroySession(req.SessionToken); err != nil {
@@ -99,11 +160,83 @@ func (h *FlightSQLHandler) doDestroySession(body []byte, stream flight.FlightSer
 	return stream.Send(&flight.Result{Body: resp})
 }
 
-func (h *FlightSQLHandler) doHealthCheck(stream flight.FlightService_DoActionServer) error {
+func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerHealthCheckPayload
+	if err := json.Unmarshal(body, &req); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid HealthCheck request: %v", err)
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+	}
+
+	// Block until warmup (extension loading + DuckLake attachment) completes.
+	// Without this, the control plane's waitForWorkerTCP health check passes
+	// as soon as the gRPC server starts, and clients get routed to a worker
+	// that hasn't attached DuckLake yet.
+	<-h.pool.warmupDone
+
+	// Poll DuckDB query progress for each active session.
+	type sessionProgressInfo struct {
+		Pct     float64 `json:"pct"`
+		Rows    uint64  `json:"rows"`
+		Total   uint64  `json:"total"`
+		Stalled bool    `json:"stalled,omitempty"`
+	}
+	sessionProgress := make(map[string]sessionProgressInfo)
+
+	h.pool.mu.RLock()
+	for token, session := range h.pool.sessions {
+		if session.duckdbConn.Ptr == nil {
+			continue
+		}
+
+		qp := bindings.QueryProgress(session.duckdbConn)
+		pct, rows, total := bindings.QueryProgressTypeMembers(&qp)
+
+		// Use truncated token as key to avoid leaking full bearer tokens
+		// in the health check JSON response. 16 hex chars = 8 bytes of entropy,
+		// sufficient for matching on the control plane side.
+		key := token
+		if len(key) > 16 {
+			key = key[:16]
+		}
+
+		stalled := false
+
+		if !session.progress.queryActive.Load() {
+			// No query running — reset stall tracking.
+			session.progress.lastRowsProcessed.Store(0)
+			session.progress.stalledChecks.Store(0)
+		} else if pct < 0 {
+			// pct == -1 means DuckDB can't track this query; skip stall detection.
+		} else {
+			if rows == session.progress.lastRowsProcessed.Load() {
+				session.progress.stalledChecks.Add(1)
+			} else {
+				session.progress.lastRowsProcessed.Store(rows)
+				session.progress.stalledChecks.Store(0)
+			}
+
+			if session.progress.stalledChecks.Load() >= stallCheckThreshold {
+				stalled = true
+				// Log once when first crossing the threshold (exact match avoids log spam).
+				if session.progress.stalledChecks.Load() == stallCheckThreshold {
+					slog.Warn("Query appears stuck — no progress detected.",
+						"session", key, "rows_processed", rows, "total_rows", total,
+						"stalled_checks", stallCheckThreshold)
+				}
+			}
+		}
+
+		sessionProgress[key] = sessionProgressInfo{Pct: pct, Rows: rows, Total: total, Stalled: stalled}
+	}
+	h.pool.mu.RUnlock()
+
 	resp, _ := json.Marshal(map[string]interface{}{
-		"healthy":   true,
-		"sessions":  h.pool.ActiveSessions(),
-		"uptime_ns": time.Since(h.pool.startTime).Nanoseconds(),
+		"healthy":          true,
+		"sessions":         h.pool.ActiveSessions(),
+		"uptime_ns":        time.Since(h.pool.startTime).Nanoseconds(),
+		"session_progress": sessionProgress,
 	})
 	return stream.Send(&flight.Result{Body: resp})
 }
@@ -149,7 +282,11 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		return nil, err
 	}
 
-	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
+	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
+	schema, err := retryOnTransient(func() (*arrow.Schema, error) {
+		return GetQuerySchema(ctx, session.Conn, query, tx)
+	})
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
@@ -222,13 +359,14 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			session.mu.Unlock()
 		}()
 
-		var rows *sql.Rows
-		var qerr error
-		if tx != nil {
-			rows, qerr = tx.QueryContext(ctx, handle.Query)
-		} else {
-			rows, qerr = session.Conn.QueryContext(ctx, handle.Query)
-		}
+		session.progress.queryActive.Store(true)
+		defer session.progress.queryActive.Store(false)
+		rows, qerr := retryOnTransient(func() (*sql.Rows, error) {
+			if tx != nil {
+				return tx.QueryContext(ctx, handle.Query)
+			}
+			return session.Conn.QueryContext(ctx, handle.Query)
+		})
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
 			return
@@ -272,14 +410,17 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if isEmptyFlightQuery(query) {
 		return 0, nil
 	}
-	var result sql.Result
-	if tx != nil {
-		result, err = tx.ExecContext(ctx, query)
-	} else {
-		result, err = session.Conn.ExecContext(ctx, query)
-	}
-	if err != nil {
-		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", err)
+	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
+
+	result, execErr := retryOnTransient(func() (sql.Result, error) {
+		if tx != nil {
+			return tx.ExecContext(ctx, query)
+		}
+		return session.Conn.ExecContext(ctx, query)
+	})
+	if execErr != nil {
+		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
 
 	affected, err := result.RowsAffected()
@@ -385,6 +526,8 @@ func (h *FlightSQLHandler) CreatePreparedStatement(ctx context.Context,
 		}, nil
 	}
 
+	session.progress.queryActive.Store(true)
+	defer session.progress.queryActive.Store(false)
 	schema, err := GetQuerySchema(ctx, session.Conn, query, tx)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.InvalidArgument, "failed to prepare: %v", err)
@@ -482,6 +625,8 @@ func (h *FlightSQLHandler) DoGetPreparedStatement(ctx context.Context,
 
 	go func() {
 		defer close(ch)
+		session.progress.queryActive.Store(true)
+		defer session.progress.queryActive.Store(false)
 		var rows *sql.Rows
 		var qerr error
 		if tx != nil {

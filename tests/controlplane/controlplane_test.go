@@ -149,7 +149,7 @@ users:
 		configContent += fmt.Sprintf("flight_port: %d\n", flightPort)
 	}
 	if opts.maxWorkers > 0 {
-		configContent += fmt.Sprintf("max_workers: %d\n", opts.maxWorkers)
+		configContent += fmt.Sprintf("process:\n  max_workers: %d\n", opts.maxWorkers)
 	}
 	if err := os.WriteFile(configFile, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write config: %v", err)
@@ -228,7 +228,6 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 	}
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
 }
-
 
 func (h *cpHarness) cleanup(t *testing.T) {
 	t.Helper()

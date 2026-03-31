@@ -17,24 +17,26 @@ func TestArtifactSinkWritesSummaryCSVAndMetrics(t *testing.T) {
 	}
 
 	if err := sink.Record(QueryResult{
-		QueryID:   "q1",
-		IntentID:  "i1",
-		Protocol:  ProtocolPGWire,
-		Status:    "ok",
-		Rows:      2,
-		Duration:  10 * time.Millisecond,
-		StartedAt: time.Unix(1700000000, 0),
+		QueryID:          "q1",
+		IntentID:         "i1",
+		MeasureIteration: 1,
+		Protocol:         ProtocolPGWire,
+		Status:           "ok",
+		Rows:             2,
+		Duration:         10 * time.Millisecond,
+		StartedAt:        time.Unix(1700000000, 0),
 	}); err != nil {
 		t.Fatalf("Record returned error: %v", err)
 	}
 	if err := sink.Record(QueryResult{
-		QueryID:   "q2",
-		IntentID:  "i2",
-		Protocol:  ProtocolFlight,
-		Status:    "error",
-		Error:     "boom",
-		Duration:  5 * time.Millisecond,
-		StartedAt: time.Unix(1700000010, 0),
+		QueryID:          "q2",
+		IntentID:         "i2",
+		MeasureIteration: 2,
+		Protocol:         ProtocolFlight,
+		Status:           "error",
+		Error:            "boom",
+		Duration:         5 * time.Millisecond,
+		StartedAt:        time.Unix(1700000010, 0),
 	}); err != nil {
 		t.Fatalf("Record returned error: %v", err)
 	}
@@ -77,7 +79,10 @@ func TestArtifactSinkWritesSummaryCSVAndMetrics(t *testing.T) {
 		t.Fatalf("ReadFile csv: %v", err)
 	}
 	csvText := string(csvBytes)
-	if !strings.Contains(csvText, "query_id,") || !strings.Contains(csvText, ",protocol,") {
-		t.Fatalf("csv header missing query_id/protocol: %q", csvText)
+	if !strings.Contains(csvText, "query_id,") || !strings.Contains(csvText, ",measure_iteration,") || !strings.Contains(csvText, ",protocol,") {
+		t.Fatalf("csv header missing query_id/measure_iteration/protocol: %q", csvText)
+	}
+	if !strings.Contains(csvText, "\nq1,i1,1,pgwire,ok,") || !strings.Contains(csvText, "\nq2,i2,2,flight,error,boom,") {
+		t.Fatalf("csv rows missing measure_iteration values: %q", csvText)
 	}
 }

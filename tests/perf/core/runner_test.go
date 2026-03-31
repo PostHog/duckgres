@@ -83,10 +83,57 @@ func TestRunnerLifecycleAndPerQueryRecording(t *testing.T) {
 	if len(sink.results) != 4 {
 		t.Fatalf("expected 4 measured records, got %d", len(sink.results))
 	}
+	for i, got := range []int{
+		sink.results[0].MeasureIteration,
+		sink.results[1].MeasureIteration,
+		sink.results[2].MeasureIteration,
+		sink.results[3].MeasureIteration,
+	} {
+		want := (i / 2) + 1
+		if got != want {
+			t.Fatalf("result %d measure iteration = %d, want %d", i, got, want)
+		}
+	}
 	if summary.TotalQueries != 4 || summary.TotalErrors != 0 {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
 	if summary.DatasetVersion != "v1" {
 		t.Fatalf("expected dataset version v1, got %q", summary.DatasetVersion)
+	}
+}
+
+func TestRunnerUsesConfiguredRunID(t *testing.T) {
+	pg := &testDriver{protocol: ProtocolPGWire}
+	sink := &inMemorySink{}
+
+	runner := NewQueryRunner(RunnerConfig{
+		RunID: "nightly-v1-20260311T234300Z",
+		Catalog: Catalog{
+			Name:              "smoke",
+			WarmupIterations:  0,
+			MeasureIterations: 1,
+			Targets:           []Protocol{ProtocolPGWire},
+			Queries: []Query{
+				{
+					QueryID:    "q1",
+					IntentID:   "i1",
+					PGWireSQL:  "SELECT 1",
+					DuckhogSQL: "SELECT 1",
+				},
+			},
+		},
+		Drivers: map[Protocol]ProtocolDriver{
+			ProtocolPGWire: pg,
+		},
+		Sink: sink,
+		Now:  func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if summary.RunID != "nightly-v1-20260311T234300Z" {
+		t.Fatalf("summary run_id = %q", summary.RunID)
 	}
 }

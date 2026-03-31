@@ -52,20 +52,6 @@ require_frozen_manifest() {
   exit 1
 }
 
-write_dataset_metadata() {
-  if [[ -z "$DATASET_VERSION" ]]; then
-    return 0
-  fi
-  local run_dir="$OUTPUT_BASE/$RUN_ID"
-  local escaped_version escaped_manifest escaped_catalog
-  escaped_version="$(printf '%s' "$DATASET_VERSION" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-  escaped_manifest="$(printf '%s' "$MANIFEST_TABLE" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-  escaped_catalog="$(printf '%s' "$CATALOG_PATH" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-  cat > "$run_dir/dataset_manifest.json" <<EOF
-{"dataset_version":"${escaped_version}","manifest_table":"${escaped_manifest}","catalog":"${escaped_catalog}","checked_at_utc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
-EOF
-}
-
 echo "Running perf smoke harness"
 echo "  catalog: $CATALOG_PATH"
 echo "  output:  $OUTPUT_BASE/$RUN_ID"
@@ -93,11 +79,6 @@ fi
 if [[ -n "$FLIGHT_ADDR" ]]; then
   go_test_args+=(-perf-flight-addr "$FLIGHT_ADDR")
 fi
-if [[ -n "$PGWIRE_DSN" ]]; then
-  PGPASSWORD="$PERF_PASSWORD" "${go_test_args[@]}"
-else
-  "${go_test_args[@]}"
-fi
-write_dataset_metadata
+"${go_test_args[@]}"
 
 echo "Perf smoke artifacts written to $OUTPUT_BASE/$RUN_ID"
