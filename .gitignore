@@ -33,3 +33,4 @@ artifacts/perf/
 .gemini/
 gha-creds-*.json
 data-test/
+.claude/scheduled_tasks.lock

@@ -44,7 +44,10 @@ type captureRuntimeWorkerStore struct {
 	neutralSpawnOwnerCPID string
 	neutralSpawnPodPrefix string
 	neutralSpawnTarget    int
-	neutralSpawnMaxGlobal int
+	neutralSpawnMaxGlobal  int
+	hotIdleClaimResult     *configstore.WorkerRecord
+	hotIdleClaimCPID       string
+	hotIdleClaimOrgID      string
 	takenOver             *configstore.WorkerRecord
 	takeOverErr           error
 	takeOverWorkerID      int
@@ -83,6 +86,18 @@ func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID str
 	}
 	claimed := *s.claimed
 	return &claimed, nil
+}
+
+func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hotIdleClaimCPID = ownerCPInstanceID
+	s.hotIdleClaimOrgID = orgID
+	if s.hotIdleClaimResult != nil {
+		r := *s.hotIdleClaimResult
+		return &r, nil
+	}
+	return nil, nil
 }
 
 func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {

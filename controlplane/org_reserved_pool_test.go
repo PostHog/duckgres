@@ -86,7 +86,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 	}
 }
 
-func TestOrgReservedPoolReleaseWorkerRetiresWorkerOnLastSession(t *testing.T) {
+func TestOrgReservedPoolReleaseWorkerTransitionsToHotIdleOnLastSession(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 9, activeSessions: 1, done: make(chan struct{})}
 	worker.SetOwnerCPInstanceID(shared.cpInstanceID)
@@ -104,8 +104,15 @@ func TestOrgReservedPoolReleaseWorkerRetiresWorkerOnLastSession(t *testing.T) {
 	pool := NewOrgReservedPool(shared, "analytics", 1, nil)
 	pool.ReleaseWorker(worker.ID)
 
-	if _, ok := shared.Worker(worker.ID); ok {
-		t.Fatal("expected worker to be retired after last session release")
+	w, ok := shared.Worker(worker.ID)
+	if !ok {
+		t.Fatal("expected worker to still exist after hot-idle transition")
+	}
+	if got := w.SharedState().NormalizedLifecycle(); got != WorkerLifecycleHotIdle {
+		t.Fatalf("expected hot_idle lifecycle, got %q", got)
+	}
+	if w.SharedState().Assignment == nil || w.SharedState().Assignment.OrgID != "analytics" {
+		t.Fatal("expected org assignment to be retained in hot_idle state")
 	}
 }
 

@@ -1178,7 +1178,7 @@ func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 	}
 
 	// Determine provider: use credential_chain if explicitly set or if no access key provided
-	provider := s3ProviderForConfig(dlCfg)
+	provider := S3ProviderForConfig(dlCfg)
 
 	var secretStmt string
 
@@ -1206,6 +1206,50 @@ func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 	}
 
 	slog.Info("Created S3 secret successfully.")
+	return nil
+}
+
+// RefreshS3Secret replaces the DuckDB S3 secret with updated credentials.
+// Used when a hot-idle worker is reclaimed and STS credentials have rotated.
+// Respects the configured S3 provider (config, aws_sdk, credential_chain).
+func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}) error {
+	if dlCfg.ObjectStore == "" {
+		return nil
+	}
+	if duckLakeSem != nil {
+		duckLakeSem <- struct{}{}
+		defer func() { <-duckLakeSem }()
+	}
+
+	provider := S3ProviderForConfig(dlCfg)
+	var secretStmt string
+	switch provider {
+	case "aws_sdk":
+		var err error
+		secretStmt, err = buildAWSSdkSecret(context.Background(), dlCfg)
+		if err != nil {
+			return fmt.Errorf("refresh aws_sdk S3 secret: %w", err)
+		}
+	case "credential_chain":
+		secretStmt = buildCredentialChainSecret(dlCfg)
+	default:
+		secretStmt = buildConfigSecret(dlCfg)
+	}
+
+	// If the previous session left the connection in DuckDB's "Current
+	// transaction is aborted" state, the exec will always fail. Issue a
+	// ROLLBACK to recover, matching the pattern in StartCredentialRefresh.
+	if _, err := db.Exec(secretStmt); err != nil {
+		if isTransactionAborted(err) {
+			_, _ = db.Exec("ROLLBACK")
+			if _, retryErr := db.Exec(secretStmt); retryErr != nil {
+				return fmt.Errorf("refresh S3 secret after rollback: %w", retryErr)
+			}
+		} else {
+			return fmt.Errorf("refresh S3 secret: %w", err)
+		}
+	}
+	slog.Debug("Refreshed S3 secret for hot-idle reuse.", "provider", provider)
 	return nil
 }
 
@@ -1374,8 +1418,8 @@ func buildAWSSdkSecret(ctx context.Context, dlCfg DuckLakeConfig) (string, error
 // ensures fresh credentials are always available without excessive IMDS calls.
 var credentialRefreshInterval = 5 * time.Minute
 
-// s3ProviderForConfig returns the effective S3 provider for the given DuckLake config.
-func s3ProviderForConfig(dlCfg DuckLakeConfig) string {
+// S3ProviderForConfig returns the effective S3 provider for the given DuckLake config.
+func S3ProviderForConfig(dlCfg DuckLakeConfig) string {
 	provider := dlCfg.S3Provider
 	if provider == "" {
 		if dlCfg.S3AccessKey != "" {
@@ -1393,7 +1437,7 @@ func needsCredentialRefresh(dlCfg DuckLakeConfig) bool {
 	if dlCfg.ObjectStore == "" {
 		return false
 	}
-	p := s3ProviderForConfig(dlCfg)
+	p := S3ProviderForConfig(dlCfg)
 	return p == "credential_chain" || p == "aws_sdk" || dlCfg.S3SessionToken != ""
 }
 
@@ -1446,7 +1490,7 @@ func StartCredentialRefresh(execer sqlExecer, dlCfg DuckLakeConfig, isTxActive .
 		ticker := time.NewTicker(credentialRefreshInterval)
 		defer ticker.Stop()
 		var consecutiveFailures int
-		provider := s3ProviderForConfig(dlCfg)
+		provider := S3ProviderForConfig(dlCfg)
 		for {
 			select {
 			case <-ticker.C:

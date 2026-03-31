@@ -8,6 +8,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
+
 const (
 	janitorRetireReasonOrphaned        = "orphaned"
 	janitorRetireReasonStuckActivating = "stuck_activating"
@@ -19,6 +20,8 @@ type controlPlaneExpiryStore interface {
 	ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error)
 	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
+	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
+	RetireHotIdleWorker(workerID int) (bool, error)
 }
 
 type ControlPlaneJanitor struct {
@@ -29,8 +32,10 @@ type ControlPlaneJanitor struct {
 	spawnTimeout          time.Duration
 	activateTimeout       time.Duration
 	maxDrainTimeout       time.Duration
+	hotIdleTTL            time.Duration
 	now                   func() time.Time
 	retireWorker          func(record configstore.WorkerRecord, reason string)
+	retireLocalWorker     func(workerID int, reason string) bool // retires from in-memory pool + pod, returns false if not local
 	reconcileWarmCapacity func()
 }
 
@@ -110,6 +115,33 @@ func (j *ControlPlaneJanitor) runOnce() {
 	} else {
 		for _, worker := range stuckWorkers {
 			j.retireRuntimeWorker(worker, janitorRetireReasonStuckActivating)
+		}
+	}
+
+	if j.hotIdleTTL > 0 {
+		cutoff := j.now().Add(-j.hotIdleTTL)
+		expired, err := j.store.ListExpiredHotIdleWorkers(cutoff)
+		if err != nil {
+			slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
+		}
+		for _, record := range expired {
+			// Atomically transition from hot_idle to retired in the DB.
+			// If the worker was concurrently reclaimed (no longer hot_idle),
+			// the conditional update returns false and we skip retirement.
+			retired, err := j.store.RetireHotIdleWorker(record.WorkerID)
+			if err != nil {
+				slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", record.WorkerID, "error", err)
+				continue
+			}
+			if !retired {
+				continue // Worker was reclaimed concurrently
+			}
+			// Try local retire first (removes from in-memory pool + deletes pod).
+			// Falls back to remote retire if the worker isn't in our local pool.
+			localRetired := j.retireLocalWorker != nil && j.retireLocalWorker(record.WorkerID, "hot_idle_ttl_expired")
+			if !localRetired {
+				j.retireRuntimeWorker(record, "hot_idle_ttl_expired")
+			}
 		}
 	}
 

@@ -12,6 +12,7 @@ const (
 	WorkerLifecycleReserved   WorkerLifecycleState = "reserved"
 	WorkerLifecycleActivating WorkerLifecycleState = "activating"
 	WorkerLifecycleHot        WorkerLifecycleState = "hot"
+	WorkerLifecycleHotIdle    WorkerLifecycleState = "hot_idle"
 	WorkerLifecycleDraining   WorkerLifecycleState = "draining"
 	WorkerLifecycleRetired    WorkerLifecycleState = "retired"
 )
@@ -49,7 +50,7 @@ func (s SharedWorkerState) Validate() error {
 			return fmt.Errorf("lifecycle %q cannot have an assignment", lifecycle)
 		}
 		return nil
-	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleDraining:
+	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle, WorkerLifecycleDraining:
 		if err := validateWorkerAssignment(s.Assignment); err != nil {
 			return fmt.Errorf("lifecycle %q requires a valid assignment: %w", lifecycle, err)
 		}
@@ -83,7 +84,7 @@ func (s SharedWorkerState) Transition(next WorkerLifecycleState, assignment *Wor
 	switch next {
 	case WorkerLifecycleIdle:
 		nextState.Assignment = nil
-	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleDraining:
+	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle, WorkerLifecycleDraining:
 		resolved, err := resolveWorkerAssignment(s.Assignment, assignment)
 		if err != nil {
 			return SharedWorkerState{}, err
@@ -118,7 +119,9 @@ func isAllowedWorkerLifecycleTransition(current, next WorkerLifecycleState) bool
 	case WorkerLifecycleActivating:
 		return next == WorkerLifecycleHot || next == WorkerLifecycleRetired
 	case WorkerLifecycleHot:
-		return next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleDraining || next == WorkerLifecycleRetired || next == WorkerLifecycleHotIdle
+	case WorkerLifecycleHotIdle:
+		return next == WorkerLifecycleReserved || next == WorkerLifecycleRetired
 	case WorkerLifecycleDraining:
 		return next == WorkerLifecycleRetired
 	case WorkerLifecycleRetired:

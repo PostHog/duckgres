@@ -496,6 +496,80 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWo
 	return claimed, nil
 }
 
+// ClaimHotIdleWorker atomically claims one hot-idle worker row that was
+// previously activated for the given org. The selected row is locked with
+// SKIP LOCKED and transitioned to reserved while incrementing owner_epoch.
+func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*WorkerRecord, error) {
+	var claimed *WorkerRecord
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		var current WorkerRecord
+		err := tx.Table(cs.runtimeTable(current.TableName())).
+			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("state = ? AND org_id = ?", WorkerStateHotIdle, orgID).
+			Order("worker_id ASC").
+			Take(&current).Error
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil
+			}
+			return err
+		}
+
+		now := time.Now()
+		if err := tx.Table(cs.runtimeTable(current.TableName())).
+			Where("worker_id = ?", current.WorkerID).
+			Updates(map[string]any{
+				"state":                WorkerStateReserved,
+				"owner_cp_instance_id": ownerCPInstanceID,
+				"owner_epoch":          gorm.Expr("owner_epoch + 1"),
+				"updated_at":           now,
+			}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Table(cs.runtimeTable(current.TableName())).
+			First(&current, "worker_id = ?", current.WorkerID).Error; err != nil {
+			return err
+		}
+		claimed = &current
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("claim hot-idle worker: %w", err)
+	}
+	return claimed, nil
+}
+
+// ListExpiredHotIdleWorkers returns hot-idle workers whose updated_at timestamp
+// is at or before the given cutoff time.
+func (cs *ConfigStore) ListExpiredHotIdleWorkers(before time.Time) ([]WorkerRecord, error) {
+	var workers []WorkerRecord
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("state = ? AND updated_at <= ?", WorkerStateHotIdle, before).
+		Find(&workers).Error
+	if err != nil {
+		return nil, fmt.Errorf("list expired hot-idle workers: %w", err)
+	}
+	return workers, nil
+}
+
+// RetireHotIdleWorker atomically transitions a worker from hot_idle to retired.
+// Returns true if the transition happened, false if the worker was no longer hot_idle
+// (e.g. it was reclaimed by another CP pod between the list query and this call).
+func (cs *ConfigStore) RetireHotIdleWorker(workerID int) (bool, error) {
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND state = ?", workerID, WorkerStateHotIdle).
+		Updates(map[string]any{
+			"state":         WorkerStateRetired,
+			"retire_reason": "hot_idle_ttl_expired",
+			"updated_at":    time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("retire hot-idle worker %d: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
 // TakeOverWorker transfers durable worker ownership to a new control-plane
 // instance when the caller still has the expected prior owner_epoch.
 func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*WorkerRecord, error) {
@@ -681,6 +755,7 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 		WorkerStateReserved,
 		WorkerStateActivating,
 		WorkerStateHot,
+		WorkerStateHotIdle,
 		WorkerStateDraining,
 		WorkerStateRetired,
 		WorkerStateLost,
@@ -748,6 +823,7 @@ func (cs *ConfigStore) countActiveWorkers(tx *gorm.DB, where ...any) (int64, err
 		WorkerStateReserved,
 		WorkerStateActivating,
 		WorkerStateHot,
+		WorkerStateHotIdle,
 		WorkerStateDraining,
 	}
 	query := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).Where("state IN ?", activeStates)
