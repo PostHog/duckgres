@@ -1277,16 +1277,19 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
 	}
 
-	// For workers that already have an activation (hot_idle reclaim), pass the
-	// claimed epoch in the health check so the worker doesn't reject epoch 0.
-	hcPayload := server.WorkerHealthCheckPayload{}
-	if claimed.OwnerEpoch > 0 {
-		hcPayload.WorkerID = claimed.WorkerID
-		hcPayload.OwnerEpoch = claimed.OwnerEpoch
-		hcPayload.CPInstanceID = claimed.OwnerCPInstanceID
+	// For hot-idle workers, skip the epoch-validated health check. The worker's
+	// epoch and CP instance ID are from the previous owner, and ClaimHotIdleWorker
+	// already bumped the epoch in the DB. The health check requires exact epoch
+	// match, so neither the old epoch (worker has N, we'd send N+1) nor the new
+	// CP instance ID will pass. ActivateTenant validates the epoch properly
+	// (accepts > current). For fresh neutral workers (epoch 0), use the normal
+	// health-checked path.
+	var client *flightsql.Client
+	if claimed.OwnerEpoch > 1 {
+		client, err = p.connectWorkerDirect(ctx, claimed.PodName, pod.Status.PodIP, token)
+	} else {
+		client, err = p.connectWorker(ctx, claimed.PodName, pod.Status.PodIP, token)
 	}
-
-	client, err := p.connectWorkerWithHealthCheck(ctx, claimed.PodName, pod.Status.PodIP, token, hcPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -1304,6 +1307,33 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 
 func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
 	return p.connectWorkerWithHealthCheck(ctx, podName, podIP, bearerToken, server.WorkerHealthCheckPayload{})
+}
+
+// connectWorkerDirect establishes a gRPC connection without running a health
+// check. Used for hot-idle adoption where the worker's epoch/CP metadata
+// doesn't match the new owner yet (ActivateTenant will update it).
+func (p *K8sWorkerPool) connectWorkerDirect(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+	if p.connectWorkerFunc != nil {
+		return p.connectWorkerFunc(ctx, podName, podIP, bearerToken)
+	}
+	if podIP == "" {
+		return nil, fmt.Errorf("worker pod %s has no IP", podName)
+	}
+	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
+	var dialOpts []grpc.DialOption
+	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
+		grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
+	))
+	if bearerToken != "" {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerBearerCreds{token: bearerToken}))
+	}
+	client, err := flightsql.NewClient(addr, nil, nil, dialOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("connect to claimed worker %s: %w", podName, err)
+	}
+	return client, nil
 }
 
 func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podName, podIP, bearerToken string, hcPayload server.WorkerHealthCheckPayload) (*flightsql.Client, error) {
