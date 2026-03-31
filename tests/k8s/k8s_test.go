@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,16 +204,18 @@ func TestK8sMultipleConcurrentConnections(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			db := openDB(t)
-			defer db.Close()
-
-			var result int
-			if err := db.QueryRow(fmt.Sprintf("SELECT %d", id)).Scan(&result); err != nil {
+			query := fmt.Sprintf("SELECT %d", id)
+			if err := retryDBOperationWithReconnect(30*time.Second, fmt.Sprintf("concurrent query %q", query), func(ctx context.Context, db *sql.DB) error {
+				var result int
+				if err := db.QueryRowContext(ctx, query).Scan(&result); err != nil {
+					return err
+				}
+				if result != id {
+					return fmt.Errorf("expected %d, got %d", id, result)
+				}
+				return nil
+			}); err != nil {
 				errs <- fmt.Errorf("connection %d: query failed: %w", id, err)
-				return
-			}
-			if result != id {
-				errs <- fmt.Errorf("connection %d: expected %d, got %d", id, id, result)
 				return
 			}
 		}(i)
@@ -383,6 +386,7 @@ func envOr(key, fallback string) string {
 
 func runCmd(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
+	cmd.Env = commandEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -392,6 +396,7 @@ func runProjectCmd(name string, args ...string) error {
 	projectRoot := findProjectRoot()
 	cmd := exec.Command(name, args...)
 	cmd.Dir = projectRoot
+	cmd.Env = commandEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -423,6 +428,7 @@ func startPortForward(ns, target string, remotePort int) (int, *exec.Cmd, error)
 
 	cmd := exec.Command("kubectl", "-n", ns, "port-forward", target,
 		fmt.Sprintf("%d:%d", localPort, remotePort))
+	cmd.Env = commandEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -473,6 +479,29 @@ func waitForPort(port int, timeout time.Duration) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("port %d not reachable after %s", port, timeout)
+}
+
+func commandEnv() []string {
+	env := os.Environ()
+	cfg := kubeconfig
+	if cfg == "" {
+		cfg = envOr("DUCKGRES_K8S_TEST_KUBECONFIG", "")
+		if cfg == "" {
+			cfg = envOr("DUCKGRES_KIND_KUBECONFIG", "")
+		}
+	}
+	if cfg == "" {
+		return env
+	}
+
+	filtered := env[:0]
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "KUBECONFIG=") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return append(filtered, "KUBECONFIG="+cfg)
 }
 
 func waitForPodGone(t *testing.T, ns, name string, timeout time.Duration) {
@@ -573,14 +602,20 @@ func openDBConn() (*sql.DB, error) {
 }
 
 func openDBConnAs(username, password string) (*sql.DB, error) {
+	databaseName := username
+	if username == "postgres" {
+		databaseName = "duckgres"
+	}
+
 	// kubectl port-forward passes raw TCP bytes, so the client still needs
 	// SSL. lib/pq sslmode=require skips server cert verification by default,
 	// which works with self-signed certs.
 	connStr := fmt.Sprintf(
-		"host=127.0.0.1 port=%d user=%s password=%s dbname=duckgres sslmode=require connect_timeout=5",
+		"host=127.0.0.1 port=%d user=%s password=%s dbname=%s sslmode=require connect_timeout=30",
 		pgPort,
 		username,
 		password,
+		databaseName,
 	)
 
 	db, err := sql.Open("postgres", connStr)

@@ -112,6 +112,32 @@ func TestKindSetupArtifactsEnableSharedWarmTarget(t *testing.T) {
 	}
 }
 
+func TestTenantIsolationSeedUsesCompositeOrgUserConflictTarget(t *testing.T) {
+	root := findProjectRootForUnitTest(t)
+
+	seedPath := filepath.Join(root, "tests", "k8s", "testdata", "tenant-isolation.seed.sql")
+	seedSQL, err := os.ReadFile(seedPath)
+	if err != nil {
+		t.Fatalf("read tenant isolation seed sql: %v", err)
+	}
+
+	content := string(seedSQL)
+	if !strings.Contains(content, "ON CONFLICT (org_id, username) DO UPDATE") {
+		t.Fatalf("expected composite org user conflict target in %s", seedPath)
+	}
+	if strings.Contains(content, "ON CONFLICT (username) DO UPDATE") {
+		t.Fatalf("expected tenant isolation seed to avoid username-only org user conflict target in %s", seedPath)
+	}
+	for _, want := range []string{
+		"('analytics', 'analytics', 0, '', 0, NOW(), NOW())",
+		"('billing', 'billing', 0, '', 0, NOW(), NOW())",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in %s", want, seedPath)
+		}
+	}
+}
+
 func TestLocalDependencyPortsStayFixedAndPreflighted(t *testing.T) {
 	root := findProjectRootForUnitTest(t)
 

@@ -1,9 +1,10 @@
-INSERT INTO duckgres_orgs (name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
+INSERT INTO duckgres_orgs (name, database_name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
 VALUES
-    ('analytics', 0, '', 0, NOW(), NOW()),
-    ('billing', 0, '', 0, NOW(), NOW())
+    ('analytics', 'analytics', 0, '', 0, NOW(), NOW()),
+    ('billing', 'billing', 0, '', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
-SET updated_at = NOW();
+SET database_name = EXCLUDED.database_name,
+    updated_at = NOW();
 
 INSERT INTO duckgres_managed_warehouses (
     org_id,
@@ -229,7 +230,7 @@ INSERT INTO duckgres_org_users (username, password, org_id, created_at, updated_
 VALUES
     ('analytics', '$2a$10$TQyt73Vw91Q1d7YcE86EVuhms/0u4qBydMDyVvZYlqDwc3/VtQAbm', 'analytics', NOW(), NOW()),
     ('billing', '$2a$10$TQyt73Vw91Q1d7YcE86EVuhms/0u4qBydMDyVvZYlqDwc3/VtQAbm', 'billing', NOW(), NOW())
-ON CONFLICT (username) DO UPDATE
+ON CONFLICT (org_id, username) DO UPDATE
 SET password = EXCLUDED.password,
     org_id = EXCLUDED.org_id,
     updated_at = NOW();
