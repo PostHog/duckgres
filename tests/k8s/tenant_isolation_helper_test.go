@@ -223,7 +223,26 @@ func waitForWorkerRetirement(podName string, timeout time.Duration) error {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("worker pod %s did not reach retired state within %s", podName, timeout)
+
+	runtimeRecord, runtimeErr := queryRuntimeStoreText(fmt.Sprintf(
+		"SELECT worker_id, pod_name, org_id, state, retire_reason, updated_at FROM cp_runtime.worker_records WHERE pod_name = '%s' ORDER BY updated_at DESC LIMIT 1",
+		psqlLiteral(podName),
+	))
+	if runtimeErr != nil {
+		runtimeRecord = fmt.Sprintf("<query failed: %v>", runtimeErr)
+	}
+
+	workerPods, podsErr := kubectlCommandOutput("-n", namespace, "get", "pods", "-l", "app=duckgres-worker", "-o", "wide")
+	if podsErr != nil {
+		workerPods = fmt.Sprintf("<kubectl get pods failed: %v>", podsErr)
+	}
+
+	controlPlaneLogs, logsErr := kubectlCommandOutput("-n", namespace, "logs", "deployment/duckgres-control-plane", "--tail=200")
+	if logsErr != nil {
+		controlPlaneLogs = fmt.Sprintf("<kubectl logs failed: %v>", logsErr)
+	}
+
+	return fmt.Errorf("%s", formatWorkerRetirementTimeoutDiagnostic(podName, timeout, runtimeRecord, workerPods, controlPlaneLogs))
 }
 
 func queryRuntimeStoreRow(query string) ([]string, error) {
@@ -241,6 +260,29 @@ func queryRuntimeStoreRow(query string) ([]string, error) {
 		return nil, nil
 	}
 	return strings.Split(line, "|"), nil
+}
+
+func queryRuntimeStoreText(query string) (string, error) {
+	cmd := exec.Command(
+		"docker", "exec", configStoreContainer,
+		"psql", "-v", "ON_ERROR_STOP=1", "-U", "duckgres", "-d", "duckgres_config",
+		"-tA", "-F", "|", "-c", query,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("query runtime store: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func kubectlCommandOutput(args ...string) (string, error) {
+	cmd := exec.Command("kubectl", args...)
+	cmd.Env = commandEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func psqlLiteral(value string) string {
