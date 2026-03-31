@@ -42,8 +42,8 @@ func TestK8sTenantIsolation_DifferentTenantsSeeDistinctCatalogs(t *testing.T) {
 		t.Fatalf("close analytics DB: %v", err)
 	}
 
-	if err := waitForWorkerRetirement(analyticsWorkerPod, 30*time.Second); err != nil {
-		t.Fatalf("wait for analytics worker retirement: %v", err)
+	if err := waitForWorkerRelease(analyticsWorkerPod, 30*time.Second); err != nil {
+		t.Fatalf("wait for analytics worker release: %v", err)
 	}
 
 	billingDB, err := openDBConnAs("billing", "postgres")

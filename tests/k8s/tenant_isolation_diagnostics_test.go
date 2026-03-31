@@ -8,7 +8,7 @@ import (
 
 func formatWorkerRetirementTimeoutDiagnostic(podName string, timeout time.Duration, runtimeRecord, workerPods, controlPlaneLogs string) string {
 	sections := []string{
-		fmt.Sprintf("worker pod %s did not reach retired state within %s", podName, timeout),
+		fmt.Sprintf("worker pod %s did not reach a released state within %s", podName, timeout),
 		"runtime record:",
 		strings.TrimSpace(emptyIfBlank(runtimeRecord, "<none>")),
 		"worker pods:",
@@ -24,4 +24,13 @@ func emptyIfBlank(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func isReleasedWorkerState(state string) bool {
+	switch state {
+	case "hot_idle", "retired":
+		return true
+	default:
+		return false
+	}
 }

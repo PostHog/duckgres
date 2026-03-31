@@ -208,7 +208,7 @@ func findActiveOrgWorkerPodSince(orgID string, since time.Time, timeout time.Dur
 	return "", fmt.Errorf("no active worker record for org %q appeared within %s", orgID, timeout)
 }
 
-func waitForWorkerRetirement(podName string, timeout time.Duration) error {
+func waitForWorkerRelease(podName string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		row, err := queryRuntimeStoreRow(fmt.Sprintf(
@@ -218,7 +218,7 @@ func waitForWorkerRetirement(podName string, timeout time.Duration) error {
 		if err != nil {
 			return err
 		}
-		if len(row) == 1 && row[0] == "retired" {
+		if len(row) == 1 && isReleasedWorkerState(row[0]) {
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)

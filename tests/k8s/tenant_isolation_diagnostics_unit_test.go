@@ -16,7 +16,7 @@ func TestFormatWorkerRetirementTimeoutDiagnostic(t *testing.T) {
 	)
 
 	for _, want := range []string{
-		"worker pod duckgres-worker-17 did not reach retired state within 30s",
+		"worker pod duckgres-worker-17 did not reach a released state within 30s",
 		"runtime record:",
 		"17|duckgres-worker-17|analytics|hot|2026-03-31 16:12:56+00",
 		"worker pods:",
@@ -26,6 +26,24 @@ func TestFormatWorkerRetirementTimeoutDiagnostic(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected diagnostic to contain %q, got %q", want, got)
+		}
+	}
+}
+
+func TestIsReleasedWorkerState(t *testing.T) {
+	for _, tc := range []struct {
+		state string
+		want  bool
+	}{
+		{state: "reserved", want: false},
+		{state: "activating", want: false},
+		{state: "hot", want: false},
+		{state: "draining", want: false},
+		{state: "hot_idle", want: true},
+		{state: "retired", want: true},
+	} {
+		if got := isReleasedWorkerState(tc.state); got != tc.want {
+			t.Fatalf("isReleasedWorkerState(%q)=%v, want %v", tc.state, got, tc.want)
 		}
 	}
 }
