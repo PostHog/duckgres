@@ -1320,14 +1320,27 @@ func (p *K8sWorkerPool) connectWorkerDirect(ctx context.Context, podName, podIP,
 		return nil, fmt.Errorf("worker pod %s has no IP", podName)
 	}
 	addr := fmt.Sprintf("%s:%d", podIP, p.workerPort)
+	_, serverCertPEM, err := p.readWorkerRPCSecurity(ctx, podName)
+	if err != nil {
+		return nil, fmt.Errorf("read worker RPC security: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(serverCertPEM) {
+		return nil, fmt.Errorf("parse worker RPC server certificate")
+	}
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		RootCAs:    roots,
+		ServerName: workerRPCDNSName,
+	}
 	var dialOpts []grpc.DialOption
-	dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
 		grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
 		grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
 	))
 	if bearerToken != "" {
-		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerBearerCreds{token: bearerToken}))
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerTLSBearerCreds{token: bearerToken}))
 	}
 	client, err := flightsql.NewClient(addr, nil, nil, dialOpts...)
 	if err != nil {
