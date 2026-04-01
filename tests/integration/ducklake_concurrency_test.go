@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,19 +18,21 @@ import (
 // When DUCKGRES_BENCH_OUT is set, all metrics are written as JSON to that
 // file so the matrix runner can compare across DuckLake versions.
 type concurrencyMetric struct {
-	Test         string  `json:"test"`
-	Successes    int64   `json:"successes"`
-	Conflicts    int64   `json:"conflicts"`
-	Errors       int64   `json:"errors,omitempty"`
-	ConflictRate float64 `json:"conflict_rate_pct"`
-	Duration     float64 `json:"duration_sec"`
-	Throughput   float64 `json:"throughput_ops_sec,omitempty"`
+	Test              string  `json:"test"`
+	MetadataLatencyMs int     `json:"metadata_latency_ms"`
+	Successes         int64   `json:"successes"`
+	Conflicts         int64   `json:"conflicts"`
+	Errors            int64   `json:"errors,omitempty"`
+	ConflictRate      float64 `json:"conflict_rate_pct"`
+	Duration          float64 `json:"duration_sec"`
+	Throughput        float64 `json:"throughput_ops_sec,omitempty"`
 }
 
 // concurrencyReport is the top-level JSON output for the matrix runner.
 type concurrencyReport struct {
 	DuckDBVersion   string              `json:"duckdb_version"`
 	DuckLakeVersion string              `json:"ducklake_version"`
+	LatenciesTested []int               `json:"latencies_tested_ms"`
 	Timestamp       string              `json:"timestamp"`
 	Metrics         []concurrencyMetric `json:"metrics"`
 }
@@ -55,12 +58,13 @@ func recordMetric(m concurrencyMetric) {
 // Duration, throughput, and conflict rate are computed automatically.
 type metric = concurrencyMetric
 
-func benchSub(t *testing.T, name string, body func(t *testing.T, m *metric)) {
+func benchSub(t *testing.T, name string, latencyMs int, body func(t *testing.T, m *metric)) {
 	t.Helper()
 	t.Run(name, func(t *testing.T) {
 		start := time.Now()
 		var m metric
 		m.Test = name
+		m.MetadataLatencyMs = latencyMs
 		body(t, &m)
 		m.Duration = time.Since(start).Seconds()
 		if m.Duration > 0 && m.Successes > 0 {
@@ -68,6 +72,47 @@ func benchSub(t *testing.T, name string, body func(t *testing.T, m *metric)) {
 		}
 		recordMetric(m)
 	})
+}
+
+// parseLatencies parses DUCKGRES_BENCH_LATENCIES env var into a sorted list of
+// millisecond values. Default: [0] (no artificial latency).
+// Format: comma-separated durations, e.g. "0ms,10ms,50ms,100ms"
+func parseLatencies() []int {
+	raw := os.Getenv("DUCKGRES_BENCH_LATENCIES")
+	if raw == "" {
+		return []int{0}
+	}
+	var latencies []int
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		s = strings.TrimSuffix(s, "ms")
+		ms, err := strconv.Atoi(s)
+		if err != nil || ms < 0 {
+			continue
+		}
+		latencies = append(latencies, ms)
+	}
+	if len(latencies) == 0 {
+		return []int{0}
+	}
+	return latencies
+}
+
+// openConnToPort opens a fresh connection to a duckgres server on the given port.
+func openConnToPort(t *testing.T, port int) *sql.DB {
+	t.Helper()
+	connStr := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass dbname=test sslmode=require", port)
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		t.Fatalf("Failed to open connection: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		t.Fatalf("Failed to ping port %d: %v", port, err)
+	}
+	return db
 }
 
 // TestDuckLakeConcurrentTransactions is an extensive concurrency test suite for
@@ -80,17 +125,16 @@ func benchSub(t *testing.T, name string, body func(t *testing.T, m *metric)) {
 // stress that behavior.
 //
 // Set DUCKGRES_BENCH_OUT=path.json to write structured metrics for comparison.
+// Set DUCKGRES_BENCH_LATENCIES=0ms,10ms,50ms,100ms to run a latency sensitivity
+// analysis (adds artificial one-way latency to the metadata PostgreSQL connection).
 func TestDuckLakeConcurrentTransactions(t *testing.T) {
 	if !testHarness.useDuckLake {
 		t.Skip("DuckLake mode not enabled (set DUCKGRES_TEST_NO_DUCKLAKE= to enable)")
 	}
 
 	// Log version info for traceability.
-	// DuckDB version functions are transpiled to PG-compat strings, so we query
-	// the extension table for DuckLake and use the library_version pragma for DuckDB.
 	conn := openDuckgresConn(t)
 	var duckdbVer, ducklakeVer string
-	// SHOW duckdb.library_version is not transpiled and returns the actual engine version
 	if err := conn.QueryRow("SELECT library_version FROM pragma_version()").Scan(&duckdbVer); err != nil {
 		duckdbVer = "unknown"
 	}
@@ -104,6 +148,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 	_ = conn.Close()
 	t.Logf("DuckDB %s, DuckLake extension %s", duckdbVer, ducklakeVer)
 
+	latencies := parseLatencies()
+
 	// Write report on cleanup
 	t.Cleanup(func() {
 		outPath := os.Getenv("DUCKGRES_BENCH_OUT")
@@ -114,6 +160,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		report := concurrencyReport{
 			DuckDBVersion:   duckdbVer,
 			DuckLakeVersion: ducklakeVer,
+			LatenciesTested: latencies,
 			Timestamp:       time.Now().UTC().Format(time.RFC3339),
 			Metrics:         metricsCollector.metrics,
 		}
@@ -131,8 +178,45 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("metrics written to %s", outPath)
 	})
 
-	benchSub(t, "concurrent_inserts_same_table", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	for _, latencyMs := range latencies {
+		latencyMs := latencyMs // capture loop var
+		name := fmt.Sprintf("latency_%dms", latencyMs)
+		t.Run(name, func(t *testing.T) {
+			// For non-zero latency, spin up a dedicated duckgres with a latency
+			// proxy in front of the metadata PostgreSQL. For 0ms, use the
+			// default test harness (no proxy overhead).
+			var openConn func(t *testing.T) *sql.DB
+			if latencyMs == 0 {
+				openConn = openDuckgresConn
+			} else {
+				cfg := DefaultConfig()
+				cfg.SkipPostgres = true
+				cfg.MetadataLatency = time.Duration(latencyMs) * time.Millisecond
+				h, err := NewTestHarness(cfg)
+				if err != nil {
+					t.Fatalf("failed to create latency harness (%dms): %v", latencyMs, err)
+				}
+				t.Cleanup(func() { _ = h.Close() })
+				port := h.dgPort
+				t.Logf("latency harness on port %d (metadata latency: %dms one-way, ~%dms RTT)", port, latencyMs, latencyMs*2)
+				openConn = func(t *testing.T) *sql.DB {
+					return openConnToPort(t, port)
+				}
+			}
+
+			runConcurrencyBenchmarks(t, latencyMs, openConn)
+		})
+	}
+}
+
+// runConcurrencyBenchmarks contains all the concurrency benchmark sub-tests.
+// It is parameterized by a connection opener (openConn) so it can run against
+// different duckgres instances (with/without metadata latency proxy).
+func runConcurrencyBenchmarks(t *testing.T, latencyMs int, openConn func(*testing.T) *sql.DB) {
+	t.Helper()
+
+	benchSub(t, "concurrent_inserts_same_table", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_insert (id INTEGER, worker INTEGER, val TEXT)")
@@ -149,7 +233,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range rowsPerWorker {
@@ -189,8 +273,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "concurrent_inserts_with_transactions", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_inserts_with_transactions", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_tx_insert (id INTEGER, batch INTEGER, val TEXT)")
@@ -208,7 +292,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for b := range batchesPerWorker {
@@ -274,8 +358,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "concurrent_updates_same_rows", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_updates_same_rows", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_update (id INTEGER, counter INTEGER, last_writer INTEGER)")
@@ -296,7 +380,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range updatesPerWorker {
@@ -338,8 +422,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "concurrent_deletes_and_inserts", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_deletes_and_inserts", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_del (id INTEGER, val TEXT)")
@@ -363,7 +447,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range opsPerWorker {
@@ -389,7 +473,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range opsPerWorker {
@@ -433,8 +517,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "concurrent_multi_table_transactions", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_multi_table_transactions", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_orders (id INTEGER, customer TEXT, total DOUBLE)")
@@ -455,7 +539,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for o := range ordersPerWorker {
@@ -541,8 +625,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "concurrent_read_write_isolation", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_read_write_isolation", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_rw (id INTEGER, val INTEGER)")
@@ -564,7 +648,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(writerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range opsPerWorker {
@@ -588,7 +672,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(readerID int) {
 				defer wg.Done()
-				rconn := openDuckgresConn(t)
+				rconn := openConn(t)
 				defer func() { _ = rconn.Close() }()
 
 				for i := range opsPerWorker {
@@ -637,8 +721,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("read/write isolation: %d write conflicts, %d read errors", writeConflicts.Load(), readErrors.Load())
 	})
 
-	benchSub(t, "concurrent_upsert_storm", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_upsert_storm", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		// DuckLake rewrites ON CONFLICT to MERGE — test it under concurrency
@@ -660,7 +744,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range opsPerWorker {
@@ -703,8 +787,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("upsert storm: %d succeeded, %d conflicts", m.Successes, m.Conflicts)
 	})
 
-	benchSub(t, "concurrent_ddl_while_writing", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_ddl_while_writing", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_ddl_write (id INTEGER, val TEXT)")
@@ -718,7 +802,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			wconn := openDuckgresConn(t)
+			wconn := openConn(t)
 			defer func() { _ = wconn.Close() }()
 
 			for i := range 60 {
@@ -744,7 +828,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			dconn := openDuckgresConn(t)
+			dconn := openConn(t)
 			defer func() { _ = dconn.Close() }()
 
 			time.Sleep(10 * time.Millisecond) // Let some writes land first
@@ -775,8 +859,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("ddl+write: %d conflicts", m.Conflicts)
 	})
 
-	benchSub(t, "concurrent_large_batch_inserts", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_large_batch_inserts", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_batch (id INTEGER, worker INTEGER, payload TEXT)")
@@ -794,7 +878,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for b := range batchesPerWorker {
@@ -855,7 +939,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "concurrent_create_drop_tables", func(t *testing.T, m *metric) {
+	benchSub(t, "concurrent_create_drop_tables", latencyMs, func(t *testing.T, m *metric) {
 		const numWorkers = 4
 		const cyclesPerWorker = 8
 		var wg sync.WaitGroup
@@ -867,7 +951,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for c := range cyclesPerWorker {
@@ -940,10 +1024,10 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("create/drop cycles: %d completed, %d conflicts", m.Successes, m.Conflicts)
 	})
 
-	benchSub(t, "concurrent_inserts_separate_tables", func(t *testing.T, m *metric) {
+	benchSub(t, "concurrent_inserts_separate_tables", latencyMs, func(t *testing.T, m *metric) {
 		// DuckLake uses global snapshot IDs, so even writes to separate tables
 		// can conflict. This test specifically targets that behavior.
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		const numTables = 6
@@ -966,7 +1050,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(tableIdx int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				tableName := fmt.Sprintf("dl_conc_sep_%d", tableIdx)
@@ -1002,9 +1086,9 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "rapid_autocommit_inserts", func(t *testing.T, m *metric) {
+	benchSub(t, "rapid_autocommit_inserts", latencyMs, func(t *testing.T, m *metric) {
 		// Fivetran-like pattern: many small autocommit inserts in rapid succession
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_rapid (id INTEGER, ts BIGINT, data TEXT)")
@@ -1021,7 +1105,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range insertsPerWorker {
@@ -1070,8 +1154,8 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "concurrent_tx_rollback_stress", func(t *testing.T, m *metric) {
-		conn := openDuckgresConn(t)
+	benchSub(t, "concurrent_tx_rollback_stress", latencyMs, func(t *testing.T, m *metric) {
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_rollback (id INTEGER, val TEXT)")
@@ -1089,7 +1173,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range txPerWorker {
@@ -1150,9 +1234,9 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "sustained_concurrent_load", func(t *testing.T, m *metric) {
+	benchSub(t, "sustained_concurrent_load", latencyMs, func(t *testing.T, m *metric) {
 		// Simulate sustained concurrent load over a time window (like Fivetran sync)
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_conc_sustained (id BIGINT, worker INTEGER, ts BIGINT, payload TEXT)")
@@ -1169,7 +1253,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				deadline := time.Now().Add(duration)
@@ -1220,12 +1304,12 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("throughput: %.0f inserts/sec, conflict rate: %.1f%%", throughput, conflictRate)
 	})
 
-	benchSub(t, "concurrent_ctas", func(t *testing.T, m *metric) {
+	benchSub(t, "concurrent_ctas", latencyMs, func(t *testing.T, m *metric) {
 		// CREATE TABLE AS SELECT (CTAS) is a combined DDL+DML operation that
 		// creates a new table and populates it in a single transaction. Under
 		// concurrency this is especially conflict-prone because the DDL catalog
 		// write and the data write both go through the DuckLake metadata store.
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		// Seed a source table
@@ -1253,7 +1337,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for c := range ctasPerWorker {
@@ -1304,7 +1388,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("concurrent CTAS: %d created, %d conflicts", m.Successes, m.Conflicts)
 	})
 
-	benchSub(t, "sqlmesh_ctas_distinct_targets", func(t *testing.T, m *metric) {
+	benchSub(t, "sqlmesh_ctas_distinct_targets", latencyMs, func(t *testing.T, m *metric) {
 		// Reproduces the exact SQLMesh production failure pattern:
 		// - Multiple models run concurrently via ThreadPoolExecutor
 		// - Each model does CREATE OR REPLACE TABLE <distinct_target> AS SELECT ... FROM <shared_source>
@@ -1313,7 +1397,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		//
 		// Prod error: "Transaction conflict - attempting to insert into table with
 		// index "25667" - but another transaction has altered it"
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		numModels := 10
@@ -1365,7 +1449,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 				wg.Add(1)
 				go func(modelID, roundID int) {
 					defer wg.Done()
-					mconn := openDuckgresConn(t)
+					mconn := openConn(t)
 					defer func() { _ = mconn.Close() }()
 
 					cat := fmt.Sprintf("cat_%d", modelID)
@@ -1421,11 +1505,11 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "sqlmesh_ctas_with_deps", func(t *testing.T, m *metric) {
+	benchSub(t, "sqlmesh_ctas_with_deps", latencyMs, func(t *testing.T, m *metric) {
 		// Extended SQLMesh pattern: models have dependency tiers (DAG levels).
 		// Tier 1 models run first, tier 2 models depend on tier 1 outputs.
 		// Within each tier, models run concurrently.
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		// Raw source
@@ -1476,7 +1560,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 				wg.Add(1)
 				go func(modelID int) {
 					defer wg.Done()
-					mconn := openDuckgresConn(t)
+					mconn := openConn(t)
 					defer func() { _ = mconn.Close() }()
 
 					_, err := mconn.Exec(fmt.Sprintf(
@@ -1511,7 +1595,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 				wg.Add(1)
 				go func(modelID int) {
 					defer wg.Done()
-					mconn := openDuckgresConn(t)
+					mconn := openConn(t)
 					defer func() { _ = mconn.Close() }()
 
 					src := modelID % numTier1
@@ -1544,11 +1628,11 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("SQLMesh DAG pattern: %d succeeded, %d conflicts total", m.Successes, m.Conflicts)
 	})
 
-	benchSub(t, "concurrent_create_or_replace_as_select", func(t *testing.T, m *metric) {
+	benchSub(t, "concurrent_create_or_replace_as_select", latencyMs, func(t *testing.T, m *metric) {
 		// CREATE OR REPLACE TABLE AS SELECT is the most conflict-prone pattern:
 		// it drops the existing table and recreates it atomically, so concurrent
 		// writers all race to replace the same target table.
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		// Seed a source table
@@ -1580,7 +1664,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for r := range replacesPerWorker {
@@ -1630,10 +1714,10 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		}
 	})
 
-	benchSub(t, "ctas_while_writing_source", func(t *testing.T, m *metric) {
+	benchSub(t, "ctas_while_writing_source", latencyMs, func(t *testing.T, m *metric) {
 		// CTAS reading from a table while other connections are actively
 		// writing to it — tests snapshot isolation of the source read.
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_ctas_live_source (id INTEGER, val TEXT)")
@@ -1660,7 +1744,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(writerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for i := range writesPerWorker {
@@ -1690,7 +1774,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(snapID int) {
 				defer wg.Done()
-				sconn := openDuckgresConn(t)
+				sconn := openConn(t)
 				defer func() { _ = sconn.Close() }()
 
 				for i := range snapshotsPerWorker {
@@ -1743,10 +1827,10 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			m.Successes, writeConflicts.Load(), ctasConflicts.Load())
 	})
 
-	benchSub(t, "concurrent_replace_while_reading", func(t *testing.T, m *metric) {
+	benchSub(t, "concurrent_replace_while_reading", latencyMs, func(t *testing.T, m *metric) {
 		// CREATE OR REPLACE while other connections are reading the same table.
 		// Readers should either see the old or new data, never a partial state.
-		conn := openDuckgresConn(t)
+		conn := openConn(t)
 		defer func() { _ = conn.Close() }()
 
 		mustExec(t, conn, "CREATE TABLE dl_replace_source_a (id INTEGER, val TEXT)")
@@ -1780,7 +1864,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(workerID int) {
 				defer wg.Done()
-				wconn := openDuckgresConn(t)
+				wconn := openConn(t)
 				defer func() { _ = wconn.Close() }()
 
 				for r := range replacesPerWorker {
@@ -1813,7 +1897,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 			wg.Add(1)
 			go func(readerID int) {
 				defer wg.Done()
-				rconn := openDuckgresConn(t)
+				rconn := openConn(t)
 				defer func() { _ = rconn.Close() }()
 
 				for i := range readsPerWorker {

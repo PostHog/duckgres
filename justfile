@@ -311,6 +311,16 @@ bench-ducklake:
 bench-ducklake-matrix:
     ./scripts/ducklake_version_matrix.sh
 
+# Run DuckLake concurrency benchmarks with metadata latency sensitivity analysis
+[group('test')]
+bench-ducklake-latency latencies="0ms,25ms,50ms,100ms":
+    DUCKGRES_BENCH_LATENCIES={{latencies}} go test -v -run TestDuckLakeConcurrentTransactions -timeout 600s ./tests/integration/...
+
+# Run full version x latency matrix
+[group('test')]
+bench-ducklake-full-matrix latencies="0ms,50ms,100ms":
+    DUCKGRES_BENCH_LATENCIES={{latencies}} ./scripts/ducklake_version_matrix.sh
+
 # Run extension loading tests
 [group('test')]
 test-extensions:
