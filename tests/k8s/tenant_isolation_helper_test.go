@@ -335,8 +335,17 @@ func waitForMinioPrefixFileCountToStayAtMost(prefix string, maximum int, duratio
 }
 
 func ensureWorkerPodLacksServiceAccountToken(podName string) error {
+	pod, err := clientset.CoreV1().Pods(namespace).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get worker pod %s: %w", podName, err)
+	}
+	if len(pod.Spec.Containers) == 0 {
+		return fmt.Errorf("worker pod %s has no containers", podName)
+	}
+	containerName := pod.Spec.Containers[0].Name
+
 	cmd := exec.Command(
-		"kubectl", "-n", namespace, "exec", podName, "--",
+		"kubectl", "-n", namespace, "exec", podName, "-c", containerName, "--",
 		"sh", "-lc",
 		"if [ -e /var/run/secrets/kubernetes.io/serviceaccount/token ]; then " +
 			"echo 'service account token present'; " +

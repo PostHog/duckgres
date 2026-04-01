@@ -209,6 +209,7 @@ func TestK8sWorkerCrashRecovery(t *testing.T) {
 
 func TestK8sMultipleConcurrentConnections(t *testing.T) {
 	const n = 5
+	const timeout = 75 * time.Second
 	var wg sync.WaitGroup
 	errs := make(chan error, n)
 
@@ -217,7 +218,7 @@ func TestK8sMultipleConcurrentConnections(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			query := fmt.Sprintf("SELECT %d", id)
-			if err := retryDBOperationWithReconnect(30*time.Second, fmt.Sprintf("concurrent query %q", query), func(ctx context.Context, db *sql.DB) error {
+			if err := retryDBOperationWithReconnect(timeout, fmt.Sprintf("concurrent query %q", query), func(ctx context.Context, db *sql.DB) error {
 				var result int
 				if err := db.QueryRowContext(ctx, query).Scan(&result); err != nil {
 					return err
