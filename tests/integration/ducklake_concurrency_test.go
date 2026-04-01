@@ -99,7 +99,7 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		if rows.Next() {
 			_ = rows.Scan(&ducklakeVer)
 		}
-		rows.Close()
+		_ = rows.Close()
 	}
 	_ = conn.Close()
 	t.Logf("DuckDB %s, DuckLake extension %s", duckdbVer, ducklakeVer)
