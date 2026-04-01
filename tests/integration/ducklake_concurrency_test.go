@@ -1304,6 +1304,246 @@ func TestDuckLakeConcurrentTransactions(t *testing.T) {
 		t.Logf("concurrent CTAS: %d created, %d conflicts", m.Successes, m.Conflicts)
 	})
 
+	benchSub(t, "sqlmesh_ctas_distinct_targets", func(t *testing.T, m *metric) {
+		// Reproduces the exact SQLMesh production failure pattern:
+		// - Multiple models run concurrently via ThreadPoolExecutor
+		// - Each model does CREATE OR REPLACE TABLE <distinct_target> AS SELECT ... FROM <shared_source>
+		// - Targets are DIFFERENT tables in the SAME schema
+		// - DuckLake conflicts because metadata transactions collide at the catalog level
+		//
+		// Prod error: "Transaction conflict - attempting to insert into table with
+		// index "25667" - but another transaction has altered it"
+		conn := openDuckgresConn(t)
+		defer func() { _ = conn.Close() }()
+
+		numModels := 10
+		if os.Getenv("DUCKGRES_STRESS") != "" {
+			numModels = 30
+		}
+
+		// Create a shared source table (like SQLMesh upstream model)
+		mustExec(t, conn, "CREATE TABLE dl_sqlmesh_source (id INTEGER, ts BIGINT, category TEXT, val DOUBLE)")
+		sourceRows := numModels * 50 // 50 rows per category
+		for i := range sourceRows {
+			cat := fmt.Sprintf("cat_%d", i%numModels)
+			mustExec(t, conn, fmt.Sprintf(
+				"INSERT INTO dl_sqlmesh_source VALUES (%d, %d, '%s', %f)",
+				i, int64(i)*1000, cat, float64(i)*1.5,
+			))
+		}
+		// Pre-create all target tables so CREATE OR REPLACE has something to replace
+		// (matches SQLMesh re-run behavior where tables already exist from prior runs)
+		for i := range numModels {
+			mustExec(t, conn, fmt.Sprintf(
+				"CREATE TABLE dl_sqlmesh_model_%d AS SELECT * FROM dl_sqlmesh_source WHERE category = 'cat_%d'",
+				i, i,
+			))
+		}
+		defer func() {
+			_, _ = conn.Exec("DROP TABLE IF EXISTS dl_sqlmesh_source")
+			for i := range 30 { // clean up max possible models
+				_, _ = conn.Exec(fmt.Sprintf("DROP TABLE IF EXISTS dl_sqlmesh_model_%d", i))
+			}
+		}()
+
+		// Simulate SQLMesh parallel model evaluation:
+		// Each "model" does CREATE OR REPLACE TABLE model_X AS SELECT ... FROM source
+		// All models run concurrently, targeting DISTINCT tables in the same schema
+		numRounds := 3 // multiple evaluation rounds like sqlmesh plan + apply cycles
+		if os.Getenv("DUCKGRES_STRESS") != "" {
+			numRounds = 5
+		}
+		var totalConflicts atomic.Int64
+		var totalSuccesses atomic.Int64
+		var totalErrors atomic.Int64
+
+		for round := range numRounds {
+			var wg sync.WaitGroup
+			errs := make(chan error, numModels)
+
+			for model := range numModels {
+				wg.Add(1)
+				go func(modelID, roundID int) {
+					defer wg.Done()
+					mconn := openDuckgresConn(t)
+					defer func() { _ = mconn.Close() }()
+
+					cat := fmt.Sprintf("cat_%d", modelID)
+					tableName := fmt.Sprintf("dl_sqlmesh_model_%d", modelID)
+
+					// This is the exact query SQLMesh generates for a FULL model refresh
+					_, err := mconn.Exec(fmt.Sprintf(
+						"CREATE OR REPLACE TABLE %s AS SELECT * FROM dl_sqlmesh_source WHERE category = '%s'",
+						tableName, cat,
+					))
+					if err != nil {
+						if isTransactionConflict(err) || isAbortedTransaction(err) {
+							totalConflicts.Add(1)
+							recoverConnection(mconn)
+							return
+						}
+						errs <- fmt.Errorf("round %d model %d: %w", roundID, modelID, err)
+						return
+					}
+					totalSuccesses.Add(1)
+
+					// Verify the table was created with correct data
+					var count int
+					if err := mconn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&count); err != nil {
+						if isTransactionConflict(err) || isAbortedTransaction(err) {
+							recoverConnection(mconn)
+							return
+						}
+						errs <- fmt.Errorf("round %d model %d verify: %w", roundID, modelID, err)
+						return
+					}
+					if count != 50 { // 50 rows per category
+						errs <- fmt.Errorf("round %d model %d: expected 50 rows, got %d", roundID, modelID, count)
+					}
+				}(model, round)
+			}
+
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Error(err)
+			}
+		}
+
+		m.Successes, m.Conflicts, m.Errors = totalSuccesses.Load(), totalConflicts.Load(), totalErrors.Load()
+		t.Logf("SQLMesh CTAS pattern: %d succeeded, %d conflicts, %d errors across %d rounds of %d models",
+			m.Successes, m.Conflicts, m.Errors, numRounds, numModels)
+
+		conflictRate := float64(m.Conflicts) / float64(m.Successes+m.Conflicts) * 100
+		t.Logf("conflict rate: %.1f%%", conflictRate)
+		if m.Conflicts > 0 {
+			t.Logf("NOTE: DuckLake transaction conflicts on DISTINCT tables in the same schema — this is the SQLMesh prod regression pattern")
+		}
+	})
+
+	benchSub(t, "sqlmesh_ctas_with_deps", func(t *testing.T, m *metric) {
+		// Extended SQLMesh pattern: models have dependency tiers (DAG levels).
+		// Tier 1 models run first, tier 2 models depend on tier 1 outputs.
+		// Within each tier, models run concurrently.
+		conn := openDuckgresConn(t)
+		defer func() { _ = conn.Close() }()
+
+		// Raw source
+		mustExec(t, conn, "CREATE TABLE dl_sqlmesh_raw (id INTEGER, ts BIGINT, event TEXT, user_id INTEGER)")
+		for i := range 300 {
+			evt := fmt.Sprintf("event_%d", i%5)
+			mustExec(t, conn, fmt.Sprintf(
+				"INSERT INTO dl_sqlmesh_raw VALUES (%d, %d, '%s', %d)",
+				i, int64(i)*1000, evt, i%20,
+			))
+		}
+
+		// Pre-create tier-1 and tier-2 tables
+		const numTier1 = 5
+		const numTier2 = 6
+		for i := range numTier1 {
+			mustExec(t, conn, fmt.Sprintf(
+				"CREATE TABLE dl_sqlmesh_t1_%d AS SELECT * FROM dl_sqlmesh_raw WHERE event = 'event_%d'",
+				i, i,
+			))
+		}
+		for i := range numTier2 {
+			src := i % numTier1
+			mustExec(t, conn, fmt.Sprintf(
+				"CREATE TABLE dl_sqlmesh_t2_%d AS SELECT *, %d AS tier2_id FROM dl_sqlmesh_t1_%d",
+				i, i, src,
+			))
+		}
+
+		defer func() {
+			_, _ = conn.Exec("DROP TABLE IF EXISTS dl_sqlmesh_raw")
+			for i := range numTier1 {
+				_, _ = conn.Exec(fmt.Sprintf("DROP TABLE IF EXISTS dl_sqlmesh_t1_%d", i))
+			}
+			for i := range numTier2 {
+				_, _ = conn.Exec(fmt.Sprintf("DROP TABLE IF EXISTS dl_sqlmesh_t2_%d", i))
+			}
+		}()
+
+		var tier1Conflicts, tier2Conflicts atomic.Int64
+		var tier1Successes, tier2Successes atomic.Int64
+
+		// Tier 1: all run concurrently, each CTAS from raw source
+		{
+			var wg sync.WaitGroup
+			errs := make(chan error, numTier1)
+			for i := range numTier1 {
+				wg.Add(1)
+				go func(modelID int) {
+					defer wg.Done()
+					mconn := openDuckgresConn(t)
+					defer func() { _ = mconn.Close() }()
+
+					_, err := mconn.Exec(fmt.Sprintf(
+						"CREATE OR REPLACE TABLE dl_sqlmesh_t1_%d AS SELECT * FROM dl_sqlmesh_raw WHERE event = 'event_%d'",
+						modelID, modelID,
+					))
+					if err != nil {
+						if isTransactionConflict(err) || isAbortedTransaction(err) {
+							tier1Conflicts.Add(1)
+							recoverConnection(mconn)
+							return
+						}
+						errs <- fmt.Errorf("tier1 model %d: %w", modelID, err)
+						return
+					}
+					tier1Successes.Add(1)
+				}(i)
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Error(err)
+			}
+			t.Logf("tier 1: %d succeeded, %d conflicts", tier1Successes.Load(), tier1Conflicts.Load())
+		}
+
+		// Tier 2: all run concurrently, each CTAS from a tier-1 output
+		{
+			var wg sync.WaitGroup
+			errs := make(chan error, numTier2)
+			for i := range numTier2 {
+				wg.Add(1)
+				go func(modelID int) {
+					defer wg.Done()
+					mconn := openDuckgresConn(t)
+					defer func() { _ = mconn.Close() }()
+
+					src := modelID % numTier1
+					_, err := mconn.Exec(fmt.Sprintf(
+						"CREATE OR REPLACE TABLE dl_sqlmesh_t2_%d AS SELECT *, %d AS tier2_id FROM dl_sqlmesh_t1_%d",
+						modelID, modelID, src,
+					))
+					if err != nil {
+						if isTransactionConflict(err) || isAbortedTransaction(err) {
+							tier2Conflicts.Add(1)
+							recoverConnection(mconn)
+							return
+						}
+						errs <- fmt.Errorf("tier2 model %d: %w", modelID, err)
+						return
+					}
+					tier2Successes.Add(1)
+				}(i)
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Error(err)
+			}
+			t.Logf("tier 2: %d succeeded, %d conflicts", tier2Successes.Load(), tier2Conflicts.Load())
+		}
+
+		m.Successes = tier1Successes.Load() + tier2Successes.Load()
+		m.Conflicts = tier1Conflicts.Load() + tier2Conflicts.Load()
+		t.Logf("SQLMesh DAG pattern: %d succeeded, %d conflicts total", m.Successes, m.Conflicts)
+	})
+
 	benchSub(t, "concurrent_create_or_replace_as_select", func(t *testing.T, m *metric) {
 		// CREATE OR REPLACE TABLE AS SELECT is the most conflict-prone pattern:
 		// it drops the existing table and recreates it atomically, so concurrent
