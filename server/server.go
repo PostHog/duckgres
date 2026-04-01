@@ -53,6 +53,13 @@ var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently open client connections",
 })
 
+// IncrementOpenConnections increments the open connections gauge.
+// Used by the control plane which handles connections separately from the standalone server.
+func IncrementOpenConnections() { connectionsGauge.Inc() }
+
+// DecrementOpenConnections decrements the open connections gauge.
+func DecrementOpenConnections() { connectionsGauge.Dec() }
+
 var queryDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "duckgres_query_duration_seconds",
 	Help:    "Query execution duration in seconds",

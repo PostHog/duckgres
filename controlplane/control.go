@@ -603,6 +603,8 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
+	server.IncrementOpenConnections()
+	defer server.DecrementOpenConnections()
 
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
@@ -864,7 +866,15 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = writer.Flush()
 		return
 	}
-	defer sessions.DestroySession(pid)
+	if orgID != "" {
+		observeOrgSessionsActive(orgID, sessions.SessionCount())
+	}
+	defer func() {
+		sessions.DestroySession(pid)
+		if orgID != "" {
+			observeOrgSessionsActive(orgID, sessions.SessionCount())
+		}
+	}()
 
 	// Register the TCP connection so OnWorkerCrash can close it to unblock
 	// the message loop if the backing worker dies.

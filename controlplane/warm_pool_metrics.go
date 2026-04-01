@@ -31,6 +31,11 @@ var hotWorkersGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of activated, tenant-bound workers serving sessions",
 })
 
+var hotIdleWorkersGauge = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_hot_idle_workers",
+	Help: "Number of activated workers retaining org assignment between sessions",
+})
+
 var drainingWorkersGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "duckgres_draining_workers",
 	Help: "Number of workers currently draining sessions before retirement",
@@ -76,7 +81,7 @@ const (
 // observeWarmPoolLifecycleGauges recalculates all lifecycle gauges from the
 // current worker map. Must be called with p.mu held (at least RLock).
 func observeWarmPoolLifecycleGauges(workers map[int]*ManagedWorker) {
-	var idle, reserved, activating, hot, draining int
+	var idle, reserved, activating, hot, hotIdle, draining int
 	for _, w := range workers {
 		select {
 		case <-w.done:
@@ -92,6 +97,8 @@ func observeWarmPoolLifecycleGauges(workers map[int]*ManagedWorker) {
 			activating++
 		case WorkerLifecycleHot:
 			hot++
+		case WorkerLifecycleHotIdle:
+			hotIdle++
 		case WorkerLifecycleDraining:
 			draining++
 		}
@@ -100,6 +107,7 @@ func observeWarmPoolLifecycleGauges(workers map[int]*ManagedWorker) {
 	reservedWorkersGauge.Set(float64(reserved))
 	activatingWorkersGauge.Set(float64(activating))
 	hotWorkersGauge.Set(float64(hot))
+	hotIdleWorkersGauge.Set(float64(hotIdle))
 	drainingWorkersGauge.Set(float64(draining))
 }
 
