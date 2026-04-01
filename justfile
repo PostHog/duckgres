@@ -296,6 +296,21 @@ test-perf:
 test-ducklake:
     ./scripts/test_ducklake.sh
 
+# Run DuckLake concurrency benchmarks (current version)
+[group('test')]
+test-ducklake-concurrency:
+    go test -v -run TestDuckLakeConcurrentTransactions -timeout 300s ./tests/integration/...
+
+# Run DuckLake concurrency benchmarks with JSON output (current version)
+[group('test')]
+bench-ducklake:
+    ./scripts/ducklake_version_matrix.sh --current-only
+
+# Run DuckLake concurrency benchmarks across multiple DuckDB/DuckLake versions
+[group('test')]
+bench-ducklake-matrix:
+    ./scripts/ducklake_version_matrix.sh
+
 # Run extension loading tests
 [group('test')]
 test-extensions:

@@ -453,6 +453,51 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		"concurrent_write_4",
 		"concurrent_ddl_test",
 		"concurrent_dml_test",
+		// DuckLake concurrency test tables
+		"dl_conc_insert",
+		"dl_conc_tx_insert",
+		"dl_conc_update",
+		"dl_conc_del",
+		"dl_conc_orders",
+		"dl_conc_items",
+		"dl_conc_rw",
+		"dl_conc_upsert",
+		"dl_conc_ddl_write",
+		"dl_conc_batch",
+		"dl_conc_rapid",
+		"dl_conc_rollback",
+		"dl_conc_sustained",
+		// DuckLake CTAS concurrency test tables
+		"dl_ctas_source",
+		"dl_cortas_source",
+		"dl_ctas_live_source",
+		"dl_replace_source_a",
+		"dl_replace_source_b",
+		"dl_replace_target",
+	}
+
+	// Also clean up dynamically-named tables from DuckLake concurrency lifecycle test
+	for w := range 4 {
+		for c := range 8 {
+			tables = append(tables, fmt.Sprintf("dl_conc_lifecycle_%d_%d", w, c))
+		}
+	}
+	for i := range 6 {
+		tables = append(tables, fmt.Sprintf("dl_conc_sep_%d", i))
+	}
+	// CTAS output tables
+	for w := range 8 {
+		for c := range 10 {
+			tables = append(tables, fmt.Sprintf("dl_ctas_out_%d_%d", w, c))
+		}
+	}
+	// CTAS snapshot tables
+	for i := range 20 {
+		tables = append(tables, fmt.Sprintf("dl_ctas_snapshot_%d", i))
+	}
+	// CREATE OR REPLACE target tables
+	for i := range 4 {
+		tables = append(tables, fmt.Sprintf("dl_cortas_target_%d", i))
 	}
 
 	for _, t := range tables {

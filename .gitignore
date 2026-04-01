@@ -34,3 +34,5 @@ artifacts/perf/
 gha-creds-*.json
 data-test/
 .claude/scheduled_tasks.lock
+.worktrees/
+bench-results/
