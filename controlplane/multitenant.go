@@ -223,14 +223,7 @@ func SetupMultiTenant(
 		router.sharedPool.retireClaimedWorker(&record, reason)
 	}
 	janitor.retireLocalWorker = func(workerID int, reason string) bool {
-		router.sharedPool.mu.Lock()
-		_, local := router.sharedPool.workers[workerID]
-		router.sharedPool.mu.Unlock()
-		if !local {
-			return false
-		}
-		router.sharedPool.retireWorkerWithReason(workerID, reason)
-		return true
+		return router.sharedPool.retireWorkerWithReason(workerID, reason)
 	}
 	janitor.reconcileWarmCapacity = func() {
 		target := router.sharedPool.WarmCapacityTarget()

@@ -814,12 +814,14 @@ func (p *K8sWorkerPool) RetireWorker(id int) {
 	p.retireWorkerWithReason(id, RetireReasonNormal)
 }
 
-func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) {
+// retireWorkerWithReason retires a worker and deletes its pod.
+// Returns true if the worker was found and retired.
+func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) bool {
 	p.mu.Lock()
 	w, ok := p.workers[id]
 	if !ok {
 		p.mu.Unlock()
-		return
+		return false
 	}
 	p.markWorkerRetiredLocked(w, reason)
 	delete(p.workers, id)
@@ -828,6 +830,7 @@ func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) {
 	observeControlPlaneWorkers(workerCount)
 
 	go p.retireWorkerPod(id, w)
+	return true
 }
 
 // RetireWorkerIfNoSessions retires a worker only if it has no active sessions.
@@ -1655,17 +1658,21 @@ func (p *K8sWorkerPool) ShutdownAll() {
 
 // retireWorkerPod closes the gRPC client and deletes the worker pod.
 func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
-	slog.Info("Retiring K8s worker.", "id", id)
+	podName := p.workerPodName(w)
+	slog.Info("Retiring K8s worker.", "id", id, "pod", podName)
 	if w.client != nil {
 		_ = w.client.Close()
 	}
-	podName := p.workerPodName(w)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+	if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 		GracePeriodSeconds: int64Ptr(10),
-	})
-	_ = p.deleteWorkerRPCSecret(ctx, podName)
+	}); err != nil {
+		slog.Warn("Failed to delete worker pod.", "id", id, "pod", podName, "error", err)
+	}
+	if err := p.deleteWorkerRPCSecret(ctx, podName); err != nil {
+		slog.Warn("Failed to delete worker RPC secret.", "id", id, "pod", podName, "error", err)
+	}
 }
 
 // idleReaper periodically retires workers that have been idle too long and
