@@ -519,7 +519,10 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		tables = append(tables, fmt.Sprintf("dl_cortas_target_%d", i))
 	}
 	// SQLMesh CTAS reproduction tables
-	tables = append(tables, "dl_sqlmesh_source", "dl_sqlmesh_raw")
+	tables = append(tables, "dl_sqlmesh_source", "dl_sqlmesh_raw", "dl_sqlmesh_comment_src")
+	for i := range 30 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_cmt_%d", i))
+	}
 	for i := range 30 {
 		tables = append(tables, fmt.Sprintf("dl_sqlmesh_model_%d", i))
 	}

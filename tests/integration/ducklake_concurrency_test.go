@@ -1505,6 +1505,122 @@ func runConcurrencyBenchmarks(t *testing.T, latencyMs int, openConn func(*testin
 		}
 	})
 
+	benchSub(t, "sqlmesh_ctas_with_comments", latencyMs, func(t *testing.T, m *metric) {
+		// Reproduces the full SQLMesh model execution pattern more accurately:
+		// each model does CREATE OR REPLACE TABLE ... AS SELECT, then immediately
+		// runs COMMENT ON TABLE to set the model description. The COMMENT is a
+		// separate DDL that hits the DuckLake metadata store, widening the
+		// conflict window. This matches the prod log pattern:
+		//   /* SQLMESH_PLAN: ... */ COMMENT ON TABLE "schema"."model" IS 'description'
+		conn := openConn(t)
+		defer func() { _ = conn.Close() }()
+
+		numModels := 10
+		if os.Getenv("DUCKGRES_STRESS") != "" {
+			numModels = 30
+		}
+
+		// Create shared source table
+		mustExec(t, conn, "CREATE TABLE dl_sqlmesh_comment_src (id INTEGER, ts BIGINT, category TEXT, val DOUBLE)")
+		for i := range numModels * 50 {
+			cat := fmt.Sprintf("cat_%d", i%numModels)
+			mustExec(t, conn, fmt.Sprintf(
+				"INSERT INTO dl_sqlmesh_comment_src VALUES (%d, %d, '%s', %f)",
+				i, int64(i)*1000, cat, float64(i)*1.5,
+			))
+		}
+		// Pre-create target tables
+		for i := range numModels {
+			mustExec(t, conn, fmt.Sprintf(
+				"CREATE TABLE dl_sqlmesh_cmt_%d AS SELECT * FROM dl_sqlmesh_comment_src WHERE category = 'cat_%d'",
+				i, i,
+			))
+		}
+		defer func() {
+			_, _ = conn.Exec("DROP TABLE IF EXISTS dl_sqlmesh_comment_src")
+			for i := range 30 {
+				_, _ = conn.Exec(fmt.Sprintf("DROP TABLE IF EXISTS dl_sqlmesh_cmt_%d", i))
+			}
+		}()
+
+		numRounds := 3
+		if os.Getenv("DUCKGRES_STRESS") != "" {
+			numRounds = 5
+		}
+		var totalConflicts, totalSuccesses, commentConflicts atomic.Int64
+
+		for round := range numRounds {
+			var wg sync.WaitGroup
+			errs := make(chan error, numModels)
+
+			for model := range numModels {
+				wg.Add(1)
+				go func(modelID, roundID int) {
+					defer wg.Done()
+					mconn := openConn(t)
+					defer func() { _ = mconn.Close() }()
+
+					cat := fmt.Sprintf("cat_%d", modelID)
+					tableName := fmt.Sprintf("dl_sqlmesh_cmt_%d", modelID)
+
+					// Step 1: CREATE OR REPLACE TABLE AS SELECT (the model evaluation)
+					_, err := mconn.Exec(fmt.Sprintf(
+						"CREATE OR REPLACE TABLE %s AS SELECT * FROM dl_sqlmesh_comment_src WHERE category = '%s'",
+						tableName, cat,
+					))
+					if err != nil {
+						if isTransactionConflict(err) || isAbortedTransaction(err) {
+							totalConflicts.Add(1)
+							recoverConnection(mconn)
+							return
+						}
+						errs <- fmt.Errorf("round %d model %d CTAS: %w", roundID, modelID, err)
+						return
+					}
+					totalSuccesses.Add(1)
+
+					// Step 2: COMMENT ON TABLE (sets model description, just like SQLMesh does)
+					comment := fmt.Sprintf("Model %d: filtered by %s (round %d)", modelID, cat, roundID)
+					_, err = mconn.Exec(fmt.Sprintf(
+						"COMMENT ON TABLE %s IS '%s'",
+						tableName, comment,
+					))
+					if err != nil {
+						if isTransactionConflict(err) || isAbortedTransaction(err) {
+							commentConflicts.Add(1)
+							recoverConnection(mconn)
+							return
+						}
+						// COMMENT ON TABLE may not be supported in DuckLake — log and continue
+						if strings.Contains(err.Error(), "Not implemented") ||
+							strings.Contains(err.Error(), "not supported") {
+							t.Logf("COMMENT ON TABLE not supported: %v", err)
+							return
+						}
+						errs <- fmt.Errorf("round %d model %d COMMENT: %w", roundID, modelID, err)
+						return
+					}
+				}(model, round)
+			}
+
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Error(err)
+			}
+		}
+
+		m.Successes, m.Conflicts = totalSuccesses.Load(), totalConflicts.Load()+commentConflicts.Load()
+		t.Logf("SQLMesh CTAS+COMMENT pattern: %d CTAS succeeded, %d CTAS conflicts, %d COMMENT conflicts across %d rounds of %d models",
+			totalSuccesses.Load(), totalConflicts.Load(), commentConflicts.Load(), numRounds, numModels)
+
+		conflictRate := float64(m.Conflicts) / float64(m.Successes+m.Conflicts) * 100
+		t.Logf("conflict rate: %.1f%% (CTAS: %.1f%%, COMMENT: %.1f%%)",
+			conflictRate,
+			float64(totalConflicts.Load())/float64(totalSuccesses.Load()+totalConflicts.Load())*100,
+			float64(commentConflicts.Load())/float64(totalSuccesses.Load()+commentConflicts.Load())*100)
+	})
+
 	benchSub(t, "sqlmesh_ctas_with_deps", latencyMs, func(t *testing.T, m *metric) {
 		// Extended SQLMesh pattern: models have dependency tiers (DAG levels).
 		// Tier 1 models run first, tier 2 models depend on tier 1 outputs.
