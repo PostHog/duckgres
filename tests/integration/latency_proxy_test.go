@@ -13,7 +13,7 @@ func TestLatencyProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 	go func() {
 		for {
 			c, err := echo.Accept()
@@ -21,7 +21,7 @@ func TestLatencyProxy(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				buf := make([]byte, 1024)
 				for {
 					n, err := c.Read(buf)
@@ -41,13 +41,13 @@ func TestLatencyProxy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer proxy.Close()
+		defer func() { _ = proxy.Close() }()
 
 		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", proxy.Port()))
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		msg := []byte("hello proxy")
 		_, err = conn.Write(msg)
@@ -56,7 +56,7 @@ func TestLatencyProxy(t *testing.T) {
 		}
 
 		buf := make([]byte, 64)
-		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, err := conn.Read(buf)
 		if err != nil {
 			t.Fatal(err)
@@ -72,20 +72,20 @@ func TestLatencyProxy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer proxy.Close()
+		defer func() { _ = proxy.Close() }()
 
 		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", proxy.Port()))
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		msg := []byte("ping")
 		start := time.Now()
 		_, _ = conn.Write(msg)
 
 		buf := make([]byte, 64)
-		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, err := conn.Read(buf)
 		elapsed := time.Since(start)
 		if err != nil {
@@ -118,14 +118,13 @@ func TestLatencyProxy(t *testing.T) {
 		_ = proxy.Close()
 
 		// After close, writes should eventually fail.
-		conn.SetDeadline(time.Now().Add(time.Second))
+		_ = conn.SetDeadline(time.Now().Add(time.Second))
 		_, err = conn.Write([]byte("after close"))
 		if err == nil {
 			// Read should fail since upstream is gone
 			buf := make([]byte, 64)
-			_, err = conn.Read(buf)
+			_, _ = conn.Read(buf)
 		}
-		// Either write or read should have errored
-		conn.Close()
+		_ = conn.Close()
 	})
 }
