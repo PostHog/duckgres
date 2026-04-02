@@ -104,11 +104,13 @@ jobs:
                   password: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Create and push ECR manifest
+              id: ecr-manifest
               run: |
                   docker manifest create ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
                       ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
                       ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
-                  docker manifest push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+                  digest=$(docker manifest push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }})
+                  echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
             - name: Create and push GHCR manifests
               run: |
@@ -136,7 +138,7 @@ jobs:
                       {
                         "values": {
                           "image": {
-                            "sha": "${{ github.sha }}"
+                            "sha": "${{ github.sha }}@${{ steps.ecr-manifest.outputs.digest }}"
                           }
                         },
                         "release": "duckgres",
