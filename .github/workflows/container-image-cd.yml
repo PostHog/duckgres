@@ -112,7 +112,7 @@ jobs:
                   docker buildx imagetools create --tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
                       ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
                       ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
-                  digest=$(docker buildx imagetools inspect ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} --format '{{.Manifest.Digest}}')
+                  digest=$(docker buildx imagetools inspect --raw ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} | sha256sum | awk '{print "sha256:"$1}')
                   echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
             - name: Create and push GHCR manifests
