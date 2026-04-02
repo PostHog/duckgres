@@ -87,6 +87,9 @@ jobs:
             packages: write
 
         steps:
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
             - name: Configure AWS credentials
               uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
               with:
@@ -106,20 +109,22 @@ jobs:
             - name: Create and push ECR manifest
               id: ecr-manifest
               run: |
-                  docker manifest create ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+                  digest=$(docker buildx imagetools create --tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
                       ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
-                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
-                  digest=$(docker manifest push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }})
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64 2>&1 | grep -oP 'sha256:[a-f0-9]+' | head -1)
+                  if [ -z "$digest" ]; then
+                      digest=$(docker buildx imagetools inspect ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} --format '{{.Manifest.Digest}}')
+                  fi
                   echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
             - name: Create and push GHCR manifests
               run: |
-                  for tag in "${{ github.sha }}" "latest"; do
-                      docker manifest create ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${tag} \
-                          ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
-                          ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
-                      docker manifest push ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${tag}
-                  done
+                  docker buildx imagetools create --tag ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
+                  docker buildx imagetools create --tag ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:latest \
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
 
             - name: Get deployer token
               id: deployer
