@@ -130,10 +130,8 @@ func TestRetryOnConflictExhaustsRetries(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
 	}
-	// conflictMaxRetries attempts in the loop + 1 final attempt to capture the error.
-	expected := conflictMaxRetries + 1
-	if calls != expected {
-		t.Fatalf("expected %d calls (%d retries + 1 final), got %d", expected, conflictMaxRetries, calls)
+	if calls != conflictMaxRetries {
+		t.Fatalf("expected %d calls, got %d", conflictMaxRetries, calls)
 	}
 	if !strings.Contains(err.Error(), "Transaction conflict on commit") {
 		t.Fatalf("expected wrapped original error, got: %v", err)

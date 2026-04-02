@@ -86,6 +86,7 @@ const (
 // Only used for autocommit queries — user-managed transactions propagate
 // the error since the entire transaction is invalid after a conflict.
 func retryOnConflict[T any](fn func() (T, error)) (T, error) {
+	var lastErr error
 	backoff := conflictInitialBackoff
 	for attempt := 1; attempt <= conflictMaxRetries; attempt++ {
 		ducklakeConflictRetriesTotal.Inc()
@@ -102,8 +103,9 @@ func retryOnConflict[T any](fn func() (T, error)) (T, error) {
 		if err == nil {
 			ducklakeConflictRetrySuccessesTotal.Inc()
 			slog.Info("DuckLake conflict retry succeeded.", "attempt", attempt)
-			return result, err
+			return result, nil
 		}
+		lastErr = err
 		if !isDuckLakeTransactionConflict(err) {
 			return result, err
 		}
@@ -116,12 +118,6 @@ func retryOnConflict[T any](fn func() (T, error)) (T, error) {
 
 	ducklakeConflictRetriesExhaustedTotal.Inc()
 	var zero T
-	// Re-run fn one last time to capture the final error for the caller.
-	result, lastErr := fn()
-	if lastErr == nil {
-		ducklakeConflictRetrySuccessesTotal.Inc()
-		return result, nil
-	}
 	slog.Error("DuckLake conflict retries exhausted.", "attempts", conflictMaxRetries, "error", lastErr)
 	return zero, fmt.Errorf("DuckLake transaction conflict: retries exhausted after %d attempts: %w", conflictMaxRetries, lastErr)
 }
