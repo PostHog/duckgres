@@ -1158,8 +1158,8 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 			ducklakeConflictTotal.Inc()
 			result, err = retryOnConflict(func() (ExecResult, error) {
-					return c.executor.ExecContext(ctx, query)
-				})
+				return c.executor.ExecContext(ctx, query)
+			})
 		}
 		if err != nil {
 			errCode := classifyErrorCode(err)
@@ -1197,6 +1197,14 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	defer cleanup()
 
 	rows, err := c.executor.QueryContext(ctx, query)
+	// Autocommit retry on DuckLake transaction conflicts (SELECT can conflict
+	// during DuckLake schema probing, symmetric with Flight SQL handler).
+	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+		ducklakeConflictTotal.Inc()
+		rows, err = retryOnConflict(func() (RowSet, error) {
+			return c.executor.QueryContext(ctx, query)
+		})
+	}
 	if err != nil {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()

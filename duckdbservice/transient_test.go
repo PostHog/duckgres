@@ -2,6 +2,7 @@ package duckdbservice
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -129,12 +130,17 @@ func TestRetryOnConflictExhaustsRetries(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
 	}
-	if calls != conflictMaxRetries {
-		t.Fatalf("expected %d calls, got %d", conflictMaxRetries, calls)
+	// conflictMaxRetries attempts in the loop + 1 final attempt to capture the error.
+	expected := conflictMaxRetries + 1
+	if calls != expected {
+		t.Fatalf("expected %d calls (%d retries + 1 final), got %d", expected, conflictMaxRetries, calls)
+	}
+	if !strings.Contains(err.Error(), "Transaction conflict on commit") {
+		t.Fatalf("expected wrapped original error, got: %v", err)
 	}
 }
 
-func TestRetryOnConflictNoRetryForNonConflict(t *testing.T) {
+func TestRetryOnConflictStopsOnNonConflictError(t *testing.T) {
 	calls := 0
 	_, err := retryOnConflict(func() (string, error) {
 		calls++
@@ -144,7 +150,9 @@ func TestRetryOnConflictNoRetryForNonConflict(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error")
 	}
+	// retryOnConflict always makes one attempt (the first retry); when the
+	// error is not a transaction conflict it stops immediately.
 	if calls != 1 {
-		t.Fatalf("expected 1 call (no retry for non-conflict), got %d", calls)
+		t.Fatalf("expected 1 call (stop on non-conflict error), got %d", calls)
 	}
 }

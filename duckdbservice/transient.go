@@ -116,6 +116,12 @@ func retryOnConflict[T any](fn func() (T, error)) (T, error) {
 
 	ducklakeConflictRetriesExhaustedTotal.Inc()
 	var zero T
-	slog.Error("DuckLake conflict retries exhausted.", "attempts", conflictMaxRetries)
-	return zero, fmt.Errorf("DuckLake transaction conflict: retries exhausted after %d attempts", conflictMaxRetries)
+	// Re-run fn one last time to capture the final error for the caller.
+	result, lastErr := fn()
+	if lastErr == nil {
+		ducklakeConflictRetrySuccessesTotal.Inc()
+		return result, nil
+	}
+	slog.Error("DuckLake conflict retries exhausted.", "attempts", conflictMaxRetries, "error", lastErr)
+	return zero, fmt.Errorf("DuckLake transaction conflict: retries exhausted after %d attempts: %w", conflictMaxRetries, lastErr)
 }

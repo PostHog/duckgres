@@ -287,6 +287,9 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	schema, err := retryOnTransient(func() (*arrow.Schema, error) {
 		return GetQuerySchema(ctx, session.Conn, query, tx)
 	})
+	// Conflict retry for autocommit only. Note: if retryOnTransient exhausted on a
+	// transient error that also matches "Transaction conflict", this chains into
+	// conflict retry — acceptable since the error patterns are distinct in practice.
 	if err != nil && tx == nil && isDuckLakeTransactionConflict(err) {
 		ducklakeConflictTotal.Inc()
 		schema, err = retryOnConflict(func() (*arrow.Schema, error) {
@@ -373,6 +376,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			}
 			return session.Conn.QueryContext(ctx, handle.Query)
 		})
+		// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 		if qerr != nil && tx == nil && isDuckLakeTransactionConflict(qerr) {
 			ducklakeConflictTotal.Inc()
 			rows, qerr = retryOnConflict(func() (*sql.Rows, error) {
@@ -431,6 +435,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		}
 		return session.Conn.ExecContext(ctx, query)
 	})
+	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 	if execErr != nil && tx == nil && isDuckLakeTransactionConflict(execErr) {
 		ducklakeConflictTotal.Inc()
 		result, execErr = retryOnConflict(func() (sql.Result, error) {
