@@ -13,9 +13,17 @@ env:
 
 jobs:
     build:
-        name: Build and push duckgres
+        name: Build ${{ matrix.platform }}
         if: github.repository == 'PostHog/duckgres'
-        runs-on: ubuntu-24.04-arm
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - platform: linux/arm64
+                      runner: ubuntu-24.04-arm
+                    - platform: linux/amd64
+                      runner: ubuntu-24.04
+        runs-on: ${{ matrix.runner }}
         permissions:
             id-token: write
             contents: read
@@ -45,23 +53,73 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Build and push container image
+            - name: Prepare platform slug
+              id: slug
+              run: echo "arch=${PLATFORM#linux/}" >> "$GITHUB_OUTPUT"
+              env:
+                  PLATFORM: ${{ matrix.platform }}
+
+            - name: Build and push by digest
               id: build
               uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
               with:
                   context: .
                   push: true
-                  platforms: linux/arm64
+                  platforms: ${{ matrix.platform }}
                   tags: |
-                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}
-                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:latest
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ steps.slug.outputs.arch }}
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ steps.slug.outputs.arch }}
                   build-args: |
                       VERSION=build-${{ github.sha }}
                       COMMIT=${{ github.sha }}
                       BUILD_TAGS=kubernetes
-                  cache-from: type=gha
-                  cache-to: type=gha,mode=max
+                  cache-from: type=gha,scope=${{ steps.slug.outputs.arch }}
+                  cache-to: type=gha,mode=max,scope=${{ steps.slug.outputs.arch }}
+
+    manifest:
+        name: Create multi-arch manifest
+        needs: build
+        if: github.repository == 'PostHog/duckgres'
+        runs-on: ubuntu-24.04
+        permissions:
+            id-token: write
+            contents: read
+            packages: write
+
+        steps:
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+              with:
+                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  aws-region: us-east-1
+
+            - name: Login to Amazon ECR
+              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+            - name: Login to GHCR
+              uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+              with:
+                  registry: ${{ env.GHCR_REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Create and push ECR manifest
+              id: ecr-manifest
+              run: |
+                  docker manifest create ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
+                  digest=$(docker manifest push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }})
+                  echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+            - name: Create and push GHCR manifests
+              run: |
+                  for tag in "${{ github.sha }}" "latest"; do
+                      docker manifest create ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${tag} \
+                          ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
+                          ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
+                      docker manifest push ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${tag}
+                  done
 
             - name: Get deployer token
               id: deployer
@@ -80,7 +138,7 @@ jobs:
                       {
                         "values": {
                           "image": {
-                            "sha": "${{ github.sha }}@${{ steps.build.outputs.digest }}"
+                            "sha": "${{ github.sha }}@${{ steps.ecr-manifest.outputs.digest }}"
                           }
                         },
                         "release": "duckgres",
