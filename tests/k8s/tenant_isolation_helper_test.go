@@ -290,10 +290,11 @@ func psqlLiteral(value string) string {
 }
 
 func minioPrefixFileCount(prefix string) (int, error) {
+	trimmedPrefix := strings.Trim(prefix, "/")
 	cmd := exec.Command(
 		"docker", "exec", "duckgres-local-minio",
 		"sh", "-lc",
-		fmt.Sprintf("find /data/duckgres-local/%s -type f 2>/dev/null | wc -l", prefix),
+		fmt.Sprintf("mc ls --recursive local/duckgres-local/%s 2>/dev/null | wc -l", trimmedPrefix),
 	)
 	out, err := cmd.Output()
 	if err != nil {
@@ -316,4 +317,46 @@ func waitForMinioPrefixFileCountAtLeast(prefix string, minimum int, timeout time
 		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("prefix %s did not reach %d files within %s", prefix, minimum, timeout)
+}
+
+func waitForMinioPrefixFileCountToStayAtMost(prefix string, maximum int, duration time.Duration) error {
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
+		count, err := minioPrefixFileCount(prefix)
+		if err != nil {
+			return err
+		}
+		if count > maximum {
+			return fmt.Errorf("prefix %s exceeded %d files during stability window: got %d", prefix, maximum, count)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return nil
+}
+
+func ensureWorkerPodLacksServiceAccountToken(podName string) error {
+	pod, err := clientset.CoreV1().Pods(namespace).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get worker pod %s: %w", podName, err)
+	}
+	if len(pod.Spec.Containers) == 0 {
+		return fmt.Errorf("worker pod %s has no containers", podName)
+	}
+	containerName := pod.Spec.Containers[0].Name
+
+	cmd := exec.Command(
+		"kubectl", "-n", namespace, "exec", podName, "-c", containerName, "--",
+		"sh", "-lc",
+		"if [ -e /var/run/secrets/kubernetes.io/serviceaccount/token ]; then " +
+			"echo 'service account token present'; " +
+			"ls -la /var/run/secrets/kubernetes.io/serviceaccount || true; " +
+			"exit 1; " +
+			"fi",
+	)
+	cmd.Env = commandEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

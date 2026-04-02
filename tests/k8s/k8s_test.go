@@ -27,8 +27,7 @@ var (
 	clientset  *kubernetes.Clientset
 	namespace  string
 	kubeconfig string
-	pgPort     int
-	portFwdCmd *exec.Cmd
+	portForward *portForwardState
 	testEnv    k8sTestEnvironment
 )
 
@@ -66,6 +65,19 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("Failed to create k8s client: %v", err)
 	}
+	portForward = newPortForwardState(
+		func() (int, *exec.Cmd, error) {
+			return startPortForward(namespace, duckgresServiceTarget, duckgresServicePort)
+		},
+		waitForPort,
+		func(cmd *exec.Cmd) {
+			if cmd == nil || cmd.Process == nil {
+				return
+			}
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		},
+	)
 
 	if _, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second); err != nil {
 		log.Fatalf("Control-plane pod not ready: %v", err)
@@ -197,6 +209,7 @@ func TestK8sWorkerCrashRecovery(t *testing.T) {
 
 func TestK8sMultipleConcurrentConnections(t *testing.T) {
 	const n = 5
+	const timeout = 75 * time.Second
 	var wg sync.WaitGroup
 	errs := make(chan error, n)
 
@@ -205,7 +218,7 @@ func TestK8sMultipleConcurrentConnections(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			query := fmt.Sprintf("SELECT %d", id)
-			if err := retryDBOperationWithReconnect(30*time.Second, fmt.Sprintf("concurrent query %q", query), func(ctx context.Context, db *sql.DB) error {
+			if err := retryDBOperationWithReconnect(timeout, fmt.Sprintf("concurrent query %q", query), func(ctx context.Context, db *sql.DB) error {
 				var result int
 				if err := db.QueryRowContext(ctx, query).Scan(&result); err != nil {
 					return err
@@ -439,33 +452,24 @@ func startPortForward(ns, target string, remotePort int) (int, *exec.Cmd, error)
 }
 
 func closePortForward() {
-	if portFwdCmd == nil || portFwdCmd.Process == nil {
-		portFwdCmd = nil
+	if portForward == nil {
 		return
 	}
-
-	_ = portFwdCmd.Process.Kill()
-	_ = portFwdCmd.Wait()
-	portFwdCmd = nil
+	portForward.closeCurrent()
 }
 
 func restartPortForward() error {
-	closePortForward()
-
-	localPort, cmd, err := startPortForward(namespace, duckgresServiceTarget, duckgresServicePort)
-	if err != nil {
-		return err
+	if portForward == nil {
+		return fmt.Errorf("port-forward state is not initialized")
 	}
+	return portForward.restart(30 * time.Second)
+}
 
-	pgPort = localPort
-	portFwdCmd = cmd
-
-	if err := waitForPort(pgPort, 30*time.Second); err != nil {
-		closePortForward()
-		return err
+func restartPortForwardIfStale(stalePort int) error {
+	if portForward == nil {
+		return fmt.Errorf("port-forward state is not initialized")
 	}
-
-	return nil
+	return portForward.restartIfStale(stalePort, 30*time.Second)
 }
 
 func waitForPort(port int, timeout time.Duration) error {
@@ -602,9 +606,16 @@ func openDBConn() (*sql.DB, error) {
 }
 
 func openDBConnAs(username, password string) (*sql.DB, error) {
+	if portForward == nil {
+		return nil, fmt.Errorf("port-forward state is not initialized")
+	}
 	databaseName := username
 	if username == "postgres" {
 		databaseName = "duckgres"
+	}
+	pgPort := portForward.currentPort()
+	if pgPort == 0 {
+		return nil, fmt.Errorf("port-forward port is not initialized")
 	}
 
 	// kubectl port-forward passes raw TCP bytes, so the client still needs
@@ -692,6 +703,10 @@ func retryDBOperationWithReconnectAs(username, password string, timeout time.Dur
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		stalePort := 0
+		if portForward != nil {
+			stalePort = portForward.currentPort()
+		}
 		db, err := openDBConnAs(username, password)
 		if err == nil {
 			attemptCtx, cancel := context.WithTimeout(context.Background(), dbAttemptTimeout)
@@ -705,7 +720,7 @@ func retryDBOperationWithReconnectAs(username, password string, timeout time.Dur
 
 		lastErr = err
 		if isTransientDBError(err) {
-			if restartErr := restartPortForward(); restartErr != nil {
+			if restartErr := restartPortForwardIfStale(stalePort); restartErr != nil {
 				lastErr = fmt.Errorf("%w; restart port-forward: %v", err, restartErr)
 			}
 		}
