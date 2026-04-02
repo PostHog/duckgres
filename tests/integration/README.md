@@ -212,6 +212,108 @@ opts := CompareOptions{
 }
 ```
 
+## DuckLake Concurrency & Latency Benchmarks
+
+The test suite includes benchmarks that measure DuckLake transaction conflict rates under concurrent load, and a latency sensitivity analysis that injects artificial metadata store latency to simulate remote RDS configurations.
+
+### Prerequisites
+
+The DuckLake benchmarks require the metadata PostgreSQL and MinIO infrastructure:
+
+```bash
+# Start DuckLake infrastructure
+docker compose -f tests/integration/docker-compose.yml up -d ducklake-metadata minio minio-init
+```
+
+### Running concurrency benchmarks
+
+```bash
+# Run all concurrency tests (default: 0ms latency)
+just test-ducklake-concurrency
+
+# Or directly:
+go test -v -run TestDuckLakeConcurrentTransactions -timeout 300s ./tests/integration/
+```
+
+### Running latency sensitivity analysis
+
+The `DUCKGRES_BENCH_LATENCIES` environment variable controls which latency levels to sweep. Each value is a one-way latency injected via a TCP proxy between DuckDB/DuckLake and the metadata PostgreSQL (total RTT overhead = 2x the configured value).
+
+```bash
+# Sweep multiple latency levels
+just bench-ducklake-latency 0ms,10ms,25ms,50ms
+
+# Or directly:
+DUCKGRES_BENCH_LATENCIES=0ms,10ms,50ms \
+  go test -v -run TestDuckLakeConcurrentTransactions -timeout 3600s ./tests/integration/
+
+# Write structured JSON results for comparison
+DUCKGRES_BENCH_LATENCIES=0ms,10ms \
+DUCKGRES_BENCH_OUT=results.json \
+  go test -v -run TestDuckLakeConcurrentTransactions -timeout 3600s ./tests/integration/
+```
+
+**Important:** Higher latency levels make tests significantly slower since every metadata round-trip pays the extra RTT. Budget roughly:
+- `0ms`: ~2 minutes for all 21 tests
+- `10ms`: ~25 minutes
+- `20ms`: ~45 minutes
+- `50ms`: may exceed 1 hour
+
+### Version matrix
+
+Compare conflict rates across DuckDB/DuckLake versions, optionally combined with latency:
+
+```bash
+# Version matrix (current version vs others)
+just bench-ducklake-matrix
+
+# Full version × latency matrix
+DUCKGRES_BENCH_LATENCIES=0ms,10ms just bench-ducklake-matrix
+```
+
+### How the latency proxy works
+
+For non-zero latency, a TCP proxy sits between DuckDB's DuckLake extension and the metadata PostgreSQL:
+
+```
+DuckDB → DuckLake ext → [TCP Proxy (+Xms per direction)] → Metadata PostgreSQL (port 35433)
+```
+
+Each read/write through the proxy gets a `time.Sleep(latency)` before forwarding. For `0ms`, no proxy is used (zero overhead). Each latency level gets its own dedicated duckgres server instance.
+
+### JSON output schema
+
+When `DUCKGRES_BENCH_OUT` is set, the test writes a JSON report:
+
+```json
+{
+  "duckdb_version": "v1.5.1",
+  "ducklake_version": "67480b1d",
+  "latencies_tested_ms": [0, 10],
+  "timestamp": "2026-04-01T19:12:47Z",
+  "metrics": [
+    {
+      "test": "concurrent_updates_same_rows",
+      "metadata_latency_ms": 0,
+      "successes": 103,
+      "conflicts": 77,
+      "conflict_rate_pct": 42.8,
+      "duration_sec": 5.2,
+      "throughput_ops_sec": 19.8
+    }
+  ]
+}
+```
+
+### Environment variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DUCKGRES_BENCH_LATENCIES` | Comma-separated latency levels (e.g. `0ms,10ms,50ms`) | `0ms` |
+| `DUCKGRES_BENCH_OUT` | Path to write JSON results | *(none, no file written)* |
+| `DUCKGRES_STRESS` | Set to any value to increase SQLMesh model count (10→30) | *(unset)* |
+| `DUCKGRES_TEST_NO_DUCKLAKE` | Set to `1` to disable DuckLake mode | *(unset)* |
+
 ## Troubleshooting
 
 ### PostgreSQL container won't start
