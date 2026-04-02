@@ -287,6 +287,12 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	schema, err := retryOnTransient(func() (*arrow.Schema, error) {
 		return GetQuerySchema(ctx, session.Conn, query, tx)
 	})
+	if err != nil && tx == nil && isDuckLakeTransactionConflict(err) {
+		ducklakeConflictTotal.Inc()
+		schema, err = retryOnConflict(func() (*arrow.Schema, error) {
+			return GetQuerySchema(ctx, session.Conn, query, tx)
+		})
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
@@ -367,6 +373,12 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			}
 			return session.Conn.QueryContext(ctx, handle.Query)
 		})
+		if qerr != nil && tx == nil && isDuckLakeTransactionConflict(qerr) {
+			ducklakeConflictTotal.Inc()
+			rows, qerr = retryOnConflict(func() (*sql.Rows, error) {
+				return session.Conn.QueryContext(ctx, handle.Query)
+			})
+		}
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
 			return
@@ -419,6 +431,12 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		}
 		return session.Conn.ExecContext(ctx, query)
 	})
+	if execErr != nil && tx == nil && isDuckLakeTransactionConflict(execErr) {
+		ducklakeConflictTotal.Inc()
+		result, execErr = retryOnConflict(func() (sql.Result, error) {
+			return session.Conn.ExecContext(ctx, query)
+		})
+	}
 	if execErr != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}

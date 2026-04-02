@@ -19,10 +19,13 @@ func TestIsTransientDuckLakeError(t *testing.T) {
 		{"connection reset", errors.New("read tcp: connection reset by peer"), true},
 		{"connection timed out", errors.New("connection timed out"), true},
 		{"server closed", errors.New("server closed the connection unexpectedly"), true},
+		{"SSL closed", errors.New(`Failed to execute query "COMMIT": SSL connection has been closed unexpectedly`), true},
+		{"current transaction aborted", errors.New("Current transaction is aborted, commands ignored until end of transaction block"), true},
 		{"no route", errors.New("no route to host"), true},
 		{"network unreachable", errors.New("network is unreachable"), true},
 		{"auth error", errors.New("password authentication failed for user"), false},
 		{"table not found", errors.New("Table with name foo does not exist"), false},
+		{"transaction conflict is not transient", errors.New(`Transaction conflict - attempting to insert into table with index "29784"`), false},
 	}
 
 	for _, tt := range tests {
@@ -79,5 +82,77 @@ func TestRetryOnTransientAttachNoRetryForNonTransient(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected 1 call (no retry for non-transient), got %d", calls)
+	}
+}
+
+func TestRetryOnConflictSucceedsAfterRetry(t *testing.T) {
+	calls := 0
+	result, err := retryOnConflict(func() (string, error) {
+		calls++
+		if calls <= 2 {
+			return "", errors.New(`Transaction conflict - attempting to insert into table with index "29784"`)
+		}
+		return "ok", nil
+	})
+
+	if err != nil {
+		t.Fatalf("expected success, got error: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("expected result 'ok', got %q", result)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 calls, got %d", calls)
+	}
+}
+
+func TestRetryOnConflictExhaustsRetries(t *testing.T) {
+	calls := 0
+	_, err := retryOnConflict(func() (string, error) {
+		calls++
+		return "", errors.New("Transaction conflict on commit")
+	})
+
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if calls != conflictMaxRetries {
+		t.Fatalf("expected %d calls, got %d", conflictMaxRetries, calls)
+	}
+}
+
+func TestRetryOnConflictNoRetryForNonConflict(t *testing.T) {
+	calls := 0
+	_, err := retryOnConflict(func() (string, error) {
+		calls++
+		return "", errors.New("syntax error at position 42")
+	})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call (no retry for non-conflict), got %d", calls)
+	}
+}
+
+func TestClassifyErrorCode(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected string
+	}{
+		{"transaction conflict", errors.New("Transaction conflict on commit"), "40001"},
+		{"query cancelled", errors.New("context canceled"), "57014"},
+		{"generic error", errors.New("syntax error"), "42000"},
+		{"SSL closed is not conflict", errors.New("SSL connection has been closed unexpectedly"), "42000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyErrorCode(tt.err); got != tt.expected {
+				t.Errorf("classifyErrorCode(%v) = %q, want %q", tt.err, got, tt.expected)
+			}
+		})
 	}
 }

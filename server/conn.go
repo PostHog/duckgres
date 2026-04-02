@@ -359,6 +359,19 @@ func isDuckLakeMetadataConnectionLost(err error) bool {
 		strings.Contains(msg, "SSL connection has been closed unexpectedly")
 }
 
+// classifyErrorCode returns the most appropriate PostgreSQL SQLSTATE for a
+// DuckDB error. Transaction conflicts get 40001 (serialization_failure), which
+// signals PG-aware clients to retry. Query cancellations get 57014.
+func classifyErrorCode(err error) string {
+	if isQueryCancelled(err) {
+		return "57014"
+	}
+	if isDuckLakeTransactionConflict(err) {
+		return "40001" // serialization_failure — client should retry
+	}
+	return "42000"
+}
+
 // logQueryError logs a query execution failure with additional context for
 // DuckLake-specific errors (transaction conflicts and metadata connection loss).
 func logQueryError(user, query string, err error) {
@@ -1079,17 +1092,22 @@ func (c *clientConn) handleQuery(body []byte) error {
 					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
 			}
+			// Autocommit retry on DuckLake transaction conflicts
+			if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+				ducklakeConflictTotal.Inc()
+				execResult, err = retryOnConflict(func() (ExecResult, error) {
+					return c.executor.ExecContext(ctx, query)
+				})
+			}
 			if err != nil {
-				errCode := "42000"
+				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if isQueryCancelled(err) {
-					errCode = "57014"
 					errMsg = "canceling statement due to user request"
-					c.sendError("ERROR", errCode, errMsg)
 				} else {
 					logQueryError(c.username, query, err)
-					c.sendError("ERROR", errCode, errMsg)
 				}
+				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
 				c.logQuery(start, originalQuery, query, cmdType, 0, 0, errCode, errMsg, "simple")
 				_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1136,13 +1154,22 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		defer cleanup()
 
 		result, err := c.executor.ExecContext(ctx, query)
+		// Autocommit retry on DuckLake transaction conflicts
+		if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+			ducklakeConflictTotal.Inc()
+			result, err = retryOnConflict(func() (ExecResult, error) {
+					return c.executor.ExecContext(ctx, query)
+				})
+		}
 		if err != nil {
+			errCode := classifyErrorCode(err)
+			errMsg := err.Error()
 			if isQueryCancelled(err) {
-				c.sendError("ERROR", "57014", "canceling statement due to user request")
+				errMsg = "canceling statement due to user request"
 			} else {
 				logQueryError(c.username, query, err)
-				c.sendError("ERROR", "42000", err.Error())
 			}
+			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
@@ -1171,16 +1198,14 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 
 	rows, err := c.executor.QueryContext(ctx, query)
 	if err != nil {
-		errCode := "42000"
+		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			errCode = "57014"
 			errMsg = "canceling statement due to user request"
-			c.sendError("ERROR", errCode, errMsg)
 		} else {
 			logQueryError(c.username, query, err)
-			c.sendError("ERROR", errCode, errMsg)
 		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
@@ -1522,11 +1547,17 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
 			}
+			// Autocommit retry on DuckLake transaction conflicts
+			if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+				ducklakeConflictTotal.Inc()
+				execResult, err = retryOnConflict(func() (ExecResult, error) {
+					return c.executor.ExecContext(ctx, executedQuery)
+				})
+			}
 			if err != nil {
-				errCode := "42000"
+				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if isQueryCancelled(err) {
-					errCode = "57014"
 					errMsg = "canceling statement due to user request"
 				} else {
 					logQueryError(c.username, executedQuery, err)
@@ -1555,10 +1586,9 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	rows, err := c.executor.QueryContext(ctx, executedQuery)
 	if err != nil {
-		errCode := "42000"
+		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			errCode = "57014"
 			errMsg = "canceling statement due to user request"
 		} else {
 			logQueryError(c.username, executedQuery, err)
@@ -4838,11 +4868,24 @@ func (c *clientConn) handleExecute(body []byte) {
 					result, err = c.executor.Exec(alteredQuery, args...)
 				}
 			}
+			// Autocommit retry on DuckLake transaction conflicts
+			if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+				ducklakeConflictTotal.Inc()
+				result, err = retryOnConflict(func() (ExecResult, error) {
+					return c.executor.Exec(convertedQuery, args...)
+				})
+			}
 			if err != nil {
-				logQueryError(c.username, convertedQuery, err)
-				c.sendError("ERROR", "42000", err.Error())
+				errCode := classifyErrorCode(err)
+				errMsg := err.Error()
+				if isQueryCancelled(err) {
+					errMsg = "canceling statement due to user request"
+				} else {
+					logQueryError(c.username, convertedQuery, err)
+				}
+				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
-				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 				return
 			}
 		}
@@ -4860,10 +4903,16 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Result-returning query: use Query with converted query
 	rows, err := c.executor.Query(convertedQuery, args...)
 	if err != nil {
-		logQueryError(c.username, convertedQuery, err)
-		c.sendError("ERROR", "42000", err.Error())
+		errCode := classifyErrorCode(err)
+		errMsg := err.Error()
+		if isQueryCancelled(err) {
+			errMsg = "canceling statement due to user request"
+		} else {
+			logQueryError(c.username, convertedQuery, err)
+		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 		return
 	}
 	defer func() { _ = rows.Close() }()
