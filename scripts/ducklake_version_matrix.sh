@@ -9,6 +9,7 @@
 #   ./scripts/ducklake_version_matrix.sh                   # run matrix
 #   ./scripts/ducklake_version_matrix.sh --current-only    # benchmark current version only
 #   DUCKLAKE_VERSIONS="v2.10501.0" ./scripts/ducklake_version_matrix.sh  # custom versions
+#   DUCKGRES_BENCH_LATENCIES=0ms,50ms,100ms ./scripts/ducklake_version_matrix.sh  # latency sweep
 #
 # Requires: Docker running (for DuckLake infra), go, git, jq (for comparison)
 
@@ -70,11 +71,12 @@ run_benchmark() {
     (
         cd "$work_dir"
         DUCKGRES_BENCH_OUT="$out_file" \
+        DUCKGRES_BENCH_LATENCIES="${DUCKGRES_BENCH_LATENCIES:-}" \
             go test -v -count=1 \
             -run TestDuckLakeConcurrentTransactions \
             -timeout "$TEST_TIMEOUT" \
             ./tests/integration/ 2>&1 \
-        | grep -E '(--- PASS|--- FAIL|FAIL|^ok|ducklake_concurrency_test.go.*:|DuckDB|DuckLake)' \
+        | grep -E '(--- PASS|--- FAIL|FAIL|^ok|ducklake_concurrency_test.go.*:|DuckDB|DuckLake|latency)' \
         || true
     )
 
@@ -149,19 +151,29 @@ compare_results() {
     echo ""
     printf '%0.s-' $(seq 1 $((45 + ${#files[@]} * 24))); echo ""
 
-    # Get all test names from first file
+    # Get unique (test, latency) pairs from first file
     local tests
-    tests=$(jq -r '.metrics[].test' "${files[0]}")
+    tests=$(jq -r '.metrics[] | "\(.test)\t\(.metadata_latency_ms // 0)"' "${files[0]}")
 
-    while IFS= read -r test; do
-        printf "%-45s" "$test"
+    while IFS=$'\t' read -r test lat; do
+        local label="$test"
+        if [[ "$lat" != "0" ]]; then
+            label="${test} (${lat}ms)"
+        fi
+        printf "%-45s" "$label"
         for f in "${files[@]}"; do
             local rate
-            rate=$(jq -r --arg t "$test" '.metrics[] | select(.test == $t) | .conflict_rate_pct // 0 | . * 10 | round / 10' "$f" 2>/dev/null || echo "n/a")
+            rate=$(jq -r --arg t "$test" --argjson l "$lat" \
+                '.metrics[] | select(.test == $t and (.metadata_latency_ms // 0) == $l) | .conflict_rate_pct // 0 | . * 10 | round / 10' \
+                "$f" 2>/dev/null || echo "n/a")
             local succ
-            succ=$(jq -r --arg t "$test" '.metrics[] | select(.test == $t) | .successes // 0' "$f" 2>/dev/null || echo "n/a")
+            succ=$(jq -r --arg t "$test" --argjson l "$lat" \
+                '.metrics[] | select(.test == $t and (.metadata_latency_ms // 0) == $l) | .successes // 0' \
+                "$f" 2>/dev/null || echo "n/a")
             local conf
-            conf=$(jq -r --arg t "$test" '.metrics[] | select(.test == $t) | .conflicts // 0' "$f" 2>/dev/null || echo "n/a")
+            conf=$(jq -r --arg t "$test" --argjson l "$lat" \
+                '.metrics[] | select(.test == $t and (.metadata_latency_ms // 0) == $l) | .conflicts // 0' \
+                "$f" 2>/dev/null || echo "n/a")
             printf "  %5s ok %4s err %4s%%" "$succ" "$conf" "$rate"
         done
         echo ""

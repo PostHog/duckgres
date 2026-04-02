@@ -22,14 +22,15 @@ var duckLakeInfraServices = []string{"ducklake-metadata", "minio", "minio-init"}
 
 // TestHarness manages PostgreSQL and Duckgres instances for side-by-side testing
 type TestHarness struct {
-	PostgresDB  *sql.DB
-	DuckgresDB  *sql.DB
-	duckgresSrv *server.Server
-	tmpDir      string
-	pgPort      int
-	dgPort      int
-	useDuckLake bool
-	mu          sync.Mutex
+	PostgresDB   *sql.DB
+	DuckgresDB   *sql.DB
+	duckgresSrv  *server.Server
+	latencyProxy *LatencyProxy
+	tmpDir       string
+	pgPort       int
+	dgPort       int
+	useDuckLake  bool
+	mu           sync.Mutex
 }
 
 // HarnessConfig configures the test harness
@@ -46,6 +47,10 @@ type HarnessConfig struct {
 	DuckLakeMetadataPort int
 	// MinIOPort is the port for MinIO S3 API (default: 39000)
 	MinIOPort int
+	// MetadataLatency adds artificial one-way latency between DuckDB/DuckLake
+	// and the metadata PostgreSQL via a TCP proxy. Total RTT overhead = 2x this value.
+	// Zero means no proxy (direct connection).
+	MetadataLatency time.Duration
 }
 
 // DefaultConfig returns the default harness configuration
@@ -143,8 +148,22 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Configure DuckLake if enabled
 	if harnessCfg.UseDuckLake {
+		metadataPort := harnessCfg.DuckLakeMetadataPort
+
+		// If latency injection is requested, start a TCP proxy in front of the
+		// metadata PostgreSQL and point DuckLake at the proxy port instead.
+		if harnessCfg.MetadataLatency > 0 {
+			target := fmt.Sprintf("127.0.0.1:%d", harnessCfg.DuckLakeMetadataPort)
+			proxy, err := NewLatencyProxy(target, harnessCfg.MetadataLatency)
+			if err != nil {
+				return fmt.Errorf("failed to start latency proxy: %w", err)
+			}
+			h.latencyProxy = proxy
+			metadataPort = proxy.Port()
+		}
+
 		cfg.DuckLake = server.DuckLakeConfig{
-			MetadataStore: fmt.Sprintf("postgres:host=127.0.0.1 port=%d user=ducklake password=ducklake dbname=ducklake", harnessCfg.DuckLakeMetadataPort),
+			MetadataStore: fmt.Sprintf("postgres:host=127.0.0.1 port=%d user=ducklake password=ducklake dbname=ducklake", metadataPort),
 			ObjectStore:   "s3://ducklake/data/",
 			S3Provider:    "config",
 			S3Endpoint:    fmt.Sprintf("127.0.0.1:%d", harnessCfg.MinIOPort),
@@ -500,7 +519,10 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		tables = append(tables, fmt.Sprintf("dl_cortas_target_%d", i))
 	}
 	// SQLMesh CTAS reproduction tables
-	tables = append(tables, "dl_sqlmesh_source", "dl_sqlmesh_raw")
+	tables = append(tables, "dl_sqlmesh_source", "dl_sqlmesh_raw", "dl_sqlmesh_comment_src")
+	for i := range 30 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_cmt_%d", i))
+	}
 	for i := range 30 {
 		tables = append(tables, fmt.Sprintf("dl_sqlmesh_model_%d", i))
 	}
@@ -544,6 +566,12 @@ func (h *TestHarness) Close() error {
 	if h.duckgresSrv != nil {
 		if err := h.duckgresSrv.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close Duckgres server: %w", err))
+		}
+	}
+
+	if h.latencyProxy != nil {
+		if err := h.latencyProxy.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close latency proxy: %w", err))
 		}
 	}
 
