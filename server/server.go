@@ -91,6 +91,26 @@ var queryCancellationsCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Total number of queries cancelled via cancel request",
 })
 
+var ducklakeConflictTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_total",
+	Help: "Total number of DuckLake transaction conflicts encountered",
+})
+
+var ducklakeConflictRetriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retries_total",
+	Help: "Total number of DuckLake transaction conflict retry attempts",
+})
+
+var ducklakeConflictRetrySuccessesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retry_successes_total",
+	Help: "Total number of DuckLake transaction conflict retries that succeeded",
+})
+
+var ducklakeConflictRetriesExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retries_exhausted_total",
+	Help: "Total number of DuckLake transaction conflicts where all retries were exhausted",
+})
+
 // BackendKey uniquely identifies a backend connection for cancel requests
 type BackendKey struct {
 	Pid       int32
