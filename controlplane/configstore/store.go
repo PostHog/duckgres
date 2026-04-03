@@ -278,7 +278,10 @@ func (cs *ConfigStore) CreateOrgUser(orgID, username, passwordHash string) error
 		Username: username,
 		Password: passwordHash,
 	}
-	return cs.db.Create(&user).Error
+	return cs.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "org_id"}, {Name: "username"}},
+		DoUpdates: clause.AssignmentColumns([]string{"password", "updated_at"}),
+	}).Create(&user).Error
 }
 
 // UpdateOrgUserPassword updates the password hash for an existing user.

@@ -197,6 +197,20 @@ func (h *handler) getWarehouseStatus(c *gin.Context) {
 func (h *handler) resetPassword(c *gin.Context) {
 	orgID := c.Param("id")
 
+	warehouse, err := h.store.GetManagedWarehouse(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "warehouse not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if warehouse.State != configstore.ManagedWarehouseStateReady {
+		c.JSON(http.StatusConflict, gin.H{"error": "warehouse must be in ready state to reset password"})
+		return
+	}
+
 	plainPassword, err := configstore.GeneratePassword()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate password"})
