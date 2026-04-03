@@ -26,6 +26,22 @@ func newFakeStore() *fakeStore {
 	}
 }
 
+func (s *fakeStore) GetOrg(orgID string) (*configstore.Org, error) {
+	org, ok := s.orgs[orgID]
+	if !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return org, nil
+}
+
+func (s *fakeStore) CreateOrgUser(orgID, username, passwordHash string) error {
+	return nil
+}
+
+func (s *fakeStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
+	return nil
+}
+
 func (s *fakeStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
 	w, ok := s.warehouses[orgID]
 	if !ok {

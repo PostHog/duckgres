@@ -2,6 +2,8 @@ package configstore
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -258,6 +260,39 @@ func HashPassword(password string) (string, error) {
 		return "", fmt.Errorf("hash password: %w", err)
 	}
 	return string(hash), nil
+}
+
+// GeneratePassword returns a cryptographically random 32-byte URL-safe password.
+func GeneratePassword() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate password: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// CreateOrgUser creates a new user for the given org.
+func (cs *ConfigStore) CreateOrgUser(orgID, username, passwordHash string) error {
+	user := OrgUser{
+		OrgID:    orgID,
+		Username: username,
+		Password: passwordHash,
+	}
+	return cs.db.Create(&user).Error
+}
+
+// UpdateOrgUserPassword updates the password hash for an existing user.
+func (cs *ConfigStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
+	result := cs.db.Model(&OrgUser{}).
+		Where("org_id = ? AND username = ?", orgID, username).
+		Update("password", passwordHash)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("user %q not found in org %q", username, orgID)
+	}
+	return nil
 }
 
 // OnChange registers a callback that fires when the config snapshot changes.
