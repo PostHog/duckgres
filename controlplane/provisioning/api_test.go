@@ -16,14 +16,39 @@ import (
 
 type fakeStore struct {
 	orgs       map[string]*configstore.Org
+	users      map[configstore.OrgUserKey]string
 	warehouses map[string]*configstore.ManagedWarehouse
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		orgs:       make(map[string]*configstore.Org),
+		users:      make(map[configstore.OrgUserKey]string),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
 	}
+}
+
+func (s *fakeStore) GetOrg(orgID string) (*configstore.Org, error) {
+	org, ok := s.orgs[orgID]
+	if !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return org, nil
+}
+
+func (s *fakeStore) CreateOrgUser(orgID, username, passwordHash string) error {
+	key := configstore.OrgUserKey{OrgID: orgID, Username: username}
+	s.users[key] = passwordHash
+	return nil
+}
+
+func (s *fakeStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
+	key := configstore.OrgUserKey{OrgID: orgID, Username: username}
+	if _, exists := s.users[key]; !exists {
+		return fmt.Errorf("user %q not found in org %q", username, orgID)
+	}
+	s.users[key] = passwordHash
+	return nil
 }
 
 func (s *fakeStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -195,6 +220,7 @@ func TestProvisionRejectsExistingNonTerminal(t *testing.T) {
 func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.users[configstore.OrgUserKey{OrgID: "analytics", Username: "root"}] = "old-hash"
 	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
 		OrgID: "analytics",
 		State: configstore.ManagedWarehouseStateFailed,
@@ -212,6 +238,27 @@ func TestProvisionAllowsRetryAfterFailure(t *testing.T) {
 	}
 	if store.warehouses["analytics"].AuroraMaxACU != 2 {
 		t.Fatalf("expected max_acu 2, got %f", store.warehouses["analytics"].AuroraMaxACU)
+	}
+}
+
+func TestProvisionAllowsRetryAfterDeleted(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.users[configstore.OrgUserKey{OrgID: "analytics", Username: "root"}] = "old-hash"
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
+		OrgID: "analytics",
+		State: configstore.ManagedWarehouseStateDeleted,
+	}
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "aurora", "aurora": {"min_acu": 0, "max_acu": 2}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
 }
 
@@ -337,5 +384,24 @@ func TestGetWarehouseNotFound(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestResetPasswordRequiresReadyWarehouse(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.users[configstore.OrgUserKey{OrgID: "analytics", Username: "root"}] = "old-hash"
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
+		OrgID: "analytics",
+		State: configstore.ManagedWarehouseStateDeleted,
+	}
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/reset-password", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
 	}
 }
