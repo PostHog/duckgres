@@ -11,6 +11,52 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
+func TestInjectPostgresKeepalive(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "adds keepalive to postgres connection",
+			input: "postgres:host=localhost dbname=dl",
+			want:  "postgres:host=localhost dbname=dl keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5",
+		},
+		{
+			name:  "skips if keepalives already set",
+			input: "postgres:host=localhost dbname=dl keepalives=1 keepalives_idle=30",
+			want:  "postgres:host=localhost dbname=dl keepalives=1 keepalives_idle=30",
+		},
+		{
+			name:  "skips non-postgres metadata stores",
+			input: "sqlite:/tmp/test.db",
+			want:  "sqlite:/tmp/test.db",
+		},
+		{
+			name:  "skips empty string",
+			input: "",
+			want:  "",
+		},
+		{
+			name:  "handles full RDS connection string",
+			input: "postgres:host=mydb.us-east-1.rds.amazonaws.com port=5432 user=admin password=secret dbname=mydb",
+			want:  "postgres:host=mydb.us-east-1.rds.amazonaws.com port=5432 user=admin password=secret dbname=mydb keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := injectPostgresKeepalive(tt.input)
+			if got != tt.want {
+				t.Errorf("injectPostgresKeepalive(%q) =\n  %s\nwant:\n  %s", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// keepalive suffix appended by injectPostgresKeepalive to postgres connection strings.
+const keepaliveSuffix = " keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5"
+
 func TestBuildDuckLakeAttachStmt(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -24,7 +70,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				MetadataStore: "postgres:host=localhost dbname=dl",
 			},
 			migrate: false,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake",
 		},
 		{
 			name: "with object store",
@@ -33,7 +79,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				ObjectStore:   "s3://bucket/path",
 			},
 			migrate: false,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (DATA_PATH 's3://bucket/path')",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake (DATA_PATH 's3://bucket/path')",
 		},
 		{
 			name: "with data path fallback",
@@ -42,7 +88,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				DataPath:      "/local/data",
 			},
 			migrate: false,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (DATA_PATH '/local/data')",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake (DATA_PATH '/local/data')",
 		},
 		{
 			name: "object store takes precedence over data path",
@@ -52,7 +98,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				DataPath:      "/local/data",
 			},
 			migrate: false,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (DATA_PATH 's3://bucket/path')",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake (DATA_PATH 's3://bucket/path')",
 		},
 		{
 			name: "with migration flag",
@@ -61,7 +107,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				ObjectStore:   "s3://bucket/path",
 			},
 			migrate: true,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (DATA_PATH 's3://bucket/path', AUTOMATIC_MIGRATION TRUE)",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake (DATA_PATH 's3://bucket/path', AUTOMATIC_MIGRATION TRUE)",
 		},
 		{
 			name: "migration without data path",
@@ -69,7 +115,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				MetadataStore: "postgres:host=localhost dbname=dl",
 			},
 			migrate: true,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (AUTOMATIC_MIGRATION TRUE)",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake (AUTOMATIC_MIGRATION TRUE)",
 		},
 		{
 			name: "escapes single quotes in connection string",
@@ -77,7 +123,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				MetadataStore: "postgres:host=localhost password=it's_secret",
 			},
 			migrate: false,
-			want:    "ATTACH 'ducklake:postgres:host=localhost password=it''s_secret' AS ducklake",
+			want:    "ATTACH 'ducklake:postgres:host=localhost password=it''s_secret" + keepaliveSuffix + "' AS ducklake",
 		},
 		{
 			name: "with data inlining disabled",
@@ -86,7 +132,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				DataInliningRowLimit: intPtr(0),
 			},
 			migrate: false,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (DATA_INLINING_ROW_LIMIT 0)",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake (DATA_INLINING_ROW_LIMIT 0)",
 		},
 		{
 			name: "with data inlining custom limit",
@@ -96,7 +142,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				DataInliningRowLimit: intPtr(100),
 			},
 			migrate: false,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake (DATA_PATH 's3://bucket/path', DATA_INLINING_ROW_LIMIT 100)",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake (DATA_PATH 's3://bucket/path', DATA_INLINING_ROW_LIMIT 100)",
 		},
 		{
 			name: "nil data inlining uses default",
@@ -104,7 +150,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 				MetadataStore: "postgres:host=localhost dbname=dl",
 			},
 			migrate: false,
-			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl' AS ducklake",
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake",
 		},
 	}
 

@@ -6,6 +6,37 @@ import (
 	"testing"
 )
 
+func TestIsTransactionControlStmt(t *testing.T) {
+	tests := []struct {
+		query    string
+		expected bool
+	}{
+		{"COMMIT", true},
+		{"commit", true},
+		{"  COMMIT  ", true},
+		{"COMMIT;", true},
+		{"ROLLBACK", true},
+		{"rollback", true},
+		{"END", true},
+		{"END TRANSACTION", true},
+		{"BEGIN", false},
+		{"begin", false},
+		{"INSERT INTO t VALUES (1)", false},
+		{"SELECT 1", false},
+		{"CREATE TABLE t (id INT)", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			if got := isTransactionControlStmt(tt.query); got != tt.expected {
+				t.Errorf("isTransactionControlStmt(%q) = %v, want %v", tt.query, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsTransientDuckLakeError(t *testing.T) {
 	tests := []struct {
 		name     string
