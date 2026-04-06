@@ -1146,6 +1146,19 @@ func TestTranspile_SetShow(t *testing.T) {
 		}
 	})
 
+	t.Run("SET search_path quoted list stays scalar", func(t *testing.T) {
+		result, err := tr.Transpile("SET search_path TO 'shadow,revenue,stripe,billing_public,credit,posthog'")
+		if err != nil {
+			t.Fatalf("Transpile error: %v", err)
+		}
+		if result.IsIgnoredSet {
+			t.Error("SET search_path should NOT be marked as ignored")
+		}
+		if got, want := result.SQL, "SET search_path = 'shadow,revenue,stripe,billing_public,credit,posthog'"; got != want {
+			t.Fatalf("expected quoted search_path list to remain a single scalar string, got %q", got)
+		}
+	})
+
 	// Test SHOW search_path queries duckdb_settings() (DuckDB's SHOW describes tables, not settings)
 	t.Run("SHOW search_path via duckdb_settings", func(t *testing.T) {
 		result, err := tr.Transpile("SHOW search_path")

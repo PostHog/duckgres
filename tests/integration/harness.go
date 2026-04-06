@@ -304,6 +304,10 @@ func (h *TestHarness) loadPostgresFixtures() error {
 		return nil
 	}
 
+	if err := h.cleanupPostgresRuntimeSchemas(); err != nil {
+		return fmt.Errorf("failed to cleanup PostgreSQL runtime schemas: %w", err)
+	}
+
 	// Drop existing objects first (in reverse dependency order)
 	dropStatements := []string{
 		"DROP VIEW IF EXISTS order_details",
@@ -367,6 +371,49 @@ func (h *TestHarness) loadPostgresFixtures() error {
 	}
 
 	return nil
+}
+
+func (h *TestHarness) cleanupPostgresRuntimeSchemas() error {
+	rows, err := h.PostgresDB.Query(`
+		SELECT schema_name
+		FROM information_schema.schemata
+		WHERE schema_name = 'cp_runtime'
+			OR schema_name LIKE 'managed_warehouse\_%\_runtime' ESCAPE '\'
+	`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var schemas []string
+	for rows.Next() {
+		var schema string
+		if err := rows.Scan(&schema); err != nil {
+			return err
+		}
+		if isEphemeralPostgresRuntimeSchema(schema) {
+			schemas = append(schemas, schema)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, schema := range schemas {
+		if _, err := h.PostgresDB.Exec(`DROP SCHEMA IF EXISTS ` + quotePostgresIdentifier(schema) + ` CASCADE`); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func isEphemeralPostgresRuntimeSchema(schema string) bool {
+	return schema == "cp_runtime" || (strings.HasPrefix(schema, "managed_warehouse_") && strings.HasSuffix(schema, "_runtime"))
+}
+
+func quotePostgresIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // cleanupDuckLakeTables drops existing tables in DuckLake before loading fixtures

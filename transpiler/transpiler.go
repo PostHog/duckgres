@@ -252,6 +252,16 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 	// DuckDB compatibility fixups on the AST before deparsing
 	fixupAST(tree)
 
+	if transformResult.SQLOverride != "" {
+		return &Result{
+			SQL:          transformResult.SQLOverride,
+			ParamCount:   transformResult.ParamCount,
+			IsNoOp:       transformResult.IsNoOp,
+			NoOpTag:      transformResult.NoOpTag,
+			IsIgnoredSet: transformResult.IsIgnoredSet,
+		}, nil
+	}
+
 	// Deparse the modified AST back to SQL
 	deparsed, err := pg_query.Deparse(tree)
 	if err != nil {

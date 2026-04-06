@@ -7,6 +7,10 @@ import (
 // Result holds transpilation metadata that transforms can modify.
 // This is passed through all transforms to accumulate information.
 type Result struct {
+	// SQLOverride replaces the normal deparse output for transforms that need
+	// a precise SQL rendering the AST cannot represent faithfully for DuckDB.
+	SQLOverride string
+
 	// ParamCount is the number of parameters found
 	ParamCount int
 
