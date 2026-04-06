@@ -95,6 +95,8 @@ just multitenant-port-forward-api
 PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres dbname=duckgres sslmode=require"
 ```
 
+`just multitenant-port-forward-pg` forwards both pgwire on `5432` and Flight SQL on `8815`.
+
 `just run-multitenant-kind` recreates a local kind cluster, starts the config store plus the local warehouse DB, DuckLake metadata DB, and MinIO backing the seeded managed-warehouse contract, attaches those dependency containers to the Docker `kind` network, loads the locally built image into kind, and deploys the shared warm-worker control plane.
 
 Default login: `postgres / postgres`
@@ -110,6 +112,8 @@ just multitenant-port-forward-pg
 just multitenant-port-forward-admin
 PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres sslmode=require"
 ```
+
+`just multitenant-port-forward-pg` forwards both pgwire on `5432` and Flight SQL on `8815`.
 
 The admin dashboard requires the admin token printed in the control-plane logs. Fetch it with:
 
