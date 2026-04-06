@@ -8,6 +8,23 @@ import (
 	"time"
 )
 
+// isTransactionControlStmt returns true if the query is a transaction control
+// statement (COMMIT, ROLLBACK, or END). These must not be retried on transient
+// errors because DuckDB invalidates the transaction internally when the DuckLake
+// metadata store connection drops — retrying would produce a confusing
+// "cannot commit - no transaction is active" error.
+// BEGIN is excluded because it carries no transaction state and is safe to retry.
+func isTransactionControlStmt(query string) bool {
+	q := strings.TrimSpace(query)
+	if len(q) == 0 {
+		return false
+	}
+	upper := strings.ToUpper(q)
+	return strings.HasPrefix(upper, "COMMIT") ||
+		strings.HasPrefix(upper, "ROLLBACK") ||
+		strings.HasPrefix(upper, "END")
+}
+
 // isTransientDuckLakeError returns true if the error message indicates a
 // transient failure that is likely to succeed on retry. This covers DNS
 // resolution failures and TCP connection errors to the DuckLake metadata store.

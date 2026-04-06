@@ -429,12 +429,24 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
 
-	result, execErr := retryOnTransient(func() (sql.Result, error) {
+	execFn := func() (sql.Result, error) {
 		if tx != nil {
 			return tx.ExecContext(ctx, query)
 		}
 		return session.Conn.ExecContext(ctx, query)
-	})
+	}
+
+	// Don't retry COMMIT/ROLLBACK on transient errors. When the DuckLake
+	// metadata store connection drops mid-COMMIT, DuckDB rolls back the
+	// transaction internally. Retrying would just produce a confusing
+	// "cannot commit - no transaction is active" secondary error.
+	var result sql.Result
+	var execErr error
+	if isTransactionControlStmt(query) {
+		result, execErr = execFn()
+	} else {
+		result, execErr = retryOnTransient(execFn)
+	}
 	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 	if execErr != nil && tx == nil && isDuckLakeTransactionConflict(execErr) {
 		ducklakeConflictTotal.Inc()
