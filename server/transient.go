@@ -1,7 +1,9 @@
 package server
 
 import (
+	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"time"
 )
@@ -21,6 +23,8 @@ func isTransientDuckLakeError(err error) bool {
 		strings.Contains(msg, "connection reset by peer") ||
 		strings.Contains(msg, "connection timed out") ||
 		strings.Contains(msg, "server closed the connection unexpectedly") ||
+		strings.Contains(msg, "SSL connection has been closed unexpectedly") ||
+		strings.Contains(msg, "Current transaction is aborted") ||
 		strings.Contains(msg, "no route to host") ||
 		strings.Contains(msg, "network is unreachable")
 }
@@ -57,4 +61,50 @@ func retryOnTransientAttach(fn func() error) error {
 
 	slog.Error("DuckLake attach retries exhausted.", "attempts", transientMaxRetries+1, "error", err)
 	return err
+}
+
+const (
+	conflictMaxRetries     = 5
+	conflictInitialBackoff = 50 * time.Millisecond
+	conflictMaxBackoff     = 2 * time.Second
+)
+
+// retryOnConflict retries fn on DuckLake transaction conflicts with
+// exponential backoff and jitter (50-100% of backoff interval).
+// Only used for autocommit queries — user-managed transactions propagate
+// the error since the entire transaction is invalid after a conflict.
+func retryOnConflict[T any](fn func() (T, error)) (T, error) {
+	var lastErr error
+	backoff := conflictInitialBackoff
+	for attempt := 1; attempt <= conflictMaxRetries; attempt++ {
+		ducklakeConflictRetriesTotal.Inc()
+
+		jittered := time.Duration(float64(backoff) * (0.5 + rand.Float64()*0.5))
+		slog.Warn("DuckLake transaction conflict, retrying.",
+			"attempt", attempt, "max_retries", conflictMaxRetries,
+			"backoff", jittered)
+
+		time.Sleep(jittered)
+
+		result, err := fn()
+		if err == nil {
+			ducklakeConflictRetrySuccessesTotal.Inc()
+			slog.Info("DuckLake conflict retry succeeded.", "attempt", attempt)
+			return result, nil
+		}
+		lastErr = err
+		if !isDuckLakeTransactionConflict(err) {
+			return result, err
+		}
+
+		backoff *= 2
+		if backoff > conflictMaxBackoff {
+			backoff = conflictMaxBackoff
+		}
+	}
+
+	ducklakeConflictRetriesExhaustedTotal.Inc()
+	var zero T
+	slog.Error("DuckLake conflict retries exhausted.", "attempts", conflictMaxRetries, "error", lastErr)
+	return zero, fmt.Errorf("DuckLake transaction conflict: retries exhausted after %d attempts: %w", conflictMaxRetries, lastErr)
 }
