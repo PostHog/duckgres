@@ -103,7 +103,7 @@ func TestIsAlterTableNotTableError(t *testing.T) {
 		err: errors.New(
 			"Catalog Error: Table with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?",
 		),
-		want: true,
+		want: false,
 	},
 	{
 		name: "unrelated missing table stays false",
@@ -126,39 +126,25 @@ func TestIsAlterTableNotTableError(t *testing.T) {
 	}
 }
 
-func TestIsRenameStmtAlreadyAppliedError(t *testing.T) {
-	query := `ALTER VIEW ducklake.bill.stg_customers__dbt_tmp RENAME TO stg_customers`
-
+func TestIsAlterTableNotTableErrorDoesNotTreatMissingObjectSuggestionAsWrongType(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
 		want bool
 	}{
 		{
-			name: "rename already applied after alter table fallback",
+			name: "qualified missing table suggestion is not treated as wrong object type",
 			err: errors.New(
-				"Catalog Error: View with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?",
+				"Catalog Error: Table with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?",
 			),
-			want: true,
-		},
-		{
-			name: "different suggestion is not treated as success",
-			err: errors.New(
-				"Catalog Error: View with name stg_customers__dbt_tmp does not exist!\nDid you mean \"other_view\"?",
-			),
-			want: false,
-		},
-		{
-			name: "non rename error is false",
-			err:  errors.New("Catalog Error: permission denied"),
 			want: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isRenameStmtAlreadyAppliedError(query, tt.err); got != tt.want {
-				t.Fatalf("isRenameStmtAlreadyAppliedError(%v) = %v, want %v", tt.err, got, tt.want)
+			if got := isAlterTableNotTableError(tt.err); got != tt.want {
+				t.Fatalf("isAlterTableNotTableError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}

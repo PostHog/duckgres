@@ -359,6 +359,46 @@ func TestFallbackUtilityCommands(t *testing.T) {
 		}
 	})
 
+	t.Run("use_database_prepared", func(t *testing.T) {
+		skipIfKnown(t)
+
+		conn := openDuckgresConn(t)
+		defer func() { _ = conn.Close() }()
+
+		var currentDb string
+		if err := conn.QueryRow("SELECT current_database()").Scan(&currentDb); err != nil {
+			t.Fatalf("Get current database failed: %v", err)
+		}
+
+		useMemory, err := conn.Prepare("USE memory")
+		if err != nil {
+			t.Fatalf("Prepare USE memory failed: %v", err)
+		}
+		defer func() { _ = useMemory.Close() }()
+
+		if _, err := useMemory.Exec(); err != nil {
+			t.Fatalf("Prepared USE memory failed: %v", err)
+		}
+
+		if _, err := conn.Exec("SELECT * FROM users LIMIT 1"); err == nil {
+			t.Fatal("expected users lookup to fail while memory is the active DuckDB catalog")
+		}
+
+		useOriginal, err := conn.Prepare("USE " + currentDb)
+		if err != nil {
+			t.Fatalf("Prepare USE original failed: %v", err)
+		}
+		defer func() { _ = useOriginal.Close() }()
+
+		if _, err := useOriginal.Exec(); err != nil {
+			t.Fatalf("Prepared USE original failed: %v", err)
+		}
+
+		if _, err := conn.Exec("SELECT * FROM users LIMIT 1"); err != nil {
+			t.Fatalf("expected users lookup to succeed after restoring logical database: %v", err)
+		}
+	})
+
 	t.Run("set_reset", func(t *testing.T) {
 		skipIfKnown(t)
 

@@ -1085,10 +1085,6 @@ func (c *clientConn) handleQuery(body []byte) error {
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
 					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
-					if err != nil && isRenameStmtAlreadyAppliedError(alteredQuery, err) {
-						err = nil
-						execResult = nil
-					}
 				}
 			}
 			// Retry DROP TABLE as DROP VIEW if target is a view
@@ -1140,8 +1136,6 @@ func (c *clientConn) handleQuery(body []byte) error {
 // executeQueryDirect executes a query directly against DuckDB without any transpilation.
 // Used for passthrough users who send DuckDB-native SQL.
 func (c *clientConn) executeQueryDirect(query, cmdType string) error {
-	query = c.rewriteDirectQuery(query)
-
 	if !queryReturnsResults(query) {
 		// Handle nested BEGIN
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
@@ -1551,7 +1545,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return true, nil
 	}
 
-	executedQuery := result.SQL
+	executedQuery := c.rewriteDirectQuery(result.SQL)
 	if executedQuery != query {
 		slog.Debug("Query transpiled.", "user", c.username, "executed", executedQuery)
 	}
@@ -1580,10 +1574,6 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
 					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
-					if err != nil && isRenameStmtAlreadyAppliedError(alteredQuery, err) {
-						err = nil
-						execResult = nil
-					}
 				}
 			}
 			if err != nil && isDropTableOnViewError(err) {
@@ -4425,7 +4415,7 @@ func (c *clientConn) handleParse(body []byte) {
 
 	c.stmts[stmtName] = &preparedStmt{
 		query:             query,      // Keep original for logging and Describe
-		convertedQuery:    result.SQL, // Transpiled SQL for execution
+		convertedQuery:    c.rewriteDirectQuery(result.SQL), // Transpiled SQL for execution
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
 		isIgnoredSet:      result.IsIgnoredSet,
@@ -4899,10 +4889,6 @@ func (c *clientConn) handleExecute(body []byte) {
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(convertedQuery); ok {
 					result, err = c.executor.Exec(alteredQuery, args...)
-					if err != nil && isRenameStmtAlreadyAppliedError(alteredQuery, err) {
-						err = nil
-						result = nil
-					}
 				}
 			}
 			// Retry DROP TABLE as DROP VIEW if target is a view
@@ -5773,34 +5759,7 @@ func isAlterTableNotTableError(err error) bool {
 		return true
 	}
 
-	// Qualified ALTER TABLE ... RENAME on a view can surface as a missing-table
-	// error instead of an explicit "not a table" message.
-	return strings.Contains(msg, "table with name") &&
-		strings.Contains(msg, "does not exist") &&
-		strings.Contains(msg, "did you mean")
-}
-
-func isRenameStmtAlreadyAppliedError(query string, err error) bool {
-	if err == nil {
-		return false
-	}
-
-	tree, parseErr := pg_query.Parse(query)
-	if parseErr != nil || len(tree.Stmts) != 1 {
-		return false
-	}
-
-	stmt := tree.Stmts[0].Stmt.GetRenameStmt()
-	if stmt == nil || stmt.Relation == nil {
-		return false
-	}
-
-	oldName := strings.ToLower(stmt.Relation.Relname)
-	newName := strings.ToLower(stmt.Newname)
-	msg := strings.ToLower(err.Error())
-
-	return strings.Contains(msg, "view with name "+oldName+" does not exist") &&
-		strings.Contains(msg, `did you mean "`+newName+`"`)
+	return false
 }
 
 // isDropTableOnViewError checks if the error indicates that a DROP TABLE
