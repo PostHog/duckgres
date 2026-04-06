@@ -16,72 +16,72 @@ func TestK8sTenantIsolation_DifferentTenantsSeeDistinctCatalogs(t *testing.T) {
 	billingTable := fmt.Sprintf("billing_isolation_%d", time.Now().UnixNano())
 	analyticsSessionStart := time.Now().UTC()
 
-	analyticsDB, err := openDBConnAs("analytics", "postgres")
-	if err != nil {
-		t.Fatalf("open analytics DB: %v", err)
-	}
-	if _, err := execDBWithTimeout(analyticsDB, "CREATE OR REPLACE TABLE "+analyticsTable+" AS SELECT 7 AS value"); err != nil {
-		_ = analyticsDB.Close()
+	if err := retryDBOperationWithReconnectAs("analytics", "postgres", 30*time.Second, "create analytics table", func(ctx context.Context, db *sql.DB) error {
+		_, err := db.ExecContext(ctx, "CREATE OR REPLACE TABLE "+analyticsTable+" AS SELECT 7 AS value")
+		return err
+	}); err != nil {
 		t.Fatalf("create analytics table: %v", err)
 	}
-	analyticsVisible, err := queryIntWithTimeout(analyticsDB, "SELECT COUNT(*) FROM "+analyticsTable)
+	analyticsVisible, err := queryIntWithReconnectAs("analytics", "postgres", "SELECT COUNT(*) FROM "+analyticsTable, 30*time.Second)
 	if err != nil {
-		_ = analyticsDB.Close()
 		t.Fatalf("count analytics table rows: %v", err)
 	}
 	if analyticsVisible != 1 {
-		_ = analyticsDB.Close()
 		t.Fatalf("expected analytics table to contain one row, got %d", analyticsVisible)
 	}
 	analyticsWorkerPod, err := findActiveOrgWorkerPodSince("analytics", analyticsSessionStart, 30*time.Second)
 	if err != nil {
-		_ = analyticsDB.Close()
 		t.Fatalf("find analytics worker pod from runtime state: %v", err)
-	}
-	if err := analyticsDB.Close(); err != nil {
-		t.Fatalf("close analytics DB: %v", err)
 	}
 
 	if err := waitForWorkerRelease(analyticsWorkerPod, 30*time.Second); err != nil {
 		t.Fatalf("wait for analytics worker release: %v", err)
 	}
 
-	billingDB, err := openDBConnAs("billing", "postgres")
+	var billingSeesAnalytics int
+	var billingMissingErr error
+	err = retryDBOperationWithReconnectAs("billing", "postgres", 30*time.Second, "billing reads analytics table", func(ctx context.Context, db *sql.DB) error {
+		err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+analyticsTable).Scan(&billingSeesAnalytics)
+		if err == nil {
+			return nil
+		}
+		if isMissingTableError(err) {
+			billingMissingErr = err
+			return nil
+		}
+		return err
+	})
 	if err != nil {
-		t.Fatalf("open billing DB: %v", err)
+		t.Fatalf("billing reads analytics table: %v", err)
 	}
-	billingSeesAnalytics, err := queryIntWithTimeout(billingDB, "SELECT COUNT(*) FROM "+analyticsTable)
-	if err == nil {
-		_ = billingDB.Close()
+	if billingMissingErr == nil {
 		t.Fatalf("expected billing not to read analytics table, got %d rows", billingSeesAnalytics)
 	}
-	if !isMissingTableError(err) {
-		_ = billingDB.Close()
-		t.Fatalf("expected missing-table error when billing reads analytics table, got %v", err)
-	}
-	if _, err := execDBWithTimeout(billingDB, "CREATE OR REPLACE TABLE "+billingTable+" AS SELECT 11 AS value"); err != nil {
-		_ = billingDB.Close()
+	if err := retryDBOperationWithReconnectAs("billing", "postgres", 30*time.Second, "create billing table", func(ctx context.Context, db *sql.DB) error {
+		_, err := db.ExecContext(ctx, "CREATE OR REPLACE TABLE "+billingTable+" AS SELECT 11 AS value")
+		return err
+	}); err != nil {
 		t.Fatalf("create billing table: %v", err)
 	}
-	if err := billingDB.Close(); err != nil {
-		t.Fatalf("close billing DB: %v", err)
-	}
 
-	analyticsDB, err = openDBConnAs("analytics", "postgres")
+	var analyticsSeesBilling int
+	var analyticsMissingErr error
+	err = retryDBOperationWithReconnectAs("analytics", "postgres", 30*time.Second, "analytics reads billing table", func(ctx context.Context, db *sql.DB) error {
+		err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+billingTable).Scan(&analyticsSeesBilling)
+		if err == nil {
+			return nil
+		}
+		if isMissingTableError(err) {
+			analyticsMissingErr = err
+			return nil
+		}
+		return err
+	})
 	if err != nil {
-		t.Fatalf("reopen analytics DB: %v", err)
+		t.Fatalf("analytics reads billing table: %v", err)
 	}
-	analyticsSeesBilling, err := queryIntWithTimeout(analyticsDB, "SELECT COUNT(*) FROM "+billingTable)
-	if err == nil {
-		_ = analyticsDB.Close()
+	if analyticsMissingErr == nil {
 		t.Fatalf("expected analytics not to read billing table, got %d rows", analyticsSeesBilling)
-	}
-	if !isMissingTableError(err) {
-		_ = analyticsDB.Close()
-		t.Fatalf("expected missing-table error when analytics reads billing table, got %v", err)
-	}
-	if err := analyticsDB.Close(); err != nil {
-		t.Fatalf("close analytics DB after verification: %v", err)
 	}
 }
 
@@ -101,16 +101,11 @@ func TestK8sTenantIsolation_WritesStayInOwnObjectStorePrefix(t *testing.T) {
 		t.Fatalf("count billing prefix before write: %v", err)
 	}
 
-	analyticsDB, err := openDBConnAs("analytics", "postgres")
-	if err != nil {
-		t.Fatalf("open analytics DB: %v", err)
-	}
-	if _, err := execDBWithTimeout(analyticsDB, "CREATE OR REPLACE TABLE "+analyticsTable+" AS SELECT i AS value, repeat('x', 4096) AS payload FROM generate_series(1, 2048) AS t(i)"); err != nil {
-		_ = analyticsDB.Close()
+	if err := retryDBOperationWithReconnectAs("analytics", "postgres", 45*time.Second, "create analytics table", func(ctx context.Context, db *sql.DB) error {
+		_, err := db.ExecContext(ctx, "CREATE OR REPLACE TABLE "+analyticsTable+" AS SELECT i AS value, repeat('x', 4096) AS payload FROM generate_series(1, 2048) AS t(i)")
+		return err
+	}); err != nil {
 		t.Fatalf("create analytics table: %v", err)
-	}
-	if err := analyticsDB.Close(); err != nil {
-		t.Fatalf("close analytics DB: %v", err)
 	}
 
 	if err := waitForMinioPrefixFileCountAtLeast(analyticsPrefix, analyticsBefore+1, 60*time.Second); err != nil {
@@ -120,16 +115,11 @@ func TestK8sTenantIsolation_WritesStayInOwnObjectStorePrefix(t *testing.T) {
 		t.Fatalf("billing prefix changed during analytics write: %v", err)
 	}
 
-	billingDB, err := openDBConnAs("billing", "postgres")
-	if err != nil {
-		t.Fatalf("open billing DB: %v", err)
-	}
-	if _, err := execDBWithTimeout(billingDB, "CREATE OR REPLACE TABLE "+billingTable+" AS SELECT i AS value, repeat('x', 4096) AS payload FROM generate_series(1, 2048) AS t(i)"); err != nil {
-		_ = billingDB.Close()
+	if err := retryDBOperationWithReconnectAs("billing", "postgres", 45*time.Second, "create billing table", func(ctx context.Context, db *sql.DB) error {
+		_, err := db.ExecContext(ctx, "CREATE OR REPLACE TABLE "+billingTable+" AS SELECT i AS value, repeat('x', 4096) AS payload FROM generate_series(1, 2048) AS t(i)")
+		return err
+	}); err != nil {
 		t.Fatalf("create billing table: %v", err)
-	}
-	if err := billingDB.Close(); err != nil {
-		t.Fatalf("close billing DB: %v", err)
 	}
 
 	if err := waitForMinioPrefixFileCountAtLeast(billingPrefix, billingBefore+1, 60*time.Second); err != nil {
@@ -148,21 +138,12 @@ func TestK8sWorkerPodsDoNotMountServiceAccountTokens(t *testing.T) {
 	}
 }
 
-func execDBWithTimeout(db *sql.DB, query string, args ...any) (sql.Result, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), dbAttemptTimeout)
-	defer cancel()
-	return db.ExecContext(ctx, query, args...)
-}
-
-func queryIntWithTimeout(db *sql.DB, query string, args ...any) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), dbAttemptTimeout)
-	defer cancel()
-
+func queryIntWithReconnectAs(username, password, query string, timeout time.Duration) (int, error) {
 	var value int
-	if err := db.QueryRowContext(ctx, query, args...).Scan(&value); err != nil {
-		return 0, err
-	}
-	return value, nil
+	err := retryDBOperationWithReconnectAs(username, password, timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
+		return db.QueryRowContext(ctx, query).Scan(&value)
+	})
+	return value, err
 }
 
 func isMissingTableError(err error) bool {

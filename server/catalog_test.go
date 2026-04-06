@@ -306,6 +306,7 @@ func TestUptimeMacros(t *testing.T) {
 	}
 }
 
+
 func TestUtilityMacrosWithoutPgCatalog(t *testing.T) {
 	// Verify that initUtilityMacros works independently of initPgCatalog,
 	// so passthrough users get uptime/version macros.
@@ -342,5 +343,65 @@ func TestUtilityMacrosWithoutPgCatalog(t *testing.T) {
 		if val != tc.want {
 			t.Errorf("%s() = %q, want %q", tc.fn, val, tc.want)
 		}
+	}
+}
+
+func TestInformationSchemaCompatViewsUseCurrentDatabaseForCatalogNames(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
+		t.Fatalf("Failed to attach ducklake catalog: %v", err)
+	}
+	if _, err := db.Exec(`CREATE OR REPLACE TEMP MACRO current_database() AS 'analytics'`); err != nil {
+		t.Fatalf("Failed to override current_database(): %v", err)
+	}
+	if err := initInformationSchema(db, true); err != nil {
+		t.Fatalf("Failed to init information_schema: %v", err)
+	}
+	if _, err := db.Exec("USE ducklake"); err != nil {
+		t.Fatalf("Failed to switch to ducklake catalog: %v", err)
+	}
+	if _, err := db.Exec("CREATE TABLE users(id INTEGER)"); err != nil {
+		t.Fatalf("Failed to create test table: %v", err)
+	}
+
+	var tableCatalog string
+	if err := db.QueryRow(`
+		SELECT table_catalog
+		FROM memory.main.information_schema_tables_compat
+		WHERE table_name = 'users'
+	`).Scan(&tableCatalog); err != nil {
+		t.Fatalf("Failed to query tables compat view: %v", err)
+	}
+	if tableCatalog != "analytics" {
+		t.Fatalf("table_catalog = %q, want %q", tableCatalog, "analytics")
+	}
+
+	var columnCatalog string
+	if err := db.QueryRow(`
+		SELECT table_catalog
+		FROM memory.main.information_schema_columns_compat
+		WHERE table_name = 'users' AND column_name = 'id'
+	`).Scan(&columnCatalog); err != nil {
+		t.Fatalf("Failed to query columns compat view: %v", err)
+	}
+	if columnCatalog != "analytics" {
+		t.Fatalf("column table_catalog = %q, want %q", columnCatalog, "analytics")
+	}
+
+	var schemaCatalog string
+	if err := db.QueryRow(`
+		SELECT catalog_name
+		FROM memory.main.information_schema_schemata_compat
+		WHERE schema_name = 'public'
+	`).Scan(&schemaCatalog); err != nil {
+		t.Fatalf("Failed to query schemata compat view: %v", err)
+	}
+	if schemaCatalog != "analytics" {
+		t.Fatalf("schemata catalog_name = %q, want %q", schemaCatalog, "analytics")
 	}
 }

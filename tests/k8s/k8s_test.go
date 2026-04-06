@@ -559,13 +559,23 @@ func latestWorkerPod(t *testing.T) corev1.Pod {
 		t.Fatal("expected at least one worker pod, found none")
 	}
 
-	latest := pods.Items[0]
-	for _, pod := range pods.Items[1:] {
-		if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+	var latest corev1.Pod
+	found := false
+	for _, pod := range pods.Items {
+		if !isReadyPod(pod) {
+			continue
+		}
+		if !found || pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
 			latest = pod
+			found = true
 		}
 	}
-	return latest
+	if found {
+		return latest
+	}
+
+	t.Fatal("expected at least one ready worker pod, found none")
+	return corev1.Pod{}
 }
 
 func latestWorkerPodBeforeQuery(timeout time.Duration) (corev1.Pod, error) {
@@ -577,18 +587,23 @@ func latestWorkerPodBeforeQuery(timeout time.Duration) (corev1.Pod, error) {
 		if err != nil {
 			return corev1.Pod{}, err
 		}
-		if len(pods.Items) > 0 {
-			latest := pods.Items[0]
-			for _, pod := range pods.Items[1:] {
-				if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
-					latest = pod
-				}
+		var latest corev1.Pod
+		found := false
+		for _, pod := range pods.Items {
+			if !isReadyPod(pod) {
+				continue
 			}
+			if !found || pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+				latest = pod
+				found = true
+			}
+		}
+		if found {
 			return latest, nil
 		}
 		time.Sleep(2 * time.Second)
 	}
-	return corev1.Pod{}, fmt.Errorf("no worker pods appeared within %s", timeout)
+	return corev1.Pod{}, fmt.Errorf("no ready worker pods appeared within %s", timeout)
 }
 
 func openDB(t *testing.T) *sql.DB {

@@ -340,14 +340,62 @@ func TestFallbackUtilityCommands(t *testing.T) {
 			t.Fatalf("Get new database failed: %v", err)
 		}
 
-		if newDb != "memory" {
-			t.Errorf("Expected database 'memory', got %q", newDb)
+		if newDb != currentDb {
+			t.Errorf("Expected logical database %q, got %q", currentDb, newDb)
+		}
+
+		if _, err := db.Exec("SELECT * FROM users LIMIT 1"); err == nil {
+			t.Fatal("expected users lookup to fail while memory is the active DuckDB catalog")
 		}
 
 		// Switch back to original database
 		_, err = db.Exec("USE " + currentDb)
 		if err != nil {
 			t.Fatalf("USE original failed: %v", err)
+		}
+
+		if _, err := db.Exec("SELECT * FROM users LIMIT 1"); err != nil {
+			t.Fatalf("expected users lookup to succeed after restoring logical database: %v", err)
+		}
+	})
+
+	t.Run("use_database_prepared", func(t *testing.T) {
+		skipIfKnown(t)
+
+		conn := openDuckgresConn(t)
+		defer func() { _ = conn.Close() }()
+
+		var currentDb string
+		if err := conn.QueryRow("SELECT current_database()").Scan(&currentDb); err != nil {
+			t.Fatalf("Get current database failed: %v", err)
+		}
+
+		useMemory, err := conn.Prepare("USE memory")
+		if err != nil {
+			t.Fatalf("Prepare USE memory failed: %v", err)
+		}
+		defer func() { _ = useMemory.Close() }()
+
+		if _, err := useMemory.Exec(); err != nil {
+			t.Fatalf("Prepared USE memory failed: %v", err)
+		}
+
+		if _, err := conn.Exec("SELECT * FROM users LIMIT 1"); err == nil {
+			t.Fatal("expected users lookup to fail while memory is the active DuckDB catalog")
+		}
+
+		useOriginal, err := conn.Prepare("USE " + currentDb)
+		if err != nil {
+			t.Fatalf("Prepare USE original failed: %v", err)
+		}
+		defer func() { _ = useOriginal.Close() }()
+
+		if _, err := useOriginal.Exec(); err != nil {
+			t.Fatalf("Prepared USE original failed: %v", err)
+		}
+
+		if _, err := conn.Exec("SELECT * FROM users LIMIT 1"); err != nil {
+			t.Fatalf("expected users lookup to succeed after restoring logical database: %v", err)
 		}
 	})
 
@@ -440,20 +488,26 @@ func TestFallbackUtilityWithComments(t *testing.T) {
 			t.Fatalf("USE with comment failed: %v", err)
 		}
 
-		// Verify we switched
-		var currentDb string
-		err = db.QueryRow("SELECT current_database()").Scan(&currentDb)
-		if err != nil {
-			t.Fatalf("Get current database failed: %v", err)
+		if _, err := db.Exec("CREATE TABLE comment_attach_test.comment_probe (id INT)"); err != nil {
+			t.Fatalf("create table in attached database failed: %v", err)
 		}
-		if currentDb != "comment_attach_test" {
-			t.Errorf("Expected 'comment_attach_test', got %q", currentDb)
+
+		var count int
+		if err := db.QueryRow("SELECT COUNT(*) FROM comment_attach_test.comment_probe").Scan(&count); err != nil {
+			t.Fatalf("query table in attached database failed: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("Expected empty attached table, got %d rows", count)
 		}
 
 		// Switch back and detach (defer handles cleanup on failure too)
 		_, err = db.Exec("/* back to original */ USE " + originalDb)
 		if err != nil {
 			t.Fatalf("USE %s failed: %v", originalDb, err)
+		}
+
+		if _, err := db.Exec("SELECT * FROM users LIMIT 1"); err != nil {
+			t.Fatalf("expected users lookup to succeed after restoring original database: %v", err)
 		}
 
 		_, err = db.Exec("/* cleanup */ DETACH comment_attach_test")

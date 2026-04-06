@@ -2,6 +2,7 @@ package transpiler
 
 import (
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,7 @@ const (
 	FlagPgCatalog                               // pg_catalog schema/view mappings
 	FlagInfoSchema                              // information_schema mappings
 	FlagPublicSchema                            // public -> main schema mapping
+	FlagLogicalCatalog                          // logical database catalog -> physical catalog mapping
 	FlagTypeMapping                             // Type mappings (JSONB->JSON, etc.)
 	FlagTypeCast                                // Type casts (::regtype -> ::varchar)
 	FlagFunctions                               // Function mappings (array_agg->list, etc.)
@@ -55,6 +57,8 @@ type Transpiler struct {
 	transforms []taggedTransform
 }
 
+var threePartIdentPattern = regexp.MustCompile(`(?i)(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*(?:"[^"]+"|[a-z_][a-z0-9_$]*)`)
+
 // New creates a Transpiler with the given configuration.
 // It registers all transforms appropriate for the config.
 func New(cfg Config) *Transpiler {
@@ -80,6 +84,9 @@ func New(cfg Config) *Transpiler {
 
 	// 3.1 Map PostgreSQL "public" schema to DuckDB "main"
 	t.transforms = append(t.transforms, taggedTransform{FlagPublicSchema, transform.NewPublicSchemaTransform()})
+
+	// 3.2 Map logical database catalog references to the physical DuckLake catalog
+	t.transforms = append(t.transforms, taggedTransform{FlagLogicalCatalog, transform.NewLogicalCatalogTransform(cfg.LogicalDatabaseName, cfg.PhysicalCatalogName)})
 
 	// 4. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, taggedTransform{FlagTypeMapping, transform.NewTypeMappingTransform()})
@@ -245,6 +252,16 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 	// DuckDB compatibility fixups on the AST before deparsing
 	fixupAST(tree)
 
+	if transformResult.SQLOverride != "" {
+		return &Result{
+			SQL:          transformResult.SQLOverride,
+			ParamCount:   transformResult.ParamCount,
+			IsNoOp:       transformResult.IsNoOp,
+			NoOpTag:      transformResult.NoOpTag,
+			IsIgnoredSet: transformResult.IsIgnoredSet,
+		}, nil
+	}
+
 	// Deparse the modified AST back to SQL
 	deparsed, err := pg_query.Deparse(tree)
 	if err != nil {
@@ -313,6 +330,13 @@ func Classify(sql string, cfg Config) Classification {
 	// public.table references (but not catalog.public.table which is 3-part)
 	if strings.Contains(upper, "PUBLIC.") {
 		flags |= FlagPublicSchema
+	}
+
+	if cfg.LogicalDatabaseName != "" || threePartIdentPattern.MatchString(sql) {
+		logicalUpper := strings.ToUpper(cfg.LogicalDatabaseName)
+		if cfg.LogicalDatabaseName == "" || containsAny(upper, logicalUpper+".", `"`+logicalUpper+`".`) || threePartIdentPattern.MatchString(sql) {
+			flags |= FlagLogicalCatalog
+		}
 	}
 
 	// version() function

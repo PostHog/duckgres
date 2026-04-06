@@ -32,18 +32,37 @@ func isTransientDBError(err error) bool {
 }
 
 func findReadyPodName(pods []corev1.Pod) (string, bool) {
+	if pod, ok := findLatestReadyPod(pods); ok {
+		return pod.Name, true
+	}
+	return "", false
+}
+
+func findLatestReadyPod(pods []corev1.Pod) (corev1.Pod, bool) {
+	var latest corev1.Pod
+	found := false
 	for _, pod := range pods {
-		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+		if !isReadyPod(pod) {
 			continue
 		}
-		for _, cond := range pod.Status.Conditions {
-			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-				return pod.Name, true
-			}
+		if !found || pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+			latest = pod
+			found = true
 		}
 	}
+	return latest, found
+}
 
-	return "", false
+func isReadyPod(pod corev1.Pod) bool {
+	if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func isPodGoneError(err error) bool {

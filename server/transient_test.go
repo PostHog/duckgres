@@ -86,6 +86,50 @@ func TestRetryOnTransientAttachNoRetryForNonTransient(t *testing.T) {
 	}
 }
 
+func TestIsAlterTableNotTableError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "classic not a table error",
+			err:  errors.New("Catalog Error: cannot use ALTER TABLE on view because it is not a table"),
+			want: true,
+		},
+		{
+			name: "can only modify view with alter view statement",
+			err:  errors.New("Catalog Error: Can only modify view with ALTER VIEW statement"),
+			want: true,
+		},
+		{
+			name: "qualified view rename reports missing table",
+			err: errors.New(
+				"Catalog Error: Table with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?",
+			),
+			want: false,
+		},
+		{
+			name: "unrelated missing table stays false",
+			err:  errors.New("Catalog Error: Table with name users does not exist!"),
+			want: false,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAlterTableNotTableError(tt.err); got != tt.want {
+				t.Fatalf("isAlterTableNotTableError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRetryOnConflictSucceedsAfterRetry(t *testing.T) {
 	calls := 0
 	result, err := retryOnConflict(func() (string, error) {
@@ -158,6 +202,62 @@ func TestClassifyErrorCode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := classifyErrorCode(tt.err); got != tt.expected {
 				t.Errorf("classifyErrorCode(%v) = %q, want %q", tt.err, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsAlterTableNotTableErrorDoesNotTreatMissingObjectSuggestionAsWrongType(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "qualified missing table suggestion is not treated as wrong object type",
+			err: errors.New(
+				"Catalog Error: Table with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?",
+			),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAlterTableNotTableError(tt.err); got != tt.want {
+				t.Fatalf("isAlterTableNotTableError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsDropTableOnViewError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "drop table on view error",
+			err:  errors.New("Catalog Error: Existing object users is of type View, trying to drop type Table"),
+			want: true,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("Catalog Error: Table with name users does not exist!"),
+			want: false,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDropTableOnViewError(tt.err); got != tt.want {
+				t.Fatalf("isDropTableOnViewError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}

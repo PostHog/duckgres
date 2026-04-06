@@ -304,6 +304,10 @@ func (h *TestHarness) loadPostgresFixtures() error {
 		return nil
 	}
 
+	if err := h.cleanupPostgresRuntimeSchemas(); err != nil {
+		return fmt.Errorf("failed to cleanup PostgreSQL runtime schemas: %w", err)
+	}
+
 	// Drop existing objects first (in reverse dependency order)
 	dropStatements := []string{
 		"DROP VIEW IF EXISTS order_details",
@@ -369,12 +373,59 @@ func (h *TestHarness) loadPostgresFixtures() error {
 	return nil
 }
 
+func (h *TestHarness) cleanupPostgresRuntimeSchemas() error {
+	rows, err := h.PostgresDB.Query(`
+		SELECT schema_name
+		FROM information_schema.schemata
+		WHERE schema_name = 'cp_runtime'
+			OR schema_name LIKE 'managed_warehouse\_%\_runtime' ESCAPE '\'
+	`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var schemas []string
+	for rows.Next() {
+		var schema string
+		if err := rows.Scan(&schema); err != nil {
+			return err
+		}
+		if isEphemeralPostgresRuntimeSchema(schema) {
+			schemas = append(schemas, schema)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, schema := range schemas {
+		if _, err := h.PostgresDB.Exec(`DROP SCHEMA IF EXISTS ` + quotePostgresIdentifier(schema) + ` CASCADE`); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func isEphemeralPostgresRuntimeSchema(schema string) bool {
+	return schema == "cp_runtime" || (strings.HasPrefix(schema, "managed_warehouse_") && strings.HasSuffix(schema, "_runtime"))
+}
+
+func quotePostgresIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
 // cleanupDuckLakeTables drops existing tables in DuckLake before loading fixtures
 func (h *TestHarness) cleanupDuckLakeTables() error {
+	// Tests may leave the session on a non-default catalog (e.g. USE memory).
+	// Force cleanup to run against the DuckLake catalog that holds persisted fixtures.
+	_, _ = h.DuckgresDB.Exec("USE ducklake")
+
 	// Drop views first (they depend on tables)
 	views := []string{"order_details", "user_stats", "active_users"}
 	for _, v := range views {
-		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", v))
+		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS ducklake.main.%s", v))
 	}
 
 	// Drop tables in reverse dependency order
@@ -535,11 +586,18 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 
 	for _, t := range tables {
 		// Ignore errors - table might not exist or schema might not exist
-		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t))
+		objectName := fmt.Sprintf("ducklake.main.%s", t)
+		if strings.Contains(t, ".") {
+			objectName = "ducklake." + t
+		}
+		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", objectName))
 	}
 
-	// Drop test schema
-	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS test_schema")
+	// Drop test schemas after contained objects have been removed.
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.test_schema CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.bill CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.ddl_schema_test CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.dbt_test CASCADE")
 
 	return nil
 }
