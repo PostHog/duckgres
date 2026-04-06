@@ -244,6 +244,51 @@ func TestTranspile_InformationSchema_DuckLakeMode(t *testing.T) {
 	}
 }
 
+func TestTranspile_LogicalCatalogMapping_DuckLakeMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "logical catalog public schema maps to ducklake main",
+			input:    "SELECT * FROM analytics.public.users",
+			contains: "ducklake.main.users",
+			excludes: "analytics.public.users",
+		},
+		{
+			name:     "explicit ducklake catalog is preserved",
+			input:    "SELECT * FROM ducklake.main.users",
+			contains: "ducklake.main.users",
+			excludes: "analytics.main.users",
+		},
+		{
+			name:     "quoted logical catalog rewrites to physical catalog",
+			input:    `SELECT * FROM "analytics"."public"."users"`,
+			contains: `ducklake.main.users`,
+			excludes: `"analytics"."public"."users"`,
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "analytics"})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
 func TestTranspile_PgCatalog_DuckLakeMode(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -363,6 +408,239 @@ func TestTranspile_PublicSchema(t *testing.T) {
 			}
 			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
 				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_LogicalDatabaseCatalog(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DuckLakeMode = true
+	cfg.LogicalDatabaseName = "DuckgresCatalog"
+	cfg.PhysicalCatalogName = "ducklake"
+	tr := New(cfg)
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "logical catalog maps to ducklake",
+			input:    "SELECT * FROM DuckgresCatalog.bill.users",
+			contains: "ducklake.bill.users",
+			excludes: "DuckgresCatalog.bill.users",
+		},
+		{
+			name:     "logical catalog public maps to ducklake main",
+			input:    "SELECT * FROM DuckgresCatalog.public.users",
+			contains: "ducklake.main.users",
+			excludes: "DuckgresCatalog.public.users",
+		},
+		{
+			name:     "quoted logical catalog maps to ducklake",
+			input:    `SELECT * FROM "DuckgresCatalog"."public"."users"`,
+			contains: "ducklake.main.users",
+			excludes: `"DuckgresCatalog"."public"."users"`,
+		},
+		{
+			name:     "physical ducklake reference preserved",
+			input:    "SELECT * FROM ducklake.bill.users",
+			contains: "ducklake.bill.users",
+			excludes: "DuckgresCatalog.bill.users",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Fatalf("Transpile(%q) = %q, want substring %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Fatalf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_LogicalDatabaseCatalogMapping(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "logical catalog public schema rewrites to physical main",
+			input:    "SELECT * FROM duckgres.public.users",
+			contains: "ducklake.main.users",
+			excludes: "duckgres.public.users",
+		},
+		{
+			name:     "logical catalog non-public schema rewrites to physical catalog",
+			input:    "SELECT * FROM duckgres.bill.users",
+			contains: "ducklake.bill.users",
+			excludes: "duckgres.bill.users",
+		},
+		{
+			name:     "quoted logical catalog preserves quoted identifiers",
+			input:    `SELECT * FROM "duckgres"."public"."QuotedUsers"`,
+			contains: `ducklake.main."QuotedUsers"`,
+			excludes: `"duckgres"."public"."QuotedUsers"`,
+		},
+		{
+			name:     "physical ducklake reference preserved",
+			input:    "SELECT * FROM ducklake.main.users",
+			expected: "SELECT * FROM ducklake.main.users",
+		},
+		{
+			name:     "unrelated external catalog preserved",
+			input:    "SELECT * FROM postgres.public.users",
+			expected: "SELECT * FROM postgres.public.users",
+		},
+	}
+
+	tr := New(Config{
+		DuckLakeMode:        true,
+		LogicalDatabaseName: "duckgres",
+		PhysicalCatalogName: "ducklake",
+	})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if tt.expected != "" && result.SQL != tt.expected {
+				t.Errorf("Transpile(%q) = %q, want %q", tt.input, result.SQL, tt.expected)
+			}
+			if tt.contains != "" && !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_LogicalDatabaseCatalogMapping_AlterTableRename(t *testing.T) {
+	tr := New(Config{
+		DuckLakeMode:        true,
+		LogicalDatabaseName: "duckgres",
+		PhysicalCatalogName: "ducklake",
+	})
+
+	result, err := tr.Transpile(`ALTER TABLE "duckgres"."bill"."stg_customers__dbt_tmp" RENAME TO "stg_customers"`)
+	if err != nil {
+		t.Fatalf("Transpile ALTER TABLE RENAME error: %v", err)
+	}
+
+	if !strings.Contains(result.SQL, `ALTER TABLE ducklake.bill.stg_customers__dbt_tmp RENAME TO stg_customers`) {
+		t.Fatalf("Transpile ALTER TABLE RENAME = %q, want ducklake.bill target", result.SQL)
+	}
+	if strings.Contains(result.SQL, `"duckgres"."bill"."stg_customers__dbt_tmp"`) {
+		t.Fatalf("Transpile ALTER TABLE RENAME = %q, should not retain logical catalog target", result.SQL)
+	}
+}
+
+func TestTranspile_LogicalDatabaseCatalogDDL(t *testing.T) {
+	tr := New(Config{
+		DuckLakeMode:        true,
+		LogicalDatabaseName: "duckgres",
+		PhysicalCatalogName: "ducklake",
+	})
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "alter table rename rewrites logical catalog",
+			input:    `ALTER TABLE "duckgres"."bill"."stg_customers__dbt_tmp" RENAME TO "stg_customers"`,
+			contains: `ALTER TABLE ducklake.bill.stg_customers__dbt_tmp RENAME TO stg_customers`,
+			excludes: `duckgres.bill.stg_customers__dbt_tmp`,
+		},
+		{
+			name:     "drop table rewrites logical catalog",
+			input:    `DROP TABLE IF EXISTS "duckgres"."bill"."stg_customers__dbt_tmp" CASCADE`,
+			contains: `DROP TABLE IF EXISTS ducklake.bill.stg_customers__dbt_tmp`,
+			excludes: `duckgres.bill.stg_customers__dbt_tmp`,
+		},
+		{
+			name: "create table as rewrites logical catalog in target and source",
+			input: `CREATE TABLE "duckgres"."bill"."customer_lifetime_value__dbt_tmp" AS (
+				SELECT *
+				FROM "duckgres"."bill"."stg_customers"
+			)`,
+			contains: `CREATE TABLE ducklake.bill.customer_lifetime_value__dbt_tmp AS SELECT * FROM ducklake.bill.stg_customers`,
+			excludes: `duckgres.bill`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Fatalf("Transpile(%q) = %q, want substring %q", tt.input, result.SQL, tt.contains)
+			}
+			if strings.Contains(result.SQL, tt.excludes) {
+				t.Fatalf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_LogicalDatabaseCatalogMapping_DbtRenameFlow(t *testing.T) {
+	tr := New(Config{
+		DuckLakeMode:        true,
+		LogicalDatabaseName: "duckgres",
+		PhysicalCatalogName: "ducklake",
+	})
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "dbt create view temp relation rewrites logical catalog",
+			input:    `create view "duckgres"."bill"."stg_customers__dbt_tmp" as (select * from "duckgres"."bill"."customers")`,
+			contains: `ducklake.bill.stg_customers__dbt_tmp`,
+			excludes: `"duckgres"."bill"."stg_customers__dbt_tmp"`,
+		},
+		{
+			name:     "dbt alter table rename temp relation rewrites logical catalog",
+			input:    `alter table "duckgres"."bill"."stg_customers__dbt_tmp" rename to "stg_customers"`,
+			contains: `ducklake.bill.stg_customers__dbt_tmp`,
+			excludes: `duckgres.bill.stg_customers__dbt_tmp`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Fatalf("Transpile(%q) = %q, want substring %q", tt.input, result.SQL, tt.contains)
+			}
+			if strings.Contains(result.SQL, tt.excludes) {
+				t.Fatalf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
 			}
 		})
 	}
@@ -3559,6 +3837,7 @@ func TestClassify_NeedsTransform(t *testing.T) {
 		{"pg_class unqualified", "SELECT * FROM pg_class", FlagPgCatalog},
 		{"information_schema", "SELECT * FROM information_schema.columns", FlagInfoSchema},
 		{"public schema", "SELECT * FROM public.users", FlagPublicSchema},
+		{"logical catalog", "SELECT * FROM analytics.public.users", FlagLogicalCatalog},
 		{"version()", "SELECT version()", FlagVersion | FlagPgCatalog},
 		{"JSONB type", "CREATE TABLE t (data JSONB)", FlagTypeMapping | FlagPgCatalog},
 		{"BYTEA type", "CREATE TABLE t (data BYTEA)", FlagTypeMapping | FlagPgCatalog},
@@ -3587,6 +3866,13 @@ func TestClassify_NeedsTransform(t *testing.T) {
 		if tt.wantFlags&FlagPlaceholder != 0 {
 			cfgToUse = Config{ConvertPlaceholders: true}
 		}
+		if tt.wantFlags&FlagLogicalCatalog != 0 {
+			cfgToUse = Config{
+				DuckLakeMode:        true,
+				LogicalDatabaseName: "analytics",
+				PhysicalCatalogName: "ducklake",
+			}
+		}
 
 		t.Run(tt.name, func(t *testing.T) {
 			cls := Classify(tt.input, cfgToUse)
@@ -3599,6 +3885,18 @@ func TestClassify_NeedsTransform(t *testing.T) {
 					tt.input, cls.Flags, tt.wantFlags, tt.wantFlags&^cls.Flags)
 			}
 		})
+	}
+}
+
+func TestClassify_LogicalCatalogMapping_DuckLakeMode(t *testing.T) {
+	cfg := Config{DuckLakeMode: true, LogicalDatabaseName: "analytics"}
+
+	cls := Classify("SELECT * FROM analytics.public.users", cfg)
+	if cls.Direct {
+		t.Fatal("expected logical catalog query to require transforms")
+	}
+	if cls.Flags&FlagLogicalCatalog == 0 {
+		t.Fatalf("expected logical catalog flag, got %d", cls.Flags)
 	}
 }
 

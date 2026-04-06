@@ -179,6 +179,8 @@ type clientConn struct {
 func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
 	return transpiler.New(transpiler.Config{
 		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "",
+		LogicalDatabaseName: c.database,
+		PhysicalCatalogName: "ducklake",
 		ConvertPlaceholders: convertPlaceholders,
 	})
 }
@@ -421,8 +423,10 @@ func (c *clientConn) safeCleanupDB() {
 	// touches the metadata connection, not just ping the local DuckDB connection.
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	if c.server.cfg.DuckLake.MetadataStore != "" {
-		// Query DuckLake metadata to verify the RDS connection is still alive
-		_, err := c.executor.ExecContext(ctx, "SELECT 1 FROM ducklake.information_schema.schemata LIMIT 1")
+		// Probe the attached DuckLake catalog via DuckDB's catalog table function.
+		// This stays valid even though DuckLake does not expose an information_schema
+		// catalog that can be referenced as ducklake.information_schema.*.
+		_, err := c.executor.ExecContext(ctx, "SELECT 1 FROM duckdb_tables() WHERE database_name = 'ducklake' LIMIT 1")
 		if err != nil {
 			slog.Warn("DuckLake connection unhealthy during cleanup, skipping SQL cleanup.",
 				"user", c.username, "error", err)
@@ -649,6 +653,16 @@ func (c *clientConn) serve() error {
 			stopRefresh()
 		}
 	}()
+
+	if !c.passthrough {
+		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := InitSessionDatabaseMetadata(initCtx, c.executor, c.database); err != nil {
+			initCancel()
+			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
+			return err
+		}
+		initCancel()
+	}
 
 	// Send initial parameters
 	c.sendInitialParams()
@@ -1034,7 +1048,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Use the transpiled SQL
 	originalQuery := query
-	query = result.SQL
+	query = c.rewriteDirectQuery(result.SQL)
 
 	// Log the transpiled query if it differs from the original
 	if query != originalQuery {
@@ -1071,10 +1085,14 @@ func (c *clientConn) handleQuery(body []byte) error {
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
 					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
+					if err != nil && isRenameStmtAlreadyAppliedError(alteredQuery, err) {
+						err = nil
+						execResult = nil
+					}
 				}
 			}
 			// Retry DROP TABLE as DROP VIEW if target is a view
-			if isDropTableOnViewError(err) {
+			if err != nil && isDropTableOnViewError(err) {
 				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
 					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
@@ -1122,6 +1140,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 // executeQueryDirect executes a query directly against DuckDB without any transpilation.
 // Used for passthrough users who send DuckDB-native SQL.
 func (c *clientConn) executeQueryDirect(query, cmdType string) error {
+	query = c.rewriteDirectQuery(query)
+
 	if !queryReturnsResults(query) {
 		// Handle nested BEGIN
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
@@ -1159,6 +1179,51 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 
 	_, _, _, err := c.executeSelectQuery(query, cmdType)
 	return err
+}
+
+func (c *clientConn) rewriteDirectQuery(query string) string {
+	if c.server == nil || c.server.cfg.DuckLake.MetadataStore == "" {
+		return query
+	}
+
+	physicalCatalog := "ducklake"
+	stripped := strings.TrimSpace(stripLeadingComments(query))
+	if len(stripped) < len("USE") || !strings.EqualFold(stripped[:len("USE")], "USE") {
+		return query
+	}
+
+	target := strings.TrimSpace(stripped[len("USE"):])
+	if target == "" {
+		return query
+	}
+
+	hasSemicolon := strings.HasSuffix(target, ";")
+	target = strings.TrimSpace(strings.TrimSuffix(target, ";"))
+	if target == "" {
+		return query
+	}
+
+	unquoted := target
+	quoteResult := false
+	if len(target) >= 2 && target[0] == '"' && target[len(target)-1] == '"' {
+		unquoted = strings.ReplaceAll(target[1:len(target)-1], `""`, `"`)
+		quoteResult = true
+	}
+
+	if !strings.EqualFold(unquoted, c.database) {
+		return query
+	}
+
+	replacement := physicalCatalog
+	if quoteResult {
+		replacement = `"` + strings.ReplaceAll(physicalCatalog, `"`, `""`) + `"`
+	}
+
+	rewritten := "USE " + replacement
+	if hasSemicolon {
+		rewritten += ";"
+	}
+	return rewritten
 }
 
 // executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
@@ -1515,9 +1580,13 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
 					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
+					if err != nil && isRenameStmtAlreadyAppliedError(alteredQuery, err) {
+						err = nil
+						execResult = nil
+					}
 				}
 			}
-			if isDropTableOnViewError(err) {
+			if err != nil && isDropTableOnViewError(err) {
 				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
 					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
 				}
@@ -4830,10 +4899,14 @@ func (c *clientConn) handleExecute(body []byte) {
 			if isAlterTableNotTableError(err) {
 				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(convertedQuery); ok {
 					result, err = c.executor.Exec(alteredQuery, args...)
+					if err != nil && isRenameStmtAlreadyAppliedError(alteredQuery, err) {
+						err = nil
+						result = nil
+					}
 				}
 			}
 			// Retry DROP TABLE as DROP VIEW if target is a view
-			if isDropTableOnViewError(err) {
+			if err != nil && isDropTableOnViewError(err) {
 				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(convertedQuery); ok {
 					result, err = c.executor.Exec(alteredQuery, args...)
 				}
@@ -5686,15 +5759,58 @@ func (c *clientConn) handleCloseCursorExtended(p *portal) {
 // was attempted on a view. DuckDB returns this error when trying to use
 // ALTER TABLE ... RENAME TO on a view instead of ALTER VIEW.
 func isAlterTableNotTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "cannot use alter table") &&
-		strings.Contains(msg, "not a table")
+	if strings.Contains(msg, "cannot use alter table") &&
+		strings.Contains(msg, "not a table") {
+		return true
+	}
+
+	if strings.Contains(msg, "can only modify view with alter view statement") {
+		return true
+	}
+
+	// Qualified ALTER TABLE ... RENAME on a view can surface as a missing-table
+	// error instead of an explicit "not a table" message.
+	return strings.Contains(msg, "table with name") &&
+		strings.Contains(msg, "does not exist") &&
+		strings.Contains(msg, "did you mean")
+}
+
+func isRenameStmtAlreadyAppliedError(query string, err error) bool {
+	if err == nil {
+		return false
+	}
+
+	tree, parseErr := pg_query.Parse(query)
+	if parseErr != nil || len(tree.Stmts) != 1 {
+		return false
+	}
+
+	stmt := tree.Stmts[0].Stmt.GetRenameStmt()
+	if stmt == nil || stmt.Relation == nil {
+		return false
+	}
+
+	oldName := strings.ToLower(stmt.Relation.Relname)
+	newName := strings.ToLower(stmt.Newname)
+	msg := strings.ToLower(err.Error())
+
+	return strings.Contains(msg, "view with name "+oldName+" does not exist") &&
+		strings.Contains(msg, `did you mean "`+newName+`"`)
 }
 
 // isDropTableOnViewError checks if the error indicates that a DROP TABLE
 // was attempted on a view. DuckDB returns:
 // "Catalog Error: Existing object X is of type View, trying to drop type Table"
 func isDropTableOnViewError(err error) bool {
+	if err == nil {
+		return false
+	}
+
 	msg := err.Error()
 	return strings.Contains(msg, "is of type View") &&
 		strings.Contains(msg, "trying to drop type Table")

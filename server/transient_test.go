@@ -81,3 +81,117 @@ func TestRetryOnTransientAttachNoRetryForNonTransient(t *testing.T) {
 		t.Fatalf("expected 1 call (no retry for non-transient), got %d", calls)
 	}
 }
+
+func TestIsAlterTableNotTableError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "classic not a table error",
+			err:  errors.New("Catalog Error: cannot use ALTER TABLE on view because it is not a table"),
+			want: true,
+		},
+	{
+		name: "can only modify view with alter view statement",
+		err:  errors.New("Catalog Error: Can only modify view with ALTER VIEW statement"),
+		want: true,
+	},
+	{
+		name: "qualified view rename reports missing table",
+		err: errors.New(
+			"Catalog Error: Table with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?",
+		),
+		want: true,
+	},
+	{
+		name: "unrelated missing table stays false",
+		err:  errors.New("Catalog Error: Table with name users does not exist!"),
+		want: false,
+	},
+	{
+		name: "nil error",
+		err:  nil,
+		want: false,
+	},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAlterTableNotTableError(tt.err); got != tt.want {
+				t.Fatalf("isAlterTableNotTableError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsRenameStmtAlreadyAppliedError(t *testing.T) {
+	query := `ALTER VIEW ducklake.bill.stg_customers__dbt_tmp RENAME TO stg_customers`
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "rename already applied after alter table fallback",
+			err: errors.New(
+				"Catalog Error: View with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?",
+			),
+			want: true,
+		},
+		{
+			name: "different suggestion is not treated as success",
+			err: errors.New(
+				"Catalog Error: View with name stg_customers__dbt_tmp does not exist!\nDid you mean \"other_view\"?",
+			),
+			want: false,
+		},
+		{
+			name: "non rename error is false",
+			err:  errors.New("Catalog Error: permission denied"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRenameStmtAlreadyAppliedError(query, tt.err); got != tt.want {
+				t.Fatalf("isRenameStmtAlreadyAppliedError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsDropTableOnViewError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "drop table on view error",
+			err:  errors.New("Catalog Error: Existing object users is of type View, trying to drop type Table"),
+			want: true,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("Catalog Error: Table with name users does not exist!"),
+			want: false,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDropTableOnViewError(tt.err); got != tt.want {
+				t.Fatalf("isDropTableOnViewError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}

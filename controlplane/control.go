@@ -876,6 +876,16 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 	}()
 
+	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = server.InitSessionDatabaseMetadata(initCtx, executor, database)
+	initCancel()
+	if err != nil {
+		slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
+		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
+		_ = writer.Flush()
+		return
+	}
+
 	// Register the TCP connection so OnWorkerCrash can close it to unblock
 	// the message loop if the backing worker dies.
 	sessions.SetConnCloser(pid, tlsConn)

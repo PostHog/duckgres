@@ -184,6 +184,7 @@ deploy-multitenant-kind:
 # End-to-end local multi-tenant setup: optional OrbStack K8s + config store + control plane
 [group('dev')]
 run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multitenant-local multitenant-seed-local
+    sleep 2
     kubectl -n duckgres rollout restart deployment/duckgres-control-plane
     kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
     @echo "Multi-tenant control plane ready."
@@ -194,6 +195,7 @@ run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multit
 # End-to-end local multi-tenant setup: kind K8s + config store + control plane
 [group('dev')]
 run-multitenant-kind: kind-cluster-reset multitenant-config-store-up-kind build-k8s-image kind-load-k8s-image deploy-multitenant-kind multitenant-seed-kind
+    sleep 2
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres rollout restart deployment/duckgres-control-plane
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
     @echo "Multi-tenant control plane ready on kind."
@@ -232,7 +234,7 @@ run-ducklake: build
 # Connect via psql (standalone default port)
 [group('dev')]
 psql port="5432":
-    PGPASSWORD=postgres psql "host=127.0.0.1 port={{port}} user=postgres sslmode=require"
+    PGPASSWORD=postgres psql "host=127.0.0.1 port={{port}} user=postgres dbname=duckgres sslmode=require"
 
 # Watch for changes and rebuild
 [group('dev')]

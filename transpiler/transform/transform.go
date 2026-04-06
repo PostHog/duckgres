@@ -89,6 +89,13 @@ func walkNode(node *pg_query.Node, fn func(*pg_query.Node) bool) bool {
 		if n.CreateStmt != nil {
 			walkCreateStmt(n.CreateStmt, fn)
 		}
+	case *pg_query.Node_CreateTableAsStmt:
+		if n.CreateTableAsStmt != nil {
+			if n.CreateTableAsStmt.Into != nil && n.CreateTableAsStmt.Into.Rel != nil {
+				walkNode(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: n.CreateTableAsStmt.Into.Rel}}, fn)
+			}
+			walkNode(n.CreateTableAsStmt.Query, fn)
+		}
 	case *pg_query.Node_RangeVar:
 		// Leaf node for table references
 	case *pg_query.Node_ColumnRef:
@@ -244,6 +251,9 @@ func walkNode(node *pg_query.Node, fn func(*pg_query.Node) bool) bool {
 		}
 	case *pg_query.Node_AlterTableStmt:
 		if n.AlterTableStmt != nil {
+			if n.AlterTableStmt.Relation != nil {
+				walkNode(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: n.AlterTableStmt.Relation}}, fn)
+			}
 			for _, cmd := range n.AlterTableStmt.Cmds {
 				walkNode(cmd, fn)
 			}
