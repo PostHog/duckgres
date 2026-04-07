@@ -5,6 +5,7 @@ package provisioner
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -65,14 +66,22 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 	return &DucklingClient{client: client}
 }
 
+// ducklingName converts an org ID to a valid K8s/AWS resource name by stripping
+// hyphens. This keeps names under the 63-char limit for RDS cluster identifiers
+// when the org ID is a full UUID.
+func ducklingName(orgID string) string {
+	return strings.ReplaceAll(orgID, "-", "")
+}
+
 // Create creates a Duckling CR for the given org.
 func (d *DucklingClient) Create(ctx context.Context, orgID string, minACU, maxACU float64) error {
+	name := ducklingName(orgID)
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "k8s.posthog.com/v1alpha1",
 			"kind":       "Duckling",
 			"metadata": map[string]interface{}{
-				"name":      orgID,
+				"name":      name,
 				"namespace": ducklingNamespace,
 			},
 			"spec": map[string]interface{}{
@@ -92,25 +101,27 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, minACU, maxAC
 
 	_, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("create duckling CR %q: %w", orgID, err)
+		return fmt.Errorf("create duckling CR %q: %w", name, err)
 	}
 	return nil
 }
 
 // Get fetches the Duckling CR and parses its status.
 func (d *DucklingClient) Get(ctx context.Context, orgID string) (*DucklingStatus, error) {
-	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, orgID, metav1.GetOptions{})
+	name := ducklingName(orgID)
+	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("get duckling CR %q: %w", orgID, err)
+		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
 	return parseDucklingStatus(cr)
 }
 
 // Delete removes the Duckling CR for the given org.
 func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
-	err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, orgID, metav1.DeleteOptions{})
+	name := ducklingName(orgID)
+	err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
-		return fmt.Errorf("delete duckling CR %q: %w", orgID, err)
+		return fmt.Errorf("delete duckling CR %q: %w", name, err)
 	}
 	return nil
 }
