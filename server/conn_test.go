@@ -3372,6 +3372,62 @@ func TestCursorCloseNonexistent(t *testing.T) {
 	}
 }
 
+func TestTransactionStatusWithCopyCommands(t *testing.T) {
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// BEGIN starts a transaction
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+
+	// COPY (to file/S3) should not change transaction status — it's a normal
+	// statement inside the transaction, not a transaction control command.
+	c.updateTxStatus("COPY")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after COPY txStatus = %c, want %c (should remain in transaction)", c.txStatus, txStatusTransaction)
+	}
+
+	// COMMIT should end the transaction
+	c.updateTxStatus("COMMIT")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after COMMIT txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+
+	// Same flow with COPY FROM STDIN (the COPY command type is the same)
+	c.updateTxStatus("BEGIN")
+	c.updateTxStatus("COPY")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after COPY FROM txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+	c.updateTxStatus("ROLLBACK")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after ROLLBACK txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+}
+
+func TestTransactionErrorOnCopyFailure(t *testing.T) {
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// BEGIN a transaction
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Fatalf("expected txStatusTransaction after BEGIN")
+	}
+
+	// Simulate COPY failing inside the transaction
+	c.setTxError()
+	if c.txStatus != txStatusError {
+		t.Errorf("after failed COPY txStatus = %c, want %c", c.txStatus, txStatusError)
+	}
+
+	// Any subsequent command should fail (error state), ROLLBACK recovers
+	c.updateTxStatus("ROLLBACK")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after ROLLBACK from error txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+}
+
 func TestTransactionCommitClosesAllCursors(t *testing.T) {
 	c := &clientConn{
 		txStatus: txStatusTransaction,

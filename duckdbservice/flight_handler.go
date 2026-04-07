@@ -284,9 +284,19 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
-	schema, err := retryOnTransient(func() (*arrow.Schema, error) {
-		return GetQuerySchema(ctx, session.Conn, query, tx)
-	})
+
+	// Only retry on transient errors for autocommit queries. Inside a
+	// transaction, a transient error invalidates the transaction — retrying
+	// would run in autocommit mode and mask the failure.
+	inTransaction := tx != nil || session.sqlTxActive.Load()
+	var schema *arrow.Schema
+	if inTransaction {
+		schema, err = GetQuerySchema(ctx, session.Conn, query, tx)
+	} else {
+		schema, err = retryOnTransient(func() (*arrow.Schema, error) {
+			return GetQuerySchema(ctx, session.Conn, query, tx)
+		})
+	}
 	// Conflict retry for autocommit only. Note: if retryOnTransient exhausted on a
 	// transient error that also matches "Transaction conflict", this chains into
 	// conflict retry — acceptable since the error patterns are distinct in practice.
@@ -299,7 +309,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	if err != nil {
 		schema, err, _ = recoverAbortedTransaction(
 			err,
-			tx == nil,
+			!inTransaction,
 			func() error {
 				_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
 				return rollbackErr
@@ -383,12 +393,22 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 
 		session.progress.queryActive.Store(true)
 		defer session.progress.queryActive.Store(false)
-		rows, qerr := retryOnTransient(func() (*sql.Rows, error) {
+
+		inTxn := tx != nil || session.sqlTxActive.Load()
+		queryFn := func() (*sql.Rows, error) {
 			if tx != nil {
 				return tx.QueryContext(ctx, handle.Query)
 			}
 			return session.Conn.QueryContext(ctx, handle.Query)
-		})
+		}
+
+		var rows *sql.Rows
+		var qerr error
+		if inTxn {
+			rows, qerr = queryFn()
+		} else {
+			rows, qerr = retryOnTransient(queryFn)
+		}
 		// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 		if qerr != nil && tx == nil && isDuckLakeTransactionConflict(qerr) {
 			ducklakeConflictTotal.Inc()
@@ -399,7 +419,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		if qerr != nil {
 			rows, qerr, _ = recoverAbortedTransaction(
 				qerr,
-				tx == nil,
+				!inTxn,
 				func() error {
 					_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
 					return rollbackErr
@@ -462,16 +482,40 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		return session.Conn.ExecContext(ctx, query)
 	}
 
-	// Don't retry COMMIT/ROLLBACK on transient errors. When the DuckLake
-	// metadata store connection drops mid-COMMIT, DuckDB rolls back the
-	// transaction internally. Retrying would just produce a confusing
-	// "cannot commit - no transaction is active" secondary error.
+	// Determine whether this statement is safe to retry on transient errors.
+	//
+	// Never retry when inside a transaction (Flight SQL or SQL-level):
+	// - Transaction control stmts (COMMIT/ROLLBACK/END): retrying after DuckDB
+	//   internally rolls back produces "no transaction is active".
+	// - Any other stmt inside a transaction: a transient error causes DuckDB to
+	//   roll back the transaction internally. Retrying would succeed in autocommit
+	//   mode, masking the rollback. The client would later COMMIT and get
+	//   "no transaction is active".
+	//
+	// Only retry for autocommit statements (no Flight SQL txn, no SQL-level txn).
+	inTransaction := tx != nil || session.sqlTxActive.Load()
+	isTxControl := isTransactionControlStmt(query)
+
 	var result sql.Result
 	var execErr error
-	if isTransactionControlStmt(query) {
+	if inTransaction || isTxControl {
 		result, execErr = execFn()
 	} else {
 		result, execErr = retryOnTransient(execFn)
+	}
+
+	// Track SQL-level transaction state for BEGIN/COMMIT/ROLLBACK sent as raw SQL.
+	if isTxControl {
+		upper := strings.ToUpper(strings.TrimSpace(query))
+		if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START") {
+			if execErr == nil {
+				session.sqlTxActive.Store(true)
+			}
+		} else {
+			// COMMIT/ROLLBACK/END: transaction is over regardless of success/failure.
+			// Even if COMMIT fails, the transaction is dead.
+			session.sqlTxActive.Store(false)
+		}
 	}
 	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 	if execErr != nil && tx == nil && isDuckLakeTransactionConflict(execErr) {
@@ -483,7 +527,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if execErr != nil {
 		result, execErr, _ = recoverAbortedTransaction(
 			execErr,
-			tx == nil,
+			!inTransaction,
 			func() error {
 				_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
 				return rollbackErr
