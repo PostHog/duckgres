@@ -130,7 +130,7 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	ctrl.reconcile(ctx)
 
 	// Verify CR was created
-	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "org-a", metav1.GetOptions{})
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-a"), metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected CR to exist: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 			"apiVersion": "k8s.posthog.com/v1alpha1",
 			"kind":       "Duckling",
 			"metadata": map[string]interface{}{
-				"name":      "org-b",
+				"name":      ducklingName("org-b"),
 				"namespace": ducklingNamespace,
 			},
 			"status": map[string]interface{}{
@@ -257,7 +257,7 @@ func TestReconcileDeletingDeletesCR(t *testing.T) {
 			"apiVersion": "k8s.posthog.com/v1alpha1",
 			"kind":       "Duckling",
 			"metadata": map[string]interface{}{
-				"name":      "org-c",
+				"name":      ducklingName("org-c"),
 				"namespace": ducklingNamespace,
 			},
 		},
@@ -271,7 +271,7 @@ func TestReconcileDeletingDeletesCR(t *testing.T) {
 	ctrl.reconcile(ctx)
 
 	// Verify CR is gone
-	_, err = fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, "org-c", metav1.GetOptions{})
+	_, err = fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-c"), metav1.GetOptions{})
 	if err == nil {
 		t.Fatal("expected CR to be deleted")
 	}
