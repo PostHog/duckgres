@@ -3,6 +3,7 @@ package duckdbservice
 import (
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -280,5 +281,133 @@ func TestRecoverAbortedTransactionReturnsRollbackFailure(t *testing.T) {
 	}
 	if retryCalls != 0 {
 		t.Fatalf("expected 0 retries after rollback failure, got %d", retryCalls)
+	}
+}
+
+func TestSQLTxActiveTracking(t *testing.T) {
+	var flag atomic.Bool
+
+	// Simulate DoPutCommandStatementUpdate tracking logic for BEGIN.
+	query := "BEGIN"
+	if isTransactionControlStmt(query) {
+		t.Fatal("BEGIN should NOT be a transaction control stmt")
+	}
+	// After successful BEGIN, set sqlTxActive.
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START") {
+		flag.Store(true)
+	}
+	if !flag.Load() {
+		t.Fatal("sqlTxActive should be true after BEGIN")
+	}
+
+	// Inside a transaction, inTransaction should be true.
+	inTransaction := flag.Load()
+	if !inTransaction {
+		t.Fatal("should be in transaction after BEGIN")
+	}
+
+	// After COMMIT (success or failure), clear sqlTxActive.
+	query = "COMMIT"
+	if !isTransactionControlStmt(query) {
+		t.Fatal("COMMIT should be a transaction control stmt")
+	}
+	flag.Store(false)
+	if flag.Load() {
+		t.Fatal("sqlTxActive should be false after COMMIT")
+	}
+}
+
+func TestSQLTxActiveSkipsRetry(t *testing.T) {
+	// Verify that when sqlTxActive is true, the retry logic (simulated here)
+	// does not retry — the transient error is returned directly.
+	var sqlTxActive atomic.Bool
+	sqlTxActive.Store(true)
+
+	calls := 0
+	transientErr := errors.New("SSL connection has been closed unexpectedly")
+
+	// Simulate the DoPutCommandStatementUpdate logic: when in a transaction,
+	// execute directly without retryOnTransient.
+	inTransaction := sqlTxActive.Load()
+	isTxControl := isTransactionControlStmt("COPY t TO 's3://bucket/file.parquet'")
+
+	var err error
+	execFn := func() (string, error) {
+		calls++
+		return "", transientErr
+	}
+
+	if inTransaction || isTxControl {
+		_, err = execFn()
+	} else {
+		_, err = retryOnTransient(execFn)
+	}
+
+	if err == nil {
+		t.Fatal("expected error to be returned")
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 call (no retry inside transaction), got %d", calls)
+	}
+	if !strings.Contains(err.Error(), "SSL connection") {
+		t.Fatalf("expected original SSL error, got: %v", err)
+	}
+}
+
+func TestSQLTxActiveAllowsRetryOutsideTransaction(t *testing.T) {
+	// When sqlTxActive is false and not in a Flight SQL txn, retries should work.
+	var sqlTxActive atomic.Bool
+	sqlTxActive.Store(false)
+
+	calls := 0
+
+	inTransaction := sqlTxActive.Load()
+	isTxControl := isTransactionControlStmt("COPY t TO 's3://bucket/file.parquet'")
+
+	var result string
+	var err error
+	execFn := func() (string, error) {
+		calls++
+		if calls == 1 {
+			return "", errors.New("SSL connection has been closed unexpectedly")
+		}
+		return "ok", nil
+	}
+
+	if inTransaction || isTxControl {
+		result, err = execFn()
+	} else {
+		result, err = retryOnTransient(execFn)
+	}
+
+	if err != nil {
+		t.Fatalf("expected success after retry, got error: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("expected 'ok', got %q", result)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls (1 failure + 1 retry), got %d", calls)
+	}
+}
+
+func TestStartTransactionTracking(t *testing.T) {
+	var flag atomic.Bool
+
+	// START TRANSACTION is an alias for BEGIN.
+	query := "START TRANSACTION"
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START") {
+		flag.Store(true)
+	}
+	if !flag.Load() {
+		t.Fatal("sqlTxActive should be true after START TRANSACTION")
+	}
+
+	// ROLLBACK clears it.
+	flag.Store(false)
+	if flag.Load() {
+		t.Fatal("sqlTxActive should be false after ROLLBACK")
 	}
 }

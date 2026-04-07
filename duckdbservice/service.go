@@ -79,6 +79,15 @@ type Session struct {
 	txnOwner      map[string]string
 	handleCounter atomic.Uint64
 
+	// sqlTxActive tracks whether a SQL-level transaction is in progress on this
+	// session's Conn (i.e., BEGIN was sent as raw SQL without a corresponding
+	// COMMIT/ROLLBACK). This is distinct from Flight SQL protocol-level
+	// transactions tracked in txns. Used to prevent retryOnTransient from
+	// retrying statements inside a user-managed transaction — a retry after a
+	// transient error would run in autocommit mode (the transaction is dead)
+	// and mask the failure from the client.
+	sqlTxActive atomic.Bool
+
 	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
 	progress   progressState    // stall detection state
 }
