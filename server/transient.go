@@ -63,6 +63,45 @@ func retryOnTransientAttach(fn func() error) error {
 	return err
 }
 
+// RecoverAbortedTransaction rolls back and retries once when a DuckLake-backed
+// connection is stuck in "Current transaction is aborted" state. This is only
+// safe when the caller owns the transaction lifecycle (autocommit / no active
+// user transaction). Callers should pass canRollback=false for explicit user
+// transactions so the original error is surfaced unchanged.
+func RecoverAbortedTransaction[T any](
+	err error,
+	canRollback bool,
+	rollback func() error,
+	retry func() (T, error),
+) (T, error, bool) {
+	var zero T
+	if err == nil || !canRollback || !isTransactionAborted(err) {
+		return zero, err, false
+	}
+
+	slog.Warn("DuckLake connection hit aborted transaction state; issuing ROLLBACK before retry.", "error", err)
+	if rollbackErr := rollback(); rollbackErr != nil {
+		return zero, fmt.Errorf("DuckLake aborted transaction recovery rollback failed: %w (original error: %v)", rollbackErr, err), true
+	}
+
+	result, retryErr := retry()
+	if retryErr == nil {
+		slog.Info("DuckLake aborted transaction recovery succeeded.")
+	} else {
+		slog.Warn("DuckLake aborted transaction recovery retry failed.", "error", retryErr)
+	}
+	return result, retryErr, true
+}
+
+func recoverAbortedTransaction[T any](
+	err error,
+	canRollback bool,
+	rollback func() error,
+	retry func() (T, error),
+) (T, error, bool) {
+	return RecoverAbortedTransaction(err, canRollback, rollback, retry)
+}
+
 const (
 	conflictMaxRetries     = 5
 	conflictInitialBackoff = 50 * time.Millisecond

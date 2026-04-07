@@ -186,6 +186,103 @@ func TestRetryOnConflictStopsOnNonConflictError(t *testing.T) {
 	}
 }
 
+func TestRecoverAbortedTransactionRetriesAfterRollbackInAutocommit(t *testing.T) {
+	rollbackCalls := 0
+	retryCalls := 0
+
+	result, err, recovered := recoverAbortedTransaction(
+		errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)"),
+		true,
+		func() error {
+			rollbackCalls++
+			return nil
+		},
+		func() (string, error) {
+			retryCalls++
+			return "ok", nil
+		},
+	)
+
+	if !recovered {
+		t.Fatal("expected aborted transaction recovery to trigger")
+	}
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got error: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("expected result 'ok', got %q", result)
+	}
+	if rollbackCalls != 1 {
+		t.Fatalf("expected 1 rollback, got %d", rollbackCalls)
+	}
+	if retryCalls != 1 {
+		t.Fatalf("expected 1 retry, got %d", retryCalls)
+	}
+}
+
+func TestRecoverAbortedTransactionSkipsRecoveryInsideUserTransaction(t *testing.T) {
+	rollbackCalls := 0
+	retryCalls := 0
+	origErr := errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+
+	_, err, recovered := recoverAbortedTransaction(
+		origErr,
+		false,
+		func() error {
+			rollbackCalls++
+			return nil
+		},
+		func() (string, error) {
+			retryCalls++
+			return "ok", nil
+		},
+	)
+
+	if recovered {
+		t.Fatal("expected aborted transaction recovery to be skipped")
+	}
+	if !errors.Is(err, origErr) {
+		t.Fatalf("expected original error, got %v", err)
+	}
+	if rollbackCalls != 0 {
+		t.Fatalf("expected 0 rollbacks, got %d", rollbackCalls)
+	}
+	if retryCalls != 0 {
+		t.Fatalf("expected 0 retries, got %d", retryCalls)
+	}
+}
+
+func TestRecoverAbortedTransactionReturnsRollbackFailure(t *testing.T) {
+	rollbackCalls := 0
+	retryCalls := 0
+
+	_, err, recovered := recoverAbortedTransaction(
+		errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)"),
+		true,
+		func() error {
+			rollbackCalls++
+			return errors.New("rollback transport failed")
+		},
+		func() (string, error) {
+			retryCalls++
+			return "ok", nil
+		},
+	)
+
+	if !recovered {
+		t.Fatal("expected aborted transaction recovery to trigger")
+	}
+	if err == nil || !strings.Contains(err.Error(), "rollback transport failed") {
+		t.Fatalf("expected rollback failure, got %v", err)
+	}
+	if rollbackCalls != 1 {
+		t.Fatalf("expected 1 rollback, got %d", rollbackCalls)
+	}
+	if retryCalls != 0 {
+		t.Fatalf("expected 0 retries after rollback failure, got %d", retryCalls)
+	}
+}
+
 func TestClassifyErrorCode(t *testing.T) {
 	tests := []struct {
 		name     string

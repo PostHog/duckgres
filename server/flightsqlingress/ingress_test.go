@@ -29,6 +29,57 @@ type testExecResult struct {
 	err      error
 }
 
+type serializingRecoveryFlightExecutor struct {
+	firstQuery      string
+	interloperQuery string
+	firstFailedCh   chan struct{}
+	rollbackStarted chan struct{}
+	releaseRollback chan struct{}
+	interloperHitCh chan struct{}
+	firstQueryCalls atomic.Int32
+}
+
+type testStatementUpdate struct {
+	query         string
+	transactionID []byte
+}
+
+func (u testStatementUpdate) GetQuery() string {
+	return u.query
+}
+
+func (u testStatementUpdate) GetTransactionId() []byte {
+	return u.transactionID
+}
+
+func (e *serializingRecoveryFlightExecutor) QueryContext(context.Context, string, ...any) (server.RowSet, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (e *serializingRecoveryFlightExecutor) ExecContext(_ context.Context, query string, _ ...any) (server.ExecResult, error) {
+	switch query {
+	case e.firstQuery:
+		if e.firstQueryCalls.Add(1) == 1 {
+			close(e.firstFailedCh)
+			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		}
+		return testExecResult{affected: 1}, nil
+	case "ROLLBACK":
+		close(e.rollbackStarted)
+		<-e.releaseRollback
+		return testExecResult{}, nil
+	case e.interloperQuery:
+		select {
+		case <-e.interloperHitCh:
+		default:
+			close(e.interloperHitCh)
+		}
+		return testExecResult{affected: 1}, nil
+	default:
+		return testExecResult{affected: 1}, nil
+	}
+}
+
 type captureDurableSessionStore struct {
 	mu      sync.Mutex
 	records map[string]DurableSessionRecord
@@ -311,6 +362,68 @@ func TestRowsAffectedOrErrorReturnsAffectedCount(t *testing.T) {
 	}
 	if affected != 42 {
 		t.Fatalf("expected affected=42, got %d", affected)
+	}
+}
+
+func TestDoPutCommandStatementUpdateKeepsRecoverySerializedPerSession(t *testing.T) {
+	exec := &serializingRecoveryFlightExecutor{
+		firstQuery:      "UPDATE t SET x = 1",
+		interloperQuery: "UPDATE interloper SET x = 1",
+		firstFailedCh:   make(chan struct{}),
+		rollbackStarted: make(chan struct{}),
+		releaseRollback: make(chan struct{}),
+		interloperHitCh: make(chan struct{}),
+	}
+
+	session := newFlightClientSession(1234, "postgres", nil)
+	session.execFn = exec.ExecContext
+	session.token = "issued-token"
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			session.token: session,
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.token))
+	cmd := testStatementUpdate{query: exec.firstQuery}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, callErr := h.DoPutCommandStatementUpdate(ctx, cmd)
+		errCh <- callErr
+	}()
+
+	go func() {
+		<-exec.firstFailedCh
+		_, _ = session.exec(context.Background(), exec.interloperQuery)
+	}()
+
+	select {
+	case <-exec.rollbackStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rollback to start")
+	}
+
+	select {
+	case <-exec.interloperHitCh:
+		t.Fatal("interloper query reached executor before recovery finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(exec.releaseRollback)
+
+	select {
+	case callErr := <-errCh:
+		if callErr != nil {
+			t.Fatalf("expected nil error, got %v", callErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for statement update to finish")
 	}
 }
 

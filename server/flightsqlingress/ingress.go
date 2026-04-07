@@ -1090,6 +1090,8 @@ type flightClientSession struct {
 	token    string
 	username string
 	executor *server.FlightExecutor
+	queryFn  func(context.Context, string, ...any) (server.RowSet, error)
+	execFn   func(context.Context, string, ...any) (server.ExecResult, error)
 
 	lastUsed atomic.Int64
 	// tokenIssuedAt stores when this token was issued; used for absolute token TTL.
@@ -1113,6 +1115,10 @@ func newFlightClientSession(pid int32, username string, executor *server.FlightE
 		txns:     make(map[string]struct{}),
 		queries:  make(map[string]*flightQueryHandle),
 	}
+	if executor != nil {
+		s.queryFn = executor.QueryContext
+		s.execFn = executor.ExecContext
+	}
 	s.touch()
 	return s
 }
@@ -1124,7 +1130,20 @@ func (s *flightClientSession) touch() {
 func (s *flightClientSession) query(ctx context.Context, query string, args ...any) (server.RowSet, error) {
 	s.touch()
 	s.opMu.Lock()
-	rows, err := s.executor.QueryContext(ctx, query, args...)
+	rows, err := s.queryLocked(ctx, query, args...)
+	if err != nil {
+		rows, err, _ = server.RecoverAbortedTransaction(
+			err,
+			s.txnCount() == 0,
+			func() error {
+				_, rollbackErr := s.execLocked(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (server.RowSet, error) {
+				return s.queryLocked(ctx, query, args...)
+			},
+		)
+	}
 	if err != nil {
 		s.opMu.Unlock()
 		return nil, err
@@ -1136,6 +1155,40 @@ func (s *flightClientSession) exec(ctx context.Context, query string, args ...an
 	s.touch()
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	result, err := s.execLocked(ctx, query, args...)
+	if err != nil {
+		result, err, _ = server.RecoverAbortedTransaction(
+			err,
+			s.txnCount() == 0,
+			func() error {
+				_, rollbackErr := s.execLocked(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (server.ExecResult, error) {
+				return s.execLocked(ctx, query, args...)
+			},
+		)
+	}
+	return result, err
+}
+
+func (s *flightClientSession) queryLocked(ctx context.Context, query string, args ...any) (server.RowSet, error) {
+	if s.queryFn != nil {
+		return s.queryFn(ctx, query, args...)
+	}
+	if s.executor == nil {
+		return nil, fmt.Errorf("flight session has no query executor")
+	}
+	return s.executor.QueryContext(ctx, query, args...)
+}
+
+func (s *flightClientSession) execLocked(ctx context.Context, query string, args ...any) (server.ExecResult, error) {
+	if s.execFn != nil {
+		return s.execFn(ctx, query, args...)
+	}
+	if s.executor == nil {
+		return nil, fmt.Errorf("flight session has no exec executor")
+	}
 	return s.executor.ExecContext(ctx, query, args...)
 }
 
