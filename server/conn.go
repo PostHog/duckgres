@@ -1092,26 +1092,41 @@ func (c *clientConn) handleQuery(body []byte) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		execResult, err := c.executor.ExecContext(ctx, query)
+		runExec := func() (ExecResult, error) {
+			execResult, err := c.executor.ExecContext(ctx, query)
+			if err != nil {
+				// Retry ALTER TABLE as ALTER VIEW if target is a view
+				if isAlterTableNotTableError(err) {
+					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
+						return c.executor.ExecContext(ctx, alteredQuery)
+					}
+				}
+				// Retry DROP TABLE as DROP VIEW if target is a view
+				if isDropTableOnViewError(err) {
+					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
+						return c.executor.ExecContext(ctx, alteredQuery)
+					}
+				}
+			}
+			return execResult, err
+		}
+
+		execResult, err := runExec()
 		if err != nil {
-			// Retry ALTER TABLE as ALTER VIEW if target is a view
-			if isAlterTableNotTableError(err) {
-				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
-					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
-				}
-			}
-			// Retry DROP TABLE as DROP VIEW if target is a view
-			if err != nil && isDropTableOnViewError(err) {
-				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
-					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
-				}
-			}
-			// Autocommit retry on DuckLake transaction conflicts
-			if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 				ducklakeConflictTotal.Inc()
-				execResult, err = retryOnConflict(func() (ExecResult, error) {
-					return c.executor.ExecContext(ctx, query)
-				})
+				execResult, err = retryOnConflict(runExec)
+			}
+			if err != nil {
+				execResult, err, _ = recoverAbortedTransaction(
+					err,
+					c.txStatus == txStatusIdle,
+					func() error {
+						_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+						return rollbackErr
+					},
+					runExec,
+				)
 			}
 			if err != nil {
 				errCode := classifyErrorCode(err)
@@ -1167,13 +1182,27 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		result, err := c.executor.ExecContext(ctx, query)
-		// Autocommit retry on DuckLake transaction conflicts
+		runExec := func() (ExecResult, error) {
+			return c.executor.ExecContext(ctx, query)
+		}
+
+		result, err := runExec()
 		if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 			ducklakeConflictTotal.Inc()
-			result, err = retryOnConflict(func() (ExecResult, error) {
-				return c.executor.ExecContext(ctx, query)
-			})
+			result, err = retryOnConflict(runExec)
+		}
+		if err != nil {
+			result, err, _ = recoverAbortedTransaction(
+				err,
+				c.txStatus == txStatusIdle,
+				func() error {
+					_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+					return rollbackErr
+				},
+				func() (ExecResult, error) {
+					return c.executor.ExecContext(ctx, query)
+				},
+			)
 		}
 		if err != nil {
 			errCode := classifyErrorCode(err)
@@ -1255,14 +1284,27 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	rows, err := c.executor.QueryContext(ctx, query)
-	// Autocommit retry on DuckLake transaction conflicts (SELECT can conflict
-	// during DuckLake schema probing, symmetric with Flight SQL handler).
+	runQuery := func() (RowSet, error) {
+		return c.executor.QueryContext(ctx, query)
+	}
+
+	rows, err := runQuery()
 	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 		ducklakeConflictTotal.Inc()
-		rows, err = retryOnConflict(func() (RowSet, error) {
-			return c.executor.QueryContext(ctx, query)
-		})
+		rows, err = retryOnConflict(runQuery)
+	}
+	if err != nil {
+		rows, err, _ = recoverAbortedTransaction(
+			err,
+			c.txStatus == txStatusIdle,
+			func() error {
+				_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (RowSet, error) {
+				return c.executor.QueryContext(ctx, query)
+			},
+		)
 	}
 	if err != nil {
 		errCode := classifyErrorCode(err)
@@ -1602,24 +1644,39 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		execResult, err := c.executor.ExecContext(ctx, executedQuery)
+		runExec := func() (ExecResult, error) {
+			execResult, err := c.executor.ExecContext(ctx, executedQuery)
+			if err != nil {
+				if isAlterTableNotTableError(err) {
+					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
+						return c.executor.ExecContext(ctx, alteredQuery)
+					}
+				}
+				if isDropTableOnViewError(err) {
+					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
+						return c.executor.ExecContext(ctx, alteredQuery)
+					}
+				}
+			}
+			return execResult, err
+		}
+
+		execResult, err := runExec()
 		if err != nil {
-			if isAlterTableNotTableError(err) {
-				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
-					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
-				}
-			}
-			if err != nil && isDropTableOnViewError(err) {
-				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
-					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
-				}
-			}
-			// Autocommit retry on DuckLake transaction conflicts
-			if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 				ducklakeConflictTotal.Inc()
-				execResult, err = retryOnConflict(func() (ExecResult, error) {
-					return c.executor.ExecContext(ctx, executedQuery)
-				})
+				execResult, err = retryOnConflict(runExec)
+			}
+			if err != nil {
+				execResult, err, _ = recoverAbortedTransaction(
+					err,
+					c.txStatus == txStatusIdle,
+					func() error {
+						_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+						return rollbackErr
+					},
+					runExec,
+				)
 			}
 			if err != nil {
 				errCode := classifyErrorCode(err)
@@ -1651,7 +1708,26 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	rows, err := c.executor.QueryContext(ctx, executedQuery)
+	runQuery := func() (RowSet, error) {
+		return c.executor.QueryContext(ctx, executedQuery)
+	}
+
+	rows, err := runQuery()
+	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+		ducklakeConflictTotal.Inc()
+		rows, err = retryOnConflict(runQuery)
+	}
+	if err != nil {
+		rows, err, _ = recoverAbortedTransaction(
+			err,
+			c.txStatus == txStatusIdle,
+			func() error {
+				_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			runQuery,
+		)
+	}
 	if err != nil {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
@@ -4452,7 +4528,7 @@ func (c *clientConn) handleParse(body []byte) {
 	delete(c.stmts, stmtName)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:             query,      // Keep original for logging and Describe
+		query:             query,                            // Keep original for logging and Describe
 		convertedQuery:    c.rewriteDirectQuery(result.SQL), // Transpiled SQL for execution
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
@@ -4921,26 +4997,41 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 
 		// Non-result-returning query: use Exec with converted query
-		result, err := c.executor.Exec(convertedQuery, args...)
+		runExec := func() (ExecResult, error) {
+			result, err := c.executor.Exec(convertedQuery, args...)
+			if err != nil {
+				// Retry ALTER TABLE as ALTER VIEW if target is a view
+				if isAlterTableNotTableError(err) {
+					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(convertedQuery); ok {
+						return c.executor.Exec(alteredQuery, args...)
+					}
+				}
+				// Retry DROP TABLE as DROP VIEW if target is a view
+				if isDropTableOnViewError(err) {
+					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(convertedQuery); ok {
+						return c.executor.Exec(alteredQuery, args...)
+					}
+				}
+			}
+			return result, err
+		}
+
+		result, err := runExec()
 		if err != nil {
-			// Retry ALTER TABLE as ALTER VIEW if target is a view
-			if isAlterTableNotTableError(err) {
-				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(convertedQuery); ok {
-					result, err = c.executor.Exec(alteredQuery, args...)
-				}
-			}
-			// Retry DROP TABLE as DROP VIEW if target is a view
-			if err != nil && isDropTableOnViewError(err) {
-				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(convertedQuery); ok {
-					result, err = c.executor.Exec(alteredQuery, args...)
-				}
-			}
-			// Autocommit retry on DuckLake transaction conflicts
-			if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 				ducklakeConflictTotal.Inc()
-				result, err = retryOnConflict(func() (ExecResult, error) {
-					return c.executor.Exec(convertedQuery, args...)
-				})
+				result, err = retryOnConflict(runExec)
+			}
+			if err != nil {
+				result, err, _ = recoverAbortedTransaction(
+					err,
+					c.txStatus == txStatusIdle,
+					func() error {
+						_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+						return rollbackErr
+					},
+					runExec,
+				)
 			}
 			if err != nil {
 				errCode := classifyErrorCode(err)
@@ -4968,7 +5059,26 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	// Result-returning query: use Query with converted query
-	rows, err := c.executor.Query(convertedQuery, args...)
+	runQuery := func() (RowSet, error) {
+		return c.executor.Query(convertedQuery, args...)
+	}
+
+	rows, err := runQuery()
+	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+		ducklakeConflictTotal.Inc()
+		rows, err = retryOnConflict(runQuery)
+	}
+	if err != nil {
+		rows, err, _ = recoverAbortedTransaction(
+			err,
+			c.txStatus == txStatusIdle,
+			func() error {
+				_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			runQuery,
+		)
+	}
 	if err != nil {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
@@ -5335,26 +5445,26 @@ var pgStatActivityColumns = []struct {
 	oid     int32
 	typSize int16
 }{
-	{"datid", 23, 4},             // int4
-	{"datname", 25, -1},          // text
-	{"pid", 23, 4},               // int4
-	{"usesysid", 23, 4},          // int4
-	{"usename", 25, -1},          // text
-	{"application_name", 25, -1}, // text
-	{"client_addr", 25, -1},      // text (inet in PG, text here)
-	{"client_port", 23, 4},       // int4
-	{"backend_start", 1184, 8},   // timestamptz
-	{"xact_start", 1184, 8},      // timestamptz (NULL)
-	{"query_start", 1184, 8},     // timestamptz (NULL)
-	{"state_change", 1184, 8},    // timestamptz (NULL)
-	{"wait_event_type", 25, -1},  // text (NULL)
-	{"wait_event", 25, -1},       // text (NULL)
-	{"state", 25, -1},            // text
-	{"backend_xid", 28, 4},       // xid (NULL)
-	{"backend_xmin", 28, 4},      // xid (NULL)
-	{"query", 25, -1},            // text
-	{"backend_type", 25, -1},     // text
-	{"leader_pid", 23, 4},        // int4 (NULL)
+	{"datid", 23, 4},                 // int4
+	{"datname", 25, -1},              // text
+	{"pid", 23, 4},                   // int4
+	{"usesysid", 23, 4},              // int4
+	{"usename", 25, -1},              // text
+	{"application_name", 25, -1},     // text
+	{"client_addr", 25, -1},          // text (inet in PG, text here)
+	{"client_port", 23, 4},           // int4
+	{"backend_start", 1184, 8},       // timestamptz
+	{"xact_start", 1184, 8},          // timestamptz (NULL)
+	{"query_start", 1184, 8},         // timestamptz (NULL)
+	{"state_change", 1184, 8},        // timestamptz (NULL)
+	{"wait_event_type", 25, -1},      // text (NULL)
+	{"wait_event", 25, -1},           // text (NULL)
+	{"state", 25, -1},                // text
+	{"backend_xid", 28, 4},           // xid (NULL)
+	{"backend_xmin", 28, 4},          // xid (NULL)
+	{"query", 25, -1},                // text
+	{"backend_type", 25, -1},         // text
+	{"leader_pid", 23, 4},            // int4 (NULL)
 	{"worker_id", 23, 4},             // int4 (duckgres extension)
 	{"query_progress", 701, 8},       // float8 (percentage, -1 if not tracked)
 	{"rows_processed", 20, 8},        // int8

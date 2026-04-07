@@ -297,6 +297,19 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		})
 	}
 	if err != nil {
+		schema, err, _ = recoverAbortedTransaction(
+			err,
+			tx == nil,
+			func() error {
+				_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (*arrow.Schema, error) {
+				return GetQuerySchema(ctx, session.Conn, query, tx)
+			},
+		)
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
 
@@ -384,6 +397,19 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			})
 		}
 		if qerr != nil {
+			rows, qerr, _ = recoverAbortedTransaction(
+				qerr,
+				tx == nil,
+				func() error {
+					_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
+					return rollbackErr
+				},
+				func() (*sql.Rows, error) {
+					return session.Conn.QueryContext(ctx, handle.Query)
+				},
+			)
+		}
+		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
 			return
 		}
@@ -453,6 +479,19 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		result, execErr = retryOnConflict(func() (sql.Result, error) {
 			return session.Conn.ExecContext(ctx, query)
 		})
+	}
+	if execErr != nil {
+		result, execErr, _ = recoverAbortedTransaction(
+			execErr,
+			tx == nil,
+			func() error {
+				_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (sql.Result, error) {
+				return execFn()
+			},
+		)
 	}
 	if execErr != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)

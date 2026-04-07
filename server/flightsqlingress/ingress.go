@@ -581,17 +581,7 @@ func (h *ControlPlaneFlightSQLHandler) BeginTransaction(ctx context.Context, req
 	}
 	_ = req
 
-	if s.txnCount() > 0 {
-		return nil, status.Error(codes.FailedPrecondition, "transaction already active")
-	}
-
-	if _, err := s.exec(ctx, "BEGIN TRANSACTION"); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to begin transaction: %v", err)
-	}
-
-	txnKey := s.nextHandle("txn")
-	s.addTxn(txnKey)
-	return []byte(txnKey), nil
+	return s.beginTransaction(ctx)
 }
 
 func (h *ControlPlaneFlightSQLHandler) EndTransaction(ctx context.Context, req flightsql.ActionEndTransactionRequest) error {
@@ -606,27 +596,7 @@ func (h *ControlPlaneFlightSQLHandler) EndTransaction(ctx context.Context, req f
 	if txnKey == "" {
 		return status.Error(codes.InvalidArgument, "missing transaction id")
 	}
-	if !s.hasTxn(txnKey) {
-		return status.Error(codes.NotFound, "transaction not found")
-	}
-
-	switch req.GetAction() {
-	case flightsql.EndTransactionCommit:
-		if _, err := s.exec(ctx, "COMMIT"); err != nil {
-			return status.Errorf(codes.Internal, "failed to commit transaction: %v", err)
-		}
-	case flightsql.EndTransactionRollback:
-		if _, err := s.exec(ctx, "ROLLBACK"); err != nil {
-			return status.Errorf(codes.Internal, "failed to rollback transaction: %v", err)
-		}
-	default:
-		_, _ = s.exec(ctx, "ROLLBACK")
-		s.deleteTxn(txnKey)
-		return status.Error(codes.InvalidArgument, "unsupported end transaction action")
-	}
-
-	s.deleteTxn(txnKey)
-	return nil
+	return s.endTransaction(ctx, txnKey, req.GetAction())
 }
 
 func (h *ControlPlaneFlightSQLHandler) CloseSession(ctx context.Context, req *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
@@ -1090,6 +1060,8 @@ type flightClientSession struct {
 	token    string
 	username string
 	executor *server.FlightExecutor
+	queryFn  func(context.Context, string, ...any) (server.RowSet, error)
+	execFn   func(context.Context, string, ...any) (server.ExecResult, error)
 
 	lastUsed atomic.Int64
 	// tokenIssuedAt stores when this token was issued; used for absolute token TTL.
@@ -1098,11 +1070,16 @@ type flightClientSession struct {
 	counter       atomic.Uint64
 	streams       atomic.Int32
 
-	opMu sync.Mutex
+	opMu      sync.Mutex
+	activeTxn bool // protected by opMu
 
 	mu      sync.RWMutex
 	txns    map[string]struct{}
 	queries map[string]*flightQueryHandle
+
+	// Test hook: runs while opMu is still held after a transaction control
+	// statement succeeds but before txn bookkeeping is updated.
+	afterTxnControlExecHook func(string)
 }
 
 func newFlightClientSession(pid int32, username string, executor *server.FlightExecutor) *flightClientSession {
@@ -1112,6 +1089,10 @@ func newFlightClientSession(pid int32, username string, executor *server.FlightE
 		executor: executor,
 		txns:     make(map[string]struct{}),
 		queries:  make(map[string]*flightQueryHandle),
+	}
+	if executor != nil {
+		s.queryFn = executor.QueryContext
+		s.execFn = executor.ExecContext
 	}
 	s.touch()
 	return s
@@ -1124,7 +1105,7 @@ func (s *flightClientSession) touch() {
 func (s *flightClientSession) query(ctx context.Context, query string, args ...any) (server.RowSet, error) {
 	s.touch()
 	s.opMu.Lock()
-	rows, err := s.executor.QueryContext(ctx, query, args...)
+	rows, err := s.queryWithRecoveryLocked(ctx, query, args...)
 	if err != nil {
 		s.opMu.Unlock()
 		return nil, err
@@ -1136,7 +1117,64 @@ func (s *flightClientSession) exec(ctx context.Context, query string, args ...an
 	s.touch()
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	result, err := s.execWithRecoveryLocked(ctx, query, args...)
+	return result, err
+}
+
+func (s *flightClientSession) queryLocked(ctx context.Context, query string, args ...any) (server.RowSet, error) {
+	if s.queryFn != nil {
+		return s.queryFn(ctx, query, args...)
+	}
+	if s.executor == nil {
+		return nil, fmt.Errorf("flight session has no query executor")
+	}
+	return s.executor.QueryContext(ctx, query, args...)
+}
+
+func (s *flightClientSession) queryWithRecoveryLocked(ctx context.Context, query string, args ...any) (server.RowSet, error) {
+	rows, err := s.queryLocked(ctx, query, args...)
+	if err != nil {
+		rows, err, _ = server.RecoverAbortedTransaction(
+			err,
+			!s.activeTxn,
+			func() error {
+				_, rollbackErr := s.execLocked(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (server.RowSet, error) {
+				return s.queryLocked(ctx, query, args...)
+			},
+		)
+	}
+	return rows, err
+}
+
+func (s *flightClientSession) execLocked(ctx context.Context, query string, args ...any) (server.ExecResult, error) {
+	if s.execFn != nil {
+		return s.execFn(ctx, query, args...)
+	}
+	if s.executor == nil {
+		return nil, fmt.Errorf("flight session has no exec executor")
+	}
 	return s.executor.ExecContext(ctx, query, args...)
+}
+
+func (s *flightClientSession) execWithRecoveryLocked(ctx context.Context, query string, args ...any) (server.ExecResult, error) {
+	result, err := s.execLocked(ctx, query, args...)
+	if err != nil {
+		result, err, _ = server.RecoverAbortedTransaction(
+			err,
+			!s.activeTxn,
+			func() error {
+				_, rollbackErr := s.execLocked(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (server.ExecResult, error) {
+				return s.execLocked(ctx, query, args...)
+			},
+		)
+	}
+	return result, err
 }
 
 func (s *flightClientSession) nextHandle(prefix string) string {
@@ -1177,6 +1215,69 @@ func (s *flightClientSession) deleteTxn(txnKey string) {
 	s.mu.Lock()
 	delete(s.txns, txnKey)
 	s.mu.Unlock()
+}
+
+func (s *flightClientSession) beginTransaction(ctx context.Context) ([]byte, error) {
+	s.touch()
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+
+	if s.activeTxn {
+		return nil, status.Error(codes.FailedPrecondition, "transaction already active")
+	}
+
+	if _, err := s.execWithRecoveryLocked(ctx, "BEGIN TRANSACTION"); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to begin transaction: %v", err)
+	}
+	if s.afterTxnControlExecHook != nil {
+		s.afterTxnControlExecHook("BEGIN TRANSACTION")
+	}
+
+	txnKey := s.nextHandle("txn")
+	s.activeTxn = true
+	s.addTxn(txnKey)
+	return []byte(txnKey), nil
+}
+
+func (s *flightClientSession) endTransaction(ctx context.Context, txnKey string, action flightsql.EndTransactionRequestType) error {
+	s.touch()
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+
+	if !s.activeTxn || !s.hasTxn(txnKey) {
+		return status.Error(codes.NotFound, "transaction not found")
+	}
+
+	switch action {
+	case flightsql.EndTransactionCommit:
+		if _, err := s.execWithRecoveryLocked(ctx, "COMMIT"); err != nil {
+			return status.Errorf(codes.Internal, "failed to commit transaction: %v", err)
+		}
+	case flightsql.EndTransactionRollback:
+		if _, err := s.execWithRecoveryLocked(ctx, "ROLLBACK"); err != nil {
+			return status.Errorf(codes.Internal, "failed to rollback transaction: %v", err)
+		}
+	default:
+		_, _ = s.execLocked(ctx, "ROLLBACK")
+		if s.afterTxnControlExecHook != nil {
+			s.afterTxnControlExecHook("ROLLBACK")
+		}
+		s.activeTxn = false
+		s.deleteTxn(txnKey)
+		return status.Error(codes.InvalidArgument, "unsupported end transaction action")
+	}
+
+	if s.afterTxnControlExecHook != nil {
+		switch action {
+		case flightsql.EndTransactionCommit:
+			s.afterTxnControlExecHook("COMMIT")
+		case flightsql.EndTransactionRollback:
+			s.afterTxnControlExecHook("ROLLBACK")
+		}
+	}
+	s.activeTxn = false
+	s.deleteTxn(txnKey)
+	return nil
 }
 
 func (s *flightClientSession) addQuery(handleID string, q *flightQueryHandle) {
