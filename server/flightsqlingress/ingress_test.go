@@ -80,6 +80,33 @@ func (e *serializingRecoveryFlightExecutor) ExecContext(_ context.Context, query
 	}
 }
 
+type beginTxnRaceFlightExecutor struct {
+	interloperQuery string
+	rollbackHitCh   chan struct{}
+}
+
+func (e *beginTxnRaceFlightExecutor) QueryContext(context.Context, string, ...any) (server.RowSet, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (e *beginTxnRaceFlightExecutor) ExecContext(_ context.Context, query string, _ ...any) (server.ExecResult, error) {
+	switch query {
+	case "BEGIN TRANSACTION":
+		return testExecResult{}, nil
+	case e.interloperQuery:
+		return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+	case "ROLLBACK":
+		select {
+		case <-e.rollbackHitCh:
+		default:
+			close(e.rollbackHitCh)
+		}
+		return testExecResult{}, nil
+	default:
+		return testExecResult{}, nil
+	}
+}
+
 type captureDurableSessionStore struct {
 	mu      sync.Mutex
 	records map[string]DurableSessionRecord
@@ -424,6 +451,66 @@ func TestDoPutCommandStatementUpdateKeepsRecoverySerializedPerSession(t *testing
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for statement update to finish")
+	}
+}
+
+func TestBeginTransactionPublishesTxnStateBeforeConcurrentRecoveryDecidesRollback(t *testing.T) {
+	exec := &beginTxnRaceFlightExecutor{
+		interloperQuery: "UPDATE interloper SET x = 1",
+		rollbackHitCh:   make(chan struct{}),
+	}
+
+	session := newFlightClientSession(1234, "postgres", nil)
+	session.execFn = exec.ExecContext
+	session.token = "issued-token"
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			session.token: session,
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.token))
+	interloperDone := make(chan error, 1)
+	session.afterTxnControlExecHook = func(query string) {
+		if query != "BEGIN TRANSACTION" {
+			return
+		}
+		go func() {
+			_, callErr := session.exec(context.Background(), exec.interloperQuery)
+			interloperDone <- callErr
+		}()
+	}
+
+	txnID, err := h.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTransaction returned error: %v", err)
+	}
+	if len(txnID) == 0 {
+		t.Fatal("expected non-empty transaction id")
+	}
+
+	select {
+	case callErr := <-interloperDone:
+		if callErr == nil {
+			t.Fatal("expected interloper to see aborted-transaction error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for interloper call")
+	}
+
+	select {
+	case <-exec.rollbackHitCh:
+		t.Fatal("interloper issued rollback against active user transaction")
+	default:
+	}
+
+	if !session.hasTxn(string(txnID)) {
+		t.Fatal("expected transaction bookkeeping to remain present")
 	}
 }
 
