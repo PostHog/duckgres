@@ -29,8 +29,8 @@ func TestInitSearchPath(t *testing.T) {
 		if err := conn.QueryRowContext(context.Background(), "SELECT current_setting('search_path')").Scan(&searchPath); err != nil {
 			t.Fatalf("failed to query search_path: %v", err)
 		}
-		if searchPath != "main" {
-			t.Errorf("expected search_path 'main', got %q", searchPath)
+		if searchPath != "main,memory.main" {
+			t.Errorf("expected search_path 'main,memory.main', got %q", searchPath)
 		}
 	})
 
@@ -52,8 +52,8 @@ func TestInitSearchPath(t *testing.T) {
 		if err := conn.QueryRowContext(context.Background(), "SELECT current_setting('search_path')").Scan(&searchPath); err != nil {
 			t.Fatalf("failed to query search_path: %v", err)
 		}
-		if searchPath != "myuser,main" {
-			t.Errorf("expected search_path 'myuser,main', got %q", searchPath)
+		if searchPath != "myuser,main,memory.main" {
+			t.Errorf("expected search_path 'myuser,main,memory.main', got %q", searchPath)
 		}
 	})
 }
