@@ -132,6 +132,34 @@ func TestLogicalDatabaseCatalogMetadata(t *testing.T) {
 			t.Fatalf("information_schema.schemata leaked %d internal DuckLake metadata rows", leaked)
 		}
 	})
+
+	t.Run("show_databases_reports_only_logical_name", func(t *testing.T) {
+		rows, err := db.Query("SHOW DATABASES")
+		if err != nil {
+			t.Fatalf("SHOW DATABASES: %v", err)
+		}
+		defer func() {
+			if err := rows.Close(); err != nil {
+				t.Fatalf("close SHOW DATABASES rows: %v", err)
+			}
+		}()
+
+		var got []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatalf("scan SHOW DATABASES row: %v", err)
+			}
+			got = append(got, name)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("iterate SHOW DATABASES rows: %v", err)
+		}
+
+		if len(got) != 1 || got[0] != "duckgres_catalog" {
+			t.Fatalf("SHOW DATABASES = %v, want [duckgres_catalog]", got)
+		}
+	})
 }
 
 func TestLogicalDatabaseCatalogQualifiedNames(t *testing.T) {

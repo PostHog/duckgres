@@ -878,10 +878,18 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	err = server.InitSessionDatabaseMetadata(initCtx, executor, database)
-	initCancel()
 	if err != nil {
+		initCancel()
 		slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
+		_ = writer.Flush()
+		return
+	}
+	duckLakeAttached, err := server.HasAttachedCatalog(initCtx, executor, "ducklake")
+	initCancel()
+	if err != nil {
+		slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
+		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
 		_ = writer.Flush()
 		return
 	}
@@ -893,6 +901,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Create real clientConn with FlightExecutor and worker assignment
 	workerID := sessions.WorkerIDForPID(pid)
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID)
+	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {

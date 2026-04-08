@@ -149,23 +149,24 @@ const (
 )
 
 type clientConn struct {
-	server      *Server
-	conn        net.Conn
-	reader      *bufio.Reader
-	writer      *bufio.Writer
-	username    string
-	orgID       string
-	database    string
-	executor    QueryExecutor
-	pid         int32
-	secretKey   int32                    // unique key for cancel requests
-	stmts       map[string]*preparedStmt // prepared statements by name
-	portals     map[string]*portal       // portals by name
-	txStatus    byte                     // current transaction status ('I', 'T', or 'E')
-	passthrough bool                     // true for passthrough users (skip transpiler + pg_catalog)
-	cursors     map[string]*cursorState  // server-side cursor emulation
-	ctx         context.Context          // connection context, cancelled when connection is closed
-	cancel      context.CancelFunc       // cancels the connection context
+	server                *Server
+	conn                  net.Conn
+	reader                *bufio.Reader
+	writer                *bufio.Writer
+	username              string
+	orgID                 string
+	database              string
+	executor              QueryExecutor
+	pid                   int32
+	secretKey             int32                    // unique key for cancel requests
+	stmts                 map[string]*preparedStmt // prepared statements by name
+	portals               map[string]*portal       // portals by name
+	txStatus              byte                     // current transaction status ('I', 'T', or 'E')
+	passthrough           bool                     // true for passthrough users (skip transpiler + pg_catalog)
+	cursors               map[string]*cursorState  // server-side cursor emulation
+	logicalCatalogMapping bool                     // true when the session has an attached ducklake catalog and logical catalog masking is active
+	ctx                   context.Context          // connection context, cancelled when connection is closed
+	cancel                context.CancelFunc       // cancels the connection context
 
 	// pg_stat_activity fields
 	backendStart    time.Time    // when this connection started
@@ -674,7 +675,13 @@ func (c *clientConn) serve() error {
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
 		}
+		duckLakeAttached, err := hasAttachedCatalog(initCtx, c.executor, "ducklake")
 		initCancel()
+		if err != nil {
+			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect ducklake catalog attachment: %v", err))
+			return err
+		}
+		c.logicalCatalogMapping = duckLakeAttached
 	}
 
 	// Send initial parameters
@@ -1232,23 +1239,30 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 }
 
 func (c *clientConn) rewriteDirectQuery(query string) string {
-	if c.server == nil || c.server.cfg.DuckLake.MetadataStore == "" {
+	if c == nil || c.server == nil || c.passthrough || !c.logicalCatalogMapping || strings.TrimSpace(c.database) == "" {
 		return query
 	}
 
-	physicalCatalog := "ducklake"
 	stripped := strings.TrimSpace(stripLeadingComments(query))
-	if len(stripped) < len("USE") || !strings.EqualFold(stripped[:len("USE")], "USE") {
+	if stripped == "" {
 		return query
 	}
 
-	target := strings.TrimSpace(stripped[len("USE"):])
-	if target == "" {
+	hasSemicolon := strings.HasSuffix(stripped, ";")
+	trimmed := strings.TrimSpace(strings.TrimSuffix(stripped, ";"))
+	if strings.EqualFold(trimmed, "SHOW DATABASES") {
+		rewritten := "SELECT current_database() AS database_name"
+		if hasSemicolon {
+			rewritten += ";"
+		}
+		return rewritten
+	}
+
+	if len(trimmed) < len("USE") || !strings.EqualFold(trimmed[:len("USE")], "USE") {
 		return query
 	}
 
-	hasSemicolon := strings.HasSuffix(target, ";")
-	target = strings.TrimSpace(strings.TrimSuffix(target, ";"))
+	target := strings.TrimSpace(trimmed[len("USE"):])
 	if target == "" {
 		return query
 	}
@@ -1264,6 +1278,7 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 		return query
 	}
 
+	physicalCatalog := "ducklake"
 	replacement := physicalCatalog
 	if quoteResult {
 		replacement = `"` + strings.ReplaceAll(physicalCatalog, `"`, `""`) + `"`

@@ -11,7 +11,8 @@ func TestRewriteDirectQuery(t *testing.T) {
 				},
 			},
 		},
-		database: "test",
+		database:              "test",
+		logicalCatalogMapping: true,
 	}
 
 	tests := []struct {
@@ -44,6 +45,16 @@ func TestRewriteDirectQuery(t *testing.T) {
 			query: "SELECT current_database()",
 			want:  "SELECT current_database()",
 		},
+		{
+			name:  "rewrites show databases to logical catalog",
+			query: "SHOW DATABASES",
+			want:  "SELECT current_database() AS database_name",
+		},
+		{
+			name:  "rewrites commented show databases with semicolon",
+			query: "/* list */ SHOW DATABASES;",
+			want:  "SELECT current_database() AS database_name;",
+		},
 	}
 
 	for _, tc := range tests {
@@ -52,5 +63,40 @@ func TestRewriteDirectQuery(t *testing.T) {
 				t.Fatalf("rewriteDirectQuery(%q) = %q, want %q", tc.query, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRewriteDirectQueryMultitenantShowDatabases(t *testing.T) {
+	c := &clientConn{
+		server:                &Server{},
+		database:              "duckgres",
+		logicalCatalogMapping: true,
+	}
+
+	if got, want := c.rewriteDirectQuery("SHOW DATABASES"), "SELECT current_database() AS database_name"; got != want {
+		t.Fatalf("rewriteDirectQuery(SHOW DATABASES) = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteDirectQueryPassthroughPreservesShowDatabases(t *testing.T) {
+	c := &clientConn{
+		server:      &Server{},
+		database:    "duckgres",
+		passthrough: true,
+	}
+
+	if got, want := c.rewriteDirectQuery("SHOW DATABASES"), "SHOW DATABASES"; got != want {
+		t.Fatalf("rewriteDirectQuery(SHOW DATABASES) = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteDirectQueryPreservesShowDatabasesWithoutLogicalCatalogMapping(t *testing.T) {
+	c := &clientConn{
+		server:   &Server{},
+		database: "duckgres",
+	}
+
+	if got, want := c.rewriteDirectQuery("SHOW DATABASES"), "SHOW DATABASES"; got != want {
+		t.Fatalf("rewriteDirectQuery(SHOW DATABASES) = %q, want %q", got, want)
 	}
 }
