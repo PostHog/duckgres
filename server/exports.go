@@ -81,6 +81,20 @@ func CancelClientConn(cc *clientConn) {
 	}
 }
 
+// SetLogicalCatalogMapping records whether this session should rewrite DuckLake
+// metadata surfaces to the client-visible logical database name.
+func SetLogicalCatalogMapping(cc *clientConn, enabled bool) {
+	if cc != nil {
+		cc.logicalCatalogMapping = enabled
+	}
+}
+
+// HasAttachedCatalog reports whether the named catalog is attached in the
+// current session.
+func HasAttachedCatalog(ctx context.Context, executor QueryExecutor, catalog string) (bool, error) {
+	return hasAttachedCatalog(ctx, executor, catalog)
+}
+
 // SendInitialParams sends the initial parameter status messages and backend key data.
 func SendInitialParams(cc *clientConn) {
 	cc.sendInitialParams()
