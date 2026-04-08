@@ -36,6 +36,9 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, da
 	defer func() {
 		if duckLakeAttached {
 			_, _ = executor.ExecContext(context.Background(), "USE ducklake")
+			// USE ducklake resets search_path to ducklake.main, excluding memory.main
+			// where pg_catalog macros live. Restore it so macros remain resolvable.
+			_, _ = executor.ExecContext(context.Background(), "SET search_path = 'main,memory.main'")
 		}
 	}()
 
