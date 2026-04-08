@@ -66,6 +66,8 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.MaxWorkers = updates.MaxWorkers
 	org.MemoryBudget = updates.MemoryBudget
 	org.IdleTimeoutS = updates.IdleTimeoutS
+	org.WorkerCPURequest = updates.WorkerCPURequest
+	org.WorkerMemoryRequest = updates.WorkerMemoryRequest
 	return copyOrg(org), true, nil
 }
 

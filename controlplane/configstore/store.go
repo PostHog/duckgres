@@ -179,13 +179,15 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 
 	for _, o := range orgs {
 		oc := &OrgConfig{
-			Name:         o.Name,
-			DatabaseName: o.DatabaseName,
-			MaxWorkers:   o.MaxWorkers,
-			MemoryBudget: o.MemoryBudget,
-			IdleTimeoutS: o.IdleTimeoutS,
-			Users:        make(map[string]string),
-			Warehouse:    copyManagedWarehouseConfig(o.Warehouse),
+			Name:                o.Name,
+			DatabaseName:        o.DatabaseName,
+			MaxWorkers:          o.MaxWorkers,
+			MemoryBudget:        o.MemoryBudget,
+			IdleTimeoutS:        o.IdleTimeoutS,
+			WorkerCPURequest:    o.WorkerCPURequest,
+			WorkerMemoryRequest: o.WorkerMemoryRequest,
+			Users:               make(map[string]string),
+			Warehouse:           copyManagedWarehouseConfig(o.Warehouse),
 		}
 		if o.DatabaseName != "" {
 			snap.DatabaseOrg[o.DatabaseName] = o.Name

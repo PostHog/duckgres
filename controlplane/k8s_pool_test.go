@@ -1755,8 +1755,17 @@ func TestWorkerResources_BothSet(t *testing.T) {
 	if mem.String() != "2Gi" {
 		t.Fatalf("expected memory request 2Gi, got %s", mem.String())
 	}
-	if res.Limits != nil {
-		t.Fatal("expected no limits to be set")
+	// Guaranteed QoS: limits == requests
+	if res.Limits == nil {
+		t.Fatal("expected limits to be set (Guaranteed QoS)")
+	}
+	cpuLimit := res.Limits[corev1.ResourceCPU]
+	if cpuLimit.String() != "500m" {
+		t.Fatalf("expected CPU limit 500m, got %s", cpuLimit.String())
+	}
+	memLimit := res.Limits[corev1.ResourceMemory]
+	if memLimit.String() != "2Gi" {
+		t.Fatalf("expected memory limit 2Gi, got %s", memLimit.String())
 	}
 }
 
@@ -1771,6 +1780,12 @@ func TestWorkerResources_CPUOnly(t *testing.T) {
 	if _, ok := res.Requests[corev1.ResourceMemory]; ok {
 		t.Fatal("expected no memory request")
 	}
+	if _, ok := res.Limits[corev1.ResourceCPU]; !ok {
+		t.Fatal("expected CPU limit (Guaranteed QoS)")
+	}
+	if _, ok := res.Limits[corev1.ResourceMemory]; ok {
+		t.Fatal("expected no memory limit")
+	}
 }
 
 func TestWorkerResources_MemoryOnly(t *testing.T) {
@@ -1783,6 +1798,12 @@ func TestWorkerResources_MemoryOnly(t *testing.T) {
 	}
 	if _, ok := res.Requests[corev1.ResourceCPU]; ok {
 		t.Fatal("expected no CPU request")
+	}
+	if _, ok := res.Limits[corev1.ResourceMemory]; !ok {
+		t.Fatal("expected memory limit (Guaranteed QoS)")
+	}
+	if _, ok := res.Limits[corev1.ResourceCPU]; ok {
+		t.Fatal("expected no CPU limit")
 	}
 }
 

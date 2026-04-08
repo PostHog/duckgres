@@ -165,9 +165,11 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 
 func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
 	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(map[string]interface{}{
-		"max_workers":    updates.MaxWorkers,
-		"memory_budget":  updates.MemoryBudget,
-		"idle_timeout_s": updates.IdleTimeoutS,
+		"max_workers":           updates.MaxWorkers,
+		"memory_budget":         updates.MemoryBudget,
+		"idle_timeout_s":        updates.IdleTimeoutS,
+		"worker_cpu_request":    updates.WorkerCPURequest,
+		"worker_memory_request": updates.WorkerMemoryRequest,
 	})
 	if result.Error != nil {
 		return nil, false, result.Error

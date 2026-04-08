@@ -1872,9 +1872,10 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	}
 }
 
-// workerResources returns resource requests for a worker pod.
+// workerResources returns resource requests and limits for a worker pod.
 // Set via DUCKGRES_K8S_WORKER_CPU_REQUEST / DUCKGRES_K8S_WORKER_MEMORY_REQUEST.
 // Returns empty (BestEffort) if neither is set.
+// When set, limits are equal to requests (Guaranteed QoS).
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	requests := corev1.ResourceList{}
 	if p.workerCPURequest != "" {
@@ -1886,7 +1887,11 @@ func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	if len(requests) == 0 {
 		return corev1.ResourceRequirements{}
 	}
-	return corev1.ResourceRequirements{Requests: requests}
+	limits := make(corev1.ResourceList, len(requests))
+	for k, v := range requests {
+		limits[k] = v.DeepCopy()
+	}
+	return corev1.ResourceRequirements{Requests: requests, Limits: limits}
 }
 
 // --- Helpers ---
@@ -2109,6 +2114,15 @@ func (p *K8sWorkerPool) SetMaxWorkers(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.maxWorkers = n
+}
+
+// SetWorkerResources updates the CPU and memory requests (and limits) applied
+// to newly spawned worker pods. Existing pods are not affected.
+func (p *K8sWorkerPool) SetWorkerResources(cpu, memory string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.workerCPURequest = cpu
+	p.workerMemoryRequest = memory
 }
 
 // SetWarmCapacityTarget updates the number of neutral idle workers the shared
