@@ -1265,6 +1265,12 @@ func setDuckLakeDefault(db *sql.DB) error {
 	if _, err := db.Exec("USE ducklake"); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
 	}
+	// Include memory.main in the search path so pg_catalog macros (pg_get_userbyid,
+	// format_type, etc.) created in memory.main are resolvable. Without this, psql
+	// commands like \dt fail because DuckDB doesn't resolve functions across catalogs.
+	if _, err := db.Exec("SET search_path = 'ducklake.main,memory.main'"); err != nil {
+		return fmt.Errorf("failed to set search_path for DuckLake: %w", err)
+	}
 	slog.Info("Set DuckLake as default catalog.")
 	return nil
 }
