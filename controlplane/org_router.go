@@ -104,6 +104,19 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		maxWorkers = tr.baseCfg.MaxWorkers
 	}
 
+	// Apply per-org worker resource overrides to the shared pool.
+	if tc.WorkerCPURequest != "" || tc.WorkerMemoryRequest != "" {
+		cpu := tc.WorkerCPURequest
+		if cpu == "" {
+			cpu = tr.baseCfg.WorkerCPURequest
+		}
+		mem := tc.WorkerMemoryRequest
+		if mem == "" {
+			mem = tr.baseCfg.WorkerMemoryRequest
+		}
+		tr.sharedPool.SetWorkerResources(cpu, mem)
+	}
+
 	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, tr.stsBroker)
 	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
@@ -269,6 +282,8 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			continue
 		}
 		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers
+		resourcesChanged := oldTC.WorkerCPURequest != newTC.WorkerCPURequest ||
+			oldTC.WorkerMemoryRequest != newTC.WorkerMemoryRequest
 
 		tr.mu.Lock()
 		if stack, ok := tr.orgs[name]; ok {
@@ -281,6 +296,19 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 					maxWorkers = tr.baseCfg.MaxWorkers
 				}
 				stack.Pool.SetMaxWorkers(maxWorkers)
+			}
+			if resourcesChanged && (newTC.WorkerCPURequest != "" || newTC.WorkerMemoryRequest != "") {
+				cpu := newTC.WorkerCPURequest
+				if cpu == "" {
+					cpu = tr.baseCfg.WorkerCPURequest
+				}
+				mem := newTC.WorkerMemoryRequest
+				if mem == "" {
+					mem = tr.baseCfg.WorkerMemoryRequest
+				}
+				slog.Info("Org worker resources changed, updating shared pool defaults.",
+					"org", name, "cpu", cpu, "memory", mem)
+				tr.sharedPool.SetWorkerResources(cpu, mem)
 			}
 		}
 		tr.mu.Unlock()

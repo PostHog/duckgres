@@ -1755,8 +1755,17 @@ func TestWorkerResources_BothSet(t *testing.T) {
 	if mem.String() != "2Gi" {
 		t.Fatalf("expected memory request 2Gi, got %s", mem.String())
 	}
-	if res.Limits != nil {
-		t.Fatal("expected no limits to be set")
+	// Guaranteed QoS: limits == requests
+	if res.Limits == nil {
+		t.Fatal("expected limits to be set (Guaranteed QoS)")
+	}
+	cpuLimit := res.Limits[corev1.ResourceCPU]
+	if cpuLimit.String() != "500m" {
+		t.Fatalf("expected CPU limit 500m, got %s", cpuLimit.String())
+	}
+	memLimit := res.Limits[corev1.ResourceMemory]
+	if memLimit.String() != "2Gi" {
+		t.Fatalf("expected memory limit 2Gi, got %s", memLimit.String())
 	}
 }
 
@@ -1771,6 +1780,12 @@ func TestWorkerResources_CPUOnly(t *testing.T) {
 	if _, ok := res.Requests[corev1.ResourceMemory]; ok {
 		t.Fatal("expected no memory request")
 	}
+	if _, ok := res.Limits[corev1.ResourceCPU]; !ok {
+		t.Fatal("expected CPU limit (Guaranteed QoS)")
+	}
+	if _, ok := res.Limits[corev1.ResourceMemory]; ok {
+		t.Fatal("expected no memory limit")
+	}
 }
 
 func TestWorkerResources_MemoryOnly(t *testing.T) {
@@ -1784,6 +1799,12 @@ func TestWorkerResources_MemoryOnly(t *testing.T) {
 	if _, ok := res.Requests[corev1.ResourceCPU]; ok {
 		t.Fatal("expected no CPU request")
 	}
+	if _, ok := res.Limits[corev1.ResourceMemory]; !ok {
+		t.Fatal("expected memory limit (Guaranteed QoS)")
+	}
+	if _, ok := res.Limits[corev1.ResourceCPU]; ok {
+		t.Fatal("expected no CPU limit")
+	}
 }
 
 func TestWorkerResources_NeitherSet(t *testing.T) {
@@ -1794,6 +1815,32 @@ func TestWorkerResources_NeitherSet(t *testing.T) {
 	}
 	if res.Limits != nil {
 		t.Fatal("expected empty limits")
+	}
+}
+
+func TestSetWorkerResources(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerCPURequest:    "500m",
+		workerMemoryRequest: "2Gi",
+	}
+	pool.SetWorkerResources("46", "360Gi")
+
+	res := pool.workerResources()
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != "46" {
+		t.Fatalf("expected CPU request 46, got %s", cpu.String())
+	}
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != "360Gi" {
+		t.Fatalf("expected memory request 360Gi, got %s", mem.String())
+	}
+	cpuLimit := res.Limits[corev1.ResourceCPU]
+	if cpuLimit.String() != "46" {
+		t.Fatalf("expected CPU limit 46, got %s", cpuLimit.String())
+	}
+	memLimit := res.Limits[corev1.ResourceMemory]
+	if memLimit.String() != "360Gi" {
+		t.Fatalf("expected memory limit 360Gi, got %s", memLimit.String())
 	}
 }
 
