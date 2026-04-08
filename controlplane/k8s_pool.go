@@ -2118,9 +2118,19 @@ func (p *K8sWorkerPool) SetMaxWorkers(n int) {
 
 // SetWorkerResources updates the CPU and memory requests (and limits) applied
 // to newly spawned worker pods. Existing pods are not affected.
+//
+// In multi-tenant mode, multiple orgs may call this — the last write wins.
+// This is acceptable when all orgs share a uniform node pool. If orgs need
+// genuinely different worker sizes, per-org dedicated pools are required.
 func (p *K8sWorkerPool) SetWorkerResources(cpu, memory string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if (p.workerCPURequest != "" && cpu != p.workerCPURequest) ||
+		(p.workerMemoryRequest != "" && memory != p.workerMemoryRequest) {
+		slog.Warn("Overwriting shared pool worker resources — multiple orgs set different values.",
+			"old_cpu", p.workerCPURequest, "new_cpu", cpu,
+			"old_memory", p.workerMemoryRequest, "new_memory", memory)
+	}
 	p.workerCPURequest = cpu
 	p.workerMemoryRequest = memory
 }
