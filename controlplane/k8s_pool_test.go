@@ -56,6 +56,13 @@ type captureRuntimeWorkerStore struct {
 	takeOverOwnerCPID     string
 	takeOverOrgID         string
 	takeOverExpectedEpoch int64
+	activeCPIDs           []string
+	activeCPIDsErr        error
+	stateBeforeRows       []configstore.WorkerRecord
+	stateBeforeErr        error
+	stateBeforeCalls      int
+	stateBeforeStates     []configstore.WorkerState
+	stateBeforeCutoff     time.Time
 }
 
 func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
@@ -181,6 +188,43 @@ func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstance
 	}
 	record := *s.takenOver
 	return &record, nil
+}
+
+func (s *captureRuntimeWorkerStore) ListActiveControlPlaneInstanceIDs() ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeCPIDsErr != nil {
+		return nil, s.activeCPIDsErr
+	}
+	out := make([]string, len(s.activeCPIDs))
+	copy(out, s.activeCPIDs)
+	return out, nil
+}
+
+func (s *captureRuntimeWorkerStore) ListWorkerRecordsByStatesBefore(states []configstore.WorkerState, updatedBefore time.Time) ([]configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stateBeforeCalls++
+	s.stateBeforeStates = append([]configstore.WorkerState(nil), states...)
+	s.stateBeforeCutoff = updatedBefore
+	if s.stateBeforeErr != nil {
+		return nil, s.stateBeforeErr
+	}
+	stateSet := make(map[configstore.WorkerState]bool, len(states))
+	for _, st := range states {
+		stateSet[st] = true
+	}
+	var out []configstore.WorkerRecord
+	for _, r := range s.stateBeforeRows {
+		if !stateSet[r.State] {
+			continue
+		}
+		if !r.UpdatedAt.IsZero() && r.UpdatedAt.After(updatedBefore) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
@@ -1861,11 +1905,13 @@ func TestSetWorkerResources(t *testing.T) {
 	}
 }
 
-func TestCleanupOrphanedWorkerPods(t *testing.T) {
+func TestCleanupOrphanedWorkers_DeletesPodsFromDeadCPs(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	pool.cpInstanceID = "new-cp:boot-123"
 
-	// Create pods: 2 from old CP, 1 from current CP, 1 with no instance ID
+	// Create pods: 2 from a dead CP, 1 from current CP, 1 unlabeled.
+	// No runtimeStore: the sweep falls back to "current CP only is active",
+	// matching the original single-CP behavior.
 	for _, tc := range []struct {
 		name       string
 		instanceID string
@@ -1887,7 +1933,7 @@ func TestCleanupOrphanedWorkerPods(t *testing.T) {
 		}
 	}
 
-	pool.cleanupOrphanedWorkerPods()
+	pool.cleanupOrphanedWorkers()
 
 	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{
 		LabelSelector: "app=duckgres-worker",
@@ -1898,19 +1944,228 @@ func TestCleanupOrphanedWorkerPods(t *testing.T) {
 		remaining[p.Name] = true
 	}
 
-	// Old CP pods should be deleted
 	if remaining["duckgres-worker-old-1"] {
 		t.Error("expected old-1 to be deleted")
 	}
 	if remaining["duckgres-worker-old-2"] {
 		t.Error("expected old-2 to be deleted")
 	}
-	// Current CP pod and unlabeled pod should survive
 	if !remaining["duckgres-worker-mine"] {
 		t.Error("expected mine to survive")
 	}
 	if !remaining["duckgres-worker-nolabel"] {
 		t.Error("expected nolabel to survive")
+	}
+}
+
+func TestCleanupOrphanedWorkers_PreservesLivePeerPods(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.cpInstanceID = "cp-self:boot-123"
+	livePeerID := "cp-peer:boot-456"
+	deadCPID := "cp-dead:boot-789"
+
+	store := &captureRuntimeWorkerStore{
+		activeCPIDs: []string{"cp-self:boot-123", livePeerID},
+	}
+	pool.runtimeStore = store
+
+	for _, tc := range []struct {
+		name       string
+		instanceID string
+	}{
+		{"duckgres-worker-self", controlPlaneIDLabelValue("cp-self:boot-123")},
+		{"duckgres-worker-peer", controlPlaneIDLabelValue(livePeerID)},
+		{"duckgres-worker-dead", controlPlaneIDLabelValue(deadCPID)},
+	} {
+		_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      tc.name,
+				Namespace: "default",
+				Labels: map[string]string{
+					"app":                     "duckgres-worker",
+					"duckgres/cp-instance-id": tc.instanceID,
+				},
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pool.cleanupOrphanedWorkers()
+
+	remaining := map[string]bool{}
+	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	for _, p := range pods.Items {
+		remaining[p.Name] = true
+	}
+	if !remaining["duckgres-worker-self"] {
+		t.Error("expected current CP's pod to survive")
+	}
+	if !remaining["duckgres-worker-peer"] {
+		t.Error("expected live peer CP's pod to survive — this is the multi-CP regression")
+	}
+	if remaining["duckgres-worker-dead"] {
+		t.Error("expected dead CP's pod to be deleted")
+	}
+}
+
+func TestCleanupOrphanedWorkers_MarksStaleIdleRowsLost(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.cpInstanceID = "cp-self:boot-123"
+
+	// One pod actually exists in K8s (the live one). Two stale DB rows
+	// remain from a previous CP whose pods are long gone — this is the
+	// exact failure mode where idle rows with empty owner_cp_instance_id
+	// can't be reaped by the periodic orphan janitor.
+	livePodName := "duckgres-worker-self-1"
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      livePodName,
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":                     "duckgres-worker",
+				"duckgres/cp-instance-id": controlPlaneIDLabelValue("cp-self:boot-123"),
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stale := time.Now().Add(-2 * time.Hour)
+	store := &captureRuntimeWorkerStore{
+		activeCPIDs: []string{"cp-self:boot-123"},
+		stateBeforeRows: []configstore.WorkerRecord{
+			{
+				WorkerID:          1,
+				PodName:           livePodName,
+				State:             configstore.WorkerStateIdle,
+				OwnerCPInstanceID: "",
+				UpdatedAt:         stale,
+			},
+			{
+				WorkerID:          2,
+				PodName:           "duckgres-worker-stale-2",
+				State:             configstore.WorkerStateIdle,
+				OwnerCPInstanceID: "",
+				UpdatedAt:         stale,
+			},
+			{
+				WorkerID:          3,
+				PodName:           "duckgres-worker-stale-3",
+				State:             configstore.WorkerStateIdle,
+				OwnerCPInstanceID: "",
+				UpdatedAt:         stale,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	pool.cleanupOrphanedWorkers()
+
+	upserted := store.snapshot()
+	if len(upserted) != 2 {
+		t.Fatalf("expected 2 stale rows to be marked lost, got %d: %#v", len(upserted), upserted)
+	}
+	gotIDs := map[int]configstore.WorkerRecord{}
+	for _, r := range upserted {
+		gotIDs[r.WorkerID] = r
+	}
+	for _, id := range []int{2, 3} {
+		r, ok := gotIDs[id]
+		if !ok {
+			t.Errorf("expected worker %d to be marked lost", id)
+			continue
+		}
+		if r.State != configstore.WorkerStateLost {
+			t.Errorf("worker %d: expected state lost, got %q", id, r.State)
+		}
+		if r.RetireReason != "pod_missing" {
+			t.Errorf("worker %d: expected retire_reason pod_missing, got %q", id, r.RetireReason)
+		}
+	}
+	if _, touched := gotIDs[1]; touched {
+		t.Error("expected worker 1 (live pod) to be left untouched")
+	}
+}
+
+func TestCleanupOrphanedWorkers_PreservesInflightSpawnsByLivePeers(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.cpInstanceID = "cp-self:boot-123"
+	peerID := "cp-peer:boot-456"
+
+	stale := time.Now().Add(-2 * time.Hour)
+	store := &captureRuntimeWorkerStore{
+		activeCPIDs: []string{"cp-self:boot-123", peerID},
+		stateBeforeRows: []configstore.WorkerRecord{
+			// In-flight spawn owned by a live peer: pod isn't visible to us
+			// yet (e.g. slow image pull), but the peer is alive and will
+			// finish or retire it. Must NOT be touched.
+			{
+				WorkerID:          11,
+				PodName:           "duckgres-worker-peer-inflight",
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: peerID,
+				UpdatedAt:         stale,
+			},
+			// Genuinely abandoned spawn from a dead CP — pod gone, owner gone.
+			{
+				WorkerID:          12,
+				PodName:           "duckgres-worker-dead-spawn",
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: "cp-dead:boot-789",
+				UpdatedAt:         stale,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	pool.cleanupOrphanedWorkers()
+
+	upserted := store.snapshot()
+	if len(upserted) != 1 || upserted[0].WorkerID != 12 {
+		t.Fatalf("expected only worker 12 (dead CP's spawn) to be marked lost, got %#v", upserted)
+	}
+	if upserted[0].State != configstore.WorkerStateLost {
+		t.Fatalf("expected lost state, got %q", upserted[0].State)
+	}
+}
+
+func TestCleanupOrphanedWorkers_GracePeriodProtectsFreshRows(t *testing.T) {
+	// The mock honors the cutoff itself, so passing a fresh updated_at row
+	// exercises the grace-period filter end-to-end: the sweep asks for rows
+	// older than (now - 30s), the mock filters them out, and nothing is
+	// marked lost.
+	pool, _ := newTestK8sPool(t, 5)
+	pool.cpInstanceID = "cp-self:boot-123"
+
+	store := &captureRuntimeWorkerStore{
+		activeCPIDs: []string{"cp-self:boot-123"},
+		stateBeforeRows: []configstore.WorkerRecord{
+			{
+				WorkerID:          21,
+				PodName:           "duckgres-worker-fresh",
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: "",
+				UpdatedAt:         time.Now(),
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	pool.cleanupOrphanedWorkers()
+
+	if rows := store.snapshot(); len(rows) != 0 {
+		t.Fatalf("expected fresh row to be skipped by grace period, got upserts: %#v", rows)
+	}
+	if store.stateBeforeCalls != 1 {
+		t.Fatalf("expected one ListWorkerRecordsByStatesBefore call, got %d", store.stateBeforeCalls)
+	}
+	if cutoff := store.stateBeforeCutoff; cutoff.IsZero() || time.Since(cutoff) < staleWorkerRowGracePeriod {
+		t.Fatalf("expected cutoff at least %s in the past, got %v (now-cutoff=%s)", staleWorkerRowGracePeriod, cutoff, time.Since(cutoff))
 	}
 }
 

@@ -422,6 +422,20 @@ func (cs *ConfigStore) GetControlPlaneInstance(id string) (*ControlPlaneInstance
 	return &instance, nil
 }
 
+// ListActiveControlPlaneInstanceIDs returns the IDs of control-plane instances
+// currently in the active state. Used by the K8s pool's startup orphan sweep
+// to distinguish "owned by a live peer" from "owned by a dead CP" without
+// needing N round-trips.
+func (cs *ConfigStore) ListActiveControlPlaneInstanceIDs() ([]string, error) {
+	var ids []string
+	if err := cs.db.Table(cs.runtimeTable((&ControlPlaneInstance{}).TableName())).
+		Where("state = ?", ControlPlaneInstanceStateActive).
+		Pluck("id", &ids).Error; err != nil {
+		return nil, fmt.Errorf("list active control plane instance ids: %w", err)
+	}
+	return ids, nil
+}
+
 // ExpireControlPlaneInstances marks stale control-plane instance rows as expired.
 func (cs *ConfigStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
 	now := time.Now()
@@ -464,6 +478,26 @@ func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 		return fmt.Errorf("upsert worker record: %w", err)
 	}
 	return nil
+}
+
+// ListWorkerRecordsByStatesBefore returns worker rows in any of the given
+// states whose updated_at is at or before the given cutoff. The age filter is
+// what makes this safe to use against in-flight spawns: callers pass a cutoff
+// well in the past (e.g. now - 30s) so a row that another CP is currently
+// touching will not appear in the result.
+func (cs *ConfigStore) ListWorkerRecordsByStatesBefore(states []WorkerState, updatedBefore time.Time) ([]WorkerRecord, error) {
+	if len(states) == 0 {
+		return nil, nil
+	}
+	var workers []WorkerRecord
+	if err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("state IN ?", states).
+		Where("updated_at <= ?", updatedBefore).
+		Order("worker_id ASC").
+		Find(&workers).Error; err != nil {
+		return nil, fmt.Errorf("list worker records by state before: %w", err)
+	}
+	return workers, nil
 }
 
 // GetWorkerRecord returns a runtime worker row by worker id.
