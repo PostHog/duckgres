@@ -277,6 +277,70 @@ func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	}
 }
 
+func TestListLiveControlPlaneInstanceIDsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 9, 12, 0, 0, 0, time.UTC)
+
+	// Active CP — should appear.
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-active:boot-a",
+		PodName:         "duckgres-active",
+		PodUID:          "pod-active",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateActive,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(active): %v", err)
+	}
+	// Draining CP — must also appear (still serving in-flight queries).
+	drainingAt := now.Add(-time.Minute)
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-draining:boot-b",
+		PodName:         "duckgres-draining",
+		PodUID:          "pod-draining",
+		BootID:          "boot-b",
+		State:           configstore.ControlPlaneInstanceStateDraining,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now.Add(-30 * time.Second),
+		DrainingAt:      &drainingAt,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(draining): %v", err)
+	}
+	// Expired CP — must NOT appear.
+	expiredAt := now.Add(-2 * time.Minute)
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-expired:boot-c",
+		PodName:         "duckgres-expired",
+		PodUID:          "pod-expired",
+		BootID:          "boot-c",
+		State:           configstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now.Add(-5 * time.Minute),
+		ExpiredAt:       &expiredAt,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(expired): %v", err)
+	}
+
+	ids, err := store.ListLiveControlPlaneInstanceIDs()
+	if err != nil {
+		t.Fatalf("ListLiveControlPlaneInstanceIDs: %v", err)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	if !got["cp-active:boot-a"] {
+		t.Error("expected active CP to be listed as live")
+	}
+	if !got["cp-draining:boot-b"] {
+		t.Error("expected draining CP to be listed as live (still serving in-flight queries)")
+	}
+	if got["cp-expired:boot-c"] {
+		t.Error("expected expired CP to NOT be listed as live")
+	}
+}
+
 func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 

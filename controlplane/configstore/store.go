@@ -422,16 +422,21 @@ func (cs *ConfigStore) GetControlPlaneInstance(id string) (*ControlPlaneInstance
 	return &instance, nil
 }
 
-// ListActiveControlPlaneInstanceIDs returns the IDs of control-plane instances
-// currently in the active state. Used by the K8s pool's startup orphan sweep
-// to distinguish "owned by a live peer" from "owned by a dead CP" without
-// needing N round-trips.
-func (cs *ConfigStore) ListActiveControlPlaneInstanceIDs() ([]string, error) {
+// ListLiveControlPlaneInstanceIDs returns the IDs of control-plane instances
+// that are not yet expired — i.e. either currently active OR draining (still
+// alive, waiting on in-flight queries to finish before SIGTERM completes).
+// Used by the K8s pool's startup orphan sweep to distinguish "owned by a CP
+// that is still serving traffic" from "owned by a dead CP".
+//
+// Including draining CPs is critical: a draining CP's worker pods are still
+// running queries that haven't finished yet, and treating them as orphans
+// would kill those queries mid-flight.
+func (cs *ConfigStore) ListLiveControlPlaneInstanceIDs() ([]string, error) {
 	var ids []string
 	if err := cs.db.Table(cs.runtimeTable((&ControlPlaneInstance{}).TableName())).
-		Where("state = ?", ControlPlaneInstanceStateActive).
+		Where("state <> ?", ControlPlaneInstanceStateExpired).
 		Pluck("id", &ids).Error; err != nil {
-		return nil, fmt.Errorf("list active control plane instance ids: %w", err)
+		return nil, fmt.Errorf("list live control plane instance ids: %w", err)
 	}
 	return ids, nil
 }

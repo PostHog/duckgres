@@ -81,7 +81,7 @@ type RuntimeWorkerStore interface {
 	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
-	ListActiveControlPlaneInstanceIDs() ([]string, error)
+	ListLiveControlPlaneInstanceIDs() ([]string, error)
 	ListWorkerRecordsByStatesBefore(states []configstore.WorkerState, updatedBefore time.Time) ([]configstore.WorkerRecord, error)
 }
 
