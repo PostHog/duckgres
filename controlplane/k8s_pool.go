@@ -1424,6 +1424,11 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				p.maxWorkers,
 			)
 			if err != nil {
+				// Retire already-claimed slots so they don't strand
+				// as durable spawning rows with no pod behind them.
+				for _, s := range slots {
+					p.retireClaimedWorker(s, RetireReasonCrash)
+				}
 				return err
 			}
 			if slot == nil {
