@@ -56,8 +56,8 @@ type captureRuntimeWorkerStore struct {
 	takeOverOwnerCPID     string
 	takeOverOrgID         string
 	takeOverExpectedEpoch int64
-	activeCPIDs           []string
-	activeCPIDsErr        error
+	liveCPIDs             []string
+	liveCPIDsErr          error
 	stateBeforeRows       []configstore.WorkerRecord
 	stateBeforeErr        error
 	stateBeforeCalls      int
@@ -190,14 +190,14 @@ func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstance
 	return &record, nil
 }
 
-func (s *captureRuntimeWorkerStore) ListActiveControlPlaneInstanceIDs() ([]string, error) {
+func (s *captureRuntimeWorkerStore) ListLiveControlPlaneInstanceIDs() ([]string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.activeCPIDsErr != nil {
-		return nil, s.activeCPIDsErr
+	if s.liveCPIDsErr != nil {
+		return nil, s.liveCPIDsErr
 	}
-	out := make([]string, len(s.activeCPIDs))
-	copy(out, s.activeCPIDs)
+	out := make([]string, len(s.liveCPIDs))
+	copy(out, s.liveCPIDs)
 	return out, nil
 }
 
@@ -1965,7 +1965,7 @@ func TestCleanupOrphanedWorkers_PreservesLivePeerPods(t *testing.T) {
 	deadCPID := "cp-dead:boot-789"
 
 	store := &captureRuntimeWorkerStore{
-		activeCPIDs: []string{"cp-self:boot-123", livePeerID},
+		liveCPIDs: []string{"cp-self:boot-123", livePeerID},
 	}
 	pool.runtimeStore = store
 
@@ -2037,7 +2037,7 @@ func TestCleanupOrphanedWorkers_MarksStaleIdleRowsLost(t *testing.T) {
 
 	stale := time.Now().Add(-2 * time.Hour)
 	store := &captureRuntimeWorkerStore{
-		activeCPIDs: []string{"cp-self:boot-123"},
+		liveCPIDs: []string{"cp-self:boot-123"},
 		stateBeforeRows: []configstore.WorkerRecord{
 			{
 				WorkerID:          1,
@@ -2099,7 +2099,7 @@ func TestCleanupOrphanedWorkers_PreservesInflightSpawnsByLivePeers(t *testing.T)
 
 	stale := time.Now().Add(-2 * time.Hour)
 	store := &captureRuntimeWorkerStore{
-		activeCPIDs: []string{"cp-self:boot-123", peerID},
+		liveCPIDs: []string{"cp-self:boot-123", peerID},
 		stateBeforeRows: []configstore.WorkerRecord{
 			// In-flight spawn owned by a live peer: pod isn't visible to us
 			// yet (e.g. slow image pull), but the peer is alive and will
@@ -2134,6 +2134,72 @@ func TestCleanupOrphanedWorkers_PreservesInflightSpawnsByLivePeers(t *testing.T)
 	}
 }
 
+func TestCleanupOrphanedWorkers_PreservesDrainingPeerWorkers(t *testing.T) {
+	// A draining CP is mid-graceful-shutdown, still serving in-flight queries
+	// on its worker pods. The startup sweep must treat draining CPs as live
+	// (state <> 'expired'), otherwise it would delete the worker pods and
+	// kill the queries the draining CP is waiting to finish.
+	pool, cs := newTestK8sPool(t, 5)
+	pool.cpInstanceID = "cp-self:boot-123"
+	drainingPeerID := "cp-draining-peer:boot-456"
+
+	// The mock returns whatever the test sets in liveCPIDs; the production
+	// store query is `state <> expired` so callers always get both active
+	// and draining CPs in this list.
+	store := &captureRuntimeWorkerStore{
+		liveCPIDs: []string{"cp-self:boot-123", drainingPeerID},
+		stateBeforeRows: []configstore.WorkerRecord{
+			// A warm idle row owned (still!) by the draining peer. Even
+			// though idle rows have empty owner in the production code,
+			// exercise the owner-active path here to make sure draining
+			// owners are honored.
+			{
+				WorkerID:          50,
+				PodName:           "duckgres-worker-draining-warm",
+				State:             configstore.WorkerStateIdle,
+				OwnerCPInstanceID: drainingPeerID,
+				UpdatedAt:         time.Now().Add(-2 * time.Hour),
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	// Worker pod owned by the draining peer — pretend it's serving a
+	// long-running query right now.
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "duckgres-worker-draining-busy",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":                     "duckgres-worker",
+				"duckgres/cp-instance-id": controlPlaneIDLabelValue(drainingPeerID),
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool.cleanupOrphanedWorkers()
+
+	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	survived := false
+	for _, p := range pods.Items {
+		if p.Name == "duckgres-worker-draining-busy" {
+			survived = true
+		}
+	}
+	if !survived {
+		t.Fatal("draining peer's worker pod was deleted — would kill in-flight queries")
+	}
+
+	if rows := store.snapshot(); len(rows) != 0 {
+		t.Fatalf("draining peer's idle row was marked lost: %#v", rows)
+	}
+}
+
 func TestCleanupOrphanedWorkers_GracePeriodProtectsFreshRows(t *testing.T) {
 	// The mock honors the cutoff itself, so passing a fresh updated_at row
 	// exercises the grace-period filter end-to-end: the sweep asks for rows
@@ -2143,7 +2209,7 @@ func TestCleanupOrphanedWorkers_GracePeriodProtectsFreshRows(t *testing.T) {
 	pool.cpInstanceID = "cp-self:boot-123"
 
 	store := &captureRuntimeWorkerStore{
-		activeCPIDs: []string{"cp-self:boot-123"},
+		liveCPIDs: []string{"cp-self:boot-123"},
 		stateBeforeRows: []configstore.WorkerRecord{
 			{
 				WorkerID:          21,

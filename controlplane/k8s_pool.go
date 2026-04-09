@@ -216,27 +216,32 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkers() {
 		return
 	}
 
-	// Build the set of currently-active CP instance IDs (both raw and label-
+	// Build the set of currently-live CP instance IDs (both raw and label-
 	// sanitized forms) so phase 1 can compare against pod labels and phase 2
 	// can compare against owner_cp_instance_id columns.
-	activeCPIDs := map[string]bool{}
-	activeCPLabels := map[string]bool{}
+	//
+	// "Live" includes both `active` and `draining` states. A draining CP
+	// is mid-graceful-shutdown waiting on in-flight queries to finish — its
+	// worker pods are still serving traffic and must NOT be treated as
+	// orphans. Only `expired` CPs are dead enough to clean up after.
+	liveCPIDs := map[string]bool{}
+	liveCPLabels := map[string]bool{}
 	if p.runtimeStore != nil {
-		ids, err := p.runtimeStore.ListActiveControlPlaneInstanceIDs()
+		ids, err := p.runtimeStore.ListLiveControlPlaneInstanceIDs()
 		if err != nil {
-			slog.Warn("Failed to list active control-plane instances for orphan cleanup; skipping sweep to avoid wiping live peers.", "error", err)
+			slog.Warn("Failed to list live control-plane instances for orphan cleanup; skipping sweep to avoid wiping live peers.", "error", err)
 			return
 		}
 		for _, id := range ids {
-			activeCPIDs[id] = true
-			activeCPLabels[controlPlaneIDLabelValue(id)] = true
+			liveCPIDs[id] = true
+			liveCPLabels[controlPlaneIDLabelValue(id)] = true
 		}
 	}
-	// Always treat the current CP as active so the sweep is safe in
+	// Always treat the current CP as live so the sweep is safe in
 	// non-runtime-store deployments and during the brief window before this
 	// CP's heartbeat is first written.
-	activeCPIDs[p.cpInstanceID] = true
-	activeCPLabels[controlPlaneIDLabelValue(p.cpInstanceID)] = true
+	liveCPIDs[p.cpInstanceID] = true
+	liveCPLabels[controlPlaneIDLabelValue(p.cpInstanceID)] = true
 
 	// Phase 1: delete pods owned by dead CPs.
 	gracePeriod := int64(10)
@@ -245,7 +250,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkers() {
 	var deletedNames sync.Map
 	for _, pod := range pods.Items {
 		podInstanceID := pod.Labels["duckgres/cp-instance-id"]
-		if podInstanceID == "" || activeCPLabels[podInstanceID] {
+		if podInstanceID == "" || liveCPLabels[podInstanceID] {
 			continue
 		}
 		wg.Add(1)
@@ -295,7 +300,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkers() {
 		if livePodNames[row.PodName] {
 			continue // pod is alive in K8s; row reflects reality
 		}
-		if row.OwnerCPInstanceID != "" && activeCPIDs[row.OwnerCPInstanceID] {
+		if row.OwnerCPInstanceID != "" && liveCPIDs[row.OwnerCPInstanceID] {
 			continue // a live owner is responsible for this row's lifecycle
 		}
 		record := row
