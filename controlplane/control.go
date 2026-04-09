@@ -139,6 +139,7 @@ type ConfigStoreInterface interface {
 type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	IsMigratingForOrg(orgID string) bool
+	SetWarmCapacityTarget(n int)
 	ShutdownAll()
 }
 
@@ -1045,6 +1046,11 @@ func (cp *ControlPlane) shutdown() {
 }
 
 func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
+	// Stop spawning warm workers immediately so we don't create pods that
+	// outlive this CP instance and block scheduling for the replacement.
+	if cp.orgRouter != nil {
+		cp.orgRouter.SetWarmCapacityTarget(0)
+	}
 	cp.stopAcceptingPGConnections()
 	if cp.flight != nil {
 		cp.flight.BeginDrain()
