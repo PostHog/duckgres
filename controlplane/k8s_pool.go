@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto/x509"
@@ -168,6 +169,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		pool.cpInstanceID = pool.cpID
 	}
 
+	// Clean up orphaned worker pods from previous CP instances before starting.
+	pool.cleanupOrphanedWorkerPods()
+
 	// Start SharedInformer for watching worker pods
 	pool.startInformer()
 
@@ -175,6 +179,53 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	go pool.idleReaper()
 
 	return pool, nil
+}
+
+// cleanupOrphanedWorkerPods deletes worker pods that were created by a
+// previous control plane instance. These orphans occupy nodes and prevent
+// the current CP from scheduling its own workers. Deletes run concurrently
+// (bounded by retireSem) so cleanup doesn't stall on slow API responses.
+func (p *K8sWorkerPool) cleanupOrphanedWorkerPods() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	if err != nil {
+		slog.Warn("Failed to list worker pods for orphan cleanup.", "error", err)
+		return
+	}
+
+	myInstanceID := controlPlaneIDLabelValue(p.cpInstanceID)
+	gracePeriod := int64(10)
+	var wg sync.WaitGroup
+	var deleted atomic.Int32
+	for _, pod := range pods.Items {
+		podInstanceID := pod.Labels["duckgres/cp-instance-id"]
+		if podInstanceID == myInstanceID || podInstanceID == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(podName, oldCP string) {
+			defer wg.Done()
+			p.retireSem <- struct{}{}
+			defer func() { <-p.retireSem }()
+
+			slog.Info("Deleting orphaned worker pod from previous CP.", "pod", podName, "old_cp", oldCP)
+			if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriod,
+			}); err != nil {
+				slog.Warn("Failed to delete orphaned worker pod.", "pod", podName, "error", err)
+			} else {
+				deleted.Add(1)
+			}
+		}(pod.Name, podInstanceID)
+	}
+	wg.Wait()
+	if n := deleted.Load(); n > 0 {
+		slog.Info("Cleaned up orphaned worker pods.", "count", n)
+	}
 }
 
 func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
