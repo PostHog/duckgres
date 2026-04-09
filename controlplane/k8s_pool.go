@@ -169,8 +169,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		pool.cpInstanceID = pool.cpID
 	}
 
-	// Clean up orphaned worker pods from previous CP instances before starting.
-	pool.cleanupOrphanedWorkerPods()
+	// Clean up orphaned worker pods from dead CP instances and reconcile any
+	// DB rows that no longer have a backing pod.
+	pool.cleanupOrphanedWorkers()
 
 	// Start SharedInformer for watching worker pods
 	pool.startInformer()
@@ -181,11 +182,29 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	return pool, nil
 }
 
-// cleanupOrphanedWorkerPods deletes worker pods that were created by a
-// previous control plane instance. These orphans occupy nodes and prevent
-// the current CP from scheduling its own workers. Deletes run concurrently
-// (bounded by retireSem) so cleanup doesn't stall on slow API responses.
-func (p *K8sWorkerPool) cleanupOrphanedWorkerPods() {
+// staleWorkerRowGracePeriod is the minimum age of a worker row before phase 2
+// of the orphan sweep is willing to mark it as lost. The owner-active filter
+// is the primary safety net, but the time filter offers belt-and-braces in
+// case a future code path persists an idle row before its pod is K8s-visible.
+const staleWorkerRowGracePeriod = 30 * time.Second
+
+// cleanupOrphanedWorkers reconciles K8s pods and config-store worker rows
+// against the live control-plane membership. It runs once at CP startup in
+// two phases:
+//
+//  1. Phase 1 (K8s → DB direction): list every worker pod in the namespace
+//     and delete any whose duckgres/cp-instance-id label points at a control
+//     plane that is *not* in the active set. Live peers' pods are explicitly
+//     left alone — without this filter the sweep would wipe warm workers
+//     spawned by alive peer CPs every time a deployment rolls.
+//
+//  2. Phase 2 (DB → K8s direction): list idle and spawning worker rows and
+//     mark as lost any whose pod is gone (or was just deleted in phase 1)
+//     and whose owning CP is not active. This rescues stale `idle` rows
+//     left behind when a CP died abruptly without retiring its warm workers
+//     — those rows have an empty owner_cp_instance_id by design and are
+//     unreachable from the periodic orphan janitor's cp_instances join.
+func (p *K8sWorkerPool) cleanupOrphanedWorkers() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -197,13 +216,36 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods() {
 		return
 	}
 
-	myInstanceID := controlPlaneIDLabelValue(p.cpInstanceID)
+	// Build the set of currently-active CP instance IDs (both raw and label-
+	// sanitized forms) so phase 1 can compare against pod labels and phase 2
+	// can compare against owner_cp_instance_id columns.
+	activeCPIDs := map[string]bool{}
+	activeCPLabels := map[string]bool{}
+	if p.runtimeStore != nil {
+		ids, err := p.runtimeStore.ListActiveControlPlaneInstanceIDs()
+		if err != nil {
+			slog.Warn("Failed to list active control-plane instances for orphan cleanup; skipping sweep to avoid wiping live peers.", "error", err)
+			return
+		}
+		for _, id := range ids {
+			activeCPIDs[id] = true
+			activeCPLabels[controlPlaneIDLabelValue(id)] = true
+		}
+	}
+	// Always treat the current CP as active so the sweep is safe in
+	// non-runtime-store deployments and during the brief window before this
+	// CP's heartbeat is first written.
+	activeCPIDs[p.cpInstanceID] = true
+	activeCPLabels[controlPlaneIDLabelValue(p.cpInstanceID)] = true
+
+	// Phase 1: delete pods owned by dead CPs.
 	gracePeriod := int64(10)
 	var wg sync.WaitGroup
 	var deleted atomic.Int32
+	var deletedNames sync.Map
 	for _, pod := range pods.Items {
 		podInstanceID := pod.Labels["duckgres/cp-instance-id"]
-		if podInstanceID == myInstanceID || podInstanceID == "" {
+		if podInstanceID == "" || activeCPLabels[podInstanceID] {
 			continue
 		}
 		wg.Add(1)
@@ -212,19 +254,68 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods() {
 			p.retireSem <- struct{}{}
 			defer func() { <-p.retireSem }()
 
-			slog.Info("Deleting orphaned worker pod from previous CP.", "pod", podName, "old_cp", oldCP)
+			slog.Info("Deleting orphaned worker pod from dead CP.", "pod", podName, "old_cp", oldCP)
 			if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 				GracePeriodSeconds: &gracePeriod,
 			}); err != nil {
 				slog.Warn("Failed to delete orphaned worker pod.", "pod", podName, "error", err)
-			} else {
-				deleted.Add(1)
+				return
 			}
+			deleted.Add(1)
+			deletedNames.Store(podName, struct{}{})
 		}(pod.Name, podInstanceID)
 	}
 	wg.Wait()
 	if n := deleted.Load(); n > 0 {
 		slog.Info("Cleaned up orphaned worker pods.", "count", n)
+	}
+
+	// Phase 2: reconcile idle/spawning DB rows against the K8s pod set.
+	if p.runtimeStore == nil {
+		return
+	}
+	rows, err := p.runtimeStore.ListWorkerRecordsByStatesBefore(
+		[]configstore.WorkerState{configstore.WorkerStateIdle, configstore.WorkerStateSpawning},
+		time.Now().Add(-staleWorkerRowGracePeriod),
+	)
+	if err != nil {
+		slog.Warn("Failed to list worker records for stale row sweep.", "error", err)
+		return
+	}
+	livePodNames := map[string]bool{}
+	for _, pod := range pods.Items {
+		if _, gone := deletedNames.Load(pod.Name); gone {
+			continue
+		}
+		livePodNames[pod.Name] = true
+	}
+	now := time.Now()
+	var marked int
+	for _, row := range rows {
+		if livePodNames[row.PodName] {
+			continue // pod is alive in K8s; row reflects reality
+		}
+		if row.OwnerCPInstanceID != "" && activeCPIDs[row.OwnerCPInstanceID] {
+			continue // a live owner is responsible for this row's lifecycle
+		}
+		record := row
+		record.State = configstore.WorkerStateLost
+		record.RetireReason = "pod_missing"
+		record.LastHeartbeatAt = now
+		if err := p.runtimeStore.UpsertWorkerRecord(&record); err != nil {
+			slog.Warn("Failed to mark stale worker row lost.", "worker_id", row.WorkerID, "error", err)
+			continue
+		}
+		slog.Info("Marked stale worker row lost.",
+			"worker_id", row.WorkerID,
+			"pod", row.PodName,
+			"prior_state", row.State,
+			"prior_owner", row.OwnerCPInstanceID,
+		)
+		marked++
+	}
+	if marked > 0 {
+		slog.Info("Reconciled stale worker rows.", "count", marked)
 	}
 }
 
