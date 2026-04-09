@@ -168,6 +168,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		pool.cpInstanceID = pool.cpID
 	}
 
+	// Clean up orphaned worker pods from previous CP instances before starting.
+	pool.cleanupOrphanedWorkerPods()
+
 	// Start SharedInformer for watching worker pods
 	pool.startInformer()
 
@@ -175,6 +178,43 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	go pool.idleReaper()
 
 	return pool, nil
+}
+
+// cleanupOrphanedWorkerPods deletes worker pods that were created by a
+// previous control plane instance. These orphans occupy nodes and prevent
+// the current CP from scheduling its own workers.
+func (p *K8sWorkerPool) cleanupOrphanedWorkerPods() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	if err != nil {
+		slog.Warn("Failed to list worker pods for orphan cleanup.", "error", err)
+		return
+	}
+
+	myInstanceID := controlPlaneIDLabelValue(p.cpInstanceID)
+	gracePeriod := int64(10)
+	deleted := 0
+	for _, pod := range pods.Items {
+		podInstanceID := pod.Labels["duckgres/cp-instance-id"]
+		if podInstanceID == myInstanceID || podInstanceID == "" {
+			continue
+		}
+		slog.Info("Deleting orphaned worker pod from previous CP.", "pod", pod.Name, "old_cp", podInstanceID)
+		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}); err != nil {
+			slog.Warn("Failed to delete orphaned worker pod.", "pod", pod.Name, "error", err)
+		} else {
+			deleted++
+		}
+	}
+	if deleted > 0 {
+		slog.Info("Cleaned up orphaned worker pods.", "count", deleted)
+	}
 }
 
 func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
