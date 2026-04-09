@@ -784,9 +784,11 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 
 // ListOrphanedWorkers returns workers whose owning control-plane instance has
 // already been marked expired long enough ago to pass the orphan grace cutoff.
-// Retired/lost rows are included so a replacement janitor can finish deleting
-// worker pods when the original control plane died after persisting retirement
-// but before the Kubernetes delete completed.
+// Retired/lost rows are deliberately excluded: their pods are either already
+// gone (in which case re-listing the row would loop the janitor on a 404 from
+// the K8s delete forever) or were leaked when the previous CP died mid-delete,
+// and that leak case is handled authoritatively by the K8s label-based startup
+// scan in K8sWorkerPool.cleanupOrphanedWorkerPods.
 func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
 	cleanupStates := []WorkerState{
@@ -797,8 +799,6 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 		WorkerStateHot,
 		WorkerStateHotIdle,
 		WorkerStateDraining,
-		WorkerStateRetired,
-		WorkerStateLost,
 	}
 	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
 	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
