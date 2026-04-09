@@ -44,6 +44,10 @@ func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 	return a.router.IsMigrating(orgID)
 }
 
+func (a *orgRouterAdapter) SetWarmCapacityTarget(n int) {
+	a.router.sharedPool.SetWarmCapacityTarget(n)
+}
+
 func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }
