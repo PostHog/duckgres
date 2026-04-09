@@ -359,6 +359,8 @@ func main() {
 	loggingShutdown := initLogging()
 	defer loggingShutdown()
 
+	logBuildInfo(*mode)
+
 	if fileCfg != nil {
 		slog.Info("Loaded configuration from " + *configFile)
 	}
