@@ -70,6 +70,7 @@ type K8sWorkerPool struct {
 	informer              cache.SharedIndexInformer
 	stopInform            chan struct{}
 	spawnSem              chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
+	retireSem             chan struct{} // limits concurrent pod deletes to avoid overwhelming the K8s API
 	podReady              sync.Map      // podName -> chan string (pod IP); signaled by informer
 
 	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
@@ -126,8 +127,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		cfg.ServiceAccount = DefaultK8sWorkerServiceAccount
 	}
 
-	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
+	// Limit concurrent K8s API calls to avoid overwhelming the API server.
 	spawnConcurrency := 3
+	retireConcurrency := 5
 	pool := &K8sWorkerPool{
 		workers:               make(map[int]*ManagedWorker),
 		maxWorkers:            cfg.MaxWorkers,
@@ -155,6 +157,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerIDGenerator:     cfg.WorkerIDGenerator,
 		runtimeStore:          cfg.RuntimeStore,
 		spawnSem:              make(chan struct{}, spawnConcurrency),
+		retireSem:             make(chan struct{}, retireConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
@@ -1685,7 +1688,11 @@ func (p *K8sWorkerPool) ShutdownAll() {
 }
 
 // retireWorkerPod closes the gRPC client and deletes the worker pod.
+// Acquires the retire semaphore to limit concurrent K8s API calls.
 func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
+	p.retireSem <- struct{}{}
+	defer func() { <-p.retireSem }()
+
 	podName := p.workerPodName(w)
 	slog.Info("Retiring K8s worker.", "id", id, "pod", podName)
 	if w.client != nil {
