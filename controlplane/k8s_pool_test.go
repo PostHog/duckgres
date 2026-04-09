@@ -40,6 +40,7 @@ type captureRuntimeWorkerStore struct {
 	spawnMaxOrgWorkers    int
 	spawnMaxGlobalWorks   int
 	neutralSpawned        *configstore.WorkerRecord
+	neutralSpawnedFunc    func() *configstore.WorkerRecord
 	neutralSpawnErr       error
 	neutralSpawnCalls     int
 	neutralSpawnOwnerCPID string
@@ -131,6 +132,14 @@ func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceI
 	s.neutralSpawnMaxGlobal = maxGlobalWorkers
 	if s.neutralSpawnErr != nil {
 		return nil, s.neutralSpawnErr
+	}
+	if s.neutralSpawnedFunc != nil {
+		rec := s.neutralSpawnedFunc()
+		if rec == nil {
+			return nil, nil
+		}
+		copy := *rec
+		return &copy, nil
 	}
 	if s.neutralSpawned == nil {
 		return nil, nil
@@ -1173,33 +1182,37 @@ func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
 	store := &captureRuntimeWorkerStore{}
 	pool.runtimeStore = store
 
-	var mu sync.Mutex
-	var slots int
-	store.neutralSpawned = &configstore.WorkerRecord{
-		WorkerID:          51,
-		PodName:           "duckgres-worker-test-cp-51",
-		State:             configstore.WorkerStateSpawning,
-		OwnerCPInstanceID: pool.cpInstanceID,
+	// Return different records on successive CreateNeutralWarmWorkerSlot calls.
+	neutralRecords := []*configstore.WorkerRecord{
+		{
+			WorkerID:          51,
+			PodName:           "duckgres-worker-test-cp-51",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+		},
+		{
+			WorkerID:          52,
+			PodName:           "duckgres-worker-test-cp-52",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+		},
 	}
+	var neutralIdx int
+	store.neutralSpawnedFunc = func() *configstore.WorkerRecord {
+		idx := neutralIdx
+		neutralIdx++
+		if idx < len(neutralRecords) {
+			return neutralRecords[idx]
+		}
+		return nil
+	}
+
+	var mu sync.Mutex
+	spawnedIDs := map[int]bool{}
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		mu.Lock()
 		defer mu.Unlock()
-		slots++
-		if slots == 1 {
-			if id != 51 {
-				t.Fatalf("expected first runtime worker id 51, got %d", id)
-			}
-			store.neutralSpawned = &configstore.WorkerRecord{
-				WorkerID:          52,
-				PodName:           "duckgres-worker-test-cp-52",
-				State:             configstore.WorkerStateSpawning,
-				OwnerCPInstanceID: pool.cpInstanceID,
-			}
-			return nil
-		}
-		if id != 52 {
-			t.Fatalf("expected second runtime worker id 52, got %d", id)
-		}
+		spawnedIDs[id] = true
 		return nil
 	}
 
@@ -1211,6 +1224,9 @@ func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
 	}
 	if store.neutralSpawnTarget != 2 {
 		t.Fatalf("expected neutral warm target 2, got %d", store.neutralSpawnTarget)
+	}
+	if !spawnedIDs[51] || !spawnedIDs[52] {
+		t.Fatalf("expected worker ids 51 and 52 to be spawned, got %v", spawnedIDs)
 	}
 }
 

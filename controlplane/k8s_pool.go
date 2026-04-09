@@ -473,7 +473,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	}
 
 	// Wait for pod to get an IP via informer (no polling).
-	podIP, err := p.waitForPodReady(ctx, podName, 90*time.Second)
+	podIP, err := p.waitForPodReady(ctx, podName, 5*time.Minute)
 	if err != nil {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
@@ -1414,7 +1414,8 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 		}
 		p.mu.Unlock()
 
-		ctx := context.Background()
+		// Claim all slots first, then spawn in parallel.
+		var slots []*configstore.WorkerRecord
 		for i := 0; i < count; i++ {
 			slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
 				p.cpInstanceID,
@@ -1428,26 +1429,41 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 			if slot == nil {
 				break
 			}
-
-			p.mu.Lock()
-			p.spawning++
-			p.mu.Unlock()
-
-			err = p.spawnWarmWorker(ctx, slot.WorkerID)
-
-			p.mu.Lock()
-			p.spawning--
-			if err == nil {
-				observeWarmPoolLifecycleGauges(p.workers)
-			}
-			p.mu.Unlock()
-
-			if err != nil {
-				p.retireClaimedWorker(slot, RetireReasonCrash)
-				return err
-			}
+			slots = append(slots, slot)
 		}
-		return nil
+
+		if len(slots) == 0 {
+			return nil
+		}
+
+		p.mu.Lock()
+		p.spawning += len(slots)
+		p.mu.Unlock()
+
+		ctx := context.Background()
+		var wg sync.WaitGroup
+		errs := make([]error, len(slots))
+		for i, slot := range slots {
+			wg.Add(1)
+			go func(i int, slot *configstore.WorkerRecord) {
+				defer wg.Done()
+				err := p.spawnWarmWorker(ctx, slot.WorkerID)
+
+				p.mu.Lock()
+				p.spawning--
+				if err == nil {
+					observeWarmPoolLifecycleGauges(p.workers)
+				}
+				p.mu.Unlock()
+
+				if err != nil {
+					p.retireClaimedWorker(slot, RetireReasonCrash)
+					errs[i] = err
+				}
+			}(i, slot)
+		}
+		wg.Wait()
+		return stderrors.Join(errs...)
 	}
 
 	p.mu.Lock()
@@ -1472,19 +1488,26 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 	ctx := context.Background()
 
-	for _, id := range ids {
-		if err := p.spawnWarmWorker(ctx, id); err != nil {
+	var wg sync.WaitGroup
+	errs := make([]error, len(ids))
+	for i, id := range ids {
+		wg.Add(1)
+		go func(i int, id int) {
+			defer wg.Done()
+			err := p.spawnWarmWorker(ctx, id)
+
 			p.mu.Lock()
 			p.spawning--
+			if err == nil {
+				observeWarmPoolLifecycleGauges(p.workers)
+			}
 			p.mu.Unlock()
-			return err
-		}
-		p.mu.Lock()
-		p.spawning--
-		observeWarmPoolLifecycleGauges(p.workers)
-		p.mu.Unlock()
+
+			errs[i] = err
+		}(i, id)
 	}
-	return nil
+	wg.Wait()
+	return stderrors.Join(errs...)
 }
 
 // HealthCheckLoop periodically checks worker health.
