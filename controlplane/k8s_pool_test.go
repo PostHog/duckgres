@@ -215,6 +215,7 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 		workerPort:   8816,
 		secretName:   "test-secret",
 		spawnSem:     make(chan struct{}, 1),
+		retireSem:    make(chan struct{}, 5),
 	}
 
 	return pool, cs
