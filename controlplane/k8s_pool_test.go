@@ -1861,6 +1861,59 @@ func TestSetWorkerResources(t *testing.T) {
 	}
 }
 
+func TestCleanupOrphanedWorkerPods(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.cpInstanceID = "new-cp:boot-123"
+
+	// Create pods: 2 from old CP, 1 from current CP, 1 with no instance ID
+	for _, tc := range []struct {
+		name       string
+		instanceID string
+	}{
+		{"duckgres-worker-old-1", controlPlaneIDLabelValue("old-cp:boot-000")},
+		{"duckgres-worker-old-2", controlPlaneIDLabelValue("old-cp:boot-000")},
+		{"duckgres-worker-mine", controlPlaneIDLabelValue("new-cp:boot-123")},
+		{"duckgres-worker-nolabel", ""},
+	} {
+		labels := map[string]string{"app": "duckgres-worker"}
+		if tc.instanceID != "" {
+			labels["duckgres/cp-instance-id"] = tc.instanceID
+		}
+		_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: tc.name, Namespace: "default", Labels: labels},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pool.cleanupOrphanedWorkerPods()
+
+	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+
+	remaining := map[string]bool{}
+	for _, p := range pods.Items {
+		remaining[p.Name] = true
+	}
+
+	// Old CP pods should be deleted
+	if remaining["duckgres-worker-old-1"] {
+		t.Error("expected old-1 to be deleted")
+	}
+	if remaining["duckgres-worker-old-2"] {
+		t.Error("expected old-2 to be deleted")
+	}
+	// Current CP pod and unlabeled pod should survive
+	if !remaining["duckgres-worker-mine"] {
+		t.Error("expected mine to survive")
+	}
+	if !remaining["duckgres-worker-nolabel"] {
+		t.Error("expected nolabel to survive")
+	}
+}
+
 func TestWorkerScheduling_NodeSelectorAndToleration(t *testing.T) {
 	pool := &K8sWorkerPool{
 		workerNodeSelector:  map[string]string{"posthog.com/duckgres-workers": "duckgres-workers"},

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto/x509"
@@ -182,7 +183,8 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 
 // cleanupOrphanedWorkerPods deletes worker pods that were created by a
 // previous control plane instance. These orphans occupy nodes and prevent
-// the current CP from scheduling its own workers.
+// the current CP from scheduling its own workers. Deletes run concurrently
+// (bounded by retireSem) so cleanup doesn't stall on slow API responses.
 func (p *K8sWorkerPool) cleanupOrphanedWorkerPods() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -197,23 +199,32 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods() {
 
 	myInstanceID := controlPlaneIDLabelValue(p.cpInstanceID)
 	gracePeriod := int64(10)
-	deleted := 0
+	var wg sync.WaitGroup
+	var deleted atomic.Int32
 	for _, pod := range pods.Items {
 		podInstanceID := pod.Labels["duckgres/cp-instance-id"]
 		if podInstanceID == myInstanceID || podInstanceID == "" {
 			continue
 		}
-		slog.Info("Deleting orphaned worker pod from previous CP.", "pod", pod.Name, "old_cp", podInstanceID)
-		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
-			GracePeriodSeconds: &gracePeriod,
-		}); err != nil {
-			slog.Warn("Failed to delete orphaned worker pod.", "pod", pod.Name, "error", err)
-		} else {
-			deleted++
-		}
+		wg.Add(1)
+		go func(podName, oldCP string) {
+			defer wg.Done()
+			p.retireSem <- struct{}{}
+			defer func() { <-p.retireSem }()
+
+			slog.Info("Deleting orphaned worker pod from previous CP.", "pod", podName, "old_cp", oldCP)
+			if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriod,
+			}); err != nil {
+				slog.Warn("Failed to delete orphaned worker pod.", "pod", podName, "error", err)
+			} else {
+				deleted.Add(1)
+			}
+		}(pod.Name, podInstanceID)
 	}
-	if deleted > 0 {
-		slog.Info("Cleaned up orphaned worker pods.", "count", deleted)
+	wg.Wait()
+	if n := deleted.Load(); n > 0 {
+		slog.Info("Cleaned up orphaned worker pods.", "count", n)
 	}
 }
 
