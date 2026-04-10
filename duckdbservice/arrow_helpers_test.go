@@ -1231,6 +1231,117 @@ func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
 	}
 }
 
+func TestIsLimitZeroProbeBug(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		expect bool
+	}{
+		{"nil error", nil, false},
+		{"generic error", fmt.Errorf("something went wrong"), false},
+		{"stoi error", fmt.Errorf("Invalid Error: stoi"), true},
+		{"stoll error", fmt.Errorf("Invalid Error: stoll"), true},
+		{"stoi nested", fmt.Errorf("failed to prepare: %w", fmt.Errorf("Invalid Error: stoi")), true},
+		{"syntax error", fmt.Errorf("syntax error at or near LIMIT"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isLimitZeroProbeBug(tt.err); got != tt.expect {
+				t.Errorf("isLimitZeroProbeBug(%v) = %v, want %v", tt.err, got, tt.expect)
+			}
+		})
+	}
+}
+
+// mockFailingQueryer returns a configurable error on the first call to
+// QueryContext, then delegates to the real DB on subsequent calls. This
+// simulates the LIMIT 0 probe failing while the retry (without LIMIT)
+// succeeds.
+type mockFailingQueryer struct {
+	real      contextQueryer
+	callCount int
+	failErr   error
+}
+
+func (m *mockFailingQueryer) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	m.callCount++
+	if m.callCount == 1 && m.failErr != nil {
+		return nil, m.failErr
+	}
+	return m.real.QueryContext(ctx, query, args...)
+}
+
+func TestGetQuerySchemaFallsBackOnStoiError(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("failed to open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	mock := &mockFailingQueryer{
+		real:    db,
+		failErr: fmt.Errorf("Invalid Error: stoi"),
+	}
+
+	schema, err := GetQuerySchema(context.Background(), mock, "SELECT 42 AS answer", nil)
+	if err != nil {
+		t.Fatalf("GetQuerySchema should have succeeded on retry, got: %v", err)
+	}
+	if schema.NumFields() != 1 {
+		t.Fatalf("expected 1 field, got %d", schema.NumFields())
+	}
+	if schema.Field(0).Name != "answer" {
+		t.Fatalf("expected field name 'answer', got %q", schema.Field(0).Name)
+	}
+	if mock.callCount != 2 {
+		t.Fatalf("expected 2 QueryContext calls (LIMIT 0 fail + retry), got %d", mock.callCount)
+	}
+}
+
+func TestGetQuerySchemaNoFallbackOnOtherErrors(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("failed to open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	mock := &mockFailingQueryer{
+		real:    db,
+		failErr: fmt.Errorf("Table with name foo does not exist"),
+	}
+
+	_, err = GetQuerySchema(context.Background(), mock, "SELECT * FROM foo", nil)
+	if err == nil {
+		t.Fatal("expected error for non-stoi failure, got nil")
+	}
+	if mock.callCount != 1 {
+		t.Fatalf("expected 1 QueryContext call (no retry for non-stoi errors), got %d", mock.callCount)
+	}
+}
+
+func TestGetQuerySchemaNoFallbackWhenLimitAlreadyPresent(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("failed to open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	mock := &mockFailingQueryer{
+		real:    db,
+		failErr: fmt.Errorf("Invalid Error: stoi"),
+	}
+
+	// Query already has LIMIT — GetQuerySchema won't add LIMIT 0,
+	// so addedLimit is false and no fallback should be attempted.
+	_, err = GetQuerySchema(context.Background(), mock, "SELECT 1 LIMIT 1", nil)
+	if err == nil {
+		t.Fatal("expected stoi error to propagate when query already has LIMIT")
+	}
+	if mock.callCount != 1 {
+		t.Fatalf("expected 1 call (no retry when LIMIT was not added by us), got %d", mock.callCount)
+	}
+}
+
 func TestSplitTopLevelCommas(t *testing.T) {
 	tests := []struct {
 		name  string
