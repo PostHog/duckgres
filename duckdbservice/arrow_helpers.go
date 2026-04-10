@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"reflect"
 	"strings"
@@ -569,21 +570,44 @@ func isNil(i contextQueryer) bool {
 }
 
 // GetQuerySchema executes a query with LIMIT 0 to discover the result schema.
+// If the LIMIT 0 probe fails (e.g., DuckDB's httpfs throws "stoi" when parsing
+// HTTP headers for remote parquet files), the function retries with the original
+// query and closes immediately after reading the column types. This avoids a
+// full table scan — database/sql's Rows.Close cancels the in-progress query.
 func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx contextQueryer) (*arrow.Schema, error) {
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
 	queryWithLimit := q
+	addedLimit := false
 	upper := strings.ToUpper(q)
 	// Only append LIMIT 0 for SELECT/WITH/VALUES/TABLE statements.
 	// SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL etc. don't support LIMIT.
 	if !strings.Contains(upper, "LIMIT") && supportsLimit(upper) {
 		queryWithLimit = q + " LIMIT 0"
+		addedLimit = true
 	}
+
+	schema, err := executeSchemaProbe(ctx, db, tx, queryWithLimit)
+	if err != nil && addedLimit && isLimitZeroProbeBug(err) {
+		// LIMIT 0 triggered a DuckDB bug (e.g., httpfs stoi/stoll parsing
+		// failure on remote files). Retry with the original query — Close()
+		// will cancel the scan after we read the column types.
+		slog.Warn("LIMIT 0 schema probe failed, retrying without LIMIT.",
+			"error", err, "query_prefix", truncateQuery(q, 120))
+		schema, err = executeSchemaProbe(ctx, db, tx, q)
+	}
+	return schema, err
+}
+
+// executeSchemaProbe runs a query and extracts the Arrow schema from the
+// result column types. The caller is responsible for choosing whether to
+// pass a LIMIT 0 variant or the original query.
+func executeSchemaProbe(ctx context.Context, db contextQueryer, tx contextQueryer, query string) (*arrow.Schema, error) {
 	var rows *sql.Rows
 	var err error
 	if !isNil(tx) {
-		rows, err = tx.QueryContext(ctx, queryWithLimit)
+		rows, err = tx.QueryContext(ctx, query)
 	} else {
-		rows, err = db.QueryContext(ctx, queryWithLimit)
+		rows, err = db.QueryContext(ctx, query)
 	}
 	if err != nil {
 		return nil, err
@@ -602,6 +626,28 @@ func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx con
 		fields[i] = arrow.Field{Name: ct.Name(), Type: DuckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
 	}
 	return arrow.NewSchema(fields, nil), nil
+}
+
+// isLimitZeroProbeBug returns true if the error is a known DuckDB bug
+// triggered specifically by the LIMIT 0 schema probe path. These errors
+// don't occur when the same query runs without LIMIT 0.
+func isLimitZeroProbeBug(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// httpfs stoi/stoll: std::stoi or std::stoll throws when parsing HTTP
+	// Content-Length or Content-Range headers from certain CDNs. The LIMIT 0
+	// code path in DuckDB's parquet reader triggers different HTTP request
+	// patterns that hit this bug while the non-LIMIT path doesn't.
+	return strings.Contains(msg, "stoi") || strings.Contains(msg, "stoll")
+}
+
+func truncateQuery(q string, maxLen int) string {
+	if len(q) <= maxLen {
+		return q
+	}
+	return q[:maxLen] + "..."
 }
 
 // supportsLimit returns true if the (uppercased) query is a statement type
