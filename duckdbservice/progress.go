@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	bindings "github.com/duckdb/duckdb-go-bindings"
@@ -18,6 +19,16 @@ type duckdbConnHandle = bindings.Connection
 // with zero progress change before a session is considered stalled.
 // 300 checks × 2s = ~10 minutes of zero progress.
 const stallCheckThreshold = 300
+
+// queryProgressTimeout is the maximum time the health check waits for a
+// single QueryProgress CGO call before treating the session as "busy
+// (untrackable)". DuckDB's QueryProgress is normally instant (reads
+// atomic counters), but can block when the connection holds an internal
+// mutex — e.g., during a long httpfs download. Without this timeout the
+// health check itself stalls, the CP's 3-second gRPC deadline fires, and
+// after 3 consecutive failures the CP kills the worker even though it's
+// alive and working.
+const queryProgressTimeout = 500 * time.Millisecond
 
 // progressState tracks query activity and stall detection for a session.
 // All fields are atomic because queryActive is written by query goroutines
