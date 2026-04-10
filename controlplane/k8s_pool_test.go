@@ -1958,6 +1958,61 @@ func TestCleanupOrphanedWorkers_DeletesPodsFromDeadCPs(t *testing.T) {
 	}
 }
 
+func TestCleanupOrphanedWorkers_DeletesPodsFromCrashedLivePeer(t *testing.T) {
+	// A CP that is still "active" in the config store but whose pod was
+	// force-deleted (crash, preemption) should be treated as dead by the
+	// startup sweep. Without this, the worker pods from the crashed CP
+	// would linger until the janitor expires the heartbeat (~50s), failing
+	// the TestK8sCPDeletionGarbageCollects integration test.
+	pool, cs := newTestK8sPool(t, 5)
+	pool.cpInstanceID = "cp-self:boot-123"
+	crashedPeerID := "cp-crashed:boot-456"
+
+	store := &captureRuntimeWorkerStore{
+		// DB says cp-crashed is live (janitor hasn't expired it yet)
+		liveCPIDs: []string{"cp-self:boot-123", crashedPeerID},
+	}
+	pool.runtimeStore = store
+
+	// Create the self CP pod (must exist) but NOT the crashed peer's pod.
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cp-self",
+			Namespace: "default",
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Note: no "cp-crashed" pod created — simulates force-delete.
+
+	// Worker pod from the crashed peer.
+	_, err = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "duckgres-worker-crashed-peer",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":                     "duckgres-worker",
+				"duckgres/cp-instance-id": controlPlaneIDLabelValue(crashedPeerID),
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool.cleanupOrphanedWorkers()
+
+	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	for _, p := range pods.Items {
+		if p.Name == "duckgres-worker-crashed-peer" {
+			t.Error("expected crashed peer's worker pod to be deleted — CP pod is gone even though DB says 'active'")
+		}
+	}
+}
+
 func TestCleanupOrphanedWorkers_PreservesLivePeerPods(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	pool.cpInstanceID = "cp-self:boot-123"
@@ -1968,6 +2023,11 @@ func TestCleanupOrphanedWorkers_PreservesLivePeerPods(t *testing.T) {
 		liveCPIDs: []string{"cp-self:boot-123", livePeerID},
 	}
 	pool.runtimeStore = store
+
+	// Create the live peer's CP pod so the pod-existence check passes.
+	_, _ = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-peer", Namespace: "default"},
+	}, metav1.CreateOptions{})
 
 	for _, tc := range []struct {
 		name       string
@@ -2093,9 +2153,14 @@ func TestCleanupOrphanedWorkers_MarksStaleIdleRowsLost(t *testing.T) {
 }
 
 func TestCleanupOrphanedWorkers_PreservesInflightSpawnsByLivePeers(t *testing.T) {
-	pool, _ := newTestK8sPool(t, 5)
+	pool, cs := newTestK8sPool(t, 5)
 	pool.cpInstanceID = "cp-self:boot-123"
 	peerID := "cp-peer:boot-456"
+
+	// Create the live peer's CP pod so the pod-existence check passes.
+	_, _ = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-peer", Namespace: "default"},
+	}, metav1.CreateOptions{})
 
 	stale := time.Now().Add(-2 * time.Hour)
 	store := &captureRuntimeWorkerStore{
@@ -2142,6 +2207,11 @@ func TestCleanupOrphanedWorkers_PreservesDrainingPeerWorkers(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	pool.cpInstanceID = "cp-self:boot-123"
 	drainingPeerID := "cp-draining-peer:boot-456"
+
+	// Create the draining peer's CP pod — it's still running (draining, not dead).
+	_, _ = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-draining-peer", Namespace: "default"},
+	}, metav1.CreateOptions{})
 
 	// The mock returns whatever the test sets in liveCPIDs; the production
 	// store query is `state <> expired` so callers always get both active
