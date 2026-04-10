@@ -176,61 +176,109 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 	<-h.pool.warmupDone
 
 	// Poll DuckDB query progress for each active session.
+	//
+	// QueryProgress is a CGO call into DuckDB that *should* return instantly
+	// (it reads atomic progress counters), but can block if DuckDB holds an
+	// internal lock — for example, when the httpfs extension is mid-download
+	// on a large remote parquet file. If that happens while we hold the pool
+	// RLock, both the health check and any session create/close operations
+	// stall, the CP's 3-second health check timeout fires, and after 3
+	// consecutive failures the CP kills the worker — even though it's alive
+	// and making progress on the download.
+	//
+	// To prevent this:
+	// 1. Snapshot the session data we need under RLock, then release it.
+	// 2. Call QueryProgress outside the lock, with a per-session timeout.
+	//    If the CGO call doesn't return within queryProgressTimeout, we
+	//    report the session as "busy" (pct=-1) and skip stall detection
+	//    for this cycle. The health check always responds promptly.
+	//
+	// Real crashes (process death) are detected by the K8s pod informer
+	// independently of health checks, so skipping stall detection during
+	// I/O-heavy operations doesn't create a blind spot for crash recovery.
 	type sessionProgressInfo struct {
 		Pct     float64 `json:"pct"`
 		Rows    uint64  `json:"rows"`
 		Total   uint64  `json:"total"`
 		Stalled bool    `json:"stalled,omitempty"`
 	}
-	sessionProgress := make(map[string]sessionProgressInfo)
+
+	type sessionSnapshot struct {
+		key      string
+		conn     duckdbConnHandle
+		progress *progressState
+	}
 
 	h.pool.mu.RLock()
+	snapshots := make([]sessionSnapshot, 0, len(h.pool.sessions))
 	for token, session := range h.pool.sessions {
 		if session.duckdbConn.Ptr == nil {
 			continue
 		}
-
-		qp := bindings.QueryProgress(session.duckdbConn)
-		pct, rows, total := bindings.QueryProgressTypeMembers(&qp)
-
-		// Use truncated token as key to avoid leaking full bearer tokens
-		// in the health check JSON response. 16 hex chars = 8 bytes of entropy,
-		// sufficient for matching on the control plane side.
 		key := token
 		if len(key) > 16 {
 			key = key[:16]
 		}
-
-		stalled := false
-
-		if !session.progress.queryActive.Load() {
-			// No query running — reset stall tracking.
-			session.progress.lastRowsProcessed.Store(0)
-			session.progress.stalledChecks.Store(0)
-		} else if pct < 0 {
-			// pct == -1 means DuckDB can't track this query; skip stall detection.
-		} else {
-			if rows == session.progress.lastRowsProcessed.Load() {
-				session.progress.stalledChecks.Add(1)
-			} else {
-				session.progress.lastRowsProcessed.Store(rows)
-				session.progress.stalledChecks.Store(0)
-			}
-
-			if session.progress.stalledChecks.Load() >= stallCheckThreshold {
-				stalled = true
-				// Log once when first crossing the threshold (exact match avoids log spam).
-				if session.progress.stalledChecks.Load() == stallCheckThreshold {
-					slog.Warn("Query appears stuck — no progress detected.",
-						"session", key, "rows_processed", rows, "total_rows", total,
-						"stalled_checks", stallCheckThreshold)
-				}
-			}
-		}
-
-		sessionProgress[key] = sessionProgressInfo{Pct: pct, Rows: rows, Total: total, Stalled: stalled}
+		snapshots = append(snapshots, sessionSnapshot{
+			key:      key,
+			conn:     session.duckdbConn,
+			progress: &session.progress,
+		})
 	}
 	h.pool.mu.RUnlock()
+
+	sessionProgress := make(map[string]sessionProgressInfo, len(snapshots))
+	for _, snap := range snapshots {
+		if !snap.progress.queryActive.Load() {
+			snap.progress.lastRowsProcessed.Store(0)
+			snap.progress.stalledChecks.Store(0)
+			sessionProgress[snap.key] = sessionProgressInfo{}
+			continue
+		}
+
+		type qpResult struct {
+			pct   float64
+			rows  uint64
+			total uint64
+		}
+		ch := make(chan qpResult, 1)
+		go func(conn duckdbConnHandle) {
+			qp := bindings.QueryProgress(conn)
+			pct, rows, total := bindings.QueryProgressTypeMembers(&qp)
+			ch <- qpResult{pct, rows, total}
+		}(snap.conn)
+
+		select {
+		case pr := <-ch:
+			stalled := false
+			if pr.pct < 0 {
+				// pct == -1 means DuckDB can't track this query; skip stall detection.
+			} else {
+				if pr.rows == snap.progress.lastRowsProcessed.Load() {
+					snap.progress.stalledChecks.Add(1)
+				} else {
+					snap.progress.lastRowsProcessed.Store(pr.rows)
+					snap.progress.stalledChecks.Store(0)
+				}
+				if snap.progress.stalledChecks.Load() >= stallCheckThreshold {
+					stalled = true
+					if snap.progress.stalledChecks.Load() == stallCheckThreshold {
+						slog.Warn("Query appears stuck — no progress detected.",
+							"session", snap.key, "rows_processed", pr.rows, "total_rows", pr.total,
+							"stalled_checks", stallCheckThreshold)
+					}
+				}
+			}
+			sessionProgress[snap.key] = sessionProgressInfo{Pct: pr.pct, Rows: pr.rows, Total: pr.total, Stalled: stalled}
+
+		case <-time.After(queryProgressTimeout):
+			// CGO call blocked — DuckDB is busy with I/O (e.g., httpfs
+			// download). Report as untrackable and don't advance stall
+			// counters so a legitimately slow operation doesn't get
+			// flagged as stuck.
+			sessionProgress[snap.key] = sessionProgressInfo{Pct: -1}
+		}
+	}
 
 	resp, _ := json.Marshal(map[string]interface{}{
 		"healthy":          true,

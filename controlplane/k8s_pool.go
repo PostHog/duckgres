@@ -233,6 +233,19 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkers() {
 			return
 		}
 		for _, id := range ids {
+			// The DB may lag behind K8s: a CP marked "active" in the DB
+			// could have been force-deleted (crash, preemption) and the
+			// janitor hasn't expired it yet. Verify the CP's pod actually
+			// exists before trusting the DB. The instance ID format is
+			// "pod-name:boot-id" — extract the pod name and check K8s.
+			podName := strings.SplitN(id, ":", 2)[0]
+			if podName != "" && id != p.cpInstanceID && podName != p.cpID {
+				_, getErr := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
+				if errors.IsNotFound(getErr) {
+					slog.Info("Live CP in DB but pod is gone; treating as dead for orphan sweep.", "cp", id, "pod", podName)
+					continue
+				}
+			}
 			liveCPIDs[id] = true
 			liveCPLabels[controlPlaneIDLabelValue(id)] = true
 		}
