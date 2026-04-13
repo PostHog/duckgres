@@ -999,11 +999,15 @@ func parseK8sCPU(s string) int {
 	}
 	if strings.HasSuffix(s, "m") {
 		var millicores int
-		fmt.Sscanf(strings.TrimSuffix(s, "m"), "%d", &millicores)
+		if _, err := fmt.Sscanf(strings.TrimSuffix(s, "m"), "%d", &millicores); err != nil {
+			return 0
+		}
 		return millicores / 1000
 	}
 	var cores int
-	fmt.Sscanf(s, "%d", &cores)
+	if _, err := fmt.Sscanf(s, "%d", &cores); err != nil {
+		return 0
+	}
 	return cores
 }
 
