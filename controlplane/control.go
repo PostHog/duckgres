@@ -115,6 +115,9 @@ type ControlPlane struct {
 	acmeManager     *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
 	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
+	// isRemoteBackend is true when workers run as separate K8s pods (remote backend).
+	isRemoteBackend bool
+
 	// Multi-tenant fields (non-nil in remote multitenant mode)
 	orgRouter      OrgRouterInterface
 	configStore    ConfigStoreInterface
@@ -326,15 +329,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 
 	cp := &ControlPlane{
-		cfg:            cfg,
-		srv:            srv,
-		rateLimiter:    server.NewRateLimiter(cfg.RateLimit),
-		tlsConfig:      tlsCfg,
-		pgListener:     pgLn,
-		upgrader:       upg,
-		parentPID:      parentPID,
-		acmeManager:    acmeMgr,
-		acmeDNSManager: acmeDNSMgr,
+		cfg:             cfg,
+		srv:             srv,
+		rateLimiter:     server.NewRateLimiter(cfg.RateLimit),
+		tlsConfig:       tlsCfg,
+		pgListener:      pgLn,
+		upgrader:        upg,
+		parentPID:       parentPID,
+		acmeManager:     acmeMgr,
+		acmeDNSManager:  acmeDNSMgr,
+		isRemoteBackend: cfg.WorkerBackend == "remote",
 	}
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
@@ -840,14 +844,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Create session on a worker. The timeout controls how long we wait in the
-	// worker queue when all slots are occupied.
-	// Pass resource limits to be applied immediately by the worker (one RPC).
+	// Derive DuckDB resource limits for the session.
+	// For remote workers (K8s pods), derive from the worker pod's resource
+	// spec — the CP's own resources are irrelevant. For local process workers,
+	// use the rebalancer which derives from the CP's system resources.
 	var (
 		memLimit string
 		threads  int
 	)
-	if rebalancer != nil {
+	if cp.isRemoteBackend {
+		memLimit, threads = cp.workerDuckDBLimits()
+	} else if rebalancer != nil {
 		memLimit = rebalancer.MemoryLimit()
 		threads = rebalancer.PerSessionThreads()
 	}
@@ -921,6 +928,87 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 
 	slog.Info("Client disconnected.", "user", username, "remote_addr", remoteAddr)
+}
+
+// workerDuckDBLimits derives DuckDB memory_limit and threads from the worker
+// pod's K8s resource spec. Uses 75% of the worker's memory limit for DuckDB
+// and the full CPU request as thread count. Returns empty/zero if worker
+// resources are not configured (DuckDB will then auto-detect on the worker).
+func (cp *ControlPlane) workerDuckDBLimits() (memLimit string, threads int) {
+	memReq := cp.cfg.K8s.WorkerMemoryRequest
+	if memReq != "" {
+		memBytes := parseK8sMemory(memReq)
+		if memBytes > 0 {
+			duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
+			const gb = 1024 * 1024 * 1024
+			const mb = 1024 * 1024
+			if duckdbBytes >= gb {
+				memLimit = fmt.Sprintf("%dGB", duckdbBytes/gb)
+			} else {
+				memLimit = fmt.Sprintf("%dMB", duckdbBytes/mb)
+			}
+		}
+	}
+
+	cpuReq := cp.cfg.K8s.WorkerCPURequest
+	if cpuReq != "" {
+		threads = parseK8sCPU(cpuReq)
+	}
+
+	return memLimit, threads
+}
+
+// parseK8sMemory parses a Kubernetes memory string (e.g., "360Gi", "8Gi", "512Mi", "4GB")
+// into bytes. Supports both IEC (Ki/Mi/Gi/Ti) and SI (KB/MB/GB/TB) units.
+func parseK8sMemory(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+
+	// Try k8s IEC notation first (Ki, Mi, Gi, Ti)
+	units := []struct {
+		suffix     string
+		multiplier uint64
+	}{
+		{"Ti", 1024 * 1024 * 1024 * 1024},
+		{"Gi", 1024 * 1024 * 1024},
+		{"Mi", 1024 * 1024},
+		{"Ki", 1024},
+	}
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			var v float64
+			if _, err := fmt.Sscanf(strings.TrimSuffix(s, u.suffix), "%f", &v); err == nil && v > 0 {
+				return uint64(v * float64(u.multiplier))
+			}
+			return 0
+		}
+	}
+
+	// Fall back to DuckDB/SI notation (KB, MB, GB, TB)
+	return server.ParseMemoryBytes(s)
+}
+
+// parseK8sCPU parses a Kubernetes CPU string (e.g., "46", "46000m", "500m")
+// into a whole thread count. Millicores below 1000 round down to 0.
+func parseK8sCPU(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if strings.HasSuffix(s, "m") {
+		var millicores int
+		if _, err := fmt.Sscanf(strings.TrimSuffix(s, "m"), "%d", &millicores); err != nil {
+			return 0
+		}
+		return millicores / 1000
+	}
+	var cores int
+	if _, err := fmt.Sscanf(s, "%d", &cores); err != nil {
+		return 0
+	}
+	return cores
 }
 
 // startupResult holds the parsed initial startup message.
