@@ -2281,10 +2281,7 @@ func (p *K8sWorkerPool) healthCheckPayloadForWorker(worker *ManagedWorker) serve
 // podNameForWorker returns the pod name for a given worker ID,
 // including the org ID if set (multi-tenant mode).
 func (p *K8sWorkerPool) podNameForWorker(id int) string {
-	if p.orgID != "" {
-		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.orgID, id)
-	}
-	return fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
+	return fmt.Sprintf("%s-%d", p.workerPodNamePrefix(), id)
 }
 
 func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
@@ -2298,10 +2295,32 @@ func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
 }
 
 func (p *K8sWorkerPool) workerPodNamePrefix() string {
+	base := trimK8sPodHashSuffix(p.cpID)
 	if p.orgID != "" {
-		return fmt.Sprintf("duckgres-worker-%s-%s", p.cpID, p.orgID)
+		return fmt.Sprintf("%s-worker-%s", base, p.orgID)
 	}
-	return fmt.Sprintf("duckgres-worker-%s", p.cpID)
+	return fmt.Sprintf("%s-worker", base)
+}
+
+// trimK8sPodHashSuffix removes the trailing 5-character random pod-hash
+// segment from a K8s deployment pod name (e.g. "duckgres-7b667c7bfd-7745x"
+// → "duckgres-7b667c7bfd"). Names that don't end in a plausible pod-hash
+// segment are returned unchanged.
+func trimK8sPodHashSuffix(name string) string {
+	idx := strings.LastIndex(name, "-")
+	if idx <= 0 {
+		return name
+	}
+	suffix := name[idx+1:]
+	if len(suffix) != 5 {
+		return name
+	}
+	for _, r := range suffix {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return name
+		}
+	}
+	return name[:idx]
 }
 
 // SetMaxWorkers updates the maximum number of workers. 0 means unlimited.

@@ -1173,8 +1173,8 @@ func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *t
 	if store.spawnOwnerEpoch != 1 {
 		t.Fatalf("expected spawn owner epoch 1, got %d", store.spawnOwnerEpoch)
 	}
-	if store.spawnPodNamePrefix != "duckgres-worker-test-cp" {
-		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.spawnPodNamePrefix)
+	if store.spawnPodNamePrefix != "test-cp-worker" {
+		t.Fatalf("expected pod name prefix test-cp-worker, got %q", store.spawnPodNamePrefix)
 	}
 	if store.spawnMaxOrgWorkers != 2 {
 		t.Fatalf("expected max org workers 2, got %d", store.spawnMaxOrgWorkers)
@@ -1217,8 +1217,8 @@ func TestK8sPoolSpawnWarmWorkerAllocatesRuntimeSlotWhenIDZero(t *testing.T) {
 	if store.neutralSpawnCalls != 1 {
 		t.Fatalf("expected one runtime neutral spawn slot allocation, got %d", store.neutralSpawnCalls)
 	}
-	if store.neutralSpawnPodPrefix != "duckgres-worker-test-cp" {
-		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.neutralSpawnPodPrefix)
+	if store.neutralSpawnPodPrefix != "test-cp-worker" {
+		t.Fatalf("expected pod name prefix test-cp-worker, got %q", store.neutralSpawnPodPrefix)
 	}
 }
 
@@ -1568,7 +1568,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	for _, env := range c.Env {
 		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 			env.ValueFrom.SecretKeyRef != nil &&
-			env.ValueFrom.SecretKeyRef.Name == "test-secret-duckgres-worker-test-cp-0" {
+			env.ValueFrom.SecretKeyRef.Name == "test-secret-test-cp-worker-0" {
 			foundEnv = true
 		}
 		if env.Name == "DUCKGRES_SHARED_WARM_WORKER" && env.Value == "true" {
@@ -1597,7 +1597,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	foundWorkerRPCSecret := false
 	for _, volume := range pod.Spec.Volumes {
 		if volume.Name == "worker-rpc-tls" && volume.Secret != nil &&
-			volume.Secret.SecretName == "test-secret-duckgres-worker-test-cp-0" {
+			volume.Secret.SecretName == "test-secret-test-cp-worker-0" {
 			foundWorkerRPCSecret = true
 		}
 	}
