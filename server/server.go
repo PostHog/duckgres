@@ -336,6 +336,7 @@ type Server struct {
 	fileDBsMu sync.Mutex
 	fileDBs   map[string]*fileDBEntry
 
+
 	// DuckLake checkpoint scheduler
 	checkpointer *DuckLakeCheckpointer
 
