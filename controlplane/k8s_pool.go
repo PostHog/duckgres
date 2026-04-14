@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"crypto/x509"
@@ -169,10 +168,6 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		pool.cpInstanceID = pool.cpID
 	}
 
-	// Clean up orphaned worker pods from dead CP instances and reconcile any
-	// DB rows that no longer have a backing pod.
-	pool.cleanupOrphanedWorkers()
-
 	// Start SharedInformer for watching worker pods
 	pool.startInformer()
 
@@ -182,159 +177,84 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	return pool, nil
 }
 
-// staleWorkerRowGracePeriod is the minimum age of a worker row before phase 2
-// of the orphan sweep is willing to mark it as lost. The owner-active filter
-// is the primary safety net, but the time filter offers belt-and-braces in
-// case a future code path persists an idle row before its pod is K8s-visible.
-const staleWorkerRowGracePeriod = 30 * time.Second
-
-// cleanupOrphanedWorkers reconciles K8s pods and config-store worker rows
-// against the live control-plane membership. It runs once at CP startup in
-// two phases:
+// RetireOneMismatchedVersionWorker scans all shared warm-worker pods in the
+// namespace for one whose duckgres/control-plane label identifies a different
+// Deployment ReplicaSet (pod-template-hash) than this CP, atomically marks
+// its idle runtime-store row retired, and deletes the pod.
 //
-//  1. Phase 1 (K8s → DB direction): list every worker pod in the namespace
-//     and delete any whose duckgres/cp-instance-id label points at a control
-//     plane that is *not* in the active set. Live peers' pods are explicitly
-//     left alone — without this filter the sweep would wipe warm workers
-//     spawned by alive peer CPs every time a deployment rolls.
+// The janitor leader is expected to invoke this once per tick: together with
+// warm-pool replenishment via reconcileWarmCapacity, old-version workers are
+// replaced one at a time with pods spawned from the leader's current binary.
+// This gives gradual rolling worker replacement driven entirely by leader
+// election — no cross-CP sweeps needed.
 //
-//  2. Phase 2 (DB → K8s direction): list idle and spawning worker rows and
-//     mark as lost any whose pod is gone (or was just deleted in phase 1)
-//     and whose owning CP is not active. This rescues stale `idle` rows
-//     left behind when a CP died abruptly without retiring its warm workers
-//     — those rows have an empty owner_cp_instance_id by design and are
-//     unreachable from the periodic orphan janitor's cp_instances join.
-func (p *K8sWorkerPool) cleanupOrphanedWorkers() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// Retirement is limited to workers currently in WorkerStateIdle. Busy or
+// hot-idle workers are left alone so in-flight sessions aren't disturbed;
+// they'll be retired on a subsequent tick once they become idle (or when
+// their hot-idle TTL expires).
+//
+// Returns true when a worker was retired this call.
+func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bool {
+	if p.runtimeStore == nil || p.clientset == nil {
+		return false
+	}
+	myVersion := trimK8sPodHashSuffix(p.cpID)
+	if myVersion == p.cpID {
+		// cpID doesn't carry a Deployment pod-template-hash suffix (e.g.
+		// bare pod or StatefulSet). Without that we can't compare versions
+		// across pods, so nothing to do.
+		return false
+	}
 
 	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=duckgres-worker",
 	})
 	if err != nil {
-		slog.Warn("Failed to list worker pods for orphan cleanup.", "error", err)
-		return
+		slog.Warn("Version-aware reaper failed to list worker pods.", "error", err)
+		return false
 	}
 
-	// Build the set of currently-live CP instance IDs (both raw and label-
-	// sanitized forms) so phase 1 can compare against pod labels and phase 2
-	// can compare against owner_cp_instance_id columns.
-	//
-	// "Live" includes both `active` and `draining` states. A draining CP
-	// is mid-graceful-shutdown waiting on in-flight queries to finish — its
-	// worker pods are still serving traffic and must NOT be treated as
-	// orphans. Only `expired` CPs are dead enough to clean up after.
-	liveCPIDs := map[string]bool{}
-	liveCPLabels := map[string]bool{}
-	if p.runtimeStore != nil {
-		ids, err := p.runtimeStore.ListLiveControlPlaneInstanceIDs()
+	for _, pod := range pods.Items {
+		label := pod.Labels["duckgres/control-plane"]
+		if label == "" {
+			continue
+		}
+		if trimK8sPodHashSuffix(label) == myVersion {
+			continue
+		}
+		idStr := pod.Labels["duckgres/worker-id"]
+		if idStr == "" {
+			continue
+		}
+		workerID, err := strconv.Atoi(idStr)
 		if err != nil {
-			slog.Warn("Failed to list live control-plane instances for orphan cleanup; skipping sweep to avoid wiping live peers.", "error", err)
-			return
-		}
-		for _, id := range ids {
-			// The DB may lag behind K8s: a CP marked "active" in the DB
-			// could have been force-deleted (crash, preemption) and the
-			// janitor hasn't expired it yet. Verify the CP's pod actually
-			// exists before trusting the DB. The instance ID format is
-			// "pod-name:boot-id" — extract the pod name and check K8s.
-			podName := strings.SplitN(id, ":", 2)[0]
-			if podName != "" && id != p.cpInstanceID && podName != p.cpID {
-				_, getErr := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
-				if errors.IsNotFound(getErr) {
-					slog.Info("Live CP in DB but pod is gone; treating as dead for orphan sweep.", "cp", id, "pod", podName)
-					continue
-				}
-			}
-			liveCPIDs[id] = true
-			liveCPLabels[controlPlaneIDLabelValue(id)] = true
-		}
-	}
-	// Always treat the current CP as live so the sweep is safe in
-	// non-runtime-store deployments and during the brief window before this
-	// CP's heartbeat is first written.
-	liveCPIDs[p.cpInstanceID] = true
-	liveCPLabels[controlPlaneIDLabelValue(p.cpInstanceID)] = true
-
-	// Phase 1: delete pods owned by dead CPs.
-	gracePeriod := int64(10)
-	var wg sync.WaitGroup
-	var deleted atomic.Int32
-	var deletedNames sync.Map
-	for _, pod := range pods.Items {
-		podInstanceID := pod.Labels["duckgres/cp-instance-id"]
-		if podInstanceID == "" || liveCPLabels[podInstanceID] {
 			continue
 		}
-		wg.Add(1)
-		go func(podName, oldCP string) {
-			defer wg.Done()
-			p.retireSem <- struct{}{}
-			defer func() { <-p.retireSem }()
-
-			slog.Info("Deleting orphaned worker pod from dead CP.", "pod", podName, "old_cp", oldCP)
-			if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
-				GracePeriodSeconds: &gracePeriod,
-			}); err != nil {
-				slog.Warn("Failed to delete orphaned worker pod.", "pod", podName, "error", err)
-				return
-			}
-			deleted.Add(1)
-			deletedNames.Store(podName, struct{}{})
-		}(pod.Name, podInstanceID)
-	}
-	wg.Wait()
-	if n := deleted.Load(); n > 0 {
-		slog.Info("Cleaned up orphaned worker pods.", "count", n)
-	}
-
-	// Phase 2: reconcile idle/spawning DB rows against the K8s pod set.
-	if p.runtimeStore == nil {
-		return
-	}
-	rows, err := p.runtimeStore.ListWorkerRecordsByStatesBefore(
-		[]configstore.WorkerState{configstore.WorkerStateIdle, configstore.WorkerStateSpawning},
-		time.Now().Add(-staleWorkerRowGracePeriod),
-	)
-	if err != nil {
-		slog.Warn("Failed to list worker records for stale row sweep.", "error", err)
-		return
-	}
-	livePodNames := map[string]bool{}
-	for _, pod := range pods.Items {
-		if _, gone := deletedNames.Load(pod.Name); gone {
+		retired, err := p.runtimeStore.RetireIdleWorker(workerID, "version_mismatch")
+		if err != nil {
+			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
 		}
-		livePodNames[pod.Name] = true
-	}
-	now := time.Now()
-	var marked int
-	for _, row := range rows {
-		if livePodNames[row.PodName] {
-			continue // pod is alive in K8s; row reflects reality
-		}
-		if row.OwnerCPInstanceID != "" && liveCPIDs[row.OwnerCPInstanceID] {
-			continue // a live owner is responsible for this row's lifecycle
-		}
-		record := row
-		record.State = configstore.WorkerStateLost
-		record.RetireReason = "pod_missing"
-		record.LastHeartbeatAt = now
-		if err := p.runtimeStore.UpsertWorkerRecord(&record); err != nil {
-			slog.Warn("Failed to mark stale worker row lost.", "worker_id", row.WorkerID, "error", err)
+		if !retired {
+			// Not currently idle (busy, reserved, hot-idle, or already
+			// retired). Leave it for a later tick.
 			continue
 		}
-		slog.Info("Marked stale worker row lost.",
-			"worker_id", row.WorkerID,
-			"pod", row.PodName,
-			"prior_state", row.State,
-			"prior_owner", row.OwnerCPInstanceID,
+		slog.Info("Retiring mismatched-version worker pod.",
+			"worker_id", workerID,
+			"pod", pod.Name,
+			"pod_version", trimK8sPodHashSuffix(label),
+			"my_version", myVersion,
 		)
-		marked++
+		gracePeriod := int64(10)
+		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}); err != nil && !errors.IsNotFound(err) {
+			slog.Warn("Version-aware reaper failed to delete pod.", "pod", pod.Name, "error", err)
+		}
+		return true
 	}
-	if marked > 0 {
-		slog.Info("Reconciled stale worker rows.", "count", marked)
-	}
+	return false
 }
 
 func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {

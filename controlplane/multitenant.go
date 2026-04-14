@@ -239,6 +239,11 @@ func SetupMultiTenant(
 			slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
 		}
 	}
+	janitor.retireMismatchedVersionWorker = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		router.sharedPool.RetireOneMismatchedVersionWorker(ctx)
+	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err

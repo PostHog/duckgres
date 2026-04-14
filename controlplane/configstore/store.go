@@ -649,6 +649,23 @@ func (cs *ConfigStore) RetireHotIdleWorker(workerID int) (bool, error) {
 	return result.RowsAffected > 0, nil
 }
 
+// RetireIdleWorker atomically transitions a worker from idle to retired.
+// Returns true if the transition happened, false if the worker was no longer
+// idle (e.g. claimed by another CP between the list query and this call).
+func (cs *ConfigStore) RetireIdleWorker(workerID int, reason string) (bool, error) {
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND state = ?", workerID, WorkerStateIdle).
+		Updates(map[string]any{
+			"state":         WorkerStateRetired,
+			"retire_reason": reason,
+			"updated_at":    time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("retire idle worker %d: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
 // TakeOverWorker transfers durable worker ownership to a new control-plane
 // instance when the caller still has the expected prior owner_epoch.
 func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*WorkerRecord, error) {
