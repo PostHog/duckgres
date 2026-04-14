@@ -25,18 +25,19 @@ type controlPlaneExpiryStore interface {
 }
 
 type ControlPlaneJanitor struct {
-	store                 controlPlaneExpiryStore
-	interval              time.Duration
-	expiryTimeout         time.Duration
-	orphanGrace           time.Duration
-	spawnTimeout          time.Duration
-	activateTimeout       time.Duration
-	maxDrainTimeout       time.Duration
-	hotIdleTTL            time.Duration
-	now                   func() time.Time
-	retireWorker          func(record configstore.WorkerRecord, reason string)
-	retireLocalWorker     func(workerID int, reason string) bool // retires from in-memory pool + pod, returns false if not local
-	reconcileWarmCapacity func()
+	store                         controlPlaneExpiryStore
+	interval                      time.Duration
+	expiryTimeout                 time.Duration
+	orphanGrace                   time.Duration
+	spawnTimeout                  time.Duration
+	activateTimeout               time.Duration
+	maxDrainTimeout               time.Duration
+	hotIdleTTL                    time.Duration
+	now                           func() time.Time
+	retireWorker                  func(record configstore.WorkerRecord, reason string)
+	retireLocalWorker             func(workerID int, reason string) bool // retires from in-memory pool + pod, returns false if not local
+	reconcileWarmCapacity         func()
+	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -147,6 +148,14 @@ func (j *ControlPlaneJanitor) runOnce() {
 
 	if _, err := j.store.ExpireFlightSessionRecords(j.now()); err != nil {
 		slog.Warn("Janitor failed to expire stale Flight sessions.", "error", err)
+	}
+
+	// Gradual rolling replacement of warm workers whose Deployment version
+	// differs from this CP's. Runs only when this CP holds the janitor
+	// leader lease, so at most one CP at a time is retiring workers and the
+	// process stalls until a new-version CP is elected leader.
+	if j.retireMismatchedVersionWorker != nil {
+		j.retireMismatchedVersionWorker()
 	}
 
 	if j.reconcileWarmCapacity != nil {
