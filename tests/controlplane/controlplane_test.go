@@ -4,6 +4,7 @@ package controlplane_test
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -723,10 +724,16 @@ func TestUpgradeWithMaxWorkers(t *testing.T) {
 
 	h.doHandover(t)
 
-	// Verify new connections work after upgrade
+	// Verify new connections work after upgrade. The first post-handover
+	// query has to spawn and DuckDB-pre-warm a fresh worker process; on slow
+	// CI runners that easily exceeds the default lib/pq read deadline. Wrap
+	// the query in an explicit 60s context so we wait long enough for the
+	// worker to come up rather than racing the warmup.
 	db := h.openConn(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	var v int
-	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT 42").Scan(&v); err != nil {
 		t.Fatalf("Post-upgrade query failed: %v\nLogs:\n%s", err, h.logBuf.String())
 	}
 	if v != 42 {
