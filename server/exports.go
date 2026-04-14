@@ -47,7 +47,7 @@ func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
 // the control plane worker. The returned value is opaque (*clientConn) but
 // can be used with SendInitialParams and RunMessageLoop.
 func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio.Writer,
-	username, database, applicationName string, executor QueryExecutor, pid, secretKey int32, workerID int) *clientConn {
+	username, orgID, database, applicationName string, executor QueryExecutor, pid, secretKey int32, workerID int) *clientConn {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &clientConn{
@@ -56,6 +56,7 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 		reader:          reader,
 		writer:          writer,
 		username:        username,
+		orgID:           orgID,
 		database:        database,
 		applicationName: applicationName,
 		executor:        executor,
@@ -80,6 +81,20 @@ func CancelClientConn(cc *clientConn) {
 	}
 }
 
+// SetLogicalCatalogMapping records whether this session should rewrite DuckLake
+// metadata surfaces to the client-visible logical database name.
+func SetLogicalCatalogMapping(cc *clientConn, enabled bool) {
+	if cc != nil {
+		cc.logicalCatalogMapping = enabled
+	}
+}
+
+// HasAttachedCatalog reports whether the named catalog is attached in the
+// current session.
+func HasAttachedCatalog(ctx context.Context, executor QueryExecutor, catalog string) (bool, error) {
+	return hasAttachedCatalog(ctx, executor, catalog)
+}
+
 // SendInitialParams sends the initial parameter status messages and backend key data.
 func SendInitialParams(cc *clientConn) {
 	cc.sendInitialParams()
@@ -89,6 +104,7 @@ func SendInitialParams(cc *clientConn) {
 // It cancels the connection context when the loop exits, ensuring in-flight
 // query contexts (and any gRPC calls derived from them) are cancelled promptly.
 func RunMessageLoop(cc *clientConn) error {
+	cc.ensureConnectionContext()
 	defer cc.cancel()
 	cc.server.registerConn(cc)
 	defer cc.server.unregisterConn(cc.pid)
@@ -125,4 +141,10 @@ func SetQueryLogger(s *Server, ql *QueryLogger) {
 // QueryLogger returns the server's query logger (may be nil).
 func (s *Server) QueryLogger() *QueryLogger {
 	return s.queryLogger
+}
+
+// SetProgressFn sets the progress lookup function on a Server.
+// Used by the control plane to provide cached query progress from worker health checks.
+func SetProgressFn(s *Server, fn func(pid int32) (pct float64, rows, totalRows uint64, stalled bool)) {
+	s.progressFn = fn
 }

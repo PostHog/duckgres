@@ -14,19 +14,24 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/cloudflare/tableflip"
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightsqlingress"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ControlPlaneConfig extends server.Config with control-plane-specific settings.
 type ControlPlaneConfig struct {
 	server.Config
+
+	Process ProcessConfig
 
 	SocketDir            string
 	ConfigPath           string // Path to config file, passed to workers
@@ -38,23 +43,51 @@ type ControlPlaneConfig struct {
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
-	// "remote": workers are network-accessible pods/containers communicating over TCP.
-	//           Currently implemented via Kubernetes (requires -tags kubernetes build).
+	// "remote": Kubernetes-backed multitenant workers communicating over TCP.
+	//           Requires ConfigStoreConn and a binary built with -tags kubernetes.
 	WorkerBackend string
 
-	// K8s contains Kubernetes-specific configuration. Only used when WorkerBackend == "remote".
+	// K8s contains Kubernetes-specific configuration. Only used for remote
+	// multitenant mode.
 	K8s K8sConfig
+
+	// ConfigStoreConn is the PostgreSQL connection string for the config store.
+	// Required when WorkerBackend == "remote".
+	ConfigStoreConn string
+
+	// ConfigPollInterval is how often to poll the config store for changes.
+	// Default: 30s.
+	ConfigPollInterval time.Duration
+
+	// InternalSecret is the shared secret for API authentication.
+	// When empty, a random secret is generated and logged at startup.
+	InternalSecret string
+}
+
+type ProcessConfig struct {
+	MinWorkers int
+	MaxWorkers int
 }
 
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage         string // Container image for worker pods (required)
-	WorkerNamespace     string // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID      string // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort          int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret        string // K8s Secret name containing bearer token
-	WorkerConfigMap     string // ConfigMap name for duckgres.yaml
-	ImagePullPolicy     string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	WorkerImage           string // Container image for worker pods (required)
+	WorkerNamespace       string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID        string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort            int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret          string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	WorkerConfigMap       string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy       string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount        string // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
+	MaxWorkers            int    // Global cap for the shared K8s worker pool (0 = auto-derived)
+	SharedWarmTarget      int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	WorkerCPURequest      string // CPU request for worker pods (e.g., "500m")
+	WorkerMemoryRequest   string // Memory request for worker pods (e.g., "1Gi")
+	WorkerNodeSelector    string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
+	WorkerTolerationKey   string // Taint key for worker pod NoSchedule toleration
+	WorkerTolerationValue string // Taint value for worker pod NoSchedule toleration
+	WorkerExclusiveNode   bool   // One worker per node via pod anti-affinity
+	AWSRegion             string // AWS region for STS client
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -62,24 +95,56 @@ type K8sConfig struct {
 // PostgreSQL wire protocol, and SQL transpilation all happen here. Workers are
 // thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets.
 type ControlPlane struct {
-	cfg              ControlPlaneConfig
-	pool             WorkerPool
-	sessions         *SessionManager
-	flight           *FlightIngress
-	rebalancer       *MemoryRebalancer
-	srv              *server.Server // Minimal server for cancel request routing
-	rateLimiter      *server.RateLimiter
-	tlsConfig        *tls.Config
-	pgListener       net.Listener
-	upgrader         *tableflip.Upgrader
-	activeConns      int64
-	closed           bool
-	closeMu          sync.Mutex
-	wg               sync.WaitGroup
-	reloading        atomic.Bool         // guards against concurrent upgrade from double SIGUSR1
-	upgradeDraining  atomic.Bool         // true after upgrade succeeded; SIGTERM should exit immediately
-	acmeManager      *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
-	acmeDNSManager   *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
+	cfg             ControlPlaneConfig
+	pool            WorkerPool      // non-nil in single-tenant process mode
+	sessions        *SessionManager // non-nil in single-tenant process mode
+	flight          *FlightIngress
+	rebalancer      *MemoryRebalancer
+	srv             *server.Server // Minimal server for cancel request routing
+	rateLimiter     *server.RateLimiter
+	tlsConfig       *tls.Config
+	pgListener      net.Listener
+	flightListener  net.Listener
+	upgrader        *tableflip.Upgrader
+	parentPID       int // tableflip parent PID (0 if first generation)
+	activeConns     int64
+	closed          bool
+	closeMu         sync.Mutex
+	wg              sync.WaitGroup
+	reloading       atomic.Bool            // guards against concurrent upgrade from double SIGUSR1
+	upgradeDraining atomic.Bool            // true after upgrade succeeded; SIGTERM should exit immediately
+	acmeManager     *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
+	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
+
+	// isRemoteBackend is true when workers run as separate K8s pods (remote backend).
+	isRemoteBackend bool
+
+	// Multi-tenant fields (non-nil in remote multitenant mode)
+	orgRouter      OrgRouterInterface
+	configStore    ConfigStoreInterface
+	apiServer      *http.Server // API server on :8080 (shut down on graceful exit)
+	runtimeTracker *ControlPlaneRuntimeTracker
+	janitorLeader  *JanitorLeaderManager
+}
+
+// ConfigStoreInterface abstracts the config store for the control plane.
+// Defined here to avoid circular imports with the configstore package.
+type ConfigStoreInterface interface {
+	ResolveDatabase(database string) (orgID string)
+	ValidateOrgUser(orgID, username, password string) bool
+	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no database param)
+	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
+	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
+	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
+	CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error
+}
+
+// OrgRouterInterface abstracts the org router for the control plane.
+type OrgRouterInterface interface {
+	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
+	IsMigratingForOrg(orgID string) bool
+	SetWarmCapacityTarget(n int)
+	ShutdownAll()
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -98,12 +163,20 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.WorkerIdleTimeout = 5 * time.Minute
 	}
 	if cfg.HandoverDrainTimeout == 0 {
-		cfg.HandoverDrainTimeout = 24 * time.Hour
+		if cfg.WorkerBackend == "remote" {
+			cfg.HandoverDrainTimeout = 15 * time.Minute
+		} else {
+			cfg.HandoverDrainTimeout = 24 * time.Hour
+		}
 	}
 
 	// Enforce secure defaults for control-plane mode.
 	if err := validateControlPlaneSecurity(cfg); err != nil {
 		slog.Error("Invalid control-plane security configuration.", "error", err)
+		os.Exit(1)
+	}
+	if err := validateWorkerBackendConfig(cfg); err != nil {
+		slog.Error("Invalid worker backend configuration.", "error", err)
 		os.Exit(1)
 	}
 
@@ -169,8 +242,27 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
+	var flightLn net.Listener
+	if cfg.FlightPort > 0 {
+		flightAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.FlightPort)
+		flightLn, err = upg.Listen("tcp", flightAddr)
+		if err != nil {
+			slog.Error("Failed to listen.", "addr", flightAddr, "error", err)
+			os.Exit(1)
+		}
+	}
+
+	// Save the tableflip parent PID before it potentially exits and we get
+	// reparented to init. We need this to kill a stuck parent during future
+	// upgrades (tableflip requires the parent to exit before the child can
+	// do its own upgrade).
+	var parentPID int
 	if upg.HasParent() {
+		parentPID = os.Getppid()
 		slog.Info("Upgrade complete, inherited PG listener.", "addr", pgLn.Addr().String())
+		if flightLn != nil {
+			slog.Info("Upgrade complete, inherited Flight listener.", "addr", flightLn.Addr().String())
+		}
 	}
 
 	if !isK8s {
@@ -194,71 +286,49 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// Initialize memory rebalancer. Every session gets the full memory budget
 	// (75% of system RAM by default). DuckDB spills to disk/swap if needed.
 	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
-	maxWorkers := cfg.MaxWorkers
 
 	// Use a temporary rebalancer to auto-detect the budget and derive
-	// a default max_workers if not explicitly set.
+	// backend-specific default max_workers if not explicitly set.
 	tempRebalancer := NewMemoryRebalancer(memBudget, 0, nil, false)
 	memBudget = tempRebalancer.memoryBudget // capture auto-detected value
 
-	// If max_workers is not set, derive a reasonable concurrency cap from
-	// the memory budget (budget / 256MB).
-	if maxWorkers == 0 {
-		maxWorkers = tempRebalancer.DefaultMaxWorkers()
-		slog.Info("Derived max_workers from memory budget.",
-			"max_workers", maxWorkers,
-			"memory_budget", formatBytes(memBudget))
+	processMaxWorkers := cfg.Process.MaxWorkers
+	if processMaxWorkers == 0 {
+		processMaxWorkers = tempRebalancer.DefaultMaxWorkers()
+	}
+	k8sMaxWorkers := cfg.K8s.MaxWorkers
+	if k8sMaxWorkers == 0 {
+		k8sMaxWorkers = tempRebalancer.DefaultMaxWorkers()
 	}
 
 	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance)
 
-	// Validate min_workers <= max_workers
-	minWorkers := cfg.MinWorkers
-	if minWorkers > maxWorkers {
-		slog.Warn("min_workers exceeds max_workers; capping to max_workers.",
-			"min_workers", minWorkers, "max_workers", maxWorkers)
-		minWorkers = maxWorkers
+	if !isK8s && cfg.Process.MaxWorkers == 0 {
+		slog.Info("Derived process.max_workers from memory budget.",
+			"process_max_workers", processMaxWorkers,
+			"memory_budget", formatBytes(memBudget))
+	}
+	if isK8s && cfg.K8s.MaxWorkers == 0 {
+		slog.Info("Derived k8s.max_workers from memory budget.",
+			"k8s_max_workers", k8sMaxWorkers,
+			"memory_budget", formatBytes(memBudget))
 	}
 
-	var pool WorkerPool
+	processMinWorkers := cfg.Process.MinWorkers
+	if processMinWorkers > processMaxWorkers {
+		slog.Warn("process.min_workers exceeds process.max_workers; capping to process.max_workers.",
+			"process_min_workers", processMinWorkers,
+			"process_max_workers", processMaxWorkers)
+		processMinWorkers = processMaxWorkers
+	}
 
-	switch cfg.WorkerBackend {
-	case "remote":
-		k8sPool, err := CreateK8sPool(K8sWorkerPoolConfig{
-			Namespace:       cfg.K8s.WorkerNamespace,
-			CPID:            cfg.K8s.ControlPlaneID,
-			WorkerImage:     cfg.K8s.WorkerImage,
-			WorkerPort:      cfg.K8s.WorkerPort,
-			SecretName:      cfg.K8s.WorkerSecret,
-			ConfigMap:       cfg.K8s.WorkerConfigMap,
-			MaxWorkers:      maxWorkers,
-			IdleTimeout:     cfg.WorkerIdleTimeout,
-			ConfigPath:      cfg.ConfigPath,
-			ImagePullPolicy: cfg.K8s.ImagePullPolicy,
-			MemoryBudget:    int64(memBudget),
-		})
-		if err != nil {
-			slog.Error("Failed to create Kubernetes worker pool.", "error", err)
-			os.Exit(1)
-		}
-		pool = k8sPool
-	default: // "process" or empty
-		procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, minWorkers, maxWorkers)
-		procPool.idleTimeout = cfg.WorkerIdleTimeout
-
-		// Pre-bind worker sockets. On upgrade with EROFS, this may fail —
-		// that's OK, workers will fall back to effectiveSocketDir (/tmp).
-		if maxWorkers > 0 {
-			if err := procPool.PreBindSockets(maxWorkers); err != nil {
-				if upg.HasParent() {
-					slog.Warn("Failed to pre-bind worker sockets (will use dynamic sockets).", "error", err)
-				} else {
-					slog.Error("Failed to pre-bind worker sockets.", "error", err)
-					os.Exit(1)
-				}
-			}
-		}
-		pool = procPool
+	k8sSharedWarmTarget := cfg.K8s.SharedWarmTarget
+	if isK8s && k8sSharedWarmTarget > k8sMaxWorkers {
+		slog.Warn("k8s.shared_warm_target exceeds k8s.max_workers; capping to k8s.max_workers.",
+			"k8s_shared_warm_target", k8sSharedWarmTarget,
+			"k8s_max_workers", k8sMaxWorkers)
+		k8sSharedWarmTarget = k8sMaxWorkers
+		cfg.K8s.SharedWarmTarget = k8sSharedWarmTarget
 	}
 
 	// Create a minimal server for cancel request routing
@@ -272,53 +342,130 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		server.SetQueryLogger(srv, ql)
 	}
 
-	sessions := NewSessionManager(pool, rebalancer)
-
-	// Wire the circular dependency: rebalancer needs sessions to iterate,
-	// sessions needs rebalancer to trigger rebalance on create/destroy.
-	// This is safe because Rebalance is only called from CreateSession/DestroySession,
-	// and no sessions exist yet at this point.
-	//
-	// Lock ordering invariant: rebalancer.mu → sm.mu(RLock). Never acquire
-	// rebalancer.mu while holding sm.mu to avoid deadlock.
-	rebalancer.SetSessionLister(sessions)
-
 	cp := &ControlPlane{
-		cfg:         cfg,
-		pool:        pool,
-		sessions:    sessions,
-		rebalancer:  rebalancer,
-		srv:         srv,
-		rateLimiter: server.NewRateLimiter(cfg.RateLimit),
-		tlsConfig:   tlsCfg,
-		pgListener:  pgLn,
-		upgrader:    upg,
-		acmeManager:    acmeMgr,
-		acmeDNSManager: acmeDNSMgr,
+		cfg:             cfg,
+		srv:             srv,
+		rateLimiter:     server.NewRateLimiter(cfg.RateLimit),
+		tlsConfig:       tlsCfg,
+		pgListener:      pgLn,
+		flightListener:  flightLn,
+		upgrader:        upg,
+		parentPID:       parentPID,
+		acmeManager:     acmeMgr,
+		acmeDNSManager:  acmeDNSMgr,
+		isRemoteBackend: cfg.WorkerBackend == "remote",
 	}
 
-	// Pre-warm workers if min_workers is set
-	if minWorkers > 0 {
-		if err := cp.pool.SpawnMinWorkers(minWorkers); err != nil {
-			slog.Error("Failed to spawn min workers.", "error", err)
+	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
+	if cfg.WorkerBackend == "remote" {
+		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers, cp.healthReady)
+		if err != nil {
+			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
 		}
-	}
+		cp.configStore = store
+		cp.orgRouter = adapter
+		cp.apiServer = apiServer
+		cp.runtimeTracker = runtimeTracker
+		cp.janitorLeader = janitorLeader
+		cp.cfg = cfg
+		_ = store // keep linter happy
+		if cp.runtimeTracker != nil {
+			if err := cp.runtimeTracker.Start(context.Background()); err != nil {
+				slog.Error("Failed to start control-plane runtime tracker.", "error", err)
+				os.Exit(1)
+			}
+		}
+		if cp.janitorLeader != nil {
+			if err := cp.janitorLeader.Start(context.Background()); err != nil {
+				slog.Error("Failed to start janitor leader election.", "error", err)
+				os.Exit(1)
+			}
+		}
+	} else {
+		// Single-tenant mode: one shared process pool + session manager
+		procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, processMinWorkers, processMaxWorkers)
+		procPool.idleTimeout = cfg.WorkerIdleTimeout
 
-	// Flight ingress is created AFTER upgrade so the old CP can keep
-	// serving Flight SQL clients until it shuts down its listener in
-	// drainAfterUpgrade. This minimizes the Flight unavailability
-	// window to just the brief port rebind, rather than the entire
-	// upgrade + pre-warm duration.
-	cp.startFlightIngress()
+		// Pre-bind worker sockets. On upgrade with EROFS, this may fail —
+		// that's OK, workers will fall back to effectiveSocketDir (/tmp).
+		if processMaxWorkers > 0 {
+			if err := procPool.PreBindSockets(processMaxWorkers); err != nil {
+				if upg.HasParent() {
+					slog.Warn("Failed to pre-bind worker sockets (will use dynamic sockets).", "error", err)
+				} else {
+					slog.Error("Failed to pre-bind worker sockets.", "error", err)
+					os.Exit(1)
+				}
+			}
+		}
+		// Check if DuckLake migration is needed (fast PG version query, <1s).
+		// If so, set the migrate flag immediately so workers use AUTOMATIC_MIGRATION
+		// TRUE and skip their own slow backup+check. The backup runs asynchronously
+		// as a safety net — it must not block startup or systemd will kill us
+		// (TimeoutStartSec=180 is shorter than the backup of large metadata stores).
+		if cfg.DuckLake.MetadataStore != "" {
+			if needed, ver, err := server.CheckDuckLakeMigrationVersion(cfg.DuckLake); err != nil {
+				slog.Warn("DuckLake migration version check failed, workers will check independently.", "error", err)
+			} else if needed {
+				slog.Info("DuckLake migration needed, workers will use AUTOMATIC_MIGRATION.", "from", ver, "to", server.DuckLakeSpecVersion())
+				procPool.ducklakeMigrate = true
+				// Run backup asynchronously — it's a safety net, not a gate.
+				go func() {
+					if err := server.BackupDuckLakeMetadata(cfg.DuckLake, cfg.DataDir); err != nil {
+						slog.Warn("DuckLake metadata backup failed (migration will still proceed).", "error", err)
+					} else {
+						slog.Info("DuckLake metadata backup completed.")
+					}
+				}()
+			}
+		}
 
-	// Start health check loop with crash notification
-	onCrash := func(workerID int) {
-		cp.sessions.OnWorkerCrash(workerID, func(pid int32) {
-			slog.Warn("Session orphaned by worker crash.", "pid", pid, "worker", workerID)
+		pool := WorkerPool(procPool)
+
+		sessions := NewSessionManager(pool, rebalancer)
+
+		// Wire the circular dependency: rebalancer needs sessions to iterate,
+		// sessions needs rebalancer to trigger rebalance on create/destroy.
+		rebalancer.SetSessionLister(sessions)
+
+		cp.pool = pool
+		cp.sessions = sessions
+		cp.rebalancer = rebalancer
+
+		// Wire progress lookup so pg_stat_activity can show query progress.
+		server.SetProgressFn(srv, func(pid int32) (pct float64, rows, totalRows uint64, stalled bool) {
+			sp := sessions.GetProgress(pid)
+			if sp == nil {
+				return -1, 0, 0, false
+			}
+			return sp.Percentage, sp.Rows, sp.TotalRows, sp.Stalled
 		})
+
+		warmTarget := processMinWorkers
+		if warmTarget > 0 {
+			if err := pool.SpawnMinWorkers(warmTarget); err != nil {
+				slog.Error("Failed to spawn min workers.", "error", err)
+				os.Exit(1)
+			}
+		}
+
+		// Start health check loop with crash notification and progress caching.
+		onCrash := func(workerID int) {
+			sessions.OnWorkerCrash(workerID, func(pid int32) {
+				slog.Warn("Session orphaned by worker crash.", "pid", pid, "worker", workerID)
+			})
+		}
+		onProgress := func(workerID int, progress map[string]*SessionProgress) {
+			sessions.UpdateProgress(workerID, progress)
+		}
+		go pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash, onProgress)
 	}
-	go cp.pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash)
+
+	// Flight ingress is created after worker/session wiring, but the TCP
+	// listener itself is pre-bound via tableflip so upgrades inherit the
+	// socket instead of racing a re-bind on the old process's 8815 listener.
+	cp.startFlightIngress()
 
 	// Handle SIGUSR1 for graceful upgrade (process mode only)
 	if !isK8s {
@@ -342,7 +489,19 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			os.Exit(0)
 		}
 		slog.Info("Received shutdown signal.", "signal", s)
-		cp.shutdown()
+		if cp.runtimeTracker != nil {
+			if err := cp.runtimeTracker.MarkDraining(); err != nil {
+				slog.Warn("Failed to mark control plane draining.", "error", err)
+			}
+		}
+		if cp.janitorLeader != nil {
+			cp.janitorLeader.Stop()
+		}
+		if isK8s {
+			cp.drainAndShutdown(cp.cfg.HandoverDrainTimeout)
+		} else {
+			cp.shutdown()
+		}
 		os.Exit(0)
 	}()
 
@@ -367,8 +526,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
 		"flight_addr", cp.flightAddr(),
-		"min_workers", minWorkers,
-		"max_workers", maxWorkers,
+		"worker_backend", cfg.WorkerBackend,
+		"process_min_workers", processMinWorkers,
+		"process_max_workers", processMaxWorkers,
+		"k8s_max_workers", k8sMaxWorkers,
+		"k8s_shared_warm_target", k8sSharedWarmTarget,
 		"worker_queue_timeout", cfg.WorkerQueueTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
 		"memory_rebalance", cfg.MemoryRebalance)
@@ -443,9 +605,24 @@ func createSessionWithRegisteredCancel(
 	return createFn(ctx)
 }
 
+func sessionCreationErrorResponse(err error) (code string, message string) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "57014", "canceling authentication due to user request"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "53300", "timed out waiting for an available worker"
+	default:
+		return "58000", fmt.Sprintf("failed to create session: %v", err)
+	}
+}
+
+// extractOrgFromSNI parses the org identifier from the TLS ServerName.
+// "acme.warehouse.posthog.com" with base "warehouse.posthog.com" returns ("acme", true).
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
+	server.IncrementOpenConnections()
+	defer server.DecrementOpenConnections()
 
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
@@ -493,6 +670,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Require SSL
 	if !params.sslRequest {
+		if params.startupMessage {
+			// Client sent a v3.0 startup without negotiating SSL (e.g. sslmode=disable).
+			// Send a PostgreSQL error so the client sees a clear message.
+			_ = server.WriteErrorResponse(conn, "FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
+		}
 		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
 		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 		_ = conn.Close()
@@ -575,15 +757,47 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 
 	password := string(bytes.TrimRight(body, "\x00"))
-	if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
-		slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
-		banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
-		if banned {
-			slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
+
+	// Authenticate
+	// In multi-tenant mode, the database name maps to an org.
+	// User uniqueness is scoped to the org.
+	var orgID string
+	if cp.configStore != nil {
+		if database == "" {
+			slog.Warn("Connection rejected: no database specified.", "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "database name is required")
+			_ = writer.Flush()
+			return
 		}
-		_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
-		_ = writer.Flush()
-		return
+		orgID = cp.configStore.ResolveDatabase(database)
+		if orgID == "" {
+			slog.Warn("Unknown database.", "database", database, "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", fmt.Sprintf("database %q does not exist", database))
+			_ = writer.Flush()
+			return
+		}
+		if !cp.configStore.ValidateOrgUser(orgID, username, password) {
+			slog.Warn("Authentication failed.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr)
+			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
+			if banned {
+				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
+			}
+			_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+			_ = writer.Flush()
+			return
+		}
+	} else {
+		// Single-tenant: static users map
+		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
+			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
+			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
+			if banned {
+				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
+			}
+			_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+			_ = writer.Flush()
+			return
+		}
 	}
 
 	// Send auth OK
@@ -595,13 +809,47 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
 
+	// Resolve the session manager and rebalancer for this connection.
+	// In multi-tenant mode, each org has its own stack.
+	var sessions *SessionManager
+	var rebalancer *MemoryRebalancer
+	if cp.orgRouter != nil {
+		// Reject connections during DuckLake migration to prevent queries from
+		// hitting a partially-migrated catalog. The client gets a clear error
+		// and can retry after the migration completes.
+		if cp.orgRouter.IsMigratingForOrg(orgID) {
+			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", orgID, "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+				"DuckLake catalog upgrade in progress for your organization, please retry in a few moments")
+			_ = writer.Flush()
+			return
+		}
+
+		_, sess, rebal, ok := cp.orgRouter.StackForOrg(orgID)
+		if !ok {
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
+			_ = writer.Flush()
+			return
+		}
+		sessions = sess
+		rebalancer = rebal
+	} else {
+		sessions = cp.sessions
+		rebalancer = cp.rebalancer
+	}
+	if cp.isDraining() {
+		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
+		_ = writer.Flush()
+		return
+	}
+
 	// Feed initial parameters and backend key data to the client IMMEDIATELY.
 	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
-	pid := cp.sessions.ReservePID()
+	pid := sessions.ReservePID()
 	secretKey := server.GenerateSecretKey()
 
 	// Use a temporary clientConn just to send initial params
-	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, database, applicationName, nil, pid, secretKey, -1)
+	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, orgID, database, applicationName, nil, pid, secretKey, -1)
 	defer server.CancelClientConn(tmpCC)
 	server.SendInitialParams(tmpCC)
 	if err := writer.Flush(); err != nil {
@@ -609,16 +857,19 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Create session on a worker. The timeout controls how long we wait in the
-	// worker queue when all slots are occupied.
-	// Pass resource limits to be applied immediately by the worker (one RPC).
+	// Derive DuckDB resource limits for the session.
+	// For remote workers (K8s pods), derive from the worker pod's resource
+	// spec — the CP's own resources are irrelevant. For local process workers,
+	// use the rebalancer which derives from the CP's system resources.
 	var (
 		memLimit string
 		threads  int
 	)
-	if cp.rebalancer != nil {
-		memLimit = cp.rebalancer.MemoryLimit()
-		threads = cp.rebalancer.PerSessionThreads()
+	if cp.isRemoteBackend {
+		memLimit, threads = cp.workerDuckDBLimits()
+	} else if rebalancer != nil {
+		memLimit = rebalancer.MemoryLimit()
+		threads = rebalancer.PerSessionThreads()
 	}
 
 	_, executor, err := createSessionWithRegisteredCancel(
@@ -626,28 +877,52 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
 		func(ctx context.Context) (int32, *server.FlightExecutor, error) {
-			return cp.sessions.CreateSession(ctx, username, pid, memLimit, threads)
+			return sessions.CreateSession(ctx, username, pid, memLimit, threads)
 		},
 	)
 	if err != nil {
 		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
-		if errors.Is(err, context.Canceled) {
-			_ = server.WriteErrorResponse(writer, "FATAL", "57014", "canceling authentication due to user request")
-		} else {
-			_ = server.WriteErrorResponse(writer, "FATAL", "53300", "too many connections")
-		}
+		code, message := sessionCreationErrorResponse(err)
+		_ = server.WriteErrorResponse(writer, "FATAL", code, message)
 		_ = writer.Flush()
 		return
 	}
-	defer cp.sessions.DestroySession(pid)
+	if orgID != "" {
+		observeOrgSessionsActive(orgID, sessions.SessionCount())
+	}
+	defer func() {
+		sessions.DestroySession(pid)
+		if orgID != "" {
+			observeOrgSessionsActive(orgID, sessions.SessionCount())
+		}
+	}()
+
+	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = server.InitSessionDatabaseMetadata(initCtx, executor, database)
+	if err != nil {
+		initCancel()
+		slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
+		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
+		_ = writer.Flush()
+		return
+	}
+	duckLakeAttached, err := server.HasAttachedCatalog(initCtx, executor, "ducklake")
+	initCancel()
+	if err != nil {
+		slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
+		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
+		_ = writer.Flush()
+		return
+	}
 
 	// Register the TCP connection so OnWorkerCrash can close it to unblock
 	// the message loop if the backing worker dies.
-	cp.sessions.SetConnCloser(pid, tlsConn)
+	sessions.SetConnCloser(pid, tlsConn)
 
 	// Create real clientConn with FlightExecutor and worker assignment
-	workerID := cp.sessions.WorkerIDForPID(pid)
-	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, database, applicationName, executor, pid, secretKey, workerID)
+	workerID := sessions.WorkerIDForPID(pid)
+	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID)
+	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
@@ -668,10 +943,92 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	slog.Info("Client disconnected.", "user", username, "remote_addr", remoteAddr)
 }
 
+// workerDuckDBLimits derives DuckDB memory_limit and threads from the worker
+// pod's K8s resource spec. Uses 75% of the worker's memory limit for DuckDB
+// and the full CPU request as thread count. Returns empty/zero if worker
+// resources are not configured (DuckDB will then auto-detect on the worker).
+func (cp *ControlPlane) workerDuckDBLimits() (memLimit string, threads int) {
+	memReq := cp.cfg.K8s.WorkerMemoryRequest
+	if memReq != "" {
+		memBytes := parseK8sMemory(memReq)
+		if memBytes > 0 {
+			duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
+			const gb = 1024 * 1024 * 1024
+			const mb = 1024 * 1024
+			if duckdbBytes >= gb {
+				memLimit = fmt.Sprintf("%dGB", duckdbBytes/gb)
+			} else {
+				memLimit = fmt.Sprintf("%dMB", duckdbBytes/mb)
+			}
+		}
+	}
+
+	cpuReq := cp.cfg.K8s.WorkerCPURequest
+	if cpuReq != "" {
+		threads = parseK8sCPU(cpuReq)
+	}
+
+	return memLimit, threads
+}
+
+// parseK8sMemory parses a Kubernetes memory string (e.g., "360Gi", "8Gi", "512Mi", "4GB")
+// into bytes. Supports both IEC (Ki/Mi/Gi/Ti) and SI (KB/MB/GB/TB) units.
+func parseK8sMemory(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+
+	// Try k8s IEC notation first (Ki, Mi, Gi, Ti)
+	units := []struct {
+		suffix     string
+		multiplier uint64
+	}{
+		{"Ti", 1024 * 1024 * 1024 * 1024},
+		{"Gi", 1024 * 1024 * 1024},
+		{"Mi", 1024 * 1024},
+		{"Ki", 1024},
+	}
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			var v float64
+			if _, err := fmt.Sscanf(strings.TrimSuffix(s, u.suffix), "%f", &v); err == nil && v > 0 {
+				return uint64(v * float64(u.multiplier))
+			}
+			return 0
+		}
+	}
+
+	// Fall back to DuckDB/SI notation (KB, MB, GB, TB)
+	return server.ParseMemoryBytes(s)
+}
+
+// parseK8sCPU parses a Kubernetes CPU string (e.g., "46", "46000m", "500m")
+// into a whole thread count. Millicores below 1000 round down to 0.
+func parseK8sCPU(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if strings.HasSuffix(s, "m") {
+		var millicores int
+		if _, err := fmt.Sscanf(strings.TrimSuffix(s, "m"), "%d", &millicores); err != nil {
+			return 0
+		}
+		return millicores / 1000
+	}
+	var cores int
+	if _, err := fmt.Sscanf(s, "%d", &cores); err != nil {
+		return 0
+	}
+	return cores
+}
+
 // startupResult holds the parsed initial startup message.
 type startupResult struct {
 	sslRequest      bool
 	gssRequest      bool
+	startupMessage  bool // true when the client sent a v3.0 startup (no SSL negotiation)
 	cancelRequest   bool
 	cancelPid       int32
 	cancelSecretKey int32
@@ -726,6 +1083,12 @@ func readStartupFromRaw(conn net.Conn) (startupResult, error) {
 			continue
 		}
 
+		// Protocol version 3.0 — client sent a startup message without
+		// negotiating SSL first (e.g. sslmode=disable).
+		if protocolVersion == 196608 {
+			return startupResult{startupMessage: true}, nil
+		}
+
 		return startupResult{}, fmt.Errorf("unexpected protocol version: %d", protocolVersion)
 	}
 
@@ -767,6 +1130,46 @@ func fullRead(conn net.Conn, buf []byte) (int, error) {
 }
 
 func (cp *ControlPlane) shutdown() {
+	cp.stopAcceptingPGConnections()
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
+	}
+	if cp.janitorLeader != nil {
+		cp.janitorLeader.Stop()
+	}
+
+	// Wait for in-flight connections to finish
+	slog.Info("Waiting for connections to drain...")
+	cp.wg.Wait()
+
+	cp.shutdownRuntimeResources()
+}
+
+func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
+	// Stop spawning warm workers immediately so we don't create pods that
+	// outlive this CP instance and block scheduling for the replacement.
+	if cp.orgRouter != nil {
+		cp.orgRouter.SetWarmCapacityTarget(0)
+	}
+	cp.stopAcceptingPGConnections()
+	if cp.flight != nil {
+		cp.flight.BeginDrain()
+	}
+	slog.Info("Waiting for planned shutdown drain.", "timeout", timeout)
+	if cp.waitForDrain(timeout) {
+		slog.Info("All pgwire connections and Flight sessions drained before shutdown.")
+	} else {
+		slog.Warn("Planned shutdown drain timeout exceeded, forcing shutdown.", "timeout", timeout)
+	}
+	if cp.flight != nil {
+		cp.flight.Shutdown()
+		cp.flight = nil
+	}
+	cp.shutdownRuntimeResources()
+}
+
+func (cp *ControlPlane) stopAcceptingPGConnections() {
 	cp.closeMu.Lock()
 	cp.closed = true
 	cp.closeMu.Unlock()
@@ -774,17 +1177,52 @@ func (cp *ControlPlane) shutdown() {
 	if cp.pgListener != nil {
 		_ = cp.pgListener.Close()
 	}
-	if cp.flight != nil {
-		cp.flight.Shutdown()
-		cp.flight = nil
+}
+
+func (cp *ControlPlane) waitForDrain(timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	pgDone := make(chan struct{})
+	go func() {
+		cp.wg.Wait()
+		close(pgDone)
+	}()
+
+	flightDone := make(chan bool, 1)
+	go func() {
+		if cp.flight != nil {
+			flightDone <- cp.flight.WaitForZeroSessions(ctx)
+			return
+		}
+		flightDone <- true
+	}()
+
+	pgClosed := false
+	flightClosed := false
+	for !pgClosed || !flightClosed {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-pgDone:
+			pgClosed = true
+		case drained := <-flightDone:
+			if !drained {
+				return false
+			}
+			flightClosed = true
+		}
 	}
+	return true
+}
 
-	// Wait for in-flight connections to finish
-	slog.Info("Waiting for connections to drain...")
-	cp.wg.Wait()
-
+func (cp *ControlPlane) shutdownRuntimeResources() {
 	slog.Info("Shutting down workers...")
-	cp.pool.ShutdownAll()
+	if cp.orgRouter != nil {
+		cp.orgRouter.ShutdownAll()
+	} else if cp.pool != nil {
+		cp.pool.ShutdownAll()
+	}
 
 	if cp.rebalancer != nil {
 		cp.rebalancer.Stop()
@@ -805,6 +1243,23 @@ func (cp *ControlPlane) shutdown() {
 	cp.stopQueryLogger()
 
 	slog.Info("Control plane shutdown complete.")
+}
+
+func (cp *ControlPlane) isDraining() bool {
+	return cp.runtimeTracker != nil && cp.runtimeTracker.Draining()
+}
+
+func (cp *ControlPlane) healthReady() bool {
+	if cp == nil {
+		return false
+	}
+	if cp.isDraining() {
+		return false
+	}
+	if cp.cfg.FlightPort <= 0 {
+		return true
+	}
+	return cp.flight != nil && cp.flight.Healthy()
 }
 
 func (cp *ControlPlane) stopQueryLogger() {
@@ -830,6 +1285,13 @@ func (cp *ControlPlane) handleUpgrade() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := cp.cfg.MetricsServer.Shutdown(ctx); err != nil {
 			slog.Warn("Metrics server shutdown failed.", "error", err)
+		}
+		cancel()
+	}
+	if cp.apiServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := cp.apiServer.Shutdown(ctx); err != nil {
+			slog.Warn("API server shutdown failed.", "error", err)
 		}
 		cancel()
 	}
@@ -860,6 +1322,20 @@ func (cp *ControlPlane) handleUpgrade() {
 	// tableflip.Upgrade() spawns the child process with all Listen'd FDs
 	// inherited, then blocks until the child calls Ready() or times out.
 	if err := cp.upgrader.Upgrade(); err != nil {
+		// tableflip requires the parent process to have fully exited before
+		// the child can perform its own upgrade. If the parent is stuck
+		// draining long-lived connections, kill it and retry.
+		if strings.Contains(err.Error(), "parent hasn't exited") && cp.killStuckParent() {
+			if retryErr := cp.upgrader.Upgrade(); retryErr == nil {
+				slog.Info("Upgrade succeeded after terminating stuck parent.")
+				cp.upgradeDraining.Store(true)
+				cp.reloading.Store(false)
+				return
+			} else {
+				err = retryErr
+			}
+		}
+
 		slog.Error("Upgrade failed, recovering.", "error", err)
 		cp.reloading.Store(false)
 		if err := sdNotify("READY=1"); err != nil {
@@ -873,6 +1349,43 @@ func (cp *ControlPlane) handleUpgrade() {
 	cp.upgradeDraining.Store(true)
 	cp.reloading.Store(false)
 	// upg.Exit() channel closes now, triggering drainAfterUpgrade in the main goroutine.
+}
+
+// killStuckParent sends SIGTERM (then SIGKILL) to the tableflip parent process
+// that failed to exit after the previous upgrade. Returns true if the parent
+// was found and terminated (or was already dead).
+func (cp *ControlPlane) killStuckParent() bool {
+	if cp.parentPID <= 1 {
+		return false
+	}
+
+	// Verify the parent is still alive.
+	if err := syscall.Kill(cp.parentPID, 0); err != nil {
+		slog.Info("Tableflip parent already exited.", "parent_pid", cp.parentPID)
+		return true
+	}
+
+	slog.Warn("Tableflip parent still alive, sending SIGTERM to unblock upgrade.", "parent_pid", cp.parentPID)
+	_ = syscall.Kill(cp.parentPID, syscall.SIGTERM)
+
+	// Wait up to 15 seconds for graceful exit.
+	deadline := time.After(15 * time.Second)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := syscall.Kill(cp.parentPID, 0); err != nil {
+				slog.Info("Tableflip parent exited after SIGTERM.", "parent_pid", cp.parentPID)
+				return true
+			}
+		case <-deadline:
+			slog.Warn("Tableflip parent did not exit after SIGTERM, sending SIGKILL.", "parent_pid", cp.parentPID)
+			_ = syscall.Kill(cp.parentPID, syscall.SIGKILL)
+			time.Sleep(1 * time.Second)
+			return true
+		}
+	}
 }
 
 // drainAfterUpgrade is called after a successful tableflip upgrade. It stops
@@ -907,7 +1420,11 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 	}
 
 	// Shut down workers
-	cp.pool.ShutdownAll()
+	if cp.orgRouter != nil {
+		cp.orgRouter.ShutdownAll()
+	} else if cp.pool != nil {
+		cp.pool.ShutdownAll()
+	}
 	cp.stopQueryLogger()
 
 	// Give systemd time to process the MAINPID notification before we exit.
@@ -920,10 +1437,40 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 }
 
 // startFlightIngress creates and starts the Flight SQL ingress listener.
-// During upgrade, the old CP's Flight listener may still be shutting down,
-// so we retry port binding briefly before giving up.
 func (cp *ControlPlane) startFlightIngress() {
 	if cp.cfg.FlightPort <= 0 {
+		return
+	}
+
+	var validator flightsqlingress.CredentialValidator
+	var provider flightsqlingress.SessionProvider
+
+	switch {
+	case cp.configStore != nil && cp.orgRouter != nil:
+		// Multi-tenant: auth via config store, sessions routed per-org.
+		// Flight SQL doesn't have SNI, so we scan orgs to find the user.
+		orgProvider := &orgRoutedSessionProvider{
+			orgRouter:   cp.orgRouter,
+			configStore: cp.configStore,
+			pidSession:  make(map[int32]flightOwnedSession),
+			userOrg:     make(map[string]string),
+		}
+		validator = flightsqlingress.FuncCredentialValidator(func(username, password string) bool {
+			orgID, ok := cp.configStore.FindAndValidateUser(username, password)
+			if ok {
+				orgProvider.mu.Lock()
+				orgProvider.userOrg[username] = orgID
+				orgProvider.mu.Unlock()
+			}
+			return ok
+		})
+		provider = orgProvider
+	case cp.sessions != nil:
+		// Single-tenant: static users map, single session manager.
+		validator = &flightsqlingress.MapCredentialValidator{Users: cp.cfg.Users}
+		provider = &flightSessionProvider{sm: cp.sessions}
+	default:
+		slog.Warn("Flight ingress disabled: no session manager or config store available.")
 		return
 	}
 
@@ -935,17 +1482,14 @@ func (cp *ControlPlane) startFlightIngress() {
 		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
 	}
 
-	var flightIngress *FlightIngress
-	var err error
-	for attempt := 0; attempt < 10; attempt++ {
-		flightIngress, err = NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, cp.cfg.Users, cp.sessions, cp.rateLimiter, flightCfg)
-		if err == nil {
-			break
-		}
-		if attempt < 9 {
-			slog.Warn("Flight ingress port not yet available, retrying...", "attempt", attempt+1, "error", err)
-			time.Sleep(500 * time.Millisecond)
-		}
+	var (
+		flightIngress *FlightIngress
+		err           error
+	)
+	if cp.flightListener != nil {
+		flightIngress, err = NewFlightIngressFromListener(cp.flightListener, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
+	} else {
+		flightIngress, err = NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
 	}
 	if err != nil {
 		slog.Error("Failed to initialize Flight ingress, continuing without Flight SQL.", "error", err)
@@ -975,9 +1519,6 @@ func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
 	addr := cp.cfg.MetricsServer.Addr
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
 	newSrv := &http.Server{Addr: addr, Handler: mux}
 	cp.cfg.MetricsServer = newSrv
 	go func() {

@@ -99,7 +99,7 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 			'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-			'pg_partitioned_table', 'pg_type', 'pg_attribute',
+			'pg_partitioned_table', 'pg_rewrite', 'pg_type', 'pg_attribute',
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', '__duckgres_column_metadata'
 		)
@@ -328,6 +328,24 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		slog.Warn("Failed to create pg_partitioned_table view.", "error", err)
 	}
 
+	// Create pg_rewrite view (query rewrite rules, empty - DuckDB doesn't support rewrite rules)
+	pgRewriteSQL := `
+		CREATE OR REPLACE VIEW pg_rewrite AS
+		SELECT
+			0::BIGINT AS oid,
+			''::VARCHAR AS rulename,
+			0::BIGINT AS ev_class,
+			0::SMALLINT AS ev_type,
+			0::SMALLINT AS ev_enabled,
+			false::BOOLEAN AS is_instead,
+			NULL::TEXT AS ev_qual,
+			NULL::TEXT AS ev_action
+		WHERE false
+	`
+	if _, err := db.Exec(pgRewriteSQL); err != nil {
+		slog.Warn("Failed to create pg_rewrite view.", "error", err)
+	}
+
 	// Create pg_stat_user_tables view (table statistics)
 	// Uses reltuples from pg_class for estimated row counts (same as PostgreSQL - it's an estimate)
 	// Returns 0 for scan/tuple statistics and NULL for timestamps (DuckDB doesn't track these)
@@ -416,7 +434,10 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 			''::VARCHAR AS query,
 			''::VARCHAR AS backend_type,
 			NULL::INTEGER AS leader_pid,
-			0::INTEGER AS worker_id
+			0::INTEGER AS worker_id,
+			0.0::DOUBLE AS query_progress,
+			0::BIGINT AS rows_processed,
+			0::BIGINT AS total_rows_to_process
 		WHERE false
 	`
 	if _, err := db.Exec(pgStatActivitySQL); err != nil {
@@ -944,6 +965,8 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 		// pg_get_constraintdef - DuckDB has a 1-arg built-in (returns NULL).
 		// The 2-arg form (oid, pretty) is handled by the transpiler, which drops
 		// the pretty arg so DuckDB's built-in handles it. No macro needed here.
+		// pg_get_partkeydef - get partition key definition (DuckDB doesn't support partitioning)
+		`CREATE OR REPLACE MACRO pg_get_partkeydef(rel_oid) AS ''`,
 		// pg_get_serial_sequence - get sequence name for a serial/identity column
 		// Returns NULL because DuckLake doesn't support sequences
 		`CREATE OR REPLACE MACRO pg_get_serial_sequence(table_name, column_name) AS NULL`,
@@ -991,6 +1014,9 @@ func initPgCatalog(db *sql.DB, serverStartTime, processStartTime time.Time, serv
 
 		// pg_table_size - size of table excluding indexes (stub, returns 0)
 		`CREATE OR REPLACE MACRO pg_table_size(rel) AS 0`,
+
+		// pg_stat_get_numscans - number of sequential/index scans on a relation (stub, returns 0)
+		`CREATE OR REPLACE MACRO pg_stat_get_numscans(rel_oid) AS 0`,
 
 		// pg_indexes_size - total size of indexes on table (stub, returns 0)
 		`CREATE OR REPLACE MACRO pg_indexes_size(rel) AS 0`,
@@ -1118,7 +1144,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	columnsViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 		SELECT
-			c.table_catalog,
+			CASE WHEN c.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE c.table_catalog END AS table_catalog,
 			CASE WHEN c.table_schema = 'main' THEN 'public' ELSE c.table_schema END AS table_schema,
 			c.table_name,
 			c.column_name,
@@ -1205,7 +1231,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		columnsViewSimpleSQL := `
 			CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 			SELECT
-				table_catalog,
+				CASE WHEN table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE table_catalog END AS table_catalog,
 				CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END AS table_schema,
 				table_name,
 				column_name,
@@ -1294,7 +1320,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	tablesViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_tables_compat AS
 		SELECT
-			t.table_catalog,
+			CASE WHEN t.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE t.table_catalog END AS table_catalog,
 			CASE WHEN t.table_schema = 'main' THEN 'public' ELSE t.table_schema END AS table_schema,
 			t.table_name,
 			t.table_type,
@@ -1315,7 +1341,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-			'pg_partitioned_table', 'pg_attribute',
+			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -1334,7 +1360,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	schemataViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_schemata_compat AS
 		SELECT
-			s.catalog_name,
+			CASE WHEN s.catalog_name IN ('ducklake', 'memory') THEN current_database() ELSE s.catalog_name END AS catalog_name,
 			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS schema_name,
 			'duckdb' AS schema_owner,
 			NULL AS default_character_set_catalog,
@@ -1343,17 +1369,18 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			NULL AS sql_path
 		FROM %s.schemata s
 		WHERE s.schema_name NOT IN ('main', 'pg_catalog', 'information_schema')
+		AND s.catalog_name NOT LIKE '__ducklake_metadata_%%'
 		UNION ALL
-		SELECT 'memory' AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
+		SELECT current_database() AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 		UNION ALL
-		SELECT 'memory' AS catalog_name, 'pg_catalog' AS schema_name, 'duckdb' AS schema_owner,
+		SELECT current_database() AS catalog_name, 'pg_catalog' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 		UNION ALL
-		SELECT 'memory' AS catalog_name, 'information_schema' AS schema_name, 'duckdb' AS schema_owner,
+		SELECT current_database() AS catalog_name, 'information_schema' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 		UNION ALL
-		SELECT 'memory' AS catalog_name, 'pg_toast' AS schema_name, 'duckdb' AS schema_owner,
+		SELECT current_database() AS catalog_name, 'pg_toast' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 	`
 	if _, err := db.Exec(fmt.Sprintf(schemataViewSQL, infoSchemaPrefix)); err != nil {
@@ -1366,7 +1393,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	viewsViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_views_compat AS
 		SELECT
-			v.table_catalog,
+			CASE WHEN v.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE v.table_catalog END AS table_catalog,
 			CASE WHEN v.table_schema = 'main' THEN 'public' ELSE v.table_schema END AS table_schema,
 			v.table_name,
 			v.view_definition,
@@ -1383,7 +1410,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			'pg_namespace', 'pg_policy', 'pg_publication', 'pg_publication_rel',
 			'pg_publication_tables', 'pg_roles', 'pg_rules', 'pg_statistic_ext', 'pg_matviews',
 			'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-			'pg_partitioned_table', 'pg_attribute',
+			'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 			-- information_schema compat views
 			'information_schema_columns_compat', 'information_schema_tables_compat',
 			'information_schema_schemata_compat', 'information_schema_views_compat'
@@ -1452,7 +1479,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 				'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-				'pg_partitioned_table', 'pg_attribute',
+				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
@@ -1502,7 +1529,7 @@ func recreatePgClassForDuckLake(db *sql.DB) error {
 				'pg_statistic_ext', 'pg_publication_tables', 'pg_rules', 'pg_publication',
 				'pg_publication_rel', 'pg_inherits', 'pg_namespace', 'pg_matviews',
 				'pg_stat_user_tables', 'pg_statio_user_tables', 'pg_stat_statements', 'pg_stat_activity',
-				'pg_partitioned_table', 'pg_attribute',
+				'pg_partitioned_table', 'pg_rewrite', 'pg_attribute',
 				'information_schema_columns_compat', 'information_schema_tables_compat',
 				'information_schema_schemata_compat', '__duckgres_column_metadata'
 		  )
@@ -1611,6 +1638,7 @@ func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 			UNION
 			SELECT schema_oid, schema_name FROM duckdb_views() WHERE database_name = 'ducklake'
 		)
+		WHERE schema_name NOT LIKE '__ducklake_metadata_%'
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err

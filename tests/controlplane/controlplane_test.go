@@ -4,6 +4,7 @@ package controlplane_test
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -149,7 +150,7 @@ users:
 		configContent += fmt.Sprintf("flight_port: %d\n", flightPort)
 	}
 	if opts.maxWorkers > 0 {
-		configContent += fmt.Sprintf("max_workers: %d\n", opts.maxWorkers)
+		configContent += fmt.Sprintf("process:\n  max_workers: %d\n", opts.maxWorkers)
 	}
 	if err := os.WriteFile(configFile, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write config: %v", err)
@@ -229,6 +230,16 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
 }
 
+func (h *cpHarness) waitForLogCount(substr string, want int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Count(h.logBuf.String(), substr) >= want {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("log %q not found %d times after %v", substr, want, timeout)
+}
 
 func (h *cpHarness) cleanup(t *testing.T) {
 	t.Helper()
@@ -724,10 +735,16 @@ func TestUpgradeWithMaxWorkers(t *testing.T) {
 
 	h.doHandover(t)
 
-	// Verify new connections work after upgrade
+	// Verify new connections work after upgrade. The first post-handover
+	// query has to spawn and DuckDB-pre-warm a fresh worker process; on slow
+	// CI runners that easily exceeds the default lib/pq read deadline. Wrap
+	// the query in an explicit 60s context so we wait long enough for the
+	// worker to come up rather than racing the warmup.
 	db := h.openConn(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	var v int
-	if err := db.QueryRow("SELECT 42").Scan(&v); err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT 42").Scan(&v); err != nil {
 		t.Fatalf("Post-upgrade query failed: %v\nLogs:\n%s", err, h.logBuf.String())
 	}
 	if v != 42 {

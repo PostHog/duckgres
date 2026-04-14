@@ -149,22 +149,24 @@ const (
 )
 
 type clientConn struct {
-	server      *Server
-	conn        net.Conn
-	reader      *bufio.Reader
-	writer      *bufio.Writer
-	username    string
-	database    string
-	executor    QueryExecutor
-	pid         int32
-	secretKey   int32                    // unique key for cancel requests
-	stmts       map[string]*preparedStmt // prepared statements by name
-	portals     map[string]*portal       // portals by name
-	txStatus    byte                     // current transaction status ('I', 'T', or 'E')
-	passthrough bool                     // true for passthrough users (skip transpiler + pg_catalog)
-	cursors     map[string]*cursorState  // server-side cursor emulation
-	ctx         context.Context          // connection context, cancelled when connection is closed
-	cancel      context.CancelFunc       // cancels the connection context
+	server                *Server
+	conn                  net.Conn
+	reader                *bufio.Reader
+	writer                *bufio.Writer
+	username              string
+	orgID                 string
+	database              string
+	executor              QueryExecutor
+	pid                   int32
+	secretKey             int32                    // unique key for cancel requests
+	stmts                 map[string]*preparedStmt // prepared statements by name
+	portals               map[string]*portal       // portals by name
+	txStatus              byte                     // current transaction status ('I', 'T', or 'E')
+	passthrough           bool                     // true for passthrough users (skip transpiler + pg_catalog)
+	cursors               map[string]*cursorState  // server-side cursor emulation
+	logicalCatalogMapping bool                     // true when the session has an attached ducklake catalog and logical catalog masking is active
+	ctx                   context.Context          // connection context, cancelled when connection is closed
+	cancel                context.CancelFunc       // cancels the connection context
 
 	// sharedDB is true when this connection uses a shared file-persistence DB pool.
 	// Cleanup differs: we return the pinned conn to the pool instead of closing the DB.
@@ -174,6 +176,7 @@ type clientConn struct {
 	backendStart    time.Time    // when this connection started
 	applicationName string       // from startup params
 	currentQuery    atomic.Value // stores string — current/last query (lock-free)
+	queryStart      atomic.Value // stores time.Time — when current query started (lock-free)
 	workerID        int          // control plane worker ID, -1 for standalone
 }
 
@@ -181,6 +184,8 @@ type clientConn struct {
 func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
 	return transpiler.New(transpiler.Config{
 		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "",
+		LogicalDatabaseName: c.database,
+		PhysicalCatalogName: "ducklake",
 		ConvertPlaceholders: convertPlaceholders,
 	})
 }
@@ -198,6 +203,18 @@ func generateSecretKey() int32 {
 // backendKey returns the backend key for this connection, used for cancel requests.
 func (c *clientConn) backendKey() BackendKey {
 	return BackendKey{Pid: c.pid, SecretKey: c.secretKey}
+}
+
+func (c *clientConn) ensureConnectionContext() {
+	if c.ctx != nil && c.cancel != nil {
+		return
+	}
+
+	parent := c.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	c.ctx, c.cancel = context.WithCancel(parent)
 }
 
 // queryContext returns a cancellable context for query execution.
@@ -227,6 +244,7 @@ func (c *clientConn) queryContextForCursor() (context.Context, func()) {
 }
 
 func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
+	c.ensureConnectionContext()
 	ctx, cancel := context.WithCancel(c.ctx)
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
@@ -323,8 +341,62 @@ func isQueryCancelled(err error) bool {
 	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
 }
 
+// isDuckLakeTransactionConflict returns true if the error is a DuckLake
+// transaction conflict. These occur when concurrent DuckLake transactions
+// try to commit overlapping changes. DuckLake uses global snapshot IDs, so
+// even writes to unrelated tables can conflict under concurrency.
+func isDuckLakeTransactionConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Transaction conflict")
+}
+
+// isDuckLakeMetadataConnectionLost returns true if the error indicates the
+// DuckLake metadata store connection was lost during a transaction. This
+// typically happens when long-running queries leave the metadata connection
+// idle long enough for RDS or a network layer to drop it.
+func isDuckLakeMetadataConnectionLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "DuckLake transaction") &&
+		strings.Contains(msg, "SSL connection has been closed unexpectedly")
+}
+
+// classifyErrorCode returns the most appropriate PostgreSQL SQLSTATE for a
+// DuckDB error. Transaction conflicts get 40001 (serialization_failure), which
+// signals PG-aware clients to retry. Query cancellations get 57014.
+func classifyErrorCode(err error) string {
+	if isQueryCancelled(err) {
+		return "57014"
+	}
+	if isDuckLakeTransactionConflict(err) {
+		return "40001" // serialization_failure — client should retry
+	}
+	return "42000"
+}
+
+// logQueryError logs a query execution failure with additional context for
+// DuckLake-specific errors (transaction conflicts and metadata connection loss).
+func logQueryError(user, query string, err error) {
+	if isDuckLakeTransactionConflict(err) {
+		slog.Warn("DuckLake transaction conflict.",
+			"user", user, "query", query, "error", err)
+		return
+	}
+	if isDuckLakeMetadataConnectionLost(err) {
+		slog.Warn("DuckLake metadata connection lost during transaction.",
+			"user", user, "query", query, "error", err)
+		return
+	}
+	slog.Error("Query execution failed.", "user", user, "query", query, "error", err)
+}
+
 // isConnectionBroken checks if an error indicates a broken connection
-// (e.g., SSL connection closed, network error)
+// (e.g., SSL connection closed, network error).
 func isConnectionBroken(err error) bool {
 	if err == nil {
 		return false
@@ -391,8 +463,10 @@ func (c *clientConn) safeCleanupDB() {
 	// touches the metadata connection, not just ping the local DuckDB connection.
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	if c.server.cfg.DuckLake.MetadataStore != "" {
-		// Query DuckLake metadata to verify the RDS connection is still alive
-		_, err := c.executor.ExecContext(ctx, "SELECT 1 FROM ducklake.information_schema.schemata LIMIT 1")
+		// Probe the attached DuckLake catalog via DuckDB's catalog table function.
+		// This stays valid even though DuckLake does not expose an information_schema
+		// catalog that can be referenced as ducklake.information_schema.*.
+		_, err := c.executor.ExecContext(ctx, "SELECT 1 FROM duckdb_tables() WHERE database_name = 'ducklake' LIMIT 1")
 		if err != nil {
 			slog.Warn("DuckLake connection unhealthy during cleanup, skipping SQL cleanup.",
 				"user", c.username, "error", err)
@@ -553,7 +627,7 @@ func hasCommandPrefix(query, prefix string) bool {
 }
 
 func (c *clientConn) serve() error {
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.ensureConnectionContext()
 	defer c.cancel()
 
 	c.reader = bufio.NewReader(c.conn)
@@ -636,6 +710,22 @@ func (c *clientConn) serve() error {
 			stopRefresh()
 		}
 	}()
+
+	if !c.passthrough {
+		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := InitSessionDatabaseMetadata(initCtx, c.executor, c.database); err != nil {
+			initCancel()
+			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
+			return err
+		}
+		duckLakeAttached, err := hasAttachedCatalog(initCtx, c.executor, "ducklake")
+		initCancel()
+		if err != nil {
+			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect ducklake catalog attachment: %v", err))
+			return err
+		}
+		c.logicalCatalogMapping = duckLakeAttached
+	}
 
 	// Send initial parameters
 	c.sendInitialParams()
@@ -723,7 +813,7 @@ func (c *clientConn) handleStartup() error {
 
 		// Reject non-TLS connections
 		if !tlsUpgraded {
-			c.sendError("FATAL", "28000", "SSL/TLS connection required")
+			c.sendError("FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
 			return fmt.Errorf("client did not request SSL")
 		}
 
@@ -894,7 +984,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	c.currentQuery.Store(query)
-	defer c.currentQuery.Store("")
+	c.queryStart.Store(time.Now())
+	defer func() {
+		c.currentQuery.Store("")
+		c.queryStart.Store(time.Time{})
+	}()
 
 	start := time.Now()
 	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
@@ -1017,7 +1111,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	// Use the transpiled SQL
 	originalQuery := query
-	query = result.SQL
+	query = c.rewriteDirectQuery(result.SQL)
 
 	// Log the transpiled query if it differs from the original
 	if query != originalQuery {
@@ -1048,31 +1142,51 @@ func (c *clientConn) handleQuery(body []byte) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		execResult, err := c.executor.ExecContext(ctx, query)
-		if err != nil {
-			// Retry ALTER TABLE as ALTER VIEW if target is a view
-			if isAlterTableNotTableError(err) {
-				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
-					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
+		runExec := func() (ExecResult, error) {
+			execResult, err := c.executor.ExecContext(ctx, query)
+			if err != nil {
+				// Retry ALTER TABLE as ALTER VIEW if target is a view
+				if isAlterTableNotTableError(err) {
+					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
+						return c.executor.ExecContext(ctx, alteredQuery)
+					}
+				}
+				// Retry DROP TABLE as DROP VIEW if target is a view
+				if isDropTableOnViewError(err) {
+					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
+						return c.executor.ExecContext(ctx, alteredQuery)
+					}
 				}
 			}
-			// Retry DROP TABLE as DROP VIEW if target is a view
-			if isDropTableOnViewError(err) {
-				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
-					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
-				}
+			return execResult, err
+		}
+
+		execResult, err := runExec()
+		if err != nil {
+			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+				ducklakeConflictTotal.Inc()
+				execResult, err = retryOnConflict(runExec)
 			}
 			if err != nil {
-				errCode := "42000"
+				execResult, err, _ = recoverAbortedTransaction(
+					err,
+					c.txStatus == txStatusIdle,
+					func() error {
+						_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+						return rollbackErr
+					},
+					runExec,
+				)
+			}
+			if err != nil {
+				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if isQueryCancelled(err) {
-					errCode = "57014"
 					errMsg = "canceling statement due to user request"
-					c.sendError("ERROR", errCode, errMsg)
 				} else {
-					slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
-					c.sendError("ERROR", errCode, errMsg)
+					logQueryError(c.username, query, err)
 				}
+				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
 				c.logQuery(start, originalQuery, query, cmdType, 0, 0, errCode, errMsg, "simple")
 				_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1118,14 +1232,37 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		result, err := c.executor.ExecContext(ctx, query)
+		runExec := func() (ExecResult, error) {
+			return c.executor.ExecContext(ctx, query)
+		}
+
+		result, err := runExec()
+		if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+			ducklakeConflictTotal.Inc()
+			result, err = retryOnConflict(runExec)
+		}
 		if err != nil {
+			result, err, _ = recoverAbortedTransaction(
+				err,
+				c.txStatus == txStatusIdle,
+				func() error {
+					_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+					return rollbackErr
+				},
+				func() (ExecResult, error) {
+					return c.executor.ExecContext(ctx, query)
+				},
+			)
+		}
+		if err != nil {
+			errCode := classifyErrorCode(err)
+			errMsg := err.Error()
 			if isQueryCancelled(err) {
-				c.sendError("ERROR", "57014", "canceling statement due to user request")
+				errMsg = "canceling statement due to user request"
 			} else {
-				slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
-				c.sendError("ERROR", "42000", err.Error())
+				logQueryError(c.username, query, err)
 			}
+			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
@@ -1144,6 +1281,59 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 	return err
 }
 
+func (c *clientConn) rewriteDirectQuery(query string) string {
+	if c == nil || c.server == nil || c.passthrough || !c.logicalCatalogMapping || strings.TrimSpace(c.database) == "" {
+		return query
+	}
+
+	stripped := strings.TrimSpace(stripLeadingComments(query))
+	if stripped == "" {
+		return query
+	}
+
+	hasSemicolon := strings.HasSuffix(stripped, ";")
+	trimmed := strings.TrimSpace(strings.TrimSuffix(stripped, ";"))
+	if strings.EqualFold(trimmed, "SHOW DATABASES") {
+		rewritten := "SELECT current_database() AS database_name"
+		if hasSemicolon {
+			rewritten += ";"
+		}
+		return rewritten
+	}
+
+	if len(trimmed) < len("USE") || !strings.EqualFold(trimmed[:len("USE")], "USE") {
+		return query
+	}
+
+	target := strings.TrimSpace(trimmed[len("USE"):])
+	if target == "" {
+		return query
+	}
+
+	unquoted := target
+	quoteResult := false
+	if len(target) >= 2 && target[0] == '"' && target[len(target)-1] == '"' {
+		unquoted = strings.ReplaceAll(target[1:len(target)-1], `""`, `"`)
+		quoteResult = true
+	}
+
+	if !strings.EqualFold(unquoted, c.database) {
+		return query
+	}
+
+	physicalCatalog := "ducklake"
+	replacement := physicalCatalog
+	if quoteResult {
+		replacement = `"` + strings.ReplaceAll(physicalCatalog, `"`, `""`) + `"`
+	}
+
+	rewritten := "USE " + replacement
+	if hasSemicolon {
+		rewritten += ";"
+	}
+	return rewritten
+}
+
 // executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.
 // Returns the number of rows sent, any SQLSTATE+message sent to the client,
@@ -1152,18 +1342,37 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	rows, err := c.executor.QueryContext(ctx, query)
+	runQuery := func() (RowSet, error) {
+		return c.executor.QueryContext(ctx, query)
+	}
+
+	rows, err := runQuery()
+	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+		ducklakeConflictTotal.Inc()
+		rows, err = retryOnConflict(runQuery)
+	}
 	if err != nil {
-		errCode := "42000"
+		rows, err, _ = recoverAbortedTransaction(
+			err,
+			c.txStatus == txStatusIdle,
+			func() error {
+				_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (RowSet, error) {
+				return c.executor.QueryContext(ctx, query)
+			},
+		)
+	}
+	if err != nil {
+		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			errCode = "57014"
 			errMsg = "canceling statement due to user request"
-			c.sendError("ERROR", errCode, errMsg)
 		} else {
-			slog.Error("Query execution failed.", "user", c.username, "query", query, "error", err)
-			c.sendError("ERROR", errCode, errMsg)
+			logQueryError(c.username, query, err)
 		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
@@ -1290,6 +1499,8 @@ func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error
 // client (so the caller can stop processing a batch), or (false, err) for
 // fatal connection errors.
 func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalErr error) {
+	start := time.Now()
+
 	// Check for cursor operations before transpilation
 	tree, parseErr := pg_query.Parse(query)
 	if parseErr == nil && len(tree.Stmts) == 1 {
@@ -1467,7 +1678,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return true, nil
 	}
 
-	executedQuery := result.SQL
+	executedQuery := c.rewriteDirectQuery(result.SQL)
 	if executedQuery != query {
 		slog.Debug("Query transpiled.", "user", c.username, "executed", executedQuery)
 	}
@@ -1491,33 +1702,63 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		execResult, err := c.executor.ExecContext(ctx, executedQuery)
-		if err != nil {
-			if isAlterTableNotTableError(err) {
-				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
-					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
+		runExec := func() (ExecResult, error) {
+			execResult, err := c.executor.ExecContext(ctx, executedQuery)
+			if err != nil {
+				if isAlterTableNotTableError(err) {
+					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(executedQuery); ok {
+						return c.executor.ExecContext(ctx, alteredQuery)
+					}
+				}
+				if isDropTableOnViewError(err) {
+					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
+						return c.executor.ExecContext(ctx, alteredQuery)
+					}
 				}
 			}
-			if isDropTableOnViewError(err) {
-				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(executedQuery); ok {
-					execResult, err = c.executor.ExecContext(ctx, alteredQuery)
-				}
+			return execResult, err
+		}
+
+		execResult, err := runExec()
+		if err != nil {
+			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+				ducklakeConflictTotal.Inc()
+				execResult, err = retryOnConflict(runExec)
 			}
 			if err != nil {
+				execResult, err, _ = recoverAbortedTransaction(
+					err,
+					c.txStatus == txStatusIdle,
+					func() error {
+						_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+						return rollbackErr
+					},
+					runExec,
+				)
+			}
+			if err != nil {
+				errCode := classifyErrorCode(err)
+				errMsg := err.Error()
 				if isQueryCancelled(err) {
-					c.sendError("ERROR", "57014", "canceling statement due to user request")
+					errMsg = "canceling statement due to user request"
 				} else {
-					slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
-					c.sendError("ERROR", "42000", err.Error())
+					logQueryError(c.username, executedQuery, err)
 				}
+				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
+				c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
 				return true, nil
 			}
 		}
 
+		var writtenRows int64
+		if execResult != nil {
+			writtenRows, _ = execResult.RowsAffected()
+		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = writeCommandComplete(c.writer, tag)
+		c.logQuery(start, query, executedQuery, cmdType, 0, writtenRows, "", "", "simple-batch")
 		return false, nil
 	}
 
@@ -1525,15 +1766,37 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	rows, err := c.executor.QueryContext(ctx, executedQuery)
+	runQuery := func() (RowSet, error) {
+		return c.executor.QueryContext(ctx, executedQuery)
+	}
+
+	rows, err := runQuery()
+	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+		ducklakeConflictTotal.Inc()
+		rows, err = retryOnConflict(runQuery)
+	}
 	if err != nil {
+		rows, err, _ = recoverAbortedTransaction(
+			err,
+			c.txStatus == txStatusIdle,
+			func() error {
+				_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			runQuery,
+		)
+	}
+	if err != nil {
+		errCode := classifyErrorCode(err)
+		errMsg := err.Error()
 		if isQueryCancelled(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+			errMsg = "canceling statement due to user request"
 		} else {
-			slog.Error("Query execution failed.", "user", c.username, "query", executedQuery, "error", err)
-			c.sendError("ERROR", "42000", err.Error())
+			logQueryError(c.username, executedQuery, err)
 		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
+		c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
 		return true, nil
 	}
 	defer func() { _ = rows.Close() }()
@@ -1584,6 +1847,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = writeCommandComplete(c.writer, tag)
+	c.logQuery(start, query, executedQuery, cmdType, int64(rowCount), 0, "", "", "simple-batch")
 	return false, nil
 }
 
@@ -2750,7 +3014,7 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 	// STRICT_MODE FALSE allows reading rows that don't strictly comply with CSV standard
 	// PARALLEL FALSE avoids "Parallel CSV Reader does not support full read" errors
 	// on files streamed from COPY FROM STDIN (temp files with no seek support for sniffing)
-	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE", "PARALLEL FALSE"}
+	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE", "PARALLEL FALSE", "MAX_LINE_SIZE 10485760"}
 	if opts.HasHeader {
 		copyOptions = append(copyOptions, "HEADER")
 	}
@@ -3141,6 +3405,20 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 		return c.handleCopyInBinary(query, opts, cols, colTypes)
 	}
 
+	// Check for BLOB columns. DuckDB's CSV parser cannot handle raw binary data
+	// in BLOB columns — it auto-detects the type but fails to parse the bytes.
+	// Fall back to in-process CSV parsing with batched INSERT for these tables.
+	var blobColIndices []int
+	for i, ct := range colTypes {
+		if ct.DatabaseTypeName() == "BLOB" {
+			blobColIndices = append(blobColIndices, i)
+		}
+	}
+	if len(blobColIndices) > 0 {
+		slog.Debug("COPY FROM STDIN: table has BLOB columns, using CSV parse fallback.", "user", c.username, "blob_columns", len(blobColIndices))
+		return c.handleCopyInCSVWithBlob(query, opts, cols, colTypes, blobColIndices)
+	}
+
 	// Send CopyInResponse
 	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
 		return err
@@ -3257,6 +3535,141 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			c.sendError("ERROR", "08P01", errMsg)
 			c.setTxError()
 			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "08P01", errMsg, "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+		}
+	}
+}
+
+// handleCopyInCSVWithBlob handles COPY FROM STDIN for tables that contain BLOB columns.
+// DuckDB's native CSV COPY cannot handle raw binary data in BLOB columns because it
+// auto-detects the type and fails to parse the bytes. This method parses the CSV in Go,
+// converts BLOB column values to []byte, and uses batched INSERT statements.
+func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions, cols []string, colTypes []ColumnTyper, blobColIndices []int) error {
+	copyStartTime := time.Now()
+
+	// Build a set for O(1) BLOB column index lookup
+	isBlobCol := make(map[int]bool, len(blobColIndices))
+	for _, idx := range blobColIndices {
+		isBlobCol[idx] = true
+	}
+
+	// Send CopyInResponse (text format)
+	if err := writeCopyInResponse(c.writer, int16(len(cols)), true); err != nil {
+		return err
+	}
+	_ = c.writer.Flush()
+
+	// Buffer all CopyData messages into memory (we need to parse CSV, not stream to file)
+	var buf bytes.Buffer
+	for {
+		msgType, body, err := readMessage(c.reader)
+		if err != nil {
+			return err
+		}
+
+		switch msgType {
+		case msgCopyData:
+			// Skip end-of-data marker
+			if (len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
+				(len(body) == 2 && body[0] == '\\' && body[1] == '.') {
+				continue
+			}
+			buf.Write(body)
+
+		case msgCopyDone:
+			dataReceiveElapsed := time.Since(copyStartTime)
+			slog.Debug("COPY FROM STDIN (BLOB fallback) CopyDone received.", "user", c.username, "bytes", buf.Len(), "duration", dataReceiveElapsed)
+
+			// Parse CSV from the buffered data
+			csvReader := csv.NewReader(&buf)
+			csvReader.Comma = rune(opts.Delimiter[0])
+			csvReader.LazyQuotes = true
+
+			// Skip header row if present
+			if opts.HasHeader {
+				if _, err := csvReader.Read(); err != nil {
+					errMsg := fmt.Sprintf("COPY failed: error reading CSV header: %v", err)
+					c.sendError("ERROR", "22P02", errMsg)
+					c.setTxError()
+					c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
+					_ = writeReadyForQuery(c.writer, c.txStatus)
+					_ = c.writer.Flush()
+					return nil
+				}
+			}
+
+			// Parse all rows and convert BLOB columns to []byte
+			var rows [][]interface{}
+			for {
+				record, err := csvReader.Read()
+				if err != nil {
+					break // EOF or error — stop reading
+				}
+				if len(record) != len(cols) {
+					slog.Warn("COPY FROM STDIN (BLOB fallback) skipping row with wrong field count.", "expected", len(cols), "got", len(record))
+					continue
+				}
+				row := make([]interface{}, len(cols))
+				for j, field := range record {
+					if field == opts.NullString {
+						row[j] = nil
+					} else if isBlobCol[j] {
+						row[j] = []byte(field)
+					} else {
+						row[j] = field
+					}
+				}
+				rows = append(rows, row)
+			}
+
+			if len(rows) == 0 {
+				_ = writeCommandComplete(c.writer, "COPY 0")
+				c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "", "", "simple")
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
+				return nil
+			}
+
+			loadStart := time.Now()
+			rowCount, err := c.batchInsertRows(opts.TableName, opts.ColumnList, cols, rows)
+			if err != nil {
+				slog.Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "user", c.username, "error", err)
+				errMsg := fmt.Sprintf("COPY failed: %v", err)
+				c.sendError("ERROR", "22P02", errMsg)
+				c.setTxError()
+				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
+				_ = writeReadyForQuery(c.writer, c.txStatus)
+				_ = c.writer.Flush()
+				return nil
+			}
+
+			totalElapsed := time.Since(copyStartTime)
+			loadElapsed := time.Since(loadStart)
+			slog.Info("COPY FROM STDIN (BLOB fallback) completed.", "user", c.username, "rows", rowCount, "total_duration", totalElapsed, "load_duration", loadElapsed)
+
+			_ = writeCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+			c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "", "", "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		case msgCopyFail:
+			errMsg := string(bytes.TrimRight(body, "\x00"))
+			exception := fmt.Sprintf("COPY failed: %s", errMsg)
+			c.sendError("ERROR", "57014", exception)
+			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
+			_ = writeReadyForQuery(c.writer, c.txStatus)
+			_ = c.writer.Flush()
+			return nil
+
+		default:
+			errMsg := fmt.Sprintf("unexpected message type during COPY: %c", msgType)
+			c.sendError("ERROR", "08P01", errMsg)
+			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", errMsg, "simple")
 			_ = writeReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
@@ -3993,6 +4406,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 	} else if severity == "ERROR" {
 		queryErrorsCounter.Inc()
 	}
+	slog.Debug("Sending error to client.", "user", c.username, "severity", severity, "code", code, "message", message)
 	_ = writeErrorResponse(c.writer, severity, code, message)
 	_ = c.writer.Flush()
 }
@@ -4172,8 +4586,8 @@ func (c *clientConn) handleParse(body []byte) {
 	delete(c.stmts, stmtName)
 
 	c.stmts[stmtName] = &preparedStmt{
-		query:             query,      // Keep original for logging and Describe
-		convertedQuery:    result.SQL, // Transpiled SQL for execution
+		query:             query,                            // Keep original for logging and Describe
+		convertedQuery:    c.rewriteDirectQuery(result.SQL), // Transpiled SQL for execution
 		paramTypes:        paramTypes,
 		numParams:         result.ParamCount,
 		isIgnoredSet:      result.IsIgnoredSet,
@@ -4556,7 +4970,11 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	c.currentQuery.Store(p.stmt.query)
-	defer c.currentQuery.Store("")
+	c.queryStart.Store(time.Now())
+	defer func() {
+		c.currentQuery.Store("")
+		c.queryStart.Store(time.Time{})
+	}()
 
 	// Handle cursor operations before normal execution
 	switch p.stmt.cursorOp {
@@ -4637,25 +5055,53 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 
 		// Non-result-returning query: use Exec with converted query
-		result, err := c.executor.Exec(convertedQuery, args...)
-		if err != nil {
-			// Retry ALTER TABLE as ALTER VIEW if target is a view
-			if isAlterTableNotTableError(err) {
-				if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(convertedQuery); ok {
-					result, err = c.executor.Exec(alteredQuery, args...)
+		runExec := func() (ExecResult, error) {
+			result, err := c.executor.Exec(convertedQuery, args...)
+			if err != nil {
+				// Retry ALTER TABLE as ALTER VIEW if target is a view
+				if isAlterTableNotTableError(err) {
+					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(convertedQuery); ok {
+						return c.executor.Exec(alteredQuery, args...)
+					}
+				}
+				// Retry DROP TABLE as DROP VIEW if target is a view
+				if isDropTableOnViewError(err) {
+					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(convertedQuery); ok {
+						return c.executor.Exec(alteredQuery, args...)
+					}
 				}
 			}
-			// Retry DROP TABLE as DROP VIEW if target is a view
-			if isDropTableOnViewError(err) {
-				if alteredQuery, ok := transpiler.ConvertDropTableToDropView(convertedQuery); ok {
-					result, err = c.executor.Exec(alteredQuery, args...)
-				}
+			return result, err
+		}
+
+		result, err := runExec()
+		if err != nil {
+			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+				ducklakeConflictTotal.Inc()
+				result, err = retryOnConflict(runExec)
 			}
 			if err != nil {
-				slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
-				c.sendError("ERROR", "42000", err.Error())
+				result, err, _ = recoverAbortedTransaction(
+					err,
+					c.txStatus == txStatusIdle,
+					func() error {
+						_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+						return rollbackErr
+					},
+					runExec,
+				)
+			}
+			if err != nil {
+				errCode := classifyErrorCode(err)
+				errMsg := err.Error()
+				if isQueryCancelled(err) {
+					errMsg = "canceling statement due to user request"
+				} else {
+					logQueryError(c.username, convertedQuery, err)
+				}
+				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
-				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+				c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 				return
 			}
 		}
@@ -4671,12 +5117,37 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	// Result-returning query: use Query with converted query
-	rows, err := c.executor.Query(convertedQuery, args...)
+	runQuery := func() (RowSet, error) {
+		return c.executor.Query(convertedQuery, args...)
+	}
+
+	rows, err := runQuery()
+	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+		ducklakeConflictTotal.Inc()
+		rows, err = retryOnConflict(runQuery)
+	}
 	if err != nil {
-		slog.Error("Query execution failed.", "user", c.username, "query", convertedQuery, "original_query", originalQuery, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		rows, err, _ = recoverAbortedTransaction(
+			err,
+			c.txStatus == txStatusIdle,
+			func() error {
+				_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			runQuery,
+		)
+	}
+	if err != nil {
+		errCode := classifyErrorCode(err)
+		errMsg := err.Error()
+		if isQueryCancelled(err) {
+			errMsg = "canceling statement due to user request"
+		} else {
+			logQueryError(c.username, convertedQuery, err)
+		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 		return
 	}
 	defer func() { _ = rows.Close() }()
@@ -5032,27 +5503,30 @@ var pgStatActivityColumns = []struct {
 	oid     int32
 	typSize int16
 }{
-	{"datid", 23, 4},             // int4
-	{"datname", 25, -1},          // text
-	{"pid", 23, 4},               // int4
-	{"usesysid", 23, 4},          // int4
-	{"usename", 25, -1},          // text
-	{"application_name", 25, -1}, // text
-	{"client_addr", 25, -1},      // text (inet in PG, text here)
-	{"client_port", 23, 4},       // int4
-	{"backend_start", 1184, 8},   // timestamptz
-	{"xact_start", 1184, 8},      // timestamptz (NULL)
-	{"query_start", 1184, 8},     // timestamptz (NULL)
-	{"state_change", 1184, 8},    // timestamptz (NULL)
-	{"wait_event_type", 25, -1},  // text (NULL)
-	{"wait_event", 25, -1},       // text (NULL)
-	{"state", 25, -1},            // text
-	{"backend_xid", 28, 4},       // xid (NULL)
-	{"backend_xmin", 28, 4},      // xid (NULL)
-	{"query", 25, -1},            // text
-	{"backend_type", 25, -1},     // text
-	{"leader_pid", 23, 4},        // int4 (NULL)
-	{"worker_id", 23, 4},         // int4 (duckgres extension)
+	{"datid", 23, 4},                 // int4
+	{"datname", 25, -1},              // text
+	{"pid", 23, 4},                   // int4
+	{"usesysid", 23, 4},              // int4
+	{"usename", 25, -1},              // text
+	{"application_name", 25, -1},     // text
+	{"client_addr", 25, -1},          // text (inet in PG, text here)
+	{"client_port", 23, 4},           // int4
+	{"backend_start", 1184, 8},       // timestamptz
+	{"xact_start", 1184, 8},          // timestamptz (NULL)
+	{"query_start", 1184, 8},         // timestamptz (NULL)
+	{"state_change", 1184, 8},        // timestamptz (NULL)
+	{"wait_event_type", 25, -1},      // text (NULL)
+	{"wait_event", 25, -1},           // text (NULL)
+	{"state", 25, -1},                // text
+	{"backend_xid", 28, 4},           // xid (NULL)
+	{"backend_xmin", 28, 4},          // xid (NULL)
+	{"query", 25, -1},                // text
+	{"backend_type", 25, -1},         // text
+	{"leader_pid", 23, 4},            // int4 (NULL)
+	{"worker_id", 23, 4},             // int4 (duckgres extension)
+	{"query_progress", 701, 8},       // float8 (percentage, -1 if not tracked)
+	{"rows_processed", 20, 8},        // int8
+	{"total_rows_to_process", 20, 8}, // int8
 }
 
 // pgStatActivityTypeOIDs is precomputed from pgStatActivityColumns to avoid per-row allocation.
@@ -5156,6 +5630,30 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		}
 	}
 
+	// query_start: populated from atomic.Value when a query is active.
+	var queryStart interface{}
+	if qs, ok := conn.queryStart.Load().(time.Time); ok && !qs.IsZero() {
+		queryStart = qs
+	}
+
+	// Query progress columns: populated from cached worker health check data
+	// (control plane mode) or nil (standalone mode).
+	var queryProgress, rowsProcessed, totalRowsToProcess interface{}
+	if c.server.progressFn != nil {
+		pct, rows, total, stalled := c.server.progressFn(conn.pid)
+		queryProgress = pct
+		rowsProcessed = int64(rows)
+		totalRowsToProcess = int64(total)
+		// Override state to "active (stuck)" when the worker detects no progress.
+		if stalled && state == "active" {
+			state = "active (stuck)"
+		}
+	} else {
+		queryProgress = float64(-1)
+		rowsProcessed = int64(0)
+		totalRowsToProcess = int64(0)
+	}
+
 	values := []interface{}{
 		int32(0),             // datid
 		conn.database,        // datname
@@ -5167,7 +5665,7 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		clientPort,           // client_port
 		conn.backendStart,    // backend_start
 		nil,                  // xact_start (NULL)
-		nil,                  // query_start (NULL)
+		queryStart,           // query_start
 		nil,                  // state_change (NULL)
 		nil,                  // wait_event_type (NULL)
 		nil,                  // wait_event (NULL)
@@ -5178,6 +5676,9 @@ func (c *clientConn) sendPgStatActivityDataRow(conn *clientConn, formatCodes []i
 		"client backend",     // backend_type
 		nil,                  // leader_pid (NULL)
 		int32(conn.workerID), // worker_id
+		queryProgress,        // query_progress (float8)
+		rowsProcessed,        // rows_processed (int8)
+		totalRowsToProcess,   // total_rows_to_process (int8)
 	}
 
 	return c.sendDataRowWithFormats(values, formatCodes, pgStatActivityTypeOIDs)
@@ -5469,15 +5970,31 @@ func (c *clientConn) handleCloseCursorExtended(p *portal) {
 // was attempted on a view. DuckDB returns this error when trying to use
 // ALTER TABLE ... RENAME TO on a view instead of ALTER VIEW.
 func isAlterTableNotTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "cannot use alter table") &&
-		strings.Contains(msg, "not a table")
+	if strings.Contains(msg, "cannot use alter table") &&
+		strings.Contains(msg, "not a table") {
+		return true
+	}
+
+	if strings.Contains(msg, "can only modify view with alter view statement") {
+		return true
+	}
+
+	return false
 }
 
 // isDropTableOnViewError checks if the error indicates that a DROP TABLE
 // was attempted on a view. DuckDB returns:
 // "Catalog Error: Existing object X is of type View, trying to drop type Table"
 func isDropTableOnViewError(err error) bool {
+	if err == nil {
+		return false
+	}
+
 	msg := err.Error()
 	return strings.Contains(msg, "is of type View") &&
 		strings.Contains(msg, "trying to drop type Table")

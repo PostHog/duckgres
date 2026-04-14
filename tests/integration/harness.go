@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -17,16 +18,19 @@ import (
 	_ "github.com/lib/pq"
 )
 
+var duckLakeInfraServices = []string{"ducklake-metadata", "minio", "minio-init"}
+
 // TestHarness manages PostgreSQL and Duckgres instances for side-by-side testing
 type TestHarness struct {
-	PostgresDB  *sql.DB
-	DuckgresDB  *sql.DB
-	duckgresSrv *server.Server
-	tmpDir      string
-	pgPort      int
-	dgPort      int
-	useDuckLake bool
-	mu          sync.Mutex
+	PostgresDB   *sql.DB
+	DuckgresDB   *sql.DB
+	duckgresSrv  *server.Server
+	latencyProxy *LatencyProxy
+	tmpDir       string
+	pgPort       int
+	dgPort       int
+	useDuckLake  bool
+	mu           sync.Mutex
 }
 
 // HarnessConfig configures the test harness
@@ -43,6 +47,10 @@ type HarnessConfig struct {
 	DuckLakeMetadataPort int
 	// MinIOPort is the port for MinIO S3 API (default: 39000)
 	MinIOPort int
+	// MetadataLatency adds artificial one-way latency between DuckDB/DuckLake
+	// and the metadata PostgreSQL via a TCP proxy. Total RTT overhead = 2x this value.
+	// Zero means no proxy (direct connection).
+	MetadataLatency time.Duration
 }
 
 // DefaultConfig returns the default harness configuration
@@ -140,8 +148,22 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Configure DuckLake if enabled
 	if harnessCfg.UseDuckLake {
+		metadataPort := harnessCfg.DuckLakeMetadataPort
+
+		// If latency injection is requested, start a TCP proxy in front of the
+		// metadata PostgreSQL and point DuckLake at the proxy port instead.
+		if harnessCfg.MetadataLatency > 0 {
+			target := fmt.Sprintf("127.0.0.1:%d", harnessCfg.DuckLakeMetadataPort)
+			proxy, err := NewLatencyProxy(target, harnessCfg.MetadataLatency)
+			if err != nil {
+				return fmt.Errorf("failed to start latency proxy: %w", err)
+			}
+			h.latencyProxy = proxy
+			metadataPort = proxy.Port()
+		}
+
 		cfg.DuckLake = server.DuckLakeConfig{
-			MetadataStore: fmt.Sprintf("postgres:host=127.0.0.1 port=%d user=ducklake password=ducklake dbname=ducklake", harnessCfg.DuckLakeMetadataPort),
+			MetadataStore: fmt.Sprintf("postgres:host=127.0.0.1 port=%d user=ducklake password=ducklake dbname=ducklake", metadataPort),
 			ObjectStore:   "s3://ducklake/data/",
 			S3Provider:    "config",
 			S3Endpoint:    fmt.Sprintf("127.0.0.1:%d", harnessCfg.MinIOPort),
@@ -282,6 +304,10 @@ func (h *TestHarness) loadPostgresFixtures() error {
 		return nil
 	}
 
+	if err := h.cleanupPostgresRuntimeSchemas(); err != nil {
+		return fmt.Errorf("failed to cleanup PostgreSQL runtime schemas: %w", err)
+	}
+
 	// Drop existing objects first (in reverse dependency order)
 	dropStatements := []string{
 		"DROP VIEW IF EXISTS order_details",
@@ -347,12 +373,59 @@ func (h *TestHarness) loadPostgresFixtures() error {
 	return nil
 }
 
+func (h *TestHarness) cleanupPostgresRuntimeSchemas() error {
+	rows, err := h.PostgresDB.Query(`
+		SELECT schema_name
+		FROM information_schema.schemata
+		WHERE schema_name = 'cp_runtime'
+			OR schema_name LIKE 'managed_warehouse\_%\_runtime' ESCAPE '\'
+	`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var schemas []string
+	for rows.Next() {
+		var schema string
+		if err := rows.Scan(&schema); err != nil {
+			return err
+		}
+		if isEphemeralPostgresRuntimeSchema(schema) {
+			schemas = append(schemas, schema)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, schema := range schemas {
+		if _, err := h.PostgresDB.Exec(`DROP SCHEMA IF EXISTS ` + quotePostgresIdentifier(schema) + ` CASCADE`); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func isEphemeralPostgresRuntimeSchema(schema string) bool {
+	return schema == "cp_runtime" || (strings.HasPrefix(schema, "managed_warehouse_") && strings.HasSuffix(schema, "_runtime"))
+}
+
+func quotePostgresIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
 // cleanupDuckLakeTables drops existing tables in DuckLake before loading fixtures
 func (h *TestHarness) cleanupDuckLakeTables() error {
+	// Tests may leave the session on a non-default catalog (e.g. USE memory).
+	// Force cleanup to run against the DuckLake catalog that holds persisted fixtures.
+	_, _ = h.DuckgresDB.Exec("USE ducklake")
+
 	// Drop views first (they depend on tables)
 	views := []string{"order_details", "user_stats", "active_users"}
 	for _, v := range views {
-		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", v))
+		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS ducklake.main.%s", v))
 	}
 
 	// Drop tables in reverse dependency order
@@ -450,15 +523,81 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		"concurrent_write_4",
 		"concurrent_ddl_test",
 		"concurrent_dml_test",
+		// DuckLake concurrency test tables
+		"dl_conc_insert",
+		"dl_conc_tx_insert",
+		"dl_conc_update",
+		"dl_conc_del",
+		"dl_conc_orders",
+		"dl_conc_items",
+		"dl_conc_rw",
+		"dl_conc_upsert",
+		"dl_conc_ddl_write",
+		"dl_conc_batch",
+		"dl_conc_rapid",
+		"dl_conc_rollback",
+		"dl_conc_sustained",
+		// DuckLake CTAS concurrency test tables
+		"dl_ctas_source",
+		"dl_cortas_source",
+		"dl_ctas_live_source",
+		"dl_replace_source_a",
+		"dl_replace_source_b",
+		"dl_replace_target",
+	}
+
+	// Also clean up dynamically-named tables from DuckLake concurrency lifecycle test
+	for w := range 4 {
+		for c := range 8 {
+			tables = append(tables, fmt.Sprintf("dl_conc_lifecycle_%d_%d", w, c))
+		}
+	}
+	for i := range 6 {
+		tables = append(tables, fmt.Sprintf("dl_conc_sep_%d", i))
+	}
+	// CTAS output tables
+	for w := range 8 {
+		for c := range 10 {
+			tables = append(tables, fmt.Sprintf("dl_ctas_out_%d_%d", w, c))
+		}
+	}
+	// CTAS snapshot tables
+	for i := range 20 {
+		tables = append(tables, fmt.Sprintf("dl_ctas_snapshot_%d", i))
+	}
+	// CREATE OR REPLACE target tables
+	for i := range 4 {
+		tables = append(tables, fmt.Sprintf("dl_cortas_target_%d", i))
+	}
+	// SQLMesh CTAS reproduction tables
+	tables = append(tables, "dl_sqlmesh_source", "dl_sqlmesh_raw", "dl_sqlmesh_comment_src")
+	for i := range 30 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_cmt_%d", i))
+	}
+	for i := range 30 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_model_%d", i))
+	}
+	for i := range 5 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_t1_%d", i))
+	}
+	for i := range 6 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_t2_%d", i))
 	}
 
 	for _, t := range tables {
 		// Ignore errors - table might not exist or schema might not exist
-		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t))
+		objectName := fmt.Sprintf("ducklake.main.%s", t)
+		if strings.Contains(t, ".") {
+			objectName = "ducklake." + t
+		}
+		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", objectName))
 	}
 
-	// Drop test schema
-	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS test_schema")
+	// Drop test schemas after contained objects have been removed.
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.test_schema CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.bill CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.ddl_schema_test CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.dbt_test CASCADE")
 
 	return nil
 }
@@ -488,6 +627,12 @@ func (h *TestHarness) Close() error {
 		}
 	}
 
+	if h.latencyProxy != nil {
+		if err := h.latencyProxy.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close latency proxy: %w", err))
+		}
+	}
+
 	if h.tmpDir != "" {
 		if err := os.RemoveAll(h.tmpDir); err != nil {
 			errs = append(errs, fmt.Errorf("failed to remove temp dir: %w", err))
@@ -500,13 +645,26 @@ func (h *TestHarness) Close() error {
 	return nil
 }
 
-// StartPostgresContainer starts the PostgreSQL Docker container
-func StartPostgresContainer() error {
+func dockerComposeArgs(composeFile string, command string, args ...string) []string {
+	composeArgs := []string{"-f", composeFile, command}
+	return append(composeArgs, args...)
+}
+
+func runDockerCompose(command string, args ...string) error {
 	testDir := getTestDir()
-	cmd := exec.Command("docker-compose", "-f", filepath.Join(testDir, "docker-compose.yml"), "up", "-d")
+	composeFile := filepath.Join(testDir, "docker-compose.yml")
+	cmd := exec.Command("docker-compose", dockerComposeArgs(composeFile, command, args...)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker-compose %s %s: %w", command, strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+// StartPostgresContainer starts only the PostgreSQL comparison container.
+func StartPostgresContainer() error {
+	if err := runDockerCompose("up", "-d", "postgres"); err != nil {
 		return fmt.Errorf("failed to start PostgreSQL container: %w", err)
 	}
 
@@ -515,10 +673,18 @@ func StartPostgresContainer() error {
 	return nil
 }
 
+// StartDuckLakeInfraContainers starts the local DuckLake metadata/object-store services.
+func StartDuckLakeInfraContainers() error {
+	if err := runDockerCompose("up", append([]string{"-d"}, duckLakeInfraServices...)...); err != nil {
+		return fmt.Errorf("failed to start DuckLake infrastructure: %w", err)
+	}
+	return nil
+}
+
 // StopPostgresContainer stops the PostgreSQL Docker container
 func StopPostgresContainer() error {
 	testDir := getTestDir()
-	cmd := exec.Command("docker-compose", "-f", filepath.Join(testDir, "docker-compose.yml"), "down", "-v")
+	cmd := exec.Command("docker-compose", dockerComposeArgs(filepath.Join(testDir, "docker-compose.yml"), "down", "-v")...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Run()
@@ -580,27 +746,11 @@ func findAvailablePort() int {
 }
 
 func getTestDir() string {
-	// Get the directory of this source file
-	_, filename, _, ok := getCallerInfo()
+	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		return "tests/integration"
 	}
 	return filepath.Dir(filename)
-}
-
-func getCallerInfo() (pc uintptr, file string, line int, ok bool) {
-	// This is a placeholder - in real code we'd use runtime.Caller
-	// For now, we'll use a relative path approach
-	cwd, _ := os.Getwd()
-	// Check if we're in the integration directory
-	if _, err := os.Stat(filepath.Join(cwd, "docker-compose.yml")); err == nil {
-		return 0, filepath.Join(cwd, "harness.go"), 0, true
-	}
-	// Check if we're in the project root
-	if _, err := os.Stat(filepath.Join(cwd, "tests", "integration", "docker-compose.yml")); err == nil {
-		return 0, filepath.Join(cwd, "tests", "integration", "harness.go"), 0, true
-	}
-	return 0, "", 0, false
 }
 
 func splitSQLStatements(sql string) []string {

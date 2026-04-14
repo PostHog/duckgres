@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
+
+const DefaultK8sWorkerServiceAccount = "duckgres-worker"
 
 // WorkerPool abstracts the lifecycle and scheduling of Flight SQL workers.
 // Two implementations exist:
@@ -32,8 +36,13 @@ type WorkerPool interface {
 	SpawnMinWorkers(count int) error
 
 	// HealthCheckLoop runs periodic health checks on all workers.
-	// onCrash handlers are called when a worker crash is detected.
-	HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash ...WorkerCrashHandler)
+	// onCrash is called when a worker crash is detected.
+	// onProgress is called with per-session progress data after each successful check.
+	// Either callback may be nil.
+	HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler)
+
+	// SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
+	SetMaxWorkers(n int)
 
 	// ShutdownAll stops all workers gracefully.
 	ShutdownAll()
@@ -41,17 +50,38 @@ type WorkerPool interface {
 
 // K8sWorkerPoolConfig holds the configuration for creating a K8sWorkerPool.
 type K8sWorkerPoolConfig struct {
-	Namespace       string
-	CPID            string // Control plane pod name, used in labels
-	WorkerImage     string
-	WorkerPort      int
-	SecretName      string // K8s Secret name containing bearer token
-	ConfigMap       string // ConfigMap name for duckgres.yaml
-	MaxWorkers      int
-	IdleTimeout     time.Duration
-	ConfigPath      string // Path inside worker pod where config is mounted
-	ImagePullPolicy string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	MemoryBudget    int64  // Total memory budget in bytes; used to derive per-worker resource limits
+	Namespace             string
+	CPID                  string // Control plane pod name, used in labels
+	CPInstanceID          string // Durable control-plane instance ID (<pod_uid>:<boot_id>)
+	WorkerImage           string
+	WorkerPort            int
+	SecretName            string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	ConfigMap             string // ConfigMap name for duckgres.yaml
+	MaxWorkers            int
+	IdleTimeout           time.Duration
+	ConfigPath            string            // Path inside worker pod where config is mounted
+	ImagePullPolicy       string            // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount        string            // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
+	WorkerCPURequest      string            // CPU request for worker pods (e.g., "500m"). Empty = BestEffort.
+	WorkerMemoryRequest   string            // Memory request for worker pods (e.g., "1Gi"). Empty = BestEffort.
+	WorkerNodeSelector    map[string]string // Node selector for worker pods. Nil = no selector.
+	WorkerTolerationKey   string            // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
+	WorkerTolerationValue string            // Taint value for worker pod NoSchedule toleration.
+	WorkerExclusiveNode   bool              // One worker per node via pod anti-affinity.
+	OrgID                 string            // Org ID for pod labels (multi-tenant mode)
+	WorkerIDGenerator     func() int        // Shared ID generator across orgs (nil = internal counter)
+	RuntimeStore          RuntimeWorkerStore
+}
+
+type RuntimeWorkerStore interface {
+	UpsertWorkerRecord(record *configstore.WorkerRecord) error
+	ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, error)
+	ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, error)
+	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
+	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
+	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
+	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
+	RetireIdleWorker(workerID int, reason string) (bool, error)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

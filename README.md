@@ -82,12 +82,16 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 - `scripts/test_metrics.sh` - Runs a quick sanity check (starts server, runs queries, verifies counts)
 - `scripts/load_generator.sh` - Generates continuous query load until Ctrl-C
 - `scripts/perf_smoke.sh` - Runs the golden-query perf harness and writes artifacts to `artifacts/perf/<run_id>`
-- `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact upload hook
+- `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact publisher
 - `metrics-compose.yml` - Starts Prometheus and Grafana locally for metrics (Prometheus at http://localhost:9091, Grafana at http://localhost:3000)
 
 ## Perf Runbook
 
-See [docs/perf-harness-runbook.md](docs/perf-harness-runbook.md) and [tests/perf/README.md](tests/perf/README.md) for local smoke and nightly operations.
+See [docs/perf-harness-runbook.md](docs/perf-harness-runbook.md) and [tests/perf/README.md](tests/perf/README.md) for local smoke and nightly operations, including:
+
+- Prod-us perf runner and Duckling topology
+- `duckgres_perf.query_results` publish path in `duckling-posthog`
+- Perf CSV artifact schema contract (`query_results.csv`)
 
 ## Quick Start
 
@@ -195,6 +199,8 @@ Run with config file:
 | `DUCKGRES_THREADS` | DuckDB threads per session | `runtime.NumCPU()` |
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
+| `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
+| `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
@@ -242,8 +248,8 @@ Options:
   -process-isolation       Enable process isolation (spawn child process per connection)
   -idle-timeout string     Connection idle timeout (e.g., '30m', '1h', '-1' to disable)
   -mode string             Run mode: standalone (default), control-plane, or duckdb-service
-  -min-workers int         Pre-warm worker count at startup (control-plane mode, default 0)
-  -max-workers int         Max worker processes, 0=unlimited (control-plane mode)
+  -process-min-workers int Pre-warm process worker count at startup (control-plane mode, default 0)
+  -process-max-workers int Max process workers, 0=auto-derived (control-plane mode)
   -memory-budget string    Total memory for all DuckDB sessions (e.g., '24GB')
   -socket-dir string       Unix socket directory (control-plane mode)
   -handover-socket string  Handover socket for graceful deployment (control-plane mode)
@@ -562,8 +568,8 @@ Start in control-plane mode:
 # Enable Flight SQL ingress for Duckhog-compatible clients
 ./duckgres --mode control-plane --port 5432 --flight-port 8815
 
-# Pre-warm 2 workers and cap at 10
-./duckgres --mode control-plane --port 5432 --min-workers 2 --max-workers 10
+# Pre-warm 2 process workers and cap at 10
+./duckgres --mode control-plane --port 5432 --process-min-workers 2 --process-max-workers 10
 
 # Connect with psql (identical to standalone mode)
 PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"
@@ -593,17 +599,29 @@ kill -USR2 <control-plane-pid>
 
 ### Remote Worker Backend
 
-In Kubernetes environments, the control plane can spawn worker pods instead of local processes using `--worker-backend remote`. The control plane creates worker pods via the Kubernetes API, communicates with them over gRPC (Arrow Flight SQL), and uses owner references for automatic garbage collection when the control plane pod is deleted.
+In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may reconnect with a durable session token if the worker survives and the token is still valid.
+
+When a shared warm-worker target is configured (`--k8s-shared-warm-target`), the pool keeps workers neutral at startup, reserves them per org, activates tenant runtime over the activation RPC, and retires them after use. The full lifecycle is: idle → reserved → activating → hot → draining → retired.
 
 ```bash
-# Build with Kubernetes support
-docker build --build-arg BUILD_TAGS=kubernetes -t duckgres:latest .
-
-# Deploy
-kubectl apply -f k8s/
+# Local multitenant K8s workflow
+just run-multitenant-kind
 ```
 
-See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and local development instructions using OrbStack.
+See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and the default local kind workflow via `just run-multitenant-kind`. The older OrbStack path remains available through `just run-multitenant-local` for manual macOS iteration.
+
+On the multi-tenant path, the config store now keeps per-team managed-warehouse metadata in addition to team/user auth and limits. That team-scoped contract is intended to become the source of truth for the tenant warehouse DB, the tenant DuckLake metadata store (which may live on shared Aurora or a dedicated RDS instance), object-store settings, worker identity, secret references, and provisioning state. The older config-store `DuckLakeConfig` singleton remains only as a legacy cluster-wide setting and should not be treated as authoritative for multi-tenant runtime wiring.
+
+The shared K8s pool keeps workers neutral at startup, reserves them per org, activates tenant runtime over the control-plane RPC channel, and retires them after use.
+
+Managed-warehouse contract notes:
+
+- At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
+- The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
+- The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared warm mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.
+- Secret references only are stored in the config store. Secret material remains outside the database.
+- The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.
+- Those state fields are open strings. Canonical values are `pending`, `provisioning`, `ready`, `failed`, `deleting`, and `deleted`, but callers may persist other values while workflows evolve.
 
 ## Two-Tier Query Processing
 

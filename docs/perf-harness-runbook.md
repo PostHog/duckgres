@@ -40,7 +40,7 @@ DUCKGRES_PERF_FLIGHT_ADDR="127.0.0.1:50051" \
 ./scripts/perf_smoke.sh
 ```
 
-4. Inspect `artifacts/perf/<run_id>/summary.json`, `query_results.csv`, and (for frozen dataset mode) `dataset_manifest.json`.
+4. Inspect `artifacts/perf/<run_id>/summary.json`, `query_results.csv`, and (for frozen dataset mode) `dataset_manifest.json`. The harness writes and validates the frozen dataset metadata artifact before publishing.
 
 If `:9095` is already in use, run the harness directly with a different metrics address:
 
@@ -56,7 +56,8 @@ go test ./tests/perf \
 
 The perf runner is configured by code in `posthog-cloud-infra`:
 
-- Terraform creates `duckling-perf-runner`, `duckling-perf-duckgres`, and perf artifact bucket resources.
+- Terraform creates `duckling-perf-runner` and `duckling-perf-duckgres` in `aws-accnt-managed-warehouse-prod-us`.
+- Nightly result publishing writes the canonical `query_results.csv` artifact into `duckling-posthog` schema `duckgres_perf`.
 - Ansible role `ansible/roles/perf_runner` installs the runner script plus a systemd timer.
 
 From `posthog-cloud-infra` repository root, configure the runner:
@@ -86,37 +87,90 @@ GitHub Actions equivalents in `posthog-cloud-infra`:
 
 Provision and update AWS resources through `posthog-cloud-infra` (Terraform/Terragrunt), not ad-hoc AWS CLI scripts.
 
-Use the managed warehouse stack:
+Use the prod-us managed warehouse stacks:
 
-- `terraform/environments/aws-accnt-managed-warehouse/us-east-1/duckling-example`
+- `terraform/environments/aws-accnt-managed-warehouse-prod-us/us-east-1/duckling-perf`
+- `terraform/environments/aws-accnt-managed-warehouse-prod-us/us-east-1/duckling-perf-runner`
 
 From the `posthog-cloud-infra` repository root:
 
 ```bash
 set -euo pipefail
 
-STACK_DIR="terraform/environments/aws-accnt-managed-warehouse/us-east-1/duckling-example"
-cd "$STACK_DIR"
+terragrunt run-all plan \
+  --working-dir terraform/environments/aws-accnt-managed-warehouse-prod-us/us-east-1 \
+  --queue-include-dir duckling-perf \
+  --queue-include-dir duckling-perf-runner
 
-terragrunt plan
-terragrunt apply
+terragrunt run-all apply \
+  --working-dir terraform/environments/aws-accnt-managed-warehouse-prod-us/us-east-1 \
+  --queue-include-dir duckling-perf \
+  --queue-include-dir duckling-perf-runner
 ```
 
-After apply, retrieve the perf-harness connection/storage values from Terragrunt outputs:
+After apply, configure Duckgres and the perf runner from the same `posthog-cloud-infra` repo:
 
 ```bash
-set -euo pipefail
+ansible-playbook ansible/duckgres-setup-playbook.yml \
+  -i ansible/hosts/duckgres.yml \
+  -e "target_hosts=managed_warehouse_prod_us_perf"
 
-RDS_ENDPOINT="$(terragrunt output -raw rds_endpoint)"
-DUCKLAKE_BUCKET="$(terragrunt output -raw bucket_name)"
-PERF_ARTIFACTS_ROOT_URI="$(terragrunt output -raw perf_artifacts_root_uri)"
-
-echo "RDS endpoint: ${RDS_ENDPOINT}"
-echo "DuckLake object store bucket: s3://${DUCKLAKE_BUCKET}/data/"
-echo "Perf artifacts root URI: ${PERF_ARTIFACTS_ROOT_URI}"
+ansible-playbook ansible/perf-runner-setup-playbook.yml \
+  -i ansible/hosts/duckgres.yml \
+  -e "target_hosts=managed_warehouse_perf_runner"
 ```
 
-Use `PERF_ARTIFACTS_ROOT_URI` for publishing nightly run artifacts (for example `.../perf-runs/<run_id>/`).
+This configures:
+
+- benchmark target: `duckling-perf-duckgres`
+- writer target: `duckling-posthog-duckgres`
+- publish table: `duckgres_perf.query_results`
+
+## Publish Path Contract (v2)
+
+Nightly runs still emit canonical local artifacts under:
+
+`artifacts/perf/<run_id>/`
+
+When publisher config is set, the perf harness publishes `query_results.csv` into:
+
+`duckgres_perf.query_results`
+
+on `duckling-posthog` over PGWire.
+
+Rows are stored with:
+
+- `run_id`
+- `query_id`
+- `intent_id`
+- `protocol`
+- `status`
+- `error`
+- `error_class`
+- `rows`
+- `duration_ms`
+- `started_at`
+- `dataset_version`
+- `run_date`
+
+The source CSV schema is fixed to:
+
+`query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at`
+
+`summary.json` remains a local run artifact and is also consumed by the publisher to populate run-level dashboard metadata.
+For frozen runs, `dataset_manifest.json` is written and validated by the harness before publisher writes begin.
+
+Publisher configuration:
+
+- `DUCKGRES_PERF_PUBLISH_DSN`
+- `DUCKGRES_PERF_PUBLISH_PASSWORD`
+- `DUCKGRES_PERF_PUBLISH_SCHEMA`
+- `DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA`
+
+## Grafana
+
+The repo-managed dashboard now lives in `posthog-cloud-infra` prod-us Grafana and queries
+`duckgres_perf.query_results` through the manually created `posthog-duckling` datasource.
 
 ## Frozen Dataset Bootstrap
 

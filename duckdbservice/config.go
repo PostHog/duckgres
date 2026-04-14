@@ -29,6 +29,10 @@ type ServiceConfig struct {
 
 	// MaxSessions limits the number of concurrent sessions. 0 means unlimited.
 	MaxSessions int
+
+	// RequireActivation forces shared warm workers to receive tenant runtime
+	// over the control-plane activation RPC before they may serve sessions.
+	RequireActivation bool
 }
 
 // ParseListenAddr parses ListenAddr into a network and address for net.Listen.

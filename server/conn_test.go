@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"encoding/csv"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1387,6 +1389,152 @@ func (e *queryErrorExecutor) PingContext(context.Context) error {
 }
 func (e *queryErrorExecutor) Close() error { return nil }
 
+type abortedSelectRecoveryExecutor struct {
+	queryCalls    int
+	rollbackCalls int
+}
+
+func (e *abortedSelectRecoveryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	e.queryCalls++
+	if e.queryCalls == 1 {
+		return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+	}
+	return &staticCountRowSet{count: 1}, nil
+}
+
+func (e *abortedSelectRecoveryExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
+	if strings.TrimSpace(strings.ToUpper(query)) == "ROLLBACK" {
+		e.rollbackCalls++
+		return &fakeExecResult{}, nil
+	}
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) Exec(string, ...any) (ExecResult, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) Close() error { return nil }
+
+type abortedExecAlterViewRecoveryExecutor struct {
+	originalQuery string
+	rewritten     string
+	execCalls     []string
+	execCtxCalls  []string
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) execResult(query string, callIndex int) (ExecResult, error) {
+	trimmed := strings.TrimSpace(query)
+	switch trimmed {
+	case "ROLLBACK":
+		return &fakeExecResult{}, nil
+	case e.originalQuery:
+		if callIndex == 1 {
+			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		}
+		return nil, errors.New("Binder Error: cannot use alter table on a view because this object is not a table; use ALTER VIEW instead")
+	case e.rewritten:
+		return &fakeExecResult{}, nil
+	default:
+		return nil, fmt.Errorf("unexpected exec query %q", query)
+	}
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
+	e.execCtxCalls = append(e.execCtxCalls, strings.TrimSpace(query))
+	return e.execResult(query, len(e.execCtxCalls))
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) Exec(query string, _ ...any) (ExecResult, error) {
+	e.execCalls = append(e.execCalls, strings.TrimSpace(query))
+	return e.execResult(query, len(e.execCalls))
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) Close() error { return nil }
+
+type abortedAlterViewRecoveryExecutor struct {
+	execContextQueries []string
+	execQueries        []string
+}
+
+func (e *abortedAlterViewRecoveryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedAlterViewRecoveryExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
+	e.execContextQueries = append(e.execContextQueries, query)
+	switch strings.TrimSpace(strings.ToUpper(query)) {
+	case "ROLLBACK":
+		return &fakeExecResult{}, nil
+	case "ALTER TABLE SOME_VIEW RENAME TO RENAMED_VIEW":
+		if len(e.execContextQueries) == 1 {
+			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		}
+		return nil, errors.New("Binder Error: Cannot use ALTER TABLE statement on object \"some_view\" because it is not a table")
+	case "ALTER VIEW SOME_VIEW RENAME TO RENAMED_VIEW":
+		return &fakeExecResult{rowsAffected: 1}, nil
+	default:
+		return nil, fmt.Errorf("unexpected ExecContext query %q", query)
+	}
+}
+
+func (e *abortedAlterViewRecoveryExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedAlterViewRecoveryExecutor) Exec(query string, _ ...any) (ExecResult, error) {
+	e.execQueries = append(e.execQueries, query)
+	switch strings.TrimSpace(strings.ToUpper(query)) {
+	case "ALTER TABLE SOME_VIEW RENAME TO RENAMED_VIEW":
+		if len(e.execQueries) == 1 {
+			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		}
+		return nil, errors.New("Binder Error: Cannot use ALTER TABLE statement on object \"some_view\" because it is not a table")
+	case "ALTER VIEW SOME_VIEW RENAME TO RENAMED_VIEW":
+		return &fakeExecResult{rowsAffected: 1}, nil
+	default:
+		return nil, fmt.Errorf("unexpected Exec query %q", query)
+	}
+}
+
+func (e *abortedAlterViewRecoveryExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedAlterViewRecoveryExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (e *abortedAlterViewRecoveryExecutor) Close() error { return nil }
+
 func TestExecuteSelectQueryReturnsErrorDetails(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	defer func() { _ = clientSide.Close() }()
@@ -1417,6 +1565,296 @@ func TestExecuteSelectQueryReturnsErrorDetails(t *testing.T) {
 	}
 	if !strings.Contains(errMsg, "missing_table") {
 		t.Fatalf("expected error message mentioning missing_table, got %q", errMsg)
+	}
+}
+
+func TestExecuteSingleStatementRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	exec := &abortedAlterViewRecoveryExecutor{}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: exec,
+	}
+
+	errSent, fatalErr := c.executeSingleStatement("ALTER TABLE some_view RENAME TO renamed_view")
+	if fatalErr != nil {
+		t.Fatalf("expected nil fatal error, got %v", fatalErr)
+	}
+	if errSent {
+		t.Fatalf("expected successful execution, got errSent=true")
+	}
+
+	want := []string{
+		"ALTER TABLE some_view RENAME TO renamed_view",
+		"ROLLBACK",
+		"ALTER TABLE some_view RENAME TO renamed_view",
+		"ALTER VIEW some_view RENAME TO renamed_view",
+	}
+	if len(exec.execContextQueries) != len(want) {
+		t.Fatalf("expected exec sequence %v, got %v", want, exec.execContextQueries)
+	}
+	for i, got := range exec.execContextQueries {
+		if got != want[i] {
+			t.Fatalf("expected exec query %d to be %q, got %q", i, want[i], got)
+		}
+	}
+}
+
+func TestExecuteSelectQueryRecoversAbortedAutocommitConnection(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	exec := &abortedSelectRecoveryExecutor{}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: exec,
+	}
+
+	rowCount, errCode, errMsg, err := c.executeSelectQuery("SELECT 1", "SELECT")
+	if err != nil {
+		t.Fatalf("expected nil connection error, got %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("expected rowCount=1, got %d", rowCount)
+	}
+	if errCode != "" || errMsg != "" {
+		t.Fatalf("expected no SQL error details, got code=%q msg=%q", errCode, errMsg)
+	}
+	if exec.rollbackCalls != 1 {
+		t.Fatalf("expected 1 rollback, got %d", exec.rollbackCalls)
+	}
+	if exec.queryCalls != 2 {
+		t.Fatalf("expected 2 query attempts, got %d", exec.queryCalls)
+	}
+}
+
+func TestHandleQueryAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	const originalQuery = "ALTER TABLE some_view RENAME TO renamed_view"
+	const rewrittenQuery = "ALTER VIEW some_view RENAME TO renamed_view"
+
+	executor := &abortedExecAlterViewRecoveryExecutor{
+		originalQuery: originalQuery,
+		rewritten:     rewrittenQuery,
+	}
+
+	var out bytes.Buffer
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: executor,
+	}
+
+	if err := c.handleQuery([]byte(originalQuery + "\x00")); err != nil {
+		t.Fatalf("handleQuery returned error: %v", err)
+	}
+
+	expectedCalls := []string{originalQuery, "ROLLBACK", originalQuery, rewrittenQuery}
+	if !slices.Equal(executor.execCtxCalls, expectedCalls) {
+		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedCalls)
+	}
+}
+
+func TestExecuteSingleStatementAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	const originalQuery = "ALTER TABLE some_view RENAME TO renamed_view"
+	const rewrittenQuery = "ALTER VIEW some_view RENAME TO renamed_view"
+
+	executor := &abortedExecAlterViewRecoveryExecutor{
+		originalQuery: originalQuery,
+		rewritten:     rewrittenQuery,
+	}
+
+	var out bytes.Buffer
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: executor,
+	}
+
+	errSent, err := c.executeSingleStatement(originalQuery)
+	if err != nil {
+		t.Fatalf("executeSingleStatement returned fatal error: %v", err)
+	}
+	if errSent {
+		t.Fatalf("executeSingleStatement reported an error response")
+	}
+
+	expectedCalls := []string{originalQuery, "ROLLBACK", originalQuery, rewrittenQuery}
+	if !slices.Equal(executor.execCtxCalls, expectedCalls) {
+		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedCalls)
+	}
+}
+
+func TestHandleExecuteAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	const originalQuery = "ALTER TABLE some_view RENAME TO renamed_view"
+	const rewrittenQuery = "ALTER VIEW some_view RENAME TO renamed_view"
+
+	executor := &abortedExecAlterViewRecoveryExecutor{
+		originalQuery: originalQuery,
+		rewritten:     rewrittenQuery,
+	}
+
+	var out bytes.Buffer
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: executor,
+		portals: map[string]*portal{
+			"p": {
+				stmt: &preparedStmt{
+					query:          originalQuery,
+					convertedQuery: originalQuery,
+				},
+			},
+		},
+	}
+
+	var body bytes.Buffer
+	body.WriteString("p")
+	body.WriteByte(0)
+	if err := binary.Write(&body, binary.BigEndian, int32(0)); err != nil {
+		t.Fatalf("encode execute body: %v", err)
+	}
+
+	c.handleExecute(body.Bytes())
+
+	expectedExecCalls := []string{originalQuery, originalQuery, rewrittenQuery}
+	if !slices.Equal(executor.execCalls, expectedExecCalls) {
+		t.Fatalf("unexpected Exec calls: got %v want %v", executor.execCalls, expectedExecCalls)
+	}
+	expectedExecContextCalls := []string{"ROLLBACK"}
+	if !slices.Equal(executor.execCtxCalls, expectedExecContextCalls) {
+		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedExecContextCalls)
+	}
+}
+
+func TestHandleExecuteRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	exec := &abortedAlterViewRecoveryExecutor{}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: exec,
+		portals: map[string]*portal{
+			"": {
+				stmt: &preparedStmt{
+					query:          "ALTER TABLE some_view RENAME TO renamed_view",
+					convertedQuery: "ALTER TABLE some_view RENAME TO renamed_view",
+				},
+			},
+		},
+	}
+
+	body := append([]byte{0}, make([]byte, 4)...)
+	c.handleExecute(body)
+
+	wantExec := []string{
+		"ALTER TABLE some_view RENAME TO renamed_view",
+		"ALTER TABLE some_view RENAME TO renamed_view",
+		"ALTER VIEW some_view RENAME TO renamed_view",
+	}
+	if len(exec.execContextQueries) != 1 || exec.execContextQueries[0] != "ROLLBACK" {
+		t.Fatalf("expected one rollback via ExecContext, got %v", exec.execContextQueries)
+	}
+	if len(exec.execQueries) != len(wantExec) {
+		t.Fatalf("expected exec sequence %v, got %v", wantExec, exec.execQueries)
+	}
+	for i, got := range exec.execQueries {
+		if got != wantExec[i] {
+			t.Fatalf("expected exec query %d to be %q, got %q", i, wantExec[i], got)
+		}
+	}
+}
+
+func TestExecuteSelectQueryDoesNotRollbackInsideUserTransaction(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	exec := &abortedSelectRecoveryExecutor{}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusTransaction,
+		executor: exec,
+	}
+
+	rowCount, errCode, errMsg, err := c.executeSelectQuery("SELECT 1", "SELECT")
+	if err != nil {
+		t.Fatalf("expected nil connection error, got %v", err)
+	}
+	if rowCount != 0 {
+		t.Fatalf("expected rowCount=0, got %d", rowCount)
+	}
+	if errCode != "42000" || !strings.Contains(errMsg, "Current transaction is aborted") {
+		t.Fatalf("expected aborted transaction error details, got code=%q msg=%q", errCode, errMsg)
+	}
+	if exec.rollbackCalls != 0 {
+		t.Fatalf("expected 0 rollbacks, got %d", exec.rollbackCalls)
+	}
+	if exec.queryCalls != 1 {
+		t.Fatalf("expected 1 query attempt, got %d", exec.queryCalls)
+	}
+	if c.txStatus != txStatusError {
+		t.Fatalf("expected transaction to be marked failed, got %c", c.txStatus)
 	}
 }
 
@@ -2057,7 +2495,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				HasHeader:  false,
 				NullString: "\\N",
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, NULL '\\N', DELIMITER '\t')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, NULL '\\N', DELIMITER '\t')",
 		},
 		{
 			name:       "CSV with header",
@@ -2070,7 +2508,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "with column list",
@@ -2083,7 +2521,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "custom NULL string",
@@ -2096,7 +2534,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "NA",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, NULL 'NA', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, NULL 'NA', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "empty NULL string",
@@ -2109,7 +2547,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, HEADER, NULL '', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, HEADER, NULL '', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "schema qualified table",
@@ -2122,7 +2560,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, HEADER, NULL '\\N', DELIMITER '\t', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, HEADER, NULL '\\N', DELIMITER '\t', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "CSV with custom escape character",
@@ -2136,7 +2574,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				Quote:      `"`,
 				Escape:     `\`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\\')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 10485760, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\\')",
 		},
 	}
 
@@ -2934,6 +3372,62 @@ func TestCursorCloseNonexistent(t *testing.T) {
 	}
 }
 
+func TestTransactionStatusWithCopyCommands(t *testing.T) {
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// BEGIN starts a transaction
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+
+	// COPY (to file/S3) should not change transaction status — it's a normal
+	// statement inside the transaction, not a transaction control command.
+	c.updateTxStatus("COPY")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after COPY txStatus = %c, want %c (should remain in transaction)", c.txStatus, txStatusTransaction)
+	}
+
+	// COMMIT should end the transaction
+	c.updateTxStatus("COMMIT")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after COMMIT txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+
+	// Same flow with COPY FROM STDIN (the COPY command type is the same)
+	c.updateTxStatus("BEGIN")
+	c.updateTxStatus("COPY")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after COPY FROM txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+	c.updateTxStatus("ROLLBACK")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after ROLLBACK txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+}
+
+func TestTransactionErrorOnCopyFailure(t *testing.T) {
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// BEGIN a transaction
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Fatalf("expected txStatusTransaction after BEGIN")
+	}
+
+	// Simulate COPY failing inside the transaction
+	c.setTxError()
+	if c.txStatus != txStatusError {
+		t.Errorf("after failed COPY txStatus = %c, want %c", c.txStatus, txStatusError)
+	}
+
+	// Any subsequent command should fail (error state), ROLLBACK recovers
+	c.updateTxStatus("ROLLBACK")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after ROLLBACK from error txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+}
+
 func TestTransactionCommitClosesAllCursors(t *testing.T) {
 	c := &clientConn{
 		txStatus: txStatusTransaction,
@@ -3183,5 +3677,180 @@ func TestInitConnsMap(t *testing.T) {
 	srv.registerConn(&clientConn{pid: 1})
 	if len(srv.conns) != 1 {
 		t.Fatalf("expected 1 conn, got %d", len(srv.conns))
+	}
+}
+
+// writePGMessage writes a PostgreSQL wire protocol message (type byte + int32 length + body)
+// into w, matching the format readMessage() expects.
+func writePGMessage(w io.Writer, msgType byte, body []byte) {
+	_ = binary.Write(w, binary.BigEndian, msgType)
+	_ = binary.Write(w, binary.BigEndian, int32(len(body)+4))
+	_, _ = w.Write(body)
+}
+
+func TestHandleCopyInCSVWithBlob(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Create table with a BLOB column
+	_, err = db.Exec("CREATE TABLE test_blob_copy (id VARCHAR, name VARCHAR, data BLOB, count_val INTEGER)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build CSV data with binary content in the BLOB column
+	binaryData := make([]byte, 64)
+	for i := range binaryData {
+		binaryData[i] = byte(i)
+	}
+	var csvBuf bytes.Buffer
+	csvWriter := csv.NewWriter(&csvBuf)
+	_ = csvWriter.Write([]string{"id", "name", "data", "count_val"})
+	_ = csvWriter.Write([]string{"row1", "Alice", string(binaryData), "42"})
+	_ = csvWriter.Write([]string{"row2", "Bob", string(binaryData[:32]), "99"})
+	csvWriter.Flush()
+
+	// Build protocol messages: CopyData with CSV content, then CopyDone
+	var msgBuf bytes.Buffer
+	writePGMessage(&msgBuf, msgCopyData, csvBuf.Bytes())
+	writePGMessage(&msgBuf, msgCopyDone, nil)
+
+	// Set up clientConn with real DuckDB executor and simulated reader/writer
+	var outputBuf bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &clientConn{
+		reader:   bufio.NewReader(&msgBuf),
+		writer:   bufio.NewWriter(&outputBuf),
+		executor: NewLocalExecutor(db),
+		server:   &Server{},
+		txStatus: txStatusIdle,
+		ctx:      ctx,
+		cancel:   cancel,
+	}
+
+	opts := &CopyFromOptions{
+		TableName:  "test_blob_copy",
+		Delimiter:  ",",
+		HasHeader:  true,
+		NullString: "\\N",
+		Quote:      `"`,
+	}
+	cols := []string{"id", "name", "data", "count_val"}
+	colTypes := []ColumnTyper{
+		describeColumnType("VARCHAR"),
+		describeColumnType("VARCHAR"),
+		describeColumnType("BLOB"),
+		describeColumnType("INTEGER"),
+	}
+	blobColIndices := []int{2}
+
+	err = c.handleCopyInCSVWithBlob(
+		"COPY test_blob_copy FROM STDIN WITH (FORMAT csv, HEADER true)",
+		opts, cols, colTypes, blobColIndices,
+	)
+	if err != nil {
+		t.Fatalf("handleCopyInCSVWithBlob returned error: %v", err)
+	}
+
+	// Verify data was inserted
+	rows, err := db.Query("SELECT id, name, octet_length(data), count_val FROM test_blob_copy ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	type result struct {
+		id       string
+		name     string
+		blobLen  int
+		countVal int
+	}
+	var results []result
+	for rows.Next() {
+		var r result
+		if err := rows.Scan(&r.id, &r.name, &r.blobLen, &r.countVal); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, r)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(results))
+	}
+	if results[0].id != "row1" || results[0].name != "Alice" || results[0].blobLen != 64 || results[0].countVal != 42 {
+		t.Errorf("row1 mismatch: %+v", results[0])
+	}
+	if results[1].id != "row2" || results[1].name != "Bob" || results[1].blobLen != 32 || results[1].countVal != 99 {
+		t.Errorf("row2 mismatch: %+v", results[1])
+	}
+}
+
+func TestHandleCopyInCSVWithBlob_NullValues(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = db.Exec("CREATE TABLE test_blob_null (id VARCHAR, data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// CSV with null BLOB value
+	csvData := "id\tdata\nrow1\t\\N\n"
+
+	var msgBuf bytes.Buffer
+	writePGMessage(&msgBuf, msgCopyData, []byte(csvData))
+	writePGMessage(&msgBuf, msgCopyDone, nil)
+
+	var outputBuf bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &clientConn{
+		reader:   bufio.NewReader(&msgBuf),
+		writer:   bufio.NewWriter(&outputBuf),
+		executor: NewLocalExecutor(db),
+		server:   &Server{},
+		txStatus: txStatusIdle,
+		ctx:      ctx,
+		cancel:   cancel,
+	}
+
+	opts := &CopyFromOptions{
+		TableName:  "test_blob_null",
+		Delimiter:  "\t",
+		HasHeader:  true,
+		NullString: "\\N",
+	}
+
+	err = c.handleCopyInCSVWithBlob(
+		"COPY test_blob_null FROM STDIN",
+		opts, []string{"id", "data"},
+		[]ColumnTyper{
+			describeColumnType("VARCHAR"),
+			describeColumnType("BLOB"),
+		},
+		[]int{1},
+	)
+	if err != nil {
+		t.Fatalf("handleCopyInCSVWithBlob returned error: %v", err)
+	}
+
+	var id string
+	var data *[]byte
+	err = db.QueryRow("SELECT id, data FROM test_blob_null").Scan(&id, &data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "row1" {
+		t.Errorf("expected id=row1, got %s", id)
+	}
+	if data != nil {
+		t.Errorf("expected data=nil (NULL), got %v", data)
 	}
 }

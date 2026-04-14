@@ -12,13 +12,25 @@ import (
 	"github.com/posthog/duckgres/server"
 )
 
+// SessionProgress holds cached query progress from a worker health check.
+type SessionProgress struct {
+	Percentage float64
+	Rows       uint64
+	TotalRows  uint64
+	Stalled    bool
+}
+
 // ManagedSession tracks a client session bound to a worker.
 type ManagedSession struct {
 	PID          int32
 	WorkerID     int
+	Protocol     string // "postgres" or "flight"
 	SessionToken string
 	Executor     *server.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
+
+	// Cached query progress from worker health checks.
+	queryProgress atomic.Value // stores *SessionProgress (or nil)
 }
 
 // SessionManager tracks all active sessions and their worker assignments.
@@ -30,6 +42,10 @@ type SessionManager struct {
 	rebalancer *MemoryRebalancer
 
 	nextPID atomic.Int32
+}
+
+type flightReconnectPool interface {
+	ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error)
 }
 
 // NewSessionManager creates a new session manager.
@@ -56,50 +72,19 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	memoryLimit, threads = sm.resolveSessionLimits(memoryLimit, threads)
 
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
-	// When max-workers is set, this blocks until a slot is available.
+	// When a backend-specific max worker cap is set, this blocks until a slot is available.
 	observeControlPlaneWorkerQueueDepthDelta(1)
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 
+	acquireStart := time.Now()
+	slog.Debug("Acquiring worker for session.", "pid", pid, "user", username)
 	worker, err := sm.pool.AcquireWorker(ctx)
 	if err != nil {
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
+	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
-	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
-	if err != nil {
-		// Clean up the worker we just spawned (but not if it was a pre-warmed idle worker
-		// that has sessions from other concurrent requests).
-		sm.pool.RetireWorkerIfNoSessions(worker.ID)
-		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
-	}
-
-	// Create FlightExecutor sharing the worker's existing gRPC connection
-	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
-
-	if pid == 0 {
-		pid = sm.nextPID.Add(1)
-	}
-
-	session := &ManagedSession{
-		PID:          pid,
-		WorkerID:     worker.ID,
-		SessionToken: sessionToken,
-		Executor:     executor,
-	}
-
-	sm.mu.Lock()
-	sm.sessions[pid] = session
-	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
-	sm.mu.Unlock()
-
-	slog.Debug("Session created.", "pid", pid, "worker", worker.ID, "user", username)
-
-	// Update other sessions if rebalancing is enabled.
-	if sm.rebalancer != nil {
-		sm.rebalancer.RequestRebalance()
-	}
-
-	return pid, executor, nil
+	return sm.createSessionOnWorker(ctx, username, pid, memoryLimit, threads, worker, "postgres", true)
 }
 
 func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) (string, int) {
@@ -113,6 +98,55 @@ func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) 
 		threads = sm.rebalancer.PerSessionThreads()
 	}
 	return memoryLimit, threads
+}
+
+func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (int32, *server.FlightExecutor, error) {
+	reconnector, ok := sm.pool.(flightReconnectPool)
+	if !ok {
+		return 0, nil, fmt.Errorf("worker pool does not support flight reconnect")
+	}
+	worker, err := reconnector.ReconnectFlightWorker(ctx, workerID, ownerEpoch)
+	if err != nil {
+		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
+	}
+	return sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false)
+}
+
+func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *server.FlightExecutor, error) {
+	createStart := time.Now()
+	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
+	if err != nil {
+		if retireOnFailure {
+			sm.pool.RetireWorkerIfNoSessions(worker.ID)
+		}
+		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
+	}
+
+	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
+	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
+
+	if pid == 0 {
+		pid = sm.nextPID.Add(1)
+	}
+
+	session := &ManagedSession{
+		PID:          pid,
+		WorkerID:     worker.ID,
+		Protocol:     protocol,
+		SessionToken: sessionToken,
+		Executor:     executor,
+	}
+
+	sm.mu.Lock()
+	sm.sessions[pid] = session
+	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
+	sm.mu.Unlock()
+
+	slog.Debug("Session created on worker.", "pid", pid, "worker", worker.ID, "user", username, "create_duration", time.Since(createStart))
+	if sm.rebalancer != nil {
+		sm.rebalancer.RequestRebalance()
+	}
+	return pid, executor, nil
 }
 
 // DestroySession destroys a session, retires its dedicated worker, and rebalances
@@ -141,7 +175,11 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		_ = session.Executor.Close()
 	}
 
-	// Destroy session on worker (best effort, skip if worker already dead)
+	// Destroy session on worker (best effort, skip if worker already dead).
+	// This must complete BEFORE ReleaseWorker so the next session doesn't
+	// overlap with cleanup on the shared DuckDB instance (MaxOpenConns=1
+	// enforces single-session isolation; releasing early would let a new
+	// session block on db.Conn() or, worse, share catalog state).
 	worker, ok := sm.pool.Worker(session.WorkerID)
 	if ok {
 		select {
@@ -154,7 +192,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Release the worker for reuse instead of retiring it immediately (pooled model)
+	// Release the worker for reuse after cleanup is complete.
 	sm.pool.ReleaseWorker(session.WorkerID)
 
 	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
@@ -250,6 +288,52 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 		return s.WorkerID
 	}
 	return -1
+}
+
+// GetProgress returns the cached query progress for a session, or nil.
+func (sm *SessionManager) GetProgress(pid int32) *SessionProgress {
+	sm.mu.RLock()
+	s, ok := sm.sessions[pid]
+	sm.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	v := s.queryProgress.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(*SessionProgress)
+}
+
+// UpdateProgress caches query progress data for sessions on the given worker.
+// Called from the health check loop after parsing the worker's health check response.
+// Progress keys are truncated session tokens (first 16 chars) to avoid leaking
+// full bearer tokens in health check JSON.
+func (sm *SessionManager) UpdateProgress(workerID int, progress map[string]*SessionProgress) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, pid := range sm.byWorker[workerID] {
+		s, ok := sm.sessions[pid]
+		if !ok {
+			continue
+		}
+		key := s.SessionToken
+		if len(key) > 16 {
+			key = key[:16]
+		}
+		if sp, ok := progress[key]; ok {
+			s.queryProgress.Store(sp)
+		}
+	}
+}
+
+// SetProtocol updates the protocol label for an active session.
+func (sm *SessionManager) SetProtocol(pid int32, protocol string) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[pid]; ok {
+		s.Protocol = protocol
+	}
 }
 
 // AllSessions returns a snapshot of all active sessions.

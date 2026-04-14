@@ -34,7 +34,7 @@ When `DUCKGRES_PERF_DATASET_VERSION` is set:
 
 - default catalog switches to `tests/perf/queries/ducklake_frozen.yaml`
 - manifest verification is required in `ducklake.main.dataset_manifest` (override with `DUCKGRES_PERF_DATASET_MANIFEST_TABLE`)
-- artifact `dataset_manifest.json` is written under `artifacts/perf/<run_id>/`
+- the harness writes and validates `dataset_manifest.json` under `artifacts/perf/<run_id>/` before any configured publish step
 
 Artifacts are written to `artifacts/perf/<run_id>`:
 
@@ -43,6 +43,25 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `server_metrics.prom`
 - `runner.log`
 - `dataset_manifest.json` (only when `DUCKGRES_PERF_DATASET_VERSION` is set)
+
+## Artifact Schema Contract (v1)
+
+`query_results.csv` is the canonical per-query artifact and its columns are fixed in v1:
+
+- `query_id`
+- `intent_id`
+- `measure_iteration`
+- `protocol`
+- `status`
+- `error`
+- `error_class`
+- `rows`
+- `duration_ms`
+- `started_at`
+
+`measure_iteration` is the 1-based measured repetition within a run (`0` is reserved for non-measured warmup work and is not emitted to the CSV today).
+`duration_ms` is emitted as milliseconds with fixed precision, and `started_at` is UTC RFC3339Nano.
+No CSV schema mutation is expected in this phase.
 
 ## Nightly Run
 
@@ -62,9 +81,12 @@ Nightly frozen dataset requirements:
 - default catalog is `tests/perf/queries/ducklake_frozen.yaml`
 - `dataset_manifest.json` must exist after run and match the configured dataset version
 
-Optional upload hook:
+Optional artifact publisher:
 
-- `DUCKGRES_PERF_ARTIFACT_UPLOAD_CMD`: shell command executed after a successful run with `DUCKGRES_PERF_RUN_DIR` set.
+- `DUCKGRES_PERF_PUBLISH_DSN`: enables post-run publishing into a Duckgres writer.
+- `DUCKGRES_PERF_PUBLISH_PASSWORD`: optional password override for the publisher connection.
+- `DUCKGRES_PERF_PUBLISH_SCHEMA`: target schema for published rows. Default: `duckgres_perf`.
+- `DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA`: when `true`, create/extend publisher tables before inserting.
 
 ## Useful Flags
 
