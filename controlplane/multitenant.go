@@ -130,6 +130,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
+	isHealthy func() bool,
 ) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
@@ -281,7 +282,7 @@ func SetupMultiTenant(
 	engine.Use(gin.Recovery())
 
 	// Health endpoint (unauthenticated, used by K8s probes)
-	engine.GET("/health", newHealthHandler(runtimeTracker.Draining))
+	engine.GET("/health", newHealthHandler(isHealthy))
 
 	// Authenticated API
 	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
@@ -316,10 +317,10 @@ func resolveK8sNamespace(namespace string) (string, error) {
 	return string(ns), nil
 }
 
-func newHealthHandler(isDraining func() bool) gin.HandlerFunc {
+func newHealthHandler(isHealthy func() bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if isDraining != nil && isDraining() {
-			c.String(http.StatusServiceUnavailable, "draining")
+		if isHealthy != nil && !isHealthy() {
+			c.String(http.StatusServiceUnavailable, "unhealthy")
 			return
 		}
 		c.String(http.StatusOK, "ok")

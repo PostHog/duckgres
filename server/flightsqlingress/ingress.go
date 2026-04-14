@@ -154,6 +154,7 @@ type FlightIngress struct {
 	listenerAddr  string
 	shutdownOnce  sync.Once
 	shutdownState atomic.Bool
+	servingState  atomic.Bool
 	wg            sync.WaitGroup
 }
 
@@ -161,10 +162,28 @@ func NewFlightIngress(host string, port int, tlsConfig *tls.Config, validator Cr
 	if port <= 0 {
 		return nil, fmt.Errorf("invalid flight port: %d", port)
 	}
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	baseListener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("flight listen %s: %w", addr, err)
+	}
+
+	ingress, err := NewFlightIngressFromListener(baseListener, tlsConfig, validator, provider, cfg, opts)
+	if err != nil {
+		_ = baseListener.Close()
+		return nil, err
+	}
+	return ingress, nil
+}
+
+func NewFlightIngressFromListener(baseListener net.Listener, tlsConfig *tls.Config, validator CredentialValidator, provider SessionProvider, cfg Config, opts Options) (*FlightIngress, error) {
+	if baseListener == nil {
+		return nil, fmt.Errorf("listener is required for Flight ingress")
+	}
 	if tlsConfig == nil {
 		return nil, fmt.Errorf("TLS config is required for Flight ingress")
 	}
-	addr := fmt.Sprintf("%s:%d", host, port)
 
 	// gRPC requires ALPN "h2" for TLS transport.
 	flightTLSConfig := tlsConfig.Clone()
@@ -172,10 +191,7 @@ func NewFlightIngress(host string, port int, tlsConfig *tls.Config, validator Cr
 		flightTLSConfig.NextProtos = append(flightTLSConfig.NextProtos, "h2")
 	}
 
-	ln, err := tls.Listen("tcp", addr, flightTLSConfig)
-	if err != nil {
-		return nil, fmt.Errorf("flight listen %s: %w", addr, err)
-	}
+	ln := tls.NewListener(baseListener, flightTLSConfig)
 
 	if cfg.SessionIdleTTL <= 0 {
 		cfg.SessionIdleTTL = defaultFlightSessionIdleTTL
@@ -222,13 +238,22 @@ func (fi *FlightIngress) Addr() string {
 
 // Start begins serving in the background.
 func (fi *FlightIngress) Start() {
+	fi.servingState.Store(true)
 	fi.wg.Add(1)
 	go func() {
 		defer fi.wg.Done()
+		defer fi.servingState.Store(false)
 		if err := fi.flightSrv.Serve(); err != nil && !fi.shutdownState.Load() {
 			slog.Error("Flight ingress server exited.", "error", err)
 		}
 	}()
+}
+
+func (fi *FlightIngress) Healthy() bool {
+	if fi == nil || fi.shutdownState.Load() || !fi.servingState.Load() {
+		return false
+	}
+	return fi.sessionStore == nil || !fi.sessionStore.Draining()
 }
 
 func (fi *FlightIngress) BeginDrain() {

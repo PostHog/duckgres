@@ -10,24 +10,24 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func TestHealthHandlerReturnsServiceUnavailableWhenDraining(t *testing.T) {
+func TestHealthHandlerReturnsServiceUnavailableWhenUnhealthy(t *testing.T) {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
-	engine.GET("/health", newHealthHandler(func() bool { return true }))
+	engine.GET("/health", newHealthHandler(func() bool { return false }))
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 	engine.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 while draining, got %d", rec.Code)
+		t.Fatalf("expected 503 while unhealthy, got %d", rec.Code)
 	}
 }
 
-func TestHealthHandlerReturnsOKWhenNotDraining(t *testing.T) {
+func TestHealthHandlerReturnsOKWhenHealthy(t *testing.T) {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
-	engine.GET("/health", newHealthHandler(func() bool { return false }))
+	engine.GET("/health", newHealthHandler(func() bool { return true }))
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()

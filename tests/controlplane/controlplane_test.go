@@ -230,6 +230,17 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
 }
 
+func (h *cpHarness) waitForLogCount(substr string, want int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Count(h.logBuf.String(), substr) >= want {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("log %q not found %d times after %v", substr, want, timeout)
+}
+
 func (h *cpHarness) cleanup(t *testing.T) {
 	t.Helper()
 

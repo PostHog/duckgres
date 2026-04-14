@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -21,6 +22,16 @@ type FlightIngress = flightsqlingress.FlightIngress
 // NewFlightIngress creates a control-plane Flight SQL ingress listener.
 func NewFlightIngress(host string, port int, tlsConfig *tls.Config, validator flightsqlingress.CredentialValidator, provider flightsqlingress.SessionProvider, rateLimiter *server.RateLimiter, cfg FlightIngressConfig) (*FlightIngress, error) {
 	return flightsqlingress.NewFlightIngress(host, port, tlsConfig, validator, provider, cfg, flightsqlingress.Options{
+		RateLimiter: rateLimiter,
+		Hooks: flightsqlingress.Hooks{
+			OnSessionCountChanged: observeFlightAuthSessions,
+			OnSessionsReaped:      observeFlightSessionsReaped,
+		},
+	})
+}
+
+func NewFlightIngressFromListener(listener net.Listener, tlsConfig *tls.Config, validator flightsqlingress.CredentialValidator, provider flightsqlingress.SessionProvider, rateLimiter *server.RateLimiter, cfg FlightIngressConfig) (*FlightIngress, error) {
+	return flightsqlingress.NewFlightIngressFromListener(listener, tlsConfig, validator, provider, cfg, flightsqlingress.Options{
 		RateLimiter: rateLimiter,
 		Hooks: flightsqlingress.Hooks{
 			OnSessionCountChanged: observeFlightAuthSessions,
