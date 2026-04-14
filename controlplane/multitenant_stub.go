@@ -15,6 +15,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
+	isHealthy func() bool,
 ) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
 	return nil, nil, nil, nil, nil, fmt.Errorf("multi-tenant mode requires -tags kubernetes build")
 }

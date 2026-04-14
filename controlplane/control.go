@@ -104,6 +104,7 @@ type ControlPlane struct {
 	rateLimiter     *server.RateLimiter
 	tlsConfig       *tls.Config
 	pgListener      net.Listener
+	flightListener  net.Listener
 	upgrader        *tableflip.Upgrader
 	parentPID       int // tableflip parent PID (0 if first generation)
 	activeConns     int64
@@ -241,6 +242,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
+	var flightLn net.Listener
+	if cfg.FlightPort > 0 {
+		flightAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.FlightPort)
+		flightLn, err = upg.Listen("tcp", flightAddr)
+		if err != nil {
+			slog.Error("Failed to listen.", "addr", flightAddr, "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// Save the tableflip parent PID before it potentially exits and we get
 	// reparented to init. We need this to kill a stuck parent during future
 	// upgrades (tableflip requires the parent to exit before the child can
@@ -249,6 +260,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if upg.HasParent() {
 		parentPID = os.Getppid()
 		slog.Info("Upgrade complete, inherited PG listener.", "addr", pgLn.Addr().String())
+		if flightLn != nil {
+			slog.Info("Upgrade complete, inherited Flight listener.", "addr", flightLn.Addr().String())
+		}
 	}
 
 	if !isK8s {
@@ -334,6 +348,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		rateLimiter:     server.NewRateLimiter(cfg.RateLimit),
 		tlsConfig:       tlsCfg,
 		pgListener:      pgLn,
+		flightListener:  flightLn,
 		upgrader:        upg,
 		parentPID:       parentPID,
 		acmeManager:     acmeMgr,
@@ -343,7 +358,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
+		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers, cp.healthReady)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
@@ -447,11 +462,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		go pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash, onProgress)
 	}
 
-	// Flight ingress is created AFTER upgrade so the old CP can keep
-	// serving Flight SQL clients until it shuts down its listener in
-	// drainAfterUpgrade. This minimizes the Flight unavailability
-	// window to just the brief port rebind, rather than the entire
-	// upgrade + pre-warm duration.
+	// Flight ingress is created after worker/session wiring, but the TCP
+	// listener itself is pre-bound via tableflip so upgrades inherit the
+	// socket instead of racing a re-bind on the old process's 8815 listener.
 	cp.startFlightIngress()
 
 	// Handle SIGUSR1 for graceful upgrade (process mode only)
@@ -1236,6 +1249,19 @@ func (cp *ControlPlane) isDraining() bool {
 	return cp.runtimeTracker != nil && cp.runtimeTracker.Draining()
 }
 
+func (cp *ControlPlane) healthReady() bool {
+	if cp == nil {
+		return false
+	}
+	if cp.isDraining() {
+		return false
+	}
+	if cp.cfg.FlightPort <= 0 {
+		return true
+	}
+	return cp.flight != nil && cp.flight.Healthy()
+}
+
 func (cp *ControlPlane) stopQueryLogger() {
 	if cp.srv != nil && cp.srv.QueryLogger() != nil {
 		cp.srv.QueryLogger().Stop()
@@ -1411,8 +1437,6 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 }
 
 // startFlightIngress creates and starts the Flight SQL ingress listener.
-// During upgrade, the old CP's Flight listener may still be shutting down,
-// so we retry port binding briefly before giving up.
 func (cp *ControlPlane) startFlightIngress() {
 	if cp.cfg.FlightPort <= 0 {
 		return
@@ -1458,17 +1482,14 @@ func (cp *ControlPlane) startFlightIngress() {
 		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
 	}
 
-	var flightIngress *FlightIngress
-	var err error
-	for attempt := 0; attempt < 10; attempt++ {
+	var (
+		flightIngress *FlightIngress
+		err           error
+	)
+	if cp.flightListener != nil {
+		flightIngress, err = NewFlightIngressFromListener(cp.flightListener, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
+	} else {
 		flightIngress, err = NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
-		if err == nil {
-			break
-		}
-		if attempt < 9 {
-			slog.Warn("Flight ingress port not yet available, retrying...", "attempt", attempt+1, "error", err)
-			time.Sleep(500 * time.Millisecond)
-		}
 	}
 	if err != nil {
 		slog.Error("Failed to initialize Flight ingress, continuing without Flight SQL.", "error", err)
