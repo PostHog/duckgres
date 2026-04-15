@@ -185,6 +185,25 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 	}
 }
 
+func TestBootstrapSchemaDoesNotUseUnsupportedConstraints(t *testing.T) {
+	tx := &fakeTx{}
+
+	if err := bootstrapSchema(context.Background(), tx, "duckgres_perf"); err != nil {
+		t.Fatalf("bootstrapSchema returned error: %v", err)
+	}
+	if len(tx.execs) != 4 {
+		t.Fatalf("expected 4 bootstrap statements, got %d", len(tx.execs))
+	}
+
+	runsDDL := tx.execs[3].query
+	if !strings.Contains(runsDDL, "CREATE TABLE IF NOT EXISTS duckgres_perf.runs") {
+		t.Fatalf("unexpected runs ddl: %s", runsDDL)
+	}
+	if strings.Contains(runsDDL, "PRIMARY KEY") || strings.Contains(runsDDL, "UNIQUE") {
+		t.Fatalf("runs ddl should not use unsupported constraints: %s", runsDDL)
+	}
+}
+
 func TestPublishArtifactsRollsBackOnInsertFailure(t *testing.T) {
 	runDir := writeFixtureRunDir(t)
 	artifacts, err := loadArtifacts(runDir)
