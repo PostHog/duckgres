@@ -948,7 +948,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}()
 
 	start := time.Now()
-	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
+	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
 	slog.Debug("Query received.", "user", c.username, "query", query)
 
 	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
@@ -4361,7 +4361,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 	if strings.HasPrefix(code, "28") {
 		authFailuresCounter.Inc()
 	} else if severity == "ERROR" {
-		queryErrorsCounter.Inc()
+		queryErrorsCounter.WithLabelValues(c.orgID).Inc()
 	}
 	slog.Debug("Sending error to client.", "user", c.username, "severity", severity, "code", code, "message", message)
 	_ = writeErrorResponse(c.writer, severity, code, message)
@@ -4960,7 +4960,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	}
 
 	start := time.Now()
-	defer func() { queryDurationHistogram.Observe(time.Since(start).Seconds()) }()
+	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
 
 	// Convert parameter values to interface{}, handling binary format
 	args, err := p.decodeParams()
