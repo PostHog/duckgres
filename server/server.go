@@ -60,16 +60,16 @@ func IncrementOpenConnections() { connectionsGauge.Inc() }
 // DecrementOpenConnections decrements the open connections gauge.
 func DecrementOpenConnections() { connectionsGauge.Dec() }
 
-var queryDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+var queryDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_query_duration_seconds",
 	Help:    "Query execution duration in seconds",
-	Buckets: prometheus.DefBuckets,
-})
+	Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 18000, 36000},
+}, []string{"org"})
 
-var queryErrorsCounter = promauto.NewCounter(prometheus.CounterOpts{
+var queryErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_query_errors_total",
 	Help: "Total number of failed queries",
-})
+}, []string{"org"})
 
 var authFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_auth_failures_total",
