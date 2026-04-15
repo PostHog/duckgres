@@ -311,7 +311,7 @@ func bootstrapSchema(ctx context.Context, tx txHandle, schema string) error {
 )`, schema),
 		fmt.Sprintf("ALTER TABLE %s.query_results ADD COLUMN IF NOT EXISTS measure_iteration INTEGER", schema),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.runs (
-  run_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
   dataset_version TEXT NOT NULL,
   started_at TIMESTAMPTZ NOT NULL,
   finished_at TIMESTAMPTZ NOT NULL,
