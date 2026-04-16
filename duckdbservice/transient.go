@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,22 @@ func isTransactionControlStmt(query string) bool {
 	return strings.HasPrefix(upper, "COMMIT") ||
 		strings.HasPrefix(upper, "ROLLBACK") ||
 		strings.HasPrefix(upper, "END")
+}
+
+func trackSQLTransactionState(query string, execErr error, sqlTxActive *atomic.Bool) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	if len(upper) == 0 {
+		return
+	}
+	if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START") {
+		if execErr == nil {
+			sqlTxActive.Store(true)
+		}
+		return
+	}
+	if isTransactionControlStmt(upper) {
+		sqlTxActive.Store(false)
+	}
 }
 
 // isTransientDuckLakeError returns true if the error message indicates a

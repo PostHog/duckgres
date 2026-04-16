@@ -287,16 +287,7 @@ func TestRecoverAbortedTransactionReturnsRollbackFailure(t *testing.T) {
 func TestSQLTxActiveTracking(t *testing.T) {
 	var flag atomic.Bool
 
-	// Simulate DoPutCommandStatementUpdate tracking logic for BEGIN.
-	query := "BEGIN"
-	if isTransactionControlStmt(query) {
-		t.Fatal("BEGIN should NOT be a transaction control stmt")
-	}
-	// After successful BEGIN, set sqlTxActive.
-	upper := strings.ToUpper(strings.TrimSpace(query))
-	if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START") {
-		flag.Store(true)
-	}
+	trackSQLTransactionState("BEGIN", nil, &flag)
 	if !flag.Load() {
 		t.Fatal("sqlTxActive should be true after BEGIN")
 	}
@@ -307,14 +298,18 @@ func TestSQLTxActiveTracking(t *testing.T) {
 		t.Fatal("should be in transaction after BEGIN")
 	}
 
-	// After COMMIT (success or failure), clear sqlTxActive.
-	query = "COMMIT"
-	if !isTransactionControlStmt(query) {
-		t.Fatal("COMMIT should be a transaction control stmt")
-	}
-	flag.Store(false)
+	trackSQLTransactionState("COMMIT", nil, &flag)
 	if flag.Load() {
 		t.Fatal("sqlTxActive should be false after COMMIT")
+	}
+}
+
+func TestSQLTxActiveTrackingDoesNotStartOnFailedBegin(t *testing.T) {
+	var flag atomic.Bool
+
+	trackSQLTransactionState("BEGIN", errors.New("boom"), &flag)
+	if flag.Load() {
+		t.Fatal("sqlTxActive should remain false after failed BEGIN")
 	}
 }
 
@@ -395,18 +390,12 @@ func TestSQLTxActiveAllowsRetryOutsideTransaction(t *testing.T) {
 func TestStartTransactionTracking(t *testing.T) {
 	var flag atomic.Bool
 
-	// START TRANSACTION is an alias for BEGIN.
-	query := "START TRANSACTION"
-	upper := strings.ToUpper(strings.TrimSpace(query))
-	if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START") {
-		flag.Store(true)
-	}
+	trackSQLTransactionState("START TRANSACTION", nil, &flag)
 	if !flag.Load() {
 		t.Fatal("sqlTxActive should be true after START TRANSACTION")
 	}
 
-	// ROLLBACK clears it.
-	flag.Store(false)
+	trackSQLTransactionState("ROLLBACK", nil, &flag)
 	if flag.Load() {
 		t.Fatal("sqlTxActive should be false after ROLLBACK")
 	}

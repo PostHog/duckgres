@@ -553,18 +553,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	}
 
 	// Track SQL-level transaction state for BEGIN/COMMIT/ROLLBACK sent as raw SQL.
-	if isTxControl {
-		upper := strings.ToUpper(strings.TrimSpace(query))
-		if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START") {
-			if execErr == nil {
-				session.sqlTxActive.Store(true)
-			}
-		} else {
-			// COMMIT/ROLLBACK/END: transaction is over regardless of success/failure.
-			// Even if COMMIT fails, the transaction is dead.
-			session.sqlTxActive.Store(false)
-		}
-	}
+	trackSQLTransactionState(query, execErr, &session.sqlTxActive)
 	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 	if execErr != nil && tx == nil && isDuckLakeTransactionConflict(execErr) {
 		ducklakeConflictTotal.Inc()
