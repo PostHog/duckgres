@@ -957,6 +957,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 			attribute.String("duckgres.protocol", "simple"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),
+			attribute.String("db.statement", truncateForSpan(query)),
 		),
 	)
 	defer span.End()
@@ -4986,6 +4987,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			attribute.String("duckgres.protocol", "extended"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),
+			attribute.String("db.statement", truncateForSpan(p.stmt.query)),
 		),
 	)
 	defer span.End()

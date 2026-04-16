@@ -16,6 +16,15 @@ func Tracer() trace.Tracer {
 	return tracer
 }
 
+// truncateForSpan truncates a query string for use as a span attribute.
+func truncateForSpan(q string) string {
+	const maxLen = 256
+	if len(q) <= maxLen {
+		return q
+	}
+	return q[:maxLen] + "..."
+}
+
 // traceIDFromContext returns the hex trace ID from the span context, or "".
 func traceIDFromContext(ctx context.Context) string {
 	sc := trace.SpanContextFromContext(ctx)
