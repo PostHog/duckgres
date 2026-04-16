@@ -20,6 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
@@ -747,6 +748,7 @@ func waitForWorkerTCPWithMetadata(addr, bearerToken string, serverCertPEM []byte
 			grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
 		))
+		dialOpts = append(dialOpts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 		if bearerToken != "" {
 			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerTLSBearerCreds{token: bearerToken}))
 		}
@@ -1436,6 +1438,7 @@ func (p *K8sWorkerPool) connectWorkerDirect(ctx context.Context, podName, podIP,
 		grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
 		grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
 	))
+	dialOpts = append(dialOpts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerTLSBearerCreds{token: bearerToken}))
 	}
