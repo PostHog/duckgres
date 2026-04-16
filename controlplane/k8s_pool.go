@@ -466,13 +466,15 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Value: "true",
 	})
 
-	// Pass OTEL trace endpoint to worker pods so they export traces
+	// Pass OTEL trace config to worker pods so they export traces
 	// to the same backend as the control plane.
-	if ep := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"); ep != "" {
-		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
-			Name:  "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-			Value: ep,
-		})
+	for _, envName := range []string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_PATH"} {
+		if v := os.Getenv(envName); v != "" {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  envName,
+				Value: v,
+			})
+		}
 	}
 
 	// Add toleration if configured

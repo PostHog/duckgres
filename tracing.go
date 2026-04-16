@@ -29,10 +29,16 @@ func initTracing() func() {
 
 	ctx := context.Background()
 
-	exporter, err := otlptracehttp.New(ctx,
+	opts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpoint(endpoint),
 		otlptracehttp.WithInsecure(),
-	)
+	}
+	// VictoriaTraces uses /insert/opentelemetry/v1/traces instead of the
+	// default /v1/traces. Allow overriding via OTEL_EXPORTER_OTLP_TRACES_PATH.
+	if path := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_PATH"); path != "" {
+		opts = append(opts, otlptracehttp.WithURLPath(path))
+	}
+	exporter, err := otlptracehttp.New(ctx, opts...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create trace exporter: %v\n", err)
 		return func() {}
