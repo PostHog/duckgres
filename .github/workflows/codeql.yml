@@ -24,5 +24,6 @@ jobs:
       - uses: github/codeql-action/init@v3
         with:
           languages: go
-      - uses: github/codeql-action/autobuild@v3
+          build-mode: manual
+      - run: go build ./...
       - uses: github/codeql-action/analyze@v3
