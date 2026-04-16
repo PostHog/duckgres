@@ -1119,6 +1119,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
+		_, execSpan := tracer.Start(ctx, "duckgres.execute")
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, query)
 			if err != nil {
@@ -1139,6 +1140,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		}
 
 		execResult, err := runExec()
+		execSpan.End()
 		if err != nil {
 			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 				ducklakeConflictTotal.Inc()
@@ -1319,6 +1321,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
+	_, execSpan := tracer.Start(ctx, "duckgres.execute")
 	runQuery := func() (RowSet, error) {
 		return c.executor.QueryContext(ctx, query)
 	}
@@ -1341,6 +1344,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			},
 		)
 	}
+	execSpan.End()
 	if err != nil {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
@@ -1378,6 +1382,9 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		_ = c.writer.Flush()
 		return 0, errCode, errMsg, nil
 	}
+
+	_, sendSpan := tracer.Start(ctx, "duckgres.send_results")
+	defer sendSpan.End()
 
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
 		return 0, "", "", err

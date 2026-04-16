@@ -1148,12 +1148,15 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
+	_, attachSpan := tracer.Start(context.Background(), "duckgres.ducklake_attach")
 	if err := retryOnTransientAttach(func() error {
 		_, err := db.Exec(attachStmt)
 		return err
 	}); err != nil {
+		attachSpan.End()
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
+	attachSpan.End()
 
 	slog.Info("Attached DuckLake catalog successfully.")
 
