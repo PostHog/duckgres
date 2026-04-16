@@ -466,6 +466,15 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Value: "true",
 	})
 
+	// Pass OTEL trace endpoint to worker pods so they export traces
+	// to the same backend as the control plane.
+	if ep := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"); ep != "" {
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+			Name:  "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+			Value: ep,
+		})
+	}
+
 	// Add toleration if configured
 	if p.workerTolerationKey != "" {
 		tol := corev1.Toleration{

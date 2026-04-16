@@ -395,7 +395,9 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 		pid INTEGER,
 		worker_id INTEGER,
 		is_transpiled BOOLEAN,
-		protocol VARCHAR
+		protocol VARCHAR,
+		trace_id VARCHAR,
+		span_id VARCHAR
 	)`)
 	if err != nil {
 		t.Fatalf("create table: %v", err)
@@ -458,7 +460,9 @@ func TestEnsureQueryLogTableAddsOrgIDToExistingTable(t *testing.T) {
 		pid INTEGER,
 		worker_id INTEGER,
 		is_transpiled BOOLEAN,
-		protocol VARCHAR
+		protocol VARCHAR,
+		trace_id VARCHAR,
+		span_id VARCHAR
 	)`)
 	if err != nil {
 		t.Fatalf("create table: %v", err)

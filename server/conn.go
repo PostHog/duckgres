@@ -27,6 +27,8 @@ import (
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/transpiler"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // errCancelHandled is returned by handleStartup when a cancel request was
@@ -949,6 +951,21 @@ func (c *clientConn) handleQuery(body []byte) error {
 
 	start := time.Now()
 	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
+
+	ctx, span := tracer.Start(c.ctx, "duckgres.query",
+		trace.WithAttributes(
+			attribute.String("duckgres.protocol", "simple"),
+			attribute.String("duckgres.org_id", c.orgID),
+			attribute.String("db.user", c.username),
+		),
+	)
+	defer span.End()
+	// Replace connection context for the duration of this query so child
+	// operations (queryContext, etc.) inherit the span.
+	prevCtx := c.ctx
+	c.ctx = ctx
+	defer func() { c.ctx = prevCtx }()
+
 	slog.Debug("Query received.", "user", c.username, "query", query)
 
 	// Check for cursor operations (DECLARE, FETCH, CLOSE) before passthrough
@@ -1012,8 +1029,10 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
+	_, transpileSpan := tracer.Start(c.ctx, "duckgres.transpile")
 	tr := c.newTranspiler(false)
 	result, err := tr.Transpile(query)
+	transpileSpan.End()
 	if err != nil {
 		// Transform error - send error to client
 		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
@@ -4961,6 +4980,15 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	start := time.Now()
 	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
+
+	_, span := tracer.Start(c.ctx, "duckgres.query",
+		trace.WithAttributes(
+			attribute.String("duckgres.protocol", "extended"),
+			attribute.String("duckgres.org_id", c.orgID),
+			attribute.String("db.user", c.username),
+		),
+	)
+	defer span.End()
 
 	// Convert parameter values to interface{}, handling binary format
 	args, err := p.decodeParams()

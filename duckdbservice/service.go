@@ -21,6 +21,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/server"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -273,6 +274,7 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 	opts = append(opts,
 		grpc.MaxRecvMsgSize(server.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(server.MaxGRPCMessageSize),
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 	)
 	if svc.cfg.BearerToken != "" {
 		opts = append(opts,
