@@ -25,5 +25,5 @@ jobs:
         with:
           languages: go
           build-mode: manual
-      - run: go build ./...
+      - run: go build .
       - uses: github/codeql-action/analyze@v3
