@@ -20,6 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
@@ -466,6 +467,17 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Value: "true",
 	})
 
+	// Pass OTEL trace config to worker pods so they export traces
+	// to the same backend as the control plane.
+	for _, envName := range []string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_PATH"} {
+		if v := os.Getenv(envName); v != "" {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  envName,
+				Value: v,
+			})
+		}
+	}
+
 	// Add toleration if configured
 	if p.workerTolerationKey != "" {
 		tol := corev1.Toleration{
@@ -736,6 +748,7 @@ func waitForWorkerTCPWithMetadata(addr, bearerToken string, serverCertPEM []byte
 			grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
 		))
+		dialOpts = append(dialOpts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 		if bearerToken != "" {
 			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerTLSBearerCreds{token: bearerToken}))
 		}
@@ -1425,6 +1438,7 @@ func (p *K8sWorkerPool) connectWorkerDirect(ctx context.Context, podName, podIP,
 		grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
 		grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
 	))
+	dialOpts = append(dialOpts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerTLSBearerCreds{token: bearerToken}))
 	}

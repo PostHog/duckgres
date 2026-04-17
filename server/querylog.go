@@ -38,6 +38,8 @@ type QueryLogEntry struct {
 	WorkerID        int
 	IsTranspiled    bool
 	Protocol        string // "simple" or "extended"
+	TraceID         string // OTEL trace ID (empty when tracing is off)
+	SpanID          string // OTEL span ID (empty when tracing is off)
 }
 
 // QueryLogger batches query log entries and writes them to a DuckLake table.
@@ -217,17 +219,18 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 	}
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(table)
-	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol) VALUES ")
+	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id) VALUES ")
 
-	args := make([]any, 0, len(batch)*21)
+	const colsPerRow = 23
+	args := make([]any, 0, len(batch)*colsPerRow)
 	for i, e := range batch {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		base := i * 21
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+		base := i * colsPerRow
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21)
+			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23)
 
 		args = append(args,
 			e.EventTime,
@@ -251,6 +254,8 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			e.WorkerID,
 			e.IsTranspiled,
 			e.Protocol,
+			e.TraceID,
+			e.SpanID,
 		)
 	}
 
@@ -307,6 +312,19 @@ func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName strin
 		}
 	}
 
+	// Add trace_id and span_id columns for OTEL tracing correlation.
+	for _, col := range []string{"trace_id", "span_id"} {
+		hasCol, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, col)
+		if err != nil {
+			return fmt.Errorf("inspect %s column: %w", col, err)
+		}
+		if !hasCol {
+			if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN " + col + " VARCHAR"); err != nil {
+				return fmt.Errorf("add %s column: %w", col, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -332,7 +350,9 @@ func queryLogCreateTableSQL(fullTableName string) string {
 		pid                 INTEGER,
 		worker_id           INTEGER,
 		is_transpiled       BOOLEAN,
-		protocol            VARCHAR
+		protocol            VARCHAR,
+		trace_id            VARCHAR,
+		span_id             VARCHAR
 	)`, fullTableName)
 }
 
@@ -495,6 +515,8 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		WorkerID:        c.workerID,
 		IsTranspiled:    transpiled != nil,
 		Protocol:        protocol,
+		TraceID:         traceIDFromContext(c.ctx),
+		SpanID:          spanIDFromContext(c.ctx),
 	})
 }
 

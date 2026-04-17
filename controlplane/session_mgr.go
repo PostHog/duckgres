@@ -77,8 +77,10 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 
 	acquireStart := time.Now()
+	ctx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
 	slog.Debug("Acquiring worker for session.", "pid", pid, "user", username)
 	worker, err := sm.pool.AcquireWorker(ctx)
+	acquireSpan.End()
 	if err != nil {
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}

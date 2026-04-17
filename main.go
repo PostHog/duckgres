@@ -187,9 +187,11 @@ func main() {
 
 	// Check if we're running as a child worker process
 	if os.Getenv("DUCKGRES_CHILD_MODE") == "1" {
-		// Use the same logging setup as parent for consistent log format
+		// Use the same logging/tracing setup as parent for consistent format
 		loggingShutdown := initLogging()
 		defer loggingShutdown()
+		tracingShutdown := initTracing()
+		defer tracingShutdown()
 		server.RunChildMode()
 		return // RunChildMode calls os.Exit
 	}
@@ -358,6 +360,9 @@ func main() {
 
 	loggingShutdown := initLogging()
 	defer loggingShutdown()
+
+	tracingShutdown := initTracing()
+	defer tracingShutdown()
 
 	logBuildInfo(*mode)
 
