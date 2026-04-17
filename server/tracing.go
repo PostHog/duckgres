@@ -130,23 +130,38 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		planSpan.End(trace.WithTimestamp(cursor))
 	}
 
+	// Estimate wall-clock time for scan vs compute. DuckDB runs operators in
+	// parallel, so cumulative times exceed wall-clock. Use the ratio of
+	// cumulative scan/(scan+compute) applied to the execution wall-clock
+	// (latency minus planning) to approximate each phase's wall-clock share.
+	execWall := m.Latency - planningDur
+	totalOpTime := scanTime + computeTime
+	scanWall := execWall
+	computeWall := 0.0
+	if totalOpTime > 0 {
+		scanWall = execWall * (scanTime / totalOpTime)
+		computeWall = execWall * (computeTime / totalOpTime)
+	}
+
 	if scanTime > 0 {
 		_, scanSpan := tracer.Start(ctx, "duckdb.scan", trace.WithTimestamp(cursor))
 		scanSpan.SetAttributes(
-			attribute.Float64("duckdb.scan_time_s", scanTime),
+			attribute.Float64("duckdb.scan_wall_s", scanWall),
+			attribute.Float64("duckdb.scan_thread_s", scanTime),
 			attribute.Float64("duckdb.scan_rows", scanRows),
 			attribute.Int64("duckdb.total_bytes_read", int64(m.TotalBytesRead)),
 		)
-		cursor = cursor.Add(time.Duration(scanTime * float64(time.Second)))
+		cursor = cursor.Add(time.Duration(scanWall * float64(time.Second)))
 		scanSpan.End(trace.WithTimestamp(cursor))
 	}
 
 	if computeTime > 0 {
 		_, compSpan := tracer.Start(ctx, "duckdb.compute", trace.WithTimestamp(cursor))
 		compSpan.SetAttributes(
-			attribute.Float64("duckdb.compute_time_s", computeTime),
+			attribute.Float64("duckdb.compute_wall_s", computeWall),
+			attribute.Float64("duckdb.compute_thread_s", computeTime),
 		)
-		cursor = cursor.Add(time.Duration(computeTime * float64(time.Second)))
+		cursor = cursor.Add(time.Duration(computeWall * float64(time.Second)))
 		compSpan.End(trace.WithTimestamp(cursor))
 	}
 }
