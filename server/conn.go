@@ -1119,7 +1119,8 @@ func (c *clientConn) handleQuery(body []byte) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
-		_, execSpan := tracer.Start(ctx, "duckgres.execute")
+		execStart := time.Now()
+		execCtx, execSpan := tracer.Start(ctx, "duckgres.execute")
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, query)
 			if err != nil {
@@ -1140,7 +1141,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		}
 
 		execResult, err := runExec()
-		enrichSpanWithProfiling(execSpan, c.executor)
+		enrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor)
 		execSpan.End()
 		if err != nil {
 			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
@@ -1322,7 +1323,8 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	_, execSpan := tracer.Start(ctx, "duckgres.execute")
+	execStart := time.Now()
+	execCtx, execSpan := tracer.Start(ctx, "duckgres.execute")
 	runQuery := func() (RowSet, error) {
 		return c.executor.QueryContext(ctx, query)
 	}
@@ -1345,7 +1347,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			},
 		)
 	}
-	enrichSpanWithProfiling(execSpan, c.executor)
+	enrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor)
 	execSpan.End()
 	if err != nil {
 		errCode := classifyErrorCode(err)
