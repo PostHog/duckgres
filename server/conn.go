@@ -386,15 +386,17 @@ func classifyErrorCode(err error) string {
 	case strings.HasPrefix(msg, "Parser Error:"):
 		return "42601" // syntax_error
 	case strings.HasPrefix(msg, "Conversion Error:"):
-		return "22P02" // invalid_text_representation
+		return conversionErrorCode(msg)
 	case strings.HasPrefix(msg, "Out of Range Error:"):
 		return "22003" // numeric_value_out_of_range
 	case strings.HasPrefix(msg, "Constraint Error:"):
 		return constraintErrorCode(msg)
 	case strings.HasPrefix(msg, "Permission Error:"):
 		return "42501" // insufficient_privilege
-	case strings.HasPrefix(msg, "Transaction Error:"):
-		return "25000" // invalid_transaction_state
+	case strings.HasPrefix(msg, "Transaction Error:"),
+		strings.HasPrefix(msg, "TransactionContext Error:"):
+		return "25000" // invalid_transaction_state — DuckDB emits both prefixes
+
 	case strings.HasPrefix(msg, "Dependency Error:"):
 		return "2BP01" // dependent_objects_still_exist
 	}
@@ -405,12 +407,12 @@ func classifyErrorCode(err error) string {
 func catalogErrorCode(msg string) string {
 	lower := strings.ToLower(msg)
 	switch {
+	case strings.Contains(lower, "schema") && strings.Contains(lower, "does not exist"):
+		return "3F000" // invalid_schema_name
 	case strings.Contains(lower, "table with name") && strings.Contains(lower, "does not exist"):
 		return "42P01" // undefined_table
 	case strings.Contains(lower, "view with name") && strings.Contains(lower, "does not exist"):
 		return "42P01" // undefined_table (views share the code)
-	case strings.Contains(lower, "schema") && strings.Contains(lower, "does not exist"):
-		return "3F000" // invalid_schema_name
 	case strings.Contains(lower, "function") && (strings.Contains(lower, "does not exist") || strings.Contains(lower, "with these arguments")):
 		return "42883" // undefined_function
 	case strings.Contains(lower, "no function matches"):
@@ -442,8 +444,26 @@ func binderErrorCode(msg string) string {
 		return "42703"
 	case strings.Contains(lower, "ambiguous"):
 		return "42702" // ambiguous_column
+	case strings.Contains(lower, "referenced table") && strings.Contains(lower, "not found"):
+		return "42P01" // undefined_table — DuckDB raises this for unknown aliases
+	case strings.Contains(lower, "no function matches"):
+		return "42883" // undefined_function — overload-resolution failure
 	}
 	return "42601" // syntax_error — binder failures without a narrower match
+}
+
+// conversionErrorCode narrows a "Conversion Error: …" message. DuckDB uses
+// this prefix for both invalid text representations and numeric overflows
+// during casts (e.g. CAST(1000 AS TINYINT));
+func conversionErrorCode(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "out of range"),
+		strings.Contains(lower, "overflow"),
+		strings.Contains(lower, "would be out of range"):
+		return "22003" // numeric_value_out_of_range
+	}
+	return "22P02" // invalid_text_representation
 }
 
 // constraintErrorCode narrows a "Constraint Error: …" message to one of the

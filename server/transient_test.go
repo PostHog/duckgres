@@ -298,8 +298,8 @@ func TestClassifyErrorCode(t *testing.T) {
 		{"catalog missing table with suggestion", errors.New("Catalog Error: Table with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?"), "42P01"},
 		{"catalog missing view", errors.New("Catalog Error: View with name v does not exist!"), "42P01"},
 		{"catalog missing schema", errors.New("Catalog Error: Schema with name \"missing\" does not exist!"), "3F000"},
+		{"catalog schema-qualified table, missing schema", errors.New("Catalog Error: Table with name \"missing_schema.t\" does not exist because schema \"missing_schema\" does not exist."), "3F000"},
 		{"catalog missing function", errors.New("Catalog Error: Scalar Function with name no_such_func does not exist!"), "42883"},
-		{"catalog function bad args", errors.New("Catalog Error: No function matches the given name and argument types 'foo(INTEGER)'. You might need to add explicit type casts."), "42883"},
 		{"catalog missing type", errors.New("Catalog Error: Type with name mytype does not exist!"), "42704"},
 		{"catalog table already exists", errors.New("Catalog Error: Table with name \"t\" already exists!"), "42P07"},
 		{"catalog schema already exists", errors.New("Catalog Error: Schema with name \"s\" already exists!"), "42P06"},
@@ -307,10 +307,14 @@ func TestClassifyErrorCode(t *testing.T) {
 
 		{"binder missing column", errors.New("Binder Error: Referenced column \"missing_col\" not found in FROM clause!"), "42703"},
 		{"binder ambiguous column", errors.New("Binder Error: Ambiguous reference to column \"id\""), "42702"},
+		{"binder missing table alias", errors.New("Binder Error: Referenced table \"t\" not found!\nCandidate tables: \"users\""), "42P01"},
+		{"binder function overload", errors.New("Binder Error: No function matches the given name and argument types 'foo(INTEGER)'. You might need to add explicit type casts."), "42883"},
 		{"binder other", errors.New("Binder Error: cannot use alter table on a view because this object is not a table; use ALTER VIEW instead"), "42601"},
 
 		{"parser syntax", errors.New("Parser Error: syntax error at or near \"FORM\""), "42601"},
 		{"conversion error", errors.New("Conversion Error: Could not convert string 'abc' to INT32"), "22P02"},
+		{"conversion out of range cast", errors.New("Conversion Error: Type INT32 with value 1000 can't be cast because the value is out of range for the destination type INT8"), "22003"},
+		{"conversion overflow", errors.New("Conversion Error: Overflow in cast from DOUBLE to INT32"), "22003"},
 		{"out of range", errors.New("Out of Range Error: Overflow in multiplication of INT32"), "22003"},
 
 		{"constraint unique", errors.New("Constraint Error: Duplicate key \"id: 1\" violates primary key constraint"), "23505"},
@@ -321,6 +325,7 @@ func TestClassifyErrorCode(t *testing.T) {
 
 		{"permission denied", errors.New("Permission Error: not allowed to write here"), "42501"},
 		{"transaction invalid", errors.New("Transaction Error: cannot begin within an existing transaction"), "25000"},
+		{"transaction context nested begin", errors.New("TransactionContext Error: cannot start a transaction within a transaction"), "25000"},
 		{"dependency error", errors.New("Dependency Error: Cannot drop entry because there are other entries that depend on it"), "2BP01"},
 	}
 
