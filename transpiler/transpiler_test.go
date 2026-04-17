@@ -3226,6 +3226,255 @@ func TestTranspile_RegexOperators(t *testing.T) {
 	}
 }
 
+func TestTranspile_BooleanPredicateComparisons(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "where equals true becomes is true",
+			input:    "SELECT * FROM users WHERE active = true",
+			contains: "active IS TRUE",
+			excludes: " = true",
+		},
+		{
+			name:     "where equals false becomes is false",
+			input:    "SELECT * FROM users WHERE active = false",
+			contains: "active IS FALSE",
+			excludes: " = false",
+		},
+		{
+			name:     "where not equals true becomes is false",
+			input:    "SELECT * FROM users WHERE active != true",
+			contains: "active IS FALSE",
+			excludes: " != true",
+		},
+		{
+			name:     "where not equals false becomes is true",
+			input:    "SELECT * FROM users WHERE active != false",
+			contains: "active IS TRUE",
+			excludes: " != false",
+		},
+		{
+			name:     "merge subquery predicate is rewritten",
+			input:    "MERGE INTO target t USING (SELECT id, val FROM src WHERE active = true) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET val = s.val WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.val)",
+			contains: "active IS TRUE",
+			excludes: " = true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Fatalf("Transpile(%q) = %q, want to contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Fatalf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_BooleanPredicateComparisonsSkipScalarWrappers(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name:     "null test wrapper preserves equality",
+			input:    "SELECT * FROM users WHERE (active = true) IS NULL",
+			contains: "active = true",
+			excludes: "active IS TRUE",
+		},
+		{
+			name:     "function argument wrapper preserves equality",
+			input:    "SELECT * FROM users WHERE coalesce(active = true, false)",
+			contains: "active = true",
+			excludes: "active IS TRUE",
+		},
+		{
+			name:     "case expression payload preserves equality",
+			input:    "SELECT * FROM users WHERE CASE WHEN id = 1 THEN active = true ELSE false END",
+			contains: "active = true",
+			excludes: "active IS TRUE",
+		},
+		{
+			name:     "not equals true preserves null semantics",
+			input:    "SELECT * FROM users WHERE NOT (active != true)",
+			contains: "CASE WHEN active IS NULL THEN NULL ELSE active IS FALSE END",
+			excludes: "NOT active IS FALSE",
+		},
+		{
+			name:     "not equals false preserves null semantics",
+			input:    "SELECT * FROM users WHERE NOT (active != false)",
+			contains: "CASE WHEN active IS NULL THEN NULL ELSE active IS TRUE END",
+			excludes: "NOT active IS TRUE",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Fatalf("Transpile(%q) = %q, want to contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Fatalf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_BooleanPredicateComparisonsWithDMLCTEs(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+	}{
+		{
+			name: "insert with cte source rewrites filter",
+			input: "WITH src AS (SELECT id FROM users WHERE active = true) " +
+				"INSERT INTO dst (id) SELECT id FROM src",
+			contains: "active IS TRUE",
+		},
+		{
+			name: "update with cte source rewrites filter",
+			input: "WITH src AS (SELECT id FROM users WHERE active = true) " +
+				"UPDATE dst SET flag = true FROM src WHERE dst.id = src.id",
+			contains: "active IS TRUE",
+		},
+		{
+			name: "delete with cte source rewrites filter",
+			input: "WITH src AS (SELECT id FROM users WHERE active = true) " +
+				"DELETE FROM dst USING src WHERE dst.id = src.id",
+			contains: "active IS TRUE",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Fatalf("Transpile(%q) = %q, want to contain %q", tt.input, result.SQL, tt.contains)
+			}
+		})
+	}
+}
+
+func TestTranspile_BooleanPredicateComparisonsInInsertOnConflictPredicates(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name: "conflict target predicate is rewritten",
+			input: "INSERT INTO users (id, active) VALUES (1, true) " +
+				"ON CONFLICT (id) WHERE active = true DO UPDATE SET active = EXCLUDED.active",
+			contains: "WHERE active IS TRUE",
+			excludes: "WHERE active = true",
+		},
+		{
+			name: "conflict action predicate is rewritten",
+			input: "INSERT INTO users (id, active) VALUES (1, true) " +
+				"ON CONFLICT (id) DO UPDATE SET active = EXCLUDED.active WHERE users.active = true",
+			contains: "WHERE users.active IS TRUE",
+			excludes: "WHERE users.active = true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Fatalf("Transpile(%q) = %q, want to contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Fatalf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+func TestTranspile_BooleanPredicateComparisonsInCaseWhenConditions(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	result, err := tr.Transpile("SELECT * FROM users WHERE CASE WHEN active = true THEN true ELSE false END")
+	if err != nil {
+		t.Fatalf("Transpile(CASE WHEN) error: %v", err)
+	}
+	if !strings.Contains(result.SQL, "active IS TRUE") {
+		t.Fatalf("Transpile(CASE WHEN) = %q, want CASE condition rewritten to active IS TRUE", result.SQL)
+	}
+}
+
+func TestTranspile_BooleanPredicateComparisonsInMergePredicates(t *testing.T) {
+	tr := New(DefaultConfig())
+
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			name: "merge join condition is rewritten",
+			input: "MERGE INTO target t USING src s ON t.id = s.id AND s.active = true " +
+				"WHEN MATCHED THEN UPDATE SET val = s.val",
+			contains: "s.active IS TRUE",
+			excludes: "s.active = true",
+		},
+		{
+			name: "merge when condition is rewritten",
+			input: "MERGE INTO target t USING src s ON t.id = s.id " +
+				"WHEN MATCHED AND s.active = true THEN UPDATE SET val = s.val",
+			contains: "s.active IS TRUE",
+			excludes: "s.active = true",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Fatalf("Transpile(%q) = %q, want to contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Fatalf("Transpile(%q) = %q, should not contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
 func TestTranspile_SimilarTo(t *testing.T) {
 	// Test SIMILAR TO pattern matching
 	// PostgreSQL converts SIMILAR TO to use similar_to_escape() and regex matching
@@ -3858,6 +4107,7 @@ func TestClassify_NeedsTransform(t *testing.T) {
 		{"::regclass cast", "SELECT 'users'::regclass", FlagTypeCast | FlagPgCatalog},
 		{"array_agg function", "SELECT array_agg(x) FROM t", FlagFunctions | FlagPgCatalog},
 		{"current_database", "SELECT current_database()", FlagFuncAlias | FlagPgCatalog},
+		{"boolean predicate", "SELECT * FROM t WHERE active = true", FlagBooleanPredicates},
 		{"JSON arrow", "SELECT data->>'name' FROM t", FlagOperators | FlagPgCatalog},
 		{"regex operator", "SELECT * FROM t WHERE name ~ '^A'", FlagOperators | FlagPgCatalog},
 		{"FOR UPDATE", "SELECT * FROM t FOR UPDATE", FlagLocking},

@@ -107,8 +107,11 @@ type cpHarness struct {
 }
 
 type cpOpts struct {
-	flightPort int
-	maxWorkers int
+	flightPort           int
+	maxWorkers           int
+	duckLake             bool
+	duckLakeMetadataPort int
+	duckLakeMinIOPort    int
 }
 
 func defaultOpts() cpOpts {
@@ -171,6 +174,18 @@ users:
 	cmd.Env = []string{
 		"HOME=" + os.Getenv("HOME"),
 		"PATH=" + os.Getenv("PATH"),
+	}
+	if opts.duckLake {
+		cmd.Env = append(cmd.Env,
+			fmt.Sprintf("DUCKGRES_DUCKLAKE_METADATA_STORE=postgres:host=127.0.0.1 port=%d user=ducklake password=ducklake dbname=ducklake", opts.duckLakeMetadataPort),
+			"DUCKGRES_DUCKLAKE_OBJECT_STORE=s3://ducklake/data/",
+			fmt.Sprintf("DUCKGRES_DUCKLAKE_S3_ENDPOINT=127.0.0.1:%d", opts.duckLakeMinIOPort),
+			"DUCKGRES_DUCKLAKE_S3_PROVIDER=config",
+			"DUCKGRES_DUCKLAKE_S3_ACCESS_KEY=minioadmin",
+			"DUCKGRES_DUCKLAKE_S3_SECRET_KEY=minioadmin",
+			"DUCKGRES_DUCKLAKE_S3_REGION=us-east-1",
+			"DUCKGRES_DUCKLAKE_S3_URL_STYLE=path",
+		)
 	}
 	// Put CP in its own process group so cleanup can kill the entire tree
 	// (CP + upgraded new CPs + all workers) with a single signal.
