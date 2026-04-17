@@ -293,6 +293,35 @@ func TestClassifyErrorCode(t *testing.T) {
 		{"query cancelled", errors.New("context canceled"), "57014"},
 		{"generic error", errors.New("syntax error"), "42000"},
 		{"SSL closed is not conflict", errors.New("SSL connection has been closed unexpectedly"), "42000"},
+
+		{"catalog missing table", errors.New("Catalog Error: Table with name users does not exist!"), "42P01"},
+		{"catalog missing table with suggestion", errors.New("Catalog Error: Table with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?"), "42P01"},
+		{"catalog missing view", errors.New("Catalog Error: View with name v does not exist!"), "42P01"},
+		{"catalog missing schema", errors.New("Catalog Error: Schema with name \"missing\" does not exist!"), "3F000"},
+		{"catalog missing function", errors.New("Catalog Error: Scalar Function with name no_such_func does not exist!"), "42883"},
+		{"catalog function bad args", errors.New("Catalog Error: No function matches the given name and argument types 'foo(INTEGER)'. You might need to add explicit type casts."), "42883"},
+		{"catalog missing type", errors.New("Catalog Error: Type with name mytype does not exist!"), "42704"},
+		{"catalog table already exists", errors.New("Catalog Error: Table with name \"t\" already exists!"), "42P07"},
+		{"catalog schema already exists", errors.New("Catalog Error: Schema with name \"s\" already exists!"), "42P06"},
+		{"catalog function already exists", errors.New("Catalog Error: Function with name \"f\" already exists!"), "42723"},
+
+		{"binder missing column", errors.New("Binder Error: Referenced column \"missing_col\" not found in FROM clause!"), "42703"},
+		{"binder ambiguous column", errors.New("Binder Error: Ambiguous reference to column \"id\""), "42702"},
+		{"binder other", errors.New("Binder Error: cannot use alter table on a view because this object is not a table; use ALTER VIEW instead"), "42601"},
+
+		{"parser syntax", errors.New("Parser Error: syntax error at or near \"FORM\""), "42601"},
+		{"conversion error", errors.New("Conversion Error: Could not convert string 'abc' to INT32"), "22P02"},
+		{"out of range", errors.New("Out of Range Error: Overflow in multiplication of INT32"), "22003"},
+
+		{"constraint unique", errors.New("Constraint Error: Duplicate key \"id: 1\" violates primary key constraint"), "23505"},
+		{"constraint not null", errors.New("Constraint Error: NOT NULL constraint failed: t.col"), "23502"},
+		{"constraint foreign key", errors.New("Constraint Error: Violates foreign key constraint because key is still referenced"), "23503"},
+		{"constraint check", errors.New("Constraint Error: CHECK constraint failed: positive"), "23514"},
+		{"constraint generic", errors.New("Constraint Error: some other constraint failure"), "23000"},
+
+		{"permission denied", errors.New("Permission Error: not allowed to write here"), "42501"},
+		{"transaction invalid", errors.New("Transaction Error: cannot begin within an existing transaction"), "25000"},
+		{"dependency error", errors.New("Dependency Error: Cannot drop entry because there are other entries that depend on it"), "2BP01"},
 	}
 
 	for _, tt := range tests {

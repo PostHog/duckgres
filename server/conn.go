@@ -366,7 +366,9 @@ func isDuckLakeMetadataConnectionLost(err error) bool {
 
 // classifyErrorCode returns the most appropriate PostgreSQL SQLSTATE for a
 // DuckDB error. Transaction conflicts get 40001 (serialization_failure), which
-// signals PG-aware clients to retry. Query cancellations get 57014.
+// signals PG-aware clients to retry. Query cancellations get 57014. Remaining
+// errors are classified by DuckDB's exception-type prefix; the prefix is the
+// only signal the Go driver exposes today, so we parse the message string.
 func classifyErrorCode(err error) string {
 	if isQueryCancelled(err) {
 		return "57014"
@@ -374,7 +376,92 @@ func classifyErrorCode(err error) string {
 	if isDuckLakeTransactionConflict(err) {
 		return "40001" // serialization_failure — client should retry
 	}
+
+	msg := err.Error()
+	switch {
+	case strings.HasPrefix(msg, "Catalog Error:"):
+		return catalogErrorCode(msg)
+	case strings.HasPrefix(msg, "Binder Error:"):
+		return binderErrorCode(msg)
+	case strings.HasPrefix(msg, "Parser Error:"):
+		return "42601" // syntax_error
+	case strings.HasPrefix(msg, "Conversion Error:"):
+		return "22P02" // invalid_text_representation
+	case strings.HasPrefix(msg, "Out of Range Error:"):
+		return "22003" // numeric_value_out_of_range
+	case strings.HasPrefix(msg, "Constraint Error:"):
+		return constraintErrorCode(msg)
+	case strings.HasPrefix(msg, "Permission Error:"):
+		return "42501" // insufficient_privilege
+	case strings.HasPrefix(msg, "Transaction Error:"):
+		return "25000" // invalid_transaction_state
+	case strings.HasPrefix(msg, "Dependency Error:"):
+		return "2BP01" // dependent_objects_still_exist
+	}
 	return "42000"
+}
+
+// catalogErrorCode narrows a "Catalog Error: …" message to a specific SQLSTATE
+func catalogErrorCode(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "table with name") && strings.Contains(lower, "does not exist"):
+		return "42P01" // undefined_table
+	case strings.Contains(lower, "view with name") && strings.Contains(lower, "does not exist"):
+		return "42P01" // undefined_table (views share the code)
+	case strings.Contains(lower, "schema") && strings.Contains(lower, "does not exist"):
+		return "3F000" // invalid_schema_name
+	case strings.Contains(lower, "function") && (strings.Contains(lower, "does not exist") || strings.Contains(lower, "with these arguments")):
+		return "42883" // undefined_function
+	case strings.Contains(lower, "no function matches"):
+		return "42883" // undefined_function — DuckDB's overload-resolution failure
+	case strings.Contains(lower, "type") && strings.Contains(lower, "does not exist"):
+		return "42704" // undefined_object
+	case strings.Contains(lower, "does not exist"):
+		return "42704" // undefined_object (generic fallback)
+	case strings.Contains(lower, "already exists"):
+		if strings.Contains(lower, "function") {
+			return "42723" // duplicate_function
+		}
+		if strings.Contains(lower, "schema") {
+			return "42P06" // duplicate_schema
+		}
+		return "42P07" // duplicate_table
+	}
+	return "42000"
+}
+
+// binderErrorCode narrows a "Binder Error: …" message. The binder raises on
+// semantic problems discovered after parsing, most commonly missing columns.
+func binderErrorCode(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "referenced column") && strings.Contains(lower, "not found"):
+		return "42703" // undefined_column
+	case strings.Contains(lower, "column") && strings.Contains(lower, "does not exist"):
+		return "42703"
+	case strings.Contains(lower, "ambiguous"):
+		return "42702" // ambiguous_column
+	}
+	return "42601" // syntax_error — binder failures without a narrower match
+}
+
+// constraintErrorCode narrows a "Constraint Error: …" message to one of the
+// integrity_constraint_violation family codes. DuckDB's messages name the
+// violated constraint explicitly, so substring matching is reliable.
+func constraintErrorCode(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "duplicate key") || strings.Contains(lower, "unique"):
+		return "23505" // unique_violation
+	case strings.Contains(lower, "not null") || strings.Contains(lower, "null value"):
+		return "23502" // not_null_violation
+	case strings.Contains(lower, "foreign key"):
+		return "23503" // foreign_key_violation
+	case strings.Contains(lower, "check constraint"):
+		return "23514" // check_violation
+	}
+	return "23000" // integrity_constraint_violation
 }
 
 // logQueryError logs a query execution failure with additional context for
