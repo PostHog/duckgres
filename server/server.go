@@ -331,6 +331,12 @@ type Server struct {
 	// Query logger for DuckLake system.query_log
 	queryLogger *QueryLogger
 
+	// Per-user shared DB pool for file persistence mode.
+	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
+	fileDBsMu sync.Mutex
+	fileDBs   map[string]*fileDBEntry
+
+
 	// DuckLake checkpoint scheduler
 	checkpointer *DuckLakeCheckpointer
 
@@ -338,11 +344,6 @@ type Server struct {
 	// In control plane mode, returns cached progress from worker health checks.
 	// Nil in standalone mode.
 	progressFn func(pid int32) (pct float64, rows, totalRows uint64, stalled bool)
-
-	// Per-user shared DB pool for file persistence mode.
-	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
-	fileDBsMu sync.Mutex
-	fileDBs   map[string]*fileDBEntry
 }
 
 func New(cfg Config) (*Server, error) {
@@ -781,7 +782,7 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// in the DSN, not via SET. Required for loading the patched httpfs extension
 	// (benben/duckdb-httpfs) which fixes stoi/stoll crashes on HTTP headers
 	// but isn't signed with DuckDB's release key.
-	path := ":memory:"
+	dsn := ":memory:?allow_unsigned_extensions=true"
 	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
 		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
 			return nil, fmt.Errorf("invalid username for file persistence: %q (contains path separator or ..)", username)
@@ -789,10 +790,10 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
 			return nil, fmt.Errorf("failed to create data directory %s: %w", cfg.DataDir, err)
 		}
-		path = filepath.Join(cfg.DataDir, username+".duckdb")
-		slog.Info("Opening file-backed DuckDB.", "path", path)
+		dsn = filepath.Join(cfg.DataDir, username+".duckdb") + "?allow_unsigned_extensions=true"
+		slog.Info("Opening file-backed DuckDB.", "path", dsn)
 	}
-	db, err := sql.Open("duckdb", path+"?allow_unsigned_extensions=true")
+	db, err := sql.Open("duckdb", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}

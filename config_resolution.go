@@ -505,6 +505,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_DUCKLAKE_S3_PROFILE"); v != "" {
 		cfg.DuckLake.S3Profile = v
 	}
+	if v := getenv("DUCKGRES_FILE_PERSISTENCE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.FilePersistence = b
+		} else {
+			warn("Invalid DUCKGRES_FILE_PERSISTENCE: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_DUCKLAKE_MIGRATE"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			cfg.DuckLake.Migrate = b
@@ -526,13 +533,6 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			}
 		} else {
 			warn("Invalid DUCKGRES_DUCKLAKE_DATA_INLINING_ROW_LIMIT: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_FILE_PERSISTENCE"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			cfg.FilePersistence = b
-		} else {
-			warn("Invalid DUCKGRES_FILE_PERSISTENCE: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {
