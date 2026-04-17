@@ -11,6 +11,7 @@ import (
 )
 
 type passthroughRecordingExecutor struct {
+	noopProfiling
 	execQueries []string
 }
 

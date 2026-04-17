@@ -302,6 +302,13 @@ func (e *FlightExecutor) Close() error {
 	return nil
 }
 
+func (e *FlightExecutor) LastProfilingOutput() string {
+	// Profiling output is only available on the DuckDB connection that ran
+	// the query. In Flight SQL mode the query runs on a remote worker, so
+	// we can't retrieve it from the control plane.
+	return ""
+}
+
 // FlightRowSet wraps an Arrow Flight RecordBatch reader to implement RowSet.
 type FlightRowSet struct {
 	reader *flight.Reader

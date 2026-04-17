@@ -10,6 +10,7 @@ import (
 )
 
 type recordingQueryExecutor struct {
+	noopProfiling
 	query      string
 	args       []any
 	rowSet     RowSet

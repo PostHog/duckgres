@@ -767,6 +767,16 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		slog.Warn("Failed to load some extensions.", "user", username, "error", err)
 	}
 
+	// Enable query profiling so per-query operator timing can be extracted
+	// and attached to OTEL trace spans. Standard mode adds sub-1% overhead
+	// (just clock_gettime per operator boundary).
+	if _, err := db.Exec("SET enable_profiling = 'json'"); err != nil {
+		slog.Warn("Failed to enable DuckDB profiling.", "error", err)
+	}
+	if _, err := db.Exec("SET profiling_mode = 'detailed'"); err != nil {
+		slog.Warn("Failed to set DuckDB profiling mode.", "error", err)
+	}
+
 	// Configure cache_httpfs cache directory if the extension is loaded.
 	// cache_httpfs wraps httpfs with a local disk cache, avoiding repeated S3/HTTP downloads.
 	if hasCacheHTTPFS(cfg.Extensions) {

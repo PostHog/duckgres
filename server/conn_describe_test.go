@@ -9,6 +9,7 @@ import (
 )
 
 type describeRecordingExecutor struct {
+	noopProfiling
 	queries []string
 	rowSet  RowSet
 }

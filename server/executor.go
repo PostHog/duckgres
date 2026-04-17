@@ -43,6 +43,11 @@ type QueryExecutor interface {
 	ConnContext(ctx context.Context) (RawConn, error)
 	PingContext(ctx context.Context) error
 	Close() error
+
+	// LastProfilingOutput returns the JSON profiling output from the last
+	// executed query, or "" if profiling is not enabled or not available
+	// (e.g. Flight SQL mode where the query ran on a remote worker).
+	LastProfilingOutput() string
 }
 
 // LocalExecutor wraps *sql.DB to implement QueryExecutor for local DuckDB access.
@@ -94,6 +99,14 @@ func (e *LocalExecutor) PingContext(ctx context.Context) error {
 
 func (e *LocalExecutor) Close() error {
 	return e.db.Close()
+}
+
+func (e *LocalExecutor) LastProfilingOutput() string {
+	var output string
+	if err := e.db.QueryRow("SELECT json(profiling_output) FROM pragma_last_profiling_output()").Scan(&output); err != nil {
+		return ""
+	}
+	return output
 }
 
 // LocalRowSet wraps *sql.Rows to implement RowSet.

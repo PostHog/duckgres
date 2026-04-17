@@ -1367,6 +1367,7 @@ func (f *fakeExecResult) RowsAffected() (int64, error) {
 
 type queryErrorExecutor struct {
 	err error
+	noopProfiling
 }
 
 func (e *queryErrorExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
@@ -1391,6 +1392,7 @@ func (e *queryErrorExecutor) Close() error { return nil }
 
 type abortedSelectRecoveryExecutor struct {
 	queryCalls    int
+	noopProfiling
 	rollbackCalls int
 }
 
@@ -1430,6 +1432,7 @@ func (e *abortedSelectRecoveryExecutor) Close() error { return nil }
 
 type abortedExecAlterViewRecoveryExecutor struct {
 	originalQuery string
+	noopProfiling
 	rewritten     string
 	execCalls     []string
 	execCtxCalls  []string
@@ -1482,6 +1485,7 @@ func (e *abortedExecAlterViewRecoveryExecutor) Close() error { return nil }
 
 type abortedAlterViewRecoveryExecutor struct {
 	execContextQueries []string
+	noopProfiling
 	execQueries        []string
 }
 
