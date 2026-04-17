@@ -396,7 +396,6 @@ func classifyErrorCode(err error) string {
 	case strings.HasPrefix(msg, "Transaction Error:"),
 		strings.HasPrefix(msg, "TransactionContext Error:"):
 		return "25000" // invalid_transaction_state — DuckDB emits both prefixes
-
 	case strings.HasPrefix(msg, "Dependency Error:"):
 		return "2BP01" // dependent_objects_still_exist
 	}

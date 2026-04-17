@@ -1,9 +1,12 @@
 package server
 
 import (
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
+
+	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 func TestIsTransientDuckLakeError(t *testing.T) {
@@ -336,6 +339,65 @@ func TestClassifyErrorCode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestClassifyErrorCodeAgainstRealDuckDB drives queries that reliably
+// produce each error prefix the classifier branches on, against a real
+// in-memory DuckDB, and asserts the SQLSTATE we map to.
+func TestClassifyErrorCodeAgainstRealDuckDB(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)`); err != nil {
+		t.Fatalf("setup create: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO t VALUES (1, 1)`); err != nil {
+		t.Fatalf("setup insert: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		query    string
+		wantCode string
+	}{
+		{"missing table", `SELECT * FROM no_such_table_xyz`, "42P01"},
+		{"missing column", `SELECT no_such_col FROM t`, "42703"},
+		{"parser syntax", `SELEC 1`, "42601"},
+		{"bad cast", `SELECT CAST('abc' AS INTEGER)`, "22P02"},
+		{"cast overflow", `SELECT CAST(1000 AS TINYINT)`, "22003"},
+		{"unique violation", `INSERT INTO t VALUES (1, 2)`, "23505"},
+		{"not null violation", `INSERT INTO t (id) VALUES (2)`, "23502"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := db.Exec(tc.query)
+			if err == nil {
+				t.Fatalf("expected error from %q, got nil", tc.query)
+			}
+			if got := classifyErrorCode(err); got != tc.wantCode {
+				t.Fatalf("classifyErrorCode for %q = %q, want %q (raw err: %v)", tc.query, got, tc.wantCode, err)
+			}
+		})
+	}
+
+	t.Run("nested begin", func(t *testing.T) {
+		if _, err := db.Exec(`BEGIN`); err != nil {
+			t.Fatalf("outer begin: %v", err)
+		}
+		defer func() { _, _ = db.Exec(`ROLLBACK`) }()
+
+		_, err := db.Exec(`BEGIN`)
+		if err == nil {
+			t.Fatal("expected error on nested BEGIN, got nil")
+		}
+		if got := classifyErrorCode(err); got != "25000" {
+			t.Fatalf("nested BEGIN SQLSTATE = %q, want %q (raw err: %v)", got, "25000", err)
+		}
+	})
 }
 
 func TestIsAlterTableNotTableErrorDoesNotTreatMissingObjectSuggestionAsWrongType(t *testing.T) {
