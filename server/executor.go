@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"os"
 )
 
 // ColumnTyper provides type name information for a database column.
@@ -102,11 +103,11 @@ func (e *LocalExecutor) Close() error {
 }
 
 func (e *LocalExecutor) LastProfilingOutput() string {
-	var output string
-	if err := e.db.QueryRow("SELECT json(profiling_output) FROM pragma_last_profiling_output()").Scan(&output); err != nil {
+	data, err := os.ReadFile("/tmp/duckgres-profiling.json")
+	if err != nil {
 		return ""
 	}
-	return output
+	return string(data)
 }
 
 // LocalRowSet wraps *sql.Rows to implement RowSet.

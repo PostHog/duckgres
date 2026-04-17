@@ -2,6 +2,7 @@ package duckdbservice
 
 import (
 	"context"
+	"os"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -11,13 +12,18 @@ import (
 // output from the worker back to the control plane.
 const profilingMetadataKey = "x-duckgres-profiling"
 
-// sendProfilingMetadata queries the last profiling output from the session's
-// DuckDB connection and sends it as gRPC trailing metadata.
+// profilingOutputPath is the fixed file path where DuckDB writes profiling
+// output. Only one query runs per worker at a time (control plane enforces
+// this), so a single file is safe.
+const profilingOutputPath = "/tmp/duckgres-profiling.json"
+
+// sendProfilingMetadata reads the profiling output file written by DuckDB
+// and sends it as gRPC trailing metadata so the control plane can attach
+// it to the trace span.
 func sendProfilingMetadata(ctx context.Context, session *Session) {
-	var output string
-	err := session.Conn.QueryRowContext(ctx, "SELECT json(profiling_output) FROM pragma_last_profiling_output()").Scan(&output)
-	if err != nil || output == "" {
+	data, err := os.ReadFile(profilingOutputPath)
+	if err != nil || len(data) == 0 {
 		return
 	}
-	_ = grpc.SetTrailer(ctx, metadata.Pairs(profilingMetadataKey, output))
+	_ = grpc.SetTrailer(ctx, metadata.Pairs(profilingMetadataKey, string(data)))
 }

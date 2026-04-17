@@ -770,11 +770,16 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Enable query profiling so per-query operator timing can be extracted
 	// and attached to OTEL trace spans. Standard mode adds sub-1% overhead
 	// (just clock_gettime per operator boundary).
+	// Output goes to a fixed temp file; in K8s mode the worker reads it
+	// after each query and sends it to the control plane via gRPC trailer.
 	if _, err := db.Exec("SET enable_profiling = 'json'"); err != nil {
 		slog.Warn("Failed to enable DuckDB profiling.", "error", err)
 	}
 	if _, err := db.Exec("SET profiling_mode = 'detailed'"); err != nil {
 		slog.Warn("Failed to set DuckDB profiling mode.", "error", err)
+	}
+	if _, err := db.Exec("SET profiling_output = '/tmp/duckgres-profiling.json'"); err != nil {
+		slog.Warn("Failed to set DuckDB profiling output path.", "error", err)
 	}
 
 	// Configure cache_httpfs cache directory if the extension is loaded.
