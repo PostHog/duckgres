@@ -12,4 +12,5 @@ func (m *mockOrgRouter) StackForOrg(_ string) (WorkerPool, *SessionManager, *Mem
 }
 
 func (m *mockOrgRouter) IsMigratingForOrg(_ string) bool { return false }
+func (m *mockOrgRouter) SetWarmCapacityTarget(_ int)     {}
 func (m *mockOrgRouter) ShutdownAll()                    {}

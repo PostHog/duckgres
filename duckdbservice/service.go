@@ -79,6 +79,15 @@ type Session struct {
 	txnOwner      map[string]string
 	handleCounter atomic.Uint64
 
+	// sqlTxActive tracks whether a SQL-level transaction is in progress on this
+	// session's Conn (i.e., BEGIN was sent as raw SQL without a corresponding
+	// COMMIT/ROLLBACK). This is distinct from Flight SQL protocol-level
+	// transactions tracked in txns. Used to prevent retryOnTransient from
+	// retrying statements inside a user-managed transaction — a retry after a
+	// transient error would run in autocommit mode (the transaction is dead)
+	// and mask the failure from the client.
+	sqlTxActive atomic.Bool
+
 	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
 	progress   progressState    // stall detection state
 }
@@ -615,13 +624,18 @@ func dropTemporary(ctx context.Context, conn *sql.Conn, query, dropFmt string) {
 
 // initSearchPath sets the DuckDB search_path for a session connection.
 // It tries to include the user's schema first; if that schema doesn't exist,
-// it falls back to just 'main' (DuckDB's default schema).
+// it falls back to just 'main'.
+//
+// memory.main is always included so that pg_catalog macros (pg_get_userbyid,
+// format_type, etc.) remain resolvable when the default catalog is ducklake.
+// Without it, DuckDB restricts function resolution to the ducklake catalog
+// and psql commands like \dt fail.
 func initSearchPath(conn *sql.Conn, username string) {
-	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET search_path = '%s,main'", username)); err != nil {
+	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET search_path = '%s,main,memory.main'", username)); err != nil {
 		slog.Debug("User schema not found, using default search_path.", "user", username)
 		// Clear the aborted transaction state before retrying.
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		if _, err := conn.ExecContext(context.Background(), "SET search_path = 'main'"); err != nil {
+		if _, err := conn.ExecContext(context.Background(), "SET search_path = 'main,memory.main'"); err != nil {
 			slog.Warn("Failed to set search_path for session.", "user", username, "error", err)
 		}
 	}

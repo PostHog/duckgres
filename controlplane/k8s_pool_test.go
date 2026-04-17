@@ -40,6 +40,7 @@ type captureRuntimeWorkerStore struct {
 	spawnMaxOrgWorkers    int
 	spawnMaxGlobalWorks   int
 	neutralSpawned        *configstore.WorkerRecord
+	neutralSpawnedFunc    func() *configstore.WorkerRecord
 	neutralSpawnErr       error
 	neutralSpawnCalls     int
 	neutralSpawnOwnerCPID string
@@ -55,6 +56,11 @@ type captureRuntimeWorkerStore struct {
 	takeOverOwnerCPID     string
 	takeOverOrgID         string
 	takeOverExpectedEpoch int64
+	retireIdleCalls         int
+	retireIdleCalledIDs     []int
+	retireIdleCalledReasons []string
+	retireIdleErr           error
+	retireIdleMisses        map[int]bool
 }
 
 func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
@@ -132,6 +138,14 @@ func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceI
 	if s.neutralSpawnErr != nil {
 		return nil, s.neutralSpawnErr
 	}
+	if s.neutralSpawnedFunc != nil {
+		rec := s.neutralSpawnedFunc()
+		if rec == nil {
+			return nil, nil
+		}
+		copy := *rec
+		return &copy, nil
+	}
 	if s.neutralSpawned == nil {
 		return nil, nil
 	}
@@ -174,6 +188,21 @@ func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstance
 	return &record, nil
 }
 
+func (s *captureRuntimeWorkerStore) RetireIdleWorker(workerID int, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retireIdleCalls++
+	s.retireIdleCalledIDs = append(s.retireIdleCalledIDs, workerID)
+	s.retireIdleCalledReasons = append(s.retireIdleCalledReasons, reason)
+	if s.retireIdleErr != nil {
+		return false, s.retireIdleErr
+	}
+	if s.retireIdleMisses[workerID] {
+		return false, nil
+	}
+	return true, nil
+}
+
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
 	t.Helper()
 	cs := fake.NewSimpleClientset()
@@ -206,6 +235,7 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 		workerPort:   8816,
 		secretName:   "test-secret",
 		spawnSem:     make(chan struct{}, 1),
+		retireSem:    make(chan struct{}, 5),
 	}
 
 	return pool, cs
@@ -1119,8 +1149,8 @@ func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *t
 	if store.spawnOwnerEpoch != 1 {
 		t.Fatalf("expected spawn owner epoch 1, got %d", store.spawnOwnerEpoch)
 	}
-	if store.spawnPodNamePrefix != "duckgres-worker-test-cp" {
-		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.spawnPodNamePrefix)
+	if store.spawnPodNamePrefix != "test-cp-worker" {
+		t.Fatalf("expected pod name prefix test-cp-worker, got %q", store.spawnPodNamePrefix)
 	}
 	if store.spawnMaxOrgWorkers != 2 {
 		t.Fatalf("expected max org workers 2, got %d", store.spawnMaxOrgWorkers)
@@ -1163,8 +1193,8 @@ func TestK8sPoolSpawnWarmWorkerAllocatesRuntimeSlotWhenIDZero(t *testing.T) {
 	if store.neutralSpawnCalls != 1 {
 		t.Fatalf("expected one runtime neutral spawn slot allocation, got %d", store.neutralSpawnCalls)
 	}
-	if store.neutralSpawnPodPrefix != "duckgres-worker-test-cp" {
-		t.Fatalf("expected pod name prefix duckgres-worker-test-cp, got %q", store.neutralSpawnPodPrefix)
+	if store.neutralSpawnPodPrefix != "test-cp-worker" {
+		t.Fatalf("expected pod name prefix test-cp-worker, got %q", store.neutralSpawnPodPrefix)
 	}
 }
 
@@ -1173,33 +1203,37 @@ func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
 	store := &captureRuntimeWorkerStore{}
 	pool.runtimeStore = store
 
-	var mu sync.Mutex
-	var slots int
-	store.neutralSpawned = &configstore.WorkerRecord{
-		WorkerID:          51,
-		PodName:           "duckgres-worker-test-cp-51",
-		State:             configstore.WorkerStateSpawning,
-		OwnerCPInstanceID: pool.cpInstanceID,
+	// Return different records on successive CreateNeutralWarmWorkerSlot calls.
+	neutralRecords := []*configstore.WorkerRecord{
+		{
+			WorkerID:          51,
+			PodName:           "duckgres-worker-test-cp-51",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+		},
+		{
+			WorkerID:          52,
+			PodName:           "duckgres-worker-test-cp-52",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+		},
 	}
+	var neutralIdx int
+	store.neutralSpawnedFunc = func() *configstore.WorkerRecord {
+		idx := neutralIdx
+		neutralIdx++
+		if idx < len(neutralRecords) {
+			return neutralRecords[idx]
+		}
+		return nil
+	}
+
+	var mu sync.Mutex
+	spawnedIDs := map[int]bool{}
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		mu.Lock()
 		defer mu.Unlock()
-		slots++
-		if slots == 1 {
-			if id != 51 {
-				t.Fatalf("expected first runtime worker id 51, got %d", id)
-			}
-			store.neutralSpawned = &configstore.WorkerRecord{
-				WorkerID:          52,
-				PodName:           "duckgres-worker-test-cp-52",
-				State:             configstore.WorkerStateSpawning,
-				OwnerCPInstanceID: pool.cpInstanceID,
-			}
-			return nil
-		}
-		if id != 52 {
-			t.Fatalf("expected second runtime worker id 52, got %d", id)
-		}
+		spawnedIDs[id] = true
 		return nil
 	}
 
@@ -1211,6 +1245,9 @@ func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
 	}
 	if store.neutralSpawnTarget != 2 {
 		t.Fatalf("expected neutral warm target 2, got %d", store.neutralSpawnTarget)
+	}
+	if !spawnedIDs[51] || !spawnedIDs[52] {
+		t.Fatalf("expected worker ids 51 and 52 to be spawned, got %v", spawnedIDs)
 	}
 }
 
@@ -1507,7 +1544,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	for _, env := range c.Env {
 		if env.Name == "DUCKGRES_DUCKDB_TOKEN" && env.ValueFrom != nil &&
 			env.ValueFrom.SecretKeyRef != nil &&
-			env.ValueFrom.SecretKeyRef.Name == "test-secret-duckgres-worker-test-cp-0" {
+			env.ValueFrom.SecretKeyRef.Name == "test-secret-test-cp-worker-0" {
 			foundEnv = true
 		}
 		if env.Name == "DUCKGRES_SHARED_WARM_WORKER" && env.Value == "true" {
@@ -1536,7 +1573,7 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	foundWorkerRPCSecret := false
 	for _, volume := range pod.Spec.Volumes {
 		if volume.Name == "worker-rpc-tls" && volume.Secret != nil &&
-			volume.Secret.SecretName == "test-secret-duckgres-worker-test-cp-0" {
+			volume.Secret.SecretName == "test-secret-test-cp-worker-0" {
 			foundWorkerRPCSecret = true
 		}
 	}
@@ -1755,8 +1792,17 @@ func TestWorkerResources_BothSet(t *testing.T) {
 	if mem.String() != "2Gi" {
 		t.Fatalf("expected memory request 2Gi, got %s", mem.String())
 	}
-	if res.Limits != nil {
-		t.Fatal("expected no limits to be set")
+	// Guaranteed QoS: limits == requests
+	if res.Limits == nil {
+		t.Fatal("expected limits to be set (Guaranteed QoS)")
+	}
+	cpuLimit := res.Limits[corev1.ResourceCPU]
+	if cpuLimit.String() != "500m" {
+		t.Fatalf("expected CPU limit 500m, got %s", cpuLimit.String())
+	}
+	memLimit := res.Limits[corev1.ResourceMemory]
+	if memLimit.String() != "2Gi" {
+		t.Fatalf("expected memory limit 2Gi, got %s", memLimit.String())
 	}
 }
 
@@ -1771,6 +1817,12 @@ func TestWorkerResources_CPUOnly(t *testing.T) {
 	if _, ok := res.Requests[corev1.ResourceMemory]; ok {
 		t.Fatal("expected no memory request")
 	}
+	if _, ok := res.Limits[corev1.ResourceCPU]; !ok {
+		t.Fatal("expected CPU limit (Guaranteed QoS)")
+	}
+	if _, ok := res.Limits[corev1.ResourceMemory]; ok {
+		t.Fatal("expected no memory limit")
+	}
 }
 
 func TestWorkerResources_MemoryOnly(t *testing.T) {
@@ -1784,6 +1836,12 @@ func TestWorkerResources_MemoryOnly(t *testing.T) {
 	if _, ok := res.Requests[corev1.ResourceCPU]; ok {
 		t.Fatal("expected no CPU request")
 	}
+	if _, ok := res.Limits[corev1.ResourceMemory]; !ok {
+		t.Fatal("expected memory limit (Guaranteed QoS)")
+	}
+	if _, ok := res.Limits[corev1.ResourceCPU]; ok {
+		t.Fatal("expected no CPU limit")
+	}
 }
 
 func TestWorkerResources_NeitherSet(t *testing.T) {
@@ -1796,6 +1854,33 @@ func TestWorkerResources_NeitherSet(t *testing.T) {
 		t.Fatal("expected empty limits")
 	}
 }
+
+func TestSetWorkerResources(t *testing.T) {
+	pool := &K8sWorkerPool{
+		workerCPURequest:    "500m",
+		workerMemoryRequest: "2Gi",
+	}
+	pool.SetWorkerResources("46", "360Gi")
+
+	res := pool.workerResources()
+	cpu := res.Requests[corev1.ResourceCPU]
+	if cpu.String() != "46" {
+		t.Fatalf("expected CPU request 46, got %s", cpu.String())
+	}
+	mem := res.Requests[corev1.ResourceMemory]
+	if mem.String() != "360Gi" {
+		t.Fatalf("expected memory request 360Gi, got %s", mem.String())
+	}
+	cpuLimit := res.Limits[corev1.ResourceCPU]
+	if cpuLimit.String() != "46" {
+		t.Fatalf("expected CPU limit 46, got %s", cpuLimit.String())
+	}
+	memLimit := res.Limits[corev1.ResourceMemory]
+	if memLimit.String() != "360Gi" {
+		t.Fatalf("expected memory limit 360Gi, got %s", memLimit.String())
+	}
+}
+
 
 func TestWorkerScheduling_NodeSelectorAndToleration(t *testing.T) {
 	pool := &K8sWorkerPool{
@@ -1860,5 +1945,146 @@ func TestParseNodeSelector(t *testing.T) {
 	// Invalid JSON
 	if parseNodeSelector("not-json") != nil {
 		t.Fatal("expected nil for invalid JSON")
+	}
+}
+
+// mismatchVersionTestPool builds a pool whose cpID looks like a Deployment
+// pod ("duckgres-<rshash>-<podhash>") so trimK8sPodHashSuffix yields a
+// comparable version prefix.
+func mismatchVersionTestPool(t *testing.T, cpID string, store RuntimeWorkerStore) (*K8sWorkerPool, *fake.Clientset) {
+	t.Helper()
+	cs := fake.NewClientset()
+	pool := &K8sWorkerPool{
+		workers:      make(map[int]*ManagedWorker),
+		shutdownCh:   make(chan struct{}),
+		stopInform:   make(chan struct{}),
+		clientset:    cs,
+		namespace:    "default",
+		cpID:         cpID,
+		cpInstanceID: cpID + "-boot",
+		runtimeStore: store,
+		retireSem:    make(chan struct{}, 5),
+	}
+	return pool, cs
+}
+
+func createMismatchWorkerPod(t *testing.T, cs *fake.Clientset, name, controlPlaneLabel, workerIDLabel string) {
+	t.Helper()
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":                    "duckgres-worker",
+				"duckgres/control-plane": controlPlaneLabel,
+				"duckgres/worker-id":     workerIDLabel,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create pod %q: %v", name, err)
+	}
+}
+
+func TestRetireOneMismatchedVersionWorker_RetiresOlderVersionIdleWorker(t *testing.T) {
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := mismatchVersionTestPool(t, "duckgres-newhash-aaaaa", store)
+	createMismatchWorkerPod(t, cs, "duckgres-oldhash-worker-7", "duckgres-oldhash-zzzzz", "7")
+
+	if !pool.RetireOneMismatchedVersionWorker(context.Background()) {
+		t.Fatal("expected reaper to retire one mismatched worker")
+	}
+	if store.retireIdleCalls != 1 || len(store.retireIdleCalledIDs) != 1 || store.retireIdleCalledIDs[0] != 7 {
+		t.Fatalf("expected one RetireIdleWorker(7) call, got calls=%d ids=%v", store.retireIdleCalls, store.retireIdleCalledIDs)
+	}
+	if reason := store.retireIdleCalledReasons[0]; reason != "version_mismatch" {
+		t.Fatalf("expected reason version_mismatch, got %q", reason)
+	}
+	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
+	if len(pods.Items) != 0 {
+		t.Fatalf("expected pod to be deleted, got %d remaining", len(pods.Items))
+	}
+}
+
+func TestRetireOneMismatchedVersionWorker_LeavesSameVersionWorkersAlone(t *testing.T) {
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := mismatchVersionTestPool(t, "duckgres-samehash-aaaaa", store)
+	createMismatchWorkerPod(t, cs, "duckgres-samehash-worker-1", "duckgres-samehash-bbbbb", "1")
+	createMismatchWorkerPod(t, cs, "duckgres-samehash-worker-2", "duckgres-samehash-ccccc", "2")
+
+	if pool.RetireOneMismatchedVersionWorker(context.Background()) {
+		t.Fatal("expected reaper to find nothing to retire when all workers share the version")
+	}
+	if store.retireIdleCalls != 0 {
+		t.Fatalf("expected no retirement calls, got %d", store.retireIdleCalls)
+	}
+	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
+	if len(pods.Items) != 2 {
+		t.Fatalf("expected both pods to survive, got %d", len(pods.Items))
+	}
+}
+
+func TestRetireOneMismatchedVersionWorker_RetiresOnePerCall(t *testing.T) {
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := mismatchVersionTestPool(t, "duckgres-new-aaaaa", store)
+	createMismatchWorkerPod(t, cs, "duckgres-old-worker-10", "duckgres-old-xxxxx", "10")
+	createMismatchWorkerPod(t, cs, "duckgres-old-worker-11", "duckgres-old-yyyyy", "11")
+	createMismatchWorkerPod(t, cs, "duckgres-old-worker-12", "duckgres-old-zzzzz", "12")
+
+	// Each call should retire at most one pod so replenishment can refill the
+	// slot with a new-version pod between ticks.
+	for i := 0; i < 3; i++ {
+		if !pool.RetireOneMismatchedVersionWorker(context.Background()) {
+			t.Fatalf("expected a retirement on call %d", i+1)
+		}
+	}
+	if pool.RetireOneMismatchedVersionWorker(context.Background()) {
+		t.Fatal("expected no more retirements after all mismatched pods removed")
+	}
+	if store.retireIdleCalls != 3 {
+		t.Fatalf("expected exactly 3 retirement attempts, got %d", store.retireIdleCalls)
+	}
+}
+
+func TestRetireOneMismatchedVersionWorker_SkipsWhenNotIdle(t *testing.T) {
+	// RetireIdleWorker returns false when the row is no longer idle (busy,
+	// reserved, hot-idle, etc.). The reaper must skip those pods and leave
+	// them running — it will try again on the next tick.
+	store := &captureRuntimeWorkerStore{
+		retireIdleMisses: map[int]bool{5: true},
+	}
+	pool, cs := mismatchVersionTestPool(t, "duckgres-new-aaaaa", store)
+	createMismatchWorkerPod(t, cs, "duckgres-old-worker-5", "duckgres-old-zzzzz", "5")
+	createMismatchWorkerPod(t, cs, "duckgres-old-worker-6", "duckgres-old-zzzzz", "6")
+
+	if !pool.RetireOneMismatchedVersionWorker(context.Background()) {
+		t.Fatal("expected reaper to skip busy worker 5 and retire worker 6")
+	}
+	remaining := map[string]bool{}
+	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
+	for _, p := range pods.Items {
+		remaining[p.Name] = true
+	}
+	if !remaining["duckgres-old-worker-5"] {
+		t.Fatal("expected busy worker 5 pod to survive (atomic CAS returned false)")
+	}
+	if remaining["duckgres-old-worker-6"] {
+		t.Fatal("expected idle worker 6 pod to be deleted")
+	}
+}
+
+func TestRetireOneMismatchedVersionWorker_NoopWhenCPIDHasNoHashSuffix(t *testing.T) {
+	// Standalone/StatefulSet deployments won't have a ReplicaSet hash in the
+	// CP pod name, so version comparison isn't meaningful. The reaper must be
+	// a no-op rather than retiring everything it can't parse.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := mismatchVersionTestPool(t, "some-bare-hostname", store)
+	createMismatchWorkerPod(t, cs, "stray-worker-1", "duckgres-somehash-aaaaa", "1")
+
+	if pool.RetireOneMismatchedVersionWorker(context.Background()) {
+		t.Fatal("expected no-op when cpID has no pod-hash suffix")
+	}
+	if store.retireIdleCalls != 0 {
+		t.Fatalf("expected no retirement calls, got %d", store.retireIdleCalls)
 	}
 }

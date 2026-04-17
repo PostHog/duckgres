@@ -164,11 +164,20 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 }
 
 func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
-	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(map[string]interface{}{
+	fields := map[string]interface{}{
 		"max_workers":    updates.MaxWorkers,
 		"memory_budget":  updates.MemoryBudget,
 		"idle_timeout_s": updates.IdleTimeoutS,
-	})
+	}
+	// Only update resource fields when explicitly provided to avoid clearing
+	// previously-set values when the caller omits them from the JSON payload.
+	if updates.WorkerCPURequest != "" {
+		fields["worker_cpu_request"] = updates.WorkerCPURequest
+	}
+	if updates.WorkerMemoryRequest != "" {
+		fields["worker_memory_request"] = updates.WorkerMemoryRequest
+	}
+	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 	if result.Error != nil {
 		return nil, false, result.Error
 	}

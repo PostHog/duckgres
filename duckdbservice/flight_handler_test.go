@@ -108,7 +108,7 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 	}
 }
 
-func TestHealthCheckRejectsMissingOwnerEpochInSharedWarmMode(t *testing.T) {
+func TestHealthCheckAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	pool := &SessionPool{
 		sessions:       make(map[string]*Session),
 		stopRefresh:    make(map[string]func()),
@@ -124,9 +124,12 @@ func TestHealthCheckRejectsMissingOwnerEpochInSharedWarmMode(t *testing.T) {
 	handler := &FlightSQLHandler{pool: pool}
 	stream := &mockDoActionStream{}
 
+	// Health checks no longer validate epoch — a fresh CP with epoch 0 should
+	// be able to health-check workers activated by a previous CP. Ownership is
+	// serialized by the config store, not by worker-side epoch checks.
 	err := handler.doHealthCheck([]byte(`{}`), stream)
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected FailedPrecondition, got %v", err)
+	if err != nil {
+		t.Fatalf("health check should succeed regardless of epoch mismatch, got %v", err)
 	}
 }
 
@@ -212,15 +215,16 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	}
 }
 
-func TestCreateSessionRejectsStaleOwnerEpochInSharedWarmMode(t *testing.T) {
+func TestCreateSessionAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	pool := &SessionPool{
 		sessions:       make(map[string]*Session),
 		stopRefresh:    make(map[string]func()),
 		warmupDone:     make(chan struct{}),
 		startTime:      time.Now(),
-		cfg:            server.Config{},
+		cfg:            server.Config{Users: map[string]string{"alice": "pass"}},
 		sharedWarmMode: true,
 		ownerEpoch:     4,
+		duckLakeSem:    make(chan struct{}, 1),
 		activation: &activatedTenantRuntime{
 			payload: ActivationPayload{
 				WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 4},
@@ -229,10 +233,16 @@ func TestCreateSessionRejectsStaleOwnerEpochInSharedWarmMode(t *testing.T) {
 		},
 	}
 	close(pool.warmupDone)
+	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
+		return sql.Open("duckdb", "")
+	}
 
 	handler := &FlightSQLHandler{pool: pool}
 	stream := &mockDoActionStream{}
 
+	// Session creation with a mismatched epoch should now succeed past the
+	// validateControlMetadata check. Epoch/CP-instance validation is no longer
+	// enforced on the worker side.
 	body, err := json.Marshal(server.WorkerCreateSessionPayload{
 		WorkerControlMetadata: server.WorkerControlMetadata{
 			OwnerEpoch: 3,
@@ -244,12 +254,12 @@ func TestCreateSessionRejectsStaleOwnerEpochInSharedWarmMode(t *testing.T) {
 	}
 
 	err = handler.doCreateSession(body, stream)
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected FailedPrecondition, got %v", err)
+	if err != nil {
+		t.Fatalf("create session should succeed regardless of epoch mismatch, got %v", err)
 	}
 }
 
-func TestSessionFromContextRejectsStaleOwnerEpoch(t *testing.T) {
+func TestSessionFromContextAcceptsMismatchedEpoch(t *testing.T) {
 	pool := &SessionPool{
 		sessions:       make(map[string]*Session),
 		stopRefresh:    make(map[string]func()),
@@ -271,9 +281,11 @@ func TestSessionFromContextRejectsStaleOwnerEpoch(t *testing.T) {
 		"x-duckgres-cp-instance-id", "cp-live:boot-a",
 	))
 
+	// Epoch mismatches are no longer rejected — ownership is serialized
+	// by the config store, not worker-side epoch checks.
 	_, err := handler.sessionFromContext(ctx)
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected FailedPrecondition, got %v", err)
+	if err != nil {
+		t.Fatalf("expected mismatched epoch to be accepted, got %v", err)
 	}
 }
 

@@ -15,8 +15,6 @@ import (
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
-	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
 // redactingHandler wraps an slog.Handler and scrubs password values from
@@ -226,15 +224,7 @@ func initLogging() func() {
 		processors = append(processors, sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)))
 	}
 
-	serviceName := "duckgres"
-	if id := os.Getenv("DUCKGRES_IDENTIFIER"); id != "" {
-		serviceName = serviceName + "-" + id
-	}
-
-	res := resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceName(serviceName),
-	)
+	res := otelResource()
 
 	opts := append(processors, sdklog.WithResource(res))
 	provider := sdklog.NewLoggerProvider(opts...)

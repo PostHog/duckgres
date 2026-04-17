@@ -53,16 +53,23 @@ var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently open client connections",
 })
 
-var queryDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+// IncrementOpenConnections increments the open connections gauge.
+// Used by the control plane which handles connections separately from the standalone server.
+func IncrementOpenConnections() { connectionsGauge.Inc() }
+
+// DecrementOpenConnections decrements the open connections gauge.
+func DecrementOpenConnections() { connectionsGauge.Dec() }
+
+var queryDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_query_duration_seconds",
 	Help:    "Query execution duration in seconds",
-	Buckets: prometheus.DefBuckets,
-})
+	Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 18000, 36000},
+}, []string{"org"})
 
-var queryErrorsCounter = promauto.NewCounter(prometheus.CounterOpts{
+var queryErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_query_errors_total",
 	Help: "Total number of failed queries",
-})
+}, []string{"org"})
 
 var authFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_auth_failures_total",
@@ -82,6 +89,26 @@ var rateLimitedIPsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 var queryCancellationsCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_query_cancellations_total",
 	Help: "Total number of queries cancelled via cancel request",
+})
+
+var ducklakeConflictTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_total",
+	Help: "Total number of DuckLake transaction conflicts encountered",
+})
+
+var ducklakeConflictRetriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retries_total",
+	Help: "Total number of DuckLake transaction conflict retry attempts",
+})
+
+var ducklakeConflictRetrySuccessesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retry_successes_total",
+	Help: "Total number of DuckLake transaction conflict retries that succeeded",
+})
+
+var ducklakeConflictRetriesExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retries_exhausted_total",
+	Help: "Total number of DuckLake transaction conflicts where all retries were exhausted",
 })
 
 // BackendKey uniquely identifies a backend connection for cancel requests
@@ -750,7 +777,11 @@ func (s *Server) releaseFileDB(username string) {
 // so performance is equivalent to in-memory while data persists across restarts.
 // When DataDir is empty, falls back to a pure in-memory database.
 func openBaseDB(cfg Config, username string) (*sql.DB, error) {
-	dsn := ":memory:"
+	// allow_unsigned_extensions is a startup-only DuckDB config — it must be
+	// in the DSN, not via SET. Required for loading the patched httpfs extension
+	// (benben/duckdb-httpfs) which fixes stoi/stoll crashes on HTTP headers
+	// but isn't signed with DuckDB's release key.
+	path := ":memory:"
 	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
 		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
 			return nil, fmt.Errorf("invalid username for file persistence: %q (contains path separator or ..)", username)
@@ -758,10 +789,10 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
 			return nil, fmt.Errorf("failed to create data directory %s: %w", cfg.DataDir, err)
 		}
-		dsn = filepath.Join(cfg.DataDir, username+".duckdb")
-		slog.Info("Opening file-backed DuckDB.", "path", dsn)
+		path = filepath.Join(cfg.DataDir, username+".duckdb")
+		slog.Info("Opening file-backed DuckDB.", "path", path)
 	}
-	db, err := sql.Open("duckdb", dsn)
+	db, err := sql.Open("duckdb", path+"?allow_unsigned_extensions=true")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
@@ -825,6 +856,21 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Load configured extensions
 	if err := LoadExtensions(db, cfg.Extensions); err != nil {
 		slog.Warn("Failed to load some extensions.", "user", username, "error", err)
+	}
+
+	// Enable query profiling so per-query operator timing can be extracted
+	// and attached to OTEL trace spans. Standard mode adds sub-1% overhead
+	// (just clock_gettime per operator boundary).
+	// Output goes to a fixed temp file; in K8s mode the worker reads it
+	// after each query and sends it to the control plane via gRPC trailer.
+	if _, err := db.Exec("SET enable_profiling = 'json'"); err != nil {
+		slog.Warn("Failed to enable DuckDB profiling.", "error", err)
+	}
+	if _, err := db.Exec("SET profiling_mode = 'detailed'"); err != nil {
+		slog.Warn("Failed to set DuckDB profiling mode.", "error", err)
+	}
+	if _, err := db.Exec("SET profiling_output = '/tmp/duckgres-profiling.json'"); err != nil {
+		slog.Warn("Failed to set DuckDB profiling output path.", "error", err)
 	}
 
 	// Configure cache_httpfs cache directory if the extension is loaded.
@@ -1208,12 +1254,15 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
+	_, attachSpan := tracer.Start(context.Background(), "duckgres.ducklake_attach")
 	if err := retryOnTransientAttach(func() error {
 		_, err := db.Exec(attachStmt)
 		return err
 	}); err != nil {
+		attachSpan.End()
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
+	attachSpan.End()
 
 	slog.Info("Attached DuckLake catalog successfully.")
 

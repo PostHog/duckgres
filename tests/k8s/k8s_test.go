@@ -19,6 +19,7 @@ import (
 	_ "github.com/lib/pq"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -27,8 +28,7 @@ var (
 	clientset  *kubernetes.Clientset
 	namespace  string
 	kubeconfig string
-	pgPort     int
-	portFwdCmd *exec.Cmd
+	portForward *portForwardState
 	testEnv    k8sTestEnvironment
 )
 
@@ -66,6 +66,19 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("Failed to create k8s client: %v", err)
 	}
+	portForward = newPortForwardState(
+		func() (int, *exec.Cmd, error) {
+			return startPortForward(namespace, duckgresServiceTarget, duckgresServicePort)
+		},
+		waitForPort,
+		func(cmd *exec.Cmd) {
+			if cmd == nil || cmd.Process == nil {
+				return
+			}
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		},
+	)
 
 	if _, err := waitForSingleReadyPod(namespace, "app=duckgres-control-plane", 90*time.Second); err != nil {
 		log.Fatalf("Control-plane pod not ready: %v", err)
@@ -197,6 +210,7 @@ func TestK8sWorkerCrashRecovery(t *testing.T) {
 
 func TestK8sMultipleConcurrentConnections(t *testing.T) {
 	const n = 5
+	const timeout = 75 * time.Second
 	var wg sync.WaitGroup
 	errs := make(chan error, n)
 
@@ -205,7 +219,7 @@ func TestK8sMultipleConcurrentConnections(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			query := fmt.Sprintf("SELECT %d", id)
-			if err := retryDBOperationWithReconnect(30*time.Second, fmt.Sprintf("concurrent query %q", query), func(ctx context.Context, db *sql.DB) error {
+			if err := retryDBOperationWithReconnect(timeout, fmt.Sprintf("concurrent query %q", query), func(ctx context.Context, db *sql.DB) error {
 				var result int
 				if err := db.QueryRowContext(ctx, query).Scan(&result); err != nil {
 					return err
@@ -271,107 +285,89 @@ func TestK8sWorkerSecurityContext(t *testing.T) {
 	}
 }
 
-func TestK8sCPDeletionGarbageCollects(t *testing.T) {
-	// Ensure a worker exists
+// TestK8sVersionMismatchedWorkerIsReaped verifies the leader-driven
+// rolling-replacement behavior introduced when the startup orphan sweep was
+// removed: when a shared warm worker pod's duckgres/control-plane label
+// identifies a different Deployment ReplicaSet than the running CP's, the
+// janitor leader retires it via an atomic idle->retired CAS and deletes the
+// pod. Together with reconcileWarmCapacity in the same tick the slot is
+// refilled with a current-version worker, so deployment rollouts replace
+// shared workers gradually instead of in a destructive cross-CP sweep.
+//
+// We simulate the version mismatch by mutating an existing warm worker's
+// label to a fake Deployment hash. The reaper has no way to distinguish a
+// genuine prior-rollout pod from this fake one, which is precisely what we
+// want to assert.
+func TestK8sVersionMismatchedWorkerIsReaped(t *testing.T) {
+	// Make sure at least one shared warm worker is up.
 	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
 
-	// List worker pods
+	// Brief idle window so the worker settles back into idle state in the
+	// configstore — RetireIdleWorker is a state-conditional CAS that no-ops
+	// on busy/reserved/hot rows.
+	time.Sleep(3 * time.Second)
+
 	workerPods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: "app=duckgres-worker",
 	})
 	if err != nil {
-		t.Fatalf("failed to list worker pods: %v", err)
+		t.Fatalf("list worker pods: %v", err)
 	}
-	if len(workerPods.Items) == 0 {
-		t.Skip("no worker pods found — cannot test GC")
-	}
-
-	ownedWorkers := workerPodsByControlPlaneLabel(workerPods.Items)
-	if len(ownedWorkers) == 0 {
-		t.Skip("no worker pods with duckgres/control-plane label found")
-	}
-
-	// Delete a CP pod that currently owns at least one worker.
-	var cpName string
-	var workerNames []string
-	for ownerName, owned := range ownedWorkers {
-		if len(owned) > 0 {
-			cpName = ownerName
-			workerNames = append([]string(nil), owned...)
-			break
+	var target *corev1.Pod
+	for i := range workerPods.Items {
+		p := &workerPods.Items[i]
+		// Shared warm workers (no duckgres/org label) only — the version
+		// reaper currently runs against the shared pool.
+		if p.Labels["duckgres/org"] != "" {
+			continue
 		}
-	}
-	if cpName == "" {
-		t.Skip("no control-plane-owned worker pods found")
-	}
-
-	cpPods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: "app=duckgres-control-plane",
-	})
-	if err != nil || len(cpPods.Items) == 0 {
-		t.Fatalf("failed to find CP pod: %v", err)
-	}
-	foundCP := false
-	for _, pod := range cpPods.Items {
-		if pod.Name == cpName {
-			foundCP = true
-			break
+		if p.Labels["duckgres/control-plane"] == "" || p.Labels["duckgres/worker-id"] == "" {
+			continue
 		}
-	}
-	if !foundCP {
-		t.Skipf("control-plane pod %s no longer exists", cpName)
-	}
-	gracePeriodSeconds := int64(0)
-	t.Logf("Force deleting CP pod %s to test crash-style garbage collection", cpName)
-	err = clientset.CoreV1().Pods(namespace).Delete(context.Background(), cpName, metav1.DeleteOptions{
-		GracePeriodSeconds: &gracePeriodSeconds,
-	})
-	if err != nil {
-		t.Fatalf("failed to delete CP pod: %v", err)
-	}
-
-	// Wait for the deleted control plane's worker pods to be retired.
-	allGone := false
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		remaining := 0
-		for _, name := range workerNames {
-			_, err := clientset.CoreV1().Pods(namespace).Get(context.Background(), name, metav1.GetOptions{})
-			switch {
-			case err == nil:
-				remaining++
-			case isPodGoneError(err):
-				continue
-			default:
-				t.Logf("transient error checking worker pod %s deletion: %v", name, err)
-				remaining++
-			}
+		if p.DeletionTimestamp != nil {
+			continue
 		}
-		if remaining == 0 {
-			allGone = true
-			break
+		if p.Status.Phase != corev1.PodRunning {
+			continue
 		}
-		time.Sleep(2 * time.Second)
+		target = p
+		break
 	}
-	if !allGone {
-		t.Error("worker pods were not garbage-collected after CP deletion within 90s")
-	}
-
-	// Wait for the deployment to recreate the CP
-	if err := waitForDeployment(namespace, "duckgres-control-plane", 120*time.Second); err != nil {
-		t.Fatalf("CP deployment did not recover: %v", err)
+	if target == nil {
+		t.Skip("no eligible shared warm worker pod found")
 	}
 
-	// Restart port-forward since the old CP pod is gone
-	if err := restartPortForward(); err != nil {
-		t.Fatalf("failed to restart port-forward: %v", err)
+	originalCPLabel := target.Labels["duckgres/control-plane"]
+	// Pick a pod-template-hash segment that's clearly different from the
+	// real one so trimK8sPodHashSuffix yields a distinct version prefix.
+	fakeCPLabel := "duckgres-control-plane-deadbeef00-fake1"
+	patch := []byte(fmt.Sprintf(`{"metadata":{"labels":{"duckgres/control-plane":%q}}}`, fakeCPLabel))
+	if _, err := clientset.CoreV1().Pods(namespace).Patch(
+		context.Background(),
+		target.Name,
+		k8stypes.StrategicMergePatchType,
+		patch,
+		metav1.PatchOptions{},
+	); err != nil {
+		t.Fatalf("patch pod %s control-plane label: %v", target.Name, err)
+	}
+	t.Logf("Mutated pod %s control-plane label %q -> %q; expecting leader version reaper to retire it",
+		target.Name, originalCPLabel, fakeCPLabel)
+
+	// Janitor leader runs every 5s; allow generous slack for leader lease
+	// acquisition, configstore CAS, pod delete + grace.
+	waitForPodGone(t, namespace, target.Name, 90*time.Second)
+	if _, err := clientset.CoreV1().Pods(namespace).Get(context.Background(), target.Name, metav1.GetOptions{}); !isPodGoneError(err) {
+		t.Fatalf("pod %s with mismatched-version label was not reaped within 90s (err=%v)", target.Name, err)
 	}
 
-	// Verify the system works again
-	if err := retryQueryWithReconnect("SELECT 1", 60*time.Second); err != nil {
-		t.Fatalf("query failed after CP recreation: %v", err)
+	// System should still serve traffic — replenishment happens in the same
+	// janitor tick that retired the mismatched worker, so there should be no
+	// observable capacity dip.
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
+		t.Fatalf("query after version reaper retired worker failed: %v", err)
 	}
 }
 
@@ -439,33 +435,24 @@ func startPortForward(ns, target string, remotePort int) (int, *exec.Cmd, error)
 }
 
 func closePortForward() {
-	if portFwdCmd == nil || portFwdCmd.Process == nil {
-		portFwdCmd = nil
+	if portForward == nil {
 		return
 	}
-
-	_ = portFwdCmd.Process.Kill()
-	_ = portFwdCmd.Wait()
-	portFwdCmd = nil
+	portForward.closeCurrent()
 }
 
 func restartPortForward() error {
-	closePortForward()
-
-	localPort, cmd, err := startPortForward(namespace, duckgresServiceTarget, duckgresServicePort)
-	if err != nil {
-		return err
+	if portForward == nil {
+		return fmt.Errorf("port-forward state is not initialized")
 	}
+	return portForward.restart(30 * time.Second)
+}
 
-	pgPort = localPort
-	portFwdCmd = cmd
-
-	if err := waitForPort(pgPort, 30*time.Second); err != nil {
-		closePortForward()
-		return err
+func restartPortForwardIfStale(stalePort int) error {
+	if portForward == nil {
+		return fmt.Errorf("port-forward state is not initialized")
 	}
-
-	return nil
+	return portForward.restartIfStale(stalePort, 30*time.Second)
 }
 
 func waitForPort(port int, timeout time.Duration) error {
@@ -555,13 +542,23 @@ func latestWorkerPod(t *testing.T) corev1.Pod {
 		t.Fatal("expected at least one worker pod, found none")
 	}
 
-	latest := pods.Items[0]
-	for _, pod := range pods.Items[1:] {
-		if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+	var latest corev1.Pod
+	found := false
+	for _, pod := range pods.Items {
+		if !isReadyPod(pod) {
+			continue
+		}
+		if !found || pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
 			latest = pod
+			found = true
 		}
 	}
-	return latest
+	if found {
+		return latest
+	}
+
+	t.Fatal("expected at least one ready worker pod, found none")
+	return corev1.Pod{}
 }
 
 func latestWorkerPodBeforeQuery(timeout time.Duration) (corev1.Pod, error) {
@@ -573,18 +570,23 @@ func latestWorkerPodBeforeQuery(timeout time.Duration) (corev1.Pod, error) {
 		if err != nil {
 			return corev1.Pod{}, err
 		}
-		if len(pods.Items) > 0 {
-			latest := pods.Items[0]
-			for _, pod := range pods.Items[1:] {
-				if pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
-					latest = pod
-				}
+		var latest corev1.Pod
+		found := false
+		for _, pod := range pods.Items {
+			if !isReadyPod(pod) {
+				continue
 			}
+			if !found || pod.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+				latest = pod
+				found = true
+			}
+		}
+		if found {
 			return latest, nil
 		}
 		time.Sleep(2 * time.Second)
 	}
-	return corev1.Pod{}, fmt.Errorf("no worker pods appeared within %s", timeout)
+	return corev1.Pod{}, fmt.Errorf("no ready worker pods appeared within %s", timeout)
 }
 
 func openDB(t *testing.T) *sql.DB {
@@ -602,9 +604,16 @@ func openDBConn() (*sql.DB, error) {
 }
 
 func openDBConnAs(username, password string) (*sql.DB, error) {
+	if portForward == nil {
+		return nil, fmt.Errorf("port-forward state is not initialized")
+	}
 	databaseName := username
 	if username == "postgres" {
 		databaseName = "duckgres"
+	}
+	pgPort := portForward.currentPort()
+	if pgPort == 0 {
+		return nil, fmt.Errorf("port-forward port is not initialized")
 	}
 
 	// kubectl port-forward passes raw TCP bytes, so the client still needs
@@ -692,6 +701,10 @@ func retryDBOperationWithReconnectAs(username, password string, timeout time.Dur
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		stalePort := 0
+		if portForward != nil {
+			stalePort = portForward.currentPort()
+		}
 		db, err := openDBConnAs(username, password)
 		if err == nil {
 			attemptCtx, cancel := context.WithTimeout(context.Background(), dbAttemptTimeout)
@@ -705,7 +718,7 @@ func retryDBOperationWithReconnectAs(username, password string, timeout time.Dur
 
 		lastErr = err
 		if isTransientDBError(err) {
-			if restartErr := restartPortForward(); restartErr != nil {
+			if restartErr := restartPortForwardIfStale(stalePort); restartErr != nil {
 				lastErr = fmt.Errorf("%w; restart port-forward: %v", err, restartErr)
 			}
 		}

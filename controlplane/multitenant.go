@@ -44,6 +44,10 @@ func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 	return a.router.IsMigrating(orgID)
 }
 
+func (a *orgRouterAdapter) SetWarmCapacityTarget(n int) {
+	a.router.sharedPool.SetWarmCapacityTarget(n)
+}
+
 func (a *orgRouterAdapter) ShutdownAll() {
 	a.router.ShutdownAll()
 }
@@ -126,6 +130,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	maxWorkers int,
+	isHealthy func() bool,
 ) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
@@ -223,14 +228,7 @@ func SetupMultiTenant(
 		router.sharedPool.retireClaimedWorker(&record, reason)
 	}
 	janitor.retireLocalWorker = func(workerID int, reason string) bool {
-		router.sharedPool.mu.Lock()
-		_, local := router.sharedPool.workers[workerID]
-		router.sharedPool.mu.Unlock()
-		if !local {
-			return false
-		}
-		router.sharedPool.retireWorkerWithReason(workerID, reason)
-		return true
+		return router.sharedPool.retireWorkerWithReason(workerID, reason)
 	}
 	janitor.reconcileWarmCapacity = func() {
 		target := router.sharedPool.WarmCapacityTarget()
@@ -241,6 +239,11 @@ func SetupMultiTenant(
 		if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
 			slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
 		}
+	}
+	janitor.retireMismatchedVersionWorker = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		router.sharedPool.RetireOneMismatchedVersionWorker(ctx)
 	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
@@ -279,7 +282,7 @@ func SetupMultiTenant(
 	engine.Use(gin.Recovery())
 
 	// Health endpoint (unauthenticated, used by K8s probes)
-	engine.GET("/health", newHealthHandler(runtimeTracker.Draining))
+	engine.GET("/health", newHealthHandler(isHealthy))
 
 	// Authenticated API
 	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
@@ -314,10 +317,10 @@ func resolveK8sNamespace(namespace string) (string, error) {
 	return string(ns), nil
 }
 
-func newHealthHandler(isDraining func() bool) gin.HandlerFunc {
+func newHealthHandler(isHealthy func() bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if isDraining != nil && isDraining() {
-			c.String(http.StatusServiceUnavailable, "draining")
+		if isHealthy != nil && !isHealthy() {
+			c.String(http.StatusServiceUnavailable, "unhealthy")
 			return
 		}
 		c.String(http.StatusOK, "ok")

@@ -184,6 +184,7 @@ deploy-multitenant-kind:
 # End-to-end local multi-tenant setup: optional OrbStack K8s + config store + control plane
 [group('dev')]
 run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multitenant-local multitenant-seed-local
+    sleep 2
     kubectl -n duckgres rollout restart deployment/duckgres-control-plane
     kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
     @echo "Multi-tenant control plane ready."
@@ -194,12 +195,13 @@ run-multitenant-local: multitenant-config-store-up build-k8s-image deploy-multit
 # End-to-end local multi-tenant setup: kind K8s + config store + control plane
 [group('dev')]
 run-multitenant-kind: kind-cluster-reset multitenant-config-store-up-kind build-k8s-image kind-load-k8s-image deploy-multitenant-kind multitenant-seed-kind
+    sleep 2
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres rollout restart deployment/duckgres-control-plane
     KUBECONFIG="${DUCKGRES_KIND_KUBECONFIG:-/tmp/duckgres-kind-kubeconfig}" kubectl -n duckgres wait deployment/duckgres-control-plane --for=condition=available --timeout=120s
     @echo "Multi-tenant control plane ready on kind."
     @echo "Default login: postgres / postgres"
     @echo "Fetch admin token with: kubectl -n duckgres logs deployment/duckgres-control-plane | rg 'Generated admin API token'"
-    @echo "Run 'just multitenant-port-forward-pg' in another terminal if you want direct psql access."
+    @echo "Run 'just multitenant-port-forward-pg' in another terminal if you want direct pgwire or Flight access."
 
 # Tear down the optional OrbStack/local multitenant environment
 [group('dev')]
@@ -214,10 +216,10 @@ cleanup-multitenant-kind:
     just multitenant-config-store-down-kind
     just kind-cluster-down
 
-# Port-forward PostgreSQL traffic from the local control plane
+# Port-forward pgwire and Flight traffic from the local control plane
 [group('dev')]
 multitenant-port-forward-pg:
-    kubectl -n duckgres port-forward svc/duckgres 5432:5432
+    kubectl -n duckgres port-forward svc/duckgres 5432:5432 8815:8815
 
 # Port-forward the API server (admin + provisioning) from the local control plane
 [group('dev')]
@@ -232,7 +234,7 @@ run-ducklake: build
 # Connect via psql (standalone default port)
 [group('dev')]
 psql port="5432":
-    PGPASSWORD=postgres psql "host=127.0.0.1 port={{port}} user=postgres sslmode=require"
+    PGPASSWORD=postgres psql "host=127.0.0.1 port={{port}} user=postgres dbname=duckgres sslmode=require"
 
 # Watch for changes and rebuild
 [group('dev')]
@@ -295,6 +297,31 @@ test-perf:
 [group('test')]
 test-ducklake:
     ./scripts/test_ducklake.sh
+
+# Run DuckLake concurrency benchmarks (current version)
+[group('test')]
+test-ducklake-concurrency:
+    go test -v -run TestDuckLakeConcurrentTransactions -timeout 300s ./tests/integration/...
+
+# Run DuckLake concurrency benchmarks with JSON output (current version)
+[group('test')]
+bench-ducklake:
+    ./scripts/ducklake_version_matrix.sh --current-only
+
+# Run DuckLake concurrency benchmarks across multiple DuckDB/DuckLake versions
+[group('test')]
+bench-ducklake-matrix:
+    ./scripts/ducklake_version_matrix.sh
+
+# Run DuckLake concurrency benchmarks with metadata latency sensitivity analysis
+[group('test')]
+bench-ducklake-latency latencies="0ms,25ms,50ms,100ms":
+    DUCKGRES_BENCH_LATENCIES={{latencies}} go test -v -run TestDuckLakeConcurrentTransactions -timeout 600s ./tests/integration/...
+
+# Run full version x latency matrix
+[group('test')]
+bench-ducklake-full-matrix latencies="0ms,50ms,100ms":
+    DUCKGRES_BENCH_LATENCIES={{latencies}} ./scripts/ducklake_version_matrix.sh
 
 # Run extension loading tests
 [group('test')]

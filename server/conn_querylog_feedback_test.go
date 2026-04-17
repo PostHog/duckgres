@@ -12,6 +12,7 @@ import (
 )
 
 type feedbackExecutor struct {
+	noopProfiling
 	queryFn func(query string, args ...any) (RowSet, error)
 }
 

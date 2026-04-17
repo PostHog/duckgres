@@ -231,6 +231,13 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 
 				paramName := strings.ToLower(n.VariableSetStmt.Name)
 
+				if paramName == "search_path" {
+					if sql, ok := normalizeSearchPathSet(n.VariableSetStmt); ok {
+						result.SQLOverride = sql
+						return true, nil
+					}
+				}
+
 				// Passthrough params are natively supported by DuckDB — forward unchanged
 				if t.PassthroughParams[paramName] {
 					return false, nil
@@ -328,6 +335,63 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 	}
 
 	return changed, nil
+}
+
+func normalizeSearchPathSet(stmt *pg_query.VariableSetStmt) (string, bool) {
+	if stmt == nil || stmt.Kind != pg_query.VariableSetKind_VAR_SET_VALUE || len(stmt.Args) == 0 {
+		return "", false
+	}
+
+	parts := make([]string, 0, len(stmt.Args))
+	for _, arg := range stmt.Args {
+		part, ok := searchPathValue(arg)
+		if !ok {
+			return "", false
+		}
+		parts = append(parts, part)
+	}
+
+	prefix := "SET search_path = "
+	if stmt.IsLocal {
+		prefix = "SET LOCAL search_path = "
+	}
+
+	value := strings.Join(parts, ",")
+	value = strings.ReplaceAll(value, "'", "''")
+	return prefix + "'" + value + "'", true
+}
+
+func searchPathValue(node *pg_query.Node) (string, bool) {
+	if node == nil {
+		return "", false
+	}
+
+	switch n := node.Node.(type) {
+	case *pg_query.Node_AConst:
+		if n.AConst == nil {
+			return "", false
+		}
+		if sval := n.AConst.GetSval(); sval != nil {
+			return sval.Sval, true
+		}
+	case *pg_query.Node_String_:
+		if n.String_ != nil {
+			return n.String_.Sval, true
+		}
+	case *pg_query.Node_ColumnRef:
+		if n.ColumnRef == nil || len(n.ColumnRef.Fields) != 1 {
+			return "", false
+		}
+		field := n.ColumnRef.Fields[0]
+		if field == nil {
+			return "", false
+		}
+		if str := field.GetString_(); str != nil {
+			return str.Sval, true
+		}
+	}
+
+	return "", false
 }
 
 // getDefaultValue returns a sensible default value for an ignored parameter

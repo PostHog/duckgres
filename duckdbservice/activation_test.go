@@ -265,7 +265,7 @@ func TestSessionPoolActivateTenantRejectsSameEpochOwnerChange(t *testing.T) {
 	}
 }
 
-func TestSessionPoolValidateControlMetadataRejectsMismatchedCPInstanceID(t *testing.T) {
+func TestSessionPoolValidateControlMetadataAcceptsMismatchedCPInstanceID(t *testing.T) {
 	pool := &SessionPool{
 		sharedWarmMode:    true,
 		ownerEpoch:        4,
@@ -273,13 +273,59 @@ func TestSessionPoolValidateControlMetadataRejectsMismatchedCPInstanceID(t *test
 		workerID:          17,
 	}
 
+	// CP instance ID mismatches are no longer rejected — any CP should be
+	// able to health-check any worker. Ownership is managed by the config store.
 	err := pool.validateControlMetadata(server.WorkerControlMetadata{
 		WorkerID:     17,
 		OwnerEpoch:   4,
 		CPInstanceID: "cp-other:boot-b",
 	})
-	if err == nil {
-		t.Fatal("expected mismatched cp_instance_id to be rejected")
+	if err != nil {
+		t.Fatalf("expected mismatched cp_instance_id to be accepted, got: %v", err)
+	}
+}
+
+// TestHealthCheckFailsAfterCPRollingRestart reproduces the epoch mismatch
+// that causes worker pod cascading deaths during a CP rolling update.
+//
+// Scenario:
+//   1. CP-old activates a worker with epoch=1
+//   2. CP-old is killed in a rolling update
+//   3. CP-new starts fresh — it discovers the worker pod via K8s informer
+//      but hasn't re-activated it yet, so its in-memory epoch is 0
+//   4. CP-new's health check loop sends a health check with epoch=0
+//   5. Worker rejects: "stale owner epoch 0 (current 1)"
+//   6. After 3 consecutive rejections, CP-new deletes the worker pod
+//
+// The health check should not kill a worker just because the CP restarted.
+// The worker is healthy and serving queries — the epoch mismatch only means
+// the CP hasn't re-activated ownership yet.
+func TestHealthCheckFailsAfterCPRollingRestart(t *testing.T) {
+	// Worker was activated by CP-old with epoch=1
+	pool := &SessionPool{
+		sharedWarmMode:    true,
+		ownerEpoch:        1,
+		ownerCPInstanceID: "cp-old:boot-a",
+		workerID:          42,
+	}
+
+	// CP-new starts fresh after rolling update. It discovers the worker via
+	// K8s informer but hasn't re-activated it. Its in-memory epoch for this
+	// worker is 0 (default). This is exactly what the health check loop at
+	// k8s_pool.go:2270-2278 sends.
+	err := pool.validateControlMetadata(server.WorkerControlMetadata{
+		WorkerID:     42,
+		OwnerEpoch:   0,
+		CPInstanceID: "cp-new:boot-b",
+	})
+
+	// BUG: This currently fails with "stale owner epoch 0 (current 1)".
+	// The health check loop treats this as a failure, and after 3 consecutive
+	// failures it deletes the worker pod — even though the worker is perfectly
+	// healthy. This cascades to all workers, causing a full cluster outage
+	// on every rolling deployment.
+	if err != nil {
+		t.Fatalf("health check after CP rolling restart should not kill the worker, but got: %v", err)
 	}
 }
 

@@ -176,61 +176,109 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 	<-h.pool.warmupDone
 
 	// Poll DuckDB query progress for each active session.
+	//
+	// QueryProgress is a CGO call into DuckDB that *should* return instantly
+	// (it reads atomic progress counters), but can block if DuckDB holds an
+	// internal lock — for example, when the httpfs extension is mid-download
+	// on a large remote parquet file. If that happens while we hold the pool
+	// RLock, both the health check and any session create/close operations
+	// stall, the CP's 3-second health check timeout fires, and after 3
+	// consecutive failures the CP kills the worker — even though it's alive
+	// and making progress on the download.
+	//
+	// To prevent this:
+	// 1. Snapshot the session data we need under RLock, then release it.
+	// 2. Call QueryProgress outside the lock, with a per-session timeout.
+	//    If the CGO call doesn't return within queryProgressTimeout, we
+	//    report the session as "busy" (pct=-1) and skip stall detection
+	//    for this cycle. The health check always responds promptly.
+	//
+	// Real crashes (process death) are detected by the K8s pod informer
+	// independently of health checks, so skipping stall detection during
+	// I/O-heavy operations doesn't create a blind spot for crash recovery.
 	type sessionProgressInfo struct {
 		Pct     float64 `json:"pct"`
 		Rows    uint64  `json:"rows"`
 		Total   uint64  `json:"total"`
 		Stalled bool    `json:"stalled,omitempty"`
 	}
-	sessionProgress := make(map[string]sessionProgressInfo)
+
+	type sessionSnapshot struct {
+		key      string
+		conn     duckdbConnHandle
+		progress *progressState
+	}
 
 	h.pool.mu.RLock()
+	snapshots := make([]sessionSnapshot, 0, len(h.pool.sessions))
 	for token, session := range h.pool.sessions {
 		if session.duckdbConn.Ptr == nil {
 			continue
 		}
-
-		qp := bindings.QueryProgress(session.duckdbConn)
-		pct, rows, total := bindings.QueryProgressTypeMembers(&qp)
-
-		// Use truncated token as key to avoid leaking full bearer tokens
-		// in the health check JSON response. 16 hex chars = 8 bytes of entropy,
-		// sufficient for matching on the control plane side.
 		key := token
 		if len(key) > 16 {
 			key = key[:16]
 		}
-
-		stalled := false
-
-		if !session.progress.queryActive.Load() {
-			// No query running — reset stall tracking.
-			session.progress.lastRowsProcessed.Store(0)
-			session.progress.stalledChecks.Store(0)
-		} else if pct < 0 {
-			// pct == -1 means DuckDB can't track this query; skip stall detection.
-		} else {
-			if rows == session.progress.lastRowsProcessed.Load() {
-				session.progress.stalledChecks.Add(1)
-			} else {
-				session.progress.lastRowsProcessed.Store(rows)
-				session.progress.stalledChecks.Store(0)
-			}
-
-			if session.progress.stalledChecks.Load() >= stallCheckThreshold {
-				stalled = true
-				// Log once when first crossing the threshold (exact match avoids log spam).
-				if session.progress.stalledChecks.Load() == stallCheckThreshold {
-					slog.Warn("Query appears stuck — no progress detected.",
-						"session", key, "rows_processed", rows, "total_rows", total,
-						"stalled_checks", stallCheckThreshold)
-				}
-			}
-		}
-
-		sessionProgress[key] = sessionProgressInfo{Pct: pct, Rows: rows, Total: total, Stalled: stalled}
+		snapshots = append(snapshots, sessionSnapshot{
+			key:      key,
+			conn:     session.duckdbConn,
+			progress: &session.progress,
+		})
 	}
 	h.pool.mu.RUnlock()
+
+	sessionProgress := make(map[string]sessionProgressInfo, len(snapshots))
+	for _, snap := range snapshots {
+		if !snap.progress.queryActive.Load() {
+			snap.progress.lastRowsProcessed.Store(0)
+			snap.progress.stalledChecks.Store(0)
+			sessionProgress[snap.key] = sessionProgressInfo{}
+			continue
+		}
+
+		type qpResult struct {
+			pct   float64
+			rows  uint64
+			total uint64
+		}
+		ch := make(chan qpResult, 1)
+		go func(conn duckdbConnHandle) {
+			qp := bindings.QueryProgress(conn)
+			pct, rows, total := bindings.QueryProgressTypeMembers(&qp)
+			ch <- qpResult{pct, rows, total}
+		}(snap.conn)
+
+		select {
+		case pr := <-ch:
+			stalled := false
+			if pr.pct < 0 {
+				// pct == -1 means DuckDB can't track this query; skip stall detection.
+			} else {
+				if pr.rows == snap.progress.lastRowsProcessed.Load() {
+					snap.progress.stalledChecks.Add(1)
+				} else {
+					snap.progress.lastRowsProcessed.Store(pr.rows)
+					snap.progress.stalledChecks.Store(0)
+				}
+				if snap.progress.stalledChecks.Load() >= stallCheckThreshold {
+					stalled = true
+					if snap.progress.stalledChecks.Load() == stallCheckThreshold {
+						slog.Warn("Query appears stuck — no progress detected.",
+							"session", snap.key, "rows_processed", pr.rows, "total_rows", pr.total,
+							"stalled_checks", stallCheckThreshold)
+					}
+				}
+			}
+			sessionProgress[snap.key] = sessionProgressInfo{Pct: pr.pct, Rows: pr.rows, Total: pr.total, Stalled: stalled}
+
+		case <-time.After(queryProgressTimeout):
+			// CGO call blocked — DuckDB is busy with I/O (e.g., httpfs
+			// download). Report as untrackable and don't advance stall
+			// counters so a legitimately slow operation doesn't get
+			// flagged as stuck.
+			sessionProgress[snap.key] = sessionProgressInfo{Pct: -1}
+		}
+	}
 
 	resp, _ := json.Marshal(map[string]interface{}{
 		"healthy":          true,
@@ -284,12 +332,48 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
-	schema, err := retryOnTransient(func() (*arrow.Schema, error) {
-		return GetQuerySchema(ctx, session.Conn, query, tx)
-	})
+
+	// Only retry on transient errors for autocommit queries. Inside a
+	// transaction, a transient error invalidates the transaction — retrying
+	// would run in autocommit mode and mask the failure.
+	inTransaction := tx != nil || session.sqlTxActive.Load()
+	var schema *arrow.Schema
+	if inTransaction {
+		schema, err = GetQuerySchema(ctx, session.Conn, query, tx)
+	} else {
+		schema, err = retryOnTransient(func() (*arrow.Schema, error) {
+			return GetQuerySchema(ctx, session.Conn, query, tx)
+		})
+	}
+	// Conflict retry for autocommit only. Note: if retryOnTransient exhausted on a
+	// transient error that also matches "Transaction conflict", this chains into
+	// conflict retry — acceptable since the error patterns are distinct in practice.
+	if err != nil && tx == nil && isDuckLakeTransactionConflict(err) {
+		ducklakeConflictTotal.Inc()
+		schema, err = retryOnConflict(func() (*arrow.Schema, error) {
+			return GetQuerySchema(ctx, session.Conn, query, tx)
+		})
+	}
+	if err != nil {
+		schema, err, _ = recoverAbortedTransaction(
+			err,
+			!inTransaction,
+			func() error {
+				_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (*arrow.Schema, error) {
+				return GetQuerySchema(ctx, session.Conn, query, tx)
+			},
+		)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
+
+	// Send DuckDB profiling output as gRPC trailing metadata so the
+	// control plane can attach it to the trace span.
+	sendProfilingMetadata(ctx, session)
 
 	handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
 	session.mu.Lock()
@@ -361,12 +445,42 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 
 		session.progress.queryActive.Store(true)
 		defer session.progress.queryActive.Store(false)
-		rows, qerr := retryOnTransient(func() (*sql.Rows, error) {
+
+		inTxn := tx != nil || session.sqlTxActive.Load()
+		queryFn := func() (*sql.Rows, error) {
 			if tx != nil {
 				return tx.QueryContext(ctx, handle.Query)
 			}
 			return session.Conn.QueryContext(ctx, handle.Query)
-		})
+		}
+
+		var rows *sql.Rows
+		var qerr error
+		if inTxn {
+			rows, qerr = queryFn()
+		} else {
+			rows, qerr = retryOnTransient(queryFn)
+		}
+		// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
+		if qerr != nil && tx == nil && isDuckLakeTransactionConflict(qerr) {
+			ducklakeConflictTotal.Inc()
+			rows, qerr = retryOnConflict(func() (*sql.Rows, error) {
+				return session.Conn.QueryContext(ctx, handle.Query)
+			})
+		}
+		if qerr != nil {
+			rows, qerr, _ = recoverAbortedTransaction(
+				qerr,
+				!inTxn,
+				func() error {
+					_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
+					return rollbackErr
+				},
+				func() (*sql.Rows, error) {
+					return session.Conn.QueryContext(ctx, handle.Query)
+				},
+			)
+		}
 		if qerr != nil {
 			ch <- flight.StreamChunk{Err: qerr}
 			return
@@ -413,15 +527,62 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	session.progress.queryActive.Store(true)
 	defer session.progress.queryActive.Store(false)
 
-	result, execErr := retryOnTransient(func() (sql.Result, error) {
+	execFn := func() (sql.Result, error) {
 		if tx != nil {
 			return tx.ExecContext(ctx, query)
 		}
 		return session.Conn.ExecContext(ctx, query)
-	})
+	}
+
+	// Determine whether this statement is safe to retry on transient errors.
+	//
+	// Never retry when inside a transaction (Flight SQL or SQL-level):
+	// - Transaction control stmts (COMMIT/ROLLBACK/END): retrying after DuckDB
+	//   internally rolls back produces "no transaction is active".
+	// - Any other stmt inside a transaction: a transient error causes DuckDB to
+	//   roll back the transaction internally. Retrying would succeed in autocommit
+	//   mode, masking the rollback. The client would later COMMIT and get
+	//   "no transaction is active".
+	//
+	// Only retry for autocommit statements (no Flight SQL txn, no SQL-level txn).
+	inTransaction := tx != nil || session.sqlTxActive.Load()
+	isTxControl := isTransactionControlStmt(query)
+
+	var result sql.Result
+	var execErr error
+	if inTransaction || isTxControl {
+		result, execErr = execFn()
+	} else {
+		result, execErr = retryOnTransient(execFn)
+	}
+
+	// Track SQL-level transaction state for BEGIN/COMMIT/ROLLBACK sent as raw SQL.
+	trackSQLTransactionState(query, execErr, &session.sqlTxActive)
+	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
+	if execErr != nil && tx == nil && isDuckLakeTransactionConflict(execErr) {
+		ducklakeConflictTotal.Inc()
+		result, execErr = retryOnConflict(func() (sql.Result, error) {
+			return session.Conn.ExecContext(ctx, query)
+		})
+	}
+	if execErr != nil {
+		result, execErr, _ = recoverAbortedTransaction(
+			execErr,
+			!inTransaction,
+			func() error {
+				_, rollbackErr := session.Conn.ExecContext(context.Background(), "ROLLBACK")
+				return rollbackErr
+			},
+			func() (sql.Result, error) {
+				return execFn()
+			},
+		)
+	}
 	if execErr != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
+
+	sendProfilingMetadata(ctx, session)
 
 	affected, err := result.RowsAffected()
 	if err != nil {

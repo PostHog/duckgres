@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"os"
 )
 
 // ColumnTyper provides type name information for a database column.
@@ -43,6 +44,11 @@ type QueryExecutor interface {
 	ConnContext(ctx context.Context) (RawConn, error)
 	PingContext(ctx context.Context) error
 	Close() error
+
+	// LastProfilingOutput returns the JSON profiling output from the last
+	// executed query, or "" if profiling is not enabled or not available
+	// (e.g. Flight SQL mode where the query ran on a remote worker).
+	LastProfilingOutput() string
 }
 
 // LocalExecutor wraps *sql.DB to implement QueryExecutor for local DuckDB access.
@@ -96,6 +102,14 @@ func (e *LocalExecutor) Close() error {
 	return e.db.Close()
 }
 
+func (e *LocalExecutor) LastProfilingOutput() string {
+	data, err := os.ReadFile("/tmp/duckgres-profiling.json")
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 // PinnedExecutor wraps a pinned *sql.Conn from a shared *sql.DB pool
 // to implement QueryExecutor for file-persistence mode.
 type PinnedExecutor struct {
@@ -147,6 +161,14 @@ func (e *PinnedExecutor) PingContext(ctx context.Context) error {
 // Close returns the pinned connection to the pool; it does not close the underlying DB.
 func (e *PinnedExecutor) Close() error {
 	return e.conn.Close()
+}
+
+func (e *PinnedExecutor) LastProfilingOutput() string {
+	data, err := os.ReadFile("/tmp/duckgres-profiling.json")
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 // LocalRowSet wraps *sql.Rows to implement RowSet.

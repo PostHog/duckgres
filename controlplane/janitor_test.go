@@ -195,6 +195,35 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 	}
 }
 
+func TestControlPlaneJanitorRunInvokesVersionReaperBeforeReconcile(t *testing.T) {
+	// The version-aware reaper must run before reconcileWarmCapacity in the
+	// same tick so that a retired-this-tick worker's warm slot is replenished
+	// immediately rather than waiting a full interval.
+	store := &captureControlPlaneExpiryStore{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+
+	var mu sync.Mutex
+	var order []string
+	janitor.retireMismatchedVersionWorker = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, "reap")
+	}
+	janitor.reconcileWarmCapacity = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, "reconcile")
+	}
+
+	janitor.runOnce()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "reap" || order[1] != "reconcile" {
+		t.Fatalf("expected reap→reconcile ordering, got %v", order)
+	}
+}
+
 func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{
 		expireErr: errors.New("boom"),

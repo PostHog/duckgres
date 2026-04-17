@@ -19,6 +19,7 @@ func (r *reconnectTestOrgRouter) StackForOrg(orgID string) (WorkerPool, *Session
 }
 
 func (r *reconnectTestOrgRouter) IsMigratingForOrg(_ string) bool { return false }
+func (r *reconnectTestOrgRouter) SetWarmCapacityTarget(_ int)     {}
 func (r *reconnectTestOrgRouter) ShutdownAll()                    {}
 
 func TestOrgRoutedSessionProviderReconnectSessionUsesDurableOrgID(t *testing.T) {

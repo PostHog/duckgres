@@ -1144,7 +1144,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	columnsViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 		SELECT
-			c.table_catalog,
+			CASE WHEN c.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE c.table_catalog END AS table_catalog,
 			CASE WHEN c.table_schema = 'main' THEN 'public' ELSE c.table_schema END AS table_schema,
 			c.table_name,
 			c.column_name,
@@ -1231,7 +1231,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 		columnsViewSimpleSQL := `
 			CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 			SELECT
-				table_catalog,
+				CASE WHEN table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE table_catalog END AS table_catalog,
 				CASE WHEN table_schema = 'main' THEN 'public' ELSE table_schema END AS table_schema,
 				table_name,
 				column_name,
@@ -1320,7 +1320,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	tablesViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_tables_compat AS
 		SELECT
-			t.table_catalog,
+			CASE WHEN t.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE t.table_catalog END AS table_catalog,
 			CASE WHEN t.table_schema = 'main' THEN 'public' ELSE t.table_schema END AS table_schema,
 			t.table_name,
 			t.table_type,
@@ -1360,7 +1360,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	schemataViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_schemata_compat AS
 		SELECT
-			s.catalog_name,
+			CASE WHEN s.catalog_name IN ('ducklake', 'memory') THEN current_database() ELSE s.catalog_name END AS catalog_name,
 			CASE WHEN s.schema_name = 'main' THEN 'public' ELSE s.schema_name END AS schema_name,
 			'duckdb' AS schema_owner,
 			NULL AS default_character_set_catalog,
@@ -1369,17 +1369,18 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 			NULL AS sql_path
 		FROM %s.schemata s
 		WHERE s.schema_name NOT IN ('main', 'pg_catalog', 'information_schema')
+		AND s.catalog_name NOT LIKE '__ducklake_metadata_%%'
 		UNION ALL
-		SELECT 'memory' AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
+		SELECT current_database() AS catalog_name, 'public' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 		UNION ALL
-		SELECT 'memory' AS catalog_name, 'pg_catalog' AS schema_name, 'duckdb' AS schema_owner,
+		SELECT current_database() AS catalog_name, 'pg_catalog' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 		UNION ALL
-		SELECT 'memory' AS catalog_name, 'information_schema' AS schema_name, 'duckdb' AS schema_owner,
+		SELECT current_database() AS catalog_name, 'information_schema' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 		UNION ALL
-		SELECT 'memory' AS catalog_name, 'pg_toast' AS schema_name, 'duckdb' AS schema_owner,
+		SELECT current_database() AS catalog_name, 'pg_toast' AS schema_name, 'duckdb' AS schema_owner,
 			NULL, NULL, NULL, NULL
 	`
 	if _, err := db.Exec(fmt.Sprintf(schemataViewSQL, infoSchemaPrefix)); err != nil {
@@ -1392,7 +1393,7 @@ func initInformationSchema(db *sql.DB, duckLakeMode bool) error {
 	viewsViewSQL := `
 		CREATE OR REPLACE VIEW main.information_schema_views_compat AS
 		SELECT
-			v.table_catalog,
+			CASE WHEN v.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE v.table_catalog END AS table_catalog,
 			CASE WHEN v.table_schema = 'main' THEN 'public' ELSE v.table_schema END AS table_schema,
 			v.table_name,
 			v.view_definition,
@@ -1637,6 +1638,7 @@ func recreatePgNamespaceForDuckLake(db *sql.DB) error {
 			UNION
 			SELECT schema_oid, schema_name FROM duckdb_views() WHERE database_name = 'ducklake'
 		)
+		WHERE schema_name NOT LIKE '__ducklake_metadata_%'
 	`
 	_, err := db.Exec(pgNamespaceSQL)
 	return err

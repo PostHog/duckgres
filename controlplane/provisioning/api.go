@@ -13,7 +13,10 @@ import (
 // Store defines the config store operations needed by the provisioning API.
 type Store interface {
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
+	GetOrg(orgID string) (*configstore.Org, error)
 	CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error
+	CreateOrgUser(orgID, username, passwordHash string) error
+	UpdateOrgUserPassword(orgID, username, passwordHash string) error
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
 	IsDatabaseNameAvailable(name string) (bool, error)
 }
@@ -24,6 +27,7 @@ func RegisterAPI(r *gin.RouterGroup, store Store) {
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
+	r.POST("/orgs/:id/reset-password", h.resetPassword)
 	r.GET("/database-name/check", h.checkDatabaseName)
 }
 
@@ -32,17 +36,27 @@ type handler struct {
 }
 
 // warehouseStatusResponse is the public-facing view of warehouse state.
-// Only exposes lifecycle status — no infrastructure secrets or internal config.
+// Exposes lifecycle status and, when ready, connection details (without password).
 type warehouseStatusResponse struct {
-	OrgID              string                                    `json:"org_id"`
+	OrgID              string                                       `json:"org_id"`
 	State              configstore.ManagedWarehouseProvisioningState `json:"state"`
-	StatusMessage      string                                    `json:"status_message"`
+	StatusMessage      string                                       `json:"status_message"`
 	S3State            configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
 	MetadataStoreState configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
 	IdentityState      configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
 	SecretsState       configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
-	ReadyAt            *time.Time                                `json:"ready_at,omitempty"`
-	FailedAt           *time.Time                                `json:"failed_at,omitempty"`
+	ReadyAt            *time.Time                                   `json:"ready_at,omitempty"`
+	FailedAt           *time.Time                                   `json:"failed_at,omitempty"`
+	Connection         *connectionDetails                           `json:"connection,omitempty"`
+}
+
+// connectionDetails is returned in status (without password) and in provision/reset-password (with password).
+type connectionDetails struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Database string `json:"database"`
+	Username string `json:"username"`
+	Password string `json:"password,omitempty"`
 }
 
 type provisionRequest struct {
@@ -89,7 +103,29 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusAccepted, gin.H{"status": "provisioning started", "org": orgID})
+	// Create root user with a generated password. The plaintext is returned
+	// in this response only — it is never stored, only the bcrypt hash is persisted.
+	plainPassword, err := configstore.GeneratePassword()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate password"})
+		return
+	}
+	hash, err := configstore.HashPassword(plainPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+		return
+	}
+	if err := h.store.CreateOrgUser(orgID, "root", hash); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create root user"})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"status":   "provisioning started",
+		"org":      orgID,
+		"username": "root",
+		"password": plainPassword,
+	})
 }
 
 func (h *handler) deprovisionWarehouse(c *gin.Context) {
@@ -131,7 +167,7 @@ func (h *handler) getWarehouseStatus(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, warehouseStatusResponse{
+	resp := warehouseStatusResponse{
 		OrgID:              warehouse.OrgID,
 		State:              warehouse.State,
 		StatusMessage:      warehouse.StatusMessage,
@@ -141,6 +177,58 @@ func (h *handler) getWarehouseStatus(c *gin.Context) {
 		SecretsState:       warehouse.SecretsState,
 		ReadyAt:            warehouse.ReadyAt,
 		FailedAt:           warehouse.FailedAt,
+	}
+
+	if warehouse.State == configstore.ManagedWarehouseStateReady {
+		org, err := h.store.GetOrg(orgID)
+		if err == nil {
+			resp.Connection = &connectionDetails{
+				Host:     warehouse.WarehouseDatabase.Endpoint,
+				Port:     warehouse.WarehouseDatabase.Port,
+				Database: org.DatabaseName,
+				Username: "root",
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *handler) resetPassword(c *gin.Context) {
+	orgID := c.Param("id")
+
+	warehouse, err := h.store.GetManagedWarehouse(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "warehouse not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if warehouse.State != configstore.ManagedWarehouseStateReady {
+		c.JSON(http.StatusConflict, gin.H{"error": "warehouse must be in ready state to reset password"})
+		return
+	}
+
+	plainPassword, err := configstore.GeneratePassword()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate password"})
+		return
+	}
+	hash, err := configstore.HashPassword(plainPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+		return
+	}
+	if err := h.store.UpdateOrgUserPassword(orgID, "root", hash); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "root user not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"username": "root",
+		"password": plainPassword,
 	})
 }
 

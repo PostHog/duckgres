@@ -81,6 +81,7 @@ type RuntimeWorkerStore interface {
 	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
+	RetireIdleWorker(workerID int, reason string) (bool, error)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

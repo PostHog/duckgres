@@ -4,15 +4,17 @@ import "time"
 
 // Org represents a tenant with per-org resource limits.
 type Org struct {
-	Name         string            `gorm:"primaryKey;size:255" json:"name"`
-	DatabaseName string            `gorm:"size:255;uniqueIndex" json:"database_name"`
-	MaxWorkers   int               `gorm:"default:0" json:"max_workers"`
-	MemoryBudget string            `gorm:"size:32" json:"memory_budget"`
-	IdleTimeoutS int               `gorm:"default:0" json:"idle_timeout_s"`
-	Users        []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse    *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
-	UpdatedAt    time.Time         `json:"updated_at"`
+	Name                string            `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName        string            `gorm:"size:255;uniqueIndex" json:"database_name"`
+	MaxWorkers          int               `gorm:"default:0" json:"max_workers"`
+	MemoryBudget        string            `gorm:"size:32" json:"memory_budget"`
+	IdleTimeoutS        int               `gorm:"default:0" json:"idle_timeout_s"`
+	WorkerCPURequest    string            `gorm:"size:32" json:"worker_cpu_request"`
+	WorkerMemoryRequest string            `gorm:"size:32" json:"worker_memory_request"`
+	Users               []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse           *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	CreatedAt           time.Time         `json:"created_at"`
+	UpdatedAt           time.Time         `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
@@ -276,13 +278,15 @@ func (FlightSessionRecord) TableName() string { return "flight_session_records" 
 
 // OrgConfig is a convenience view combining org metadata with resource limits.
 type OrgConfig struct {
-	Name         string
-	DatabaseName string
-	MaxWorkers   int
-	MemoryBudget string
-	IdleTimeoutS int
-	Users        map[string]string // username -> password
-	Warehouse    *ManagedWarehouseConfig
+	Name                string
+	DatabaseName        string
+	MaxWorkers          int
+	MemoryBudget        string
+	IdleTimeoutS        int
+	WorkerCPURequest    string
+	WorkerMemoryRequest string
+	Users               map[string]string // username -> password
+	Warehouse           *ManagedWarehouseConfig
 }
 
 // ManagedWarehouseConfig is the in-memory snapshot view of an org's warehouse metadata.

@@ -214,3 +214,35 @@ func TestFlightIngressServerIssuedSessionTokenAllowsTokenOnlyAuth(t *testing.T) 
 		t.Fatalf("token+basic GetTables failed: %v", err)
 	}
 }
+
+func TestFlightIngressAcceptsNewConnectionsAfterHandover(t *testing.T) {
+	h := startControlPlane(t, cpOpts{
+		flightPort: freePort(t),
+		maxWorkers: 1,
+	})
+	readyLogCount := strings.Count(h.logBuf.String(), "Control plane listening.")
+
+	client1 := newFlightClient(t, h.flightPort)
+	defer func() { _ = client1.Close() }()
+
+	ctx1, cancel1 := context.WithTimeout(flightAuthContext("testuser", "testpass"), 20*time.Second)
+	if _, err := client1.GetTables(ctx1, &flightsql.GetTablesOpts{}); err != nil {
+		cancel1()
+		t.Fatalf("pre-handover Flight bootstrap failed: %v", err)
+	}
+	cancel1()
+
+	h.doHandover(t)
+	if err := h.waitForLogCount("Control plane listening.", readyLogCount+1, 30*time.Second); err != nil {
+		t.Fatalf("child control plane did not reach ready state after handover: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+
+	client2 := newFlightClient(t, h.flightPort)
+	defer func() { _ = client2.Close() }()
+
+	ctx2, cancel2 := context.WithTimeout(flightAuthContext("testuser", "testpass"), 20*time.Second)
+	defer cancel2()
+	if _, err := client2.GetTables(ctx2, &flightsql.GetTablesOpts{}); err != nil {
+		t.Fatalf("post-handover Flight bootstrap failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+}

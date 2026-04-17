@@ -7,6 +7,10 @@ import (
 // Result holds transpilation metadata that transforms can modify.
 // This is passed through all transforms to accumulate information.
 type Result struct {
+	// SQLOverride replaces the normal deparse output for transforms that need
+	// a precise SQL rendering the AST cannot represent faithfully for DuckDB.
+	SQLOverride string
+
 	// ParamCount is the number of parameters found
 	ParamCount int
 
@@ -88,6 +92,13 @@ func walkNode(node *pg_query.Node, fn func(*pg_query.Node) bool) bool {
 	case *pg_query.Node_CreateStmt:
 		if n.CreateStmt != nil {
 			walkCreateStmt(n.CreateStmt, fn)
+		}
+	case *pg_query.Node_CreateTableAsStmt:
+		if n.CreateTableAsStmt != nil {
+			if n.CreateTableAsStmt.Into != nil && n.CreateTableAsStmt.Into.Rel != nil {
+				walkNode(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: n.CreateTableAsStmt.Into.Rel}}, fn)
+			}
+			walkNode(n.CreateTableAsStmt.Query, fn)
 		}
 	case *pg_query.Node_RangeVar:
 		// Leaf node for table references
@@ -244,6 +255,9 @@ func walkNode(node *pg_query.Node, fn func(*pg_query.Node) bool) bool {
 		}
 	case *pg_query.Node_AlterTableStmt:
 		if n.AlterTableStmt != nil {
+			if n.AlterTableStmt.Relation != nil {
+				walkNode(&pg_query.Node{Node: &pg_query.Node_RangeVar{RangeVar: n.AlterTableStmt.Relation}}, fn)
+			}
 			for _, cmd := range n.AlterTableStmt.Cmds {
 				walkNode(cmd, fn)
 			}

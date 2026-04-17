@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1366,6 +1367,7 @@ func (f *fakeExecResult) RowsAffected() (int64, error) {
 
 type queryErrorExecutor struct {
 	err error
+	noopProfiling
 }
 
 func (e *queryErrorExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
@@ -1387,6 +1389,155 @@ func (e *queryErrorExecutor) PingContext(context.Context) error {
 	return errors.New("not implemented")
 }
 func (e *queryErrorExecutor) Close() error { return nil }
+
+type abortedSelectRecoveryExecutor struct {
+	queryCalls    int
+	noopProfiling
+	rollbackCalls int
+}
+
+func (e *abortedSelectRecoveryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	e.queryCalls++
+	if e.queryCalls == 1 {
+		return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+	}
+	return &staticCountRowSet{count: 1}, nil
+}
+
+func (e *abortedSelectRecoveryExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
+	if strings.TrimSpace(strings.ToUpper(query)) == "ROLLBACK" {
+		e.rollbackCalls++
+		return &fakeExecResult{}, nil
+	}
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) Exec(string, ...any) (ExecResult, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (e *abortedSelectRecoveryExecutor) Close() error { return nil }
+
+type abortedExecAlterViewRecoveryExecutor struct {
+	originalQuery string
+	noopProfiling
+	rewritten     string
+	execCalls     []string
+	execCtxCalls  []string
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) execResult(query string, callIndex int) (ExecResult, error) {
+	trimmed := strings.TrimSpace(query)
+	switch trimmed {
+	case "ROLLBACK":
+		return &fakeExecResult{}, nil
+	case e.originalQuery:
+		if callIndex == 1 {
+			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		}
+		return nil, errors.New("Binder Error: cannot use alter table on a view because this object is not a table; use ALTER VIEW instead")
+	case e.rewritten:
+		return &fakeExecResult{}, nil
+	default:
+		return nil, fmt.Errorf("unexpected exec query %q", query)
+	}
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
+	e.execCtxCalls = append(e.execCtxCalls, strings.TrimSpace(query))
+	return e.execResult(query, len(e.execCtxCalls))
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) Exec(query string, _ ...any) (ExecResult, error) {
+	e.execCalls = append(e.execCalls, strings.TrimSpace(query))
+	return e.execResult(query, len(e.execCalls))
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (e *abortedExecAlterViewRecoveryExecutor) Close() error { return nil }
+
+type abortedAlterViewRecoveryExecutor struct {
+	execContextQueries []string
+	noopProfiling
+	execQueries        []string
+}
+
+func (e *abortedAlterViewRecoveryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedAlterViewRecoveryExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
+	e.execContextQueries = append(e.execContextQueries, query)
+	switch strings.TrimSpace(strings.ToUpper(query)) {
+	case "ROLLBACK":
+		return &fakeExecResult{}, nil
+	case "ALTER TABLE SOME_VIEW RENAME TO RENAMED_VIEW":
+		if len(e.execContextQueries) == 1 {
+			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		}
+		return nil, errors.New("Binder Error: Cannot use ALTER TABLE statement on object \"some_view\" because it is not a table")
+	case "ALTER VIEW SOME_VIEW RENAME TO RENAMED_VIEW":
+		return &fakeExecResult{rowsAffected: 1}, nil
+	default:
+		return nil, fmt.Errorf("unexpected ExecContext query %q", query)
+	}
+}
+
+func (e *abortedAlterViewRecoveryExecutor) Query(string, ...any) (RowSet, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedAlterViewRecoveryExecutor) Exec(query string, _ ...any) (ExecResult, error) {
+	e.execQueries = append(e.execQueries, query)
+	switch strings.TrimSpace(strings.ToUpper(query)) {
+	case "ALTER TABLE SOME_VIEW RENAME TO RENAMED_VIEW":
+		if len(e.execQueries) == 1 {
+			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		}
+		return nil, errors.New("Binder Error: Cannot use ALTER TABLE statement on object \"some_view\" because it is not a table")
+	case "ALTER VIEW SOME_VIEW RENAME TO RENAMED_VIEW":
+		return &fakeExecResult{rowsAffected: 1}, nil
+	default:
+		return nil, fmt.Errorf("unexpected Exec query %q", query)
+	}
+}
+
+func (e *abortedAlterViewRecoveryExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *abortedAlterViewRecoveryExecutor) PingContext(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func (e *abortedAlterViewRecoveryExecutor) Close() error { return nil }
 
 func TestExecuteSelectQueryReturnsErrorDetails(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
@@ -1418,6 +1569,296 @@ func TestExecuteSelectQueryReturnsErrorDetails(t *testing.T) {
 	}
 	if !strings.Contains(errMsg, "missing_table") {
 		t.Fatalf("expected error message mentioning missing_table, got %q", errMsg)
+	}
+}
+
+func TestExecuteSingleStatementRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	exec := &abortedAlterViewRecoveryExecutor{}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: exec,
+	}
+
+	errSent, fatalErr := c.executeSingleStatement("ALTER TABLE some_view RENAME TO renamed_view")
+	if fatalErr != nil {
+		t.Fatalf("expected nil fatal error, got %v", fatalErr)
+	}
+	if errSent {
+		t.Fatalf("expected successful execution, got errSent=true")
+	}
+
+	want := []string{
+		"ALTER TABLE some_view RENAME TO renamed_view",
+		"ROLLBACK",
+		"ALTER TABLE some_view RENAME TO renamed_view",
+		"ALTER VIEW some_view RENAME TO renamed_view",
+	}
+	if len(exec.execContextQueries) != len(want) {
+		t.Fatalf("expected exec sequence %v, got %v", want, exec.execContextQueries)
+	}
+	for i, got := range exec.execContextQueries {
+		if got != want[i] {
+			t.Fatalf("expected exec query %d to be %q, got %q", i, want[i], got)
+		}
+	}
+}
+
+func TestExecuteSelectQueryRecoversAbortedAutocommitConnection(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	exec := &abortedSelectRecoveryExecutor{}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: exec,
+	}
+
+	rowCount, errCode, errMsg, err := c.executeSelectQuery("SELECT 1", "SELECT")
+	if err != nil {
+		t.Fatalf("expected nil connection error, got %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("expected rowCount=1, got %d", rowCount)
+	}
+	if errCode != "" || errMsg != "" {
+		t.Fatalf("expected no SQL error details, got code=%q msg=%q", errCode, errMsg)
+	}
+	if exec.rollbackCalls != 1 {
+		t.Fatalf("expected 1 rollback, got %d", exec.rollbackCalls)
+	}
+	if exec.queryCalls != 2 {
+		t.Fatalf("expected 2 query attempts, got %d", exec.queryCalls)
+	}
+}
+
+func TestHandleQueryAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	const originalQuery = "ALTER TABLE some_view RENAME TO renamed_view"
+	const rewrittenQuery = "ALTER VIEW some_view RENAME TO renamed_view"
+
+	executor := &abortedExecAlterViewRecoveryExecutor{
+		originalQuery: originalQuery,
+		rewritten:     rewrittenQuery,
+	}
+
+	var out bytes.Buffer
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: executor,
+	}
+
+	if err := c.handleQuery([]byte(originalQuery + "\x00")); err != nil {
+		t.Fatalf("handleQuery returned error: %v", err)
+	}
+
+	expectedCalls := []string{originalQuery, "ROLLBACK", originalQuery, rewrittenQuery}
+	if !slices.Equal(executor.execCtxCalls, expectedCalls) {
+		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedCalls)
+	}
+}
+
+func TestExecuteSingleStatementAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	const originalQuery = "ALTER TABLE some_view RENAME TO renamed_view"
+	const rewrittenQuery = "ALTER VIEW some_view RENAME TO renamed_view"
+
+	executor := &abortedExecAlterViewRecoveryExecutor{
+		originalQuery: originalQuery,
+		rewritten:     rewrittenQuery,
+	}
+
+	var out bytes.Buffer
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: executor,
+	}
+
+	errSent, err := c.executeSingleStatement(originalQuery)
+	if err != nil {
+		t.Fatalf("executeSingleStatement returned fatal error: %v", err)
+	}
+	if errSent {
+		t.Fatalf("executeSingleStatement reported an error response")
+	}
+
+	expectedCalls := []string{originalQuery, "ROLLBACK", originalQuery, rewrittenQuery}
+	if !slices.Equal(executor.execCtxCalls, expectedCalls) {
+		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedCalls)
+	}
+}
+
+func TestHandleExecuteAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	const originalQuery = "ALTER TABLE some_view RENAME TO renamed_view"
+	const rewrittenQuery = "ALTER VIEW some_view RENAME TO renamed_view"
+
+	executor := &abortedExecAlterViewRecoveryExecutor{
+		originalQuery: originalQuery,
+		rewritten:     rewrittenQuery,
+	}
+
+	var out bytes.Buffer
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: executor,
+		portals: map[string]*portal{
+			"p": {
+				stmt: &preparedStmt{
+					query:          originalQuery,
+					convertedQuery: originalQuery,
+				},
+			},
+		},
+	}
+
+	var body bytes.Buffer
+	body.WriteString("p")
+	body.WriteByte(0)
+	if err := binary.Write(&body, binary.BigEndian, int32(0)); err != nil {
+		t.Fatalf("encode execute body: %v", err)
+	}
+
+	c.handleExecute(body.Bytes())
+
+	expectedExecCalls := []string{originalQuery, originalQuery, rewrittenQuery}
+	if !slices.Equal(executor.execCalls, expectedExecCalls) {
+		t.Fatalf("unexpected Exec calls: got %v want %v", executor.execCalls, expectedExecCalls)
+	}
+	expectedExecContextCalls := []string{"ROLLBACK"}
+	if !slices.Equal(executor.execCtxCalls, expectedExecContextCalls) {
+		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedExecContextCalls)
+	}
+}
+
+func TestHandleExecuteRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	exec := &abortedAlterViewRecoveryExecutor{}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusIdle,
+		executor: exec,
+		portals: map[string]*portal{
+			"": {
+				stmt: &preparedStmt{
+					query:          "ALTER TABLE some_view RENAME TO renamed_view",
+					convertedQuery: "ALTER TABLE some_view RENAME TO renamed_view",
+				},
+			},
+		},
+	}
+
+	body := append([]byte{0}, make([]byte, 4)...)
+	c.handleExecute(body)
+
+	wantExec := []string{
+		"ALTER TABLE some_view RENAME TO renamed_view",
+		"ALTER TABLE some_view RENAME TO renamed_view",
+		"ALTER VIEW some_view RENAME TO renamed_view",
+	}
+	if len(exec.execContextQueries) != 1 || exec.execContextQueries[0] != "ROLLBACK" {
+		t.Fatalf("expected one rollback via ExecContext, got %v", exec.execContextQueries)
+	}
+	if len(exec.execQueries) != len(wantExec) {
+		t.Fatalf("expected exec sequence %v, got %v", wantExec, exec.execQueries)
+	}
+	for i, got := range exec.execQueries {
+		if got != wantExec[i] {
+			t.Fatalf("expected exec query %d to be %q, got %q", i, wantExec[i], got)
+		}
+	}
+}
+
+func TestExecuteSelectQueryDoesNotRollbackInsideUserTransaction(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	var out bytes.Buffer
+	exec := &abortedSelectRecoveryExecutor{}
+	c := &clientConn{
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+		conn:     clientSide,
+		reader:   bufio.NewReader(clientSide),
+		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		txStatus: txStatusTransaction,
+		executor: exec,
+	}
+
+	rowCount, errCode, errMsg, err := c.executeSelectQuery("SELECT 1", "SELECT")
+	if err != nil {
+		t.Fatalf("expected nil connection error, got %v", err)
+	}
+	if rowCount != 0 {
+		t.Fatalf("expected rowCount=0, got %d", rowCount)
+	}
+	if errCode != "42000" || !strings.Contains(errMsg, "Current transaction is aborted") {
+		t.Fatalf("expected aborted transaction error details, got code=%q msg=%q", errCode, errMsg)
+	}
+	if exec.rollbackCalls != 0 {
+		t.Fatalf("expected 0 rollbacks, got %d", exec.rollbackCalls)
+	}
+	if exec.queryCalls != 1 {
+		t.Fatalf("expected 1 query attempt, got %d", exec.queryCalls)
+	}
+	if c.txStatus != txStatusError {
+		t.Fatalf("expected transaction to be marked failed, got %c", c.txStatus)
 	}
 }
 
@@ -2932,6 +3373,62 @@ func TestCursorCloseNonexistent(t *testing.T) {
 
 	if len(c.cursors) != 1 {
 		t.Errorf("expected 1 cursor, got %d", len(c.cursors))
+	}
+}
+
+func TestTransactionStatusWithCopyCommands(t *testing.T) {
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// BEGIN starts a transaction
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after BEGIN txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+
+	// COPY (to file/S3) should not change transaction status — it's a normal
+	// statement inside the transaction, not a transaction control command.
+	c.updateTxStatus("COPY")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after COPY txStatus = %c, want %c (should remain in transaction)", c.txStatus, txStatusTransaction)
+	}
+
+	// COMMIT should end the transaction
+	c.updateTxStatus("COMMIT")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after COMMIT txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+
+	// Same flow with COPY FROM STDIN (the COPY command type is the same)
+	c.updateTxStatus("BEGIN")
+	c.updateTxStatus("COPY")
+	if c.txStatus != txStatusTransaction {
+		t.Errorf("after COPY FROM txStatus = %c, want %c", c.txStatus, txStatusTransaction)
+	}
+	c.updateTxStatus("ROLLBACK")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after ROLLBACK txStatus = %c, want %c", c.txStatus, txStatusIdle)
+	}
+}
+
+func TestTransactionErrorOnCopyFailure(t *testing.T) {
+	c := &clientConn{txStatus: txStatusIdle}
+
+	// BEGIN a transaction
+	c.updateTxStatus("BEGIN")
+	if c.txStatus != txStatusTransaction {
+		t.Fatalf("expected txStatusTransaction after BEGIN")
+	}
+
+	// Simulate COPY failing inside the transaction
+	c.setTxError()
+	if c.txStatus != txStatusError {
+		t.Errorf("after failed COPY txStatus = %c, want %c", c.txStatus, txStatusError)
+	}
+
+	// Any subsequent command should fail (error state), ROLLBACK recovers
+	c.updateTxStatus("ROLLBACK")
+	if c.txStatus != txStatusIdle {
+		t.Errorf("after ROLLBACK from error txStatus = %c, want %c", c.txStatus, txStatusIdle)
 	}
 }
 

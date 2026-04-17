@@ -225,6 +225,7 @@ func TestCatalogPsqlCommands(t *testing.T) {
 				FROM pg_catalog.pg_database d
 				ORDER BY 1
 			`,
+			DuckgresOnly: true, // PR1 exposes the logical pgwire database name, which intentionally differs from the PostgreSQL fixture dbname.
 		},
 	}
 	runQueryTests(t, tests)

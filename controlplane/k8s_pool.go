@@ -70,6 +70,7 @@ type K8sWorkerPool struct {
 	informer              cache.SharedIndexInformer
 	stopInform            chan struct{}
 	spawnSem              chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
+	retireSem             chan struct{} // limits concurrent pod deletes to avoid overwhelming the K8s API
 	podReady              sync.Map      // podName -> chan string (pod IP); signaled by informer
 
 	spawnWarmWorkerFunc           func(ctx context.Context, id int) error
@@ -126,8 +127,9 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		cfg.ServiceAccount = DefaultK8sWorkerServiceAccount
 	}
 
-	// Allow up to 3 concurrent pod creates to limit K8s API pressure.
+	// Limit concurrent K8s API calls to avoid overwhelming the API server.
 	spawnConcurrency := 3
+	retireConcurrency := 5
 	pool := &K8sWorkerPool{
 		workers:               make(map[int]*ManagedWorker),
 		maxWorkers:            cfg.MaxWorkers,
@@ -155,6 +157,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerIDGenerator:     cfg.WorkerIDGenerator,
 		runtimeStore:          cfg.RuntimeStore,
 		spawnSem:              make(chan struct{}, spawnConcurrency),
+		retireSem:             make(chan struct{}, retireConcurrency),
 	}
 
 	// Resolve CP pod UID for owner references
@@ -172,6 +175,86 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	go pool.idleReaper()
 
 	return pool, nil
+}
+
+// RetireOneMismatchedVersionWorker scans all shared warm-worker pods in the
+// namespace for one whose duckgres/control-plane label identifies a different
+// Deployment ReplicaSet (pod-template-hash) than this CP, atomically marks
+// its idle runtime-store row retired, and deletes the pod.
+//
+// The janitor leader is expected to invoke this once per tick: together with
+// warm-pool replenishment via reconcileWarmCapacity, old-version workers are
+// replaced one at a time with pods spawned from the leader's current binary.
+// This gives gradual rolling worker replacement driven entirely by leader
+// election — no cross-CP sweeps needed.
+//
+// Retirement is limited to workers currently in WorkerStateIdle. Busy or
+// hot-idle workers are left alone so in-flight sessions aren't disturbed;
+// they'll be retired on a subsequent tick once they become idle (or when
+// their hot-idle TTL expires).
+//
+// Returns true when a worker was retired this call.
+func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bool {
+	if p.runtimeStore == nil || p.clientset == nil {
+		return false
+	}
+	myVersion := trimK8sPodHashSuffix(p.cpID)
+	if myVersion == p.cpID {
+		// cpID doesn't carry a Deployment pod-template-hash suffix (e.g.
+		// bare pod or StatefulSet). Without that we can't compare versions
+		// across pods, so nothing to do.
+		return false
+	}
+
+	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	if err != nil {
+		slog.Warn("Version-aware reaper failed to list worker pods.", "error", err)
+		return false
+	}
+
+	for _, pod := range pods.Items {
+		label := pod.Labels["duckgres/control-plane"]
+		if label == "" {
+			continue
+		}
+		if trimK8sPodHashSuffix(label) == myVersion {
+			continue
+		}
+		idStr := pod.Labels["duckgres/worker-id"]
+		if idStr == "" {
+			continue
+		}
+		workerID, err := strconv.Atoi(idStr)
+		if err != nil {
+			continue
+		}
+		retired, err := p.runtimeStore.RetireIdleWorker(workerID, "version_mismatch")
+		if err != nil {
+			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
+			continue
+		}
+		if !retired {
+			// Not currently idle (busy, reserved, hot-idle, or already
+			// retired). Leave it for a later tick.
+			continue
+		}
+		slog.Info("Retiring mismatched-version worker pod.",
+			"worker_id", workerID,
+			"pod", pod.Name,
+			"pod_version", trimK8sPodHashSuffix(label),
+			"my_version", myVersion,
+		)
+		gracePeriod := int64(10)
+		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}); err != nil && !errors.IsNotFound(err) {
+			slog.Warn("Version-aware reaper failed to delete pod.", "pod", pod.Name, "error", err)
+		}
+		return true
+	}
+	return false
 }
 
 func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
@@ -383,6 +466,17 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Value: "true",
 	})
 
+	// Pass OTEL trace config to worker pods so they export traces
+	// to the same backend as the control plane.
+	for _, envName := range []string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_PATH"} {
+		if v := os.Getenv(envName); v != "" {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  envName,
+				Value: v,
+			})
+		}
+	}
+
 	// Add toleration if configured
 	if p.workerTolerationKey != "" {
 		tol := corev1.Toleration{
@@ -473,7 +567,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	}
 
 	// Wait for pod to get an IP via informer (no polling).
-	podIP, err := p.waitForPodReady(ctx, podName, 90*time.Second)
+	podIP, err := p.waitForPodReady(ctx, podName, 5*time.Minute)
 	if err != nil {
 		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: int64Ptr(0),
@@ -653,6 +747,7 @@ func waitForWorkerTCPWithMetadata(addr, bearerToken string, serverCertPEM []byte
 			grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
 			grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
 		))
+		dialOpts = append(dialOpts, server.OTELGRPCClientHandler())
 		if bearerToken != "" {
 			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerTLSBearerCreds{token: bearerToken}))
 		}
@@ -814,12 +909,14 @@ func (p *K8sWorkerPool) RetireWorker(id int) {
 	p.retireWorkerWithReason(id, RetireReasonNormal)
 }
 
-func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) {
+// retireWorkerWithReason retires a worker and deletes its pod.
+// Returns true if the worker was found and retired.
+func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) bool {
 	p.mu.Lock()
 	w, ok := p.workers[id]
 	if !ok {
 		p.mu.Unlock()
-		return
+		return false
 	}
 	p.markWorkerRetiredLocked(w, reason)
 	delete(p.workers, id)
@@ -828,6 +925,7 @@ func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) {
 	observeControlPlaneWorkers(workerCount)
 
 	go p.retireWorkerPod(id, w)
+	return true
 }
 
 // RetireWorkerIfNoSessions retires a worker only if it has no active sessions.
@@ -1339,6 +1437,7 @@ func (p *K8sWorkerPool) connectWorkerDirect(ctx context.Context, podName, podIP,
 		grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
 		grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
 	))
+	dialOpts = append(dialOpts, server.OTELGRPCClientHandler())
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&workerTLSBearerCreds{token: bearerToken}))
 	}
@@ -1411,7 +1510,8 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 		}
 		p.mu.Unlock()
 
-		ctx := context.Background()
+		// Claim all slots first, then spawn in parallel.
+		var slots []*configstore.WorkerRecord
 		for i := 0; i < count; i++ {
 			slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
 				p.cpInstanceID,
@@ -1420,31 +1520,51 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				p.maxWorkers,
 			)
 			if err != nil {
+				// Retire already-claimed slots so they don't strand
+				// as durable spawning rows with no pod behind them.
+				for _, s := range slots {
+					p.retireClaimedWorker(s, RetireReasonCrash)
+				}
 				return err
 			}
 			if slot == nil {
 				break
 			}
-
-			p.mu.Lock()
-			p.spawning++
-			p.mu.Unlock()
-
-			err = p.spawnWarmWorker(ctx, slot.WorkerID)
-
-			p.mu.Lock()
-			p.spawning--
-			if err == nil {
-				observeWarmPoolLifecycleGauges(p.workers)
-			}
-			p.mu.Unlock()
-
-			if err != nil {
-				p.retireClaimedWorker(slot, RetireReasonCrash)
-				return err
-			}
+			slots = append(slots, slot)
 		}
-		return nil
+
+		if len(slots) == 0 {
+			return nil
+		}
+
+		p.mu.Lock()
+		p.spawning += len(slots)
+		p.mu.Unlock()
+
+		ctx := context.Background()
+		var wg sync.WaitGroup
+		errs := make([]error, len(slots))
+		for i, slot := range slots {
+			wg.Add(1)
+			go func(i int, slot *configstore.WorkerRecord) {
+				defer wg.Done()
+				err := p.spawnWarmWorker(ctx, slot.WorkerID)
+
+				p.mu.Lock()
+				p.spawning--
+				if err == nil {
+					observeWarmPoolLifecycleGauges(p.workers)
+				}
+				p.mu.Unlock()
+
+				if err != nil {
+					p.retireClaimedWorker(slot, RetireReasonCrash)
+					errs[i] = err
+				}
+			}(i, slot)
+		}
+		wg.Wait()
+		return stderrors.Join(errs...)
 	}
 
 	p.mu.Lock()
@@ -1469,19 +1589,26 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 	ctx := context.Background()
 
-	for _, id := range ids {
-		if err := p.spawnWarmWorker(ctx, id); err != nil {
+	var wg sync.WaitGroup
+	errs := make([]error, len(ids))
+	for i, id := range ids {
+		wg.Add(1)
+		go func(i int, id int) {
+			defer wg.Done()
+			err := p.spawnWarmWorker(ctx, id)
+
 			p.mu.Lock()
 			p.spawning--
+			if err == nil {
+				observeWarmPoolLifecycleGauges(p.workers)
+			}
 			p.mu.Unlock()
-			return err
-		}
-		p.mu.Lock()
-		p.spawning--
-		observeWarmPoolLifecycleGauges(p.workers)
-		p.mu.Unlock()
+
+			errs[i] = err
+		}(i, id)
 	}
-	return nil
+	wg.Wait()
+	return stderrors.Join(errs...)
 }
 
 // HealthCheckLoop periodically checks worker health.
@@ -1654,18 +1781,26 @@ func (p *K8sWorkerPool) ShutdownAll() {
 }
 
 // retireWorkerPod closes the gRPC client and deletes the worker pod.
+// Acquires the retire semaphore to limit concurrent K8s API calls.
 func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
-	slog.Info("Retiring K8s worker.", "id", id)
+	p.retireSem <- struct{}{}
+	defer func() { <-p.retireSem }()
+
+	podName := p.workerPodName(w)
+	slog.Info("Retiring K8s worker.", "id", id, "pod", podName)
 	if w.client != nil {
 		_ = w.client.Close()
 	}
-	podName := p.workerPodName(w)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+	if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 		GracePeriodSeconds: int64Ptr(10),
-	})
-	_ = p.deleteWorkerRPCSecret(ctx, podName)
+	}); err != nil {
+		slog.Warn("Failed to delete worker pod.", "id", id, "pod", podName, "error", err)
+	}
+	if err := p.deleteWorkerRPCSecret(ctx, podName); err != nil {
+		slog.Warn("Failed to delete worker RPC secret.", "id", id, "pod", podName, "error", err)
+	}
 }
 
 // idleReaper periodically retires workers that have been idle too long and
@@ -1865,9 +2000,10 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	}
 }
 
-// workerResources returns resource requests for a worker pod.
+// workerResources returns resource requests and limits for a worker pod.
 // Set via DUCKGRES_K8S_WORKER_CPU_REQUEST / DUCKGRES_K8S_WORKER_MEMORY_REQUEST.
 // Returns empty (BestEffort) if neither is set.
+// When set, limits are equal to requests (Guaranteed QoS).
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	requests := corev1.ResourceList{}
 	if p.workerCPURequest != "" {
@@ -1879,7 +2015,11 @@ func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	if len(requests) == 0 {
 		return corev1.ResourceRequirements{}
 	}
-	return corev1.ResourceRequirements{Requests: requests}
+	limits := make(corev1.ResourceList, len(requests))
+	for k, v := range requests {
+		limits[k] = v.DeepCopy()
+	}
+	return corev1.ResourceRequirements{Requests: requests, Limits: limits}
 }
 
 // --- Helpers ---
@@ -2074,10 +2214,7 @@ func (p *K8sWorkerPool) healthCheckPayloadForWorker(worker *ManagedWorker) serve
 // podNameForWorker returns the pod name for a given worker ID,
 // including the org ID if set (multi-tenant mode).
 func (p *K8sWorkerPool) podNameForWorker(id int) string {
-	if p.orgID != "" {
-		return fmt.Sprintf("duckgres-worker-%s-%s-%d", p.cpID, p.orgID, id)
-	}
-	return fmt.Sprintf("duckgres-worker-%s-%d", p.cpID, id)
+	return fmt.Sprintf("%s-%d", p.workerPodNamePrefix(), id)
 }
 
 func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
@@ -2091,10 +2228,32 @@ func (p *K8sWorkerPool) workerPodName(worker *ManagedWorker) string {
 }
 
 func (p *K8sWorkerPool) workerPodNamePrefix() string {
+	base := trimK8sPodHashSuffix(p.cpID)
 	if p.orgID != "" {
-		return fmt.Sprintf("duckgres-worker-%s-%s", p.cpID, p.orgID)
+		return fmt.Sprintf("%s-worker-%s", base, p.orgID)
 	}
-	return fmt.Sprintf("duckgres-worker-%s", p.cpID)
+	return fmt.Sprintf("%s-worker", base)
+}
+
+// trimK8sPodHashSuffix removes the trailing 5-character random pod-hash
+// segment from a K8s deployment pod name (e.g. "duckgres-7b667c7bfd-7745x"
+// → "duckgres-7b667c7bfd"). Names that don't end in a plausible pod-hash
+// segment are returned unchanged.
+func trimK8sPodHashSuffix(name string) string {
+	idx := strings.LastIndex(name, "-")
+	if idx <= 0 {
+		return name
+	}
+	suffix := name[idx+1:]
+	if len(suffix) != 5 {
+		return name
+	}
+	for _, r := range suffix {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return name
+		}
+	}
+	return name[:idx]
 }
 
 // SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
@@ -2102,6 +2261,25 @@ func (p *K8sWorkerPool) SetMaxWorkers(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.maxWorkers = n
+}
+
+// SetWorkerResources updates the CPU and memory requests (and limits) applied
+// to newly spawned worker pods. Existing pods are not affected.
+//
+// In multi-tenant mode, multiple orgs may call this — the last write wins.
+// This is acceptable when all orgs share a uniform node pool. If orgs need
+// genuinely different worker sizes, per-org dedicated pools are required.
+func (p *K8sWorkerPool) SetWorkerResources(cpu, memory string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if (p.workerCPURequest != "" && cpu != p.workerCPURequest) ||
+		(p.workerMemoryRequest != "" && memory != p.workerMemoryRequest) {
+		slog.Warn("Overwriting shared pool worker resources — multiple orgs set different values.",
+			"old_cpu", p.workerCPURequest, "new_cpu", cpu,
+			"old_memory", p.workerMemoryRequest, "new_memory", memory)
+	}
+	p.workerCPURequest = cpu
+	p.workerMemoryRequest = memory
 }
 
 // SetWarmCapacityTarget updates the number of neutral idle workers the shared

@@ -205,28 +205,22 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {
+	// Epoch and CP instance ID checks are intentionally omitted here.
+	// Worker ownership is already serialized by the config store's transactional
+	// ClaimIdleWorker / ClaimHotIdleWorker / TakeOverWorker operations, and a
+	// worker's org assignment never changes after activation (hot → hot-idle
+	// stays on the same org until TTL expiry). Validating epoch/cpInstanceID
+	// on every health check caused cascading worker kills during CP rolling
+	// updates: the fresh CP starts with epoch 0 while workers remember a
+	// higher epoch from the previous CP, so all health checks fail and all
+	// workers get deleted.
 	if !p.sharedWarmMode {
 		return nil
-	}
-	if meta.OwnerEpoch < 0 {
-		return fmt.Errorf("owner_epoch must be non-negative")
 	}
 
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.workerID > 0 && meta.WorkerID != 0 && meta.WorkerID != p.workerID {
-		return fmt.Errorf("stale worker_id %d (current %d)", meta.WorkerID, p.workerID)
-	}
-	if p.activation == nil && p.ownerCPInstanceID == "" {
-		return nil
-	}
-	if meta.OwnerEpoch != p.ownerEpoch {
-		return fmt.Errorf("stale owner epoch %d (current %d)", meta.OwnerEpoch, p.ownerEpoch)
-	}
-	if p.ownerCPInstanceID != "" && meta.CPInstanceID != p.ownerCPInstanceID {
-		return fmt.Errorf("stale cp_instance_id %q (current %q)", meta.CPInstanceID, p.ownerCPInstanceID)
-	}
-	if p.workerID > 0 && meta.WorkerID != p.workerID {
 		return fmt.Errorf("stale worker_id %d (current %d)", meta.WorkerID, p.workerID)
 	}
 	return nil

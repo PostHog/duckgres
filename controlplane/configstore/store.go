@@ -2,6 +2,8 @@ package configstore
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -177,13 +179,15 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 
 	for _, o := range orgs {
 		oc := &OrgConfig{
-			Name:         o.Name,
-			DatabaseName: o.DatabaseName,
-			MaxWorkers:   o.MaxWorkers,
-			MemoryBudget: o.MemoryBudget,
-			IdleTimeoutS: o.IdleTimeoutS,
-			Users:        make(map[string]string),
-			Warehouse:    copyManagedWarehouseConfig(o.Warehouse),
+			Name:                o.Name,
+			DatabaseName:        o.DatabaseName,
+			MaxWorkers:          o.MaxWorkers,
+			MemoryBudget:        o.MemoryBudget,
+			IdleTimeoutS:        o.IdleTimeoutS,
+			WorkerCPURequest:    o.WorkerCPURequest,
+			WorkerMemoryRequest: o.WorkerMemoryRequest,
+			Users:               make(map[string]string),
+			Warehouse:           copyManagedWarehouseConfig(o.Warehouse),
 		}
 		if o.DatabaseName != "" {
 			snap.DatabaseOrg[o.DatabaseName] = o.Name
@@ -258,6 +262,42 @@ func HashPassword(password string) (string, error) {
 		return "", fmt.Errorf("hash password: %w", err)
 	}
 	return string(hash), nil
+}
+
+// GeneratePassword returns a cryptographically random 32-byte URL-safe password.
+func GeneratePassword() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate password: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// CreateOrgUser creates a new user for the given org.
+func (cs *ConfigStore) CreateOrgUser(orgID, username, passwordHash string) error {
+	user := OrgUser{
+		OrgID:    orgID,
+		Username: username,
+		Password: passwordHash,
+	}
+	return cs.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "org_id"}, {Name: "username"}},
+		DoUpdates: clause.AssignmentColumns([]string{"password", "updated_at"}),
+	}).Create(&user).Error
+}
+
+// UpdateOrgUserPassword updates the password hash for an existing user.
+func (cs *ConfigStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
+	result := cs.db.Model(&OrgUser{}).
+		Where("org_id = ? AND username = ?", orgID, username).
+		Update("password", passwordHash)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("user %q not found in org %q", username, orgID)
+	}
+	return nil
 }
 
 // OnChange registers a callback that fires when the config snapshot changes.
@@ -382,6 +422,25 @@ func (cs *ConfigStore) GetControlPlaneInstance(id string) (*ControlPlaneInstance
 	return &instance, nil
 }
 
+// ListLiveControlPlaneInstanceIDs returns the IDs of control-plane instances
+// that are not yet expired — i.e. either currently active OR draining (still
+// alive, waiting on in-flight queries to finish before SIGTERM completes).
+// Used by the K8s pool's startup orphan sweep to distinguish "owned by a CP
+// that is still serving traffic" from "owned by a dead CP".
+//
+// Including draining CPs is critical: a draining CP's worker pods are still
+// running queries that haven't finished yet, and treating them as orphans
+// would kill those queries mid-flight.
+func (cs *ConfigStore) ListLiveControlPlaneInstanceIDs() ([]string, error) {
+	var ids []string
+	if err := cs.db.Table(cs.runtimeTable((&ControlPlaneInstance{}).TableName())).
+		Where("state <> ?", ControlPlaneInstanceStateExpired).
+		Pluck("id", &ids).Error; err != nil {
+		return nil, fmt.Errorf("list live control plane instance ids: %w", err)
+	}
+	return ids, nil
+}
+
 // ExpireControlPlaneInstances marks stale control-plane instance rows as expired.
 func (cs *ConfigStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
 	now := time.Now()
@@ -424,6 +483,26 @@ func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 		return fmt.Errorf("upsert worker record: %w", err)
 	}
 	return nil
+}
+
+// ListWorkerRecordsByStatesBefore returns worker rows in any of the given
+// states whose updated_at is at or before the given cutoff. The age filter is
+// what makes this safe to use against in-flight spawns: callers pass a cutoff
+// well in the past (e.g. now - 30s) so a row that another CP is currently
+// touching will not appear in the result.
+func (cs *ConfigStore) ListWorkerRecordsByStatesBefore(states []WorkerState, updatedBefore time.Time) ([]WorkerRecord, error) {
+	if len(states) == 0 {
+		return nil, nil
+	}
+	var workers []WorkerRecord
+	if err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("state IN ?", states).
+		Where("updated_at <= ?", updatedBefore).
+		Order("worker_id ASC").
+		Find(&workers).Error; err != nil {
+		return nil, fmt.Errorf("list worker records by state before: %w", err)
+	}
+	return workers, nil
 }
 
 // GetWorkerRecord returns a runtime worker row by worker id.
@@ -566,6 +645,23 @@ func (cs *ConfigStore) RetireHotIdleWorker(workerID int) (bool, error) {
 		})
 	if result.Error != nil {
 		return false, fmt.Errorf("retire hot-idle worker %d: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// RetireIdleWorker atomically transitions a worker from idle to retired.
+// Returns true if the transition happened, false if the worker was no longer
+// idle (e.g. claimed by another CP between the list query and this call).
+func (cs *ConfigStore) RetireIdleWorker(workerID int, reason string) (bool, error) {
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND state = ?", workerID, WorkerStateIdle).
+		Updates(map[string]any{
+			"state":         WorkerStateRetired,
+			"retire_reason": reason,
+			"updated_at":    time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("retire idle worker %d: %w", workerID, result.Error)
 	}
 	return result.RowsAffected > 0, nil
 }
@@ -744,9 +840,11 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 
 // ListOrphanedWorkers returns workers whose owning control-plane instance has
 // already been marked expired long enough ago to pass the orphan grace cutoff.
-// Retired/lost rows are included so a replacement janitor can finish deleting
-// worker pods when the original control plane died after persisting retirement
-// but before the Kubernetes delete completed.
+// Retired/lost rows are deliberately excluded: their pods are either already
+// gone (in which case re-listing the row would loop the janitor on a 404 from
+// the K8s delete forever) or were leaked when the previous CP died mid-delete,
+// and that leak case is handled authoritatively by the K8s label-based startup
+// scan in K8sWorkerPool.cleanupOrphanedWorkerPods.
 func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
 	cleanupStates := []WorkerState{
@@ -757,8 +855,6 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 		WorkerStateHot,
 		WorkerStateHotIdle,
 		WorkerStateDraining,
-		WorkerStateRetired,
-		WorkerStateLost,
 	}
 	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
 	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())

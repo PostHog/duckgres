@@ -7,6 +7,15 @@ type Config struct {
 	// SERIAL types are converted to INTEGER, and DEFAULT now() is stripped.
 	DuckLakeMode bool
 
+	// LogicalDatabaseName is the client-visible database name for the session.
+	// When set in DuckLake mode, three-part references using this catalog are
+	// rewritten to PhysicalCatalogName.
+	LogicalDatabaseName string
+
+	// PhysicalCatalogName is the executable DuckDB catalog alias that backs the
+	// logical database name. Defaults to "ducklake" when empty in DuckLake mode.
+	PhysicalCatalogName string
+
 	// ConvertPlaceholders converts PostgreSQL $1, $2 placeholders to ? for database/sql.
 	// This is needed for the extended query protocol (prepared statements).
 	ConvertPlaceholders bool
@@ -16,6 +25,8 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		DuckLakeMode:        false,
+		LogicalDatabaseName: "",
+		PhysicalCatalogName: "",
 		ConvertPlaceholders: false,
 	}
 }

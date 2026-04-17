@@ -104,6 +104,7 @@ type ControlPlane struct {
 	rateLimiter     *server.RateLimiter
 	tlsConfig       *tls.Config
 	pgListener      net.Listener
+	flightListener  net.Listener
 	upgrader        *tableflip.Upgrader
 	parentPID       int // tableflip parent PID (0 if first generation)
 	activeConns     int64
@@ -114,6 +115,9 @@ type ControlPlane struct {
 	upgradeDraining atomic.Bool            // true after upgrade succeeded; SIGTERM should exit immediately
 	acmeManager     *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
 	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
+
+	// isRemoteBackend is true when workers run as separate K8s pods (remote backend).
+	isRemoteBackend bool
 
 	// Multi-tenant fields (non-nil in remote multitenant mode)
 	orgRouter      OrgRouterInterface
@@ -139,6 +143,7 @@ type ConfigStoreInterface interface {
 type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
 	IsMigratingForOrg(orgID string) bool
+	SetWarmCapacityTarget(n int)
 	ShutdownAll()
 }
 
@@ -237,6 +242,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
+	var flightLn net.Listener
+	if cfg.FlightPort > 0 {
+		flightAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.FlightPort)
+		flightLn, err = upg.Listen("tcp", flightAddr)
+		if err != nil {
+			slog.Error("Failed to listen.", "addr", flightAddr, "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// Save the tableflip parent PID before it potentially exits and we get
 	// reparented to init. We need this to kill a stuck parent during future
 	// upgrades (tableflip requires the parent to exit before the child can
@@ -245,6 +260,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if upg.HasParent() {
 		parentPID = os.Getppid()
 		slog.Info("Upgrade complete, inherited PG listener.", "addr", pgLn.Addr().String())
+		if flightLn != nil {
+			slog.Info("Upgrade complete, inherited Flight listener.", "addr", flightLn.Addr().String())
+		}
 	}
 
 	if !isK8s {
@@ -325,20 +343,22 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 
 	cp := &ControlPlane{
-		cfg:            cfg,
-		srv:            srv,
-		rateLimiter:    server.NewRateLimiter(cfg.RateLimit),
-		tlsConfig:      tlsCfg,
-		pgListener:     pgLn,
-		upgrader:       upg,
-		parentPID:      parentPID,
-		acmeManager:    acmeMgr,
-		acmeDNSManager: acmeDNSMgr,
+		cfg:             cfg,
+		srv:             srv,
+		rateLimiter:     server.NewRateLimiter(cfg.RateLimit),
+		tlsConfig:       tlsCfg,
+		pgListener:      pgLn,
+		flightListener:  flightLn,
+		upgrader:        upg,
+		parentPID:       parentPID,
+		acmeManager:     acmeMgr,
+		acmeDNSManager:  acmeDNSMgr,
+		isRemoteBackend: cfg.WorkerBackend == "remote",
 	}
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers)
+		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers, cp.healthReady)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
@@ -442,11 +462,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		go pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash, onProgress)
 	}
 
-	// Flight ingress is created AFTER upgrade so the old CP can keep
-	// serving Flight SQL clients until it shuts down its listener in
-	// drainAfterUpgrade. This minimizes the Flight unavailability
-	// window to just the brief port rebind, rather than the entire
-	// upgrade + pre-warm duration.
+	// Flight ingress is created after worker/session wiring, but the TCP
+	// listener itself is pre-bound via tableflip so upgrades inherit the
+	// socket instead of racing a re-bind on the old process's 8815 listener.
 	cp.startFlightIngress()
 
 	// Handle SIGUSR1 for graceful upgrade (process mode only)
@@ -603,6 +621,8 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
+	server.IncrementOpenConnections()
+	defer server.DecrementOpenConnections()
 
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
@@ -837,14 +857,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Create session on a worker. The timeout controls how long we wait in the
-	// worker queue when all slots are occupied.
-	// Pass resource limits to be applied immediately by the worker (one RPC).
+	// Derive DuckDB resource limits for the session.
+	// For remote workers (K8s pods), derive from the worker pod's resource
+	// spec — the CP's own resources are irrelevant. For local process workers,
+	// use the rebalancer which derives from the CP's system resources.
 	var (
 		memLimit string
 		threads  int
 	)
-	if rebalancer != nil {
+	if cp.isRemoteBackend {
+		memLimit, threads = cp.workerDuckDBLimits()
+	} else if rebalancer != nil {
 		memLimit = rebalancer.MemoryLimit()
 		threads = rebalancer.PerSessionThreads()
 	}
@@ -864,7 +887,33 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = writer.Flush()
 		return
 	}
-	defer sessions.DestroySession(pid)
+	if orgID != "" {
+		observeOrgSessionsActive(orgID, sessions.SessionCount())
+	}
+	defer func() {
+		sessions.DestroySession(pid)
+		if orgID != "" {
+			observeOrgSessionsActive(orgID, sessions.SessionCount())
+		}
+	}()
+
+	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err = server.InitSessionDatabaseMetadata(initCtx, executor, database)
+	if err != nil {
+		initCancel()
+		slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
+		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
+		_ = writer.Flush()
+		return
+	}
+	duckLakeAttached, err := server.HasAttachedCatalog(initCtx, executor, "ducklake")
+	initCancel()
+	if err != nil {
+		slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
+		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
+		_ = writer.Flush()
+		return
+	}
 
 	// Register the TCP connection so OnWorkerCrash can close it to unblock
 	// the message loop if the backing worker dies.
@@ -873,6 +922,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Create real clientConn with FlightExecutor and worker assignment
 	workerID := sessions.WorkerIDForPID(pid)
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID)
+	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
@@ -891,6 +941,87 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 
 	slog.Info("Client disconnected.", "user", username, "remote_addr", remoteAddr)
+}
+
+// workerDuckDBLimits derives DuckDB memory_limit and threads from the worker
+// pod's K8s resource spec. Uses 75% of the worker's memory limit for DuckDB
+// and the full CPU request as thread count. Returns empty/zero if worker
+// resources are not configured (DuckDB will then auto-detect on the worker).
+func (cp *ControlPlane) workerDuckDBLimits() (memLimit string, threads int) {
+	memReq := cp.cfg.K8s.WorkerMemoryRequest
+	if memReq != "" {
+		memBytes := parseK8sMemory(memReq)
+		if memBytes > 0 {
+			duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
+			const gb = 1024 * 1024 * 1024
+			const mb = 1024 * 1024
+			if duckdbBytes >= gb {
+				memLimit = fmt.Sprintf("%dGB", duckdbBytes/gb)
+			} else {
+				memLimit = fmt.Sprintf("%dMB", duckdbBytes/mb)
+			}
+		}
+	}
+
+	cpuReq := cp.cfg.K8s.WorkerCPURequest
+	if cpuReq != "" {
+		threads = parseK8sCPU(cpuReq)
+	}
+
+	return memLimit, threads
+}
+
+// parseK8sMemory parses a Kubernetes memory string (e.g., "360Gi", "8Gi", "512Mi", "4GB")
+// into bytes. Supports both IEC (Ki/Mi/Gi/Ti) and SI (KB/MB/GB/TB) units.
+func parseK8sMemory(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+
+	// Try k8s IEC notation first (Ki, Mi, Gi, Ti)
+	units := []struct {
+		suffix     string
+		multiplier uint64
+	}{
+		{"Ti", 1024 * 1024 * 1024 * 1024},
+		{"Gi", 1024 * 1024 * 1024},
+		{"Mi", 1024 * 1024},
+		{"Ki", 1024},
+	}
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			var v float64
+			if _, err := fmt.Sscanf(strings.TrimSuffix(s, u.suffix), "%f", &v); err == nil && v > 0 {
+				return uint64(v * float64(u.multiplier))
+			}
+			return 0
+		}
+	}
+
+	// Fall back to DuckDB/SI notation (KB, MB, GB, TB)
+	return server.ParseMemoryBytes(s)
+}
+
+// parseK8sCPU parses a Kubernetes CPU string (e.g., "46", "46000m", "500m")
+// into a whole thread count. Millicores below 1000 round down to 0.
+func parseK8sCPU(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if strings.HasSuffix(s, "m") {
+		var millicores int
+		if _, err := fmt.Sscanf(strings.TrimSuffix(s, "m"), "%d", &millicores); err != nil {
+			return 0
+		}
+		return millicores / 1000
+	}
+	var cores int
+	if _, err := fmt.Sscanf(s, "%d", &cores); err != nil {
+		return 0
+	}
+	return cores
 }
 
 // startupResult holds the parsed initial startup message.
@@ -1016,6 +1147,11 @@ func (cp *ControlPlane) shutdown() {
 }
 
 func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
+	// Stop spawning warm workers immediately so we don't create pods that
+	// outlive this CP instance and block scheduling for the replacement.
+	if cp.orgRouter != nil {
+		cp.orgRouter.SetWarmCapacityTarget(0)
+	}
 	cp.stopAcceptingPGConnections()
 	if cp.flight != nil {
 		cp.flight.BeginDrain()
@@ -1111,6 +1247,19 @@ func (cp *ControlPlane) shutdownRuntimeResources() {
 
 func (cp *ControlPlane) isDraining() bool {
 	return cp.runtimeTracker != nil && cp.runtimeTracker.Draining()
+}
+
+func (cp *ControlPlane) healthReady() bool {
+	if cp == nil {
+		return false
+	}
+	if cp.isDraining() {
+		return false
+	}
+	if cp.cfg.FlightPort <= 0 {
+		return true
+	}
+	return cp.flight != nil && cp.flight.Healthy()
 }
 
 func (cp *ControlPlane) stopQueryLogger() {
@@ -1288,8 +1437,6 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 }
 
 // startFlightIngress creates and starts the Flight SQL ingress listener.
-// During upgrade, the old CP's Flight listener may still be shutting down,
-// so we retry port binding briefly before giving up.
 func (cp *ControlPlane) startFlightIngress() {
 	if cp.cfg.FlightPort <= 0 {
 		return
@@ -1335,17 +1482,14 @@ func (cp *ControlPlane) startFlightIngress() {
 		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
 	}
 
-	var flightIngress *FlightIngress
-	var err error
-	for attempt := 0; attempt < 10; attempt++ {
+	var (
+		flightIngress *FlightIngress
+		err           error
+	)
+	if cp.flightListener != nil {
+		flightIngress, err = NewFlightIngressFromListener(cp.flightListener, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
+	} else {
 		flightIngress, err = NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
-		if err == nil {
-			break
-		}
-		if attempt < 9 {
-			slog.Warn("Flight ingress port not yet available, retrying...", "attempt", attempt+1, "error", err)
-			time.Sleep(500 * time.Millisecond)
-		}
 	}
 	if err != nil {
 		slog.Error("Failed to initialize Flight ingress, continuing without Flight SQL.", "error", err)

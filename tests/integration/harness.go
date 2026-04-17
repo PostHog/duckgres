@@ -22,14 +22,15 @@ var duckLakeInfraServices = []string{"ducklake-metadata", "minio", "minio-init"}
 
 // TestHarness manages PostgreSQL and Duckgres instances for side-by-side testing
 type TestHarness struct {
-	PostgresDB  *sql.DB
-	DuckgresDB  *sql.DB
-	duckgresSrv *server.Server
-	tmpDir      string
-	pgPort      int
-	dgPort      int
-	useDuckLake bool
-	mu          sync.Mutex
+	PostgresDB   *sql.DB
+	DuckgresDB   *sql.DB
+	duckgresSrv  *server.Server
+	latencyProxy *LatencyProxy
+	tmpDir       string
+	pgPort       int
+	dgPort       int
+	useDuckLake  bool
+	mu           sync.Mutex
 }
 
 // HarnessConfig configures the test harness
@@ -46,6 +47,10 @@ type HarnessConfig struct {
 	DuckLakeMetadataPort int
 	// MinIOPort is the port for MinIO S3 API (default: 39000)
 	MinIOPort int
+	// MetadataLatency adds artificial one-way latency between DuckDB/DuckLake
+	// and the metadata PostgreSQL via a TCP proxy. Total RTT overhead = 2x this value.
+	// Zero means no proxy (direct connection).
+	MetadataLatency time.Duration
 }
 
 // DefaultConfig returns the default harness configuration
@@ -143,8 +148,22 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Configure DuckLake if enabled
 	if harnessCfg.UseDuckLake {
+		metadataPort := harnessCfg.DuckLakeMetadataPort
+
+		// If latency injection is requested, start a TCP proxy in front of the
+		// metadata PostgreSQL and point DuckLake at the proxy port instead.
+		if harnessCfg.MetadataLatency > 0 {
+			target := fmt.Sprintf("127.0.0.1:%d", harnessCfg.DuckLakeMetadataPort)
+			proxy, err := NewLatencyProxy(target, harnessCfg.MetadataLatency)
+			if err != nil {
+				return fmt.Errorf("failed to start latency proxy: %w", err)
+			}
+			h.latencyProxy = proxy
+			metadataPort = proxy.Port()
+		}
+
 		cfg.DuckLake = server.DuckLakeConfig{
-			MetadataStore: fmt.Sprintf("postgres:host=127.0.0.1 port=%d user=ducklake password=ducklake dbname=ducklake", harnessCfg.DuckLakeMetadataPort),
+			MetadataStore: fmt.Sprintf("postgres:host=127.0.0.1 port=%d user=ducklake password=ducklake dbname=ducklake", metadataPort),
 			ObjectStore:   "s3://ducklake/data/",
 			S3Provider:    "config",
 			S3Endpoint:    fmt.Sprintf("127.0.0.1:%d", harnessCfg.MinIOPort),
@@ -285,6 +304,10 @@ func (h *TestHarness) loadPostgresFixtures() error {
 		return nil
 	}
 
+	if err := h.cleanupPostgresRuntimeSchemas(); err != nil {
+		return fmt.Errorf("failed to cleanup PostgreSQL runtime schemas: %w", err)
+	}
+
 	// Drop existing objects first (in reverse dependency order)
 	dropStatements := []string{
 		"DROP VIEW IF EXISTS order_details",
@@ -350,12 +373,59 @@ func (h *TestHarness) loadPostgresFixtures() error {
 	return nil
 }
 
+func (h *TestHarness) cleanupPostgresRuntimeSchemas() error {
+	rows, err := h.PostgresDB.Query(`
+		SELECT schema_name
+		FROM information_schema.schemata
+		WHERE schema_name = 'cp_runtime'
+			OR schema_name LIKE 'managed_warehouse\_%\_runtime' ESCAPE '\'
+	`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var schemas []string
+	for rows.Next() {
+		var schema string
+		if err := rows.Scan(&schema); err != nil {
+			return err
+		}
+		if isEphemeralPostgresRuntimeSchema(schema) {
+			schemas = append(schemas, schema)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, schema := range schemas {
+		if _, err := h.PostgresDB.Exec(`DROP SCHEMA IF EXISTS ` + quotePostgresIdentifier(schema) + ` CASCADE`); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func isEphemeralPostgresRuntimeSchema(schema string) bool {
+	return schema == "cp_runtime" || (strings.HasPrefix(schema, "managed_warehouse_") && strings.HasSuffix(schema, "_runtime"))
+}
+
+func quotePostgresIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
 // cleanupDuckLakeTables drops existing tables in DuckLake before loading fixtures
 func (h *TestHarness) cleanupDuckLakeTables() error {
+	// Tests may leave the session on a non-default catalog (e.g. USE memory).
+	// Force cleanup to run against the DuckLake catalog that holds persisted fixtures.
+	_, _ = h.DuckgresDB.Exec("USE ducklake")
+
 	// Drop views first (they depend on tables)
 	views := []string{"order_details", "user_stats", "active_users"}
 	for _, v := range views {
-		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS %s", v))
+		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP VIEW IF EXISTS ducklake.main.%s", v))
 	}
 
 	// Drop tables in reverse dependency order
@@ -453,15 +523,81 @@ func (h *TestHarness) cleanupDuckLakeTables() error {
 		"concurrent_write_4",
 		"concurrent_ddl_test",
 		"concurrent_dml_test",
+		// DuckLake concurrency test tables
+		"dl_conc_insert",
+		"dl_conc_tx_insert",
+		"dl_conc_update",
+		"dl_conc_del",
+		"dl_conc_orders",
+		"dl_conc_items",
+		"dl_conc_rw",
+		"dl_conc_upsert",
+		"dl_conc_ddl_write",
+		"dl_conc_batch",
+		"dl_conc_rapid",
+		"dl_conc_rollback",
+		"dl_conc_sustained",
+		// DuckLake CTAS concurrency test tables
+		"dl_ctas_source",
+		"dl_cortas_source",
+		"dl_ctas_live_source",
+		"dl_replace_source_a",
+		"dl_replace_source_b",
+		"dl_replace_target",
+	}
+
+	// Also clean up dynamically-named tables from DuckLake concurrency lifecycle test
+	for w := range 4 {
+		for c := range 8 {
+			tables = append(tables, fmt.Sprintf("dl_conc_lifecycle_%d_%d", w, c))
+		}
+	}
+	for i := range 6 {
+		tables = append(tables, fmt.Sprintf("dl_conc_sep_%d", i))
+	}
+	// CTAS output tables
+	for w := range 8 {
+		for c := range 10 {
+			tables = append(tables, fmt.Sprintf("dl_ctas_out_%d_%d", w, c))
+		}
+	}
+	// CTAS snapshot tables
+	for i := range 20 {
+		tables = append(tables, fmt.Sprintf("dl_ctas_snapshot_%d", i))
+	}
+	// CREATE OR REPLACE target tables
+	for i := range 4 {
+		tables = append(tables, fmt.Sprintf("dl_cortas_target_%d", i))
+	}
+	// SQLMesh CTAS reproduction tables
+	tables = append(tables, "dl_sqlmesh_source", "dl_sqlmesh_raw", "dl_sqlmesh_comment_src")
+	for i := range 30 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_cmt_%d", i))
+	}
+	for i := range 30 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_model_%d", i))
+	}
+	for i := range 5 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_t1_%d", i))
+	}
+	for i := range 6 {
+		tables = append(tables, fmt.Sprintf("dl_sqlmesh_t2_%d", i))
 	}
 
 	for _, t := range tables {
 		// Ignore errors - table might not exist or schema might not exist
-		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t))
+		objectName := fmt.Sprintf("ducklake.main.%s", t)
+		if strings.Contains(t, ".") {
+			objectName = "ducklake." + t
+		}
+		_, _ = h.DuckgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", objectName))
 	}
 
-	// Drop test schema
-	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS test_schema")
+	// Drop test schemas after contained objects have been removed.
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.test_schema CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.bill CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.ddl_schema_test CASCADE")
+	_, _ = h.DuckgresDB.Exec("DROP SCHEMA IF EXISTS ducklake.dbt_test CASCADE")
 
 	return nil
 }
@@ -488,6 +624,12 @@ func (h *TestHarness) Close() error {
 	if h.duckgresSrv != nil {
 		if err := h.duckgresSrv.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close Duckgres server: %w", err))
+		}
+	}
+
+	if h.latencyProxy != nil {
+		if err := h.latencyProxy.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close latency proxy: %w", err))
 		}
 	}
 

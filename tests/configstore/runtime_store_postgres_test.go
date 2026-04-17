@@ -277,6 +277,70 @@ func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	}
 }
 
+func TestListLiveControlPlaneInstanceIDsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 9, 12, 0, 0, 0, time.UTC)
+
+	// Active CP — should appear.
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-active:boot-a",
+		PodName:         "duckgres-active",
+		PodUID:          "pod-active",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateActive,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(active): %v", err)
+	}
+	// Draining CP — must also appear (still serving in-flight queries).
+	drainingAt := now.Add(-time.Minute)
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-draining:boot-b",
+		PodName:         "duckgres-draining",
+		PodUID:          "pod-draining",
+		BootID:          "boot-b",
+		State:           configstore.ControlPlaneInstanceStateDraining,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now.Add(-30 * time.Second),
+		DrainingAt:      &drainingAt,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(draining): %v", err)
+	}
+	// Expired CP — must NOT appear.
+	expiredAt := now.Add(-2 * time.Minute)
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-expired:boot-c",
+		PodName:         "duckgres-expired",
+		PodUID:          "pod-expired",
+		BootID:          "boot-c",
+		State:           configstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now.Add(-5 * time.Minute),
+		ExpiredAt:       &expiredAt,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(expired): %v", err)
+	}
+
+	ids, err := store.ListLiveControlPlaneInstanceIDs()
+	if err != nil {
+		t.Fatalf("ListLiveControlPlaneInstanceIDs: %v", err)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	if !got["cp-active:boot-a"] {
+		t.Error("expected active CP to be listed as live")
+	}
+	if !got["cp-draining:boot-b"] {
+		t.Error("expected draining CP to be listed as live (still serving in-flight queries)")
+	}
+	if got["cp-expired:boot-c"] {
+		t.Error("expected expired CP to NOT be listed as live")
+	}
+}
+
 func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
@@ -476,6 +540,10 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertWorkerRecord(orphaned): %v", err)
 	}
+	// Retired and lost rows whose owning CP is expired must NOT be returned:
+	// their pods are already deleted (or will be cleaned up by the K8s label
+	// scan on the next CP startup), so re-listing them would loop the janitor
+	// on a 404 from the K8s pod delete forever.
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          63,
 		PodName:           "duckgres-worker-63",
@@ -487,6 +555,18 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 		RetireReason:      "normal",
 	}); err != nil {
 		t.Fatalf("UpsertWorkerRecord(retired orphan): %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          64,
+		PodName:           "duckgres-worker-64",
+		State:             configstore.WorkerStateLost,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-expired:boot-a",
+		OwnerEpoch:        4,
+		LastHeartbeatAt:   now.Add(-time.Minute),
+		RetireReason:      "crash",
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(lost orphan): %v", err)
 	}
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          62,
@@ -509,11 +589,8 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListOrphanedWorkers: %v", err)
 	}
-	if len(orphaned) != 2 {
-		t.Fatalf("expected orphaned worker 61, got %#v", orphaned)
-	}
-	if orphaned[0].WorkerID != 61 || orphaned[1].WorkerID != 63 {
-		t.Fatalf("expected orphaned workers 61 and 63, got %#v", orphaned)
+	if len(orphaned) != 1 || orphaned[0].WorkerID != 61 {
+		t.Fatalf("expected only active orphaned worker 61, got %#v", orphaned)
 	}
 
 	stuck, err := store.ListStuckWorkers(now.Add(-2*time.Minute), now.Add(-2*time.Minute))
