@@ -144,11 +144,21 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 	}
 
 	if scanTime > 0 {
+		// Estimate actual rows scanned (deduplicated across threads).
+		// scan_rows_cumulative counts each thread's rows independently.
+		scanRowsWall := scanRows
+		if m.CPUTime > 0 && m.Latency > 0 {
+			parallelism := m.CPUTime / m.Latency
+			if parallelism > 1 {
+				scanRowsWall = scanRows / parallelism
+			}
+		}
 		_, scanSpan := tracer.Start(ctx, "duckdb.scan", trace.WithTimestamp(cursor))
 		scanSpan.SetAttributes(
 			attribute.Float64("duckdb.scan_wall_s", scanWall),
 			attribute.Float64("duckdb.scan_thread_s", scanTime),
-			attribute.Float64("duckdb.scan_rows", scanRows),
+			attribute.Float64("duckdb.scan_rows_wall", scanRowsWall),
+			attribute.Float64("duckdb.scan_rows_cumulative", scanRows),
 			attribute.Int64("duckdb.total_bytes_read", int64(m.TotalBytesRead)),
 		)
 		cursor = cursor.Add(time.Duration(scanWall * float64(time.Second)))
