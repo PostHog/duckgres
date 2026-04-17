@@ -7,6 +7,7 @@ import (
 )
 
 type cleanupRecordingExecutor struct {
+	noopProfiling
 	execQueries []string
 }
 

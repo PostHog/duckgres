@@ -19,7 +19,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -58,6 +57,10 @@ type FlightExecutor struct {
 
 	ctx    context.Context    // base context for all requests
 	cancel context.CancelFunc // cancels the base context
+
+	// lastProfiling stores the most recent DuckDB profiling output received
+	// from the worker via gRPC trailing metadata.
+	lastProfiling atomic.Value // stores string
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -73,9 +76,8 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 	))
 
 	// Propagate OTEL trace context across gRPC to worker pods.
-	dialOpts = append(dialOpts,
-		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
-	)
+	// Filtered to query RPCs only (GetFlightInfo, DoGet).
+	dialOpts = append(dialOpts, OTELGRPCClientHandler())
 
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&bearerCreds{token: bearerToken}))
@@ -188,7 +190,9 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 
 	reqCtx = e.withSession(reqCtx)
 
-	info, err := e.client.Execute(reqCtx, query)
+	var trailer metadata.MD
+	info, err := e.client.Execute(reqCtx, query, grpc.Trailer(&trailer))
+	e.storeProfilingFromTrailer(trailer)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute: %w", err)
 	}
@@ -245,7 +249,9 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 
 	reqCtx = e.withSession(reqCtx)
 
-	affected, err := e.client.ExecuteUpdate(reqCtx, query)
+	var trailer metadata.MD
+	affected, err := e.client.ExecuteUpdate(reqCtx, query, grpc.Trailer(&trailer))
+	e.storeProfilingFromTrailer(trailer)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute update: %w", err)
 	}
@@ -300,6 +306,24 @@ func (e *FlightExecutor) Close() error {
 		return e.client.Close()
 	}
 	return nil
+}
+
+func (e *FlightExecutor) LastProfilingOutput() string {
+	v := e.lastProfiling.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+const profilingMetadataKey = "x-duckgres-profiling"
+
+func (e *FlightExecutor) storeProfilingFromTrailer(trailer metadata.MD) {
+	if vals := trailer.Get(profilingMetadataKey); len(vals) > 0 {
+		e.lastProfiling.Store(vals[0])
+	} else {
+		e.lastProfiling.Store("")
+	}
 }
 
 // FlightRowSet wraps an Arrow Flight RecordBatch reader to implement RowSet.

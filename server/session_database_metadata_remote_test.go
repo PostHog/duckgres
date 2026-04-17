@@ -7,6 +7,7 @@ import (
 )
 
 type attachedCatalogProbeExecutor struct {
+	noopProfiling
 	lastQuery string
 	lastArgs  []any
 }
