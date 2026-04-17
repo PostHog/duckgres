@@ -19,7 +19,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -77,9 +76,8 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 	))
 
 	// Propagate OTEL trace context across gRPC to worker pods.
-	dialOpts = append(dialOpts,
-		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
-	)
+	// Filtered to query RPCs only (GetFlightInfo, DoGet).
+	dialOpts = append(dialOpts, OTELGRPCClientHandler())
 
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&bearerCreds{token: bearerToken}))
