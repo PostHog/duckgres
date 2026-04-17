@@ -12,7 +12,7 @@ func TestProfilingOutputToFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open duckdb: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	tmpFile := t.TempDir() + "/profiling.json"
 
@@ -37,7 +37,7 @@ func TestProfilingOutputToFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	// Read profiling output from file
 	data, err := os.ReadFile(tmpFile)
