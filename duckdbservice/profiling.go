@@ -1,7 +1,9 @@
 package duckdbservice
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 
 	"google.golang.org/grpc"
@@ -25,5 +27,10 @@ func sendProfilingMetadata(ctx context.Context, session *Session) {
 	if err != nil || len(data) == 0 {
 		return
 	}
-	_ = grpc.SetTrailer(ctx, metadata.Pairs(profilingMetadataKey, string(data)))
+	// Compact JSON to a single line — gRPC metadata values cannot contain newlines.
+	var compact bytes.Buffer
+	if json.Compact(&compact, data) != nil {
+		return
+	}
+	_ = grpc.SetTrailer(ctx, metadata.Pairs(profilingMetadataKey, compact.String()))
 }
