@@ -58,6 +58,10 @@ type FlightExecutor struct {
 
 	ctx    context.Context    // base context for all requests
 	cancel context.CancelFunc // cancels the base context
+
+	// lastProfiling stores the most recent DuckDB profiling output received
+	// from the worker via gRPC trailing metadata.
+	lastProfiling atomic.Value // stores string
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -188,7 +192,9 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 
 	reqCtx = e.withSession(reqCtx)
 
-	info, err := e.client.Execute(reqCtx, query)
+	var trailer metadata.MD
+	info, err := e.client.Execute(reqCtx, query, grpc.Trailer(&trailer))
+	e.storeProfilingFromTrailer(trailer)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute: %w", err)
 	}
@@ -245,7 +251,9 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 
 	reqCtx = e.withSession(reqCtx)
 
-	affected, err := e.client.ExecuteUpdate(reqCtx, query)
+	var trailer metadata.MD
+	affected, err := e.client.ExecuteUpdate(reqCtx, query, grpc.Trailer(&trailer))
+	e.storeProfilingFromTrailer(trailer)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute update: %w", err)
 	}
@@ -303,10 +311,21 @@ func (e *FlightExecutor) Close() error {
 }
 
 func (e *FlightExecutor) LastProfilingOutput() string {
-	// Profiling output is only available on the DuckDB connection that ran
-	// the query. In Flight SQL mode the query runs on a remote worker, so
-	// we can't retrieve it from the control plane.
-	return ""
+	v := e.lastProfiling.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+const profilingMetadataKey = "x-duckgres-profiling"
+
+func (e *FlightExecutor) storeProfilingFromTrailer(trailer metadata.MD) {
+	if vals := trailer.Get(profilingMetadataKey); len(vals) > 0 {
+		e.lastProfiling.Store(vals[0])
+	} else {
+		e.lastProfiling.Store("")
+	}
 }
 
 // FlightRowSet wraps an Arrow Flight RecordBatch reader to implement RowSet.

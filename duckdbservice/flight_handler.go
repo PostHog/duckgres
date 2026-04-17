@@ -371,6 +371,10 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
 
+	// Send DuckDB profiling output as gRPC trailing metadata so the
+	// control plane can attach it to the trace span.
+	sendProfilingMetadata(ctx, session)
+
 	handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
 	session.mu.Lock()
 	session.queries[handleID] = &QueryHandle{Query: query, Schema: schema, TxnID: txnKey}
@@ -577,6 +581,8 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if execErr != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
+
+	sendProfilingMetadata(ctx, session)
 
 	affected, err := result.RowsAffected()
 	if err != nil {
