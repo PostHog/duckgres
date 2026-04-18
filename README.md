@@ -498,7 +498,7 @@ GROUP BY name;
 
 ## Architecture
 
-Duckgres supports two run modes: **standalone** (single process, default) and **control-plane** (multi-process with worker pool).
+Duckgres supports three run modes: **standalone** (single process, default), **control-plane** (multi-process with worker pool), and **duckdb-service** (worker process mode used by the control plane).
 
 ### Standalone Mode
 

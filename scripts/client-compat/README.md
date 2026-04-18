@@ -26,15 +26,18 @@ just query-last-run
 |---------|-------------|
 | `just all` | Build and run all clients, produce report |
 | `just build` | Build all container images |
+| `just rebuild` | Rebuild all container images from scratch |
 | `just <client>` | Run a single client standalone (no report) |
 | `just down` | Tear down containers and volumes |
 | `just clean` | Remove the `results/` directory |
+| `just overview` | One-line per-client overview with real/stub/client-specific coverage |
 | `just summary` | Pass/fail counts by client and suite |
 | `just client-results <client>` | Full results for a specific client |
 | `just view-last-run` | Print the full results table |
 | `just query-last-run` | Open the latest results database in DuckDB CLI |
+| `just web` | Open the latest results database in the DuckDB web UI |
 
-Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `node-postgres`, `sqlalchemy`, `dbt`.
+Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgres`, `node-postgres`, `sqlalchemy`, `dbt`, `pgadmin`.
 
 ## Clients
 
@@ -48,6 +51,7 @@ Available single-client targets: `psycopg`, `pgx`, `psql`, `jdbc`, `tokio-postgr
 | node-postgres | Node.js 22 | pg 8.x | node:22-bookworm-slim |
 | sqlalchemy | Python 3.12 | SQLAlchemy 2.x + psycopg2 | python:3.12-slim |
 | dbt | Python 3.12 | dbt-postgres (psycopg2) | python:3.12-slim |
+| pgadmin | Python 3.12 | pgAdmin 4 query replay via psycopg2 | python:3.12-slim |
 
 ## Architecture
 
@@ -119,6 +123,7 @@ Each client tests driver-specific features beyond the shared catalog:
 | node-postgres | `connection`, `ddl_dml`, `prepared`, `result_metadata` |
 | sqlalchemy | `connection`, `core_ddl_dml`, `orm`, `inspection`, `raw_params` |
 | dbt | `dbt_lifecycle` (`dbt debug`, `dbt run`, `dbt test`, `dbt docs generate`) |
+| pgadmin | `pgadmin_connect` (catalog and browser-tree introspection query replay) |
 
 ## Results
 
