@@ -109,7 +109,7 @@ Default login: `postgres / postgres`
 orb start k8s
 just run-multitenant-local
 just multitenant-port-forward-pg
-just multitenant-port-forward-admin
+just multitenant-port-forward-api
 PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres sslmode=require"
 ```
 

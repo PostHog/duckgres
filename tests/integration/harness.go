@@ -148,6 +148,13 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Configure DuckLake if enabled
 	if harnessCfg.UseDuckLake {
+		// CI and local integration runs reuse a long-lived pgwire session.
+		// In DuckLake mode, catalog queries fan out to the metadata Postgres via
+		// DuckDB worker threads, so the runtime default can exhaust the metadata
+		// store and poison the shared session for later tests. Keep the harness
+		// explicit and conservative here instead of inheriting production defaults.
+		cfg.Threads = 1
+
 		metadataPort := harnessCfg.DuckLakeMetadataPort
 
 		// If latency injection is requested, start a TCP proxy in front of the
@@ -650,14 +657,19 @@ func dockerComposeArgs(composeFile string, command string, args ...string) []str
 	return append(composeArgs, args...)
 }
 
+func dockerComposeCommand(composeFile string, command string, args ...string) (string, []string) {
+	return "docker", append([]string{"compose"}, dockerComposeArgs(composeFile, command, args...)...)
+}
+
 func runDockerCompose(command string, args ...string) error {
 	testDir := getTestDir()
 	composeFile := filepath.Join(testDir, "docker-compose.yml")
-	cmd := exec.Command("docker-compose", dockerComposeArgs(composeFile, command, args...)...)
+	cmdName, cmdArgs := dockerComposeCommand(composeFile, command, args...)
+	cmd := exec.Command(cmdName, cmdArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker-compose %s %s: %w", command, strings.Join(args, " "), err)
+		return fmt.Errorf("docker compose %s %s: %w", command, strings.Join(args, " "), err)
 	}
 	return nil
 }
@@ -684,7 +696,8 @@ func StartDuckLakeInfraContainers() error {
 // StopPostgresContainer stops the PostgreSQL Docker container
 func StopPostgresContainer() error {
 	testDir := getTestDir()
-	cmd := exec.Command("docker-compose", dockerComposeArgs(filepath.Join(testDir, "docker-compose.yml"), "down", "-v")...)
+	cmdName, cmdArgs := dockerComposeCommand(filepath.Join(testDir, "docker-compose.yml"), "down", "-v")
+	cmd := exec.Command(cmdName, cmdArgs...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	return cmd.Run()

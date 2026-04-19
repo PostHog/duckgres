@@ -37,7 +37,8 @@ The test suite runs queries against both a real PostgreSQL 16 instance and Duckg
 ### Prerequisites
 
 - Go 1.21+
-- Docker and Docker Compose
+- Docker with `docker compose`
+- [`just`](https://github.com/casey/just)
 - GCC C++ compiler (for DuckDB native bindings - provides libstdc++ for linking)
 
 ```bash
@@ -54,21 +55,32 @@ xcode-select --install
 ### Running Tests
 
 ```bash
-# Start PostgreSQL container
-docker-compose -f tests/integration/docker-compose.yml up -d
+# Preferred: run the integration suite through the repo task runner
+just test-integration
 
-# Wait for PostgreSQL to be ready (about 5 seconds)
-sleep 5
+# DuckLake concurrency benchmark
+just test-ducklake-concurrency
+```
 
-# Run all integration tests
+### Focused Iteration
+
+Use direct `go test` invocations when narrowing to a specific package or test name:
+
+```bash
+# Run the full integration package directly
 go test -v ./tests/integration/...
 
 # Run without PostgreSQL (Duckgres-only mode)
-# Tests will automatically fall back if PostgreSQL isn't running
+# Tests automatically fall back if PostgreSQL is not running
 go test -v ./tests/integration/...
+```
 
-# Stop PostgreSQL when done
-docker-compose -f tests/integration/docker-compose.yml down -v
+If you want to manage the PostgreSQL reference container yourself during local iteration:
+
+```bash
+docker compose -f tests/integration/docker-compose.yml up -d
+go test -v ./tests/integration/...
+docker compose -f tests/integration/docker-compose.yml down -v
 ```
 
 ### Running Specific Test Categories
@@ -287,7 +299,7 @@ When `DUCKGRES_BENCH_OUT` is set, the test writes a JSON report:
 
 ```json
 {
-  "duckdb_version": "v1.5.1",
+  "duckdb_version": "v1.5.2",
   "ducklake_version": "67480b1d",
   "latencies_tested_ms": [0, 10],
   "timestamp": "2026-04-01T19:12:47Z",

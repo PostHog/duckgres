@@ -36,6 +36,19 @@ func TestDockerComposeArgsWithoutServices(t *testing.T) {
 	}
 }
 
+func TestDockerComposeCommandUsesDockerCLIPlugin(t *testing.T) {
+	composeFile := filepath.Join("/tmp", "docker-compose.yml")
+
+	gotName, gotArgs := dockerComposeCommand(composeFile, "up", "-d", "ducklake-metadata")
+	wantArgs := []string{"compose", "-f", composeFile, "up", "-d", "ducklake-metadata"}
+	if gotName != "docker" {
+		t.Fatalf("dockerComposeCommand() name = %q, want %q", gotName, "docker")
+	}
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("dockerComposeCommand() args = %#v, want %#v", gotArgs, wantArgs)
+	}
+}
+
 func TestIsEphemeralPostgresRuntimeSchema(t *testing.T) {
 	tests := []struct {
 		name   string

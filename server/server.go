@@ -779,9 +779,7 @@ func (s *Server) releaseFileDB(username string) {
 // When DataDir is empty, falls back to a pure in-memory database.
 func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// allow_unsigned_extensions is a startup-only DuckDB config — it must be
-	// in the DSN, not via SET. Required for loading the patched httpfs extension
-	// (benben/duckdb-httpfs) which fixes stoi/stoll crashes on HTTP headers
-	// but isn't signed with DuckDB's release key.
+	// in the DSN, not via SET.
 	dsn := ":memory:?allow_unsigned_extensions=true"
 	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
 		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
