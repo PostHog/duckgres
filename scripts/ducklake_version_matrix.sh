@@ -22,9 +22,9 @@ TEST_TIMEOUT="${DUCKLAKE_TEST_TIMEOUT:-300s}"
 
 # DuckDB Go driver versions to test.
 # Format: "module_version" — maps to duckdb-go/v2 + duckdb-go-bindings.
-#   v2.10500.0 → DuckDB 1.5.0 (DuckLake 0.3)
 #   v2.10501.0 → DuckDB 1.5.1 (DuckLake 0.4)
-DEFAULT_VERSIONS="v2.10501.0 v2.10500.0"
+#   v2.10502.0 → DuckDB 1.5.2 (DuckLake 1.0)
+DEFAULT_VERSIONS="v2.10502.0 v2.10501.0"
 VERSIONS="${DUCKLAKE_VERSIONS:-$DEFAULT_VERSIONS}"
 
 CURRENT_ONLY=false

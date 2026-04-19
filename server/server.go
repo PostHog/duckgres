@@ -698,9 +698,7 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 // This shared setup is used by both regular and passthrough connections.
 func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// allow_unsigned_extensions is a startup-only DuckDB config — it must be
-	// in the DSN, not via SET. Required for loading the patched httpfs extension
-	// (benben/duckdb-httpfs) which fixes stoi/stoll crashes on HTTP headers
-	// but isn't signed with DuckDB's release key.
+	// in the DSN, not via SET.
 	db, err := sql.Open("duckdb", ":memory:?allow_unsigned_extensions=true")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)

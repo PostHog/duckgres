@@ -299,7 +299,7 @@ When `DUCKGRES_BENCH_OUT` is set, the test writes a JSON report:
 
 ```json
 {
-  "duckdb_version": "v1.5.1",
+  "duckdb_version": "v1.5.2",
   "ducklake_version": "67480b1d",
   "latencies_tested_ms": [0, 10],
   "timestamp": "2026-04-01T19:12:47Z",
