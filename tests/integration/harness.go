@@ -148,12 +148,9 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Configure DuckLake if enabled
 	if harnessCfg.UseDuckLake {
-		// CI and local integration runs reuse a long-lived pgwire session.
-		// In DuckLake mode, catalog queries fan out to the metadata Postgres via
-		// DuckDB worker threads, so the runtime default can exhaust the metadata
-		// store and poison the shared session for later tests. Keep the harness
-		// explicit and conservative here instead of inheriting production defaults.
-		cfg.Threads = 1
+		// Try the upstream postgres_scanner fix from core_nightly in the
+		// DuckLake-backed integration harness without changing global defaults.
+		cfg.Extensions = []string{"postgres FROM core_nightly", "ducklake"}
 
 		metadataPort := harnessCfg.DuckLakeMetadataPort
 
