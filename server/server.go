@@ -1268,12 +1268,15 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// See: https://github.com/duckdb/ducklake/issues/1031
 	var threadCount int64
 	if err := db.QueryRow("SELECT current_setting('threads')::BIGINT").Scan(&threadCount); err != nil {
-		slog.Warn("Failed to read DuckDB threads setting; using fallback pool size.", "error", err)
-		threadCount = int64(runtime.NumCPU() * 2)
-	}
-	poolMax := threadCount + 4
-	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL pg_pool_max_connections = %d", poolMax)); err != nil {
-		slog.Warn("Failed to set pg_pool_max_connections.", "error", err)
+		// Skip the SET and let DuckDB's default apply — runtime.NumCPU() reports
+		// the host's CPU count, not the pod's cgroup limit, so any fallback
+		// computed here would be wrong in K8s.
+		slog.Warn("Failed to read DuckDB threads setting; leaving pg_pool_max_connections at default.", "error", err)
+	} else {
+		poolMax := threadCount + 4
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL pg_pool_max_connections = %d", poolMax)); err != nil {
+			slog.Warn("Failed to set pg_pool_max_connections.", "error", err)
+		}
 	}
 
 	// Build the ATTACH statement.
