@@ -1251,18 +1251,6 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 			"Consider connecting directly to PostgreSQL instead.")
 	}
 
-	// Raise the postgres_scanner connection pool limit before ATTACH. DuckDB 1.5.2
-	// reduced the default from 64 (unbounded wait) to max(num_cpus, 8) with a 30s
-	// timeout; DuckLake piggybacks on postgres_scanner for its metadata store and,
-	// with thread-local connection caching, each DuckDB worker pins a pool slot,
-	// saturating the pool under catalog-enumerating workloads (e.g. duckdb_tables(),
-	// information_schema.tables). Plain `SET` does NOT propagate to DuckLake's
-	// internal __ducklake_metadata_* catalog; only `SET GLOBAL` does.
-	// See: https://github.com/duckdb/ducklake/issues/1031
-	if _, err := db.Exec("SET GLOBAL pg_pool_max_connections = 64"); err != nil {
-		slog.Warn("Failed to set pg_pool_max_connections.", "error", err)
-	}
-
 	// Build the ATTACH statement.
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
 	migrate := dlCfg.Migrate || duckLakeMigrationNeeded()
