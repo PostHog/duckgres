@@ -1276,6 +1276,8 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		poolMax := threadCount + 4
 		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL pg_pool_max_connections = %d", poolMax)); err != nil {
 			slog.Warn("Failed to set pg_pool_max_connections.", "error", err)
+		} else {
+			slog.Info("Set DuckLake metadata pg_pool_max_connections.", "pool_max", poolMax, "threads", threadCount)
 		}
 	}
 
