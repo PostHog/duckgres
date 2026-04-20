@@ -11,10 +11,11 @@ ARG COMMIT=unknown
 ARG BUILD_TAGS=""
 ARG TARGETARCH
 ARG DUCKDB_EXTENSION_VERSION=1.5.2
+ARG HTTPFS_EXTENSION_TAG=v1.5.2-stoi-fix
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 RUN mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
-    && curl -fsSL "https://extensions.duckdb.org/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension.gz" \
-      | gzip -d > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension"
+    && curl -fsSL "https://github.com/benben/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
+      -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension"
 
 FROM debian:bookworm-slim
 

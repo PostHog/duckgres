@@ -79,6 +79,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 
 	cfg := p.cfg
 	cfg.DuckLake = payload.DuckLake
+	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 
 	<-p.warmupDone
 
@@ -239,6 +240,7 @@ func (p *SessionPool) currentSessionConfig() (server.Config, error) {
 
 	cfg := p.cfg
 	cfg.DuckLake = p.activation.payload.DuckLake
+	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 	return cfg, nil
 }
 

@@ -193,6 +193,7 @@ func main() {
 		defer loggingShutdown()
 		tracingShutdown := initTracing()
 		defer tracingShutdown()
+		duckdbservice.LogCacheProxyStatus()
 		server.RunChildMode()
 		return // RunChildMode calls os.Exit
 	}
@@ -368,6 +369,7 @@ func main() {
 	defer tracingShutdown()
 
 	logBuildInfo(*mode)
+	duckdbservice.LogCacheProxyStatus()
 
 	if fileCfg != nil {
 		slog.Info("Loaded configuration from " + *configFile)
