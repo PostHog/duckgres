@@ -1553,7 +1553,7 @@ func TestExecuteSelectQueryReturnsErrorDetails(t *testing.T) {
 		ctx:    context.Background(),
 		cancel: func() {},
 		executor: &queryErrorExecutor{
-			err: errors.New("relation missing_table does not exist"),
+			err: errors.New("Catalog Error: Table with name missing_table does not exist!"),
 		},
 	}
 
@@ -1564,12 +1564,99 @@ func TestExecuteSelectQueryReturnsErrorDetails(t *testing.T) {
 	if rowCount != 0 {
 		t.Fatalf("expected rowCount=0, got %d", rowCount)
 	}
-	if errCode != "42000" {
-		t.Fatalf("expected error code 42000, got %q", errCode)
+	if errCode != "42P01" {
+		t.Fatalf("expected error code 42P01 (undefined_table), got %q", errCode)
 	}
 	if !strings.Contains(errMsg, "missing_table") {
 		t.Fatalf("expected error message mentioning missing_table, got %q", errMsg)
 	}
+}
+
+// TestHandleQueryEmitsCorrectSQLSTATEOnDuckDBErrors exercises the full
+// handleQuery → wire-frame path so PG-aware clients (psycopg2, SQLAlchemy,
+// dlt) receive the SQLSTATE they branch on. The test injects canonical
+// DuckDB error strings via the executor mock, then parses the resulting
+// ErrorResponse frame out of the writer buffer and asserts the 'C' field.
+func TestHandleQueryEmitsCorrectSQLSTATEOnDuckDBErrors(t *testing.T) {
+	cases := []struct {
+		name     string
+		duckErr  string
+		wantCode string
+	}{
+		{"missing table", "Catalog Error: Table with name nope does not exist!", "42P01"},
+		{"missing schema", "Catalog Error: Schema with name missing_schema does not exist!", "3F000"},
+		{"missing function", "Catalog Error: Scalar Function with name no_such_func does not exist!", "42883"},
+		{"missing column", "Binder Error: Referenced column \"missing_col\" not found in FROM clause!", "42703"},
+		{"parser syntax", "Parser Error: syntax error at or near \"FORM\"", "42601"},
+		{"conversion", "Conversion Error: Could not convert string 'abc' to INT32", "22P02"},
+		{"unique violation", "Constraint Error: Duplicate key \"id: 1\" violates primary key constraint", "23505"},
+		{"permission", "Permission Error: not allowed to write here", "42501"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientSide, serverSide := net.Pipe()
+			defer func() { _ = clientSide.Close() }()
+			defer func() { _ = serverSide.Close() }()
+
+			var out bytes.Buffer
+			c := &clientConn{
+				server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
+				conn:     clientSide,
+				reader:   bufio.NewReader(clientSide),
+				writer:   bufio.NewWriter(&out),
+				ctx:      context.Background(),
+				cancel:   func() {},
+				txStatus: txStatusIdle,
+				executor: &queryErrorExecutor{err: errors.New(tc.duckErr)},
+			}
+
+			if err := c.handleQuery([]byte("SELECT 1\x00")); err != nil {
+				t.Fatalf("handleQuery returned error: %v", err)
+			}
+
+			code := extractErrorResponseField(t, out.Bytes(), 'C')
+			if code != tc.wantCode {
+				t.Fatalf("SQLSTATE: got %q, want %q (duckErr=%q)", code, tc.wantCode, tc.duckErr)
+			}
+		})
+	}
+}
+
+// extractErrorResponseField scans wire-protocol frames for an ErrorResponse
+// ('E') message and returns the requested field value (e.g., 'C' for
+// SQLSTATE, 'M' for primary message). Fails the test if no ErrorResponse
+// is found or the field is absent.
+func extractErrorResponseField(t *testing.T, buf []byte, field byte) string {
+	t.Helper()
+	for i := 0; i+5 <= len(buf); {
+		msgType := buf[i]
+		length := int(binary.BigEndian.Uint32(buf[i+1 : i+5]))
+		if length < 4 || i+1+length > len(buf) {
+			return ""
+		}
+		body := buf[i+5 : i+1+length]
+		if msgType == 'E' {
+			for j := 0; j < len(body); {
+				code := body[j]
+				if code == 0 {
+					break
+				}
+				end := bytes.IndexByte(body[j+1:], 0)
+				if end < 0 {
+					return ""
+				}
+				if code == field {
+					return string(body[j+1 : j+1+end])
+				}
+				j += 1 + end + 1
+			}
+			t.Fatalf("ErrorResponse found but field %q missing", field)
+		}
+		i += 1 + length
+	}
+	t.Fatalf("no ErrorResponse frame in output (%d bytes)", len(buf))
+	return ""
 }
 
 func TestExecuteSingleStatementRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
@@ -1848,7 +1935,7 @@ func TestExecuteSelectQueryDoesNotRollbackInsideUserTransaction(t *testing.T) {
 	if rowCount != 0 {
 		t.Fatalf("expected rowCount=0, got %d", rowCount)
 	}
-	if errCode != "42000" || !strings.Contains(errMsg, "Current transaction is aborted") {
+	if errCode != "25000" || !strings.Contains(errMsg, "Current transaction is aborted") {
 		t.Fatalf("expected aborted transaction error details, got code=%q msg=%q", errCode, errMsg)
 	}
 	if exec.rollbackCalls != 0 {
