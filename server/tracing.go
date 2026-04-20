@@ -91,7 +91,8 @@ func collectOperatorTimings(ops []profilingOperator) (scanTime, scanRows float64
 
 // enrichSpanWithProfiling creates child spans from DuckDB profiling output
 // showing where execution time was spent: planning, scanning (I/O), and compute.
-func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart time.Time, executor QueryExecutor) {
+// Also emits Prometheus metrics for baseline measurement.
+func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart time.Time, executor QueryExecutor, orgID string) {
 	output := executor.LastProfilingOutput()
 	if output == "" {
 		return
@@ -141,6 +142,19 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 	if totalOpTime > 0 {
 		scanWall = execWall * (scanTime / totalOpTime)
 		computeWall = execWall * (computeTime / totalOpTime)
+	}
+
+	// Emit Prometheus metrics for baseline measurement.
+	s3BytesReadTotal.WithLabelValues(orgID).Add(float64(m.TotalBytesRead))
+	scanWallSecondsHistogram.WithLabelValues(orgID).Observe(scanWall)
+	scanRowsWallEstimate := scanRows
+	if m.CPUTime > 0 && m.Latency > 0 {
+		if p := m.CPUTime / m.Latency; p > 1 {
+			scanRowsWallEstimate = scanRows / p
+		}
+	}
+	if scanWall > 0 && scanRowsWallEstimate > 0 {
+		scanRowsPerSecondHistogram.WithLabelValues(orgID).Observe(scanRowsWallEstimate / scanWall)
 	}
 
 	if scanTime > 0 {

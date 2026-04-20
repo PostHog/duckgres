@@ -111,6 +111,23 @@ var ducklakeConflictRetriesExhaustedTotal = promauto.NewCounter(prometheus.Count
 	Help: "Total number of DuckLake transaction conflicts where all retries were exhausted",
 })
 
+var s3BytesReadTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_s3_bytes_read_total",
+	Help: "Total bytes read from S3 by DuckDB",
+}, []string{"org"})
+
+var scanWallSecondsHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "duckgres_scan_wall_seconds",
+	Help:    "Estimated wall-clock scan time per query",
+	Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60},
+}, []string{"org"})
+
+var scanRowsPerSecondHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "duckgres_scan_rows_per_second",
+	Help:    "Scan throughput: estimated wall-clock rows scanned per second",
+	Buckets: []float64{1e5, 5e5, 1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9},
+}, []string{"org"})
+
 // BackendKey uniquely identifies a backend connection for cancel requests
 type BackendKey struct {
 	Pid       int32
