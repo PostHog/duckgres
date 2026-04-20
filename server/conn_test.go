@@ -1931,7 +1931,7 @@ func TestExecuteSelectQueryDoesNotRollbackInsideUserTransaction(t *testing.T) {
 	if rowCount != 0 {
 		t.Fatalf("expected rowCount=0, got %d", rowCount)
 	}
-	if errCode != "42000" || !strings.Contains(errMsg, "Current transaction is aborted") {
+	if errCode != "25000" || !strings.Contains(errMsg, "Current transaction is aborted") {
 		t.Fatalf("expected aborted transaction error details, got code=%q msg=%q", errCode, errMsg)
 	}
 	if exec.rollbackCalls != 0 {
