@@ -135,6 +135,12 @@ func (p *SessionPool) Warmup() error {
 
 	start := time.Now()
 	slog.Info("Pre-warming worker DuckDB instance...")
+
+	// Wait for the local cache proxy to be ready before serving queries.
+	// When DUCKGRES_CACHE_PROXY_ADDR is set, DuckDB will route S3 traffic
+	// through it — worker startup must block until the proxy is healthy.
+	// Included in the pre-warm duration so slow proxy startup is visible.
+	waitForCacheProxy()
 	// Use a system-level username for warmup
 	db, err := p.createDBConnection(p.sharedWarmupConfig(), p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
 	if err != nil {
