@@ -1141,7 +1141,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		}
 
 		execResult, err := runExec()
-		enrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor)
+		enrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 		execSpan.End()
 		if err != nil {
 			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
@@ -1347,7 +1347,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			},
 		)
 	}
-	enrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor)
+	enrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 	execSpan.End()
 	if err != nil {
 		errCode := classifyErrorCode(err)
