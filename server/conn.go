@@ -170,6 +170,10 @@ type clientConn struct {
 	ctx                   context.Context          // connection context, cancelled when connection is closed
 	cancel                context.CancelFunc       // cancels the connection context
 
+	// sharedDB is true when this connection uses a shared file-persistence DB pool.
+	// Cleanup differs: we return the pinned conn to the pool instead of closing the DB.
+	sharedDB bool
+
 	// pg_stat_activity fields
 	backendStart    time.Time    // when this connection started
 	applicationName string       // from startup params
@@ -539,6 +543,28 @@ func (c *clientConn) safeCleanupDB() {
 	}()
 
 	cleanupTimeout := 5 * time.Second
+
+	if c.sharedDB {
+		// Shared file-persistence pool: ROLLBACK any open transaction on the
+		// pinned connection, then return it to the pool. Skip DuckLake DETACH
+		// since the underlying DB is shared across connections.
+		if c.txStatus == txStatusTransaction || c.txStatus == txStatusError {
+			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+			_, err := c.executor.ExecContext(ctx, "ROLLBACK")
+			cancel()
+			if err != nil {
+				slog.Warn("Failed to rollback transaction during cleanup.",
+					"user", c.username, "error", err)
+			}
+		}
+		// Close returns the pinned *sql.Conn to the pool (does not close the DB).
+		if err := c.executor.Close(); err != nil {
+			slog.Warn("Failed to return connection to pool.", "user", c.username, "error", err)
+		}
+		c.server.releaseFileDB(c.username)
+		return
+	}
+
 	connHealthy := true
 
 	// Check connection health. For DuckLake, we need to actually run a query that
@@ -744,23 +770,40 @@ func (c *clientConn) serve() error {
 	// Create a DuckDB connection for this client session (unless pre-created by caller)
 	var stopRefresh func()
 	if c.executor == nil {
-		var db *sql.DB
-		var err error
-		if c.passthrough {
-			db, err = CreatePassthroughDBConnection(c.server.cfg, c.server.duckLakeSem, c.username, processStartTime, processVersion)
+		if c.server.cfg.FilePersistence {
+			db, err := c.server.acquireFileDB(c.username, c.passthrough)
+			if err != nil {
+				c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
+				return err
+			}
+			conn, err := db.Conn(c.ctx)
+			if err != nil {
+				c.server.releaseFileDB(c.username)
+				c.sendError("FATAL", "28000", fmt.Sprintf("failed to get pooled connection: %v", err))
+				return err
+			}
+			c.executor = NewPinnedExecutor(conn, db)
+			c.sharedDB = true
+			// Don't start per-connection credential refresh; the pool manages it.
 		} else {
-			db, err = c.server.createDBConnection(c.username)
-		}
-		if err != nil {
-			c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
-			return err
-		}
-		c.executor = NewLocalExecutor(db)
+			var db *sql.DB
+			var err error
+			if c.passthrough {
+				db, err = CreatePassthroughDBConnection(c.server.cfg, c.server.duckLakeSem, c.username, processStartTime, processVersion)
+			} else {
+				db, err = c.server.createDBConnection(c.username)
+			}
+			if err != nil {
+				c.sendError("FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
+				return err
+			}
+			c.executor = NewLocalExecutor(db)
 
-		// Start background credential refresh for long-lived connections.
-		// Only needed when we create the DB here; the control plane manages
-		// refresh for pre-created connections via DBPool.
-		stopRefresh = StartCredentialRefresh(db, c.server.cfg.DuckLake)
+			// Start background credential refresh for long-lived connections.
+			// Only needed when we create the DB here; the control plane manages
+			// refresh for pre-created connections via DBPool.
+			stopRefresh = StartCredentialRefresh(db, c.server.cfg.DuckLake)
+		}
 	}
 	// Defers run LIFO: close cursors first (they hold open RowSets), then stop
 	// credential refresh, then clean up the database connection.

@@ -734,6 +734,60 @@ func TestResolveEffectiveConfigACMEDNSProviderValidation(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigFilePersistenceFromFile(t *testing.T) {
+	fileCfg := &FileConfig{
+		FilePersistence: true,
+		DataDir:         "/tmp/data",
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence from YAML to be true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceFromEnv(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "true",
+	}
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence from env to be true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceEnvOverridesFile(t *testing.T) {
+	fileCfg := &FileConfig{
+		FilePersistence: true,
+	}
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "false",
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected env false to override file true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceCLIOverridesEnv(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "false",
+	}
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{
+		Set:             map[string]bool{"file-persistence": true},
+		FilePersistence: true,
+	}, envFromMap(env), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected CLI true to override env false")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceDefaultFalse(t *testing.T) {
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence to default to false")
+	}
+}
+
 func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 	fileCfg := &FileConfig{
 		TLS: TLSConfig{
@@ -765,5 +819,36 @@ func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected warning about missing ACME domain for DNS mode, warnings: %v", warns)
+	}
+}
+
+func TestFilePersistenceRequiresDataDir(t *testing.T) {
+	var warns []string
+	// Use CLI to explicitly set data-dir to empty, overriding the default.
+	resolved := resolveEffectiveConfig(
+		&FileConfig{
+			FilePersistence: true,
+		},
+		configCLIInputs{
+			Set:     map[string]bool{"data-dir": true},
+			DataDir: "",
+		},
+		nil,
+		func(msg string) { warns = append(warns, msg) },
+	)
+
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected FilePersistence to be disabled when DataDir is empty")
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "file_persistence is enabled but data_dir is empty") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about empty data_dir, warnings: %v", warns)
 	}
 }
