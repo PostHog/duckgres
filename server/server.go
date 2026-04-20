@@ -123,9 +123,10 @@ var scanWallSecondsHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts
 }, []string{"org"})
 
 var scanRowsPerSecondHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "duckgres_scan_rows_per_second",
-	Help:    "Scan throughput: estimated wall-clock rows scanned per second",
-	Buckets: []float64{1e5, 5e5, 1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9},
+	Name: "duckgres_scan_rows_per_second",
+	Help: "Scan throughput: estimated wall-clock rows scanned per second. High values (>1e10) indicate buffer pool/cache hits.",
+	// Range spans S3 cold reads (1e5-1e8) through in-memory cache hits (1e9-1e12).
+	Buckets: []float64{1e5, 5e5, 1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9, 1e10, 1e11, 1e12},
 }, []string{"org"})
 
 // BackendKey uniquely identifies a backend connection for cancel requests
