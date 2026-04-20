@@ -1251,15 +1251,28 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 			"Consider connecting directly to PostgreSQL instead.")
 	}
 
-	// Raise the postgres_scanner connection pool limit before ATTACH. DuckDB 1.5.2
-	// reduced the default from 64 (unbounded wait) to max(num_cpus, 8) with a 30s
-	// timeout; DuckLake piggybacks on postgres_scanner for its metadata store and,
-	// with thread-local connection caching, each DuckDB worker pins a pool slot,
-	// saturating the pool under catalog-enumerating workloads (e.g. duckdb_tables(),
-	// information_schema.tables). Plain `SET` does NOT propagate to DuckLake's
-	// internal __ducklake_metadata_* catalog; only `SET GLOBAL` does.
+	// Size the postgres_scanner connection pool to match this session's thread
+	// count (plus a small margin). DuckDB 1.5.2 reduced the pool default from 64
+	// to max(num_cpus, 8) with a 30s timeout; DuckLake piggybacks on
+	// postgres_scanner for its metadata store and, with thread-local connection
+	// caching enabled, each DuckDB worker thread pins one pool slot. If
+	// pool_max < threads, threads beyond the cap time out after 30s (#434 bumped
+	// to a flat 64 to fix that, but that caps RDS occupancy at sessions*64).
+	//
+	// Sizing to `threads + 4` gives every worker thread a cached slot plus a
+	// small buffer for transient acquirers (reaper, migration probe, parallel
+	// scan fan-out) without inflating steady-state RDS connection count.
+	//
+	// Plain `SET` does NOT propagate to DuckLake's internal
+	// __ducklake_metadata_* catalog; only `SET GLOBAL` does.
 	// See: https://github.com/duckdb/ducklake/issues/1031
-	if _, err := db.Exec("SET GLOBAL pg_pool_max_connections = 64"); err != nil {
+	var threadCount int64
+	if err := db.QueryRow("SELECT current_setting('threads')::BIGINT").Scan(&threadCount); err != nil {
+		slog.Warn("Failed to read DuckDB threads setting; using fallback pool size.", "error", err)
+		threadCount = int64(runtime.NumCPU() * 2)
+	}
+	poolMax := threadCount + 4
+	if _, err := db.Exec(fmt.Sprintf("SET GLOBAL pg_pool_max_connections = %d", poolMax)); err != nil {
 		slog.Warn("Failed to set pg_pool_max_connections.", "error", err)
 	}
 
