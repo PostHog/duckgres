@@ -100,11 +100,6 @@ func overrideS3EndpointForCacheProxy(cfg *server.DuckLakeConfig) {
 		}
 		cfg.S3Endpoint = "s3." + region + ".amazonaws.com"
 	}
-	slog.Info("Routing S3 traffic through local cache proxy.",
-		"from_use_ssl", cfg.S3UseSSL,
-		"http_proxy", proxyURL,
-		"endpoint", cfg.S3Endpoint,
-	)
 	cfg.HTTPProxy = proxyURL
 	cfg.S3UseSSL = false
 }

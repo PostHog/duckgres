@@ -26,7 +26,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Build metadata, set at link time via -ldflags (see Dockerfile).
+var (
+	version = "dev"
+	commit  = "unknown"
+	date    = "unknown"
+)
+
 func main() {
+	slog.Info("Cache-proxy build info.", "version", version, "commit", commit, "built", date)
+
 	cacheDir := envOrDefault("CACHE_DIR", "/cache")
 	maxPercent, _ := strconv.Atoi(envOrDefault("CACHE_MAX_PERCENT", "80"))
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
