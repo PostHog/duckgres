@@ -31,6 +31,7 @@ type configCLIInputs struct {
 	MemoryRebalance           bool
 	ProcessMinWorkers         int
 	ProcessMaxWorkers         int
+	ProcessRetireOnSessionEnd bool
 	WorkerQueueTimeout        string
 	WorkerIdleTimeout         string
 	HandoverDrainTimeout      string
@@ -65,33 +66,34 @@ type configCLIInputs struct {
 }
 
 type resolvedConfig struct {
-	Server                   server.Config
-	ProcessMinWorkers        int
-	ProcessMaxWorkers        int
-	WorkerQueueTimeout       time.Duration
-	WorkerIdleTimeout        time.Duration
-	HandoverDrainTimeout     time.Duration
-	WorkerBackend            string
-	K8sWorkerImage           string
-	K8sWorkerNamespace       string
-	K8sControlPlaneID        string
-	K8sWorkerPort            int
-	K8sWorkerSecret          string
-	K8sWorkerConfigMap       string
-	K8sWorkerImagePullPolicy string
-	K8sWorkerServiceAccount  string
-	K8sMaxWorkers            int
-	K8sSharedWarmTarget      int
-	K8sWorkerCPURequest      string
-	K8sWorkerMemoryRequest   string
-	K8sWorkerNodeSelector    string
-	K8sWorkerTolerationKey   string
-	K8sWorkerTolerationValue string
-	K8sWorkerExclusiveNode   bool
-	AWSRegion                string
-	ConfigStoreConn          string
-	ConfigPollInterval       time.Duration
-	InternalSecret           string
+	Server                    server.Config
+	ProcessMinWorkers         int
+	ProcessMaxWorkers         int
+	ProcessRetireOnSessionEnd bool
+	WorkerQueueTimeout        time.Duration
+	WorkerIdleTimeout         time.Duration
+	HandoverDrainTimeout      time.Duration
+	WorkerBackend             string
+	K8sWorkerImage            string
+	K8sWorkerNamespace        string
+	K8sControlPlaneID         string
+	K8sWorkerPort             int
+	K8sWorkerSecret           string
+	K8sWorkerConfigMap        string
+	K8sWorkerImagePullPolicy  string
+	K8sWorkerServiceAccount   string
+	K8sMaxWorkers             int
+	K8sSharedWarmTarget       int
+	K8sWorkerCPURequest       string
+	K8sWorkerMemoryRequest    string
+	K8sWorkerNodeSelector     string
+	K8sWorkerTolerationKey    string
+	K8sWorkerTolerationValue  string
+	K8sWorkerExclusiveNode    bool
+	AWSRegion                 string
+	ConfigStoreConn           string
+	ConfigPollInterval        time.Duration
+	InternalSecret            string
 }
 
 func intPtr(n int) *int { return &n }
@@ -113,7 +115,7 @@ func defaultServerConfig() server.Config {
 		},
 		Extensions: []string{"ducklake"},
 		DuckLake: server.DuckLakeConfig{
-			CheckpointInterval:  24 * time.Hour,
+			CheckpointInterval:   24 * time.Hour,
 			DataInliningRowLimit: intPtr(0),
 		},
 		QueryLog: server.QueryLogConfig{
@@ -143,6 +145,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
 	var processMinWorkers, processMaxWorkers int
+	var processRetireOnSessionEnd bool
 	var workerBackend string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
@@ -311,6 +314,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.Process.MaxWorkers != 0 {
 			processMaxWorkers = fileCfg.Process.MaxWorkers
+		}
+		if fileCfg.Process.RetireOnSessionEnd != nil {
+			processRetireOnSessionEnd = *fileCfg.Process.RetireOnSessionEnd
 		}
 		if fileCfg.WorkerQueueTimeout != "" {
 			if d, err := time.ParseDuration(fileCfg.WorkerQueueTimeout); err == nil {
@@ -583,6 +589,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_PROCESS_MAX_WORKERS: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_PROCESS_RETIRE_ON_SESSION_END"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			processRetireOnSessionEnd = b
+		} else {
+			warn("Invalid DUCKGRES_PROCESS_RETIRE_ON_SESSION_END: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_WORKER_QUEUE_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			workerQueueTimeout = d
@@ -822,6 +835,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["process-max-workers"] {
 		processMaxWorkers = cli.ProcessMaxWorkers
 	}
+	if cli.Set["process-retire-on-session-end"] {
+		processRetireOnSessionEnd = cli.ProcessRetireOnSessionEnd
+	}
 	if cli.Set["worker-queue-timeout"] {
 		if d, err := time.ParseDuration(cli.WorkerQueueTimeout); err == nil {
 			workerQueueTimeout = d
@@ -967,32 +983,33 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	return resolvedConfig{
-		Server:                   cfg,
-		ProcessMinWorkers:        processMinWorkers,
-		ProcessMaxWorkers:        processMaxWorkers,
-		WorkerQueueTimeout:       workerQueueTimeout,
-		WorkerIdleTimeout:        workerIdleTimeout,
-		HandoverDrainTimeout:     handoverDrainTimeout,
-		WorkerBackend:            workerBackend,
-		K8sWorkerImage:           k8sWorkerImage,
-		K8sWorkerNamespace:       k8sWorkerNamespace,
-		K8sControlPlaneID:        k8sControlPlaneID,
-		K8sWorkerPort:            k8sWorkerPort,
-		K8sWorkerSecret:          k8sWorkerSecret,
-		K8sWorkerConfigMap:       k8sWorkerConfigMap,
-		K8sWorkerImagePullPolicy: k8sWorkerImagePullPolicy,
-		K8sWorkerServiceAccount:  k8sWorkerServiceAccount,
-		K8sMaxWorkers:            k8sMaxWorkers,
-		K8sSharedWarmTarget:      k8sSharedWarmTarget,
-		K8sWorkerCPURequest:     k8sWorkerCPURequest,
-		K8sWorkerMemoryRequest:  k8sWorkerMemoryRequest,
-		K8sWorkerNodeSelector:   k8sWorkerNodeSelector,
-		K8sWorkerTolerationKey:   k8sWorkerTolerationKey,
-		K8sWorkerTolerationValue: k8sWorkerTolerationValue,
-		K8sWorkerExclusiveNode:  k8sWorkerExclusiveNode,
-		AWSRegion:                awsRegion,
-		ConfigStoreConn:          configStoreConn,
-		ConfigPollInterval:       configPollInterval,
-		InternalSecret:           internalSecret,
+		Server:                    cfg,
+		ProcessMinWorkers:         processMinWorkers,
+		ProcessMaxWorkers:         processMaxWorkers,
+		ProcessRetireOnSessionEnd: processRetireOnSessionEnd,
+		WorkerQueueTimeout:        workerQueueTimeout,
+		WorkerIdleTimeout:         workerIdleTimeout,
+		HandoverDrainTimeout:      handoverDrainTimeout,
+		WorkerBackend:             workerBackend,
+		K8sWorkerImage:            k8sWorkerImage,
+		K8sWorkerNamespace:        k8sWorkerNamespace,
+		K8sControlPlaneID:         k8sControlPlaneID,
+		K8sWorkerPort:             k8sWorkerPort,
+		K8sWorkerSecret:           k8sWorkerSecret,
+		K8sWorkerConfigMap:        k8sWorkerConfigMap,
+		K8sWorkerImagePullPolicy:  k8sWorkerImagePullPolicy,
+		K8sWorkerServiceAccount:   k8sWorkerServiceAccount,
+		K8sMaxWorkers:             k8sMaxWorkers,
+		K8sSharedWarmTarget:       k8sSharedWarmTarget,
+		K8sWorkerCPURequest:       k8sWorkerCPURequest,
+		K8sWorkerMemoryRequest:    k8sWorkerMemoryRequest,
+		K8sWorkerNodeSelector:     k8sWorkerNodeSelector,
+		K8sWorkerTolerationKey:    k8sWorkerTolerationKey,
+		K8sWorkerTolerationValue:  k8sWorkerTolerationValue,
+		K8sWorkerExclusiveNode:    k8sWorkerExclusiveNode,
+		AWSRegion:                 awsRegion,
+		ConfigStoreConn:           configStoreConn,
+		ConfigPollInterval:        configPollInterval,
+		InternalSecret:            internalSecret,
 	}
 }

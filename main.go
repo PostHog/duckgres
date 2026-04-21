@@ -56,8 +56,9 @@ type FileConfig struct {
 }
 
 type ProcessFileConfig struct {
-	MinWorkers int `yaml:"min_workers"`
-	MaxWorkers int `yaml:"max_workers"`
+	MinWorkers         int   `yaml:"min_workers"`
+	MaxWorkers         int   `yaml:"max_workers"`
+	RetireOnSessionEnd *bool `yaml:"retire_on_session_end"`
 }
 
 // K8sFileConfig holds Kubernetes worker configuration from YAML.
@@ -229,6 +230,7 @@ func main() {
 	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
 	processMinWorkers := flag.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
 	processMaxWorkers := flag.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
+	processRetireOnSessionEnd := flag.Bool("process-retire-on-session-end", false, "Retire a process worker immediately after its last session ends instead of keeping it warm for reuse (control-plane mode) (env: DUCKGRES_PROCESS_RETIRE_ON_SESSION_END)")
 	workerQueueTimeout := flag.String("worker-queue-timeout", "", "How long to wait for an available worker slot (e.g., '5m') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
 	workerIdleTimeout := flag.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
 	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for planned shutdowns/upgrades to drain before forcing exit (default: '24h' in process mode, '15m' in remote mode) (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
@@ -293,6 +295,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_REBALANCE   Enable dynamic per-connection memory reallocation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_MIN_WORKERS  Pre-warm worker count for process workers (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_MAX_WORKERS  Max process workers (control-plane mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_RETIRE_ON_SESSION_END  Retire process workers immediately after their last session ends (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_WORKER_QUEUE_TIMEOUT  Worker queue timeout (default: 5m)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_HANDOVER_DRAIN_TIMEOUT  Planned shutdown/upgrade drain timeout (default: 24h in process mode, 15m in remote mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DOMAIN        Domain for ACME/Let's Encrypt certificate\n")
@@ -405,6 +408,7 @@ func main() {
 		MemoryRebalance:           *memoryRebalance,
 		ProcessMinWorkers:         *processMinWorkers,
 		ProcessMaxWorkers:         *processMaxWorkers,
+		ProcessRetireOnSessionEnd: *processRetireOnSessionEnd,
 		WorkerQueueTimeout:        *workerQueueTimeout,
 		WorkerIdleTimeout:         *workerIdleTimeout,
 		HandoverDrainTimeout:      *handoverDrainTimeout,
@@ -556,6 +560,7 @@ func main() {
 			ConfigPath:           *configFile,
 			WorkerQueueTimeout:   resolved.WorkerQueueTimeout,
 			WorkerIdleTimeout:    resolved.WorkerIdleTimeout,
+			RetireOnSessionEnd:   resolved.ProcessRetireOnSessionEnd,
 			HandoverDrainTimeout: resolved.HandoverDrainTimeout,
 			MetricsServer:        metricsSrv,
 			WorkerBackend:        resolved.WorkerBackend,
@@ -563,23 +568,23 @@ func main() {
 			ConfigPollInterval:   resolved.ConfigPollInterval,
 			InternalSecret:       resolved.InternalSecret,
 			K8s: controlplane.K8sConfig{
-				WorkerImage:       resolved.K8sWorkerImage,
-				WorkerNamespace:   resolved.K8sWorkerNamespace,
-				ControlPlaneID:    resolved.K8sControlPlaneID,
-				WorkerPort:        resolved.K8sWorkerPort,
-				WorkerSecret:      resolved.K8sWorkerSecret,
-				WorkerConfigMap:   resolved.K8sWorkerConfigMap,
-				ImagePullPolicy:   resolved.K8sWorkerImagePullPolicy,
-				ServiceAccount:    resolved.K8sWorkerServiceAccount,
-				MaxWorkers:        resolved.K8sMaxWorkers,
-				SharedWarmTarget:    resolved.K8sSharedWarmTarget,
-				WorkerCPURequest:    resolved.K8sWorkerCPURequest,
-				WorkerMemoryRequest: resolved.K8sWorkerMemoryRequest,
-				WorkerNodeSelector:  resolved.K8sWorkerNodeSelector,
+				WorkerImage:           resolved.K8sWorkerImage,
+				WorkerNamespace:       resolved.K8sWorkerNamespace,
+				ControlPlaneID:        resolved.K8sControlPlaneID,
+				WorkerPort:            resolved.K8sWorkerPort,
+				WorkerSecret:          resolved.K8sWorkerSecret,
+				WorkerConfigMap:       resolved.K8sWorkerConfigMap,
+				ImagePullPolicy:       resolved.K8sWorkerImagePullPolicy,
+				ServiceAccount:        resolved.K8sWorkerServiceAccount,
+				MaxWorkers:            resolved.K8sMaxWorkers,
+				SharedWarmTarget:      resolved.K8sSharedWarmTarget,
+				WorkerCPURequest:      resolved.K8sWorkerCPURequest,
+				WorkerMemoryRequest:   resolved.K8sWorkerMemoryRequest,
+				WorkerNodeSelector:    resolved.K8sWorkerNodeSelector,
 				WorkerTolerationKey:   resolved.K8sWorkerTolerationKey,
 				WorkerTolerationValue: resolved.K8sWorkerTolerationValue,
-				WorkerExclusiveNode:  resolved.K8sWorkerExclusiveNode,
-				AWSRegion:           resolved.AWSRegion,
+				WorkerExclusiveNode:   resolved.K8sWorkerExclusiveNode,
+				AWSRegion:             resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

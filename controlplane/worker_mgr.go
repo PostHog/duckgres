@@ -25,24 +25,24 @@ import (
 
 // ManagedWorker represents a duckdb-service worker process.
 type ManagedWorker struct {
-	ID             int
-	podName        string
-	cmd            *exec.Cmd
-	socketPath     string
-	bearerToken    string
-	client         *flightsql.Client
-	parentListener net.Listener    // CP-side listener; lifecycle managed by releaseSocket
-	prebound       *preboundSocket // non-nil if using a pre-bound socket slot
-	releaseOnce    sync.Once       // ensures releaseWorkerSocket body runs exactly once
-	done           chan struct{}   // closed when process exits
-	exitErr        error
-	activeSessions int       // Number of sessions currently assigned to this worker
-	lastUsed       time.Time // Last time a session was destroyed on this worker
-	sharedState    SharedWorkerState
-	reservedAt     time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
-	peakSessions   int       // High-water mark of concurrent sessions (for retirement metrics)
-	ownerEpoch     int64
-	ownerCPInstanceID      string
+	ID                      int
+	podName                 string
+	cmd                     *exec.Cmd
+	socketPath              string
+	bearerToken             string
+	client                  *flightsql.Client
+	parentListener          net.Listener    // CP-side listener; lifecycle managed by releaseSocket
+	prebound                *preboundSocket // non-nil if using a pre-bound socket slot
+	releaseOnce             sync.Once       // ensures releaseWorkerSocket body runs exactly once
+	done                    chan struct{}   // closed when process exits
+	exitErr                 error
+	activeSessions          int       // Number of sessions currently assigned to this worker
+	lastUsed                time.Time // Last time a session was destroyed on this worker
+	sharedState             SharedWorkerState
+	reservedAt              time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
+	peakSessions            int       // High-water mark of concurrent sessions (for retirement metrics)
+	ownerEpoch              int64
+	ownerCPInstanceID       string
 	hotIdleReclaimed        bool //nolint:unused // only set in kubernetes hot-idle reclaim path
 	cachedActivationPayload any  //nolint:unused // *TenantActivationPayload, cached in kubernetes activation path
 }
@@ -98,25 +98,26 @@ type preboundSocket struct {
 }
 
 type FlightWorkerPool struct {
-	mu                sync.RWMutex
-	workers           map[int]*ManagedWorker
-	nextWorkerID      int // auto-incrementing worker ID
-	spawning          int // number of workers currently being spawned (not yet in workers map)
-	socketDir         string
-	fallbackSocketDir string // set lazily when socketDir is EROFS; empty means use primary
-	configPath        string
-	binaryPath        string
-	maxWorkers        int           // 0 = unlimited; caps the number of live worker processes
-	minWorkers        int           // minimum number of workers to keep alive
-	idleTimeout       time.Duration // how long to keep an idle worker alive
-	shuttingDown      bool
-	shutdownCh        chan struct{} // closed by ShutdownAll to stop idle reaper
+	mu                 sync.RWMutex
+	workers            map[int]*ManagedWorker
+	nextWorkerID       int // auto-incrementing worker ID
+	spawning           int // number of workers currently being spawned (not yet in workers map)
+	socketDir          string
+	fallbackSocketDir  string // set lazily when socketDir is EROFS; empty means use primary
+	configPath         string
+	binaryPath         string
+	maxWorkers         int           // 0 = unlimited; caps the number of live worker processes
+	minWorkers         int           // minimum number of workers to keep alive
+	idleTimeout        time.Duration // how long to keep an idle worker alive
+	retireOnSessionEnd bool          // when true, retire a worker as soon as its last session ends
+	shuttingDown       bool
+	shutdownCh         chan struct{} // closed by ShutdownAll to stop idle reaper
 
 	preboundMu sync.Mutex
 	prebound   []*preboundSocket // available pre-bound socket slots
 
-	ducklakeMigrateMu sync.Mutex  // serializes worker spawns during migration
-	ducklakeMigrate   bool        // when true, pass DUCKGRES_DUCKLAKE_MIGRATE=true to workers
+	ducklakeMigrateMu sync.Mutex // serializes worker spawns during migration
+	ducklakeMigrate   bool       // when true, pass DUCKGRES_DUCKLAKE_MIGRATE=true to workers
 }
 
 // NewFlightWorkerPool creates a new worker pool.
@@ -716,14 +717,24 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, e
 // ReleaseWorker decrements the active session count for a worker and updates its lastUsed time.
 func (p *FlightWorkerPool) ReleaseWorker(id int) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	w, ok := p.workers[id]
-	if ok {
-		if w.activeSessions > 0 {
-			w.activeSessions--
-		}
-		w.lastUsed = time.Now()
+	if !ok {
+		p.mu.Unlock()
+		return
 	}
+	if w.activeSessions > 0 {
+		w.activeSessions--
+	}
+	if p.retireOnSessionEnd && w.activeSessions == 0 {
+		delete(p.workers, id)
+		workerCount := len(p.workers)
+		p.mu.Unlock()
+		observeControlPlaneWorkers(workerCount)
+		go p.retireWorkerProcess(w)
+		return
+	}
+	w.lastUsed = time.Now()
+	p.mu.Unlock()
 }
 
 // idleReaper periodically retires workers that have been idle for longer than idleTimeout.

@@ -38,6 +38,7 @@ type ControlPlaneConfig struct {
 	HealthCheckInterval  time.Duration
 	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
+	RetireOnSessionEnd   bool          // When true, process workers are retired immediately after their last session ends.
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade (default: 24h)
 	MetricsServer        *http.Server  // Optional metrics server to shut down during upgrade
 
@@ -386,6 +387,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		// Single-tenant mode: one shared process pool + session manager
 		procPool := NewFlightWorkerPool(cfg.SocketDir, cfg.ConfigPath, processMinWorkers, processMaxWorkers)
 		procPool.idleTimeout = cfg.WorkerIdleTimeout
+		procPool.retireOnSessionEnd = cfg.RetireOnSessionEnd
 
 		// Pre-bind worker sockets. On upgrade with EROFS, this may fail —
 		// that's OK, workers will fall back to effectiveSocketDir (/tmp).
