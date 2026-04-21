@@ -54,6 +54,11 @@ ducklake:
   # depends on, causing cascading failures. Connect directly to PostgreSQL instead.
   # metadata_store: "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
 
+  # Disable postgres_scanner thread-local metadata connection caching before
+  # ATTACH creates the hidden DuckLake metadata pool. This reduces retained
+  # metadata connections at the cost of some warm-reuse performance.
+  # disable_metadata_thread_local_cache: true
+
   # S3-compatible object storage for data files (optional)
   # If not specified, data is stored alongside the metadata
   # object_store: "s3://bucket/path/"

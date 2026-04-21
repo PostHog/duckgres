@@ -248,6 +248,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.DuckLake.DataPath != "" {
 			cfg.DuckLake.DataPath = fileCfg.DuckLake.DataPath
 		}
+		cfg.DuckLake.DisableMetadataThreadLocalCache = fileCfg.DuckLake.DisableMetadataThreadLocalCache
 		if fileCfg.DuckLake.S3Provider != "" {
 			cfg.DuckLake.S3Provider = fileCfg.DuckLake.S3Provider
 		}
@@ -479,6 +480,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if v := getenv("DUCKGRES_DUCKLAKE_OBJECT_STORE"); v != "" {
 		cfg.DuckLake.ObjectStore = v
+	}
+	if v := getenv("DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.DuckLake.DisableMetadataThreadLocalCache = b
+		} else {
+			warn("Invalid DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE: " + err.Error())
+		}
 	}
 	if v := getenv("DUCKGRES_DUCKLAKE_S3_PROVIDER"); v != "" {
 		cfg.DuckLake.S3Provider = v

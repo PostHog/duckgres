@@ -110,6 +110,10 @@ type DuckLakeFileConfig struct {
 	ObjectStore   string `yaml:"object_store"`   // e.g., "s3://bucket/path/" for S3/MinIO storage
 	DataPath      string `yaml:"data_path"`      // Local file path for data storage (alternative to object_store)
 
+	// Disable metadata postgres_scanner thread-local cache before ATTACH creates
+	// the hidden metadata pool.
+	DisableMetadataThreadLocalCache bool `yaml:"disable_metadata_thread_local_cache"`
+
 	// S3 credential provider: "config" (explicit) or "credential_chain" (AWS SDK)
 	S3Provider string `yaml:"s3_provider"`
 

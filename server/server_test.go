@@ -133,6 +133,73 @@ func TestNeedsCredentialRefresh(t *testing.T) {
 	}
 }
 
+func TestBuildDuckLakePreAttachStatements(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  DuckLakeConfig
+		want []string
+	}{
+		{
+			name: "default no statements",
+			cfg:  DuckLakeConfig{},
+			want: nil,
+		},
+		{
+			name: "disable metadata tls cache",
+			cfg: DuckLakeConfig{
+				DisableMetadataThreadLocalCache: true,
+			},
+			want: []string{"SET GLOBAL pg_pool_enable_thread_local_cache = false"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildDuckLakePreAttachStatements(tt.cfg)
+			if len(got) != len(tt.want) {
+				t.Fatalf("statement count = %d, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("statement[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestIsMissingDuckLakePoolSettingError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "matches duckdb text",
+			err:  errors.New("Catalog Error: unrecognized configuration parameter \"pg_pool_enable_thread_local_cache\""),
+			want: true,
+		},
+		{
+			name: "different error",
+			err:  errors.New("permission denied"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isMissingDuckLakePoolSettingError(tt.err); got != tt.want {
+				t.Fatalf("isMissingDuckLakePoolSettingError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStartCredentialRefresh_NoOpForStaticCredentials(t *testing.T) {
 	// Static credentials should return a no-op stop function immediately
 	stop := StartCredentialRefresh(nil, DuckLakeConfig{
