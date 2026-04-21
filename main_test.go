@@ -321,12 +321,14 @@ func TestResolveEffectiveConfigInvalidMemoryLimit(t *testing.T) {
 }
 
 func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
+	retireTrue := true
 	// YAML only
 	fileCfg := &FileConfig{
 		MemoryBudget: "24GB",
 		Process: ProcessFileConfig{
-			MinWorkers: 2,
-			MaxWorkers: 10,
+			MinWorkers:         2,
+			MaxWorkers:         10,
+			RetireOnSessionEnd: &retireTrue,
 		},
 		K8s: K8sFileConfig{
 			MaxWorkers: 12,
@@ -342,16 +344,20 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	if resolved.ProcessMaxWorkers != 10 {
 		t.Fatalf("expected process.max_workers from file, got %d", resolved.ProcessMaxWorkers)
 	}
+	if !resolved.ProcessRetireOnSessionEnd {
+		t.Fatal("expected process.retire_on_session_end from file")
+	}
 	if resolved.K8sMaxWorkers != 12 {
 		t.Fatalf("expected k8s.max_workers from file, got %d", resolved.K8sMaxWorkers)
 	}
 
 	// Env overrides file
 	env := map[string]string{
-		"DUCKGRES_MEMORY_BUDGET":       "32GB",
-		"DUCKGRES_PROCESS_MIN_WORKERS": "4",
-		"DUCKGRES_PROCESS_MAX_WORKERS": "20",
-		"DUCKGRES_K8S_MAX_WORKERS":     "24",
+		"DUCKGRES_MEMORY_BUDGET":                 "32GB",
+		"DUCKGRES_PROCESS_MIN_WORKERS":           "4",
+		"DUCKGRES_PROCESS_MAX_WORKERS":           "20",
+		"DUCKGRES_PROCESS_RETIRE_ON_SESSION_END": "false",
+		"DUCKGRES_K8S_MAX_WORKERS":               "24",
 	}
 	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.MemoryBudget != "32GB" {
@@ -363,17 +369,21 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	if resolved.ProcessMaxWorkers != 20 {
 		t.Fatalf("expected process.max_workers from env, got %d", resolved.ProcessMaxWorkers)
 	}
+	if resolved.ProcessRetireOnSessionEnd {
+		t.Fatal("expected process.retire_on_session_end from env")
+	}
 	if resolved.K8sMaxWorkers != 24 {
 		t.Fatalf("expected k8s.max_workers from env, got %d", resolved.K8sMaxWorkers)
 	}
 
 	// CLI overrides env
 	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
-		Set:               map[string]bool{"memory-budget": true, "process-min-workers": true, "process-max-workers": true, "k8s-max-workers": true},
-		MemoryBudget:      "48GB",
-		ProcessMinWorkers: 8,
-		ProcessMaxWorkers: 50,
-		K8sMaxWorkers:     64,
+		Set:                       map[string]bool{"memory-budget": true, "process-min-workers": true, "process-max-workers": true, "process-retire-on-session-end": true, "k8s-max-workers": true},
+		MemoryBudget:              "48GB",
+		ProcessMinWorkers:         8,
+		ProcessMaxWorkers:         50,
+		ProcessRetireOnSessionEnd: true,
+		K8sMaxWorkers:             64,
 	}, envFromMap(env), nil)
 	if resolved.Server.MemoryBudget != "48GB" {
 		t.Fatalf("expected memory_budget from CLI, got %q", resolved.Server.MemoryBudget)
@@ -383,6 +393,9 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	}
 	if resolved.ProcessMaxWorkers != 50 {
 		t.Fatalf("expected process.max_workers from CLI, got %d", resolved.ProcessMaxWorkers)
+	}
+	if !resolved.ProcessRetireOnSessionEnd {
+		t.Fatal("expected process.retire_on_session_end from CLI")
 	}
 	if resolved.K8sMaxWorkers != 64 {
 		t.Fatalf("expected k8s.max_workers from CLI, got %d", resolved.K8sMaxWorkers)
@@ -446,9 +459,10 @@ func TestResolveEffectiveConfigInvalidMemoryBudget(t *testing.T) {
 
 func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	env := map[string]string{
-		"DUCKGRES_PROCESS_MIN_WORKERS": "not-a-number",
-		"DUCKGRES_PROCESS_MAX_WORKERS": "also-bad",
-		"DUCKGRES_K8S_MAX_WORKERS":     "still-bad",
+		"DUCKGRES_PROCESS_MIN_WORKERS":           "not-a-number",
+		"DUCKGRES_PROCESS_MAX_WORKERS":           "also-bad",
+		"DUCKGRES_PROCESS_RETIRE_ON_SESSION_END": "definitely-not-bool",
+		"DUCKGRES_K8S_MAX_WORKERS":               "still-bad",
 	}
 
 	var warns []string
@@ -465,10 +479,14 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	if resolved.K8sMaxWorkers != 0 {
 		t.Fatalf("expected default k8s.max_workers, got %d", resolved.K8sMaxWorkers)
 	}
+	if resolved.ProcessRetireOnSessionEnd {
+		t.Fatal("expected default process.retire_on_session_end")
+	}
 
 	wantWarnings := []string{
 		"Invalid DUCKGRES_PROCESS_MIN_WORKERS",
 		"Invalid DUCKGRES_PROCESS_MAX_WORKERS",
+		"Invalid DUCKGRES_PROCESS_RETIRE_ON_SESSION_END",
 		"Invalid DUCKGRES_K8S_MAX_WORKERS",
 	}
 	for _, w := range wantWarnings {

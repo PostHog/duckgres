@@ -93,8 +93,11 @@ ducklake:
 # process:
 #   # min_workers: pre-warm process workers at startup for instant connection handling.
 #   # max_workers: cap on total process workers (0 = auto-derived).
+#   # retire_on_session_end: retire a process worker immediately after its last
+#   # session ends instead of keeping it warm for reuse.
 #   min_workers: 0
 #   max_workers: 0
+#   retire_on_session_end: false
 
 # Kubernetes multi-tenant shared warm-pool settings
 # k8s:
