@@ -1289,18 +1289,28 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		}
 	}
 
-	// Route httpfs traffic through a forward HTTP proxy (cache proxy DaemonSet).
-	// DuckDB keeps SigV4 for the real S3 hostname; the proxy forwards the signed
-	// request verbatim, so the proxy needs no AWS credentials.
+	// Route httpfs traffic for the DuckLake bucket through a forward HTTP proxy
+	// (cache proxy DaemonSet). DuckDB keeps SigV4 for the real S3 hostname; the
+	// proxy forwards the signed request verbatim, so the proxy needs no AWS
+	// credentials.
 	//
-	// Set BEFORE the ATTACH and use SET GLOBAL — some DuckDB settings don't
-	// propagate to DuckLake's internal subcatalogs when set post-attach
-	// (same gotcha as pg_pool_max_connections).
+	// Scope the proxy to the bucket only — global http_proxy would also catch
+	// read_parquet('https://...') from other hosts, which the proxy can't handle.
+	//
+	// Set BEFORE the ATTACH so the proxy is in effect for the initial catalog
+	// read (some settings don't propagate to DuckLake's subcatalogs post-attach,
+	// same gotcha as pg_pool_max_connections).
 	if dlCfg.HTTPProxy != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy)); err != nil {
-			slog.Warn("Failed to set http_proxy for httpfs.", "proxy", dlCfg.HTTPProxy, "error", err)
+		scope := buildHTTPProxyScope(dlCfg)
+		if len(scope) == 0 {
+			slog.Warn("Skipping cache proxy: could not derive bucket scope from DuckLake config.")
 		} else {
-			slog.Info("Routed httpfs traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy)
+			stmt := buildHTTPProxySecret(dlCfg.HTTPProxy, scope)
+			if _, err := db.Exec(stmt); err != nil {
+				slog.Warn("Failed to create scoped http_proxy secret.", "proxy", dlCfg.HTTPProxy, "scope", scope, "error", err)
+			} else {
+				slog.Info("Routed DuckLake S3 traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy, "scope", scope)
+			}
 		}
 	}
 
@@ -1743,6 +1753,45 @@ func buildAWSSdkSecret(ctx context.Context, dlCfg DuckLakeConfig) (string, error
 
 	secret += "\n\t\t)"
 	return secret, nil
+}
+
+// buildHTTPProxyScope derives the URL prefixes that the cache proxy should apply
+// to. Both path-style (http://endpoint/bucket/) and vhost-style
+// (http://bucket.endpoint/) URLs are included because DuckDB httpfs may use
+// either depending on the S3 secret's URL_STYLE.
+func buildHTTPProxyScope(dlCfg DuckLakeConfig) []string {
+	obj := strings.TrimPrefix(dlCfg.ObjectStore, "s3://")
+	bucket, _, _ := strings.Cut(obj, "/")
+	if bucket == "" {
+		return nil
+	}
+	endpoint := dlCfg.S3Endpoint
+	if endpoint == "" {
+		region := dlCfg.S3Region
+		if region == "" {
+			region = "us-east-1"
+		}
+		endpoint = fmt.Sprintf("s3.%s.amazonaws.com", region)
+	}
+	return []string{
+		fmt.Sprintf("http://%s/%s/", endpoint, bucket),
+		fmt.Sprintf("http://%s.%s/", bucket, endpoint),
+	}
+}
+
+// buildHTTPProxySecret returns a CREATE SECRET statement configuring DuckDB
+// httpfs to route requests whose URL matches `scope` through the given proxy.
+func buildHTTPProxySecret(proxy string, scope []string) string {
+	quoted := make([]string, len(scope))
+	for i, s := range scope {
+		quoted[i] = fmt.Sprintf("'%s'", s)
+	}
+	return fmt.Sprintf(`
+		CREATE OR REPLACE SECRET ducklake_http_proxy (
+			TYPE HTTP,
+			HTTP_PROXY '%s',
+			SCOPE [%s]
+		)`, proxy, strings.Join(quoted, ", "))
 }
 
 // credentialRefreshInterval is how often to refresh S3 credentials for long-lived connections.
