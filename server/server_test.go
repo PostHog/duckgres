@@ -140,9 +140,11 @@ func TestBuildDuckLakePreAttachStatements(t *testing.T) {
 		want []string
 	}{
 		{
-			name: "default no statements",
-			cfg:  DuckLakeConfig{},
-			want: nil,
+			name: "default disables metadata tls cache",
+			cfg: DuckLakeConfig{
+				DisableMetadataThreadLocalCache: true,
+			},
+			want: []string{"SET GLOBAL pg_pool_enable_thread_local_cache = false"},
 		},
 		{
 			name: "disable metadata tls cache",
@@ -150,6 +152,13 @@ func TestBuildDuckLakePreAttachStatements(t *testing.T) {
 				DisableMetadataThreadLocalCache: true,
 			},
 			want: []string{"SET GLOBAL pg_pool_enable_thread_local_cache = false"},
+		},
+		{
+			name: "explicitly keep metadata tls cache enabled",
+			cfg: DuckLakeConfig{
+				DisableMetadataThreadLocalCache: false,
+			},
+			want: nil,
 		},
 	}
 

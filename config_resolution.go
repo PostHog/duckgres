@@ -115,8 +115,9 @@ func defaultServerConfig() server.Config {
 		},
 		Extensions: []string{"ducklake"},
 		DuckLake: server.DuckLakeConfig{
-			CheckpointInterval:   24 * time.Hour,
-			DataInliningRowLimit: intPtr(0),
+			CheckpointInterval:                24 * time.Hour,
+			DataInliningRowLimit:              intPtr(0),
+			DisableMetadataThreadLocalCache:   true,
 		},
 		QueryLog: server.QueryLogConfig{
 			Enabled:              true,
@@ -248,7 +249,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.DuckLake.DataPath != "" {
 			cfg.DuckLake.DataPath = fileCfg.DuckLake.DataPath
 		}
-		cfg.DuckLake.DisableMetadataThreadLocalCache = fileCfg.DuckLake.DisableMetadataThreadLocalCache
+		if fileCfg.DuckLake.DisableMetadataThreadLocalCache != nil {
+			cfg.DuckLake.DisableMetadataThreadLocalCache = *fileCfg.DuckLake.DisableMetadataThreadLocalCache
+		}
 		if fileCfg.DuckLake.S3Provider != "" {
 			cfg.DuckLake.S3Provider = fileCfg.DuckLake.S3Provider
 		}
