@@ -111,6 +111,8 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		return nil, fmt.Errorf("querylog: attach ducklake: %w", err)
 	}
 
+	configureDuckLakeMetadataPool(db)
+
 	// Create schema and table
 	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
 		_ = db.Close()

@@ -70,6 +70,8 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 		return nil, fmt.Errorf("checkpoint: attach ducklake: %w", err)
 	}
 
+	configureDuckLakeMetadataPool(db)
+
 	// Create system.checkpoints table to record checkpoint history
 	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
 		_ = db.Close()

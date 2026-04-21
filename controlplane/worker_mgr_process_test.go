@@ -13,6 +13,39 @@ import (
 	"time"
 )
 
+func waitForWorkerGone(t *testing.T, pool *FlightWorkerPool, id int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, ok := pool.Worker(id); !ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("worker %d still present after %s", id, timeout)
+}
+
+func countIdleReusableWorkers(pool *FlightWorkerPool) int {
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+
+	count := 0
+	for _, w := range pool.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if w.retiring {
+			continue
+		}
+		if w.activeSessions == 0 {
+			count++
+		}
+	}
+	return count
+}
+
 func setInvalidWorkerBinary(pool *FlightWorkerPool) {
 	pool.binaryPath = "/nonexistent/duckgres-test-worker"
 }
@@ -273,6 +306,29 @@ func makeFakeWorker(t *testing.T, id int) (*ManagedWorker, func()) {
 	return w, cleanup
 }
 
+func makeFakeWorkerIgnoringInterrupt(t *testing.T, id int) (*ManagedWorker, func()) {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", "trap '' INT; sleep 60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start interrupt-ignoring fake worker process: %v", err)
+	}
+	done := make(chan struct{})
+	w := &ManagedWorker{
+		ID:   id,
+		cmd:  cmd,
+		done: done,
+	}
+	go func() {
+		w.exitErr = cmd.Wait()
+		close(done)
+	}()
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		<-done
+	}
+	return w, cleanup
+}
+
 func TestAcquireWorkerReusesIdleWorker(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 2)
 
@@ -466,13 +522,63 @@ func TestRetireWorkerIfNoSessions_RetiresWhenLastSession(t *testing.T) {
 		t.Fatal("expected RetireWorkerIfNoSessions to return true")
 	}
 
-	if _, ok := pool.Worker(1); ok {
-		t.Fatal("worker should have been retired")
+	pool.mu.RLock()
+	if got := pool.liveWorkerCountLocked(); got != 1 {
+		pool.mu.RUnlock()
+		t.Fatalf("expected retiring worker to remain counted as live until exit, got %d", got)
 	}
+	current, ok := pool.workers[1]
+	pool.mu.RUnlock()
+	if !ok || current != w || !current.retiring {
+		t.Fatal("worker should remain in the pool marked retiring until process exit")
+	}
+
+	waitForWorkerGone(t, pool, 1, 5*time.Second)
 }
 
 func TestReleaseWorker_RetiresWhenLastSessionAndEnabled(t *testing.T) {
 	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 1)
+	pool.retireOnSessionEnd = true
+
+	w, cleanup := makeFakeWorkerIgnoringInterrupt(t, 1)
+	defer cleanup()
+	w.activeSessions = 1
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.mu.Unlock()
+
+	pool.ReleaseWorker(1)
+
+	pool.mu.RLock()
+	if got := pool.liveWorkerCountLocked(); got != 1 {
+		pool.mu.RUnlock()
+		t.Fatalf("expected retiring worker to remain counted as live until exit, got %d", got)
+	}
+	current, ok := pool.workers[1]
+	idle := pool.findIdleWorkerLocked()
+	leastLoaded := pool.leastLoadedWorkerLocked()
+	pool.mu.RUnlock()
+	if !ok || current != w || !current.retiring {
+		t.Fatal("worker should remain in pool marked retiring during drain")
+	}
+	if idle != nil {
+		t.Fatal("retiring worker must not be treated as an idle reusable worker")
+	}
+	if leastLoaded != nil {
+		t.Fatal("retiring worker must not be selected as least-loaded")
+	}
+
+	waitForWorkerGone(t, pool, 1, 5*time.Second)
+	select {
+	case <-w.done:
+	default:
+		t.Fatal("worker process should have exited after retire-on-session-end")
+	}
+}
+
+func TestReleaseWorker_RetireOnSessionEndRespectsMinWorkers(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 1, 2)
 	pool.retireOnSessionEnd = true
 
 	w, cleanup := makeFakeWorker(t, 1)
@@ -485,27 +591,23 @@ func TestReleaseWorker_RetiresWhenLastSessionAndEnabled(t *testing.T) {
 
 	pool.ReleaseWorker(1)
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, ok := pool.Worker(1); ok {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		select {
-		case <-w.done:
-			return
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
+	pool.mu.RLock()
+	current, ok := pool.workers[1]
+	pool.mu.RUnlock()
+	if !ok || current != w {
+		t.Fatal("worker should stay in the pool to preserve minWorkers")
+	}
+	if current.retiring {
+		t.Fatal("worker should not retire when it would violate minWorkers")
+	}
+	if current.activeSessions != 0 {
+		t.Fatalf("expected released worker to be idle, got %d active sessions", current.activeSessions)
 	}
 
-	if _, ok := pool.Worker(1); ok {
-		t.Fatal("worker should have been retired after its last session ended")
-	}
 	select {
 	case <-w.done:
+		t.Fatal("worker should remain alive to satisfy minWorkers")
 	default:
-		t.Fatal("worker process should have exited after retire-on-session-end")
 	}
 }
 
@@ -561,9 +663,14 @@ func TestRetireWorker_RemovesFromPool(t *testing.T) {
 
 	pool.RetireWorker(1)
 
-	if _, ok := pool.Worker(1); ok {
-		t.Fatal("worker should have been removed from pool")
+	pool.mu.RLock()
+	current, ok := pool.workers[1]
+	pool.mu.RUnlock()
+	if !ok || current != w || !current.retiring {
+		t.Fatal("worker should remain in pool marked retiring until it exits")
 	}
+
+	waitForWorkerGone(t, pool, 1, 5*time.Second)
 }
 
 func TestCrashRemovesWorkerFromPool(t *testing.T) {
@@ -1105,12 +1212,8 @@ func TestReapIdleWorkersRespectsMinWorkers(t *testing.T) {
 	// Reap - should only reap 1 worker, leaving 2 (minWorkers)
 	pool.reapIdleWorkers()
 
-	pool.mu.Lock()
-	count := len(pool.workers)
-	pool.mu.Unlock()
-
-	if count != 2 {
-		t.Errorf("expected 2 workers remaining, got %d", count)
+	if got := countIdleReusableWorkers(pool); got != 2 {
+		t.Errorf("expected 2 reusable idle workers remaining, got %d", got)
 	}
 }
 
@@ -1131,12 +1234,8 @@ func TestReapIdleWorkersReapsAllAboveMin(t *testing.T) {
 	// Reap - should reap 2 workers, leaving 1 (minWorkers)
 	pool.reapIdleWorkers()
 
-	pool.mu.Lock()
-	count := len(pool.workers)
-	pool.mu.Unlock()
-
-	if count != 1 {
-		t.Errorf("expected 1 worker remaining, got %d", count)
+	if got := countIdleReusableWorkers(pool); got != 1 {
+		t.Errorf("expected 1 reusable idle worker remaining, got %d", got)
 	}
 }
 
@@ -1156,17 +1255,8 @@ func TestReapIdleWorkersPreservesIdleFloor(t *testing.T) {
 
 	pool.reapIdleWorkers()
 
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-	idleCount := 0
-	for _, w := range pool.workers {
-		if w.activeSessions == 0 {
-			idleCount++
-		}
-	}
-
-	if idleCount < pool.minWorkers {
-		t.Fatalf("expected at least %d idle workers to remain, got %d", pool.minWorkers, idleCount)
+	if idleCount := countIdleReusableWorkers(pool); idleCount < pool.minWorkers {
+		t.Fatalf("expected at least %d reusable idle workers to remain, got %d", pool.minWorkers, idleCount)
 	}
 }
 
