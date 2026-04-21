@@ -1339,19 +1339,17 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
 
-	// Reclaim idle metadata connections. DuckDB 1.5.2 / DuckLake 1.0 introduced
-	// thread-local connection caching for postgres_scanner (default ON) but
-	// ships with reaper_thread=off and both idle/lifetime timeouts=0, so every
-	// connection a DuckDB worker thread ever caches stays pinned forever.
-	// That produced a large steady-state spike in metadata RDS connections
-	// post-upgrade. Enabling the reaper with a modest idle timeout lets idle
-	// cached connections close while active workers keep the warm-connection
-	// latency benefit of TLC. 10-min max lifetime is a belt-and-braces cap
-	// against stuck connections (NAT table churn, pgbouncer-style kills).
+	// Reclaim idle metadata connections. DuckDB 1.5.2 / DuckLake 1.0 enabled
+	// thread-local connection caching for postgres_scanner by default but ships
+	// with reaper_thread=off and idle/lifetime timeouts=0, so every connection
+	// a worker thread ever caches stays pinned forever — producing a steady-state
+	// spike in metadata RDS connections post-upgrade. Enabling the reaper with a
+	// 60s idle timeout reclaims idle cached connections while keeping the warm-
+	// connection latency benefit for active workers; the 10-min max lifetime is
+	// a belt-and-braces cap against stuck connections (NAT churn, pgbouncer kills).
 	//
-	// Use postgres_configure_pool() (not SET GLOBAL) to reconfigure the pool
-	// that was just created by ATTACH. SET GLOBAL only affects pools created
-	// after it runs, so it's a no-op for the pool baked during ATTACH above.
+	// postgres_configure_pool() reconfigures the pool that ATTACH already created;
+	// SET GLOBAL only affects pools created after it runs, so would be a no-op here.
 	// See: https://github.com/duckdb/ducklake/issues/1031 and
 	// https://github.com/duckdb/duckdb-postgres/pull/430
 	rows, err := db.Query(`SELECT * FROM postgres_configure_pool(
