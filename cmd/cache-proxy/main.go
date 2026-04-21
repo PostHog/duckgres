@@ -34,6 +34,17 @@ var (
 )
 
 func main() {
+	// Attach pod/node identifiers to every log line (Downward API).
+	handler := slog.NewTextHandler(os.Stderr, nil)
+	logger := slog.New(handler)
+	if pod := os.Getenv("POD_NAME"); pod != "" {
+		logger = logger.With("pod", pod)
+	}
+	if node := os.Getenv("NODE_NAME"); node != "" {
+		logger = logger.With("node", node)
+	}
+	slog.SetDefault(logger)
+
 	slog.Info("Cache-proxy build info.", "version", version, "commit", commit, "built", date)
 
 	cacheDir := envOrDefault("CACHE_DIR", "/cache")

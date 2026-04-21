@@ -167,6 +167,27 @@ func parseLogLevel() slog.Level {
 // Logs always go to stderr; PostHog is additive.
 // The log level is controlled by DUCKGRES_LOG_LEVEL (debug, info, warn, error).
 // Returns a shutdown function that flushes all OTLP batch processors.
+// podAndNodeAttrs returns pod/node identifiers (Downward API) to attach to
+// every log line. Empty attrs are skipped.
+func podAndNodeAttrs() []any {
+	var attrs []any
+	if pod := os.Getenv("POD_NAME"); pod != "" {
+		attrs = append(attrs, "pod", pod)
+	}
+	if node := os.Getenv("NODE_NAME"); node != "" {
+		attrs = append(attrs, "node", node)
+	}
+	return attrs
+}
+
+func setDefaultLogger(h slog.Handler) {
+	logger := slog.New(h)
+	if attrs := podAndNodeAttrs(); len(attrs) > 0 {
+		logger = logger.With(attrs...)
+	}
+	slog.SetDefault(logger)
+}
+
 func initLogging() func() {
 	level := parseLogLevel()
 
@@ -175,7 +196,7 @@ func initLogging() func() {
 		if os.Getenv("ADDITIONAL_POSTHOG_API_KEYS") != "" {
 			fmt.Fprintln(os.Stderr, "ADDITIONAL_POSTHOG_API_KEYS is set but POSTHOG_API_KEY is not; ignoring additional keys")
 		}
-		slog.SetDefault(slog.New(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})}))
+		setDefaultLogger(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})})
 		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
 		return func() {}
 	}
@@ -209,7 +230,7 @@ func initLogging() func() {
 	// The primary exporter must succeed; additional ones are best-effort.
 	primaryExp := newPostHogExporter(ctx, host, apiKey)
 	if primaryExp == nil {
-		slog.SetDefault(slog.New(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})}))
+		setDefaultLogger(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})})
 		fmt.Fprintln(os.Stderr, "Primary PostHog exporter failed to initialize, continuing with stderr only")
 		return func() {}
 	}
@@ -232,9 +253,9 @@ func initLogging() func() {
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
 	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 
-	slog.SetDefault(slog.New(&redactingHandler{inner: &multiHandler{
+	setDefaultLogger(&redactingHandler{inner: &multiHandler{
 		handlers: []slog.Handler{textHandler, otelHandler},
-	}}))
+	}})
 
 	slog.Info("PostHog logging enabled.", "host", host, "exporters", len(processors))
 
