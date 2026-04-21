@@ -1301,16 +1301,22 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// cached connections close while active workers keep the warm-connection
 	// latency benefit of TLC. 10-min max lifetime is a belt-and-braces cap
 	// against stuck connections (NAT table churn, pgbouncer-style kills).
+	//
+	// Use postgres_configure_pool() (not SET GLOBAL) to reconfigure the pool
+	// that was just created by ATTACH. SET GLOBAL only affects pools created
+	// after it runs, so it's a no-op for the pool baked during ATTACH above.
 	// See: https://github.com/duckdb/ducklake/issues/1031 and
 	// https://github.com/duckdb/duckdb-postgres/pull/430
-	if _, err := db.Exec("SET GLOBAL pg_pool_enable_reaper_thread = true"); err != nil {
-		slog.Warn("Failed to enable pg_pool reaper thread.", "error", err)
-	}
-	if _, err := db.Exec("SET GLOBAL pg_pool_idle_timeout_millis = 60000"); err != nil {
-		slog.Warn("Failed to set pg_pool_idle_timeout_millis.", "error", err)
-	}
-	if _, err := db.Exec("SET GLOBAL pg_pool_max_lifetime_millis = 600000"); err != nil {
-		slog.Warn("Failed to set pg_pool_max_lifetime_millis.", "error", err)
+	rows, err := db.Query(`SELECT * FROM postgres_configure_pool(
+		catalog_name := '__ducklake_metadata_ducklake',
+		enable_reaper_thread := true,
+		idle_timeout_millis := 60000,
+		max_lifetime_millis := 600000
+	)`)
+	if err != nil {
+		slog.Warn("Failed to configure DuckLake metadata pg pool.", "error", err)
+	} else {
+		_ = rows.Close()
 	}
 
 	// Ensure performance indexes exist on the DuckLake metadata tables.
