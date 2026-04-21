@@ -292,6 +292,12 @@ type DuckLakeConfig struct {
 	S3Chain   string // e.g., "env;config" to check env vars then config files
 	S3Profile string // AWS profile name to use (for "config" chain)
 
+	// HTTPProxy routes DuckDB httpfs traffic through a forward HTTP proxy.
+	// When set, DuckDB signs S3 requests for the real S3 hostname and sends them
+	// through the proxy as plain HTTP (requires S3UseSSL=false). Used by the
+	// local cache proxy DaemonSet for NVMe caching.
+	HTTPProxy string
+
 	// CheckpointInterval controls how often DuckLake CHECKPOINT runs.
 	// CHECKPOINT performs full catalog maintenance: expire snapshots,
 	// merge adjacent files, rewrite data files, and clean up orphaned files.
@@ -1280,6 +1286,21 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 			if err := createS3Secret(db, dlCfg); err != nil {
 				return fmt.Errorf("failed to create S3 secret: %w", err)
 			}
+		}
+	}
+
+	// Route httpfs traffic through a forward HTTP proxy (cache proxy DaemonSet).
+	// DuckDB keeps SigV4 for the real S3 hostname; the proxy forwards the signed
+	// request verbatim, so the proxy needs no AWS credentials.
+	//
+	// Set BEFORE the ATTACH and use SET GLOBAL — some DuckDB settings don't
+	// propagate to DuckLake's internal subcatalogs when set post-attach
+	// (same gotcha as pg_pool_max_connections).
+	if dlCfg.HTTPProxy != "" {
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy)); err != nil {
+			slog.Warn("Failed to set http_proxy for httpfs.", "proxy", dlCfg.HTTPProxy, "error", err)
+		} else {
+			slog.Info("Routed httpfs traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy)
 		}
 	}
 

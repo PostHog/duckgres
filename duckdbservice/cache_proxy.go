@@ -75,25 +75,26 @@ func LogCacheProxyStatus() {
 	)
 }
 
-// overrideS3EndpointForCacheProxy rewrites the DuckLake S3 configuration to
-// route traffic through the local cache proxy. The proxy runs as a DaemonSet
-// on worker nodes and caches S3 responses to local NVMe.
+// overrideS3EndpointForCacheProxy routes DuckLake S3 traffic through the local
+// cache proxy as a forward HTTP proxy. The proxy runs as a DaemonSet on worker
+// nodes and caches S3 responses to local NVMe.
 //
-// The proxy handles authentication itself via AWS credentials on its Pod
-// Identity, so we use path-style URLs and disable SSL on the local hop.
+// The request keeps DuckDB's SigV4 signature for the real S3 hostname intact —
+// the proxy just forwards the signed request verbatim. This requires plain HTTP
+// (no TLS tunnel) so the proxy can see the URL to cache by. The proxy itself
+// needs zero AWS credentials.
 func overrideS3EndpointForCacheProxy(cfg *server.DuckLakeConfig) {
 	addr := cacheProxyS3Addr()
 	if addr == "" {
 		return
 	}
+	proxyURL := "http://" + addr
 	slog.Info("Routing S3 traffic through local cache proxy.",
-		"from_endpoint", cfg.S3Endpoint,
 		"from_use_ssl", cfg.S3UseSSL,
-		"to_endpoint", addr,
+		"http_proxy", proxyURL,
 	)
-	cfg.S3Endpoint = addr
+	cfg.HTTPProxy = proxyURL
 	cfg.S3UseSSL = false
-	cfg.S3URLStyle = "path"
 }
 
 // waitForCacheProxy blocks until the local cache proxy responds healthy.
