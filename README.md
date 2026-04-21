@@ -166,6 +166,10 @@ extensions:
 
 ducklake:
   metadata_store: "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
+  # Default: true. Disables postgres_scanner thread-local caching for the
+  # hidden DuckLake metadata pool to reduce retained metadata connections.
+  # Set to false to opt back into warm connection reuse.
+  disable_metadata_thread_local_cache: true
 
 process:
   min_workers: 0
@@ -284,6 +288,11 @@ DuckLake provides a SQL-based lakehouse format. When configured, the DuckLake ca
 ducklake:
   # Full connection string for the DuckLake metadata database
   metadata_store: "postgres:host=ducklake.example.com user=ducklake password=secret dbname=ducklake"
+
+  # Default: true. Disables postgres_scanner thread-local caching for the
+  # hidden DuckLake metadata pool before ATTACH creates it.
+  # Set to false to opt back into warm connection reuse.
+  disable_metadata_thread_local_cache: true
 ```
 
 This runs the equivalent of:
@@ -292,6 +301,12 @@ ATTACH 'ducklake:postgres:host=ducklake.example.com user=ducklake password=secre
 ```
 
 See [DuckLake documentation](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details.
+
+`ducklake.disable_metadata_thread_local_cache` defaults to `true`. This applies a
+pre-attach workaround for the hidden DuckLake metadata postgres pool so idle
+worker threads do not retain metadata connections indefinitely. Set it to
+`false` only if you explicitly want the older warm-reuse behavior and accept the
+larger steady-state metadata connection footprint.
 
 ### Quick Start with Docker
 
