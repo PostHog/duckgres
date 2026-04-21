@@ -43,10 +43,12 @@ var (
 	})
 )
 
-// CacheKey computes a deterministic cache key from a bucket, object key, and byte range.
-func CacheKey(bucket, key, rangeHeader string) string {
+// CacheKey computes a deterministic cache key from a full URL and byte range.
+// The URL includes scheme, host, path, and query — so different buckets, regions,
+// or query-signed URLs naturally produce different keys.
+func CacheKey(url, rangeHeader string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s/%s/%s", bucket, key, rangeHeader)
+	fmt.Fprintf(h, "%s|%s", url, rangeHeader)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 

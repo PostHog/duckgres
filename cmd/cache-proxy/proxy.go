@@ -9,22 +9,20 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// CacheProxy handles S3 requests from DuckDB, caching responses on local NVMe
-// and fetching from peers or S3 on cache miss.
+// CacheProxy is a forward HTTP proxy that caches responses on local NVMe.
+// DuckDB httpfs sends each S3 request as a signed plain-HTTP request to the
+// proxy; the proxy caches by URL+Range and forwards misses verbatim. The
+// SigV4 signature stays valid because Host/URL are unchanged, so the proxy
+// needs no AWS credentials of its own.
 type CacheProxy struct {
-	store    *DiskCache
-	peers    *PeerManager
-	s3Client *s3.Client
-	flights  singleFlight
+	store   *DiskCache
+	peers   *PeerManager
+	client  *http.Client
+	flights singleFlight
 }
 
-// singleFlight deduplicates concurrent fetches for the same cache key.
 type singleFlight struct {
 	mu sync.Mutex
 	m  map[string]*call
@@ -62,160 +60,180 @@ func (sf *singleFlight) Do(key string, fn func() ([]byte, error)) ([]byte, error
 }
 
 func NewCacheProxy(store *DiskCache, peers *PeerManager) *CacheProxy {
-	// Initialize AWS S3 client using default credential chain
-	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
-	if err != nil {
-		slog.Error("Failed to load AWS config for S3 client.", "error", err)
-	}
-
-	var s3Client *s3.Client
-	if err == nil {
-		s3Client = s3.NewFromConfig(cfg)
-	}
-
 	return &CacheProxy{
-		store:    store,
-		peers:    peers,
-		s3Client: s3Client,
+		store:  store,
+		peers:  peers,
+		client: &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
-// HandleS3Request handles S3 GET requests from DuckDB.
-// DuckDB sends requests like: GET /bucket/key with Range header.
-func (p *CacheProxy) HandleS3Request(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "HEAD" {
-		p.handleHeadRequest(w, r)
-		return
-	}
-	if r.Method != "GET" {
-		http.Error(w, "only GET and HEAD supported", http.StatusMethodNotAllowed)
+// Hop-by-hop headers per RFC 7230 §6.1 — must not be forwarded.
+var hopByHop = map[string]bool{
+	"connection":          true,
+	"keep-alive":          true,
+	"proxy-authenticate":  true,
+	"proxy-authorization": true,
+	"te":                  true,
+	"trailers":            true,
+	"transfer-encoding":   true,
+	"upgrade":             true,
+}
+
+// HandleProxy handles forward HTTP proxy requests from DuckDB httpfs.
+// Expects absolute-form URIs (scheme + host + path in the request-line).
+func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		http.Error(w, "CONNECT not supported; configure DuckDB with USE_SSL=false", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Parse bucket and key from path: /bucket/key/path
-	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
-	if len(parts) < 2 {
-		http.Error(w, "invalid path: expected /bucket/key", http.StatusBadRequest)
+	if r.URL.Scheme == "" || r.URL.Host == "" {
+		http.Error(w, "expected forward-proxy absolute-form URL", http.StatusBadRequest)
 		return
 	}
-	bucket := parts[0]
-	key := parts[1]
+
+	// Only GET with Range gets cached (parquet byte-range fetches). Pass everything
+	// else (HEAD for metadata, etc.) straight through uncached.
+	if r.Method != http.MethodGet {
+		p.forwardUncached(w, r)
+		return
+	}
+
 	rangeHeader := r.Header.Get("Range")
+	cacheKey := CacheKey(r.URL.String(), rangeHeader)
 
-	cacheKey := CacheKey(bucket, key, rangeHeader)
-
-	// 1. Check local cache
 	if data, ok := p.store.Get(cacheKey); ok {
 		cacheBytesServed.WithLabelValues("local").Add(float64(len(data)))
-		if rangeHeader != "" {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %s/%d", strings.TrimPrefix(rangeHeader, "bytes="), len(data)))
-			w.WriteHeader(http.StatusPartialContent)
-		}
-		w.Write(data)
+		p.serveBody(w, data, rangeHeader, "")
 		return
 	}
 	cacheMissesTotal.Inc()
 
-	// 2 + 3. Fetch (deduplicated): try peers, then S3
+	data, contentType, err := p.fetchDedup(cacheKey, r, rangeHeader)
+	if err != nil {
+		slog.Error("Failed to fetch.", "url", r.URL.String(), "range", rangeHeader, "error", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	if err := p.store.Put(cacheKey, data); err != nil {
+		slog.Warn("Failed to cache.", "key", cacheKey[:16], "error", err)
+	}
+	p.serveBody(w, data, rangeHeader, contentType)
+}
+
+// fetchDedup tries peers then origin, deduplicating concurrent fetches.
+// contentType is reported only for origin fetches (peers strip it).
+func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) ([]byte, string, error) {
+	var contentType string
 	data, err := p.flights.Do(cacheKey, func() ([]byte, error) {
-		// Try peers
 		if p.peers != nil {
 			if peerData, peerAddr, ok := p.peers.FetchFromPeers(cacheKey); ok {
-				slog.Debug("Cache peer hit.", "key", cacheKey[:16], "peer", peerAddr)
+				slog.Debug("Peer hit.", "key", cacheKey[:16], "peer", peerAddr)
 				cacheBytesServed.WithLabelValues("peer").Add(float64(len(peerData)))
 				return peerData, nil
 			}
 		}
-
-		// Fetch from S3
-		slog.Debug("Cache miss, fetching from S3.", "bucket", bucket, "key", key, "range", rangeHeader)
-		data, err := p.fetchFromS3(r.Context(), bucket, key, rangeHeader)
+		slog.Debug("Fetching from origin.", "url", r.URL.String(), "range", rangeHeader)
+		data, ct, err := p.fetchOrigin(r)
 		if err != nil {
 			return nil, err
 		}
+		contentType = ct
 		cacheBytesServed.WithLabelValues("s3").Add(float64(len(data)))
 		return data, nil
 	})
-
-	if err != nil {
-		slog.Error("Failed to fetch.", "bucket", bucket, "key", key, "error", err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	// Cache locally
-	if err := p.store.Put(cacheKey, data); err != nil {
-		slog.Warn("Failed to cache.", "key", cacheKey[:16], "error", err)
-	}
-
-	if rangeHeader != "" {
-		w.WriteHeader(http.StatusPartialContent)
-	}
-	w.Write(data)
+	return data, contentType, err
 }
 
-func (p *CacheProxy) handleHeadRequest(w http.ResponseWriter, r *http.Request) {
-	// Forward HEAD requests directly to S3 (metadata, not cached)
-	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
-	if len(parts) < 2 {
-		http.Error(w, "invalid path", http.StatusBadRequest)
-		return
-	}
-
-	if p.s3Client == nil {
-		http.Error(w, "S3 client not configured", http.StatusServiceUnavailable)
-		return
-	}
-
-	out, err := p.s3Client.HeadObject(r.Context(), &s3.HeadObjectInput{
-		Bucket: aws.String(parts[0]),
-		Key:    aws.String(parts[1]),
-	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	if out.ContentLength != nil {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", *out.ContentLength))
-	}
-	if out.ContentType != nil {
-		w.Header().Set("Content-Type", *out.ContentType)
-	}
-	if out.ETag != nil {
-		w.Header().Set("ETag", *out.ETag)
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-func (p *CacheProxy) fetchFromS3(ctx context.Context, bucket, key, rangeHeader string) ([]byte, error) {
-	if p.s3Client == nil {
-		return nil, fmt.Errorf("S3 client not configured")
-	}
-
-	input := &s3.GetObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	}
-	if rangeHeader != "" {
-		input.Range = aws.String(rangeHeader)
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+// fetchOrigin forwards the request verbatim (headers, Host, signature) to the
+// real origin and returns the body. The SigV4 signature remains valid because
+// the URL and Host header are unchanged.
+func (p *CacheProxy) fetchOrigin(r *http.Request) ([]byte, string, error) {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	out, err := p.s3Client.GetObject(ctx, input)
+	req, err := http.NewRequestWithContext(ctx, r.Method, r.URL.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("s3 GetObject: %w", err)
+		return nil, "", err
 	}
-	defer out.Body.Close()
+	for k, vv := range r.Header {
+		if hopByHop[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Host = r.Host
 
-	data, err := io.ReadAll(out.Body)
+	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("read s3 response: %w", err)
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, "", fmt.Errorf("origin %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	return data, nil
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, resp.Header.Get("Content-Type"), nil
+}
+
+// serveBody writes cached data back to the client, reconstructing 206 Partial
+// Content semantics when the original request had a Range header.
+func (p *CacheProxy) serveBody(w http.ResponseWriter, data []byte, rangeHeader, contentType string) {
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	if rangeHeader != "" {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %s/%d", strings.TrimPrefix(rangeHeader, "bytes="), len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+	}
+	_, _ = w.Write(data)
+}
+
+// forwardUncached forwards a request to the origin without caching. Used for
+// HEAD and other non-GET methods that shouldn't consume cache space.
+func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	for k, vv := range r.Header {
+		if hopByHop[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Host = r.Host
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		if hopByHop[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 // HandlePeerHas responds to "do you have this cache key?" from peers.
@@ -248,5 +266,5 @@ func (p *CacheProxy) HandlePeerGet(w http.ResponseWriter, r *http.Request) {
 	defer reader.Close()
 
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	io.Copy(w, reader)
+	_, _ = io.Copy(w, reader)
 }

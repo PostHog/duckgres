@@ -58,10 +58,9 @@ func main() {
 
 	proxy := NewCacheProxy(store, peers)
 
-	// S3 proxy handler (DuckDB traffic)
-	s3Mux := http.NewServeMux()
-	s3Mux.HandleFunc("/", proxy.HandleS3Request)
-	s3Server := &http.Server{Addr: listenAddr, Handler: s3Mux}
+	// Forward HTTP proxy (DuckDB httpfs traffic). ServeMux can't match absolute
+	// URLs in forward-proxy requests, so use the handler directly.
+	s3Server := &http.Server{Addr: listenAddr, Handler: http.HandlerFunc(proxy.HandleProxy)}
 
 	// Peer API (cache lookups from other nodes)
 	peerMux := http.NewServeMux()
