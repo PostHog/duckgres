@@ -82,6 +82,15 @@ var hopByHop = map[string]bool{
 // HandleProxy handles forward HTTP proxy requests from DuckDB httpfs.
 // Expects absolute-form URIs (scheme + host + path in the request-line).
 func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
+	slog.Info("Request received.",
+		"method", r.Method,
+		"url", r.URL.String(),
+		"scheme", r.URL.Scheme,
+		"host", r.Host,
+		"path", r.URL.Path,
+		"range", r.Header.Get("Range"),
+	)
+
 	if r.Method == http.MethodConnect {
 		http.Error(w, "CONNECT not supported; configure DuckDB with USE_SSL=false", http.StatusMethodNotAllowed)
 		return
