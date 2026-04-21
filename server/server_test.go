@@ -168,22 +168,20 @@ func TestBuildDuckLakePreAttachStatements(t *testing.T) {
 	}{
 		{
 			name: "default disables metadata tls cache",
-			cfg: DuckLakeConfig{
-				DisableMetadataThreadLocalCache: true,
-			},
+			cfg:  DuckLakeConfig{},
 			want: []string{"SET GLOBAL pg_pool_enable_thread_local_cache = false"},
 		},
 		{
 			name: "disable metadata tls cache",
 			cfg: DuckLakeConfig{
-				DisableMetadataThreadLocalCache: true,
+				DisableMetadataThreadLocalCache: boolPtr(true),
 			},
 			want: []string{"SET GLOBAL pg_pool_enable_thread_local_cache = false"},
 		},
 		{
 			name: "explicitly keep metadata tls cache enabled",
 			cfg: DuckLakeConfig{
-				DisableMetadataThreadLocalCache: false,
+				DisableMetadataThreadLocalCache: boolPtr(false),
 			},
 			want: nil,
 		},
@@ -247,7 +245,7 @@ func TestApplyDuckLakePreAttachSettingsWith_IgnoresUnsupportedSettingWhenLoaderF
 	err := applyDuckLakePreAttachSettingsWith(execer, func() error {
 		loadCalls++
 		return errors.New("offline")
-	}, DuckLakeConfig{DisableMetadataThreadLocalCache: true})
+	}, DuckLakeConfig{DisableMetadataThreadLocalCache: boolPtr(true)})
 	if err != nil {
 		t.Fatalf("expected unsupported pre-attach setting to be best-effort, got %v", err)
 	}
@@ -271,7 +269,7 @@ func TestApplyDuckLakePreAttachSettingsWith_IgnoresUnsupportedSettingAfterLoad(t
 	err := applyDuckLakePreAttachSettingsWith(execer, func() error {
 		loadCalls++
 		return nil
-	}, DuckLakeConfig{DisableMetadataThreadLocalCache: true})
+	}, DuckLakeConfig{DisableMetadataThreadLocalCache: boolPtr(true)})
 	if err != nil {
 		t.Fatalf("expected unsupported pre-attach setting to be ignored after load retry, got %v", err)
 	}

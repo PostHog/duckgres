@@ -261,7 +261,8 @@ type DuckLakeConfig struct {
 	// connection caching for the hidden DuckLake metadata pool as early as
 	// possible, before ATTACH creates that pool. This trades some warm-reuse
 	// performance for a lower retained metadata-connection footprint.
-	DisableMetadataThreadLocalCache bool
+	// Nil means use the server default (enabled).
+	DisableMetadataThreadLocalCache *bool
 
 	// ObjectStore is the S3-compatible storage path for DuckLake data files
 	// Format: "s3://bucket/path/" for S3/MinIO
@@ -1174,9 +1175,18 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 	return lastErr
 }
 
+func boolPtr(v bool) *bool { return &v }
+
+func duckLakeDisableMetadataThreadLocalCacheEnabled(dlCfg DuckLakeConfig) bool {
+	if dlCfg.DisableMetadataThreadLocalCache == nil {
+		return true
+	}
+	return *dlCfg.DisableMetadataThreadLocalCache
+}
+
 func buildDuckLakePreAttachStatements(dlCfg DuckLakeConfig) []string {
 	var statements []string
-	if dlCfg.DisableMetadataThreadLocalCache {
+	if duckLakeDisableMetadataThreadLocalCacheEnabled(dlCfg) {
 		statements = append(statements, "SET GLOBAL pg_pool_enable_thread_local_cache = false")
 	}
 	return statements
