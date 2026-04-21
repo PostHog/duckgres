@@ -1302,11 +1302,20 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// read (some settings don't propagate to DuckLake's subcatalogs post-attach,
 	// same gotcha as pg_pool_max_connections).
 	if dlCfg.HTTPProxy != "" {
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy)); err != nil {
-			slog.Warn("Failed to set http_proxy for httpfs.", "proxy", dlCfg.HTTPProxy, "error", err)
-		} else {
-			slog.Info("Routed httpfs traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy)
+		// Force plaintext HTTP + path-style at the session level in addition to
+		// the S3 secret's USE_SSL/URL_STYLE — DuckDB observed to ignore secret
+		// settings and tunnel via HTTPS CONNECT when the endpoint looks like AWS
+		// S3, which the proxy can't cache (encrypted tunnel).
+		for _, stmt := range []string{
+			fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy),
+			"SET GLOBAL s3_use_ssl = false",
+			"SET GLOBAL s3_url_style = 'path'",
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				slog.Warn("Failed to set httpfs proxy config.", "stmt", stmt, "error", err)
+			}
 		}
+		slog.Info("Routed httpfs traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy)
 	}
 
 	// Warn if metadata store appears to connect via pgbouncer.
