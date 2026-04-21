@@ -99,6 +99,11 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 		}
 	}
 
+	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("querylog: pre-attach settings: %w", err)
+	}
+
 	// Attach DuckLake
 	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded())
 	if _, err := db.Exec(attachStmt); err != nil {

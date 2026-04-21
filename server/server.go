@@ -257,6 +257,12 @@ type DuckLakeConfig struct {
 	// Format: "postgres:host=<host> user=<user> password=<password> dbname=<db>"
 	MetadataStore string
 
+	// DisableMetadataThreadLocalCache disables postgres_scanner thread-local
+	// connection caching for the hidden DuckLake metadata pool as early as
+	// possible, before ATTACH creates that pool. This trades some warm-reuse
+	// performance for a lower retained metadata-connection footprint.
+	DisableMetadataThreadLocalCache bool
+
 	// ObjectStore is the S3-compatible storage path for DuckLake data files
 	// Format: "s3://bucket/path/" for S3/MinIO
 	// If not specified, uses DataPath for local storage
@@ -353,7 +359,6 @@ type Server struct {
 	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
 	fileDBsMu sync.Mutex
 	fileDBs   map[string]*fileDBEntry
-
 
 	// DuckLake checkpoint scheduler
 	checkpointer *DuckLakeCheckpointer
@@ -1169,6 +1174,45 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 	return lastErr
 }
 
+func buildDuckLakePreAttachStatements(dlCfg DuckLakeConfig) []string {
+	var statements []string
+	if dlCfg.DisableMetadataThreadLocalCache {
+		statements = append(statements, "SET GLOBAL pg_pool_enable_thread_local_cache = false")
+	}
+	return statements
+}
+
+func isMissingDuckLakePoolSettingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unrecognized configuration parameter")
+}
+
+func applyDuckLakePreAttachSettings(db *sql.DB, dlCfg DuckLakeConfig) error {
+	statements := buildDuckLakePreAttachStatements(dlCfg)
+	if len(statements) == 0 {
+		return nil
+	}
+
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			if isMissingDuckLakePoolSettingError(err) {
+				if loadErr := LoadExtensions(db, []string{"postgres_scanner"}); loadErr != nil {
+					return fmt.Errorf("load postgres_scanner for pre-attach settings: %w", loadErr)
+				}
+				if _, retryErr := db.Exec(stmt); retryErr != nil {
+					return fmt.Errorf("apply DuckLake pre-attach setting %q after loading postgres_scanner: %w", stmt, retryErr)
+				}
+				continue
+			}
+			return fmt.Errorf("apply DuckLake pre-attach setting %q: %w", stmt, err)
+		}
+	}
+	return nil
+}
+
 // hasCacheHTTPFS checks if cache_httpfs is in the extensions list.
 func hasCacheHTTPFS(extensions []string) bool {
 	for _, ext := range extensions {
@@ -1253,6 +1297,9 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 
 	// Build the ATTACH statement.
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
+	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
+		return err
+	}
 	migrate := dlCfg.Migrate || duckLakeMigrationNeeded()
 	attachStmt := buildDuckLakeAttachStmt(dlCfg, migrate)
 
