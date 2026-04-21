@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +34,17 @@ func main() {
 	healthAddr := envOrDefault("HEALTH_ADDR", ":8082")
 	peerService := os.Getenv("PEER_SERVICE") // headless K8s service for peer discovery
 
+	// Comma-separated Host substrings we should cache. Anything else is tunneled
+	// or forwarded without caching. Empty means "cache everything" (legacy).
+	var cacheHostSuffixes []string
+	if raw := os.Getenv("CACHE_HOST_SUFFIXES"); raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				cacheHostSuffixes = append(cacheHostSuffixes, s)
+			}
+		}
+	}
+
 	slog.Info("Starting cache-proxy.",
 		"cache_dir", cacheDir,
 		"max_percent", maxPercent,
@@ -40,6 +52,7 @@ func main() {
 		"peer_listen", peerAddr,
 		"health", healthAddr,
 		"peer_service", peerService,
+		"cache_host_suffixes", cacheHostSuffixes,
 	)
 
 	// Initialize cache store
@@ -56,7 +69,7 @@ func main() {
 		go peers.WatchEndpoints(context.Background())
 	}
 
-	proxy := NewCacheProxy(store, peers)
+	proxy := NewCacheProxy(store, peers, cacheHostSuffixes)
 
 	// Forward HTTP proxy (DuckDB httpfs traffic). ServeMux can't match absolute
 	// URLs in forward-proxy requests, so use the handler directly.

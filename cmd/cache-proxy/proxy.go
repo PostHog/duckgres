@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -21,6 +22,11 @@ type CacheProxy struct {
 	peers   *PeerManager
 	client  *http.Client
 	flights singleFlight
+
+	// cacheHostSuffixes are the Host substrings that identify DuckLake bucket
+	// traffic worth caching. Requests whose Host doesn't contain any of these
+	// are passed through without caching.
+	cacheHostSuffixes []string
 }
 
 type singleFlight struct {
@@ -59,12 +65,69 @@ func (sf *singleFlight) Do(key string, fn func() ([]byte, error)) ([]byte, error
 	return c.val, c.err
 }
 
-func NewCacheProxy(store *DiskCache, peers *PeerManager) *CacheProxy {
+func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []string) *CacheProxy {
 	return &CacheProxy{
-		store:  store,
-		peers:  peers,
-		client: &http.Client{Timeout: 60 * time.Second},
+		store:             store,
+		peers:             peers,
+		client:            &http.Client{Timeout: 60 * time.Second},
+		cacheHostSuffixes: cacheHostSuffixes,
 	}
+}
+
+// shouldCache returns true if the request targets a host we want to cache.
+// When no suffixes are configured, all GETs are cached (legacy behavior).
+func (p *CacheProxy) shouldCache(r *http.Request) bool {
+	if len(p.cacheHostSuffixes) == 0 {
+		return true
+	}
+	host := r.URL.Host
+	if host == "" {
+		host = r.Host
+	}
+	for _, s := range p.cacheHostSuffixes {
+		if strings.Contains(host, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleConnect tunnels an HTTPS CONNECT request. We don't cache — just copy
+// bytes between client and origin. Required because SET GLOBAL http_proxy
+// makes DuckDB tunnel all HTTPS through us, including external sources.
+func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	upstream, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		upstream.Close()
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	client, _, err := hijacker.Hijack()
+	if err != nil {
+		upstream.Close()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		upstream.Close()
+		client.Close()
+		return
+	}
+	go func() {
+		defer upstream.Close()
+		defer client.Close()
+		_, _ = io.Copy(upstream, client)
+	}()
+	go func() {
+		defer upstream.Close()
+		defer client.Close()
+		_, _ = io.Copy(client, upstream)
+	}()
 }
 
 // Hop-by-hop headers per RFC 7230 §6.1 — must not be forwarded.
@@ -91,8 +154,12 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		"range", r.Header.Get("Range"),
 	)
 
+	// HTTPS via CONNECT tunnel — we can't cache encrypted traffic, but we must
+	// still tunnel it so DuckDB can reach external HTTPS sources (e.g.
+	// read_parquet('https://datasets.clickhouse.com/...')) while
+	// http_proxy is set globally.
 	if r.Method == http.MethodConnect {
-		http.Error(w, "CONNECT not supported; configure DuckDB with USE_SSL=false", http.StatusMethodNotAllowed)
+		p.handleConnect(w, r)
 		return
 	}
 
@@ -101,9 +168,15 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only GET with Range gets cached (parquet byte-range fetches). Pass everything
-	// else (HEAD for metadata, etc.) straight through uncached.
+	// Non-GET (HEAD, etc.) is never cached — forward and return.
 	if r.Method != http.MethodGet {
+		p.forwardUncached(w, r)
+		return
+	}
+
+	// Only cache URLs that look like DuckLake bucket traffic. Anything else
+	// (non-bucket HTTP) is a passthrough.
+	if !p.shouldCache(r) {
 		p.forwardUncached(w, r)
 		return
 	}
