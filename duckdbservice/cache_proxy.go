@@ -83,15 +83,27 @@ func LogCacheProxyStatus() {
 // the proxy just forwards the signed request verbatim. This requires plain HTTP
 // (no TLS tunnel) so the proxy can see the URL to cache by. The proxy itself
 // needs zero AWS credentials.
+//
+// DuckDB only honors USE_SSL=false when an explicit ENDPOINT is set on the S3
+// secret (otherwise it defaults to HTTPS regardless), so we pin the real S3
+// endpoint for the configured region.
 func overrideS3EndpointForCacheProxy(cfg *server.DuckLakeConfig) {
 	addr := cacheProxyS3Addr()
 	if addr == "" {
 		return
 	}
 	proxyURL := "http://" + addr
+	if cfg.S3Endpoint == "" {
+		region := cfg.S3Region
+		if region == "" {
+			region = "us-east-1"
+		}
+		cfg.S3Endpoint = "s3." + region + ".amazonaws.com"
+	}
 	slog.Info("Routing S3 traffic through local cache proxy.",
 		"from_use_ssl", cfg.S3UseSSL,
 		"http_proxy", proxyURL,
+		"endpoint", cfg.S3Endpoint,
 	)
 	cfg.HTTPProxy = proxyURL
 	cfg.S3UseSSL = false
