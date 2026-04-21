@@ -1292,6 +1292,27 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
 
+	// Reclaim idle metadata connections. DuckDB 1.5.2 / DuckLake 1.0 introduced
+	// thread-local connection caching for postgres_scanner (default ON) but
+	// ships with reaper_thread=off and both idle/lifetime timeouts=0, so every
+	// connection a DuckDB worker thread ever caches stays pinned forever.
+	// That produced a large steady-state spike in metadata RDS connections
+	// post-upgrade. Enabling the reaper with a modest idle timeout lets idle
+	// cached connections close while active workers keep the warm-connection
+	// latency benefit of TLC. 10-min max lifetime is a belt-and-braces cap
+	// against stuck connections (NAT table churn, pgbouncer-style kills).
+	// See: https://github.com/duckdb/ducklake/issues/1031 and
+	// https://github.com/duckdb/duckdb-postgres/pull/430
+	if _, err := db.Exec("SET GLOBAL pg_pool_enable_reaper_thread = true"); err != nil {
+		slog.Warn("Failed to enable pg_pool reaper thread.", "error", err)
+	}
+	if _, err := db.Exec("SET GLOBAL pg_pool_idle_timeout_millis = 60000"); err != nil {
+		slog.Warn("Failed to set pg_pool_idle_timeout_millis.", "error", err)
+	}
+	if _, err := db.Exec("SET GLOBAL pg_pool_max_lifetime_millis = 600000"); err != nil {
+		slog.Warn("Failed to set pg_pool_max_lifetime_millis.", "error", err)
+	}
+
 	// Ensure performance indexes exist on the DuckLake metadata tables.
 	// Run in a goroutine so it doesn't block the DuckLake semaphore or
 	// delay connection setup. Uses atomic flag to retry on transient failures.
