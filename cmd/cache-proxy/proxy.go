@@ -145,15 +145,6 @@ var hopByHop = map[string]bool{
 // HandleProxy handles forward HTTP proxy requests from DuckDB httpfs.
 // Expects absolute-form URIs (scheme + host + path in the request-line).
 func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Request received.",
-		"method", r.Method,
-		"url", r.URL.String(),
-		"scheme", r.URL.Scheme,
-		"host", r.Host,
-		"path", r.URL.Path,
-		"range", r.Header.Get("Range"),
-	)
-
 	// HTTPS via CONNECT tunnel — we can't cache encrypted traffic, but we must
 	// still tunnel it so DuckDB can reach external HTTPS sources (e.g.
 	// read_parquet('https://datasets.clickhouse.com/...')) while
