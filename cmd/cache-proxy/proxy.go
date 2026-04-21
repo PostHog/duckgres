@@ -104,12 +104,13 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if data, ok := p.store.Get(cacheKey); ok {
 		cacheBytesServed.WithLabelValues("local").Add(float64(len(data)))
+		slog.Info("Served.", "source", "hit", "url", r.URL.String(), "range", rangeHeader, "bytes", len(data))
 		p.serveBody(w, data, rangeHeader, "")
 		return
 	}
 	cacheMissesTotal.Inc()
 
-	data, contentType, err := p.fetchDedup(cacheKey, r, rangeHeader)
+	data, contentType, source, err := p.fetchDedup(cacheKey, r, rangeHeader)
 	if err != nil {
 		slog.Error("Failed to fetch.", "url", r.URL.String(), "range", rangeHeader, "error", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -119,31 +120,34 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	if err := p.store.Put(cacheKey, data); err != nil {
 		slog.Warn("Failed to cache.", "key", cacheKey[:16], "error", err)
 	}
+	slog.Info("Served.", "source", source, "url", r.URL.String(), "range", rangeHeader, "bytes", len(data))
 	p.serveBody(w, data, rangeHeader, contentType)
 }
 
 // fetchDedup tries peers then origin, deduplicating concurrent fetches.
 // contentType is reported only for origin fetches (peers strip it).
-func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) ([]byte, string, error) {
-	var contentType string
+// source is "peer" or "miss" depending on where the data came from.
+func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) ([]byte, string, string, error) {
+	var contentType, source string
 	data, err := p.flights.Do(cacheKey, func() ([]byte, error) {
 		if p.peers != nil {
 			if peerData, peerAddr, ok := p.peers.FetchFromPeers(cacheKey); ok {
-				slog.Debug("Peer hit.", "key", cacheKey[:16], "peer", peerAddr)
 				cacheBytesServed.WithLabelValues("peer").Add(float64(len(peerData)))
+				source = "peer"
+				_ = peerAddr
 				return peerData, nil
 			}
 		}
-		slog.Debug("Fetching from origin.", "url", r.URL.String(), "range", rangeHeader)
 		data, ct, err := p.fetchOrigin(r)
 		if err != nil {
 			return nil, err
 		}
 		contentType = ct
 		cacheBytesServed.WithLabelValues("s3").Add(float64(len(data)))
+		source = "miss"
 		return data, nil
 	})
-	return data, contentType, err
+	return data, contentType, source, err
 }
 
 // fetchOrigin forwards the request verbatim (headers, Host, signature) to the
