@@ -45,7 +45,6 @@ type ManagedWorker struct {
 	ownerCPInstanceID       string
 	hotIdleReclaimed        bool //nolint:unused // only set in kubernetes hot-idle reclaim path
 	cachedActivationPayload any  //nolint:unused // *TenantActivationPayload, cached in kubernetes activation path
-	retiring                bool // worker is draining toward exit and must not be reused
 }
 
 // SharedState returns the additive shared warm-worker lifecycle metadata for
@@ -726,8 +725,11 @@ func (p *FlightWorkerPool) ReleaseWorker(id int) {
 	if w.activeSessions > 0 {
 		w.activeSessions--
 	}
-	if p.retireOnSessionEnd && w.activeSessions == 0 && p.markWorkerRetiringLocked(w, true) {
+	if p.retireOnSessionEnd && w.activeSessions == 0 {
+		delete(p.workers, id)
+		workerCount := len(p.workers)
 		p.mu.Unlock()
+		observeControlPlaneWorkers(workerCount)
 		go p.retireWorkerProcess(w)
 		return
 	}
@@ -761,9 +763,6 @@ func (p *FlightWorkerPool) reapIdleWorkers() {
 			continue
 		default:
 		}
-		if w.retiring {
-			continue
-		}
 		if w.activeSessions == 0 {
 			idleCount++
 		}
@@ -773,16 +772,13 @@ func (p *FlightWorkerPool) reapIdleWorkers() {
 	// Map iteration is random, but that's fine for simple reaping.
 	// If we wanted to be smart, we'd sort by lastUsed.
 
-	for _, w := range p.workers {
+	for id, w := range p.workers {
 		if idleCount <= p.minWorkers {
 			break
 		}
-		if w.retiring {
-			continue
-		}
 		if w.activeSessions == 0 && !w.lastUsed.IsZero() && now.Sub(w.lastUsed) > p.idleTimeout {
 			toRetire = append(toRetire, w)
-			w.retiring = true
+			delete(p.workers, id)
 			idleCount--
 		}
 	}
@@ -791,6 +787,7 @@ func (p *FlightWorkerPool) reapIdleWorkers() {
 
 	if len(toRetire) > 0 {
 		slog.Info("Reaping idle workers.", "count", len(toRetire), "remaining", workerCount, "min", p.minWorkers)
+		observeControlPlaneWorkers(workerCount)
 		for _, w := range toRetire {
 			go p.retireWorkerProcess(w)
 		}
@@ -805,9 +802,6 @@ func (p *FlightWorkerPool) findIdleWorkerLocked() *ManagedWorker {
 		case <-w.done:
 			continue // dead
 		default:
-		}
-		if w.retiring {
-			continue
 		}
 		if w.activeSessions == 0 {
 			return w
@@ -826,46 +820,11 @@ func (p *FlightWorkerPool) leastLoadedWorkerLocked() *ManagedWorker {
 			continue // dead
 		default:
 		}
-		if w.retiring {
-			continue
-		}
 		if best == nil || w.activeSessions < best.activeSessions {
 			best = w
 		}
 	}
 	return best
-}
-
-// markWorkerRetiringLocked marks a worker for retirement while keeping it
-// counted as a live process until the child actually exits. Caller must hold p.mu.
-func (p *FlightWorkerPool) markWorkerRetiringLocked(w *ManagedWorker, respectMinIdle bool) bool {
-	if w == nil || w.retiring {
-		return false
-	}
-
-	// Preserve the configured warm idle floor even when retire-on-session-end is enabled.
-	if respectMinIdle && p.minWorkers > 0 {
-		idleAvailable := 0
-		for _, candidate := range p.workers {
-			select {
-			case <-candidate.done:
-				continue
-			default:
-			}
-			if candidate.retiring {
-				continue
-			}
-			if candidate.activeSessions == 0 {
-				idleAvailable++
-			}
-		}
-		if idleAvailable <= p.minWorkers {
-			return false
-		}
-	}
-
-	w.retiring = true
-	return true
 }
 
 // liveWorkerCountLocked returns the number of workers whose process is still
@@ -920,11 +879,10 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 		p.mu.Unlock()
 		return
 	}
-	if !p.markWorkerRetiringLocked(w, false) {
-		p.mu.Unlock()
-		return
-	}
+	delete(p.workers, id)
+	workerCount := len(p.workers)
 	p.mu.Unlock()
+	observeControlPlaneWorkers(workerCount)
 
 	// Run the actual process cleanup asynchronously so DestroySession
 	// doesn't block the connection handler goroutine for up to 3s+.
@@ -948,8 +906,11 @@ func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 	}
 
 	// If it has NO other active sessions, kill it to be safe (it might be broken).
-	if w.activeSessions == 0 && p.markWorkerRetiringLocked(w, false) {
+	if w.activeSessions == 0 {
+		delete(p.workers, id)
+		workerCount := len(p.workers)
 		p.mu.Unlock()
+		observeControlPlaneWorkers(workerCount)
 		go p.retireWorkerProcess(w)
 		return true
 	}
@@ -991,6 +952,8 @@ func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 			slog.Warn("Worker did not exit in time, killing.", "id", w.ID)
 			if w.cmd != nil && w.cmd.Process != nil {
 				_ = w.cmd.Process.Kill()
+			}
+			if w.done != nil {
 				<-w.done
 			}
 		}
@@ -1003,16 +966,6 @@ func (p *FlightWorkerPool) retireWorkerProcess(w *ManagedWorker) {
 
 	// Return pre-bound socket to pool for reuse, or close non-pre-bound listener.
 	p.releaseWorkerSocket(w)
-
-	p.mu.Lock()
-	if current, ok := p.workers[w.ID]; ok && current == w {
-		delete(p.workers, w.ID)
-		workerCount := len(p.workers)
-		p.mu.Unlock()
-		observeControlPlaneWorkers(workerCount)
-		return
-	}
-	p.mu.Unlock()
 }
 
 // SetMaxWorkers updates the maximum number of workers. 0 means unlimited.
