@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -26,6 +27,44 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// stampedHandler emits log records in the order: time, level, pod, node,
+// msg, attrs. Go's built-in TextHandler forces time/level/msg to the front
+// and appends all other attrs after msg, which hides pod/node at the end
+// of long lines. Having pod/node up front makes log triage scannable.
+type stampedHandler struct {
+	out   io.Writer
+	level slog.Level
+	stamp []slog.Attr
+}
+
+func (h *stampedHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= h.level
+}
+
+func (h *stampedHandler) Handle(_ context.Context, r slog.Record) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "time=%s level=%s", r.Time.UTC().Format(time.RFC3339Nano), r.Level.String())
+	for _, a := range h.stamp {
+		fmt.Fprintf(&b, " %s=%s", a.Key, a.Value.String())
+	}
+	fmt.Fprintf(&b, " msg=%q", r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		fmt.Fprintf(&b, " %s=%s", a.Key, a.Value.String())
+		return true
+	})
+	b.WriteByte('\n')
+	_, err := io.WriteString(h.out, b.String())
+	return err
+}
+
+func (h *stampedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	nh := *h
+	nh.stamp = append(append([]slog.Attr{}, h.stamp...), attrs...)
+	return &nh
+}
+
+func (h *stampedHandler) WithGroup(_ string) slog.Handler { return h }
+
 // Build metadata, set at link time via -ldflags (see Dockerfile).
 var (
 	version = "dev"
@@ -34,16 +73,16 @@ var (
 )
 
 func main() {
-	// Attach pod/node identifiers to every log line (Downward API).
-	handler := slog.NewTextHandler(os.Stderr, nil)
-	logger := slog.New(handler)
+	// Attach pod/node identifiers to every log line (Downward API) so they
+	// appear right after level for quick triage.
+	var stamp []slog.Attr
 	if pod := os.Getenv("POD_NAME"); pod != "" {
-		logger = logger.With("pod", pod)
+		stamp = append(stamp, slog.String("pod", pod))
 	}
 	if node := os.Getenv("NODE_NAME"); node != "" {
-		logger = logger.With("node", node)
+		stamp = append(stamp, slog.String("node", node))
 	}
-	slog.SetDefault(logger)
+	slog.SetDefault(slog.New(&stampedHandler{out: os.Stderr, level: slog.LevelInfo, stamp: stamp}))
 
 	slog.Info("Cache-proxy build info.", "version", version, "commit", commit, "built", date)
 
