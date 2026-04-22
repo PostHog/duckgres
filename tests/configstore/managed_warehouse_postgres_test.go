@@ -66,9 +66,11 @@ func TestManagedWarehouseConfigStorePostgres(t *testing.T) {
 	orgCfg := store.Snapshot().Orgs["analytics"]
 	if orgCfg == nil {
 		t.Fatal("expected analytics org in snapshot")
+		return
 	}
 	if orgCfg.Warehouse == nil {
 		t.Fatal("expected warehouse to be preloaded into snapshot")
+		return
 	}
 	if orgCfg.Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
 		t.Fatalf("expected analytics_wh, got %q", orgCfg.Warehouse.WarehouseDatabase.DatabaseName)
