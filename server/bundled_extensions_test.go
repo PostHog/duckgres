@@ -2,8 +2,10 @@ package server
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -148,9 +150,9 @@ func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
 	}
 }
 
-func TestConfigureExtensionDirectorySeedsBundledExtensions(t *testing.T) {
+func TestBootstrapBundledExtensionsSeedsBundledExtensions(t *testing.T) {
 	bundledRoot := t.TempDir()
-	extDir := t.TempDir()
+	dataDir := t.TempDir()
 
 	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
@@ -161,16 +163,20 @@ func TestConfigureExtensionDirectorySeedsBundledExtensions(t *testing.T) {
 		t.Fatalf("write src extension: %v", err)
 	}
 
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
+	prevBundledRoot := bundledDuckDBExtensionsDir
+	bundledDuckDBExtensionsDir = bundledRoot
+	defer func() { bundledDuckDBExtensionsDir = prevBundledRoot }()
 
-	if err := configureExtensionDirectory(db, bundledRoot, extDir, "test"); err != nil {
-		t.Fatalf("configureExtensionDirectory: %v", err)
+	bundledExtensionBootstrap = struct {
+		mu     sync.Mutex
+		byPath map[string]error
+	}{}
+
+	if err := bootstrapBundledExtensions(dataDir); err != nil {
+		t.Fatalf("bootstrapBundledExtensions: %v", err)
 	}
 
+	extDir := filepath.Join(dataDir, "extensions")
 	dstExt := filepath.Join(extDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
 	got, err := os.ReadFile(dstExt)
 	if err != nil {
@@ -181,8 +187,51 @@ func TestConfigureExtensionDirectorySeedsBundledExtensions(t *testing.T) {
 	}
 }
 
-func TestConfigureExtensionDirectorySetsDuckDBExtensionDirectory(t *testing.T) {
+func TestBootstrapBundledExtensionsRunsOncePerExtensionDirectory(t *testing.T) {
 	bundledRoot := t.TempDir()
+	dataDir := t.TempDir()
+	extDir := filepath.Join(dataDir, "extensions")
+
+	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("nightly"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	prevBundledRoot := bundledDuckDBExtensionsDir
+	bundledDuckDBExtensionsDir = bundledRoot
+	defer func() { bundledDuckDBExtensionsDir = prevBundledRoot }()
+
+	bundledExtensionBootstrap = struct {
+		mu     sync.Mutex
+		byPath map[string]error
+	}{}
+
+	if err := bootstrapBundledExtensions(dataDir); err != nil {
+		t.Fatalf("bootstrapBundledExtensions: %v", err)
+	}
+
+	if err := os.WriteFile(srcExt, []byte("newer-nightly"), 0o644); err != nil {
+		t.Fatalf("rewrite src extension: %v", err)
+	}
+	if err := bootstrapBundledExtensions(dataDir); err != nil {
+		t.Fatalf("second bootstrapBundledExtensions: %v", err)
+	}
+
+	dstExt := filepath.Join(extDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "nightly" {
+		t.Fatalf("expected bootstrap to run once, got %q", string(got))
+	}
+}
+
+func TestSetExtensionDirectoryUsesPreparedCache(t *testing.T) {
 	extDir := t.TempDir()
 
 	db, err := sql.Open("duckdb", ":memory:")
@@ -191,8 +240,8 @@ func TestConfigureExtensionDirectorySetsDuckDBExtensionDirectory(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	if err := configureExtensionDirectory(db, bundledRoot, extDir, "test"); err != nil {
-		t.Fatalf("configureExtensionDirectory: %v", err)
+	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
+		t.Fatalf("set extension_directory: %v", err)
 	}
 
 	var got string

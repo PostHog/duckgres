@@ -71,9 +71,9 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 
 	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
 	extDir := filepath.Join(cfg.DataDir, "extensions")
-	if err := configureExtensionDirectory(db, bundledDuckDBExtensionsDir, extDir, "querylog"); err != nil {
+	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
 		_ = db.Close()
-		return nil, err
+		return nil, fmt.Errorf("querylog: set extension_directory: %w", err)
 	}
 
 	// Load ducklake extension

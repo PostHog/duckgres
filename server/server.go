@@ -37,13 +37,35 @@ var processVersion = "dev"
 // clients pinning connection goroutines indefinitely.
 var startupReadTimeout = 30 * time.Second
 
-const bundledDuckDBExtensionsDir = "/app/extensions"
+var bundledDuckDBExtensionsDir = "/app/extensions"
+
+var bundledExtensionBootstrap struct {
+	mu     sync.Mutex
+	byPath map[string]error
+}
 
 // SetProcessVersion sets the version string for this process. Called from main().
 func SetProcessVersion(v string) { processVersion = v }
 
 // ProcessVersion returns the version string for this process.
 func ProcessVersion() string { return processVersion }
+
+func bootstrapBundledExtensions(dataDir string) error {
+	extDir := filepath.Join(dataDir, "extensions")
+
+	bundledExtensionBootstrap.mu.Lock()
+	defer bundledExtensionBootstrap.mu.Unlock()
+	if bundledExtensionBootstrap.byPath == nil {
+		bundledExtensionBootstrap.byPath = make(map[string]error)
+	}
+	if err, ok := bundledExtensionBootstrap.byPath[extDir]; ok {
+		return err
+	}
+
+	err := seedBundledExtensions(bundledDuckDBExtensionsDir, extDir)
+	bundledExtensionBootstrap.byPath[extDir] = err
+	return err
+}
 
 // passwordPattern matches password=<value> or password: <value> with quoted or unquoted values.
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
@@ -477,6 +499,10 @@ func New(cfg Config) (*Server, error) {
 		ensureDuckLakeMigrationCheck(cfg.DuckLake, cfg.DataDir)
 	}
 
+	if err := bootstrapBundledExtensions(cfg.DataDir); err != nil {
+		slog.Warn("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(cfg.DataDir, "extensions"), "error", err)
+	}
+
 	// Initialize query logger (non-fatal on error)
 	if ql, err := NewQueryLogger(cfg); err != nil {
 		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
@@ -873,8 +899,8 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
 	// for autoloading/installing extensions.
 	extDir := filepath.Join(cfg.DataDir, "extensions")
-	if err := configureExtensionDirectory(db, bundledDuckDBExtensionsDir, extDir, "openBaseDB"); err != nil {
-		slog.Warn("Failed to configure DuckDB extension_directory.", "extension_directory", extDir, "error", err)
+	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
+		slog.Warn("Failed to set DuckDB extension_directory.", "extension_directory", extDir, "error", err)
 	} else {
 		slog.Debug("Set DuckDB extension_directory.", "extension_directory", extDir)
 	}
@@ -974,16 +1000,6 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 
 		return copyFile(path, dstPath, info.Mode().Perm())
 	})
-}
-
-func configureExtensionDirectory(db *sql.DB, bundledSrcRoot, extDir, scope string) error {
-	if err := seedBundledExtensions(bundledSrcRoot, extDir); err != nil {
-		return fmt.Errorf("%s: seed bundled extensions: %w", scope, err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
-		return fmt.Errorf("%s: set extension_directory: %w", scope, err)
-	}
-	return nil
 }
 
 func shouldRefreshBundledExtension(srcPath string) bool {

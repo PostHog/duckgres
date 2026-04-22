@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,6 +19,9 @@ import (
 // DuckLake, and pg_catalog views are all available.
 func RunShell(cfg Config) {
 	sem := make(chan struct{}, 1)
+	if err := bootstrapBundledExtensions(cfg.DataDir); err != nil {
+		slog.Warn("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(cfg.DataDir, "extensions"), "error", err)
+	}
 
 	db, err := CreateDBConnection(cfg, sem, "shell", processStartTime, processVersion)
 	if err != nil {
