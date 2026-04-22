@@ -41,7 +41,7 @@ func TestSeedBundledExtensionsCopiesMissingFiles(t *testing.T) {
 	}
 }
 
-func TestSeedBundledExtensionsPreservesExistingFiles(t *testing.T) {
+func TestSeedBundledExtensionsPreservesExistingFilesWithMatchingContents(t *testing.T) {
 	srcRoot := t.TempDir()
 	dstRoot := t.TempDir()
 
@@ -49,7 +49,7 @@ func TestSeedBundledExtensionsPreservesExistingFiles(t *testing.T) {
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(srcDir, "httpfs.duckdb_extension"), []byte("new"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(srcDir, "httpfs.duckdb_extension"), []byte("existing"), 0o644); err != nil {
 		t.Fatalf("write src extension: %v", err)
 	}
 
@@ -72,5 +72,40 @@ func TestSeedBundledExtensionsPreservesExistingFiles(t *testing.T) {
 	}
 	if string(got) != "existing" {
 		t.Fatalf("expected existing extension to be preserved, got %q", string(got))
+	}
+}
+
+func TestSeedBundledExtensionsReplacesExistingFilesWithUpdatedContents(t *testing.T) {
+	srcRoot := t.TempDir()
+	dstRoot := t.TempDir()
+
+	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("nightly"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	dstDir := filepath.Join(dstRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	dstExt := filepath.Join(dstDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(dstExt, []byte("stable"), 0o644); err != nil {
+		t.Fatalf("write dst extension: %v", err)
+	}
+
+	if err := seedBundledExtensions(srcRoot, dstRoot); err != nil {
+		t.Fatalf("seedBundledExtensions: %v", err)
+	}
+
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "nightly" {
+		t.Fatalf("expected existing extension to be replaced, got %q", string(got))
 	}
 }

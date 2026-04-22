@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/posthog/duckgres/server"
 	_ "github.com/lib/pq"
+	"github.com/posthog/duckgres/server"
 )
 
 var duckLakeInfraServices = []string{"ducklake-metadata", "minio", "minio-init"}

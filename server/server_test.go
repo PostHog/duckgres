@@ -126,6 +126,33 @@ func TestPostgresCoreNightlyExtension(t *testing.T) {
 	}
 }
 
+func TestInstallExtensionStatement(t *testing.T) {
+	tests := []struct {
+		name       string
+		installCmd string
+		want       string
+	}{
+		{
+			name:       "default repository uses install",
+			installCmd: "ducklake",
+			want:       "INSTALL ducklake",
+		},
+		{
+			name:       "explicit repository uses force install",
+			installCmd: "postgres FROM core_nightly",
+			want:       "FORCE INSTALL postgres FROM core_nightly",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := installExtensionStatement(tt.installCmd); got != tt.want {
+				t.Fatalf("installExtensionStatement(%q) = %q, want %q", tt.installCmd, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNeedsCredentialRefresh(t *testing.T) {
 	tests := []struct {
 		name string

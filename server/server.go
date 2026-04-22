@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"database/sql"
@@ -964,36 +965,100 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil
 		}
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o750); err != nil {
+			return err
+		}
 		if _, err := os.Stat(dstPath); err == nil {
-			return nil
+			same, err := filesEqual(path, dstPath)
+			if err != nil {
+				return err
+			}
+			if same {
+				return nil
+			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 
-		srcFile, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
-		if err != nil {
-			_ = srcFile.Close()
-			return err
-		}
-		if _, err := io.Copy(dstFile, srcFile); err != nil {
-			_ = srcFile.Close()
-			_ = dstFile.Close()
-			return err
-		}
-		if err := srcFile.Close(); err != nil {
-			_ = dstFile.Close()
-			return err
-		}
-		if err := dstFile.Close(); err != nil {
-			return err
-		}
-		return nil
+		return copyFile(path, dstPath, info.Mode().Perm())
 	})
+}
+
+func filesEqual(srcPath, dstPath string) (bool, error) {
+	srcInfo, err := os.Stat(srcPath)
+	if err != nil {
+		return false, err
+	}
+	dstInfo, err := os.Stat(dstPath)
+	if err != nil {
+		return false, err
+	}
+	if srcInfo.Size() != dstInfo.Size() {
+		return false, nil
+	}
+
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = srcFile.Close() }()
+
+	dstFile, err := os.Open(dstPath)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = dstFile.Close() }()
+
+	srcBuf := make([]byte, 32*1024)
+	dstBuf := make([]byte, 32*1024)
+	for {
+		srcN, srcErr := srcFile.Read(srcBuf)
+		dstN, dstErr := dstFile.Read(dstBuf)
+		if srcN != dstN {
+			return false, nil
+		}
+		if srcN > 0 && !bytes.Equal(srcBuf[:srcN], dstBuf[:dstN]) {
+			return false, nil
+		}
+		if errors.Is(srcErr, io.EOF) && errors.Is(dstErr, io.EOF) {
+			return true, nil
+		}
+		if srcErr != nil && !errors.Is(srcErr, io.EOF) {
+			return false, srcErr
+		}
+		if dstErr != nil && !errors.Is(dstErr, io.EOF) {
+			return false, dstErr
+		}
+	}
+}
+
+func copyFile(srcPath, dstPath string, mode os.FileMode) error {
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = srcFile.Close() }()
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(dstPath), ".bundled-extension-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := tmpFile.Chmod(mode); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := io.Copy(tmpFile, srcFile); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpPath, dstPath)
 }
 
 // CreateDBConnection creates a DuckDB connection for a client session.
@@ -1146,6 +1211,13 @@ func parseExtensionName(ext string) (name, installCmd string) {
 	return ext, ext
 }
 
+func installExtensionStatement(installCmd string) string {
+	if strings.Contains(strings.ToUpper(installCmd), " FROM ") {
+		return "FORCE INSTALL " + installCmd
+	}
+	return "INSTALL " + installCmd
+}
+
 // PostgresCoreNightlyExtension installs the DuckDB Postgres extension from the
 // core_nightly repository while still loading it under its canonical name.
 const PostgresCoreNightlyExtension = "postgres FROM core_nightly"
@@ -1166,7 +1238,7 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 		name, installCmd := parseExtensionName(ext)
 
 		// First install the extension (downloads if needed)
-		if _, err := db.Exec("INSTALL " + installCmd); err != nil {
+		if _, err := db.Exec(installExtensionStatement(installCmd)); err != nil {
 			slog.Warn("Failed to install extension.", "extension", installCmd, "error", err)
 			lastErr = err
 			continue
