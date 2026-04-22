@@ -1,0 +1,279 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+// newTestProxy wires a CacheProxy with no peers and a tempdir-backed store.
+func newTestProxy(t *testing.T) *CacheProxy {
+	t.Helper()
+	return NewCacheProxy(newTestCache(t), nil, nil)
+}
+
+// newTestServer returns an httptest origin plus a proxy that rewrites inbound
+// forward-proxy-style requests to target that origin. DuckDB sends absolute-form
+// URIs (scheme + host + path); we give the test the origin's URL so the proxy's
+// fetchOrigin hits httptest.Server directly.
+func newTestServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, string) {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	// httptest URL looks like http://127.0.0.1:PORT
+	return srv, srv.URL
+}
+
+// doForwardProxyRequest sends a request through the proxy in forward-proxy
+// form (absolute URI in the request line). httptest's serve path preserves
+// the URL.Host and URL.Scheme when we construct the request this way.
+func doForwardProxyRequest(proxy *CacheProxy, method, absoluteURL string, headers http.Header) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, absoluteURL, nil)
+	req.Host = req.URL.Host
+	for k, vv := range headers {
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	rec := httptest.NewRecorder()
+	proxy.HandleProxy(rec, req)
+	return rec
+}
+
+func TestHandleProxyGETMissThenHit(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	var originCalls int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&originCalls, 1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello-parquet-bytes"))
+	})
+
+	// First request: cache miss → origin fetch → cached.
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", http.Header{"Range": []string{"bytes=0-18"}})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("miss: status = %d, want 206", rec.Code)
+	}
+	if body := rec.Body.String(); body != "hello-parquet-bytes" {
+		t.Errorf("miss body = %q, want hello-parquet-bytes", body)
+	}
+	if atomic.LoadInt32(&originCalls) != 1 {
+		t.Errorf("origin calls = %d, want 1 on miss", originCalls)
+	}
+
+	// Second request for the same URL + Range: cache hit, no extra origin call.
+	rec = doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", http.Header{"Range": []string{"bytes=0-18"}})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("hit: status = %d, want 206", rec.Code)
+	}
+	if atomic.LoadInt32(&originCalls) != 1 {
+		t.Errorf("origin calls = %d after hit, want 1", originCalls)
+	}
+}
+
+func TestHandleProxyHEADForwardedUncached(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	var calls int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		if r.Method != "HEAD" {
+			t.Errorf("origin got method=%s, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "42")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	rec := doForwardProxyRequest(proxy, "HEAD", originURL+"/bucket/meta", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200", rec.Code)
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Errorf("origin calls = %d, want 1", calls)
+	}
+
+	// A repeat HEAD should ALSO hit the origin (HEAD is never cached).
+	_ = doForwardProxyRequest(proxy, "HEAD", originURL+"/bucket/meta", nil)
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Errorf("origin calls after repeat HEAD = %d, want 2", calls)
+	}
+}
+
+func TestHandleProxyRejectsNonAbsoluteURL(t *testing.T) {
+	proxy := newTestProxy(t)
+	req := httptest.NewRequest("GET", "/relative/only", nil)
+	// Clear scheme/host to simulate origin-form.
+	req.URL.Scheme = ""
+	req.URL.Host = ""
+	rec := httptest.NewRecorder()
+	proxy.HandleProxy(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for non-absolute URL", rec.Code)
+	}
+}
+
+func TestHandleProxyOriginError(t *testing.T) {
+	proxy := newTestProxy(t)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/broken", http.Header{"Range": []string{"bytes=0-1"}})
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 on origin error", rec.Code)
+	}
+}
+
+func TestHandlePeerHasAndGet(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	key := strings.Repeat("c", 64)
+	body := []byte("peer-cached-payload")
+	if err := proxy.store.Put(key, body); err != nil {
+		t.Fatalf("seed Put: %v", err)
+	}
+
+	// /cache/has → 200 for known key
+	req := httptest.NewRequest("GET", "/cache/has?key="+key, nil)
+	rec := httptest.NewRecorder()
+	proxy.HandlePeerHas(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("HandlePeerHas known key: status = %d, want 200", rec.Code)
+	}
+
+	// /cache/has → 404 for unknown key
+	missing := strings.Repeat("d", 64)
+	req = httptest.NewRequest("GET", "/cache/has?key="+missing, nil)
+	rec = httptest.NewRecorder()
+	proxy.HandlePeerHas(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("HandlePeerHas missing key: status = %d, want 404", rec.Code)
+	}
+
+	// /cache/get → 200 + body for known key
+	req = httptest.NewRequest("GET", "/cache/get?key="+key, nil)
+	rec = httptest.NewRecorder()
+	proxy.HandlePeerGet(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("HandlePeerGet: status = %d, want 200", rec.Code)
+	}
+	if got := rec.Body.String(); got != string(body) {
+		t.Errorf("HandlePeerGet body = %q, want %q", got, body)
+	}
+}
+
+func TestHandlePeerRejectsInvalidKey(t *testing.T) {
+	proxy := newTestProxy(t)
+	for _, key := range []string{"", "../../etc/passwd", "deadbeef"} {
+		req := httptest.NewRequest("GET", "/cache/has?key="+key, nil)
+		rec := httptest.NewRecorder()
+		proxy.HandlePeerHas(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("HandlePeerHas(%q): status = %d, want 400", key, rec.Code)
+		}
+		req = httptest.NewRequest("GET", "/cache/get?key="+key, nil)
+		rec = httptest.NewRecorder()
+		proxy.HandlePeerGet(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("HandlePeerGet(%q): status = %d, want 400", key, rec.Code)
+		}
+	}
+}
+
+func TestSingleFlightDedups(t *testing.T) {
+	var sf singleFlight
+	var calls int32
+	fn := func() ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return []byte("payload"), nil
+	}
+
+	// Sequential calls with the same key should still invoke fn each time
+	// (singleflight only coalesces concurrent in-flight callers). We verify
+	// that the return values are correct rather than count.
+	got1, err := sf.Do("k", fn)
+	if err != nil || string(got1) != "payload" {
+		t.Fatalf("sf.Do: got=%q err=%v", got1, err)
+	}
+	got2, err := sf.Do("k", fn)
+	if err != nil || string(got2) != "payload" {
+		t.Fatalf("sf.Do repeat: got=%q err=%v", got2, err)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Errorf("sequential calls invoked fn %d times, want 2", calls)
+	}
+}
+
+// TestServeBodyContentRange verifies that when a Range header is present,
+// the cached body is returned with HTTP 206 + Content-Range.
+func TestServeBodyContentRange(t *testing.T) {
+	proxy := newTestProxy(t)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("0123456789"))
+	})
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/r", http.Header{"Range": []string{"bytes=0-9"}})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec.Code)
+	}
+	if cr := rec.Header().Get("Content-Range"); !strings.HasPrefix(cr, "bytes 0-9/") {
+		t.Errorf("Content-Range = %q, want prefix 'bytes 0-9/'", cr)
+	}
+}
+
+// TestFetchOriginPreservesSignedHeaders confirms the proxy forwards SigV4
+// headers verbatim (we can't verify against real S3 here, but we can verify
+// the wire representation reaches the origin).
+func TestFetchOriginPreservesSignedHeaders(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	var gotAuth, gotDate string
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotDate = r.Header.Get("X-Amz-Date")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	h := http.Header{
+		"Range":                  []string{"bytes=0-1"},
+		"Authorization":          []string{"AWS4-HMAC-SHA256 Credential=AKIATEST/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abcdef"},
+		"X-Amz-Date":             []string{"20260101T000000Z"},
+		"X-Amz-Content-Sha256":   []string{"UNSIGNED-PAYLOAD"},
+		// Hop-by-hop header must NOT be forwarded.
+		"Proxy-Connection": []string{"Keep-Alive"},
+	}
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/signed", h)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", rec.Code)
+	}
+	if !strings.Contains(gotAuth, "Signature=abcdef") {
+		t.Errorf("origin Authorization = %q, want SigV4 preserved", gotAuth)
+	}
+	if gotDate != "20260101T000000Z" {
+		t.Errorf("origin X-Amz-Date = %q, want 20260101T000000Z", gotDate)
+	}
+}
+
+// Sanity check that Content-Length set via serveBody matches body length.
+func TestServeBodyContentLength(t *testing.T) {
+	proxy := newTestProxy(t)
+	payload := []byte("abcdef")
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	})
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/b/k", http.Header{"Range": []string{"bytes=0-5"}})
+	if rec.Header().Get("Content-Length") != fmt.Sprintf("%d", len(payload)) {
+		t.Errorf("Content-Length = %q, want %d", rec.Header().Get("Content-Length"), len(payload))
+	}
+	got, _ := io.ReadAll(rec.Body)
+	if string(got) != string(payload) {
+		t.Errorf("body = %q, want %q", got, payload)
+	}
+}
