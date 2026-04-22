@@ -1052,6 +1052,7 @@ func TestFlightAuthSessionStoreReconnectsDurableSessionByToken(t *testing.T) {
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to remain present")
+		return
 	}
 	if record.State != DurableSessionStateActive {
 		t.Fatalf("expected durable session to remain active, got %q", record.State)
@@ -1148,6 +1149,7 @@ func TestFlightAuthSessionStoreReconnectRefreshesDurableSessionMetadata(t *testi
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to be present")
+		return
 	}
 	if record.OwnerEpoch != 5 {
 		t.Fatalf("expected refreshed owner epoch 5, got %d", record.OwnerEpoch)
@@ -1214,6 +1216,7 @@ func TestFlightAuthSessionStoreReconnectFailureUpdatesDurableSessionState(t *tes
 			}
 			if record == nil {
 				t.Fatal("expected durable session record to remain present")
+				return
 			}
 			if record.State != tt.wantState {
 				t.Fatalf("expected durable session state %q, got %q", tt.wantState, record.State)

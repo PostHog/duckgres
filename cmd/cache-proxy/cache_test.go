@@ -96,7 +96,7 @@ func TestDiskCacheOpen(t *testing.T) {
 	if !ok {
 		t.Fatal("Open should find entry")
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	if size != int64(len(data)) {
 		t.Errorf("size = %d, want %d", size, len(data))
 	}

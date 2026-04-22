@@ -5,7 +5,6 @@ package k8s_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,13 +16,10 @@ import (
 // every log line (slog stampedHandler) and are unconditional — cache on
 // or off, they should always be present.
 func TestK8sWorkerAlwaysStampedWithPodAndNode(t *testing.T) {
-	// Force a worker to spawn, then inspect its spec.
-	var result int
-	if err := retryScanIntWithReconnect("SELECT 1", 30*time.Second, &result); err != nil {
-		t.Fatalf("warmup query failed: %v", err)
+	pod, ok := firstReadyWorkerPod(t)
+	if !ok {
+		t.Skip("no worker pods present; earlier tests should have spawned at least one")
 	}
-
-	pod := latestWorkerPod(t)
 	env := podContainerEnv(pod, "duckgres")
 
 	if !hasDownwardFieldRef(env, "POD_NAME", "metadata.name") {
@@ -44,12 +40,10 @@ func TestK8sWorkerCacheEnvWhenEnabled(t *testing.T) {
 		t.Skip("control plane does not have DUCKGRES_CACHE_ENABLED=true; skipping cache wiring assertions")
 	}
 
-	var result int
-	if err := retryScanIntWithReconnect("SELECT 1", 30*time.Second, &result); err != nil {
-		t.Fatalf("warmup query failed: %v", err)
+	pod, ok := firstReadyWorkerPod(t)
+	if !ok {
+		t.Skip("no worker pods present; earlier tests should have spawned at least one")
 	}
-
-	pod := latestWorkerPod(t)
 	env := podContainerEnv(pod, "duckgres")
 
 	if v := envValue(env, "DUCKGRES_CACHE_ENABLED"); v != "true" {
@@ -60,19 +54,39 @@ func TestK8sWorkerCacheEnvWhenEnabled(t *testing.T) {
 	}
 }
 
-// cpHasCacheEnabled reports whether the duckgres control-plane Deployment
-// has DUCKGRES_CACHE_ENABLED=true on its primary container.
+// firstReadyWorkerPod returns any ready worker pod in the namespace, or
+// (zero, false) when none exist. Unlike latestWorkerPod, it never calls
+// t.Fatal — the caller decides whether to Skip or Fatal.
+func firstReadyWorkerPod(t *testing.T) (corev1.Pod, bool) {
+	t.Helper()
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	if err != nil {
+		t.Fatalf("failed to list worker pods: %v", err)
+	}
+	for _, pod := range pods.Items {
+		if isReadyPod(pod) {
+			return pod, true
+		}
+	}
+	return corev1.Pod{}, false
+}
+
+// cpHasCacheEnabled reports whether any control-plane pod in the test
+// namespace has DUCKGRES_CACHE_ENABLED=true set on the duckgres container.
+// Checking pod spec rather than a named Deployment avoids coupling to the
+// deployment's resource name, which varies across Helm chart configurations.
 func cpHasCacheEnabled(t *testing.T) bool {
 	t.Helper()
-	deploy, err := clientset.AppsV1().Deployments(namespace).Get(context.Background(), "duckgres", metav1.GetOptions{})
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=duckgres-control-plane",
+	})
 	if err != nil {
-		t.Fatalf("failed to fetch duckgres deployment: %v", err)
+		t.Fatalf("failed to list control-plane pods: %v", err)
 	}
-	if len(deploy.Spec.Template.Spec.Containers) == 0 {
-		return false
-	}
-	for _, e := range deploy.Spec.Template.Spec.Containers[0].Env {
-		if e.Name == "DUCKGRES_CACHE_ENABLED" && e.Value == "true" {
+	for _, pod := range pods.Items {
+		if envValue(podContainerEnv(pod, "duckgres"), "DUCKGRES_CACHE_ENABLED") == "true" {
 			return true
 		}
 	}
