@@ -520,6 +520,7 @@ func TestK8sPoolActivateReservedWorkerRetiresOnFailure(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected activation failure")
+		return
 	}
 
 	time.Sleep(100 * time.Millisecond)
@@ -551,6 +552,7 @@ func TestK8sPoolReserveClaimedWorkerUnlocksPoolOnTransitionError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected transition error")
+		return
 	}
 
 	locked := make(chan struct{})
@@ -884,6 +886,7 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		if worker == nil {
 			t.Fatal("expected claimed worker for liveness check")
+			return
 		}
 		if worker.ID != 21 {
 			t.Fatalf("expected claimed worker id 21, got %d", worker.ID)
@@ -1093,6 +1096,7 @@ func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected unhealthy claimed worker to fail liveness recheck")
+		return
 	}
 	if claimed != nil {
 		t.Fatalf("expected no claimed worker, got %#v", claimed)
@@ -1392,6 +1396,7 @@ func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
 	}
 	if worker == nil {
 		t.Fatal("expected reserved worker")
+		return
 	}
 	if got := worker.SharedState().Lifecycle; got != WorkerLifecycleReserved {
 		t.Fatalf("expected reserved lifecycle after cold start, got %q", got)
@@ -1488,6 +1493,7 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 	if !found {
 		if createdWorkerPod == nil {
 			t.Fatal("expected worker pod create to be attempted before cleanup")
+			return
 		}
 		assertSpawnedWorkerPod(t, createdWorkerPod)
 	}
@@ -1623,6 +1629,7 @@ ducklake:
 `))
 	if err == nil {
 		t.Fatal("expected tenant runtime fields to be rejected in shared startup config")
+		return
 	}
 }
 
@@ -1655,6 +1662,7 @@ ducklake:
 `))
 	if err == nil {
 		t.Fatal("expected tenant runtime fields to be rejected")
+		return
 	}
 }
 

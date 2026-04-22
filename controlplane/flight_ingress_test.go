@@ -43,6 +43,7 @@ func TestOrgRoutedSessionProviderReconnectSessionUsesDurableOrgID(t *testing.T) 
 	})
 	if err == nil {
 		t.Fatal("expected reconnect to fail without a live org stack")
+		return
 	}
 	if pid != 0 {
 		t.Fatalf("expected pid 0 on failed reconnect, got %d", pid)

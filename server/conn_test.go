@@ -2918,6 +2918,7 @@ func TestParseCopyFromOptions_Binary(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error")
+					return
 				}
 				return
 			}
@@ -3055,6 +3056,7 @@ func TestDecodeBinaryCopy(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error")
+					return
 				}
 				return
 			}

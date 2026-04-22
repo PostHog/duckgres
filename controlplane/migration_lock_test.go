@@ -161,6 +161,7 @@ func TestActivatorClearsMigrationLockOnFailure(t *testing.T) {
 	err := activator.ActivateReservedWorker(context.Background(), worker)
 	if err == nil {
 		t.Fatal("expected error from ActivateReservedWorker")
+		return
 	}
 
 	if *clearOrg != "fail-org" {

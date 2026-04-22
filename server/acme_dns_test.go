@@ -37,11 +37,13 @@ func TestACMEDNSManagerRequiresFields(t *testing.T) {
 	_, err := NewACMEDNSManager("", "test@example.com", "Z123", t.TempDir())
 	if err == nil {
 		t.Fatal("expected error for empty domain")
+		return
 	}
 
 	_, err = NewACMEDNSManager("test.example.com", "test@example.com", "", t.TempDir())
 	if err == nil {
 		t.Fatal("expected error for empty zone ID")
+		return
 	}
 }
 

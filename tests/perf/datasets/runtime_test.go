@@ -31,6 +31,7 @@ func TestResolveRuntimeContractFailsForMissingRequestedVersion(t *testing.T) {
 	_, err := ResolveRuntimeContract("")
 	if err == nil {
 		t.Fatalf("expected missing requested version to fail")
+		return
 	}
 	if !strings.Contains(err.Error(), "not found in manifest") {
 		t.Fatalf("expected manifest version error, got %v", err)

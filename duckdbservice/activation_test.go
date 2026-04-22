@@ -345,5 +345,6 @@ func TestSessionPoolValidateControlMetadataRejectsMismatchedWorkerID(t *testing.
 	})
 	if err == nil {
 		t.Fatal("expected mismatched worker_id to be rejected")
+		return
 	}
 }

@@ -60,6 +60,7 @@ queries:
 	_, err := ParseCatalog([]byte(raw))
 	if err == nil {
 		t.Fatalf("expected duplicate query_id to fail")
+		return
 	}
 	if !strings.Contains(err.Error(), "duplicate query_id") {
 		t.Fatalf("expected duplicate query_id error, got %v", err)
@@ -96,6 +97,7 @@ func TestValidateReadOnlyCatalogRejectsNonSelectQueries(t *testing.T) {
 	err := ValidateReadOnlyCatalog(catalog)
 	if err == nil {
 		t.Fatalf("expected non-select query to fail")
+		return
 	}
 	if !strings.Contains(err.Error(), "SELECT-only") {
 		t.Fatalf("expected SELECT-only error, got %v", err)

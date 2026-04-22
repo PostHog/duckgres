@@ -96,6 +96,7 @@ func TestNetworkPolicyManifestRestrictsWorkerIngressAndEgressAndProtectsControlP
 		spec, _ := doc["spec"].(map[string]any)
 		if spec == nil {
 			t.Fatal("worker network policy missing spec")
+			return
 		}
 		egress, _ := spec["egress"].([]any)
 		for _, rule := range egress {

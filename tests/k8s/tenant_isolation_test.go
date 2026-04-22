@@ -56,6 +56,7 @@ func TestK8sTenantIsolation_DifferentTenantsSeeDistinctCatalogs(t *testing.T) {
 	}
 	if billingMissingErr == nil {
 		t.Fatalf("expected billing not to read analytics table, got %d rows", billingSeesAnalytics)
+		return
 	}
 	if err := retryDBOperationWithReconnectAs("billing", "postgres", 30*time.Second, "create billing table", func(ctx context.Context, db *sql.DB) error {
 		_, err := db.ExecContext(ctx, "CREATE OR REPLACE TABLE "+billingTable+" AS SELECT 11 AS value")
@@ -82,6 +83,7 @@ func TestK8sTenantIsolation_DifferentTenantsSeeDistinctCatalogs(t *testing.T) {
 	}
 	if analyticsMissingErr == nil {
 		t.Fatalf("expected analytics not to read billing table, got %d rows", analyticsSeesBilling)
+		return
 	}
 }
 
