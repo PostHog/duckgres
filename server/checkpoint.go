@@ -33,9 +33,9 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 	}
 
 	extDir := filepath.Join(cfg.DataDir, "extensions")
-	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
+	if err := configureExtensionDirectory(db, bundledDuckDBExtensionsDir, extDir, "checkpoint"); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("checkpoint: set extension_directory: %w", err)
+		return nil, err
 	}
 
 	if _, err := db.Exec("INSTALL ducklake; LOAD ducklake"); err != nil {

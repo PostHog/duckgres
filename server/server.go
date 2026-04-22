@@ -873,11 +873,8 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
 	// for autoloading/installing extensions.
 	extDir := filepath.Join(cfg.DataDir, "extensions")
-	if err := seedBundledExtensions(bundledDuckDBExtensionsDir, extDir); err != nil {
-		slog.Warn("Failed to seed bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", extDir, "error", err)
-	}
-	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
-		slog.Warn("Failed to set DuckDB extension_directory.", "extension_directory", extDir, "error", err)
+	if err := configureExtensionDirectory(db, bundledDuckDBExtensionsDir, extDir, "openBaseDB"); err != nil {
+		slog.Warn("Failed to configure DuckDB extension_directory.", "extension_directory", extDir, "error", err)
 	} else {
 		slog.Debug("Set DuckDB extension_directory.", "extension_directory", extDir)
 	}
@@ -977,6 +974,16 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 
 		return copyFile(path, dstPath, info.Mode().Perm())
 	})
+}
+
+func configureExtensionDirectory(db *sql.DB, bundledSrcRoot, extDir, scope string) error {
+	if err := seedBundledExtensions(bundledSrcRoot, extDir); err != nil {
+		return fmt.Errorf("%s: seed bundled extensions: %w", scope, err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
+		return fmt.Errorf("%s: set extension_directory: %w", scope, err)
+	}
+	return nil
 }
 
 func shouldRefreshBundledExtension(srcPath string) bool {

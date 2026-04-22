@@ -1,9 +1,12 @@
 package server
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
+
+	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 func TestSeedBundledExtensionsCopiesMissingFiles(t *testing.T) {
@@ -142,5 +145,62 @@ func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
 	}
 	if string(got) != "existing-httpfs" {
 		t.Fatalf("expected non-targeted extension to be preserved, got %q", string(got))
+	}
+}
+
+func TestConfigureExtensionDirectorySeedsBundledExtensions(t *testing.T) {
+	bundledRoot := t.TempDir()
+	extDir := t.TempDir()
+
+	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("nightly"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := configureExtensionDirectory(db, bundledRoot, extDir, "test"); err != nil {
+		t.Fatalf("configureExtensionDirectory: %v", err)
+	}
+
+	dstExt := filepath.Join(extDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "nightly" {
+		t.Fatalf("expected seeded extension to match bundled contents, got %q", string(got))
+	}
+}
+
+func TestConfigureExtensionDirectorySetsDuckDBExtensionDirectory(t *testing.T) {
+	bundledRoot := t.TempDir()
+	extDir := t.TempDir()
+
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := configureExtensionDirectory(db, bundledRoot, extDir, "test"); err != nil {
+		t.Fatalf("configureExtensionDirectory: %v", err)
+	}
+
+	var got string
+	row := db.QueryRow("SELECT current_setting('extension_directory')")
+	if err := row.Scan(&got); err != nil {
+		t.Fatalf("scan extension_directory: %v", err)
+	}
+	if got != extDir {
+		t.Fatalf("extension_directory = %q, want %q", got, extDir)
 	}
 }
