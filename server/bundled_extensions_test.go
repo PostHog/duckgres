@@ -109,3 +109,38 @@ func TestSeedBundledExtensionsReplacesExistingFilesWithUpdatedContents(t *testin
 		t.Fatalf("expected existing extension to be replaced, got %q", string(got))
 	}
 }
+
+func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
+	srcRoot := t.TempDir()
+	dstRoot := t.TempDir()
+
+	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "httpfs.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("new-httpfs"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	dstDir := filepath.Join(dstRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	dstExt := filepath.Join(dstDir, "httpfs.duckdb_extension")
+	if err := os.WriteFile(dstExt, []byte("existing-httpfs"), 0o644); err != nil {
+		t.Fatalf("write dst extension: %v", err)
+	}
+
+	if err := seedBundledExtensions(srcRoot, dstRoot); err != nil {
+		t.Fatalf("seedBundledExtensions: %v", err)
+	}
+
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "existing-httpfs" {
+		t.Fatalf("expected non-targeted extension to be preserved, got %q", string(got))
+	}
+}

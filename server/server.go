@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"database/sql"
@@ -969,11 +968,7 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 			return err
 		}
 		if _, err := os.Stat(dstPath); err == nil {
-			same, err := filesEqual(path, dstPath)
-			if err != nil {
-				return err
-			}
-			if same {
+			if !shouldRefreshBundledExtension(path) {
 				return nil
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -984,52 +979,8 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 	})
 }
 
-func filesEqual(srcPath, dstPath string) (bool, error) {
-	srcInfo, err := os.Stat(srcPath)
-	if err != nil {
-		return false, err
-	}
-	dstInfo, err := os.Stat(dstPath)
-	if err != nil {
-		return false, err
-	}
-	if srcInfo.Size() != dstInfo.Size() {
-		return false, nil
-	}
-
-	srcFile, err := os.Open(srcPath)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = srcFile.Close() }()
-
-	dstFile, err := os.Open(dstPath)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = dstFile.Close() }()
-
-	srcBuf := make([]byte, 32*1024)
-	dstBuf := make([]byte, 32*1024)
-	for {
-		srcN, srcErr := srcFile.Read(srcBuf)
-		dstN, dstErr := dstFile.Read(dstBuf)
-		if srcN != dstN {
-			return false, nil
-		}
-		if srcN > 0 && !bytes.Equal(srcBuf[:srcN], dstBuf[:dstN]) {
-			return false, nil
-		}
-		if errors.Is(srcErr, io.EOF) && errors.Is(dstErr, io.EOF) {
-			return true, nil
-		}
-		if srcErr != nil && !errors.Is(srcErr, io.EOF) {
-			return false, srcErr
-		}
-		if dstErr != nil && !errors.Is(dstErr, io.EOF) {
-			return false, dstErr
-		}
-	}
+func shouldRefreshBundledExtension(srcPath string) bool {
+	return filepath.Base(srcPath) == "postgres_scanner.duckdb_extension"
 }
 
 func copyFile(srcPath, dstPath string, mode os.FileMode) error {
@@ -1212,7 +1163,7 @@ func parseExtensionName(ext string) (name, installCmd string) {
 }
 
 func installExtensionStatement(installCmd string) string {
-	if strings.Contains(strings.ToUpper(installCmd), " FROM ") {
+	if strings.EqualFold(strings.TrimSpace(installCmd), PostgresCoreNightlyExtension) {
 		return "FORCE INSTALL " + installCmd
 	}
 	return "INSTALL " + installCmd

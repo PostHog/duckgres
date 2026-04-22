@@ -138,9 +138,14 @@ func TestInstallExtensionStatement(t *testing.T) {
 			want:       "INSTALL ducklake",
 		},
 		{
-			name:       "explicit repository uses force install",
+			name:       "nightly postgres uses force install",
 			installCmd: "postgres FROM core_nightly",
 			want:       "FORCE INSTALL postgres FROM core_nightly",
+		},
+		{
+			name:       "other explicit repositories still use install",
+			installCmd: "cache_httpfs FROM community",
+			want:       "INSTALL cache_httpfs FROM community",
 		},
 	}
 
