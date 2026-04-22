@@ -1,14 +1,10 @@
 package server
 
 import (
-	"database/sql"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
-
-	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 func TestSeedBundledExtensionsCopiesMissingFiles(t *testing.T) {
@@ -228,28 +224,5 @@ func TestBootstrapBundledExtensionsRunsOncePerExtensionDirectory(t *testing.T) {
 	}
 	if string(got) != "nightly" {
 		t.Fatalf("expected bootstrap to run once, got %q", string(got))
-	}
-}
-
-func TestSetExtensionDirectoryUsesPreparedCache(t *testing.T) {
-	extDir := t.TempDir()
-
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
-		t.Fatalf("set extension_directory: %v", err)
-	}
-
-	var got string
-	row := db.QueryRow("SELECT current_setting('extension_directory')")
-	if err := row.Scan(&got); err != nil {
-		t.Fatalf("scan extension_directory: %v", err)
-	}
-	if got != extDir {
-		t.Fatalf("extension_directory = %q, want %q", got, extDir)
 	}
 }

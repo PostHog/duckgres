@@ -148,8 +148,6 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Configure DuckLake if enabled
 	if harnessCfg.UseDuckLake {
-		cfg.Extensions = []string{"ducklake"}
-
 		metadataPort := harnessCfg.DuckLakeMetadataPort
 
 		// If latency injection is requested, start a TCP proxy in front of the
