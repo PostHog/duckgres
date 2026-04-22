@@ -122,7 +122,7 @@ func waitForCacheProxy() {
 	for {
 		resp, err := client.Get(url)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				slog.Info("Cache proxy is ready.", "wait_duration", time.Since(start))
 				return
