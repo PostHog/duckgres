@@ -148,9 +148,7 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Configure DuckLake if enabled
 	if harnessCfg.UseDuckLake {
-		// Try the upstream postgres_scanner fix from core_nightly in the
-		// DuckLake-backed integration harness without changing global defaults.
-		cfg.Extensions = []string{server.PostgresCoreNightlyExtension, "ducklake"}
+		cfg.Extensions = []string{"ducklake"}
 
 		metadataPort := harnessCfg.DuckLakeMetadataPort
 

@@ -112,20 +112,6 @@ func TestParseExtensionName(t *testing.T) {
 	}
 }
 
-func TestPostgresCoreNightlyExtension(t *testing.T) {
-	if PostgresCoreNightlyExtension != "postgres FROM core_nightly" {
-		t.Fatalf("PostgresCoreNightlyExtension = %q, want %q", PostgresCoreNightlyExtension, "postgres FROM core_nightly")
-	}
-
-	name, installCmd := parseExtensionName(PostgresCoreNightlyExtension)
-	if name != "postgres" {
-		t.Fatalf("parseExtensionName(%q) name = %q, want %q", PostgresCoreNightlyExtension, name, "postgres")
-	}
-	if installCmd != PostgresCoreNightlyExtension {
-		t.Fatalf("parseExtensionName(%q) installCmd = %q, want %q", PostgresCoreNightlyExtension, installCmd, PostgresCoreNightlyExtension)
-	}
-}
-
 func TestInstallExtensionStatement(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -138,9 +124,9 @@ func TestInstallExtensionStatement(t *testing.T) {
 			want:       "INSTALL ducklake",
 		},
 		{
-			name:       "nightly postgres uses force install",
+			name:       "nightly postgres still uses plain install",
 			installCmd: "postgres FROM core_nightly",
-			want:       "FORCE INSTALL postgres FROM core_nightly",
+			want:       "INSTALL postgres FROM core_nightly",
 		},
 		{
 			name:       "other explicit repositories still use install",
