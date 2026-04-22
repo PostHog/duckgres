@@ -151,9 +151,9 @@ func main() {
 
 	// Start servers
 	go func() {
-		slog.Info("S3 proxy listening.", "addr", listenAddr)
+		slog.Info("Forward HTTP proxy listening.", "addr", listenAddr)
 		if err := s3Server.ListenAndServe(); err != http.ErrServerClosed {
-			slog.Error("S3 proxy error.", "error", err)
+			slog.Error("Forward HTTP proxy error.", "error", err)
 		}
 	}()
 	go func() {
