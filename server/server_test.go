@@ -20,6 +20,33 @@ type mockRefreshExecer struct {
 	secretErrFn   func(callNum int) error
 }
 
+type mockDuckLakeExecer struct {
+	mu        sync.Mutex
+	errs      []error
+	queries   []string
+	execCalls int
+}
+
+func (m *mockDuckLakeExecer) Exec(query string, _ ...any) (sql.Result, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.queries = append(m.queries, query)
+	m.execCalls++
+	if len(m.errs) == 0 {
+		return nil, nil
+	}
+	err := m.errs[0]
+	m.errs = m.errs[1:]
+	return nil, err
+}
+
+func (m *mockDuckLakeExecer) calls() (int, []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	queries := append([]string(nil), m.queries...)
+	return m.execCalls, queries
+}
+
 func (m *mockRefreshExecer) ExecContext(_ context.Context, query string, _ ...any) (sql.Result, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -141,22 +168,20 @@ func TestBuildDuckLakePreAttachStatements(t *testing.T) {
 	}{
 		{
 			name: "default disables metadata tls cache",
-			cfg: DuckLakeConfig{
-				DisableMetadataThreadLocalCache: true,
-			},
+			cfg:  DuckLakeConfig{},
 			want: []string{"SET GLOBAL pg_pool_enable_thread_local_cache = false"},
 		},
 		{
 			name: "disable metadata tls cache",
 			cfg: DuckLakeConfig{
-				DisableMetadataThreadLocalCache: true,
+				DisableMetadataThreadLocalCache: boolPtr(true),
 			},
 			want: []string{"SET GLOBAL pg_pool_enable_thread_local_cache = false"},
 		},
 		{
 			name: "explicitly keep metadata tls cache enabled",
 			cfg: DuckLakeConfig{
-				DisableMetadataThreadLocalCache: false,
+				DisableMetadataThreadLocalCache: boolPtr(false),
 			},
 			want: nil,
 		},
@@ -206,6 +231,66 @@ func TestIsMissingDuckLakePoolSettingError(t *testing.T) {
 				t.Fatalf("isMissingDuckLakePoolSettingError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestApplyDuckLakePreAttachSettingsWith_IgnoresUnsupportedSettingWhenLoaderFails(t *testing.T) {
+	execer := &mockDuckLakeExecer{
+		errs: []error{
+			errors.New("Catalog Error: unrecognized configuration parameter \"pg_pool_enable_thread_local_cache\""),
+		},
+	}
+
+	loadCalls := 0
+	err := applyDuckLakePreAttachSettingsWith(execer, func() error {
+		loadCalls++
+		return errors.New("offline")
+	}, DuckLakeConfig{DisableMetadataThreadLocalCache: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("expected unsupported pre-attach setting to be best-effort, got %v", err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("expected one load attempt, got %d", loadCalls)
+	}
+	if calls, _ := execer.calls(); calls != 1 {
+		t.Fatalf("expected one exec attempt, got %d", calls)
+	}
+}
+
+func TestApplyDuckLakePreAttachSettingsWith_IgnoresUnsupportedSettingAfterLoad(t *testing.T) {
+	execer := &mockDuckLakeExecer{
+		errs: []error{
+			errors.New("Catalog Error: unrecognized configuration parameter \"pg_pool_enable_thread_local_cache\""),
+			errors.New("Catalog Error: unrecognized configuration parameter \"pg_pool_enable_thread_local_cache\""),
+		},
+	}
+
+	loadCalls := 0
+	err := applyDuckLakePreAttachSettingsWith(execer, func() error {
+		loadCalls++
+		return nil
+	}, DuckLakeConfig{DisableMetadataThreadLocalCache: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("expected unsupported pre-attach setting to be ignored after load retry, got %v", err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("expected one load attempt, got %d", loadCalls)
+	}
+	if calls, _ := execer.calls(); calls != 2 {
+		t.Fatalf("expected two exec attempts, got %d", calls)
+	}
+}
+
+func TestConfigureDuckLakeMetadataPoolRunsExpectedStatement(t *testing.T) {
+	execer := &mockDuckLakeExecer{}
+	configureDuckLakeMetadataPool(execer)
+
+	calls, queries := execer.calls()
+	if calls != 1 {
+		t.Fatalf("expected one pool-config exec, got %d", calls)
+	}
+	if len(queries) != 1 || !strings.Contains(queries[0], "postgres_configure_pool") {
+		t.Fatalf("expected postgres_configure_pool statement, got %v", queries)
 	}
 }
 

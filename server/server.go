@@ -261,7 +261,8 @@ type DuckLakeConfig struct {
 	// connection caching for the hidden DuckLake metadata pool as early as
 	// possible, before ATTACH creates that pool. This trades some warm-reuse
 	// performance for a lower retained metadata-connection footprint.
-	DisableMetadataThreadLocalCache bool
+	// Nil means use the server default (enabled).
+	DisableMetadataThreadLocalCache *bool
 
 	// ObjectStore is the S3-compatible storage path for DuckLake data files
 	// Format: "s3://bucket/path/" for S3/MinIO
@@ -1180,12 +1181,25 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 	return lastErr
 }
 
+func boolPtr(v bool) *bool { return &v }
+
+func duckLakeDisableMetadataThreadLocalCacheEnabled(dlCfg DuckLakeConfig) bool {
+	if dlCfg.DisableMetadataThreadLocalCache == nil {
+		return true
+	}
+	return *dlCfg.DisableMetadataThreadLocalCache
+}
+
 func buildDuckLakePreAttachStatements(dlCfg DuckLakeConfig) []string {
 	var statements []string
-	if dlCfg.DisableMetadataThreadLocalCache {
+	if duckLakeDisableMetadataThreadLocalCacheEnabled(dlCfg) {
 		statements = append(statements, "SET GLOBAL pg_pool_enable_thread_local_cache = false")
 	}
 	return statements
+}
+
+type duckLakeSQLExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
 }
 
 func isMissingDuckLakePoolSettingError(err error) bool {
@@ -1196,7 +1210,7 @@ func isMissingDuckLakePoolSettingError(err error) bool {
 	return strings.Contains(msg, "unrecognized configuration parameter")
 }
 
-func applyDuckLakePreAttachSettings(db *sql.DB, dlCfg DuckLakeConfig) error {
+func applyDuckLakePreAttachSettingsWith(db duckLakeSQLExecer, loadPostgresScanner func() error, dlCfg DuckLakeConfig) error {
 	statements := buildDuckLakePreAttachStatements(dlCfg)
 	if len(statements) == 0 {
 		return nil
@@ -1205,10 +1219,17 @@ func applyDuckLakePreAttachSettings(db *sql.DB, dlCfg DuckLakeConfig) error {
 	for _, stmt := range statements {
 		if _, err := db.Exec(stmt); err != nil {
 			if isMissingDuckLakePoolSettingError(err) {
-				if loadErr := LoadExtensions(db, []string{"postgres_scanner"}); loadErr != nil {
-					return fmt.Errorf("load postgres_scanner for pre-attach settings: %w", loadErr)
+				if loadErr := loadPostgresScanner(); loadErr != nil {
+					slog.Warn("DuckLake pre-attach pool setting unavailable; continuing without it.",
+						"statement", stmt, "error", loadErr)
+					continue
 				}
 				if _, retryErr := db.Exec(stmt); retryErr != nil {
+					if isMissingDuckLakePoolSettingError(retryErr) {
+						slog.Warn("DuckLake pre-attach pool setting still unavailable after loading postgres_scanner; continuing without it.",
+							"statement", stmt, "error", retryErr)
+						continue
+					}
 					return fmt.Errorf("apply DuckLake pre-attach setting %q after loading postgres_scanner: %w", stmt, retryErr)
 				}
 				continue
@@ -1217,6 +1238,24 @@ func applyDuckLakePreAttachSettings(db *sql.DB, dlCfg DuckLakeConfig) error {
 		}
 	}
 	return nil
+}
+
+func applyDuckLakePreAttachSettings(db *sql.DB, dlCfg DuckLakeConfig) error {
+	return applyDuckLakePreAttachSettingsWith(db, func() error {
+		return LoadExtensions(db, []string{"postgres_scanner"})
+	}, dlCfg)
+}
+
+func configureDuckLakeMetadataPool(db duckLakeSQLExecer) {
+	_, err := db.Exec(`SELECT * FROM postgres_configure_pool(
+		catalog_name := '__ducklake_metadata_ducklake',
+		enable_reaper_thread := true,
+		idle_timeout_millis := 60000,
+		max_lifetime_millis := 600000
+	)`)
+	if err != nil {
+		slog.Warn("Failed to configure DuckLake metadata pg pool.", "error", err)
+	}
 }
 
 // hasCacheHTTPFS checks if cache_httpfs is in the extensions list.
@@ -1387,17 +1426,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// SET GLOBAL only affects pools created after it runs, so would be a no-op here.
 	// See: https://github.com/duckdb/ducklake/issues/1031 and
 	// https://github.com/duckdb/duckdb-postgres/pull/430
-	rows, err := db.Query(`SELECT * FROM postgres_configure_pool(
-		catalog_name := '__ducklake_metadata_ducklake',
-		enable_reaper_thread := true,
-		idle_timeout_millis := 60000,
-		max_lifetime_millis := 600000
-	)`)
-	if err != nil {
-		slog.Warn("Failed to configure DuckLake metadata pg pool.", "error", err)
-	} else {
-		_ = rows.Close()
-	}
+	configureDuckLakeMetadataPool(db)
 
 	// Ensure performance indexes exist on the DuckLake metadata tables.
 	// Run in a goroutine so it doesn't block the DuckLake semaphore or

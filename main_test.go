@@ -139,7 +139,7 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	if !resolved.Server.DuckLake.S3UseSSL {
 		t.Fatalf("invalid env S3_USE_SSL should not override valid file value")
 	}
-	if !resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatalf("invalid env disable_metadata_thread_local_cache should not override valid file value")
 	}
 	if resolved.Server.IdleTimeout != 45*time.Minute {
@@ -175,7 +175,7 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCache(t *testin
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
-	if !resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected ducklake.disable_metadata_thread_local_cache from YAML to be true")
 	}
 
@@ -183,20 +183,20 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCache(t *testin
 		"DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE": "false",
 	}
 	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
-	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || *resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected env false to override file true for ducklake.disable_metadata_thread_local_cache")
 	}
 
 	env["DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE"] = "true"
 	resolved = resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(env), nil)
-	if !resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected env true to enable ducklake.disable_metadata_thread_local_cache")
 	}
 }
 
 func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCacheDefaultsTrue(t *testing.T) {
 	resolved := resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(nil), nil)
-	if !resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected ducklake.disable_metadata_thread_local_cache to default to true")
 	}
 
@@ -206,7 +206,7 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCacheDefaultsTr
 			DisableMetadataThreadLocalCache: &disabled,
 		},
 	}, configCLIInputs{}, envFromMap(nil), nil)
-	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || *resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected YAML false to disable ducklake.disable_metadata_thread_local_cache")
 	}
 }
