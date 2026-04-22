@@ -134,6 +134,7 @@ func TestProvisionCreatesWarehouse(t *testing.T) {
 	w := store.warehouses["analytics"]
 	if w == nil {
 		t.Fatal("expected warehouse to be created")
+		return
 	}
 	if w.State != configstore.ManagedWarehouseStatePending {
 		t.Fatalf("expected state pending, got %q", w.State)

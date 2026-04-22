@@ -970,6 +970,7 @@ func TestFlightAuthSessionStorePersistsDurableSessionRecordOnCreate(t *testing.T
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to be persisted")
+		return
 	}
 	if record.Username != "postgres" {
 		t.Fatalf("expected username postgres, got %q", record.Username)
