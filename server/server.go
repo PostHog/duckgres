@@ -1146,6 +1146,10 @@ func parseExtensionName(ext string) (name, installCmd string) {
 	return ext, ext
 }
 
+// PostgresCoreNightlyExtension installs the DuckDB Postgres extension from the
+// core_nightly repository while still loading it under its canonical name.
+const PostgresCoreNightlyExtension = "postgres FROM core_nightly"
+
 // LoadExtensions installs and loads DuckDB extensions.
 // This is a standalone function so it can be reused by control plane workers.
 // Extension strings can include a source, e.g. "cache_httpfs FROM community".
@@ -1242,7 +1246,7 @@ func applyDuckLakePreAttachSettingsWith(db duckLakeSQLExecer, loadPostgresScanne
 
 func applyDuckLakePreAttachSettings(db *sql.DB, dlCfg DuckLakeConfig) error {
 	return applyDuckLakePreAttachSettingsWith(db, func() error {
-		return LoadExtensions(db, []string{"postgres_scanner"})
+		return LoadExtensions(db, []string{PostgresCoreNightlyExtension})
 	}, dlCfg)
 }
 

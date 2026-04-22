@@ -112,6 +112,20 @@ func TestParseExtensionName(t *testing.T) {
 	}
 }
 
+func TestPostgresCoreNightlyExtension(t *testing.T) {
+	if PostgresCoreNightlyExtension != "postgres FROM core_nightly" {
+		t.Fatalf("PostgresCoreNightlyExtension = %q, want %q", PostgresCoreNightlyExtension, "postgres FROM core_nightly")
+	}
+
+	name, installCmd := parseExtensionName(PostgresCoreNightlyExtension)
+	if name != "postgres" {
+		t.Fatalf("parseExtensionName(%q) name = %q, want %q", PostgresCoreNightlyExtension, name, "postgres")
+	}
+	if installCmd != PostgresCoreNightlyExtension {
+		t.Fatalf("parseExtensionName(%q) installCmd = %q, want %q", PostgresCoreNightlyExtension, installCmd, PostgresCoreNightlyExtension)
+	}
+}
+
 func TestNeedsCredentialRefresh(t *testing.T) {
 	tests := []struct {
 		name string
