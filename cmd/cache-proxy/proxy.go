@@ -316,8 +316,8 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 // HandlePeerHas responds to "do you have this cache key?" from peers.
 func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
-	if key == "" {
-		http.Error(w, "missing key", http.StatusBadRequest)
+	if !IsValidCacheKey(key) {
+		http.Error(w, "invalid key", http.StatusBadRequest)
 		return
 	}
 	if p.store.Has(key) {
@@ -330,8 +330,8 @@ func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
 // HandlePeerGet returns cached data to a peer.
 func (p *CacheProxy) HandlePeerGet(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
-	if key == "" {
-		http.Error(w, "missing key", http.StatusBadRequest)
+	if !IsValidCacheKey(key) {
+		http.Error(w, "invalid key", http.StatusBadRequest)
 		return
 	}
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"sync"
 	"syscall"
@@ -15,6 +16,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+// validCacheKey matches the 64-hex-digit output of CacheKey (sha256 hex).
+// Cache keys arrive from untrusted peers via HTTP query params; anything
+// that isn't a clean hex digest is rejected to prevent filepath traversal
+// when composing the on-disk path.
+var validCacheKey = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// IsValidCacheKey returns true if key is a 64-char lowercase hex string.
+func IsValidCacheKey(key string) bool {
+	return validCacheKey.MatchString(key)
+}
 
 var (
 	cacheHitsTotal = promauto.NewCounter(prometheus.CounterOpts{
@@ -132,6 +144,9 @@ func (c *DiskCache) scanExisting() {
 
 // Has returns true if the cache contains the given key.
 func (c *DiskCache) Has(key string) bool {
+	if !IsValidCacheKey(key) {
+		return false
+	}
 	path := filepath.Join(c.dir, key)
 	_, err := os.Stat(path)
 	return err == nil
@@ -139,6 +154,9 @@ func (c *DiskCache) Has(key string) bool {
 
 // Get returns the cached data for the given key, or nil if not found.
 func (c *DiskCache) Get(key string) ([]byte, bool) {
+	if !IsValidCacheKey(key) {
+		return nil, false
+	}
 	path := filepath.Join(c.dir, key)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -155,6 +173,9 @@ func (c *DiskCache) Get(key string) ([]byte, bool) {
 
 // Put stores data in the cache, evicting old entries if needed.
 func (c *DiskCache) Put(key string, data []byte) error {
+	if !IsValidCacheKey(key) {
+		return fmt.Errorf("invalid cache key")
+	}
 	size := int64(len(data))
 
 	c.mu.Lock()
@@ -184,6 +205,9 @@ func (c *DiskCache) Put(key string, data []byte) error {
 
 // Open returns a reader for the cached data. Caller must close it.
 func (c *DiskCache) Open(key string) (io.ReadCloser, int64, bool) {
+	if !IsValidCacheKey(key) {
+		return nil, 0, false
+	}
 	path := filepath.Join(c.dir, key)
 	f, err := os.Open(path)
 	if err != nil {
