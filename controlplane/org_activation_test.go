@@ -112,6 +112,7 @@ func TestSharedWorkerActivatorRequiresManagedWarehouse(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected missing warehouse to fail")
+		return
 	}
 }
 
@@ -274,6 +275,7 @@ func TestSharedWorkerActivatorDucklingCRRequiresSTSBroker(t *testing.T) {
 	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "test-org"})
 	if err == nil {
 		t.Fatal("expected shared warm activation to fail without an STS broker")
+		return
 	}
 }
 
@@ -398,6 +400,7 @@ func TestSharedWorkerActivatorRejectsSecretRefOutsideTenantScope(t *testing.T) {
 	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
 	if err == nil {
 		t.Fatal("expected cross-tenant secret ref to be rejected")
+		return
 	}
 }
 
@@ -428,6 +431,7 @@ func TestSharedWorkerActivatorRejectsSecretRefOutsideTenantPrefix(t *testing.T) 
 	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
 	if err == nil {
 		t.Fatal("expected non-org-prefixed secret ref to be rejected")
+		return
 	}
 }
 
@@ -454,6 +458,7 @@ func TestSharedWorkerActivatorRejectsSecretRefWithoutTenantNamespace(t *testing.
 	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
 	if err == nil {
 		t.Fatal("expected secret ref without tenant namespace to be rejected")
+		return
 	}
 }
 
@@ -483,6 +488,7 @@ func TestSharedWorkerActivatorRejectsSecretRefWithoutExplicitNamespace(t *testin
 	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
 	if err == nil {
 		t.Fatal("expected secret ref without explicit namespace to be rejected")
+		return
 	}
 	if !strings.Contains(err.Error(), "SecretRef.Namespace") {
 		t.Fatalf("expected explicit namespace guidance, got %v", err)
@@ -501,6 +507,7 @@ func TestSharedWorkerActivatorReadSecretValueRejectsBlankNamespace(t *testing.T)
 	})
 	if err == nil {
 		t.Fatal("expected blank secret namespace to be rejected")
+		return
 	}
 	if !strings.Contains(err.Error(), "SecretRef.Namespace") {
 		t.Fatalf("expected explicit namespace guidance, got %v", err)
@@ -534,5 +541,6 @@ func TestSharedWorkerActivatorRejectsSecretRefWithOnlySubstringOrgMatch(t *testi
 	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "analytics"})
 	if err == nil {
 		t.Fatal("expected substring-only org match to be rejected")
+		return
 	}
 }

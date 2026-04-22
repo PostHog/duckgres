@@ -498,6 +498,7 @@ func TestBeginTransactionPublishesTxnStateBeforeConcurrentRecoveryDecidesRollbac
 	case callErr := <-interloperDone:
 		if callErr == nil {
 			t.Fatal("expected interloper to see aborted-transaction error")
+			return
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for interloper call")
@@ -569,6 +570,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithoutBasicAuth(t *te
 	}
 	if got == nil {
 		t.Fatalf("expected non-nil session")
+		return
 	}
 	if got != s {
 		t.Fatalf("expected existing token session to be reused")
@@ -852,6 +854,7 @@ func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T
 		}
 		if issued == nil {
 			t.Fatalf("expected non-nil issued session")
+			return
 		}
 		if strings.TrimSpace(issued.token) == "" {
 			t.Fatalf("expected non-empty issued token")
@@ -970,6 +973,7 @@ func TestFlightAuthSessionStorePersistsDurableSessionRecordOnCreate(t *testing.T
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to be persisted")
+		return
 	}
 	if record.Username != "postgres" {
 		t.Fatalf("expected username postgres, got %q", record.Username)
@@ -1051,6 +1055,7 @@ func TestFlightAuthSessionStoreReconnectsDurableSessionByToken(t *testing.T) {
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to remain present")
+		return
 	}
 	if record.State != DurableSessionStateActive {
 		t.Fatalf("expected durable session to remain active, got %q", record.State)
@@ -1147,6 +1152,7 @@ func TestFlightAuthSessionStoreReconnectRefreshesDurableSessionMetadata(t *testi
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to be present")
+		return
 	}
 	if record.OwnerEpoch != 5 {
 		t.Fatalf("expected refreshed owner epoch 5, got %d", record.OwnerEpoch)
@@ -1213,6 +1219,7 @@ func TestFlightAuthSessionStoreReconnectFailureUpdatesDurableSessionState(t *tes
 			}
 			if record == nil {
 				t.Fatal("expected durable session record to remain present")
+				return
 			}
 			if record.State != tt.wantState {
 				t.Fatalf("expected durable session state %q, got %q", tt.wantState, record.State)
@@ -1472,6 +1479,7 @@ func TestNewControlPlaneFlightSQLHandlerReturnsError(t *testing.T) {
 	}
 	if h == nil {
 		t.Fatalf("expected non-nil handler")
+		return
 	}
 }
 
@@ -1520,6 +1528,7 @@ func TestSessionFromContextSuccessIncrementsIngressSessionOutcomeMetric(t *testi
 	}
 	if s == nil {
 		t.Fatalf("expected non-nil session")
+		return
 	}
 	if after-before != 1 {
 		t.Fatalf("expected duckgres_flight_ingress_sessions_total{outcome=created} delta 1, got %.0f", after-before)
@@ -1536,6 +1545,7 @@ func TestRPCDurationMetricRecordsOnError(t *testing.T) {
 
 	if err == nil {
 		t.Fatalf("expected GetFlightInfoSchemas to fail without auth context")
+		return
 	}
 	if after-before != 1 {
 		t.Fatalf("expected duckgres_flight_rpc_duration_seconds sample count delta 1, got %d", after-before)
@@ -1588,6 +1598,7 @@ func TestSessionFromContextFailedAndSuccessfulAuthUpdateRateLimiter(t *testing.T
 	}
 	if s == nil {
 		t.Fatalf("expected non-nil session")
+		return
 	}
 
 	_, err = h.sessionFromContext(authContextForPeer(addr, "postgres", "wrong"))

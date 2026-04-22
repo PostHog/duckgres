@@ -334,6 +334,7 @@ func TestNewRejectsUnsupportedACMEDNSProvider(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unsupported ACME DNS provider")
+		return
 	}
 	if !strings.Contains(err.Error(), "unsupported ACME DNS provider") {
 		t.Fatalf("expected unsupported provider error, got: %v", err)
@@ -346,6 +347,7 @@ func TestNewRejectsACMEDNSProviderWithoutDomain(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when ACME DNS provider is set without ACME domain")
+		return
 	}
 	if !strings.Contains(err.Error(), "ACME DNS provider requires ACME domain") {
 		t.Fatalf("expected missing domain error, got: %v", err)

@@ -466,15 +466,54 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		Value: "true",
 	})
 
-	// Pass OTEL trace config to worker pods so they export traces
-	// to the same backend as the control plane.
-	for _, envName := range []string{"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_PATH"} {
+	// Stamp every log line with pod and node identifiers via the Downward API.
+	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+		corev1.EnvVar{
+			Name: "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		corev1.EnvVar{
+			Name: "NODE_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+			},
+		},
+	)
+
+	// Pass OTEL trace config to worker pods.
+	for _, envName := range []string{
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_TRACES_PATH",
+	} {
 		if v := os.Getenv(envName); v != "" {
 			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
 				Name:  envName,
 				Value: v,
 			})
 		}
+	}
+
+	// Cache proxy integration: when enabled, workers need to reach the
+	// DaemonSet proxy on the same node via the node IP + fixed hostPort.
+	// Inject NODE_IP via the Downward API so the worker process can resolve
+	// the proxy address at runtime.
+	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" {
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
+			corev1.EnvVar{
+				Name:  "DUCKGRES_CACHE_ENABLED",
+				Value: "true",
+			},
+			corev1.EnvVar{
+				Name: "NODE_IP",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "status.hostIP",
+					},
+				},
+			},
+		)
 	}
 
 	// Add toleration if configured

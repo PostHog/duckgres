@@ -232,6 +232,7 @@ func TestHighBitHashRejectsUbigint(t *testing.T) {
 	_, err = db.Exec("INSERT INTO test_hash_u VALUES ($1)", highBitHash)
 	if err == nil {
 		t.Fatal("expected error inserting negative int64 into UBIGINT, but insert succeeded")
+		return
 	}
 }
 
@@ -256,6 +257,7 @@ func TestUbigintToBigintMigrationViaDrop(t *testing.T) {
 	_, err = db.Exec("INSERT INTO query_log VALUES ($1)", highBitHash)
 	if err == nil {
 		t.Fatal("expected UBIGINT to reject negative int64")
+		return
 	}
 
 	// Check column type via information_schema (simulates the migration check)
@@ -354,6 +356,7 @@ func TestTruncateNullableQuery(t *testing.T) {
 	got := truncateNullableQuery(longPtr)
 	if got == nil {
 		t.Fatal("expected non-nil truncated query")
+		return
 	} else if len(*got) != maxQueryLength {
 		t.Fatalf("expected truncated length %d, got %d", maxQueryLength, len(*got))
 	}

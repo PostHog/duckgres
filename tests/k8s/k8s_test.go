@@ -279,6 +279,7 @@ func TestK8sWorkerSecurityContext(t *testing.T) {
 	csc := pod.Spec.Containers[0].SecurityContext
 	if csc == nil {
 		t.Fatal("container security context is nil")
+		return
 	}
 	if csc.AllowPrivilegeEscalation == nil || *csc.AllowPrivilegeEscalation {
 		t.Error("expected allowPrivilegeEscalation=false")

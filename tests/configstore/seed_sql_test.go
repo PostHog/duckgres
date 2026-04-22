@@ -26,6 +26,7 @@ func TestLocalConfigStoreSeedSQL(t *testing.T) {
 	orgCfg := snap.Orgs["local"]
 	if orgCfg == nil {
 		t.Fatal("expected local org from seed")
+		return
 	}
 	if orgCfg.Warehouse == nil {
 		t.Fatal("expected local warehouse from seed")
@@ -65,6 +66,7 @@ func TestKindConfigStoreSeedSQL(t *testing.T) {
 	orgCfg := snap.Orgs["local"]
 	if orgCfg == nil {
 		t.Fatal("expected local org from kind seed")
+		return
 	}
 	if orgCfg.Warehouse == nil {
 		t.Fatal("expected local warehouse from kind seed")
@@ -125,6 +127,7 @@ func TestTenantIsolationConfigStoreSeedSQL(t *testing.T) {
 		orgCfg := snap.Orgs[tc.orgID]
 		if orgCfg == nil {
 			t.Fatalf("expected %s org from tenant isolation seed", tc.orgID)
+			return
 		}
 		if orgCfg.DatabaseName != tc.databaseName {
 			t.Fatalf("expected %s database name %q, got %q", tc.orgID, tc.databaseName, orgCfg.DatabaseName)

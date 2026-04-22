@@ -108,6 +108,7 @@ func TestReadStartupFromRaw_UnknownProtocol(t *testing.T) {
 	_, err := readStartupFromRaw(server)
 	if err == nil {
 		t.Fatal("expected error for unknown protocol version")
+		return
 	}
 }
 
@@ -121,6 +122,7 @@ func TestReadStartupFromRaw_EOF(t *testing.T) {
 	_, err := readStartupFromRaw(server)
 	if err == nil {
 		t.Fatal("expected error on EOF")
+		return
 	}
 }
 
@@ -138,6 +140,7 @@ func TestReadStartupFromRaw_StartupTimeout(t *testing.T) {
 	_, err := readStartupFromRaw(server)
 	if err == nil {
 		t.Fatal("expected timeout error")
+		return
 	}
 	if !isTimeoutErr(err) {
 		t.Fatalf("expected timeout error, got: %v (%T)", err, err)
@@ -175,6 +178,7 @@ func TestReadStartupFromRaw_EOFNotTimeout(t *testing.T) {
 	_, err := readStartupFromRaw(server)
 	if err == nil {
 		t.Fatal("expected error on closed connection")
+		return
 	}
 	if isTimeoutErr(err) {
 		t.Fatal("io.EOF should not be reported as a timeout")

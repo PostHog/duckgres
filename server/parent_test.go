@@ -126,6 +126,7 @@ func TestChildTrackerBasicOperations(t *testing.T) {
 	got := tracker.Get(1001)
 	if got == nil {
 		t.Fatal("Expected to find child by PID")
+		return
 	} else if got.Username != "user1" {
 		t.Errorf("Username mismatch: got %q, want %q", got.Username, "user1")
 	}
@@ -149,6 +150,7 @@ func TestChildTrackerBasicOperations(t *testing.T) {
 	found := tracker.FindByBackendKey(BackendKey{Pid: 1002, SecretKey: 222})
 	if found == nil {
 		t.Fatal("Expected to find child by backend key")
+		return
 	} else if found.PID != 1002 {
 		t.Errorf("PID mismatch: got %d, want %d", found.PID, 1002)
 	}

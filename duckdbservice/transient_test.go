@@ -100,6 +100,7 @@ func TestRetryOnTransientNoRetryForNonTransient(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected error")
+		return
 	}
 	if calls != 1 {
 		t.Fatalf("expected 1 call (no retry for non-transient), got %d", calls)
@@ -161,6 +162,7 @@ func TestRetryOnConflictExhaustsRetries(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
+		return
 	}
 	if calls != conflictMaxRetries {
 		t.Fatalf("expected %d calls, got %d", conflictMaxRetries, calls)
@@ -179,6 +181,7 @@ func TestRetryOnConflictStopsOnNonConflictError(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected error")
+		return
 	}
 	// retryOnConflict always makes one attempt (the first retry); when the
 	// error is not a transaction conflict it stops immediately.

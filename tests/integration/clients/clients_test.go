@@ -585,6 +585,7 @@ func TestExtendedQueryErrorHandling(t *testing.T) {
 		err = conn.QueryRowContext(context.Background(), "SELECT CAST($1 AS INTEGER)", "not-a-number").Scan(&val)
 		if err == nil {
 			t.Fatal("Expected conversion error, got none")
+			return
 		}
 
 		// The SAME connection should still be usable after the error.
@@ -614,6 +615,7 @@ func TestExtendedQueryErrorHandling(t *testing.T) {
 			err := conn.QueryRowContext(context.Background(), "SELECT CAST($1 AS INTEGER)", "bad").Scan(&badVal)
 			if err == nil {
 				t.Fatalf("Expected error on iteration %d", i)
+				return
 			}
 
 			// Successful query via extended protocol on the same connection

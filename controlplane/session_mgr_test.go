@@ -165,6 +165,7 @@ func TestRecoverWorkerPanic_NilPointer(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected error from recovered nil pointer panic")
+		return
 	}
 	if !strings.Contains(err.Error(), "worker likely crashed") {
 		t.Fatalf("expected crash message, got: %v", err)
@@ -176,6 +177,7 @@ func TestRecoverWorkerPanic_NonNilPointerRePanics(t *testing.T) {
 		r := recover()
 		if r == nil {
 			t.Fatal("expected re-panic for non-nil-pointer panic")
+			return
 		}
 		if s, ok := r.(string); !ok || s != "unrelated panic" {
 			t.Fatalf("expected original panic value, got: %v", r)
@@ -196,6 +198,7 @@ func TestRecoverWorkerPanic_RuntimeErrorRePanics(t *testing.T) {
 		r := recover()
 		if r == nil {
 			t.Fatal("expected re-panic for non-nil-pointer runtime error")
+			return
 		}
 		if re, ok := r.(runtime.Error); !ok {
 			t.Fatalf("expected runtime.Error, got %T: %v", r, r)

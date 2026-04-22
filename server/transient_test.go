@@ -68,6 +68,7 @@ func TestRetryOnTransientAttachExhaustsRetries(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
+		return
 	}
 	if calls != 4 { // 1 initial + 3 retries
 		t.Fatalf("expected 4 calls (1 initial + 3 retries), got %d", calls)
@@ -83,6 +84,7 @@ func TestRetryOnTransientAttachNoRetryForNonTransient(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected error")
+		return
 	}
 	if calls != 1 {
 		t.Fatalf("expected 1 call (no retry for non-transient), got %d", calls)
@@ -163,6 +165,7 @@ func TestRetryOnConflictExhaustsRetries(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
+		return
 	}
 	if calls != conflictMaxRetries {
 		t.Fatalf("expected %d calls, got %d", conflictMaxRetries, calls)
@@ -181,6 +184,7 @@ func TestRetryOnConflictStopsOnNonConflictError(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected error")
+		return
 	}
 	// retryOnConflict always makes one attempt (the first retry); when the
 	// error is not a transaction conflict it stops immediately.
@@ -377,6 +381,7 @@ func TestClassifyErrorCodeAgainstRealDuckDB(t *testing.T) {
 			_, err := db.Exec(tc.query)
 			if err == nil {
 				t.Fatalf("expected error from %q, got nil", tc.query)
+				return
 			}
 			if got := classifyErrorCode(err); got != tc.wantCode {
 				t.Fatalf("classifyErrorCode for %q = %q, want %q (raw err: %v)", tc.query, got, tc.wantCode, err)
@@ -393,6 +398,7 @@ func TestClassifyErrorCodeAgainstRealDuckDB(t *testing.T) {
 		_, err := db.Exec(`BEGIN`)
 		if err == nil {
 			t.Fatal("expected error on nested BEGIN, got nil")
+			return
 		}
 		if got := classifyErrorCode(err); got != "25000" {
 			t.Fatalf("nested BEGIN SQLSTATE = %q, want %q (raw err: %v)", got, "25000", err)

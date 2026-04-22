@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -16,6 +17,55 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 )
+
+// stampedHandler emits records as: time, level, pod, node, msg, attrs.
+// slog.TextHandler forces attrs after msg, which pushes pod/node to the end
+// of long lines. Putting them up front makes kubectl-logs triage scannable.
+type stampedHandler struct {
+	out   io.Writer
+	level slog.Level
+	stamp []slog.Attr
+}
+
+func (h *stampedHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= h.level
+}
+
+func (h *stampedHandler) Handle(_ context.Context, r slog.Record) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "time=%s level=%s", r.Time.UTC().Format(time.RFC3339Nano), r.Level.String())
+	for _, a := range h.stamp {
+		fmt.Fprintf(&b, " %s=%s", a.Key, a.Value.String())
+	}
+	fmt.Fprintf(&b, " msg=%q", r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		fmt.Fprintf(&b, " %s=%s", a.Key, a.Value.String())
+		return true
+	})
+	b.WriteByte('\n')
+	_, err := io.WriteString(h.out, b.String())
+	return err
+}
+
+func (h *stampedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	nh := *h
+	nh.stamp = append(append([]slog.Attr{}, h.stamp...), attrs...)
+	return &nh
+}
+
+func (h *stampedHandler) WithGroup(_ string) slog.Handler { return h }
+
+// newStampedHandler returns a handler with pod/node env vars pre-attached.
+func newStampedHandler(level slog.Level) *stampedHandler {
+	var stamp []slog.Attr
+	if pod := os.Getenv("POD_NAME"); pod != "" {
+		stamp = append(stamp, slog.String("pod", pod))
+	}
+	if node := os.Getenv("NODE_NAME"); node != "" {
+		stamp = append(stamp, slog.String("node", node))
+	}
+	return &stampedHandler{out: os.Stderr, level: level, stamp: stamp}
+}
 
 // redactingHandler wraps an slog.Handler and scrubs password values from
 // log messages and string attributes before forwarding to the inner handler.
@@ -175,7 +225,7 @@ func initLogging() func() {
 		if os.Getenv("ADDITIONAL_POSTHOG_API_KEYS") != "" {
 			fmt.Fprintln(os.Stderr, "ADDITIONAL_POSTHOG_API_KEYS is set but POSTHOG_API_KEY is not; ignoring additional keys")
 		}
-		slog.SetDefault(slog.New(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})}))
+		slog.SetDefault(slog.New(&redactingHandler{inner: newStampedHandler(level)}))
 		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
 		return func() {}
 	}
@@ -209,7 +259,7 @@ func initLogging() func() {
 	// The primary exporter must succeed; additional ones are best-effort.
 	primaryExp := newPostHogExporter(ctx, host, apiKey)
 	if primaryExp == nil {
-		slog.SetDefault(slog.New(&redactingHandler{inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})}))
+		slog.SetDefault(slog.New(&redactingHandler{inner: newStampedHandler(level)}))
 		fmt.Fprintln(os.Stderr, "Primary PostHog exporter failed to initialize, continuing with stderr only")
 		return func() {}
 	}
@@ -230,10 +280,9 @@ func initLogging() func() {
 	provider := sdklog.NewLoggerProvider(opts...)
 
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
-	textHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 
 	slog.SetDefault(slog.New(&redactingHandler{inner: &multiHandler{
-		handlers: []slog.Handler{textHandler, otelHandler},
+		handlers: []slog.Handler{newStampedHandler(level), otelHandler},
 	}}))
 
 	slog.Info("PostHog logging enabled.", "host", host, "exporters", len(processors))

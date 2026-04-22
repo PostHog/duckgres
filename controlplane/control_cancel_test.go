@@ -47,6 +47,7 @@ func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) 
 	case err := <-errCh:
 		if err == nil {
 			t.Fatal("expected context cancellation error")
+			return
 		}
 		if err != context.Canceled {
 			t.Fatalf("expected context.Canceled, got %v", err)

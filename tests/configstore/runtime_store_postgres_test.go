@@ -131,6 +131,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 	}
 	if claimed == nil {
 		t.Fatal("expected idle worker claim to succeed")
+		return
 	}
 	if claimed.WorkerID != 7 {
 		t.Fatalf("expected worker id 7, got %d", claimed.WorkerID)
@@ -412,6 +413,7 @@ func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	}
 	if slot == nil {
 		t.Fatal("expected spawning worker slot to be created")
+		return
 	}
 	if slot.WorkerID <= 0 {
 		t.Fatalf("expected positive worker id, got %d", slot.WorkerID)
@@ -504,6 +506,7 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 	}
 	if slot == nil {
 		t.Fatal("expected neutral warm slot to be created")
+		return
 	}
 	if slot.OrgID != "" {
 		t.Fatalf("expected neutral warm slot org to be empty, got %q", slot.OrgID)
@@ -723,6 +726,7 @@ func TestTakeOverWorkerPostgres(t *testing.T) {
 	}
 	if claimed == nil {
 		t.Fatal("expected takeover to succeed")
+		return
 	}
 	if claimed.OwnerCPInstanceID != "cp-new:boot-b" {
 		t.Fatalf("expected owner cp-instance cp-new:boot-b, got %q", claimed.OwnerCPInstanceID)

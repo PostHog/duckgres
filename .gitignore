@@ -36,3 +36,5 @@ data-test/
 .claude/scheduled_tasks.lock
 .worktrees/
 bench-results/
+/cache-proxy
+/cmd/cache-proxy/cache-proxy

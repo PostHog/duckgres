@@ -274,6 +274,7 @@ func TestReconcileDeletingDeletesCR(t *testing.T) {
 	_, err = fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-c"), metav1.GetOptions{})
 	if err == nil {
 		t.Fatal("expected CR to be deleted")
+		return
 	}
 
 	// Verify state transitioned to deleted

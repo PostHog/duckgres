@@ -208,6 +208,7 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 	got, err := pool.AcquireWorker(ctx)
 	if err == nil {
 		t.Fatalf("expected AcquireWorker to wait instead of reusing busy worker, got worker %d", got.ID)
+		return
 	}
 	if got != nil {
 		t.Fatalf("expected no worker on timeout, got %v", got)

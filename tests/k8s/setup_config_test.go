@@ -69,6 +69,7 @@ func TestLoadK8sTestEnvironmentRejectsUnknownSetupMode(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown setup mode")
+		return
 	}
 }
 

@@ -209,6 +209,7 @@ func TestSessionPoolActivateTenantAllowsSameOrgTakeover(t *testing.T) {
 	current := pool.currentActivation()
 	if current == nil {
 		t.Fatal("expected activation to remain present")
+		return
 	}
 	if current.payload.OwnerEpoch != 3 {
 		t.Fatalf("expected owner epoch 3, got %d", current.payload.OwnerEpoch)
@@ -344,5 +345,6 @@ func TestSessionPoolValidateControlMetadataRejectsMismatchedWorkerID(t *testing.
 	})
 	if err == nil {
 		t.Fatal("expected mismatched worker_id to be rejected")
+		return
 	}
 }

@@ -347,6 +347,7 @@ func TestAcquireWorkerSpawnsWhenBelowCapacity(t *testing.T) {
 	_, err := pool.AcquireWorker(context.Background())
 	if err == nil {
 		t.Fatal("expected spawn error with non-existent binary")
+		return
 	}
 	// The error should be a spawn error, not a "no worker found" error.
 	if pool.nextWorkerID <= 1 {
@@ -384,6 +385,7 @@ func TestAcquireWorkerCleansDeadWorkersWhenAllDead(t *testing.T) {
 	// Will fail to spawn since no real binary, but dead workers should be cleaned.
 	if err == nil {
 		t.Fatal("expected spawn error")
+		return
 	}
 
 	pool.mu.RLock()
@@ -408,6 +410,7 @@ func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
 	// it didn't block.
 	if err == nil {
 		t.Fatal("expected spawn error with non-existent binary")
+		return
 	}
 }
 
@@ -418,6 +421,7 @@ func TestAcquireWorkerShutdownReturnsError(t *testing.T) {
 	_, err := pool.AcquireWorker(context.Background())
 	if err == nil {
 		t.Fatal("expected error after shutdown")
+		return
 	}
 }
 
@@ -822,6 +826,7 @@ func TestPreBindSocketsCleanupOnPartialFailure(t *testing.T) {
 	err := pool.PreBindSockets(3)
 	if err == nil {
 		t.Fatal("expected PreBindSockets to fail")
+		return
 	}
 
 	pool.preboundMu.Lock()

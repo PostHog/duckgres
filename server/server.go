@@ -292,6 +292,12 @@ type DuckLakeConfig struct {
 	S3Chain   string // e.g., "env;config" to check env vars then config files
 	S3Profile string // AWS profile name to use (for "config" chain)
 
+	// HTTPProxy routes DuckDB httpfs traffic through a forward HTTP proxy.
+	// When set, DuckDB signs S3 requests for the real S3 hostname and sends them
+	// through the proxy as plain HTTP (requires S3UseSSL=false). Used by the
+	// local cache proxy DaemonSet for NVMe caching.
+	HTTPProxy string
+
 	// CheckpointInterval controls how often DuckLake CHECKPOINT runs.
 	// CHECKPOINT performs full catalog maintenance: expire snapshots,
 	// merge adjacent files, rewrite data files, and clean up orphaned files.
@@ -1283,6 +1289,35 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		}
 	}
 
+	// Route httpfs traffic through a forward HTTP proxy (cache proxy DaemonSet).
+	// DuckDB keeps SigV4 for the real S3 hostname; the proxy forwards the signed
+	// request verbatim, so the proxy needs no AWS credentials.
+	//
+	// Use SET GLOBAL http_proxy (not a scoped HTTP secret) — DuckDB's S3
+	// extension doesn't honor HTTP-secret SCOPE for S3 URLs, so proxying must
+	// be global. The proxy itself CONNECT-tunnels non-bucket HTTPS traffic
+	// (e.g. read_parquet('https://...')) and only caches DuckLake bucket URLs.
+	//
+	// Set BEFORE the ATTACH so the proxy is in effect for the initial catalog
+	// read (some settings don't propagate to DuckLake's subcatalogs post-attach,
+	// same gotcha as pg_pool_max_connections).
+	if dlCfg.HTTPProxy != "" {
+		// Force plaintext HTTP + path-style at the session level in addition to
+		// the S3 secret's USE_SSL/URL_STYLE — DuckDB observed to ignore secret
+		// settings and tunnel via HTTPS CONNECT when the endpoint looks like AWS
+		// S3, which the proxy can't cache (encrypted tunnel).
+		for _, stmt := range []string{
+			fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy),
+			"SET GLOBAL s3_use_ssl = false",
+			"SET GLOBAL s3_url_style = 'path'",
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				slog.Warn("Failed to set httpfs proxy config.", "stmt", stmt, "error", err)
+			}
+		}
+		slog.Info("Routed httpfs traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy)
+	}
+
 	// Warn if metadata store appears to connect via pgbouncer.
 	// pgbouncer's connection lifecycle management (idle timeout, server_lifetime, etc.)
 	// can kill connections that DuckLake's internal metadata database depends on,
@@ -1339,19 +1374,17 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
 
-	// Reclaim idle metadata connections. DuckDB 1.5.2 / DuckLake 1.0 introduced
-	// thread-local connection caching for postgres_scanner (default ON) but
-	// ships with reaper_thread=off and both idle/lifetime timeouts=0, so every
-	// connection a DuckDB worker thread ever caches stays pinned forever.
-	// That produced a large steady-state spike in metadata RDS connections
-	// post-upgrade. Enabling the reaper with a modest idle timeout lets idle
-	// cached connections close while active workers keep the warm-connection
-	// latency benefit of TLC. 10-min max lifetime is a belt-and-braces cap
-	// against stuck connections (NAT table churn, pgbouncer-style kills).
+	// Reclaim idle metadata connections. DuckDB 1.5.2 / DuckLake 1.0 enabled
+	// thread-local connection caching for postgres_scanner by default but ships
+	// with reaper_thread=off and idle/lifetime timeouts=0, so every connection
+	// a worker thread ever caches stays pinned forever — producing a steady-state
+	// spike in metadata RDS connections post-upgrade. Enabling the reaper with a
+	// 60s idle timeout reclaims idle cached connections while keeping the warm-
+	// connection latency benefit for active workers; the 10-min max lifetime is
+	// a belt-and-braces cap against stuck connections (NAT churn, pgbouncer kills).
 	//
-	// Use postgres_configure_pool() (not SET GLOBAL) to reconfigure the pool
-	// that was just created by ATTACH. SET GLOBAL only affects pools created
-	// after it runs, so it's a no-op for the pool baked during ATTACH above.
+	// postgres_configure_pool() reconfigures the pool that ATTACH already created;
+	// SET GLOBAL only affects pools created after it runs, so would be a no-op here.
 	// See: https://github.com/duckdb/ducklake/issues/1031 and
 	// https://github.com/duckdb/duckdb-postgres/pull/430
 	rows, err := db.Query(`SELECT * FROM postgres_configure_pool(

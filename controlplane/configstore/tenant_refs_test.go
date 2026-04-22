@@ -12,6 +12,7 @@ func TestValidateTenantSecretRefRequiresTenantNamespace(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected missing tenant namespace to be rejected")
+		return
 	}
 }
 
@@ -23,6 +24,7 @@ func TestValidateTenantSecretRefRejectsNamespaceMismatch(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected namespace mismatch to be rejected")
+		return
 	}
 }
 
@@ -33,6 +35,7 @@ func TestValidateTenantSecretRefRequiresExplicitSecretNamespace(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected blank secret namespace to be rejected")
+		return
 	}
 	if !strings.Contains(err.Error(), "SecretRef.Namespace") {
 		t.Fatalf("expected explicit namespace guidance, got %v", err)
@@ -47,6 +50,7 @@ func TestValidateTenantSecretRefRejectsSubstringOnlyOrgMatch(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected substring-only org match to be rejected")
+		return
 	}
 }
 
@@ -57,5 +61,6 @@ func TestValidateTenantSecretRefRejectsDefaultNamespaceFallbackWithoutTenantName
 	})
 	if err == nil {
 		t.Fatal("expected secret ref without tenant namespace to be rejected even if a default namespace exists")
+		return
 	}
 }
