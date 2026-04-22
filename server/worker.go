@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -293,6 +294,10 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		parentVersion = cfg.ServerVersion
 	}
 
+	if err := bootstrapBundledExtensions(serverCfg.DataDir); err != nil {
+		slog.Warn("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(serverCfg.DataDir, "extensions"), "error", err)
+	}
+
 	// Create DuckDB connection
 	db, err := CreateDBConnection(serverCfg, make(chan struct{}, 1), username, parentStartTime, parentVersion)
 	if err != nil {
@@ -382,4 +387,3 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		return ExitSuccess
 	}
 }
-

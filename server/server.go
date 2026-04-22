@@ -37,13 +37,35 @@ var processVersion = "dev"
 // clients pinning connection goroutines indefinitely.
 var startupReadTimeout = 30 * time.Second
 
-const bundledDuckDBExtensionsDir = "/app/extensions"
+var bundledDuckDBExtensionsDir = "/app/extensions"
+
+var bundledExtensionBootstrap struct {
+	mu     sync.Mutex
+	byPath map[string]error
+}
 
 // SetProcessVersion sets the version string for this process. Called from main().
 func SetProcessVersion(v string) { processVersion = v }
 
 // ProcessVersion returns the version string for this process.
 func ProcessVersion() string { return processVersion }
+
+func bootstrapBundledExtensions(dataDir string) error {
+	extDir := filepath.Join(dataDir, "extensions")
+
+	bundledExtensionBootstrap.mu.Lock()
+	defer bundledExtensionBootstrap.mu.Unlock()
+	if bundledExtensionBootstrap.byPath == nil {
+		bundledExtensionBootstrap.byPath = make(map[string]error)
+	}
+	if err, ok := bundledExtensionBootstrap.byPath[extDir]; ok {
+		return err
+	}
+
+	err := seedBundledExtensions(bundledDuckDBExtensionsDir, extDir)
+	bundledExtensionBootstrap.byPath[extDir] = err
+	return err
+}
 
 // passwordPattern matches password=<value> or password: <value> with quoted or unquoted values.
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
@@ -477,6 +499,10 @@ func New(cfg Config) (*Server, error) {
 		ensureDuckLakeMigrationCheck(cfg.DuckLake, cfg.DataDir)
 	}
 
+	if err := bootstrapBundledExtensions(cfg.DataDir); err != nil {
+		slog.Warn("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(cfg.DataDir, "extensions"), "error", err)
+	}
+
 	// Initialize query logger (non-fatal on error)
 	if ql, err := NewQueryLogger(cfg); err != nil {
 		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
@@ -873,9 +899,6 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
 	// for autoloading/installing extensions.
 	extDir := filepath.Join(cfg.DataDir, "extensions")
-	if err := seedBundledExtensions(bundledDuckDBExtensionsDir, extDir); err != nil {
-		slog.Warn("Failed to seed bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", extDir, "error", err)
-	}
 	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
 		slog.Warn("Failed to set DuckDB extension_directory.", "extension_directory", extDir, "error", err)
 	} else {
@@ -964,36 +987,52 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil
 		}
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o750); err != nil {
+			return err
+		}
 		if _, err := os.Stat(dstPath); err == nil {
-			return nil
+			if !shouldRefreshBundledExtension(path) {
+				return nil
+			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 
-		srcFile, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
-		if err != nil {
-			_ = srcFile.Close()
-			return err
-		}
-		if _, err := io.Copy(dstFile, srcFile); err != nil {
-			_ = srcFile.Close()
-			_ = dstFile.Close()
-			return err
-		}
-		if err := srcFile.Close(); err != nil {
-			_ = dstFile.Close()
-			return err
-		}
-		if err := dstFile.Close(); err != nil {
-			return err
-		}
-		return nil
+		return copyFile(path, dstPath, info.Mode().Perm())
 	})
+}
+
+func shouldRefreshBundledExtension(srcPath string) bool {
+	return filepath.Base(srcPath) == "postgres_scanner.duckdb_extension"
+}
+
+func copyFile(srcPath, dstPath string, mode os.FileMode) error {
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = srcFile.Close() }()
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(dstPath), ".bundled-extension-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := tmpFile.Chmod(mode); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := io.Copy(tmpFile, srcFile); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpPath, dstPath)
 }
 
 // CreateDBConnection creates a DuckDB connection for a client session.

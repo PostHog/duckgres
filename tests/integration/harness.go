@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/posthog/duckgres/server"
 	_ "github.com/lib/pq"
+	"github.com/posthog/duckgres/server"
 )
 
 var duckLakeInfraServices = []string{"ducklake-metadata", "minio", "minio-init"}
@@ -148,10 +148,6 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 
 	// Configure DuckLake if enabled
 	if harnessCfg.UseDuckLake {
-		// Try the upstream postgres_scanner fix from core_nightly in the
-		// DuckLake-backed integration harness without changing global defaults.
-		cfg.Extensions = []string{"postgres FROM core_nightly", "ducklake"}
-
 		metadataPort := harnessCfg.DuckLakeMetadataPort
 
 		// If latency injection is requested, start a TCP proxy in front of the

@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -41,7 +42,7 @@ func TestSeedBundledExtensionsCopiesMissingFiles(t *testing.T) {
 	}
 }
 
-func TestSeedBundledExtensionsPreservesExistingFiles(t *testing.T) {
+func TestSeedBundledExtensionsPreservesExistingFilesWithMatchingContents(t *testing.T) {
 	srcRoot := t.TempDir()
 	dstRoot := t.TempDir()
 
@@ -49,7 +50,7 @@ func TestSeedBundledExtensionsPreservesExistingFiles(t *testing.T) {
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(srcDir, "httpfs.duckdb_extension"), []byte("new"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(srcDir, "httpfs.duckdb_extension"), []byte("existing"), 0o644); err != nil {
 		t.Fatalf("write src extension: %v", err)
 	}
 
@@ -72,5 +73,156 @@ func TestSeedBundledExtensionsPreservesExistingFiles(t *testing.T) {
 	}
 	if string(got) != "existing" {
 		t.Fatalf("expected existing extension to be preserved, got %q", string(got))
+	}
+}
+
+func TestSeedBundledExtensionsReplacesExistingFilesWithUpdatedContents(t *testing.T) {
+	srcRoot := t.TempDir()
+	dstRoot := t.TempDir()
+
+	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("nightly"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	dstDir := filepath.Join(dstRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	dstExt := filepath.Join(dstDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(dstExt, []byte("stable"), 0o644); err != nil {
+		t.Fatalf("write dst extension: %v", err)
+	}
+
+	if err := seedBundledExtensions(srcRoot, dstRoot); err != nil {
+		t.Fatalf("seedBundledExtensions: %v", err)
+	}
+
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "nightly" {
+		t.Fatalf("expected existing extension to be replaced, got %q", string(got))
+	}
+}
+
+func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
+	srcRoot := t.TempDir()
+	dstRoot := t.TempDir()
+
+	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "httpfs.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("new-httpfs"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	dstDir := filepath.Join(dstRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		t.Fatalf("mkdir dst: %v", err)
+	}
+	dstExt := filepath.Join(dstDir, "httpfs.duckdb_extension")
+	if err := os.WriteFile(dstExt, []byte("existing-httpfs"), 0o644); err != nil {
+		t.Fatalf("write dst extension: %v", err)
+	}
+
+	if err := seedBundledExtensions(srcRoot, dstRoot); err != nil {
+		t.Fatalf("seedBundledExtensions: %v", err)
+	}
+
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "existing-httpfs" {
+		t.Fatalf("expected non-targeted extension to be preserved, got %q", string(got))
+	}
+}
+
+func TestBootstrapBundledExtensionsSeedsBundledExtensions(t *testing.T) {
+	bundledRoot := t.TempDir()
+	dataDir := t.TempDir()
+
+	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("nightly"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	prevBundledRoot := bundledDuckDBExtensionsDir
+	bundledDuckDBExtensionsDir = bundledRoot
+	defer func() { bundledDuckDBExtensionsDir = prevBundledRoot }()
+
+	bundledExtensionBootstrap = struct {
+		mu     sync.Mutex
+		byPath map[string]error
+	}{}
+
+	if err := bootstrapBundledExtensions(dataDir); err != nil {
+		t.Fatalf("bootstrapBundledExtensions: %v", err)
+	}
+
+	extDir := filepath.Join(dataDir, "extensions")
+	dstExt := filepath.Join(extDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "nightly" {
+		t.Fatalf("expected seeded extension to match bundled contents, got %q", string(got))
+	}
+}
+
+func TestBootstrapBundledExtensionsRunsOncePerExtensionDirectory(t *testing.T) {
+	bundledRoot := t.TempDir()
+	dataDir := t.TempDir()
+	extDir := filepath.Join(dataDir, "extensions")
+
+	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("nightly"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	prevBundledRoot := bundledDuckDBExtensionsDir
+	bundledDuckDBExtensionsDir = bundledRoot
+	defer func() { bundledDuckDBExtensionsDir = prevBundledRoot }()
+
+	bundledExtensionBootstrap = struct {
+		mu     sync.Mutex
+		byPath map[string]error
+	}{}
+
+	if err := bootstrapBundledExtensions(dataDir); err != nil {
+		t.Fatalf("bootstrapBundledExtensions: %v", err)
+	}
+
+	if err := os.WriteFile(srcExt, []byte("newer-nightly"), 0o644); err != nil {
+		t.Fatalf("rewrite src extension: %v", err)
+	}
+	if err := bootstrapBundledExtensions(dataDir); err != nil {
+		t.Fatalf("second bootstrapBundledExtensions: %v", err)
+	}
+
+	dstExt := filepath.Join(extDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "nightly" {
+		t.Fatalf("expected bootstrap to run once, got %q", string(got))
 	}
 }
