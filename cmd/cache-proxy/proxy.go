@@ -103,29 +103,29 @@ func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		upstream.Close()
+		_ = upstream.Close()
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 	client, _, err := hijacker.Hijack()
 	if err != nil {
-		upstream.Close()
+		_ = upstream.Close()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
-		upstream.Close()
-		client.Close()
+		_ = upstream.Close()
+		_ = client.Close()
 		return
 	}
 	go func() {
-		defer upstream.Close()
-		defer client.Close()
+		defer func() { _ = upstream.Close() }()
+		defer func() { _ = client.Close() }()
 		_, _ = io.Copy(upstream, client)
 	}()
 	go func() {
-		defer upstream.Close()
-		defer client.Close()
+		defer func() { _ = upstream.Close() }()
+		defer func() { _ = client.Close() }()
 		_, _ = io.Copy(client, upstream)
 	}()
 }
@@ -248,7 +248,7 @@ func (p *CacheProxy) fetchOrigin(r *http.Request) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
@@ -340,7 +340,7 @@ func (p *CacheProxy) HandlePeerGet(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 	_, _ = io.Copy(w, reader)

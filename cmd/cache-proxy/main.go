@@ -144,7 +144,7 @@ func main() {
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "OK")
+		_, _ = fmt.Fprint(w, "OK")
 	})
 	healthMux.Handle("/metrics", promhttp.Handler())
 	healthServer := &http.Server{Addr: healthAddr, Handler: healthMux}

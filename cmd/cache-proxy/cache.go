@@ -48,7 +48,7 @@ var (
 // or query-signed URLs naturally produce different keys.
 func CacheKey(url, rangeHeader string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s", url, rangeHeader)
+	_, _ = fmt.Fprintf(h, "%s|%s", url, rangeHeader)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
@@ -191,7 +191,7 @@ func (c *DiskCache) Open(key string) (io.ReadCloser, int64, bool) {
 	}
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, 0, false
 	}
 

@@ -144,12 +144,12 @@ func (pm *PeerManager) FetchFromPeers(cacheKey string) ([]byte, string, bool) {
 			resp, err := pm.client.Do(req)
 			if err != nil || resp.StatusCode != http.StatusOK {
 				if resp != nil {
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 				results <- result{ok: false}
 				return
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			// Peer has it — fetch the data
 			getURL := fmt.Sprintf("http://%s/cache/get?key=%s", addr, cacheKey)
@@ -161,12 +161,12 @@ func (pm *PeerManager) FetchFromPeers(cacheKey string) ([]byte, string, bool) {
 			resp2, err := pm.client.Do(req2)
 			if err != nil || resp2.StatusCode != http.StatusOK {
 				if resp2 != nil {
-					resp2.Body.Close()
+					_ = resp2.Body.Close()
 				}
 				results <- result{ok: false}
 				return
 			}
-			defer resp2.Body.Close()
+			defer func() { _ = resp2.Body.Close() }()
 
 			data, err := io.ReadAll(resp2.Body)
 			if err != nil {
