@@ -11,7 +11,7 @@ import (
 
 // Cache proxy integration is controlled by a single env var:
 //
-//   DUCKGRES_CACHE_ENABLED=true
+//	DUCKGRES_CACHE_ENABLED=true
 //
 // When enabled, duckgres assumes a cache proxy DaemonSet is running on the
 // same node and:

@@ -58,7 +58,7 @@ type DiskCache struct {
 	maxBytes    int64
 	currentSize int64
 
-	mu    sync.Mutex
+	mu sync.Mutex
 	// access order: most recently used at the end
 	order []cacheEntry
 }

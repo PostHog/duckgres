@@ -44,7 +44,7 @@ func NewPeerManager(serviceName, peerPort string) *PeerManager {
 			Timeout: 2 * time.Second,
 			Transport: &http.Transport{
 				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:    30 * time.Second,
+				IdleConnTimeout:     30 * time.Second,
 			},
 		},
 	}
