@@ -1162,10 +1162,6 @@ func parseExtensionName(ext string) (name, installCmd string) {
 	return ext, ext
 }
 
-func installExtensionStatement(installCmd string) string {
-	return "INSTALL " + installCmd
-}
-
 // LoadExtensions installs and loads DuckDB extensions.
 // This is a standalone function so it can be reused by control plane workers.
 // Extension strings can include a source, e.g. "cache_httpfs FROM community".
@@ -1182,7 +1178,7 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 		name, installCmd := parseExtensionName(ext)
 
 		// First install the extension (downloads if needed)
-		if _, err := db.Exec(installExtensionStatement(installCmd)); err != nil {
+		if _, err := db.Exec("INSTALL " + installCmd); err != nil {
 			slog.Warn("Failed to install extension.", "extension", installCmd, "error", err)
 			lastErr = err
 			continue
