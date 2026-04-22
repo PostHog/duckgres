@@ -20,7 +20,7 @@ func TestK8sWorkerAlwaysStampedWithPodAndNode(t *testing.T) {
 	if !ok {
 		t.Skip("no worker pods present; earlier tests should have spawned at least one")
 	}
-	env := podContainerEnv(pod, "duckgres")
+	env := podContainerEnv(pod, "duckdb-worker")
 
 	if !hasDownwardFieldRef(env, "POD_NAME", "metadata.name") {
 		t.Errorf("worker pod %s missing POD_NAME Downward API env var (fieldRef: metadata.name)", pod.Name)
@@ -44,7 +44,7 @@ func TestK8sWorkerCacheEnvWhenEnabled(t *testing.T) {
 	if !ok {
 		t.Skip("no worker pods present; earlier tests should have spawned at least one")
 	}
-	env := podContainerEnv(pod, "duckgres")
+	env := podContainerEnv(pod, "duckdb-worker")
 
 	if v := envValue(env, "DUCKGRES_CACHE_ENABLED"); v != "true" {
 		t.Errorf("worker %s DUCKGRES_CACHE_ENABLED = %q, want %q", pod.Name, v, "true")
@@ -86,7 +86,7 @@ func cpHasCacheEnabled(t *testing.T) bool {
 		t.Fatalf("failed to list control-plane pods: %v", err)
 	}
 	for _, pod := range pods.Items {
-		if envValue(podContainerEnv(pod, "duckgres"), "DUCKGRES_CACHE_ENABLED") == "true" {
+		if envValue(podContainerEnv(pod, "control-plane"), "DUCKGRES_CACHE_ENABLED") == "true" {
 			return true
 		}
 	}
