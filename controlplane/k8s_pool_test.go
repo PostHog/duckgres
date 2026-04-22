@@ -886,7 +886,7 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		if worker == nil {
 			t.Fatal("expected claimed worker for liveness check")
-			return
+			return nil
 		}
 		if worker.ID != 21 {
 			t.Fatalf("expected claimed worker id 21, got %d", worker.ID)
