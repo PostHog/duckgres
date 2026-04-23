@@ -505,10 +505,18 @@ func (cs *ConfigStore) ListWorkerRecordsByStatesBefore(states []WorkerState, upd
 	return workers, nil
 }
 
-// GetWorkerRecord returns a runtime worker row by worker id.
+// GetWorkerRecord returns a runtime worker row by worker id. Returns
+// (nil, nil) when no row matches — "not found" is a normal state for
+// callers like cleanupOrphanedWorkerPods that need to distinguish between
+// a known terminal row and no row at all. Any other DB error is wrapped
+// and returned so callers can log and retry on the next tick.
 func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 	var record WorkerRecord
-	if err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "worker_id = ?", workerID).Error; err != nil {
+	err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "worker_id = ?", workerID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("get worker record: %w", err)
 	}
 	return &record, nil
