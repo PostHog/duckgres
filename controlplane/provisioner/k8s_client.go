@@ -74,9 +74,28 @@ func ducklingName(orgID string) string {
 	return strings.ReplaceAll(orgID, "-", "")
 }
 
+// CreateOptions carries per-org knobs that shape the generated Duckling CR.
+type CreateOptions struct {
+	MinACU           float64
+	MaxACU           float64
+	PgBouncerEnabled bool
+}
+
 // Create creates a Duckling CR for the given org.
-func (d *DucklingClient) Create(ctx context.Context, orgID string, minACU, maxACU float64) error {
+func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOptions) error {
 	name := ducklingName(orgID)
+	metadataStore := map[string]interface{}{
+		"type": "aurora",
+		"aurora": map[string]interface{}{
+			"minACU": opts.MinACU,
+			"maxACU": opts.MaxACU,
+		},
+	}
+	if opts.PgBouncerEnabled {
+		metadataStore["pgbouncer"] = map[string]interface{}{
+			"enabled": true,
+		}
+	}
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "k8s.posthog.com/v1alpha1",
@@ -86,13 +105,7 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, minACU, maxAC
 				"namespace": ducklingNamespace,
 			},
 			"spec": map[string]interface{}{
-				"metadataStore": map[string]interface{}{
-					"type": "aurora",
-					"aurora": map[string]interface{}{
-						"minACU": minACU,
-						"maxACU": maxACU,
-					},
-				},
+				"metadataStore": metadataStore,
 				"dataStore": map[string]interface{}{
 					"type": "s3bucket",
 				},

@@ -119,8 +119,12 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 	}
 
 	// Create the Duckling CR
-	log.Info("Creating Duckling CR.")
-	if err := c.duckling.Create(ctx, w.OrgID, w.AuroraMinACU, w.AuroraMaxACU); err != nil {
+	log.Info("Creating Duckling CR.", "pgbouncer_enabled", w.PgBouncer.Enabled)
+	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
+		MinACU:           w.AuroraMinACU,
+		MaxACU:           w.AuroraMaxACU,
+		PgBouncerEnabled: w.PgBouncer.Enabled,
+	}); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,

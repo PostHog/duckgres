@@ -71,6 +71,16 @@ type ManagedWarehouseMetadataStore struct {
 	Username     string `gorm:"size:255" json:"username"`
 }
 
+// ManagedWarehousePgBouncer captures per-org opt-in state for the per-Duckling
+// PgBouncer pooler provisioned by the Crossplane composition. When Enabled is
+// true, the provisioner controller sets spec.metadataStore.pgbouncer.enabled
+// on the Duckling CR at creation time; worker DSN routing through the pooler
+// is driven by status.metadataStore.pgbouncerEndpoint (populated by the
+// composition once the pooler Service is up).
+type ManagedWarehousePgBouncer struct {
+	Enabled bool `json:"enabled"`
+}
+
 // ManagedWarehouseS3 stores object-store metadata for an org's warehouse.
 type ManagedWarehouseS3 struct {
 	Provider   string `gorm:"size:64" json:"provider"`
@@ -99,6 +109,7 @@ type ManagedWarehouse struct {
 
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
+	PgBouncer         ManagedWarehousePgBouncer      `gorm:"embedded;embeddedPrefix:pgbouncer_" json:"pgbouncer"`
 	S3                ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
 	WorkerIdentity    ManagedWarehouseWorkerIdentity `gorm:"embedded;embeddedPrefix:worker_identity_" json:"worker_identity"`
 
@@ -299,6 +310,7 @@ type ManagedWarehouseConfig struct {
 
 	WarehouseDatabase ManagedWarehouseDatabase
 	MetadataStore     ManagedWarehouseMetadataStore
+	PgBouncer         ManagedWarehousePgBouncer
 	S3                ManagedWarehouseS3
 	WorkerIdentity    ManagedWarehouseWorkerIdentity
 
@@ -335,6 +347,7 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 		AuroraMaxACU:                   warehouse.AuroraMaxACU,
 		WarehouseDatabase:              warehouse.WarehouseDatabase,
 		MetadataStore:                  warehouse.MetadataStore,
+		PgBouncer:                      warehouse.PgBouncer,
 		S3:                             warehouse.S3,
 		WorkerIdentity:                 warehouse.WorkerIdentity,
 		WarehouseDatabaseCredentials:   warehouse.WarehouseDatabaseCredentials,

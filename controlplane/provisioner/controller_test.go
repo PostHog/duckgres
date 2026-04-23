@@ -164,6 +164,41 @@ func TestReconcilePendingCreatesCR(t *testing.T) {
 	if fs.warehouses["org-a"].ProvisioningStartedAt == nil {
 		t.Fatal("expected provisioning_started_at to be set")
 	}
+
+	// Default path has PgBouncer.Enabled=false — no pgbouncer block should appear.
+	if _, present := metadataStore["pgbouncer"]; present {
+		t.Fatalf("expected no pgbouncer block when disabled, got %v", metadataStore["pgbouncer"])
+	}
+}
+
+func TestReconcilePendingEmitsPgBouncerBlock(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-pgb"] = &configstore.ManagedWarehouse{
+		OrgID:        "org-pgb",
+		State:        configstore.ManagedWarehouseStatePending,
+		AuroraMinACU: 0.5,
+		AuroraMaxACU: 4,
+		PgBouncer:    configstore.ManagedWarehousePgBouncer{Enabled: true},
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctx := context.Background()
+	ctrl.reconcile(ctx)
+
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-pgb"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected CR to exist: %v", err)
+	}
+	spec := cr.Object["spec"].(map[string]interface{})
+	metadataStore := spec["metadataStore"].(map[string]interface{})
+	pgb, ok := metadataStore["pgbouncer"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected pgbouncer block in metadataStore, got %v", metadataStore)
+	}
+	if pgb["enabled"] != true {
+		t.Fatalf("expected pgbouncer.enabled=true, got %v", pgb["enabled"])
+	}
 }
 
 func TestReconcileProvisioningAllReady(t *testing.T) {

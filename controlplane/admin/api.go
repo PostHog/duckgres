@@ -306,6 +306,7 @@ func managedWarehouseUpsertColumns() []string {
 		"metadata_store_port",
 		"metadata_store_database_name",
 		"metadata_store_username",
+		"pgbouncer_enabled",
 		"s3_provider",
 		"s3_region",
 		"s3_bucket",
@@ -402,6 +403,7 @@ type apiHandler struct {
 type managedWarehouseRequest struct {
 	WarehouseDatabase              configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
 	MetadataStore                  configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
+	PgBouncer                      configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
 	S3                             configstore.ManagedWarehouseS3                `json:"s3"`
 	WorkerIdentity                 configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
 	WarehouseDatabaseCredentials   configstore.SecretRef                         `json:"warehouse_database_credentials"`
@@ -428,6 +430,7 @@ func (r managedWarehouseRequest) toManagedWarehouse() configstore.ManagedWarehou
 	return configstore.ManagedWarehouse{
 		WarehouseDatabase:              r.WarehouseDatabase,
 		MetadataStore:                  r.MetadataStore,
+		PgBouncer:                      r.PgBouncer,
 		S3:                             r.S3,
 		WorkerIdentity:                 r.WorkerIdentity,
 		WarehouseDatabaseCredentials:   r.WarehouseDatabaseCredentials,
