@@ -15,7 +15,9 @@ import java.nio.file.Path;
 import java.sql.*;
 import java.util.*;
 
+import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
 
 public class JdbcCompatTest {
 
@@ -112,7 +114,7 @@ public class JdbcCompatTest {
     @SuppressWarnings("unchecked")
     private static List<Map<String, Object>> loadQueries(String path) throws Exception {
         String content = Files.readString(Path.of(path));
-        Yaml yaml = new Yaml();
+        Yaml yaml = new Yaml(new SafeConstructor(new LoaderOptions()));
         return yaml.load(content);
     }
 

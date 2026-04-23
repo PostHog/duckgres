@@ -17,6 +17,10 @@ certs/
 *.swp
 *.swo
 
+# Dashboard UI
+dashboard/ui/node_modules/
+dashboard/ui/.svelte-kit/
+
 # OS
 .DS_Store
 Thumbs.db
