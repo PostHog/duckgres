@@ -437,6 +437,47 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 	}
 }
 
+func TestPutWarehouseMergesPartialUpdateIntoExistingWarehouse(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"pgbouncer": {
+			"enabled": true
+		}
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	warehouse := store.warehouses["analytics"]
+	if warehouse == nil {
+		t.Fatal("expected stored warehouse")
+	}
+	if !warehouse.PgBouncer.Enabled {
+		t.Fatal("expected pgbouncer to be enabled")
+	}
+	if warehouse.MetadataStore.DatabaseName != "analytics_metadata" {
+		t.Fatalf("expected metadata db analytics_metadata, got %q", warehouse.MetadataStore.DatabaseName)
+	}
+	if warehouse.S3.Bucket != "analytics-bucket" {
+		t.Fatalf("expected s3 bucket analytics-bucket, got %q", warehouse.S3.Bucket)
+	}
+	if warehouse.MetadataStoreCredentials.Name != "analytics-metadata" {
+		t.Fatalf("expected metadata secret analytics-metadata, got %q", warehouse.MetadataStoreCredentials.Name)
+	}
+	if warehouse.State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected state ready, got %q", warehouse.State)
+	}
+}
+
 func TestPutWarehouseRejectsSecretRefsOutsideTenantScope(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}

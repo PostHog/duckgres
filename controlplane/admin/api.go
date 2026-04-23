@@ -3,8 +3,10 @@
 package admin
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"time"
 
@@ -454,6 +456,78 @@ func (r managedWarehouseRequest) toManagedWarehouse() configstore.ManagedWarehou
 	}
 }
 
+func (r managedWarehouseRequest) applyToManagedWarehouse(dst *configstore.ManagedWarehouse, present map[string]json.RawMessage) {
+	if _, ok := present["warehouse_database"]; ok {
+		dst.WarehouseDatabase = r.WarehouseDatabase
+	}
+	if _, ok := present["metadata_store"]; ok {
+		dst.MetadataStore = r.MetadataStore
+	}
+	if _, ok := present["pgbouncer"]; ok {
+		dst.PgBouncer = r.PgBouncer
+	}
+	if _, ok := present["s3"]; ok {
+		dst.S3 = r.S3
+	}
+	if _, ok := present["worker_identity"]; ok {
+		dst.WorkerIdentity = r.WorkerIdentity
+	}
+	if _, ok := present["warehouse_database_credentials"]; ok {
+		dst.WarehouseDatabaseCredentials = r.WarehouseDatabaseCredentials
+	}
+	if _, ok := present["metadata_store_credentials"]; ok {
+		dst.MetadataStoreCredentials = r.MetadataStoreCredentials
+	}
+	if _, ok := present["s3_credentials"]; ok {
+		dst.S3Credentials = r.S3Credentials
+	}
+	if _, ok := present["runtime_config"]; ok {
+		dst.RuntimeConfig = r.RuntimeConfig
+	}
+	if _, ok := present["state"]; ok {
+		dst.State = r.State
+	}
+	if _, ok := present["status_message"]; ok {
+		dst.StatusMessage = r.StatusMessage
+	}
+	if _, ok := present["warehouse_database_state"]; ok {
+		dst.WarehouseDatabaseState = r.WarehouseDatabaseState
+	}
+	if _, ok := present["warehouse_database_status_message"]; ok {
+		dst.WarehouseDatabaseStatusMessage = r.WarehouseDatabaseStatusMessage
+	}
+	if _, ok := present["metadata_store_state"]; ok {
+		dst.MetadataStoreState = r.MetadataStoreState
+	}
+	if _, ok := present["metadata_store_status_message"]; ok {
+		dst.MetadataStoreStatusMessage = r.MetadataStoreStatusMessage
+	}
+	if _, ok := present["s3_state"]; ok {
+		dst.S3State = r.S3State
+	}
+	if _, ok := present["s3_status_message"]; ok {
+		dst.S3StatusMessage = r.S3StatusMessage
+	}
+	if _, ok := present["identity_state"]; ok {
+		dst.IdentityState = r.IdentityState
+	}
+	if _, ok := present["identity_status_message"]; ok {
+		dst.IdentityStatusMessage = r.IdentityStatusMessage
+	}
+	if _, ok := present["secrets_state"]; ok {
+		dst.SecretsState = r.SecretsState
+	}
+	if _, ok := present["secrets_status_message"]; ok {
+		dst.SecretsStatusMessage = r.SecretsStatusMessage
+	}
+	if _, ok := present["ready_at"]; ok {
+		dst.ReadyAt = r.ReadyAt
+	}
+	if _, ok := present["failed_at"]; ok {
+		dst.FailedAt = r.FailedAt
+	}
+}
+
 func decodeStrictWarehouseRequest(c *gin.Context, dst *managedWarehouseRequest) error {
 	dec := json.NewDecoder(c.Request.Body)
 	dec.DisallowUnknownFields()
@@ -561,12 +635,33 @@ func (h *apiHandler) getManagedWarehouse(c *gin.Context) {
 
 func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 	orgID := c.Param("id")
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	var req managedWarehouseRequest
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	if err := decodeStrictWarehouseRequest(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	var present map[string]json.RawMessage
+	if err := json.Unmarshal(body, &present); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	warehouse := req.toManagedWarehouse()
+	existing, err := h.store.GetManagedWarehouse(orgID)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err == nil {
+		warehouse = *existing
+		req.applyToManagedWarehouse(&warehouse, present)
+	}
 	cfgView := &configstore.ManagedWarehouseConfig{
 		OrgID:                        orgID,
 		WarehouseDatabase:            warehouse.WarehouseDatabase,
