@@ -245,6 +245,13 @@ func SetupMultiTenant(
 		defer cancel()
 		router.sharedPool.RetireOneMismatchedVersionWorker(ctx)
 	}
+	janitor.cleanupOrphanedWorkerPods = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if n := router.sharedPool.cleanupOrphanedWorkerPods(ctx, 2*time.Minute); n > 0 {
+			slog.Info("Stranded worker pods reconciled.", "count", n)
+		}
+	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err

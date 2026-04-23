@@ -195,6 +195,61 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 	}
 }
 
+func TestControlPlaneJanitorRunInvokesStrandedPodReconciler(t *testing.T) {
+	// Every tick the janitor must invoke the stranded-pod reconciler so that
+	// pods leaked by a previous CP (which marked its workers retired but
+	// failed to delete the K8s pod) get cleaned up automatically.
+	store := &captureControlPlaneExpiryStore{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+
+	var mu sync.Mutex
+	calls := 0
+	janitor.cleanupOrphanedWorkerPods = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+	}
+
+	janitor.runOnce()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected janitor to invoke stranded-pod reconciler exactly once, got %d", calls)
+	}
+}
+
+func TestControlPlaneJanitorRunInvokesReconcilerAfterVersionReaper(t *testing.T) {
+	// Ordering matters: retireMismatchedVersionWorker retires an idle worker
+	// (setting its row to retired) and deletes the pod. If the pod delete
+	// fails, the stranded-pod reconciler in the next tick's pass must catch
+	// it. Running them in order within the same tick ensures a delete failure
+	// gets a retry within ~5s instead of waiting for the next full tick.
+	store := &captureControlPlaneExpiryStore{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+
+	var mu sync.Mutex
+	var order []string
+	janitor.retireMismatchedVersionWorker = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, "version_reap")
+	}
+	janitor.cleanupOrphanedWorkerPods = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, "reconcile_stranded")
+	}
+
+	janitor.runOnce()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "version_reap" || order[1] != "reconcile_stranded" {
+		t.Fatalf("expected version_reap → reconcile_stranded ordering, got %v", order)
+	}
+}
+
 func TestControlPlaneJanitorRunInvokesVersionReaperBeforeReconcile(t *testing.T) {
 	// The version-aware reaper must run before reconcileWarmCapacity in the
 	// same tick so that a retired-this-tick worker's warm slot is replenished
