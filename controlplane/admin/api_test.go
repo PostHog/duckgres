@@ -478,6 +478,86 @@ func TestPutWarehouseMergesPartialUpdateIntoExistingWarehouse(t *testing.T) {
 	}
 }
 
+func TestPutWarehouseDisablesPgBouncerWhenSetToFalse(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	store.warehouses["analytics"].PgBouncer = configstore.ManagedWarehousePgBouncer{Enabled: true}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"pgbouncer": {"enabled": false}}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.warehouses["analytics"].PgBouncer.Enabled {
+		t.Fatal("expected pgbouncer to be disabled after PUT with enabled=false")
+	}
+}
+
+func TestPutWarehousePreservesNestedFieldsOnPartialUpdate(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	router := newTestAPIRouter(store)
+
+	// Send only one inner field. Every other metadata_store field must stay
+	// as seeded — confirms the merge is nested-aware, not whole-struct replace.
+	body := []byte(`{"metadata_store": {"database_name": "renamed_metadata"}}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	got := store.warehouses["analytics"].MetadataStore
+	if got.DatabaseName != "renamed_metadata" {
+		t.Fatalf("database_name = %q, want renamed_metadata", got.DatabaseName)
+	}
+	if got.Endpoint != "analytics-metadata.cluster.example" {
+		t.Fatalf("endpoint = %q, want analytics-metadata.cluster.example (nested fields were wiped)", got.Endpoint)
+	}
+	if got.Region != "us-east-1" {
+		t.Fatalf("region = %q, want us-east-1", got.Region)
+	}
+	if got.Port != 5432 {
+		t.Fatalf("port = %d, want 5432", got.Port)
+	}
+	if got.Kind != "dedicated_rds" {
+		t.Fatalf("kind = %q, want dedicated_rds", got.Kind)
+	}
+	if got.Engine != "postgres" {
+		t.Fatalf("engine = %q, want postgres", got.Engine)
+	}
+	if got.Username != "metadata_user" {
+		t.Fatalf("username = %q, want metadata_user", got.Username)
+	}
+}
+
+func TestPutWarehouseRejectsOversizedBody(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	router := newTestAPIRouter(store)
+
+	// Pad the body past the 1 MiB cap inside a valid top-level field so the
+	// reader errors on size rather than JSON parsing.
+	oversized := strings.Repeat("a", (1<<20)+1024)
+	body := []byte(`{"status_message": "` + oversized + `"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
 func TestPutWarehouseRejectsSecretRefsOutsideTenantScope(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
