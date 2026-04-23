@@ -68,6 +68,20 @@ func TestDucklingMetadataStoreAddressRejectsInvalidPgBouncerEndpoint(t *testing.
 	}
 }
 
+func TestDucklingMetadataStoreAddressRejectsEmptyEndpoints(t *testing.T) {
+	// Status with neither endpoint set — surface a clear error up front rather
+	// than letting an empty host propagate into a DSN and fail opaquely later.
+	status := &provisioner.DucklingStatus{}
+
+	_, _, _, err := ducklingMetadataStoreAddress(status, "analytics")
+	if err == nil {
+		t.Fatal("expected error when both endpoints are empty")
+	}
+	if !strings.Contains(err.Error(), "no metadata store endpoint") {
+		t.Fatalf("expected missing-endpoint error, got %v", err)
+	}
+}
+
 func TestSharedWorkerActivatorBuildsActivationRequestFromManagedWarehouse(t *testing.T) {
 	clientset := fake.NewSimpleClientset(
 		&corev1.Secret{

@@ -201,6 +201,146 @@ func TestReconcilePendingEmitsPgBouncerBlock(t *testing.T) {
 	}
 }
 
+func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOn(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-flip"] = &configstore.ManagedWarehouse{
+		OrgID:     "org-flip",
+		State:     configstore.ManagedWarehouseStateReady,
+		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: true},
+	}
+	// Seed a CR whose spec still reflects the pre-flip world (no pgbouncer block).
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata": map[string]interface{}{
+			"name":      ducklingName("org-flip"),
+			"namespace": ducklingNamespace,
+		},
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type": "aurora",
+				"aurora": map[string]interface{}{
+					"minACU": 0.5,
+					"maxACU": 2.0,
+				},
+			},
+		},
+	}}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-flip"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("re-fetch CR: %v", err)
+	}
+	spec := got.Object["spec"].(map[string]interface{})
+	ms := spec["metadataStore"].(map[string]interface{})
+	pgb, ok := ms["pgbouncer"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected pgbouncer block after drift patch, got %v", ms)
+	}
+	if pgb["enabled"] != true {
+		t.Fatalf("expected pgbouncer.enabled=true, got %v", pgb["enabled"])
+	}
+	// Merge-patch must not wipe sibling metadataStore fields.
+	if ms["type"] != "aurora" {
+		t.Fatalf("expected metadataStore.type preserved, got %v", ms["type"])
+	}
+	if _, ok := ms["aurora"].(map[string]interface{}); !ok {
+		t.Fatalf("expected aurora block preserved, got %v", ms)
+	}
+}
+
+func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOff(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-off"] = &configstore.ManagedWarehouse{
+		OrgID:     "org-off",
+		State:     configstore.ManagedWarehouseStateReady,
+		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: false},
+	}
+	// Seed a CR that currently has pgbouncer enabled — expect it to be
+	// patched back to false to match the config store.
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata": map[string]interface{}{
+			"name":      ducklingName("org-off"),
+			"namespace": ducklingNamespace,
+		},
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type": "aurora",
+				"pgbouncer": map[string]interface{}{
+					"enabled": true,
+				},
+			},
+		},
+	}}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-off"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("re-fetch CR: %v", err)
+	}
+	spec := got.Object["spec"].(map[string]interface{})
+	ms := spec["metadataStore"].(map[string]interface{})
+	pgb := ms["pgbouncer"].(map[string]interface{})
+	if pgb["enabled"] != false {
+		t.Fatalf("expected pgbouncer.enabled=false after drift patch, got %v", pgb["enabled"])
+	}
+}
+
+func TestReconcileReadyNoDriftDoesNotPatch(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-sync"] = &configstore.ManagedWarehouse{
+		OrgID:     "org-sync",
+		State:     configstore.ManagedWarehouseStateReady,
+		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: true},
+	}
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata": map[string]interface{}{
+			"name":            ducklingName("org-sync"),
+			"namespace":       ducklingNamespace,
+			"resourceVersion": "42",
+		},
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":      "aurora",
+				"pgbouncer": map[string]interface{}{"enabled": true},
+			},
+		},
+	}}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+	seededRV := cr.GetResourceVersion()
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-sync"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("re-fetch CR: %v", err)
+	}
+	if got.GetResourceVersion() != seededRV {
+		t.Fatalf("expected no patch when in sync, resourceVersion went %q -> %q", seededRV, got.GetResourceVersion())
+	}
+}
+
 func TestReconcileProvisioningAllReady(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	fs := newFakeStore()

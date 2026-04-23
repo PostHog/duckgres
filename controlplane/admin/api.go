@@ -126,6 +126,13 @@ type apiStore interface {
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
+	// MutateManagedWarehouse loads the existing warehouse (or a zero value if
+	// none), calls mutate to apply changes, and persists the result — all
+	// inside a single transaction with a row-level lock on the warehouse row.
+	// Closes the read-modify-write race that plain Get+Upsert is exposed to
+	// when concurrent PUTs target the same org. Returns (nil, false, nil) if
+	// the org doesn't exist.
+	MutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error) (*configstore.ManagedWarehouse, bool, error)
 
 	GetGlobalConfig() (configstore.GlobalConfig, error)
 	SaveGlobalConfig(cfg *configstore.GlobalConfig) error
@@ -296,6 +303,57 @@ func (s *gormAPIStore) UpsertManagedWarehouse(orgID string, warehouse *configsto
 	return stored, true, nil
 }
 
+func (s *gormAPIStore) MutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error) (*configstore.ManagedWarehouse, bool, error) {
+	var (
+		stored    *configstore.ManagedWarehouse
+		orgExists bool
+	)
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		var count int64
+		if err := tx.Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return nil
+		}
+		orgExists = true
+
+		// SELECT ... FOR UPDATE: blocks concurrent mutators on the same row
+		// until this transaction commits. A missing row is not an error —
+		// PUT on a brand-new warehouse lands in the same path.
+		var warehouse configstore.ManagedWarehouse
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&warehouse, "org_id = ?", orgID).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		if err := mutate(&warehouse); err != nil {
+			return err
+		}
+
+		warehouse.OrgID = orgID
+		warehouse.UpdatedAt = time.Now().UTC()
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "org_id"}},
+			DoUpdates: clause.AssignmentColumns(managedWarehouseUpsertColumns()),
+		}).Create(&warehouse).Error; err != nil {
+			return err
+		}
+
+		var reloaded configstore.ManagedWarehouse
+		if err := tx.First(&reloaded, "org_id = ?", orgID).Error; err != nil {
+			return err
+		}
+		stored = &reloaded
+		return nil
+	})
+	if err != nil {
+		return nil, orgExists, err
+	}
+	return stored, orgExists, nil
+}
+
 func managedWarehouseUpsertColumns() []string {
 	return []string{
 		"image",
@@ -407,6 +465,13 @@ type apiHandler struct {
 	info  OrgStackInfo
 }
 
+// managedWarehouseRequest is the whitelist of fields a caller may set on the
+// PUT endpoint. It's only used for strict decode (DisallowUnknownFields) — the
+// actual merge is performed by json.Unmarshal directly onto a ManagedWarehouse
+// (see putManagedWarehouse). For that to work, every `json:` tag here must
+// match the corresponding `json:` tag on configstore.ManagedWarehouse. If you
+// add a field here without a matching tag on ManagedWarehouse, strict decode
+// will accept it and the merge will silently drop it.
 type managedWarehouseRequest struct {
 	WarehouseDatabase              configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
 	MetadataStore                  configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
@@ -544,6 +609,14 @@ func (h *apiHandler) getManagedWarehouse(c *gin.Context) {
 	c.JSON(http.StatusOK, warehouse)
 }
 
+// warehouseBadRequestError marks an error from the mutate closure as caused by
+// bad caller input rather than a store-level failure. The handler maps it to
+// 400, not 500.
+type warehouseBadRequestError struct{ err error }
+
+func (e warehouseBadRequestError) Error() string { return e.err.Error() }
+func (e warehouseBadRequestError) Unwrap() error { return e.err }
+
 func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 	orgID := c.Param("id")
 
@@ -562,43 +635,39 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		return
 	}
 
-	// Load any existing row, then unmarshal the body onto it. json.Unmarshal
-	// only overwrites fields whose JSON keys appear in the body — both at the
-	// top level AND within each nested struct. Callers can therefore PATCH a
-	// single field (e.g. `{"metadata_store":{"database_name":"x"}}`) without
-	// wiping sibling fields. Note: concurrent PUTs on the same org can still
-	// interleave (read-modify-write across two store calls); the admin API is
-	// low-frequency enough that we accept this for now.
-	existing, err := h.store.GetManagedWarehouse(orgID)
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	var warehouse configstore.ManagedWarehouse
-	if err == nil {
-		warehouse = *existing
-	}
-	if err := json.Unmarshal(body, &warehouse); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfgView := &configstore.ManagedWarehouseConfig{
-		OrgID:                        orgID,
-		WarehouseDatabase:            warehouse.WarehouseDatabase,
-		MetadataStore:                warehouse.MetadataStore,
-		S3:                           warehouse.S3,
-		WorkerIdentity:               warehouse.WorkerIdentity,
-		WarehouseDatabaseCredentials: warehouse.WarehouseDatabaseCredentials,
-		MetadataStoreCredentials:     warehouse.MetadataStoreCredentials,
-		S3Credentials:                warehouse.S3Credentials,
-		RuntimeConfig:                warehouse.RuntimeConfig,
-	}
-	if err := configstore.ValidateManagedWarehouseSecretRefs(orgID, "", cfgView); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	stored, ok, err := h.store.UpsertManagedWarehouse(orgID, &warehouse)
+	// MutateManagedWarehouse locks the row inside a transaction, runs the
+	// closure, and commits — closing the race where two concurrent PUTs would
+	// otherwise Get + modify different snapshots and silently clobber each
+	// other. The closure does the merge and validation on the locked row.
+	stored, ok, err := h.store.MutateManagedWarehouse(orgID, func(w *configstore.ManagedWarehouse) error {
+		// json.Unmarshal only overwrites fields whose keys appear in the body
+		// — top-level AND nested. Callers can PATCH one inner field (e.g.
+		// `{"metadata_store":{"database_name":"x"}}`) without wiping siblings.
+		if err := json.Unmarshal(body, w); err != nil {
+			return warehouseBadRequestError{err}
+		}
+		cfgView := &configstore.ManagedWarehouseConfig{
+			OrgID:                        orgID,
+			WarehouseDatabase:            w.WarehouseDatabase,
+			MetadataStore:                w.MetadataStore,
+			S3:                           w.S3,
+			WorkerIdentity:               w.WorkerIdentity,
+			WarehouseDatabaseCredentials: w.WarehouseDatabaseCredentials,
+			MetadataStoreCredentials:     w.MetadataStoreCredentials,
+			S3Credentials:                w.S3Credentials,
+			RuntimeConfig:                w.RuntimeConfig,
+		}
+		if err := configstore.ValidateManagedWarehouseSecretRefs(orgID, "", cfgView); err != nil {
+			return warehouseBadRequestError{err}
+		}
+		return nil
+	})
 	if err != nil {
+		var badReq warehouseBadRequestError
+		if errors.As(err, &badReq) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": badReq.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

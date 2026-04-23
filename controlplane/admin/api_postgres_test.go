@@ -154,3 +154,50 @@ func TestUpsertManagedWarehousePreservesCreatedAt(t *testing.T) {
 		t.Fatalf("expected updated metadata db name, got %q", stored.MetadataStore.DatabaseName)
 	}
 }
+
+func TestMutateManagedWarehouseSerializesConcurrentWriters(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	if err := store.DB().Create(&configstore.Org{Name: "analytics"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if err := store.DB().Create(&configstore.ManagedWarehouse{
+		OrgID: "analytics",
+		State: configstore.ManagedWarehouseStatePending,
+	}).Error; err != nil {
+		t.Fatalf("seed warehouse: %v", err)
+	}
+
+	// Fan out N concurrent Mutate calls, each incrementing a counter encoded
+	// in StatusMessage. With plain Get+Upsert these would race and drop some
+	// increments. With SELECT ... FOR UPDATE inside a transaction, every
+	// writer observes the prior one's commit and the counter lands at N.
+	const writers = 8
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		go func() {
+			_, _, err := apiStore.MutateManagedWarehouse("analytics", func(w *configstore.ManagedWarehouse) error {
+				var n int
+				_, _ = fmt.Sscanf(w.StatusMessage, "n=%d", &n)
+				w.StatusMessage = fmt.Sprintf("n=%d", n+1)
+				return nil
+			})
+			errs <- err
+		}()
+	}
+	for i := 0; i < writers; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("mutate %d: %v", i, err)
+		}
+	}
+
+	final, err := apiStore.GetManagedWarehouse("analytics")
+	if err != nil {
+		t.Fatalf("get warehouse: %v", err)
+	}
+	want := fmt.Sprintf("n=%d", writers)
+	if final.StatusMessage != want {
+		t.Fatalf("status_message = %q, want %q (lost updates under concurrency)", final.StatusMessage, want)
+	}
+}

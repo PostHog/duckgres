@@ -70,9 +70,12 @@ func (c *Controller) Run(ctx context.Context) {
 }
 
 // actionableStates are the warehouse states the controller acts on.
+// Ready is included so we can drift-correct user-mutable CR fields (today
+// just pgbouncer.enabled) without waiting for the Duckling to be recreated.
 var actionableStates = []configstore.ManagedWarehouseProvisioningState{
 	configstore.ManagedWarehouseStatePending,
 	configstore.ManagedWarehouseStateProvisioning,
+	configstore.ManagedWarehouseStateReady,
 	configstore.ManagedWarehouseStateDeleting,
 }
 
@@ -92,6 +95,8 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.reconcilePending(ctx, &w)
 		case configstore.ManagedWarehouseStateProvisioning:
 			c.reconcileProvisioning(ctx, &w)
+		case configstore.ManagedWarehouseStateReady:
+			c.reconcileReady(ctx, &w)
 		case configstore.ManagedWarehouseStateDeleting:
 			c.reconcileDeleting(ctx, &w)
 		}
@@ -227,6 +232,39 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, updates); err != nil {
 			log.Warn("Failed to update warehouse state.", "error", err)
 		}
+	}
+}
+
+// reconcileReady handles drift correction for Ready warehouses. Today the
+// only post-create-mutable spec field is metadataStore.pgbouncer.enabled;
+// if an operator flips it in the config store (admin API), we patch the CR
+// so the Crossplane composition provisions / tears down the pooler.
+//
+// Scope is intentionally narrow: we do NOT reconcile ACU, image, or other
+// spec fields. Those aren't user-mutable via the admin API today, and
+// aggressive drift correction would conflict with manual kubectl patches.
+func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedWarehouse) {
+	log := slog.With("org", w.OrgID, "phase", "ready")
+
+	currentEnabled, err := c.duckling.GetPgBouncerEnabled(ctx, w.OrgID)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// CR is gone but the warehouse is still marked Ready. Don't try
+			// to patch; leave the state machine to catch up.
+			log.Warn("Duckling CR not found for Ready warehouse — skipping drift check.")
+			return
+		}
+		log.Warn("Failed to read Duckling CR for drift check.", "error", err)
+		return
+	}
+	if currentEnabled == w.PgBouncer.Enabled {
+		return
+	}
+
+	log.Info("PgBouncer drift detected, patching Duckling CR.",
+		"desired", w.PgBouncer.Enabled, "current", currentEnabled)
+	if err := c.duckling.SetPgBouncerEnabled(ctx, w.OrgID, w.PgBouncer.Enabled); err != nil {
+		log.Warn("Failed to patch Duckling CR pgbouncer.enabled.", "error", err)
 	}
 }
 

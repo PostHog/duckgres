@@ -151,6 +151,25 @@ func (s *fakeAPIStore) UpsertManagedWarehouse(orgID string, warehouse *configsto
 	return copyWarehouse(clone), true, nil
 }
 
+func (s *fakeAPIStore) MutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error) (*configstore.ManagedWarehouse, bool, error) {
+	org, ok := s.orgs[orgID]
+	if !ok {
+		return nil, false, nil
+	}
+	var warehouse configstore.ManagedWarehouse
+	if existing, ok := s.warehouses[orgID]; ok {
+		warehouse = *existing
+	}
+	if err := mutate(&warehouse); err != nil {
+		return nil, true, err
+	}
+	clone := copyWarehouse(&warehouse)
+	clone.OrgID = orgID
+	s.warehouses[orgID] = clone
+	org.Warehouse = copyWarehouse(clone)
+	return copyWarehouse(clone), true, nil
+}
+
 func (s *fakeAPIStore) GetGlobalConfig() (configstore.GlobalConfig, error) {
 	return configstore.GlobalConfig{}, nil
 }
