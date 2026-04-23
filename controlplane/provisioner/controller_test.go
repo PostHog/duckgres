@@ -331,6 +331,34 @@ func TestParseDucklingStatusSyncedFalse(t *testing.T) {
 	}
 }
 
+func TestParseDucklingStatusPgBouncerEndpoint(t *testing.T) {
+	cr := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"status": map[string]interface{}{
+				"metadataStore": map[string]interface{}{
+					"type":              "aurora",
+					"endpoint":          "posthog-duckling-foo.cluster-xyz.us-east-1.rds.amazonaws.com",
+					"pgbouncerEndpoint": "pgbouncer-duckling-foo.ducklings.svc.cluster.local:6543",
+					"user":              "postgres",
+					"database":          "postgres",
+					"password":          "s3cret",
+				},
+			},
+		},
+	}
+
+	status, err := parseDucklingStatus(cr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := status.MetadataStore.PgBouncerEndpoint; got != "pgbouncer-duckling-foo.ducklings.svc.cluster.local:6543" {
+		t.Fatalf("PgBouncerEndpoint = %q, want pooler DNS", got)
+	}
+	if got := status.MetadataStore.Endpoint; got != "posthog-duckling-foo.cluster-xyz.us-east-1.rds.amazonaws.com" {
+		t.Fatalf("Endpoint = %q, want Aurora DNS", got)
+	}
+}
+
 func TestParseDucklingStatusEmpty(t *testing.T) {
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{},

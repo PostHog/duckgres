@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -193,18 +195,40 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 		return server.DuckLakeConfig{}, fmt.Errorf("duckling CR %q has no data store bucket", orgID)
 	}
 
+	// Prefer the PgBouncer endpoint when the Duckling exposes one — the
+	// Crossplane composition sets status.metadataStore.pgbouncerEndpoint
+	// (as "<host>:<port>") when a per-Duckling pooler is provisioned.
+	// Otherwise connect directly to the metadata store on its default port.
+	host := status.MetadataStore.Endpoint
+	port := 5432 // Aurora always uses 5432
+	viaPgBouncer := false
+	if pgb := status.MetadataStore.PgBouncerEndpoint; pgb != "" {
+		h, p, err := net.SplitHostPort(pgb)
+		if err != nil {
+			return server.DuckLakeConfig{}, fmt.Errorf("parse pgbouncerEndpoint %q for org %q: %w", pgb, orgID, err)
+		}
+		portNum, err := strconv.Atoi(p)
+		if err != nil {
+			return server.DuckLakeConfig{}, fmt.Errorf("parse pgbouncerEndpoint port %q for org %q: %w", p, orgID, err)
+		}
+		host = h
+		port = portNum
+		viaPgBouncer = true
+	}
+
 	dl := server.DuckLakeConfig{
 		MetadataStore: buildDuckLakeMetadataStoreDSN(
-			status.MetadataStore.Endpoint,
-			5432, // Aurora always uses 5432
+			host,
+			port,
 			status.MetadataStore.User,
 			status.MetadataStore.Password,
 			status.MetadataStore.Database,
 		),
-		ObjectStore: fmt.Sprintf("s3://%s/", status.DataStore.BucketName),
-		S3Region:    status.DataStore.S3Region,
-		S3UseSSL:    true,
-		S3URLStyle:  "vhost",
+		ViaPgBouncer: viaPgBouncer,
+		ObjectStore:  fmt.Sprintf("s3://%s/", status.DataStore.BucketName),
+		S3Region:     status.DataStore.S3Region,
+		S3UseSSL:     true,
+		S3URLStyle:   "vhost",
 	}
 
 	// Broker S3 credentials via STS AssumeRole

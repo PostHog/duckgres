@@ -185,6 +185,24 @@ func TestBuildDuckLakePreAttachStatements(t *testing.T) {
 			},
 			want: nil,
 		},
+		{
+			name: "via pgbouncer disables in-process pool",
+			cfg: DuckLakeConfig{
+				DisableMetadataThreadLocalCache: boolPtr(false),
+				ViaPgBouncer:                    true,
+			},
+			want: []string{"SET GLOBAL pg_pool_max_connections = 0"},
+		},
+		{
+			name: "via pgbouncer with tls cache disabled emits both",
+			cfg: DuckLakeConfig{
+				ViaPgBouncer: true,
+			},
+			want: []string{
+				"SET GLOBAL pg_pool_enable_thread_local_cache = false",
+				"SET GLOBAL pg_pool_max_connections = 0",
+			},
+		},
 	}
 
 	for _, tt := range tests {

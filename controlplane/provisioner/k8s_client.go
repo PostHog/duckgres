@@ -27,11 +27,12 @@ const ducklingNamespace = "ducklings"
 // but not K8s workloads — those are managed by the duckgres Helm chart.
 type DucklingStatus struct {
 	MetadataStore struct {
-		Type     string
-		Endpoint string
-		Password string
-		User     string
-		Database string
+		Type              string
+		Endpoint          string
+		PgBouncerEndpoint string
+		Password          string
+		User              string
+		Database          string
 	}
 	DataStore struct {
 		Type       string
@@ -140,6 +141,7 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 	if md, ok := status["metadataStore"].(map[string]interface{}); ok {
 		ds.MetadataStore.Type = getNestedString(md, "type")
 		ds.MetadataStore.Endpoint = getNestedString(md, "endpoint")
+		ds.MetadataStore.PgBouncerEndpoint = getNestedString(md, "pgbouncerEndpoint")
 		ds.MetadataStore.Password = getNestedString(md, "password")
 		ds.MetadataStore.User = getNestedString(md, "user")
 		ds.MetadataStore.Database = getNestedString(md, "database")
