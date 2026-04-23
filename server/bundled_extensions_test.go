@@ -1,10 +1,13 @@
 package server
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 func TestSeedBundledExtensionsCopiesMissingFiles(t *testing.T) {
@@ -224,5 +227,61 @@ func TestBootstrapBundledExtensionsRunsOncePerExtensionDirectory(t *testing.T) {
 	}
 	if string(got) != "nightly" {
 		t.Fatalf("expected bootstrap to run once, got %q", string(got))
+	}
+}
+
+func TestSetExtensionDirectorySetsPathAfterBootstrap(t *testing.T) {
+	bundledRoot := t.TempDir()
+	dataDir := t.TempDir()
+
+	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	srcExt := filepath.Join(srcDir, "postgres_scanner.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("nightly"), 0o644); err != nil {
+		t.Fatalf("write src extension: %v", err)
+	}
+
+	prevBundledRoot := bundledDuckDBExtensionsDir
+	bundledDuckDBExtensionsDir = bundledRoot
+	defer func() { bundledDuckDBExtensionsDir = prevBundledRoot }()
+
+	bundledExtensionBootstrap = struct {
+		mu     sync.Mutex
+		byPath map[string]error
+	}{}
+
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := bootstrapBundledExtensions(dataDir); err != nil {
+		t.Fatalf("bootstrapBundledExtensions: %v", err)
+	}
+
+	if err := setExtensionDirectory(db, dataDir); err != nil {
+		t.Fatalf("setExtensionDirectory: %v", err)
+	}
+
+	var gotExtDir string
+	if err := db.QueryRow("SELECT current_setting('extension_directory')").Scan(&gotExtDir); err != nil {
+		t.Fatalf("query extension_directory: %v", err)
+	}
+
+	wantExtDir := filepath.Join(dataDir, "extensions")
+	if gotExtDir != wantExtDir {
+		t.Fatalf("extension_directory = %q, want %q", gotExtDir, wantExtDir)
+	}
+
+	dstExt := filepath.Join(wantExtDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
+	got, err := os.ReadFile(dstExt)
+	if err != nil {
+		t.Fatalf("read dst extension: %v", err)
+	}
+	if string(got) != "nightly" {
+		t.Fatalf("expected seeded extension to match bundled contents, got %q", string(got))
 	}
 }

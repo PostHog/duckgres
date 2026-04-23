@@ -67,6 +67,21 @@ func bootstrapBundledExtensions(dataDir string) error {
 	return err
 }
 
+// BootstrapBundledExtensions eagerly seeds bundled extension binaries into the
+// configured extension_directory cache once per data directory.
+func BootstrapBundledExtensions(dataDir string) error {
+	return bootstrapBundledExtensions(dataDir)
+}
+
+func setExtensionDirectory(db *sql.DB, dataDir string) error {
+	extDir := filepath.Join(dataDir, "extensions")
+	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
+		return fmt.Errorf("set extension_directory %s: %w", extDir, err)
+	}
+
+	return nil
+}
+
 // passwordPattern matches password=<value> or password: <value> with quoted or unquoted values.
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
 
@@ -500,7 +515,7 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	if err := bootstrapBundledExtensions(cfg.DataDir); err != nil {
-		slog.Warn("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(cfg.DataDir, "extensions"), "error", err)
+		return nil, fmt.Errorf("failed to bootstrap bundled DuckDB extensions: %w", err)
 	}
 
 	// Initialize query logger (non-fatal on error)
@@ -896,13 +911,9 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		slog.Debug("Set DuckDB temp_directory.", "temp_directory", tempDir)
 	}
 
-	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
-	// for autoloading/installing extensions.
-	extDir := filepath.Join(cfg.DataDir, "extensions")
-	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
-		slog.Warn("Failed to set DuckDB extension_directory.", "extension_directory", extDir, "error", err)
-	} else {
-		slog.Debug("Set DuckDB extension_directory.", "extension_directory", extDir)
+	if err := setExtensionDirectory(db, cfg.DataDir); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to configure extension_directory: %w", err)
 	}
 
 	// Load configured extensions
@@ -1200,11 +1211,15 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 	for _, ext := range extensions {
 		name, installCmd := parseExtensionName(ext)
 
-		// First install the extension (downloads if needed)
-		if _, err := db.Exec("INSTALL " + installCmd); err != nil {
-			slog.Warn("Failed to install extension.", "extension", installCmd, "error", err)
-			lastErr = err
-			continue
+		if shouldInstallExtension(name) {
+			// First install the extension (downloads if needed). Bundled extensions
+			// are preseeded into the extension cache and INSTALL can overwrite that
+			// bundled binary with DuckDB's repository copy.
+			if _, err := db.Exec("INSTALL " + installCmd); err != nil {
+				slog.Warn("Failed to install extension.", "extension", installCmd, "error", err)
+				lastErr = err
+				continue
+			}
 		}
 
 		// Then load it into the current session
@@ -1218,6 +1233,15 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 	}
 
 	return lastErr
+}
+
+func shouldInstallExtension(name string) bool {
+	return !hasBundledExtensionBinary(name)
+}
+
+func hasBundledExtensionBinary(name string) bool {
+	matches, err := filepath.Glob(filepath.Join(bundledDuckDBExtensionsDir, "*", "*", name+".duckdb_extension"))
+	return err == nil && len(matches) > 0
 }
 
 func boolPtr(v bool) *bool { return &v }

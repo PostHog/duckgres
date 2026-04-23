@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -32,13 +31,12 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 		return nil, fmt.Errorf("checkpoint: open duckdb: %w", err)
 	}
 
-	extDir := filepath.Join(cfg.DataDir, "extensions")
-	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
+	if err := setExtensionDirectory(db, cfg.DataDir); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("checkpoint: set extension_directory: %w", err)
+		return nil, fmt.Errorf("checkpoint: set extension directory: %w", err)
 	}
 
-	if _, err := db.Exec("INSTALL ducklake; LOAD ducklake"); err != nil {
+	if err := LoadExtensions(db, []string{"ducklake"}); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("checkpoint: load ducklake: %w", err)
 	}

@@ -295,7 +295,10 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	}
 
 	if err := bootstrapBundledExtensions(serverCfg.DataDir); err != nil {
-		slog.Warn("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(serverCfg.DataDir, "extensions"), "error", err)
+		slog.Error("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(serverCfg.DataDir, "extensions"), "error", err)
+		_ = writeErrorResponse(writer, "FATAL", "58000", fmt.Sprintf("failed to prepare bundled extensions: %v", err))
+		_ = writer.Flush()
+		return ExitError
 	}
 
 	// Create DuckDB connection

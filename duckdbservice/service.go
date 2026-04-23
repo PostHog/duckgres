@@ -198,6 +198,14 @@ func (p *SessionPool) reapLoop() {
 func Run(cfg ServiceConfig) {
 	svc := NewDuckDBService(cfg)
 
+	if err := server.BootstrapBundledExtensions(cfg.ServerConfig.DataDir); err != nil {
+		slog.Error("Failed to bootstrap bundled DuckDB extensions.",
+			"source", "/app/extensions",
+			"extension_directory", cfg.ServerConfig.DataDir+"/extensions",
+			"error", err)
+		os.Exit(1)
+	}
+
 	// Pre-warm the DuckDB instance (load extensions, attach DuckLake)
 	// in the background so we don't block the gRPC server from starting.
 	// This ensures that waitForWorker doesn't time out during spawn.
