@@ -25,6 +25,9 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
+var bootstrapBundledExtensions = server.BootstrapBundledExtensions
+var exitProcess = os.Exit
+
 // DuckDBService is a standalone Arrow Flight SQL service backed by DuckDB.
 type DuckDBService struct {
 	cfg       ServiceConfig
@@ -197,6 +200,14 @@ func (p *SessionPool) reapLoop() {
 // Run starts the DuckDB service, blocking until shutdown.
 func Run(cfg ServiceConfig) {
 	svc := NewDuckDBService(cfg)
+
+	if err := bootstrapBundledExtensions(cfg.ServerConfig.DataDir); err != nil {
+		slog.Error("Failed to bootstrap bundled DuckDB extensions.",
+			"source", "/app/extensions",
+			"extension_directory", cfg.ServerConfig.DataDir+"/extensions",
+			"error", err)
+		exitProcess(1)
+	}
 
 	// Pre-warm the DuckDB instance (load extensions, attach DuckLake)
 	// in the background so we don't block the gRPC server from starting.

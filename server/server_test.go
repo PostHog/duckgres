@@ -112,6 +112,44 @@ func TestParseExtensionName(t *testing.T) {
 	}
 }
 
+func TestNewFailsWhenBundledExtensionBootstrapFails(t *testing.T) {
+	bundledRoot := filepath.Join(t.TempDir(), "extensions-file")
+	if err := os.WriteFile(bundledRoot, []byte("not-a-directory"), 0o644); err != nil {
+		t.Fatalf("write bundled root file: %v", err)
+	}
+
+	prevBundledRoot := bundledDuckDBExtensionsDir
+	bundledDuckDBExtensionsDir = bundledRoot
+	defer func() { bundledDuckDBExtensionsDir = prevBundledRoot }()
+
+	bundledExtensionBootstrap = struct {
+		mu     sync.Mutex
+		byPath map[string]error
+	}{}
+
+	certDir := t.TempDir()
+	certFile := filepath.Join(certDir, "server.crt")
+	keyFile := filepath.Join(certDir, "server.key")
+	if err := generateSelfSignedCert(certFile, keyFile); err != nil {
+		t.Fatalf("generateSelfSignedCert: %v", err)
+	}
+
+	_, err := New(Config{
+		Host:        "127.0.0.1",
+		Port:        5432,
+		DataDir:     t.TempDir(),
+		Users:       map[string]string{"postgres": "postgres"},
+		TLSCertFile: certFile,
+		TLSKeyFile:  keyFile,
+	})
+	if err == nil {
+		t.Fatal("expected bootstrap failure")
+	}
+	if !strings.Contains(err.Error(), "bootstrap bundled DuckDB extensions") {
+		t.Fatalf("expected bootstrap error, got %v", err)
+	}
+}
+
 func TestNeedsCredentialRefresh(t *testing.T) {
 	tests := []struct {
 		name string

@@ -20,9 +20,9 @@ import (
 func RunShell(cfg Config) {
 	sem := make(chan struct{}, 1)
 	if err := bootstrapBundledExtensions(cfg.DataDir); err != nil {
-		slog.Warn("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(cfg.DataDir, "extensions"), "error", err)
+		slog.Error("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(cfg.DataDir, "extensions"), "error", err)
+		os.Exit(1)
 	}
-
 	db, err := CreateDBConnection(cfg, sem, "shell", processStartTime, processVersion)
 	if err != nil {
 		slog.Error("Failed to create database connection.", "error", err)
