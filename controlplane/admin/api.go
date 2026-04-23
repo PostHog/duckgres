@@ -3,8 +3,10 @@
 package admin
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"time"
 
@@ -15,6 +17,11 @@ import (
 )
 
 var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:id/warehouse")
+
+// maxWarehousePutBodyBytes caps the admin PUT body. Warehouse payloads are
+// under 10 KB in practice; 1 MiB leaves room for future fields while keeping
+// the handler from loading unbounded input into memory.
+const maxWarehousePutBodyBytes = 1 << 20
 
 // WorkerStatus represents a worker's current status for the API.
 type WorkerStatus struct {
@@ -306,6 +313,7 @@ func managedWarehouseUpsertColumns() []string {
 		"metadata_store_port",
 		"metadata_store_database_name",
 		"metadata_store_username",
+		"pgbouncer_enabled",
 		"s3_provider",
 		"s3_region",
 		"s3_bucket",
@@ -402,6 +410,7 @@ type apiHandler struct {
 type managedWarehouseRequest struct {
 	WarehouseDatabase              configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
 	MetadataStore                  configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
+	PgBouncer                      configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
 	S3                             configstore.ManagedWarehouseS3                `json:"s3"`
 	WorkerIdentity                 configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
 	WarehouseDatabaseCredentials   configstore.SecretRef                         `json:"warehouse_database_credentials"`
@@ -424,35 +433,14 @@ type managedWarehouseRequest struct {
 	FailedAt                       *time.Time                                    `json:"failed_at"`
 }
 
-func (r managedWarehouseRequest) toManagedWarehouse() configstore.ManagedWarehouse {
-	return configstore.ManagedWarehouse{
-		WarehouseDatabase:              r.WarehouseDatabase,
-		MetadataStore:                  r.MetadataStore,
-		S3:                             r.S3,
-		WorkerIdentity:                 r.WorkerIdentity,
-		WarehouseDatabaseCredentials:   r.WarehouseDatabaseCredentials,
-		MetadataStoreCredentials:       r.MetadataStoreCredentials,
-		S3Credentials:                  r.S3Credentials,
-		RuntimeConfig:                  r.RuntimeConfig,
-		State:                          r.State,
-		StatusMessage:                  r.StatusMessage,
-		WarehouseDatabaseState:         r.WarehouseDatabaseState,
-		WarehouseDatabaseStatusMessage: r.WarehouseDatabaseStatusMessage,
-		MetadataStoreState:             r.MetadataStoreState,
-		MetadataStoreStatusMessage:     r.MetadataStoreStatusMessage,
-		S3State:                        r.S3State,
-		S3StatusMessage:                r.S3StatusMessage,
-		IdentityState:                  r.IdentityState,
-		IdentityStatusMessage:          r.IdentityStatusMessage,
-		SecretsState:                   r.SecretsState,
-		SecretsStatusMessage:           r.SecretsStatusMessage,
-		ReadyAt:                        r.ReadyAt,
-		FailedAt:                       r.FailedAt,
-	}
-}
-
-func decodeStrictWarehouseRequest(c *gin.Context, dst *managedWarehouseRequest) error {
-	dec := json.NewDecoder(c.Request.Body)
+// decodeStrictWarehouseRequest validates a PUT body by decoding it into
+// managedWarehouseRequest with DisallowUnknownFields. This whitelists which
+// top-level fields a caller may set; the actual merge is performed separately
+// by unmarshaling the same body onto an existing ManagedWarehouse (see
+// putManagedWarehouse) so missing keys — at any nesting level — preserve
+// whatever the stored row already holds.
+func decodeStrictWarehouseRequest(body []byte, dst *managedWarehouseRequest) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	return dec.Decode(dst)
 }
@@ -558,12 +546,42 @@ func (h *apiHandler) getManagedWarehouse(c *gin.Context) {
 
 func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 	orgID := c.Param("id")
-	var req managedWarehouseRequest
-	if err := decodeStrictWarehouseRequest(c, &req); err != nil {
+
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxWarehousePutBodyBytes))
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	warehouse := req.toManagedWarehouse()
+
+	// Strict decode rejects unknown top-level fields and malformed JSON. We
+	// don't use the decoded value directly; it just gates which keys the body
+	// is allowed to carry.
+	var req managedWarehouseRequest
+	if err := decodeStrictWarehouseRequest(body, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Load any existing row, then unmarshal the body onto it. json.Unmarshal
+	// only overwrites fields whose JSON keys appear in the body — both at the
+	// top level AND within each nested struct. Callers can therefore PATCH a
+	// single field (e.g. `{"metadata_store":{"database_name":"x"}}`) without
+	// wiping sibling fields. Note: concurrent PUTs on the same org can still
+	// interleave (read-modify-write across two store calls); the admin API is
+	// low-frequency enough that we accept this for now.
+	existing, err := h.store.GetManagedWarehouse(orgID)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var warehouse configstore.ManagedWarehouse
+	if err == nil {
+		warehouse = *existing
+	}
+	if err := json.Unmarshal(body, &warehouse); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	cfgView := &configstore.ManagedWarehouseConfig{
 		OrgID:                        orgID,
 		WarehouseDatabase:            warehouse.WarehouseDatabase,

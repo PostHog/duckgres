@@ -15,6 +15,59 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
+func TestDucklingMetadataStoreAddressUsesDirectEndpointByDefault(t *testing.T) {
+	status := &provisioner.DucklingStatus{}
+	status.MetadataStore.Endpoint = "direct-aurora.example.internal"
+
+	host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, "analytics")
+	if err != nil {
+		t.Fatalf("ducklingMetadataStoreAddress: %v", err)
+	}
+	if host != "direct-aurora.example.internal" {
+		t.Fatalf("host = %q, want direct endpoint", host)
+	}
+	if port != 5432 {
+		t.Fatalf("port = %d, want 5432", port)
+	}
+	if viaPgBouncer {
+		t.Fatal("expected viaPgBouncer=false when no pooler endpoint is present")
+	}
+}
+
+func TestDucklingMetadataStoreAddressPrefersPgBouncerEndpoint(t *testing.T) {
+	status := &provisioner.DucklingStatus{}
+	status.MetadataStore.Endpoint = "direct-aurora.example.internal"
+	status.MetadataStore.PgBouncerEndpoint = "pooler.ducklings.svc.cluster.local:6543"
+
+	host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, "analytics")
+	if err != nil {
+		t.Fatalf("ducklingMetadataStoreAddress: %v", err)
+	}
+	if host != "pooler.ducklings.svc.cluster.local" {
+		t.Fatalf("host = %q, want pooler host", host)
+	}
+	if port != 6543 {
+		t.Fatalf("port = %d, want 6543", port)
+	}
+	if !viaPgBouncer {
+		t.Fatal("expected viaPgBouncer=true when pooler endpoint is present")
+	}
+}
+
+func TestDucklingMetadataStoreAddressRejectsInvalidPgBouncerEndpoint(t *testing.T) {
+	status := &provisioner.DucklingStatus{}
+	status.MetadataStore.Endpoint = "direct-aurora.example.internal"
+	status.MetadataStore.PgBouncerEndpoint = "not-a-host-port"
+
+	_, _, _, err := ducklingMetadataStoreAddress(status, "analytics")
+	if err == nil {
+		t.Fatal("expected invalid pgbouncer endpoint to fail")
+	}
+	if !strings.Contains(err.Error(), "parse pgbouncerEndpoint") {
+		t.Fatalf("expected parse error, got %v", err)
+	}
+}
+
 func TestSharedWorkerActivatorBuildsActivationRequestFromManagedWarehouse(t *testing.T) {
 	clientset := fake.NewSimpleClientset(
 		&corev1.Secret{

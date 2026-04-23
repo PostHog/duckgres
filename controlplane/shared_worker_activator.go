@@ -195,25 +195,9 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 		return server.DuckLakeConfig{}, fmt.Errorf("duckling CR %q has no data store bucket", orgID)
 	}
 
-	// Prefer the PgBouncer endpoint when the Duckling exposes one — the
-	// Crossplane composition sets status.metadataStore.pgbouncerEndpoint
-	// (as "<host>:<port>") when a per-Duckling pooler is provisioned.
-	// Otherwise connect directly to the metadata store on its default port.
-	host := status.MetadataStore.Endpoint
-	port := 5432 // Aurora always uses 5432
-	viaPgBouncer := false
-	if pgb := status.MetadataStore.PgBouncerEndpoint; pgb != "" {
-		h, p, err := net.SplitHostPort(pgb)
-		if err != nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("parse pgbouncerEndpoint %q for org %q: %w", pgb, orgID, err)
-		}
-		portNum, err := strconv.Atoi(p)
-		if err != nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("parse pgbouncerEndpoint port %q for org %q: %w", p, orgID, err)
-		}
-		host = h
-		port = portNum
-		viaPgBouncer = true
+	host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
+	if err != nil {
+		return server.DuckLakeConfig{}, err
 	}
 
 	dl := server.DuckLakeConfig{
@@ -248,6 +232,29 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 	dl.S3SessionToken = creds.SessionToken
 
 	return dl, nil
+}
+
+func ducklingMetadataStoreAddress(status *provisioner.DucklingStatus, orgID string) (host string, port int, viaPgBouncer bool, err error) {
+	host = status.MetadataStore.Endpoint
+	port = 5432 // Aurora always uses 5432
+
+	// Prefer the PgBouncer endpoint when the Duckling exposes one — the
+	// Crossplane composition sets status.metadataStore.pgbouncerEndpoint
+	// (as "<host>:<port>") when a per-Duckling pooler is provisioned.
+	pgb := status.MetadataStore.PgBouncerEndpoint
+	if pgb == "" {
+		return host, port, false, nil
+	}
+
+	h, p, err := net.SplitHostPort(pgb)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("parse pgbouncerEndpoint %q for org %q: %w", pgb, orgID, err)
+	}
+	portNum, err := strconv.Atoi(p)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("parse pgbouncerEndpoint port %q for org %q: %w", p, orgID, err)
+	}
+	return h, portNum, true, nil
 }
 
 // buildDuckLakeConfigFromConfigStore reads infrastructure details from the config store
