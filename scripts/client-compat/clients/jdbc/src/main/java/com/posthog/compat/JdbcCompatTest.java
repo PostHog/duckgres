@@ -1,6 +1,8 @@
 package com.posthog.compat;
 
+import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.SafeConstructor;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -345,7 +347,7 @@ public final class JdbcCompatTest {
     }
 
     private static List<Map<String, Object>> loadQueries(String path) throws IOException {
-        Yaml yaml = new Yaml();
+        Yaml yaml = new Yaml(new SafeConstructor(new LoaderOptions()));
         try (InputStream in = Files.newInputStream(Path.of(path))) {
             Object loaded = yaml.load(in);
             if (!(loaded instanceof List<?> list)) {
