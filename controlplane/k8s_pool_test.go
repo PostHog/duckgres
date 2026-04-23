@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 	"sync"
@@ -234,8 +235,9 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 		workerImage:  "duckgres:test",
 		workerPort:   8816,
 		secretName:   "test-secret",
-		spawnSem:     make(chan struct{}, 1),
-		retireSem:    make(chan struct{}, 5),
+		spawnSem:      make(chan struct{}, 1),
+		retireSem:     make(chan struct{}, 5),
+		nodeFirstSeen: make(map[string]time.Time),
 	}
 
 	return pool, cs
@@ -2094,5 +2096,194 @@ func TestRetireOneMismatchedVersionWorker_NoopWhenCPIDHasNoHashSuffix(t *testing
 	}
 	if store.retireIdleCalls != 0 {
 		t.Fatalf("expected no retirement calls, got %d", store.retireIdleCalls)
+	}
+}
+
+// --- Node-age-aware scheduling tests ---
+//
+// These cover the two places the pool uses `nodeFirstSeen`: picking the next
+// idle worker to claim (oldest node preferred) and picking which excess idle
+// worker to reap (newest node preferred). Ordering must be deterministic so
+// query sessions land on cache-warm nodes and Karpenter can consolidate the
+// newest nodes first.
+
+// addIdleWorker inserts a ready warm-idle worker on nodeName with a matching
+// nodeFirstSeen entry. idleFor controls how far in the past lastUsed is —
+// must exceed idleTimeout for the reaper to consider it.
+func addIdleWorker(t *testing.T, p *K8sWorkerPool, id int, nodeName string, nodeSeenAt time.Time, idleFor time.Duration) {
+	t.Helper()
+	w := &ManagedWorker{
+		ID:       id,
+		podName:  fmt.Sprintf("worker-%d", id),
+		nodeName: nodeName,
+		done:     make(chan struct{}),
+		lastUsed: time.Now().Add(-idleFor),
+	}
+	p.workers[id] = w
+	if _, ok := p.nodeFirstSeen[nodeName]; !ok {
+		p.nodeFirstSeen[nodeName] = nodeSeenAt
+	}
+}
+
+func TestStampNodeFirstSeenLockedOnlySetsOnce(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	pool.stampNodeFirstSeenLocked("node-a")
+	first := pool.nodeFirstSeen["node-a"]
+
+	// Sleep long enough that the Now() reading would differ if we overwrote.
+	time.Sleep(2 * time.Millisecond)
+	pool.stampNodeFirstSeenLocked("node-a")
+	if pool.nodeFirstSeen["node-a"] != first {
+		t.Errorf("nodeFirstSeen overwritten on repeat stamp; want stable %v, got %v", first, pool.nodeFirstSeen["node-a"])
+	}
+}
+
+func TestStampNodeFirstSeenLockedIgnoresEmptyNodeName(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.stampNodeFirstSeenLocked("")
+	if len(pool.nodeFirstSeen) != 0 {
+		t.Errorf("empty nodeName should not be recorded, got %v", pool.nodeFirstSeen)
+	}
+}
+
+func TestPruneNodeFirstSeenLockedRemovesOnlyOrphanedEntries(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	now := time.Now()
+	addIdleWorker(t, pool, 1, "node-a", now.Add(-1*time.Hour), time.Hour)
+	addIdleWorker(t, pool, 2, "node-a", now.Add(-1*time.Hour), time.Hour)
+	addIdleWorker(t, pool, 3, "node-b", now.Add(-10*time.Minute), time.Hour)
+
+	// Remove one worker on node-a — node-a should stay because worker 2 remains.
+	delete(pool.workers, 1)
+	pool.pruneNodeFirstSeenLocked("node-a")
+	if _, ok := pool.nodeFirstSeen["node-a"]; !ok {
+		t.Error("node-a pruned while worker still references it")
+	}
+
+	// Remove the last worker on node-a — entry should go.
+	delete(pool.workers, 2)
+	pool.pruneNodeFirstSeenLocked("node-a")
+	if _, ok := pool.nodeFirstSeen["node-a"]; ok {
+		t.Error("node-a not pruned after last worker removed")
+	}
+	// node-b untouched.
+	if _, ok := pool.nodeFirstSeen["node-b"]; !ok {
+		t.Error("pruning node-a should leave node-b alone")
+	}
+}
+
+func TestFindIdleWorkerLockedPrefersOldestNode(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	now := time.Now()
+	addIdleWorker(t, pool, 1, "node-young", now.Add(-1*time.Minute), time.Hour)
+	addIdleWorker(t, pool, 2, "node-old", now.Add(-1*time.Hour), time.Hour)
+	addIdleWorker(t, pool, 3, "node-mid", now.Add(-10*time.Minute), time.Hour)
+
+	chosen := pool.findIdleWorkerLocked()
+	if chosen == nil {
+		t.Fatal("expected to find an idle worker")
+	}
+	if chosen.nodeName != "node-old" {
+		t.Errorf("claim picked %q, want node-old (longest-lived cache)", chosen.nodeName)
+	}
+}
+
+func TestFindIdleWorkerLockedUnknownNodeSortsLast(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	now := time.Now()
+	// Worker on a known old node + worker with no node info (e.g. race between
+	// spawn and the informer). The known-old node must win.
+	addIdleWorker(t, pool, 1, "node-old", now.Add(-1*time.Hour), time.Hour)
+	w := &ManagedWorker{ID: 2, podName: "worker-2", done: make(chan struct{}), lastUsed: time.Now().Add(-time.Hour)}
+	pool.workers[2] = w
+
+	chosen := pool.findIdleWorkerLocked()
+	if chosen == nil || chosen.ID != 1 {
+		t.Errorf("expected worker on node-old (id=1), got %+v", chosen)
+	}
+}
+
+func TestReapIdleWorkersEvictsNewestNodeFirst(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.minWorkers = 1
+	pool.idleTimeout = 5 * time.Minute
+
+	now := time.Now()
+	// 3 idle workers, 3 different nodes. minWorkers=1 so 2 get reaped.
+	// Expect: node-youngest + node-mid reaped (newest-first), node-old survives.
+	addIdleWorker(t, pool, 1, "node-old", now.Add(-1*time.Hour), time.Hour)
+	addIdleWorker(t, pool, 2, "node-youngest", now.Add(-1*time.Minute), time.Hour)
+	addIdleWorker(t, pool, 3, "node-mid", now.Add(-10*time.Minute), time.Hour)
+
+	// Stub retireWorkerPod so the reaper doesn't try to talk to k8s.
+	var retired []string
+	pool.retireSem = make(chan struct{}, 5)
+	origClient := pool.clientset
+	_ = origClient
+	// Monkey-patch via clientset fake — easier: just mark workers retired and observe.
+	// Call the reap logic directly; spot-check deletions via p.workers.
+
+	pool.reapIdleWorkers()
+
+	// Drain any retire goroutines by giving them a chance (they just run fake k8s).
+	// We only assert on map state, which reapIdleWorkers mutates under the lock.
+
+	if _, ok := pool.workers[1]; !ok {
+		t.Error("worker on node-old was reaped; expected to survive (oldest node)")
+	}
+	if _, ok := pool.workers[2]; ok {
+		t.Error("worker on node-youngest not reaped; expected to be evicted first")
+	}
+	if _, ok := pool.workers[3]; ok {
+		t.Error("worker on node-mid not reaped; should have been second eviction")
+	}
+	if _, ok := pool.nodeFirstSeen["node-youngest"]; ok {
+		t.Error("nodeFirstSeen entry for node-youngest not pruned after last worker reaped")
+	}
+	if _, ok := pool.nodeFirstSeen["node-mid"]; ok {
+		t.Error("nodeFirstSeen entry for node-mid not pruned after last worker reaped")
+	}
+	if _, ok := pool.nodeFirstSeen["node-old"]; !ok {
+		t.Error("nodeFirstSeen entry for node-old incorrectly pruned (worker still alive)")
+	}
+	_ = retired
+}
+
+func TestReapIdleWorkersStopsAtMinWorkers(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.minWorkers = 2
+	pool.idleTimeout = 5 * time.Minute
+
+	now := time.Now()
+	addIdleWorker(t, pool, 1, "node-a", now.Add(-1*time.Hour), time.Hour)
+	addIdleWorker(t, pool, 2, "node-b", now.Add(-45*time.Minute), time.Hour)
+	addIdleWorker(t, pool, 3, "node-c", now.Add(-30*time.Minute), time.Hour)
+
+	pool.reapIdleWorkers()
+
+	// 3 idle - 2 minWorkers = 1 should be reaped (the newest, node-c).
+	if len(pool.workers) != 2 {
+		t.Fatalf("expected 2 workers after reap, got %d", len(pool.workers))
+	}
+	if _, ok := pool.workers[3]; ok {
+		t.Error("expected worker on node-c (newest) to be reaped")
+	}
+}
+
+func TestReapIdleWorkersSkipsWorkersWithinIdleTimeout(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.minWorkers = 0
+	pool.idleTimeout = 5 * time.Minute
+
+	now := time.Now()
+	// Idle for only 1 minute — well under idleTimeout.
+	addIdleWorker(t, pool, 1, "node-a", now.Add(-1*time.Hour), 1*time.Minute)
+	addIdleWorker(t, pool, 2, "node-b", now.Add(-30*time.Minute), 1*time.Minute)
+
+	pool.reapIdleWorkers()
+
+	if len(pool.workers) != 2 {
+		t.Errorf("expected both workers to survive (under idleTimeout); got %d remaining", len(pool.workers))
 	}
 }

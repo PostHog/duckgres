@@ -27,6 +27,7 @@ import (
 type ManagedWorker struct {
 	ID                      int
 	podName                 string
+	nodeName                string //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
 	cmd                     *exec.Cmd
 	socketPath              string
 	bearerToken             string
