@@ -352,6 +352,14 @@ type DuckLakeConfig struct {
 	// re-running the version check. This avoids redundant backups and
 	// long-running checks in worker processes.
 	Migrate bool `json:"migrate,omitempty" yaml:"-"`
+
+	// ViaPgBouncer is set by the control plane when the DuckLake metadata
+	// connection is routed through a network-level pooler (e.g. PgBouncer)
+	// rather than direct to Postgres. When true, the worker disables the
+	// postgres_scanner in-process pool via `SET GLOBAL pg_pool_max_connections = 0`.
+	// See duckdb/ducklake#1031: behind a network pooler, client-side pooling
+	// is redundant and prevents the pooler from reclaiming idle connections.
+	ViaPgBouncer bool `json:"via_pgbouncer,omitempty" yaml:"-"`
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.
@@ -1257,6 +1265,9 @@ func buildDuckLakePreAttachStatements(dlCfg DuckLakeConfig) []string {
 	var statements []string
 	if duckLakeDisableMetadataThreadLocalCacheEnabled(dlCfg) {
 		statements = append(statements, "SET GLOBAL pg_pool_enable_thread_local_cache = false")
+	}
+	if dlCfg.ViaPgBouncer {
+		statements = append(statements, "SET GLOBAL pg_pool_max_connections = 0")
 	}
 	return statements
 }

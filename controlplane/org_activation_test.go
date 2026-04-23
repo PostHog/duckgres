@@ -240,11 +240,12 @@ func TestSharedWorkerActivatorDucklingCRRequiresSTSBroker(t *testing.T) {
 			}
 			return &provisioner.DucklingStatus{
 				MetadataStore: struct {
-					Type     string
-					Endpoint string
-					Password string
-					User     string
-					Database string
+					Type              string
+					Endpoint          string
+					PgBouncerEndpoint string
+					Password          string
+					User              string
+					Database          string
 				}{
 					Endpoint: "test-org.cluster.rds.amazonaws.com",
 					Password: "duckling-password-123",
@@ -295,11 +296,12 @@ func TestSharedWorkerActivatorPrefersSecretRefOverDucklingCR(t *testing.T) {
 			ducklingCalled = true
 			return &provisioner.DucklingStatus{
 				MetadataStore: struct {
-					Type     string
-					Endpoint string
-					Password string
-					User     string
-					Database string
+					Type              string
+					Endpoint          string
+					PgBouncerEndpoint string
+					Password          string
+					User              string
+					Database          string
 				}{Password: "cr-password"},
 			}, nil
 		},
