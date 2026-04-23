@@ -62,6 +62,26 @@ type captureRuntimeWorkerStore struct {
 	retireIdleCalledReasons []string
 	retireIdleErr           error
 	retireIdleMisses        map[int]bool
+	preloadedRecords        map[int]*configstore.WorkerRecord
+	getRecordErrIDs         map[int]error
+	markDrainingCalls       int
+	markDrainingCalledIDs   []int
+	markDrainingCalledCPs   []string
+	markDrainingMisses      map[int]bool
+	markDrainingErr         error
+	retireDrainingCalls     int
+	retireDrainingCalledIDs []int
+	retireDrainingReasons   []string
+	retireDrainingMisses    map[int]bool
+	retireDrainingErr       error
+	// events records a unified, ordered timeline of state transitions on
+	// this store so tests can assert happens-before relationships (e.g.
+	// that pod-delete occurs between markDraining and retireDraining).
+	events []string
+}
+
+func (s *captureRuntimeWorkerStore) recordEvent(evt string) {
+	s.events = append(s.events, evt)
 }
 
 func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
@@ -157,6 +177,16 @@ func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceI
 func (s *captureRuntimeWorkerStore) GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err, ok := s.getRecordErrIDs[workerID]; ok {
+		return nil, err
+	}
+	if rec, ok := s.preloadedRecords[workerID]; ok {
+		if rec == nil {
+			return nil, nil
+		}
+		record := *rec
+		return &record, nil
+	}
 	if s.claimed != nil && s.claimed.WorkerID == workerID {
 		record := *s.claimed
 		return &record, nil
@@ -199,6 +229,38 @@ func (s *captureRuntimeWorkerStore) RetireIdleWorker(workerID int, reason string
 		return false, s.retireIdleErr
 	}
 	if s.retireIdleMisses[workerID] {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *captureRuntimeWorkerStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markDrainingCalls++
+	s.markDrainingCalledIDs = append(s.markDrainingCalledIDs, workerID)
+	s.markDrainingCalledCPs = append(s.markDrainingCalledCPs, ownerCPInstanceID)
+	s.recordEvent(fmt.Sprintf("draining:%d", workerID))
+	if s.markDrainingErr != nil {
+		return false, s.markDrainingErr
+	}
+	if s.markDrainingMisses[workerID] {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *captureRuntimeWorkerStore) RetireDrainingWorker(workerID int, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retireDrainingCalls++
+	s.retireDrainingCalledIDs = append(s.retireDrainingCalledIDs, workerID)
+	s.retireDrainingReasons = append(s.retireDrainingReasons, reason)
+	s.recordEvent(fmt.Sprintf("retired:%d", workerID))
+	if s.retireDrainingErr != nil {
+		return false, s.retireDrainingErr
+	}
+	if s.retireDrainingMisses[workerID] {
 		return false, nil
 	}
 	return true, nil
@@ -2096,6 +2158,415 @@ func TestRetireOneMismatchedVersionWorker_NoopWhenCPIDHasNoHashSuffix(t *testing
 	}
 	if store.retireIdleCalls != 0 {
 		t.Fatalf("expected no retirement calls, got %d", store.retireIdleCalls)
+	}
+}
+
+// --- Stranded-pod reconciler tests ---
+//
+// cleanupOrphanedWorkerPods closes a gap left by ShutdownAll: the CP marks the
+// worker row terminal (retired/lost) in the DB before issuing the K8s pod
+// delete, and the delete is fire-and-forget. If the delete fails (API hiccup,
+// CP SIGKILL'd mid-shutdown), the pod survives forever because:
+//   - ListOrphanedWorkers excludes terminal states, so orphan cleanup ignores it
+//   - Bare worker pods have no owner reference, so nothing else reaps them
+// These tests pin the expected behavior of the K8s-label-based reconciler.
+
+// strandedReconcilerPool wires a K8sWorkerPool with a fake clientset and store
+// for reconciler tests. Ownership labels aren't checked by the reconciler, so
+// we keep the setup minimal.
+func strandedReconcilerPool(t *testing.T, store RuntimeWorkerStore) (*K8sWorkerPool, *fake.Clientset) {
+	t.Helper()
+	cs := fake.NewClientset()
+	pool := &K8sWorkerPool{
+		workers:      make(map[int]*ManagedWorker),
+		shutdownCh:   make(chan struct{}),
+		stopInform:   make(chan struct{}),
+		clientset:    cs,
+		namespace:    "default",
+		cpID:         "duckgres-new-aaaaa",
+		cpInstanceID: "duckgres-new-aaaaa-boot",
+		runtimeStore: store,
+		retireSem:    make(chan struct{}, 5),
+	}
+	return pool, cs
+}
+
+func createStrandedWorkerPod(t *testing.T, cs *fake.Clientset, name, workerIDLabel string, age time.Duration) {
+	t.Helper()
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-age)),
+			Labels: map[string]string{
+				"app":                "duckgres-worker",
+				"duckgres/worker-id": workerIDLabel,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create pod %q: %v", name, err)
+	}
+}
+
+func podExists(t *testing.T, cs *fake.Clientset, name string) bool {
+	t.Helper()
+	_, err := cs.CoreV1().Pods("default").Get(context.Background(), name, metav1.GetOptions{})
+	if err == nil {
+		return true
+	}
+	if k8serrors.IsNotFound(err) {
+		return false
+	}
+	t.Fatalf("unexpected error fetching pod %q: %v", name, err)
+	return false
+}
+
+func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBStateRetired(t *testing.T) {
+	// This is the exact prod scenario: worker's DB row is state=retired (a
+	// previous CP marked it during ShutdownAll) but the K8s pod survived
+	// because the delete failed or was interrupted. The reconciler must catch
+	// this and delete the pod.
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			31758: {WorkerID: 31758, State: configstore.WorkerStateRetired},
+		},
+	}
+	pool, cs := strandedReconcilerPool(t, store)
+	createStrandedWorkerPod(t, cs, "duckgres-old-worker-31758", "31758", 10*time.Minute)
+
+	deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute)
+	if deleted != 1 {
+		t.Fatalf("expected 1 pod deleted, got %d", deleted)
+	}
+	if podExists(t, cs, "duckgres-old-worker-31758") {
+		t.Fatal("expected stranded pod to be deleted")
+	}
+}
+
+func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBStateLost(t *testing.T) {
+	// lost is the DB state assigned when a worker is retired with reason=crash
+	// (see markWorkerRetiredLocked). These pods are also terminal-in-DB and
+	// must be reconciled.
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			42: {WorkerID: 42, State: configstore.WorkerStateLost},
+		},
+	}
+	pool, cs := strandedReconcilerPool(t, store)
+	createStrandedWorkerPod(t, cs, "duckgres-lost-worker-42", "42", 10*time.Minute)
+
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 1 {
+		t.Fatalf("expected 1 pod deleted, got %d", deleted)
+	}
+	if podExists(t, cs, "duckgres-lost-worker-42") {
+		t.Fatal("expected lost-state pod to be deleted")
+	}
+}
+
+func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBRecordMissing(t *testing.T) {
+	// No DB row exists at all for this worker-id: fully orphaned pod, likely
+	// from a worker row that was purged while the pod kept running. Treat it
+	// the same as a terminal-state pod.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := strandedReconcilerPool(t, store)
+	createStrandedWorkerPod(t, cs, "duckgres-ghost-worker-99", "99", 10*time.Minute)
+
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 1 {
+		t.Fatalf("expected 1 pod deleted, got %d", deleted)
+	}
+	if podExists(t, cs, "duckgres-ghost-worker-99") {
+		t.Fatal("expected ghost pod with no DB row to be deleted")
+	}
+}
+
+func TestCleanupOrphanedWorkerPods_LeavesLivePodAlone(t *testing.T) {
+	// Workers in any non-terminal state (idle, reserved, activating, hot,
+	// hot_idle, spawning, draining) are part of the normal lifecycle — the
+	// reconciler must not disturb them. This test covers the common live
+	// state (idle). Other states follow the same code path.
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			7: {WorkerID: 7, State: configstore.WorkerStateIdle},
+		},
+	}
+	pool, cs := strandedReconcilerPool(t, store)
+	createStrandedWorkerPod(t, cs, "duckgres-live-worker-7", "7", 10*time.Minute)
+
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
+		t.Fatalf("expected no pods deleted for live worker, got %d", deleted)
+	}
+	if !podExists(t, cs, "duckgres-live-worker-7") {
+		t.Fatal("expected idle worker pod to survive reconciliation")
+	}
+}
+
+func TestCleanupOrphanedWorkerPods_SkipsYoungPod(t *testing.T) {
+	// Spawning workers create the pod BEFORE inserting the DB row. Without a
+	// grace window on pod age, the reconciler would delete freshly-spawned
+	// pods in the ~100ms race window between pod creation and DB upsert.
+	store := &captureRuntimeWorkerStore{} // no record yet — newborn
+	pool, cs := strandedReconcilerPool(t, store)
+	createStrandedWorkerPod(t, cs, "duckgres-newborn-worker-11", "11", 30*time.Second)
+
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
+		t.Fatalf("expected young pod to be skipped, got deleted=%d", deleted)
+	}
+	if !podExists(t, cs, "duckgres-newborn-worker-11") {
+		t.Fatal("expected newborn pod to survive (under grace window)")
+	}
+}
+
+func TestCleanupOrphanedWorkerPods_TreatsNotFoundAsSuccess(t *testing.T) {
+	// If two CPs both become leader for a moment during a split-brain, or the
+	// pod was evicted by kubelet between our List and Delete, the delete will
+	// return NotFound. The reconciler must treat that as success.
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			50: {WorkerID: 50, State: configstore.WorkerStateRetired},
+			51: {WorkerID: 51, State: configstore.WorkerStateRetired},
+		},
+	}
+	pool, cs := strandedReconcilerPool(t, store)
+	createStrandedWorkerPod(t, cs, "duckgres-gone-worker-50", "50", 10*time.Minute)
+	createStrandedWorkerPod(t, cs, "duckgres-stale-worker-51", "51", 10*time.Minute)
+
+	// Make the DELETE for worker 50 return NotFound (simulating race).
+	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		da := action.(k8stesting.DeleteAction)
+		if da.GetName() == "duckgres-gone-worker-50" {
+			return true, nil, k8serrors.NewNotFound(corev1.Resource("pods"), da.GetName())
+		}
+		return false, nil, nil
+	})
+
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 2 {
+		t.Fatalf("expected 2 pods deleted (NotFound counts as success), got %d", deleted)
+	}
+	if podExists(t, cs, "duckgres-stale-worker-51") {
+		t.Fatal("expected worker 51's pod to be deleted")
+	}
+}
+
+func TestCleanupOrphanedWorkerPods_IgnoresNonWorkerPods(t *testing.T) {
+	// Only pods carrying the duckgres-worker app label should be considered.
+	// This guards against accidentally reaping CP pods or other workloads
+	// that happened to be scheduled into the duckgres namespace.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := strandedReconcilerPool(t, store)
+	// Non-worker pod (missing app=duckgres-worker label) — must be ignored.
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "some-other-pod",
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+			Labels:            map[string]string{"app": "something-else"},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create other pod: %v", err)
+	}
+
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
+		t.Fatalf("expected no deletions, got %d", deleted)
+	}
+	if !podExists(t, cs, "some-other-pod") {
+		t.Fatal("non-worker pod must survive reconciliation")
+	}
+}
+
+// --- ShutdownAll draining-chain tests ---
+//
+// ShutdownAll is called when the CP pod receives SIGTERM from Kubernetes. The
+// old implementation marked each worker retired in the DB and then fire-and-
+// forget deleted the pod — on delete failure the DB row moved on but the pod
+// survived forever (ListOrphanedWorkers excludes terminal states). These
+// tests pin the new 3-step chain:
+//
+//   1. MarkWorkerDraining: atomic CAS idle/hot_idle/... → draining. Fences
+//      the worker against claims by other CPs (their claim queries match
+//      state=idle/hot_idle, which no longer applies).
+//   2. K8s pod delete.
+//   3. RetireDrainingWorker: atomic CAS draining → retired. Only reached on
+//      successful pod-delete — so on delete failure the row stays in
+//      draining, where ListOrphanedWorkers picks it up once the CP's
+//      heartbeat expires, or cleanupOrphanedWorkerPods handles it by pod
+//      label regardless of DB state.
+
+func shutdownTestPool(t *testing.T, store *captureRuntimeWorkerStore) (*K8sWorkerPool, *fake.Clientset) {
+	t.Helper()
+	pool, cs := newTestK8sPool(t, 5)
+	pool.runtimeStore = store
+	// Intercept pod deletions so the test can assert that Delete is invoked
+	// strictly between MarkWorkerDraining and RetireDrainingWorker.
+	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		da := action.(k8stesting.DeleteAction)
+		store.mu.Lock()
+		store.recordEvent(fmt.Sprintf("delete:%s", da.GetName()))
+		store.mu.Unlock()
+		return false, nil, nil // fall through so the fake actually removes the pod
+	})
+	return pool, cs
+}
+
+func addShutdownWorker(t *testing.T, p *K8sWorkerPool, cs *fake.Clientset, id int) *ManagedWorker {
+	t.Helper()
+	w := &ManagedWorker{
+		ID:      id,
+		podName: fmt.Sprintf("worker-%d", id),
+		done:    make(chan struct{}),
+	}
+	p.workers[id] = w
+	_, err := cs.CoreV1().Pods(p.namespace).Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      w.podName,
+			Namespace: p.namespace,
+			Labels:    map[string]string{"app": "duckgres-worker", "duckgres/worker-id": strconv.Itoa(id)},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create pod %q: %v", w.podName, err)
+	}
+	return w
+}
+
+func TestShutdownAll_UsesDrainingChainPerWorker(t *testing.T) {
+	// Per worker: MarkWorkerDraining → Delete pod → RetireDrainingWorker.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := shutdownTestPool(t, store)
+	addShutdownWorker(t, pool, cs, 1)
+	addShutdownWorker(t, pool, cs, 2)
+
+	pool.ShutdownAll()
+
+	if store.markDrainingCalls != 2 {
+		t.Fatalf("expected 2 MarkWorkerDraining calls, got %d", store.markDrainingCalls)
+	}
+	if store.retireDrainingCalls != 2 {
+		t.Fatalf("expected 2 RetireDrainingWorker calls, got %d", store.retireDrainingCalls)
+	}
+	for _, reason := range store.retireDrainingReasons {
+		if reason != RetireReasonShutdown {
+			t.Fatalf("expected retire reason=%q, got %q", RetireReasonShutdown, reason)
+		}
+	}
+	for _, name := range []string{"worker-1", "worker-2"} {
+		if podExists(t, cs, name) {
+			t.Fatalf("expected pod %q to be deleted", name)
+		}
+	}
+}
+
+func TestShutdownAll_DrainBeforeDeleteBeforeRetire(t *testing.T) {
+	// Enforces the happens-before chain for a single worker: the SQL CAS to
+	// draining must complete before the K8s delete, and the K8s delete must
+	// complete before the SQL CAS to retired. If the order were swapped,
+	// another CP could claim the worker mid-delete (delete → claim → fail),
+	// or a crash between delete and retire would leave a stranded pod that
+	// the orphan sweep can't see (excludes terminal states).
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := shutdownTestPool(t, store)
+	addShutdownWorker(t, pool, cs, 42)
+
+	pool.ShutdownAll()
+
+	wantSuffix := []string{"draining:42", "delete:worker-42", "retired:42"}
+	if len(store.events) < len(wantSuffix) {
+		t.Fatalf("expected at least %d events, got %d: %v", len(wantSuffix), len(store.events), store.events)
+	}
+	for i, want := range wantSuffix {
+		if store.events[i] != want {
+			t.Fatalf("event[%d] = %q, want %q (full events: %v)", i, store.events[i], want, store.events)
+		}
+	}
+}
+
+func TestShutdownAll_SkipsWorkerWhenMarkDrainingCASMisses(t *testing.T) {
+	// MarkWorkerDraining returns false when the row is already terminal (e.g.
+	// the worker was retired on another path between list and CAS) or owned
+	// by a different CP. In that case there's nothing to drain, so we must
+	// neither delete the pod nor call RetireDrainingWorker (which would
+	// transition from a state that isn't draining, never matching).
+	store := &captureRuntimeWorkerStore{
+		markDrainingMisses: map[int]bool{99: true},
+	}
+	pool, cs := shutdownTestPool(t, store)
+	addShutdownWorker(t, pool, cs, 99)
+	addShutdownWorker(t, pool, cs, 100)
+
+	pool.ShutdownAll()
+
+	// Worker 99 should be skipped entirely after the CAS miss: no pod delete,
+	// no RetireDrainingWorker call. Worker 100 should proceed normally.
+	for _, event := range store.events {
+		if event == "delete:worker-99" {
+			t.Fatal("expected no pod delete for worker 99 (MarkDraining CAS missed)")
+		}
+	}
+	for _, id := range store.retireDrainingCalledIDs {
+		if id == 99 {
+			t.Fatal("expected no RetireDrainingWorker for worker 99 after CAS miss")
+		}
+	}
+	if !podExists(t, cs, "worker-99") {
+		t.Fatal("expected pod worker-99 to survive — its DB row wasn't owned by us")
+	}
+	if podExists(t, cs, "worker-100") {
+		t.Fatal("expected worker-100 pod to be deleted")
+	}
+}
+
+func TestShutdownAll_LeavesInDrainingWhenPodDeleteFails(t *testing.T) {
+	// On pod-delete failure the worker row stays in draining. That's the
+	// signal for recovery paths:
+	//   - Once this CP's heartbeat expires, ListOrphanedWorkers picks up
+	//     draining rows owned by expired CPs and retires them.
+	//   - cleanupOrphanedWorkerPods sees the pod by label and deletes it
+	//     regardless of DB state.
+	// What we must NOT do is call RetireDrainingWorker, since that would
+	// clear the signal and let a stranded pod linger indefinitely.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := shutdownTestPool(t, store)
+	addShutdownWorker(t, pool, cs, 7)
+	// Make the Delete fail with a non-NotFound error.
+	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		da := action.(k8stesting.DeleteAction)
+		if da.GetName() == "worker-7" {
+			return true, nil, errors.New("api server timeout")
+		}
+		return false, nil, nil
+	})
+
+	pool.ShutdownAll()
+
+	if store.markDrainingCalls != 1 {
+		t.Fatalf("expected 1 MarkDraining call, got %d", store.markDrainingCalls)
+	}
+	if store.retireDrainingCalls != 0 {
+		t.Fatalf("expected no RetireDrainingWorker call after delete failure, got %d", store.retireDrainingCalls)
+	}
+}
+
+func TestShutdownAll_TreatsPodNotFoundAsDeleteSuccess(t *testing.T) {
+	// NotFound means another actor already removed the pod (node eviction,
+	// a racing CP during split-brain, manual kubectl delete). The state
+	// machine effectively reached "pod gone", so we should proceed to the
+	// final retire CAS rather than leaving the worker pinned in draining.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := shutdownTestPool(t, store)
+	addShutdownWorker(t, pool, cs, 8)
+	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		da := action.(k8stesting.DeleteAction)
+		if da.GetName() == "worker-8" {
+			return true, nil, k8serrors.NewNotFound(corev1.Resource("pods"), da.GetName())
+		}
+		return false, nil, nil
+	})
+
+	pool.ShutdownAll()
+
+	if store.retireDrainingCalls != 1 {
+		t.Fatalf("expected RetireDrainingWorker even when delete returned NotFound, got calls=%d", store.retireDrainingCalls)
 	}
 }
 

@@ -218,6 +218,24 @@ func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 	}
 }
 
+func TestGetWorkerRecordReturnsNilNilForMissingRow(t *testing.T) {
+	// cleanupOrphanedWorkerPods in k8s_pool.go treats (nil, nil) as "no DB
+	// row — this pod is fully orphaned and safe to delete" and a non-nil
+	// error as "skip this tick and retry." If GetWorkerRecord wrapped
+	// gorm.ErrRecordNotFound as an error, the missing-row branch of the
+	// reconciler would be unreachable in production and stranded pods with
+	// no DB row would never be cleaned up. This test pins the contract.
+	store := newIsolatedConfigStore(t)
+
+	record, err := store.GetWorkerRecord(99999)
+	if err != nil {
+		t.Fatalf("expected (nil, nil) for missing row, got err=%v", err)
+	}
+	if record != nil {
+		t.Fatalf("expected nil record for missing row, got %#v", record)
+	}
+}
+
 func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 

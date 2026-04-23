@@ -266,6 +266,76 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 	return false
 }
 
+// cleanupOrphanedWorkerPods deletes worker pods whose DB row is in a terminal
+// state (retired/lost) or has no DB row at all, reconciling K8s against the
+// state store. Runs from the janitor loop (leader-only).
+//
+// This closes a gap between ShutdownAll and the janitor's orphan sweep.
+// ShutdownAll marks the worker row retired in the DB before issuing the K8s
+// pod delete, and the delete is fire-and-forget — so if the delete fails (API
+// hiccup) or the CP is SIGKILL'd mid-shutdown, the pod survives while the DB
+// row is already terminal. ListOrphanedWorkers explicitly excludes
+// terminal-state rows, so without this reconciler those pods live forever.
+// Bare worker pods have no owner reference, so nothing else in the cluster
+// reaps them either.
+//
+// minAge protects newly-spawned pods: the spawn path creates the pod BEFORE
+// upserting the DB row, so there's a brief window where a live pod has no DB
+// record. Without the age gate the reconciler would race the spawner.
+//
+// Returns the number of pods deleted this call.
+func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge time.Duration) int {
+	if p.runtimeStore == nil || p.clientset == nil {
+		return 0
+	}
+	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=duckgres-worker",
+	})
+	if err != nil {
+		slog.Warn("Stranded-pod reconciler failed to list worker pods.", "error", err)
+		return 0
+	}
+	cutoff := time.Now().Add(-minAge)
+	deleted := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.CreationTimestamp.Time.After(cutoff) {
+			continue
+		}
+		idStr := pod.Labels["duckgres/worker-id"]
+		if idStr == "" {
+			continue
+		}
+		workerID, err := strconv.Atoi(idStr)
+		if err != nil {
+			continue
+		}
+		rec, err := p.runtimeStore.GetWorkerRecord(workerID)
+		if err != nil {
+			slog.Warn("Stranded-pod reconciler failed to load worker record.", "worker_id", workerID, "error", err)
+			continue
+		}
+		dbState := "missing"
+		if rec != nil {
+			if rec.State != configstore.WorkerStateRetired && rec.State != configstore.WorkerStateLost {
+				continue
+			}
+			dbState = string(rec.State)
+		}
+		gracePeriod := int64(10)
+		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}); err != nil && !errors.IsNotFound(err) {
+			slog.Warn("Stranded-pod reconciler failed to delete pod.", "pod", pod.Name, "worker_id", workerID, "error", err)
+			continue
+		}
+		_ = p.deleteWorkerRPCSecret(ctx, pod.Name)
+		slog.Info("Stranded worker pod reconciled.", "pod", pod.Name, "worker_id", workerID, "db_state", dbState)
+		deleted++
+	}
+	return deleted
+}
+
 func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
 	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, p.cpID, metav1.GetOptions{})
 	if err != nil {
@@ -1800,7 +1870,25 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 	}
 }
 
-// ShutdownAll stops all workers by deleting their pods.
+// ShutdownAll stops all workers by deleting their pods. Per worker it runs a
+// 3-step CAS chain against the runtime store and K8s API:
+//
+//  1. MarkWorkerDraining — atomic SQL CAS from a non-terminal state to
+//     draining. Fences the worker against claims by other CPs: their claim
+//     queries match state=idle/hot_idle, which no longer apply. If the CAS
+//     misses (row already terminal or owned by another CP) the worker is
+//     skipped entirely.
+//  2. K8s pod delete. Only reached after the CAS succeeds. NotFound is
+//     treated as success (the pod is gone by some other path).
+//  3. RetireDrainingWorker — atomic SQL CAS draining → retired. Only reached
+//     on successful pod delete. On delete failure the row stays in
+//     draining, which lets ListOrphanedWorkers pick it up once the CP's
+//     heartbeat expires, and lets cleanupOrphanedWorkerPods delete the pod
+//     by label on the next janitor tick.
+//
+// This ordering closes the old race where the DB row was flipped to retired
+// before the pod delete: if the delete failed, the pod survived forever
+// because terminal-state rows are excluded from ListOrphanedWorkers.
 func (p *K8sWorkerPool) ShutdownAll() {
 	p.mu.Lock()
 	if p.shuttingDown {
@@ -1810,7 +1898,6 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	p.shuttingDown = true
 	workers := make([]*ManagedWorker, 0, len(p.workers))
 	for _, w := range p.workers {
-		p.markWorkerRetiredLocked(w, RetireReasonShutdown)
 		workers = append(workers, w)
 	}
 	p.mu.Unlock()
@@ -1821,15 +1908,55 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	ctx := context.Background()
 	for _, w := range workers {
 		podName := p.workerPodName(w)
-		gracePeriod := int64(10)
 		slog.Info("Shutting down K8s worker.", "id", w.ID, "pod", podName)
-		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+
+		// Step 1: CAS to draining. Skip the worker on CAS miss or error —
+		// there's no safe way to proceed if we don't own the row.
+		if p.runtimeStore != nil {
+			transitioned, err := p.runtimeStore.MarkWorkerDraining(w.ID, p.cpInstanceID)
+			if err != nil {
+				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
+					"worker_id", w.ID, "error", err)
+				continue
+			}
+			if !transitioned {
+				slog.Debug("ShutdownAll: worker not owned by us or already terminal; skipping.",
+					"worker_id", w.ID)
+				continue
+			}
+		}
+
+		// Step 2: delete pod. Leave the row in draining on any error other
+		// than NotFound so recovery paths pick it up.
+		gracePeriod := int64(10)
+		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
-		})
+		}); err != nil && !errors.IsNotFound(err) {
+			slog.Warn("ShutdownAll: pod delete failed; worker left in draining for orphan sweep/reconciler.",
+				"id", w.ID, "pod", podName, "error", err)
+			continue
+		}
 		_ = p.deleteWorkerRPCSecret(ctx, podName)
 		if w.client != nil {
 			_ = w.client.Close()
 		}
+
+		// Step 3: final CAS to retired. If this fails (network blip during
+		// shutdown) the row stays in draining and the orphan sweep handles
+		// it once this CP's heartbeat expires.
+		if p.runtimeStore != nil {
+			if _, err := p.runtimeStore.RetireDrainingWorker(w.ID, RetireReasonShutdown); err != nil {
+				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
+					"worker_id", w.ID, "error", err)
+				continue
+			}
+		}
+
+		// In-memory lifecycle + metrics. Intentionally skips persistence
+		// (we've already persisted the retired state via the CAS chain).
+		p.mu.Lock()
+		p.markWorkerRetiredInMemoryLocked(w, RetireReasonShutdown)
+		p.mu.Unlock()
 	}
 
 	p.mu.Lock()
@@ -2276,6 +2403,21 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int) {
 }
 
 func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
+	p.markWorkerRetiredInMemoryLocked(w, reason)
+	workerState := configstore.WorkerStateRetired
+	if reason == RetireReasonCrash {
+		workerState = configstore.WorkerStateLost
+	}
+	p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil))
+}
+
+// markWorkerRetiredInMemoryLocked performs only the in-memory lifecycle
+// transition and metrics bookkeeping for a worker retirement, without
+// persisting to the runtime store. Used by callers that have already
+// advanced the DB state via a scoped CAS (e.g. ShutdownAll's draining
+// chain) and don't want an unconditional UpsertWorkerRecord to overwrite
+// fields set by that CAS.
+func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker, reason string) {
 	lifecycle := w.SharedState().NormalizedLifecycle()
 	if lifecycle == WorkerLifecycleHot || lifecycle == WorkerLifecycleHotIdle {
 		observeHotWorkerSessions(w.peakSessions)
@@ -2285,11 +2427,6 @@ func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string)
 		return
 	}
 	_ = w.SetSharedState(nextState)
-	workerState := configstore.WorkerStateRetired
-	if reason == RetireReasonCrash {
-		workerState = configstore.WorkerStateLost
-	}
-	p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil))
 	observeWorkerRetirement(reason)
 	observeWarmPoolLifecycleGauges(p.workers)
 }

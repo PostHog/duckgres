@@ -38,6 +38,7 @@ type ControlPlaneJanitor struct {
 	retireLocalWorker             func(workerID int, reason string) bool // retires from in-memory pool + pod, returns false if not local
 	reconcileWarmCapacity         func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
+	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -156,6 +157,14 @@ func (j *ControlPlaneJanitor) runOnce() {
 	// process stalls until a new-version CP is elected leader.
 	if j.retireMismatchedVersionWorker != nil {
 		j.retireMismatchedVersionWorker()
+	}
+
+	// Reconcile K8s pods against the DB state store: delete any worker pod
+	// whose DB row is terminal (retired/lost) or missing entirely. Catches
+	// pods leaked by a previous CP that died mid-shutdown (ShutdownAll marked
+	// the row retired before the K8s delete completed).
+	if j.cleanupOrphanedWorkerPods != nil {
+		j.cleanupOrphanedWorkerPods()
 	}
 
 	if j.reconcileWarmCapacity != nil {

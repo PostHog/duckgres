@@ -505,10 +505,18 @@ func (cs *ConfigStore) ListWorkerRecordsByStatesBefore(states []WorkerState, upd
 	return workers, nil
 }
 
-// GetWorkerRecord returns a runtime worker row by worker id.
+// GetWorkerRecord returns a runtime worker row by worker id. Returns
+// (nil, nil) when no row matches — "not found" is a normal state for
+// callers like cleanupOrphanedWorkerPods that need to distinguish between
+// a known terminal row and no row at all. Any other DB error is wrapped
+// and returned so callers can log and retry on the next tick.
 func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 	var record WorkerRecord
-	if err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "worker_id = ?", workerID).Error; err != nil {
+	err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "worker_id = ?", workerID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("get worker record: %w", err)
 	}
 	return &record, nil
@@ -662,6 +670,58 @@ func (cs *ConfigStore) RetireIdleWorker(workerID int, reason string) (bool, erro
 		})
 	if result.Error != nil {
 		return false, fmt.Errorf("retire idle worker %d: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// MarkWorkerDraining atomically transitions a worker into the draining state
+// if and only if it is still owned by the caller and not already terminal. It
+// returns true when the transition happened.
+//
+// Used by ShutdownAll to fence a worker before issuing its K8s pod delete: no
+// other CP can claim the worker once it's draining (ClaimIdleWorker and
+// ClaimHotIdleWorker filter on state=idle and state=hot_idle respectively),
+// so the pod-delete/DB-retire chain can proceed without a claim race. If the
+// CP then crashes before the final retired transition, ListOrphanedWorkers
+// includes draining rows whose owner CP has expired, so orphan cleanup
+// retires the worker and deletes the pod.
+//
+// The ownerCPInstanceID guard prevents a stale CP from moving a worker that
+// has already been taken over by a successor.
+func (cs *ConfigStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error) {
+	drainableStates := []WorkerState{
+		WorkerStateSpawning,
+		WorkerStateIdle,
+		WorkerStateReserved,
+		WorkerStateActivating,
+		WorkerStateHot,
+		WorkerStateHotIdle,
+	}
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND owner_cp_instance_id = ? AND state IN ?", workerID, ownerCPInstanceID, drainableStates).
+		Updates(map[string]any{
+			"state":      WorkerStateDraining,
+			"updated_at": time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("mark worker %d draining: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// RetireDrainingWorker atomically transitions a draining worker to retired.
+// Returns true if the transition happened, false if the worker was no longer
+// in draining (e.g. already retired by an orphan sweep after a CP restart).
+func (cs *ConfigStore) RetireDrainingWorker(workerID int, reason string) (bool, error) {
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND state = ?", workerID, WorkerStateDraining).
+		Updates(map[string]any{
+			"state":         WorkerStateRetired,
+			"retire_reason": reason,
+			"updated_at":    time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("retire draining worker %d: %w", workerID, result.Error)
 	}
 	return result.RowsAffected > 0, nil
 }
@@ -842,9 +902,10 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 // already been marked expired long enough ago to pass the orphan grace cutoff.
 // Retired/lost rows are deliberately excluded: their pods are either already
 // gone (in which case re-listing the row would loop the janitor on a 404 from
-// the K8s delete forever) or were leaked when the previous CP died mid-delete,
-// and that leak case is handled authoritatively by the K8s label-based startup
-// scan in K8sWorkerPool.cleanupOrphanedWorkerPods.
+// the K8s delete forever) or were leaked when the previous CP died mid-delete.
+// That leak case is handled by the K8s label-based reconciler in
+// K8sWorkerPool.cleanupOrphanedWorkerPods, which runs every janitor tick on
+// the leader and deletes pods whose DB row is retired/lost or missing.
 func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
 	cleanupStates := []WorkerState{
