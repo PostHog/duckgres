@@ -235,26 +235,28 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 }
 
 func ducklingMetadataStoreAddress(status *provisioner.DucklingStatus, orgID string) (host string, port int, viaPgBouncer bool, err error) {
-	host = status.MetadataStore.Endpoint
-	port = 5432 // Aurora always uses 5432
-
 	// Prefer the PgBouncer endpoint when the Duckling exposes one — the
 	// Crossplane composition sets status.metadataStore.pgbouncerEndpoint
 	// (as "<host>:<port>") when a per-Duckling pooler is provisioned.
-	pgb := status.MetadataStore.PgBouncerEndpoint
-	if pgb == "" {
-		return host, port, false, nil
+	if pgb := status.MetadataStore.PgBouncerEndpoint; pgb != "" {
+		h, p, err := net.SplitHostPort(pgb)
+		if err != nil {
+			return "", 0, false, fmt.Errorf("parse pgbouncerEndpoint %q for org %q: %w", pgb, orgID, err)
+		}
+		portNum, err := strconv.Atoi(p)
+		if err != nil {
+			return "", 0, false, fmt.Errorf("parse pgbouncerEndpoint port %q for org %q: %w", p, orgID, err)
+		}
+		return h, portNum, true, nil
 	}
 
-	h, p, err := net.SplitHostPort(pgb)
-	if err != nil {
-		return "", 0, false, fmt.Errorf("parse pgbouncerEndpoint %q for org %q: %w", pgb, orgID, err)
+	// No pooler — fall back to the direct Aurora endpoint. Guard against an
+	// empty endpoint here rather than letting a malformed DSN surface later
+	// as an opaque connect error.
+	if status.MetadataStore.Endpoint == "" {
+		return "", 0, false, fmt.Errorf("duckling CR %q has no metadata store endpoint or pgbouncerEndpoint", orgID)
 	}
-	portNum, err := strconv.Atoi(p)
-	if err != nil {
-		return "", 0, false, fmt.Errorf("parse pgbouncerEndpoint port %q for org %q: %w", p, orgID, err)
-	}
-	return h, portNum, true, nil
+	return status.MetadataStore.Endpoint, 5432, false, nil
 }
 
 // buildDuckLakeConfigFromConfigStore reads infrastructure details from the config store

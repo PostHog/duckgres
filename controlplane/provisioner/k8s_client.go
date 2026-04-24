@@ -4,12 +4,14 @@ package provisioner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 )
@@ -136,6 +138,59 @@ func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
 	err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
 		return fmt.Errorf("delete duckling CR %q: %w", name, err)
+	}
+	return nil
+}
+
+// GetPgBouncerEnabled reads spec.metadataStore.pgbouncer.enabled from the
+// Duckling CR. Missing blocks (composition at an older schema, CR never
+// carried a pgbouncer section) are reported as false — same as an explicit
+// opt-out — so the caller just needs to compare against the desired value.
+func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, orgID string) (bool, error) {
+	name := ducklingName(orgID)
+	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	ms, ok := spec["metadataStore"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	pgb, ok := ms["pgbouncer"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	enabled, _ := pgb["enabled"].(bool)
+	return enabled, nil
+}
+
+// SetPgBouncerEnabled patches spec.metadataStore.pgbouncer.enabled on the
+// Duckling CR for the given org. Uses a JSON merge patch (RFC 7396) so the
+// call is idempotent and only touches the pgbouncer block — sibling fields
+// under metadataStore (aurora, type) are left untouched.
+func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, enabled bool) error {
+	name := ducklingName(orgID)
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"pgbouncer": map[string]interface{}{
+					"enabled": enabled,
+				},
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal pgbouncer patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q pgbouncer: %w", name, err)
 	}
 	return nil
 }
