@@ -1573,7 +1573,7 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 	if _, err := db.Exec(attachStmt); err != nil {
 		return fmt.Errorf("failed to attach Delta catalog: %w", err)
 	}
-	slog.Info("Attached Delta catalog successfully.")
+	slog.Info("Attached Delta catalog successfully.", "path", catalogPath)
 	return nil
 }
 

@@ -565,11 +565,12 @@ func buildDuckLakeAttachStmt(dlCfg DuckLakeConfig, migrate bool) string {
 }
 
 // DefaultDeltaCatalogPath returns the default Delta Lake catalog location for a
-// DuckLake-backed worker. For object stores, keep Delta in its own top-level
-// prefix beside the DuckLake prefix rather than at the bucket root.
+// DuckLake-backed worker as a sibling of the DuckLake prefix at the same parent
+// level. For s3://bucket/team/ducklake/ this returns s3://bucket/team/delta/, so
+// per-tenant prefixes do not collapse to a shared bucket-root delta/.
 func DefaultDeltaCatalogPath(dlCfg DuckLakeConfig) string {
 	if dlCfg.ObjectStore != "" {
-		return objectStoreRootPrefix(dlCfg.ObjectStore) + "delta/"
+		return objectStoreParentPrefix(dlCfg.ObjectStore) + "delta/"
 	}
 	if dlCfg.DataPath != "" {
 		return filepath.Join(filepath.Dir(filepath.Clean(dlCfg.DataPath)), "delta")
@@ -577,18 +578,26 @@ func DefaultDeltaCatalogPath(dlCfg DuckLakeConfig) string {
 	return ""
 }
 
-func objectStoreRootPrefix(path string) string {
+// objectStoreParentPrefix returns the parent directory of a URI-style object
+// store path, preserving the trailing slash. For s3://bucket/team/ducklake/ it
+// returns s3://bucket/team/; for s3://bucket/ducklake/ it returns s3://bucket/.
+// A bare bucket (s3://bucket or s3://bucket/) is treated as its own parent.
+func objectStoreParentPrefix(path string) string {
 	schemeIdx := strings.Index(path, "://")
-	if schemeIdx < 0 {
-		return strings.TrimRight(path, "/") + "/"
+	var scheme string
+	rest := path
+	if schemeIdx >= 0 {
+		scheme = path[:schemeIdx+len("://")]
+		rest = path[schemeIdx+len("://"):]
 	}
-	prefixEnd := schemeIdx + len("://")
-	rest := path[prefixEnd:]
-	slashIdx := strings.IndexByte(rest, '/')
-	if slashIdx < 0 {
-		return path + "/"
+	rest = strings.TrimRight(rest, "/")
+	if rest == "" {
+		return scheme
 	}
-	return path[:prefixEnd+slashIdx+1]
+	if idx := strings.LastIndexByte(rest, '/'); idx >= 0 {
+		return scheme + rest[:idx+1]
+	}
+	return scheme + rest + "/"
 }
 
 func deltaCatalogPath(dlCfg DuckLakeConfig) string {
