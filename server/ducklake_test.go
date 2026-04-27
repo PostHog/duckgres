@@ -61,3 +61,18 @@ func TestGetCommandTypeWithConstraints(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildDeltaCatalogAttachStmt(t *testing.T) {
+	cfg := DuckLakeConfig{
+		ObjectStore:         "s3://warehouse/ducklake/",
+		DeltaCatalogEnabled: true,
+	}
+	if got, want := buildDeltaCatalogAttachStmt(cfg), "ATTACH 's3://warehouse/delta/' AS delta (TYPE delta)"; got != want {
+		t.Fatalf("buildDeltaCatalogAttachStmt() = %q, want %q", got, want)
+	}
+
+	cfg.DeltaCatalogPath = "s3://warehouse/custom-delta/"
+	if got, want := buildDeltaCatalogAttachStmt(cfg), "ATTACH 's3://warehouse/custom-delta/' AS delta (TYPE delta)"; got != want {
+		t.Fatalf("buildDeltaCatalogAttachStmt() = %q, want %q", got, want)
+	}
+}

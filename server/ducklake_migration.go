@@ -563,3 +563,41 @@ func buildDuckLakeAttachStmt(dlCfg DuckLakeConfig, migrate bool) string {
 	}
 	return fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", connStr)
 }
+
+// DefaultDeltaCatalogPath returns the default Delta Lake catalog location for a
+// DuckLake-backed worker. For object stores, keep Delta in its own top-level
+// prefix beside the DuckLake prefix rather than at the bucket root.
+func DefaultDeltaCatalogPath(dlCfg DuckLakeConfig) string {
+	if dlCfg.ObjectStore != "" {
+		return objectStoreRootPrefix(dlCfg.ObjectStore) + "delta/"
+	}
+	if dlCfg.DataPath != "" {
+		return filepath.Join(filepath.Dir(filepath.Clean(dlCfg.DataPath)), "delta")
+	}
+	return ""
+}
+
+func objectStoreRootPrefix(path string) string {
+	schemeIdx := strings.Index(path, "://")
+	if schemeIdx < 0 {
+		return strings.TrimRight(path, "/") + "/"
+	}
+	prefixEnd := schemeIdx + len("://")
+	rest := path[prefixEnd:]
+	slashIdx := strings.IndexByte(rest, '/')
+	if slashIdx < 0 {
+		return path + "/"
+	}
+	return path[:prefixEnd+slashIdx+1]
+}
+
+func deltaCatalogPath(dlCfg DuckLakeConfig) string {
+	if dlCfg.DeltaCatalogPath != "" {
+		return dlCfg.DeltaCatalogPath
+	}
+	return DefaultDeltaCatalogPath(dlCfg)
+}
+
+func buildDeltaCatalogAttachStmt(dlCfg DuckLakeConfig) string {
+	return fmt.Sprintf("ATTACH '%s' AS delta (TYPE delta)", escapeSQLStringLiteral(deltaCatalogPath(dlCfg)))
+}

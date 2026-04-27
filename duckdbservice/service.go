@@ -583,14 +583,44 @@ func (p *SessionPool) CloseAll() {
 		}
 	}
 
+	cleanupCfg := p.cfg
+	if p.activation != nil {
+		cleanupCfg.DuckLake = p.activation.payload.DuckLake
+	}
+
 	if p.warmupDB != nil {
+		cleanupWorkerCatalogs(p.warmupDB, cleanupCfg)
 		_ = p.warmupDB.Close()
 	}
 	if p.fallbackDB != nil && p.fallbackDB != p.warmupDB {
+		cleanupWorkerCatalogs(p.fallbackDB, cleanupCfg)
 		_ = p.fallbackDB.Close()
 	}
 	if p.activation != nil && p.activation.db != nil && p.activation.db != p.warmupDB && p.activation.db != p.fallbackDB {
+		cleanupWorkerCatalogs(p.activation.db, cleanupCfg)
 		_ = p.activation.db.Close()
+	}
+}
+
+func cleanupWorkerCatalogs(db *sql.DB, cfg server.Config) {
+	if db == nil || (!cfg.DuckLake.DeltaCatalogEnabled && cfg.DuckLake.MetadataStore == "") {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, "USE memory"); err != nil {
+		slog.Warn("Failed to switch worker DB to memory during shutdown.", "error", err)
+		return
+	}
+	if cfg.DuckLake.DeltaCatalogEnabled {
+		if _, err := db.ExecContext(ctx, "DETACH delta"); err != nil {
+			slog.Warn("Failed to detach worker Delta catalog during shutdown.", "error", err)
+		}
+	}
+	if cfg.DuckLake.MetadataStore != "" {
+		if _, err := db.ExecContext(ctx, "DETACH ducklake"); err != nil {
+			slog.Warn("Failed to detach worker DuckLake catalog during shutdown.", "error", err)
+		}
 	}
 }
 

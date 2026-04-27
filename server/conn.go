@@ -605,8 +605,9 @@ func (c *clientConn) safeCleanupDB() {
 		}
 	}
 
-	// Detach DuckLake to release the RDS metadata connection (only if connection is healthy)
-	if connHealthy && c.server.cfg.DuckLake.MetadataStore != "" {
+	// Detach attached lake catalogs to release remote metadata/object-store handles
+	// before closing the DuckDB connection.
+	if connHealthy && (c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.DuckLake.DeltaCatalogEnabled) {
 		// Must switch away from ducklake before detaching - DuckDB doesn't allow
 		// detaching the default database
 		ctx3, cancel3 := context.WithTimeout(context.Background(), cleanupTimeout)
@@ -620,11 +621,22 @@ func (c *clientConn) safeCleanupDB() {
 		}
 
 		if connHealthy {
-			ctx4, cancel4 := context.WithTimeout(context.Background(), cleanupTimeout)
-			_, err := c.executor.ExecContext(ctx4, "DETACH ducklake")
-			cancel4()
-			if err != nil {
-				slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err)
+			if c.server.cfg.DuckLake.DeltaCatalogEnabled {
+				ctxDelta, cancelDelta := context.WithTimeout(context.Background(), cleanupTimeout)
+				_, err := c.executor.ExecContext(ctxDelta, "DETACH delta")
+				cancelDelta()
+				if err != nil {
+					slog.Warn("Failed to detach Delta catalog.", "user", c.username, "error", err)
+				}
+			}
+
+			if c.server.cfg.DuckLake.MetadataStore != "" {
+				ctx4, cancel4 := context.WithTimeout(context.Background(), cleanupTimeout)
+				_, err := c.executor.ExecContext(ctx4, "DETACH ducklake")
+				cancel4()
+				if err != nil {
+					slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err)
+				}
 			}
 		}
 	}

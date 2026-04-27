@@ -211,6 +211,53 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCacheDefaultsTr
 	}
 }
 
+func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
+	fileEnabled := true
+	resolved := resolveEffectiveConfig(&FileConfig{
+		DuckLake: DuckLakeFileConfig{
+			ObjectStore:         "s3://warehouse/ducklake/",
+			DeltaCatalogEnabled: &fileEnabled,
+		},
+	}, configCLIInputs{}, envFromMap(nil), nil)
+	if !resolved.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected YAML ducklake.delta_catalog_enabled to enable Delta catalog")
+	}
+	if got, want := resolved.Server.DuckLake.DeltaCatalogPath, "s3://warehouse/delta/"; got != want {
+		t.Fatalf("expected derived Delta catalog path %q, got %q", want, got)
+	}
+
+	resolved = resolveEffectiveConfig(&FileConfig{
+		DuckLake: DuckLakeFileConfig{
+			DeltaCatalogEnabled: &fileEnabled,
+			DeltaCatalogPath:    "s3://warehouse/custom-delta/",
+		},
+	}, configCLIInputs{}, envFromMap(map[string]string{
+		"DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED": "false",
+		"DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH":    "s3://warehouse/env-delta/",
+	}), nil)
+	if resolved.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected env DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED=false to override YAML")
+	}
+	if got, want := resolved.Server.DuckLake.DeltaCatalogPath, "s3://warehouse/env-delta/"; got != want {
+		t.Fatalf("expected env Delta catalog path %q, got %q", want, got)
+	}
+
+	resolved = resolveEffectiveConfig(nil, configCLIInputs{
+		Set:                         map[string]bool{"ducklake-delta-catalog-enabled": true, "ducklake-delta-catalog-path": true},
+		DuckLakeDeltaCatalogEnabled: true,
+		DuckLakeDeltaCatalogPath:    "s3://warehouse/cli-delta/",
+	}, envFromMap(map[string]string{
+		"DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED": "false",
+		"DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH":    "s3://warehouse/env-delta/",
+	}), nil)
+	if !resolved.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected CLI --ducklake-delta-catalog-enabled to override env")
+	}
+	if got, want := resolved.Server.DuckLake.DeltaCatalogPath, "s3://warehouse/cli-delta/"; got != want {
+		t.Fatalf("expected CLI Delta catalog path %q, got %q", want, got)
+	}
+}
+
 func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL":   "0s",

@@ -46,7 +46,9 @@ func TestSafeCleanupDBUsesValidDuckLakeHealthProbe(t *testing.T) {
 		server: &Server{
 			cfg: Config{
 				DuckLake: DuckLakeConfig{
-					MetadataStore: "postgres:host=127.0.0.1 dbname=ducklake",
+					MetadataStore:       "postgres:host=127.0.0.1 dbname=ducklake",
+					DeltaCatalogEnabled: true,
+					DeltaCatalogPath:    "s3://warehouse/delta/",
 				},
 			},
 		},
@@ -59,6 +61,7 @@ func TestSafeCleanupDBUsesValidDuckLakeHealthProbe(t *testing.T) {
 	want := []string{
 		"SELECT 1 FROM duckdb_tables() WHERE database_name = 'ducklake' LIMIT 1",
 		"USE memory",
+		"DETACH delta",
 		"DETACH ducklake",
 	}
 	if len(exec.execQueries) != len(want) {

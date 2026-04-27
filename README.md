@@ -170,6 +170,11 @@ ducklake:
   # hidden DuckLake metadata pool to reduce retained metadata connections.
   # Set to false to opt back into warm connection reuse.
   disable_metadata_thread_local_cache: true
+  # Default: false. Also attach a Delta Lake catalog/table on worker boot.
+  # Without delta_catalog_path, defaults to a sibling top-level delta/ prefix
+  # beside the configured DuckLake object_store prefix.
+  delta_catalog_enabled: false
+  # delta_catalog_path: "s3://bucket/delta/"
 
 process:
   min_workers: 0
@@ -212,6 +217,8 @@ Run with config file:
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
+| `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
+| `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
@@ -293,11 +300,20 @@ ducklake:
   # hidden DuckLake metadata pool before ATTACH creates it.
   # Set to false to opt back into warm connection reuse.
   disable_metadata_thread_local_cache: true
+
+  # Also attach a Delta Lake catalog/table as catalog "delta" during worker
+  # boot/activation. If delta_catalog_path is omitted, Duckgres derives
+  # s3://<bucket>/delta/ from ducklake.object_store. Prefer that isolated
+  # prefix over the bucket root so DuckLake and Delta files do not collide.
+  delta_catalog_enabled: false
+  # delta_catalog_path: "s3://my-bucket/delta/"
 ```
 
 This runs the equivalent of:
 ```sql
 ATTACH 'ducklake:postgres:host=ducklake.example.com user=ducklake password=secret dbname=ducklake' AS ducklake;
+-- when delta_catalog_enabled=true:
+ATTACH 's3://my-bucket/delta/' AS delta (TYPE delta);
 ```
 
 See [DuckLake documentation](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details.
@@ -353,6 +369,7 @@ DuckLake can store data files in S3-compatible object storage (AWS S3, MinIO, et
 ducklake:
   metadata_store: "postgres:host=localhost port=5433 user=ducklake password=ducklake dbname=ducklake"
   object_store: "s3://ducklake/data/"
+  delta_catalog_enabled: true       # attaches s3://ducklake/delta/ by default
   s3_provider: "config"            # Explicit credentials (default if s3_access_key is set)
   s3_endpoint: "localhost:9000"    # MinIO or custom S3 endpoint
   s3_access_key: "minioadmin"
@@ -390,6 +407,8 @@ See [DuckDB S3 API docs](https://duckdb.org/docs/stable/core_extensions/httpfs/s
 
 All S3 settings can be configured via environment variables:
 - `DUCKGRES_DUCKLAKE_OBJECT_STORE` - S3 path (e.g., `s3://bucket/path/`)
+- `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` - attach Delta catalog (`true`/`false`)
+- `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` - Delta catalog/table path (e.g., `s3://bucket/delta/`)
 - `DUCKGRES_DUCKLAKE_S3_PROVIDER` - `config` or `credential_chain`
 - `DUCKGRES_DUCKLAKE_S3_ENDPOINT` - S3 endpoint (for MinIO)
 - `DUCKGRES_DUCKLAKE_S3_ACCESS_KEY` - Access key ID
