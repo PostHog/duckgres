@@ -62,6 +62,11 @@ type captureRuntimeWorkerStore struct {
 	retireIdleCalledReasons []string
 	retireIdleErr           error
 	retireIdleMisses        map[int]bool
+	retireIdleOrHotIdleCalls         int
+	retireIdleOrHotIdleCalledIDs     []int
+	retireIdleOrHotIdleCalledReasons []string
+	retireIdleOrHotIdleErr           error
+	retireIdleOrHotIdleMisses        map[int]bool
 	preloadedRecords        map[int]*configstore.WorkerRecord
 	getRecordErrIDs         map[int]error
 	markDrainingCalls       int
@@ -229,6 +234,21 @@ func (s *captureRuntimeWorkerStore) RetireIdleWorker(workerID int, reason string
 		return false, s.retireIdleErr
 	}
 	if s.retireIdleMisses[workerID] {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *captureRuntimeWorkerStore) RetireIdleOrHotIdleWorker(workerID int, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retireIdleOrHotIdleCalls++
+	s.retireIdleOrHotIdleCalledIDs = append(s.retireIdleOrHotIdleCalledIDs, workerID)
+	s.retireIdleOrHotIdleCalledReasons = append(s.retireIdleOrHotIdleCalledReasons, reason)
+	if s.retireIdleOrHotIdleErr != nil {
+		return false, s.retireIdleOrHotIdleErr
+	}
+	if s.retireIdleOrHotIdleMisses[workerID] {
 		return false, nil
 	}
 	return true, nil
@@ -2066,15 +2086,35 @@ func TestRetireOneMismatchedVersionWorker_RetiresOlderVersionIdleWorker(t *testi
 	if !pool.RetireOneMismatchedVersionWorker(context.Background()) {
 		t.Fatal("expected reaper to retire one mismatched worker")
 	}
-	if store.retireIdleCalls != 1 || len(store.retireIdleCalledIDs) != 1 || store.retireIdleCalledIDs[0] != 7 {
-		t.Fatalf("expected one RetireIdleWorker(7) call, got calls=%d ids=%v", store.retireIdleCalls, store.retireIdleCalledIDs)
+	if store.retireIdleOrHotIdleCalls != 1 || len(store.retireIdleOrHotIdleCalledIDs) != 1 || store.retireIdleOrHotIdleCalledIDs[0] != 7 {
+		t.Fatalf("expected one RetireIdleOrHotIdleWorker(7) call, got calls=%d ids=%v", store.retireIdleOrHotIdleCalls, store.retireIdleOrHotIdleCalledIDs)
 	}
-	if reason := store.retireIdleCalledReasons[0]; reason != "version_mismatch" {
+	if reason := store.retireIdleOrHotIdleCalledReasons[0]; reason != "version_mismatch" {
 		t.Fatalf("expected reason version_mismatch, got %q", reason)
 	}
 	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
 	if len(pods.Items) != 0 {
 		t.Fatalf("expected pod to be deleted, got %d remaining", len(pods.Items))
+	}
+}
+
+func TestRetireOneMismatchedVersionWorker_RetiresHotIdleWorker(t *testing.T) {
+	// hot-idle workers have handled a session but are currently idle. They
+	// are safe to reap during a rolling update.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := mismatchVersionTestPool(t, "duckgres-new-aaaaa", store)
+	createMismatchWorkerPod(t, cs, "duckgres-old-worker-9", "duckgres-old-zzzzz", "9")
+
+	if !pool.RetireOneMismatchedVersionWorker(context.Background()) {
+		t.Fatal("expected reaper to retire the mismatched hot-idle worker")
+	}
+	if store.retireIdleOrHotIdleCalls != 1 || store.retireIdleOrHotIdleCalledIDs[0] != 9 {
+		t.Fatalf("expected RetireIdleOrHotIdleWorker(9), got calls=%d ids=%v", store.retireIdleOrHotIdleCalls, store.retireIdleOrHotIdleCalledIDs)
+	}
+	if !podExists(t, cs, "duckgres-old-worker-9") {
+		// good, pod deleted
+	} else {
+		t.Fatal("expected hot-idle pod to be deleted")
 	}
 }
 
@@ -2113,17 +2153,17 @@ func TestRetireOneMismatchedVersionWorker_RetiresOnePerCall(t *testing.T) {
 	if pool.RetireOneMismatchedVersionWorker(context.Background()) {
 		t.Fatal("expected no more retirements after all mismatched pods removed")
 	}
-	if store.retireIdleCalls != 3 {
-		t.Fatalf("expected exactly 3 retirement attempts, got %d", store.retireIdleCalls)
+	if store.retireIdleOrHotIdleCalls != 3 {
+		t.Fatalf("expected exactly 3 retirement attempts, got %d", store.retireIdleOrHotIdleCalls)
 	}
 }
 
 func TestRetireOneMismatchedVersionWorker_SkipsWhenNotIdle(t *testing.T) {
-	// RetireIdleWorker returns false when the row is no longer idle (busy,
-	// reserved, hot-idle, etc.). The reaper must skip those pods and leave
+	// RetireIdleOrHotIdleWorker returns false when the row is no longer idle (busy,
+	// reserved, etc.). The reaper must skip those pods and leave
 	// them running — it will try again on the next tick.
 	store := &captureRuntimeWorkerStore{
-		retireIdleMisses: map[int]bool{5: true},
+		retireIdleOrHotIdleMisses: map[int]bool{5: true},
 	}
 	pool, cs := mismatchVersionTestPool(t, "duckgres-new-aaaaa", store)
 	createMismatchWorkerPod(t, cs, "duckgres-old-worker-5", "duckgres-old-zzzzz", "5")

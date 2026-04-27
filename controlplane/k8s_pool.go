@@ -239,7 +239,7 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		if err != nil {
 			continue
 		}
-		retired, err := p.runtimeStore.RetireIdleWorker(workerID, "version_mismatch")
+		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(workerID, "version_mismatch")
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
