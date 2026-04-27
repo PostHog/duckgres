@@ -674,6 +674,23 @@ func (cs *ConfigStore) RetireIdleWorker(workerID int, reason string) (bool, erro
 	return result.RowsAffected > 0, nil
 }
 
+// RetireIdleOrHotIdleWorker atomically transitions a worker from idle or hot_idle
+// to retired. Returns true if the transition happened, false if the worker was
+// in some other state (e.g. claimed/activating/hot).
+func (cs *ConfigStore) RetireIdleOrHotIdleWorker(workerID int, reason string) (bool, error) {
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND state IN ?", workerID, []WorkerState{WorkerStateIdle, WorkerStateHotIdle}).
+		Updates(map[string]any{
+			"state":         WorkerStateRetired,
+			"retire_reason": reason,
+			"updated_at":    time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("retire idle/hot_idle worker %d: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
 // MarkWorkerDraining atomically transitions a worker into the draining state
 // if and only if it is still owned by the caller and not already terminal. It
 // returns true when the transition happened.

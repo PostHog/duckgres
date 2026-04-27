@@ -277,9 +277,11 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 		),
 		ObjectStore: buildManagedWarehouseObjectStore(warehouse.S3),
 		S3Endpoint:  warehouse.S3.Endpoint,
-		S3Region:    warehouse.S3.Region,
-		S3UseSSL:    warehouse.S3.UseSSL,
-		S3URLStyle:  warehouse.S3.URLStyle,
+		S3Region:            warehouse.S3.Region,
+		S3UseSSL:            warehouse.S3.UseSSL,
+		S3URLStyle:          warehouse.S3.URLStyle,
+		DeltaCatalogEnabled: warehouse.S3.DeltaCatalogEnabled,
+		DeltaCatalogPath:    warehouse.S3.DeltaCatalogPath,
 	}
 
 	switch {

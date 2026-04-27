@@ -83,13 +83,15 @@ type ManagedWarehousePgBouncer struct {
 
 // ManagedWarehouseS3 stores object-store metadata for an org's warehouse.
 type ManagedWarehouseS3 struct {
-	Provider   string `gorm:"size:64" json:"provider"`
-	Region     string `gorm:"size:64" json:"region"`
-	Bucket     string `gorm:"size:255" json:"bucket"`
-	PathPrefix string `gorm:"size:1024" json:"path_prefix"`
-	Endpoint   string `gorm:"size:512" json:"endpoint"`
-	UseSSL     bool   `json:"use_ssl"`
-	URLStyle   string `gorm:"size:16" json:"url_style"`
+	Provider            string `gorm:"size:64" json:"provider"`
+	Region              string `gorm:"size:64" json:"region"`
+	Bucket              string `gorm:"size:255" json:"bucket"`
+	PathPrefix          string `gorm:"size:1024" json:"path_prefix"`
+	Endpoint            string `gorm:"size:512" json:"endpoint"`
+	UseSSL              bool   `json:"use_ssl"`
+	URLStyle            string `gorm:"size:16" json:"url_style"`
+	DeltaCatalogEnabled bool   `json:"delta_catalog_enabled"`
+	DeltaCatalogPath    string `gorm:"size:1024" json:"delta_catalog_path"`
 }
 
 // ManagedWarehouseWorkerIdentity stores org-scoped worker identity metadata.
@@ -167,10 +169,12 @@ type DuckLakeConfig struct {
 	S3SecretKey   string    `gorm:"size:255" json:"-"`
 	S3Region      string    `gorm:"size:64" json:"s3_region"`
 	S3UseSSL      bool      `json:"s3_use_ssl"`
-	S3URLStyle    string    `gorm:"size:16" json:"s3_url_style"`
-	S3Chain       string    `gorm:"size:255" json:"s3_chain"`
-	S3Profile     string    `gorm:"size:255" json:"s3_profile"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	S3URLStyle          string    `gorm:"size:16" json:"s3_url_style"`
+	S3Chain             string    `gorm:"size:255" json:"s3_chain"`
+	S3Profile           string    `gorm:"size:255" json:"s3_profile"`
+	DeltaCatalogEnabled bool      `json:"delta_catalog_enabled"`
+	DeltaCatalogPath    string    `gorm:"size:1024" json:"delta_catalog_path"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 func (DuckLakeConfig) TableName() string { return "duckgres_ducklake_config" }
