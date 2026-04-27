@@ -22,7 +22,7 @@ jobs:
           go-version-file: go.mod
       - uses: golangci/golangci-lint-action@971e284b6050e8a5849b72094c50ab08da042db8 # v6.1.1
         with:
-          version: v1.61.0
+          version: v1.64.2
 
   unit-tests:
     runs-on: ubuntu-24.04-arm
