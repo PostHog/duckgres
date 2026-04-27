@@ -110,6 +110,11 @@ type DuckLakeFileConfig struct {
 	ObjectStore   string `yaml:"object_store"`   // e.g., "s3://bucket/path/" for S3/MinIO storage
 	DataPath      string `yaml:"data_path"`      // Local file path for data storage (alternative to object_store)
 
+	// Delta catalog attachment. When enabled without an explicit path, the
+	// catalog path is derived as a sibling delta/ prefix at the object store root.
+	DeltaCatalogEnabled *bool  `yaml:"delta_catalog_enabled"`
+	DeltaCatalogPath    string `yaml:"delta_catalog_path"`
+
 	// Disable metadata postgres_scanner thread-local cache before ATTACH creates
 	// the hidden metadata pool. Nil means use the server default.
 	DisableMetadataThreadLocalCache *bool `yaml:"disable_metadata_thread_local_cache"`
@@ -222,6 +227,8 @@ func main() {
 	threads := flag.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	memoryBudget := flag.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
 	memoryRebalance := flag.Bool("memory-rebalance", false, "Enable dynamic per-connection memory reallocation (control-plane mode) (env: DUCKGRES_MEMORY_REBALANCE)")
+	duckLakeDeltaCatalogEnabled := flag.Bool("ducklake-delta-catalog-enabled", false, "Attach a Delta Lake catalog during DuckLake worker boot (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
+	duckLakeDeltaCatalogPath := flag.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach, defaults to sibling delta/ prefix at DuckLake object-store root (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
 	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error (env: DUCKGRES_LOG_LEVEL)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
@@ -394,52 +401,54 @@ func main() {
 	}
 
 	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
-		Set:                       cliSet,
-		Host:                      *host,
-		Port:                      *port,
-		FlightPort:                *flightPort,
-		FlightSessionIdleTTL:      *flightSessionIdleTTL,
-		FlightSessionReapInterval: *flightSessionReapInterval,
-		FlightHandleIdleTTL:       *flightHandleIdleTTL,
-		FlightSessionTokenTTL:     *flightSessionTokenTTL,
-		DataDir:                   *dataDir,
-		CertFile:                  *certFile,
-		KeyFile:                   *keyFile,
-		FilePersistence:           *filePersistence,
-		ProcessIsolation:          *processIsolation,
-		IdleTimeout:               *idleTimeout,
-		MemoryLimit:               *memoryLimit,
-		Threads:                   *threads,
-		MemoryBudget:              *memoryBudget,
-		MemoryRebalance:           *memoryRebalance,
-		ProcessMinWorkers:         *processMinWorkers,
-		ProcessMaxWorkers:         *processMaxWorkers,
-		ProcessRetireOnSessionEnd: *processRetireOnSessionEnd,
-		WorkerQueueTimeout:        *workerQueueTimeout,
-		WorkerIdleTimeout:         *workerIdleTimeout,
-		HandoverDrainTimeout:      *handoverDrainTimeout,
-		ACMEDomain:                *acmeDomain,
-		ACMEEmail:                 *acmeEmail,
-		ACMECacheDir:              *acmeCacheDir,
-		ACMEDNSProvider:           *acmeDNSProvider,
-		ACMEDNSZoneID:             *acmeDNSZoneID,
-		MaxConnections:            *maxConnections,
-		ConfigStoreConn:           *configStore,
-		ConfigPollInterval:        *configPollInterval,
-		InternalSecret:            *internalSecret,
-		WorkerBackend:             *workerBackend,
-		K8sWorkerImage:            *k8sWorkerImage,
-		K8sWorkerNamespace:        *k8sWorkerNamespace,
-		K8sControlPlaneID:         *k8sControlPlaneID,
-		K8sWorkerPort:             *k8sWorkerPort,
-		K8sWorkerSecret:           *k8sWorkerSecret,
-		K8sWorkerConfigMap:        *k8sWorkerConfigMap,
-		K8sWorkerImagePullPolicy:  *k8sWorkerImagePullPolicy,
-		K8sWorkerServiceAccount:   *k8sWorkerServiceAccount,
-		K8sMaxWorkers:             *k8sMaxWorkers,
-		K8sSharedWarmTarget:       *k8sSharedWarmTarget,
-		AWSRegion:                 *awsRegion,
-		QueryLog:                  *queryLog,
+		Set:                         cliSet,
+		Host:                        *host,
+		Port:                        *port,
+		FlightPort:                  *flightPort,
+		FlightSessionIdleTTL:        *flightSessionIdleTTL,
+		FlightSessionReapInterval:   *flightSessionReapInterval,
+		FlightHandleIdleTTL:         *flightHandleIdleTTL,
+		FlightSessionTokenTTL:       *flightSessionTokenTTL,
+		DataDir:                     *dataDir,
+		CertFile:                    *certFile,
+		KeyFile:                     *keyFile,
+		FilePersistence:             *filePersistence,
+		ProcessIsolation:            *processIsolation,
+		IdleTimeout:                 *idleTimeout,
+		MemoryLimit:                 *memoryLimit,
+		Threads:                     *threads,
+		MemoryBudget:                *memoryBudget,
+		MemoryRebalance:             *memoryRebalance,
+		DuckLakeDeltaCatalogEnabled: *duckLakeDeltaCatalogEnabled,
+		DuckLakeDeltaCatalogPath:    *duckLakeDeltaCatalogPath,
+		ProcessMinWorkers:           *processMinWorkers,
+		ProcessMaxWorkers:           *processMaxWorkers,
+		ProcessRetireOnSessionEnd:   *processRetireOnSessionEnd,
+		WorkerQueueTimeout:          *workerQueueTimeout,
+		WorkerIdleTimeout:           *workerIdleTimeout,
+		HandoverDrainTimeout:        *handoverDrainTimeout,
+		ACMEDomain:                  *acmeDomain,
+		ACMEEmail:                   *acmeEmail,
+		ACMECacheDir:                *acmeCacheDir,
+		ACMEDNSProvider:             *acmeDNSProvider,
+		ACMEDNSZoneID:               *acmeDNSZoneID,
+		MaxConnections:              *maxConnections,
+		ConfigStoreConn:             *configStore,
+		ConfigPollInterval:          *configPollInterval,
+		InternalSecret:              *internalSecret,
+		WorkerBackend:               *workerBackend,
+		K8sWorkerImage:              *k8sWorkerImage,
+		K8sWorkerNamespace:          *k8sWorkerNamespace,
+		K8sControlPlaneID:           *k8sControlPlaneID,
+		K8sWorkerPort:               *k8sWorkerPort,
+		K8sWorkerSecret:             *k8sWorkerSecret,
+		K8sWorkerConfigMap:          *k8sWorkerConfigMap,
+		K8sWorkerImagePullPolicy:    *k8sWorkerImagePullPolicy,
+		K8sWorkerServiceAccount:     *k8sWorkerServiceAccount,
+		K8sMaxWorkers:               *k8sMaxWorkers,
+		K8sSharedWarmTarget:         *k8sSharedWarmTarget,
+		AWSRegion:                   *awsRegion,
+		QueryLog:                    *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})

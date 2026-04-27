@@ -64,6 +64,14 @@ ducklake:
   # If not specified, data is stored alongside the metadata
   # object_store: "s3://bucket/path/"
 
+  # Also attach a Delta Lake catalog/table at worker boot/activation.
+  # Default: false. If delta_catalog_path is omitted, Duckgres derives a
+  # sibling top-level prefix from object_store, e.g. s3://bucket/ducklake/
+  # becomes s3://bucket/delta/. Avoid using the bucket root directly so
+  # DuckLake and Delta metadata/data stay isolated.
+  # delta_catalog_enabled: false
+  # delta_catalog_path: "s3://bucket/delta/"
+
   # S3 credential provider: "config" (explicit) or "credential_chain" (AWS SDK)
   # Default: "config" if s3_access_key is set, otherwise "credential_chain"
   # s3_provider: "config"

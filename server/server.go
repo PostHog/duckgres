@@ -310,6 +310,12 @@ type DuckLakeConfig struct {
 	// Used when ObjectStore is not set (for local/non-S3 storage)
 	DataPath string
 
+	// DeltaCatalogEnabled attaches the DuckDB Delta extension catalog at worker
+	// startup/activation in addition to DuckLake. DeltaCatalogPath defaults to a
+	// sibling delta/ prefix at the DuckLake object-store root when omitted.
+	DeltaCatalogEnabled bool
+	DeltaCatalogPath    string
+
 	// S3 credential provider: "config" (explicit credentials) or "credential_chain" (AWS SDK chain)
 	// Default: "config" if S3AccessKey is set, otherwise "credential_chain"
 	S3Provider string
@@ -1115,6 +1121,12 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 			// Non-fatal: continue with DuckDB-based pg_namespace
 		}
 	}
+	if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
+		if cfg.DuckLake.DeltaCatalogEnabled {
+			return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
+		}
+		slog.Warn("Failed to attach Delta catalog.", "user", username, "error", err)
+	}
 
 	// Initialize information_schema compatibility views in memory.main
 	// Must be done AFTER attaching DuckLake (so views can reference ducklake.information_schema)
@@ -1143,6 +1155,9 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+	}
+	if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
+		return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
 	}
 
 	if err := recreatePgClassForDuckLake(db); err != nil {
@@ -1189,6 +1204,13 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
 		}
+	}
+	if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
+		if cfg.DuckLake.DeltaCatalogEnabled {
+			_ = db.Close()
+			return nil, fmt.Errorf("delta catalog configured but attachment failed: %w", err)
+		}
+		slog.Warn("Failed to attach Delta catalog.", "user", username, "error", err)
 	}
 
 	return db, nil
@@ -1509,6 +1531,63 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	go ensureDuckLakeMetadataIndexes(dlCfg)
 
 	return nil
+}
+
+// AttachDeltaCatalog attaches the configured Delta Lake catalog/table alongside
+// DuckLake. It reuses the DuckLake S3 secret settings so Delta scans can access
+// the same object store credentials.
+func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
+	if !dlCfg.DeltaCatalogEnabled {
+		return nil
+	}
+	catalogPath := deltaCatalogPath(dlCfg)
+	if catalogPath == "" {
+		return fmt.Errorf("delta catalog path is empty")
+	}
+
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for Delta catalog attachment lock")
+	}
+
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'delta'").Scan(&count)
+	if err == nil && count > 0 {
+		return nil
+	}
+
+	if err := LoadExtensions(db, []string{"delta"}); err != nil {
+		return fmt.Errorf("load delta extension: %w", err)
+	}
+
+	if deltaCatalogNeedsS3Secret(catalogPath, dlCfg) {
+		if err := createS3Secret(db, dlCfg); err != nil {
+			return fmt.Errorf("failed to create S3 secret: %w", err)
+		}
+	}
+
+	attachStmt := buildDeltaCatalogAttachStmt(dlCfg)
+	slog.Info("Attaching Delta catalog.", "path", catalogPath)
+	if _, err := db.Exec(attachStmt); err != nil {
+		return fmt.Errorf("failed to attach Delta catalog: %w", err)
+	}
+	slog.Info("Attached Delta catalog successfully.", "path", catalogPath)
+	return nil
+}
+
+func deltaCatalogNeedsS3Secret(catalogPath string, dlCfg DuckLakeConfig) bool {
+	if !strings.Contains(catalogPath, "://") {
+		return false
+	}
+	provider := S3ProviderForConfig(dlCfg)
+	return dlCfg.S3Endpoint != "" ||
+		dlCfg.S3AccessKey != "" ||
+		provider == "credential_chain" ||
+		provider == "aws_sdk" ||
+		dlCfg.S3Chain != "" ||
+		dlCfg.S3Profile != ""
 }
 
 // duckLakeIndexDone tracks whether metadata indexes have been successfully created.

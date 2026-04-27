@@ -584,13 +584,63 @@ func (p *SessionPool) CloseAll() {
 	}
 
 	if p.warmupDB != nil {
+		cleanupWorkerCatalogs(p.warmupDB)
 		_ = p.warmupDB.Close()
 	}
 	if p.fallbackDB != nil && p.fallbackDB != p.warmupDB {
+		cleanupWorkerCatalogs(p.fallbackDB)
 		_ = p.fallbackDB.Close()
 	}
 	if p.activation != nil && p.activation.db != nil && p.activation.db != p.warmupDB && p.activation.db != p.fallbackDB {
+		cleanupWorkerCatalogs(p.activation.db)
 		_ = p.activation.db.Close()
+	}
+}
+
+// cleanupWorkerCatalogs detaches the lake catalogs that are actually attached
+// on db before shutdown. Probing duckdb_databases() avoids spurious "failed to
+// detach" warnings on the warmup/fallback DBs that never had a tenant catalog
+// attached, while still cleaning up the activation DB that does.
+func cleanupWorkerCatalogs(db *sql.DB) {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, "SELECT database_name FROM duckdb_databases() WHERE database_name IN ('delta', 'ducklake')")
+	if err != nil {
+		slog.Debug("Failed to list attached catalogs during shutdown.", "error", err)
+		return
+	}
+	attached := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			slog.Debug("Failed to scan attached catalog name during shutdown.", "error", err)
+			return
+		}
+		attached[name] = true
+	}
+	_ = rows.Close()
+
+	if !attached["delta"] && !attached["ducklake"] {
+		return
+	}
+	if _, err := db.ExecContext(ctx, "USE memory"); err != nil {
+		slog.Warn("Failed to switch worker DB to memory during shutdown.", "error", err)
+		return
+	}
+	if attached["delta"] {
+		if _, err := db.ExecContext(ctx, "DETACH delta"); err != nil {
+			slog.Warn("Failed to detach worker Delta catalog during shutdown.", "error", err)
+		}
+	}
+	if attached["ducklake"] {
+		if _, err := db.ExecContext(ctx, "DETACH ducklake"); err != nil {
+			slog.Warn("Failed to detach worker DuckLake catalog during shutdown.", "error", err)
+		}
 	}
 }
 

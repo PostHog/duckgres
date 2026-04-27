@@ -563,3 +563,50 @@ func buildDuckLakeAttachStmt(dlCfg DuckLakeConfig, migrate bool) string {
 	}
 	return fmt.Sprintf("ATTACH 'ducklake:%s' AS ducklake", connStr)
 }
+
+// DefaultDeltaCatalogPath returns the default Delta Lake catalog location for a
+// DuckLake-backed worker as a sibling of the DuckLake prefix at the same parent
+// level. For s3://bucket/team/ducklake/ this returns s3://bucket/team/delta/, so
+// per-tenant prefixes do not collapse to a shared bucket-root delta/.
+func DefaultDeltaCatalogPath(dlCfg DuckLakeConfig) string {
+	if dlCfg.ObjectStore != "" {
+		return objectStoreParentPrefix(dlCfg.ObjectStore) + "delta/"
+	}
+	if dlCfg.DataPath != "" {
+		return filepath.Join(filepath.Dir(filepath.Clean(dlCfg.DataPath)), "delta")
+	}
+	return ""
+}
+
+// objectStoreParentPrefix returns the parent directory of a URI-style object
+// store path, preserving the trailing slash. For s3://bucket/team/ducklake/ it
+// returns s3://bucket/team/; for s3://bucket/ducklake/ it returns s3://bucket/.
+// A bare bucket (s3://bucket or s3://bucket/) is treated as its own parent.
+func objectStoreParentPrefix(path string) string {
+	schemeIdx := strings.Index(path, "://")
+	var scheme string
+	rest := path
+	if schemeIdx >= 0 {
+		scheme = path[:schemeIdx+len("://")]
+		rest = path[schemeIdx+len("://"):]
+	}
+	rest = strings.TrimRight(rest, "/")
+	if rest == "" {
+		return scheme
+	}
+	if idx := strings.LastIndexByte(rest, '/'); idx >= 0 {
+		return scheme + rest[:idx+1]
+	}
+	return scheme + rest + "/"
+}
+
+func deltaCatalogPath(dlCfg DuckLakeConfig) string {
+	if dlCfg.DeltaCatalogPath != "" {
+		return dlCfg.DeltaCatalogPath
+	}
+	return DefaultDeltaCatalogPath(dlCfg)
+}
+
+func buildDeltaCatalogAttachStmt(dlCfg DuckLakeConfig) string {
+	return fmt.Sprintf("ATTACH '%s' AS delta (TYPE delta)", escapeSQLStringLiteral(deltaCatalogPath(dlCfg)))
+}

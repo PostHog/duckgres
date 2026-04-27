@@ -12,57 +12,59 @@ import (
 type configCLIInputs struct {
 	Set map[string]bool
 
-	Host                      string
-	Port                      int
-	FlightPort                int
-	FlightSessionIdleTTL      string
-	FlightSessionReapInterval string
-	FlightHandleIdleTTL       string
-	FlightSessionTokenTTL     string
-	DataDir                   string
-	CertFile                  string
-	KeyFile                   string
-	FilePersistence           bool
-	ProcessIsolation          bool
-	IdleTimeout               string
-	MemoryLimit               string
-	Threads                   int
-	MemoryBudget              string
-	MemoryRebalance           bool
-	ProcessMinWorkers         int
-	ProcessMaxWorkers         int
-	ProcessRetireOnSessionEnd bool
-	WorkerQueueTimeout        string
-	WorkerIdleTimeout         string
-	HandoverDrainTimeout      string
-	ACMEDomain                string
-	ACMEEmail                 string
-	ACMECacheDir              string
-	ACMEDNSProvider           string
-	ACMEDNSZoneID             string
-	MaxConnections            int
-	ConfigStoreConn           string
-	ConfigPollInterval        string
-	InternalSecret            string
-	WorkerBackend             string
-	K8sWorkerImage            string
-	K8sWorkerNamespace        string
-	K8sControlPlaneID         string
-	K8sWorkerPort             int
-	K8sWorkerSecret           string
-	K8sWorkerConfigMap        string
-	K8sWorkerImagePullPolicy  string
-	K8sWorkerServiceAccount   string
-	K8sMaxWorkers             int
-	K8sSharedWarmTarget       int
-	K8sWorkerCPURequest       string
-	K8sWorkerMemoryRequest    string
-	K8sWorkerNodeSelector     string
-	K8sWorkerTolerationKey    string
-	K8sWorkerTolerationValue  string
-	K8sWorkerExclusiveNode    bool
-	AWSRegion                 string
-	QueryLog                  bool
+	Host                        string
+	Port                        int
+	FlightPort                  int
+	FlightSessionIdleTTL        string
+	FlightSessionReapInterval   string
+	FlightHandleIdleTTL         string
+	FlightSessionTokenTTL       string
+	DataDir                     string
+	CertFile                    string
+	KeyFile                     string
+	FilePersistence             bool
+	ProcessIsolation            bool
+	IdleTimeout                 string
+	MemoryLimit                 string
+	Threads                     int
+	MemoryBudget                string
+	MemoryRebalance             bool
+	DuckLakeDeltaCatalogEnabled bool
+	DuckLakeDeltaCatalogPath    string
+	ProcessMinWorkers           int
+	ProcessMaxWorkers           int
+	ProcessRetireOnSessionEnd   bool
+	WorkerQueueTimeout          string
+	WorkerIdleTimeout           string
+	HandoverDrainTimeout        string
+	ACMEDomain                  string
+	ACMEEmail                   string
+	ACMECacheDir                string
+	ACMEDNSProvider             string
+	ACMEDNSZoneID               string
+	MaxConnections              int
+	ConfigStoreConn             string
+	ConfigPollInterval          string
+	InternalSecret              string
+	WorkerBackend               string
+	K8sWorkerImage              string
+	K8sWorkerNamespace          string
+	K8sControlPlaneID           string
+	K8sWorkerPort               int
+	K8sWorkerSecret             string
+	K8sWorkerConfigMap          string
+	K8sWorkerImagePullPolicy    string
+	K8sWorkerServiceAccount     string
+	K8sMaxWorkers               int
+	K8sSharedWarmTarget         int
+	K8sWorkerCPURequest         string
+	K8sWorkerMemoryRequest      string
+	K8sWorkerNodeSelector       string
+	K8sWorkerTolerationKey      string
+	K8sWorkerTolerationValue    string
+	K8sWorkerExclusiveNode      bool
+	AWSRegion                   string
+	QueryLog                    bool
 }
 
 type resolvedConfig struct {
@@ -249,6 +251,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 		if fileCfg.DuckLake.DataPath != "" {
 			cfg.DuckLake.DataPath = fileCfg.DuckLake.DataPath
+		}
+		if fileCfg.DuckLake.DeltaCatalogEnabled != nil {
+			cfg.DuckLake.DeltaCatalogEnabled = *fileCfg.DuckLake.DeltaCatalogEnabled
+		}
+		if fileCfg.DuckLake.DeltaCatalogPath != "" {
+			cfg.DuckLake.DeltaCatalogPath = fileCfg.DuckLake.DeltaCatalogPath
 		}
 		if fileCfg.DuckLake.DisableMetadataThreadLocalCache != nil {
 			cfg.DuckLake.DisableMetadataThreadLocalCache = boolPtr(*fileCfg.DuckLake.DisableMetadataThreadLocalCache)
@@ -484,6 +492,16 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if v := getenv("DUCKGRES_DUCKLAKE_OBJECT_STORE"); v != "" {
 		cfg.DuckLake.ObjectStore = v
+	}
+	if v := getenv("DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.DuckLake.DeltaCatalogEnabled = b
+		} else {
+			warn("Invalid DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH"); v != "" {
+		cfg.DuckLake.DeltaCatalogPath = v
 	}
 	if v := getenv("DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -841,6 +859,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["memory-rebalance"] {
 		cfg.MemoryRebalance = cli.MemoryRebalance
 	}
+	if cli.Set["ducklake-delta-catalog-enabled"] {
+		cfg.DuckLake.DeltaCatalogEnabled = cli.DuckLakeDeltaCatalogEnabled
+	}
+	if cli.Set["ducklake-delta-catalog-path"] {
+		cfg.DuckLake.DeltaCatalogPath = cli.DuckLakeDeltaCatalogPath
+	}
 	if cli.Set["process-min-workers"] {
 		processMinWorkers = cli.ProcessMinWorkers
 	}
@@ -992,6 +1016,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cfg.QueryLog.CompactInterval <= 0 {
 		warn("DUCKGRES_QUERY_LOG_COMPACT_INTERVAL must be > 0; using default")
 		cfg.QueryLog.CompactInterval = defaultQueryLog.CompactInterval
+	}
+	if cfg.DuckLake.DeltaCatalogEnabled && cfg.DuckLake.DeltaCatalogPath == "" {
+		cfg.DuckLake.DeltaCatalogPath = server.DefaultDeltaCatalogPath(cfg.DuckLake)
+		if cfg.DuckLake.DeltaCatalogPath == "" {
+			warn("ducklake.delta_catalog_enabled requires ducklake.delta_catalog_path when no ducklake.object_store or ducklake.data_path is configured")
+		}
 	}
 
 	return resolvedConfig{

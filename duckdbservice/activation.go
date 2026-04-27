@@ -193,6 +193,8 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 	return a.MetadataStore == b.MetadataStore &&
 		a.ObjectStore == b.ObjectStore &&
 		a.DataPath == b.DataPath &&
+		a.DeltaCatalogEnabled == b.DeltaCatalogEnabled &&
+		a.DeltaCatalogPath == b.DeltaCatalogPath &&
 		a.S3Provider == b.S3Provider &&
 		a.S3Endpoint == b.S3Endpoint &&
 		a.S3Region == b.S3Region &&
