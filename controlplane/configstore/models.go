@@ -251,6 +251,7 @@ type WorkerRecord struct {
 	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`
 	PodName             string      `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
 	PodUID              string      `gorm:"size:255" json:"pod_uid"`
+	Image               string      `gorm:"size:512" json:"image"`
 	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
 	OrgID               string      `gorm:"size:255;index" json:"org_id"`
 	OwnerCPInstanceID   string      `gorm:"size:255;index" json:"owner_cp_instance_id"`

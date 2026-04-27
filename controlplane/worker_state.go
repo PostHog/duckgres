@@ -22,6 +22,7 @@ const (
 type WorkerAssignment struct {
 	OrgID      string
 	MaxWorkers int
+	Image      string
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared

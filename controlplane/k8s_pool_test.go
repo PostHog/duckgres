@@ -30,12 +30,14 @@ type captureRuntimeWorkerStore struct {
 	claimCalls            int
 	claimOwnerCPID        string
 	claimOrgID            string
+	claimImage            string
 	claimMaxOrgWorkers    int
 	spawned               *configstore.WorkerRecord
 	spawnErr              error
 	spawnCalls            int
 	spawnOwnerCPID        string
 	spawnOrgID            string
+	spawnImage            string
 	spawnOwnerEpoch       int64
 	spawnPodNamePrefix    string
 	spawnMaxOrgWorkers    int
@@ -46,6 +48,7 @@ type captureRuntimeWorkerStore struct {
 	neutralSpawnCalls     int
 	neutralSpawnOwnerCPID string
 	neutralSpawnPodPrefix string
+	neutralSpawnImage     string
 	neutralSpawnTarget    int
 	neutralSpawnMaxGlobal  int
 	hotIdleClaimResult     *configstore.WorkerRecord
@@ -104,12 +107,13 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	return out
 }
 
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
 	s.claimOwnerCPID = ownerCPInstanceID
 	s.claimOrgID = orgID
+	s.claimImage = image
 	s.claimMaxOrgWorkers = maxOrgWorkers
 	if s.claimErr != nil {
 		return nil, s.claimErr
@@ -133,12 +137,13 @@ func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID 
 	return nil, nil
 }
 
-func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.spawnCalls++
 	s.spawnOwnerCPID = ownerCPInstanceID
 	s.spawnOrgID = orgID
+	s.spawnImage = image
 	s.spawnOwnerEpoch = ownerEpoch
 	s.spawnPodNamePrefix = podNamePrefix
 	s.spawnMaxOrgWorkers = maxOrgWorkers
@@ -153,12 +158,13 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 	return &spawned, nil
 }
 
-func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.neutralSpawnCalls++
 	s.neutralSpawnOwnerCPID = ownerCPInstanceID
 	s.neutralSpawnPodPrefix = podNamePrefix
+	s.neutralSpawnImage = image
 	s.neutralSpawnTarget = targetWarmWorkers
 	s.neutralSpawnMaxGlobal = maxGlobalWorkers
 	if s.neutralSpawnErr != nil {
@@ -1272,7 +1278,7 @@ func TestK8sPoolSpawnWarmWorkerAllocatesRuntimeSlotWhenIDZero(t *testing.T) {
 		return nil
 	}
 
-	if err := pool.spawnWarmWorker(context.Background(), 0); err != nil {
+	if err := pool.spawnWarmWorker(context.Background(), 0, pool.workerImage); err != nil {
 		t.Fatalf("spawnWarmWorker: %v", err)
 	}
 	if spawnedID != 41 {
@@ -1555,7 +1561,7 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 	// real pod running, but we can verify the pod was created correctly.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = pool.SpawnWorker(ctx, 0)
+	_ = pool.SpawnWorker(ctx, 0, pool.workerImage)
 
 	pods, err := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{
 		LabelSelector: "duckgres/control-plane=test-cp",
