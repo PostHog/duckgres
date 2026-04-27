@@ -24,6 +24,7 @@ import (
 type SharedWorkerActivator struct {
 	clientset              kubernetes.Interface
 	defaultNamespace       string
+	defaultSpecVersion     string
 	stsBroker              *STSBroker
 	resolveOrgConfig       func(string) (*configstore.OrgConfig, error)
 	resolveDucklingStatus  func(context.Context, string) (*provisioner.DucklingStatus, error)
@@ -44,13 +45,14 @@ type TenantActivationPayload struct {
 	DuckLake  server.DuckLakeConfig `json:"ducklake"`
 }
 
-func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, resolveOrgConfig func(string) (*configstore.OrgConfig, error)) *SharedWorkerActivator {
+func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, defaultSpecVersion string, resolveOrgConfig func(string) (*configstore.OrgConfig, error)) *SharedWorkerActivator {
 	if shared == nil {
 		return nil
 	}
 	return &SharedWorkerActivator{
 		clientset:              shared.clientset,
 		defaultNamespace:       shared.namespace,
+		defaultSpecVersion:     defaultSpecVersion,
 		stsBroker:              stsBroker,
 		resolveOrgConfig:       resolveOrgConfig,
 		activateReservedWorker: shared.ActivateReservedWorker,
@@ -76,6 +78,16 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 		return err
 	}
 
+	// Resolve target DuckLake spec version.
+	targetSpecVersion := org.Warehouse.DuckLakeVersion
+	if targetSpecVersion == "" {
+		targetSpecVersion = a.defaultSpecVersion
+	}
+	if targetSpecVersion == "" {
+		targetSpecVersion = server.DefaultDuckLakeSpecVersion
+	}
+	payload.DuckLake.SpecVersion = targetSpecVersion
+
 	// Check if this org needs DuckLake migration. The result is cached per org
 	// to avoid redundant pgx roundtrips on every worker activation — once the
 	// metadata store is checked, its version won't change (migration is
@@ -88,7 +100,7 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 		// First activation for this org — run the check in the control plane.
 		// The backup file is written to os.TempDir() since the CP may not have
 		// a persistent /data mount.
-		if needed, err := server.CheckAndBackupDuckLakeMigration(payload.DuckLake, os.TempDir()); err != nil {
+		if needed, err := server.CheckAndBackupDuckLakeMigration(payload.DuckLake, os.TempDir(), targetSpecVersion); err != nil {
 			slog.Warn("DuckLake migration check failed, proceeding without migration.",
 				"org", payload.OrgID, "error", err)
 		} else {

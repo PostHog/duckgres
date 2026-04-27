@@ -125,7 +125,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", 0)
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", 0)
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", 1)
+	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", 1, "duckgres-worker-test-cp", 3, 5)
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", 1, "duckgres-worker-test-cp", 3, 5)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
 	}
@@ -477,7 +477,7 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(existing): %v", err)
 	}
 
-	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", 1, "duckgres-worker-test-cp", 1, 5)
+	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", 1, "duckgres-worker-test-cp", 1, 5)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(org cap): %v", err)
 	}
@@ -485,7 +485,7 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("expected org cap to block spawning, got %#v", orgLimited)
 	}
 
-	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", 1, "duckgres-worker-test-cp", 2, 1)
+	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", "duckgres:test", 1, "duckgres-worker-test-cp", 2, 1)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(global cap): %v", err)
 	}
@@ -510,7 +510,7 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(existing neutral): %v", err)
 	}
 
-	blocked, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", 1, 5)
+	blocked, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", 1, 5)
 	if err != nil {
 		t.Fatalf("CreateNeutralWarmWorkerSlot(shared target): %v", err)
 	}
@@ -518,7 +518,7 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 		t.Fatalf("expected shared warm target to block spawning, got %#v", blocked)
 	}
 
-	slot, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", 2, 5)
+	slot, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", 2, 5)
 	if err != nil {
 		t.Fatalf("CreateNeutralWarmWorkerSlot(expand target): %v", err)
 	}

@@ -13,10 +13,10 @@ import (
 	"time"
 )
 
-// duckLakeSpecVersion is the DuckLake spec version that this build of duckgres expects.
+// DefaultDuckLakeSpecVersion is the DuckLake spec version that this build of duckgres expects.
 // When the metadata store is at an older version, we backup and migrate automatically.
 // This must match the DuckLake version bundled with the current DuckDB driver.
-const duckLakeSpecVersion = "1.0"
+const DefaultDuckLakeSpecVersion = "1.0"
 
 // dlMigration holds the result of the migration check.
 // The check retries on transient errors (e.g., metadata store not reachable yet)
@@ -29,7 +29,7 @@ const duckLakeSpecVersion = "1.0"
 var dlMigration struct {
 	mu       sync.Mutex
 	done     bool   // true once the check has completed successfully
-	needed   bool   // true if metadata store version < duckLakeSpecVersion
+	needed   bool   // true if metadata store version < target spec version
 	err      error  // non-nil if the most recent check or backup failed
 	checkedV string // the version found in the metadata store
 }
@@ -52,7 +52,12 @@ func ensureDuckLakeMigrationCheck(dlCfg DuckLakeConfig, dataDir string) {
 		return
 	}
 
-	needed, ver, err := checkAndBackupIfNeeded(dlCfg, dataDir)
+	targetVersion := dlCfg.SpecVersion
+	if targetVersion == "" {
+		targetVersion = DefaultDuckLakeSpecVersion
+	}
+
+	needed, ver, err := checkAndBackupIfNeeded(dlCfg, dataDir, targetVersion)
 	dlMigration.needed = needed
 	dlMigration.checkedV = ver
 	dlMigration.err = err
@@ -82,26 +87,33 @@ func duckLakeMigrationCheckedVersion() string {
 func DuckLakeMigrationCheckedVersion() string { return duckLakeMigrationCheckedVersion() }
 
 // DuckLakeSpecVersion returns the expected DuckLake spec version.
-func DuckLakeSpecVersion() string { return duckLakeSpecVersion }
+func DuckLakeSpecVersion() string { return DefaultDuckLakeSpecVersion }
 
 // CheckAndBackupDuckLakeMigration runs the migration check for the given
 // DuckLake config and returns whether migration is needed. If migration is
 // needed, it backs up the metadata store first. This is exported for use by
 // the control plane, which runs the check once before activating workers.
-func CheckAndBackupDuckLakeMigration(dlCfg DuckLakeConfig, dataDir string) (bool, error) {
+func CheckAndBackupDuckLakeMigration(dlCfg DuckLakeConfig, dataDir string, targetVersion string) (bool, error) {
 	if dlCfg.MetadataStore == "" {
 		return false, nil
 	}
-	needed, _, err := checkAndBackupIfNeeded(dlCfg, dataDir)
+	if targetVersion == "" {
+		targetVersion = DefaultDuckLakeSpecVersion
+	}
+	needed, _, err := checkAndBackupIfNeeded(dlCfg, dataDir, targetVersion)
 	return needed, err
 }
 
 // CheckDuckLakeMigrationVersion checks only whether a DuckLake metadata store
 // needs migration, without performing the backup. This is fast (<1s) and safe
 // to call during startup without risking timeouts.
-func CheckDuckLakeMigrationVersion(dlCfg DuckLakeConfig) (needed bool, version string, err error) {
+func CheckDuckLakeMigrationVersion(dlCfg DuckLakeConfig, targetVersion string) (needed bool, version string, err error) {
 	if dlCfg.MetadataStore == "" || !strings.HasPrefix(dlCfg.MetadataStore, "postgres:") {
 		return false, "", nil
+	}
+
+	if targetVersion == "" {
+		targetVersion = DefaultDuckLakeSpecVersion
 	}
 
 	connStr := strings.TrimPrefix(dlCfg.MetadataStore, "postgres:")
@@ -135,7 +147,7 @@ func CheckDuckLakeMigrationVersion(dlCfg DuckLakeConfig) (needed bool, version s
 		return false, "", fmt.Errorf("read DuckLake spec version: %w", err)
 	}
 
-	less, err := versionLessThan(ver, duckLakeSpecVersion)
+	less, err := versionLessThan(ver, targetVersion)
 	if err != nil {
 		return false, ver, fmt.Errorf("compare DuckLake versions: %w", err)
 	}
@@ -204,7 +216,7 @@ func versionLessThan(a, b string) (bool, error) {
 // checkAndBackupIfNeeded connects to the metadata PostgreSQL store, checks the
 // DuckLake spec version, and if migration is required, dumps all ducklake_* tables
 // to a SQL backup file before returning.
-func checkAndBackupIfNeeded(dlCfg DuckLakeConfig, dataDir string) (needed bool, version string, err error) {
+func checkAndBackupIfNeeded(dlCfg DuckLakeConfig, dataDir string, targetVersion string) (needed bool, version string, err error) {
 	if !strings.HasPrefix(dlCfg.MetadataStore, "postgres:") {
 		return false, "", nil
 	}
@@ -244,9 +256,9 @@ func checkAndBackupIfNeeded(dlCfg DuckLakeConfig, dataDir string) (needed bool, 
 		return false, "", fmt.Errorf("read DuckLake spec version: %w", err)
 	}
 
-	slog.Info("DuckLake metadata store version detected.", "version", ver, "expected", duckLakeSpecVersion)
+	slog.Info("DuckLake metadata store version detected.", "version", ver, "expected", targetVersion)
 
-	less, err := versionLessThan(ver, duckLakeSpecVersion)
+	less, err := versionLessThan(ver, targetVersion)
 	if err != nil {
 		return false, ver, fmt.Errorf("compare DuckLake versions: %w", err)
 	}
@@ -256,7 +268,7 @@ func checkAndBackupIfNeeded(dlCfg DuckLakeConfig, dataDir string) (needed bool, 
 
 	// Migration needed — backup first.
 	slog.Info("DuckLake metadata migration required. Backing up metadata store before upgrade.",
-		"from", ver, "to", duckLakeSpecVersion)
+		"from", ver, "to", targetVersion)
 
 	if err := backupDuckLakeMetadata(pgDB, dataDir, ver); err != nil {
 		return true, ver, fmt.Errorf("backup metadata before migration: %w", err)
@@ -328,7 +340,7 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 	}()
 
 	// Write header.
-	if _, err := fmt.Fprintf(f, "-- DuckLake metadata backup before migration (v%s → v%s)\n", version, duckLakeSpecVersion); err != nil {
+	if _, err := fmt.Fprintf(f, "-- DuckLake metadata backup before migration (v%s → v%s)\n", version, DefaultDuckLakeSpecVersion); err != nil {
 		return fmt.Errorf("write backup header: %w", err)
 	}
 	if _, err := fmt.Fprintf(f, "-- Generated: %s\n", time.Now().UTC().Format(time.RFC3339)); err != nil {

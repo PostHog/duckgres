@@ -123,7 +123,7 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	}
 
 	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, image, tr.stsBroker)
-	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, func(orgID string) (*configstore.OrgConfig, error) {
+	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, tr.baseCfg.DuckLakeDefaultSpecVersion, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {
 			return nil, fmt.Errorf("config snapshot unavailable for org %s", orgID)

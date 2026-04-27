@@ -181,9 +181,10 @@ func SetupMultiTenant(
 		WorkerCPURequest:      cfg.K8s.WorkerCPURequest,
 		WorkerMemoryRequest:   cfg.K8s.WorkerMemoryRequest,
 		WorkerNodeSelector:    parseNodeSelector(cfg.K8s.WorkerNodeSelector),
-		WorkerTolerationKey:   cfg.K8s.WorkerTolerationKey,
-		WorkerTolerationValue: cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:   cfg.K8s.WorkerExclusiveNode,
+		WorkerTolerationKey:        cfg.K8s.WorkerTolerationKey,
+		WorkerTolerationValue:      cfg.K8s.WorkerTolerationValue,
+		WorkerExclusiveNode:        cfg.K8s.WorkerExclusiveNode,
+		DuckLakeDefaultSpecVersion: cfg.DuckLakeDefaultSpecVersion,
 	}
 
 	// Initialize STS broker for credential brokering (best-effort)

@@ -63,6 +63,10 @@ type ControlPlaneConfig struct {
 	// InternalSecret is the shared secret for API authentication.
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
+
+	// DuckLakeDefaultSpecVersion is the global default DuckLake spec version
+	// used for migration checks when an org doesn't specify an override.
+	DuckLakeDefaultSpecVersion string
 }
 
 type ProcessConfig struct {
@@ -407,10 +411,14 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		// as a safety net — it must not block startup or systemd will kill us
 		// (TimeoutStartSec=180 is shorter than the backup of large metadata stores).
 		if cfg.DuckLake.MetadataStore != "" {
-			if needed, ver, err := server.CheckDuckLakeMigrationVersion(cfg.DuckLake); err != nil {
+			targetVersion := cfg.DuckLakeDefaultSpecVersion
+			if targetVersion == "" {
+				targetVersion = server.DefaultDuckLakeSpecVersion
+			}
+			if needed, ver, err := server.CheckDuckLakeMigrationVersion(cfg.DuckLake, targetVersion); err != nil {
 				slog.Warn("DuckLake migration version check failed, workers will check independently.", "error", err)
 			} else if needed {
-				slog.Info("DuckLake migration needed, workers will use AUTOMATIC_MIGRATION.", "from", ver, "to", server.DuckLakeSpecVersion())
+				slog.Info("DuckLake migration needed, workers will use AUTOMATIC_MIGRATION.", "from", ver, "to", targetVersion)
 				procPool.ducklakeMigrate = true
 				// Run backup asynchronously — it's a safety net, not a gate.
 				go func() {

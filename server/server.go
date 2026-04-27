@@ -359,6 +359,10 @@ type DuckLakeConfig struct {
 	// long-running checks in worker processes.
 	Migrate bool `json:"migrate,omitempty" yaml:"-"`
 
+	// SpecVersion is the target DuckLake spec version for this connection.
+	// When empty, the worker uses its own built-in default.
+	SpecVersion string `json:"spec_version,omitempty" yaml:"-"`
+
 	// ViaPgBouncer is set by the control plane when the DuckLake metadata
 	// connection is routed through a network-level pooler (e.g. PgBouncer)
 	// rather than direct to Postgres. When true, the worker disables the
@@ -1478,8 +1482,12 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		dataPath = dlCfg.DataPath
 	}
 	if migrate {
+		targetVersion := dlCfg.SpecVersion
+		if targetVersion == "" {
+			targetVersion = DefaultDuckLakeSpecVersion
+		}
 		slog.Info("Attaching DuckLake catalog with automatic migration.",
-			"from", duckLakeMigrationCheckedVersion(), "to", duckLakeSpecVersion,
+			"from", duckLakeMigrationCheckedVersion(), "to", targetVersion,
 			"metadata", redactConnectionString(dlCfg.MetadataStore))
 	} else if dataPath != "" {
 		slog.Info("Attaching DuckLake catalog with data path.",
