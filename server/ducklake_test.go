@@ -76,3 +76,57 @@ func TestBuildDeltaCatalogAttachStmt(t *testing.T) {
 		t.Fatalf("buildDeltaCatalogAttachStmt() = %q, want %q", got, want)
 	}
 }
+
+func TestDeltaCatalogNeedsS3Secret(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		cfg  DuckLakeConfig
+		want bool
+	}{
+		{
+			name: "default credential chain for explicit s3 delta path",
+			path: "s3://warehouse/delta/",
+			cfg:  DuckLakeConfig{},
+			want: true,
+		},
+		{
+			name: "local delta path",
+			path: "/var/lib/duckgres/delta",
+			cfg:  DuckLakeConfig{},
+			want: false,
+		},
+		{
+			name: "explicit config credentials",
+			path: "s3://warehouse/delta/",
+			cfg: DuckLakeConfig{
+				S3AccessKey: "AKIA...",
+			},
+			want: true,
+		},
+		{
+			name: "aws sdk provider",
+			path: "s3://warehouse/delta/",
+			cfg: DuckLakeConfig{
+				S3Provider: "aws_sdk",
+			},
+			want: true,
+		},
+		{
+			name: "credential chain profile",
+			path: "s3://warehouse/delta/",
+			cfg: DuckLakeConfig{
+				S3Profile: "prod",
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := deltaCatalogNeedsS3Secret(tt.path, tt.cfg); got != tt.want {
+				t.Fatalf("deltaCatalogNeedsS3Secret() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

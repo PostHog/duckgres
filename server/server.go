@@ -1562,17 +1562,9 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 		return fmt.Errorf("load delta extension: %w", err)
 	}
 
-	if strings.Contains(catalogPath, "://") {
-		needsSecret := dlCfg.S3Endpoint != "" ||
-			dlCfg.S3AccessKey != "" ||
-			dlCfg.S3Provider == "credential_chain" ||
-			dlCfg.S3Provider == "aws_sdk" ||
-			dlCfg.S3Chain != "" ||
-			dlCfg.S3Profile != ""
-		if needsSecret {
-			if err := createS3Secret(db, dlCfg); err != nil {
-				return fmt.Errorf("failed to create S3 secret: %w", err)
-			}
+	if deltaCatalogNeedsS3Secret(catalogPath, dlCfg) {
+		if err := createS3Secret(db, dlCfg); err != nil {
+			return fmt.Errorf("failed to create S3 secret: %w", err)
 		}
 	}
 
@@ -1583,6 +1575,19 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 	}
 	slog.Info("Attached Delta catalog successfully.")
 	return nil
+}
+
+func deltaCatalogNeedsS3Secret(catalogPath string, dlCfg DuckLakeConfig) bool {
+	if !strings.Contains(catalogPath, "://") {
+		return false
+	}
+	provider := S3ProviderForConfig(dlCfg)
+	return dlCfg.S3Endpoint != "" ||
+		dlCfg.S3AccessKey != "" ||
+		provider == "credential_chain" ||
+		provider == "aws_sdk" ||
+		dlCfg.S3Chain != "" ||
+		dlCfg.S3Profile != ""
 }
 
 // duckLakeIndexDone tracks whether metadata indexes have been successfully created.
