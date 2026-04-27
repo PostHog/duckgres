@@ -20,9 +20,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
+      - uses: golangci/golangci-lint-action@v6
         with:
-          version: v2.8.0
+          version: v1.61.0
 
   unit-tests:
     runs-on: ubuntu-24.04-arm

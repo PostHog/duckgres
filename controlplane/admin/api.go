@@ -379,6 +379,8 @@ func managedWarehouseUpsertColumns() []string {
 		"s3_endpoint",
 		"s3_use_ssl",
 		"s3_url_style",
+		"s3_delta_catalog_enabled",
+		"s3_delta_catalog_path",
 		"worker_identity_namespace",
 		"worker_identity_service_account_name",
 		"worker_identity_iam_role_arn",
