@@ -488,13 +488,6 @@ func constraintErrorCode(msg string) string {
 	return "23000" // integrity_constraint_violation
 }
 
-// workerLogAttrs returns slog key/values for the worker that this connection
-// is bound to. Use with `slog.Xxx("...", args, c.workerLogAttrs()...)` so
-// every connection-attributable log line carries the same worker fields.
-func (c *clientConn) workerLogAttrs() []any {
-	return []any{"worker", c.workerID, "worker_pod", c.workerPod}
-}
-
 // logQueryError logs a query execution failure with additional context for
 // DuckLake-specific errors (transaction conflicts and metadata connection loss).
 func (c *clientConn) logQueryError(query string, err error) {
