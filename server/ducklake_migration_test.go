@@ -267,6 +267,14 @@ func TestVersionLessThan_Invalid(t *testing.T) {
 	}
 }
 
+func TestDuckLakeBackupHeaderUsesTargetVersion(t *testing.T) {
+	got := duckLakeBackupHeader("1.0", "1.1")
+	want := "-- DuckLake metadata backup before migration (v1.0 \u2192 v1.1)\n"
+	if got != want {
+		t.Fatalf("expected backup header %q, got %q", want, got)
+	}
+}
+
 func TestDuckLakeMigrationNeeded_FalseWhenError(t *testing.T) {
 	connStr := "postgres://user@host/db"
 	dlMigrations.Store(connStr, &migrationState{
@@ -336,7 +344,7 @@ func TestBackupDuckLakeMetadata_Integration(t *testing.T) {
 
 	// backupDuckLakeMetadata discovers tables matching "ducklake_%" — our test
 	// tables match that pattern. We can call it directly.
-	err = backupDuckLakeMetadata(pgDB, tmpDir, "0.3")
+	err = backupDuckLakeMetadata(pgDB, tmpDir, "0.3", DefaultDuckLakeSpecVersion)
 	if err != nil {
 		t.Fatalf("backupDuckLakeMetadata: %v", err)
 	}

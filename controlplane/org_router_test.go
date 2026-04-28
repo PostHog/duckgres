@@ -87,6 +87,43 @@ func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	}
 }
 
+func TestOrgRouterHandleConfigChangeRefreshesOrgWorkerImage(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2, "posthog/duckgres:v1.0.0", nil)
+
+	oldTC := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			Image: "posthog/duckgres:v1.0.0",
+		},
+	}
+	newTC := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			Image: "posthog/duckgres:v1.1.0",
+		},
+	}
+
+	tr := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {
+				Config: oldTC,
+				Pool:   pool,
+			},
+		},
+		baseCfg: K8sWorkerPoolConfig{MaxWorkers: 2, WorkerImage: "posthog/duckgres:v1.0.0"},
+	}
+
+	tr.HandleConfigChange(
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": oldTC}},
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": newTC}},
+	)
+
+	if got := pool.image; got != "posthog/duckgres:v1.1.0" {
+		t.Fatalf("expected org reserved pool image to refresh, got %q", got)
+	}
+}
+
 func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerActivator(t *testing.T) {
 	sharedPool, cs := newTestK8sPool(t, 10)
 	sharedPool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {

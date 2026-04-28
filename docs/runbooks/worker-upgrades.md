@@ -7,7 +7,7 @@ Duckgres supports running multiple versions of DuckDB and DuckLake workers simul
 The control plane manages a heterogeneous pool of workers. The target build for any given connection is resolved with the following precedence:
 
 1.  **Tenant Override:** The `image` and `ducklake_version` fields in the `managed_warehouses` table (Config Store).
-2.  **Global Fallback:** The `k8s.worker_image` and `ducklake_default_spec_version` set in the Control Plane's `duckgres.yaml`.
+2.  **Global Fallback:** The `k8s.worker_image` and `ducklake.default_spec_version` set in the Control Plane's `duckgres.yaml`.
 
 ### 1. Setting Global Defaults
 
@@ -17,10 +17,11 @@ Maintainers define the "stable" fleet version in the Control Plane configuration
 # duckgres.yaml
 k8s:
   worker_image: "posthog/duckgres:v1.1.0"
-  image_pull_policy: "IfNotPresent"
+  worker_image_pull_policy: "IfNotPresent"
 
-# Default DuckLake spec version for migration checks
-ducklake_default_spec_version: "1.0"
+ducklake:
+  # Default DuckLake spec version for migration checks
+  default_spec_version: "1.0"
 ```
 
 When the Control Plane starts, the **Janitor** will ensure that the shared "neutral" warm pool is populated with pods running this image.
@@ -32,8 +33,8 @@ To test a new build (e.g., a DuckDB upgrade) for a specific subset of tenants wi
 1.  **Update the Tenant Config:** Set the `image` field for the target org in the Config Store database.
 
     ```sql
-    UPDATE managed_warehouses 
-    SET image = 'posthog/duckgres:v1.2.0-beta.1' 
+    UPDATE managed_warehouses
+    SET image = 'posthog/duckgres:v1.2.0-beta.1'
     WHERE org_id = 'org-uuid-123';
     ```
 
@@ -47,14 +48,14 @@ To test a new build (e.g., a DuckDB upgrade) for a specific subset of tenants wi
 If a new worker build requires a newer DuckLake metadata schema (e.g., moving from v1.0 to v1.1), you must also designate the target spec version to trigger the migration logic.
 
 ```sql
-UPDATE managed_warehouses 
+UPDATE managed_warehouses
 SET image = 'posthog/duckgres:v1.2.0',
     ducklake_version = '1.1'
 WHERE org_id = 'org-uuid-123';
 ```
 
 **The Control Plane Authority:**
-The Control Plane (CP) performs a "pre-flight" migration check before activating a worker. 
+The Control Plane (CP) performs a "pre-flight" migration check before activating a worker.
 *   If `ducklake_version` in the DB (or the global default) is newer than the version detected in the tenant's metadata store, the CP triggers a **backup**.
 *   The CP then signals the worker to perform `AUTOMATIC_MIGRATION TRUE` during attachment.
 

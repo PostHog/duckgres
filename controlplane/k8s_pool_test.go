@@ -23,65 +23,65 @@ import (
 )
 
 type captureRuntimeWorkerStore struct {
-	mu                    sync.Mutex
-	records               []configstore.WorkerRecord
-	claimed               *configstore.WorkerRecord
-	claimErr              error
-	claimCalls            int
-	claimOwnerCPID        string
-	claimOrgID            string
-	claimImage            string
-	claimMaxOrgWorkers    int
-	spawned               *configstore.WorkerRecord
-	spawnErr              error
-	spawnCalls            int
-	spawnOwnerCPID        string
-	spawnOrgID            string
-	spawnImage            string
-	spawnOwnerEpoch       int64
-	spawnPodNamePrefix    string
-	spawnMaxOrgWorkers    int
-	spawnMaxGlobalWorks   int
-	neutralSpawned        *configstore.WorkerRecord
-	neutralSpawnedFunc    func() *configstore.WorkerRecord
-	neutralSpawnErr       error
-	neutralSpawnCalls     int
-	neutralSpawnOwnerCPID string
-	neutralSpawnPodPrefix string
-	neutralSpawnImage     string
-	neutralSpawnTarget    int
-	neutralSpawnMaxGlobal  int
-	hotIdleClaimResult     *configstore.WorkerRecord
-	hotIdleClaimCPID       string
-	hotIdleClaimOrgID      string
-	takenOver             *configstore.WorkerRecord
-	takeOverErr           error
-	takeOverWorkerID      int
-	takeOverOwnerCPID     string
-	takeOverOrgID         string
-	takeOverExpectedEpoch int64
-	retireIdleCalls         int
-	retireIdleCalledIDs     []int
-	retireIdleCalledReasons []string
-	retireIdleErr           error
-	retireIdleMisses        map[int]bool
+	mu                               sync.Mutex
+	records                          []configstore.WorkerRecord
+	claimed                          *configstore.WorkerRecord
+	claimErr                         error
+	claimCalls                       int
+	claimOwnerCPID                   string
+	claimOrgID                       string
+	claimImage                       string
+	claimMaxOrgWorkers               int
+	spawned                          *configstore.WorkerRecord
+	spawnErr                         error
+	spawnCalls                       int
+	spawnOwnerCPID                   string
+	spawnOrgID                       string
+	spawnImage                       string
+	spawnOwnerEpoch                  int64
+	spawnPodNamePrefix               string
+	spawnMaxOrgWorkers               int
+	spawnMaxGlobalWorks              int
+	neutralSpawned                   *configstore.WorkerRecord
+	neutralSpawnedFunc               func() *configstore.WorkerRecord
+	neutralSpawnErr                  error
+	neutralSpawnCalls                int
+	neutralSpawnOwnerCPID            string
+	neutralSpawnPodPrefix            string
+	neutralSpawnImage                string
+	neutralSpawnTarget               int
+	neutralSpawnMaxGlobal            int
+	hotIdleClaimResult               *configstore.WorkerRecord
+	hotIdleClaimCPID                 string
+	hotIdleClaimOrgID                string
+	takenOver                        *configstore.WorkerRecord
+	takeOverErr                      error
+	takeOverWorkerID                 int
+	takeOverOwnerCPID                string
+	takeOverOrgID                    string
+	takeOverExpectedEpoch            int64
+	retireIdleCalls                  int
+	retireIdleCalledIDs              []int
+	retireIdleCalledReasons          []string
+	retireIdleErr                    error
+	retireIdleMisses                 map[int]bool
 	retireIdleOrHotIdleCalls         int
 	retireIdleOrHotIdleCalledIDs     []int
 	retireIdleOrHotIdleCalledReasons []string
 	retireIdleOrHotIdleErr           error
 	retireIdleOrHotIdleMisses        map[int]bool
-	preloadedRecords        map[int]*configstore.WorkerRecord
-	getRecordErrIDs         map[int]error
-	markDrainingCalls       int
-	markDrainingCalledIDs   []int
-	markDrainingCalledCPs   []string
-	markDrainingMisses      map[int]bool
-	markDrainingErr         error
-	retireDrainingCalls     int
-	retireDrainingCalledIDs []int
-	retireDrainingReasons   []string
-	retireDrainingMisses    map[int]bool
-	retireDrainingErr       error
+	preloadedRecords                 map[int]*configstore.WorkerRecord
+	getRecordErrIDs                  map[int]error
+	markDrainingCalls                int
+	markDrainingCalledIDs            []int
+	markDrainingCalledCPs            []string
+	markDrainingMisses               map[int]bool
+	markDrainingErr                  error
+	retireDrainingCalls              int
+	retireDrainingCalledIDs          []int
+	retireDrainingReasons            []string
+	retireDrainingMisses             map[int]bool
+	retireDrainingErr                error
 	// events records a unified, ordered timeline of state transitions on
 	// this store so tests can assert happens-before relationships (e.g.
 	// that pod-delete occurs between markDraining and retireDraining).
@@ -311,19 +311,19 @@ func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clients
 	}
 
 	pool := &K8sWorkerPool{
-		workers:      make(map[int]*ManagedWorker),
-		maxWorkers:   maxWorkers,
-		idleTimeout:  5 * time.Minute,
-		shutdownCh:   make(chan struct{}),
-		stopInform:   make(chan struct{}),
-		clientset:    cs,
-		namespace:    "default",
-		cpID:         "test-cp",
-		cpInstanceID: "cp-uid-123:boot-abc",
-		cpUID:        "cp-uid-123",
-		workerImage:  "duckgres:test",
-		workerPort:   8816,
-		secretName:   "test-secret",
+		workers:       make(map[int]*ManagedWorker),
+		maxWorkers:    maxWorkers,
+		idleTimeout:   5 * time.Minute,
+		shutdownCh:    make(chan struct{}),
+		stopInform:    make(chan struct{}),
+		clientset:     cs,
+		namespace:     "default",
+		cpID:          "test-cp",
+		cpInstanceID:  "cp-uid-123:boot-abc",
+		cpUID:         "cp-uid-123",
+		workerImage:   "duckgres:test",
+		workerPort:    8816,
+		secretName:    "test-secret",
 		spawnSem:      make(chan struct{}, 1),
 		retireSem:     make(chan struct{}, 5),
 		nodeFirstSeen: make(map[string]time.Time),
@@ -1263,8 +1263,8 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 			Labels: map[string]string{"duckgres/worker-id": "42"},
 		},
 		Status: corev1.PodStatus{
-			Phase:  corev1.PodRunning,
-			PodIP:  "10.0.0.42",
+			Phase: corev1.PodRunning,
+			PodIP: "10.0.0.42",
 		},
 	}, metav1.CreateOptions{})
 
@@ -2069,7 +2069,6 @@ func TestSetWorkerResources(t *testing.T) {
 	}
 }
 
-
 func TestWorkerScheduling_NodeSelectorAndToleration(t *testing.T) {
 	pool := &K8sWorkerPool{
 		workerNodeSelector:  map[string]string{"posthog.com/duckgres-workers": "duckgres-workers"},
@@ -2158,7 +2157,12 @@ func mismatchVersionTestPool(t *testing.T, cpID string, store RuntimeWorkerStore
 
 func createMismatchWorkerPod(t *testing.T, cs *fake.Clientset, name, controlPlaneLabel, workerIDLabel string) {
 	t.Helper()
-	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+	createMismatchWorkerPodWithImage(t, cs, name, controlPlaneLabel, workerIDLabel, "")
+}
+
+func createMismatchWorkerPodWithImage(t *testing.T, cs *fake.Clientset, name, controlPlaneLabel, workerIDLabel, image string) {
+	t.Helper()
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: "default",
@@ -2168,6 +2172,16 @@ func createMismatchWorkerPod(t *testing.T, cs *fake.Clientset, name, controlPlan
 				"duckgres/worker-id":     workerIDLabel,
 			},
 		},
+	}
+	if image != "" {
+		pod.Spec.Containers = []corev1.Container{{
+			Name:  "duckdb-worker",
+			Image: image,
+		}}
+	}
+	_, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: pod.ObjectMeta,
+		Spec:       pod.Spec,
 	}, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("create pod %q: %v", name, err)
@@ -2211,6 +2225,43 @@ func TestRetireOneMismatchedVersionWorker_RetiresHotIdleWorker(t *testing.T) {
 		// good, pod deleted
 	} else {
 		t.Fatal("expected hot-idle pod to be deleted")
+	}
+}
+
+func TestRetireOneMismatchedVersionWorker_UsesRuntimeOrgForSharedAssignedWorker(t *testing.T) {
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			42: {
+				WorkerID: 42,
+				OrgID:    "org-1",
+				Image:    "posthog/duckgres:old",
+				State:    configstore.WorkerStateHotIdle,
+			},
+		},
+	}
+	pool, cs := mismatchVersionTestPool(t, "duckgres-current-aaaaa", store)
+	pool.workerImage = "posthog/duckgres:stable"
+	pool.resolveOrgConfig = func(orgID string) (*configstore.OrgConfig, error) {
+		if orgID != "org-1" {
+			t.Fatalf("unexpected org lookup %q", orgID)
+		}
+		return &configstore.OrgConfig{
+			Name: "org-1",
+			Warehouse: &configstore.ManagedWarehouseConfig{
+				Image: "posthog/duckgres:new",
+			},
+		}, nil
+	}
+	createMismatchWorkerPodWithImage(t, cs, "duckgres-worker-42", "duckgres-current-bbbbb", "42", "posthog/duckgres:old")
+
+	if !pool.RetireOneMismatchedVersionWorker(context.Background()) {
+		t.Fatal("expected reaper to retire shared assigned worker with tenant image mismatch")
+	}
+	if store.retireIdleOrHotIdleCalls != 1 || store.retireIdleOrHotIdleCalledIDs[0] != 42 {
+		t.Fatalf("expected RetireIdleOrHotIdleWorker(42), got calls=%d ids=%v", store.retireIdleOrHotIdleCalls, store.retireIdleOrHotIdleCalledIDs)
+	}
+	if podExists(t, cs, "duckgres-worker-42") {
+		t.Fatal("expected mismatched tenant worker pod to be deleted")
 	}
 }
 

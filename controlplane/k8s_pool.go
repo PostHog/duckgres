@@ -60,14 +60,14 @@ type K8sWorkerPool struct {
 	configPath            string
 	imagePullPolicy       corev1.PullPolicy
 	serviceAccount        string
-	workerCPURequest      string            // CPU request for worker pods (e.g., "500m")
-	workerMemoryRequest   string            // memory request for worker pods (e.g., "1Gi")
-	workerNodeSelector    map[string]string // node selector for worker pods
-	workerTolerationKey   string            // taint key for NoSchedule toleration
-	workerTolerationValue string            // taint value for NoSchedule toleration
-	workerExclusiveNode   bool              // one worker per node via anti-affinity
-	orgID                 string            // org ID for pod labels (multi-tenant mode)
-	workerIDGenerator     func() int                        // shared ID generator across orgs (nil = internal counter)
+	workerCPURequest      string                                       // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest   string                                       // memory request for worker pods (e.g., "1Gi")
+	workerNodeSelector    map[string]string                            // node selector for worker pods
+	workerTolerationKey   string                                       // taint key for NoSchedule toleration
+	workerTolerationValue string                                       // taint value for NoSchedule toleration
+	workerExclusiveNode   bool                                         // one worker per node via anti-affinity
+	orgID                 string                                       // org ID for pod labels (multi-tenant mode)
+	workerIDGenerator     func() int                                   // shared ID generator across orgs (nil = internal counter)
 	resolveOrgConfig      func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping
 	informer              cache.SharedIndexInformer
 	stopInform            chan struct{}
@@ -230,12 +230,32 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		if label == "" {
 			continue
 		}
+		idStr := pod.Labels["duckgres/worker-id"]
+		if idStr == "" {
+			continue
+		}
+		workerID, err := strconv.Atoi(idStr)
+		if err != nil {
+			continue
+		}
+
+		var record *configstore.WorkerRecord
+		if p.runtimeStore != nil {
+			var err error
+			record, err = p.runtimeStore.GetWorkerRecord(workerID)
+			if err != nil {
+				slog.Warn("Version-aware reaper failed to load worker record.", "worker_id", workerID, "error", err)
+			}
+		}
 
 		// Resolve the target version for this specific pod.
 		// For neutral workers, the target is the global binary version.
 		// For assigned workers, the target is the tenant's configured image.
 		var isMismatched bool
 		podOrgID := pod.Labels["duckgres/org"]
+		if podOrgID == "" && record != nil {
+			podOrgID = record.OrgID
+		}
 
 		if podOrgID != "" && p.resolveOrgConfig != nil {
 			// Per-tenant version check
@@ -249,13 +269,9 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 				targetImage = org.Warehouse.Image
 			}
 
-			// Find the worker container image
-			var actualImage string
-			for _, container := range pod.Spec.Containers {
-				if container.Name == "duckdb-worker" {
-					actualImage = container.Image
-					break
-				}
+			actualImage := workerImageForPod(&pod)
+			if actualImage == "" && record != nil {
+				actualImage = record.Image
 			}
 			if actualImage != "" && actualImage != targetImage {
 				isMismatched = true
@@ -273,14 +289,6 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			continue
 		}
 
-		idStr := pod.Labels["duckgres/worker-id"]
-		if idStr == "" {
-			continue
-		}
-		workerID, err := strconv.Atoi(idStr)
-		if err != nil {
-			continue
-		}
 		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(workerID, RetireReasonMismatchedVersion)
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
@@ -305,6 +313,15 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		return true
 	}
 	return false
+}
+
+func workerImageForPod(pod *corev1.Pod) string {
+	for _, container := range pod.Spec.Containers {
+		if container.Name == "duckdb-worker" {
+			return container.Image
+		}
+	}
+	return ""
 }
 
 // cleanupOrphanedWorkerPods deletes worker pods whose DB row is in a terminal

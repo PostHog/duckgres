@@ -69,34 +69,35 @@ type configCLIInputs struct {
 }
 
 type resolvedConfig struct {
-	Server                    server.Config
-	ProcessMinWorkers         int
-	ProcessMaxWorkers         int
-	ProcessRetireOnSessionEnd bool
-	WorkerQueueTimeout        time.Duration
-	WorkerIdleTimeout         time.Duration
-	HandoverDrainTimeout      time.Duration
-	WorkerBackend             string
-	K8sWorkerImage            string
-	K8sWorkerNamespace        string
-	K8sControlPlaneID         string
-	K8sWorkerPort             int
-	K8sWorkerSecret           string
-	K8sWorkerConfigMap        string
-	K8sWorkerImagePullPolicy  string
-	K8sWorkerServiceAccount   string
-	K8sMaxWorkers             int
-	K8sSharedWarmTarget       int
-	K8sWorkerCPURequest       string
-	K8sWorkerMemoryRequest    string
-	K8sWorkerNodeSelector     string
-	K8sWorkerTolerationKey    string
-	K8sWorkerTolerationValue  string
-	K8sWorkerExclusiveNode    bool
-	AWSRegion                 string
-	ConfigStoreConn           string
-	ConfigPollInterval        time.Duration
-	InternalSecret            string
+	Server                     server.Config
+	ProcessMinWorkers          int
+	ProcessMaxWorkers          int
+	ProcessRetireOnSessionEnd  bool
+	WorkerQueueTimeout         time.Duration
+	WorkerIdleTimeout          time.Duration
+	HandoverDrainTimeout       time.Duration
+	WorkerBackend              string
+	K8sWorkerImage             string
+	K8sWorkerNamespace         string
+	K8sControlPlaneID          string
+	K8sWorkerPort              int
+	K8sWorkerSecret            string
+	K8sWorkerConfigMap         string
+	K8sWorkerImagePullPolicy   string
+	K8sWorkerServiceAccount    string
+	K8sMaxWorkers              int
+	K8sSharedWarmTarget        int
+	K8sWorkerCPURequest        string
+	K8sWorkerMemoryRequest     string
+	K8sWorkerNodeSelector      string
+	K8sWorkerTolerationKey     string
+	K8sWorkerTolerationValue   string
+	K8sWorkerExclusiveNode     bool
+	AWSRegion                  string
+	ConfigStoreConn            string
+	ConfigPollInterval         time.Duration
+	InternalSecret             string
+	DuckLakeDefaultSpecVersion string
 }
 
 func intPtr(n int) *int    { return &n }
@@ -1035,33 +1036,34 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 
 	return resolvedConfig{
-		Server:                    cfg,
-		ProcessMinWorkers:         processMinWorkers,
-		ProcessMaxWorkers:         processMaxWorkers,
-		ProcessRetireOnSessionEnd: processRetireOnSessionEnd,
-		WorkerQueueTimeout:        workerQueueTimeout,
-		WorkerIdleTimeout:         workerIdleTimeout,
-		HandoverDrainTimeout:      handoverDrainTimeout,
-		WorkerBackend:             workerBackend,
-		K8sWorkerImage:            k8sWorkerImage,
-		K8sWorkerNamespace:        k8sWorkerNamespace,
-		K8sControlPlaneID:         k8sControlPlaneID,
-		K8sWorkerPort:             k8sWorkerPort,
-		K8sWorkerSecret:           k8sWorkerSecret,
-		K8sWorkerConfigMap:        k8sWorkerConfigMap,
-		K8sWorkerImagePullPolicy:  k8sWorkerImagePullPolicy,
-		K8sWorkerServiceAccount:   k8sWorkerServiceAccount,
-		K8sMaxWorkers:             k8sMaxWorkers,
-		K8sSharedWarmTarget:       k8sSharedWarmTarget,
-		K8sWorkerCPURequest:       k8sWorkerCPURequest,
-		K8sWorkerMemoryRequest:    k8sWorkerMemoryRequest,
-		K8sWorkerNodeSelector:     k8sWorkerNodeSelector,
-		K8sWorkerTolerationKey:    k8sWorkerTolerationKey,
-		K8sWorkerTolerationValue:  k8sWorkerTolerationValue,
-		K8sWorkerExclusiveNode:    k8sWorkerExclusiveNode,
-		AWSRegion:                 awsRegion,
-		ConfigStoreConn:           configStoreConn,
-		ConfigPollInterval:        configPollInterval,
-		InternalSecret:            internalSecret,
+		Server:                     cfg,
+		ProcessMinWorkers:          processMinWorkers,
+		ProcessMaxWorkers:          processMaxWorkers,
+		ProcessRetireOnSessionEnd:  processRetireOnSessionEnd,
+		WorkerQueueTimeout:         workerQueueTimeout,
+		WorkerIdleTimeout:          workerIdleTimeout,
+		HandoverDrainTimeout:       handoverDrainTimeout,
+		WorkerBackend:              workerBackend,
+		K8sWorkerImage:             k8sWorkerImage,
+		K8sWorkerNamespace:         k8sWorkerNamespace,
+		K8sControlPlaneID:          k8sControlPlaneID,
+		K8sWorkerPort:              k8sWorkerPort,
+		K8sWorkerSecret:            k8sWorkerSecret,
+		K8sWorkerConfigMap:         k8sWorkerConfigMap,
+		K8sWorkerImagePullPolicy:   k8sWorkerImagePullPolicy,
+		K8sWorkerServiceAccount:    k8sWorkerServiceAccount,
+		K8sMaxWorkers:              k8sMaxWorkers,
+		K8sSharedWarmTarget:        k8sSharedWarmTarget,
+		K8sWorkerCPURequest:        k8sWorkerCPURequest,
+		K8sWorkerMemoryRequest:     k8sWorkerMemoryRequest,
+		K8sWorkerNodeSelector:      k8sWorkerNodeSelector,
+		K8sWorkerTolerationKey:     k8sWorkerTolerationKey,
+		K8sWorkerTolerationValue:   k8sWorkerTolerationValue,
+		K8sWorkerExclusiveNode:     k8sWorkerExclusiveNode,
+		AWSRegion:                  awsRegion,
+		ConfigStoreConn:            configStoreConn,
+		ConfigPollInterval:         configPollInterval,
+		InternalSecret:             internalSecret,
+		DuckLakeDefaultSpecVersion: cfg.DuckLake.SpecVersion,
 	}
 }

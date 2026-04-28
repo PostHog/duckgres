@@ -117,12 +117,7 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		tr.sharedPool.SetWorkerResources(cpu, mem)
 	}
 
-	image := tr.baseCfg.WorkerImage
-	if tc.Warehouse != nil && tc.Warehouse.Image != "" {
-		image = tc.Warehouse.Image
-	}
-
-	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, image, tr.stsBroker)
+	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, workerImageForOrg(tc, tr.baseCfg.WorkerImage), tr.stsBroker)
 	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, tr.globalCfg.DuckLakeDefaultSpecVersion, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {
@@ -222,7 +217,6 @@ func (tr *OrgRouter) IsMigrating(orgID string) bool {
 	return ok
 }
 
-
 // HandleConfigChange reconciles org stacks when the config snapshot changes.
 func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 	// Detect new orgs or orgs whose warehouse just became ready
@@ -287,6 +281,7 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			continue
 		}
 		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers
+		imageChanged := workerImageForOrg(oldTC, tr.baseCfg.WorkerImage) != workerImageForOrg(newTC, tr.baseCfg.WorkerImage)
 		resourcesChanged := oldTC.WorkerCPURequest != newTC.WorkerCPURequest ||
 			oldTC.WorkerMemoryRequest != newTC.WorkerMemoryRequest
 
@@ -301,6 +296,13 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 					maxWorkers = tr.baseCfg.MaxWorkers
 				}
 				stack.Pool.SetMaxWorkers(maxWorkers)
+			}
+			if imageChanged {
+				image := workerImageForOrg(newTC, tr.baseCfg.WorkerImage)
+				slog.Info("Org worker image changed.", "org", name, "image", image)
+				if pool, ok := stack.Pool.(interface{ SetWorkerImage(string) }); ok {
+					pool.SetWorkerImage(image)
+				}
 			}
 			if resourcesChanged && (newTC.WorkerCPURequest != "" || newTC.WorkerMemoryRequest != "") {
 				cpu := newTC.WorkerCPURequest
@@ -320,6 +322,13 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 	}
 
 	tr.reconcileWarmCapacity(new)
+}
+
+func workerImageForOrg(tc *configstore.OrgConfig, fallback string) string {
+	if tc != nil && tc.Warehouse != nil && tc.Warehouse.Image != "" {
+		return tc.Warehouse.Image
+	}
+	return fallback
 }
 
 // AllStacks returns a snapshot of all org stacks for admin API usage.

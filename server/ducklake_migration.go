@@ -112,7 +112,6 @@ func DuckLakeMigrationCheckedVersion() string {
 	return version
 }
 
-
 // CheckAndBackupDuckLakeMigration runs the migration check for the given
 // DuckLake config and returns whether migration is needed. If migration is
 // needed, it backs up the metadata store first. This is exported for use by
@@ -201,7 +200,11 @@ func BackupDuckLakeMetadata(dlCfg DuckLakeConfig, dataDir string) error {
 		return fmt.Errorf("read DuckLake spec version for backup: %w", err)
 	}
 
-	return backupDuckLakeMetadata(pgDB, dataDir, ver)
+	targetVersion := dlCfg.SpecVersion
+	if targetVersion == "" {
+		targetVersion = DefaultDuckLakeSpecVersion
+	}
+	return backupDuckLakeMetadata(pgDB, dataDir, ver, targetVersion)
 }
 
 // parseDuckLakeVersion parses a DuckLake version string like "0.3" into
@@ -294,7 +297,7 @@ func checkAndBackupIfNeeded(dlCfg DuckLakeConfig, dataDir string, targetVersion 
 	slog.Info("DuckLake metadata migration required. Backing up metadata store before upgrade.",
 		"from", ver, "to", targetVersion)
 
-	if err := backupDuckLakeMetadata(pgDB, dataDir, ver); err != nil {
+	if err := backupDuckLakeMetadata(pgDB, dataDir, ver, targetVersion); err != nil {
 		return true, ver, fmt.Errorf("backup metadata before migration: %w", err)
 	}
 
@@ -304,7 +307,7 @@ func checkAndBackupIfNeeded(dlCfg DuckLakeConfig, dataDir string, targetVersion 
 // backupDuckLakeMetadata dumps all ducklake_* tables from the PostgreSQL metadata
 // store to a SQL file. The file contains CREATE TABLE + INSERT statements that can
 // be used to restore the metadata if the migration goes wrong.
-func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error {
+func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string, targetVersion string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -364,7 +367,7 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 	}()
 
 	// Write header.
-	if _, err := fmt.Fprintf(f, "-- DuckLake metadata backup before migration (v%s → v%s)\n", version, DefaultDuckLakeSpecVersion); err != nil {
+	if _, err := fmt.Fprint(f, duckLakeBackupHeader(version, targetVersion)); err != nil {
 		return fmt.Errorf("write backup header: %w", err)
 	}
 	if _, err := fmt.Fprintf(f, "-- Generated: %s\n", time.Now().UTC().Format(time.RFC3339)); err != nil {
@@ -410,6 +413,13 @@ func backupDuckLakeMetadata(pgDB *sql.DB, dataDir string, version string) error 
 		"size_mb", fmt.Sprintf("%.1f", sizeMB))
 
 	return nil
+}
+
+func duckLakeBackupHeader(version string, targetVersion string) string {
+	if targetVersion == "" {
+		targetVersion = DefaultDuckLakeSpecVersion
+	}
+	return fmt.Sprintf("-- DuckLake metadata backup before migration (v%s → v%s)\n", version, targetVersion)
 }
 
 // quoteIdent quotes a PostgreSQL identifier with double quotes.
