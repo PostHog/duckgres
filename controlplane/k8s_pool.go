@@ -1262,8 +1262,8 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				if hotClaimed != nil {
 					// Check if image matches (hot-idle reclamation is strict on version)
 					if assignment.Image != "" && hotClaimed.Image != assignment.Image {
-						slog.Info("Hot-idle worker image mismatch, skipping reclamation.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
-						// We can't use this hot-idle worker, let the janitor eventually reap it.
+						slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
+						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion)
 						// Fall through to neutral idle claim or spawn.
 					} else {
 						worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)

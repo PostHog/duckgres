@@ -218,6 +218,54 @@ func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 	}
 }
 
+func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID: 7,
+		PodName:  "duckgres-worker-v1",
+		State:    configstore.WorkerStateIdle,
+		Image:    "duckgres:v1",
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID: 8,
+		PodName:  "duckgres-worker-v2",
+		State:    configstore.WorkerStateIdle,
+		Image:    "duckgres:v2",
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	// Try claiming v2
+	claimed, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", 0)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed == nil || claimed.WorkerID != 8 {
+		t.Fatalf("expected to claim worker 8 (v2), got %#v", claimed)
+	}
+
+	// Try claiming v3 (none exist)
+	claimed, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", 0)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claim for v3, got %#v", claimed)
+	}
+
+	// Neutral claim (no image filter) - should get v1 (lowest ID)
+	claimed, err = store.ClaimIdleWorker("cp-1", "org-1", "", 0)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed == nil || claimed.WorkerID != 7 {
+		t.Fatalf("expected to claim worker 7 (neutral), got %#v", claimed)
+	}
+}
+
 func TestGetWorkerRecordReturnsNilNilForMissingRow(t *testing.T) {
 	// cleanupOrphanedWorkerPods in k8s_pool.go treats (nil, nil) as "no DB
 	// row — this pod is fully orphaned and safe to delete" and a non-nil

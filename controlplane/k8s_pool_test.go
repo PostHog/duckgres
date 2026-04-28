@@ -1196,6 +1196,69 @@ func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
 	}
 }
 
+func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	// Setup a hot-idle worker with "v1" image
+	w := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	if err := w.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{OrgID: "analytics", Image: "duckgres:v1"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[7] = w
+
+	store := &captureRuntimeWorkerStore{
+		hotIdleClaimResult: &configstore.WorkerRecord{
+			WorkerID: 7,
+			Image:    "duckgres:v1",
+		},
+		spawned: &configstore.WorkerRecord{
+			WorkerID: 42,
+			Image:    "duckgres:v2",
+		},
+	}
+	pool.runtimeStore = store
+
+	// Org requests "v2" image
+	assignment := &WorkerAssignment{
+		OrgID: "analytics",
+		Image: "duckgres:v2",
+	}
+
+	// Mock spawnWarmWorker since we don't have real pods
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error { return nil }
+
+	// Provide a mock secret for the spawned pod (worker 42)
+	podName := pool.podNameForWorker(42)
+	secretName := pool.workerRPCSecretName(podName)
+	_, _ = pool.clientset.CoreV1().Secrets(pool.namespace).Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName},
+		Data: map[string][]byte{
+			"bearer-token":      []byte("secret"),
+			"worker-rpc-ca.crt": []byte("ca"),
+		},
+	}, metav1.CreateOptions{})
+
+	got, err := pool.ReserveSharedWorker(context.Background(), assignment)
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+
+	if got.ID != 42 {
+		t.Fatalf("expected to spawn new worker 42, got %d (v1 worker was incorrectly reclaimed)", got.ID)
+	}
+
+	// Verify v1 worker was retired
+	if store.retireIdleOrHotIdleCalls != 1 || store.retireIdleOrHotIdleCalledIDs[0] != 7 {
+		t.Fatalf("expected mismatched hot-idle worker 7 to be retired, got calls=%d ids=%v", store.retireIdleOrHotIdleCalls, store.retireIdleOrHotIdleCalledIDs)
+	}
+	if store.retireIdleOrHotIdleCalledReasons[0] != RetireReasonMismatchedVersion {
+		t.Fatalf("expected reason %q, got %q", RetireReasonMismatchedVersion, store.retireIdleOrHotIdleCalledReasons[0])
+	}
+}
+
 func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{

@@ -140,6 +140,10 @@ type DuckLakeFileConfig struct {
 	// DataInliningRowLimit controls max rows inlined in metadata per insert.
 	// Default: 0 (disabled). Set to a positive value to enable inlining.
 	DataInliningRowLimit *int `yaml:"data_inlining_row_limit"`
+
+	// DefaultSpecVersion is the global default DuckLake spec version
+	// used for migration checks when an org doesn't specify an override.
+	DefaultSpecVersion string `yaml:"default_spec_version"`
 }
 
 // loadConfigFile loads configuration from a YAML file
@@ -229,6 +233,7 @@ func main() {
 	memoryRebalance := flag.Bool("memory-rebalance", false, "Enable dynamic per-connection memory reallocation (control-plane mode) (env: DUCKGRES_MEMORY_REBALANCE)")
 	duckLakeDeltaCatalogEnabled := flag.Bool("ducklake-delta-catalog-enabled", false, "Attach a Delta Lake catalog during DuckLake worker boot (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
 	duckLakeDeltaCatalogPath := flag.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach, defaults to sibling delta/ prefix at DuckLake object-store root (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
+	duckLakeDefaultSpecVersion := flag.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
 	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error (env: DUCKGRES_LOG_LEVEL)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
@@ -421,6 +426,7 @@ func main() {
 		MemoryRebalance:             *memoryRebalance,
 		DuckLakeDeltaCatalogEnabled: *duckLakeDeltaCatalogEnabled,
 		DuckLakeDeltaCatalogPath:    *duckLakeDeltaCatalogPath,
+		DuckLakeDefaultSpecVersion:  *duckLakeDefaultSpecVersion,
 		ProcessMinWorkers:           *processMinWorkers,
 		ProcessMaxWorkers:           *processMaxWorkers,
 		ProcessRetireOnSessionEnd:   *processRetireOnSessionEnd,

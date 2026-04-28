@@ -86,9 +86,6 @@ func duckLakeMigrationCheckedVersion() string {
 // DuckLakeMigrationCheckedVersion is an exported accessor for the control plane.
 func DuckLakeMigrationCheckedVersion() string { return duckLakeMigrationCheckedVersion() }
 
-// DuckLakeSpecVersion returns the expected DuckLake spec version.
-func DuckLakeSpecVersion() string { return DefaultDuckLakeSpecVersion }
-
 // CheckAndBackupDuckLakeMigration runs the migration check for the given
 // DuckLake config and returns whether migration is needed. If migration is
 // needed, it backs up the metadata store first. This is exported for use by

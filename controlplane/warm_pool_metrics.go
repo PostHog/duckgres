@@ -76,6 +76,7 @@ const (
 	RetireReasonShutdown          = "shutdown"
 	RetireReasonIdleTimeout       = "idle_timeout"
 	RetireReasonStuckActivating   = "stuck_activating"
+	RetireReasonMismatchedVersion = "mismatched_version"
 )
 
 // observeWarmPoolLifecycleGauges recalculates all lifecycle gauges from the
