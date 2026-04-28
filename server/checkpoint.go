@@ -62,7 +62,7 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 		return nil, fmt.Errorf("checkpoint: pre-attach settings: %w", err)
 	}
 
-	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded())
+	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded(dlCfg.MetadataStore))
 	if _, err := db.Exec(attachStmt); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("checkpoint: attach ducklake: %w", err)

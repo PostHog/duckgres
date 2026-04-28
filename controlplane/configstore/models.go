@@ -105,9 +105,10 @@ type ManagedWarehouseWorkerIdentity struct {
 type ManagedWarehouse struct {
 	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
 
-	Image        string  `gorm:"size:512" json:"image"`
-	AuroraMinACU float64 `json:"aurora_min_acu"`
-	AuroraMaxACU float64 `json:"aurora_max_acu"`
+	Image           string  `gorm:"size:512" json:"image"`
+	DuckLakeVersion string  `gorm:"size:32" json:"ducklake_version"`
+	AuroraMinACU    float64 `json:"aurora_min_acu"`
+	AuroraMaxACU    float64 `json:"aurora_max_acu"`
 
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
@@ -251,6 +252,7 @@ type WorkerRecord struct {
 	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`
 	PodName             string      `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
 	PodUID              string      `gorm:"size:255" json:"pod_uid"`
+	Image               string      `gorm:"size:512;index" json:"image"`
 	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
 	OrgID               string      `gorm:"size:255;index" json:"org_id"`
 	OwnerCPInstanceID   string      `gorm:"size:255;index" json:"owner_cp_instance_id"`
@@ -308,9 +310,10 @@ type OrgConfig struct {
 type ManagedWarehouseConfig struct {
 	OrgID string
 
-	Image        string
-	AuroraMinACU float64
-	AuroraMaxACU float64
+	Image           string
+	DuckLakeVersion string
+	AuroraMinACU    float64
+	AuroraMaxACU    float64
 
 	WarehouseDatabase ManagedWarehouseDatabase
 	MetadataStore     ManagedWarehouseMetadataStore
@@ -347,6 +350,7 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 	cfg := &ManagedWarehouseConfig{
 		OrgID:                          warehouse.OrgID,
 		Image:                          warehouse.Image,
+		DuckLakeVersion:                warehouse.DuckLakeVersion,
 		AuroraMinACU:                   warehouse.AuroraMinACU,
 		AuroraMaxACU:                   warehouse.AuroraMaxACU,
 		WarehouseDatabase:              warehouse.WarehouseDatabase,

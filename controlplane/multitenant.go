@@ -181,9 +181,20 @@ func SetupMultiTenant(
 		WorkerCPURequest:      cfg.K8s.WorkerCPURequest,
 		WorkerMemoryRequest:   cfg.K8s.WorkerMemoryRequest,
 		WorkerNodeSelector:    parseNodeSelector(cfg.K8s.WorkerNodeSelector),
-		WorkerTolerationKey:   cfg.K8s.WorkerTolerationKey,
+		WorkerTolerationKey:        cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue: cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:   cfg.K8s.WorkerExclusiveNode,
+		WorkerExclusiveNode:  cfg.K8s.WorkerExclusiveNode,
+		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
+			snap := store.Snapshot()
+			if snap == nil {
+				return nil, fmt.Errorf("config snapshot unavailable")
+			}
+			org, ok := snap.Orgs[orgID]
+			if !ok {
+				return nil, fmt.Errorf("org %s not found in snapshot", orgID)
+			}
+			return org, nil
+		},
 	}
 
 	// Initialize STS broker for credential brokering (best-effort)

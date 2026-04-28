@@ -101,7 +101,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	}
 
 	// Attach DuckLake
-	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded())
+	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded(dlCfg.MetadataStore))
 	if _, err := db.Exec(attachStmt); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("querylog: attach ducklake: %w", err)

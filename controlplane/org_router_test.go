@@ -47,7 +47,7 @@ func TestOrgRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.T
 
 func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
-	pool := NewOrgReservedPool(sharedPool, "analytics", 2, nil)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil)
 
 	oldTC := &configstore.OrgConfig{
 		Name: "analytics",
@@ -84,6 +84,43 @@ func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 
 	if got := tr.orgs["analytics"].Config.Warehouse.MetadataStore.Endpoint; got != "new-metadata.internal" {
 		t.Fatalf("expected runtime-only update to refresh stack config, got %q", got)
+	}
+}
+
+func TestOrgRouterHandleConfigChangeRefreshesOrgWorkerImage(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2, "posthog/duckgres:v1.0.0", nil)
+
+	oldTC := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			Image: "posthog/duckgres:v1.0.0",
+		},
+	}
+	newTC := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			Image: "posthog/duckgres:v1.1.0",
+		},
+	}
+
+	tr := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {
+				Config: oldTC,
+				Pool:   pool,
+			},
+		},
+		baseCfg: K8sWorkerPoolConfig{MaxWorkers: 2, WorkerImage: "posthog/duckgres:v1.0.0"},
+	}
+
+	tr.HandleConfigChange(
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": oldTC}},
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": newTC}},
+	)
+
+	if got := pool.image; got != "posthog/duckgres:v1.1.0" {
+		t.Fatalf("expected org reserved pool image to refresh, got %q", got)
 	}
 }
 
@@ -224,4 +261,56 @@ func newTestConfigStoreWithSnapshot(snapshot *configstore.Snapshot) *configstore
 func setTestConfigStoreSnapshot(store *configstore.ConfigStore, snapshot *configstore.Snapshot) {
 	field := reflect.ValueOf(store).Elem().FieldByName("snapshot")
 	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(reflect.ValueOf(snapshot))
+}
+
+func TestWorkerImageForOrg(t *testing.T) {
+	fallback := "posthog/duckgres:v1.0.0"
+
+	tests := []struct {
+		name     string
+		org      *configstore.OrgConfig
+		expected string
+	}{
+		{
+			name:     "nil org returns fallback",
+			org:      nil,
+			expected: fallback,
+		},
+		{
+			name: "nil warehouse returns fallback",
+			org: &configstore.OrgConfig{
+				Name:      "analytics",
+				Warehouse: nil,
+			},
+			expected: fallback,
+		},
+		{
+			name: "empty image returns fallback",
+			org: &configstore.OrgConfig{
+				Name: "analytics",
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					Image: "",
+				},
+			},
+			expected: fallback,
+		},
+		{
+			name: "custom image is returned",
+			org: &configstore.OrgConfig{
+				Name: "analytics",
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					Image: "posthog/duckgres:v1.2.0-canary",
+				},
+			},
+			expected: "posthog/duckgres:v1.2.0-canary",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := workerImageForOrg(tt.org, fallback); got != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, got)
+			}
+		})
+	}
 }
