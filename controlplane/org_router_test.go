@@ -262,3 +262,55 @@ func setTestConfigStoreSnapshot(store *configstore.ConfigStore, snapshot *config
 	field := reflect.ValueOf(store).Elem().FieldByName("snapshot")
 	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().Set(reflect.ValueOf(snapshot))
 }
+
+func TestWorkerImageForOrg(t *testing.T) {
+	fallback := "posthog/duckgres:v1.0.0"
+
+	tests := []struct {
+		name     string
+		org      *configstore.OrgConfig
+		expected string
+	}{
+		{
+			name:     "nil org returns fallback",
+			org:      nil,
+			expected: fallback,
+		},
+		{
+			name: "nil warehouse returns fallback",
+			org: &configstore.OrgConfig{
+				Name:      "analytics",
+				Warehouse: nil,
+			},
+			expected: fallback,
+		},
+		{
+			name: "empty image returns fallback",
+			org: &configstore.OrgConfig{
+				Name: "analytics",
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					Image: "",
+				},
+			},
+			expected: fallback,
+		},
+		{
+			name: "custom image is returned",
+			org: &configstore.OrgConfig{
+				Name: "analytics",
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					Image: "posthog/duckgres:v1.2.0-canary",
+				},
+			},
+			expected: "posthog/duckgres:v1.2.0-canary",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := workerImageForOrg(tt.org, fallback); got != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, got)
+			}
+		})
+	}
+}

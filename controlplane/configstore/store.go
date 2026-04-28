@@ -478,7 +478,7 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "worker_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "pod_uid", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert worker record: %w", err)
 	}

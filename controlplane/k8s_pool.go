@@ -772,6 +772,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int, image string) e
 		ID:          id,
 		podName:     podName,
 		nodeName:    ready.nodeName,
+		image:       image,
 		bearerToken: token,
 		client:      client,
 		done:        done,
@@ -1597,6 +1598,7 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	worker := &ManagedWorker{
 		ID:          claimed.WorkerID,
 		podName:     claimed.PodName,
+		image:       claimed.Image,
 		bearerToken: token,
 		client:      client,
 		done:        make(chan struct{}),
@@ -2531,6 +2533,7 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	record := &configstore.WorkerRecord{
 		WorkerID:          id,
 		PodName:           p.podNameForWorker(id),
+		Image:             p.workerImage,
 		State:             state,
 		OwnerCPInstanceID: p.cpInstanceID,
 		OwnerEpoch:        ownerEpoch,
@@ -2549,6 +2552,9 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	}
 	record.PodName = p.workerPodName(worker)
 	record.OwnerCPInstanceID = worker.OwnerCPInstanceID()
+	if worker.image != "" {
+		record.Image = worker.image
+	}
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID
 	}

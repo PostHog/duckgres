@@ -77,6 +77,7 @@ func ensureDuckLakeMigrationCheck(dlCfg DuckLakeConfig, dataDir string) {
 		err:      err,
 		done:     err == nil,
 	})
+	dlMigrationMu.Delete(connStr)
 }
 
 // duckLakeMigrationNeeded returns whether the ATTACH statement should include
@@ -97,19 +98,6 @@ func duckLakeMigrationCheckedVersion(connStr string) string {
 		return state.checkedV
 	}
 	return ""
-}
-
-// DuckLakeMigrationCheckedVersion is an exported accessor for the control plane.
-// NOTE: In multi-tenant mode, this only returns a value if called from a worker
-// with a single metadata store. Control Plane should use per-org state.
-func DuckLakeMigrationCheckedVersion() string {
-	// Best-effort: if there is exactly one entry, return it.
-	var version string
-	dlMigrations.Range(func(_, value any) bool {
-		version = value.(*migrationState).checkedV
-		return false // stop iteration
-	})
-	return version
 }
 
 // CheckAndBackupDuckLakeMigration runs the migration check for the given
