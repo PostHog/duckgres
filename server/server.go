@@ -1385,8 +1385,11 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// In standalone mode, the check runs here (once per process).
 	if !dlCfg.Migrate {
 		ensureDuckLakeMigrationCheck(dlCfg, dataDir)
-		if dlMigration.err != nil {
-			return fmt.Errorf("DuckLake migration check failed: %w", dlMigration.err)
+		if val, ok := dlMigrations.Load(dlCfg.MetadataStore); ok {
+			state := val.(*migrationState)
+			if state.err != nil {
+				return fmt.Errorf("DuckLake migration check failed: %w", state.err)
+			}
 		}
 	}
 
@@ -1474,7 +1477,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
 		return err
 	}
-	migrate := dlCfg.Migrate || duckLakeMigrationNeeded()
+	migrate := dlCfg.Migrate || duckLakeMigrationNeeded(dlCfg.MetadataStore)
 	attachStmt := buildDuckLakeAttachStmt(dlCfg, migrate)
 
 	dataPath := dlCfg.ObjectStore
@@ -1487,7 +1490,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 			targetVersion = DefaultDuckLakeSpecVersion
 		}
 		slog.Info("Attaching DuckLake catalog with automatic migration.",
-			"from", duckLakeMigrationCheckedVersion(), "to", targetVersion,
+			"from", duckLakeMigrationCheckedVersion(dlCfg.MetadataStore), "to", targetVersion,
 			"metadata", redactConnectionString(dlCfg.MetadataStore))
 	} else if dataPath != "" {
 		slog.Info("Attaching DuckLake catalog with data path.",

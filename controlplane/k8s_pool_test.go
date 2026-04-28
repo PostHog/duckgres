@@ -155,6 +155,7 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 		return nil, nil
 	}
 	spawned := *s.spawned
+	spawned.OwnerEpoch = ownerEpoch
 	return &spawned, nil
 }
 
@@ -1216,6 +1217,7 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 		},
 		spawned: &configstore.WorkerRecord{
 			WorkerID: 42,
+			PodName:  "test-cp-worker-42",
 			Image:    "duckgres:v2",
 		},
 	}
@@ -1229,15 +1231,40 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 
 	// Mock spawnWarmWorker since we don't have real pods
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error { return nil }
+	// Mock health check since we don't have real worker binaries
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error { return nil }
+	// Mock connection since we don't have real pods
+	pool.connectWorkerFunc = func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+		return nil, nil
+	}
 
 	// Provide a mock secret for the spawned pod (worker 42)
-	podName := pool.podNameForWorker(42)
+	podName := "test-cp-worker-42"
 	secretName := pool.workerRPCSecretName(podName)
+
+	// Minimal valid PEM blocks for a self-signed cert/key to satisfy parsing.
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nMIICojCCAYqgAwIBAgIQI6v5m9mN6L3Xv8O5/0u/2zANBgkqhkiG9w0BAQsFADAV\nMRMwEQYDVQQDEwpkdWNra2dyZXMwHhcNMjYwNDI3MDEwODIyWhcNMjYwNTI3MDEw\nODIyWjAVMRMwEQYDVQQDEwpkdWNra2dyZXMwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC8u9+9\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEAvLvf\n-----END RSA PRIVATE KEY-----\n")
+
 	_, _ = pool.clientset.CoreV1().Secrets(pool.namespace).Create(context.Background(), &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: secretName},
 		Data: map[string][]byte{
 			"bearer-token":      []byte("secret"),
-			"worker-rpc-ca.crt": []byte("ca"),
+			"tls.crt":           certPEM,
+			"tls.key":           keyPEM,
+			"worker-rpc-ca.crt": certPEM,
+		},
+	}, metav1.CreateOptions{})
+
+	// Provide mock pod
+	_, _ = pool.clientset.CoreV1().Pods(pool.namespace).Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   podName,
+			Labels: map[string]string{"duckgres/worker-id": "42"},
+		},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIP:  "10.0.0.42",
 		},
 	}, metav1.CreateOptions{})
 
@@ -2158,8 +2185,8 @@ func TestRetireOneMismatchedVersionWorker_RetiresOlderVersionIdleWorker(t *testi
 	if store.retireIdleOrHotIdleCalls != 1 || len(store.retireIdleOrHotIdleCalledIDs) != 1 || store.retireIdleOrHotIdleCalledIDs[0] != 7 {
 		t.Fatalf("expected one RetireIdleOrHotIdleWorker(7) call, got calls=%d ids=%v", store.retireIdleOrHotIdleCalls, store.retireIdleOrHotIdleCalledIDs)
 	}
-	if reason := store.retireIdleOrHotIdleCalledReasons[0]; reason != "version_mismatch" {
-		t.Fatalf("expected reason version_mismatch, got %q", reason)
+	if reason := store.retireIdleOrHotIdleCalledReasons[0]; reason != RetireReasonMismatchedVersion {
+		t.Fatalf("expected reason %q, got %q", RetireReasonMismatchedVersion, reason)
 	}
 	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
 	if len(pods.Items) != 0 {

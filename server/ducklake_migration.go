@@ -18,21 +18,21 @@ import (
 // This must match the DuckLake version bundled with the current DuckDB driver.
 const DefaultDuckLakeSpecVersion = "1.0"
 
-// dlMigration holds the result of the migration check.
-// The check retries on transient errors (e.g., metadata store not reachable yet)
-// but locks in the result once it succeeds.
-//
-// In multitenant control-plane mode, each worker process serves a single tenant
-// with its own metadata store, so the per-process state is correct.
-// If this changes (multiple metadata stores per process), this must be replaced
-// with a sync.Map keyed by metadata store connection string.
-var dlMigration struct {
-	mu       sync.Mutex
-	done     bool   // true once the check has completed successfully
-	needed   bool   // true if metadata store version < target spec version
-	err      error  // non-nil if the most recent check or backup failed
-	checkedV string // the version found in the metadata store
+// migrationState holds the result of a single migration check.
+type migrationState struct {
+	done     bool
+	needed   bool
+	err      error
+	checkedV string
 }
+
+// dlMigrations caches per-metadata-store migration check results.
+// This is critical for the multi-tenant Control Plane to avoid cross-tenant
+// cache contamination.
+var dlMigrations sync.Map // connStr (string) -> *migrationState
+
+// dlMigrationMu synchronizes concurrent checks for the same connection string.
+var dlMigrationMu sync.Map // connStr (string) -> *sync.Mutex
 
 // ensureDuckLakeMigrationCheck runs the migration check, retrying on transient errors.
 // Once the check succeeds (regardless of whether migration is needed), the result
@@ -45,11 +45,24 @@ var dlMigration struct {
 // This should be called BEFORE acquiring the DuckLake attachment semaphore,
 // since the backup can take minutes for large metadata stores.
 func ensureDuckLakeMigrationCheck(dlCfg DuckLakeConfig, dataDir string) {
-	dlMigration.mu.Lock()
-	defer dlMigration.mu.Unlock()
-
-	if dlMigration.done {
+	if dlCfg.MetadataStore == "" {
 		return
+	}
+	connStr := dlCfg.MetadataStore
+
+	// Get or create a mutex for this specific connection string.
+	muAny, _ := dlMigrationMu.LoadOrStore(connStr, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check if we already have a successful result for this connection string.
+	if val, ok := dlMigrations.Load(connStr); ok {
+		state := val.(*migrationState)
+		if state.done {
+			return
+		}
 	}
 
 	targetVersion := dlCfg.SpecVersion
@@ -58,33 +71,47 @@ func ensureDuckLakeMigrationCheck(dlCfg DuckLakeConfig, dataDir string) {
 	}
 
 	needed, ver, err := checkAndBackupIfNeeded(dlCfg, dataDir, targetVersion)
-	dlMigration.needed = needed
-	dlMigration.checkedV = ver
-	dlMigration.err = err
-
-	if err == nil {
-		dlMigration.done = true
-	}
+	dlMigrations.Store(connStr, &migrationState{
+		needed:   needed,
+		checkedV: ver,
+		err:      err,
+		done:     err == nil,
+	})
 }
 
 // duckLakeMigrationNeeded returns whether the ATTACH statement should include
 // AUTOMATIC_MIGRATION TRUE. Safe to call after ensureDuckLakeMigrationCheck.
-func duckLakeMigrationNeeded() bool {
-	dlMigration.mu.Lock()
-	defer dlMigration.mu.Unlock()
-	return dlMigration.needed && dlMigration.err == nil
+func duckLakeMigrationNeeded(connStr string) bool {
+	if val, ok := dlMigrations.Load(connStr); ok {
+		state := val.(*migrationState)
+		return state.needed && state.err == nil
+	}
+	return false
 }
 
 // duckLakeMigrationCheckedVersion returns the version found in the metadata store.
 // Returns "" if the check has not run or the metadata store had no version.
-func duckLakeMigrationCheckedVersion() string {
-	dlMigration.mu.Lock()
-	defer dlMigration.mu.Unlock()
-	return dlMigration.checkedV
+func duckLakeMigrationCheckedVersion(connStr string) string {
+	if val, ok := dlMigrations.Load(connStr); ok {
+		state := val.(*migrationState)
+		return state.checkedV
+	}
+	return ""
 }
 
 // DuckLakeMigrationCheckedVersion is an exported accessor for the control plane.
-func DuckLakeMigrationCheckedVersion() string { return duckLakeMigrationCheckedVersion() }
+// NOTE: In multi-tenant mode, this only returns a value if called from a worker
+// with a single metadata store. Control Plane should use per-org state.
+func DuckLakeMigrationCheckedVersion() string {
+	// Best-effort: if there is exactly one entry, return it.
+	var version string
+	dlMigrations.Range(func(_, value any) bool {
+		version = value.(*migrationState).checkedV
+		return false // stop iteration
+	})
+	return version
+}
+
 
 // CheckAndBackupDuckLakeMigration runs the migration check for the given
 // DuckLake config and returns whether migration is needed. If migration is

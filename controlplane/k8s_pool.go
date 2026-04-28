@@ -67,7 +67,8 @@ type K8sWorkerPool struct {
 	workerTolerationValue string            // taint value for NoSchedule toleration
 	workerExclusiveNode   bool              // one worker per node via anti-affinity
 	orgID                 string            // org ID for pod labels (multi-tenant mode)
-	workerIDGenerator     func() int        // shared ID generator across orgs (nil = internal counter)
+	workerIDGenerator     func() int                        // shared ID generator across orgs (nil = internal counter)
+	resolveOrgConfig      func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping
 	informer              cache.SharedIndexInformer
 	stopInform            chan struct{}
 	spawnSem              chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
@@ -163,6 +164,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerExclusiveNode:   cfg.WorkerExclusiveNode,
 		orgID:                 cfg.OrgID,
 		workerIDGenerator:     cfg.WorkerIDGenerator,
+		resolveOrgConfig:      cfg.ResolveOrgConfig,
 		runtimeStore:          cfg.RuntimeStore,
 		spawnSem:              make(chan struct{}, spawnConcurrency),
 		retireSem:             make(chan struct{}, retireConcurrency),
@@ -228,9 +230,49 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		if label == "" {
 			continue
 		}
-		if trimK8sPodHashSuffix(label) == myVersion {
+
+		// Resolve the target version for this specific pod.
+		// For neutral workers, the target is the global binary version.
+		// For assigned workers, the target is the tenant's configured image.
+		var isMismatched bool
+		podOrgID := pod.Labels["duckgres/org"]
+
+		if podOrgID != "" && p.resolveOrgConfig != nil {
+			// Per-tenant version check
+			org, err := p.resolveOrgConfig(podOrgID)
+			if err != nil {
+				// Best-effort: skip if we can't resolve config this tick
+				continue
+			}
+			targetImage := p.workerImage
+			if org.Warehouse != nil && org.Warehouse.Image != "" {
+				targetImage = org.Warehouse.Image
+			}
+
+			// Find the worker container image
+			var actualImage string
+			for _, container := range pod.Spec.Containers {
+				if container.Name == "duckdb-worker" {
+					actualImage = container.Image
+					break
+				}
+			}
+			if actualImage != "" && actualImage != targetImage {
+				isMismatched = true
+				slog.Debug("Detected per-tenant worker image mismatch.",
+					"org", podOrgID, "pod", pod.Name, "actual", actualImage, "target", targetImage)
+			}
+		} else {
+			// Global CP binary version check
+			if trimK8sPodHashSuffix(label) != myVersion {
+				isMismatched = true
+			}
+		}
+
+		if !isMismatched {
 			continue
 		}
+
 		idStr := pod.Labels["duckgres/worker-id"]
 		if idStr == "" {
 			continue
@@ -239,21 +281,20 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		if err != nil {
 			continue
 		}
-		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(workerID, "version_mismatch")
+		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(workerID, RetireReasonMismatchedVersion)
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
 		}
 		if !retired {
-			// Not currently idle (busy, reserved, hot-idle, or already
+			// Not currently idle or hot-idle (busy, reserved, or already
 			// retired). Leave it for a later tick.
 			continue
 		}
 		slog.Info("Retiring mismatched-version worker pod.",
 			"worker_id", workerID,
+			"org", podOrgID,
 			"pod", pod.Name,
-			"pod_version", trimK8sPodHashSuffix(label),
-			"my_version", myVersion,
 		)
 		gracePeriod := int64(10)
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
@@ -1613,6 +1654,12 @@ func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podNam
 }
 
 func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string) {
+	if p.runtimeStore != nil {
+		// Mark retired in DB immediately so the next capacity check doesn't
+		// count this slot.
+		_, _ = p.runtimeStore.RetireIdleOrHotIdleWorker(claimed.WorkerID, reason)
+	}
+
 	worker := &ManagedWorker{
 		ID:      claimed.WorkerID,
 		podName: claimed.PodName,
