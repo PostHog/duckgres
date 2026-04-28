@@ -851,7 +851,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	secretKey := server.GenerateSecretKey()
 
 	// Use a temporary clientConn just to send initial params
-	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, orgID, database, applicationName, nil, pid, secretKey, -1)
+	tmpCC := server.NewClientConn(cp.srv, nil, nil, writer, username, orgID, database, applicationName, nil, pid, secretKey, -1, "")
 	defer server.CancelClientConn(tmpCC)
 	server.SendInitialParams(tmpCC)
 	if err := writer.Flush(); err != nil {
@@ -889,6 +889,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = writer.Flush()
 		return
 	}
+	// Worker is now assigned — capture identity for log correlation.
+	workerID := sessions.WorkerIDForPID(pid)
+	workerPod := sessions.WorkerPodNameForPID(pid)
 	if orgID != "" {
 		observeOrgSessionsActive(orgID, sessions.SessionCount())
 	}
@@ -903,7 +906,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	err = server.InitSessionDatabaseMetadata(initCtx, executor, database)
 	if err != nil {
 		initCancel()
-		slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
+		slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
 		_ = writer.Flush()
 		return
@@ -911,7 +914,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	duckLakeAttached, err := server.HasAttachedCatalog(initCtx, executor, "ducklake")
 	initCancel()
 	if err != nil {
-		slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err)
+		slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
 		_ = writer.Flush()
 		return
@@ -922,27 +925,26 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	sessions.SetConnCloser(pid, tlsConn)
 
 	// Create real clientConn with FlightExecutor and worker assignment
-	workerID := sessions.WorkerIDForPID(pid)
-	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID)
+	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
 	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
-		slog.Error("Failed to send ReadyForQuery.", "remote_addr", remoteAddr, "error", err)
+		slog.Error("Failed to send ReadyForQuery.", "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 		return
 	}
 	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err)
+		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 		return
 	}
 
 	// Run message loop
 	if err := server.RunMessageLoop(cc); err != nil {
-		slog.Error("Message loop error.", "user", username, "remote_addr", remoteAddr, "error", err)
+		slog.Error("Message loop error.", "user", username, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 		return
 	}
 
-	slog.Info("Client disconnected.", "user", username, "remote_addr", remoteAddr)
+	slog.Info("Client disconnected.", "user", username, "remote_addr", remoteAddr, "worker", workerID, "worker_pod", workerPod)
 }
 
 // workerDuckDBLimits derives DuckDB memory_limit and threads from the worker

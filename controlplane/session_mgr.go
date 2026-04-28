@@ -292,6 +292,22 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 	return -1
 }
 
+// WorkerPodNameForPID returns the K8s pod name of the worker hosting the
+// session, or "" if not found or not running on K8s.
+func (sm *SessionManager) WorkerPodNameForPID(pid int32) string {
+	sm.mu.RLock()
+	s, ok := sm.sessions[pid]
+	sm.mu.RUnlock()
+	if !ok {
+		return ""
+	}
+	worker, ok := sm.pool.Worker(s.WorkerID)
+	if !ok || worker == nil {
+		return ""
+	}
+	return worker.PodName()
+}
+
 // GetProgress returns the cached query progress for a session, or nil.
 func (sm *SessionManager) GetProgress(pid int32) *SessionProgress {
 	sm.mu.RLock()

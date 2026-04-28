@@ -251,7 +251,7 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		}
 		slog.Info("Retiring mismatched-version worker pod.",
 			"worker_id", workerID,
-			"pod", pod.Name,
+			"worker_pod", pod.Name,
 			"pod_version", trimK8sPodHashSuffix(label),
 			"my_version", myVersion,
 		)
@@ -259,7 +259,7 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
 		}); err != nil && !errors.IsNotFound(err) {
-			slog.Warn("Version-aware reaper failed to delete pod.", "pod", pod.Name, "error", err)
+			slog.Warn("Version-aware reaper failed to delete pod.", "worker_pod", pod.Name, "error", err)
 		}
 		return true
 	}
@@ -326,11 +326,11 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
 		}); err != nil && !errors.IsNotFound(err) {
-			slog.Warn("Stranded-pod reconciler failed to delete pod.", "pod", pod.Name, "worker_id", workerID, "error", err)
+			slog.Warn("Stranded-pod reconciler failed to delete pod.", "worker_pod", pod.Name, "worker_id", workerID, "error", err)
 			continue
 		}
 		_ = p.deleteWorkerRPCSecret(ctx, pod.Name)
-		slog.Info("Stranded worker pod reconciled.", "pod", pod.Name, "worker_id", workerID, "db_state", dbState)
+		slog.Info("Stranded worker pod reconciled.", "worker_pod", pod.Name, "worker_id", workerID, "db_state", dbState)
 		deleted++
 	}
 	return deleted
@@ -437,7 +437,7 @@ func (p *K8sWorkerPool) onPodTerminated(pod *corev1.Pod) {
 	case <-w.done:
 		// Already closed
 	default:
-		slog.Warn("Worker pod terminated.", "id", id, "pod", pod.Name, "phase", pod.Status.Phase)
+		slog.Warn("Worker pod terminated.", "id", id, "worker_pod", pod.Name, "phase", pod.Status.Phase)
 		close(w.done)
 	}
 }
@@ -728,7 +728,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 	p.persistWorkerRecord(p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil))
 	observeControlPlaneWorkers(workerCount)
 
-	slog.Info("K8s worker spawned.", "id", id, "pod", podName, "addr", addr)
+	slog.Info("K8s worker spawned.", "id", id, "worker_pod", podName, "addr", addr)
 	return nil
 }
 
@@ -793,7 +793,7 @@ func (p *K8sWorkerPool) createPodWithBackoff(ctx context.Context, pod *corev1.Po
 			return fmt.Errorf("create worker pod %s after %d retries: %w", pod.Name, maxRetries, err)
 		}
 		slog.Warn("Transient K8s API error creating pod, retrying.",
-			"pod", pod.Name, "attempt", attempt+1, "backoff", backoff, "error", err)
+			"worker_pod", pod.Name, "attempt", attempt+1, "backoff", backoff, "error", err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -1280,7 +1280,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				if reserveErr == nil {
 					return worker, nil
 				}
-				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "pod", claimed.PodName, "error", reserveErr)
+				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "worker_pod", claimed.PodName, "error", reserveErr)
 				p.retireClaimedWorker(claimed, RetireReasonCrash)
 				continue
 			}
@@ -1466,7 +1466,7 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 		p.persistWorkerRecord(reservedRecord)
 	}
 	if err := p.checkReservedWorkerLiveness(ctx, worker); err != nil {
-		slog.Warn("Claimed worker failed liveness recheck.", "worker", worker.ID, "pod", worker.PodName(), "error", err)
+		slog.Warn("Claimed worker failed liveness recheck.", "worker", worker.ID, "worker_pod", worker.PodName(), "error", err)
 		p.retireWorkerWithReason(worker.ID, RetireReasonCrash)
 		return nil, err
 	}
@@ -1908,7 +1908,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	ctx := context.Background()
 	for _, w := range workers {
 		podName := p.workerPodName(w)
-		slog.Info("Shutting down K8s worker.", "id", w.ID, "pod", podName)
+		slog.Info("Shutting down K8s worker.", "id", w.ID, "worker_pod", podName)
 
 		// Step 1: CAS to draining. Skip the worker on CAS miss or error —
 		// there's no safe way to proceed if we don't own the row.
@@ -1933,7 +1933,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 			GracePeriodSeconds: &gracePeriod,
 		}); err != nil && !errors.IsNotFound(err) {
 			slog.Warn("ShutdownAll: pod delete failed; worker left in draining for orphan sweep/reconciler.",
-				"id", w.ID, "pod", podName, "error", err)
+				"id", w.ID, "worker_pod", podName, "error", err)
 			continue
 		}
 		_ = p.deleteWorkerRPCSecret(ctx, podName)
@@ -1972,7 +1972,7 @@ func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
 	defer func() { <-p.retireSem }()
 
 	podName := p.workerPodName(w)
-	slog.Info("Retiring K8s worker.", "id", id, "pod", podName)
+	slog.Info("Retiring K8s worker.", "id", id, "worker_pod", podName)
 	if w.client != nil {
 		_ = w.client.Close()
 	}
@@ -1981,10 +1981,10 @@ func (p *K8sWorkerPool) retireWorkerPod(id int, w *ManagedWorker) {
 	if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 		GracePeriodSeconds: int64Ptr(10),
 	}); err != nil {
-		slog.Warn("Failed to delete worker pod.", "id", id, "pod", podName, "error", err)
+		slog.Warn("Failed to delete worker pod.", "id", id, "worker_pod", podName, "error", err)
 	}
 	if err := p.deleteWorkerRPCSecret(ctx, podName); err != nil {
-		slog.Warn("Failed to delete worker RPC secret.", "id", id, "pod", podName, "error", err)
+		slog.Warn("Failed to delete worker RPC secret.", "id", id, "worker_pod", podName, "error", err)
 	}
 }
 

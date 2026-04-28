@@ -47,7 +47,7 @@ func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
 // the control plane worker. The returned value is opaque (*clientConn) but
 // can be used with SendInitialParams and RunMessageLoop.
 func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio.Writer,
-	username, orgID, database, applicationName string, executor QueryExecutor, pid, secretKey int32, workerID int) *clientConn {
+	username, orgID, database, applicationName string, executor QueryExecutor, pid, secretKey int32, workerID int, workerPod string) *clientConn {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &clientConn{
@@ -71,6 +71,7 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 		cancel:          cancel,
 		backendStart:    time.Now(),
 		workerID:        workerID,
+		workerPod:       workerPod,
 	}
 }
 

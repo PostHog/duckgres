@@ -180,6 +180,7 @@ type clientConn struct {
 	currentQuery    atomic.Value // stores string — current/last query (lock-free)
 	queryStart      atomic.Value // stores time.Time — when current query started (lock-free)
 	workerID        int          // control plane worker ID, -1 for standalone
+	workerPod       string       // K8s pod name of the worker, empty for standalone or in-process workers
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -487,20 +488,26 @@ func constraintErrorCode(msg string) string {
 	return "23000" // integrity_constraint_violation
 }
 
+// workerLogAttrs returns slog key/values for the worker that this connection
+// is bound to. Use with `slog.Xxx("...", args, c.workerLogAttrs()...)` so
+// every connection-attributable log line carries the same worker fields.
+func (c *clientConn) workerLogAttrs() []any {
+	return []any{"worker", c.workerID, "worker_pod", c.workerPod}
+}
+
 // logQueryError logs a query execution failure with additional context for
 // DuckLake-specific errors (transaction conflicts and metadata connection loss).
-func logQueryError(user, query string, err error) {
+func (c *clientConn) logQueryError(query string, err error) {
+	attrs := []any{"user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod}
 	if isDuckLakeTransactionConflict(err) {
-		slog.Warn("DuckLake transaction conflict.",
-			"user", user, "query", query, "error", err)
+		slog.Warn("DuckLake transaction conflict.", attrs...)
 		return
 	}
 	if isDuckLakeMetadataConnectionLost(err) {
-		slog.Warn("DuckLake metadata connection lost during transaction.",
-			"user", user, "query", query, "error", err)
+		slog.Warn("DuckLake metadata connection lost during transaction.", attrs...)
 		return
 	}
-	slog.Error("Query execution failed.", "user", user, "query", query, "error", err)
+	slog.Error("Query execution failed.", attrs...)
 }
 
 // isConnectionBroken checks if an error indicates a broken connection
@@ -554,12 +561,12 @@ func (c *clientConn) safeCleanupDB() {
 			cancel()
 			if err != nil {
 				slog.Warn("Failed to rollback transaction during cleanup.",
-					"user", c.username, "error", err)
+					"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			}
 		}
 		// Close returns the pinned *sql.Conn to the pool (does not close the DB).
 		if err := c.executor.Close(); err != nil {
-			slog.Warn("Failed to return connection to pool.", "user", c.username, "error", err)
+			slog.Warn("Failed to return connection to pool.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		}
 		c.server.releaseFileDB(c.username)
 		return
@@ -577,13 +584,13 @@ func (c *clientConn) safeCleanupDB() {
 		_, err := c.executor.ExecContext(ctx, "SELECT 1 FROM duckdb_tables() WHERE database_name = 'ducklake' LIMIT 1")
 		if err != nil {
 			slog.Warn("DuckLake connection unhealthy during cleanup, skipping SQL cleanup.",
-				"user", c.username, "error", err)
+				"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			connHealthy = false
 		}
 	} else {
 		if err := c.executor.PingContext(ctx); err != nil {
 			slog.Warn("Database connection unhealthy during cleanup, skipping SQL cleanup.",
-				"user", c.username, "error", err)
+				"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			connHealthy = false
 		}
 	}
@@ -598,7 +605,7 @@ func (c *clientConn) safeCleanupDB() {
 		cancel2()
 		if err != nil {
 			slog.Warn("Failed to rollback transaction during cleanup.",
-				"user", c.username, "error", err)
+				"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			if isConnectionBroken(err) {
 				connHealthy = false
 			}
@@ -614,7 +621,7 @@ func (c *clientConn) safeCleanupDB() {
 		_, err := c.executor.ExecContext(ctx3, "USE memory")
 		cancel3()
 		if err != nil {
-			slog.Warn("Failed to switch to memory.", "user", c.username, "error", err)
+			slog.Warn("Failed to switch to memory.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			if isConnectionBroken(err) {
 				connHealthy = false
 			}
@@ -626,7 +633,7 @@ func (c *clientConn) safeCleanupDB() {
 				_, err := c.executor.ExecContext(ctxDelta, "DETACH delta")
 				cancelDelta()
 				if err != nil {
-					slog.Warn("Failed to detach Delta catalog.", "user", c.username, "error", err)
+					slog.Warn("Failed to detach Delta catalog.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 				}
 			}
 
@@ -635,7 +642,7 @@ func (c *clientConn) safeCleanupDB() {
 				_, err := c.executor.ExecContext(ctx4, "DETACH ducklake")
 				cancel4()
 				if err != nil {
-					slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err)
+					slog.Warn("Failed to detach DuckLake.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 				}
 			}
 		}
@@ -645,7 +652,7 @@ func (c *clientConn) safeCleanupDB() {
 	// If the connection is broken, this may still throw, but we've done our best
 	// to clean up the transaction state first.
 	if err := c.executor.Close(); err != nil {
-		slog.Warn("Failed to close database.", "user", c.username, "error", err)
+		slog.Warn("Failed to close database.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 	}
 }
 
@@ -1326,7 +1333,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 				if isQueryCancelled(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
-					logQueryError(c.username, query, err)
+					c.logQueryError(query, err)
 				}
 				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
@@ -1402,7 +1409,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			if isQueryCancelled(err) {
 				errMsg = "canceling statement due to user request"
 			} else {
-				logQueryError(c.username, query, err)
+				c.logQueryError(query, err)
 			}
 			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
@@ -1516,7 +1523,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		if isQueryCancelled(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
-			logQueryError(c.username, query, err)
+			c.logQueryError(query, err)
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
@@ -1592,7 +1599,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			errMsg = "canceling statement due to user request"
 			c.sendError("ERROR", errCode, errMsg)
 		} else {
-			slog.Error("Row iteration error.", "user", c.username, "error", err)
+			slog.Error("Row iteration error.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
@@ -1891,7 +1898,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				if isQueryCancelled(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
-					logQueryError(c.username, executedQuery, err)
+					c.logQueryError(executedQuery, err)
 				}
 				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
@@ -1941,7 +1948,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		if isQueryCancelled(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
-			logQueryError(c.username, executedQuery, err)
+			c.logQueryError(executedQuery, err)
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
@@ -2035,7 +2042,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		slog.Debug("Multi-stmt setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		_, err := c.executor.Exec(stmt)
 		if err != nil {
-			slog.Error("Multi-stmt setup error.", "user", c.username, "query", stmt, "error", err)
+			slog.Error("Multi-stmt setup error.", "user", c.username, "query", stmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -2056,7 +2063,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt)
 		if err != nil {
-			slog.Error("Multi-stmt final query error.", "user", c.username, "query", finalStmt, "error", err)
+			slog.Error("Multi-stmt final query error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -2077,7 +2084,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt)
 		if err != nil {
-			slog.Error("Multi-stmt final exec error.", "user", c.username, "query", finalStmt, "error", err)
+			slog.Error("Multi-stmt final exec error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -2105,7 +2112,7 @@ func (c *clientConn) executeCleanup(cleanup []string) {
 		_, err := c.executor.Exec(stmt)
 		if err != nil {
 			// Log but don't fail - cleanup is best effort
-			slog.Warn("Multi-stmt cleanup error (ignored).", "user", c.username, "error", err)
+			slog.Warn("Multi-stmt cleanup error (ignored).", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		}
 	}
 }
@@ -2137,7 +2144,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		slog.Debug("Multi-stmt-ext setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
 		_, err := c.executor.Exec(stmt, args...)
 		if err != nil {
-			slog.Error("Multi-stmt-ext setup error.", "user", c.username, "query", stmt, "error", err)
+			slog.Error("Multi-stmt-ext setup error.", "user", c.username, "query", stmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
@@ -2156,7 +2163,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
-			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "query", finalStmt, "error", err)
+			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -2174,7 +2181,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
-			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "query", finalStmt, "error", err)
+			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
@@ -2197,7 +2204,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		slog.Error("Failed to get column info.", "user", c.username, "query", query, "error", err)
+		slog.Error("Failed to get column info.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -2205,7 +2212,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		slog.Error("Failed to get column types.", "user", c.username, "query", query, "error", err)
+		slog.Error("Failed to get column types.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return
@@ -2234,7 +2241,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err)
+			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			return
@@ -2250,7 +2257,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 		if isQueryCancelled(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
-			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err)
+			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.sendError("ERROR", "42000", err.Error())
 		}
 		c.setTxError()
@@ -2268,7 +2275,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 	// Get column info
 	cols, err := rows.Columns()
 	if err != nil {
-		slog.Error("Failed to get column info.", "user", c.username, "query", query, "error", err)
+		slog.Error("Failed to get column info.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -2278,7 +2285,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		slog.Error("Failed to get column types.", "user", c.username, "query", query, "error", err)
+		slog.Error("Failed to get column types.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -2307,7 +2314,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
-			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err)
+			slog.Error("Failed to scan row.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -2325,7 +2332,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 		if isQueryCancelled(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
-			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err)
+			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.sendError("ERROR", "42000", err.Error())
 		}
 		c.setTxError()
@@ -3257,7 +3264,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	// Execute the query
 	rows, err := c.executor.Query(selectQuery)
 	if err != nil {
-		slog.Error("COPY TO query failed.", "user", c.username, "query", selectQuery, "error", err)
+		slog.Error("COPY TO query failed.", "user", c.username, "query", selectQuery, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
@@ -3269,7 +3276,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		slog.Error("COPY TO failed to get columns.", "user", c.username, "query", selectQuery, "error", err)
+		slog.Error("COPY TO failed to get columns.", "user", c.username, "query", selectQuery, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
@@ -3536,7 +3543,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	}
 	testRows, err := c.executor.Query(colQuery)
 	if err != nil {
-		slog.Error("COPY FROM table check failed.", "user", c.username, "table", tableName, "error", err)
+		slog.Error("COPY FROM table check failed.", "user", c.username, "table", tableName, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		errMsg := fmt.Sprintf("relation \"%s\" does not exist", tableName)
 		c.sendError("ERROR", "42P01", errMsg)
 		c.setTxError()
@@ -3580,7 +3587,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	// type conversions automatically and can load millions of rows in seconds.
 	tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
 	if err != nil {
-		slog.Error("COPY FROM STDIN failed to create temp file.", "user", c.username, "error", err)
+		slog.Error("COPY FROM STDIN failed to create temp file.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		errMsg := fmt.Sprintf("failed to create temp file: %v", err)
 		c.sendError("ERROR", "58000", errMsg)
 		c.setTxError()
@@ -3601,7 +3608,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	for {
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
-			slog.Error("COPY FROM STDIN error reading message.", "user", c.username, "error", err)
+			slog.Error("COPY FROM STDIN error reading message.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			_ = tmpFile.Close()
 			return err
 		}
@@ -3616,7 +3623,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			}
 			n, err := tmpFile.Write(body)
 			if err != nil {
-				slog.Error("COPY FROM STDIN failed to write to temp file.", "user", c.username, "error", err)
+				slog.Error("COPY FROM STDIN failed to write to temp file.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 				_ = tmpFile.Close()
 				errMsg := fmt.Sprintf("failed to write to temp file: %v", err)
 				c.sendError("ERROR", "58000", errMsg)
@@ -3645,7 +3652,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 
 			result, err := c.executor.Exec(copySQL)
 			if err != nil {
-				slog.Error("COPY FROM STDIN DuckDB COPY failed.", "user", c.username, "error", err)
+				slog.Error("COPY FROM STDIN DuckDB COPY failed.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -3784,7 +3791,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			loadStart := time.Now()
 			rowCount, err := c.batchInsertRows(opts.TableName, opts.ColumnList, cols, rows)
 			if err != nil {
-				slog.Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "user", c.username, "error", err)
+				slog.Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -3849,7 +3856,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 	for {
 		msgType, body, err := readMessage(c.reader)
 		if err != nil {
-			slog.Error("COPY FROM STDIN binary: error reading message.", "user", c.username, "error", err)
+			slog.Error("COPY FROM STDIN binary: error reading message.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			return err
 		}
 
@@ -3862,7 +3869,7 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 			data := buf.Bytes()
 			rowCount, err := c.parseBinaryCopyAndInsert(data, opts.TableName, opts.ColumnList, cols, typeOIDs)
 			if err != nil {
-				slog.Error("COPY FROM STDIN binary: parse/insert failed.", "user", c.username, "error", err)
+				slog.Error("COPY FROM STDIN binary: parse/insert failed.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
@@ -5256,7 +5263,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				if isQueryCancelled(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
-					logQueryError(c.username, convertedQuery, err)
+					c.logQueryError(convertedQuery, err)
 				}
 				c.sendError("ERROR", errCode, errMsg)
 				c.setTxError()
@@ -5302,7 +5309,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		if isQueryCancelled(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
-			logQueryError(c.username, convertedQuery, err)
+			c.logQueryError(convertedQuery, err)
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
@@ -5313,7 +5320,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		slog.Error("Columns error.", "user", c.username, "error", err)
+		slog.Error("Columns error.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
@@ -5373,7 +5380,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			errMsg = "canceling statement due to user request"
 			c.sendError("ERROR", errCode, errMsg)
 		} else {
-			slog.Error("Row iteration error.", "user", c.username, "error", err)
+			slog.Error("Row iteration error.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
