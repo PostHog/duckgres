@@ -28,6 +28,7 @@ type ManagedWorker struct {
 	ID                      int
 	podName                 string
 	nodeName                string //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
+	image                   string //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
 	cmd                     *exec.Cmd
 	socketPath              string
 	bearerToken             string

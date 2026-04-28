@@ -67,18 +67,19 @@ type K8sWorkerPoolConfig struct {
 	WorkerNodeSelector    map[string]string // Node selector for worker pods. Nil = no selector.
 	WorkerTolerationKey   string            // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
 	WorkerTolerationValue string            // Taint value for worker pod NoSchedule toleration.
-	WorkerExclusiveNode   bool              // One worker per node via pod anti-affinity.
-	OrgID                 string            // Org ID for pod labels (multi-tenant mode)
-	WorkerIDGenerator     func() int        // Shared ID generator across orgs (nil = internal counter)
-	RuntimeStore          RuntimeWorkerStore
+	WorkerExclusiveNode bool                             // One worker per node via pod anti-affinity.
+	OrgID               string                           // Org ID for pod labels (multi-tenant mode)
+	WorkerIDGenerator   func() int                       // Shared ID generator across orgs (nil = internal counter)
+	ResolveOrgConfig    func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
+	RuntimeStore        RuntimeWorkerStore
 }
 
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
-	ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, error)
+	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, error)
 	ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, error)
-	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
-	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
+	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
+	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
 	RetireIdleWorker(workerID int, reason string) (bool, error)

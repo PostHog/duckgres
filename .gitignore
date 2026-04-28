@@ -32,6 +32,7 @@ Thumbs.db
 *.out
 coverage.html
 duckgres.yaml
+duckgres_local_test.yaml
 artifacts/perf/
 
 .gemini/

@@ -478,7 +478,7 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "worker_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "pod_uid", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert worker record: %w", err)
 	}
@@ -526,7 +526,7 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // The selected row is locked with SKIP LOCKED and transitioned to reserved while
 // incrementing owner_epoch. When maxOrgWorkers is set, org claims are serialized
 // under the same advisory lock used for spawn-slot allocation.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*WorkerRecord, error) {
 	var claimed *WorkerRecord
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
 		if orgID != "" {
@@ -545,11 +545,15 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWo
 		}
 
 		var current WorkerRecord
-		err := tx.Table(cs.runtimeTable(current.TableName())).
+		query := tx.Table(cs.runtimeTable(current.TableName())).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("state = ?", WorkerStateIdle).
-			Order("worker_id ASC").
-			Take(&current).Error
+			Where("state = ?", WorkerStateIdle)
+
+		if image != "" {
+			query = query.Where("image = ?", image)
+		}
+
+		err := query.Order("worker_id ASC").Take(&current).Error
 		if err != nil {
 			if err == gorm.ErrRecordNotFound {
 				return nil
@@ -789,7 +793,7 @@ func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID str
 
 // CreateSpawningWorkerSlot creates a durable spawning worker row under advisory-lock
 // protected org/global capacity checks. A nil result means capacity blocked the spawn.
-func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
 	if strings.TrimSpace(podNamePrefix) == "" {
 		return nil, fmt.Errorf("pod name prefix is required")
 	}
@@ -833,6 +837,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string,
 		record := &WorkerRecord{
 			WorkerID:          int(workerID),
 			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
+			Image:             image,
 			State:             WorkerStateSpawning,
 			OrgID:             orgID,
 			OwnerCPInstanceID: ownerCPInstanceID,
@@ -855,7 +860,7 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string,
 // neutral warm pool under advisory-lock protected cluster-wide warm-target and
 // global capacity checks. A nil result means capacity already satisfies the target
 // or the global worker cap blocked the spawn.
-func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*WorkerRecord, error) {
 	if strings.TrimSpace(podNamePrefix) == "" {
 		return nil, fmt.Errorf("pod name prefix is required")
 	}
@@ -897,6 +902,7 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 		record := &WorkerRecord{
 			WorkerID:          int(workerID),
 			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
+			Image:             image,
 			State:             WorkerStateSpawning,
 			OrgID:             "",
 			OwnerCPInstanceID: ownerCPInstanceID,

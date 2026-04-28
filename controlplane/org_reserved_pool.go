@@ -16,15 +16,17 @@ type OrgReservedPool struct {
 	shared                 *K8sWorkerPool
 	orgID                  string
 	maxWorkers             int
+	image                  string
 	stsBroker              *STSBroker
 	activateReservedWorker func(context.Context, *ManagedWorker) error
 }
 
-func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, stsBroker *STSBroker) *OrgReservedPool {
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker) *OrgReservedPool {
 	pool := &OrgReservedPool{
 		shared:     shared,
 		orgID:      orgID,
 		maxWorkers: maxWorkers,
+		image:      image,
 		stsBroker:  stsBroker,
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
@@ -58,10 +60,14 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 
 		assignedCount := p.assignedWorkerCountLocked()
 		if p.maxWorkers == 0 || assignedCount < p.maxWorkers {
+			maxWorkers := p.maxWorkers
+			image := p.image
 			p.shared.mu.Unlock()
 
 			worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-				OrgID: p.orgID,
+				OrgID:      p.orgID,
+				MaxWorkers: maxWorkers,
+				Image:      image,
 			})
 			if err != nil {
 				return nil, err
@@ -141,6 +147,12 @@ func (p *OrgReservedPool) SetMaxWorkers(n int) {
 	p.shared.mu.Lock()
 	defer p.shared.mu.Unlock()
 	p.maxWorkers = n
+}
+
+func (p *OrgReservedPool) SetWorkerImage(image string) {
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	p.image = image
 }
 
 func (p *OrgReservedPool) ShutdownAll() {
@@ -273,9 +285,15 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 }
 
 func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error) {
+	p.shared.mu.RLock()
+	maxWorkers := p.maxWorkers
+	image := p.image
+	p.shared.mu.RUnlock()
+
 	worker, err := p.shared.claimSpecificWorker(ctx, workerID, ownerEpoch, &WorkerAssignment{
 		OrgID:      p.orgID,
-		MaxWorkers: p.maxWorkers,
+		MaxWorkers: maxWorkers,
+		Image:      image,
 	})
 	if err != nil {
 		return nil, err

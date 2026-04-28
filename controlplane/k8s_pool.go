@@ -60,14 +60,15 @@ type K8sWorkerPool struct {
 	configPath            string
 	imagePullPolicy       corev1.PullPolicy
 	serviceAccount        string
-	workerCPURequest      string            // CPU request for worker pods (e.g., "500m")
-	workerMemoryRequest   string            // memory request for worker pods (e.g., "1Gi")
-	workerNodeSelector    map[string]string // node selector for worker pods
-	workerTolerationKey   string            // taint key for NoSchedule toleration
-	workerTolerationValue string            // taint value for NoSchedule toleration
-	workerExclusiveNode   bool              // one worker per node via anti-affinity
-	orgID                 string            // org ID for pod labels (multi-tenant mode)
-	workerIDGenerator     func() int        // shared ID generator across orgs (nil = internal counter)
+	workerCPURequest      string                                       // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest   string                                       // memory request for worker pods (e.g., "1Gi")
+	workerNodeSelector    map[string]string                            // node selector for worker pods
+	workerTolerationKey   string                                       // taint key for NoSchedule toleration
+	workerTolerationValue string                                       // taint value for NoSchedule toleration
+	workerExclusiveNode   bool                                         // one worker per node via anti-affinity
+	orgID                 string                                       // org ID for pod labels (multi-tenant mode)
+	workerIDGenerator     func() int                                   // shared ID generator across orgs (nil = internal counter)
+	resolveOrgConfig      func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping
 	informer              cache.SharedIndexInformer
 	stopInform            chan struct{}
 	spawnSem              chan struct{} // limits concurrent pod creates to avoid overwhelming the K8s API
@@ -163,6 +164,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerExclusiveNode:   cfg.WorkerExclusiveNode,
 		orgID:                 cfg.OrgID,
 		workerIDGenerator:     cfg.WorkerIDGenerator,
+		resolveOrgConfig:      cfg.ResolveOrgConfig,
 		runtimeStore:          cfg.RuntimeStore,
 		spawnSem:              make(chan struct{}, spawnConcurrency),
 		retireSem:             make(chan struct{}, retireConcurrency),
@@ -228,9 +230,6 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		if label == "" {
 			continue
 		}
-		if trimK8sPodHashSuffix(label) == myVersion {
-			continue
-		}
 		idStr := pod.Labels["duckgres/worker-id"]
 		if idStr == "" {
 			continue
@@ -239,21 +238,71 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		if err != nil {
 			continue
 		}
-		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(workerID, "version_mismatch")
+
+		var record *configstore.WorkerRecord
+		if p.runtimeStore != nil {
+			var err error
+			record, err = p.runtimeStore.GetWorkerRecord(workerID)
+			if err != nil {
+				slog.Warn("Version-aware reaper failed to load worker record.", "worker_id", workerID, "error", err)
+			}
+		}
+
+		// Resolve the target version for this specific pod.
+		// For neutral workers, the target is the global binary version.
+		// For assigned workers, the target is the tenant's configured image.
+		var isMismatched bool
+		podOrgID := pod.Labels["duckgres/org"]
+		if podOrgID == "" && record != nil {
+			podOrgID = record.OrgID
+		}
+
+		if podOrgID != "" && p.resolveOrgConfig != nil {
+			// Per-tenant version check
+			org, err := p.resolveOrgConfig(podOrgID)
+			if err != nil {
+				// Best-effort: skip if we can't resolve config this tick
+				continue
+			}
+			targetImage := p.workerImage
+			if org.Warehouse != nil && org.Warehouse.Image != "" {
+				targetImage = org.Warehouse.Image
+			}
+
+			actualImage := workerImageForPod(&pod)
+			if actualImage == "" && record != nil {
+				actualImage = record.Image
+			}
+			if actualImage != "" && actualImage != targetImage {
+				isMismatched = true
+				slog.Debug("Detected per-tenant worker image mismatch.",
+					"org", podOrgID, "pod", pod.Name, "actual", actualImage, "target", targetImage)
+			}
+		} else {
+			// Global CP binary version check
+			if trimK8sPodHashSuffix(label) != myVersion {
+				isMismatched = true
+			}
+		}
+
+		if !isMismatched {
+			continue
+		}
+
+		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(workerID, RetireReasonMismatchedVersion)
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
 		}
 		if !retired {
-			// Not currently idle (busy, reserved, hot-idle, or already
+			// Not currently idle or hot-idle (busy, reserved, or already
 			// retired). Leave it for a later tick.
 			continue
 		}
 		slog.Info("Retiring mismatched-version worker pod.",
 			"worker_id", workerID,
+			"org", podOrgID,
 			"pod", pod.Name,
-			"pod_version", trimK8sPodHashSuffix(label),
-			"my_version", myVersion,
 		)
 		gracePeriod := int64(10)
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
@@ -264,6 +313,16 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		return true
 	}
 	return false
+}
+
+func workerImageForPod(pod *corev1.Pod) string {
+	for _, container := range pod.Spec.Containers {
+		if container.Name == "duckdb-worker" {
+			return container.Image
+		}
+	}
+	slog.Debug("workerImageForPod: duckdb-worker container not found in pod spec.", "pod", pod.Name)
+	return ""
 }
 
 // cleanupOrphanedWorkerPods deletes worker pods whose DB row is in a terminal
@@ -445,7 +504,7 @@ func (p *K8sWorkerPool) onPodTerminated(pod *corev1.Pod) {
 // SpawnWorker creates a new worker pod and waits for it to become ready.
 // It acquires the spawn semaphore to limit concurrent K8s API calls and
 // retries transient API errors with exponential backoff.
-func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
+func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int, image string) error {
 	// Acquire spawn semaphore to limit concurrent pod creates.
 	select {
 	case p.spawnSem <- struct{}{}:
@@ -496,7 +555,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 			Containers: []corev1.Container{
 				{
 					Name:            "duckdb-worker",
-					Image:           p.workerImage,
+					Image:           image,
 					ImagePullPolicy: p.imagePullPolicy,
 					Args: []string{
 						"--mode", "duckdb-service",
@@ -714,6 +773,7 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int) error {
 		ID:          id,
 		podName:     podName,
 		nodeName:    ready.nodeName,
+		image:       image,
 		bearerToken: token,
 		client:      client,
 		done:        done,
@@ -950,7 +1010,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 					p.mu.Unlock()
 					slog.Debug("Assigned to least-loaded worker, spawning new worker in background.",
 						"worker", w.ID, "active_sessions", w.activeSessions, "background_worker", id)
-					go p.spawnWorkerBackground(id)
+					go p.spawnWorkerBackground(id, p.workerImage)
 				} else {
 					p.mu.Unlock()
 					slog.Debug("Assigned to least-loaded worker (at capacity).",
@@ -967,7 +1027,7 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 			p.mu.Unlock()
 
 			slog.Info("No live workers, blocking on spawn.", "worker", id)
-			err := p.SpawnWorker(ctx, id)
+			err := p.SpawnWorker(ctx, id, p.workerImage)
 
 			p.mu.Lock()
 			p.spawning--
@@ -1002,11 +1062,11 @@ func (p *K8sWorkerPool) AcquireWorker(ctx context.Context) (*ManagedWorker, erro
 
 // spawnWorkerBackground spawns a worker pod without blocking AcquireWorker.
 // The new worker becomes available for future sessions once ready.
-func (p *K8sWorkerPool) spawnWorkerBackground(id int) {
+func (p *K8sWorkerPool) spawnWorkerBackground(id int, image string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	err := p.spawnWarmWorker(ctx, id)
+	err := p.spawnWarmWorker(ctx, id, image)
 
 	p.mu.Lock()
 	p.spawning--
@@ -1260,18 +1320,25 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					return nil, err
 				}
 				if hotClaimed != nil {
-					worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)
-					if reserveErr == nil {
-						worker.hotIdleReclaimed = true
-						return worker, nil
+					// Check if image matches (hot-idle reclamation is strict on version)
+					if assignment.Image != "" && hotClaimed.Image != assignment.Image {
+						slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
+						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion)
+						// Fall through to neutral idle claim or spawn.
+					} else {
+						worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)
+						if reserveErr == nil {
+							worker.hotIdleReclaimed = true
+							return worker, nil
+						}
+						slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
+						p.retireClaimedWorker(hotClaimed, RetireReasonCrash)
+						// Fall through to neutral idle claim
 					}
-					slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
-					p.retireClaimedWorker(hotClaimed, RetireReasonCrash)
-					// Fall through to neutral idle claim
 				}
 			}
 
-			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.MaxWorkers)
+			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, assignment.MaxWorkers)
 			if err != nil {
 				return nil, err
 			}
@@ -1331,7 +1398,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			}
 
 			if shouldReplenish {
-				p.spawnWarmWorkerBackground(replenishID)
+				p.spawnWarmWorkerBackground(replenishID, p.workerImage)
 			}
 			return idle, nil
 		}
@@ -1339,9 +1406,14 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		liveCount := p.liveWorkerCountLocked()
 		if p.maxWorkers == 0 || liveCount < p.maxWorkers {
 			if p.runtimeStore != nil {
+				image := assignment.Image
+				if image == "" {
+					image = p.workerImage
+				}
 				slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
 					p.cpInstanceID,
 					assignment.OrgID,
+					image,
 					1,
 					p.workerPodNamePrefix(),
 					assignment.MaxWorkers,
@@ -1363,7 +1435,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				p.spawning++
 				p.mu.Unlock()
 
-				err = p.spawnWarmWorker(ctx, slot.WorkerID)
+				err = p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image)
 
 				p.mu.Lock()
 				p.spawning--
@@ -1383,7 +1455,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			p.spawning++
 			p.mu.Unlock()
 
-			err := p.spawnWarmWorker(ctx, id)
+			err := p.spawnWarmWorker(ctx, id, p.workerImage)
 
 			p.mu.Lock()
 			p.spawning--
@@ -1490,6 +1562,11 @@ func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, e
 	if record == nil {
 		return nil, fmt.Errorf("worker %d could not be claimed", workerID)
 	}
+
+	if assignment.Image != "" && record.Image != assignment.Image {
+		return nil, fmt.Errorf("worker %d image mismatch (expected %q, got %q)", workerID, assignment.Image, record.Image)
+	}
+
 	return p.reserveClaimedWorker(ctx, record, assignment)
 }
 
@@ -1522,6 +1599,7 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	worker := &ManagedWorker{
 		ID:          claimed.WorkerID,
 		podName:     claimed.PodName,
+		image:       claimed.Image,
 		bearerToken: token,
 		client:      client,
 		done:        make(chan struct{}),
@@ -1596,6 +1674,12 @@ func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podNam
 }
 
 func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string) {
+	if p.runtimeStore != nil {
+		// Mark retired in DB immediately so the next capacity check doesn't
+		// count this slot.
+		_, _ = p.runtimeStore.RetireIdleOrHotIdleWorker(claimed.WorkerID, reason)
+	}
+
 	worker := &ManagedWorker{
 		ID:      claimed.WorkerID,
 		podName: claimed.PodName,
@@ -1644,6 +1728,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 			slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
 				p.cpInstanceID,
 				p.workerPodNamePrefix(),
+				p.workerImage,
 				count,
 				p.maxWorkers,
 			)
@@ -1676,7 +1761,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 			wg.Add(1)
 			go func(i int, slot *configstore.WorkerRecord) {
 				defer wg.Done()
-				err := p.spawnWarmWorker(ctx, slot.WorkerID)
+				err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image)
 
 				p.mu.Lock()
 				p.spawning--
@@ -1723,7 +1808,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 		wg.Add(1)
 		go func(i int, id int) {
 			defer wg.Done()
-			err := p.spawnWarmWorker(ctx, id)
+			err := p.spawnWarmWorker(ctx, id, p.workerImage)
 
 			p.mu.Lock()
 			p.spawning--
@@ -1800,7 +1885,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						})
 						delCancel()
 						if shouldReplenish {
-							p.spawnWarmWorkerBackground(replacementID)
+							p.spawnWarmWorkerBackground(replacementID, p.workerImage)
 						}
 					default:
 						// Worker alive, do health check
@@ -1847,7 +1932,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 									_ = w.client.Close()
 								}
 								if shouldReplenish {
-									p.spawnWarmWorkerBackground(replacementID)
+									p.spawnWarmWorkerBackground(replacementID, p.workerImage)
 								}
 							}
 						} else {
@@ -2120,7 +2205,7 @@ func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
 			go p.retireWorkerPod(entry.id, entry.w)
 		}
 		for _, id := range spawnIDs {
-			p.spawnWarmWorkerBackground(id)
+			p.spawnWarmWorkerBackground(id, p.workerImage)
 		}
 	}
 }
@@ -2257,7 +2342,7 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	if removedAny {
 		observeControlPlaneWorkers(len(p.workers))
 		for _, id := range spawnIDs {
-			go p.spawnWarmWorkerBackground(id)
+			go p.spawnWarmWorkerBackground(id, p.workerImage)
 		}
 	}
 }
@@ -2372,11 +2457,15 @@ func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
 	return p.maxWorkers == 0 || liveCount < p.maxWorkers
 }
 
-func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int) error {
+func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int, image string) error {
 	if id <= 0 && p.runtimeStore != nil {
+		if image == "" {
+			image = p.workerImage
+		}
 		slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlot(
 			p.cpInstanceID,
 			p.workerPodNamePrefix(),
+			image,
 			p.minWorkers,
 			p.maxWorkers,
 		)
@@ -2387,19 +2476,20 @@ func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int) error {
 			return nil
 		}
 		id = slot.WorkerID
+		image = slot.Image
 	}
 	if p.spawnWarmWorkerFunc != nil {
 		return p.spawnWarmWorkerFunc(ctx, id)
 	}
-	return p.SpawnWorker(ctx, id)
+	return p.SpawnWorker(ctx, id, image)
 }
 
-func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int) {
+func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int, image string) {
 	if p.spawnWarmWorkerBackgroundFunc != nil {
 		p.spawnWarmWorkerBackgroundFunc(id)
 		return
 	}
-	go p.spawnWorkerBackground(id)
+	go p.spawnWorkerBackground(id, image)
 }
 
 func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
@@ -2444,6 +2534,7 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	record := &configstore.WorkerRecord{
 		WorkerID:          id,
 		PodName:           p.podNameForWorker(id),
+		Image:             p.workerImage,
 		State:             state,
 		OwnerCPInstanceID: p.cpInstanceID,
 		OwnerEpoch:        ownerEpoch,
@@ -2462,6 +2553,9 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 	}
 	record.PodName = p.workerPodName(worker)
 	record.OwnerCPInstanceID = worker.OwnerCPInstanceID()
+	if worker.image != "" {
+		record.Image = worker.image
+	}
 	if assignment := worker.SharedState().Assignment; assignment != nil {
 		record.OrgID = assignment.OrgID
 	}

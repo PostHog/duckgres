@@ -10,7 +10,9 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 - [Features](#features)
 - [Metrics](#metrics)
-- [Perf Runbook](#perf-runbook)
+- [Runbooks](#runbooks)
+  - [Perf Runbook](docs/perf-harness-runbook.md)
+  - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
   - [YAML Configuration](#yaml-configuration)
@@ -85,13 +87,11 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 - `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact publisher
 - `metrics-compose.yml` - Starts Prometheus and Grafana locally for metrics (Prometheus at http://localhost:9091, Grafana at http://localhost:3000)
 
-## Perf Runbook
+## Runbooks
 
-See [docs/perf-harness-runbook.md](docs/perf-harness-runbook.md) and [tests/perf/README.md](tests/perf/README.md) for local smoke and nightly operations, including:
-
-- Prod-us perf runner and Duckling topology
-- `duckgres_perf.query_results` publish path in `duckling-posthog`
-- Perf CSV artifact schema contract (`query_results.csv`)
+- [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.
+- [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
+- [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 
 ## Quick Start
 
