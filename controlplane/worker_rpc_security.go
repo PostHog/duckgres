@@ -122,7 +122,7 @@ func (p *K8sWorkerPool) ensureWorkerRPCSecret(ctx context.Context, podName strin
 		if _, err := p.clientset.CoreV1().Secrets(p.namespace).Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
 			return "", fmt.Errorf("update secret %s with worker RPC data: %w", secretName, err)
 		}
-		slog.Info("Populated missing worker RPC secret data.", "name", secretName, "pod", podName)
+		slog.Info("Populated missing worker RPC secret data.", "name", secretName, "worker_pod", podName)
 		return secretName, nil
 	}
 	if !k8serrors.IsNotFound(err) {
@@ -151,7 +151,7 @@ func (p *K8sWorkerPool) ensureWorkerRPCSecret(ctx context.Context, podName strin
 	if _, err := p.clientset.CoreV1().Secrets(p.namespace).Create(ctx, secret, metav1.CreateOptions{}); err != nil {
 		return "", fmt.Errorf("create secret %s: %w", secretName, err)
 	}
-	slog.Info("Created worker RPC secret.", "name", secretName, "pod", podName)
+	slog.Info("Created worker RPC secret.", "name", secretName, "worker_pod", podName)
 	return secretName, nil
 }
 
