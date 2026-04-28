@@ -54,46 +54,6 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
   - Top-level: `transpiler.go`, `config.go`, `boolpredicates.go`, `show_create.go`
   - `transform/`: individual transforms; see registered pipeline in `transpiler.go` `New()`
 
-## PostgreSQL Wire Protocol
-
-The server implements the PostgreSQL v3 protocol:
-
-### Message Types (server/protocol.go)
-- **Frontend (client→server)**: Query, Parse, Bind, Describe, Execute, Sync, Close, CopyData, CopyDone
-- **Backend (server→client)**: AuthOK, RowDescription, DataRow, CommandComplete, ReadyForQuery, CopyInResponse, CopyOutResponse
-
-### Query Flow
-1. Client sends Query message ('Q')
-2. Server parses SQL, rewrites pg_catalog references
-3. Server executes via DuckDB's database/sql driver
-4. Server sends RowDescription + DataRow messages
-5. Server sends CommandComplete + ReadyForQuery
-
-### Extended Query Protocol
-Supports prepared statements (Parse/Bind/Execute) for parameterized queries and binary result formats.
-
-## pg_catalog Compatibility
-
-psql and other clients expect PostgreSQL system catalogs. We provide compatibility by:
-
-1. **Creating views** in main schema (server/catalog.go `initPgCatalog()`):
-   - `pg_database`, `pg_class_full`, `pg_collation`, `pg_policy`, `pg_roles`
-   - `pg_statistic_ext`, `pg_publication`, `pg_publication_rel`, `pg_inherits`, etc.
-
-2. **Creating macros** for PostgreSQL functions (server/catalog.go):
-   - `pg_get_userbyid`, `pg_table_is_visible`, `format_type`, `pg_get_expr`
-   - `obj_description`, `col_description`, `pg_get_indexdef`, etc.
-
-3. **AST-based SQL transpilation** (transpiler/ package):
-   Parses PostgreSQL SQL into an AST via pg_query_go, applies an ordered transform pipeline, and deparses back to DuckDB SQL. See `transpiler/transform/` for the full set and `transpiler/transpiler.go` `New()` for the registered order. Notable transforms: PgCatalog, TypeCast, Version, SetShow, DDL (DuckLake mode), Placeholder, WritableCTE, OnConflict.
-
-## COPY Protocol (server/conn.go)
-
-Supports bulk data transfer:
-- **COPY TO STDOUT**: Streams query results to client
-- **COPY FROM STDIN**: Receives data from client, inserts row by row
-- Supports CSV format with HEADER, DELIMITER, and NULL options
-
 ## Run Modes
 
 - **standalone** (default): Single process, handles everything including TLS, auth, PG protocol, and DuckDB execution.
@@ -139,27 +99,6 @@ Note: `--mode` is CLI-only (not loadable from YAML/env). A handful of K8s pod-sc
 
 The project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available recipes for building, testing, running, metrics, and scripts.
 
-## Common Development Tasks
-
-### Adding a new pg_catalog view
-1. Add view creation SQL in `initPgCatalog()` in `catalog.go`
-2. If the view needs query rewriting (e.g., `pg_catalog.viewname` → `viewname`):
-   - Add mapping in `transpiler/transform/pgcatalog.go` in `pgCatalogViewMappings`
-
-### Adding a new PostgreSQL function
-1. Add `CREATE MACRO` in the `functions` slice in `initPgCatalog()`
-2. The transpiler automatically strips `pg_catalog.` prefix from function calls
-
-### Adding a new transform
-1. Create a new file in `transpiler/transform/` implementing the `Transform` interface
-2. Register the transform in `transpiler/transpiler.go` `New()` function
-3. Add tests in `transpiler/transpiler_test.go`
-
-### Adding protocol support
-1. Add message type constant in `protocol.go`
-2. Add write function (e.g., `writeCopyData()`)
-3. Handle in message loop in `conn.go`
-
 ## Dependencies
 
 - `github.com/duckdb/duckdb-go/v2` - DuckDB Go driver
@@ -173,40 +112,14 @@ The project uses [just](https://github.com/casey/just) as a command runner. Run 
 - Unmapped DuckDB types (MAP, STRUCT, UNION, ENUM, BIT) fall back to OidText
 - DML RETURNING is not supported via extended query protocol (see below)
 
-## DML RETURNING Detection (conn.go)
+## DML RETURNING Detection
 
-DML statements with RETURNING clauses produce result rows but **cannot be described without executing the mutation**. The extended query protocol's Describe step probes schema by executing the query, which would cause unintended side effects. We reject these at Describe time with SQLSTATE `0A000` (feature_not_supported).
+DML with RETURNING is rejected at extended-query Describe time with SQLSTATE `0A000` — the Describe path probes schema by executing the query, which would cause an unintended mutation. Detection lives in `isDMLReturning` and friends in `server/conn.go` (heuristic SQL-aware lexer, with any-depth scanning for WITH-prefixed writable CTEs). Invariants for anyone editing this code:
 
-### Architecture
-
-Three functions form the detection chain:
-
-- **`scanForReturning(upper, topLevelOnly)`** — SQL-aware lexer that scans for the RETURNING keyword while skipping strings (single-quoted, E-strings, dollar-quoted), double-quoted identifiers, block/line comments, and tracking parenthesis depth.
-- **`containsReturning(upper)`** — wrapper that matches RETURNING at depth 0 only. Used for plain DML (INSERT/UPDATE/DELETE prefix).
-- **`containsReturningAnyDepth(upper)`** — wrapper that matches RETURNING at any depth. Used for WITH-prefixed queries because writable CTEs place RETURNING inside `AS (...)` parens.
-- **`isDMLReturning(query)`** — top-level guard called from `handleDescribe`. Routes to depth-0 or any-depth scanning based on the query prefix.
-
-### Why WITH needs any-depth scanning
-
-In writable CTEs, RETURNING is syntactically required inside the CTE body:
-```sql
-WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d
---                       ^^^^^^^^^ depth 1, inside AS (...)
-```
-Depth-0-only scanning structurally cannot detect this. The any-depth scan accepts a small false-positive risk (a column literally named `returning` in a CTE) in exchange for preventing mutation during Describe.
-
-### Supporting functions
-
-- **`stripLeadingNoise(query)`** — loops `stripLeadingComments` + `TrimLeft` to handle interleaved parentheses, whitespace, and comments before the query keyword.
-- **`queryReturnsResults(query)`** — determines whether a query produces result rows (SELECT, WITH, VALUES, SHOW, DML RETURNING, etc.). Gates whether Describe attempts schema probing at all.
-
-### When modifying this code
-
-- **False negatives are dangerous** — the Describe path executes the query, causing unintended mutations. Err on the side of false positives.
-- **False positives are safe** — the client gets an error but no data corruption. A column named `returning` triggering the guard is acceptable.
-- All detection is heuristic (string scanning). If precision becomes critical, consider using `pg_query_go` AST parsing instead.
-- LIMIT 0 does NOT prevent CTE side effects — PostgreSQL CTEs are optimization fences, so writable CTEs execute even with LIMIT 0.
-- DuckDB does not currently support MERGE. If it adds MERGE RETURNING in the future, add `MERGE` to the prefix check in `isDMLReturning`.
+- **False negatives are dangerous** — they cause silent mutations during Describe. False positives are safe (just an error to the client). Err toward false positives.
+- All detection is heuristic string scanning. If precision becomes critical, switch to `pg_query_go` AST parsing.
+- LIMIT 0 does NOT prevent CTE side effects — Postgres CTEs are optimization fences, so writable CTEs execute even with LIMIT 0.
+- DuckDB does not currently support MERGE. If it adds MERGE RETURNING, add `MERGE` to the prefix check in `isDMLReturning`.
 
 ## TODO Reference
 
