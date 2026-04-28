@@ -491,7 +491,7 @@ func TestSharedWorkerActivatorDuckLakeVersionPrecedence(t *testing.T) {
 	}
 }
 
-	func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T) {
+func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T) {
 	clientset := fake.NewSimpleClientset(
 		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "fallback-org-metadata"},

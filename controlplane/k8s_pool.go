@@ -321,6 +321,7 @@ func workerImageForPod(pod *corev1.Pod) string {
 			return container.Image
 		}
 	}
+	slog.Debug("workerImageForPod: duckdb-worker container not found in pod spec.", "pod", pod.Name)
 	return ""
 }
 
