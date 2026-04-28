@@ -20,7 +20,7 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -67,7 +67,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
@@ -101,7 +101,7 @@ func TestOrgReservedPoolReleaseWorkerTransitionsToHotIdleOnLastSession(t *testin
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil)
 	pool.ReleaseWorker(worker.ID)
 
 	w, ok := shared.Worker(worker.ID)
@@ -129,7 +129,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	}
 
 	activated := false
-	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated = true
 		return nil
@@ -162,7 +162,7 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 		return nil
 	}
 
-	pool := NewOrgReservedPool(shared, "analytics", 2, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
 	activated := 0
 	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		activated++
@@ -200,7 +200,7 @@ func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testin
 	}
 	shared.workers[worker.ID] = worker
 
-	pool := NewOrgReservedPool(shared, "analytics", 1, nil)
+	pool := NewOrgReservedPool(shared, "analytics", 1, shared.workerImage, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()

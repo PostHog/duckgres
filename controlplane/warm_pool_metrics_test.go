@@ -161,7 +161,7 @@ func TestActivateWorkerForOrgUpdatesActivatingGauge(t *testing.T) {
 	pool.workers[1] = worker
 	observeWarmPoolLifecycleGauges(pool.workers)
 
-	orgPool := NewOrgReservedPool(pool, "org-1", 1, nil)
+	orgPool := NewOrgReservedPool(pool, "org-1", 1, pool.workerImage, nil)
 	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		assertGaugeValue(t, reservedWorkersGauge, 0)
 		assertGaugeValue(t, activatingWorkersGauge, 1)
@@ -182,7 +182,7 @@ func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *te
 	worker.reservedAt = time.Now().Add(-2 * time.Second)
 	pool.workers[1] = worker
 
-	orgPool := NewOrgReservedPool(pool, "org-1", 1, nil)
+	orgPool := NewOrgReservedPool(pool, "org-1", 1, pool.workerImage, nil)
 	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
 		nextState, err := worker.SharedState().Transition(WorkerLifecycleHot, nil)
 		if err != nil {

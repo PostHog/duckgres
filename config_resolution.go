@@ -31,6 +31,7 @@ type configCLIInputs struct {
 	MemoryRebalance             bool
 	DuckLakeDeltaCatalogEnabled bool
 	DuckLakeDeltaCatalogPath    string
+	DuckLakeDefaultSpecVersion  string
 	ProcessMinWorkers           int
 	ProcessMaxWorkers           int
 	ProcessRetireOnSessionEnd   bool
@@ -433,6 +434,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.K8s.SharedWarmTarget != 0 {
 			k8sSharedWarmTarget = fileCfg.K8s.SharedWarmTarget
 		}
+		if fileCfg.DuckLake.DefaultSpecVersion != "" {
+			cfg.DuckLake.SpecVersion = fileCfg.DuckLake.DefaultSpecVersion
+		}
 	}
 
 	if v := getenv("DUCKGRES_HOST"); v != "" {
@@ -570,6 +574,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		} else {
 			warn("Invalid DUCKGRES_DUCKLAKE_DATA_INLINING_ROW_LIMIT: " + err.Error())
 		}
+	}
+	if v := getenv("DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION"); v != "" {
+		cfg.DuckLake.SpecVersion = v
 	}
 	if v := getenv("DUCKGRES_PROCESS_ISOLATION"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -864,6 +871,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	}
 	if cli.Set["ducklake-delta-catalog-path"] {
 		cfg.DuckLake.DeltaCatalogPath = cli.DuckLakeDeltaCatalogPath
+	}
+	if cli.Set["ducklake-default-spec-version"] {
+		cfg.DuckLake.SpecVersion = cli.DuckLakeDefaultSpecVersion
 	}
 	if cli.Set["process-min-workers"] {
 		processMinWorkers = cli.ProcessMinWorkers

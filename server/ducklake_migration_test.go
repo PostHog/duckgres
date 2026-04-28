@@ -268,26 +268,14 @@ func TestVersionLessThan_Invalid(t *testing.T) {
 }
 
 func TestDuckLakeMigrationNeeded_FalseWhenError(t *testing.T) {
-	// Save and restore global state.
-	dlMigration.mu.Lock()
-	origDone := dlMigration.done
-	origNeeded := dlMigration.needed
-	origErr := dlMigration.err
-	dlMigration.mu.Unlock()
-	defer func() {
-		dlMigration.mu.Lock()
-		dlMigration.done = origDone
-		dlMigration.needed = origNeeded
-		dlMigration.err = origErr
-		dlMigration.mu.Unlock()
-	}()
+	connStr := "postgres://user@host/db"
+	dlMigrations.Store(connStr, &migrationState{
+		needed: true,
+		err:    fmt.Errorf("backup failed"),
+	})
+	defer dlMigrations.Delete(connStr)
 
-	dlMigration.mu.Lock()
-	dlMigration.needed = true
-	dlMigration.err = fmt.Errorf("backup failed")
-	dlMigration.mu.Unlock()
-
-	if duckLakeMigrationNeeded() {
+	if duckLakeMigrationNeeded(connStr) {
 		t.Error("duckLakeMigrationNeeded() should return false when err is set")
 	}
 }

@@ -379,7 +379,7 @@ func TestSharedWorkerActivatorPrefersSecretRefOverDucklingCR(t *testing.T) {
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			OrgID: "org-with-secretref",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
-				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
 			},
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace: "ns",
@@ -397,12 +397,101 @@ func TestSharedWorkerActivatorPrefersSecretRefOverDucklingCR(t *testing.T) {
 	// However, the CR resolver IS called since it's non-nil. The key check is that the
 	// final DSN uses the correct password.
 	_ = ducklingCalled
-	if got := req.DuckLake.MetadataStore; got != "postgres:host=host port=5432 user=u password=secret-ref-password dbname=db" {
+	if got := req.DuckLake.MetadataStore; got != "postgres:host= port=5432 user=u password=secret-ref-password dbname=db" {
 		t.Fatalf("expected secret-ref password in DSN, got %q", got)
 	}
 }
 
-func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T) {
+func TestSharedWorkerActivatorDuckLakeVersionPrecedence(t *testing.T) {
+	clientset := fake.NewSimpleClientset(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "test-org-metadata"},
+			Data:       map[string][]byte{"dsn": []byte("password")},
+		},
+	)
+	activator := &SharedWorkerActivator{
+		clientset:          clientset,
+		defaultNamespace:   "duckgres-workers",
+		defaultSpecVersion: "global-default",
+	}
+
+	worker := &ManagedWorker{ID: 7}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleReserved,
+		Assignment: &WorkerAssignment{OrgID: "test-org"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+
+	// Case 1: Per-org override
+	orgWithVersion := &configstore.OrgConfig{
+		Name: "test-org",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "test-org",
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Namespace: "tenant-a", Name: "test-org-metadata", Key: "dsn",
+			},
+			DuckLakeVersion: "tenant-specific",
+		},
+	}
+	activator.resolveOrgConfig = func(string) (*configstore.OrgConfig, error) { return orgWithVersion, nil }
+	activator.activateReservedWorker = func(ctx context.Context, w *ManagedWorker, payload TenantActivationPayload) error {
+		if payload.DuckLake.SpecVersion != "tenant-specific" {
+			t.Fatalf("Case 1: expected 'tenant-specific', got %q", payload.DuckLake.SpecVersion)
+		}
+		return nil
+	}
+	if err := activator.ActivateReservedWorker(context.Background(), worker); err != nil {
+		t.Fatalf("Case 1: %v", err)
+	}
+
+	// Case 2: Global default fallback
+	orgWithoutVersion := &configstore.OrgConfig{
+		Name: "test-org",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			OrgID: "test-org",
+			MetadataStore: configstore.ManagedWarehouseMetadataStore{
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
+			},
+			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
+				Namespace: "tenant-a",
+			},
+			MetadataStoreCredentials: configstore.SecretRef{
+				Namespace: "tenant-a", Name: "test-org-metadata", Key: "dsn",
+			},
+		},
+	}
+	activator.resolveOrgConfig = func(string) (*configstore.OrgConfig, error) { return orgWithoutVersion, nil }
+	activator.activateReservedWorker = func(ctx context.Context, w *ManagedWorker, payload TenantActivationPayload) error {
+		if payload.DuckLake.SpecVersion != "global-default" {
+			t.Fatalf("Case 2: expected 'global-default', got %q", payload.DuckLake.SpecVersion)
+		}
+		return nil
+	}
+	if err := activator.ActivateReservedWorker(context.Background(), worker); err != nil {
+		t.Fatalf("Case 2: %v", err)
+	}
+
+	// Case 3: Built-in default fallback
+	activator.defaultSpecVersion = ""
+	activator.activateReservedWorker = func(ctx context.Context, w *ManagedWorker, payload TenantActivationPayload) error {
+		if payload.DuckLake.SpecVersion != "1.0" { // server.DefaultDuckLakeSpecVersion
+			t.Fatalf("Case 3: expected '1.0', got %q", payload.DuckLake.SpecVersion)
+		}
+		return nil
+	}
+	if err := activator.ActivateReservedWorker(context.Background(), worker); err != nil {
+		t.Fatalf("Case 3: %v", err)
+	}
+}
+
+	func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T) {
 	clientset := fake.NewSimpleClientset(
 		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "fallback-org-metadata"},
@@ -423,7 +512,7 @@ func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			OrgID: "fallback-org",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
-				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
 			},
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace: "ns",
@@ -437,7 +526,7 @@ func TestSharedWorkerActivatorDucklingCRErrorFallsBackToConfigStore(t *testing.T
 		t.Fatalf("expected fallback to config store, got error: %v", err)
 	}
 
-	if got := req.DuckLake.MetadataStore; got != "postgres:host=host port=5432 user=u password=fallback-password dbname=db" {
+	if got := req.DuckLake.MetadataStore; got != "postgres:host= port=5432 user=u password=fallback-password dbname=db" {
 		t.Fatalf("expected fallback password in DSN, got %q", got)
 	}
 }
@@ -453,7 +542,7 @@ func TestSharedWorkerActivatorRejectsSecretRefOutsideTenantScope(t *testing.T) {
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			OrgID: "analytics",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
-				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
 			},
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace: "tenant-a",
@@ -484,7 +573,7 @@ func TestSharedWorkerActivatorRejectsSecretRefOutsideTenantPrefix(t *testing.T) 
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			OrgID: "analytics",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
-				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
 			},
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace: "tenant-a",
@@ -515,7 +604,7 @@ func TestSharedWorkerActivatorRejectsSecretRefWithoutTenantNamespace(t *testing.
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			OrgID: "analytics",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
-				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
 			},
 			MetadataStoreCredentials: configstore.SecretRef{
 				Name: "analytics-metadata",
@@ -542,7 +631,7 @@ func TestSharedWorkerActivatorRejectsSecretRefWithoutExplicitNamespace(t *testin
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			OrgID: "analytics",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
-				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
 			},
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace: "tenant-a",
@@ -594,7 +683,7 @@ func TestSharedWorkerActivatorRejectsSecretRefWithOnlySubstringOrgMatch(t *testi
 		Warehouse: &configstore.ManagedWarehouseConfig{
 			OrgID: "analytics",
 			MetadataStore: configstore.ManagedWarehouseMetadataStore{
-				Endpoint: "host", Port: 5432, Username: "u", DatabaseName: "db",
+				Endpoint: "", Port: 5432, Username: "u", DatabaseName: "db",
 			},
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace: "tenant-a",

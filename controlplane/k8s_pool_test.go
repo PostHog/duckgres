@@ -30,12 +30,14 @@ type captureRuntimeWorkerStore struct {
 	claimCalls            int
 	claimOwnerCPID        string
 	claimOrgID            string
+	claimImage            string
 	claimMaxOrgWorkers    int
 	spawned               *configstore.WorkerRecord
 	spawnErr              error
 	spawnCalls            int
 	spawnOwnerCPID        string
 	spawnOrgID            string
+	spawnImage            string
 	spawnOwnerEpoch       int64
 	spawnPodNamePrefix    string
 	spawnMaxOrgWorkers    int
@@ -46,6 +48,7 @@ type captureRuntimeWorkerStore struct {
 	neutralSpawnCalls     int
 	neutralSpawnOwnerCPID string
 	neutralSpawnPodPrefix string
+	neutralSpawnImage     string
 	neutralSpawnTarget    int
 	neutralSpawnMaxGlobal  int
 	hotIdleClaimResult     *configstore.WorkerRecord
@@ -104,12 +107,13 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	return out
 }
 
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
 	s.claimOwnerCPID = ownerCPInstanceID
 	s.claimOrgID = orgID
+	s.claimImage = image
 	s.claimMaxOrgWorkers = maxOrgWorkers
 	if s.claimErr != nil {
 		return nil, s.claimErr
@@ -133,12 +137,13 @@ func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID 
 	return nil, nil
 }
 
-func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.spawnCalls++
 	s.spawnOwnerCPID = ownerCPInstanceID
 	s.spawnOrgID = orgID
+	s.spawnImage = image
 	s.spawnOwnerEpoch = ownerEpoch
 	s.spawnPodNamePrefix = podNamePrefix
 	s.spawnMaxOrgWorkers = maxOrgWorkers
@@ -150,15 +155,17 @@ func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, 
 		return nil, nil
 	}
 	spawned := *s.spawned
+	spawned.OwnerEpoch = ownerEpoch
 	return &spawned, nil
 }
 
-func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.neutralSpawnCalls++
 	s.neutralSpawnOwnerCPID = ownerCPInstanceID
 	s.neutralSpawnPodPrefix = podNamePrefix
+	s.neutralSpawnImage = image
 	s.neutralSpawnTarget = targetWarmWorkers
 	s.neutralSpawnMaxGlobal = maxGlobalWorkers
 	if s.neutralSpawnErr != nil {
@@ -1190,6 +1197,95 @@ func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
 	}
 }
 
+func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	// Setup a hot-idle worker with "v1" image
+	w := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	if err := w.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{OrgID: "analytics", Image: "duckgres:v1"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[7] = w
+
+	store := &captureRuntimeWorkerStore{
+		hotIdleClaimResult: &configstore.WorkerRecord{
+			WorkerID: 7,
+			Image:    "duckgres:v1",
+		},
+		spawned: &configstore.WorkerRecord{
+			WorkerID: 42,
+			PodName:  "test-cp-worker-42",
+			Image:    "duckgres:v2",
+		},
+	}
+	pool.runtimeStore = store
+
+	// Org requests "v2" image
+	assignment := &WorkerAssignment{
+		OrgID: "analytics",
+		Image: "duckgres:v2",
+	}
+
+	// Mock spawnWarmWorker since we don't have real pods
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error { return nil }
+	// Mock health check since we don't have real worker binaries
+	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error { return nil }
+	// Mock connection since we don't have real pods
+	pool.connectWorkerFunc = func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
+		return nil, nil
+	}
+
+	// Provide a mock secret for the spawned pod (worker 42)
+	podName := "test-cp-worker-42"
+	secretName := pool.workerRPCSecretName(podName)
+
+	// Minimal valid PEM blocks for a self-signed cert/key to satisfy parsing.
+	certPEM := []byte("-----BEGIN CERTIFICATE-----\nMIICojCCAYqgAwIBAgIQI6v5m9mN6L3Xv8O5/0u/2zANBgkqhkiG9w0BAQsFADAV\nMRMwEQYDVQQDEwpkdWNra2dyZXMwHhcNMjYwNDI3MDEwODIyWhcNMjYwNTI3MDEw\nODIyWjAVMRMwEQYDVQQDEwpkdWNra2dyZXMwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC8u9+9\n-----END CERTIFICATE-----\n")
+	keyPEM := []byte("-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEAvLvf\n-----END RSA PRIVATE KEY-----\n")
+
+	_, _ = pool.clientset.CoreV1().Secrets(pool.namespace).Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName},
+		Data: map[string][]byte{
+			"bearer-token":      []byte("secret"),
+			"tls.crt":           certPEM,
+			"tls.key":           keyPEM,
+			"worker-rpc-ca.crt": certPEM,
+		},
+	}, metav1.CreateOptions{})
+
+	// Provide mock pod
+	_, _ = pool.clientset.CoreV1().Pods(pool.namespace).Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   podName,
+			Labels: map[string]string{"duckgres/worker-id": "42"},
+		},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIP:  "10.0.0.42",
+		},
+	}, metav1.CreateOptions{})
+
+	got, err := pool.ReserveSharedWorker(context.Background(), assignment)
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+
+	if got.ID != 42 {
+		t.Fatalf("expected to spawn new worker 42, got %d (v1 worker was incorrectly reclaimed)", got.ID)
+	}
+
+	// Verify v1 worker was retired
+	if store.retireIdleOrHotIdleCalls != 1 || store.retireIdleOrHotIdleCalledIDs[0] != 7 {
+		t.Fatalf("expected mismatched hot-idle worker 7 to be retired, got calls=%d ids=%v", store.retireIdleOrHotIdleCalls, store.retireIdleOrHotIdleCalledIDs)
+	}
+	if store.retireIdleOrHotIdleCalledReasons[0] != RetireReasonMismatchedVersion {
+		t.Fatalf("expected reason %q, got %q", RetireReasonMismatchedVersion, store.retireIdleOrHotIdleCalledReasons[0])
+	}
+}
+
 func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{
@@ -1272,7 +1368,7 @@ func TestK8sPoolSpawnWarmWorkerAllocatesRuntimeSlotWhenIDZero(t *testing.T) {
 		return nil
 	}
 
-	if err := pool.spawnWarmWorker(context.Background(), 0); err != nil {
+	if err := pool.spawnWarmWorker(context.Background(), 0, pool.workerImage); err != nil {
 		t.Fatalf("spawnWarmWorker: %v", err)
 	}
 	if spawnedID != 41 {
@@ -1555,7 +1651,7 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 	// real pod running, but we can verify the pod was created correctly.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = pool.SpawnWorker(ctx, 0)
+	_ = pool.SpawnWorker(ctx, 0, pool.workerImage)
 
 	pods, err := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{
 		LabelSelector: "duckgres/control-plane=test-cp",
@@ -2089,8 +2185,8 @@ func TestRetireOneMismatchedVersionWorker_RetiresOlderVersionIdleWorker(t *testi
 	if store.retireIdleOrHotIdleCalls != 1 || len(store.retireIdleOrHotIdleCalledIDs) != 1 || store.retireIdleOrHotIdleCalledIDs[0] != 7 {
 		t.Fatalf("expected one RetireIdleOrHotIdleWorker(7) call, got calls=%d ids=%v", store.retireIdleOrHotIdleCalls, store.retireIdleOrHotIdleCalledIDs)
 	}
-	if reason := store.retireIdleOrHotIdleCalledReasons[0]; reason != "version_mismatch" {
-		t.Fatalf("expected reason version_mismatch, got %q", reason)
+	if reason := store.retireIdleOrHotIdleCalledReasons[0]; reason != RetireReasonMismatchedVersion {
+		t.Fatalf("expected reason %q, got %q", RetireReasonMismatchedVersion, reason)
 	}
 	pods, _ := cs.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
 	if len(pods.Items) != 0 {

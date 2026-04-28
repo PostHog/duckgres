@@ -16,15 +16,17 @@ type OrgReservedPool struct {
 	shared                 *K8sWorkerPool
 	orgID                  string
 	maxWorkers             int
+	image                  string
 	stsBroker              *STSBroker
 	activateReservedWorker func(context.Context, *ManagedWorker) error
 }
 
-func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, stsBroker *STSBroker) *OrgReservedPool {
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker) *OrgReservedPool {
 	pool := &OrgReservedPool{
 		shared:     shared,
 		orgID:      orgID,
 		maxWorkers: maxWorkers,
+		image:      image,
 		stsBroker:  stsBroker,
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
@@ -61,7 +63,9 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			p.shared.mu.Unlock()
 
 			worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-				OrgID: p.orgID,
+				OrgID:      p.orgID,
+				MaxWorkers: p.maxWorkers,
+				Image:      p.image,
 			})
 			if err != nil {
 				return nil, err
@@ -276,6 +280,7 @@ func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID in
 	worker, err := p.shared.claimSpecificWorker(ctx, workerID, ownerEpoch, &WorkerAssignment{
 		OrgID:      p.orgID,
 		MaxWorkers: p.maxWorkers,
+		Image:      p.image,
 	})
 	if err != nil {
 		return nil, err
