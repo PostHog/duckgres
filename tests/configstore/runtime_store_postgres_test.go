@@ -599,6 +599,21 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertControlPlaneInstance(expired): %v", err)
 	}
+	// Insert the live CP that owns worker 62 below. Without this row, the
+	// dangling-owner branch of ListOrphanedWorkers would (correctly) flag
+	// worker 62 as an orphan; we need it to remain in the "stuck with a
+	// live owner" bucket here, since that's what ListStuckWorkers covers.
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-live:boot-b",
+		PodName:         "duckgres-live",
+		PodUID:          "pod-live",
+		BootID:          "boot-b",
+		State:           configstore.ControlPlaneInstanceStateActive,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(live): %v", err)
+	}
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          61,
 		PodName:           "duckgres-worker-61",
