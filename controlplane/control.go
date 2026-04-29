@@ -857,6 +857,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
+		// From here on, `database` reflects the SNI-resolved org. This is what
+		// gets passed to the worker as the logical database (drives the
+		// `current_database()` macro and pg_database view) so observability
+		// surfaces the actual routing decision rather than whatever the
+		// client typed in the startup packet.
+		database = effectiveDatabase
 	} else {
 		// Single-tenant: static users map
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
