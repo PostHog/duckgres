@@ -67,6 +67,10 @@ spec:
             - "/certs/server.key"
             - "--flight-port"
             - "8815"
+            - "--sni-routing-mode"
+            - "passthrough"
+            - "--managed-hostname-suffixes"
+            - ".dw.test.local"
             - "--config"
             - "/etc/duckgres/duckgres.yaml"
           ports:
