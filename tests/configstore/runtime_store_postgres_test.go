@@ -4,6 +4,7 @@ package configstore_test
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -598,6 +599,21 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertControlPlaneInstance(expired): %v", err)
 	}
+	// Insert the live CP that owns worker 62 below. Without this row, the
+	// dangling-owner branch of ListOrphanedWorkers would (correctly) flag
+	// worker 62 as an orphan; we need it to remain in the "stuck with a
+	// live owner" bucket here, since that's what ListStuckWorkers covers.
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-live:boot-b",
+		PodName:         "duckgres-live",
+		PodUID:          "pod-live",
+		BootID:          "boot-b",
+		State:           configstore.ControlPlaneInstanceStateActive,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(live): %v", err)
+	}
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          61,
 		PodName:           "duckgres-worker-61",
@@ -668,6 +684,193 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	}
 	if len(stuck) != 1 || stuck[0].WorkerID != 62 {
 		t.Fatalf("expected stuck worker 62, got %#v", stuck)
+	}
+}
+
+// TestListOrphanedWorkersIncludesOwnerlessIdleWorkers seeds a row that
+// reproduces the mw-dev incident: a neutral idle worker whose
+// owner_cp_instance_id is the empty string. Today's INNER JOIN against
+// the cp_instances table excludes such rows, so the orphan janitor never
+// retires them, the warm-target check counts them as live capacity, and
+// no new warm workers ever spawn. The fix LEFT JOINs and adds an explicit
+// "ownerless and stale" branch.
+func TestListOrphanedWorkersIncludesOwnerlessIdleWorkers(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
+
+	// Stale ownerless idle worker — exactly the row that gets stuck today.
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          77,
+		PodName:           "duckgres-worker-77",
+		State:             configstore.WorkerStateIdle,
+		OrgID:             "",
+		OwnerCPInstanceID: "",
+		OwnerEpoch:        0,
+		LastHeartbeatAt:   now.Add(-1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(ownerless idle): %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	if len(orphaned) != 1 || orphaned[0].WorkerID != 77 {
+		t.Fatalf("expected ownerless idle worker 77 to be returned as an orphan, got %#v", orphaned)
+	}
+}
+
+// TestListOrphanedWorkersIncludesDanglingOwnerWorkers covers the
+// "owner_cp_instance_id is set but no matching cp_instances row exists"
+// case — the CP row was hard-deleted (or somehow skipped insertion) but
+// the worker row is still active. Same blast radius as the ownerless
+// case: invisible to today's INNER JOIN.
+func TestListOrphanedWorkersIncludesDanglingOwnerWorkers(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          88,
+		PodName:           "duckgres-worker-88",
+		State:             configstore.WorkerStateIdle,
+		OrgID:             "",
+		OwnerCPInstanceID: "ghost-cp:boot-x", // no matching cp_instances row
+		OwnerEpoch:        0,
+		LastHeartbeatAt:   now.Add(-1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(dangling owner): %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	if len(orphaned) != 1 || orphaned[0].WorkerID != 88 {
+		t.Fatalf("expected dangling-owner idle worker 88 to be returned as an orphan, got %#v", orphaned)
+	}
+}
+
+// TestListOrphanedWorkersExcludesFreshOwnerlessWorker guards against
+// over-eager cleanup. The spawn path creates the worker pod first, then
+// inserts the DB row with a fresh heartbeat. There's also a brief window
+// during slot creation before the owner is stamped. Either way, a freshly-
+// stamped ownerless row must NOT be treated as an orphan, or we'd race
+// every spawn into the orphan retirement path.
+func TestListOrphanedWorkersExcludesFreshOwnerlessWorker(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          99,
+		PodName:           "duckgres-worker-99",
+		State:             configstore.WorkerStateIdle,
+		OrgID:             "",
+		OwnerCPInstanceID: "",
+		OwnerEpoch:        0,
+		LastHeartbeatAt:   now, // fresh
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(fresh ownerless): %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	if len(orphaned) != 0 {
+		t.Fatalf("expected fresh ownerless worker NOT to be returned as orphan, got %#v", orphaned)
+	}
+}
+
+// TestRetireOrphanWorkerHandlesAllActiveStates exercises the full set of
+// states that ListOrphanedWorkers can return. The existing
+// RetireIdleOrHotIdleWorker only transitions idle/hot_idle; for an orphan
+// stuck in spawning/reserved/activating/hot/draining, that's a no-op and
+// the row stays counted as live capacity. The new RetireOrphanWorker must
+// transition any of these to retired.
+func TestRetireOrphanWorkerHandlesAllActiveStates(t *testing.T) {
+	cases := []struct {
+		name  string
+		state configstore.WorkerState
+	}{
+		{"spawning", configstore.WorkerStateSpawning},
+		{"idle", configstore.WorkerStateIdle},
+		{"reserved", configstore.WorkerStateReserved},
+		{"activating", configstore.WorkerStateActivating},
+		{"hot", configstore.WorkerStateHot},
+		{"hot_idle", configstore.WorkerStateHotIdle},
+		{"draining", configstore.WorkerStateDraining},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newIsolatedConfigStore(t)
+			workerID := 1000 + i
+
+			if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+				WorkerID:          workerID,
+				PodName:           fmt.Sprintf("duckgres-worker-%d", workerID),
+				State:             tc.state,
+				OwnerCPInstanceID: "",
+				LastHeartbeatAt:   time.Now().Add(-1 * time.Hour),
+			}); err != nil {
+				t.Fatalf("UpsertWorkerRecord(%s): %v", tc.state, err)
+			}
+
+			retired, err := store.RetireOrphanWorker(workerID, "test_orphan_cleanup")
+			if err != nil {
+				t.Fatalf("RetireOrphanWorker(%s): %v", tc.state, err)
+			}
+			if !retired {
+				t.Fatalf("expected RetireOrphanWorker(%s) to transition the row, returned false", tc.state)
+			}
+
+			// Verify final DB state via a follow-up no-op call (returns false).
+			retiredAgain, err := store.RetireOrphanWorker(workerID, "test_orphan_cleanup")
+			if err != nil {
+				t.Fatalf("RetireOrphanWorker(%s) follow-up: %v", tc.state, err)
+			}
+			if retiredAgain {
+				t.Fatalf("RetireOrphanWorker(%s) was called twice; the second call should be a no-op", tc.state)
+			}
+		})
+	}
+}
+
+// TestRetireOrphanWorkerNoOpOnTerminalStates: terminal rows (retired/lost)
+// must not be touched. They're already done; transitioning them again
+// would clobber retire_reason / updated_at and could mask original
+// failure data.
+func TestRetireOrphanWorkerNoOpOnTerminalStates(t *testing.T) {
+	cases := []struct {
+		name  string
+		state configstore.WorkerState
+	}{
+		{"retired", configstore.WorkerStateRetired},
+		{"lost", configstore.WorkerStateLost},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newIsolatedConfigStore(t)
+			workerID := 2000 + i
+
+			if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+				WorkerID:          workerID,
+				PodName:           fmt.Sprintf("duckgres-worker-%d", workerID),
+				State:             tc.state,
+				OwnerCPInstanceID: "",
+				LastHeartbeatAt:   time.Now().Add(-1 * time.Hour),
+				RetireReason:      "original_reason",
+			}); err != nil {
+				t.Fatalf("UpsertWorkerRecord(%s): %v", tc.state, err)
+			}
+
+			retired, err := store.RetireOrphanWorker(workerID, "should_be_ignored")
+			if err != nil {
+				t.Fatalf("RetireOrphanWorker(%s): %v", tc.state, err)
+			}
+			if retired {
+				t.Fatalf("RetireOrphanWorker on terminal %s should be a no-op, but returned true", tc.state)
+			}
+		})
 	}
 }
 

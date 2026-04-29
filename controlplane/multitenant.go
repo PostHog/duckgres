@@ -238,6 +238,9 @@ func SetupMultiTenant(
 	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
 		router.sharedPool.retireClaimedWorker(&record, reason)
 	}
+	janitor.retireOrphanWorker = func(record configstore.WorkerRecord, reason string) {
+		router.sharedPool.retireOrphanWorker(&record, reason)
+	}
 	janitor.retireLocalWorker = func(workerID int, reason string) bool {
 		return router.sharedPool.retireWorkerWithReason(workerID, reason)
 	}
