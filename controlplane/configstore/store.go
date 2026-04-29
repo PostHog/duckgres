@@ -678,6 +678,23 @@ func (cs *ConfigStore) RetireIdleWorker(workerID int, reason string) (bool, erro
 	return result.RowsAffected > 0, nil
 }
 
+// RetireOrphanWorker is the orphan-cleanup counterpart to
+// RetireIdleOrHotIdleWorker. Whereas the latter only handles `idle` /
+// `hot_idle`, this method transitions a worker to `retired` from any
+// active state (spawning, idle, reserved, activating, hot, hot_idle,
+// draining). That breadth is safe in the orphan path because by the time
+// orphan cleanup picks up the row, no live CP could still be acting on
+// it (the owner CP is expired or absent) — so we can short-circuit the
+// state-machine guards and just terminate the row.
+//
+// Returns true if a row transitioned, false if the row was already
+// terminal (`retired` / `lost`) or no row matches the given worker_id.
+//
+// TODO: replace stub with real implementation.
+func (cs *ConfigStore) RetireOrphanWorker(workerID int, reason string) (bool, error) {
+	return false, nil
+}
+
 // RetireIdleOrHotIdleWorker atomically transitions a worker from idle or hot_idle
 // to retired. Returns true if the transition happened, false if the worker was
 // in some other state (e.g. claimed/activating/hot).
