@@ -35,7 +35,8 @@ type ControlPlaneJanitor struct {
 	hotIdleTTL                    time.Duration
 	now                           func() time.Time
 	retireWorker                  func(record configstore.WorkerRecord, reason string)
-	retireLocalWorker             func(workerID int, reason string) bool // retires from in-memory pool + pod, returns false if not local
+	retireOrphanWorker            func(record configstore.WorkerRecord, reason string) // orphan-cleanup variant: handles any active state, skips local-pool bookkeeping
+	retireLocalWorker             func(workerID int, reason string) bool               // retires from in-memory pool + pod, returns false if not local
 	reconcileWarmCapacity         func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
@@ -104,8 +105,19 @@ func (j *ControlPlaneJanitor) runOnce() {
 	if err != nil {
 		slog.Warn("Janitor failed to list orphaned workers.", "error", err)
 	} else {
+		if len(orphaned) > 0 {
+			slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
+		}
 		for _, worker := range orphaned {
-			j.retireRuntimeWorker(worker, janitorRetireReasonOrphaned)
+			// Prefer the orphan-specific retire path so workers in any
+			// active state transition to retired (not just idle/hot_idle
+			// like the older retireRuntimeWorker chain). Fall back to the
+			// legacy path if a caller hasn't wired the new lambda.
+			if j.retireOrphanWorker != nil {
+				j.retireOrphanWorker(worker, janitorRetireReasonOrphaned)
+			} else {
+				j.retireRuntimeWorker(worker, janitorRetireReasonOrphaned)
+			}
 		}
 	}
 

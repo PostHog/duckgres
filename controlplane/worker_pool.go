@@ -84,6 +84,7 @@ type RuntimeWorkerStore interface {
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
 	RetireIdleWorker(workerID int, reason string) (bool, error)
 	RetireIdleOrHotIdleWorker(workerID int, reason string) (bool, error)
+	RetireOrphanWorker(workerID int, reason string) (bool, error)
 	MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error)
 	RetireDrainingWorker(workerID int, reason string) (bool, error)
 }

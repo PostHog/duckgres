@@ -70,6 +70,10 @@ type captureRuntimeWorkerStore struct {
 	retireIdleOrHotIdleCalledReasons []string
 	retireIdleOrHotIdleErr           error
 	retireIdleOrHotIdleMisses        map[int]bool
+	retireOrphanCalls                int
+	retireOrphanCalledIDs            []int
+	retireOrphanCalledReasons        []string
+	retireOrphanErr                  error
 	preloadedRecords                 map[int]*configstore.WorkerRecord
 	getRecordErrIDs                  map[int]error
 	markDrainingCalls                int
@@ -257,6 +261,18 @@ func (s *captureRuntimeWorkerStore) RetireIdleOrHotIdleWorker(workerID int, reas
 	}
 	if s.retireIdleOrHotIdleMisses[workerID] {
 		return false, nil
+	}
+	return true, nil
+}
+
+func (s *captureRuntimeWorkerStore) RetireOrphanWorker(workerID int, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retireOrphanCalls++
+	s.retireOrphanCalledIDs = append(s.retireOrphanCalledIDs, workerID)
+	s.retireOrphanCalledReasons = append(s.retireOrphanCalledReasons, reason)
+	if s.retireOrphanErr != nil {
+		return false, s.retireOrphanErr
 	}
 	return true, nil
 }

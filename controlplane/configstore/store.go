@@ -689,10 +689,27 @@ func (cs *ConfigStore) RetireIdleWorker(workerID int, reason string) (bool, erro
 //
 // Returns true if a row transitioned, false if the row was already
 // terminal (`retired` / `lost`) or no row matches the given worker_id.
-//
-// TODO: replace stub with real implementation.
 func (cs *ConfigStore) RetireOrphanWorker(workerID int, reason string) (bool, error) {
-	return false, nil
+	cleanupStates := []WorkerState{
+		WorkerStateSpawning,
+		WorkerStateIdle,
+		WorkerStateReserved,
+		WorkerStateActivating,
+		WorkerStateHot,
+		WorkerStateHotIdle,
+		WorkerStateDraining,
+	}
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND state IN ?", workerID, cleanupStates).
+		Updates(map[string]any{
+			"state":         WorkerStateRetired,
+			"retire_reason": reason,
+			"updated_at":    time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("retire orphan worker %d: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // RetireIdleOrHotIdleWorker atomically transitions a worker from idle or hot_idle
@@ -938,14 +955,32 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 	return created, nil
 }
 
-// ListOrphanedWorkers returns workers whose owning control-plane instance has
-// already been marked expired long enough ago to pass the orphan grace cutoff.
-// Retired/lost rows are deliberately excluded: their pods are either already
-// gone (in which case re-listing the row would loop the janitor on a 404 from
-// the K8s delete forever) or were leaked when the previous CP died mid-delete.
-// That leak case is handled by the K8s label-based reconciler in
-// K8sWorkerPool.cleanupOrphanedWorkerPods, which runs every janitor tick on
-// the leader and deletes pods whose DB row is retired/lost or missing.
+// ListOrphanedWorkers returns workers in active states that no live CP
+// is responsible for any longer. Three independent failure modes are
+// covered, joined by OR:
+//
+//  1. The owning CP row exists and has been marked expired at least
+//     `before` ago. This is the canonical case — a CP died, the
+//     liveness janitor flipped its row to expired, the orphan grace
+//     elapsed, and now the worker is fair game.
+//  2. owner_cp_instance_id is empty / NULL and the worker hasn't
+//     heartbeat since `before`. Observed in production: rows whose
+//     owner string was lost end up invisible to (1)'s INNER JOIN and
+//     accumulate forever, blocking warm-pool replenishment because
+//     countNeutralWarmWorkers still counts them. The stale-heartbeat
+//     guard avoids racing the spawn path's create-then-stamp window.
+//  3. owner_cp_instance_id is set but no matching cp_instances row
+//     exists at all (hard-deleted somehow), and again the heartbeat
+//     is stale. Same shape as (2), different cause.
+//
+// Retired/lost rows are deliberately excluded — their pods are already
+// gone (or are reconciled by K8sWorkerPool.cleanupOrphanedWorkerPods).
+// Re-listing terminal rows here would loop the janitor on K8s 404s.
+//
+// The join switched from INNER to LEFT in Apr 2026 to handle (2)/(3);
+// the original implementation only handled (1). See
+// TestListOrphanedWorkers* in tests/configstore for the regression
+// fixtures.
 func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
 	cleanupStates := []WorkerState{
@@ -961,10 +996,19 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
 	err := cs.db.Table(workerTable+" AS w").
 		Select("w.*").
-		Joins("JOIN "+cpTable+" AS cp ON cp.id = w.owner_cp_instance_id").
+		Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = w.owner_cp_instance_id").
 		Where("w.state IN ?", cleanupStates).
-		Where("cp.state = ?", ControlPlaneInstanceStateExpired).
-		Where("cp.expired_at IS NOT NULL AND cp.expired_at <= ?", before).
+		Where(
+			// (1) owner CP exists and is expired long enough ago
+			"(cp.state = ? AND cp.expired_at IS NOT NULL AND cp.expired_at <= ?) "+
+				// (2) owner string is empty/NULL and heartbeat is stale
+				"OR (NULLIF(w.owner_cp_instance_id, '') IS NULL AND w.last_heartbeat_at <= ?) "+
+				// (3) owner string is set but no matching CP row, heartbeat stale
+				"OR (cp.id IS NULL AND NULLIF(w.owner_cp_instance_id, '') IS NOT NULL AND w.last_heartbeat_at <= ?)",
+			ControlPlaneInstanceStateExpired, before,
+			before,
+			before,
+		).
 		Order("w.worker_id ASC").
 		Find(&workers).Error
 	if err != nil {

@@ -1693,6 +1693,30 @@ func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, r
 	go p.retireWorkerPod(worker.ID, worker)
 }
 
+// retireOrphanWorker retires a worker the orphan janitor has identified
+// (its owning CP is expired, missing, or never existed). Unlike
+// retireClaimedWorker, this path skips the in-memory pool bookkeeping
+// (the worker isn't owned by this CP) and uses the broader
+// RetireOrphanWorker DB transition that handles every active state, not
+// just idle/hot_idle. The K8s pod delete is fire-and-forget and harmless
+// if the pod is already gone.
+func (p *K8sWorkerPool) retireOrphanWorker(record *configstore.WorkerRecord, reason string) {
+	if p.runtimeStore == nil || record == nil {
+		return
+	}
+	if _, err := p.runtimeStore.RetireOrphanWorker(record.WorkerID, reason); err != nil {
+		slog.Warn("Failed to retire orphan worker.",
+			"worker_id", record.WorkerID, "reason", reason, "error", err)
+		return
+	}
+	worker := &ManagedWorker{
+		ID:      record.WorkerID,
+		podName: record.PodName,
+		done:    make(chan struct{}),
+	}
+	go p.retireWorkerPod(worker.ID, worker)
+}
+
 func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker *ManagedWorker) error {
 	check := p.healthCheckFunc
 	if check == nil {
