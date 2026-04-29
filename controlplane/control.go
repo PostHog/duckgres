@@ -64,6 +64,25 @@ type ControlPlaneConfig struct {
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
 
+	// SNIRoutingMode controls hostname-based org routing. Values:
+	//   "" or "off"   - SNI is ignored; legacy database-param routing only
+	//                   (default).
+	//   "passthrough" - SNI determines org when it matches a managed suffix;
+	//                   otherwise fall back to legacy with a warn log
+	//                   identifying the legacy caller.
+	//   "enforce"     - Reject connections whose SNI doesn't match a managed
+	//                   suffix.
+	// Only consulted in multi-tenant control-plane builds (kubernetes tag);
+	// other builds always behave as "off".
+	SNIRoutingMode string
+
+	// ManagedHostnameSuffixes lists DNS suffixes (each starting with a dot)
+	// for which the TLS hostname is authoritative for org routing. When the
+	// SNI matches one of these suffixes, the single-label prefix is treated
+	// as the org name (e.g. SNI "acme.dw.us.postwh.com" with suffix
+	// ".dw.us.postwh.com" resolves to org "acme").
+	ManagedHostnameSuffixes []string
+
 	// DuckLakeDefaultSpecVersion is the global default DuckLake spec version
 	// used for migration checks when an org doesn't specify an override.
 	DuckLakeDefaultSpecVersion string
@@ -626,8 +645,13 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 	}
 }
 
-// extractOrgFromSNI parses the org identifier from the TLS ServerName.
-// "acme.warehouse.posthog.com" with base "warehouse.posthog.com" returns ("acme", true).
+// SNI routing modes (values for ControlPlaneConfig.SNIRoutingMode).
+const (
+	SNIRoutingOff         = "off"         // ignore SNI entirely (default)
+	SNIRoutingPassthrough = "passthrough" // prefer SNI; fall back + log on miss
+	SNIRoutingEnforce     = "enforce"     // reject connections without a managed hostname
+)
+
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
@@ -773,21 +797,58 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// User uniqueness is scoped to the org.
 	var orgID string
 	if cp.configStore != nil {
-		if database == "" {
+		// Resolve the effective database name based on SNI routing mode.
+		// "off"         - legacy: use the startup `database` param.
+		// "passthrough" - prefer SNI when it matches a managed suffix; fall
+		//                 back to `database` with a warn log otherwise.
+		// "enforce"     - require SNI to match a managed suffix; reject
+		//                 connections that don't.
+		sni := tlsConn.ConnectionState().ServerName
+		orgName, isManaged := cp.extractOrgFromSNI(sni)
+		effectiveDatabase := database
+		switch cp.cfg.SNIRoutingMode {
+		case SNIRoutingEnforce:
+			if !isManaged {
+				slog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
+					"sni", sni, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+				_ = server.WriteErrorResponse(writer, "FATAL", "08006",
+					"this server requires connecting via a managed hostname (e.g. <org>.dw.<env>.postwh.com)")
+				_ = writer.Flush()
+				return
+			}
+			effectiveDatabase = orgName
+		case SNIRoutingPassthrough:
+			if isManaged {
+				effectiveDatabase = orgName
+				if database != "" && database != orgName {
+					slog.Info("Postgres SNI overrides database param.",
+						"sni", sni, "sni_org", orgName, "database_param", database, "remote_addr", remoteAddr)
+				}
+			} else if sni == "" {
+				slog.Warn("Postgres client connected without SNI; please migrate to a managed hostname.",
+					"remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
+			} else {
+				slog.Warn("Postgres client using legacy hostname; please migrate to a managed hostname.",
+					"sni", sni, "remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
+			}
+		default: // SNIRoutingOff or unset — legacy behavior, no SNI handling
+		}
+
+		if effectiveDatabase == "" {
 			slog.Warn("Connection rejected: no database specified.", "remote_addr", remoteAddr)
 			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "database name is required")
 			_ = writer.Flush()
 			return
 		}
-		orgID = cp.configStore.ResolveDatabase(database)
+		orgID = cp.configStore.ResolveDatabase(effectiveDatabase)
 		if orgID == "" {
-			slog.Warn("Unknown database.", "database", database, "remote_addr", remoteAddr)
-			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", fmt.Sprintf("database %q does not exist", database))
+			slog.Warn("Unknown database.", "database", effectiveDatabase, "remote_addr", remoteAddr)
+			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", fmt.Sprintf("database %q does not exist", effectiveDatabase))
 			_ = writer.Flush()
 			return
 		}
 		if !cp.configStore.ValidateOrgUser(orgID, username, password) {
-			slog.Warn("Authentication failed.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr)
+			slog.Warn("Authentication failed.", "user", username, "org", orgID, "database", effectiveDatabase, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
 				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
@@ -796,6 +857,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
+		// From here on, `database` reflects the SNI-resolved org. This is what
+		// gets passed to the worker as the logical database (drives the
+		// `current_database()` macro and pg_database view) so observability
+		// surfaces the actual routing decision rather than whatever the
+		// client typed in the startup packet.
+		database = effectiveDatabase
 	} else {
 		// Single-tenant: static users map
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
@@ -1449,6 +1516,82 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 }
 
 // startFlightIngress creates and starts the Flight SQL ingress listener.
+// cpFlightCredentialValidator authenticates Flight SQL clients in
+// multi-tenant mode. It implements both flightsqlingress.CredentialValidator
+// (legacy: scan all orgs to find the user) and SNIAwareCredentialValidator
+// (preferred: derive org from SNI, scope to that org's users only).
+// Behavior is gated on cp.cfg.SNIRoutingMode just like the Postgres path.
+type cpFlightCredentialValidator struct {
+	cp          *ControlPlane
+	orgProvider *orgRoutedSessionProvider
+}
+
+func (v *cpFlightCredentialValidator) ValidateCredentials(username, password string) bool {
+	return v.ValidateCredentialsForSNI("", username, password)
+}
+
+func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, password string) bool {
+	cp := v.cp
+	orgName, isManaged := cp.extractOrgFromSNI(sni)
+
+	switch cp.cfg.SNIRoutingMode {
+	case SNIRoutingEnforce:
+		if !isManaged {
+			slog.Warn("Flight auth rejected: SNI does not match a managed hostname.",
+				"sni", sni, "user", username)
+			return false
+		}
+		return v.authForOrgName(sni, orgName, username, password)
+	case SNIRoutingPassthrough:
+		if isManaged {
+			return v.authForOrgName(sni, orgName, username, password)
+		}
+		if sni == "" {
+			slog.Warn("Flight client connected without SNI; please migrate to a managed hostname.",
+				"user", username)
+		} else {
+			slog.Warn("Flight client using legacy hostname; please migrate to a managed hostname.",
+				"sni", sni, "user", username)
+		}
+		return v.authByScan(username, password)
+	default: // SNIRoutingOff or unset
+		return v.authByScan(username, password)
+	}
+}
+
+// authForOrgName validates (username, password) against a single org
+// resolved from the SNI-derived org name. Used by enforce / matched-passthrough.
+func (v *cpFlightCredentialValidator) authForOrgName(sni, orgName, username, password string) bool {
+	cp := v.cp
+	orgID := cp.configStore.ResolveDatabase(orgName)
+	if orgID == "" {
+		slog.Warn("Flight client SNI references unknown org.",
+			"sni", sni, "sni_org", orgName, "user", username)
+		return false
+	}
+	if !cp.configStore.ValidateOrgUser(orgID, username, password) {
+		return false
+	}
+	v.orgProvider.mu.Lock()
+	v.orgProvider.userOrg[username] = orgID
+	v.orgProvider.mu.Unlock()
+	return true
+}
+
+// authByScan is the legacy Flight auth path: scan all orgs to find a user
+// matching (username, password). First match wins.
+func (v *cpFlightCredentialValidator) authByScan(username, password string) bool {
+	cp := v.cp
+	orgID, ok := cp.configStore.FindAndValidateUser(username, password)
+	if !ok {
+		return false
+	}
+	v.orgProvider.mu.Lock()
+	v.orgProvider.userOrg[username] = orgID
+	v.orgProvider.mu.Unlock()
+	return true
+}
+
 func (cp *ControlPlane) startFlightIngress() {
 	if cp.cfg.FlightPort <= 0 {
 		return
@@ -1460,22 +1603,17 @@ func (cp *ControlPlane) startFlightIngress() {
 	switch {
 	case cp.configStore != nil && cp.orgRouter != nil:
 		// Multi-tenant: auth via config store, sessions routed per-org.
-		// Flight SQL doesn't have SNI, so we scan orgs to find the user.
+		// When the client connected via a managed hostname, the SNI is
+		// authoritative for org routing; otherwise we fall back to scanning
+		// orgs by (username, password) and log a warning so legacy callers
+		// can be migrated.
 		orgProvider := &orgRoutedSessionProvider{
 			orgRouter:   cp.orgRouter,
 			configStore: cp.configStore,
 			pidSession:  make(map[int32]flightOwnedSession),
 			userOrg:     make(map[string]string),
 		}
-		validator = flightsqlingress.FuncCredentialValidator(func(username, password string) bool {
-			orgID, ok := cp.configStore.FindAndValidateUser(username, password)
-			if ok {
-				orgProvider.mu.Lock()
-				orgProvider.userOrg[username] = orgID
-				orgProvider.mu.Unlock()
-			}
-			return ok
-		})
+		validator = &cpFlightCredentialValidator{cp: cp, orgProvider: orgProvider}
 		provider = orgProvider
 	case cp.sessions != nil:
 		// Single-tenant: static users map, single session manager.
