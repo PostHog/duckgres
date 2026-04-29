@@ -49,6 +49,43 @@ func TestExtractOrgFromSNIEmptySuffixes(t *testing.T) {
 	}
 }
 
+func TestManagedHostnameHint(t *testing.T) {
+	cases := []struct {
+		name     string
+		suffixes []string
+		want     string
+	}{
+		{
+			name:     "single dev suffix",
+			suffixes: []string{".dw.dev.postwh.com"},
+			want:     "<org-id>.dw.dev.postwh.com",
+		},
+		{
+			name:     "single prod-us suffix",
+			suffixes: []string{".dw.us.postwh.com"},
+			want:     "<org-id>.dw.us.postwh.com",
+		},
+		{
+			name:     "multiple suffixes are listed with 'or'",
+			suffixes: []string{".dw.us.postwh.com", ".dw.eu.postwh.com"},
+			want:     "<org-id>.dw.us.postwh.com or <org-id>.dw.eu.postwh.com",
+		},
+		{
+			name:     "empty suffixes fall back to a generic placeholder",
+			suffixes: nil,
+			want:     "<org-id>.<managed-suffix>",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := &ControlPlane{cfg: ControlPlaneConfig{ManagedHostnameSuffixes: tc.suffixes}}
+			if got := cp.managedHostnameHint(); got != tc.want {
+				t.Fatalf("managedHostnameHint() = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // fakeConfigStore captures calls and lets each test choose what each method
 // returns. Only methods used by cpFlightCredentialValidator are exercised;
 // the rest are stubbed to fail loudly if hit.

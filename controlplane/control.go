@@ -652,6 +652,27 @@ const (
 	SNIRoutingEnforce     = "enforce"     // reject connections without a managed hostname
 )
 
+// managedHostnameHint formats the configured ManagedHostnameSuffixes into a
+// "<org-id>.dw.<env>.postwh.com" string suitable for user-facing error
+// messages and migration warnings. The leading dot of each suffix is
+// preserved so the result is a syntactically valid hostname template.
+//
+// Examples:
+//   - [".dw.dev.postwh.com"]                       → "<org-id>.dw.dev.postwh.com"
+//   - [".dw.us.postwh.com", ".dw.eu.postwh.com"]   → "<org-id>.dw.us.postwh.com or <org-id>.dw.eu.postwh.com"
+//   - []                                           → "<org-id>.<managed-suffix>" (generic, indicates misconfig)
+func (cp *ControlPlane) managedHostnameHint() string {
+	suffixes := cp.cfg.ManagedHostnameSuffixes
+	if len(suffixes) == 0 {
+		return "<org-id>.<managed-suffix>"
+	}
+	parts := make([]string, len(suffixes))
+	for i, s := range suffixes {
+		parts[i] = "<org-id>" + s
+	}
+	return strings.Join(parts, " or ")
+}
+
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
 	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
@@ -809,10 +830,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		switch cp.cfg.SNIRoutingMode {
 		case SNIRoutingEnforce:
 			if !isManaged {
+				hint := cp.managedHostnameHint()
 				slog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
-					"sni", sni, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+					"sni", sni, "expected", hint, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
 				_ = server.WriteErrorResponse(writer, "FATAL", "08006",
-					"this server requires connecting via a managed hostname (e.g. <org>.dw.<env>.postwh.com)")
+					fmt.Sprintf("this server requires connecting via %s", hint))
 				_ = writer.Flush()
 				return
 			}
@@ -826,10 +848,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 				}
 			} else if sni == "" {
 				slog.Warn("Postgres client connected without SNI; please migrate to a managed hostname.",
-					"remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
+					"expected", cp.managedHostnameHint(), "remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
 			} else {
 				slog.Warn("Postgres client using legacy hostname; please migrate to a managed hostname.",
-					"sni", sni, "remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
+					"sni", sni, "expected", cp.managedHostnameHint(), "remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
 			}
 		default: // SNIRoutingOff or unset — legacy behavior, no SNI handling
 		}
@@ -1538,7 +1560,7 @@ func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, p
 	case SNIRoutingEnforce:
 		if !isManaged {
 			slog.Warn("Flight auth rejected: SNI does not match a managed hostname.",
-				"sni", sni, "user", username)
+				"sni", sni, "expected", cp.managedHostnameHint(), "user", username)
 			return false
 		}
 		return v.authForOrgName(sni, orgName, username, password)
@@ -1548,10 +1570,10 @@ func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, p
 		}
 		if sni == "" {
 			slog.Warn("Flight client connected without SNI; please migrate to a managed hostname.",
-				"user", username)
+				"expected", cp.managedHostnameHint(), "user", username)
 		} else {
 			slog.Warn("Flight client using legacy hostname; please migrate to a managed hostname.",
-				"sni", sni, "user", username)
+				"sni", sni, "expected", cp.managedHostnameHint(), "user", username)
 		}
 		return v.authByScan(username, password)
 	default: // SNIRoutingOff or unset
