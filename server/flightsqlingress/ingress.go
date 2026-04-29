@@ -26,6 +26,7 @@ import (
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -117,6 +118,15 @@ type durableSessionStoreProvider interface {
 // CredentialValidator abstracts username/password authentication.
 type CredentialValidator interface {
 	ValidateCredentials(username, password string) bool
+}
+
+// SNIAwareCredentialValidator is an optional extension. When the validator
+// implements it, the Flight handler passes the TLS SNI value alongside the
+// credentials so the validator can use the hostname for org routing
+// (instead of scanning all orgs to match a username/password pair).
+// Validators that don't implement this interface keep the legacy behavior.
+type SNIAwareCredentialValidator interface {
+	ValidateCredentialsForSNI(sni, username, password string) bool
 }
 
 // MapCredentialValidator wraps a static users map (single-tenant / tests).
@@ -341,7 +351,7 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContextWithTokenMetadata(ctx c
 	if sessionToken := incomingSessionToken(md); sessionToken != "" {
 		var authenticatedUsername string
 		if hasAuthorizationHeader(md) {
-			username, err := h.authenticateBasicCredentials(md, remoteAddr)
+			username, err := h.authenticateBasicCredentials(ctx, md, remoteAddr)
 			if err != nil {
 				return nil, err
 			}
@@ -382,7 +392,7 @@ func (h *ControlPlaneFlightSQLHandler) sessionFromContextWithTokenMetadata(ctx c
 		return nil, status.Error(codes.ResourceExhausted, "authentication rate limit exceeded")
 	}
 
-	username, err := h.authenticateBasicCredentials(md, remoteAddr)
+	username, err := h.authenticateBasicCredentials(ctx, md, remoteAddr)
 	if err != nil {
 		observeFlightIngressSessionOutcome("auth_failed")
 		return nil, err
@@ -404,7 +414,7 @@ func hasAuthorizationHeader(md metadata.MD) bool {
 	return len(md.Get("authorization")) > 0
 }
 
-func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(md metadata.MD, remoteAddr net.Addr) (string, error) {
+func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(ctx context.Context, md metadata.MD, remoteAddr net.Addr) (string, error) {
 	authHeaders := md.Get("authorization")
 	if len(authHeaders) == 0 {
 		server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
@@ -417,7 +427,17 @@ func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(md metadata.
 		return "", status.Error(codes.Unauthenticated, err.Error())
 	}
 
-	if !h.validator.ValidateCredentials(username, password) {
+	// Hand SNI to the validator when it can use it for org routing. SNI is
+	// only available on real TLS connections; in tests (no TLS layer) the
+	// AuthInfo cast fails and the empty value falls through to the legacy
+	// CredentialValidator path.
+	ok := false
+	if sniAware, isSNIAware := h.validator.(SNIAwareCredentialValidator); isSNIAware {
+		ok = sniAware.ValidateCredentialsForSNI(sniFromContext(ctx), username, password)
+	} else {
+		ok = h.validator.ValidateCredentials(username, password)
+	}
+	if !ok {
 		banned := server.RecordFailedAuthAttempt(h.rateLimiter, remoteAddr)
 		if banned {
 			slog.Warn("Flight client IP banned after auth failures.", "remote_addr", remoteAddr)
@@ -426,6 +446,20 @@ func (h *ControlPlaneFlightSQLHandler) authenticateBasicCredentials(md metadata.
 	}
 	server.RecordSuccessfulAuthAttempt(h.rateLimiter, remoteAddr)
 	return username, nil
+}
+
+// sniFromContext returns the TLS ServerName the client sent, or "" if the
+// connection isn't TLS-terminated by this server (e.g. in unit tests).
+func sniFromContext(ctx context.Context) string {
+	pr, ok := peer.FromContext(ctx)
+	if !ok || pr == nil {
+		return ""
+	}
+	tlsInfo, ok := pr.AuthInfo.(credentials.TLSInfo)
+	if !ok {
+		return ""
+	}
+	return tlsInfo.State.ServerName
 }
 
 func incomingSessionToken(md metadata.MD) string {

@@ -269,6 +269,8 @@ func main() {
 	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := flag.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
 	internalSecret := flag.String("internal-secret", "", "Shared secret for API authentication (env: DUCKGRES_INTERNAL_SECRET)")
+	sniRoutingMode := flag.String("sni-routing-mode", "", "Hostname-based org routing: 'off' (default), 'passthrough' (prefer SNI, log legacy), 'enforce' (reject without managed hostname). Multi-tenant only. (env: DUCKGRES_SNI_ROUTING_MODE)")
+	managedHostnameSuffixes := flag.String("managed-hostname-suffixes", "", "Comma-separated DNS suffixes (each starting with '.') treated as authoritative for org routing, e.g. '.dw.us.postwh.com'. (env: DUCKGRES_MANAGED_HOSTNAME_SUFFIXES)")
 
 	// ACME/Let's Encrypt flags
 	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -442,6 +444,8 @@ func main() {
 		ConfigStoreConn:             *configStore,
 		ConfigPollInterval:          *configPollInterval,
 		InternalSecret:              *internalSecret,
+		SNIRoutingMode:              *sniRoutingMode,
+		ManagedHostnameSuffixes:     *managedHostnameSuffixes,
 		WorkerBackend:               *workerBackend,
 		K8sWorkerImage:              *k8sWorkerImage,
 		K8sWorkerNamespace:          *k8sWorkerNamespace,
@@ -588,6 +592,8 @@ func main() {
 			ConfigStoreConn:            resolved.ConfigStoreConn,
 			ConfigPollInterval:         resolved.ConfigPollInterval,
 			InternalSecret:             resolved.InternalSecret,
+			SNIRoutingMode:             resolved.SNIRoutingMode,
+			ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
 			DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
 			K8s: controlplane.K8sConfig{
 				WorkerImage:           resolved.K8sWorkerImage,

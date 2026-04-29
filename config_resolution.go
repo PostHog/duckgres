@@ -47,6 +47,8 @@ type configCLIInputs struct {
 	ConfigStoreConn             string
 	ConfigPollInterval          string
 	InternalSecret              string
+	SNIRoutingMode              string
+	ManagedHostnameSuffixes     string
 	WorkerBackend               string
 	K8sWorkerImage              string
 	K8sWorkerNamespace          string
@@ -97,6 +99,8 @@ type resolvedConfig struct {
 	ConfigStoreConn            string
 	ConfigPollInterval         time.Duration
 	InternalSecret             string
+	SNIRoutingMode             string
+	ManagedHostnameSuffixes    []string
 	DuckLakeDefaultSpecVersion string
 }
 
@@ -165,6 +169,8 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	var configStoreConn string
 	var configPollInterval time.Duration
 	var internalSecret string
+	var sniRoutingMode string
+	var managedHostnameSuffixes []string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -690,6 +696,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if v := getenv("DUCKGRES_INTERNAL_SECRET"); v != "" {
 		internalSecret = v
 	}
+	if v := getenv("DUCKGRES_SNI_ROUTING_MODE"); v != "" {
+		sniRoutingMode = v
+	}
+	if v := getenv("DUCKGRES_MANAGED_HOSTNAME_SUFFIXES"); v != "" {
+		managedHostnameSuffixes = splitAndTrim(v, ",")
+	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
 	}
@@ -937,6 +949,12 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 	if cli.Set["internal-secret"] {
 		internalSecret = cli.InternalSecret
 	}
+	if cli.Set["sni-routing-mode"] {
+		sniRoutingMode = cli.SNIRoutingMode
+	}
+	if cli.Set["managed-hostname-suffixes"] {
+		managedHostnameSuffixes = splitAndTrim(cli.ManagedHostnameSuffixes, ",")
+	}
 	if cli.Set["worker-backend"] {
 		workerBackend = cli.WorkerBackend
 	}
@@ -1064,6 +1082,24 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		ConfigStoreConn:            configStoreConn,
 		ConfigPollInterval:         configPollInterval,
 		InternalSecret:             internalSecret,
+		SNIRoutingMode:             sniRoutingMode,
+		ManagedHostnameSuffixes:    managedHostnameSuffixes,
 		DuckLakeDefaultSpecVersion: cfg.DuckLake.SpecVersion,
 	}
+}
+
+// splitAndTrim splits s on sep, trims whitespace from each part, and drops
+// any empty resulting strings.
+func splitAndTrim(s, sep string) []string {
+	if s == "" {
+		return nil
+	}
+	raw := strings.Split(s, sep)
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
