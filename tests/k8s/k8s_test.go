@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -56,11 +58,22 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	// Build kubeconfig clientset
-	kubeconfig = envOr("DUCKGRES_K8S_TEST_KUBECONFIG", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
+	// SAFETY: require an explicit kubeconfig path. Falling back to
+	// ~/.kube/config is how this suite once ran against the live mw-dev
+	// cluster and wiped the duckgres namespace via setupMultiTenant's
+	// `kubectl delete namespace duckgres`. Always fail loudly instead.
+	kubeconfig = os.Getenv("DUCKGRES_K8S_TEST_KUBECONFIG")
+	if kubeconfig == "" {
+		log.Fatalf("DUCKGRES_K8S_TEST_KUBECONFIG is required. Run via `just test-k8s-integration` (which sets it to a kind kubeconfig) or set it explicitly. Refusing to fall back to the user's default kubeconfig because this suite is destructive.")
+	}
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Fatalf("Failed to load kubeconfig: %v", err)
+	}
+	// SAFETY: confirm the resolved kubeconfig actually points at a local
+	// kind cluster before running anything destructive.
+	if err := requireLocalKindCluster(kubeconfig, config); err != nil {
+		log.Fatalf("REFUSING to run k8s integration tests: %v", err)
 	}
 	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
@@ -467,6 +480,47 @@ func waitForPort(port int, timeout time.Duration) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("port %d not reachable after %s", port, timeout)
+}
+
+// requireLocalKindCluster errors out unless the resolved kubeconfig points
+// at a loopback API server AND the current-context name mentions "kind".
+// Two independent signals so a misconfigured local proxy can't masquerade
+// as kind, and so a kind kubeconfig that's been edited to reach a remote
+// cluster (somehow) is also rejected.
+//
+// Why it matters: setupMultiTenant() begins with
+//
+//	kubectl delete namespace duckgres --ignore-not-found --wait=true
+//
+// against the resolved kubeconfig. If that resolves to a real cluster, the
+// command silently succeeds and wipes production data. The loopback check
+// is the reliable fingerprint — managed clusters (EKS, GKE, AKS) always
+// expose a cloud DNS hostname; kind always exposes 127.0.0.1.
+func requireLocalKindCluster(kubeconfigPath string, cfg *rest.Config) error {
+	u, err := url.Parse(cfg.Host)
+	if err != nil {
+		return fmt.Errorf("parse API server URL %q: %w", cfg.Host, err)
+	}
+	host := u.Hostname()
+	switch host {
+	case "127.0.0.1", "localhost", "::1":
+		// loopback — kind cluster, proceed.
+	default:
+		return fmt.Errorf(
+			"API server at %q is not loopback. The k8s integration suite is destructive (it deletes the duckgres namespace at startup) and must only run against a local kind cluster. Run via `just test-k8s-integration` or point DUCKGRES_K8S_TEST_KUBECONFIG at a kind kubeconfig",
+			cfg.Host)
+	}
+
+	raw, err := clientcmd.LoadFromFile(kubeconfigPath)
+	if err != nil {
+		return fmt.Errorf("load kubeconfig %q: %w", kubeconfigPath, err)
+	}
+	if !strings.Contains(strings.ToLower(raw.CurrentContext), "kind") {
+		return fmt.Errorf(
+			"current-context %q in %s does not look like a kind cluster (expected name containing \"kind\")",
+			raw.CurrentContext, kubeconfigPath)
+	}
+	return nil
 }
 
 func commandEnv() []string {
