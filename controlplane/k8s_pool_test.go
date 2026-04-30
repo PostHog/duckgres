@@ -1502,7 +1502,7 @@ func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *t
 // TestK8sPoolWorkerRecordForIdleStampsOwnerCPInstanceID guards against the
 // warm-pool churn loop. workerRecordFor used to clear OwnerCPInstanceID
 // whenever state==Idle, which left every freshly-spawned warm worker
-// matching ListOrphanedWorkers case (2) (NULLIF(owner_cp_instance_id, '') IS
+// matching ListOrphanedWorkers case (2) (NULLIF(owner_cp_instance_id, ”) IS
 // NULL AND last_heartbeat_at <= before) the moment it crossed the orphan
 // grace. The janitor then retired it, the warm pool replenished, and the
 // loop repeated indefinitely. Stamping warm workers with the creating CP's

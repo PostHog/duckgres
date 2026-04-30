@@ -39,7 +39,7 @@ type ControlPlaneConfig struct {
 	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
 	RetireOnSessionEnd   bool          // When true, process workers are retired immediately after their last session ends.
-	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade (default: 24h)
+	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade. 0 = unbounded (wait until k8s SIGKILL via terminationGracePeriodSeconds). Default: 0 in remote mode (so a CP rolling out doesn't kill in-flight customer queries at a self-imposed wall — see drainAndShutdown), 24h in process mode.
 	MetricsServer        *http.Server  // Optional metrics server to shut down during upgrade
 
 	// WorkerBackend selects the worker management backend.
@@ -187,8 +187,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.WorkerIdleTimeout = 5 * time.Minute
 	}
 	if cfg.HandoverDrainTimeout == 0 {
+		// Remote mode: no internal drain timeout. The CP waits for active
+		// sessions to finish for as long as it takes; k8s
+		// terminationGracePeriodSeconds is the only hard wall. The
+		// previous 15m default cut off in-flight customer queries that
+		// just happened to be running at the wall (see the worker-40761
+		// incident) — moving the wall doesn't fix that race, removing it
+		// does. Process mode keeps 24h since there's no k8s safety net.
 		if cfg.WorkerBackend == "remote" {
-			cfg.HandoverDrainTimeout = 15 * time.Minute
+			cfg.HandoverDrainTimeout = 0
 		} else {
 			cfg.HandoverDrainTimeout = 24 * time.Hour
 		}
@@ -1257,7 +1264,11 @@ func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
 	if cp.flight != nil {
 		cp.flight.BeginDrain()
 	}
-	slog.Info("Waiting for planned shutdown drain.", "timeout", timeout)
+	if timeout > 0 {
+		slog.Info("Waiting for planned shutdown drain.", "timeout", timeout)
+	} else {
+		slog.Info("Waiting for planned shutdown drain (unbounded — k8s SIGKILL is the wall).")
+	}
 	if cp.waitForDrain(timeout) {
 		slog.Info("All pgwire connections and Flight sessions drained before shutdown.")
 	} else {
@@ -1280,9 +1291,17 @@ func (cp *ControlPlane) stopAcceptingPGConnections() {
 	}
 }
 
+// waitForDrain blocks until both the pgwire and Flight server report
+// zero in-flight work, or the timeout fires. timeout == 0 means
+// unbounded — k8s terminationGracePeriodSeconds becomes the only wall.
+// Returns true on clean drain, false on timeout.
 func (cp *ControlPlane) waitForDrain(timeout time.Duration) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
 	pgDone := make(chan struct{})
 	go func() {
