@@ -1275,17 +1275,19 @@ func (c *clientConn) handleQuery(body []byte) error {
 		return c.executeQueryDirect(query, cmdType)
 	}
 
-	// Route COPY TO STDOUT / COPY FROM STDIN directly to handleCopy()
+	// Route COPY directly to handleCopy()
 	// before transpilation, because:
-	// 1. The inner SELECT may contain DuckDB-specific syntax (QUALIFY, ASOF, struct literals)
+	// 1. File COPY options such as FORMAT 'parquet' must reach DuckDB intact;
+	//    pg_query deparses them into PostgreSQL's FORMAT parquet form.
+	// 2. The inner SELECT may contain DuckDB-specific syntax (QUALIFY, ASOF, struct literals)
 	//    that pg_query can't parse
-	// 2. handleCopyOut() already extracts and transpiles the inner SELECT separately
-	// 3. validateWithDuckDB() can't EXPLAIN COPY with FORMAT "binary"
+	// 3. handleCopyOut() already extracts and transpiles the inner SELECT separately
+	// 4. validateWithDuckDB() can't EXPLAIN COPY with FORMAT "binary"
 	//
 	// NOTE: This must stay above queryContext(). handleCopyIn reads from
 	// c.reader directly, which would race with the disconnect monitor.
 	upperQueryEarly := strings.ToUpper(query)
-	if copyToStdoutRegex.MatchString(upperQueryEarly) || copyFromStdinRegex.MatchString(upperQueryEarly) {
+	if shouldHandleCopyBeforeTranspile(query) {
 		return c.handleCopy(query, upperQueryEarly)
 	}
 
@@ -3130,6 +3132,11 @@ func (c *clientConn) buildCommandTag(cmdType string, result ExecResult) string {
 	default:
 		return cmdType
 	}
+}
+
+func shouldHandleCopyBeforeTranspile(query string) bool {
+	trimmed := strings.TrimSpace(query)
+	return strings.HasPrefix(strings.ToUpper(trimmed), "COPY")
 }
 
 // Regular expressions for parsing COPY commands
