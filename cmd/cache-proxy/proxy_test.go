@@ -363,10 +363,10 @@ func TestFetchOriginPreservesSignedHeaders(t *testing.T) {
 	})
 
 	h := http.Header{
-		"Range":                  []string{"bytes=0-1"},
-		"Authorization":          []string{"AWS4-HMAC-SHA256 Credential=AKIATEST/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abcdef"},
-		"X-Amz-Date":             []string{"20260101T000000Z"},
-		"X-Amz-Content-Sha256":   []string{"UNSIGNED-PAYLOAD"},
+		"Range":                []string{"bytes=0-1"},
+		"Authorization":        []string{"AWS4-HMAC-SHA256 Credential=AKIATEST/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abcdef"},
+		"X-Amz-Date":           []string{"20260101T000000Z"},
+		"X-Amz-Content-Sha256": []string{"UNSIGNED-PAYLOAD"},
 		// Hop-by-hop header must NOT be forwarded.
 		"Proxy-Connection": []string{"Keep-Alive"},
 	}

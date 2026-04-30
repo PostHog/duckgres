@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -185,6 +186,22 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	data, contentType, source, err := p.fetchDedup(cacheKey, r, rangeHeader)
 	if err != nil {
+		// An origin that responded with a non-2xx (e.g. S3 returning a 400 with
+		// <Code>ExpiredToken</Code> in an XML envelope) is forwarded back to
+		// DuckDB verbatim — same status code, same body, same headers minus
+		// hop-by-hop. This preserves the error class so httpfs can distinguish
+		// transient (5xx) from terminal (4xx) failures, and gives DuckLake the
+		// raw S3 error body it knows how to parse.
+		var oe *originStatusError
+		if errors.As(err, &oe) {
+			slog.Warn("Origin returned non-2xx; forwarding verbatim.",
+				"url", r.URL.String(), "range", rangeHeader, "status", oe.status, "body_preview", previewBody(oe.body))
+			oe.writeTo(w)
+			return
+		}
+		// True transport-level failure (DNS, connection refused, TLS, timeout):
+		// no upstream status exists, so 502 Bad Gateway is the right answer
+		// here — and it's also the one DuckDB's httpfs treats as transient.
 		slog.Error("Failed to fetch.", "url", r.URL.String(), "range", rangeHeader, "error", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -251,8 +268,15 @@ func (p *CacheProxy) fetchOrigin(r *http.Request) ([]byte, string, error) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, "", fmt.Errorf("origin %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		// Capture the body up to a generous cap. S3 error envelopes are
+		// typically <1 KiB; the cap is just a guard against a misbehaving
+		// origin streaming forever. The 60s context above also protects us.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, originErrorBodyCap))
+		return nil, "", &originStatusError{
+			status:  resp.StatusCode,
+			headers: resp.Header.Clone(),
+			body:    body,
+		}
 	}
 
 	data, err := io.ReadAll(resp.Body)
@@ -260,6 +284,53 @@ func (p *CacheProxy) fetchOrigin(r *http.Request) ([]byte, string, error) {
 		return nil, "", err
 	}
 	return data, resp.Header.Get("Content-Type"), nil
+}
+
+// originErrorBodyCap is the maximum number of bytes we'll buffer from a
+// non-2xx origin response. S3 XML error envelopes are tiny; this is just a
+// safety net.
+const originErrorBodyCap = 1 << 20 // 1 MiB
+
+// originStatusError captures a non-2xx response from the origin so the
+// proxy can forward it back to the client verbatim. The status code, body,
+// and response headers are all preserved (minus hop-by-hop) so DuckDB sees
+// exactly what S3 said — including the XML error envelope DuckLake may
+// inspect.
+type originStatusError struct {
+	status  int
+	headers http.Header
+	body    []byte
+}
+
+func (e *originStatusError) Error() string {
+	return fmt.Sprintf("origin %d: %s", e.status, strings.TrimSpace(string(e.body)))
+}
+
+// writeTo replays the captured origin response onto w. Any header the
+// origin set that isn't a hop-by-hop is forwarded; status code and body
+// follow.
+func (e *originStatusError) writeTo(w http.ResponseWriter) {
+	for k, vv := range e.headers {
+		if hopByHop[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(e.status)
+	_, _ = w.Write(e.body)
+}
+
+// previewBody returns up to 256 bytes of the body for log lines so we don't
+// spam multi-KiB XML envelopes into structured logs while still keeping the
+// useful prefix (S3 puts the <Code>...</Code> first).
+func previewBody(body []byte) string {
+	const max = 256
+	if len(body) <= max {
+		return string(body)
+	}
+	return string(body[:max]) + "...(truncated)"
 }
 
 // serveBody writes cached data back to the client, reconstructing 206 Partial
