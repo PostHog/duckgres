@@ -22,7 +22,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
@@ -2151,7 +2150,7 @@ func rowSetToRecord(alloc memory.Allocator, rows server.RowSet, schema *arrow.Sc
 		}
 
 		for i, val := range values {
-			duckdbservice.AppendValue(builder.Field(i), val)
+			arrowmap.AppendValue(builder.Field(i), val)
 		}
 		count++
 	}
