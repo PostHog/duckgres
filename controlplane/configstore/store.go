@@ -1078,8 +1078,17 @@ func (cs *ConfigStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePre
 // Re-listing terminal rows here would loop the janitor on K8s 404s.
 //
 // The join switched from INNER to LEFT in Apr 2026 to handle (2)/(3);
-// the original implementation only handled (1). See
-// TestListOrphanedWorkers* in tests/configstore for the regression
+// the original implementation only handled (1).
+//
+// Apr 2026 also added an exclusion for workers with reclaimable Flight
+// sessions: a row with at least one flight_session_records entry in
+// active or reconnecting state is spared from orphan retirement so a
+// customer reconnecting by session token can still pick up their query
+// (see TakeOverWorker). Once the session record itself becomes terminal
+// (expired/closed via ExpireFlightSessionRecords), the worker is
+// retired normally on the next sweep.
+//
+// See TestListOrphanedWorkers* in tests/configstore for the regression
 // fixtures.
 func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
@@ -1092,8 +1101,13 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 		WorkerStateHotIdle,
 		WorkerStateDraining,
 	}
+	reclaimableSessionStates := []FlightSessionState{
+		FlightSessionStateActive,
+		FlightSessionStateReconnecting,
+	}
 	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
 	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	flightTable := cs.runtimeTable((&FlightSessionRecord{}).TableName())
 	err := cs.db.Table(workerTable+" AS w").
 		Select("w.*").
 		Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = w.owner_cp_instance_id").
@@ -1109,6 +1123,14 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 			before,
 			before,
 		).
+		// Spare workers with at least one reclaimable Flight session: a
+		// retire here would kill the customer's mid-flight query at the
+		// moment they reconnect by session token. Bounded by
+		// ExpireFlightSessionRecords — once the session record is moved
+		// to a terminal state, the worker is no longer protected.
+		Where("NOT EXISTS (SELECT 1 FROM "+flightTable+" AS f "+
+			"WHERE f.worker_id = w.worker_id AND f.state IN ?)",
+			reclaimableSessionStates).
 		Order("w.worker_id ASC").
 		Find(&workers).Error
 	if err != nil {

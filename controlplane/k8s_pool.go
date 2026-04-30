@@ -2015,8 +2015,32 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	close(p.stopInform)
 
 	ctx := context.Background()
+	preserved := make(map[int]*ManagedWorker)
 	for _, w := range workers {
 		podName := p.workerPodName(w)
+
+		// A worker that's serving sessions must not be torn down during
+		// CP shutdown — pod-deletion would kill in-flight customer queries
+		// at exactly the moment ShutdownAll runs (the failure mode hit by
+		// the production worker-40761 incident on a 15-minute drain wall).
+		// Leave the worker in `hot` state, owned by this dying CP. Two
+		// downstream guarantees keep this safe:
+		//   (1) Flight clients can reconnect by session token; a peer CP
+		//       claims via TakeOverWorker and the query resumes.
+		//   (2) ListOrphanedWorkers' JOIN against flight_session_records
+		//       prevents peer CPs' janitors from retiring the worker
+		//       while a session is still active or reconnecting; once the
+		//       session record is expired the worker is retired normally.
+		// pgwire customers connected to this CP have already lost their
+		// connection (the CP socket is going away) — protecting the
+		// worker doesn't help them, but it doesn't hurt either.
+		if w.activeSessions > 0 {
+			slog.Info("ShutdownAll: worker has active sessions; leaving pod alive for Flight reconnect.",
+				"id", w.ID, "worker_pod", podName, "active_sessions", w.activeSessions)
+			preserved[w.ID] = w
+			continue
+		}
+
 		slog.Info("Shutting down K8s worker.", "id", w.ID, "worker_pod", podName)
 
 		// Step 1: CAS to draining. Skip the worker on CAS miss or error —
@@ -2068,10 +2092,14 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		p.mu.Unlock()
 	}
 
+	// Workers preserved due to active sessions stay in the in-memory map
+	// so any remaining session bookkeeping inside this CP still finds them
+	// during the residual shutdown window. The map is wiped on process
+	// exit; preservation is purely about not yanking the rug here.
 	p.mu.Lock()
-	p.workers = make(map[int]*ManagedWorker)
+	p.workers = preserved
 	p.mu.Unlock()
-	observeControlPlaneWorkers(0)
+	observeControlPlaneWorkers(len(preserved))
 }
 
 // retireWorkerPod closes the gRPC client and deletes the worker pod.
