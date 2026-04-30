@@ -2013,6 +2013,48 @@ func TestCopyToStdoutRegex(t *testing.T) {
 	}
 }
 
+func TestShouldHandleCopyBeforeTranspile(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want bool
+	}{
+		{
+			name: "copy query to file",
+			sql:  "COPY (SELECT 1) TO 's3://bucket/probe.parquet' (FORMAT 'parquet')",
+			want: true,
+		},
+		{
+			name: "copy table to file",
+			sql:  "COPY users TO '/tmp/users.parquet' (FORMAT 'parquet')",
+			want: true,
+		},
+		{
+			name: "copy to stdout",
+			sql:  "COPY users TO STDOUT WITH (FORMAT CSV)",
+			want: true,
+		},
+		{
+			name: "copy from stdin",
+			sql:  "COPY users FROM STDIN WITH (FORMAT CSV)",
+			want: true,
+		},
+		{
+			name: "select",
+			sql:  "SELECT 1",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldHandleCopyBeforeTranspile(tt.sql); got != tt.want {
+				t.Fatalf("shouldHandleCopyBeforeTranspile(%q) = %v, want %v", tt.sql, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCopyFromStdinRegex(t *testing.T) {
 	tests := []struct {
 		name            string
