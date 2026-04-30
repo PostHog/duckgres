@@ -1,4 +1,4 @@
-package server
+package tlscert
 
 import (
 	"crypto/ecdsa"
@@ -31,7 +31,7 @@ func EnsureCertificates(certFile, keyFile string) error {
 	}
 
 	// Generate new certificates
-	return generateSelfSignedCert(certFile, keyFile)
+	return GenerateSelfSignedCert(certFile, keyFile)
 }
 
 func fileExists(path string) bool {
@@ -39,7 +39,11 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func generateSelfSignedCert(certFile, keyFile string) error {
+// GenerateSelfSignedCert writes a fresh self-signed certificate and ECDSA
+// private key to the given paths. Used directly by tests that need a cert
+// pair on disk without going through EnsureCertificates' file-existence
+// check.
+func GenerateSelfSignedCert(certFile, keyFile string) error {
 	// Generate ECDSA private key
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
