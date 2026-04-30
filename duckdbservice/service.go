@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -538,11 +539,19 @@ func (p *SessionPool) DestroySession(token string) error {
 		// so they'd leak into the next session that gets the same connection.
 		cleanupStart := time.Now()
 		slog.Debug("Cleaning up session state.", "user", session.Username)
-		cleanupSessionState(session.Conn)
-		slog.Debug("Session state cleaned up.", "user", session.Username, "duration", time.Since(cleanupStart))
+		clean := cleanupSessionState(session.Conn)
+		slog.Debug("Session state cleaned up.", "user", session.Username, "duration", time.Since(cleanupStart), "clean", clean)
+		if !clean {
+			// Cleanup failed — likely the conn is in an aborted/INTERRUPT'd state
+			// from the prior cancelled query. Returning it to the pool would poison
+			// the next session that gets it (every operation fails until the conn
+			// is forcibly recycled). Mark it bad via Raw so database/sql discards
+			// it instead. The next Conn() call gets a fresh DuckDB connection.
+			_ = session.Conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
 		connCloseStart := time.Now()
 		_ = session.Conn.Close()
-		slog.Debug("Session connection closed (returned to pool).", "user", session.Username, "duration", time.Since(connCloseStart))
+		slog.Debug("Session connection closed.", "user", session.Username, "duration", time.Since(connCloseStart), "discarded", !clean)
 	}
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
 	p.mu.RLock()
@@ -667,29 +676,46 @@ func cleanupWorkerCatalogs(db *sql.DB) {
 
 // cleanupSessionState drops temporary tables and views on the connection so
 // that session-scoped state doesn't leak when the connection is returned to
-// the pool.
-func cleanupSessionState(conn *sql.Conn) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// the pool. Returns true if every step succeeded and the connection is safe
+// to reuse; false if any operation failed (typically because the prior query
+// was cancelled and the conn is in an aborted/INTERRUPT'd state).
+func cleanupSessionState(conn *sql.Conn) bool {
+	// Clear any aborted-transaction state from the prior query before running
+	// the cleanup operations. After a cancelled query, DuckDB can leave the
+	// session in a state where every subsequent statement returns "INTERRUPT
+	// Error: Interrupted!" until ROLLBACK runs. Same pattern as initSearchPath.
+	rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	if _, err := conn.ExecContext(rollbackCtx, "ROLLBACK"); err != nil {
+		// ROLLBACK with no active txn returns a no-op error in some drivers; not fatal.
+		slog.Debug("ROLLBACK during cleanup returned an error.", "error", err)
+	}
+	rollbackCancel()
 
-	// Drop temporary tables
-	dropTemporary(ctx, conn,
+	ok := dropTemporary(conn,
 		"SELECT table_name FROM duckdb_tables() WHERE temporary = true",
 		`DROP TABLE IF EXISTS temp."%s"`,
 	)
-
-	// Drop temporary views
-	dropTemporary(ctx, conn,
+	// Run views even if tables failed — gives best-effort progress and a
+	// consistent ok=false signal if anything didn't complete.
+	ok = dropTemporary(conn,
 		"SELECT view_name FROM duckdb_views() WHERE temporary = true",
 		`DROP VIEW IF EXISTS temp."%s"`,
-	)
+	) && ok
+	return ok
 }
 
-func dropTemporary(ctx context.Context, conn *sql.Conn, query, dropFmt string) {
-	rows, err := conn.QueryContext(ctx, query)
+func dropTemporary(conn *sql.Conn, query, dropFmt string) bool {
+	// Per-step contexts: previously a single 5s context spanned both the
+	// SELECT and every DROP. A slow SELECT could exhaust the budget before
+	// a single DROP ran, causing all DROPs to fail with deadline-exceeded
+	// in lockstep. Now SELECT has its own 3s and each DROP its own 1s, so
+	// the failure of one operation doesn't cascade into the next.
+	enumCtx, enumCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer enumCancel()
+	rows, err := conn.QueryContext(enumCtx, query)
 	if err != nil {
 		slog.Warn("Failed to query temporary objects for cleanup.", "error", err)
-		return
+		return false
 	}
 	var names []string
 	for rows.Next() {
@@ -703,11 +729,16 @@ func dropTemporary(ctx context.Context, conn *sql.Conn, query, dropFmt string) {
 	}
 	_ = rows.Close()
 
+	ok := true
 	for _, name := range names {
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf(dropFmt, name)); err != nil {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 1*time.Second)
+		if _, err := conn.ExecContext(dropCtx, fmt.Sprintf(dropFmt, name)); err != nil {
 			slog.Warn("Failed to drop temporary object during cleanup.", "name", name, "error", err)
+			ok = false
 		}
+		dropCancel()
 	}
+	return ok
 }
 
 // initSearchPath sets the DuckDB search_path for a session connection.
