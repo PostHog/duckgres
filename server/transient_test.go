@@ -298,8 +298,12 @@ func TestClassifyErrorCode(t *testing.T) {
 	}{
 		{"transaction conflict", errors.New("Transaction conflict on commit"), "40001"},
 		{"query cancelled", errors.New("context canceled"), "57014"},
-		{"generic error", errors.New("syntax error"), "42000"},
-		{"SSL closed is not conflict", errors.New("SSL connection has been closed unexpectedly"), "42000"},
+		// Unknown error class (no DuckDB prefix) maps to XX000 — internal /
+		// infra rather than user-class — so isUserQueryError correctly
+		// routes it to the alert-worthy log path. Adding this prefix to a
+		// user class would hide real infra failures.
+		{"generic error with no DuckDB prefix", errors.New("syntax error"), "XX000"},
+		{"SSL closed is infra not user", errors.New("SSL connection has been closed unexpectedly"), "XX000"},
 
 		{"catalog missing table", errors.New("Catalog Error: Table with name users does not exist!"), "42P01"},
 		{"catalog missing table with suggestion", errors.New("Catalog Error: Table with name stg_customers__dbt_tmp does not exist!\nDid you mean \"stg_customers\"?"), "42P01"},
@@ -343,6 +347,72 @@ func TestClassifyErrorCode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIsUserQueryError pins the SQLSTATE-class-based discriminator
+// that splits Query execution log lines between Info ("user wrote
+// something that doesn't make sense") and Error ("the system itself
+// failed"). The logger uses this to keep the Error level meaningful
+// for alerting; a regression here would either drown alerts in user-
+// typo noise or silently downgrade real infra failures.
+func TestIsUserQueryError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool // true == user error (Info), false == infra error (Error)
+	}{
+		// Class 42 — by far the most common user errors (table/column not
+		// found, syntax errors, access rule violations).
+		{"missing table (42P01)", errors.New("Catalog Error: Table with name users does not exist!"), true},
+		{"missing column (42703)", errors.New("Binder Error: Referenced column \"missing_col\" not found in FROM clause!"), true},
+		{"syntax error (42601)", errors.New("Parser Error: syntax error at or near \"FORM\""), true},
+		{"missing function (42883)", errors.New("Catalog Error: Scalar Function with name no_such_func does not exist!"), true},
+		{"permission denied (42501)", errors.New("Permission Error: not allowed to write here"), true},
+		{"duplicate table (42P07)", errors.New("Catalog Error: Table with name \"t\" already exists!"), true},
+
+		// Other user classes — bad input, integrity, transaction misuse.
+		{"data exception conversion (22P02)", errors.New("Conversion Error: Could not convert string 'abc' to INT32"), true},
+		{"data exception out of range (22003)", errors.New("Out of Range Error: Overflow in multiplication of INT32"), true},
+		{"unique violation (23505)", errors.New("Constraint Error: Duplicate key \"id: 1\" violates primary key constraint"), true},
+		{"not null violation (23502)", errors.New("Constraint Error: NOT NULL constraint failed: t.col"), true},
+		{"invalid transaction state (25000)", errors.New("Transaction Error: cannot begin within an existing transaction"), true},
+		{"missing schema (3F000)", errors.New("Catalog Error: Schema with name \"missing\" does not exist!"), true},
+		{"dependent objects (2BP01)", errors.New("Dependency Error: Cannot drop entry because there are other entries that depend on it"), true},
+
+		// 57014 cancellation — class 57 is otherwise infra, but client-
+		// initiated cancels are user events. The short-circuit in
+		// isUserQueryError must keep this in the user bucket.
+		{"client cancellation (57014)", errors.New("context canceled"), true},
+
+		// Infra classes — must NOT be treated as user errors.
+		{"unknown error → XX000", errors.New("something went wrong"), false},
+		{"SSL closed → infra", errors.New("SSL connection has been closed unexpectedly"), false},
+		{"nil error", nil, false},
+
+		// 40001 retryable conflicts are a special case handled before the
+		// SQLSTATE check fires (logQueryError emits its own Warn for them),
+		// so they never reach this function in production. But verify the
+		// classification is unambiguously infra-side here so a future
+		// caller doesn't accidentally bucket retries as user errors.
+		{"transaction conflict 40001 is not user", errors.New("Transaction conflict on commit"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isUserQueryError(tt.err); got != tt.want {
+				t.Errorf("isUserQueryError(%v) = %v, want %v (SQLSTATE=%s)",
+					tt.err, got, tt.want, classifyErrorCodeOrEmpty(tt.err))
+			}
+		})
+	}
+}
+
+// classifyErrorCodeOrEmpty is a test helper to surface the computed
+// SQLSTATE in failure messages without crashing on nil errors.
+func classifyErrorCodeOrEmpty(err error) string {
+	if err == nil {
+		return "(nil)"
+	}
+	return classifyErrorCode(err)
 }
 
 // TestClassifyErrorCodeAgainstRealDuckDB drives queries that reliably
