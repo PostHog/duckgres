@@ -459,11 +459,32 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		return nil, cfgErr
 	}
 
-	stop := server.StartCredentialRefresh(conn, cfg.DuckLake, func() bool {
-		session.mu.Lock()
-		defer session.mu.Unlock()
-		return len(session.txns) > 0
-	})
+	// In shared-warm (multi-tenant) mode the control plane drives credential
+	// refresh by re-activating the worker with a freshly-brokered STS payload
+	// before the current creds expire (see controlplane/janitor scheduler +
+	// activator.RefreshActivationCredentials). Running the in-process ticker
+	// here is wrong for that mode for two reasons:
+	//   1. It executes on this session's pinned *sql.Conn, so it serializes
+	//      behind any in-flight user query. A long query can starve the
+	//      ticker until creds have already expired.
+	//   2. For provider="config" with a session token (the multi-tenant
+	//      activation shape) the ticker falls into the `else` branch and
+	//      replaces the org's STS-brokered secret with a credential_chain
+	//      one. DuckDB's built-in chain doesn't see EKS Pod Identity, so
+	//      the resulting secret can't actually authenticate against the
+	//      org's bucket — quietly downgrading correctness.
+	// The single-tenant standalone path still benefits from the ticker (no
+	// control plane to drive refreshes), so we only skip it in shared-warm.
+	var stop func()
+	if p.sharedWarmMode {
+		stop = func() {}
+	} else {
+		stop = server.StartCredentialRefresh(conn, cfg.DuckLake, func() bool {
+			session.mu.Lock()
+			defer session.mu.Unlock()
+			return len(session.txns) > 0
+		})
+	}
 
 	p.mu.Lock()
 	p.reserved--

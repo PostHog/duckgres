@@ -160,16 +160,16 @@ func (GlobalConfig) TableName() string { return "duckgres_global_config" }
 // DuckLakeConfig is a singleton row (ID=1) for legacy cluster-wide DuckLake settings.
 // In multi-tenant mode, the managed-warehouse contract is the intended per-org source of truth.
 type DuckLakeConfig struct {
-	ID            uint      `gorm:"primaryKey" json:"-"`
-	MetadataStore string    `gorm:"size:1024" json:"metadata_store"`
-	ObjectStore   string    `gorm:"size:1024" json:"object_store"`
-	DataPath      string    `gorm:"size:1024" json:"data_path"`
-	S3Provider    string    `gorm:"size:64" json:"s3_provider"`
-	S3Endpoint    string    `gorm:"size:512" json:"s3_endpoint"`
-	S3AccessKey   string    `gorm:"size:255" json:"s3_access_key"`
-	S3SecretKey   string    `gorm:"size:255" json:"-"`
-	S3Region      string    `gorm:"size:64" json:"s3_region"`
-	S3UseSSL      bool      `json:"s3_use_ssl"`
+	ID                  uint      `gorm:"primaryKey" json:"-"`
+	MetadataStore       string    `gorm:"size:1024" json:"metadata_store"`
+	ObjectStore         string    `gorm:"size:1024" json:"object_store"`
+	DataPath            string    `gorm:"size:1024" json:"data_path"`
+	S3Provider          string    `gorm:"size:64" json:"s3_provider"`
+	S3Endpoint          string    `gorm:"size:512" json:"s3_endpoint"`
+	S3AccessKey         string    `gorm:"size:255" json:"s3_access_key"`
+	S3SecretKey         string    `gorm:"size:255" json:"-"`
+	S3Region            string    `gorm:"size:64" json:"s3_region"`
+	S3UseSSL            bool      `json:"s3_use_ssl"`
 	S3URLStyle          string    `gorm:"size:16" json:"s3_url_style"`
 	S3Chain             string    `gorm:"size:255" json:"s3_chain"`
 	S3Profile           string    `gorm:"size:255" json:"s3_profile"`
@@ -260,8 +260,17 @@ type WorkerRecord struct {
 	ActivationStartedAt *time.Time  `json:"activation_started_at,omitempty"`
 	LastHeartbeatAt     time.Time   `json:"last_heartbeat_at"`
 	RetireReason        string      `gorm:"size:64" json:"retire_reason"`
-	CreatedAt           time.Time   `json:"created_at"`
-	UpdatedAt           time.Time   `json:"updated_at"`
+	// S3CredentialsExpiresAt is when the most recent STS-brokered S3
+	// credentials currently active in the worker's DuckDB ducklake_s3 secret
+	// will expire. Stamped when the control plane mints creds (initial
+	// activation, takeover, scheduled refresh) and consulted by the
+	// credential refresh scheduler to pick workers nearing expiry. NULL on
+	// workers that haven't had creds issued yet (warm pool) and on legacy
+	// rows from before this column existed — both are treated as "due now"
+	// by the scheduler so they get refreshed eagerly.
+	S3CredentialsExpiresAt *time.Time `gorm:"index" json:"s3_credentials_expires_at,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
 }
 
 func (WorkerRecord) TableName() string { return "worker_records" }

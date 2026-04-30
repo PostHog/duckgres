@@ -874,6 +874,229 @@ func TestRetireOrphanWorkerNoOpOnTerminalStates(t *testing.T) {
 	}
 }
 
+// TestListWorkersDueForCredentialRefreshScopesByOwner: only workers owned
+// by the calling CP are returned. Workers owned by another CP — even if
+// their creds have expired — are that CP's problem.
+func TestListWorkersDueForCredentialRefreshScopesByOwner(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
+	expired := now.Add(-1 * time.Hour)
+
+	mine := &configstore.WorkerRecord{
+		WorkerID:               1,
+		PodName:                "duckgres-worker-1",
+		State:                  configstore.WorkerStateHot,
+		OrgID:                  "acme",
+		OwnerCPInstanceID:      "cp-me:boot-a",
+		OwnerEpoch:             3,
+		LastHeartbeatAt:        now,
+		S3CredentialsExpiresAt: &expired,
+	}
+	other := &configstore.WorkerRecord{
+		WorkerID:               2,
+		PodName:                "duckgres-worker-2",
+		State:                  configstore.WorkerStateHot,
+		OrgID:                  "acme",
+		OwnerCPInstanceID:      "cp-other:boot-b",
+		OwnerEpoch:             5,
+		LastHeartbeatAt:        now,
+		S3CredentialsExpiresAt: &expired,
+	}
+	for _, w := range []*configstore.WorkerRecord{mine, other} {
+		if err := store.UpsertWorkerRecord(w); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", w.WorkerID, err)
+		}
+	}
+
+	due, err := store.ListWorkersDueForCredentialRefresh("cp-me:boot-a", now)
+	if err != nil {
+		t.Fatalf("ListWorkersDueForCredentialRefresh: %v", err)
+	}
+	if len(due) != 1 || due[0].WorkerID != 1 {
+		t.Fatalf("expected only worker 1 (mine), got %#v", due)
+	}
+}
+
+// TestListWorkersDueForCredentialRefreshTreatsNullAsDue: a row with
+// s3_credentials_expires_at = NULL needs immediate refresh. This covers
+// pre-migration rows and any path where activation forgot to stamp.
+func TestListWorkersDueForCredentialRefreshTreatsNullAsDue(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7,
+		PodName:           "duckgres-worker-7",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "acme",
+		OwnerCPInstanceID: "cp-me:boot-a",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+		// S3CredentialsExpiresAt deliberately left nil
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	due, err := store.ListWorkersDueForCredentialRefresh("cp-me:boot-a", now)
+	if err != nil {
+		t.Fatalf("ListWorkersDueForCredentialRefresh: %v", err)
+	}
+	if len(due) != 1 || due[0].WorkerID != 7 {
+		t.Fatalf("expected worker 7 (NULL expiry treated as due), got %#v", due)
+	}
+}
+
+// TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral:
+//   - Healthy row (expiry comfortably in the future): not returned.
+//   - Neutral warm row (org_id=”): not returned regardless of expiry.
+//     A pre-activation worker has no STS creds to refresh.
+//   - Terminal row (retired): not returned.
+func TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
+	farFuture := now.Add(2 * time.Hour)
+	pastDue := now.Add(-1 * time.Minute)
+
+	rows := []*configstore.WorkerRecord{
+		{
+			WorkerID: 10, PodName: "duckgres-worker-10",
+			State: configstore.WorkerStateHot, OrgID: "acme",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now, S3CredentialsExpiresAt: &farFuture,
+		},
+		{
+			WorkerID: 11, PodName: "duckgres-worker-11",
+			State: configstore.WorkerStateIdle, OrgID: "",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now, S3CredentialsExpiresAt: &pastDue,
+		},
+		{
+			WorkerID: 12, PodName: "duckgres-worker-12",
+			State: configstore.WorkerStateRetired, OrgID: "acme",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now, S3CredentialsExpiresAt: &pastDue,
+			RetireReason: "normal",
+		},
+	}
+	for _, w := range rows {
+		if err := store.UpsertWorkerRecord(w); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", w.WorkerID, err)
+		}
+	}
+
+	due, err := store.ListWorkersDueForCredentialRefresh("cp-me:boot-a", now)
+	if err != nil {
+		t.Fatalf("ListWorkersDueForCredentialRefresh: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("expected no rows returned (healthy / neutral / terminal), got %#v", due)
+	}
+}
+
+// TestMarkCredentialsRefreshedSucceeds: happy path — same owner, same
+// epoch, write goes through and returns true.
+func TestMarkCredentialsRefreshedSucceeds(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
+	oldExpiry := now.Add(-1 * time.Minute)
+	newExpiry := now.Add(1 * time.Hour)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:               20,
+		PodName:                "duckgres-worker-20",
+		State:                  configstore.WorkerStateHot,
+		OrgID:                  "acme",
+		OwnerCPInstanceID:      "cp-me:boot-a",
+		OwnerEpoch:             3,
+		LastHeartbeatAt:        now,
+		S3CredentialsExpiresAt: &oldExpiry,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	updated, err := store.MarkCredentialsRefreshed(20, "cp-me:boot-a", 3, newExpiry)
+	if err != nil {
+		t.Fatalf("MarkCredentialsRefreshed: %v", err)
+	}
+	if !updated {
+		t.Fatalf("expected MarkCredentialsRefreshed to update the row, got false")
+	}
+
+	persisted, err := store.GetWorkerRecord(20)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.S3CredentialsExpiresAt == nil || !persisted.S3CredentialsExpiresAt.Equal(newExpiry) {
+		t.Fatalf("expected expires_at = %v, got %v", newExpiry, persisted.S3CredentialsExpiresAt)
+	}
+}
+
+// TestMarkCredentialsRefreshedFailsOnEpochMismatch: another CP took over
+// the worker (bumped owner_epoch), and our just-minted creds are stale —
+// the conditional update returns false rather than overwriting.
+func TestMarkCredentialsRefreshedFailsOnEpochMismatch(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
+	oldExpiry := now.Add(-1 * time.Minute)
+	originalExpiryRow := oldExpiry
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:               21,
+		PodName:                "duckgres-worker-21",
+		State:                  configstore.WorkerStateHot,
+		OrgID:                  "acme",
+		OwnerCPInstanceID:      "cp-me:boot-a",
+		OwnerEpoch:             7, // newer than the caller will pass
+		LastHeartbeatAt:        now,
+		S3CredentialsExpiresAt: &originalExpiryRow,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	updated, err := store.MarkCredentialsRefreshed(21, "cp-me:boot-a", 6, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("MarkCredentialsRefreshed: %v", err)
+	}
+	if updated {
+		t.Fatalf("expected stale-epoch caller to be rejected, got updated=true")
+	}
+
+	persisted, err := store.GetWorkerRecord(21)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.S3CredentialsExpiresAt == nil || !persisted.S3CredentialsExpiresAt.Equal(originalExpiryRow) {
+		t.Fatalf("expected expires_at to be unchanged after epoch mismatch, got %v", persisted.S3CredentialsExpiresAt)
+	}
+}
+
+// TestMarkCredentialsRefreshedFailsOnOwnerMismatch: another CP took
+// ownership entirely. Same conditional-update protection.
+func TestMarkCredentialsRefreshedFailsOnOwnerMismatch(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          22,
+		PodName:           "duckgres-worker-22",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "acme",
+		OwnerCPInstanceID: "cp-other:boot-b",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	updated, err := store.MarkCredentialsRefreshed(22, "cp-me:boot-a", 2, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("MarkCredentialsRefreshed: %v", err)
+	}
+	if updated {
+		t.Fatalf("expected wrong-owner caller to be rejected, got updated=true")
+	}
+}
+
 func TestExpireFlightSessionRecordsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 15, 0, 0, 0, time.UTC)
