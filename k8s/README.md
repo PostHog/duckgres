@@ -36,7 +36,7 @@ This directory contains **development/reference manifests** for running duckgres
 └─────────────────────────────────────────────────────┘
 ```
 
-The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL transpilation. Workers are thin DuckDB execution engines exposed via Arrow Flight SQL. Workers are spawned on demand and reaped when idle. Planned rolling replacements mark old replicas draining and fail readiness before termination; unplanned control-plane failure still drops existing pgwire connections.
+The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL transpilation. Workers are thin DuckDB execution engines exposed via Arrow Flight SQL. The shared warm pool keeps neutral workers ready when `--k8s-shared-warm-target` is greater than zero, activates workers per org on demand, and moves them to `hot_idle` after their last session. Hot-idle workers keep their org assignment and DuckLake attachment for same-org reuse, then are retired by the janitor after 5 minutes if not reclaimed. Planned rolling replacements mark old replicas draining and fail readiness before termination; unplanned control-plane failure still drops existing pgwire connections.
 
 ## Manifests
 
@@ -69,7 +69,7 @@ Key flags for Kubernetes multitenant mode:
 | `--k8s-worker-service-account` | `DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT` | Neutral ServiceAccount name for worker pods (`duckgres-worker` default) |
 | `--k8s-worker-secret` | `DUCKGRES_K8S_WORKER_SECRET` | K8s Secret name for bearer token |
 | `--k8s-worker-configmap` | `DUCKGRES_K8S_WORKER_CONFIGMAP` | ConfigMap name for worker config |
-| `--k8s-shared-warm-target` | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for multi-tenant K8s mode (`0` disables prewarm) |
+| `--k8s-shared-warm-target` | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Global neutral shared warm-worker target for multi-tenant K8s mode (`0` disables prewarm; subject to `--k8s-max-workers`) |
 
 The worker Secret setting is a base name for per-worker RPC Secrets. Each worker pod gets its own derived Secret containing its RPC bearer token and TLS material. If the derived Secret does not exist, the control plane creates it before spawning the pod.
 

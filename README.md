@@ -215,7 +215,7 @@ Run with config file:
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
-| `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm) | `0` |
+| `DUCKGRES_K8S_SHARED_WARM_TARGET` | Global neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm; subject to `DUCKGRES_K8S_MAX_WORKERS`) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
@@ -643,7 +643,7 @@ kill -USR2 <control-plane-pid>
 
 In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may reconnect with a durable session token if the worker survives and the token is still valid.
 
-When a shared warm-worker target is configured (`--k8s-shared-warm-target`), the pool keeps workers neutral at startup, reserves them per org, activates tenant runtime over the activation RPC, and retires them after use. The full lifecycle is: idle → reserved → activating → hot → draining → retired.
+When a shared warm-worker target is configured (`--k8s-shared-warm-target`, default `0`), the pool keeps neutral workers ready at startup. On demand, a neutral worker is reserved for an org, activated over the worker control RPC, and becomes hot for that org. When its last session ends, the worker moves to `hot_idle` instead of being retired immediately: it keeps the org assignment and DuckLake attachment so any control-plane replica can reclaim it for the same org without full reactivation. Hot-idle reuse is image/version strict; a worker whose image no longer matches the org target is retired instead of reused. The janitor retires unreclaimed hot-idle workers after 5 minutes. The main lifecycle is: idle → reserved → activating → hot → hot_idle → retired. Workers can also move through `draining` during shutdown, rollout, or cleanup.
 
 ```bash
 # Local multitenant K8s workflow
@@ -654,7 +654,7 @@ See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration re
 
 On the multi-tenant path, the config store now keeps per-team managed-warehouse metadata in addition to team/user auth and limits. That team-scoped contract is intended to become the source of truth for the tenant warehouse DB, the tenant DuckLake metadata store (which may live on shared Aurora or a dedicated RDS instance), object-store settings, worker identity, secret references, and provisioning state. The older config-store `DuckLakeConfig` singleton remains only as a legacy cluster-wide setting and should not be treated as authoritative for multi-tenant runtime wiring.
 
-The shared K8s pool keeps workers neutral at startup, reserves them per org, activates tenant runtime over the control-plane RPC channel, and retires them after use.
+The shared K8s pool keeps workers neutral at startup, reserves them per org, activates tenant runtime over the control-plane RPC channel, and keeps idle activated workers briefly available for same-org hot-idle reuse before janitor retirement.
 
 Managed-warehouse contract notes:
 
