@@ -1,17 +1,28 @@
 // Package arrowmap provides DuckDB-free helpers for translating DuckDB type
-// strings into Arrow types and for quoting/qualifying SQL identifiers.
+// strings into Arrow types, quoting/qualifying SQL identifiers, and appending
+// scanned values into Arrow array builders.
 //
 // These helpers are kept in their own package (with no dependency on
 // github.com/duckdb/duckdb-go) so that the control plane can use them
-// without linking libduckdb.
+// without linking libduckdb. The DuckDB driver-specific value types
+// (duckdb.Interval, duckdb.Decimal, duckdb.UUID, duckdb.OrderedMap,
+// duckdb.Map) are handled via the RegisterAppender hook so duckdbservice
+// can register them at init time without arrowmap depending on duckdb-go.
 package arrowmap
 
 import (
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"math/big"
 	"strings"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 )
 
 // DuckDBTypeToArrow maps a DuckDB type name to an Arrow DataType.
@@ -286,4 +297,300 @@ func QualifyTableName(catalog, schema sql.NullString, table string) string {
 func QuoteIdent(ident string) string {
 	escaped := strings.ReplaceAll(ident, `"`, `""`)
 	return `"` + escaped + `"`
+}
+
+// OrderedMapValue represents an Arrow MAP as parallel key/value slices,
+// preserving insertion order. Using parallel slices instead of a Go map
+// avoids panics on non-comparable key types (e.g., []byte from BLOB keys)
+// and preserves the source MAP ordering.
+//
+// Lives in arrowmap so AppendValue can switch on it without depending on
+// the server package (which transitively links libduckdb). The flight
+// executor in the server package re-exports it as server.OrderedMapValue
+// via a type alias for backward compatibility.
+type OrderedMapValue struct {
+	Keys   []any
+	Values []any
+}
+
+// Appender is a hook that handles append for value types arrowmap doesn't
+// know about (typically driver-specific types like duckdb.Interval). It
+// reports whether it handled the value; arrowmap.AppendValue falls back to
+// its built-in handling when no registered Appender claims the value.
+//
+// Hooks must be safe to call concurrently and must not panic. They run in
+// registration order; the first one to return true wins.
+type Appender func(builder array.Builder, val any) (handled bool)
+
+// appenders is loaded once into an atomic.Value as []Appender. Reads on the
+// hot path (AppendValue) are lock-free; registrations rebuild the slice.
+// Registrations are expected to happen at init time so contention is rare.
+var appenders atomic.Value // []Appender
+
+// RegisterAppender adds a hook that AppendValue will consult before falling
+// back to its built-in value-type handling. Intended for use from package
+// init() functions in importers that own driver-specific value types
+// (e.g., duckdbservice registers handlers for duckdb.Interval, Decimal,
+// UUID, OrderedMap, and Map).
+func RegisterAppender(a Appender) {
+	if a == nil {
+		return
+	}
+	cur, _ := appenders.Load().([]Appender)
+	next := make([]Appender, 0, len(cur)+1)
+	next = append(next, cur...)
+	next = append(next, a)
+	appenders.Store(next)
+}
+
+// AppendValue appends a value to an Arrow array builder with type coercion.
+// It first asks any registered Appender hooks (see RegisterAppender), then
+// falls back to handling the standard Arrow / Go value types itself.
+func AppendValue(builder array.Builder, val any) {
+	if val == nil {
+		builder.AppendNull()
+		return
+	}
+	if hooks, _ := appenders.Load().([]Appender); len(hooks) > 0 {
+		for _, h := range hooks {
+			if h(builder, val) {
+				return
+			}
+		}
+	}
+	appendBuiltin(builder, val)
+}
+
+// appendBuiltin handles the value types arrowmap knows about natively
+// (everything that doesn't depend on a database driver package).
+func appendBuiltin(builder array.Builder, val any) {
+	switch b := builder.(type) {
+	case *array.Int64Builder:
+		switch v := val.(type) {
+		case int64:
+			b.Append(v)
+		case int32:
+			b.Append(int64(v))
+		case int:
+			b.Append(int64(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Int32Builder:
+		switch v := val.(type) {
+		case int32:
+			b.Append(v)
+		case int64:
+			b.Append(int32(v))
+		case int:
+			b.Append(int32(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Int16Builder:
+		switch v := val.(type) {
+		case int16:
+			b.Append(v)
+		case int32:
+			b.Append(int16(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Int8Builder:
+		switch v := val.(type) {
+		case int8:
+			b.Append(v)
+		case int32:
+			b.Append(int8(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Uint8Builder:
+		switch v := val.(type) {
+		case uint8:
+			b.Append(v)
+		case uint16:
+			b.Append(uint8(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Uint16Builder:
+		switch v := val.(type) {
+		case uint16:
+			b.Append(v)
+		case uint32:
+			b.Append(uint16(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Uint32Builder:
+		switch v := val.(type) {
+		case uint32:
+			b.Append(v)
+		case uint64:
+			b.Append(uint32(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Uint64Builder:
+		switch v := val.(type) {
+		case uint64:
+			b.Append(v)
+		default:
+			b.AppendNull()
+		}
+	case *array.Float64Builder:
+		switch v := val.(type) {
+		case float64:
+			b.Append(v)
+		case float32:
+			b.Append(float64(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.Float32Builder:
+		switch v := val.(type) {
+		case float32:
+			b.Append(v)
+		case float64:
+			b.Append(float32(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.BooleanBuilder:
+		if v, ok := val.(bool); ok {
+			b.Append(v)
+		} else {
+			b.AppendNull()
+		}
+	case *array.Date32Builder:
+		switch v := val.(type) {
+		case time.Time:
+			// Floor division to handle pre-epoch dates correctly.
+			// Go's integer division truncates toward zero, but Date32
+			// needs days since epoch rounded toward negative infinity.
+			unix := v.Unix()
+			days := unix / 86400
+			if unix%86400 < 0 {
+				days--
+			}
+			b.Append(arrow.Date32(days))
+		default:
+			b.AppendNull()
+		}
+	case *array.TimestampBuilder:
+		switch v := val.(type) {
+		case time.Time:
+			b.AppendTime(v)
+		default:
+			b.AppendNull()
+		}
+	case *array.Time64Builder:
+		switch v := val.(type) {
+		case time.Time:
+			micros := int64(v.Hour())*3600000000 + int64(v.Minute())*60000000 +
+				int64(v.Second())*1000000 + int64(v.Nanosecond())/1000
+			b.Append(arrow.Time64(micros))
+		default:
+			b.AppendNull()
+		}
+	case *array.MonthDayNanoIntervalBuilder:
+		// arrowmap natively handles arrow.MonthDayNanoInterval; driver-specific
+		// interval types (e.g., duckdb.Interval) come in via Appender hooks.
+		switch v := val.(type) {
+		case arrow.MonthDayNanoInterval:
+			b.Append(v)
+		default:
+			b.AppendNull()
+		}
+	case *array.Decimal128Builder:
+		switch v := val.(type) {
+		case *big.Int:
+			b.Append(decimal128.FromBigInt(v))
+		default:
+			b.AppendNull()
+		}
+	case *array.FixedSizeBinaryBuilder:
+		switch v := val.(type) {
+		case []byte:
+			b.Append(v)
+		default:
+			b.AppendNull()
+		}
+	case *array.ListBuilder:
+		switch v := val.(type) {
+		case []any:
+			b.Append(true)
+			vb := b.ValueBuilder()
+			for _, elem := range v {
+				AppendValue(vb, elem)
+			}
+		default:
+			b.AppendNull()
+		}
+	case *array.StructBuilder:
+		switch v := val.(type) {
+		case map[string]any:
+			b.Append(true)
+			st := b.Type().(*arrow.StructType)
+			for i := 0; i < st.NumFields(); i++ {
+				fieldVal, ok := v[st.Field(i).Name]
+				if !ok {
+					b.FieldBuilder(i).AppendNull()
+				} else {
+					AppendValue(b.FieldBuilder(i), fieldVal)
+				}
+			}
+		default:
+			b.AppendNull()
+		}
+	case *array.MapBuilder:
+		switch v := val.(type) {
+		case OrderedMapValue:
+			b.Append(true)
+			kb, ib := b.KeyBuilder(), b.ItemBuilder()
+			for i, k := range v.Keys {
+				AppendValue(kb, k)
+				AppendValue(ib, v.Values[i])
+			}
+		case map[any]any:
+			b.Append(true)
+			kb, ib := b.KeyBuilder(), b.ItemBuilder()
+			for k, item := range v {
+				AppendValue(kb, k)
+				AppendValue(ib, item)
+			}
+		default:
+			b.AppendNull()
+		}
+	case *array.StringBuilder:
+		switch v := val.(type) {
+		case string:
+			b.Append(v)
+		case []byte:
+			// 16-byte non-UTF-8 input is heuristically formatted as a UUID
+			// string. This pairs with DuckDBTypeToArrow("UUID") returning
+			// String — duckdb's Go driver returns []byte (not duckdb.UUID)
+			// when scanning UUID columns into interface{}.
+			if len(v) == 16 && !utf8.Valid(v) {
+				s := hex.EncodeToString(v)
+				b.Append(s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32])
+			} else {
+				b.Append(string(v))
+			}
+		default:
+			b.Append(fmt.Sprintf("%v", v))
+		}
+	case *array.BinaryBuilder:
+		switch v := val.(type) {
+		case []byte:
+			b.Append(v)
+		case string:
+			b.Append([]byte(v))
+		default:
+			b.AppendNull()
+		}
+	default:
+		builder.AppendNull()
+	}
 }
