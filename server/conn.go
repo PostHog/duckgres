@@ -543,6 +543,50 @@ func isUserQueryError(err error) bool {
 	return ok
 }
 
+// logQueryStarted records a query handing off to a worker. Pairs with
+// logQueryFinished at every termination point so logs and traces can
+// be cross-referenced — the trace_id attribute matches the OTEL span
+// ID exported by the same query, so a search like trace_id=abc123 in
+// Loki/Grafana lines up directly with the trace view.
+//
+// Includes worker_id and worker_pod so an operator chasing a specific
+// worker incident (e.g. the one in the worker-40761 postmortem) can
+// filter to just that worker's queries without joining across logs.
+func (c *clientConn) logQueryStarted(query string) {
+	slog.Info("Query started.",
+		"user", c.username,
+		"query", query,
+		"worker", c.workerID,
+		"worker_pod", c.workerPod,
+		"trace_id", traceIDFromContext(c.ctx))
+}
+
+// logQueryFinished records a query terminating on the worker. Counter-
+// part to logQueryStarted; emit once per query regardless of outcome
+// so the start/finish pair is always balanced.
+//
+// On error paths logQueryError still fires for severity routing
+// (Info vs Error based on SQLSTATE class). logQueryFinished
+// deliberately stays at Info even on error so the lifecycle pair stays
+// readable as a stream — operators following one trace see both a
+// "started" and a "finished" line, and can look at the separate error
+// line for severity context.
+func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64, err error) {
+	attrs := []any{
+		"user", c.username,
+		"query", query,
+		"duration_ms", time.Since(start).Milliseconds(),
+		"rows", rows,
+		"worker", c.workerID,
+		"worker_pod", c.workerPod,
+		"trace_id", traceIDFromContext(c.ctx),
+	}
+	if err != nil {
+		attrs = append(attrs, "error", err.Error())
+	}
+	slog.Info("Query finished.", attrs...)
+}
+
 // logQueryError logs a query execution failure. DuckLake-specific
 // retryable conditions and user-attributable errors get Warn / Info so
 // the Error level stays meaningful as an alerting signal — "Query
@@ -1549,6 +1593,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 
 	execStart := time.Now()
 	execCtx, execSpan := tracer.Start(ctx, "duckgres.execute")
+	c.logQueryStarted(query)
 	runQuery := func() (RowSet, error) {
 		return c.executor.QueryContext(ctx, query)
 	}
@@ -1581,6 +1626,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		} else {
 			c.logQueryError(query, err)
 		}
+		c.logQueryFinished(query, execStart, 0, err)
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = writeReadyForQuery(c.writer, c.txStatus)
@@ -1669,6 +1715,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	_ = writeCommandComplete(c.writer, tag)
 	_ = writeReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
+	c.logQueryFinished(query, execStart, int64(rowCount), nil)
 	return int64(rowCount), "", "", nil
 }
 
