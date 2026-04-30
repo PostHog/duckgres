@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
@@ -26,6 +27,7 @@ type SharedWorkerActivator struct {
 	defaultNamespace       string
 	defaultSpecVersion     string
 	stsBroker              *STSBroker
+	runtimeStore           credentialExpiryStore
 	resolveOrgConfig       func(string) (*configstore.OrgConfig, error)
 	resolveDucklingStatus  func(context.Context, string) (*provisioner.DucklingStatus, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, TenantActivationPayload) error
@@ -39,17 +41,35 @@ type SharedWorkerActivator struct {
 	migrationChecked sync.Map // orgID (string) → bool (needed)
 }
 
+// credentialExpiryStore is the slice of the runtime store the activator uses
+// to record when STS-brokered S3 credentials expire on a worker, and to
+// bump the owner epoch atomically when re-activating a worker for refresh.
+// Defined as an interface so tests can substitute a fake without standing
+// up Postgres.
+type credentialExpiryStore interface {
+	MarkCredentialsRefreshed(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, expiresAt time.Time) (bool, error)
+	BumpWorkerEpoch(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64) (int64, error)
+}
+
 type TenantActivationPayload struct {
 	OrgID     string                `json:"org_id"`
 	Usernames []string              `json:"usernames,omitempty"`
 	DuckLake  server.DuckLakeConfig `json:"ducklake"`
+	// S3CredentialsExpiresAt is the absolute expiration time of the STS
+	// credentials embedded in DuckLake.{S3AccessKey,S3SecretKey,S3SessionToken}.
+	// nil for non-STS payloads (config-store-driven warehouses use static
+	// credentials with no expiration). When set, the activator persists it
+	// onto the worker_records row after a successful activation so the
+	// credential refresh scheduler can pick the worker up before the token
+	// goes stale.
+	S3CredentialsExpiresAt *time.Time `json:"s3_credentials_expires_at,omitempty"`
 }
 
 func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, defaultSpecVersion string, resolveOrgConfig func(string) (*configstore.OrgConfig, error)) *SharedWorkerActivator {
 	if shared == nil {
 		return nil
 	}
-	return &SharedWorkerActivator{
+	a := &SharedWorkerActivator{
 		clientset:              shared.clientset,
 		defaultNamespace:       shared.namespace,
 		defaultSpecVersion:     defaultSpecVersion,
@@ -57,6 +77,15 @@ func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, defau
 		resolveOrgConfig:       resolveOrgConfig,
 		activateReservedWorker: shared.ActivateReservedWorker,
 	}
+	// The K8s pool already wraps the underlying configstore via its
+	// runtimeStore; the activator can borrow it for the credential-refresh
+	// stamp. Tests that construct a pool without a runtime store get a nil
+	// here, which is fine — the persist step is skipped (the stamp is best-
+	// effort; the next scheduler tick will retry).
+	if rs, ok := shared.runtimeStore.(credentialExpiryStore); ok {
+		a.runtimeStore = rs
+	}
+	return a
 }
 
 func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, worker *ManagedWorker) error {
@@ -138,7 +167,97 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 		}
 	}
 
+	// Stamp the STS expiration onto the worker_records row so the
+	// credential-refresh scheduler can pick this worker up before its
+	// session token goes stale. Best-effort: a failure here doesn't fail
+	// the activation. The next scheduler tick will see a NULL or stale
+	// expiry and refresh inline.
+	if err == nil && payload.S3CredentialsExpiresAt != nil && a.runtimeStore != nil {
+		if _, mErr := a.runtimeStore.MarkCredentialsRefreshed(
+			worker.ID,
+			worker.OwnerCPInstanceID(),
+			worker.OwnerEpoch(),
+			*payload.S3CredentialsExpiresAt,
+		); mErr != nil {
+			slog.Warn("Failed to record S3 credential expiry on activation.",
+				"worker_id", worker.ID, "org", payload.OrgID, "error", mErr)
+		}
+	}
+
 	return err
+}
+
+// RefreshCredentials brokers a fresh STS session for the worker's org and
+// re-sends ActivateTenant so the worker's DuckDB ducklake_s3 secret picks
+// up the new (AccessKey, SecretKey, SessionToken). Used by the
+// credential-refresh scheduler to keep long-running workers alive across
+// the STS session-duration boundary without ever touching a session's
+// pinned *sql.Conn.
+//
+// The owner_epoch is bumped atomically in the runtime store before the
+// RPC; the in-memory ManagedWorker is updated to match, then the
+// ActivateTenant RPC carries the new epoch so the worker's
+// reuseExistingActivation guard accepts the payload. On RPC success the
+// worker's in-memory state is replaced and MarkCredentialsRefreshed
+// stamps the new expiry. Any of these steps can fail — a failure aborts
+// without trampling the worker's existing (still-valid-for-now) creds,
+// and the next scheduler tick retries.
+func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *ManagedWorker) error {
+	if worker == nil {
+		return fmt.Errorf("worker is required for credential refresh")
+	}
+	if a.runtimeStore == nil {
+		return fmt.Errorf("credential refresh requires a runtime store")
+	}
+	state := worker.SharedState()
+	if state.Assignment == nil || state.Assignment.OrgID == "" {
+		return fmt.Errorf("worker %d has no org assignment to refresh credentials for", worker.ID)
+	}
+
+	org, err := a.lookupOrgConfig(state.Assignment.OrgID)
+	if err != nil {
+		return err
+	}
+	payload, err := a.BuildActivationRequest(ctx, org, state.Assignment)
+	if err != nil {
+		return err
+	}
+	if payload.S3CredentialsExpiresAt == nil {
+		// Static-cred warehouses don't need refresh — defensive guard so we
+		// don't incorrectly mark expiry on rows that genuinely have none.
+		return nil
+	}
+
+	currentEpoch := worker.OwnerEpoch()
+	cpInstanceID := worker.OwnerCPInstanceID()
+	newEpoch, err := a.runtimeStore.BumpWorkerEpoch(worker.ID, cpInstanceID, currentEpoch)
+	if err != nil {
+		return fmt.Errorf("bump owner epoch for refresh: %w", err)
+	}
+	worker.SetOwnerEpoch(newEpoch)
+
+	rpcPayload := server.WorkerActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			WorkerID:     worker.ID,
+			OwnerEpoch:   newEpoch,
+			CPInstanceID: cpInstanceID,
+		},
+		OrgID:    payload.OrgID,
+		DuckLake: payload.DuckLake,
+	}
+	if err := worker.ActivateTenant(ctx, rpcPayload); err != nil {
+		return fmt.Errorf("activate tenant for refresh: %w", err)
+	}
+
+	if _, err := a.runtimeStore.MarkCredentialsRefreshed(
+		worker.ID, cpInstanceID, newEpoch, *payload.S3CredentialsExpiresAt,
+	); err != nil {
+		// The worker has new creds in DuckDB; we just couldn't record the
+		// new expiry. Next tick will see a stale expiry and refresh again.
+		slog.Warn("Failed to record refreshed credential expiry.",
+			"worker_id", worker.ID, "org", payload.OrgID, "error", err)
+	}
+	return nil
 }
 
 func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org *configstore.OrgConfig, assignment *WorkerAssignment) (TenantActivationPayload, error) {
@@ -153,17 +272,20 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 
 	var dl server.DuckLakeConfig
+	var expiresAt *time.Time
 	var err error
 
 	// Try reading infrastructure details from the Duckling CR first (Crossplane-provisioned).
 	// Fall back to the config store path for non-Crossplane warehouses (manual seed, MinIO, etc.).
 	if a.resolveDucklingStatus != nil {
-		dl, err = a.buildDuckLakeConfigFromDuckling(ctx, assignment.OrgID)
+		dl, expiresAt, err = a.buildDuckLakeConfigFromDuckling(ctx, assignment.OrgID)
 		if err != nil {
 			slog.Warn("Duckling CR activation failed, falling back to config store.", "org", assignment.OrgID, "error", err)
 		}
 	}
 	if a.resolveDucklingStatus == nil || err != nil {
+		// Config-store warehouses use static creds (no STS), so expiresAt
+		// stays nil and the credential refresh scheduler skips them.
 		dl, err = a.buildDuckLakeConfigFromConfigStore(ctx, org.Warehouse)
 	}
 	if err != nil {
@@ -187,29 +309,32 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	dl.SpecVersion = targetSpecVersion
 
 	return TenantActivationPayload{
-		OrgID:     assignment.OrgID,
-		Usernames: usernames,
-		DuckLake:  dl,
+		OrgID:                  assignment.OrgID,
+		Usernames:              usernames,
+		DuckLake:               dl,
+		S3CredentialsExpiresAt: expiresAt,
 	}, nil
 }
 
 // buildDuckLakeConfigFromDuckling reads all infrastructure details from the Duckling CR
 // and uses STS to broker S3 credentials. Used for Crossplane-provisioned ducklings.
-func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Context, orgID string) (server.DuckLakeConfig, error) {
+// The returned *time.Time is the STS credentials' expiration; nil for paths that
+// don't broker temporary credentials.
+func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Context, orgID string) (server.DuckLakeConfig, *time.Time, error) {
 	status, err := a.resolveDucklingStatus(ctx, orgID)
 	if err != nil {
-		return server.DuckLakeConfig{}, fmt.Errorf("resolve duckling CR %q: %w", orgID, err)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("resolve duckling CR %q: %w", orgID, err)
 	}
 	if status.MetadataStore.Password == "" {
-		return server.DuckLakeConfig{}, fmt.Errorf("duckling CR %q has no metadata store password", orgID)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no metadata store password", orgID)
 	}
 	if status.DataStore.BucketName == "" {
-		return server.DuckLakeConfig{}, fmt.Errorf("duckling CR %q has no data store bucket", orgID)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no data store bucket", orgID)
 	}
 
 	host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
 	if err != nil {
-		return server.DuckLakeConfig{}, err
+		return server.DuckLakeConfig{}, nil, err
 	}
 
 	dl := server.DuckLakeConfig{
@@ -229,21 +354,22 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 
 	// Broker S3 credentials via STS AssumeRole
 	if status.IAMRoleARN == "" {
-		return server.DuckLakeConfig{}, fmt.Errorf("duckling CR %q has no IAM role ARN for shared warm activation", orgID)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no IAM role ARN for shared warm activation", orgID)
 	}
 	if a.stsBroker == nil {
-		return server.DuckLakeConfig{}, fmt.Errorf("STS broker is required for shared warm activation for org %q", orgID)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("STS broker is required for shared warm activation for org %q", orgID)
 	}
 	creds, err := a.stsBroker.AssumeRole(ctx, status.IAMRoleARN)
 	if err != nil {
-		return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", orgID, err)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("STS AssumeRole for org %q: %w", orgID, err)
 	}
 	dl.S3Provider = "config"
 	dl.S3AccessKey = creds.AccessKeyID
 	dl.S3SecretKey = creds.SecretAccessKey
 	dl.S3SessionToken = creds.SessionToken
 
-	return dl, nil
+	expiresAt := creds.Expiration
+	return dl, &expiresAt, nil
 }
 
 func ducklingMetadataStoreAddress(status *provisioner.DucklingStatus, orgID string) (host string, port int, viaPgBouncer bool, err error) {
@@ -287,8 +413,8 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 			metadataPassword,
 			warehouse.MetadataStore.DatabaseName,
 		),
-		ObjectStore: buildManagedWarehouseObjectStore(warehouse.S3),
-		S3Endpoint:  warehouse.S3.Endpoint,
+		ObjectStore:         buildManagedWarehouseObjectStore(warehouse.S3),
+		S3Endpoint:          warehouse.S3.Endpoint,
 		S3Region:            warehouse.S3.Region,
 		S3UseSSL:            warehouse.S3.UseSSL,
 		S3URLStyle:          warehouse.S3.URLStyle,

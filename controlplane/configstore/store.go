@@ -478,7 +478,7 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "worker_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at"}),
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert worker record: %w", err)
 	}
@@ -708,6 +708,106 @@ func (cs *ConfigStore) RetireOrphanWorker(workerID int, reason string) (bool, er
 		})
 	if result.Error != nil {
 		return false, fmt.Errorf("retire orphan worker %d: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// ListWorkersDueForCredentialRefresh returns workers owned by the given CP
+// whose S3 credentials are about to expire (or have already expired) and
+// therefore need a refresh. The cutoff defines "soon": typically the
+// scheduler passes (now + half the STS session duration), so a worker is
+// picked up well before its session token actually goes invalid.
+//
+// NULL s3_credentials_expires_at is treated as "due immediately". This
+// covers two cases: warm-pool rows that haven't been activated yet (these
+// have no creds, so the predicate is irrelevant — they're filtered out by
+// the state set anyway since neutral idle workers shouldn't carry creds),
+// and pre-migration rows that existed before this column was introduced
+// (these get refreshed eagerly so we converge to the new state).
+//
+// Only active states are considered: retired/lost/draining(-out) rows
+// don't need creds. We include `idle` deliberately — an idle worker that
+// belongs to an org (post-activation) still has live creds in DuckDB and
+// will need them on the next session.
+func (cs *ConfigStore) ListWorkersDueForCredentialRefresh(ownerCPInstanceID string, cutoff time.Time) ([]WorkerRecord, error) {
+	var workers []WorkerRecord
+	credEligibleStates := []WorkerState{
+		WorkerStateIdle,
+		WorkerStateReserved,
+		WorkerStateActivating,
+		WorkerStateHot,
+		WorkerStateHotIdle,
+	}
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("owner_cp_instance_id = ?", ownerCPInstanceID).
+		Where("state IN ?", credEligibleStates).
+		// Org-bound rows only: a neutral warm row (org_id='') hasn't been
+		// activated, so it has no STS-brokered creds yet.
+		Where("org_id <> ''").
+		Where("s3_credentials_expires_at IS NULL OR s3_credentials_expires_at <= ?", cutoff).
+		Order("s3_credentials_expires_at ASC NULLS FIRST, worker_id ASC").
+		Find(&workers).Error
+	if err != nil {
+		return nil, fmt.Errorf("list workers due for credential refresh: %w", err)
+	}
+	return workers, nil
+}
+
+// BumpWorkerEpoch atomically increments owner_epoch on a worker we
+// already own, returning the new epoch. Used by the credential-refresh
+// scheduler before re-sending ActivateTenant with rotated STS creds: the
+// worker's reuseExistingActivation guard requires payload.OwnerEpoch >
+// current, so the scheduler bumps here, applies the new epoch on the
+// in-memory ManagedWorker, then dispatches the activation. If another CP
+// has already taken over the row (different owner_cp_instance_id or
+// already-bumped epoch), this returns ErrWorkerOwnerEpochMismatch and the
+// caller drops the in-flight refresh.
+func (cs *ConfigStore) BumpWorkerEpoch(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64) (int64, error) {
+	var newEpoch int64
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+			Where("worker_id = ? AND owner_cp_instance_id = ? AND owner_epoch = ?",
+				workerID, ownerCPInstanceID, expectedOwnerEpoch).
+			Updates(map[string]any{
+				"owner_epoch": gorm.Expr("owner_epoch + 1"),
+				"updated_at":  time.Now(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrWorkerOwnerEpochMismatch
+		}
+		var current WorkerRecord
+		if err := tx.Table(cs.runtimeTable(current.TableName())).
+			Where("worker_id = ?", workerID).
+			Take(&current).Error; err != nil {
+			return err
+		}
+		newEpoch = current.OwnerEpoch
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return newEpoch, nil
+}
+
+// MarkCredentialsRefreshed conditionally stamps a new S3 credential
+// expiration onto a worker row. The update only takes effect when the
+// caller is still the owner (same owner_cp_instance_id and owner_epoch);
+// any drift means another CP took over the worker and the caller's just-
+// minted creds are stale — we discard them rather than trample. Returns
+// true when the row was updated.
+func (cs *ConfigStore) MarkCredentialsRefreshed(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, expiresAt time.Time) (bool, error) {
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND owner_cp_instance_id = ? AND owner_epoch = ?", workerID, ownerCPInstanceID, expectedOwnerEpoch).
+		Updates(map[string]any{
+			"s3_credentials_expires_at": expiresAt,
+			"updated_at":                time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("mark credentials refreshed for worker %d: %w", workerID, result.Error)
 	}
 	return result.RowsAffected > 0, nil
 }

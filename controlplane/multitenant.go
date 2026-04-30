@@ -181,9 +181,9 @@ func SetupMultiTenant(
 		WorkerCPURequest:      cfg.K8s.WorkerCPURequest,
 		WorkerMemoryRequest:   cfg.K8s.WorkerMemoryRequest,
 		WorkerNodeSelector:    parseNodeSelector(cfg.K8s.WorkerNodeSelector),
-		WorkerTolerationKey:        cfg.K8s.WorkerTolerationKey,
+		WorkerTolerationKey:   cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue: cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:  cfg.K8s.WorkerExclusiveNode,
+		WorkerExclusiveNode:   cfg.K8s.WorkerExclusiveNode,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()
 			if snap == nil {
@@ -264,6 +264,70 @@ func SetupMultiTenant(
 		defer cancel()
 		if n := router.sharedPool.cleanupOrphanedWorkerPods(ctx, 2*time.Minute); n > 0 {
 			slog.Info("Stranded worker pods reconciled.", "count", n)
+		}
+	}
+
+	// Scheduler-side activator: a single SharedWorkerActivator instance
+	// that the credential-refresh tick uses to re-broker STS sessions for
+	// any worker we own. It's distinct from the per-org activators created
+	// inside createOrgStack (those are wired into the worker-claim path);
+	// this one operates across all orgs by looking each up in the snapshot.
+	refreshActivator := NewSharedWorkerActivator(
+		router.sharedPool,
+		stsBroker,
+		cfg.DuckLakeDefaultSpecVersion,
+		func(orgID string) (*configstore.OrgConfig, error) {
+			snap := store.Snapshot()
+			if snap == nil {
+				return nil, fmt.Errorf("config snapshot unavailable for org %s", orgID)
+			}
+			org, ok := snap.Orgs[orgID]
+			if !ok {
+				return nil, fmt.Errorf("org %s not found in config snapshot", orgID)
+			}
+			return org, nil
+		},
+	)
+	if refreshActivator != nil {
+		refreshActivator.resolveDucklingStatus = resolveDucklingStatus
+	}
+
+	// Half the configured STS session duration: a worker due for refresh
+	// gets picked up well before its current session token actually goes
+	// stale, with a full half-life of slack to retry transient STS / RPC
+	// failures on subsequent ticks.
+	const credentialRefreshLookahead = stsSessionDuration / 2
+
+	janitor.refreshExpiringCredentials = func() {
+		if refreshActivator == nil {
+			return
+		}
+		cutoff := time.Now().Add(credentialRefreshLookahead)
+		due, err := store.ListWorkersDueForCredentialRefresh(cpInstanceID, cutoff)
+		if err != nil {
+			slog.Warn("Janitor failed to list workers due for credential refresh.", "error", err)
+			return
+		}
+		if len(due) == 0 {
+			return
+		}
+		slog.Info("Refreshing S3 credentials on workers nearing expiry.", "count", len(due))
+		for i := range due {
+			rec := due[i]
+			worker, ok := router.sharedPool.Worker(rec.WorkerID)
+			if !ok {
+				// Worker isn't in this CP's in-memory pool right now —
+				// could be mid-takeover, mid-retire, or just briefly
+				// dropped. Skip; if it comes back to us next tick we'll
+				// pick it up then.
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := refreshActivator.RefreshCredentials(ctx, worker); err != nil {
+				slog.Warn("Failed to refresh worker S3 credentials.",
+					"worker_id", rec.WorkerID, "org", rec.OrgID, "error", err)
+			}
+			cancel()
 		}
 	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)

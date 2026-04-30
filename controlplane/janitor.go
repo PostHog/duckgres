@@ -8,7 +8,6 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-
 const (
 	janitorRetireReasonOrphaned        = "orphaned"
 	janitorRetireReasonStuckActivating = "stuck_activating"
@@ -22,6 +21,8 @@ type controlPlaneExpiryStore interface {
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
 	RetireHotIdleWorker(workerID int) (bool, error)
+	ListWorkersDueForCredentialRefresh(ownerCPInstanceID string, cutoff time.Time) ([]configstore.WorkerRecord, error)
+	MarkCredentialsRefreshed(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, expiresAt time.Time) (bool, error)
 }
 
 type ControlPlaneJanitor struct {
@@ -40,6 +41,7 @@ type ControlPlaneJanitor struct {
 	reconcileWarmCapacity         func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
+	refreshExpiringCredentials    func() // re-activates workers whose STS-brokered S3 credentials are about to expire (leader-only)
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -181,6 +183,17 @@ func (j *ControlPlaneJanitor) runOnce() {
 
 	if j.reconcileWarmCapacity != nil {
 		j.reconcileWarmCapacity()
+	}
+
+	// Refresh STS-brokered S3 credentials on workers we own that are
+	// approaching expiry. Runs every tick on the leader; the underlying
+	// query is cheap (indexed lookup on owner + expires_at) and only does
+	// work when there's actually a worker due. Keeps long-running queries
+	// healthy across the STS session-duration boundary by re-activating
+	// the worker via a side connection rather than blocking on the
+	// session's pinned *sql.Conn.
+	if j.refreshExpiringCredentials != nil {
+		j.refreshExpiringCredentials()
 	}
 }
 
