@@ -298,37 +298,21 @@ func SetupMultiTenant(
 	// failures on subsequent ticks.
 	const credentialRefreshLookahead = stsSessionDuration / 2
 
-	janitor.refreshExpiringCredentials = func() {
-		if refreshActivator == nil {
-			return
+	// Per-CP scheduler — runs on every CP regardless of leader status, since
+	// each CP refreshes only the workers it owns (filtered by cpInstanceID in
+	// the SQL). Running this on the janitor leader only would leave workers
+	// owned by non-leader CPs to expire naturally, breaking long-running
+	// queries.
+	if refreshActivator != nil {
+		scheduler := &credentialRefreshScheduler{
+			interval:     5 * time.Second,
+			lookahead:    credentialRefreshLookahead,
+			cpInstanceID: cpInstanceID,
+			store:        store,
+			workerByID:   router.sharedPool.Worker,
+			refresh:      refreshActivator.RefreshCredentials,
 		}
-		cutoff := time.Now().Add(credentialRefreshLookahead)
-		due, err := store.ListWorkersDueForCredentialRefresh(cpInstanceID, cutoff)
-		if err != nil {
-			slog.Warn("Janitor failed to list workers due for credential refresh.", "error", err)
-			return
-		}
-		if len(due) == 0 {
-			return
-		}
-		slog.Info("Refreshing S3 credentials on workers nearing expiry.", "count", len(due))
-		for i := range due {
-			rec := due[i]
-			worker, ok := router.sharedPool.Worker(rec.WorkerID)
-			if !ok {
-				// Worker isn't in this CP's in-memory pool right now —
-				// could be mid-takeover, mid-retire, or just briefly
-				// dropped. Skip; if it comes back to us next tick we'll
-				// pick it up then.
-				continue
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := refreshActivator.RefreshCredentials(ctx, worker); err != nil {
-				slog.Warn("Failed to refresh worker S3 credentials.",
-					"worker_id", rec.WorkerID, "org", rec.OrgID, "error", err)
-			}
-			cancel()
-		}
+		go scheduler.Run(context.Background())
 	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
