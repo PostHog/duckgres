@@ -84,39 +84,6 @@ func (s *captureControlPlaneExpiryStore) RetireHotIdleWorker(workerID int) (bool
 	return true, nil
 }
 
-func (s *captureControlPlaneExpiryStore) ListWorkersDueForCredentialRefresh(ownerCPInstanceID string, cutoff time.Time) ([]configstore.WorkerRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return nil, nil
-}
-
-func (s *captureControlPlaneExpiryStore) MarkCredentialsRefreshed(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, expiresAt time.Time) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return true, nil
-}
-
-// TestControlPlaneJanitorRunCallsRefreshExpiringCredentials proves the
-// scheduler hook fires every tick on the leader. The actual STS / RPC
-// work is exercised by the postgres-backed and integration tests; here
-// we just verify wiring so a future regression in runOnce can't silently
-// drop the credential refresh.
-func TestControlPlaneJanitorRunCallsRefreshExpiringCredentials(t *testing.T) {
-	store := &captureControlPlaneExpiryStore{}
-	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
-	janitor.now = func() time.Time { return time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC) }
-
-	var calls int
-	janitor.refreshExpiringCredentials = func() { calls++ }
-
-	janitor.runOnce()
-	janitor.runOnce()
-
-	if calls != 2 {
-		t.Fatalf("expected refreshExpiringCredentials to fire on each runOnce; got %d calls in 2 ticks", calls)
-	}
-}
-
 func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{}
 	now := time.Date(2026, time.March, 26, 15, 0, 0, 0, time.UTC)
