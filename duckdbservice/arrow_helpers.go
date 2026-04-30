@@ -133,8 +133,8 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		// irrecoverably lost at the driver level.
 		return arrow.FixedWidthTypes.Time64us
 
-	// Timestamps (no timezone → empty TimeZone string)
-	case "TIMESTAMP":
+	case "TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE":
+		// No timezone means an empty Arrow TimeZone string.
 		return &arrow.TimestampType{Unit: arrow.Microsecond}
 	case "TIMESTAMP_S":
 		return &arrow.TimestampType{Unit: arrow.Second}
@@ -142,7 +142,7 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		return &arrow.TimestampType{Unit: arrow.Millisecond}
 	case "TIMESTAMP_NS":
 		return &arrow.TimestampType{Unit: arrow.Nanosecond}
-	case "TIMESTAMPTZ":
+	case "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE":
 		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
 
 	// Interval

@@ -65,11 +65,15 @@ func TestDuckDBTypeToArrow(t *testing.T) {
 
 		// Timestamps — plain TIMESTAMP must NOT have timezone
 		{"TIMESTAMP", &arrow.TimestampType{Unit: arrow.Microsecond}},
+		{"TIMESTAMP WITHOUT TIME ZONE", &arrow.TimestampType{Unit: arrow.Microsecond}},
+		{"timestamp without time zone", &arrow.TimestampType{Unit: arrow.Microsecond}},
 		{"TIMESTAMP_S", &arrow.TimestampType{Unit: arrow.Second}},
 		{"TIMESTAMP_MS", &arrow.TimestampType{Unit: arrow.Millisecond}},
 		{"TIMESTAMP_NS", &arrow.TimestampType{Unit: arrow.Nanosecond}},
 		// TIMESTAMPTZ must have UTC timezone
 		{"TIMESTAMPTZ", &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
+		{"TIMESTAMP WITH TIME ZONE", &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
+		{"timestamp with time zone", &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}},
 
 		// Interval
 		{"INTERVAL", arrow.FixedWidthTypes.MonthDayNanoInterval},
@@ -171,11 +175,11 @@ func TestParseDecimalParams(t *testing.T) {
 		{"DECIMAL(10,5)", 10, 5},
 		{"DECIMAL(38,0)", 38, 0},
 		{"NUMERIC(5,3)", 5, 3},
-		{"DECIMAL", 18, 3},   // default fallback
-		{"DECIMAL()", 18, 3}, // empty parens
-		{"DECIMAL(abc,def)", 18, 3},  // non-numeric
-		{"DECIMAL(18,)", 18, 3},      // missing scale
-		{"DECIMAL(,2)", 18, 3},       // missing precision
+		{"DECIMAL", 18, 3},          // default fallback
+		{"DECIMAL()", 18, 3},        // empty parens
+		{"DECIMAL(abc,def)", 18, 3}, // non-numeric
+		{"DECIMAL(18,)", 18, 3},     // missing scale
+		{"DECIMAL(,2)", 18, 3},      // missing precision
 	}
 
 	for _, tt := range tests {
