@@ -23,6 +23,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice"
+	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -1086,7 +1087,7 @@ func (h *ControlPlaneFlightSQLHandler) DoGetTables(ctx context.Context, cmd flig
 			}
 			tableSchema := tableSchemas[key]
 			if tableSchema == nil {
-				qualified := duckdbservice.QualifyTableName(t.catalog, t.schema, t.name)
+				qualified := arrowmap.QualifyTableName(t.catalog, t.schema, t.name)
 				var schemaErr error
 				tableSchema, schemaErr = getQuerySchema(ctx, s, "SELECT * FROM "+qualified)
 				if schemaErr != nil {
@@ -2038,7 +2039,7 @@ func getQuerySchema(ctx context.Context, session *flightClientSession, query str
 		}
 		fields[i] = arrow.Field{
 			Name:     col,
-			Type:     duckdbservice.DuckDBTypeToArrow(dbType),
+			Type:     arrowmap.DuckDBTypeToArrow(dbType),
 			Nullable: true,
 		}
 	}
@@ -2117,7 +2118,7 @@ func loadTableSchemas(ctx context.Context, s *flightClientSession, cmd flightsql
 		nullable := strings.EqualFold(toString(values[5]), "YES")
 		fieldsByTable[key] = append(fieldsByTable[key], arrow.Field{
 			Name:     toString(values[3]),
-			Type:     duckdbservice.DuckDBTypeToArrow(toString(values[4])),
+			Type:     arrowmap.DuckDBTypeToArrow(toString(values[4])),
 			Nullable: nullable,
 		})
 	}
