@@ -350,6 +350,28 @@ func TestConfigureDuckLakeMetadataPoolRunsExpectedStatement(t *testing.T) {
 	}
 }
 
+func TestDuckLakeMetadataIndexesNamesMatchStatements(t *testing.T) {
+	if len(duckLakeMetadataIndexes) == 0 {
+		t.Fatalf("duckLakeMetadataIndexes must not be empty")
+	}
+	seen := make(map[string]struct{}, len(duckLakeMetadataIndexes))
+	for _, ix := range duckLakeMetadataIndexes {
+		if ix.name == "" {
+			t.Errorf("index has empty name: %+v", ix)
+		}
+		if !strings.Contains(ix.stmt, ix.name) {
+			t.Errorf("index %q statement does not reference its own name: %q", ix.name, ix.stmt)
+		}
+		if !strings.HasPrefix(ix.stmt, "CREATE INDEX IF NOT EXISTS ") {
+			t.Errorf("index %q statement must use CREATE INDEX IF NOT EXISTS: %q", ix.name, ix.stmt)
+		}
+		if _, dup := seen[ix.name]; dup {
+			t.Errorf("duplicate index name %q", ix.name)
+		}
+		seen[ix.name] = struct{}{}
+	}
+}
+
 func TestStartCredentialRefresh_NoOpForStaticCredentials(t *testing.T) {
 	// Static credentials should return a no-op stop function immediately
 	stop := StartCredentialRefresh(nil, DuckLakeConfig{
