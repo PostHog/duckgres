@@ -118,14 +118,136 @@ func TestHandleProxyRejectsNonAbsoluteURL(t *testing.T) {
 	}
 }
 
-func TestHandleProxyOriginError(t *testing.T) {
+// TestHandleProxyForwardsOrigin5xxVerbatim: any non-2xx the origin returns
+// must be passed back to DuckDB unchanged. Translating a 500 into a 502
+// (the old behaviour) made DuckDB's httpfs retry transient-class errors that
+// were really terminal, and hid the real status from logs and the client.
+func TestHandleProxyForwardsOrigin5xxVerbatim(t *testing.T) {
 	proxy := newTestProxy(t)
 	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
 	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/broken", http.Header{"Range": []string{"bytes=0-1"}})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 forwarded verbatim", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "boom") {
+		t.Errorf("body = %q, want it to contain origin body 'boom'", rec.Body.String())
+	}
+}
+
+// TestHandleProxyForwardsOrigin400Verbatim is the case the user actually
+// hit: S3 returns 400 with an XML envelope (<Code>ExpiredToken</Code>) and
+// DuckDB needs to see *that* body and *that* status, not a generic 502 with
+// a Go-formatted error string. Without verbatim passthrough the error class
+// (4xx terminal vs 5xx retriable) is lost and httpfs retries non-retriable
+// auth failures.
+func TestHandleProxyForwardsOrigin400Verbatim(t *testing.T) {
+	proxy := newTestProxy(t)
+	const errBody = `<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>ExpiredToken</Code><Message>The provided token has expired.</Message></Error>`
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("X-Amz-Request-Id", "TESTREQID123")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(errBody))
+	})
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/expired.parquet", http.Header{"Range": []string{"bytes=0-1023"}})
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 forwarded verbatim", rec.Code)
+	}
+	if got := rec.Body.String(); got != errBody {
+		t.Errorf("body mismatch:\n got = %q\nwant = %q", got, errBody)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/xml" {
+		t.Errorf("Content-Type = %q, want application/xml so DuckLake parses it as an S3 error envelope", ct)
+	}
+	if rid := rec.Header().Get("X-Amz-Request-Id"); rid != "TESTREQID123" {
+		t.Errorf("X-Amz-Request-Id = %q, want TESTREQID123 (preserved for debugging)", rid)
+	}
+}
+
+// TestHandleProxyForwardsOrigin404Verbatim: a 404 must stay a 404 so
+// DuckDB / DuckLake can distinguish "object missing" (terminal) from
+// "transient gateway error" (retriable).
+func TestHandleProxyForwardsOrigin404Verbatim(t *testing.T) {
+	proxy := newTestProxy(t)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("missing"))
+	})
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/gone.parquet", http.Header{"Range": []string{"bytes=0-1"}})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 forwarded verbatim", rec.Code)
+	}
+}
+
+// TestHandleProxyForwardsOrigin416Verbatim: Range Not Satisfiable carries
+// semantically important metadata for DuckLake; collapsing to 502 made it
+// look like a network error.
+func TestHandleProxyForwardsOrigin416Verbatim(t *testing.T) {
+	proxy := newTestProxy(t)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes */1024")
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+	})
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/short.parquet", http.Header{"Range": []string{"bytes=999999-1000000"}})
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416 forwarded verbatim", rec.Code)
+	}
+	if cr := rec.Header().Get("Content-Range"); cr != "bytes */1024" {
+		t.Errorf("Content-Range = %q, want 'bytes */1024' (DuckDB uses this to learn the actual file size)", cr)
+	}
+}
+
+// TestHandleProxyDoesNotCacheErrorResponses: a transient origin error
+// must not poison the cache. The next request for the same key has to hit
+// the origin again — otherwise an ExpiredToken error would persist past
+// the credential refresh that fixes it.
+func TestHandleProxyDoesNotCacheErrorResponses(t *testing.T) {
+	proxy := newTestProxy(t)
+	var calls int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("first call fails"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-now"))
+	})
+
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/flaky.parquet", http.Header{"Range": []string{"bytes=0-5"}})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("first call: status = %d, want 400", rec.Code)
+	}
+
+	rec = doForwardProxyRequest(proxy, "GET", originURL+"/bucket/flaky.parquet", http.Header{"Range": []string{"bytes=0-5"}})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("retry: status = %d, want 206 (cache must not have stored the prior error)", rec.Code)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Errorf("origin calls = %d, want 2 (the cache must not serve a previously-failed request from cache)", calls)
+	}
+}
+
+// TestHandleProxyNetworkErrorStill502: when the origin is fully
+// unreachable (no HTTP response at all), 502 is still the right answer —
+// there was no upstream status to forward, and httpfs's "retry on 5xx"
+// behaviour is appropriate here.
+func TestHandleProxyNetworkErrorStill502(t *testing.T) {
+	proxy := newTestProxy(t)
+	// Construct a URL that points at no listener: srv.Close before use.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dead := srv.URL
+	srv.Close()
+
+	rec := doForwardProxyRequest(proxy, "GET", dead+"/bucket/anything", http.Header{"Range": []string{"bytes=0-1"}})
 	if rec.Code != http.StatusBadGateway {
-		t.Errorf("status = %d, want 502 on origin error", rec.Code)
+		t.Fatalf("status = %d, want 502 when origin is unreachable", rec.Code)
 	}
 }
 
