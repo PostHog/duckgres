@@ -26,6 +26,7 @@ import (
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/transpiler"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -4668,7 +4669,7 @@ func (c *clientConn) sendError(severity, code, message string) {
 	// NOTE: If one adds a FATAL error with a non-28 code, be sure to add
 	// a metric for it here.
 	if strings.HasPrefix(code, "28") {
-		authFailuresCounter.Inc()
+		auth.AuthFailuresCounter.Inc()
 	} else if severity == "ERROR" {
 		queryErrorsCounter.WithLabelValues(c.orgID).Inc()
 	}
