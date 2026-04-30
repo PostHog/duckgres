@@ -1499,6 +1499,46 @@ func TestK8sPoolActivateReservedWorkerPersistsActivatingThenHotWorkerRecord(t *t
 	}
 }
 
+// TestK8sPoolWorkerRecordForIdleStampsOwnerCPInstanceID guards against the
+// warm-pool churn loop. workerRecordFor used to clear OwnerCPInstanceID
+// whenever state==Idle, which left every freshly-spawned warm worker
+// matching ListOrphanedWorkers case (2) (NULLIF(owner_cp_instance_id, '') IS
+// NULL AND last_heartbeat_at <= before) the moment it crossed the orphan
+// grace. The janitor then retired it, the warm pool replenished, and the
+// loop repeated indefinitely. Stamping warm workers with the creating CP's
+// id makes case (1) handle them via the existing CP heartbeat instead.
+func TestK8sPoolWorkerRecordForIdleStampsOwnerCPInstanceID(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	// worker == nil branch: spawn path before the in-memory ManagedWorker
+	// exists. Used by the warm-slot creation flow.
+	rec := pool.workerRecordFor(11, nil, 0, configstore.WorkerStateIdle, "", nil)
+	if rec.OwnerCPInstanceID != pool.cpInstanceID {
+		t.Fatalf("worker==nil idle: expected OwnerCPInstanceID %q, got %q", pool.cpInstanceID, rec.OwnerCPInstanceID)
+	}
+
+	// worker != nil branch with the worker already stamped: ManagedWorker
+	// owner is preserved.
+	w := &ManagedWorker{ID: 12, done: make(chan struct{})}
+	w.SetOwnerCPInstanceID(pool.cpInstanceID)
+	rec = pool.workerRecordFor(w.ID, w, 0, configstore.WorkerStateIdle, "", nil)
+	if rec.OwnerCPInstanceID != pool.cpInstanceID {
+		t.Fatalf("worker!=nil idle: expected OwnerCPInstanceID %q, got %q", pool.cpInstanceID, rec.OwnerCPInstanceID)
+	}
+	if rec.OrgID != "" {
+		t.Fatalf("idle workers must have empty OrgID, got %q", rec.OrgID)
+	}
+
+	// worker != nil branch with the worker not yet stamped (e.g. the spawn
+	// path's transition into Idle before SetOwnerCPInstanceID has run):
+	// fall back to this CP's id rather than persisting an empty owner.
+	w2 := &ManagedWorker{ID: 13, done: make(chan struct{})}
+	rec = pool.workerRecordFor(w2.ID, w2, 0, configstore.WorkerStateIdle, "", nil)
+	if rec.OwnerCPInstanceID != pool.cpInstanceID {
+		t.Fatalf("worker!=nil unstamped idle: expected OwnerCPInstanceID %q, got %q", pool.cpInstanceID, rec.OwnerCPInstanceID)
+	}
+}
+
 func TestK8sPoolRetireWorkerPersistsRetiredWorkerRecord(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{}
