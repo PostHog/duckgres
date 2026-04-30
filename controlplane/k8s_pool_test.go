@@ -2790,6 +2790,49 @@ func TestShutdownAll_LeavesInDrainingWhenPodDeleteFails(t *testing.T) {
 	}
 }
 
+// TestShutdownAll_SparesWorkersWithActiveSessions: a CP receiving SIGTERM
+// must not pod-delete a worker that's mid-query. Today the chain runs for
+// every owned worker regardless of session count, which collapses every
+// in-flight query at the moment ShutdownAll fires (the failure mode the
+// production incident hit on a 15-minute drain wall).
+//
+// After the fix, busy workers (activeSessions > 0) are skipped — left in
+// hot/serving state, owned by the dying CP. Customer Flight clients can
+// reconnect via session token; the orphan janitor's flight-session JOIN
+// (Layer 3) prevents peer CPs from retiring them while a session record
+// is still active. Idle workers (activeSessions == 0) drain normally.
+func TestShutdownAll_SparesWorkersWithActiveSessions(t *testing.T) {
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := shutdownTestPool(t, store)
+
+	busy := addShutdownWorker(t, pool, cs, 1)
+	busy.activeSessions = 2
+
+	addShutdownWorker(t, pool, cs, 2) // idle (activeSessions == 0)
+
+	pool.ShutdownAll()
+
+	// Busy worker: pod survives, no DB transitions on its row.
+	if !podExists(t, cs, "worker-1") {
+		t.Fatal("worker-1 has active sessions; ShutdownAll must not delete its pod")
+	}
+	for _, id := range store.markDrainingCalledIDs {
+		if id == 1 {
+			t.Fatalf("MarkWorkerDraining called for busy worker 1; ShutdownAll must skip it (calls=%v)", store.markDrainingCalledIDs)
+		}
+	}
+	for _, id := range store.retireDrainingCalledIDs {
+		if id == 1 {
+			t.Fatalf("RetireDrainingWorker called for busy worker 1; ShutdownAll must skip it (calls=%v)", store.retireDrainingCalledIDs)
+		}
+	}
+
+	// Idle worker: drained as before.
+	if podExists(t, cs, "worker-2") {
+		t.Fatal("worker-2 is idle; ShutdownAll should have deleted its pod")
+	}
+}
+
 func TestShutdownAll_TreatsPodNotFoundAsDeleteSuccess(t *testing.T) {
 	// NotFound means another actor already removed the pod (node eviction,
 	// a racing CP during split-brain, manual kubectl delete). The state

@@ -1097,6 +1097,188 @@ func TestMarkCredentialsRefreshedFailsOnOwnerMismatch(t *testing.T) {
 	}
 }
 
+// TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions: a
+// worker whose owning CP has expired is normally an orphan-cleanup
+// candidate. But if a Flight client could still reconnect by session
+// token (record is in active or reconnecting state), the orphan retire
+// would kill an in-flight customer query the moment they reconnect. The
+// JOIN onto flight_session_records gives those workers a reprieve until
+// the session record itself is expired by ExpireFlightSessionRecords.
+func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
+
+	// Owner CP is expired long ago — easily past the 30s orphan grace.
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-old:boot-a",
+		PodName:         "duckgres-old",
+		PodUID:          "pod-old",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-2 * time.Hour),
+		LastHeartbeatAt: now.Add(-1 * time.Hour),
+		ExpiredAt:       ptrTime(now.Add(-1 * time.Hour)),
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance: %v", err)
+	}
+
+	// A hot worker owned by that expired CP — exactly the shape that
+	// today's orphan janitor would retire. With Layer 3, the active Flight
+	// session below should spare it.
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          501,
+		PodName:           "duckgres-worker-501",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "acme",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now.Add(-30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	// Reclaimable Flight session pointing at that worker.
+	if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
+		SessionToken: "tok-reclaim-501",
+		Username:     "postgres",
+		OrgID:        "acme",
+		WorkerID:     501,
+		OwnerEpoch:   2,
+		State:        configstore.FlightSessionStateActive,
+		ExpiresAt:    now.Add(30 * time.Minute), // not yet expired
+		LastSeenAt:   now.Add(-2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord: %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	for _, w := range orphaned {
+		if w.WorkerID == 501 {
+			t.Fatalf("worker 501 has an active Flight session; orphan janitor must spare it (got %#v)", orphaned)
+		}
+	}
+}
+
+// TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions:
+// the reconnecting state means a customer is mid-handshake from a Flight
+// client picking the session back up. Same protection applies — kill the
+// worker and you kill the resumption.
+func TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-old:boot-a",
+		PodName:         "duckgres-old",
+		PodUID:          "pod-old",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-2 * time.Hour),
+		LastHeartbeatAt: now.Add(-1 * time.Hour),
+		ExpiredAt:       ptrTime(now.Add(-1 * time.Hour)),
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance: %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          502,
+		PodName:           "duckgres-worker-502",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "acme",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now.Add(-30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+	if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
+		SessionToken: "tok-reconnect-502",
+		Username:     "postgres",
+		OrgID:        "acme",
+		WorkerID:     502,
+		OwnerEpoch:   2,
+		State:        configstore.FlightSessionStateReconnecting,
+		ExpiresAt:    now.Add(30 * time.Minute),
+		LastSeenAt:   now.Add(-1 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord: %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	for _, w := range orphaned {
+		if w.WorkerID == 502 {
+			t.Fatalf("worker 502 has a Flight session in reconnecting state; orphan janitor must spare it (got %#v)", orphaned)
+		}
+	}
+}
+
+// TestListOrphanedWorkersIncludesWorkersWithExpiredFlightSessions: once
+// the Flight session record has been moved to a terminal state (expired
+// or closed), the customer can no longer reclaim. The worker should
+// then be retired by the orphan janitor like any other unowned row.
+// Without this, a worker would linger forever once its session expired
+// and the orphan list filtered it out forever.
+func TestListOrphanedWorkersIncludesWorkersWithExpiredFlightSessions(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
+
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-old:boot-a",
+		PodName:         "duckgres-old",
+		PodUID:          "pod-old",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-2 * time.Hour),
+		LastHeartbeatAt: now.Add(-1 * time.Hour),
+		ExpiredAt:       ptrTime(now.Add(-1 * time.Hour)),
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance: %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          503,
+		PodName:           "duckgres-worker-503",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "acme",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now.Add(-30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+	if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
+		SessionToken: "tok-gone-503",
+		Username:     "postgres",
+		OrgID:        "acme",
+		WorkerID:     503,
+		OwnerEpoch:   2,
+		State:        configstore.FlightSessionStateExpired,
+		ExpiresAt:    now.Add(-10 * time.Minute),
+		LastSeenAt:   now.Add(-2 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord: %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	found := false
+	for _, w := range orphaned {
+		if w.WorkerID == 503 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("worker 503's Flight session is expired; orphan janitor MUST return it for retirement (got %#v)", orphaned)
+	}
+}
+
 func TestExpireFlightSessionRecordsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 15, 0, 0, 0, time.UTC)
