@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/posthog/duckgres/server/ducklake"
 )
 
 // QueryLogEntry represents a single entry in the query log.
@@ -101,7 +103,7 @@ func NewQueryLogger(cfg Config) (*QueryLogger, error) {
 	}
 
 	// Attach DuckLake
-	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded(dlCfg.MetadataStore))
+	attachStmt := ducklake.BuildAttachStmt(dlCfg, ducklake.MigrationNeeded(dlCfg.MetadataStore))
 	if _, err := db.Exec(attachStmt); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("querylog: attach ducklake: %w", err)

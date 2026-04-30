@@ -7,6 +7,7 @@ import (
 
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/ducklake"
 )
 
 type configCLIInputs struct {
@@ -1047,7 +1048,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		cfg.QueryLog.CompactInterval = defaultQueryLog.CompactInterval
 	}
 	if cfg.DuckLake.DeltaCatalogEnabled && cfg.DuckLake.DeltaCatalogPath == "" {
-		cfg.DuckLake.DeltaCatalogPath = server.DefaultDeltaCatalogPath(cfg.DuckLake)
+		cfg.DuckLake.DeltaCatalogPath = ducklake.DefaultDeltaCatalogPath(cfg.DuckLake)
 		if cfg.DuckLake.DeltaCatalogPath == "" {
 			warn("ducklake.delta_catalog_enabled requires ducklake.delta_catalog_path when no ducklake.object_store or ducklake.data_path is configured")
 		}

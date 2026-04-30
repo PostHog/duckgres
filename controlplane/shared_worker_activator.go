@@ -17,6 +17,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/ducklake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -90,7 +91,7 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 		// First activation for this org — run the check in the control plane.
 		// The backup file is written to os.TempDir() since the CP may not have
 		// a persistent /data mount.
-		if needed, err := server.CheckAndBackupDuckLakeMigration(payload.DuckLake, os.TempDir(), payload.DuckLake.SpecVersion); err != nil {
+		if needed, err := ducklake.CheckAndBackupMigration(payload.DuckLake, os.TempDir(), payload.DuckLake.SpecVersion); err != nil {
 			slog.Warn("DuckLake migration check failed, proceeding without migration.",
 				"org", payload.OrgID, "error", err)
 		} else {
@@ -182,7 +183,7 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 		targetSpecVersion = a.defaultSpecVersion
 	}
 	if targetSpecVersion == "" {
-		targetSpecVersion = server.DefaultDuckLakeSpecVersion
+		targetSpecVersion = ducklake.DefaultSpecVersion
 	}
 	dl.SpecVersion = targetSpecVersion
 
