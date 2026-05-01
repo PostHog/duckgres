@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 )
 
@@ -611,21 +610,15 @@ func decodeTime(data []byte) (string, error) {
 // encodeInterval encodes an INTERVAL value in PostgreSQL binary format:
 // int64 microseconds + int32 days + int32 months = 16 bytes.
 func encodeInterval(v interface{}) []byte {
+	v = normalizeDriverValue(v)
 	buf := make([]byte, 16)
-	switch val := v.(type) {
-	case duckdb.Interval:
-		binary.BigEndian.PutUint64(buf[0:8], uint64(val.Micros))
-		binary.BigEndian.PutUint32(buf[8:12], uint32(val.Days))
-		binary.BigEndian.PutUint32(buf[12:16], uint32(val.Months))
-	case arrowmap.IntervalValue:
-		// Arrow Flight returns arrowmap.IntervalValue instead of duckdb.Interval
-		binary.BigEndian.PutUint64(buf[0:8], uint64(val.Micros))
-		binary.BigEndian.PutUint32(buf[8:12], uint32(val.Days))
-		binary.BigEndian.PutUint32(buf[12:16], uint32(val.Months))
-	default:
-		_ = val
+	val, ok := v.(arrowmap.IntervalValue)
+	if !ok {
 		return nil
 	}
+	binary.BigEndian.PutUint64(buf[0:8], uint64(val.Micros))
+	binary.BigEndian.PutUint32(buf[8:12], uint32(val.Days))
+	binary.BigEndian.PutUint32(buf[12:16], uint32(val.Months))
 	return buf
 }
 
@@ -690,8 +683,8 @@ func encodeNumeric(v interface{}) []byte {
 	var val *big.Int
 	var dscale int16
 
-	switch x := v.(type) {
-	case duckdb.Decimal:
+	switch x := normalizeDriverValue(v).(type) {
+	case arrowmap.DecimalValue:
 		val = new(big.Int).Set(x.Value)
 		dscale = int16(x.Scale)
 	case *big.Int:

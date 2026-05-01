@@ -323,6 +323,16 @@ type IntervalValue struct {
 	Micros int64
 }
 
+// DecimalValue is the duckdb-free representation of a fixed-precision
+// decimal (the unscaled integer plus the scale). Used by the binary-format
+// encoder in server/types.go so it can switch on this type without
+// importing the duckdb-go driver. duckdbservice's value-normalizer hook
+// converts duckdb.Decimal to arrowmap.DecimalValue at scan time.
+type DecimalValue struct {
+	Value *big.Int
+	Scale int
+}
+
 // Appender is a hook that handles append for value types arrowmap doesn't
 // know about (typically driver-specific types like duckdb.Interval). It
 // reports whether it handled the value; arrowmap.AppendValue falls back to

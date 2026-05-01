@@ -6,17 +6,44 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
+	"github.com/posthog/duckgres/server"
 )
 
 // init registers handlers for the duckdb-go driver value types so that any
-// caller (including arrowmap.AppendValue and the wrapper duckdbservice.AppendValue)
-// gets full type coverage when this package is linked into the binary.
+// caller gets full type coverage when this package is linked into the binary:
+//   - arrowmap.AppendValue gets a hook for the Arrow array builders that
+//     receive duckdb.Interval / Decimal / UUID / OrderedMap / Map values
+//   - server.normalizeDriverValue gets a hook so the PG binary-format
+//     encoders in server/types.go convert duckdb.Interval and duckdb.Decimal
+//     into their arrowmap equivalents (IntervalValue, DecimalValue) before
+//     dispatching
 //
 // Binaries that don't link duckdbservice (e.g., a future control-plane-only
 // binary) won't see these registrations — which is correct, because they
 // also won't be the ones scanning rows from a duckdb-go driver connection.
 func init() {
 	arrowmap.RegisterAppender(handleDuckDBValue)
+	server.RegisterValueNormalizer(normalizeDuckDBValue)
+}
+
+// normalizeDuckDBValue converts the duckdb-go driver's interval and decimal
+// types to their duckdb-free arrowmap equivalents. Other inputs pass
+// through unchanged.
+func normalizeDuckDBValue(v any) any {
+	switch x := v.(type) {
+	case duckdb.Interval:
+		return arrowmap.IntervalValue{
+			Months: x.Months,
+			Days:   x.Days,
+			Micros: x.Micros,
+		}
+	case duckdb.Decimal:
+		return arrowmap.DecimalValue{
+			Value: x.Value,
+			Scale: int(x.Scale),
+		}
+	}
+	return v
 }
 
 // handleDuckDBValue implements arrowmap.Appender for duckdb-go's driver
