@@ -105,6 +105,7 @@ func main() {
 	filePersistence := flag.Bool("file-persistence", false, "Persist DuckDB to <data-dir>/<username>.duckdb instead of in-memory (env: DUCKGRES_FILE_PERSISTENCE)")
 	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
+	sessionInitTimeout := flag.String("session-init-timeout", "", "Session startup metadata/probe timeout (e.g., '10s', '30s') (env: DUCKGRES_SESSION_INIT_TIMEOUT)")
 	memoryLimit := flag.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
 	threads := flag.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	memoryBudget := flag.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
@@ -186,6 +187,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_FILE_PERSISTENCE   Persist DuckDB to <data_dir>/<username>.duckdb (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_SESSION_INIT_TIMEOUT  Session startup metadata/probe timeout (default: 10s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_THREADS            DuckDB threads per session\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_BUDGET      Total memory for all DuckDB sessions (e.g., 24GB)\n")
@@ -300,6 +302,7 @@ func main() {
 		FilePersistence:             *filePersistence,
 		ProcessIsolation:            *processIsolation,
 		IdleTimeout:                 *idleTimeout,
+		SessionInitTimeout:          *sessionInitTimeout,
 		MemoryLimit:                 *memoryLimit,
 		Threads:                     *threads,
 		MemoryBudget:                *memoryBudget,

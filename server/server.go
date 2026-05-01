@@ -41,6 +41,9 @@ type DuckLakeConfig = ducklake.Config
 // constant under the server package before the migration code moved.
 const DefaultDuckLakeSpecVersion = ducklake.DefaultSpecVersion
 
+// DefaultSessionInitTimeout bounds startup metadata initialization and catalog probes.
+const DefaultSessionInitTimeout = 10 * time.Second
+
 // Re-exports of the migration / backup / delta-path entry points so callers
 // that referenced them under the server package continue to compile after
 // the implementation moved to server/ducklake. New code should import
@@ -229,6 +232,10 @@ type Config struct {
 	// uncleanly. Default: 24 hours. Set to a negative value (e.g., -1) to disable.
 	IdleTimeout time.Duration
 
+	// SessionInitTimeout bounds startup metadata initialization and catalog probes.
+	// Default: 10 seconds.
+	SessionInitTimeout time.Duration
+
 	// FilePersistence stores DuckDB data in <DataDir>/<username>.duckdb instead of :memory:.
 	// DuckDB memory-maps the file and serves queries from RAM, so performance is similar
 	// to in-memory mode while data persists across connections and restarts.
@@ -275,7 +282,6 @@ type QueryLogConfig struct {
 	CompactInterval      time.Duration
 	DataInliningRowLimit int
 }
-
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.
 // One entry per user file; multiple PG connections share the pool via pinned *sql.Conn.
@@ -366,6 +372,9 @@ func New(cfg Config) (*Server, error) {
 		cfg.IdleTimeout = 24 * time.Hour
 	} else if cfg.IdleTimeout < 0 {
 		cfg.IdleTimeout = 0
+	}
+	if cfg.SessionInitTimeout == 0 {
+		cfg.SessionInitTimeout = DefaultSessionInitTimeout
 	}
 
 	if cfg.ACMEDNSProvider != "" && cfg.ACMEDomain == "" {

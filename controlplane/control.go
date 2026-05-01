@@ -189,6 +189,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if cfg.WorkerIdleTimeout == 0 {
 		cfg.WorkerIdleTimeout = 5 * time.Minute
 	}
+	if cfg.SessionInitTimeout == 0 {
+		cfg.SessionInitTimeout = server.DefaultSessionInitTimeout
+	}
 	if cfg.HandoverDrainTimeout == 0 {
 		// Remote mode: no internal drain timeout. The CP waits for active
 		// sessions to finish for as long as it takes; k8s
@@ -571,6 +574,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"k8s_max_workers", k8sMaxWorkers,
 		"k8s_shared_warm_target", k8sSharedWarmTarget,
 		"worker_queue_timeout", cfg.WorkerQueueTimeout,
+		"session_init_timeout", cfg.SessionInitTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
 		"memory_rebalance", cfg.MemoryRebalance)
 
@@ -1009,7 +1013,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 	}()
 
-	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
 	err = sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, database)
 	if err != nil {
 		initCancel()

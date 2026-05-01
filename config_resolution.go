@@ -26,6 +26,7 @@ type configCLIInputs struct {
 	FilePersistence             bool
 	ProcessIsolation            bool
 	IdleTimeout                 string
+	SessionInitTimeout          string
 	MemoryLimit                 string
 	Threads                     int
 	MemoryBudget                string
@@ -76,6 +77,7 @@ type resolvedConfig struct {
 	ProcessMinWorkers          int
 	ProcessMaxWorkers          int
 	ProcessRetireOnSessionEnd  bool
+	SessionInitTimeout         time.Duration
 	WorkerQueueTimeout         time.Duration
 	WorkerIdleTimeout          time.Duration
 	HandoverDrainTimeout       time.Duration
@@ -118,6 +120,7 @@ func defaultServerConfig() server.Config {
 		FlightHandleIdleTTL:       15 * time.Minute,
 		FlightSessionTokenTTL:     1 * time.Hour,
 		DataDir:                   "./data",
+		SessionInitTimeout:        server.DefaultSessionInitTimeout,
 		TLSCertFile:               "./certs/server.crt",
 		TLSKeyFile:                "./certs/server.key",
 		Users: map[string]string{
@@ -317,6 +320,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 				cfg.IdleTimeout = d
 			} else {
 				warn("Invalid idle_timeout duration: " + err.Error())
+			}
+		}
+		if fileCfg.SessionInitTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.SessionInitTimeout); err == nil {
+				cfg.SessionInitTimeout = d
+			} else {
+				warn("Invalid session_init_timeout duration: " + err.Error())
 			}
 		}
 		if fileCfg.MemoryLimit != "" {
@@ -600,6 +610,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid DUCKGRES_IDLE_TIMEOUT duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_SESSION_INIT_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.SessionInitTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_SESSION_INIT_TIMEOUT duration: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_MEMORY_LIMIT"); v != "" {
 		cfg.MemoryLimit = v
 	}
@@ -868,6 +885,13 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			warn("Invalid --idle-timeout duration: " + err.Error())
 		}
 	}
+	if cli.Set["session-init-timeout"] {
+		if d, err := time.ParseDuration(cli.SessionInitTimeout); err == nil {
+			cfg.SessionInitTimeout = d
+		} else {
+			warn("Invalid --session-init-timeout duration: " + err.Error())
+		}
+	}
 	if cli.Set["memory-limit"] {
 		cfg.MemoryLimit = cli.MemoryLimit
 	}
@@ -1059,6 +1083,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		ProcessMinWorkers:          processMinWorkers,
 		ProcessMaxWorkers:          processMaxWorkers,
 		ProcessRetireOnSessionEnd:  processRetireOnSessionEnd,
+		SessionInitTimeout:         cfg.SessionInitTimeout,
 		WorkerQueueTimeout:         workerQueueTimeout,
 		WorkerIdleTimeout:          workerIdleTimeout,
 		HandoverDrainTimeout:       handoverDrainTimeout,

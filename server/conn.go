@@ -936,7 +936,11 @@ func (c *clientConn) serve() error {
 	}()
 
 	if !c.passthrough {
-		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		initTimeout := c.server.cfg.SessionInitTimeout
+		if initTimeout == 0 {
+			initTimeout = DefaultSessionInitTimeout
+		}
+		initCtx, initCancel := context.WithTimeout(context.Background(), initTimeout)
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, c.database); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
@@ -2474,7 +2478,7 @@ func countDollarParams(query string) int {
 // isEmptyQuery and stripLeadingComments moved to server/sqlcore so the
 // Flight client can call them without importing server. Local thin wrappers
 // preserve the unexported call-site spellings used throughout this file.
-func isEmptyQuery(query string) bool         { return sqlcore.IsEmptyQuery(query) }
+func isEmptyQuery(query string) bool           { return sqlcore.IsEmptyQuery(query) }
 func stripLeadingComments(query string) string { return sqlcore.StripLeadingComments(query) }
 
 // stripLeadingNoise strips leading whitespace, comments, and parentheses from
