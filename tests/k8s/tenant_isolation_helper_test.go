@@ -192,8 +192,14 @@ func waitForWorkerReplacement(oldPodName string, timeout time.Duration) (corev1.
 func findActiveOrgWorkerPodSince(orgID string, since time.Time, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		// hot_idle workers are still bound to the org (org_id stays set on
+		// the runtime record) — they're the right answer when the session
+		// has just ended and the worker is sitting idle waiting for a
+		// re-claim from the same org. Including hot_idle here keeps the
+		// test correct when session teardown is fast enough that a worker
+		// transitions out of 'hot' before the polling loop catches it.
 		row, err := queryRuntimeStoreRow(fmt.Sprintf(
-			"SELECT pod_name, state FROM cp_runtime.worker_records WHERE org_id = '%s' AND updated_at >= TIMESTAMPTZ '%s' AND state IN ('reserved', 'activating', 'hot', 'draining') ORDER BY updated_at DESC LIMIT 1",
+			"SELECT pod_name, state FROM cp_runtime.worker_records WHERE org_id = '%s' AND updated_at >= TIMESTAMPTZ '%s' AND state IN ('reserved', 'activating', 'hot', 'hot_idle', 'draining') ORDER BY updated_at DESC LIMIT 1",
 			psqlLiteral(orgID),
 			since.UTC().Format(time.RFC3339Nano),
 		))
