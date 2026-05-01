@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/posthog/duckgres/server/chsql"
 )
 
 func TestClickHouseMacros(t *testing.T) {
@@ -14,7 +15,7 @@ func TestClickHouseMacros(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	initClickHouseMacros(db)
+	chsql.InitMacros(db)
 
 	tests := []struct {
 		name  string
@@ -73,7 +74,7 @@ func TestClickHouseMacros_SplitByChar(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	initClickHouseMacros(db)
+	chsql.InitMacros(db)
 
 	// splitByChar returns a list; verify via array_length
 	var got int
@@ -92,7 +93,7 @@ func TestClickHouseMacros_GenerateUUIDv4(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	initClickHouseMacros(db)
+	chsql.InitMacros(db)
 
 	var got string
 	if err := db.QueryRow("SELECT CAST(generateUUIDv4() AS VARCHAR)").Scan(&got); err != nil {

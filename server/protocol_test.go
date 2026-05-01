@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"strings"
 	"testing"
+
+	"github.com/posthog/duckgres/server/wire"
 )
 
 func TestReadStartupMessage(t *testing.T) {
@@ -43,9 +45,9 @@ func TestReadStartupMessage(t *testing.T) {
 		}
 		buf.WriteByte(0) // final null
 
-		result, err := readStartupMessage(&buf)
+		result, err := wire.ReadStartupMessage(&buf)
 		if err != nil {
-			t.Fatalf("readStartupMessage() error = %v", err)
+			t.Fatalf("wire.ReadStartupMessage() error = %v", err)
 		}
 
 		if result["user"] != "testuser" {
@@ -63,9 +65,9 @@ func TestReadStartupMessage(t *testing.T) {
 		_ = binary.Write(&buf, binary.BigEndian, int32(8))
 		_ = binary.Write(&buf, binary.BigEndian, uint32(80877103))
 
-		result, err := readStartupMessage(&buf)
+		result, err := wire.ReadStartupMessage(&buf)
 		if err != nil {
-			t.Fatalf("readStartupMessage() error = %v", err)
+			t.Fatalf("wire.ReadStartupMessage() error = %v", err)
 		}
 
 		if result["__ssl_request"] != "true" {
@@ -80,9 +82,9 @@ func TestReadStartupMessage(t *testing.T) {
 		_ = binary.Write(&buf, binary.BigEndian, int32(8))
 		_ = binary.Write(&buf, binary.BigEndian, uint32(80877104))
 
-		result, err := readStartupMessage(&buf)
+		result, err := wire.ReadStartupMessage(&buf)
 		if err != nil {
-			t.Fatalf("readStartupMessage() error = %v", err)
+			t.Fatalf("wire.ReadStartupMessage() error = %v", err)
 		}
 
 		if result["__gssenc_request"] != "true" {
@@ -99,9 +101,9 @@ func TestReadStartupMessage(t *testing.T) {
 		_ = binary.Write(&buf, binary.BigEndian, uint32(12345)) // pid
 		_ = binary.Write(&buf, binary.BigEndian, uint32(67890)) // key
 
-		result, err := readStartupMessage(&buf)
+		result, err := wire.ReadStartupMessage(&buf)
 		if err != nil {
-			t.Fatalf("readStartupMessage() error = %v", err)
+			t.Fatalf("wire.ReadStartupMessage() error = %v", err)
 		}
 
 		if result["__cancel_request"] != "true" {
@@ -121,9 +123,9 @@ func TestReadMessage(t *testing.T) {
 		buf.WriteString(query)
 		buf.WriteByte(0)
 
-		msgType, body, err := readMessage(&buf)
+		msgType, body, err := wire.ReadMessage(&buf)
 		if err != nil {
-			t.Fatalf("readMessage() error = %v", err)
+			t.Fatalf("wire.ReadMessage() error = %v", err)
 		}
 
 		if msgType != 'Q' {
@@ -144,9 +146,9 @@ func TestReadMessage(t *testing.T) {
 		buf.WriteByte('X')
 		_ = binary.Write(&buf, binary.BigEndian, int32(4))
 
-		msgType, body, err := readMessage(&buf)
+		msgType, body, err := wire.ReadMessage(&buf)
 		if err != nil {
-			t.Fatalf("readMessage() error = %v", err)
+			t.Fatalf("wire.ReadMessage() error = %v", err)
 		}
 
 		if msgType != 'X' {
@@ -166,9 +168,9 @@ func TestReadMessage(t *testing.T) {
 		_ = binary.Write(&buf, binary.BigEndian, int32(len(data)+4))
 		buf.Write(data)
 
-		msgType, body, err := readMessage(&buf)
+		msgType, body, err := wire.ReadMessage(&buf)
 		if err != nil {
-			t.Fatalf("readMessage() error = %v", err)
+			t.Fatalf("wire.ReadMessage() error = %v", err)
 		}
 
 		if msgType != 'd' {
@@ -186,9 +188,9 @@ func TestWriteMessage(t *testing.T) {
 		var buf bytes.Buffer
 
 		data := []byte("test data")
-		err := writeMessage(&buf, 'T', data)
+		err := wire.WriteMessage(&buf, 'T', data)
 		if err != nil {
-			t.Fatalf("writeMessage() error = %v", err)
+			t.Fatalf("wire.WriteMessage() error = %v", err)
 		}
 
 		// Check message type
@@ -211,9 +213,9 @@ func TestWriteMessage(t *testing.T) {
 	t.Run("write empty message", func(t *testing.T) {
 		var buf bytes.Buffer
 
-		err := writeMessage(&buf, 'Z', []byte{})
+		err := wire.WriteMessage(&buf, 'Z', []byte{})
 		if err != nil {
-			t.Fatalf("writeMessage() error = %v", err)
+			t.Fatalf("wire.WriteMessage() error = %v", err)
 		}
 
 		// Total should be 5 bytes: type (1) + length (4)
@@ -232,9 +234,9 @@ func TestWriteMessage(t *testing.T) {
 func TestWriteAuthOK(t *testing.T) {
 	var buf bytes.Buffer
 
-	err := writeAuthOK(&buf)
+	err := wire.WriteAuthOK(&buf)
 	if err != nil {
-		t.Fatalf("writeAuthOK() error = %v", err)
+		t.Fatalf("wire.WriteAuthOK() error = %v", err)
 	}
 
 	// Message type should be 'R'
@@ -258,9 +260,9 @@ func TestWriteAuthOK(t *testing.T) {
 func TestWriteAuthCleartextPassword(t *testing.T) {
 	var buf bytes.Buffer
 
-	err := writeAuthCleartextPassword(&buf)
+	err := wire.WriteAuthCleartextPassword(&buf)
 	if err != nil {
-		t.Fatalf("writeAuthCleartextPassword() error = %v", err)
+		t.Fatalf("wire.WriteAuthCleartextPassword() error = %v", err)
 	}
 
 	// Auth type should be 3 (cleartext password)
@@ -273,9 +275,9 @@ func TestWriteAuthCleartextPassword(t *testing.T) {
 func TestWriteParameterStatus(t *testing.T) {
 	var buf bytes.Buffer
 
-	err := writeParameterStatus(&buf, "server_version", "15.0")
+	err := wire.WriteParameterStatus(&buf, "server_version", "15.0")
 	if err != nil {
-		t.Fatalf("writeParameterStatus() error = %v", err)
+		t.Fatalf("wire.WriteParameterStatus() error = %v", err)
 	}
 
 	// Message type should be 'S'
@@ -298,9 +300,9 @@ func TestWriteParameterStatus(t *testing.T) {
 func TestWriteBackendKeyData(t *testing.T) {
 	var buf bytes.Buffer
 
-	err := writeBackendKeyData(&buf, 12345, 67890)
+	err := wire.WriteBackendKeyData(&buf, 12345, 67890)
 	if err != nil {
-		t.Fatalf("writeBackendKeyData() error = %v", err)
+		t.Fatalf("wire.WriteBackendKeyData() error = %v", err)
 	}
 
 	// Message type should be 'K'
@@ -341,9 +343,9 @@ func TestWriteReadyForQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 
-			err := writeReadyForQuery(&buf, tt.txStatus)
+			err := wire.WriteReadyForQuery(&buf, tt.txStatus)
 			if err != nil {
-				t.Fatalf("writeReadyForQuery() error = %v", err)
+				t.Fatalf("wire.WriteReadyForQuery() error = %v", err)
 			}
 
 			// Message type should be 'Z'
@@ -368,9 +370,9 @@ func TestWriteReadyForQuery(t *testing.T) {
 func TestWriteErrorResponse(t *testing.T) {
 	var buf bytes.Buffer
 
-	err := writeErrorResponse(&buf, "ERROR", "42601", "syntax error")
+	err := wire.WriteErrorResponse(&buf, "ERROR", "42601", "syntax error")
 	if err != nil {
-		t.Fatalf("writeErrorResponse() error = %v", err)
+		t.Fatalf("wire.WriteErrorResponse() error = %v", err)
 	}
 
 	// Message type should be 'E'
@@ -397,9 +399,9 @@ func TestWriteErrorResponseRedactsPassword(t *testing.T) {
 	var buf bytes.Buffer
 
 	msg := `flight execute update: rpc error: Unable to connect to Postgres at "host=db.example.com port=5432 user=myuser password=superSecret123 dbname=mydb": connection failed`
-	err := writeErrorResponse(&buf, "ERROR", "42000", msg)
+	err := wire.WriteErrorResponse(&buf, "ERROR", "42000", msg)
 	if err != nil {
-		t.Fatalf("writeErrorResponse() error = %v", err)
+		t.Fatalf("wire.WriteErrorResponse() error = %v", err)
 	}
 
 	output := buf.String()
@@ -414,9 +416,9 @@ func TestWriteErrorResponseRedactsPassword(t *testing.T) {
 func TestWriteNoticeResponse(t *testing.T) {
 	var buf bytes.Buffer
 
-	err := writeNoticeResponse(&buf, "WARNING", "01000", "some warning")
+	err := wire.WriteNoticeResponse(&buf, "WARNING", "01000", "some warning")
 	if err != nil {
-		t.Fatalf("writeNoticeResponse() error = %v", err)
+		t.Fatalf("wire.WriteNoticeResponse() error = %v", err)
 	}
 
 	// Message type should be 'N' (notice)
@@ -448,15 +450,15 @@ func TestMessageRoundTrip(t *testing.T) {
 			var buf bytes.Buffer
 
 			// Write
-			err := writeMessage(&buf, tc.msgType, tc.data)
+			err := wire.WriteMessage(&buf, tc.msgType, tc.data)
 			if err != nil {
-				t.Fatalf("writeMessage() error = %v", err)
+				t.Fatalf("wire.WriteMessage() error = %v", err)
 			}
 
 			// Read
-			msgType, body, err := readMessage(&buf)
+			msgType, body, err := wire.ReadMessage(&buf)
 			if err != nil {
-				t.Fatalf("readMessage() error = %v", err)
+				t.Fatalf("wire.ReadMessage() error = %v", err)
 			}
 
 			if msgType != tc.msgType {

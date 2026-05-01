@@ -15,35 +15,35 @@ import (
 // These delegate to the internal (lowercase) implementations.
 
 func ReadStartupMessage(r io.Reader) (map[string]string, error) {
-	return readStartupMessage(r)
+	return wire.ReadStartupMessage(r)
 }
 
 func ReadMessage(r io.Reader) (byte, []byte, error) {
-	return readMessage(r)
+	return wire.ReadMessage(r)
 }
 
 func WriteAuthOK(w io.Writer) error {
-	return writeAuthOK(w)
+	return wire.WriteAuthOK(w)
 }
 
 func WriteAuthCleartextPassword(w io.Writer) error {
-	return writeAuthCleartextPassword(w)
+	return wire.WriteAuthCleartextPassword(w)
 }
 
 func WriteReadyForQuery(w io.Writer, txStatus byte) error {
-	return writeReadyForQuery(w, txStatus)
+	return wire.WriteReadyForQuery(w, txStatus)
 }
 
 func WriteErrorResponse(w io.Writer, severity, code, message string) error {
-	return writeErrorResponse(w, severity, code, message)
+	return wire.WriteErrorResponse(w, severity, code, message)
 }
 
 func WriteParameterStatus(w io.Writer, name, value string) error {
-	return writeParameterStatus(w, name, value)
+	return wire.WriteParameterStatus(w, name, value)
 }
 
 func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
-	return writeBackendKeyData(w, pid, secretKey)
+	return wire.WriteBackendKeyData(w, pid, secretKey)
 }
 
 // NewClientConn creates a clientConn with pre-initialized fields for use by
