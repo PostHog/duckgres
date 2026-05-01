@@ -15,6 +15,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	_ "github.com/posthog/duckgres/duckdbservice" // registers the "duckdb" sql driver and the duckdb-go value normalizer / Appender hooks
 	"github.com/posthog/duckgres/server"
 )
 

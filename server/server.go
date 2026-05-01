@@ -20,7 +20,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	_ "github.com/duckdb/duckdb-go/v2"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/chsql"
