@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -31,14 +32,11 @@ const MaxGRPCMessageSize = 1 << 30 // 1GB
 // ErrWorkerDead is returned when the backing worker process has crashed.
 var ErrWorkerDead = errors.New("flight worker is dead")
 
-// OrderedMapValue represents a DuckDB MAP as parallel key/value slices,
-// preserving insertion order from Arrow MAP arrays. Using parallel slices
-// instead of a Go map avoids panics on non-comparable key types (e.g.,
-// []byte from BLOB keys) and preserves DuckDB's MAP ordering.
-type OrderedMapValue struct {
-	Keys   []any
-	Values []any
-}
+// OrderedMapValue is an alias for arrowmap.OrderedMapValue. The type was
+// moved into arrowmap so AppendValue's MAP branch can switch on it without
+// arrowmap depending on the server package. The alias preserves the
+// existing server.OrderedMapValue spelling for current call sites.
+type OrderedMapValue = arrowmap.OrderedMapValue
 
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.

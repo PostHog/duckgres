@@ -17,6 +17,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/posthog/duckgres/server/auth"
 )
 
 // Exit codes for child processes
@@ -220,7 +222,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	expectedPassword, ok := cfg.Users[username]
 	if !ok {
 		slog.Warn("Unknown user", "user", username, "remote_addr", cfg.RemoteAddr)
-		authFailuresCounter.Inc()
+		auth.AuthFailuresCounter.Inc()
 		_ = writeErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
 		return ExitAuthFailure
@@ -254,7 +256,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	password := string(bytes.TrimRight(body, "\x00"))
 	if password != expectedPassword {
 		slog.Warn("Authentication failed", "user", username, "remote_addr", cfg.RemoteAddr)
-		authFailuresCounter.Inc()
+		auth.AuthFailuresCounter.Inc()
 		_ = writeErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
 		return ExitAuthFailure

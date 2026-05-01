@@ -1,4 +1,4 @@
-package server
+package auth
 
 import (
 	"crypto/subtle"
@@ -16,11 +16,11 @@ func BeginRateLimitedAuthAttempt(rateLimiter *RateLimiter, remoteAddr net.Addr) 
 	}
 
 	if msg := rateLimiter.CheckConnection(remoteAddr); msg != "" {
-		rateLimitRejectsCounter.Inc()
+		RateLimitRejectsCounter.Inc()
 		return release, msg
 	}
 	if !rateLimiter.RegisterConnection(remoteAddr) {
-		rateLimitRejectsCounter.Inc()
+		RateLimitRejectsCounter.Inc()
 		if msg := rateLimiter.CheckConnection(remoteAddr); msg != "" {
 			return release, msg
 		}
@@ -35,7 +35,7 @@ func BeginRateLimitedAuthAttempt(rateLimiter *RateLimiter, remoteAddr net.Addr) 
 // RecordFailedAuthAttempt records auth telemetry and updates rate-limit state.
 // Returns true when this failure causes the source IP to be banned.
 func RecordFailedAuthAttempt(rateLimiter *RateLimiter, remoteAddr net.Addr) bool {
-	authFailuresCounter.Inc()
+	AuthFailuresCounter.Inc()
 	if rateLimiter == nil {
 		return false
 	}

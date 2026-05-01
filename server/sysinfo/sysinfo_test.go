@@ -1,4 +1,4 @@
-package server
+package sysinfo
 
 import (
 	"runtime"
@@ -11,9 +11,9 @@ func TestAutoMemoryLimit(t *testing.T) {
 	autoMemoryLimitOnce = sync.Once{}
 	autoMemoryLimitValue = ""
 
-	result := autoMemoryLimit()
+	result := AutoMemoryLimit()
 	if result == "" {
-		t.Fatal("autoMemoryLimit returned empty string")
+		t.Fatal("AutoMemoryLimit returned empty string")
 	}
 
 	// On Linux (CI and production), we should detect system memory
@@ -31,7 +31,7 @@ func TestAutoMemoryLimitFormat(t *testing.T) {
 	autoMemoryLimitOnce = sync.Once{}
 	autoMemoryLimitValue = ""
 
-	result := autoMemoryLimit()
+	result := AutoMemoryLimit()
 	// Should end with GB or MB
 	validSuffix := false
 	for _, suffix := range []string{"GB", "MB"} {
@@ -41,7 +41,7 @@ func TestAutoMemoryLimitFormat(t *testing.T) {
 		}
 	}
 	if !validSuffix {
-		t.Fatalf("autoMemoryLimit returned %q, expected suffix GB or MB", result)
+		t.Fatalf("AutoMemoryLimit returned %q, expected suffix GB or MB", result)
 	}
 }
 
@@ -50,10 +50,10 @@ func TestAutoMemoryLimitCached(t *testing.T) {
 	autoMemoryLimitOnce = sync.Once{}
 	autoMemoryLimitValue = ""
 
-	first := autoMemoryLimit()
-	second := autoMemoryLimit()
+	first := AutoMemoryLimit()
+	second := AutoMemoryLimit()
 	if first != second {
-		t.Fatalf("autoMemoryLimit not stable: %q vs %q", first, second)
+		t.Fatalf("AutoMemoryLimit not stable: %q vs %q", first, second)
 	}
 }
 

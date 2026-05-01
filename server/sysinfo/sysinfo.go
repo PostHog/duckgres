@@ -1,4 +1,7 @@
-package server
+// Package sysinfo holds duckgres' system-memory detection helpers and the
+// memory-limit string parser shared between the server, the control plane,
+// and config resolution. No dependency on github.com/duckdb/duckdb-go.
+package sysinfo
 
 import (
 	"bufio"
@@ -52,13 +55,13 @@ var (
 	autoMemoryLimitValue string
 )
 
-// autoMemoryLimit computes a DuckDB memory_limit based on system memory.
+// AutoMemoryLimit computes a DuckDB memory_limit based on system memory.
 // Formula: totalMem * 0.75, with a floor of 256MB.
 // Every session gets the full budget — DuckDB will spill to disk/swap if
 // aggregate usage exceeds physical RAM.
 // Returns "4GB" as a safe default if system memory cannot be detected.
 // The result is computed once and cached since system memory doesn't change.
-func autoMemoryLimit() string {
+func AutoMemoryLimit() string {
 	autoMemoryLimitOnce.Do(func() {
 		totalBytes := SystemMemoryBytes()
 		if totalBytes == 0 {
@@ -74,7 +77,7 @@ func autoMemoryLimit() string {
 			limitBytes = 256 * mb
 		}
 
-		// Format as human-readable: use GB if >= 1GB, else MB
+		// Format as human-readable: use GB if >= 1GB, else MB.
 		if limitBytes >= gb {
 			limitGB := limitBytes / gb
 			autoMemoryLimitValue = fmt.Sprintf("%dGB", limitGB)
