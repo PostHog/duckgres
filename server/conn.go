@@ -4440,6 +4440,7 @@ func formatValue(v interface{}) string {
 	if v == nil {
 		return ""
 	}
+	v = normalizeDriverValue(v)
 
 	switch val := v.(type) {
 	case []byte:
@@ -4477,12 +4478,12 @@ func formatValue(v interface{}) string {
 	case []any:
 		// PostgreSQL array text format: {1,2,3}
 		return formatArrayValue(val)
-	case duckdb.Interval:
-		// PostgreSQL interval text format: "1 year 2 mons 3 days 04:05:06.123456"
-		return formatInterval(val)
 	case arrowmap.IntervalValue:
-		// Arrow Flight returns arrowmap.IntervalValue instead of duckdb.Interval
-		return formatInterval(duckdb.Interval{Months: val.Months, Days: val.Days, Micros: val.Micros})
+		// PostgreSQL interval text format: "1 year 2 mons 3 days 04:05:06.123456".
+		// Driver-specific interval types (e.g. duckdb.Interval) are converted to
+		// arrowmap.IntervalValue by normalizeDriverValue before reaching this
+		// switch — see server/value_normalize.go.
+		return formatInterval(val)
 	case map[string]any:
 		// STRUCT text format: {"key1": val1, "key2": val2}
 		return formatMapValue(val)
@@ -4494,9 +4495,10 @@ func formatValue(v interface{}) string {
 	}
 }
 
-// formatInterval formats a duckdb.Interval as a PostgreSQL-compatible interval string.
-// Examples: "00:13:08.917797", "1 day 02:30:00", "1 year 2 mons 3 days 04:05:06".
-func formatInterval(iv duckdb.Interval) string {
+// formatInterval formats an arrowmap.IntervalValue as a PostgreSQL-compatible
+// interval string. Examples: "00:13:08.917797", "1 day 02:30:00",
+// "1 year 2 mons 3 days 04:05:06".
+func formatInterval(iv arrowmap.IntervalValue) string {
 	var parts []string
 	if iv.Months != 0 {
 		years := iv.Months / 12
