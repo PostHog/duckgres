@@ -24,6 +24,7 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
 	"github.com/posthog/duckgres/server/auth"
+	"github.com/posthog/duckgres/server/chsql"
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sysinfo"
@@ -1004,7 +1005,7 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 	}
 
 	// Register ClickHouse SQL macros (chsql compat)
-	initClickHouseMacros(db)
+	chsql.InitMacros(db)
 
 	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
@@ -1102,7 +1103,7 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 	initUtilityMacros(db, serverStartTime, processStartTime, serverVersion, processVersion)
 
 	// Register ClickHouse SQL macros (chsql compat)
-	initClickHouseMacros(db)
+	chsql.InitMacros(db)
 
 	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {

@@ -1,15 +1,15 @@
-package server
+package chsql
 
 import (
 	"database/sql"
 	"log/slog"
 )
 
-// initClickHouseMacros registers ClickHouse SQL function macros so that
+// InitMacros registers ClickHouse SQL function macros so that
 // ClickHouse-flavoured queries work out of the box against DuckDB.
 // This is a subset of the chsql community extension's functions, implemented
 // as plain SQL macros following the same pattern as initUtilityMacros.
-func initClickHouseMacros(db *sql.DB) {
+func InitMacros(db *sql.DB) {
 	macros := []string{
 		// -- Type conversion --
 		`CREATE OR REPLACE MACRO toString(x) AS CAST(x AS VARCHAR)`,
