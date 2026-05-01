@@ -23,7 +23,9 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	_ "github.com/duckdb/duckdb-go/v2"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
+	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/ducklake"
+	"github.com/posthog/duckgres/server/sysinfo"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -129,21 +131,6 @@ var queryErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_query_errors_total",
 	Help: "Total number of failed queries",
 }, []string{"org"})
-
-var authFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "duckgres_auth_failures_total",
-	Help: "Total number of authentication failures",
-})
-
-var rateLimitRejectsCounter = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "duckgres_rate_limit_rejects_total",
-	Help: "Total number of connections rejected due to rate limiting",
-})
-
-var rateLimitedIPsGauge = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "duckgres_rate_limited_ips",
-	Help: "Number of currently rate-limited IP addresses",
-})
 
 var queryCancellationsCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_query_cancellations_total",
@@ -850,7 +837,7 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set DuckDB memory limit
 	memLimit := cfg.MemoryLimit
 	if memLimit == "" {
-		memLimit = autoMemoryLimit()
+		memLimit = sysinfo.AutoMemoryLimit()
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET memory_limit = '%s'", memLimit)); err != nil {
 		slog.Warn("Failed to set DuckDB memory_limit.", "memory_limit", memLimit, "error", err)
@@ -2085,7 +2072,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	if msg := s.rateLimiter.CheckConnection(remoteAddr); msg != "" {
 		// Send PostgreSQL error and close
 		slog.Warn("Connection rejected.", "remote_addr", remoteAddr, "reason", msg)
-		rateLimitRejectsCounter.Inc()
+		auth.RateLimitRejectsCounter.Inc()
 		_ = conn.Close()
 		return
 	}
@@ -2093,7 +2080,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// Register this connection
 	if !s.rateLimiter.RegisterConnection(remoteAddr) {
 		slog.Warn("Connection rejected: rate limit exceeded.", "remote_addr", remoteAddr)
-		rateLimitRejectsCounter.Inc()
+		auth.RateLimitRejectsCounter.Inc()
 		_ = conn.Close()
 		return
 	}
