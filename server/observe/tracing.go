@@ -1,4 +1,9 @@
-package server
+// Package observe holds duckgres' OpenTelemetry tracing helpers, the
+// connection-count gauge, and the per-query Prometheus metrics emitted from
+// the trace path. The package has no dependency on github.com/duckdb/duckdb-go,
+// so the control plane and other duckdb-free callers can use it without
+// linking libduckdb.
+package observe
 
 import (
 	"context"
@@ -9,19 +14,19 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/posthog/duckgres/server/sqlcore"
 )
 
-// tracer is the package-level tracer for the server package.
+// tracer is the package-level OTEL tracer. Exposed via Tracer() so callers
+// outside this package can start spans linked to server operations.
 var tracer = otel.Tracer("duckgres/server")
 
-// Tracer returns the server package tracer for use by other packages
-// that need to create spans linked to server operations.
-func Tracer() trace.Tracer {
-	return tracer
-}
+// Tracer returns the package-level tracer.
+func Tracer() trace.Tracer { return tracer }
 
-// truncateForSpan truncates a query string for use as a span attribute.
-func truncateForSpan(q string) string {
+// TruncateForSpan truncates a query string for use as a span attribute.
+func TruncateForSpan(q string) string {
 	const maxLen = 256
 	if len(q) <= maxLen {
 		return q
@@ -29,20 +34,22 @@ func truncateForSpan(q string) string {
 	return q[:maxLen] + "..."
 }
 
-// profilingRoot represents the top-level DuckDB JSON profiling output.
+// ProfilingRoot represents the top-level DuckDB JSON profiling output.
+type ProfilingRoot = profilingRoot
+
 type profilingRoot struct {
-	Latency                  float64           `json:"latency"`
-	CPUTime                  float64           `json:"cpu_time"`
-	RowsReturned             uint64            `json:"rows_returned"`
-	ResultSetSize            uint64            `json:"result_set_size"`
-	TotalMemoryAllocated     uint64            `json:"total_memory_allocated"`
-	PeakBufferMemory         uint64            `json:"system_peak_buffer_memory"`
-	TotalBytesRead           uint64            `json:"total_bytes_read"`
-	Planner                  float64           `json:"planner"`
-	PlannerBinding           float64           `json:"planner_binding"`
-	CumulativeOptimizerTiming float64          `json:"cumulative_optimizer_timing"`
-	PhysicalPlanner          float64           `json:"physical_planner"`
-	Children                 []profilingOperator `json:"children"`
+	Latency                   float64             `json:"latency"`
+	CPUTime                   float64             `json:"cpu_time"`
+	RowsReturned              uint64              `json:"rows_returned"`
+	ResultSetSize             uint64              `json:"result_set_size"`
+	TotalMemoryAllocated      uint64              `json:"total_memory_allocated"`
+	PeakBufferMemory          uint64              `json:"system_peak_buffer_memory"`
+	TotalBytesRead            uint64              `json:"total_bytes_read"`
+	Planner                   float64             `json:"planner"`
+	PlannerBinding            float64             `json:"planner_binding"`
+	CumulativeOptimizerTiming float64             `json:"cumulative_optimizer_timing"`
+	PhysicalPlanner           float64             `json:"physical_planner"`
+	Children                  []profilingOperator `json:"children"`
 }
 
 type profilingOperator struct {
@@ -53,7 +60,15 @@ type profilingOperator struct {
 	Children            []profilingOperator `json:"children"`
 }
 
-// parseProfilingOutput extracts the full profiling tree from DuckDB's JSON output.
+// ParseProfilingOutput extracts the full profiling tree from DuckDB's JSON
+// output. Exposed for the integration test in package server, which captures
+// real DuckDB profiling JSON and verifies our parser handles it.
+func ParseProfilingOutput(jsonStr string) (profilingRoot, bool) {
+	return parseProfilingOutput(jsonStr)
+}
+
+// parseProfilingOutput is the internal worker — kept private so the rest of
+// observe can switch on the lowercase type without exposing it.
 func parseProfilingOutput(jsonStr string) (profilingRoot, bool) {
 	if jsonStr == "" {
 		return profilingRoot{}, false
@@ -89,10 +104,10 @@ func collectOperatorTimings(ops []profilingOperator) (scanTime, scanRows float64
 	return
 }
 
-// enrichSpanWithProfiling creates child spans from DuckDB profiling output
+// EnrichSpanWithProfiling creates child spans from DuckDB profiling output
 // showing where execution time was spent: planning, scanning (I/O), and compute.
 // Also emits Prometheus metrics for baseline measurement.
-func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart time.Time, executor QueryExecutor, orgID string) {
+func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart time.Time, executor sqlcore.QueryExecutor, orgID string) {
 	output := executor.LastProfilingOutput()
 	if output == "" {
 		return
@@ -102,7 +117,6 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		return
 	}
 
-	// Set top-level metrics on the execute span.
 	span.SetAttributes(
 		attribute.Float64("duckdb.latency_s", m.Latency),
 		attribute.Int64("duckdb.rows_returned", int64(m.RowsReturned)),
@@ -112,9 +126,6 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		attribute.Int64("duckdb.total_bytes_read", int64(m.TotalBytesRead)),
 	)
 
-	// Create child spans with explicit timestamps for the planning, scan,
-	// and compute phases. These are approximate — operators may overlap in
-	// parallel execution — but give a useful visual breakdown.
 	planningDur := m.Planner + m.PlannerBinding + m.CumulativeOptimizerTiming + m.PhysicalPlanner
 	scanTime, scanRows, computeTime := collectOperatorTimings(m.Children)
 
@@ -131,10 +142,6 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		planSpan.End(trace.WithTimestamp(cursor))
 	}
 
-	// Estimate wall-clock time for scan vs compute. DuckDB runs operators in
-	// parallel, so cumulative times exceed wall-clock. Use the ratio of
-	// cumulative scan/(scan+compute) applied to the execution wall-clock
-	// (latency minus planning) to approximate each phase's wall-clock share.
 	execWall := m.Latency - planningDur
 	totalOpTime := scanTime + computeTime
 	scanWall := execWall
@@ -144,9 +151,8 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		computeWall = execWall * (computeTime / totalOpTime)
 	}
 
-	// Emit Prometheus metrics for baseline measurement.
-	s3BytesReadTotal.WithLabelValues(orgID).Add(float64(m.TotalBytesRead))
-	scanWallSecondsHistogram.WithLabelValues(orgID).Observe(scanWall)
+	S3BytesReadTotal.WithLabelValues(orgID).Add(float64(m.TotalBytesRead))
+	ScanWallSecondsHistogram.WithLabelValues(orgID).Observe(scanWall)
 	scanRowsWallEstimate := scanRows
 	if m.CPUTime > 0 && m.Latency > 0 {
 		if p := m.CPUTime / m.Latency; p > 1 {
@@ -154,12 +160,10 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		}
 	}
 	if scanWall > 0 && scanRowsWallEstimate > 0 {
-		scanRowsPerSecondHistogram.WithLabelValues(orgID).Observe(scanRowsWallEstimate / scanWall)
+		ScanRowsPerSecondHistogram.WithLabelValues(orgID).Observe(scanRowsWallEstimate / scanWall)
 	}
 
 	if scanTime > 0 {
-		// Estimate actual rows scanned (deduplicated across threads).
-		// scan_rows_cumulative counts each thread's rows independently.
 		scanRowsWall := scanRows
 		if m.CPUTime > 0 && m.Latency > 0 {
 			parallelism := m.CPUTime / m.Latency
@@ -190,8 +194,8 @@ func enrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 	}
 }
 
-// traceIDFromContext returns the hex trace ID from the span context, or "".
-func traceIDFromContext(ctx context.Context) string {
+// TraceIDFromContext returns the hex trace ID from the span context, or "".
+func TraceIDFromContext(ctx context.Context) string {
 	sc := trace.SpanContextFromContext(ctx)
 	if sc.HasTraceID() {
 		return sc.TraceID().String()
@@ -199,8 +203,8 @@ func traceIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// spanIDFromContext returns the hex span ID from the span context, or "".
-func spanIDFromContext(ctx context.Context) string {
+// SpanIDFromContext returns the hex span ID from the span context, or "".
+func SpanIDFromContext(ctx context.Context) string {
 	sc := trace.SpanContextFromContext(ctx)
 	if sc.HasSpanID() {
 		return sc.SpanID().String()

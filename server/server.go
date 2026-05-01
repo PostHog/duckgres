@@ -25,6 +25,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/ducklake"
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sysinfo"
 	"github.com/posthog/duckgres/server/wire"
 	"github.com/prometheus/client_golang/prometheus"
@@ -110,17 +111,13 @@ func setExtensionDirectory(db *sql.DB, dataDir string) error {
 // passwordPattern matches password=<value> or password: <value> with quoted or unquoted values.
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
 
-var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "duckgres_connections_open",
-	Help: "Number of currently open client connections",
-})
-
-// IncrementOpenConnections increments the open connections gauge.
-// Used by the control plane which handles connections separately from the standalone server.
-func IncrementOpenConnections() { connectionsGauge.Inc() }
-
-// DecrementOpenConnections decrements the open connections gauge.
-func DecrementOpenConnections() { connectionsGauge.Dec() }
+// connectionsGauge, IncrementOpenConnections, DecrementOpenConnections moved
+// to server/observe. The aliases below preserve the existing server.X
+// spellings for the call sites in this package and the control plane.
+var (
+	IncrementOpenConnections = observe.IncrementOpenConnections
+	DecrementOpenConnections = observe.DecrementOpenConnections
+)
 
 var queryDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_query_duration_seconds",
@@ -158,23 +155,8 @@ var ducklakeConflictRetriesExhaustedTotal = promauto.NewCounter(prometheus.Count
 	Help: "Total number of DuckLake transaction conflicts where all retries were exhausted",
 })
 
-var s3BytesReadTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_s3_bytes_read_total",
-	Help: "Total bytes read from S3 by DuckDB",
-}, []string{"org"})
-
-var scanWallSecondsHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "duckgres_scan_wall_seconds",
-	Help:    "Estimated wall-clock scan time per query",
-	Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60},
-}, []string{"org"})
-
-var scanRowsPerSecondHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name: "duckgres_scan_rows_per_second",
-	Help: "Scan throughput: estimated wall-clock rows scanned per second. High values (>1e10) indicate buffer pool/cache hits.",
-	// Range spans S3 cold reads (1e5-1e8) through in-memory cache hits (1e9-1e12).
-	Buckets: []float64{1e5, 5e5, 1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9, 1e10, 1e11, 1e12},
-}, []string{"org"})
+// s3BytesReadTotal, scanWallSecondsHistogram, scanRowsPerSecondHistogram
+// moved to server/observe alongside the tracing helpers that bump them.
 
 // BackendKey moved to server/wire. Alias kept for back-compat with the
 // dozens of references to server.BackendKey across this package and the
@@ -1422,7 +1404,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
-	_, attachSpan := tracer.Start(context.Background(), "duckgres.ducklake_attach")
+	_, attachSpan := observe.Tracer().Start(context.Background(), "duckgres.ducklake_attach")
 	if err := retryOnTransientAttach(func() error {
 		_, err := db.Exec(attachStmt)
 		return err
@@ -2101,10 +2083,10 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 
 	// Track active connections (only after rate limiting passes)
 	atomic.AddInt64(&s.activeConns, 1)
-	connectionsGauge.Inc()
+	observe.IncrementOpenConnections()
 	defer func() {
 		atomic.AddInt64(&s.activeConns, -1)
-		connectionsGauge.Dec()
+		observe.DecrementOpenConnections()
 	}()
 
 	// Ensure we unregister when done
@@ -2218,7 +2200,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 		// We spawn a child process to handle TLS and everything after.
 		// Track active connections
 		atomic.AddInt64(&s.activeConns, 1)
-		connectionsGauge.Inc()
+		observe.IncrementOpenConnections()
 
 		// Spawn child process - it will do TLS handshake and read the startup message
 		child, err := s.spawnChildForTLS(conn)
@@ -2226,7 +2208,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 			slog.Error("Failed to spawn child process.", "remote_addr", remoteAddr, "error", err)
 			s.rateLimiter.UnregisterConnection(remoteAddr)
 			atomic.AddInt64(&s.activeConns, -1)
-			connectionsGauge.Dec()
+			observe.DecrementOpenConnections()
 			_ = conn.Close()
 			return
 		}
@@ -2239,7 +2221,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 			s.monitorChild(child)
 			s.rateLimiter.UnregisterConnection(remoteAddr)
 			atomic.AddInt64(&s.activeConns, -1)
-			connectionsGauge.Dec()
+			observe.DecrementOpenConnections()
 		}()
 	} else {
 		// No SSL request - reject connection (TLS is required)

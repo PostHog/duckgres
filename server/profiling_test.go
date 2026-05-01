@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+
+	"github.com/posthog/duckgres/server/observe"
 )
 
 func TestProfilingOutputToFile(t *testing.T) {
@@ -49,7 +51,7 @@ func TestProfilingOutputToFile(t *testing.T) {
 	}
 
 	// Parse and verify key fields
-	m, ok := parseProfilingOutput(string(data))
+	m, ok := observe.ParseProfilingOutput(string(data))
 	if !ok {
 		t.Fatalf("failed to parse profiling output: %s", data[:min(200, len(data))])
 	}

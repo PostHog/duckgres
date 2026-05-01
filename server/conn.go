@@ -26,6 +26,7 @@ import (
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/server/wire"
 	"github.com/posthog/duckgres/transpiler"
@@ -555,7 +556,7 @@ func (c *clientConn) logQueryStarted(query string) {
 		"query", query,
 		"worker", c.workerID,
 		"worker_pod", c.workerPod,
-		"trace_id", traceIDFromContext(c.ctx))
+		"trace_id", observe.TraceIDFromContext(c.ctx))
 }
 
 // logQueryFinished records a query terminating on the worker. Counter-
@@ -576,7 +577,7 @@ func (c *clientConn) logQueryFinished(query string, start time.Time, rows int64,
 		"rows", rows,
 		"worker", c.workerID,
 		"worker_pod", c.workerPod,
-		"trace_id", traceIDFromContext(c.ctx),
+		"trace_id", observe.TraceIDFromContext(c.ctx),
 	}
 	if err != nil {
 		attrs = append(attrs, "error", err.Error())
@@ -1217,12 +1218,12 @@ func (c *clientConn) handleQuery(body []byte) error {
 	start := time.Now()
 	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
 
-	ctx, span := tracer.Start(c.ctx, "duckgres.query",
+	ctx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
 			attribute.String("duckgres.protocol", "simple"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),
-			attribute.String("db.statement", truncateForSpan(query)),
+			attribute.String("db.statement", observe.TruncateForSpan(query)),
 		),
 	)
 	defer span.End()
@@ -1297,7 +1298,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	}
 
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
-	_, transpileSpan := tracer.Start(c.ctx, "duckgres.transpile")
+	_, transpileSpan := observe.Tracer().Start(c.ctx, "duckgres.transpile")
 	tr := c.newTranspiler(false)
 	result, err := tr.Transpile(query)
 	transpileSpan.End()
@@ -1387,7 +1388,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		defer cleanup()
 
 		execStart := time.Now()
-		execCtx, execSpan := tracer.Start(ctx, "duckgres.execute")
+		execCtx, execSpan := observe.Tracer().Start(ctx, "duckgres.execute")
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, query)
 			if err != nil {
@@ -1408,7 +1409,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		}
 
 		execResult, err := runExec()
-		enrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 		execSpan.End()
 		if err != nil {
 			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
@@ -1591,7 +1592,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	defer cleanup()
 
 	execStart := time.Now()
-	execCtx, execSpan := tracer.Start(ctx, "duckgres.execute")
+	execCtx, execSpan := observe.Tracer().Start(ctx, "duckgres.execute")
 	c.logQueryStarted(query)
 	runQuery := func() (RowSet, error) {
 		return c.executor.QueryContext(ctx, query)
@@ -1615,7 +1616,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			},
 		)
 	}
-	enrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+	observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 	execSpan.End()
 	if err != nil {
 		errCode := classifyErrorCode(err)
@@ -1656,7 +1657,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		return 0, errCode, errMsg, nil
 	}
 
-	_, sendSpan := tracer.Start(ctx, "duckgres.send_results")
+	_, sendSpan := observe.Tracer().Start(ctx, "duckgres.send_results")
 	defer sendSpan.End()
 
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
@@ -5238,12 +5239,12 @@ func (c *clientConn) handleExecute(body []byte) {
 	start := time.Now()
 	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
 
-	_, span := tracer.Start(c.ctx, "duckgres.query",
+	_, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
 			attribute.String("duckgres.protocol", "extended"),
 			attribute.String("duckgres.org_id", c.orgID),
 			attribute.String("db.user", c.username),
-			attribute.String("db.statement", truncateForSpan(p.stmt.query)),
+			attribute.String("db.statement", observe.TruncateForSpan(p.stmt.query)),
 		),
 	)
 	defer span.End()

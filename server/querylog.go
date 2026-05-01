@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/posthog/duckgres/server/ducklake"
+	"github.com/posthog/duckgres/server/observe"
 )
 
 // QueryLogEntry represents a single entry in the query log.
@@ -520,8 +521,8 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		WorkerID:        c.workerID,
 		IsTranspiled:    transpiled != nil,
 		Protocol:        protocol,
-		TraceID:         traceIDFromContext(c.ctx),
-		SpanID:          spanIDFromContext(c.ctx),
+		TraceID:         observe.TraceIDFromContext(c.ctx),
+		SpanID:          observe.SpanIDFromContext(c.ctx),
 	})
 }
 
