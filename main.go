@@ -26,8 +26,10 @@ import (
 // cmd/duckgres-worker binaries parse the same shape.
 type FileConfig = configloader.FileConfig
 
-// Type aliases for the nested configloader types so the rest of main.go's
-// resolveEffectiveConfig logic continues to compile unchanged.
+// Type aliases for the nested configloader types so main.go's flag-binding
+// code continues to refer to FileConfig / ProcessFileConfig / etc. without
+// the configloader. prefix on every line. The actual resolver now lives in
+// the configresolve package and takes *configloader.FileConfig directly.
 type (
 	ProcessFileConfig   = configloader.ProcessFileConfig
 	K8sFileConfig       = configloader.K8sFileConfig

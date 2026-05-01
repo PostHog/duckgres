@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/posthog/duckgres/configresolve"
 )
 
 func envFromMap(values map[string]string) func(string) string {
@@ -37,7 +39,7 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		"DUCKGRES_IDLE_TIMEOUT":      "2h",
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set: map[string]bool{
 			"host":              true,
 			"port":              true,
@@ -97,7 +99,7 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 		"DUCKGRES_FLIGHT_PORT": "6001",
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
 
 	if resolved.Server.Host != "env-host" {
 		t.Fatalf("expected env host, got %q", resolved.Server.Host)
@@ -129,7 +131,7 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), func(msg string) {
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -174,7 +176,7 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCache(t *testin
 		},
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected ducklake.disable_metadata_thread_local_cache from YAML to be true")
 	}
@@ -182,30 +184,30 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCache(t *testin
 	env := map[string]string{
 		"DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE": "false",
 	}
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || *resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected env false to override file true for ducklake.disable_metadata_thread_local_cache")
 	}
 
 	env["DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE"] = "true"
-	resolved = resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(env), nil)
+	resolved = configresolve.ResolveEffective(&FileConfig{}, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected env true to enable ducklake.disable_metadata_thread_local_cache")
 	}
 }
 
 func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCacheDefaultsTrue(t *testing.T) {
-	resolved := resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(&FileConfig{}, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected ducklake.disable_metadata_thread_local_cache to default to true")
 	}
 
 	disabled := false
-	resolved = resolveEffectiveConfig(&FileConfig{
+	resolved = configresolve.ResolveEffective(&FileConfig{
 		DuckLake: DuckLakeFileConfig{
 			DisableMetadataThreadLocalCache: &disabled,
 		},
-	}, configCLIInputs{}, envFromMap(nil), nil)
+	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || *resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
 		t.Fatal("expected YAML false to disable ducklake.disable_metadata_thread_local_cache")
 	}
@@ -213,12 +215,12 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCacheDefaultsTr
 
 func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
 	fileEnabled := true
-	resolved := resolveEffectiveConfig(&FileConfig{
+	resolved := configresolve.ResolveEffective(&FileConfig{
 		DuckLake: DuckLakeFileConfig{
 			ObjectStore:         "s3://warehouse/ducklake/",
 			DeltaCatalogEnabled: &fileEnabled,
 		},
-	}, configCLIInputs{}, envFromMap(nil), nil)
+	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if !resolved.Server.DuckLake.DeltaCatalogEnabled {
 		t.Fatal("expected YAML ducklake.delta_catalog_enabled to enable Delta catalog")
 	}
@@ -226,12 +228,12 @@ func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
 		t.Fatalf("expected derived Delta catalog path %q, got %q", want, got)
 	}
 
-	resolved = resolveEffectiveConfig(&FileConfig{
+	resolved = configresolve.ResolveEffective(&FileConfig{
 		DuckLake: DuckLakeFileConfig{
 			DeltaCatalogEnabled: &fileEnabled,
 			DeltaCatalogPath:    "s3://warehouse/custom-delta/",
 		},
-	}, configCLIInputs{}, envFromMap(map[string]string{
+	}, configresolve.CLIInputs{}, envFromMap(map[string]string{
 		"DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED": "false",
 		"DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH":    "s3://warehouse/env-delta/",
 	}), nil)
@@ -242,7 +244,7 @@ func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
 		t.Fatalf("expected env Delta catalog path %q, got %q", want, got)
 	}
 
-	resolved = resolveEffectiveConfig(nil, configCLIInputs{
+	resolved = configresolve.ResolveEffective(nil, configresolve.CLIInputs{
 		Set:                         map[string]bool{"ducklake-delta-catalog-enabled": true, "ducklake-delta-catalog-path": true},
 		DuckLakeDeltaCatalogEnabled: true,
 		DuckLakeDeltaCatalogPath:    "s3://warehouse/cli-delta/",
@@ -266,7 +268,7 @@ func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -304,7 +306,7 @@ func TestResolveEffectiveConfigQueryLogCLIOverride(t *testing.T) {
 
 	// CLI true should override env false when flag is explicitly set.
 	envDisabled := map[string]string{"DUCKGRES_QUERY_LOG_ENABLED": "false"}
-	enabled := resolveEffectiveConfig(fileCfg, configCLIInputs{
+	enabled := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set:      map[string]bool{"query-log": true},
 		QueryLog: true,
 	}, envFromMap(envDisabled), nil)
@@ -314,7 +316,7 @@ func TestResolveEffectiveConfigQueryLogCLIOverride(t *testing.T) {
 
 	// CLI false should override env true when flag is explicitly set.
 	envEnabled := map[string]string{"DUCKGRES_QUERY_LOG_ENABLED": "true"}
-	disabled := resolveEffectiveConfig(fileCfg, configCLIInputs{
+	disabled := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set:      map[string]bool{"query-log": true},
 		QueryLog: false,
 	}, envFromMap(envEnabled), nil)
@@ -331,7 +333,7 @@ func TestResolveEffectiveConfigMemoryLimitAndThreads(t *testing.T) {
 		MemoryLimit: "2GB",
 		Threads:     2,
 	}
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.MemoryLimit != "2GB" {
 		t.Fatalf("expected memory_limit from file, got %q", resolved.Server.MemoryLimit)
 	}
@@ -344,7 +346,7 @@ func TestResolveEffectiveConfigMemoryLimitAndThreads(t *testing.T) {
 		"DUCKGRES_MEMORY_LIMIT": "8GB",
 		"DUCKGRES_THREADS":      "8",
 	}
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.MemoryLimit != "8GB" {
 		t.Fatalf("expected memory_limit from env, got %q", resolved.Server.MemoryLimit)
 	}
@@ -353,7 +355,7 @@ func TestResolveEffectiveConfigMemoryLimitAndThreads(t *testing.T) {
 	}
 
 	// CLI overrides env
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set:         map[string]bool{"memory-limit": true, "threads": true},
 		MemoryLimit: "16GB",
 		Threads:     16,
@@ -372,7 +374,7 @@ func TestResolveEffectiveConfigInvalidThreadsEnv(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -398,7 +400,7 @@ func TestResolveEffectiveConfigInvalidMemoryLimit(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -433,7 +435,7 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 			MaxWorkers: 12,
 		},
 	}
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.MemoryBudget != "24GB" {
 		t.Fatalf("expected memory_budget from file, got %q", resolved.Server.MemoryBudget)
 	}
@@ -458,7 +460,7 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 		"DUCKGRES_PROCESS_RETIRE_ON_SESSION_END": "false",
 		"DUCKGRES_K8S_MAX_WORKERS":               "24",
 	}
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.MemoryBudget != "32GB" {
 		t.Fatalf("expected memory_budget from env, got %q", resolved.Server.MemoryBudget)
 	}
@@ -476,7 +478,7 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	}
 
 	// CLI overrides env
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set:                       map[string]bool{"memory-budget": true, "process-min-workers": true, "process-max-workers": true, "process-retire-on-session-end": true, "k8s-max-workers": true},
 		MemoryBudget:              "48GB",
 		ProcessMinWorkers:         8,
@@ -508,7 +510,7 @@ func TestResolveEffectiveConfigK8sSharedWarmTarget(t *testing.T) {
 		},
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.K8sSharedWarmTarget != 3 {
 		t.Fatalf("expected k8s shared warm target from file, got %d", resolved.K8sSharedWarmTarget)
 	}
@@ -516,12 +518,12 @@ func TestResolveEffectiveConfigK8sSharedWarmTarget(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_K8S_SHARED_WARM_TARGET": "5",
 	}
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.K8sSharedWarmTarget != 5 {
 		t.Fatalf("expected k8s shared warm target from env, got %d", resolved.K8sSharedWarmTarget)
 	}
 
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set:                 map[string]bool{"k8s-shared-warm-target": true},
 		K8sSharedWarmTarget: 8,
 	}, envFromMap(env), nil)
@@ -536,7 +538,7 @@ func TestResolveEffectiveConfigInvalidMemoryBudget(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -565,7 +567,7 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), func(msg string) {
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -617,7 +619,7 @@ func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
 		"DUCKGRES_FLIGHT_SESSION_TOKEN_TTL":     "90m",
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set: map[string]bool{
 			"flight-session-idle-ttl":      true,
 			"flight-session-reap-interval": true,
@@ -686,7 +688,7 @@ func TestResolveEffectiveConfigFlightIngressDurationsFromFile(t *testing.T) {
 		FlightSessionTokenTTL:     "2h",
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 
 	if resolved.Server.FlightSessionIdleTTL != 7*time.Minute {
 		t.Fatalf("expected file flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
@@ -710,7 +712,7 @@ func TestResolveEffectiveConfigFlightIngressDurationsFromEnv(t *testing.T) {
 		"DUCKGRES_FLIGHT_SESSION_TOKEN_TTL":     "30m",
 	}
 
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), nil)
 
 	if resolved.Server.FlightSessionIdleTTL != 9*time.Minute {
 		t.Fatalf("expected env flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
@@ -735,7 +737,7 @@ func TestResolveEffectiveConfigInvalidFlightPortEnv(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), func(msg string) {
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -759,7 +761,7 @@ func TestResolveEffectiveConfigPassthroughUsers(t *testing.T) {
 	fileCfg := &FileConfig{
 		PassthroughUsers: []string{"alice", "bob"},
 	}
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 
 	if len(resolved.Server.PassthroughUsers) != 2 {
 		t.Fatalf("expected 2 passthrough users, got %d", len(resolved.Server.PassthroughUsers))
@@ -772,7 +774,7 @@ func TestResolveEffectiveConfigPassthroughUsers(t *testing.T) {
 	}
 
 	// Empty list should not set the map
-	resolved = resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(nil), nil)
+	resolved = configresolve.ResolveEffective(&FileConfig{}, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.PassthroughUsers != nil {
 		t.Fatalf("expected nil passthrough users for empty config, got %v", resolved.Server.PassthroughUsers)
 	}
@@ -789,7 +791,7 @@ func TestResolveEffectiveConfigACME(t *testing.T) {
 			},
 		},
 	}
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.ACMEDomain != "test.us.duckgres.com" {
 		t.Fatalf("expected ACME domain from file, got %q", resolved.Server.ACMEDomain)
 	}
@@ -806,7 +808,7 @@ func TestResolveEffectiveConfigACME(t *testing.T) {
 		"DUCKGRES_ACME_EMAIL":     "ops@posthog.com",
 		"DUCKGRES_ACME_CACHE_DIR": "/tmp/acme-cache",
 	}
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.ACMEDomain != "env.us.duckgres.com" {
 		t.Fatalf("expected ACME domain from env, got %q", resolved.Server.ACMEDomain)
 	}
@@ -818,7 +820,7 @@ func TestResolveEffectiveConfigACME(t *testing.T) {
 	}
 
 	// CLI overrides env
-	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set:          map[string]bool{"acme-domain": true, "acme-email": true, "acme-cache-dir": true},
 		ACMEDomain:   "cli.us.duckgres.com",
 		ACMEEmail:    "cli@posthog.com",
@@ -841,7 +843,7 @@ func TestResolveEffectiveConfigACMEEnvOnly(t *testing.T) {
 		"DUCKGRES_ACME_DOMAIN": "envonly.us.duckgres.com",
 		"DUCKGRES_ACME_EMAIL":  "test@example.com",
 	}
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.ACMEDomain != "envonly.us.duckgres.com" {
 		t.Fatalf("expected ACME domain from env, got %q", resolved.Server.ACMEDomain)
 	}
@@ -862,7 +864,7 @@ func TestResolveEffectiveConfigACMEDNSProviderValidation(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), func(msg string) {
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -890,7 +892,7 @@ func TestResolveEffectiveConfigFilePersistenceFromFile(t *testing.T) {
 		FilePersistence: true,
 		DataDir:         "/tmp/data",
 	}
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if !resolved.Server.FilePersistence {
 		t.Fatal("expected file_persistence from YAML to be true")
 	}
@@ -900,7 +902,7 @@ func TestResolveEffectiveConfigFilePersistenceFromEnv(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_FILE_PERSISTENCE": "true",
 	}
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if !resolved.Server.FilePersistence {
 		t.Fatal("expected file_persistence from env to be true")
 	}
@@ -913,7 +915,7 @@ func TestResolveEffectiveConfigFilePersistenceEnvOverridesFile(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_FILE_PERSISTENCE": "false",
 	}
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.FilePersistence {
 		t.Fatal("expected env false to override file true")
 	}
@@ -923,7 +925,7 @@ func TestResolveEffectiveConfigFilePersistenceCLIOverridesEnv(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_FILE_PERSISTENCE": "false",
 	}
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{
 		Set:             map[string]bool{"file-persistence": true},
 		FilePersistence: true,
 	}, envFromMap(env), nil)
@@ -933,7 +935,7 @@ func TestResolveEffectiveConfigFilePersistenceCLIOverridesEnv(t *testing.T) {
 }
 
 func TestResolveEffectiveConfigFilePersistenceDefaultFalse(t *testing.T) {
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(nil), nil)
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.FilePersistence {
 		t.Fatal("expected file_persistence to default to false")
 	}
@@ -950,7 +952,7 @@ func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 	}
 
 	var warns []string
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), func(msg string) {
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), func(msg string) {
 		warns = append(warns, msg)
 	})
 
@@ -976,11 +978,11 @@ func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 func TestFilePersistenceRequiresDataDir(t *testing.T) {
 	var warns []string
 	// Use CLI to explicitly set data-dir to empty, overriding the default.
-	resolved := resolveEffectiveConfig(
+	resolved := configresolve.ResolveEffective(
 		&FileConfig{
 			FilePersistence: true,
 		},
-		configCLIInputs{
+		configresolve.CLIInputs{
 			Set:     map[string]bool{"data-dir": true},
 			DataDir: "",
 		},
