@@ -1,0 +1,81 @@
+# Dockerfile.worker — builds cmd/duckgres-worker, the DuckDB-service-only
+# binary. Pinned to a single DuckDB driver version per build via the
+# DUCKDB_GO_VERSION / DUCKDB_BINDINGS_VERSION / DUCKDB_EXTENSION_VERSION /
+# HTTPFS_EXTENSION_TAG build args. The matrix-build CD workflow produces
+# one image per (DuckDB version × arch).
+#
+# The control plane spawns these images as worker pods; their PG wire
+# surface is the all-in-one duckgres binary (or the CP-only binary in
+# cmd/duckgres-controlplane), which routes queries to whichever worker
+# image the per-tenant `image` config-store column points at.
+FROM golang:1.25-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY go.mod go.sum ./
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_TAGS=""
+ARG TARGETARCH
+
+# DuckDB driver pin. Default to whatever the repo's go.mod is currently
+# tracking; override via --build-arg when the matrix produces an image
+# for a specific DuckDB minor version. The corresponding
+# duckdb-go-bindings version must move in lock-step (the duckdb-go-bindings
+# release stream uses the same numeric encoding as duckdb-go/v2 just
+# without the v2 prefix).
+ARG DUCKDB_GO_VERSION=
+ARG DUCKDB_BINDINGS_VERSION=
+
+RUN if [ -n "$DUCKDB_GO_VERSION" ] && [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
+      go get "github.com/duckdb/duckdb-go/v2@${DUCKDB_GO_VERSION}" \
+      && go get "github.com/duckdb/duckdb-go-bindings@${DUCKDB_BINDINGS_VERSION}" \
+      && for arch in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64 windows-amd64; do \
+           go get "github.com/duckdb/duckdb-go-bindings/lib/${arch}@${DUCKDB_BINDINGS_VERSION}" 2>/dev/null || true; \
+         done \
+      && go mod tidy ; \
+    fi
+
+RUN go mod download
+COPY . .
+
+ARG DUCKDB_EXTENSION_VERSION=1.5.2
+ARG HTTPFS_EXTENSION_TAG=v1.5.2-stoi-fix
+ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
+ARG DUCKDB_NIGHTLY_EXTENSION_REPOSITORY=http://nightly-extensions.duckdb.org
+
+RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" \
+    -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -o duckgres-worker \
+    ./cmd/duckgres-worker
+
+RUN mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
+    && curl -fsSL "https://github.com/benben/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
+      -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension" \
+    && for ext in ducklake json; do \
+         curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/${ext}.duckdb_extension.gz" \
+           | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/${ext}.duckdb_extension"; \
+       done \
+    && curl -fsSL "${DUCKDB_NIGHTLY_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension.gz" \
+      | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension"
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
+
+WORKDIR /app
+COPY --from=builder /build/duckgres-worker .
+COPY --from=builder /build/duckdb-extensions ./extensions
+RUN mkdir -p data certs && chown -R duckgres:duckgres /app
+
+USER duckgres
+
+# 8816 = Arrow Flight SQL listener (configurable via --duckdb-listen)
+# 9090 = metrics. The CP-side PG wire port (5432) is intentionally absent;
+# this binary does not serve PG wire.
+EXPOSE 8816 9090
+
+ENTRYPOINT ["/app/duckgres-worker"]
