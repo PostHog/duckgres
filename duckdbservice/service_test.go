@@ -190,9 +190,9 @@ func TestDestroySessionClusterModeDiscardsConn(t *testing.T) {
 	}
 
 	// Open a fresh conn from the same pool and verify the macro is gone.
-	// In cluster mode the prior conn was marked bad via Conn.Raw, so the
-	// driver pool discarded it; this fresh conn opens a new DuckDB connection
-	// that never had the macro defined.
+	// In cluster mode the prior conn was evicted via evictConnFromPool, so
+	// this fresh conn opens a new DuckDB connection that never had the
+	// macro defined.
 	fresh, err := db.Conn(context.Background())
 	if err != nil {
 		t.Fatalf("acquire fresh conn: %v", err)
