@@ -533,25 +533,47 @@ func (p *SessionPool) DestroySession(token string) error {
 		stop()
 	}
 	if session.Conn != nil {
-		// Drop temporary tables before returning the connection to the pool.
 		// sql.Conn.Close() returns the underlying driver connection to sql.DB's
-		// pool rather than closing it. DuckDB temp tables are connection-scoped,
-		// so they'd leak into the next session that gets the same connection.
+		// pool rather than closing it. DuckDB temp tables, temp views, and
+		// temp macros are connection-scoped, so without intervention they'd
+		// leak into the next session that gets the same pooled connection.
+		//
+		// Two strategies:
+		//   - Cluster mode (sharedWarmMode): always evict the conn. The
+		//     worker is bound to a single org via activateTenant, so security
+		//     boundaries align with worker lifecycle, and the per-session
+		//     cleanup loop is mostly wasted work (a typical SELECT-1 session
+		//     creates zero user temp objects but the cleanup still issues
+		//     ~46 DROP IF EXISTS no-ops against system views in non-temp
+		//     schemas). Eviction is also more correct: the existing cleanup
+		//     only handles temp tables/views, not temp macros, types, or
+		//     sequences — those still leak through pooled-conn reuse.
+		//   - Standalone mode: pooled conns can be reused across orgs, so
+		//     scrubbing per-conn state is required. Falls back to eviction
+		//     if the cleanup fails.
 		cleanupStart := time.Now()
-		slog.Debug("Cleaning up session state.", "user", session.Username)
-		clean := cleanupSessionState(session.Conn)
-		slog.Debug("Session state cleaned up.", "user", session.Username, "duration", time.Since(cleanupStart), "clean", clean)
-		if !clean {
-			// Cleanup failed — likely the conn is in an aborted/INTERRUPT'd state
-			// from the prior cancelled query. Returning it to the pool would poison
-			// the next session that gets it (every operation fails until the conn
-			// is forcibly recycled). Mark it bad via Raw so database/sql discards
-			// it instead. The next Conn() call gets a fresh DuckDB connection.
-			_ = session.Conn.Raw(func(any) error { return driver.ErrBadConn })
+		var evicted bool
+		if p.sharedWarmMode {
+			slog.Debug("Evicting session connection from pool (cluster mode).", "user", session.Username)
+			evictConnFromPool(session.Conn)
+			evicted = true
+		} else {
+			slog.Debug("Cleaning up session state (standalone mode).", "user", session.Username)
+			clean := cleanupSessionState(session.Conn)
+			slog.Debug("Session state cleaned up.", "user", session.Username, "duration", time.Since(cleanupStart), "clean", clean)
+			if !clean {
+				// Cleanup failed — likely an aborted/INTERRUPT'd conn from a
+				// cancelled query. Evict rather than poison the next session.
+				evictConnFromPool(session.Conn)
+				evicted = true
+			}
 		}
 		connCloseStart := time.Now()
 		_ = session.Conn.Close()
-		slog.Debug("Session connection closed.", "user", session.Username, "duration", time.Since(connCloseStart), "discarded", !clean)
+		slog.Debug("Session connection closed.", "user", session.Username,
+			"cleanup_duration", time.Since(cleanupStart),
+			"close_duration", time.Since(connCloseStart),
+			"evicted", evicted)
 	}
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
 	p.mu.RLock()
@@ -672,6 +694,19 @@ func cleanupWorkerCatalogs(db *sql.DB) {
 			slog.Warn("Failed to detach worker DuckLake catalog during shutdown.", "error", err)
 		}
 	}
+}
+
+// evictConnFromPool removes a *sql.Conn's underlying driver connection from
+// the *sql.DB pool so it's not reused by a future caller.
+//
+// The standard library exposes no direct API for this, so the idiom is to
+// return driver.ErrBadConn from Conn.Raw — the database/sql pool checks for
+// that error specifically and discards rather than re-pools the conn (see
+// putConn in database/sql). The connection isn't actually broken; we just
+// don't want it pooled. The Go team has acknowledged the API gap (see
+// golang/go#40722) but no cleaner replacement exists today.
+func evictConnFromPool(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 }
 
 // cleanupSessionState drops temporary tables and views on the connection so
