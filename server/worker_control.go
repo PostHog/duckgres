@@ -1,31 +1,16 @@
 package server
 
-// WorkerControlMetadata identifies the logical worker owner on a control-plane
-// to worker request.
-type WorkerControlMetadata struct {
-	WorkerID     int    `json:"worker_id"`
-	OwnerEpoch   int64  `json:"owner_epoch"`
-	CPInstanceID string `json:"cp_instance_id,omitempty"`
-}
+import "github.com/posthog/duckgres/server/wire"
 
-// WorkerCreateSessionPayload is the control-plane request body for creating a
-// worker-local session.
-type WorkerCreateSessionPayload struct {
-	WorkerControlMetadata
-	Username    string `json:"username"`
-	MemoryLimit string `json:"memory_limit"`
-	Threads     int    `json:"threads"`
-}
+// Aliases retained so existing references to server.WorkerControlMetadata,
+// server.WorkerCreateSessionPayload, server.WorkerDestroySessionPayload and
+// server.WorkerHealthCheckPayload continue to compile after the types
+// moved to server/wire. New code should import server/wire and use
+// wire.X directly.
 
-// WorkerDestroySessionPayload is the control-plane request body for destroying
-// a worker-local session.
-type WorkerDestroySessionPayload struct {
-	WorkerControlMetadata
-	SessionToken string `json:"session_token"`
-}
-
-// WorkerHealthCheckPayload is the control-plane request body for health-checking
-// a worker.
-type WorkerHealthCheckPayload struct {
-	WorkerControlMetadata
-}
+type (
+	WorkerControlMetadata       = wire.WorkerControlMetadata
+	WorkerCreateSessionPayload  = wire.WorkerCreateSessionPayload
+	WorkerDestroySessionPayload = wire.WorkerDestroySessionPayload
+	WorkerHealthCheckPayload    = wire.WorkerHealthCheckPayload
+)

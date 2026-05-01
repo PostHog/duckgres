@@ -26,6 +26,7 @@ import (
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/sysinfo"
+	"github.com/posthog/duckgres/server/wire"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -175,11 +176,10 @@ var scanRowsPerSecondHistogram = promauto.NewHistogramVec(prometheus.HistogramOp
 	Buckets: []float64{1e5, 5e5, 1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9, 1e10, 1e11, 1e12},
 }, []string{"org"})
 
-// BackendKey uniquely identifies a backend connection for cancel requests
-type BackendKey struct {
-	Pid       int32
-	SecretKey int32
-}
+// BackendKey moved to server/wire. Alias kept for back-compat with the
+// dozens of references to server.BackendKey across this package and the
+// control plane.
+type BackendKey = wire.BackendKey
 
 // RedactSecrets replaces password=<value> (and password: <value>) patterns with
 // password=[REDACTED] for safe logging and error reporting. It handles both quoted

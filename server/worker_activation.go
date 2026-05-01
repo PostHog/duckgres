@@ -1,9 +1,8 @@
 package server
 
-// WorkerActivationPayload is the tenant runtime material delivered to a shared
-// warm worker over the control-plane RPC path.
-type WorkerActivationPayload struct {
-	WorkerControlMetadata
-	OrgID    string         `json:"org_id"`
-	DuckLake DuckLakeConfig `json:"ducklake"`
-}
+import "github.com/posthog/duckgres/server/wire"
+
+// WorkerActivationPayload moved to server/wire so the control plane can use
+// it without importing the rest of server. The alias preserves the existing
+// server.WorkerActivationPayload spelling for current call sites.
+type WorkerActivationPayload = wire.WorkerActivationPayload

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"database/sql"
 	"database/sql/driver"
@@ -14,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/big"
 	"net"
 	"os"
 	"regexp"
@@ -29,6 +27,7 @@ import (
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/sqlcore"
+	"github.com/posthog/duckgres/server/wire"
 	"github.com/posthog/duckgres/transpiler"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -196,15 +195,10 @@ func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpi
 	})
 }
 
-// generateSecretKey generates a cryptographically random secret key for cancel requests.
-func generateSecretKey() int32 {
-	n, err := rand.Int(rand.Reader, big.NewInt(1<<31))
-	if err != nil {
-		// Fallback to time-based key if crypto/rand fails
-		return int32(time.Now().UnixNano() & 0x7FFFFFFF)
-	}
-	return int32(n.Int64())
-}
+// generateSecretKey is a thin alias for wire.GenerateSecretKey kept for the
+// internal call sites in this file. New code should call wire.GenerateSecretKey
+// directly.
+var generateSecretKey = wire.GenerateSecretKey
 
 // backendKey returns the backend key for this connection, used for cancel requests.
 func (c *clientConn) backendKey() BackendKey {
