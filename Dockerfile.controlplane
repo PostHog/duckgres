@@ -1,0 +1,47 @@
+# Dockerfile.controlplane — builds cmd/duckgres-controlplane, the
+# control-plane-only binary. Does NOT link libduckdb (verified in CI by
+# the controlplane-no-libduckdb job). Does NOT bundle the DuckDB extension
+# downloads — there's no DuckDB driver in this image, so the extensions
+# would be dead weight.
+#
+# This image deploys as the control-plane Pod / process. All SQL execution
+# is routed to remote duckgres-worker images (see Dockerfile.worker), so
+# the CP image is small, ships once across all DuckDB versions, and rolls
+# independently of the worker fleet.
+#
+# CGO is still enabled because the transpiler uses
+# github.com/pganalyze/pg_query_go which links libpg_query. That's a
+# pure-Postgres parser dependency — nothing to do with DuckDB.
+FROM golang:1.25-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_TAGS=""
+
+RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" \
+    -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -o duckgres-controlplane \
+    ./cmd/duckgres-controlplane
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
+
+WORKDIR /app
+COPY --from=builder /build/duckgres-controlplane .
+RUN mkdir -p data certs && chown -R duckgres:duckgres /app
+
+USER duckgres
+
+# 5432 = PG wire (clients), 8816 = optional Flight SQL ingress, 9090 = metrics.
+EXPOSE 5432 8816 9090
+
+ENTRYPOINT ["/app/duckgres-controlplane"]
