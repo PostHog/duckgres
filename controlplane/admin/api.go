@@ -361,7 +361,13 @@ func (s *gormAPIStore) MutateManagedWarehouse(orgID string, mutate func(*configs
 func managedWarehouseUpsertColumns() []string {
 	return []string{
 		"image",
-		"ducklake_version",
+		// GORM's default naming strategy splits CamelCase on every
+		// uppercase-after-lowercase boundary, so `DuckLakeVersion` lands as
+		// `duck_lake_version` in Postgres — NOT `ducklake_version`. The JSON
+		// tag is `ducklake_version` but that only controls API I/O, not the
+		// DB column name. Mismatching this against the actual column makes
+		// the ON CONFLICT … DO UPDATE clause throw 42703.
+		"duck_lake_version",
 		"aurora_min_acu",
 		"aurora_max_acu",
 		"warehouse_database_region",
