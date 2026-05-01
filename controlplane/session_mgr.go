@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 )
 
 // SessionProgress holds cached query progress from a worker health check.
@@ -26,7 +27,7 @@ type ManagedSession struct {
 	WorkerID     int
 	Protocol     string // "postgres" or "flight"
 	SessionToken string
-	Executor     *server.FlightExecutor
+	Executor     *flightclient.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
 
 	// Cached query progress from worker health checks.
@@ -68,7 +69,7 @@ func (sm *SessionManager) ReservePID() int32 {
 // CreateSession acquires a worker (reusing an idle one or spawning a new one),
 // creates a session on it, and rebalances memory/thread limits across all active sessions.
 // If pid is 0, a new one is generated.
-func (sm *SessionManager) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+func (sm *SessionManager) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 	memoryLimit, threads = sm.resolveSessionLimits(memoryLimit, threads)
 
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
@@ -102,7 +103,7 @@ func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) 
 	return memoryLimit, threads
 }
 
-func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (int32, *server.FlightExecutor, error) {
+func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (int32, *flightclient.FlightExecutor, error) {
 	reconnector, ok := sm.pool.(flightReconnectPool)
 	if !ok {
 		return 0, nil, fmt.Errorf("worker pool does not support flight reconnect")
@@ -114,7 +115,7 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	return sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false)
 }
 
-func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *server.FlightExecutor, error) {
+func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *flightclient.FlightExecutor, error) {
 	createStart := time.Now()
 	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
 	if err != nil {
@@ -124,7 +125,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
 	}
 
-	executor := server.NewFlightExecutorFromClient(worker.client, sessionToken)
+	executor := flightclient.NewFlightExecutorFromClient(worker.client, sessionToken)
 	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
 
 	if pid == 0 {

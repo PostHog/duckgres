@@ -127,11 +127,6 @@ func GenerateSecretKey() int32 {
 	return generateSecretKey()
 }
 
-// IsEmptyQuery checks if a query contains only semicolons, whitespace, and/or SQL comments.
-// PostgreSQL returns EmptyQueryResponse for queries like ";", "-- ping", "/* */", etc.
-func IsEmptyQuery(query string) bool {
-	return isEmptyQuery(query)
-}
 
 // SetQueryLogger sets the query logger on a Server. Used by the control plane
 // to attach a query logger to the minimal server after creation.

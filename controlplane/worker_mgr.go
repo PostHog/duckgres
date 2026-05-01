@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -454,8 +455,8 @@ func waitForWorker(socketPath, bearerToken string, timeout time.Duration) (*flig
 			var dialOpts []grpc.DialOption
 			dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
-				grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
+				grpc.MaxCallRecvMsgSize(flightclient.MaxGRPCMessageSize),
+				grpc.MaxCallSendMsgSize(flightclient.MaxGRPCMessageSize),
 			))
 
 			if bearerToken != "" {

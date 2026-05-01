@@ -17,7 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
@@ -35,8 +35,8 @@ func newFlightClient(t *testing.T, port int) *flightsql.Client {
 	client, err := flightsql.NewClient(addr, nil, nil,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
-			grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
+			grpc.MaxCallRecvMsgSize(flightclient.MaxGRPCMessageSize),
+			grpc.MaxCallSendMsgSize(flightclient.MaxGRPCMessageSize),
 		),
 	)
 	if err != nil {

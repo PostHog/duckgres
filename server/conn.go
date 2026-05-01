@@ -26,7 +26,9 @@ import (
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/transpiler"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -2475,41 +2477,11 @@ func countDollarParams(query string) int {
 	return max
 }
 
-// isEmptyQuery checks if a query contains only semicolons, whitespace, and/or comments.
-// PostgreSQL returns EmptyQueryResponse for queries like ";", ";;;", "-- ping", etc.
-func isEmptyQuery(query string) bool {
-	// Strip SQL comments first (e.g., pgx sends "-- ping" for Ping())
-	stripped := stripLeadingComments(query)
-	for _, r := range stripped {
-		if r != ';' && r != ' ' && r != '\t' && r != '\n' && r != '\r' {
-			return false
-		}
-	}
-	return true
-}
-
-// stripLeadingComments removes leading SQL comments from a query.
-// Handles both block comments /* ... */ and line comments -- ...
-func stripLeadingComments(query string) string {
-	for {
-		query = strings.TrimSpace(query)
-		if strings.HasPrefix(query, "/*") {
-			end := strings.Index(query, "*/")
-			if end == -1 {
-				return query
-			}
-			query = query[end+2:]
-		} else if strings.HasPrefix(query, "--") {
-			end := strings.Index(query, "\n")
-			if end == -1 {
-				return ""
-			}
-			query = query[end+1:]
-		} else {
-			return query
-		}
-	}
-}
+// isEmptyQuery and stripLeadingComments moved to server/sqlcore so the
+// Flight client can call them without importing server. Local thin wrappers
+// preserve the unexported call-site spellings used throughout this file.
+func isEmptyQuery(query string) bool         { return sqlcore.IsEmptyQuery(query) }
+func stripLeadingComments(query string) string { return sqlcore.StripLeadingComments(query) }
 
 // stripLeadingNoise strips leading whitespace, comments, and parentheses from
 // a query string in a loop until none remain. This handles cases like
@@ -4308,7 +4280,7 @@ func (c *clientConn) formatCopyValue(v interface{}) string {
 		return formatArrayValue(val)
 	case map[string]any:
 		return formatMapValue(val)
-	case OrderedMapValue:
+	case arrowmap.OrderedMapValue:
 		return formatOrderedMapValue(val)
 	default:
 		return fmt.Sprintf("%v", val)
@@ -4512,13 +4484,13 @@ func formatValue(v interface{}) string {
 	case duckdb.Interval:
 		// PostgreSQL interval text format: "1 year 2 mons 3 days 04:05:06.123456"
 		return formatInterval(val)
-	case intervalValue:
-		// Arrow Flight returns intervalValue instead of duckdb.Interval
+	case arrowmap.IntervalValue:
+		// Arrow Flight returns arrowmap.IntervalValue instead of duckdb.Interval
 		return formatInterval(duckdb.Interval{Months: val.Months, Days: val.Days, Micros: val.Micros})
 	case map[string]any:
 		// STRUCT text format: {"key1": val1, "key2": val2}
 		return formatMapValue(val)
-	case OrderedMapValue:
+	case arrowmap.OrderedMapValue:
 		return formatOrderedMapValue(val)
 	default:
 		// For other types, try to convert to string
@@ -4647,7 +4619,7 @@ func formatMapValue(m map[string]any) string {
 
 // formatOrderedMapValue formats an OrderedMapValue as a key-value text
 // representation, preserving the original insertion order from the Arrow array.
-func formatOrderedMapValue(m OrderedMapValue) string {
+func formatOrderedMapValue(m arrowmap.OrderedMapValue) string {
 	var buf strings.Builder
 	buf.WriteByte('{')
 	for i, k := range m.Keys {

@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 )
 
 // mockCloser tracks whether Close was called.
@@ -27,7 +27,7 @@ func TestOnWorkerCrash_MarksExecutorsDead(t *testing.T) {
 	}
 	sm := NewSessionManager(pool, nil)
 
-	executor := &server.FlightExecutor{}
+	executor := &flightclient.FlightExecutor{}
 	pid := int32(1001)
 
 	sm.mu.Lock()
@@ -67,7 +67,7 @@ func TestOnWorkerCrash_ClosesConnections(t *testing.T) {
 	sm := NewSessionManager(pool, nil)
 
 	conn := &mockCloser{}
-	executor := &server.FlightExecutor{}
+	executor := &flightclient.FlightExecutor{}
 	pid := int32(1002)
 
 	sm.mu.Lock()
@@ -93,8 +93,8 @@ func TestOnWorkerCrash_MultipleSessions(t *testing.T) {
 	}
 	sm := NewSessionManager(pool, nil)
 
-	exec1 := &server.FlightExecutor{}
-	exec2 := &server.FlightExecutor{}
+	exec1 := &flightclient.FlightExecutor{}
+	exec2 := &flightclient.FlightExecutor{}
 	conn1 := &mockCloser{}
 	conn2 := &mockCloser{}
 
@@ -228,7 +228,7 @@ func TestDestroySessionAfterOnWorkerCrash(t *testing.T) {
 	sm := NewSessionManager(pool, nil)
 
 	conn := &mockCloser{}
-	executor := &server.FlightExecutor{}
+	executor := &flightclient.FlightExecutor{}
 	pid := int32(1010)
 
 	sm.mu.Lock()

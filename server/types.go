@@ -12,6 +12,7 @@ import (
 	"time"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
+	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 )
 
 // PostgreSQL type OIDs
@@ -616,8 +617,8 @@ func encodeInterval(v interface{}) []byte {
 		binary.BigEndian.PutUint64(buf[0:8], uint64(val.Micros))
 		binary.BigEndian.PutUint32(buf[8:12], uint32(val.Days))
 		binary.BigEndian.PutUint32(buf[12:16], uint32(val.Months))
-	case intervalValue:
-		// Arrow Flight returns intervalValue instead of duckdb.Interval
+	case arrowmap.IntervalValue:
+		// Arrow Flight returns arrowmap.IntervalValue instead of duckdb.Interval
 		binary.BigEndian.PutUint64(buf[0:8], uint64(val.Micros))
 		binary.BigEndian.PutUint32(buf[8:12], uint32(val.Days))
 		binary.BigEndian.PutUint32(buf[12:16], uint32(val.Months))
