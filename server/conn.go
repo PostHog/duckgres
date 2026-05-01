@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/binary"
 	"encoding/csv"
 	"errors"
@@ -22,7 +21,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
@@ -4012,59 +4010,6 @@ func splitQualifiedName(name string) []string {
 
 // appendWithDuckDBAppender uses the DuckDB Appender API for fast bulk inserts.
 // Only works for full-column inserts (no column subset).
-func (c *clientConn) appendWithDuckDBAppender(tableName string, rows [][]interface{}) (int, error) {
-	parts := splitQualifiedName(tableName)
-
-	ctx := context.Background()
-	sqlConn, err := c.executor.ConnContext(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get DB connection: %w", err)
-	}
-	defer sqlConn.Close() //nolint:errcheck
-
-	var rowCount int
-	err = sqlConn.Raw(func(driverConn interface{}) error {
-		dc, ok := driverConn.(driver.Conn)
-		if !ok {
-			return fmt.Errorf("underlying connection does not implement driver.Conn")
-		}
-
-		var appender *duckdb.Appender
-		var appErr error
-		switch len(parts) {
-		case 1:
-			appender, appErr = duckdb.NewAppenderFromConn(dc, "", parts[0])
-		case 2:
-			appender, appErr = duckdb.NewAppenderFromConn(dc, parts[0], parts[1])
-		default:
-			appender, appErr = duckdb.NewAppender(dc, parts[0], parts[1], parts[2])
-		}
-		if appErr != nil {
-			return fmt.Errorf("failed to create Appender: %w", appErr)
-		}
-
-		for i, row := range rows {
-			driverVals := make([]driver.Value, len(row))
-			for j, v := range row {
-				driverVals[j] = v
-			}
-			if appErr = appender.AppendRow(driverVals...); appErr != nil {
-				_ = appender.Close()
-				return fmt.Errorf("AppendRow failed at row %d: %w", i+1, appErr)
-			}
-		}
-
-		if appErr = appender.Close(); appErr != nil {
-			return fmt.Errorf("Appender.Close failed: %w", appErr)
-		}
-
-		rowCount = len(rows)
-		return nil
-	})
-
-	return rowCount, err
-}
-
 // batchInsertRows inserts rows using batched multi-row INSERT statements.
 // Used as fallback when Appender can't be used (column subsets, unsupported types).
 func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string, rows [][]interface{}) (int, error) {
