@@ -16,8 +16,8 @@ import (
 	"strings"
 	"testing"
 
-	duckdb "github.com/duckdb/duckdb-go/v2"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/wire"
 )
 
@@ -3271,39 +3271,39 @@ func TestParseMultiLineCSV(t *testing.T) {
 func TestFormatInterval(t *testing.T) {
 	tests := []struct {
 		name     string
-		interval duckdb.Interval
+		interval arrowmap.IntervalValue
 		want     string
 	}{
 		// Zero
-		{"zero", duckdb.Interval{}, "00:00:00"},
+		{"zero", arrowmap.IntervalValue{}, "00:00:00"},
 
 		// Time only
-		{"seconds", duckdb.Interval{Micros: 5_000_000}, "00:00:05"},
-		{"minutes and seconds", duckdb.Interval{Micros: 788_000_000}, "00:13:08"},
-		{"hours minutes seconds", duckdb.Interval{Micros: 3_661_000_000}, "01:01:01"},
-		{"fractional seconds", duckdb.Interval{Micros: 788_917_797}, "00:13:08.917797"},
-		{"exact microseconds", duckdb.Interval{Micros: 1}, "00:00:00.000001"},
+		{"seconds", arrowmap.IntervalValue{Micros: 5_000_000}, "00:00:05"},
+		{"minutes and seconds", arrowmap.IntervalValue{Micros: 788_000_000}, "00:13:08"},
+		{"hours minutes seconds", arrowmap.IntervalValue{Micros: 3_661_000_000}, "01:01:01"},
+		{"fractional seconds", arrowmap.IntervalValue{Micros: 788_917_797}, "00:13:08.917797"},
+		{"exact microseconds", arrowmap.IntervalValue{Micros: 1}, "00:00:00.000001"},
 
 		// Days
-		{"one day", duckdb.Interval{Days: 1}, "1 day"},
-		{"multiple days", duckdb.Interval{Days: 5}, "5 days"},
-		{"days and time", duckdb.Interval{Days: 3, Micros: 9_000_000_000}, "3 days 02:30:00"},
+		{"one day", arrowmap.IntervalValue{Days: 1}, "1 day"},
+		{"multiple days", arrowmap.IntervalValue{Days: 5}, "5 days"},
+		{"days and time", arrowmap.IntervalValue{Days: 3, Micros: 9_000_000_000}, "3 days 02:30:00"},
 
 		// Months
-		{"one month", duckdb.Interval{Months: 1}, "1 mon"},
-		{"multiple months", duckdb.Interval{Months: 7}, "7 mons"},
-		{"one year", duckdb.Interval{Months: 12}, "1 year"},
-		{"years and months", duckdb.Interval{Months: 14}, "1 year 2 mons"},
-		{"multiple years", duckdb.Interval{Months: 36}, "3 years"},
+		{"one month", arrowmap.IntervalValue{Months: 1}, "1 mon"},
+		{"multiple months", arrowmap.IntervalValue{Months: 7}, "7 mons"},
+		{"one year", arrowmap.IntervalValue{Months: 12}, "1 year"},
+		{"years and months", arrowmap.IntervalValue{Months: 14}, "1 year 2 mons"},
+		{"multiple years", arrowmap.IntervalValue{Months: 36}, "3 years"},
 
 		// Mixed
-		{"full interval", duckdb.Interval{Months: 14, Days: 3, Micros: 14_706_123_456}, "1 year 2 mons 3 days 04:05:06.123456"},
+		{"full interval", arrowmap.IntervalValue{Months: 14, Days: 3, Micros: 14_706_123_456}, "1 year 2 mons 3 days 04:05:06.123456"},
 
 		// Negative
-		{"negative time", duckdb.Interval{Micros: -3_600_000_000}, "-01:00:00"},
-		{"negative days", duckdb.Interval{Days: -2}, "-2 days"},
-		{"negative months", duckdb.Interval{Months: -1}, "-1 mon"},
-		{"negative years", duckdb.Interval{Months: -14}, "-1 year -2 mons"},
+		{"negative time", arrowmap.IntervalValue{Micros: -3_600_000_000}, "-01:00:00"},
+		{"negative days", arrowmap.IntervalValue{Days: -2}, "-2 days"},
+		{"negative months", arrowmap.IntervalValue{Months: -1}, "-1 mon"},
+		{"negative years", arrowmap.IntervalValue{Months: -14}, "-1 year -2 mons"},
 	}
 
 	for _, tt := range tests {
