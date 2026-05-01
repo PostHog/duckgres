@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 )
 
 func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) {
@@ -24,7 +25,7 @@ func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) 
 			srv,
 			200*time.Millisecond,
 			key,
-			func(ctx context.Context) (int32, *server.FlightExecutor, error) {
+			func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
 				close(started)
 				<-ctx.Done()
 				return 0, nil, ctx.Err()

@@ -24,6 +24,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -64,7 +65,7 @@ type Config struct {
 }
 
 type SessionProvider interface {
-	CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error)
+	CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error)
 	DestroySession(int32)
 }
 
@@ -108,7 +109,7 @@ type sessionMetadataProvider interface {
 }
 
 type sessionReconnector interface {
-	ReconnectSession(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error)
+	ReconnectSession(ctx context.Context, record DurableSessionRecord) (int32, *flightclient.FlightExecutor, error)
 }
 
 type durableSessionStoreProvider interface {
@@ -225,8 +226,8 @@ func NewFlightIngressFromListener(baseListener net.Listener, tlsConfig *tls.Conf
 	handler.rateLimiter = opts.RateLimiter
 
 	grpcOpts := []grpc.ServerOption{
-		grpc.MaxRecvMsgSize(server.MaxGRPCMessageSize),
-		grpc.MaxSendMsgSize(server.MaxGRPCMessageSize),
+		grpc.MaxRecvMsgSize(flightclient.MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(flightclient.MaxGRPCMessageSize),
 	}
 
 	srv := flight.NewServerWithMiddleware(nil, grpcOpts...)
@@ -1118,7 +1119,7 @@ type flightClientSession struct {
 	pid      int32
 	token    string
 	username string
-	executor *server.FlightExecutor
+	executor *flightclient.FlightExecutor
 	queryFn  func(context.Context, string, ...any) (server.RowSet, error)
 	execFn   func(context.Context, string, ...any) (server.ExecResult, error)
 
@@ -1141,7 +1142,7 @@ type flightClientSession struct {
 	afterTxnControlExecHook func(string)
 }
 
-func newFlightClientSession(pid int32, username string, executor *server.FlightExecutor) *flightClientSession {
+func newFlightClientSession(pid int32, username string, executor *flightclient.FlightExecutor) *flightClientSession {
 	s := &flightClientSession{
 		pid:      pid,
 		username: username,
@@ -1408,7 +1409,7 @@ type flightAuthSessionStore struct {
 	workerQueueTimeout time.Duration
 	hooks              Hooks
 
-	createSessionFn  func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error)
+	createSessionFn  func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error)
 	destroySessionFn func(int32)
 	metadataProvider sessionMetadataProvider
 	reconnector      sessionReconnector
@@ -1438,7 +1439,7 @@ func (r *lockedRowSet) Close() error {
 }
 
 func newFlightAuthSessionStore(provider SessionProvider, idleTTL, reapInterval, handleIdleTTL, tokenTTL, workerQueueTimeout time.Duration, opts Options) *flightAuthSessionStore {
-	createFn := func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+	createFn := func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 		return 0, nil, fmt.Errorf("session provider is not configured")
 	}
 	destroyFn := func(int32) {}
