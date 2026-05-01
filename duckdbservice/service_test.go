@@ -149,6 +149,123 @@ func TestCleanupSessionState(t *testing.T) {
 	})
 }
 
+func TestDestroySessionClusterModeDiscardsConn(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		warmupDB:       db,
+		sharedWarmMode: true,
+	}
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("acquire conn: %v", err)
+	}
+
+	// Create a temp macro on this conn — current cleanupSessionState does NOT
+	// drop temp macros (only tables/views), so without conn discard a macro
+	// would leak via the pool to the next session that reuses the conn.
+	if _, err := conn.ExecContext(context.Background(),
+		"CREATE OR REPLACE TEMP MACRO leak_check() AS 'leaked'",
+	); err != nil {
+		t.Fatalf("create temp macro: %v", err)
+	}
+
+	const token = "tok-cluster"
+	pool.sessions[token] = &Session{
+		ID:       token,
+		DB:       db,
+		Conn:     conn,
+		Username: "test_user",
+	}
+
+	if err := pool.DestroySession(token); err != nil {
+		t.Fatalf("DestroySession: %v", err)
+	}
+
+	// Open a fresh conn from the same pool and verify the macro is gone.
+	// In cluster mode the prior conn was marked bad via Conn.Raw, so the
+	// driver pool discarded it; this fresh conn opens a new DuckDB connection
+	// that never had the macro defined.
+	fresh, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("acquire fresh conn: %v", err)
+	}
+	defer func() { _ = fresh.Close() }()
+
+	var v string
+	err = fresh.QueryRowContext(context.Background(), "SELECT leak_check()").Scan(&v)
+	if err == nil {
+		t.Errorf("temp macro leaked across sessions: got value %q, expected error", v)
+	}
+}
+
+func TestDestroySessionStandaloneModeRunsCleanup(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		warmupDB:       db,
+		sharedWarmMode: false, // standalone mode — cleanup path runs
+	}
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("acquire conn: %v", err)
+	}
+
+	// Create a user-level temp table — this is what the standalone cleanup
+	// path is responsible for scrubbing before returning the conn to the pool.
+	if _, err := conn.ExecContext(context.Background(),
+		"CREATE TEMP TABLE standalone_leak (x INTEGER)",
+	); err != nil {
+		t.Fatalf("create temp table: %v", err)
+	}
+
+	const token = "tok-standalone"
+	pool.sessions[token] = &Session{
+		ID:       token,
+		DB:       db,
+		Conn:     conn,
+		Username: "test_user",
+	}
+
+	if err := pool.DestroySession(token); err != nil {
+		t.Fatalf("DestroySession: %v", err)
+	}
+
+	// In standalone mode the cleanup ran and dropped the temp table,
+	// then the conn was returned to the pool (since cleanup succeeded).
+	// A fresh conn shouldn't see standalone_leak regardless of which
+	// driver conn it gets.
+	fresh, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("acquire fresh conn: %v", err)
+	}
+	defer func() { _ = fresh.Close() }()
+
+	var n int
+	if err := fresh.QueryRowContext(context.Background(),
+		"SELECT count(*) FROM duckdb_tables() WHERE table_name = 'standalone_leak'",
+	).Scan(&n); err != nil {
+		t.Fatalf("count standalone_leak: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("standalone_leak survived cleanup: count=%d", n)
+	}
+}
+
 func TestRunExitsWhenBundledExtensionBootstrapFails(t *testing.T) {
 	prevBootstrap := bootstrapBundledExtensions
 	prevExit := exitProcess
