@@ -1,14 +1,23 @@
-package server
+// Package sessionmeta installs session-local catalog/metadata overrides on
+// a duckgres connection (current_database, pg_database, information_schema
+// views) so they reflect the client-visible database name on the PG wire.
+//
+// Pure helpers — no dependency on github.com/duckdb/duckdb-go. The control
+// plane and other duckdb-free callers use this package without linking
+// libduckdb.
+package sessionmeta
 
 import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 // InitSessionDatabaseMetadata installs session-local overrides for metadata
 // surfaces that should reflect the client-visible database name on pgwire.
-func InitSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, database string) error {
+func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExecutor, database string) error {
 	if executor == nil {
 		return fmt.Errorf("session executor is required")
 	}
@@ -25,7 +34,7 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, da
 		return fmt.Errorf("create current_database() macro: %w", err)
 	}
 
-	duckLakeAttached, err := hasAttachedCatalog(ctx, executor, "ducklake")
+	duckLakeAttached, err := HasAttachedCatalog(ctx, executor, "ducklake")
 	if err != nil {
 		return fmt.Errorf("detect ducklake attachment: %w", err)
 	}
@@ -51,11 +60,7 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, da
 	return nil
 }
 
-func initSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, database string) error {
-	return InitSessionDatabaseMetadata(ctx, executor, database)
-}
-
-func hasAttachedCatalog(ctx context.Context, executor QueryExecutor, catalog string) (bool, error) {
+func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) (bool, error) {
 	query := fmt.Sprintf(
 		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = %s",
 		quoteSQLStringLiteral(catalog),

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/posthog/duckgres/server/sessionmeta"
 )
 
 type recordingQueryExecutor struct {
@@ -67,9 +68,9 @@ func TestHasAttachedCatalogEmbedsCatalogNameWithoutBoundArgs(t *testing.T) {
 		rowSet: &staticCountRowSet{count: 1},
 	}
 
-	attached, err := hasAttachedCatalog(context.Background(), exec, "ducklake")
+	attached, err := sessionmeta.HasAttachedCatalog(context.Background(), exec, "ducklake")
 	if err != nil {
-		t.Fatalf("hasAttachedCatalog returned error: %v", err)
+		t.Fatalf("sessionmeta.HasAttachedCatalog returned error: %v", err)
 	}
 	if !attached {
 		t.Fatal("expected attached catalog to be detected")
@@ -91,7 +92,7 @@ func TestInitSessionDatabaseMetadataOverridesCurrentDatabaseAndPgDatabase(t *tes
 	defer func() { _ = db.Close() }()
 
 	executor := NewLocalExecutor(db)
-	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -146,7 +147,7 @@ func TestInitSessionDatabaseMetadataOverridesInformationSchemaCatalogColumns(t *
 	}
 
 	executor := NewLocalExecutor(db)
-	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -208,7 +209,7 @@ func TestInitSessionDatabaseMetadataExcludesInternalDuckLakeMetadataCatalogs(t *
 	}
 
 	executor := NewLocalExecutor(db)
-	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 

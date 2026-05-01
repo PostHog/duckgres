@@ -7,6 +7,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/wire"
 )
 
@@ -92,11 +93,14 @@ func SetLogicalCatalogMapping(cc *clientConn, enabled bool) {
 	}
 }
 
-// HasAttachedCatalog reports whether the named catalog is attached in the
-// current session.
-func HasAttachedCatalog(ctx context.Context, executor QueryExecutor, catalog string) (bool, error) {
-	return hasAttachedCatalog(ctx, executor, catalog)
-}
+// HasAttachedCatalog and InitSessionDatabaseMetadata moved to
+// server/sessionmeta. Re-exports kept here for the dozen call sites in
+// the control plane and elsewhere; new code should import server/sessionmeta
+// directly.
+var (
+	HasAttachedCatalog           = sessionmeta.HasAttachedCatalog
+	InitSessionDatabaseMetadata  = sessionmeta.InitSessionDatabaseMetadata
+)
 
 // SendInitialParams sends the initial parameter status messages and backend key data.
 func SendInitialParams(cc *clientConn) {

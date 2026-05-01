@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/posthog/duckgres/server/sessionmeta"
 )
 
 type attachedCatalogProbeExecutor struct {
@@ -86,9 +88,9 @@ func (r *attachedCatalogProbeRowSet) Err() error {
 func TestHasAttachedCatalogUsesEmbeddedCatalogLiteral(t *testing.T) {
 	executor := &attachedCatalogProbeExecutor{}
 
-	attached, err := hasAttachedCatalog(context.Background(), executor, "ducklake")
+	attached, err := sessionmeta.HasAttachedCatalog(context.Background(), executor, "ducklake")
 	if err != nil {
-		t.Fatalf("hasAttachedCatalog returned error: %v", err)
+		t.Fatalf("sessionmeta.HasAttachedCatalog returned error: %v", err)
 	}
 	if !attached {
 		t.Fatal("expected ducklake catalog to be reported as attached")
