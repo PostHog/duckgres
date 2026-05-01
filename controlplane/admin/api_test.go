@@ -950,15 +950,18 @@ func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	if !slices.Contains(columns, "metadata_store_database_name") {
 		t.Fatal("expected metadata_store_database_name to be included in managed warehouse upserts")
 	}
-	// Regression guards: image and ducklake_version must be in the upsert
+	// Regression guards: image and duck_lake_version must be in the upsert
 	// column list so the per-tenant pinning patch endpoint actually
 	// persists. If either is missing, PATCH /orgs/:id/warehouse/pinning
-	// silently no-ops and the matrix-build cutover breaks.
+	// silently no-ops and the matrix-build cutover breaks. Note the actual
+	// Postgres column is `duck_lake_version` (GORM CamelCase→snake_case
+	// splits on every uppercase-after-lowercase boundary), not the JSON-tag
+	// shape `ducklake_version` callers see on the wire.
 	if !slices.Contains(columns, "image") {
 		t.Fatal("expected image to be included in managed warehouse upserts (tenant pinning)")
 	}
-	if !slices.Contains(columns, "ducklake_version") {
-		t.Fatal("expected ducklake_version to be included in managed warehouse upserts (tenant pinning)")
+	if !slices.Contains(columns, "duck_lake_version") {
+		t.Fatal("expected duck_lake_version to be included in managed warehouse upserts (tenant pinning)")
 	}
 }
 

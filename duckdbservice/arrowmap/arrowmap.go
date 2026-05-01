@@ -333,6 +333,34 @@ type DecimalValue struct {
 	Scale int
 }
 
+// String renders the decimal in plain numeric form, e.g. {314159, 5} →
+// "3.14159" and {-5, 2} → "-0.05". Required so the PG text-protocol
+// formatter (server.formatValue) and any other fmt.Sprint-based callers
+// produce a number string instead of falling back to the Go default
+// "{value scale}" struct rendering. Negative values keep the sign in
+// front of the integer part. Scale 0 prints as the integer.
+func (d DecimalValue) String() string {
+	if d.Value == nil {
+		return "0"
+	}
+	if d.Scale <= 0 {
+		return d.Value.String()
+	}
+	abs := new(big.Int).Abs(d.Value).String()
+	// Left-pad with zeros so the digit count is at least Scale+1, giving us
+	// room to insert the decimal point even when |Value| < 10^Scale.
+	if pad := d.Scale + 1 - len(abs); pad > 0 {
+		abs = strings.Repeat("0", pad) + abs
+	}
+	intPart := abs[:len(abs)-d.Scale]
+	fracPart := abs[len(abs)-d.Scale:]
+	sign := ""
+	if d.Value.Sign() < 0 {
+		sign = "-"
+	}
+	return sign + intPart + "." + fracPart
+}
+
 // Appender is a hook that handles append for value types arrowmap doesn't
 // know about (typically driver-specific types like duckdb.Interval). It
 // reports whether it handled the value; arrowmap.AppendValue falls back to

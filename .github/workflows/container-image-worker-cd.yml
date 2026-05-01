@@ -7,7 +7,6 @@ on:
     workflow_dispatch:
 
 env:
-    ECR_REGISTRY: 795637471508.dkr.ecr.us-east-1.amazonaws.com
     GHCR_REGISTRY: ghcr.io
     IMAGE_NAME: duckgres-worker
 
@@ -27,6 +26,15 @@ env:
 # so DuckDB 1.5.1 → v0.10501.0 / v2.10501.0 and 1.5.2 → v0.10502.0 /
 # v2.10502.0. See scripts/ducklake_version_matrix.sh for the same
 # mapping in test code.
+#
+# NOTE: ECR push is intentionally disabled — the duckgres-worker ECR
+# repository does not yet exist in the AWS root account. Re-enable
+# `aws-actions/configure-aws-credentials` + `amazon-ecr-login` and the
+# corresponding ECR tags once posthog-cloud-infra adds the repo as a
+# `module "ecr_duckgres_worker"` in
+# terraform/environments/aws-accnt-root/ecr.tf. GHCR is the source of
+# truth in the meantime; downstream Charts dispatch already pulls from
+# GHCR via posthog/duckgres-worker.
 
 jobs:
     build:
@@ -66,15 +74,6 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-            - name: Configure AWS credentials
-              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
-              with:
-                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
-                  aws-region: us-east-1
-
-            - name: Login to Amazon ECR
-              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
-
             - name: Login to GHCR
               uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
               with:
@@ -90,7 +89,6 @@ jobs:
                   push: true
                   platforms: ${{ matrix.platform.platform }}
                   tags: |
-                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-duckdb${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
                       ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-duckdb${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
                   build-args: |
                       VERSION=build-${{ github.sha }}
@@ -125,15 +123,6 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-            - name: Configure AWS credentials
-              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
-              with:
-                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
-                  aws-region: us-east-1
-
-            - name: Login to Amazon ECR
-              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
-
             - name: Login to GHCR
               uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
               with:
@@ -141,14 +130,10 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Create and push ECR / GHCR manifests for this version
+            - name: Create and push GHCR manifest for this version
               run: |
                   set -euo pipefail
                   TAG_BASE="${{ github.sha }}-duckdb${{ matrix.duckdb.version }}"
-                  docker buildx imagetools create \
-                      --tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE} \
-                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
-                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-amd64
                   docker buildx imagetools create \
                       --tag ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${TAG_BASE} \
                       ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
@@ -162,10 +147,6 @@ jobs:
                   for tag in "${{ github.sha }}" "latest"; do
                       docker buildx imagetools create \
                           --tag ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${tag} \
-                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
-                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-amd64
-                      docker buildx imagetools create \
-                          --tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag} \
-                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
-                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-amd64
+                          ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
+                          ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${TAG_BASE}-amd64
                   done
