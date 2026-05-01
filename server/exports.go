@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/posthog/duckgres/server/wire"
 )
 
 // Exported wrappers for protocol functions used by the control plane worker.
@@ -122,10 +124,10 @@ func InitMinimalServer(s *Server, cfg Config, queryCancelCh <-chan struct{}) {
 	s.conns = make(map[int32]*clientConn)
 }
 
-// GenerateSecretKey generates a cryptographically random secret key for cancel requests.
-func GenerateSecretKey() int32 {
-	return generateSecretKey()
-}
+// GenerateSecretKey re-exports wire.GenerateSecretKey so existing callers
+// that imported it from server keep compiling. New code should use
+// server/wire directly.
+var GenerateSecretKey = wire.GenerateSecretKey
 
 
 // SetQueryLogger sets the query logger on a Server. Used by the control plane
