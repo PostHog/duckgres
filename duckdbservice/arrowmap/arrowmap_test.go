@@ -1,10 +1,41 @@
 package arrowmap
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
 )
+
+func TestDecimalValueString(t *testing.T) {
+	tests := []struct {
+		name  string
+		value *big.Int
+		scale int
+		want  string
+	}{
+		{name: "scale_zero_positive", value: big.NewInt(42), scale: 0, want: "42"},
+		{name: "scale_zero_negative", value: big.NewInt(-42), scale: 0, want: "-42"},
+		{name: "typical_pi", value: big.NewInt(314159), scale: 5, want: "3.14159"},
+		{name: "typical_pi_negative", value: big.NewInt(-314159), scale: 5, want: "-3.14159"},
+		{name: "smaller_than_scale", value: big.NewInt(5), scale: 2, want: "0.05"},
+		{name: "smaller_than_scale_negative", value: big.NewInt(-5), scale: 2, want: "-0.05"},
+		{name: "exactly_one", value: big.NewInt(100), scale: 2, want: "1.00"},
+		{name: "zero_value", value: big.NewInt(0), scale: 3, want: "0.000"},
+		// Defensive: nil Value should not panic. Falls back to "0" — this
+		// path shouldn't fire for normal scan results, but guarding it keeps
+		// fmt.Sprint("%v", DecimalValue{}) safe in error reporting.
+		{name: "nil_value", value: nil, scale: 5, want: "0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := DecimalValue{Value: tt.value, Scale: tt.scale}
+			if got := d.String(); got != tt.want {
+				t.Errorf("DecimalValue{%v, %d}.String() = %q, want %q", tt.value, tt.scale, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestDuckDBTypeToArrow(t *testing.T) {
 	tests := []struct {
