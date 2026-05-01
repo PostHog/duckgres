@@ -1,0 +1,171 @@
+name: Container Image Worker CD (per DuckDB version)
+
+on:
+    push:
+        branches:
+            - main
+    workflow_dispatch:
+
+env:
+    ECR_REGISTRY: 795637471508.dkr.ecr.us-east-1.amazonaws.com
+    GHCR_REGISTRY: ghcr.io
+    IMAGE_NAME: duckgres-worker
+
+# Per-DuckDB-version matrix build for cmd/duckgres-worker.
+#
+# Each row produces one image (or multi-arch manifest) tagged
+# duckgres-worker:<sha>-duckdb<version>. The "default" row is unsuffixed
+# and triggers the Charts dispatch (kept stable so the existing duckgres
+# release continues to roll out as before). Non-default rows publish
+# their suffixed images and stop there — operators flip a tenant's
+# `image` config-store column to point at a specific suffixed tag to
+# canary that DuckDB version for that tenant.
+#
+# To add a DuckDB version, add a row under matrix.duckdb. The
+# DUCKDB_GO_VERSION / DUCKDB_BINDINGS_VERSION pair maps to the
+# duckdb-go module versions; the encoding is `v0.<major><minor:02d><patch:02d>.0`,
+# so DuckDB 1.5.1 → v0.10501.0 / v2.10501.0 and 1.5.2 → v0.10502.0 /
+# v2.10502.0. See scripts/ducklake_version_matrix.sh for the same
+# mapping in test code.
+
+jobs:
+    build:
+        name: Build worker ${{ matrix.duckdb.version }} ${{ matrix.platform.platform }}
+        if: github.repository == 'PostHog/duckgres'
+        strategy:
+            fail-fast: false
+            matrix:
+                duckdb:
+                    - version: "1.5.2"
+                      go: "v2.10502.0"
+                      bindings: "v0.10502.0"
+                      httpfs: "v1.5.2-stoi-fix"
+                      default: true
+                    - version: "1.5.1"
+                      go: "v2.10501.0"
+                      bindings: "v0.10501.0"
+                      httpfs: "v1.5.1-stoi-fix"
+                      default: false
+                platform:
+                    - platform: linux/arm64
+                      runner: ubuntu-24.04-arm
+                      slug: arm64
+                    - platform: linux/amd64
+                      runner: ubuntu-24.04
+                      slug: amd64
+        runs-on: ${{ matrix.platform.runner }}
+        permissions:
+            id-token: write
+            contents: read
+            packages: write
+
+        steps:
+            - name: Check out
+              uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+              with:
+                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  aws-region: us-east-1
+
+            - name: Login to Amazon ECR
+              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+            - name: Login to GHCR
+              uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+              with:
+                  registry: ${{ env.GHCR_REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push by digest
+              uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+              with:
+                  context: .
+                  file: Dockerfile.worker
+                  push: true
+                  platforms: ${{ matrix.platform.platform }}
+                  tags: |
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-duckdb${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-duckdb${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
+                  build-args: |
+                      VERSION=build-${{ github.sha }}
+                      COMMIT=${{ github.sha }}
+                      BUILD_TAGS=kubernetes
+                      DUCKDB_GO_VERSION=${{ matrix.duckdb.go }}
+                      DUCKDB_BINDINGS_VERSION=${{ matrix.duckdb.bindings }}
+                      DUCKDB_EXTENSION_VERSION=${{ matrix.duckdb.version }}
+                      HTTPFS_EXTENSION_TAG=${{ matrix.duckdb.httpfs }}
+                  cache-from: type=gha,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
+                  cache-to: type=gha,mode=max,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
+
+    manifest:
+        name: Multi-arch manifest worker ${{ matrix.duckdb.version }}
+        needs: build
+        if: github.repository == 'PostHog/duckgres'
+        strategy:
+            fail-fast: false
+            matrix:
+                duckdb:
+                    - version: "1.5.2"
+                      default: true
+                    - version: "1.5.1"
+                      default: false
+        runs-on: ubuntu-24.04
+        permissions:
+            id-token: write
+            contents: read
+            packages: write
+
+        steps:
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+              with:
+                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  aws-region: us-east-1
+
+            - name: Login to Amazon ECR
+              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+            - name: Login to GHCR
+              uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+              with:
+                  registry: ${{ env.GHCR_REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Create and push ECR / GHCR manifests for this version
+              run: |
+                  set -euo pipefail
+                  TAG_BASE="${{ github.sha }}-duckdb${{ matrix.duckdb.version }}"
+                  docker buildx imagetools create \
+                      --tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE} \
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-amd64
+                  docker buildx imagetools create \
+                      --tag ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${TAG_BASE} \
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
+                      ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${TAG_BASE}-amd64
+
+            - name: Tag default version as <sha> and latest (default rows only)
+              if: matrix.duckdb.default
+              run: |
+                  set -euo pipefail
+                  TAG_BASE="${{ github.sha }}-duckdb${{ matrix.duckdb.version }}"
+                  for tag in "${{ github.sha }}" "latest"; do
+                      docker buildx imagetools create \
+                          --tag ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${tag} \
+                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
+                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-amd64
+                      docker buildx imagetools create \
+                          --tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag} \
+                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-arm64 \
+                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG_BASE}-amd64
+                  done
