@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
-	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/tests/perf/core"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -36,8 +36,8 @@ func NewFromAddress(addr, username, password string, insecureSkipVerify bool) (*
 		nil,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
-			grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
+			grpc.MaxCallRecvMsgSize(flightclient.MaxGRPCMessageSize),
+			grpc.MaxCallSendMsgSize(flightclient.MaxGRPCMessageSize),
 		),
 	)
 	if err != nil {
@@ -49,7 +49,7 @@ func NewFromAddress(addr, username, password string, insecureSkipVerify bool) (*
 		_ = client.Close()
 		return nil, err
 	}
-	exec := server.NewFlightExecutorFromClient(client, token)
+	exec := flightclient.NewFlightExecutorFromClient(client, token)
 	return &Driver{
 		exec: &flightExecutor{
 			client: client,
@@ -87,7 +87,7 @@ func (d *Driver) Close() error {
 
 type flightExecutor struct {
 	client *flightsql.Client
-	exec   *server.FlightExecutor
+	exec   *flightclient.FlightExecutor
 }
 
 func (e *flightExecutor) Execute(ctx context.Context, query string, args []any) (int64, error) {

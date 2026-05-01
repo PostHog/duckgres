@@ -12,6 +12,7 @@ import (
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/flightsqlingress"
 )
 
@@ -45,7 +46,7 @@ type flightSessionProvider struct {
 	sm *SessionManager
 }
 
-func (p *flightSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+func (p *flightSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 	workerPID, executor, err := p.sm.CreateSession(ctx, username, pid, memoryLimit, threads)
 	if err != nil {
 		return 0, nil, err
@@ -74,7 +75,7 @@ type orgRoutedSessionProvider struct {
 	userOrg    map[string]string            // username → orgID (populated during auth)
 }
 
-func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 	p.mu.RLock()
 	orgID := p.userOrg[username]
 	p.mu.RUnlock()
@@ -141,7 +142,7 @@ func (p *orgRoutedSessionProvider) DurableSessionMetadata(pid int32, username st
 	}, nil
 }
 
-func (p *orgRoutedSessionProvider) ReconnectSession(ctx context.Context, record flightsqlingress.DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+func (p *orgRoutedSessionProvider) ReconnectSession(ctx context.Context, record flightsqlingress.DurableSessionRecord) (int32, *flightclient.FlightExecutor, error) {
 	_, sessions, _, ok := p.orgRouter.StackForOrg(record.OrgID)
 	if !ok {
 		return 0, nil, fmt.Errorf("no org stack for org %q", record.OrgID)

@@ -21,6 +21,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
@@ -932,8 +933,8 @@ func waitForWorkerTCPWithMetadata(addr, bearerToken string, serverCertPEM []byte
 		var dialOpts []grpc.DialOption
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
-			grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
+			grpc.MaxCallRecvMsgSize(flightclient.MaxGRPCMessageSize),
+			grpc.MaxCallSendMsgSize(flightclient.MaxGRPCMessageSize),
 		))
 		dialOpts = append(dialOpts, server.OTELGRPCClientHandler())
 		if bearerToken != "" {
@@ -1640,8 +1641,8 @@ func (p *K8sWorkerPool) connectWorkerDirect(ctx context.Context, podName, podIP,
 	var dialOpts []grpc.DialOption
 	dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
-		grpc.MaxCallRecvMsgSize(server.MaxGRPCMessageSize),
-		grpc.MaxCallSendMsgSize(server.MaxGRPCMessageSize),
+		grpc.MaxCallRecvMsgSize(flightclient.MaxGRPCMessageSize),
+		grpc.MaxCallSendMsgSize(flightclient.MaxGRPCMessageSize),
 	))
 	dialOpts = append(dialOpts, server.OTELGRPCClientHandler())
 	if bearerToken != "" {

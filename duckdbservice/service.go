@@ -22,6 +22,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -289,8 +290,8 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 
 	var opts []grpc.ServerOption
 	opts = append(opts,
-		grpc.MaxRecvMsgSize(server.MaxGRPCMessageSize),
-		grpc.MaxSendMsgSize(server.MaxGRPCMessageSize),
+		grpc.MaxRecvMsgSize(flightclient.MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(flightclient.MaxGRPCMessageSize),
 	)
 	if svc.cfg.BearerToken != "" {
 		opts = append(opts,

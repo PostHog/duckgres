@@ -1,4 +1,4 @@
-package server
+package flightclient
 
 import (
 	"context"
@@ -20,6 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
+	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -31,12 +32,6 @@ const MaxGRPCMessageSize = 1 << 30 // 1GB
 
 // ErrWorkerDead is returned when the backing worker process has crashed.
 var ErrWorkerDead = errors.New("flight worker is dead")
-
-// OrderedMapValue is an alias for arrowmap.OrderedMapValue. The type was
-// moved into arrowmap so AppendValue's MAP branch can switch on it without
-// arrowmap depending on the server package. The alias preserves the
-// existing server.OrderedMapValue spelling for current call sites.
-type OrderedMapValue = arrowmap.OrderedMapValue
 
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.
@@ -75,7 +70,7 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 
 	// Propagate OTEL trace context across gRPC to worker pods.
 	// Filtered to query RPCs only (GetFlightInfo, DoGet).
-	dialOpts = append(dialOpts, OTELGRPCClientHandler())
+	dialOpts = append(dialOpts, server.OTELGRPCClientHandler())
 
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&bearerCreds{token: bearerToken}))
@@ -161,14 +156,14 @@ func recoverClientPanic(err *error) {
 	}
 }
 
-func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ...any) (rs RowSet, err error) {
+func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ...any) (rs server.RowSet, err error) {
 	if e.dead.Load() {
 		return nil, ErrWorkerDead
 	}
 
 	// Return empty results for queries that are only semicolons, whitespace,
 	// and/or comments. These represent PostgreSQL client pings (e.g., pgx sends "-- ping").
-	if IsEmptyQuery(query) {
+	if server.IsEmptyQuery(query) {
 		return &emptyRowSet{}, nil
 	}
 
@@ -226,13 +221,13 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 	}, nil
 }
 
-func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...any) (result ExecResult, err error) {
+func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...any) (result server.ExecResult, err error) {
 	if e.dead.Load() {
 		return nil, ErrWorkerDead
 	}
 
 	// Return zero rows affected for empty/comment-only queries.
-	if IsEmptyQuery(query) {
+	if server.IsEmptyQuery(query) {
 		return &flightExecResult{rowsAffected: 0}, nil
 	}
 
@@ -257,15 +252,15 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 	return &flightExecResult{rowsAffected: affected}, nil
 }
 
-func (e *FlightExecutor) Query(query string, args ...any) (RowSet, error) {
+func (e *FlightExecutor) Query(query string, args ...any) (server.RowSet, error) {
 	return e.QueryContext(context.Background(), query, args...)
 }
 
-func (e *FlightExecutor) Exec(query string, args ...any) (ExecResult, error) {
+func (e *FlightExecutor) Exec(query string, args ...any) (server.ExecResult, error) {
 	return e.ExecContext(context.Background(), query, args...)
 }
 
-func (e *FlightExecutor) ConnContext(ctx context.Context) (RawConn, error) {
+func (e *FlightExecutor) ConnContext(ctx context.Context) (server.RawConn, error) {
 	return nil, fmt.Errorf("ConnContext not supported in Flight mode (use batched INSERT for COPY FROM)")
 }
 
@@ -346,8 +341,8 @@ func (r *FlightRowSet) Columns() ([]string, error) {
 	return names, nil
 }
 
-func (r *FlightRowSet) ColumnTypes() ([]ColumnTyper, error) {
-	types := make([]ColumnTyper, r.schema.NumFields())
+func (r *FlightRowSet) ColumnTypes() ([]server.ColumnTyper, error) {
+	types := make([]server.ColumnTyper, r.schema.NumFields())
 	for i := 0; i < r.schema.NumFields(); i++ {
 		types[i] = &arrowColumnType{dt: r.schema.Field(i).Type}
 	}
@@ -433,7 +428,7 @@ func (r *FlightRowSet) Err() error {
 type emptyRowSet struct{}
 
 func (e *emptyRowSet) Columns() ([]string, error)          { return nil, nil }
-func (e *emptyRowSet) ColumnTypes() ([]ColumnTyper, error) { return nil, nil }
+func (e *emptyRowSet) ColumnTypes() ([]server.ColumnTyper, error) { return nil, nil }
 func (e *emptyRowSet) Next() bool                          { return false }
 func (e *emptyRowSet) Scan(dest ...any) error              { return fmt.Errorf("no rows") }
 func (e *emptyRowSet) Close() error                        { return nil }
@@ -455,8 +450,8 @@ func (e *emptySchemaRowSet) Columns() ([]string, error) {
 	return cols, nil
 }
 
-func (e *emptySchemaRowSet) ColumnTypes() ([]ColumnTyper, error) {
-	types := make([]ColumnTyper, e.schema.NumFields())
+func (e *emptySchemaRowSet) ColumnTypes() ([]server.ColumnTyper, error) {
+	types := make([]server.ColumnTyper, e.schema.NumFields())
 	for i := 0; i < e.schema.NumFields(); i++ {
 		types[i] = &arrowColumnType{dt: e.schema.Field(i).Type}
 	}
@@ -634,7 +629,7 @@ func extractArrowValue(col arrow.Array, row int) interface{} {
 			ks = append(ks, extractArrowValue(keys, i))
 			vs = append(vs, extractArrowValue(items, i))
 		}
-		return OrderedMapValue{Keys: ks, Values: vs}
+		return arrowmap.OrderedMapValue{Keys: ks, Values: vs}
 	default:
 		// Fallback: use String representation
 		return arr.ValueStr(row)
@@ -683,14 +678,8 @@ func decimalToBigInt(val decimal128.Num, dt *arrow.Decimal128Type) interface{} {
 	return result
 }
 
-type intervalValue struct {
-	Months int32
-	Days   int32
-	Micros int64
-}
-
-func monthDayNanoToInterval(val arrow.MonthDayNanoInterval) intervalValue {
-	return intervalValue{
+func monthDayNanoToInterval(val arrow.MonthDayNanoInterval) arrowmap.IntervalValue {
+	return arrowmap.IntervalValue{
 		Months: val.Months,
 		Days:   val.Days,
 		Micros: val.Nanoseconds / 1000,

@@ -305,12 +305,22 @@ func QuoteIdent(ident string) string {
 // and preserves the source MAP ordering.
 //
 // Lives in arrowmap so AppendValue can switch on it without depending on
-// the server package (which transitively links libduckdb). The flight
-// executor in the server package re-exports it as server.OrderedMapValue
-// via a type alias for backward compatibility.
+// the server package, and the flight client + result formatters in
+// server/ can both reference it without creating an import cycle.
 type OrderedMapValue struct {
 	Keys   []any
 	Values []any
+}
+
+// IntervalValue is the duckdb-free representation of an Arrow
+// MonthDayNanoInterval as decoded by the Flight client. It stores the
+// component fields directly (Months/Days/Micros) so result formatters
+// in the server package can switch on the type without importing the
+// flight subpackage (which would create a cycle).
+type IntervalValue struct {
+	Months int32
+	Days   int32
+	Micros int64
 }
 
 // Appender is a hook that handles append for value types arrowmap doesn't

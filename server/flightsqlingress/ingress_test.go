@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/grpc"
@@ -163,14 +164,14 @@ func (s *captureDurableSessionStore) CloseSession(sessionToken string, closedAt 
 }
 
 type testDurableSessionProvider struct {
-	createSessionFn    func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error)
+	createSessionFn    func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error)
 	destroySessionFn   func(int32)
 	metadataFn         func(pid int32, username string) (DurableSessionMetadata, error)
-	reconnectSessionFn func(context.Context, DurableSessionRecord) (int32, *server.FlightExecutor, error)
+	reconnectSessionFn func(context.Context, DurableSessionRecord) (int32, *flightclient.FlightExecutor, error)
 	durableStore       DurableSessionStore
 }
 
-func (p *testDurableSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+func (p *testDurableSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 	return p.createSessionFn(ctx, username, pid, memoryLimit, threads)
 }
 
@@ -187,7 +188,7 @@ func (p *testDurableSessionProvider) DurableSessionMetadata(pid int32, username 
 	return p.metadataFn(pid, username)
 }
 
-func (p *testDurableSessionProvider) ReconnectSession(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+func (p *testDurableSessionProvider) ReconnectSession(ctx context.Context, record DurableSessionRecord) (int32, *flightclient.FlightExecutor, error) {
 	return p.reconnectSessionFn(ctx, record)
 }
 
@@ -324,7 +325,7 @@ func testFlightHandlerWithStoreAndRateLimiter(t *testing.T, users map[string]str
 		sessions:      make(map[string]*flightClientSession),
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 1234, nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -579,7 +580,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithoutBasicAuth(t *te
 
 func TestSessionFromContextRejectsUnknownSessionTokenEvenWithBasicAuth(t *testing.T) {
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 9876, nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -682,7 +683,7 @@ func TestSessionFromContextTokenPathDoesNotClearRateLimiterFailures(t *testing.T
 func TestSessionFromContextWithoutTokenCreatesDistinctSessions(t *testing.T) {
 	var createCalls atomic.Int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return createCalls.Add(1), nil, nil
 		},
 		destroySessionFn: func(int32) {},
@@ -834,7 +835,7 @@ func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T
 		idleTTL:       time.Minute,
 		handleIdleTTL: time.Minute,
 		tokenTTL:      time.Hour,
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 1234, nil, nil
 		},
 		destroySessionFn: func(pid int32) {
@@ -947,7 +948,7 @@ func TestFlightAuthSessionStorePersistsDurableSessionRecordOnCreate(t *testing.T
 	durable := &captureDurableSessionStore{}
 	provider := &testDurableSessionProvider{
 		durableStore: durable,
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 4321, nil, nil
 		},
 		metadataFn: func(pid int32, username string) (DurableSessionMetadata, error) {
@@ -1026,10 +1027,10 @@ func TestFlightAuthSessionStoreReconnectsDurableSessionByToken(t *testing.T) {
 				CPInstanceID: "cp-old:boot-a",
 			}, nil
 		},
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("unexpected create path")
 		},
-		reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+		reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *flightclient.FlightExecutor, error) {
 			reconnected = record
 			return 9876, nil, nil
 		},
@@ -1081,10 +1082,10 @@ func TestFlightAuthSessionStoreRejectsClosedDurableSessionToken(t *testing.T) {
 	reconnectCalls := 0
 	provider := &testDurableSessionProvider{
 		durableStore: durable,
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("unexpected create path")
 		},
-		reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+		reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *flightclient.FlightExecutor, error) {
 			reconnectCalls++
 			return 9876, nil, nil
 		},
@@ -1129,10 +1130,10 @@ func TestFlightAuthSessionStoreReconnectRefreshesDurableSessionMetadata(t *testi
 				CPInstanceID: "cp-new:boot-b",
 			}, nil
 		},
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("unexpected create path")
 		},
-		reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+		reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *flightclient.FlightExecutor, error) {
 			return 9876, nil, nil
 		},
 	}
@@ -1203,7 +1204,7 @@ func TestFlightAuthSessionStoreReconnectFailureUpdatesDurableSessionState(t *tes
 			reconnectCalls := 0
 			provider := &testDurableSessionProvider{
 				durableStore: durable,
-				reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *server.FlightExecutor, error) {
+				reconnectSessionFn: func(ctx context.Context, record DurableSessionRecord) (int32, *flightclient.FlightExecutor, error) {
 					reconnectCalls++
 					return 0, nil, tt.reconnectErr
 				},
@@ -1237,7 +1238,7 @@ func TestFlightAuthSessionStoreReconnectFailureUpdatesDurableSessionState(t *tes
 
 func TestFlightAuthSessionStoreRejectsNewSessionsWhileDraining(t *testing.T) {
 	provider := &testDurableSessionProvider{
-		createSessionFn: func(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 			return 321, nil, nil
 		},
 	}
@@ -1265,7 +1266,7 @@ func TestFlightAuthSessionStoreRejectsNewSessionsWhileDraining(t *testing.T) {
 
 func TestFlightAuthSessionStoreWaitForZeroSessions(t *testing.T) {
 	provider := &testDurableSessionProvider{
-		createSessionFn: func(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 			return 654, nil, nil
 		},
 	}
@@ -1357,7 +1358,7 @@ func TestCloseSessionRevokesTokenAndDestroysWorker(t *testing.T) {
 func TestCloseSessionMissingTokenDoesNotBootstrap(t *testing.T) {
 	var createCalls atomic.Int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			createCalls.Add(1)
 			return 1234, nil, nil
 		},
@@ -1389,7 +1390,7 @@ func TestCloseSessionTokenOnlyRevokesTokenAndDoesNotBootstrap(t *testing.T) {
 	var createCalls atomic.Int32
 	var destroyed []int32
 	store := &flightAuthSessionStore{
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			createCalls.Add(1)
 			return 9876, nil, nil
 		},
@@ -1631,7 +1632,7 @@ func TestFlightAuthSessionStoreReapHookReceivesTrigger(t *testing.T) {
 				reapedCount = count
 			},
 		},
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(int32) {},
@@ -1666,7 +1667,7 @@ func TestFlightAuthSessionStoreReapKeepsSessionWithFreshHandle(t *testing.T) {
 		},
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(pid int32) {
@@ -1703,7 +1704,7 @@ func TestFlightAuthSessionStoreReapStaleHandleAllowsSessionReap(t *testing.T) {
 		},
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
-		createSessionFn: func(context.Context, string, int32, string, int) (int32, *server.FlightExecutor, error) {
+		createSessionFn: func(context.Context, string, int32, string, int) (int32, *flightclient.FlightExecutor, error) {
 			return 0, nil, fmt.Errorf("not used")
 		},
 		destroySessionFn: func(pid int32) {

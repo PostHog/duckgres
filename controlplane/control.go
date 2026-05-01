@@ -24,6 +24,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
+	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/flightsqlingress"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -631,8 +632,8 @@ func createSessionWithRegisteredCancel(
 	srv *server.Server,
 	timeout time.Duration,
 	key server.BackendKey,
-	createFn func(context.Context) (int32, *server.FlightExecutor, error),
-) (int32, *server.FlightExecutor, error) {
+	createFn func(context.Context) (int32, *flightclient.FlightExecutor, error),
+) (int32, *flightclient.FlightExecutor, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -983,7 +984,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		cp.srv,
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
-		func(ctx context.Context) (int32, *server.FlightExecutor, error) {
+		func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
 			return sessions.CreateSession(ctx, username, pid, memLimit, threads)
 		},
 	)
