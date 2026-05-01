@@ -1,4 +1,4 @@
-package server
+package ducklake
 
 import (
 	"database/sql"
@@ -57,16 +57,16 @@ func TestInjectPostgresKeepalive(t *testing.T) {
 // keepalive suffix appended by injectPostgresKeepalive to postgres connection strings.
 const keepaliveSuffix = " keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5"
 
-func TestBuildDuckLakeAttachStmt(t *testing.T) {
+func TestBuildAttachStmt(t *testing.T) {
 	tests := []struct {
 		name    string
-		dlCfg   DuckLakeConfig
+		dlCfg   Config
 		migrate bool
 		want    string
 	}{
 		{
 			name: "basic without data path",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore: "postgres:host=localhost dbname=dl",
 			},
 			migrate: false,
@@ -74,7 +74,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "with object store",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore: "postgres:host=localhost dbname=dl",
 				ObjectStore:   "s3://bucket/path",
 			},
@@ -83,7 +83,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "with data path fallback",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore: "postgres:host=localhost dbname=dl",
 				DataPath:      "/local/data",
 			},
@@ -92,7 +92,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "object store takes precedence over data path",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore: "postgres:host=localhost dbname=dl",
 				ObjectStore:   "s3://bucket/path",
 				DataPath:      "/local/data",
@@ -102,7 +102,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "with migration flag",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore: "postgres:host=localhost dbname=dl",
 				ObjectStore:   "s3://bucket/path",
 			},
@@ -111,7 +111,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "migration without data path",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore: "postgres:host=localhost dbname=dl",
 			},
 			migrate: true,
@@ -119,7 +119,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "escapes single quotes in connection string",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore: "postgres:host=localhost password=it's_secret",
 			},
 			migrate: false,
@@ -127,7 +127,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "with data inlining disabled",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore:        "postgres:host=localhost dbname=dl",
 				DataInliningRowLimit: intPtr(0),
 			},
@@ -136,7 +136,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "with data inlining custom limit",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore:        "postgres:host=localhost dbname=dl",
 				ObjectStore:          "s3://bucket/path",
 				DataInliningRowLimit: intPtr(100),
@@ -146,7 +146,7 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 		},
 		{
 			name: "nil data inlining uses default",
-			dlCfg: DuckLakeConfig{
+			dlCfg: Config{
 				MetadataStore: "postgres:host=localhost dbname=dl",
 			},
 			migrate: false,
@@ -156,9 +156,9 @@ func TestBuildDuckLakeAttachStmt(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildDuckLakeAttachStmt(tt.dlCfg, tt.migrate)
+			got := BuildAttachStmt(tt.dlCfg, tt.migrate)
 			if got != tt.want {
-				t.Errorf("buildDuckLakeAttachStmt() =\n  %s\nwant:\n  %s", got, tt.want)
+				t.Errorf("BuildAttachStmt() =\n  %s\nwant:\n  %s", got, tt.want)
 			}
 		})
 	}
@@ -267,35 +267,139 @@ func TestVersionLessThan_Invalid(t *testing.T) {
 	}
 }
 
-func TestDuckLakeBackupHeaderUsesTargetVersion(t *testing.T) {
-	got := duckLakeBackupHeader("1.0", "1.1")
-	want := "-- DuckLake metadata backup before migration (v1.0 \u2192 v1.1)\n"
+func TestBuildDeltaAttachStmt(t *testing.T) {
+	cfg := Config{
+		ObjectStore:         "s3://warehouse/ducklake/",
+		DeltaCatalogEnabled: true,
+	}
+	if got, want := BuildDeltaAttachStmt(cfg), "ATTACH 's3://warehouse/delta/' AS delta (TYPE delta)"; got != want {
+		t.Fatalf("BuildDeltaAttachStmt() = %q, want %q", got, want)
+	}
+
+	cfg.DeltaCatalogPath = "s3://warehouse/custom-delta/"
+	if got, want := BuildDeltaAttachStmt(cfg), "ATTACH 's3://warehouse/custom-delta/' AS delta (TYPE delta)"; got != want {
+		t.Fatalf("BuildDeltaAttachStmt() = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultDeltaCatalogPath(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "object store at bucket root",
+			cfg:  Config{ObjectStore: "s3://warehouse/ducklake/"},
+			want: "s3://warehouse/delta/",
+		},
+		{
+			name: "object store nested under tenant prefix",
+			cfg:  Config{ObjectStore: "s3://warehouse/team-a/ducklake/"},
+			want: "s3://warehouse/team-a/delta/",
+		},
+		{
+			name: "object store deeply nested",
+			cfg:  Config{ObjectStore: "s3://warehouse/region/team-a/ducklake/"},
+			want: "s3://warehouse/region/team-a/delta/",
+		},
+		{
+			name: "object store with no trailing slash",
+			cfg:  Config{ObjectStore: "s3://warehouse/ducklake"},
+			want: "s3://warehouse/delta/",
+		},
+		{
+			name: "bare bucket",
+			cfg:  Config{ObjectStore: "s3://warehouse"},
+			want: "s3://warehouse/delta/",
+		},
+		{
+			name: "bare bucket with trailing slash",
+			cfg:  Config{ObjectStore: "s3://warehouse/"},
+			want: "s3://warehouse/delta/",
+		},
+		{
+			name: "local data path",
+			cfg:  Config{DataPath: "/var/lib/duckgres/ducklake"},
+			want: "/var/lib/duckgres/delta",
+		},
+		{
+			name: "no object store or data path",
+			cfg:  Config{},
+			want: "",
+		},
+		{
+			name: "explicit delta path is not overridden by default derivation",
+			cfg: Config{
+				ObjectStore:      "s3://warehouse/team-a/ducklake/",
+				DeltaCatalogPath: "s3://other/explicit/",
+			},
+			want: "s3://warehouse/team-a/delta/", // default ignores explicit; DeltaCatalogPath() handles override
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := DefaultDeltaCatalogPath(tt.cfg); got != tt.want {
+				t.Fatalf("DefaultDeltaCatalogPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestObjectStoreParentPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "scheme with multi-segment path", path: "s3://bucket/team/ducklake/", want: "s3://bucket/team/"},
+		{name: "scheme with single-segment path", path: "s3://bucket/ducklake/", want: "s3://bucket/"},
+		{name: "scheme with no trailing slash", path: "s3://bucket/ducklake", want: "s3://bucket/"},
+		{name: "scheme with bare bucket", path: "s3://bucket", want: "s3://bucket/"},
+		{name: "scheme with bare bucket trailing slash", path: "s3://bucket/", want: "s3://bucket/"},
+		{name: "no scheme, multi-segment path", path: "/var/lib/duckgres/ducklake/", want: "/var/lib/duckgres/"},
+		{name: "no scheme, no trailing slash", path: "/var/lib/duckgres/ducklake", want: "/var/lib/duckgres/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := objectStoreParentPrefix(tt.path); got != tt.want {
+				t.Fatalf("objectStoreParentPrefix(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBackupHeaderUsesTargetVersion(t *testing.T) {
+	got := backupHeader("1.0", "1.1")
+	want := "-- DuckLake metadata backup before migration (v1.0 → v1.1)\n"
 	if got != want {
 		t.Fatalf("expected backup header %q, got %q", want, got)
 	}
 }
 
-func TestDuckLakeMigrationNeeded_FalseWhenError(t *testing.T) {
+func TestMigrationNeeded_FalseWhenError(t *testing.T) {
 	connStr := "postgres://user@host/db"
-	dlMigrations.Store(connStr, &migrationState{
+	migrations.Store(connStr, &migrationState{
 		needed: true,
 		err:    fmt.Errorf("backup failed"),
 	})
-	defer dlMigrations.Delete(connStr)
+	defer migrations.Delete(connStr)
 
-	if duckLakeMigrationNeeded(connStr) {
-		t.Error("duckLakeMigrationNeeded() should return false when err is set")
+	if MigrationNeeded(connStr) {
+		t.Error("MigrationNeeded() should return false when err is set")
 	}
 }
 
-// TestBackupDuckLakeMetadata_Integration verifies the backup path end-to-end
-// against a real PostgreSQL instance. Skipped when DUCKGRES_TEST_POSTGRES_DSN
-// is not set (e.g., in CI without a local PostgreSQL).
+// TestBackupMetadata_Integration verifies the backup path end-to-end against
+// a real PostgreSQL instance. Skipped when DUCKGRES_TEST_POSTGRES_DSN is not
+// set (e.g., in CI without a local PostgreSQL).
 //
 // Run locally:
 //
-//	DUCKGRES_TEST_POSTGRES_DSN="host=localhost user=postgres dbname=postgres sslmode=disable" go test ./server/ -run TestBackupDuckLakeMetadata_Integration -v
-func TestBackupDuckLakeMetadata_Integration(t *testing.T) {
+//	DUCKGRES_TEST_POSTGRES_DSN="host=localhost user=postgres dbname=postgres sslmode=disable" go test ./server/ducklake/ -run TestBackupMetadata_Integration -v
+func TestBackupMetadata_Integration(t *testing.T) {
 	dsn := os.Getenv("DUCKGRES_TEST_POSTGRES_DSN")
 	if dsn == "" {
 		t.Skip("DUCKGRES_TEST_POSTGRES_DSN not set, skipping integration test")
@@ -342,11 +446,11 @@ func TestBackupDuckLakeMetadata_Integration(t *testing.T) {
 	// Run backup to a temp directory.
 	tmpDir := t.TempDir()
 
-	// backupDuckLakeMetadata discovers tables matching "ducklake_%" — our test
-	// tables match that pattern. We can call it directly.
-	err = backupDuckLakeMetadata(pgDB, tmpDir, "0.3", DefaultDuckLakeSpecVersion)
+	// backupMetadata discovers tables matching "ducklake_%" — our test tables
+	// match that pattern. We can call it directly.
+	err = backupMetadata(pgDB, tmpDir, "0.3", DefaultSpecVersion)
 	if err != nil {
-		t.Fatalf("backupDuckLakeMetadata: %v", err)
+		t.Fatalf("backupMetadata: %v", err)
 	}
 
 	// Find the backup file.

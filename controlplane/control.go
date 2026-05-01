@@ -23,6 +23,7 @@ import (
 	"github.com/cloudflare/tableflip"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightsqlingress"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -439,16 +440,16 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		if cfg.DuckLake.MetadataStore != "" {
 			targetVersion := cfg.DuckLakeDefaultSpecVersion
 			if targetVersion == "" {
-				targetVersion = server.DefaultDuckLakeSpecVersion
+				targetVersion = ducklake.DefaultSpecVersion
 			}
-			if needed, ver, err := server.CheckDuckLakeMigrationVersion(cfg.DuckLake, targetVersion); err != nil {
+			if needed, ver, err := ducklake.CheckMigrationVersion(cfg.DuckLake, targetVersion); err != nil {
 				slog.Warn("DuckLake migration version check failed, workers will check independently.", "error", err)
 			} else if needed {
 				slog.Info("DuckLake migration needed, workers will use AUTOMATIC_MIGRATION.", "from", ver, "to", targetVersion)
 				procPool.ducklakeMigrate = true
 				// Run backup asynchronously — it's a safety net, not a gate.
 				go func() {
-					if err := server.BackupDuckLakeMetadata(cfg.DuckLake, cfg.DataDir); err != nil {
+					if err := ducklake.BackupMetadata(cfg.DuckLake, cfg.DataDir); err != nil {
 						slog.Warn("DuckLake metadata backup failed (migration will still proceed).", "error", err)
 					} else {
 						slog.Info("DuckLake metadata backup completed.")

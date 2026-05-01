@@ -23,8 +23,30 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	_ "github.com/duckdb/duckdb-go/v2"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
+	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// DuckLakeConfig is an alias for ducklake.Config retained so the dozens of
+// references to server.DuckLakeConfig across this package and others continue
+// to compile after the migration code moved to server/ducklake. New code
+// should import server/ducklake and use ducklake.Config directly.
+type DuckLakeConfig = ducklake.Config
+
+// DefaultDuckLakeSpecVersion is re-exported for callers that referenced the
+// constant under the server package before the migration code moved.
+const DefaultDuckLakeSpecVersion = ducklake.DefaultSpecVersion
+
+// Re-exports of the migration / backup / delta-path entry points so callers
+// that referenced them under the server package continue to compile after
+// the implementation moved to server/ducklake. New code should import
+// server/ducklake directly.
+var (
+	CheckDuckLakeMigrationVersion   = ducklake.CheckMigrationVersion
+	CheckAndBackupDuckLakeMigration = ducklake.CheckAndBackupMigration
+	BackupDuckLakeMetadata          = ducklake.BackupMetadata
+	DefaultDeltaCatalogPath         = ducklake.DefaultDeltaCatalogPath
 )
 
 // processStartTime is captured at process init, used to distinguish server vs child process uptime.
@@ -288,89 +310,6 @@ type QueryLogConfig struct {
 	DataInliningRowLimit int
 }
 
-// DuckLakeConfig configures DuckLake catalog attachment
-type DuckLakeConfig struct {
-	// MetadataStore is the connection string for the DuckLake metadata database
-	// Format: "postgres:host=<host> user=<user> password=<password> dbname=<db>"
-	MetadataStore string
-
-	// DisableMetadataThreadLocalCache disables postgres_scanner thread-local
-	// connection caching for the hidden DuckLake metadata pool as early as
-	// possible, before ATTACH creates that pool. This trades some warm-reuse
-	// performance for a lower retained metadata-connection footprint.
-	// Nil means use the server default (enabled).
-	DisableMetadataThreadLocalCache *bool
-
-	// ObjectStore is the S3-compatible storage path for DuckLake data files
-	// Format: "s3://bucket/path/" for S3/MinIO
-	// If not specified, uses DataPath for local storage
-	ObjectStore string
-
-	// DataPath is the local file system path for DuckLake data files
-	// Used when ObjectStore is not set (for local/non-S3 storage)
-	DataPath string
-
-	// DeltaCatalogEnabled attaches the DuckDB Delta extension catalog at worker
-	// startup/activation in addition to DuckLake. DeltaCatalogPath defaults to a
-	// sibling delta/ prefix at the DuckLake object-store root when omitted.
-	DeltaCatalogEnabled bool
-	DeltaCatalogPath    string
-
-	// S3 credential provider: "config" (explicit credentials) or "credential_chain" (AWS SDK chain)
-	// Default: "config" if S3AccessKey is set, otherwise "credential_chain"
-	S3Provider string
-
-	// S3 configuration for "config" provider (explicit credentials for MinIO or S3)
-	S3Endpoint     string // e.g., "localhost:9000" for MinIO
-	S3AccessKey    string // S3 access key ID
-	S3SecretKey    string // S3 secret access key
-	S3SessionToken string // STS session token for temporary credentials
-	S3Region       string // S3 region (default: us-east-1)
-	S3UseSSL       bool   // Use HTTPS for S3 connections (default: false for MinIO)
-	S3URLStyle     string // "path" or "vhost" (default: "path" for MinIO compatibility)
-
-	// S3 configuration for "credential_chain" provider (AWS SDK credential chain)
-	// Chain specifies which credential sources to check, semicolon-separated
-	// Options: env, config, sts, sso, instance, process
-	// Default: checks all sources in AWS SDK order
-	S3Chain   string // e.g., "env;config" to check env vars then config files
-	S3Profile string // AWS profile name to use (for "config" chain)
-
-	// HTTPProxy routes DuckDB httpfs traffic through a forward HTTP proxy.
-	// When set, DuckDB signs S3 requests for the real S3 hostname and sends them
-	// through the proxy as plain HTTP (requires S3UseSSL=false). Used by the
-	// local cache proxy DaemonSet for NVMe caching.
-	HTTPProxy string
-
-	// CheckpointInterval controls how often DuckLake CHECKPOINT runs.
-	// CHECKPOINT performs full catalog maintenance: expire snapshots,
-	// merge adjacent files, rewrite data files, and clean up orphaned files.
-	// Set to 0 to disable. Default: 24h.
-	CheckpointInterval time.Duration
-
-	// DataInliningRowLimit controls the maximum number of rows to inline
-	// in DuckLake metadata instead of writing to Parquet files.
-	// Default: 0 (disabled). Set to a positive value to enable inlining.
-	DataInliningRowLimit *int
-
-	// Migrate is set by the control plane after running the migration check.
-	// When true, AttachDuckLake uses AUTOMATIC_MIGRATION TRUE without
-	// re-running the version check. This avoids redundant backups and
-	// long-running checks in worker processes.
-	Migrate bool `json:"migrate,omitempty" yaml:"-"`
-
-	// SpecVersion is the target DuckLake spec version for this connection.
-	// When empty, the worker uses its own built-in default.
-	SpecVersion string `json:"spec_version,omitempty" yaml:"-"`
-
-	// ViaPgBouncer is set by the control plane when the DuckLake metadata
-	// connection is routed through a network-level pooler (e.g. PgBouncer)
-	// rather than direct to Postgres. When true, the worker disables the
-	// postgres_scanner in-process pool via `SET GLOBAL pg_pool_max_connections = 0`.
-	// See duckdb/ducklake#1031: behind a network pooler, client-side pooling
-	// is redundant and prevents the pooler from reclaiming idle connections.
-	ViaPgBouncer bool `json:"via_pgbouncer,omitempty" yaml:"-"`
-}
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.
 // One entry per user file; multiple PG connections share the pool via pinned *sql.Conn.
@@ -529,7 +468,7 @@ func New(cfg Config) (*Server, error) {
 	// Run DuckLake migration check before initializing query logger and checkpointer,
 	// since they both attach DuckLake and need to know if migration is required.
 	if cfg.DuckLake.MetadataStore != "" {
-		ensureDuckLakeMigrationCheck(cfg.DuckLake, cfg.DataDir)
+		ducklake.EnsureMigrationCheck(cfg.DuckLake, cfg.DataDir)
 	}
 
 	if err := bootstrapBundledExtensions(cfg.DataDir); err != nil {
@@ -1384,12 +1323,9 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// health-check timeouts during long backup operations.
 	// In standalone mode, the check runs here (once per process).
 	if !dlCfg.Migrate {
-		ensureDuckLakeMigrationCheck(dlCfg, dataDir)
-		if val, ok := dlMigrations.Load(dlCfg.MetadataStore); ok {
-			state := val.(*migrationState)
-			if state.err != nil {
-				return fmt.Errorf("DuckLake migration check failed: %w", state.err)
-			}
+		ducklake.EnsureMigrationCheck(dlCfg, dataDir)
+		if err := ducklake.MigrationCheckError(dlCfg.MetadataStore); err != nil {
+			return fmt.Errorf("DuckLake migration check failed: %w", err)
 		}
 	}
 
@@ -1477,8 +1413,8 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
 		return err
 	}
-	migrate := dlCfg.Migrate || duckLakeMigrationNeeded(dlCfg.MetadataStore)
-	attachStmt := buildDuckLakeAttachStmt(dlCfg, migrate)
+	migrate := dlCfg.Migrate || ducklake.MigrationNeeded(dlCfg.MetadataStore)
+	attachStmt := ducklake.BuildAttachStmt(dlCfg, migrate)
 
 	dataPath := dlCfg.ObjectStore
 	if dataPath == "" {
@@ -1490,7 +1426,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 			targetVersion = DefaultDuckLakeSpecVersion
 		}
 		slog.Info("Attaching DuckLake catalog with automatic migration.",
-			"from", duckLakeMigrationCheckedVersion(dlCfg.MetadataStore), "to", targetVersion,
+			"from", ducklake.MigrationCheckedVersion(dlCfg.MetadataStore), "to", targetVersion,
 			"metadata", redactConnectionString(dlCfg.MetadataStore))
 	} else if dataPath != "" {
 		slog.Info("Attaching DuckLake catalog with data path.",
@@ -1551,7 +1487,7 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 	if !dlCfg.DeltaCatalogEnabled {
 		return nil
 	}
-	catalogPath := deltaCatalogPath(dlCfg)
+	catalogPath := ducklake.DeltaCatalogPath(dlCfg)
 	if catalogPath == "" {
 		return fmt.Errorf("delta catalog path is empty")
 	}
@@ -1579,7 +1515,7 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 		}
 	}
 
-	attachStmt := buildDeltaCatalogAttachStmt(dlCfg)
+	attachStmt := ducklake.BuildDeltaAttachStmt(dlCfg)
 	slog.Info("Attaching Delta catalog.", "path", catalogPath)
 	if _, err := db.Exec(attachStmt); err != nil {
 		return fmt.Errorf("failed to attach Delta catalog: %w", err)

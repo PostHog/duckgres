@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/posthog/duckgres/server/ducklake"
 )
 
 // DuckLakeCheckpointer runs DuckLake CHECKPOINT on a schedule.
@@ -62,7 +64,7 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 		return nil, fmt.Errorf("checkpoint: pre-attach settings: %w", err)
 	}
 
-	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded(dlCfg.MetadataStore))
+	attachStmt := ducklake.BuildAttachStmt(dlCfg, ducklake.MigrationNeeded(dlCfg.MetadataStore))
 	if _, err := db.Exec(attachStmt); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("checkpoint: attach ducklake: %w", err)
