@@ -44,8 +44,6 @@ var (
 	perfPublishBootstrap      = flag.Bool("perf-publish-bootstrap-schema", envBoolOrDefault("DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA", true), "bootstrap publisher schema/table definitions before inserting rows")
 )
 
-var publishRunDir = publisher.PublishRunDir
-
 func TestGoldenQueryPerformanceHarness(t *testing.T) {
 	if !*perfRun {
 		t.Skip("set -perf-run to execute the perf harness")
@@ -202,16 +200,6 @@ func currentPublisherConfig() publisher.Config {
 		Schema:          *perfPublishSchema,
 		BootstrapSchema: *perfPublishBootstrap,
 	}
-}
-
-func publishArtifactsIfConfigured(ctx context.Context, cfg publisher.Config, runDir string) error {
-	if !cfg.Enabled() {
-		return nil
-	}
-	if err := publishRunDir(ctx, cfg, runDir); err != nil {
-		return fmt.Errorf("publish perf artifacts: %w", err)
-	}
-	return nil
 }
 
 func envOrDefault(key, fallback string) string {
