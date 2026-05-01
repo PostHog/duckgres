@@ -7,6 +7,7 @@ on:
     workflow_dispatch:
 
 env:
+    ECR_REGISTRY: 795637471508.dkr.ecr.us-east-1.amazonaws.com
     GHCR_REGISTRY: ghcr.io
     IMAGE_NAME: duckgres-controlplane
 
@@ -14,14 +15,6 @@ env:
 # Single build per sha (no DuckDB-version matrix — the CP is version-
 # agnostic by design and one image fits all worker fleets). Multi-arch
 # manifest with arm64 + amd64.
-#
-# NOTE: ECR push is intentionally disabled — the duckgres-controlplane
-# ECR repository does not yet exist in the AWS root account. Re-enable
-# `aws-actions/configure-aws-credentials` + `amazon-ecr-login` and the
-# corresponding ECR tags once posthog-cloud-infra adds the repo as a
-# `module "ecr_duckgres_controlplane"` in
-# terraform/environments/aws-accnt-root/ecr.tf. GHCR is the source of
-# truth in the meantime.
 
 jobs:
     build:
@@ -48,6 +41,15 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+              with:
+                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  aws-region: us-east-1
+
+            - name: Login to Amazon ECR
+              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
             - name: Login to GHCR
               uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
               with:
@@ -69,6 +71,7 @@ jobs:
                   push: true
                   platforms: ${{ matrix.platform }}
                   tags: |
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ steps.slug.outputs.arch }}
                       ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ steps.slug.outputs.arch }}
                   build-args: |
                       VERSION=build-${{ github.sha }}
@@ -91,6 +94,15 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+              with:
+                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  aws-region: us-east-1
+
+            - name: Login to Amazon ECR
+              uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
             - name: Login to GHCR
               uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
               with:
@@ -98,10 +110,14 @@ jobs:
                   username: ${{ github.actor }}
                   password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Create and push GHCR manifest
+            - name: Create and push ECR / GHCR manifests
               run: |
                   set -euo pipefail
                   for tag in "${{ github.sha }}" "latest"; do
+                      docker buildx imagetools create \
+                          --tag ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${tag} \
+                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
+                          ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
                       docker buildx imagetools create \
                           --tag ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${tag} \
                           ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64 \
