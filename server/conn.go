@@ -28,6 +28,7 @@ import (
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/transpiler"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -2476,41 +2477,11 @@ func countDollarParams(query string) int {
 	return max
 }
 
-// isEmptyQuery checks if a query contains only semicolons, whitespace, and/or comments.
-// PostgreSQL returns EmptyQueryResponse for queries like ";", ";;;", "-- ping", etc.
-func isEmptyQuery(query string) bool {
-	// Strip SQL comments first (e.g., pgx sends "-- ping" for Ping())
-	stripped := stripLeadingComments(query)
-	for _, r := range stripped {
-		if r != ';' && r != ' ' && r != '\t' && r != '\n' && r != '\r' {
-			return false
-		}
-	}
-	return true
-}
-
-// stripLeadingComments removes leading SQL comments from a query.
-// Handles both block comments /* ... */ and line comments -- ...
-func stripLeadingComments(query string) string {
-	for {
-		query = strings.TrimSpace(query)
-		if strings.HasPrefix(query, "/*") {
-			end := strings.Index(query, "*/")
-			if end == -1 {
-				return query
-			}
-			query = query[end+2:]
-		} else if strings.HasPrefix(query, "--") {
-			end := strings.Index(query, "\n")
-			if end == -1 {
-				return ""
-			}
-			query = query[end+1:]
-		} else {
-			return query
-		}
-	}
-}
+// isEmptyQuery and stripLeadingComments moved to server/sqlcore so the
+// Flight client can call them without importing server. Local thin wrappers
+// preserve the unexported call-site spellings used throughout this file.
+func isEmptyQuery(query string) bool         { return sqlcore.IsEmptyQuery(query) }
+func stripLeadingComments(query string) string { return sqlcore.StripLeadingComments(query) }
 
 // stripLeadingNoise strips leading whitespace, comments, and parentheses from
 // a query string in a loop until none remain. This handles cases like

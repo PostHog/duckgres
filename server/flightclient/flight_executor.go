@@ -20,7 +20,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
-	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -70,7 +70,7 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 
 	// Propagate OTEL trace context across gRPC to worker pods.
 	// Filtered to query RPCs only (GetFlightInfo, DoGet).
-	dialOpts = append(dialOpts, server.OTELGRPCClientHandler())
+	dialOpts = append(dialOpts, sqlcore.OTELGRPCClientHandler())
 
 	if bearerToken != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&bearerCreds{token: bearerToken}))
@@ -156,14 +156,14 @@ func recoverClientPanic(err *error) {
 	}
 }
 
-func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ...any) (rs server.RowSet, err error) {
+func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ...any) (rs sqlcore.RowSet, err error) {
 	if e.dead.Load() {
 		return nil, ErrWorkerDead
 	}
 
 	// Return empty results for queries that are only semicolons, whitespace,
 	// and/or comments. These represent PostgreSQL client pings (e.g., pgx sends "-- ping").
-	if server.IsEmptyQuery(query) {
+	if sqlcore.IsEmptyQuery(query) {
 		return &emptyRowSet{}, nil
 	}
 
@@ -221,13 +221,13 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 	}, nil
 }
 
-func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...any) (result server.ExecResult, err error) {
+func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...any) (result sqlcore.ExecResult, err error) {
 	if e.dead.Load() {
 		return nil, ErrWorkerDead
 	}
 
 	// Return zero rows affected for empty/comment-only queries.
-	if server.IsEmptyQuery(query) {
+	if sqlcore.IsEmptyQuery(query) {
 		return &flightExecResult{rowsAffected: 0}, nil
 	}
 
@@ -252,15 +252,15 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 	return &flightExecResult{rowsAffected: affected}, nil
 }
 
-func (e *FlightExecutor) Query(query string, args ...any) (server.RowSet, error) {
+func (e *FlightExecutor) Query(query string, args ...any) (sqlcore.RowSet, error) {
 	return e.QueryContext(context.Background(), query, args...)
 }
 
-func (e *FlightExecutor) Exec(query string, args ...any) (server.ExecResult, error) {
+func (e *FlightExecutor) Exec(query string, args ...any) (sqlcore.ExecResult, error) {
 	return e.ExecContext(context.Background(), query, args...)
 }
 
-func (e *FlightExecutor) ConnContext(ctx context.Context) (server.RawConn, error) {
+func (e *FlightExecutor) ConnContext(ctx context.Context) (sqlcore.RawConn, error) {
 	return nil, fmt.Errorf("ConnContext not supported in Flight mode (use batched INSERT for COPY FROM)")
 }
 
@@ -341,8 +341,8 @@ func (r *FlightRowSet) Columns() ([]string, error) {
 	return names, nil
 }
 
-func (r *FlightRowSet) ColumnTypes() ([]server.ColumnTyper, error) {
-	types := make([]server.ColumnTyper, r.schema.NumFields())
+func (r *FlightRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) {
+	types := make([]sqlcore.ColumnTyper, r.schema.NumFields())
 	for i := 0; i < r.schema.NumFields(); i++ {
 		types[i] = &arrowColumnType{dt: r.schema.Field(i).Type}
 	}
@@ -428,7 +428,7 @@ func (r *FlightRowSet) Err() error {
 type emptyRowSet struct{}
 
 func (e *emptyRowSet) Columns() ([]string, error)          { return nil, nil }
-func (e *emptyRowSet) ColumnTypes() ([]server.ColumnTyper, error) { return nil, nil }
+func (e *emptyRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) { return nil, nil }
 func (e *emptyRowSet) Next() bool                          { return false }
 func (e *emptyRowSet) Scan(dest ...any) error              { return fmt.Errorf("no rows") }
 func (e *emptyRowSet) Close() error                        { return nil }
@@ -450,8 +450,8 @@ func (e *emptySchemaRowSet) Columns() ([]string, error) {
 	return cols, nil
 }
 
-func (e *emptySchemaRowSet) ColumnTypes() ([]server.ColumnTyper, error) {
-	types := make([]server.ColumnTyper, e.schema.NumFields())
+func (e *emptySchemaRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) {
+	types := make([]sqlcore.ColumnTyper, e.schema.NumFields())
 	for i := 0; i < e.schema.NumFields(); i++ {
 		types[i] = &arrowColumnType{dt: e.schema.Field(i).Type}
 	}
