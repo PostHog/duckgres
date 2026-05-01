@@ -9,7 +9,26 @@ import (
 	"time"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
+
+	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 )
+
+// In the all-in-one binary, duckdbservice's init() registers a normalizer
+// that converts duckdb.Interval / duckdb.Decimal to arrowmap.IntervalValue /
+// arrowmap.DecimalValue before encode*Funcs dispatch. We can't import
+// duckdbservice from a server test (import cycle), so register the same
+// hook here so TestEncodeNumeric / TestEncodeInterval keep working.
+func init() {
+	RegisterValueNormalizer(func(v any) any {
+		switch x := v.(type) {
+		case duckdb.Interval:
+			return arrowmap.IntervalValue{Months: x.Months, Days: x.Days, Micros: x.Micros}
+		case duckdb.Decimal:
+			return arrowmap.DecimalValue{Value: x.Value, Scale: int(x.Scale)}
+		}
+		return v
+	})
+}
 
 func TestMapDuckDBType(t *testing.T) {
 	tests := []struct {
