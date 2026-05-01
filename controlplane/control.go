@@ -26,6 +26,7 @@ import (
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/flightsqlingress"
+	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -1009,7 +1010,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}()
 
 	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	err = server.InitSessionDatabaseMetadata(initCtx, executor, database)
+	err = sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, database)
 	if err != nil {
 		initCancel()
 		slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
@@ -1017,7 +1018,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = writer.Flush()
 		return
 	}
-	duckLakeAttached, err := server.HasAttachedCatalog(initCtx, executor, "ducklake")
+	duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
 	initCancel()
 	if err != nil {
 		slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)

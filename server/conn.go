@@ -27,6 +27,7 @@ import (
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/server/wire"
 	"github.com/posthog/duckgres/transpiler"
@@ -938,12 +939,12 @@ func (c *clientConn) serve() error {
 
 	if !c.passthrough {
 		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := InitSessionDatabaseMetadata(initCtx, c.executor, c.database); err != nil {
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, c.database); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
 		}
-		duckLakeAttached, err := hasAttachedCatalog(initCtx, c.executor, "ducklake")
+		duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, c.executor, "ducklake")
 		initCancel()
 		if err != nil {
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to detect ducklake catalog attachment: %v", err))
