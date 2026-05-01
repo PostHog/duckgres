@@ -7,8 +7,9 @@
 //
 //	go list -deps ./cmd/duckgres-controlplane | grep duckdb-go   # empty
 //
-// At runtime, attempts to use standalone or worker modes are rejected at
-// startup; this binary only supports `--mode control-plane`.
+// At runtime, this binary only supports control-plane mode; standalone /
+// duckdb-service modes belong in the all-in-one duckgres binary or
+// cmd/duckgres-worker respectively.
 package main
 
 import (
@@ -17,7 +18,8 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/posthog/duckgres/controlplane"
+	"github.com/posthog/duckgres/configloader"
+	_ "github.com/posthog/duckgres/controlplane" // keep the import live so go list -deps reflects the real CP graph
 )
 
 func main() {
@@ -29,9 +31,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "via Arrow Flight SQL.")
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "Configuration mirrors the all-in-one duckgres binary running in")
-		fmt.Fprintln(os.Stderr, "`--mode control-plane --worker-backend remote`. See the duckgres")
-		fmt.Fprintln(os.Stderr, "README for the full flag set; this stub accepts a single -config")
-		fmt.Fprintln(os.Stderr, "flag pointing at a YAML file for now.")
+		fmt.Fprintln(os.Stderr, "`--mode control-plane --worker-backend remote`. The CLI/env")
+		fmt.Fprintln(os.Stderr, "flag plumbing currently lives in the all-in-one main.go and")
+		fmt.Fprintln(os.Stderr, "will be lifted into a shared package in a follow-up PR; until")
+		fmt.Fprintln(os.Stderr, "then this binary loads -config <path> as the source of truth.")
 		flag.PrintDefaults()
 	}
 
@@ -43,12 +46,27 @@ func main() {
 		os.Exit(2)
 	}
 
-	// TODO: load YAML, resolve effective config, build ControlPlaneConfig.
-	// For the first cut this binary only proves the import graph stays
-	// duckdb-free; wiring it through the existing config-resolution code in
-	// main.go (which lives in the same package as the all-in-one binary) is
-	// the follow-up. Until then, error out clearly.
-	slog.Error("duckgres-controlplane stub: config loading is not wired up yet — use the all-in-one duckgres binary in --mode control-plane while this is being built out.")
-	_ = controlplane.RunControlPlane // keep the import live so go list -deps reflects the real CP graph
+	cfg, err := configloader.LoadFile(*configPath)
+	if err != nil {
+		slog.Error("failed to load config", "path", *configPath, "error", err)
+		os.Exit(1)
+	}
+	slog.Info("duckgres-controlplane: loaded config",
+		"path", *configPath,
+		"data_dir", cfg.DataDir,
+		"port", cfg.Port,
+		"flight_port", cfg.FlightPort,
+		"worker_backend", cfg.WorkerBackend,
+		"k8s_worker_image", cfg.K8s.WorkerImage,
+		"ducklake_default_spec_version", cfg.DuckLake.DefaultSpecVersion,
+	)
+
+	// TODO: build controlplane.ControlPlaneConfig from cfg, then call
+	// controlplane.RunControlPlane(cpCfg). Today resolveEffectiveConfig in
+	// the all-in-one main.go does this — lifting it into a shared
+	// resolution package both binaries can call is the follow-up to PR
+	// #505 (which extracted the YAML schema). Until then, error out so
+	// no one mistakes this for a working CP binary.
+	slog.Error("duckgres-controlplane: config-resolution wiring is still in the all-in-one main.go — use the all-in-one duckgres binary in --mode control-plane while this is being built out.")
 	os.Exit(1)
 }

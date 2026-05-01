@@ -13,159 +13,37 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/posthog/duckgres/configloader"
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/yaml.v3"
 )
 
-// FileConfig represents the YAML configuration file structure
-type FileConfig struct {
-	Host                      string              `yaml:"host"`
-	Port                      int                 `yaml:"port"`
-	FlightPort                int                 `yaml:"flight_port"`                  // Control-plane Flight SQL ingress port (0 disables)
-	FlightSessionIdleTTL      string              `yaml:"flight_session_idle_ttl"`      // e.g., "10m"
-	FlightSessionReapInterval string              `yaml:"flight_session_reap_interval"` // e.g., "1m"
-	FlightHandleIdleTTL       string              `yaml:"flight_handle_idle_ttl"`       // e.g., "15m"
-	FlightSessionTokenTTL     string              `yaml:"flight_session_token_ttl"`     // e.g., "1h"
-	DataDir                   string              `yaml:"data_dir"`
-	TLS                       TLSConfig           `yaml:"tls"`
-	Users                     map[string]string   `yaml:"users"`
-	RateLimit                 RateLimitFileConfig `yaml:"rate_limit"`
-	Extensions                []string            `yaml:"extensions"`
-	DuckLake                  DuckLakeFileConfig  `yaml:"ducklake"`
-	FilePersistence           bool                `yaml:"file_persistence"`  // Persist DuckDB to <data_dir>/<username>.duckdb instead of :memory:
-	ProcessIsolation          bool                `yaml:"process_isolation"` // Enable process isolation per connection
-	IdleTimeout               string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
-	MemoryLimit               string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
-	Threads                   int                 `yaml:"threads"`           // DuckDB threads per session
-	MemoryBudget              string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
-	MemoryRebalance           *bool               `yaml:"memory_rebalance"`  // Enable dynamic per-connection memory reallocation
-	Process                   ProcessFileConfig   `yaml:"process"`
-	WorkerQueueTimeout        string              `yaml:"worker_queue_timeout"`   // e.g., "5m"
-	WorkerIdleTimeout         string              `yaml:"worker_idle_timeout"`    // e.g., "5m"
-	HandoverDrainTimeout      string              `yaml:"handover_drain_timeout"` // e.g., "24h"
-	PassthroughUsers          []string            `yaml:"passthrough_users"`      // Users that bypass transpiler + pg_catalog
-	LogLevel                  string              `yaml:"log_level"`              // Log level: debug, info, warn, error
-	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`              // Query log configuration
+// FileConfig is the YAML configuration schema, sourced from the
+// configloader package so the new cmd/duckgres-controlplane and
+// cmd/duckgres-worker binaries parse the same shape.
+type FileConfig = configloader.FileConfig
 
-	// Worker backend configuration
-	WorkerBackend string        `yaml:"worker_backend"` // "process" (default) or "remote" for config-store-backed K8s multitenant mode
-	K8s           K8sFileConfig `yaml:"k8s"`
-}
+// Type aliases for the nested configloader types so the rest of main.go's
+// resolveEffectiveConfig logic continues to compile unchanged.
+type (
+	ProcessFileConfig   = configloader.ProcessFileConfig
+	K8sFileConfig       = configloader.K8sFileConfig
+	QueryLogFileConfig  = configloader.QueryLogFileConfig
+	TLSConfig           = configloader.TLSConfig
+	ACMEConfig          = configloader.ACMEConfig
+	RateLimitFileConfig = configloader.RateLimitFileConfig
+	DuckLakeFileConfig  = configloader.DuckLakeFileConfig
+)
 
-type ProcessFileConfig struct {
-	MinWorkers         int   `yaml:"min_workers"`
-	MaxWorkers         int   `yaml:"max_workers"`
-	RetireOnSessionEnd *bool `yaml:"retire_on_session_end"`
-}
-
-// K8sFileConfig holds Kubernetes worker configuration from YAML.
-type K8sFileConfig struct {
-	WorkerImage           string `yaml:"worker_image"`
-	WorkerNamespace       string `yaml:"worker_namespace"`
-	ControlPlaneID        string `yaml:"control_plane_id"`
-	WorkerPort            int    `yaml:"worker_port"`
-	WorkerSecret          string `yaml:"worker_secret"`
-	WorkerConfigMap       string `yaml:"worker_configmap"`
-	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
-	WorkerServiceAccount  string `yaml:"worker_service_account"`
-	MaxWorkers            int    `yaml:"max_workers"`
-	SharedWarmTarget      int    `yaml:"shared_warm_target"`
-}
-
-type QueryLogFileConfig struct {
-	Enabled              *bool  `yaml:"enabled"`                 // nil = default (true when DuckLake configured)
-	FlushInterval        string `yaml:"flush_interval"`          // e.g., "5s"
-	BatchSize            int    `yaml:"batch_size"`              // max entries per batch INSERT
-	CompactInterval      string `yaml:"compact_interval"`        // e.g., "10m"
-	DataInliningRowLimit int    `yaml:"data_inlining_row_limit"` // DuckLake inlining threshold
-}
-
-type TLSConfig struct {
-	Cert string     `yaml:"cert"`
-	Key  string     `yaml:"key"`
-	ACME ACMEConfig `yaml:"acme"`
-}
-
-type ACMEConfig struct {
-	Domain      string `yaml:"domain"`
-	Email       string `yaml:"email"`
-	CacheDir    string `yaml:"cache_dir"`
-	DNSProvider string `yaml:"dns_provider"` // "route53" for DNS-01 challenges
-	DNSZoneID   string `yaml:"dns_zone_id"`  // Route53 hosted zone ID
-}
-
-type RateLimitFileConfig struct {
-	MaxFailedAttempts   int    `yaml:"max_failed_attempts"`
-	FailedAttemptWindow string `yaml:"failed_attempt_window"` // e.g., "5m"
-	BanDuration         string `yaml:"ban_duration"`          // e.g., "15m"
-	MaxConnectionsPerIP int    `yaml:"max_connections_per_ip"`
-	MaxConnections      int    `yaml:"max_connections"`
-}
-
-type DuckLakeFileConfig struct {
-	MetadataStore string `yaml:"metadata_store"` // e.g., "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
-	ObjectStore   string `yaml:"object_store"`   // e.g., "s3://bucket/path/" for S3/MinIO storage
-	DataPath      string `yaml:"data_path"`      // Local file path for data storage (alternative to object_store)
-
-	// Delta catalog attachment. When enabled without an explicit path, the
-	// catalog path is derived as a sibling delta/ prefix at the object store root.
-	DeltaCatalogEnabled *bool  `yaml:"delta_catalog_enabled"`
-	DeltaCatalogPath    string `yaml:"delta_catalog_path"`
-
-	// Disable metadata postgres_scanner thread-local cache before ATTACH creates
-	// the hidden metadata pool. Nil means use the server default.
-	DisableMetadataThreadLocalCache *bool `yaml:"disable_metadata_thread_local_cache"`
-
-	// S3 credential provider: "config" (explicit) or "credential_chain" (AWS SDK)
-	S3Provider string `yaml:"s3_provider"`
-
-	// Config provider settings (explicit credentials)
-	S3Endpoint  string `yaml:"s3_endpoint"`   // e.g., "localhost:9000" for MinIO
-	S3AccessKey string `yaml:"s3_access_key"` // S3 access key ID
-	S3SecretKey string `yaml:"s3_secret_key"` // S3 secret access key
-	S3Region    string `yaml:"s3_region"`     // S3 region (default: us-east-1)
-	S3UseSSL    bool   `yaml:"s3_use_ssl"`    // Use HTTPS for S3 connections
-	S3URLStyle  string `yaml:"s3_url_style"`  // "path" or "vhost" (default: path)
-
-	// Credential chain provider settings (AWS SDK credential chain)
-	S3Chain   string `yaml:"s3_chain"`   // e.g., "env;config" - which credential sources to check
-	S3Profile string `yaml:"s3_profile"` // AWS profile name for config chain
-
-	// Checkpoint interval for DuckLake maintenance (e.g., "24h", "6h")
-	CheckpointInterval string `yaml:"checkpoint_interval"`
-
-	// DataInliningRowLimit controls max rows inlined in metadata per insert.
-	// Default: 0 (disabled). Set to a positive value to enable inlining.
-	DataInliningRowLimit *int `yaml:"data_inlining_row_limit"`
-
-	// DefaultSpecVersion is the global default DuckLake spec version
-	// used for migration checks when an org doesn't specify an override.
-	DefaultSpecVersion string `yaml:"default_spec_version"`
-}
-
-// loadConfigFile loads configuration from a YAML file
-func loadConfigFile(path string) (*FileConfig, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg FileConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
-	}
-	return &cfg, nil
-}
-
-// env returns the environment variable value or a default
-func env(key, defaultVal string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultVal
-}
+// loadConfigFile + env are thin wrappers around configloader for back-compat
+// with the rest of this file. New binaries should call configloader.LoadFile
+// and configloader.Env directly.
+var (
+	loadConfigFile = configloader.LoadFile
+	env            = configloader.Env
+)
 
 // initMetrics starts the Prometheus metrics HTTP server on :9090/metrics.
 // Returns the http.Server instance so it can be shut down during handover.

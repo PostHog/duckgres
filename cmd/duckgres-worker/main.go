@@ -6,12 +6,6 @@
 // shape spawned by the control plane over Unix sockets / TCP). The
 // standalone PG-wire path is not exposed here — for that, use the
 // all-in-one duckgres binary in `--mode standalone`.
-//
-// Configuration mirrors the all-in-one duckgres binary running in
-// `--mode duckdb-service`. See the duckgres README for the full flag set;
-// this stub accepts a single -config flag pointing at a YAML file for now.
-// Wiring config resolution out of the all-in-one main package and into a
-// shared package both binaries can use is a follow-up PR.
 package main
 
 import (
@@ -20,7 +14,8 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/posthog/duckgres/duckdbservice"
+	"github.com/posthog/duckgres/configloader"
+	_ "github.com/posthog/duckgres/duckdbservice" // keep the import live so the worker binary actually links libduckdb via duckdbservice
 )
 
 func main() {
@@ -45,13 +40,25 @@ func main() {
 		os.Exit(2)
 	}
 
-	// TODO: load YAML, resolve effective config, build duckdbservice.ServiceConfig.
-	// For the first cut this binary only proves the worker entry point exists
-	// and the duckdbservice import graph is healthy; wiring it through the
-	// existing config-resolution code in main.go (which lives in the same
-	// package as the all-in-one binary) is the follow-up. Until then, error
-	// out clearly.
-	slog.Error("duckgres-worker stub: config loading is not wired up yet — use the all-in-one duckgres binary in --mode duckdb-service while this is being built out.")
-	_ = duckdbservice.Run // keep the import live so the worker binary actually links libduckdb via duckdbservice
+	cfg, err := configloader.LoadFile(*configPath)
+	if err != nil {
+		slog.Error("failed to load config", "path", *configPath, "error", err)
+		os.Exit(1)
+	}
+	slog.Info("duckgres-worker: loaded config",
+		"path", *configPath,
+		"data_dir", cfg.DataDir,
+		"memory_limit", cfg.MemoryLimit,
+		"threads", cfg.Threads,
+		"ducklake_metadata_store_set", cfg.DuckLake.MetadataStore != "",
+	)
+
+	// TODO: build duckdbservice.ServiceConfig from cfg, then call
+	// duckdbservice.Run. Today resolveEffectiveConfig in the all-in-one
+	// main.go does this — lifting it into a shared resolution package
+	// both binaries can call is the follow-up to PR #505 (which
+	// extracted the YAML schema). Until then, error out so no one
+	// mistakes this for a working worker binary.
+	slog.Error("duckgres-worker: config-resolution wiring is still in the all-in-one main.go — use the all-in-one duckgres binary in --mode duckdb-service while this is being built out.")
 	os.Exit(1)
 }
