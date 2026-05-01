@@ -950,4 +950,192 @@ func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	if !slices.Contains(columns, "metadata_store_database_name") {
 		t.Fatal("expected metadata_store_database_name to be included in managed warehouse upserts")
 	}
+	// Regression guards: image and ducklake_version must be in the upsert
+	// column list so the per-tenant pinning patch endpoint actually
+	// persists. If either is missing, PATCH /orgs/:id/warehouse/pinning
+	// silently no-ops and the matrix-build cutover breaks.
+	if !slices.Contains(columns, "image") {
+		t.Fatal("expected image to be included in managed warehouse upserts (tenant pinning)")
+	}
+	if !slices.Contains(columns, "ducklake_version") {
+		t.Fatal("expected ducklake_version to be included in managed warehouse upserts (tenant pinning)")
+	}
+}
+
+func TestPatchTenantPinningSetsImageAndDuckLakeVersion(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
+		OrgID:           "analytics",
+		Image:           "old-image:1.0",
+		DuckLakeVersion: "0.3",
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"image":"posthog/duckgres-worker:abc-duckdb1.5.1","ducklake_version":"0.4"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/orgs/analytics/warehouse/pinning", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	got := store.warehouses["analytics"]
+	if got.Image != "posthog/duckgres-worker:abc-duckdb1.5.1" {
+		t.Errorf("image = %q, want posthog/duckgres-worker:abc-duckdb1.5.1", got.Image)
+	}
+	if got.DuckLakeVersion != "0.4" {
+		t.Errorf("ducklake_version = %q, want 0.4", got.DuckLakeVersion)
+	}
+}
+
+func TestPatchTenantPinningPreservesUntouchedField(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
+		OrgID:           "analytics",
+		Image:           "existing-image:1.0",
+		DuckLakeVersion: "0.4",
+	}
+	router := newTestAPIRouter(store)
+
+	// Only set image; ducklake_version absent ⇒ preserve.
+	body := []byte(`{"image":"new-image:2.0"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/orgs/analytics/warehouse/pinning", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	got := store.warehouses["analytics"]
+	if got.Image != "new-image:2.0" {
+		t.Errorf("image = %q, want new-image:2.0", got.Image)
+	}
+	if got.DuckLakeVersion != "0.4" {
+		t.Errorf("ducklake_version = %q, want 0.4 (untouched)", got.DuckLakeVersion)
+	}
+}
+
+func TestPatchTenantPinningEmptyStringClearsField(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
+		OrgID:           "analytics",
+		Image:           "pinned:1.0",
+		DuckLakeVersion: "0.4",
+	}
+	router := newTestAPIRouter(store)
+
+	// Explicit "" — distinct from absent — falls back to global default.
+	body := []byte(`{"image":""}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/orgs/analytics/warehouse/pinning", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	got := store.warehouses["analytics"]
+	if got.Image != "" {
+		t.Errorf("image = %q, want empty (cleared)", got.Image)
+	}
+	if got.DuckLakeVersion != "0.4" {
+		t.Errorf("ducklake_version = %q, want 0.4 (untouched)", got.DuckLakeVersion)
+	}
+}
+
+func TestPatchTenantPinningRejectsEmptyBody(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{OrgID: "analytics"}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/orgs/analytics/warehouse/pinning", bytes.NewReader([]byte(`{}`)))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestPatchTenantPinningRejectsBadVersion(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{OrgID: "analytics"}
+	router := newTestAPIRouter(store)
+
+	cases := []string{
+		`{"ducklake_version":"foo"}`,
+		`{"ducklake_version":"1"}`,
+		`{"ducklake_version":"1.0.0"}`,
+		`{"ducklake_version":"1."}`,
+		`{"ducklake_version":".1"}`,
+	}
+	for _, body := range cases {
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/orgs/analytics/warehouse/pinning", bytes.NewReader([]byte(body)))
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want %d", body, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+func TestPatchTenantPinningRejectsUnknownFields(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{OrgID: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"image":"x","aurora_max_acu":42}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/orgs/analytics/warehouse/pinning", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestPatchTenantPinningReturnsNotFoundForMissingOrg(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"image":"x"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/orgs/missing/warehouse/pinning", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestIsValidDuckLakeSpecVersion(t *testing.T) {
+	cases := []struct {
+		v    string
+		want bool
+	}{
+		{"0.3", true},
+		{"0.4", true},
+		{"1.0", true},
+		{"0.10", true},
+		{"1.5", true},
+		{"", false},
+		{"1", false},
+		{"1.", false},
+		{".1", false},
+		{"1.0.0", false},
+		{"foo", false},
+		{"1.x", false},
+		{"-1.0", false},
+	}
+	for _, tc := range cases {
+		if got := isValidDuckLakeSpecVersion(tc.v); got != tc.want {
+			t.Errorf("isValidDuckLakeSpecVersion(%q) = %v, want %v", tc.v, got, tc.want)
+		}
+	}
 }

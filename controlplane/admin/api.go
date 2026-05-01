@@ -83,6 +83,10 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo)
 	r.DELETE("/orgs/:id", h.deleteOrg)
 	r.GET("/orgs/:id/warehouse", h.getManagedWarehouse)
 	r.PUT("/orgs/:id/warehouse", h.putManagedWarehouse)
+	// Focused endpoint for pinning a tenant to a specific worker image and
+	// DuckLake spec version — the operator workflow we want to be able to
+	// run without ever touching the config-store DB directly.
+	r.PATCH("/orgs/:id/warehouse/pinning", h.patchTenantPinning)
 
 	// Users CRUD
 	r.GET("/users", h.listUsers)
@@ -357,6 +361,7 @@ func (s *gormAPIStore) MutateManagedWarehouse(orgID string, mutate func(*configs
 func managedWarehouseUpsertColumns() []string {
 	return []string{
 		"image",
+		"ducklake_version",
 		"aurora_min_acu",
 		"aurora_max_acu",
 		"warehouse_database_region",
@@ -475,6 +480,8 @@ type apiHandler struct {
 // add a field here without a matching tag on ManagedWarehouse, strict decode
 // will accept it and the merge will silently drop it.
 type managedWarehouseRequest struct {
+	Image                          string                                        `json:"image"`
+	DuckLakeVersion                string                                        `json:"ducklake_version"`
 	WarehouseDatabase              configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
 	MetadataStore                  configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
 	PgBouncer                      configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
@@ -678,6 +685,106 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, stored)
+}
+
+// tenantPinningRequest carries the two columns that determine which worker
+// image and DuckLake spec version a tenant pins to. Both fields are
+// optional — omitting one preserves the stored value, mirroring the partial
+// patch semantics of putManagedWarehouse.
+//
+// We use *string instead of string so the JSON decoder can distinguish
+// "field absent" (preserve) from "field present and empty" (clear). Clearing
+// the image falls back to the global default; clearing ducklake_version
+// likewise falls back to the global default. We don't allow both to be nil
+// after the patch — that's a no-op which is almost certainly a caller bug.
+type tenantPinningRequest struct {
+	Image           *string `json:"image,omitempty"`
+	DuckLakeVersion *string `json:"ducklake_version,omitempty"`
+}
+
+const maxPinningPatchBodyBytes = 4 << 10 // 4 KiB; the body is two strings
+
+// patchTenantPinning sets the image and/or ducklake_version columns on a
+// tenant's managed_warehouses row without touching the rest of the
+// warehouse config. This replaces the operational shape of running
+// `UPDATE duckgres_managed_warehouses SET image=..., ducklake_version=...`
+// against the config store directly — which is fine for one-offs but
+// creates audit + concurrency risks at any scale.
+//
+// Returns 200 with the updated warehouse on success, 400 for malformed
+// requests (unknown fields, both fields absent, invalid version format),
+// 404 if the org has no managed warehouse row, and 500 on store errors.
+func (h *apiHandler) patchTenantPinning(c *gin.Context) {
+	orgID := c.Param("id")
+
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxPinningPatchBodyBytes))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	var req tenantPinningRequest
+	if err := dec.Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Image == nil && req.DuckLakeVersion == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of image or ducklake_version must be set"})
+		return
+	}
+	if req.DuckLakeVersion != nil && *req.DuckLakeVersion != "" {
+		if !isValidDuckLakeSpecVersion(*req.DuckLakeVersion) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "ducklake_version must be a major.minor string like \"0.4\" or \"1.0\""})
+			return
+		}
+	}
+
+	stored, ok, err := h.store.MutateManagedWarehouse(orgID, func(w *configstore.ManagedWarehouse) error {
+		if req.Image != nil {
+			w.Image = *req.Image
+		}
+		if req.DuckLakeVersion != nil {
+			w.DuckLakeVersion = *req.DuckLakeVersion
+		}
+		return nil
+	})
+	if err != nil {
+		var badReq warehouseBadRequestError
+		if errors.As(err, &badReq) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": badReq.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		return
+	}
+	c.JSON(http.StatusOK, stored)
+}
+
+// isValidDuckLakeSpecVersion accepts the same major.minor format that
+// server/ducklake.versionLessThan parses (e.g., "0.4", "1.0", "0.10"). We
+// don't import server/ducklake here to avoid a cross-cutting dependency
+// from the admin API onto a server subpackage; the check is just a shape
+// gate to catch typos before the value gets persisted.
+func isValidDuckLakeSpecVersion(v string) bool {
+	dot := -1
+	for i := 0; i < len(v); i++ {
+		if v[i] == '.' {
+			if dot >= 0 {
+				return false // multiple dots
+			}
+			dot = i
+			continue
+		}
+		if v[i] < '0' || v[i] > '9' {
+			return false
+		}
+	}
+	return dot > 0 && dot < len(v)-1
 }
 
 // --- Users ---
