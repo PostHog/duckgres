@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+
+	"github.com/posthog/duckgres/server/wire"
 	"sync"
 	"syscall"
 	"time"
@@ -197,7 +199,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	writer := bufio.NewWriter(tlsConn)
 
 	// Read startup message (sent by client after TLS handshake)
-	params, err := readStartupMessage(reader)
+	params, err := wire.ReadStartupMessage(reader)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection after TLS handshake but before sending startup message.")
@@ -213,7 +215,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 
 	if username == "" {
 		slog.Error("No user specified in startup message")
-		_ = writeErrorResponse(writer, "FATAL", "28000", "no user specified")
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28000", "no user specified")
 		_ = writer.Flush()
 		return ExitError
 	}
@@ -223,13 +225,13 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	if !ok {
 		slog.Warn("Unknown user", "user", username, "remote_addr", cfg.RemoteAddr)
 		auth.AuthFailuresCounter.Inc()
-		_ = writeErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
 		return ExitAuthFailure
 	}
 
 	// Request password
-	if err := writeAuthCleartextPassword(writer); err != nil {
+	if err := wire.WriteAuthCleartextPassword(writer); err != nil {
 		slog.Error("Failed to request password", "error", err)
 		return ExitError
 	}
@@ -239,15 +241,15 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	}
 
 	// Read password response
-	msgType, body, err := readMessage(reader)
+	msgType, body, err := wire.ReadMessage(reader)
 	if err != nil {
 		slog.Error("Failed to read password message", "error", err)
 		return ExitError
 	}
 
-	if msgType != msgPassword {
+	if msgType != wire.MsgPassword {
 		slog.Error("Expected password message", "got", string(msgType))
-		_ = writeErrorResponse(writer, "FATAL", "28000", "expected password message")
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
 		_ = writer.Flush()
 		return ExitError
 	}
@@ -257,13 +259,13 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	if password != expectedPassword {
 		slog.Warn("Authentication failed", "user", username, "remote_addr", cfg.RemoteAddr)
 		auth.AuthFailuresCounter.Inc()
-		_ = writeErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 		_ = writer.Flush()
 		return ExitAuthFailure
 	}
 
 	// Send auth OK
-	if err := writeAuthOK(writer); err != nil {
+	if err := wire.WriteAuthOK(writer); err != nil {
 		slog.Error("Failed to send auth OK", "error", err)
 		return ExitError
 	}
@@ -298,7 +300,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 
 	if err := bootstrapBundledExtensions(serverCfg.DataDir); err != nil {
 		slog.Error("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(serverCfg.DataDir, "extensions"), "error", err)
-		_ = writeErrorResponse(writer, "FATAL", "58000", fmt.Sprintf("failed to prepare bundled extensions: %v", err))
+		_ = wire.WriteErrorResponse(writer, "FATAL", "58000", fmt.Sprintf("failed to prepare bundled extensions: %v", err))
 		_ = writer.Flush()
 		return ExitError
 	}
@@ -307,7 +309,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	db, err := CreateDBConnection(serverCfg, make(chan struct{}, 1), username, parentStartTime, parentVersion)
 	if err != nil {
 		slog.Error("Failed to create database connection", "error", err)
-		_ = writeErrorResponse(writer, "FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28000", fmt.Sprintf("failed to open database: %v", err))
 		_ = writer.Flush()
 		return ExitError
 	}
@@ -362,7 +364,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	clientConn.sendInitialParams()
 
 	// Send ready for query
-	if err := writeReadyForQuery(writer, clientConn.txStatus); err != nil {
+	if err := wire.WriteReadyForQuery(writer, clientConn.txStatus); err != nil {
 		slog.Error("Failed to send ready for query", "error", err)
 		return ExitError
 	}

@@ -18,6 +18,7 @@ import (
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/posthog/duckgres/server/wire"
 )
 
 func TestIsEmptyQuery(t *testing.T) {
@@ -3816,7 +3817,7 @@ func TestInitConnsMap(t *testing.T) {
 }
 
 // writePGMessage writes a PostgreSQL wire protocol message (type byte + int32 length + body)
-// into w, matching the format readMessage() expects.
+// into w, matching the format wire.ReadMessage() expects.
 func writePGMessage(w io.Writer, msgType byte, body []byte) {
 	_ = binary.Write(w, binary.BigEndian, msgType)
 	_ = binary.Write(w, binary.BigEndian, int32(len(body)+4))
@@ -3850,8 +3851,8 @@ func TestHandleCopyInCSVWithBlob(t *testing.T) {
 
 	// Build protocol messages: CopyData with CSV content, then CopyDone
 	var msgBuf bytes.Buffer
-	writePGMessage(&msgBuf, msgCopyData, csvBuf.Bytes())
-	writePGMessage(&msgBuf, msgCopyDone, nil)
+	writePGMessage(&msgBuf, wire.MsgCopyData, csvBuf.Bytes())
+	writePGMessage(&msgBuf, wire.MsgCopyDone, nil)
 
 	// Set up clientConn with real DuckDB executor and simulated reader/writer
 	var outputBuf bytes.Buffer
@@ -3940,8 +3941,8 @@ func TestHandleCopyInCSVWithBlob_NullValues(t *testing.T) {
 	csvData := "id\tdata\nrow1\t\\N\n"
 
 	var msgBuf bytes.Buffer
-	writePGMessage(&msgBuf, msgCopyData, []byte(csvData))
-	writePGMessage(&msgBuf, msgCopyDone, nil)
+	writePGMessage(&msgBuf, wire.MsgCopyData, []byte(csvData))
+	writePGMessage(&msgBuf, wire.MsgCopyDone, nil)
 
 	var outputBuf bytes.Buffer
 	ctx, cancel := context.WithCancel(context.Background())

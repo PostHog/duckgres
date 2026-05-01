@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -109,8 +108,9 @@ func setExtensionDirectory(db *sql.DB, dataDir string) error {
 	return nil
 }
 
-// passwordPattern matches password=<value> or password: <value> with quoted or unquoted values.
-var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
+// passwordPattern + RedactSecrets moved to server/wire — see
+// server/wire/redact.go. RedactSecrets is re-exported below for the
+// existing server.RedactSecrets call sites.
 
 // connectionsGauge, IncrementOpenConnections, DecrementOpenConnections moved
 // to server/observe. The aliases below preserve the existing server.X
@@ -164,15 +164,12 @@ var ducklakeConflictRetriesExhaustedTotal = promauto.NewCounter(prometheus.Count
 // control plane.
 type BackendKey = wire.BackendKey
 
-// RedactSecrets replaces password=<value> (and password: <value>) patterns with
-// password=[REDACTED] for safe logging and error reporting. It handles both quoted
-// and unquoted values. It does not currently redact other secret types (tokens, keys).
-func RedactSecrets(s string) string {
-	return passwordPattern.ReplaceAllString(s, "${1}[REDACTED]")
-}
+// RedactSecrets is a re-export var for callers that imported it from this
+// package. See server/wire/redact.go for the implementation.
+var RedactSecrets = wire.RedactSecrets
 
 func redactConnectionString(connStr string) string {
-	return RedactSecrets(connStr)
+	return wire.RedactSecrets(connStr)
 }
 
 type Config struct {
@@ -2133,7 +2130,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// should be read by the child process after FD passing.
 	// The SSL request is a single, small message and the client waits for 'S'
 	// before sending the TLS ClientHello, so unbuffered reads are safe here.
-	params, err := readStartupMessage(conn)
+	params, err := wire.ReadStartupMessage(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
@@ -2159,7 +2156,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 			return
 		}
 		// Re-read: client will send SSLRequest next
-		params, err = readStartupMessage(conn)
+		params, err = wire.ReadStartupMessage(conn)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, io.EOF) {
 				slog.Debug("Client closed connection after GSSENC decline.", "remote_addr", remoteAddr)

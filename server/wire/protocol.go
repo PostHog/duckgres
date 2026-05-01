@@ -1,4 +1,4 @@
-package server
+package wire
 
 import (
 	"encoding/binary"
@@ -9,39 +9,39 @@ import (
 // PostgreSQL message types
 const (
 	// Frontend (client) messages
-	msgQuery       = 'Q'
-	msgTerminate   = 'X'
-	msgPassword    = 'p'
-	msgParse       = 'P'
-	msgBind        = 'B'
-	msgDescribe    = 'D'
-	msgExecute     = 'E'
-	msgSync        = 'S'
-	msgClose       = 'C'
-	msgFlush       = 'H'
+	MsgQuery       = 'Q'
+	MsgTerminate   = 'X'
+	MsgPassword    = 'p'
+	MsgParse       = 'P'
+	MsgBind        = 'B'
+	MsgDescribe    = 'D'
+	MsgExecute     = 'E'
+	MsgSync        = 'S'
+	MsgClose       = 'C'
+	MsgFlush       = 'H'
 
 	// Backend (server) messages
-	msgAuth            = 'R'
-	msgParamStatus     = 'S'
-	msgBackendKeyData  = 'K'
-	msgReadyForQuery   = 'Z'
-	msgRowDescription  = 'T'
-	msgDataRow         = 'D'
-	msgCommandComplete = 'C'
-	msgErrorResponse   = 'E'
-	msgNoticeResponse  = 'N'
-	msgEmptyQuery      = 'I'
-	msgParseComplete   = '1'
-	msgBindComplete    = '2'
-	msgCloseComplete   = '3'
-	msgNoData          = 'n'
+	MsgAuth            = 'R'
+	MsgParamStatus     = 'S'
+	MsgBackendKeyData  = 'K'
+	MsgReadyForQuery   = 'Z'
+	MsgRowDescription  = 'T'
+	MsgDataRow         = 'D'
+	MsgCommandComplete = 'C'
+	MsgErrorResponse   = 'E'
+	MsgNoticeResponse  = 'N'
+	MsgEmptyQuery      = 'I'
+	MsgParseComplete   = '1'
+	MsgBindComplete    = '2'
+	MsgCloseComplete   = '3'
+	MsgNoData          = 'n'
 
 	// COPY messages (both directions)
-	msgCopyData        = 'd' // Contains COPY data
-	msgCopyDone        = 'c' // COPY completed
-	msgCopyFail        = 'f' // COPY failed (frontend only)
-	msgCopyInResponse  = 'G' // Server ready to receive COPY data
-	msgCopyOutResponse = 'H' // Server about to send COPY data
+	MsgCopyData        = 'd' // Contains COPY data
+	MsgCopyDone        = 'c' // COPY completed
+	MsgCopyFail        = 'f' // COPY failed (frontend only)
+	MsgCopyInResponse  = 'G' // Server ready to receive COPY data
+	MsgCopyOutResponse = 'H' // Server about to send COPY data
 )
 
 // Authentication types
@@ -52,7 +52,7 @@ const (
 )
 
 // readStartupMessage reads the initial startup message from the client
-func readStartupMessage(r io.Reader) (map[string]string, error) {
+func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 	// Read message length (4 bytes)
 	var length int32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
@@ -130,7 +130,7 @@ func readStartupMessage(r io.Reader) (map[string]string, error) {
 }
 
 // readMessage reads a single message from the client
-func readMessage(r io.Reader) (byte, []byte, error) {
+func ReadMessage(r io.Reader) (byte, []byte, error) {
 	// Read message type (1 byte)
 	typeBuf := make([]byte, 1)
 	if _, err := io.ReadFull(r, typeBuf); err != nil {
@@ -156,7 +156,7 @@ func readMessage(r io.Reader) (byte, []byte, error) {
 }
 
 // writeMessage writes a message to the client
-func writeMessage(w io.Writer, msgType byte, data []byte) error {
+func WriteMessage(w io.Writer, msgType byte, data []byte) error {
 	// Write message type
 	if _, err := w.Write([]byte{msgType}); err != nil {
 		return err
@@ -179,43 +179,43 @@ func writeMessage(w io.Writer, msgType byte, data []byte) error {
 }
 
 // writeAuthOK sends authentication success
-func writeAuthOK(w io.Writer) error {
+func WriteAuthOK(w io.Writer) error {
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data, authOK)
-	return writeMessage(w, msgAuth, data)
+	return WriteMessage(w, MsgAuth, data)
 }
 
 // writeAuthCleartextPassword requests cleartext password
-func writeAuthCleartextPassword(w io.Writer) error {
+func WriteAuthCleartextPassword(w io.Writer) error {
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data, authCleartextPwd)
-	return writeMessage(w, msgAuth, data)
+	return WriteMessage(w, MsgAuth, data)
 }
 
 // writeParameterStatus sends a parameter status message
-func writeParameterStatus(w io.Writer, name, value string) error {
+func WriteParameterStatus(w io.Writer, name, value string) error {
 	data := []byte(name)
 	data = append(data, 0)
 	data = append(data, []byte(value)...)
 	data = append(data, 0)
-	return writeMessage(w, msgParamStatus, data)
+	return WriteMessage(w, MsgParamStatus, data)
 }
 
 // writeBackendKeyData sends the backend key data (for cancel requests)
-func writeBackendKeyData(w io.Writer, pid, secretKey int32) error {
+func WriteBackendKeyData(w io.Writer, pid, secretKey int32) error {
 	data := make([]byte, 8)
 	binary.BigEndian.PutUint32(data[:4], uint32(pid))
 	binary.BigEndian.PutUint32(data[4:], uint32(secretKey))
-	return writeMessage(w, msgBackendKeyData, data)
+	return WriteMessage(w, MsgBackendKeyData, data)
 }
 
 // writeReadyForQuery indicates the server is ready for a new query
-func writeReadyForQuery(w io.Writer, txStatus byte) error {
-	return writeMessage(w, msgReadyForQuery, []byte{txStatus})
+func WriteReadyForQuery(w io.Writer, txStatus byte) error {
+	return WriteMessage(w, MsgReadyForQuery, []byte{txStatus})
 }
 
 // writeErrorResponse sends an error to the client
-func writeErrorResponse(w io.Writer, severity, code, message string) error {
+func WriteErrorResponse(w io.Writer, severity, code, message string) error {
 	message = RedactSecrets(message)
 
 	var data []byte
@@ -238,12 +238,12 @@ func writeErrorResponse(w io.Writer, severity, code, message string) error {
 	// Terminator
 	data = append(data, 0)
 
-	return writeMessage(w, msgErrorResponse, data)
+	return WriteMessage(w, MsgErrorResponse, data)
 }
 
 // writeNoticeResponse sends a notice/warning to the client
 // Unlike errors, notices are informational and don't terminate the command
-func writeNoticeResponse(w io.Writer, severity, code, message string) error {
+func WriteNoticeResponse(w io.Writer, severity, code, message string) error {
 	var data []byte
 
 	// Severity (WARNING, NOTICE, INFO, DEBUG, LOG)
@@ -264,44 +264,44 @@ func writeNoticeResponse(w io.Writer, severity, code, message string) error {
 	// Terminator
 	data = append(data, 0)
 
-	return writeMessage(w, msgNoticeResponse, data)
+	return WriteMessage(w, MsgNoticeResponse, data)
 }
 
 // writeCommandComplete sends a command completion message
-func writeCommandComplete(w io.Writer, tag string) error {
+func WriteCommandComplete(w io.Writer, tag string) error {
 	data := []byte(tag)
 	data = append(data, 0)
-	return writeMessage(w, msgCommandComplete, data)
+	return WriteMessage(w, MsgCommandComplete, data)
 }
 
 // writeEmptyQueryResponse sends an empty query response
-func writeEmptyQueryResponse(w io.Writer) error {
-	return writeMessage(w, msgEmptyQuery, nil)
+func WriteEmptyQueryResponse(w io.Writer) error {
+	return WriteMessage(w, MsgEmptyQuery, nil)
 }
 
 // writeParseComplete sends parse complete
-func writeParseComplete(w io.Writer) error {
-	return writeMessage(w, msgParseComplete, nil)
+func WriteParseComplete(w io.Writer) error {
+	return WriteMessage(w, MsgParseComplete, nil)
 }
 
 // writeBindComplete sends bind complete
-func writeBindComplete(w io.Writer) error {
-	return writeMessage(w, msgBindComplete, nil)
+func WriteBindComplete(w io.Writer) error {
+	return WriteMessage(w, MsgBindComplete, nil)
 }
 
 // writeCloseComplete sends close complete
-func writeCloseComplete(w io.Writer) error {
-	return writeMessage(w, msgCloseComplete, nil)
+func WriteCloseComplete(w io.Writer) error {
+	return WriteMessage(w, MsgCloseComplete, nil)
 }
 
 // writeNoData sends no data response
-func writeNoData(w io.Writer) error {
-	return writeMessage(w, msgNoData, nil)
+func WriteNoData(w io.Writer) error {
+	return WriteMessage(w, MsgNoData, nil)
 }
 
 // writeCopyOutResponse tells client we're about to send COPY data
 // Format: overall format (0=text, 1=binary), num columns, format per column
-func writeCopyOutResponse(w io.Writer, numColumns int16, textFormat bool) error {
+func WriteCopyOutResponse(w io.Writer, numColumns int16, textFormat bool) error {
 	var data []byte
 
 	// Overall format (0=text)
@@ -327,11 +327,11 @@ func writeCopyOutResponse(w io.Writer, numColumns int16, textFormat bool) error 
 		data = append(data, formatBytes...)
 	}
 
-	return writeMessage(w, msgCopyOutResponse, data)
+	return WriteMessage(w, MsgCopyOutResponse, data)
 }
 
 // writeCopyInResponse tells client to send COPY data
-func writeCopyInResponse(w io.Writer, numColumns int16, textFormat bool) error {
+func WriteCopyInResponse(w io.Writer, numColumns int16, textFormat bool) error {
 	var data []byte
 
 	// Overall format (0=text)
@@ -357,15 +357,15 @@ func writeCopyInResponse(w io.Writer, numColumns int16, textFormat bool) error {
 		data = append(data, formatBytes...)
 	}
 
-	return writeMessage(w, msgCopyInResponse, data)
+	return WriteMessage(w, MsgCopyInResponse, data)
 }
 
 // writeCopyData sends a row of COPY data
-func writeCopyData(w io.Writer, data []byte) error {
-	return writeMessage(w, msgCopyData, data)
+func WriteCopyData(w io.Writer, data []byte) error {
+	return WriteMessage(w, MsgCopyData, data)
 }
 
 // writeCopyDone signals the end of COPY data
-func writeCopyDone(w io.Writer) error {
-	return writeMessage(w, msgCopyDone, nil)
+func WriteCopyDone(w io.Writer) error {
+	return WriteMessage(w, MsgCopyDone, nil)
 }
