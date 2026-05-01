@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/configloader"
+	"github.com/posthog/duckgres/configresolve"
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/server"
@@ -287,7 +288,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set:                         cliSet,
 		Host:                        *host,
 		Port:                        *port,

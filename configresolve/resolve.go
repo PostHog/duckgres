@@ -1,16 +1,30 @@
-package main
+// Package configresolve owns the precedence-aware merge of duckgres
+// configuration sources (CLI flags > env > YAML > built-in defaults). It
+// produces a Resolved value that the all-in-one duckgres binary, and
+// eventually cmd/duckgres-controlplane and cmd/duckgres-worker, all feed
+// directly into server / controlplane / duckdbservice startup. The package
+// is intentionally separate from configloader (which only owns YAML
+// parsing) so configloader can stay light; configresolve is heavy by
+// design and pulls in server, controlplane, and server/ducklake.
+package configresolve
 
 import (
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/posthog/duckgres/configloader"
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
 )
 
-type configCLIInputs struct {
+// CLIInputs carries the post-flag.Parse() values from the binary's main
+// plus a Set map indicating which flags the user actually provided. The
+// caller is the source of truth for "was this flag set", since flag.Visit
+// only sees flags that landed in os.Args; defaults look identical to
+// unset flags from the resolver's perspective without this signal.
+type CLIInputs struct {
 	Set map[string]bool
 
 	Host                        string
@@ -72,7 +86,7 @@ type configCLIInputs struct {
 	QueryLog                    bool
 }
 
-type resolvedConfig struct {
+type Resolved struct {
 	Server                     server.Config
 	ProcessMinWorkers          int
 	ProcessMaxWorkers          int
@@ -110,7 +124,7 @@ type resolvedConfig struct {
 func intPtr(n int) *int    { return &n }
 func boolPtr(b bool) *bool { return &b }
 
-func defaultServerConfig() server.Config {
+func DefaultServerConfig() server.Config {
 	return server.Config{
 		Host:                      "0.0.0.0",
 		Port:                      5432,
@@ -142,7 +156,11 @@ func defaultServerConfig() server.Config {
 	}
 }
 
-func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv func(string) string, warn func(string)) resolvedConfig {
+// ResolveEffective layers CLI inputs on top of env vars on top of YAML on
+// top of built-in defaults to produce the runtime config every duckgres
+// binary boots from. getenv and warn are pluggable so unit tests can run
+// without touching os.Getenv or stderr; nil maps to no-op equivalents.
+func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv func(string) string, warn func(string)) Resolved {
 	if getenv == nil {
 		getenv = func(string) string { return "" }
 	}
@@ -153,7 +171,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		cli.Set = map[string]bool{}
 	}
 
-	cfg := defaultServerConfig()
+	cfg := DefaultServerConfig()
 	defaultQueryLog := cfg.QueryLog
 	var workerQueueTimeout time.Duration
 	var workerIdleTimeout time.Duration
@@ -1078,7 +1096,7 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		}
 	}
 
-	return resolvedConfig{
+	return Resolved{
 		Server:                     cfg,
 		ProcessMinWorkers:          processMinWorkers,
 		ProcessMaxWorkers:          processMaxWorkers,
