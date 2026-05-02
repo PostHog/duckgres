@@ -644,6 +644,40 @@ func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigSessionInitTimeout(t *testing.T) {
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, nil, nil)
+	if resolved.SessionInitTimeout != 10*time.Second {
+		t.Fatalf("expected default session init timeout 10s, got %s", resolved.SessionInitTimeout)
+	}
+	if resolved.Server.SessionInitTimeout != 10*time.Second {
+		t.Fatalf("expected server default session init timeout 10s, got %s", resolved.Server.SessionInitTimeout)
+	}
+}
+
+func TestResolveEffectiveConfigSessionInitTimeoutPrecedence(t *testing.T) {
+	fileCfg := &FileConfig{
+		SessionInitTimeout: "7s",
+	}
+
+	env := map[string]string{
+		"DUCKGRES_SESSION_INIT_TIMEOUT": "9s",
+	}
+
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+		Set: map[string]bool{
+			"session-init-timeout": true,
+		},
+		SessionInitTimeout: "11s",
+	}, envFromMap(env), nil)
+
+	if resolved.SessionInitTimeout != 11*time.Second {
+		t.Fatalf("expected CLI session_init_timeout, got %s", resolved.SessionInitTimeout)
+	}
+	if resolved.Server.SessionInitTimeout != 11*time.Second {
+		t.Fatalf("expected server CLI session_init_timeout, got %s", resolved.Server.SessionInitTimeout)
+	}
+}
+
 func TestResolveEffectiveConfigFlightIngressDurationsFromFile(t *testing.T) {
 	fileCfg := &FileConfig{
 		FlightSessionIdleTTL:      "7m",

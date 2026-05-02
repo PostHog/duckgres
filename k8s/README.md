@@ -63,6 +63,7 @@ Key flags for Kubernetes multitenant mode:
 |------|---------|-------------|
 | `--worker-backend remote` | - | Use K8s remote workers in config-store-backed multitenant mode |
 | `--config-store` | `DUCKGRES_CONFIG_STORE` | PostgreSQL config-store connection string required for remote mode |
+| `--session-init-timeout` | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout (`10s` default) |
 | `--handover-drain-timeout` | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns/upgrades before forced exit (`15m` default in remote mode) |
 | `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
 | `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |

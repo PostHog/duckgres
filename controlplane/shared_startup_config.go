@@ -22,6 +22,7 @@ var allowedSharedStartupConfigKeys = map[string]struct{}{
 	"memory_limit":         {},
 	"memory_rebalance":     {},
 	"query_log":            {},
+	"session_init_timeout": {},
 	"threads":              {},
 	"worker_idle_timeout":  {},
 	"worker_queue_timeout": {},
