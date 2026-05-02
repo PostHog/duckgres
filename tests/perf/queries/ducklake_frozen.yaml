@@ -1,5 +1,5 @@
-name: ducklake-frozen-v1
-description: Read-only DuckLake frozen dataset query corpus for nightly perf.
+name: posthog-frozen-file-views-v1
+description: Read-only PostHog frozen dataset query corpus over file-backed parquet views.
 seed: 42
 dataset_scale: 1
 targets:
@@ -8,37 +8,44 @@ targets:
 warmup_iterations: 1
 measure_iterations: 3
 queries:
-  - query_id: q_orders_total
-    intent_id: intent_orders_total
-    tags: [nightly, frozen, ducklake, select-only]
+  - query_id: q_persons_total
+    intent_id: intent_persons_total
+    tags: [nightly, frozen, posthog, persons, aggregate, file-view]
     params: {}
-    pgwire_sql: SELECT COUNT(*) AS order_count FROM ducklake.main.orders
-    duckhog_sql: SELECT COUNT(*) AS order_count FROM ducklake.main.orders
+    pgwire_sql: SELECT COUNT(*) AS persons FROM frozen_v1.persons_file_view
+    duckhog_sql: SELECT COUNT(*) AS persons FROM frozen_v1.persons_file_view
 
-  - query_id: q_order_status_mix
-    intent_id: intent_order_status_mix
-    tags: [nightly, frozen, ducklake, select-only]
+  - query_id: q_persons_daily_april_2026
+    intent_id: intent_persons_daily_april_2026
+    tags: [nightly, frozen, posthog, persons, aggregate, time-series, file-view]
     params: {}
-    pgwire_sql: SELECT status, COUNT(*) AS order_count, ROUND(SUM(total_amount), 2) AS gross_amount FROM ducklake.main.orders GROUP BY status ORDER BY status
-    duckhog_sql: SELECT status, COUNT(*) AS order_count, ROUND(SUM(total_amount), 2) AS gross_amount FROM ducklake.main.orders GROUP BY status ORDER BY status
+    pgwire_sql: SELECT date_trunc('day', _timestamp) AS day, COUNT(*) AS persons FROM frozen_v1.persons_file_view WHERE _timestamp >= TIMESTAMPTZ '2026-04-01 00:00:00+00' AND _timestamp < TIMESTAMPTZ '2026-05-01 00:00:00+00' GROUP BY 1 ORDER BY 1
+    duckhog_sql: SELECT date_trunc('day', _timestamp) AS day, COUNT(*) AS persons FROM frozen_v1.persons_file_view WHERE _timestamp >= TIMESTAMPTZ '2026-04-01 00:00:00+00' AND _timestamp < TIMESTAMPTZ '2026-05-01 00:00:00+00' GROUP BY 1 ORDER BY 1
 
-  - query_id: q_category_revenue
-    intent_id: intent_category_revenue
-    tags: [nightly, frozen, ducklake, select-only, join]
+  - query_id: q_events_total
+    intent_id: intent_events_total
+    tags: [nightly, frozen, posthog, events, aggregate, file-view]
     params: {}
-    pgwire_sql: SELECT c.name AS category_name, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS gross_revenue FROM ducklake.main.order_items oi JOIN ducklake.main.products p ON oi.product_id = p.id JOIN ducklake.main.categories c ON p.category_id = c.id GROUP BY c.name ORDER BY gross_revenue DESC, c.name LIMIT 10
-    duckhog_sql: SELECT c.name AS category_name, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS gross_revenue FROM ducklake.main.order_items oi JOIN ducklake.main.products p ON oi.product_id = p.id JOIN ducklake.main.categories c ON p.category_id = c.id GROUP BY c.name ORDER BY gross_revenue DESC, c.name LIMIT 10
+    pgwire_sql: SELECT COUNT(*) AS events FROM frozen_v1.events_file_view
+    duckhog_sql: SELECT COUNT(*) AS events FROM frozen_v1.events_file_view
 
-  - query_id: q_events_by_name
-    intent_id: intent_events_by_name
-    tags: [nightly, frozen, ducklake, select-only, analytics]
+  - query_id: q_events_by_name_march_2026
+    intent_id: intent_events_by_name_march_2026
+    tags: [nightly, frozen, posthog, events, aggregate, analytics, file-view]
     params: {}
-    pgwire_sql: SELECT event_name, COUNT(*) AS event_count FROM ducklake.main.events GROUP BY event_name ORDER BY event_count DESC, event_name
-    duckhog_sql: SELECT event_name, COUNT(*) AS event_count FROM ducklake.main.events GROUP BY event_name ORDER BY event_count DESC, event_name
+    pgwire_sql: SELECT event, COUNT(*) AS events FROM frozen_v1.events_file_view WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+    duckhog_sql: SELECT event, COUNT(*) AS events FROM frozen_v1.events_file_view WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
 
-  - query_id: q_avg_page_duration
-    intent_id: intent_avg_page_duration
-    tags: [nightly, frozen, ducklake, select-only, analytics]
+  - query_id: q_events_daily_march_2026
+    intent_id: intent_events_daily_march_2026
+    tags: [nightly, frozen, posthog, events, aggregate, time-series, file-view]
     params: {}
-    pgwire_sql: SELECT page_path, ROUND(AVG(duration_seconds), 2) AS avg_duration_seconds, COUNT(*) AS views FROM ducklake.main.page_views GROUP BY page_path ORDER BY avg_duration_seconds DESC, page_path LIMIT 20
-    duckhog_sql: SELECT page_path, ROUND(AVG(duration_seconds), 2) AS avg_duration_seconds, COUNT(*) AS views FROM ducklake.main.page_views GROUP BY page_path ORDER BY avg_duration_seconds DESC, page_path LIMIT 20
+    pgwire_sql: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM frozen_v1.events_file_view WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY 1 ORDER BY 1
+    duckhog_sql: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM frozen_v1.events_file_view WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY 1 ORDER BY 1
+
+  - query_id: q_events_distinct_persons
+    intent_id: intent_events_distinct_persons
+    tags: [nightly, frozen, posthog, events, aggregate, distinct, file-view]
+    params: {}
+    pgwire_sql: SELECT COUNT(DISTINCT person_id) AS distinct_persons FROM frozen_v1.events_file_view WHERE person_id IS NOT NULL
+    duckhog_sql: SELECT COUNT(DISTINCT person_id) AS distinct_persons FROM frozen_v1.events_file_view WHERE person_id IS NOT NULL
