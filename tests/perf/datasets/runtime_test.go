@@ -57,3 +57,13 @@ func TestResolveRuntimeContractWithDefaultManifestPath(t *testing.T) {
 		t.Fatalf("expected manifest path %q, got %q", manifestPath, contract.ManifestPath)
 	}
 }
+
+func TestRepositoryManifestIncludesPostHogFileViewsVersion(t *testing.T) {
+	manifest, err := LoadManifest("manifest.yaml")
+	if err != nil {
+		t.Fatalf("LoadManifest returned error: %v", err)
+	}
+	if !manifest.HasVersion("posthog-file-views-v1") {
+		t.Fatalf("expected repository manifest to include posthog-file-views-v1")
+	}
+}
