@@ -2,6 +2,7 @@ package duckdbservice
 
 import (
 	"database/sql"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,13 +26,13 @@ func TestSessionPoolActivateTenantConfiguresTenantRuntime(t *testing.T) {
 	var captured server.Config
 	var opened *sql.DB
 	pool.sharedWarmMode = true
-	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
 		db, err := sql.Open("duckdb", "")
 		if err != nil {
 			return nil, err
 		}
 		opened = db
-		return db, nil
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		captured = cfg
@@ -83,8 +84,12 @@ func TestSessionPoolActivateTenantRejectsSecondActivation(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
-		return sql.Open("duckdb", "")
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		return nil
@@ -131,8 +136,12 @@ func TestSessionPoolActivateTenantRejectsStaleOwnerEpoch(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
-		return sql.Open("duckdb", "")
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		return nil
@@ -172,8 +181,12 @@ func TestSessionPoolActivateTenantAllowsSameOrgTakeover(t *testing.T) {
 	close(pool.warmupDone)
 
 	var activateCalls int
-	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
-		return sql.Open("duckdb", "")
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		activateCalls++
@@ -237,8 +250,12 @@ func TestSessionPoolActivateTenantRejectsSameEpochOwnerChange(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
-		return sql.Open("duckdb", "")
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		return nil
@@ -290,13 +307,13 @@ func TestSessionPoolValidateControlMetadataAcceptsMismatchedCPInstanceID(t *test
 // that causes worker pod cascading deaths during a CP rolling update.
 //
 // Scenario:
-//   1. CP-old activates a worker with epoch=1
-//   2. CP-old is killed in a rolling update
-//   3. CP-new starts fresh — it discovers the worker pod via K8s informer
-//      but hasn't re-activated it yet, so its in-memory epoch is 0
-//   4. CP-new's health check loop sends a health check with epoch=0
-//   5. Worker rejects: "stale owner epoch 0 (current 1)"
-//   6. After 3 consecutive rejections, CP-new deletes the worker pod
+//  1. CP-old activates a worker with epoch=1
+//  2. CP-old is killed in a rolling update
+//  3. CP-new starts fresh — it discovers the worker pod via K8s informer
+//     but hasn't re-activated it yet, so its in-memory epoch is 0
+//  4. CP-new's health check loop sends a health check with epoch=0
+//  5. Worker rejects: "stale owner epoch 0 (current 1)"
+//  6. After 3 consecutive rejections, CP-new deletes the worker pod
 //
 // The health check should not kill a worker just because the CP restarted.
 // The worker is healthy and serving queries — the epoch mismatch only means
@@ -346,5 +363,123 @@ func TestSessionPoolValidateControlMetadataRejectsMismatchedWorkerID(t *testing.
 	if err == nil {
 		t.Fatal("expected mismatched worker_id to be rejected")
 		return
+	}
+}
+
+// TestReuseExistingActivationDoesNotBlockHealthChecks pins down the deadlock
+// that killed workers in mw-prod-us 2026-05-04: reuseExistingActivation used
+// to run RefreshS3Secret while still holding p.mu.Lock, so any concurrent
+// RLock acquirer (the gRPC health-check goroutine snapshotting sessions)
+// stalled until the secret SQL finished — and the secret SQL itself blocked
+// on the single client-query connection. After 3 health-check timeouts (~9s)
+// the CP force-deleted the worker.
+//
+// We simulate the slow refresh with a channel and assert that an RLock
+// acquirer in another goroutine returns within 100ms while the refresh is
+// in-flight. This fails on the pre-fix code path (RLock blocks until the
+// channel is closed) and passes on the lock-released path.
+func TestReuseExistingActivationDoesNotBlockHealthChecks(t *testing.T) {
+	mainDB, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open main duckdb: %v", err)
+	}
+	defer func() { _ = mainDB.Close() }()
+	controlDB, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open control duckdb: %v", err)
+	}
+	defer func() { _ = controlDB.Close() }()
+
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+		warmupDB:       mainDB,
+		controlDB:      controlDB,
+		activation: &activatedTenantRuntime{
+			payload: ActivationPayload{
+				WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 1},
+				OrgID:                 "analytics",
+				DuckLake: server.DuckLakeConfig{
+					MetadataStore: "postgres:host=meta port=5432 user=u password=p dbname=d",
+					ObjectStore:   "s3://analytics/",
+					S3AccessKey:   "OLD_ACCESS_KEY",
+					S3SecretKey:   "OLD_SECRET_KEY",
+				},
+			},
+			db: mainDB,
+		},
+		ownerEpoch: 1,
+	}
+	close(pool.warmupDone)
+
+	released := make(chan struct{})
+	refreshStarted := make(chan struct{})
+	var refreshDB *sql.DB
+	pool.refreshS3Secret = func(db *sql.DB, dlCfg server.DuckLakeConfig, sem chan struct{}) error {
+		refreshDB = db
+		close(refreshStarted)
+		<-released // simulate a CREATE OR REPLACE SECRET stuck behind a long query
+		return nil
+	}
+
+	newPayload := ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 2},
+		OrgID:                 "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=meta port=5432 user=u password=p dbname=d",
+			ObjectStore:   "s3://analytics/",
+			S3AccessKey:   "NEW_ACCESS_KEY",
+			S3SecretKey:   "NEW_SECRET_KEY",
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !pool.reuseExistingActivation(newPayload) {
+			t.Errorf("reuseExistingActivation returned false; expected true after refresh")
+		}
+	}()
+
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not start within 1s")
+	}
+
+	rlockAcquired := make(chan struct{})
+	go func() {
+		pool.mu.RLock()
+		close(rlockAcquired)
+		pool.mu.RUnlock()
+	}()
+
+	select {
+	case <-rlockAcquired:
+		// Good — RLock returned while RefreshS3Secret is still running.
+	case <-time.After(100 * time.Millisecond):
+		close(released) // unblock the goroutine so wg.Wait doesn't hang
+		t.Fatal("RLock blocked while refresh was in flight: deadlock regression — reuseExistingActivation is holding p.mu.Lock across the slow secret rotation")
+	}
+
+	close(released)
+	wg.Wait()
+
+	// Fix #2 assertion: the slow refresh must run on controlDB (the side
+	// connection), not on the main client-query DB.
+	if refreshDB != controlDB {
+		t.Errorf("expected refresh to run on controlDB, ran on %p (controlDB=%p, mainDB=%p)", refreshDB, controlDB, mainDB)
+	}
+
+	// Sanity: the new payload must be committed.
+	if pool.activation == nil || pool.activation.payload.DuckLake.S3AccessKey != "NEW_ACCESS_KEY" {
+		t.Fatalf("expected new credentials committed to activation payload; got %#v", pool.activation)
+	}
+	if pool.ownerEpoch != 2 {
+		t.Fatalf("expected ownerEpoch=2 after refresh, got %d", pool.ownerEpoch)
 	}
 }

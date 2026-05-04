@@ -781,18 +781,9 @@ func (s *Server) releaseFileDB(username string) {
 // so performance is equivalent to in-memory while data persists across restarts.
 // When DataDir is empty, falls back to a pure in-memory database.
 func openBaseDB(cfg Config, username string) (*sql.DB, error) {
-	// allow_unsigned_extensions is a startup-only DuckDB config — it must be
-	// in the DSN, not via SET.
-	dsn := ":memory:?allow_unsigned_extensions=true"
-	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
-		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
-			return nil, fmt.Errorf("invalid username for file persistence: %q (contains path separator or ..)", username)
-		}
-		if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
-			return nil, fmt.Errorf("failed to create data directory %s: %w", cfg.DataDir, err)
-		}
-		dsn = filepath.Join(cfg.DataDir, username+".duckdb") + "?allow_unsigned_extensions=true"
-		slog.Info("Opening file-backed DuckDB.", "path", dsn)
+	dsn, err := DuckDBDSN(cfg, username)
+	if err != nil {
+		return nil, err
 	}
 	db, err := sql.Open("duckdb", dsn)
 	if err != nil {
@@ -811,6 +802,37 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
 	}
 
+	if err := ConfigureMainDB(db, cfg, username); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// DuckDBDSN returns the DSN openBaseDB / the duckdbservice pair builder use
+// for cfg/username. Exported so duckdbservice (which holds the duckdb-go-v2
+// import) can build a *duckdb.Connector against the same DSN that openBaseDB
+// would have passed to sql.Open.
+func DuckDBDSN(cfg Config, username string) (string, error) {
+	dsn := ":memory:?allow_unsigned_extensions=true"
+	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
+		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
+			return "", fmt.Errorf("invalid username for file persistence: %q (contains path separator or ..)", username)
+		}
+		if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
+			return "", fmt.Errorf("failed to create data directory %s: %w", cfg.DataDir, err)
+		}
+		dsn = filepath.Join(cfg.DataDir, username+".duckdb") + "?allow_unsigned_extensions=true"
+		slog.Info("Opening file-backed DuckDB.", "path", dsn)
+	}
+	return dsn, nil
+}
+
+// ConfigureMainDB applies the per-instance DuckDB settings (threads, memory,
+// temp dir, extensions, profiling) that the client-query DB needs. Shared
+// between openBaseDB (single-DB path) and OpenDuckDBPair (shared-connector
+// path) so the main DB is configured identically either way.
+func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 	// Set DuckDB threads
 	threads := cfg.Threads
 	if threads == 0 {
@@ -844,8 +866,7 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	}
 
 	if err := setExtensionDirectory(db, cfg.DataDir); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to configure extension_directory: %w", err)
+		return fmt.Errorf("failed to configure extension_directory: %w", err)
 	}
 
 	// Load configured extensions
@@ -881,8 +902,7 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 			slog.Debug("Set cache_httpfs cache directory.", "cache_directory", cacheDir)
 		}
 	}
-
-	return db, nil
+	return nil
 }
 
 func seedBundledExtensions(srcRoot, dstRoot string) error {
