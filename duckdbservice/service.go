@@ -53,6 +53,16 @@ type SessionPool struct {
 	dbInitOnce  sync.Once     // Serializes fallback CreateDBConnection when warmup fails
 	fallbackDB  *sql.DB       // Lazily created if warmup fails
 	fallbackErr error         // Cached error from fallback creation
+	// activePair is the DuckDBPair backing whichever of warmupDB/fallbackDB is
+	// currently in use. It owns the underlying *duckdb.Connector and a
+	// secondary *sql.DB (Control) sharing the same DuckDB instance —
+	// see duckdbservice's credential-refresh path for why we need a side
+	// connection that doesn't queue behind a long-running client query.
+	activePair *server.DuckDBPair
+	// controlDB is activePair.Control, surfaced for direct use by control-side
+	// ops (CREATE OR REPLACE SECRET on STS rotation). Always nil before
+	// activation; nil-check before use and fall back to the main DB.
+	controlDB *sql.DB
 
 	sharedWarmMode       bool
 	activation           *activatedTenantRuntime
@@ -60,8 +70,13 @@ type SessionPool struct {
 	ownerCPInstanceID    string
 	workerID             int
 	activateTenantFunc   func(ActivationPayload) error
-	createDBConnection   func(server.Config, chan struct{}, string, time.Time, string) (*sql.DB, error)
+	createDBPair         func(server.Config, chan struct{}, string, time.Time, string) (*server.DuckDBPair, error)
 	activateDBConnection func(*sql.DB, server.Config, chan struct{}, string) error
+	// refreshS3Secret is the indirection used for credential rotation on the
+	// active tenant. Defaults to server.RefreshS3Secret in production; tests
+	// inject a stub to verify the credential-refresh path is non-blocking
+	// (see TestReuseExistingActivationDoesNotBlockHealthChecks).
+	refreshS3Secret func(*sql.DB, server.DuckLakeConfig, chan struct{}) error
 }
 
 type trackedTx struct {
@@ -116,8 +131,9 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		stopCh:               make(chan struct{}),
 		warmupDone:           make(chan struct{}),
 		sharedWarmMode:       cfg.RequireActivation || sharedWarmWorkerEnabled(),
-		createDBConnection:   server.CreateDBConnection,
+		createDBPair:         server.CreateWorkerDBPair,
 		activateDBConnection: server.ActivateDBConnection,
+		refreshS3Secret:      server.RefreshS3Secret,
 	}
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
@@ -147,13 +163,15 @@ func (p *SessionPool) Warmup() error {
 	// Included in the pre-warm duration so slow proxy startup is visible.
 	waitForCacheProxy()
 	// Use a system-level username for warmup
-	db, err := p.createDBConnection(p.sharedWarmupConfig(), p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
+	pair, err := p.createDBPair(p.sharedWarmupConfig(), p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
 	if err != nil {
 		return fmt.Errorf("warmup failed after %v: %w", time.Since(start), err)
 	}
 
 	p.mu.Lock()
-	p.warmupDB = db
+	p.warmupDB = pair.Main
+	p.activePair = pair
+	p.controlDB = pair.Control
 	p.mu.Unlock()
 
 	slog.Info("Worker pre-warmed successfully.", "duration", time.Since(start))
@@ -383,7 +401,14 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		// concurrent LOAD of the same C++ extension corrupts the heap.
 		fallbackStart := time.Now()
 		p.dbInitOnce.Do(func() {
-			p.fallbackDB, p.fallbackErr = p.createDBConnection(cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
+			pair, err := p.createDBPair(cfg, p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
+			if err != nil {
+				p.fallbackErr = err
+				return
+			}
+			p.fallbackDB = pair.Main
+			p.activePair = pair
+			p.controlDB = pair.Control
 		})
 		if p.fallbackErr != nil {
 			p.mu.Lock()
@@ -638,15 +663,33 @@ func (p *SessionPool) CloseAll() {
 
 	if p.warmupDB != nil {
 		cleanupWorkerCatalogs(p.warmupDB)
-		_ = p.warmupDB.Close()
 	}
 	if p.fallbackDB != nil && p.fallbackDB != p.warmupDB {
 		cleanupWorkerCatalogs(p.fallbackDB)
-		_ = p.fallbackDB.Close()
 	}
 	if p.activation != nil && p.activation.db != nil && p.activation.db != p.warmupDB && p.activation.db != p.fallbackDB {
 		cleanupWorkerCatalogs(p.activation.db)
 		_ = p.activation.db.Close()
+	}
+	// activePair owns the underlying *duckdb.Connector and the Control side
+	// connection; closing it tears the DuckDB instance down once. Both
+	// warmupDB and fallbackDB are p.activePair.Main for in-pool DBs, so this
+	// supersedes the old per-DB close calls.
+	if p.activePair != nil {
+		_ = p.activePair.Close()
+		p.activePair = nil
+		p.warmupDB = nil
+		p.fallbackDB = nil
+		p.controlDB = nil
+	} else {
+		// Fallback path for tests that bypass the pair factory and assigned
+		// warmupDB/fallbackDB directly without an activePair.
+		if p.warmupDB != nil {
+			_ = p.warmupDB.Close()
+		}
+		if p.fallbackDB != nil && p.fallbackDB != p.warmupDB {
+			_ = p.fallbackDB.Close()
+		}
 	}
 }
 

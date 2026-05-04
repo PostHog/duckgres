@@ -110,12 +110,12 @@ func TestHealthCheckReturnsImmediatelyAfterWarmup(t *testing.T) {
 
 func TestHealthCheckAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	pool := &SessionPool{
-		sessions:       make(map[string]*Session),
-		stopRefresh:    make(map[string]func()),
-		warmupDone:     make(chan struct{}),
-		startTime:      time.Now(),
-		sharedWarmMode: true,
-		ownerEpoch:     5,
+		sessions:          make(map[string]*Session),
+		stopRefresh:       make(map[string]func()),
+		warmupDone:        make(chan struct{}),
+		startTime:         time.Now(),
+		sharedWarmMode:    true,
+		ownerEpoch:        5,
 		ownerCPInstanceID: "cp-live:boot-a",
 		workerID:          17,
 	}
@@ -171,8 +171,8 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	pool.createDBConnection = func(server.Config, chan struct{}, string, time.Time, string) (*sql.DB, error) {
-		return &sql.DB{}, nil
+	pool.createDBPair = func(server.Config, chan struct{}, string, time.Time, string) (*server.DuckDBPair, error) {
+		return server.PairFromMain(&sql.DB{}), nil
 	}
 	pool.activateDBConnection = func(*sql.DB, server.Config, chan struct{}, string) error {
 		return nil
@@ -233,8 +233,12 @@ func TestCreateSessionAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 		},
 	}
 	close(pool.warmupDone)
-	pool.createDBConnection = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*sql.DB, error) {
-		return sql.Open("duckdb", "")
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*server.DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		return server.PairFromMain(db), nil
 	}
 
 	handler := &FlightSQLHandler{pool: pool}
@@ -261,12 +265,12 @@ func TestCreateSessionAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 
 func TestSessionFromContextAcceptsMismatchedEpoch(t *testing.T) {
 	pool := &SessionPool{
-		sessions:       make(map[string]*Session),
-		stopRefresh:    make(map[string]func()),
-		warmupDone:     make(chan struct{}),
-		startTime:      time.Now(),
-		sharedWarmMode: true,
-		ownerEpoch:     5,
+		sessions:          make(map[string]*Session),
+		stopRefresh:       make(map[string]func()),
+		warmupDone:        make(chan struct{}),
+		startTime:         time.Now(),
+		sharedWarmMode:    true,
+		ownerEpoch:        5,
 		ownerCPInstanceID: "cp-live:boot-a",
 		workerID:          17,
 	}
@@ -291,14 +295,14 @@ func TestSessionFromContextAcceptsMismatchedEpoch(t *testing.T) {
 
 func TestSessionFromContextRejectsMismatchedControlIdentity(t *testing.T) {
 	pool := &SessionPool{
-		sessions:           make(map[string]*Session),
-		stopRefresh:        make(map[string]func()),
-		warmupDone:         make(chan struct{}),
-		startTime:          time.Now(),
-		sharedWarmMode:     true,
-		ownerEpoch:         5,
-		ownerCPInstanceID:  "cp-live:boot-a",
-		workerID:           17,
+		sessions:          make(map[string]*Session),
+		stopRefresh:       make(map[string]func()),
+		warmupDone:        make(chan struct{}),
+		startTime:         time.Now(),
+		sharedWarmMode:    true,
+		ownerEpoch:        5,
+		ownerCPInstanceID: "cp-live:boot-a",
+		workerID:          17,
 	}
 	close(pool.warmupDone)
 	pool.sessions["session-1"] = &Session{ID: "session-1"}
