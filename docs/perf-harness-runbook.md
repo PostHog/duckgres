@@ -170,34 +170,10 @@ Publisher configuration:
 The repo-managed dashboard now lives in `grafana-dashboards` under `managed-warehouse/duckgres-perf.json` and queries
 `duckgres_perf.query_results` through the existing prod-us datasource.
 
-## Frozen Dataset Bootstrap
-
-Use repository helper script (no cloud provisioning) to deterministically regenerate data and publish dataset metadata:
-
-```bash
-DUCKGRES_PERF_PGWIRE_DSN="host=127.0.0.1 port=5432 user=perfuser dbname=test sslmode=require" \
-DUCKGRES_PERF_DATASET_VERSION=v1 \
-./scripts/bootstrap_ducklake_frozen_dataset.sh
-```
-
-Optional generation controls:
-
-- `DUCKGRES_PERF_CATEGORIES_COUNT`
-- `DUCKGRES_PERF_PRODUCTS_COUNT`
-- `DUCKGRES_PERF_CUSTOMERS_COUNT`
-- `DUCKGRES_PERF_ORDERS_COUNT`
-- `DUCKGRES_PERF_ITEMS_PER_ORDER`
-- `DUCKGRES_PERF_EVENTS_COUNT`
-- `DUCKGRES_PERF_PAGE_VIEWS_COUNT`
-- `DUCKGRES_PERF_GENERATOR_VERSION`
-- `DUCKGRES_PERF_ALLOW_OVERWRITE=1` (replace an existing dataset version row)
-
-The script writes metadata to `ducklake.main.dataset_manifest` (override with `DUCKGRES_PERF_DATASET_MANIFEST_TABLE`).
-
 ## Manifest Expectations
 
 - `DUCKGRES_PERF_DATASET_VERSION` must resolve to at least one row in `DUCKGRES_PERF_DATASET_MANIFEST_TABLE`.
-- Query corpus for frozen runs must remain SELECT-only and target `ducklake.main.*`.
+- Query corpus for frozen runs must remain SELECT-only.
 - Run artifacts should include `dataset_manifest.json` with dataset version and manifest table used.
 
 ## Failure Recovery

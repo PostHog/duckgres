@@ -393,8 +393,3 @@ gen-certs:
 [group('scripts')]
 seed-ducklake:
     ./scripts/seed_ducklake.sh
-
-# Bootstrap DuckLake frozen dataset
-[group('scripts')]
-bootstrap-ducklake:
-    ./scripts/bootstrap_ducklake_frozen_dataset.sh
