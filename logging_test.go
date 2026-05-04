@@ -3,10 +3,63 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 )
+
+// TestStampedHandlerQuotesValuesWithSpaces guards against regressions where
+// the text encoder emits unquoted multi-word values (e.g. error strings),
+// which break key=value parsers downstream.
+func TestStampedHandlerQuotesValuesWithSpaces(t *testing.T) {
+	tests := []struct {
+		name      string
+		attrs     []slog.Attr
+		wantSub   string
+		notWant   string
+	}{
+		{
+			name:    "error with spaces is quoted",
+			attrs:   []slog.Attr{slog.Any("error", errors.New("flight worker is dead")), slog.Int("worker", 41757)},
+			wantSub: `error="flight worker is dead" worker=41757`,
+			notWant: "error=flight worker is dead",
+		},
+		{
+			name:    "value with embedded equals is quoted",
+			attrs:   []slog.Attr{slog.String("dsn", "host=foo dbname=bar")},
+			wantSub: `dsn="host=foo dbname=bar"`,
+		},
+		{
+			name:    "simple alphanumeric stays unquoted",
+			attrs:   []slog.Attr{slog.String("worker_pod", "duckgres-5fdb-worker-40772"), slog.Int("count", 3)},
+			wantSub: `worker_pod=duckgres-5fdb-worker-40772 count=3`,
+			notWant: `"duckgres-5fdb-worker-40772"`,
+		},
+		{
+			name:    "empty string is quoted to stay unambiguous",
+			attrs:   []slog.Attr{slog.String("reason", "")},
+			wantSub: `reason=""`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			h := &stampedHandler{out: &buf, level: slog.LevelDebug}
+			logger := slog.New(h)
+			logger.LogAttrs(context.Background(), slog.LevelInfo, "msg", tt.attrs...)
+			out := buf.String()
+			if !strings.Contains(out, tt.wantSub) {
+				t.Errorf("missing %q in:\n%s", tt.wantSub, out)
+			}
+			if tt.notWant != "" && strings.Contains(out, tt.notWant) {
+				t.Errorf("unexpected %q in:\n%s", tt.notWant, out)
+			}
+		})
+	}
+}
 
 func TestRedactingHandler(t *testing.T) {
 	tests := []struct {

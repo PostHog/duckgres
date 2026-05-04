@@ -7,9 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/posthog/duckgres/server"
 
@@ -35,16 +37,45 @@ func (h *stampedHandler) Handle(_ context.Context, r slog.Record) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "time=%s level=%s", r.Time.UTC().Format(time.RFC3339Nano), r.Level.String())
 	for _, a := range h.stamp {
-		fmt.Fprintf(&b, " %s=%s", a.Key, a.Value.String())
+		writeAttr(&b, a)
 	}
 	fmt.Fprintf(&b, " msg=%q", r.Message)
 	r.Attrs(func(a slog.Attr) bool {
-		fmt.Fprintf(&b, " %s=%s", a.Key, a.Value.String())
+		writeAttr(&b, a)
 		return true
 	})
 	b.WriteByte('\n')
 	_, err := io.WriteString(h.out, b.String())
 	return err
+}
+
+// writeAttr appends " key=value" to b, quoting the value if it contains
+// whitespace, '=', '"', or unprintable runes — matching slog's TextHandler.
+// Without this, an attr like error="flight worker is dead" prints as
+// `error=flight worker is dead worker=41757`, which makes downstream
+// key=value parsing think `is`, `dead`, etc. are bare keys.
+func writeAttr(b *strings.Builder, a slog.Attr) {
+	b.WriteByte(' ')
+	b.WriteString(a.Key)
+	b.WriteByte('=')
+	v := a.Value.String()
+	if needsQuoting(v) {
+		b.WriteString(strconv.Quote(v))
+	} else {
+		b.WriteString(v)
+	}
+}
+
+func needsQuoting(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, r := range s {
+		if r == ' ' || r == '=' || r == '"' || r == '\\' || !unicode.IsPrint(r) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *stampedHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
