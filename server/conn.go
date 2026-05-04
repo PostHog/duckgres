@@ -1484,6 +1484,17 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		ctx, cleanup := c.queryContext()
 		defer cleanup()
 
+		// Lifecycle log pair (PR #519): every DML simple-query gets a
+		// matched logQueryStarted / logQueryFinished. Captured via
+		// closures so the deferred call sees the eventual rows + err.
+		queryStart := time.Now()
+		var queryRowsAff int64
+		var queryFinalErr error
+		c.logQueryStarted(query)
+		defer func() {
+			c.logQueryFinished(query, queryStart, queryRowsAff, queryFinalErr)
+		}()
+
 		runExec := func() (ExecResult, error) {
 			return c.executor.ExecContext(ctx, query)
 		}
@@ -1507,6 +1518,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			)
 		}
 		if err != nil {
+			queryFinalErr = err
 			errCode := classifyErrorCode(err)
 			errMsg := err.Error()
 			if isQueryCancelled(err) {
@@ -1521,6 +1533,9 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			return nil
 		}
 
+		if result != nil {
+			queryRowsAff, _ = result.RowsAffected()
+		}
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
 		_ = wire.WriteCommandComplete(c.writer, tag)
@@ -1596,7 +1611,16 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 
 	execStart := time.Now()
 	execCtx, execSpan := observe.Tracer().Start(ctx, "duckgres.execute")
+	// Lifecycle log pair: deferred logQueryFinished captures the eventual
+	// rowCount and any error from any return path — including Scan,
+	// ColumnTypes, sendRowDescription, and rows.Err() — so the pair is
+	// always balanced.
+	var queryRowsAff int64
+	var queryFinalErr error
 	c.logQueryStarted(query)
+	defer func() {
+		c.logQueryFinished(query, execStart, queryRowsAff, queryFinalErr)
+	}()
 	runQuery := func() (RowSet, error) {
 		return c.executor.QueryContext(ctx, query)
 	}
@@ -1622,6 +1646,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 	execSpan.End()
 	if err != nil {
+		queryFinalErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if isQueryCancelled(err) {
@@ -1629,7 +1654,6 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		} else {
 			c.logQueryError(query, err)
 		}
-		c.logQueryFinished(query, execStart, 0, err)
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -1640,6 +1664,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 
 	cols, err := rows.Columns()
 	if err != nil {
+		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
 		c.sendError("ERROR", errCode, errMsg)
@@ -1651,6 +1676,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
+		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
 		c.sendError("ERROR", errCode, errMsg)
@@ -1664,6 +1690,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	defer sendSpan.End()
 
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
+		queryFinalErr = err
 		return 0, "", "", err
 	}
 
@@ -1681,6 +1708,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
+			queryFinalErr = err
 			errCode := "42000"
 			errMsg := err.Error()
 			c.sendError("ERROR", errCode, errMsg)
@@ -1691,12 +1719,15 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		}
 
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
+			queryFinalErr = err
 			return 0, "", "", err
 		}
 		rowCount++
 	}
+	queryRowsAff = int64(rowCount)
 
 	if err := rows.Err(); err != nil {
+		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
 		if isQueryCancelled(err) {
@@ -1718,7 +1749,6 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	_ = wire.WriteCommandComplete(c.writer, tag)
 	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
 	_ = c.writer.Flush()
-	c.logQueryFinished(query, execStart, int64(rowCount), nil)
 	return int64(rowCount), "", "", nil
 }
 
@@ -1954,6 +1984,18 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return true, nil
 	}
 
+	// Lifecycle log pair: every per-statement run in a multi-statement
+	// simple-query batch gets a logQueryStarted / logQueryFinished bracket
+	// (PR #519). The deferred close captures whichever code path the
+	// statement took — DML, SELECT, retry, transaction-conflict recovery.
+	queryStart := time.Now()
+	var queryRowsAff int64
+	var queryFinalErr error
+	c.logQueryStarted(executedQuery)
+	defer func() {
+		c.logQueryFinished(executedQuery, queryStart, queryRowsAff, queryFinalErr)
+	}()
+
 	if !queryReturnsResults(executedQuery) {
 		if cmdType == "BEGIN" && c.txStatus == txStatusTransaction {
 			c.sendNotice("WARNING", "25001", "there is already a transaction in progress")
@@ -1999,6 +2041,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				)
 			}
 			if err != nil {
+				queryFinalErr = err
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if isQueryCancelled(err) {
@@ -2017,6 +2060,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		if execResult != nil {
 			writtenRows, _ = execResult.RowsAffected()
 		}
+		queryRowsAff = writtenRows
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, execResult)
 		_ = wire.WriteCommandComplete(c.writer, tag)
@@ -2049,6 +2093,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		)
 	}
 	if err != nil {
+		queryFinalErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if isQueryCancelled(err) {
@@ -2065,6 +2110,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	cols, err := rows.Columns()
 	if err != nil {
+		queryFinalErr = err
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return true, nil
@@ -2072,12 +2118,14 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
+		queryFinalErr = err
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		return true, nil
 	}
 
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
+		queryFinalErr = err
 		return false, err
 	}
 
@@ -2096,15 +2144,18 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
+			queryFinalErr = err
 			c.sendError("ERROR", "42000", err.Error())
 			return true, nil
 		}
 
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
+			queryFinalErr = err
 			return false, err
 		}
 		rowCount++
 	}
+	queryRowsAff = int64(rowCount)
 
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
@@ -2142,11 +2193,20 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
-	// Execute setup statements (all but last)
+	// Execute setup statements (all but last). Each step is its own
+	// logical query on the worker, so each gets its own logQueryStarted /
+	// logQueryFinished pair (PR #519).
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
 		slog.Debug("Multi-stmt setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
-		_, err := c.executor.Exec(stmt)
+		setupStart := time.Now()
+		c.logQueryStarted(stmt)
+		result, err := c.executor.Exec(stmt)
+		var setupRows int64
+		if result != nil {
+			setupRows, _ = result.RowsAffected()
+		}
+		c.logQueryFinished(stmt, setupStart, setupRows, err)
 		if err != nil {
 			slog.Error("Multi-stmt setup error.", "user", c.username, "query", stmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
@@ -2165,10 +2225,19 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 	cmdType := c.getCommandType(upperFinal)
 	slog.Debug("Multi-stmt final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
 
+	finalStart := time.Now()
+	var finalRowsAff int64
+	var finalErr error
+	c.logQueryStarted(finalStmt)
+	defer func() {
+		c.logQueryFinished(finalStmt, finalStart, finalRowsAff, finalErr)
+	}()
+
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt)
 		if err != nil {
+			finalErr = err
 			slog.Error("Multi-stmt final query error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			c.executeCleanup(cleanup)
@@ -2183,13 +2252,22 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		// DuckDB cursor holds result data even after source tables are dropped
 		c.executeCleanup(cleanup)
 
-		// Now stream results from cursor
-		return c.streamRowsToClient(rows, cmdType, finalStmt)
+		// Now stream results from cursor. streamRowsToClient counts rows
+		// internally; we approximate Finished's rowsAff with 0 here
+		// (logQuery's own structured channel still records the precise
+		// count). A future refactor can plumb the count out of
+		// streamRowsToClient.
+		err = c.streamRowsToClient(rows, cmdType, finalStmt)
+		if err != nil {
+			finalErr = err
+		}
+		return err
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt)
 		if err != nil {
+			finalErr = err
 			slog.Error("Multi-stmt final exec error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			c.executeCleanup(cleanup)
@@ -2197,6 +2275,9 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
 			_ = c.writer.Flush()
 			return nil
+		}
+		if result != nil {
+			finalRowsAff, _ = result.RowsAffected()
 		}
 
 		// Execute cleanup
@@ -2244,11 +2325,20 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
-	// Execute setup statements (all but last)
+	// Execute setup statements (all but last). Each step gets its own
+	// logQueryStarted / logQueryFinished pair (PR #519) so multi-stmt
+	// setup work is observable per statement, not just per outer query.
 	for i := 0; i < len(statements)-1; i++ {
 		stmt := statements[i]
 		slog.Debug("Multi-stmt-ext setup.", "user", c.username, "step", i+1, "total", len(statements)-1, "stmt", stmt)
-		_, err := c.executor.Exec(stmt, args...)
+		setupStart := time.Now()
+		c.logQueryStarted(stmt)
+		result, err := c.executor.Exec(stmt, args...)
+		var setupRows int64
+		if result != nil {
+			setupRows, _ = result.RowsAffected()
+		}
+		c.logQueryFinished(stmt, setupStart, setupRows, err)
 		if err != nil {
 			slog.Error("Multi-stmt-ext setup error.", "user", c.username, "query", stmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
@@ -2265,10 +2355,19 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 	cmdType := c.getCommandType(upperFinal)
 	slog.Debug("Multi-stmt-ext final.", "user", c.username, "stmt", finalStmt, "cmd_type", cmdType)
 
+	finalStart := time.Now()
+	var finalRowsAff int64
+	var finalErr error
+	c.logQueryStarted(finalStmt)
+	defer func() {
+		c.logQueryFinished(finalStmt, finalStart, finalRowsAff, finalErr)
+	}()
+
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
 		rows, err := c.executor.Query(finalStmt, args...)
 		if err != nil {
+			finalErr = err
 			slog.Error("Multi-stmt-ext final query error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			c.executeCleanup(cleanup)
@@ -2280,18 +2379,25 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		// Execute cleanup while cursor is open (data is materialized in cursor)
 		c.executeCleanup(cleanup)
 
-		// Stream results from cursor (extended protocol version)
+		// Stream results from cursor (extended protocol version). Row count
+		// is tracked by streamRowsToClientExtended; the deferred Finished
+		// log uses 0 as an approximation (logQuery still records the
+		// precise count via the structured channel).
 		c.streamRowsToClientExtended(rows, cmdType, resultFormats, described, finalStmt)
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
 		result, err := c.executor.Exec(finalStmt, args...)
 		if err != nil {
+			finalErr = err
 			slog.Error("Multi-stmt-ext final exec error.", "user", c.username, "query", finalStmt, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 			c.setTxError()
 			c.executeCleanup(cleanup)
 			c.sendError("ERROR", "42000", err.Error())
 			return
+		}
+		if result != nil {
+			finalRowsAff, _ = result.RowsAffected()
 		}
 
 		// Execute cleanup
@@ -3291,7 +3397,14 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	}
 
 	// For other COPY commands (e.g., COPY TO file), pass through to DuckDB
+	c.logQueryStarted(query)
+	queryStart := time.Now()
 	result, err := c.executor.Exec(query)
+	var rowsAffected int64
+	if result != nil {
+		rowsAffected, _ = result.RowsAffected()
+	}
+	c.logQueryFinished(query, queryStart, rowsAffected, err)
 	if err != nil {
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
@@ -3301,7 +3414,6 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 		return nil
 	}
 
-	rowsAffected, _ := result.RowsAffected()
 	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowsAffected))
 	c.logQuery(start, query, query, "COPY", 0, rowsAffected, "", "", "simple")
 	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -3342,9 +3454,20 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		}
 	}
 
-	// Execute the query
+	// Execute the query. Lifecycle log pair (PR #519): every COPY-OUT
+	// driven SELECT gets a logQueryStarted and a logQueryFinished — the
+	// row count comes from the iteration loop further down, so the
+	// deferred close in the outer function path captures it.
+	queryStart := time.Now()
+	var copyRowsRead int64
+	var copyFinalErr error
+	c.logQueryStarted(selectQuery)
+	defer func() {
+		c.logQueryFinished(selectQuery, queryStart, copyRowsRead, copyFinalErr)
+	}()
 	rows, err := c.executor.Query(selectQuery)
 	if err != nil {
+		copyFinalErr = err
 		slog.Error("COPY TO query failed.", "user", c.username, "query", selectQuery, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
@@ -3375,6 +3498,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	// Get column types for JSON-aware formatting
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
+		copyFinalErr = err
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
@@ -3419,6 +3543,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
+			copyFinalErr = err
 			c.sendError("ERROR", "42000", err.Error())
 			c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
 			break
@@ -3435,12 +3560,15 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 		}
 		line := strings.Join(rowData, delimiter) + "\n"
 		if err := wire.WriteCopyData(c.writer, []byte(line)); err != nil {
+			copyFinalErr = err
 			return err
 		}
 		rowCount++
 	}
+	copyRowsRead = int64(rowCount)
 
 	if err := rows.Err(); err != nil {
+		copyFinalErr = err
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
 		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
@@ -3451,6 +3579,7 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	// Send CopyDone
 	if err := wire.WriteCopyDone(c.writer); err != nil {
+		copyFinalErr = err
 		return err
 	}
 
@@ -3731,7 +3860,16 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			slog.Debug("COPY FROM STDIN executing native DuckDB COPY.", "user", c.username, "sql", copySQL)
 			loadStart := time.Now()
 
+			// Lifecycle log pair (PR #519): the native DuckDB COPY FROM is
+			// the actual query the worker runs; everything before this is
+			// CSV byte-pumping into a tempfile, not worker work.
+			c.logQueryStarted(copySQL)
 			result, err := c.executor.Exec(copySQL)
+			var copyRowsAffected int64
+			if result != nil {
+				copyRowsAffected, _ = result.RowsAffected()
+			}
+			c.logQueryFinished(copySQL, loadStart, copyRowsAffected, err)
 			if err != nil {
 				slog.Error("COPY FROM STDIN DuckDB COPY failed.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
@@ -3743,8 +3881,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 				return nil
 			}
 
-			rowCount64, _ := result.RowsAffected()
-			rowCount = int(rowCount64)
+			rowCount = int(copyRowsAffected)
 
 			totalElapsed := time.Since(copyStartTime)
 			loadElapsed := time.Since(loadStart)
@@ -4053,7 +4190,17 @@ func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string
 		insertSQL := fmt.Sprintf("INSERT INTO %s %s VALUES %s",
 			tableName, colNames, strings.Join(valueClauses, ", "))
 
-		if _, err := c.executor.Exec(insertSQL, args...); err != nil {
+		// Lifecycle log pair (PR #519) per batched INSERT — one query
+		// the worker actually runs.
+		batchStart := time.Now()
+		c.logQueryStarted(insertSQL)
+		result, err := c.executor.Exec(insertSQL, args...)
+		var rowsAff int64
+		if result != nil {
+			rowsAff, _ = result.RowsAffected()
+		}
+		c.logQueryFinished(insertSQL, batchStart, rowsAff, err)
+		if err != nil {
 			return rowCount, fmt.Errorf("batch INSERT failed at rows %d-%d: %v", start+1, start+len(batch), err)
 		}
 		rowCount += len(batch)
@@ -5241,6 +5388,23 @@ func (c *clientConn) handleExecute(body []byte) {
 	originalQuery := p.stmt.query
 	convertedQuery := p.stmt.convertedQuery
 
+	// Lifecycle log pair for the extended-query path. logQueryStarted /
+	// logQueryFinished are the canonical "did a query run on a worker?"
+	// signal for Loki / Grafana (PR #519). Without these, the only log a
+	// successful extended-query produces is the structured logQuery() to
+	// the queryLogger channel, which doesn't carry worker_id and isn't
+	// scrape-friendly. queryFinalErr is captured by the deferred call so
+	// every termination path — success, ALTER-TABLE-as-VIEW retry,
+	// transaction-conflict retry, recovery rollback, fatal error — emits
+	// exactly one Finished log per Started.
+	queryStart := time.Now()
+	var queryRowsAff int64
+	var queryFinalErr error
+	c.logQueryStarted(convertedQuery)
+	defer func() {
+		c.logQueryFinished(convertedQuery, queryStart, queryRowsAff, queryFinalErr)
+	}()
+
 	if !returnsResults {
 		// Handle nested BEGIN: PostgreSQL issues a warning but continues,
 		// while DuckDB throws an error. Match PostgreSQL behavior.
@@ -5288,6 +5452,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				)
 			}
 			if err != nil {
+				queryFinalErr = err
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if isQueryCancelled(err) {
@@ -5305,6 +5470,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		if result != nil {
 			writtenRows, _ = result.RowsAffected()
 		}
+		queryRowsAff = writtenRows
 		c.updateTxStatus(cmdType)
 		tag := c.buildCommandTag(cmdType, result)
 		_ = wire.WriteCommandComplete(c.writer, tag)
@@ -5334,6 +5500,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		)
 	}
 	if err != nil {
+		queryFinalErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if isQueryCancelled(err) {
@@ -5350,6 +5517,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	cols, err := rows.Columns()
 	if err != nil {
+		queryFinalErr = err
 		slog.Error("Columns error.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
@@ -5390,6 +5558,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
+			queryFinalErr = err
 			c.sendError("ERROR", "42000", err.Error())
 			c.setTxError()
 			c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
@@ -5397,12 +5566,15 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 
 		if err := c.sendDataRowWithFormats(values, p.resultFormats, typeOIDs); err != nil {
+			queryFinalErr = err
 			return
 		}
 		rowCount++
 	}
+	queryRowsAff = int64(rowCount)
 
 	if err := rows.Err(); err != nil {
+		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
 		if isQueryCancelled(err) {
@@ -5495,8 +5667,16 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 	ctx, cleanup := c.queryContextForCursor()
 	cursor.cleanup = cleanup
 
+	// Lifecycle log pair (PR #519): the cursor's underlying SELECT is the
+	// query the worker runs at OPEN time. The eventual row count comes
+	// from later FETCH iterations against the same rowset, which the
+	// outer cursor lifecycle (closeCursor) doesn't currently bubble up to
+	// us — log the cursor metadata phase as rows=0 / err=initial failure.
+	cursorStart := time.Now()
+	c.logQueryStarted(cursor.query)
 	rows, err := c.executor.QueryContext(ctx, cursor.query)
 	if err != nil {
+		c.logQueryFinished(cursor.query, cursorStart, 0, err)
 		cleanup()
 		cursor.cleanup = nil
 		return err
@@ -5505,6 +5685,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
+		c.logQueryFinished(cursor.query, cursorStart, 0, err)
 		_ = rows.Close()
 		cursor.rows = nil
 		cleanup()
@@ -5515,6 +5696,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
+		c.logQueryFinished(cursor.query, cursorStart, 0, err)
 		_ = rows.Close()
 		cursor.rows = nil
 		cleanup()
@@ -5522,6 +5704,10 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 		return err
 	}
 	cursor.colTypes = colTypes
+	// Cursor opened successfully — emit the matching Finished now (rows=0,
+	// since rows are streamed via FETCH later and we'd otherwise log
+	// nothing on the success path).
+	c.logQueryFinished(cursor.query, cursorStart, 0, nil)
 
 	typeOIDs := make([]int32, len(colTypes))
 	for i, ct := range colTypes {
