@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -379,10 +382,12 @@ func TestIsUserQueryError(t *testing.T) {
 		{"missing schema (3F000)", errors.New("Catalog Error: Schema with name \"missing\" does not exist!"), true},
 		{"dependent objects (2BP01)", errors.New("Dependency Error: Cannot drop entry because there are other entries that depend on it"), true},
 
-		// 57014 cancellation — class 57 is otherwise infra, but client-
-		// initiated cancels are user events. The short-circuit in
-		// isUserQueryError must keep this in the user bucket.
-		{"client cancellation (57014)", errors.New("context canceled"), true},
+		// 57014 cancellation — class 57 is "operator intervention". Caller-
+		// driven cancellation (Ctrl-C, deadline, client disconnect) is filtered
+		// at the call site via clientConn.isCallerCancellation, so any
+		// cancellation reaching isUserQueryError is infra (gRPC client closed
+		// because the worker died, takeover, etc.) and must surface at Error.
+		{"infra cancellation (57014)", errors.New("context canceled"), false},
 
 		// Infra classes — must NOT be treated as user errors.
 		{"unknown error → XX000", errors.New("something went wrong"), false},
@@ -529,5 +534,98 @@ func TestIsDropTableOnViewError(t *testing.T) {
 				t.Fatalf("isDropTableOnViewError(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestIsCallerCancellation pins down the discriminator that makes the
+// difference between "user pressed Ctrl-C" and "the worker died and gRPC
+// surfaced a Canceled status with a healthy request ctx." The latter must
+// NOT be classified as caller-driven, otherwise the error is silently
+// suppressed and infra failures don't show up in alerting.
+func TestIsCallerCancellation(t *testing.T) {
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{
+			name: "infra-driven gRPC Canceled with healthy ctx is NOT caller cancel",
+			ctx:  context.Background(),
+			err:  errors.New("flight execute: rpc error: code = Canceled desc = context canceled"),
+			want: false,
+		},
+		{
+			name: "user Ctrl-C: ctx canceled and err propagates",
+			ctx:  cancelledCtx,
+			err:  errors.New("flight execute: rpc error: code = Canceled desc = context canceled"),
+			want: true,
+		},
+		{
+			name: "raw context.Canceled with cancelled ctx",
+			ctx:  cancelledCtx,
+			err:  context.Canceled,
+			want: true,
+		},
+		{
+			name: "non-cancel error with cancelled ctx is not classified as cancel",
+			ctx:  cancelledCtx,
+			err:  errors.New("Catalog Error: table does not exist"),
+			want: false,
+		},
+		{
+			name: "nil err",
+			ctx:  cancelledCtx,
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "client connection closing (worker died)",
+			ctx:  context.Background(),
+			err:  errors.New("flight execute: rpc error: code = Canceled desc = grpc: the client connection is closing"),
+			want: false, // pre-fix this would have looked like a user cancel via the substring match
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &clientConn{ctx: tt.ctx}
+			if got := c.isCallerCancellation(tt.err); got != tt.want {
+				t.Errorf("isCallerCancellation = %v, want %v (err=%v, ctx.Err=%v)",
+					got, tt.want, tt.err, tt.ctx.Err())
+			}
+		})
+	}
+}
+
+// TestLogQueryErrorRoutesInfraCancelToErrorLevel locks in the alerting
+// invariant: a worker-death cancellation (gRPC Canceled bubbling up while
+// c.ctx is still healthy) must produce slog.LevelError "Query execution
+// errored.", not Info "Query execution failed." — because the latter gets
+// filtered out of alerting and drove the dev/prod observability blind spot
+// reported on 2026-05-04 (PR #516).
+func TestLogQueryErrorRoutesInfraCancelToErrorLevel(t *testing.T) {
+	prevLogger := slog.Default()
+	defer slog.SetDefault(prevLogger)
+
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	c := &clientConn{ctx: context.Background(), username: "test"}
+	infraErr := errors.New("flight execute: rpc error: code = Canceled desc = context canceled")
+	c.logQueryError("SELECT 1", infraErr)
+
+	out := buf.String()
+	if !strings.Contains(out, `level=ERROR`) {
+		t.Errorf("expected ERROR level for infra cancel, got:\n%s", out)
+	}
+	if !strings.Contains(out, `Query execution errored.`) {
+		t.Errorf("expected message 'Query execution errored.', got:\n%s", out)
+	}
+	if strings.Contains(out, `Query execution failed.`) {
+		t.Errorf("infra cancel should NOT emit 'Query execution failed.':\n%s", out)
 	}
 }

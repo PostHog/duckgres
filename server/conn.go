@@ -336,9 +336,34 @@ func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
 	}
 }
 
-// isQueryCancelled checks if an error is due to query cancellation
+// isQueryCancelled checks whether an error string indicates that *some*
+// context cancellation was involved. It does NOT distinguish caller-driven
+// cancellation (Ctrl-C, client disconnect, deadline) from infra-driven
+// cancellation (worker died, CP closed the gRPC client) — both surface here
+// as a wrapped "context canceled" string. Use it for SQLSTATE classification
+// where 57014 is correct either way; do not use it to gate error logging,
+// since infra cancels are real failures we want surfaced. Use
+// (*clientConn).isCallerCancellation for that.
 func isQueryCancelled(err error) bool {
 	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
+}
+
+// isCallerCancellation reports whether err is a cancellation that the caller
+// asked for — either through pgwire CancelRequest, an explicit ctx cancel, or
+// a deadline. Distinct from a gRPC Canceled status that bubbles up purely
+// because the CP closed the worker connection (worker death, takeover): in
+// that case c.ctx is still healthy, c.ctx.Err() is nil, and the surface error
+// must be logged as an infra failure rather than suppressed as "user
+// cancelled". This matters for alerting — "Query execution errored." should
+// fire on worker kills, not get silently downgraded to "Query finished.".
+func (c *clientConn) isCallerCancellation(err error) bool {
+	if !isQueryCancelled(err) {
+		return false
+	}
+	if c == nil || c.ctx == nil {
+		return false
+	}
+	return c.ctx.Err() != nil
 }
 
 // isDuckLakeTransactionConflict returns true if the error is a DuckLake
@@ -372,6 +397,10 @@ func isDuckLakeMetadataConnectionLost(err error) bool {
 // errors are classified by DuckDB's exception-type prefix; the prefix is the
 // only signal the Go driver exposes today, so we parse the message string.
 func classifyErrorCode(err error) string {
+	// Wire-side SQLSTATE: 57014 is correct for any cancellation regardless of
+	// whether the caller drove it. Use isQueryCancelled here, not the
+	// clientConn-aware variant — classifyErrorCode is called from contexts
+	// that don't have a *clientConn (e.g., direct test fixtures).
 	if isQueryCancelled(err) {
 		return "57014"
 	}
@@ -521,16 +550,16 @@ var userErrorSQLSTATEClasses = map[string]struct{}{
 // execution errored."). The discriminator is the SQLSTATE class —
 // already computed via classifyErrorCode for the pgwire response.
 //
-// 57014 (query_canceled) is technically class 57 (operator
-// intervention, otherwise treated as infra) but in our usage it means
-// the client pressed Ctrl-C, which is a user-initiated event — short-
-// circuit it back into the user bucket.
+// Cancellations (SQLSTATE 57014) are NOT short-circuited as user errors
+// here. The call sites (logQueryError, the clientConn error paths) gate
+// caller-driven cancellations upstream via clientConn.isCallerCancellation,
+// so by the time isUserQueryError sees a cancel-shaped err the cancellation
+// was infra-driven (gRPC client closed because the worker died, the worker
+// was retired, etc.) and class 57 = operator intervention is the right
+// bucket — that's a real failure we want surfaced at Error level.
 func isUserQueryError(err error) bool {
 	if err == nil {
 		return false
-	}
-	if isQueryCancelled(err) {
-		return true
 	}
 	code := classifyErrorCode(err)
 	if len(code) < 2 {
@@ -1433,7 +1462,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 			if err != nil {
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
-				if isQueryCancelled(err) {
+				if c.isCallerCancellation(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
 					c.logQueryError(query, err)
@@ -1509,7 +1538,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 		if err != nil {
 			errCode := classifyErrorCode(err)
 			errMsg := err.Error()
-			if isQueryCancelled(err) {
+			if c.isCallerCancellation(err) {
 				errMsg = "canceling statement due to user request"
 			} else {
 				c.logQueryError(query, err)
@@ -1624,7 +1653,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	if err != nil {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
 			c.logQueryError(query, err)
@@ -1699,7 +1728,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	if err := rows.Err(); err != nil {
 		errCode := "42000"
 		errMsg := err.Error()
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			errCode = "57014"
 			errMsg = "canceling statement due to user request"
 			c.sendError("ERROR", errCode, errMsg)
@@ -1803,7 +1832,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			}
 			if cursor.rows == nil {
 				if err := c.openCursor(cursor); err != nil {
-					if isQueryCancelled(err) {
+					if c.isCallerCancellation(err) {
 						c.sendError("ERROR", "57014", "canceling statement due to user request")
 					} else {
 						c.sendError("ERROR", "42000", err.Error())
@@ -1852,7 +1881,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				rowCount++
 			}
 			if err := cursor.rows.Err(); err != nil {
-				if isQueryCancelled(err) {
+				if c.isCallerCancellation(err) {
 					c.sendError("ERROR", "57014", "canceling statement due to user request")
 				} else {
 					c.sendError("ERROR", "42000", err.Error())
@@ -2001,7 +2030,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 			if err != nil {
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
-				if isQueryCancelled(err) {
+				if c.isCallerCancellation(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
 					c.logQueryError(executedQuery, err)
@@ -2051,7 +2080,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	if err != nil {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
 			c.logQueryError(executedQuery, err)
@@ -2360,7 +2389,7 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 	}
 
 	if err := rows.Err(); err != nil {
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
 			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
@@ -2435,7 +2464,7 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 	}
 
 	if err := rows.Err(); err != nil {
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
 			slog.Error("Row iteration error.", "user", c.username, "query", query, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
@@ -5290,7 +5319,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			if err != nil {
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
-				if isQueryCancelled(err) {
+				if c.isCallerCancellation(err) {
 					errMsg = "canceling statement due to user request"
 				} else {
 					c.logQueryError(convertedQuery, err)
@@ -5336,7 +5365,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	if err != nil {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			errMsg = "canceling statement due to user request"
 		} else {
 			c.logQueryError(convertedQuery, err)
@@ -5405,7 +5434,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	if err := rows.Err(); err != nil {
 		errCode := "42000"
 		errMsg := err.Error()
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			errCode = "57014"
 			errMsg = "canceling statement due to user request"
 			c.sendError("ERROR", errCode, errMsg)
@@ -5951,7 +5980,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 		if err := c.openCursor(cursor); err != nil {
 			errCode := "42000"
 			errMsg := err.Error()
-			if isQueryCancelled(err) {
+			if c.isCallerCancellation(err) {
 				errCode = "57014"
 				errMsg = "canceling statement due to user request"
 			}
@@ -6026,7 +6055,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 	if err := cursor.rows.Err(); err != nil {
 		errCode := "42000"
 		errMsg := err.Error()
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			errCode = "57014"
 			errMsg = "canceling statement due to user request"
 		}
@@ -6093,7 +6122,7 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 	// Open cursor on first FETCH
 	if cursor.rows == nil {
 		if err := c.openCursor(cursor); err != nil {
-			if isQueryCancelled(err) {
+			if c.isCallerCancellation(err) {
 				c.sendError("ERROR", "57014", "canceling statement due to user request")
 			} else {
 				c.sendError("ERROR", "42000", err.Error())
@@ -6134,7 +6163,7 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 	}
 
 	if err := cursor.rows.Err(); err != nil {
-		if isQueryCancelled(err) {
+		if c.isCallerCancellation(err) {
 			c.sendError("ERROR", "57014", "canceling statement due to user request")
 		} else {
 			c.sendError("ERROR", "42000", err.Error())
