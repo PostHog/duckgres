@@ -171,8 +171,8 @@ func TestActivateTenantRejectsDifferentTenantAfterActivation(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	pool.createDBPair = func(server.Config, chan struct{}, string, time.Time, string) (*server.DuckDBPair, error) {
-		return server.PairFromMain(&sql.DB{}), nil
+	pool.createDBPair = func(server.Config, chan struct{}, string, time.Time, string) (*DuckDBPair, error) {
+		return PairFromMain(&sql.DB{}), nil
 	}
 	pool.activateDBConnection = func(*sql.DB, server.Config, chan struct{}, string) error {
 		return nil
@@ -233,12 +233,12 @@ func TestCreateSessionAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 		},
 	}
 	close(pool.warmupDone)
-	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*server.DuckDBPair, error) {
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
 		db, err := sql.Open("duckdb", "")
 		if err != nil {
 			return nil, err
 		}
-		return server.PairFromMain(db), nil
+		return PairFromMain(db), nil
 	}
 
 	handler := &FlightSQLHandler{pool: pool}

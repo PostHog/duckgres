@@ -781,7 +781,7 @@ func (s *Server) releaseFileDB(username string) {
 // so performance is equivalent to in-memory while data persists across restarts.
 // When DataDir is empty, falls back to a pure in-memory database.
 func openBaseDB(cfg Config, username string) (*sql.DB, error) {
-	dsn, err := duckDBDSN(cfg, username)
+	dsn, err := DuckDBDSN(cfg, username)
 	if err != nil {
 		return nil, err
 	}
@@ -802,18 +802,37 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to ping duckdb: %w", err)
 	}
 
-	if err := configureMainDB(db, cfg, username); err != nil {
+	if err := ConfigureMainDB(db, cfg, username); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return db, nil
 }
 
-// configureMainDB applies the per-instance DuckDB settings (threads, memory,
+// DuckDBDSN returns the DSN openBaseDB / the duckdbservice pair builder use
+// for cfg/username. Exported so duckdbservice (which holds the duckdb-go-v2
+// import) can build a *duckdb.Connector against the same DSN that openBaseDB
+// would have passed to sql.Open.
+func DuckDBDSN(cfg Config, username string) (string, error) {
+	dsn := ":memory:?allow_unsigned_extensions=true"
+	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
+		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
+			return "", fmt.Errorf("invalid username for file persistence: %q (contains path separator or ..)", username)
+		}
+		if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
+			return "", fmt.Errorf("failed to create data directory %s: %w", cfg.DataDir, err)
+		}
+		dsn = filepath.Join(cfg.DataDir, username+".duckdb") + "?allow_unsigned_extensions=true"
+		slog.Info("Opening file-backed DuckDB.", "path", dsn)
+	}
+	return dsn, nil
+}
+
+// ConfigureMainDB applies the per-instance DuckDB settings (threads, memory,
 // temp dir, extensions, profiling) that the client-query DB needs. Shared
 // between openBaseDB (single-DB path) and OpenDuckDBPair (shared-connector
 // path) so the main DB is configured identically either way.
-func configureMainDB(db *sql.DB, cfg Config, username string) error {
+func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 	// Set DuckDB threads
 	threads := cfg.Threads
 	if threads == 0 {

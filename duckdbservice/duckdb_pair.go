@@ -1,17 +1,14 @@
-package server
+package duckdbservice
 
 import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
-	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
+	"github.com/posthog/duckgres/server"
 )
 
 // DuckDBPair holds two *sql.DBs that share the same underlying DuckDB instance:
@@ -27,6 +24,11 @@ import (
 // means catalogs, the SecretManager, and registered extensions are all visible
 // across both. The main session running a query benefits from a fresh secret
 // the moment Control swaps it — see RefreshS3Secret callers for the rationale.
+//
+// Lives in duckdbservice (not server) so the control-plane binary, which
+// imports server but not duckdbservice, doesn't transitively pull in the
+// libduckdb-linked duckdb-go-v2 driver. CI's "does-not-link-libduckdb" check
+// enforces this boundary.
 //
 // The owner must call Close on the pair when shutting down. Close on the
 // individual *sql.DBs goes through a non-closing wrapper, so the underlying
@@ -85,8 +87,8 @@ func (*nonClosingConnector) Close() error { return nil }
 // *sql.DB sharing it. The Main DB still goes through the same configuration
 // path as openBaseDB (threads, memory_limit, extensions, profiling, cache
 // settings); the Control DB is intentionally minimal.
-func OpenDuckDBPair(cfg Config, username string) (*DuckDBPair, error) {
-	dsn, err := duckDBDSN(cfg, username)
+func OpenDuckDBPair(cfg server.Config, username string) (*DuckDBPair, error) {
+	dsn, err := server.DuckDBDSN(cfg, username)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +120,7 @@ func OpenDuckDBPair(cfg Config, username string) (*DuckDBPair, error) {
 		return nil, fmt.Errorf("failed to ping duckdb (control): %w", err)
 	}
 
-	if err := configureMainDB(mainDB, cfg, username); err != nil {
+	if err := server.ConfigureMainDB(mainDB, cfg, username); err != nil {
 		_ = mainDB.Close()
 		_ = controlDB.Close()
 		_ = connector.Close()
@@ -139,12 +141,12 @@ func OpenDuckDBPair(cfg Config, username string) (*DuckDBPair, error) {
 // state — it sees the same Database (and therefore the same SecretManager and
 // attached catalogs) thanks to the shared connector, so no per-conn init is
 // needed for credential rotation.
-func CreateWorkerDBPair(cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time, serverVersion string) (*DuckDBPair, error) {
+func CreateWorkerDBPair(cfg server.Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time, serverVersion string) (*DuckDBPair, error) {
 	pair, err := OpenDuckDBPair(cfg, username)
 	if err != nil {
 		return nil, err
 	}
-	if err := ConfigureDBConnection(pair.Main, cfg, duckLakeSem, username, serverStartTime, serverVersion); err != nil {
+	if err := server.ConfigureDBConnection(pair.Main, cfg, duckLakeSem, username, serverStartTime, serverVersion); err != nil {
 		_ = pair.Close()
 		return nil, err
 	}
@@ -157,21 +159,4 @@ func CreateWorkerDBPair(cfg Config, duckLakeSem chan struct{}, username string, 
 // CreateWorkerDBPair, which returns a real pair.
 func PairFromMain(db *sql.DB) *DuckDBPair {
 	return &DuckDBPair{Main: db, Control: db}
-}
-
-// duckDBDSN returns the DSN openBaseDB would build for cfg/username. Kept
-// separate so OpenDuckDBPair and openBaseDB stay in lock-step.
-func duckDBDSN(cfg Config, username string) (string, error) {
-	dsn := ":memory:?allow_unsigned_extensions=true"
-	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
-		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
-			return "", fmt.Errorf("invalid username for file persistence: %q (contains path separator or ..)", username)
-		}
-		if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
-			return "", fmt.Errorf("failed to create data directory %s: %w", cfg.DataDir, err)
-		}
-		dsn = filepath.Join(cfg.DataDir, username+".duckdb") + "?allow_unsigned_extensions=true"
-		slog.Info("Opening file-backed DuckDB.", "path", dsn)
-	}
-	return dsn, nil
 }

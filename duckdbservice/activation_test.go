@@ -26,13 +26,13 @@ func TestSessionPoolActivateTenantConfiguresTenantRuntime(t *testing.T) {
 	var captured server.Config
 	var opened *sql.DB
 	pool.sharedWarmMode = true
-	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*server.DuckDBPair, error) {
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
 		db, err := sql.Open("duckdb", "")
 		if err != nil {
 			return nil, err
 		}
 		opened = db
-		return server.PairFromMain(db), nil
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		captured = cfg
@@ -84,12 +84,12 @@ func TestSessionPoolActivateTenantRejectsSecondActivation(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*server.DuckDBPair, error) {
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
 		db, err := sql.Open("duckdb", "")
 		if err != nil {
 			return nil, err
 		}
-		return server.PairFromMain(db), nil
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		return nil
@@ -136,12 +136,12 @@ func TestSessionPoolActivateTenantRejectsStaleOwnerEpoch(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*server.DuckDBPair, error) {
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
 		db, err := sql.Open("duckdb", "")
 		if err != nil {
 			return nil, err
 		}
-		return server.PairFromMain(db), nil
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		return nil
@@ -181,12 +181,12 @@ func TestSessionPoolActivateTenantAllowsSameOrgTakeover(t *testing.T) {
 	close(pool.warmupDone)
 
 	var activateCalls int
-	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*server.DuckDBPair, error) {
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
 		db, err := sql.Open("duckdb", "")
 		if err != nil {
 			return nil, err
 		}
-		return server.PairFromMain(db), nil
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		activateCalls++
@@ -250,12 +250,12 @@ func TestSessionPoolActivateTenantRejectsSameEpochOwnerChange(t *testing.T) {
 	}
 	close(pool.warmupDone)
 
-	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*server.DuckDBPair, error) {
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
 		db, err := sql.Open("duckdb", "")
 		if err != nil {
 			return nil, err
 		}
-		return server.PairFromMain(db), nil
+		return PairFromMain(db), nil
 	}
 	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
 		return nil
@@ -383,12 +383,12 @@ func TestReuseExistingActivationDoesNotBlockHealthChecks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open main duckdb: %v", err)
 	}
-	defer mainDB.Close()
+	defer func() { _ = mainDB.Close() }()
 	controlDB, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatalf("open control duckdb: %v", err)
 	}
-	defer controlDB.Close()
+	defer func() { _ = controlDB.Close() }()
 
 	pool := &SessionPool{
 		sessions:       make(map[string]*Session),

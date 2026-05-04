@@ -58,7 +58,7 @@ type SessionPool struct {
 	// secondary *sql.DB (Control) sharing the same DuckDB instance —
 	// see duckdbservice's credential-refresh path for why we need a side
 	// connection that doesn't queue behind a long-running client query.
-	activePair *server.DuckDBPair
+	activePair *DuckDBPair
 	// controlDB is activePair.Control, surfaced for direct use by control-side
 	// ops (CREATE OR REPLACE SECRET on STS rotation). Always nil before
 	// activation; nil-check before use and fall back to the main DB.
@@ -70,7 +70,7 @@ type SessionPool struct {
 	ownerCPInstanceID    string
 	workerID             int
 	activateTenantFunc   func(ActivationPayload) error
-	createDBPair         func(server.Config, chan struct{}, string, time.Time, string) (*server.DuckDBPair, error)
+	createDBPair         func(server.Config, chan struct{}, string, time.Time, string) (*DuckDBPair, error)
 	activateDBConnection func(*sql.DB, server.Config, chan struct{}, string) error
 	// refreshS3Secret is the indirection used for credential rotation on the
 	// active tenant. Defaults to server.RefreshS3Secret in production; tests
@@ -131,7 +131,7 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		stopCh:               make(chan struct{}),
 		warmupDone:           make(chan struct{}),
 		sharedWarmMode:       cfg.RequireActivation || sharedWarmWorkerEnabled(),
-		createDBPair:         server.CreateWorkerDBPair,
+		createDBPair:         CreateWorkerDBPair,
 		activateDBConnection: server.ActivateDBConnection,
 		refreshS3Secret:      server.RefreshS3Secret,
 	}
