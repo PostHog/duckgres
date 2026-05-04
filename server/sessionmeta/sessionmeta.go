@@ -51,10 +51,8 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 		}
 	}()
 
-	for _, stmt := range buildSessionMetadataSQL(database) {
-		if _, err := executor.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("apply session metadata override: %w", err)
-		}
+	if _, err := executor.ExecContext(ctx, buildSessionMetadataSQL(database)); err != nil {
+		return fmt.Errorf("apply session metadata override: %w", err)
 	}
 
 	return nil
@@ -112,8 +110,18 @@ func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, cat
 	return count > 0, rows.Err()
 }
 
-func buildSessionMetadataSQL(database string) []string {
-	return []string{
+// buildSessionMetadataSQL returns a single SQL script containing all the
+// per-session catalog/metadata setup statements concatenated with semicolons.
+// The DuckDB driver executes the script as a multi-statement batch in one
+// ExecContext call (one Flight RPC from the control plane to the worker
+// instead of N), which materially cuts session establishment latency on
+// remote-worker setups where each round-trip is non-trivial.
+//
+// All statements are independent: each is CREATE OR REPLACE VIEW or
+// CREATE TABLE IF NOT EXISTS, with no cross-statement dependencies that would
+// require ordering beyond the order they appear in the script.
+func buildSessionMetadataSQL(database string) string {
+	parts := []string{
 		sessionColumnMetadataTableSQL(),
 		buildSessionPgDatabaseViewSQL(database),
 		buildSessionInformationSchemaColumnsViewSQL(),
@@ -121,6 +129,7 @@ func buildSessionMetadataSQL(database string) []string {
 		buildSessionInformationSchemaSchemataViewSQL(),
 		buildSessionInformationSchemaViewsViewSQL(),
 	}
+	return strings.Join(parts, ";\n") + ";"
 }
 
 func sessionColumnMetadataTableSQL() string {
