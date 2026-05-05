@@ -66,8 +66,20 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.MaxWorkers = updates.MaxWorkers
 	org.MemoryBudget = updates.MemoryBudget
 	org.IdleTimeoutS = updates.IdleTimeoutS
-	org.WorkerCPURequest = updates.WorkerCPURequest
-	org.WorkerMemoryRequest = updates.WorkerMemoryRequest
+	if updates.WorkerCPURequest != "" {
+		org.WorkerCPURequest = updates.WorkerCPURequest
+	}
+	if updates.WorkerMemoryRequest != "" {
+		org.WorkerMemoryRequest = updates.WorkerMemoryRequest
+	}
+	if updates.HostnameAlias != nil {
+		if *updates.HostnameAlias == "" {
+			org.HostnameAlias = nil
+		} else {
+			alias := *updates.HostnameAlias
+			org.HostnameAlias = &alias
+		}
+	}
 	return copyOrg(org), true, nil
 }
 
@@ -1120,13 +1132,12 @@ func TestPatchTenantPinningReturnsNotFoundForMissingOrg(t *testing.T) {
 	}
 }
 
-func TestCreateUserPersistsPassthroughFlag(t *testing.T) {
+func TestCreateOrgPersistsHostnameAlias(t *testing.T) {
 	store := newFakeAPIStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"org_id":"analytics","username":"raw","password":"hunter2","passthrough":true}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	body := []byte(`{"name":"portola-uuid","database_name":"portola","hostname_alias":"entirely-chief-wildcat"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -1134,22 +1145,21 @@ func TestCreateUserPersistsPassthroughFlag(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	stored := store.users["analytics/raw"]
+	stored := store.orgs["portola-uuid"]
 	if stored == nil {
-		t.Fatal("user not stored")
+		t.Fatal("org not stored")
 	}
-	if !stored.Passthrough {
-		t.Errorf("Passthrough = false, want true")
+	if stored.HostnameAlias == nil || *stored.HostnameAlias != "entirely-chief-wildcat" {
+		t.Errorf("HostnameAlias = %v, want pointer to %q", stored.HostnameAlias, "entirely-chief-wildcat")
 	}
 }
 
-func TestCreateUserDefaultsPassthroughFalse(t *testing.T) {
+func TestCreateOrgEmptyHostnameAliasIsTreatedAsNone(t *testing.T) {
 	store := newFakeAPIStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"org_id":"analytics","username":"alice","password":"hunter2"}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	body := []byte(`{"name":"plain","database_name":"plain","hostname_alias":""}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -1157,28 +1167,27 @@ func TestCreateUserDefaultsPassthroughFalse(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	stored := store.users["analytics/alice"]
+	stored := store.orgs["plain"]
 	if stored == nil {
-		t.Fatal("user not stored")
+		t.Fatal("org not stored")
 	}
-	if stored.Passthrough {
-		t.Error("Passthrough = true, want false (default)")
+	if stored.HostnameAlias != nil {
+		t.Errorf("HostnameAlias = %v, want nil (empty string normalized to none)", stored.HostnameAlias)
 	}
 }
 
-func TestUpdateUserClearsPassthroughWithoutTouchingPassword(t *testing.T) {
+func TestUpdateOrgClearsHostnameAliasWithEmptyString(t *testing.T) {
 	store := newFakeAPIStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.users["analytics/raw"] = &configstore.OrgUser{
-		OrgID:       "analytics",
-		Username:    "raw",
-		Password:    "stored-hash",
-		Passthrough: true,
+	alias := "entirely-chief-wildcat"
+	store.orgs["portola-uuid"] = &configstore.Org{
+		Name:          "portola-uuid",
+		DatabaseName:  "portola",
+		HostnameAlias: &alias,
 	}
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"passthrough":false}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/raw", bytes.NewReader(body))
+	body := []byte(`{"hostname_alias":""}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/portola-uuid", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -1186,32 +1195,93 @@ func TestUpdateUserClearsPassthroughWithoutTouchingPassword(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	stored := store.users["analytics/raw"]
-	if stored.Passthrough {
-		t.Error("Passthrough not cleared")
-	}
-	if stored.Password != "stored-hash" {
-		t.Errorf("Password = %q, want preserved %q", stored.Password, "stored-hash")
+	stored := store.orgs["portola-uuid"]
+	if stored.HostnameAlias != nil {
+		t.Errorf("HostnameAlias not cleared: %v", stored.HostnameAlias)
 	}
 }
 
-func TestUpdateUserEmptyBodyReturnsCurrentRow(t *testing.T) {
-	// Pre-existing handler returned 404 here even though the user existed —
-	// the empty body produced an empty updates map, which GORM treats as a
-	// no-op (RowsAffected=0 → "user not found"). The new short-circuit makes
-	// no-op PUTs return 200 with the stored row so the response no longer
-	// lies about the user's existence.
+func TestCreateOrgRejectsInvalidHostnameAlias(t *testing.T) {
+	cases := []struct {
+		name  string
+		alias string
+	}{
+		{"contains dot (would silently fail SNI matching)", "foo.bar"},
+		{"contains underscore", "foo_bar"},
+		{"leading hyphen", "-foo"},
+		{"trailing hyphen", "foo-"},
+		{"contains slash", "foo/bar"},
+		{"contains uppercase A-Z is fine actually", ""}, // skipped — uppercase is allowed
+	}
+	for _, tc := range cases {
+		if tc.alias == "" {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			router := newTestAPIRouter(store)
+
+			body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q}`, tc.alias))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("alias %q: status = %d, want %d: %s", tc.alias, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if _, ok := store.orgs["acme"]; ok {
+				t.Errorf("alias %q: org should NOT have been created", tc.alias)
+			}
+		})
+	}
+}
+
+func TestCreateOrgAcceptsLongValidHostnameAlias(t *testing.T) {
 	store := newFakeAPIStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.users["analytics/raw"] = &configstore.OrgUser{
-		OrgID:       "analytics",
-		Username:    "raw",
-		Password:    "stored-hash",
-		Passthrough: true,
+	router := newTestAPIRouter(store)
+
+	// 63 chars exactly — at the RFC 1035 DNS label limit.
+	alias := strings.Repeat("a", 63)
+	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q}`, alias))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("63-char alias should be accepted: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateOrgRejectsHostnameAliasOver63Chars(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	alias := strings.Repeat("a", 64) // one over the limit
+	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q}`, alias))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("64-char alias should be rejected: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUpdateOrgOmittingHostnameAliasPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	alias := "entirely-chief-wildcat"
+	store.orgs["portola-uuid"] = &configstore.Org{
+		Name:          "portola-uuid",
+		DatabaseName:  "portola",
+		HostnameAlias: &alias,
 	}
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/raw", bytes.NewReader([]byte(`{}`)))
+	body := []byte(`{"max_workers":8}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/portola-uuid", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -1219,55 +1289,9 @@ func TestUpdateUserEmptyBodyReturnsCurrentRow(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	stored := store.users["analytics/raw"]
-	if stored.Password != "stored-hash" || !stored.Passthrough {
-		t.Errorf("no-op PUT changed stored row: password=%q passthrough=%v", stored.Password, stored.Passthrough)
-	}
-}
-
-func TestUpdateUserEmptyBodyOnMissingUserReturns404(t *testing.T) {
-	// The no-op short-circuit must still surface "user not found" when the
-	// underlying user genuinely doesn't exist.
-	store := newFakeAPIStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	router := newTestAPIRouter(store)
-
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/ghost", bytes.NewReader([]byte(`{}`)))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
-	}
-}
-
-func TestUpdateUserOmittingPassthroughPreservesIt(t *testing.T) {
-	store := newFakeAPIStore()
-	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.users["analytics/raw"] = &configstore.OrgUser{
-		OrgID:       "analytics",
-		Username:    "raw",
-		Password:    "stored-hash",
-		Passthrough: true,
-	}
-	router := newTestAPIRouter(store)
-
-	body := []byte(`{"password":"new-pw"}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/raw", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	stored := store.users["analytics/raw"]
-	if !stored.Passthrough {
-		t.Error("Passthrough cleared by partial update; should preserve when field omitted")
-	}
-	if stored.Password == "stored-hash" {
-		t.Error("Password not updated")
+	stored := store.orgs["portola-uuid"]
+	if stored.HostnameAlias == nil || *stored.HostnameAlias != "entirely-chief-wildcat" {
+		t.Errorf("HostnameAlias not preserved: %v", stored.HostnameAlias)
 	}
 }
 

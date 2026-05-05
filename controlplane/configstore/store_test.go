@@ -177,72 +177,43 @@ func TestSnapshotBuild(t *testing.T) {
 	}
 }
 
-func TestIsOrgUserPassthrough(t *testing.T) {
+func TestDatabaseNameForSNIPrefix(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
-			OrgUserPassthrough: map[OrgUserKey]bool{
-				{OrgID: "analytics", Username: "raw"}: true,
+			Orgs: map[string]*OrgConfig{
+				"portola-uuid": {Name: "portola-uuid", DatabaseName: "portola"},
+				"acme":         {Name: "acme", DatabaseName: "acme"},
+			},
+			DatabaseOrg: map[string]string{
+				"portola": "portola-uuid",
+				"acme":    "acme",
+			},
+			HostnameAliasOrg: map[string]string{
+				"entirely-chief-wildcat": "portola-uuid",
 			},
 		},
 	}
 
-	if !cs.IsOrgUserPassthrough("analytics", "raw") {
-		t.Error("IsOrgUserPassthrough(raw) = false, want true")
+	// Alias resolves to the org's database_name (the security-through-obscurity case).
+	if got := cs.DatabaseNameForSNIPrefix("entirely-chief-wildcat"); got != "portola" {
+		t.Errorf("DatabaseNameForSNIPrefix(alias) = %q, want %q", got, "portola")
 	}
-	// Unknown user -> false (no false-positive).
-	if cs.IsOrgUserPassthrough("analytics", "alice") {
-		t.Error("IsOrgUserPassthrough(unknown) = true, want false")
+	// Plain prefix passes through unchanged so legacy tenants (no alias) keep working.
+	if got := cs.DatabaseNameForSNIPrefix("acme"); got != "acme" {
+		t.Errorf("DatabaseNameForSNIPrefix(dbname) = %q, want %q", got, "acme")
 	}
-	// Unknown org -> false.
-	if cs.IsOrgUserPassthrough("other-org", "raw") {
-		t.Error("IsOrgUserPassthrough(other-org/raw) = true, want false")
+	// Unknown prefix passes through too — caller (ResolveDatabase) is the gate.
+	if got := cs.DatabaseNameForSNIPrefix("nobody"); got != "nobody" {
+		t.Errorf("DatabaseNameForSNIPrefix(unknown) = %q, want %q", got, "nobody")
 	}
-	// nil snapshot -> false (no panic).
+	// Empty input returns empty (don't masquerade as an unknown prefix).
+	if got := cs.DatabaseNameForSNIPrefix(""); got != "" {
+		t.Errorf("DatabaseNameForSNIPrefix(\"\") = %q, want \"\"", got)
+	}
+	// nil snapshot -> returns prefix (no panic).
 	empty := &ConfigStore{}
-	if empty.IsOrgUserPassthrough("analytics", "raw") {
-		t.Error("IsOrgUserPassthrough on empty store = true, want false")
-	}
-}
-
-func TestValidateOrgUserAndGetPassthrough(t *testing.T) {
-	hash := mustHash(t, "secret1")
-	cs := &ConfigStore{
-		snapshot: &Snapshot{
-			OrgUserPassword: map[OrgUserKey]string{
-				{OrgID: "analytics", Username: "alice"}: hash,
-				{OrgID: "analytics", Username: "raw"}:   hash,
-			},
-			OrgUserPassthrough: map[OrgUserKey]bool{
-				{OrgID: "analytics", Username: "raw"}: true,
-			},
-		},
-	}
-
-	// Valid creds + passthrough flag set -> (true, true).
-	valid, pt := cs.ValidateOrgUserAndGetPassthrough("analytics", "raw", "secret1")
-	if !valid || !pt {
-		t.Errorf("raw with secret1 = (%v,%v), want (true,true)", valid, pt)
-	}
-	// Valid creds + flag absent -> (true, false).
-	valid, pt = cs.ValidateOrgUserAndGetPassthrough("analytics", "alice", "secret1")
-	if !valid || pt {
-		t.Errorf("alice with secret1 = (%v,%v), want (true,false)", valid, pt)
-	}
-	// Wrong password -> (false, false). Passthrough must NOT leak through.
-	valid, pt = cs.ValidateOrgUserAndGetPassthrough("analytics", "raw", "wrong")
-	if valid || pt {
-		t.Errorf("raw with wrong pw = (%v,%v), want (false,false)", valid, pt)
-	}
-	// Unknown user -> (false, false).
-	valid, pt = cs.ValidateOrgUserAndGetPassthrough("analytics", "ghost", "secret1")
-	if valid || pt {
-		t.Errorf("ghost = (%v,%v), want (false,false)", valid, pt)
-	}
-	// nil snapshot -> (false, false), no panic.
-	empty := &ConfigStore{}
-	valid, pt = empty.ValidateOrgUserAndGetPassthrough("analytics", "raw", "secret1")
-	if valid || pt {
-		t.Errorf("empty store = (%v,%v), want (false,false)", valid, pt)
+	if got := empty.DatabaseNameForSNIPrefix("x"); got != "x" {
+		t.Errorf("DatabaseNameForSNIPrefix on empty store = %q, want %q", got, "x")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -194,6 +195,15 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	}
 	if updates.WorkerMemoryRequest != "" {
 		fields["worker_memory_request"] = updates.WorkerMemoryRequest
+	}
+	// HostnameAlias is *string: nil = preserve, "" = clear (NULL), "x" = set.
+	// NULL releases the unique-index slot so other orgs can take that alias.
+	if updates.HostnameAlias != nil {
+		if *updates.HostnameAlias == "" {
+			fields["hostname_alias"] = nil
+		} else {
+			fields["hostname_alias"] = *updates.HostnameAlias
+		}
 	}
 	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 	if result.Error != nil {
@@ -565,6 +575,13 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	// Normalize empty hostname_alias to NULL on insert so the unique index
+	// doesn't reject a second org with an explicit empty string. Centralizing
+	// the rule at the handler layer keeps any future store impl from having
+	// to repeat it.
+	if org.HostnameAlias != nil && *org.HostnameAlias == "" {
+		org.HostnameAlias = nil
+	}
 	if err := h.store.CreateOrg(&org); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -620,8 +637,43 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 }
 
 func validateOrgMutationPayload(org *configstore.Org) error {
-	if org != nil && org.Warehouse != nil {
+	if org == nil {
+		return nil
+	}
+	if org.Warehouse != nil {
 		return errWarehousePayloadNotAllowed
+	}
+	if org.HostnameAlias != nil {
+		if err := validateHostnameAlias(*org.HostnameAlias); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateHostnameAlias enforces that an alias is a valid single DNS label
+// (RFC 1035): alphanumeric + hyphens, no leading/trailing hyphen, 1–63
+// characters. The empty string is allowed (means "clear" on update / "no
+// alias" on create — see handler-level normalization). Aliases that violate
+// this would silently fail SNI matching (`sni_kubernetes.go:23` rejects
+// multi-label prefixes), so the validation lives at admission time to surface
+// the typo as a 400 instead of a mysteriously unreachable tenant.
+func validateHostnameAlias(alias string) error {
+	if alias == "" {
+		return nil
+	}
+	if len(alias) > 63 {
+		return errors.New("hostname_alias must be at most 63 characters (DNS label limit)")
+	}
+	for i, r := range alias {
+		isAlnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		isHyphen := r == '-'
+		if !isAlnum && !isHyphen {
+			return fmt.Errorf("hostname_alias contains invalid character %q (allowed: A-Z, a-z, 0-9, hyphen)", r)
+		}
+		if isHyphen && (i == 0 || i == len(alias)-1) {
+			return errors.New("hostname_alias must not start or end with a hyphen")
+		}
 	}
 	return nil
 }
