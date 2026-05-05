@@ -56,6 +56,15 @@ func main() {
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
 
+	// --mode is accepted but must be "duckdb-service". The K8s control
+	// plane spawns workers with `--mode duckdb-service` hardcoded
+	// (controlplane/k8s_pool.go), and the all-in-one duckgres binary
+	// uses --mode to route between standalone/control-plane/duckdb-service.
+	// This binary is duckdb-service by definition; we accept the flag so
+	// existing CP pod specs don't crash flag.Parse with "flag provided but
+	// not defined", and reject any other value to surface misuse loudly.
+	mode := flag.String("mode", "duckdb-service", "Run mode (must be 'duckdb-service'; accepted for compatibility with the control plane's hardcoded pod spec)")
+
 	// DuckDB execution
 	dataDir := flag.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	memoryLimit := flag.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
@@ -112,6 +121,21 @@ func main() {
 		flag.Usage()
 		os.Exit(0)
 	}
+
+	// Reject any --mode other than duckdb-service. This binary is
+	// duckdb-service by construction; --mode exists only for compatibility
+	// with the all-in-one binary's CLI shape.
+	if *mode != "duckdb-service" {
+		fmt.Fprintf(os.Stderr, "duckgres-worker only supports --mode duckdb-service (got %q). Use the all-in-one duckgres binary for standalone or control-plane modes.\n", *mode)
+		os.Exit(2)
+	}
+
+	// duckdbservice.SessionPool.Warmup() gates pre-warm on
+	// DUCKGRES_MODE == "duckdb-service" (duckdbservice/service.go). The K8s
+	// pool sets this env var when spawning workers, but we set it here
+	// defensively so the binary works identically when invoked directly
+	// (local smoke runs, custom orchestrators, etc.). No-op when already set.
+	_ = os.Setenv("DUCKGRES_MODE", "duckdb-service")
 
 	// Track explicitly-set flags so configresolve precedence (CLI > env > YAML > default) is consistent.
 	cliSet := make(map[string]bool)
