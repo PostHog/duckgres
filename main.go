@@ -17,6 +17,7 @@ import (
 	"github.com/posthog/duckgres/configresolve"
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
+	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/server"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -84,9 +85,9 @@ func main() {
 	// Check if we're running as a child worker process
 	if os.Getenv("DUCKGRES_CHILD_MODE") == "1" {
 		// Use the same logging/tracing setup as parent for consistent format
-		loggingShutdown := initLogging()
+		loggingShutdown := cliboot.InitLogging()
 		defer loggingShutdown()
-		tracingShutdown := initTracing()
+		tracingShutdown := cliboot.InitTracing()
 		defer tracingShutdown()
 		duckdbservice.LogCacheProxyStatus()
 		server.RunChildMode()
@@ -222,7 +223,7 @@ func main() {
 	// Handle -v shorthand before flag.Parse (Go's flag package doesn't support short aliases)
 	for _, arg := range os.Args[1:] {
 		if arg == "-v" {
-			fmt.Println(versionString())
+			fmt.Println(buildInfo().String())
 			os.Exit(0)
 		}
 	}
@@ -230,7 +231,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println(versionString())
+		fmt.Println(buildInfo().String())
 		os.Exit(0)
 	}
 
@@ -247,7 +248,7 @@ func main() {
 		}
 	}
 
-	// Load config file early so log_level from YAML can feed into initLogging().
+	// Load config file early so log_level from YAML can feed into cliboot.InitLogging().
 	var fileCfg *FileConfig
 	if *configFile != "" {
 		loadedCfg, err := loadConfigFile(*configFile)
@@ -259,20 +260,20 @@ func main() {
 	}
 
 	// Resolve log level: CLI flag > env var > YAML config > default (info).
-	// Set the env var so workers inherit it and parseLogLevel() picks it up.
+	// Set the env var so workers inherit it and cliboot's parseLogLevel picks it up.
 	if *logLevel != "" {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", *logLevel)
 	} else if os.Getenv("DUCKGRES_LOG_LEVEL") == "" && fileCfg != nil && fileCfg.LogLevel != "" {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", fileCfg.LogLevel)
 	}
 
-	loggingShutdown := initLogging()
+	loggingShutdown := cliboot.InitLogging()
 	defer loggingShutdown()
 
-	tracingShutdown := initTracing()
+	tracingShutdown := cliboot.InitTracing()
 	defer tracingShutdown()
 
-	logBuildInfo(*mode)
+	buildInfo().Log(*mode)
 	duckdbservice.LogCacheProxyStatus()
 
 	if fileCfg != nil {
