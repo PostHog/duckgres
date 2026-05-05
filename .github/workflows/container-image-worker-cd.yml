@@ -149,6 +149,12 @@ jobs:
                   # PR #528 follow-up).
                   echo "::group::generate ephemeral TLS pair"
                   CERT_DIR="$(mktemp -d)"
+                  # `-nodes` (skip private key encryption) is required: Go's
+                  # tls.LoadX509KeyPair expects an unencrypted PEM. The cert
+                  # lives in CI for ~30s, is never published, never reused,
+                  # and protects nothing real — so the unencrypted key is
+                  # the desired property here, not a vulnerability.
+                  # nosemgrep: trailofbits.generic.openssl-insecure-flags.openssl-insecure-flags
                   openssl req -x509 -newkey rsa:2048 -nodes \
                       -keyout "$CERT_DIR/server.key" \
                       -out "$CERT_DIR/server.crt" \
