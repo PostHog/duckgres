@@ -125,6 +125,12 @@ func (f *fakeConfigStore) IsOrgUserPassthrough(string, string) bool {
 	// elsewhere. Returning false keeps the existing assertions intact.
 	return false
 }
+func (f *fakeConfigStore) ValidateOrgUserAndGetPassthrough(orgID, user, pass string) (bool, bool) {
+	// SNI tests drive Flight SQL, not the PG auth path that uses the
+	// combined call. Forward to ValidateOrgUser so the test fakes that set
+	// validateOrgUser still work unchanged.
+	return f.ValidateOrgUser(orgID, user, pass), false
+}
 func (f *fakeConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
 	panic("UpsertFlightSessionRecord should not be called from SNI tests")
 }

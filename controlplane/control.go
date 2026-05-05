@@ -159,7 +159,11 @@ type ControlPlane struct {
 type ConfigStoreInterface interface {
 	ResolveDatabase(database string) (orgID string)
 	ValidateOrgUser(orgID, username, password string) bool
-	IsOrgUserPassthrough(orgID, username string) bool
+	// ValidateOrgUserAndGetPassthrough does both lookups against the same
+	// snapshot — the auth path needs both, and a single read closes the
+	// window where the snapshot could swap between two separate calls.
+	// passthrough is always false when valid is false.
+	ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool)
 	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no database param)
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
@@ -887,7 +891,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
-		if !cp.configStore.ValidateOrgUser(orgID, username, password) {
+		// Single combined lookup: validate credentials and read the
+		// passthrough flag against the same snapshot so a config-store poll
+		// that swaps the snapshot between two reads can't produce a stale
+		// passthrough flag for an authenticated session.
+		valid, isPassthrough := cp.configStore.ValidateOrgUserAndGetPassthrough(orgID, username, password)
+		if !valid {
 			slog.Warn("Authentication failed.", "user", username, "org", orgID, "database", effectiveDatabase, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
@@ -897,7 +906,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
-		passthroughUser = cp.configStore.IsOrgUserPassthrough(orgID, username)
+		passthroughUser = isPassthrough
 		// From here on, `database` reflects the SNI-resolved org. This is what
 		// gets passed to the worker as the logical database (drives the
 		// `current_database()` macro and pg_database view) so observability
@@ -1049,6 +1058,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
 	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
 	server.SetPassthrough(cc, passthroughUser)
+	if orgID != "" {
+		observeOrgPgSessionAccepted(orgID, passthroughUser)
+	}
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {

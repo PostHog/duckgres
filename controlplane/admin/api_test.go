@@ -1195,6 +1195,53 @@ func TestUpdateUserClearsPassthroughWithoutTouchingPassword(t *testing.T) {
 	}
 }
 
+func TestUpdateUserEmptyBodyReturnsCurrentRow(t *testing.T) {
+	// Pre-existing handler returned 404 here even though the user existed —
+	// the empty body produced an empty updates map, which GORM treats as a
+	// no-op (RowsAffected=0 → "user not found"). The new short-circuit makes
+	// no-op PUTs return 200 with the stored row so the response no longer
+	// lies about the user's existence.
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.users["analytics/raw"] = &configstore.OrgUser{
+		OrgID:       "analytics",
+		Username:    "raw",
+		Password:    "stored-hash",
+		Passthrough: true,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/raw", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.users["analytics/raw"]
+	if stored.Password != "stored-hash" || !stored.Passthrough {
+		t.Errorf("no-op PUT changed stored row: password=%q passthrough=%v", stored.Password, stored.Passthrough)
+	}
+}
+
+func TestUpdateUserEmptyBodyOnMissingUserReturns404(t *testing.T) {
+	// The no-op short-circuit must still surface "user not found" when the
+	// underlying user genuinely doesn't exist.
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/ghost", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
 func TestUpdateUserOmittingPassthroughPreservesIt(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}

@@ -244,6 +244,10 @@ func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
 // IsOrgUserPassthrough reports whether the given (org, user) is configured to
 // bypass the PostgreSQL compatibility layer. Returns false for unknown users —
 // callers must validate credentials separately before trusting this.
+//
+// Prefer ValidateOrgUserAndGetPassthrough when both auth and passthrough are
+// needed at the same point; this method is exposed for introspection (e.g.
+// admin dashboards) where credentials aren't being checked.
 func (cs *ConfigStore) IsOrgUserPassthrough(orgID, username string) bool {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -251,6 +255,32 @@ func (cs *ConfigStore) IsOrgUserPassthrough(orgID, username string) bool {
 		return false
 	}
 	return cs.snapshot.OrgUserPassthrough[OrgUserKey{OrgID: orgID, Username: username}]
+}
+
+// ValidateOrgUserAndGetPassthrough validates credentials AND reads the
+// passthrough flag against the same snapshot, eliminating the swap window
+// that two separate ValidateOrgUser + IsOrgUserPassthrough calls would
+// expose. valid=false always returns passthrough=false — never leak the
+// flag for failed auth or unknown users.
+func (cs *ConfigStore) ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		// Match ValidateOrgUser's timing-leak guard: still spend bcrypt time
+		// on failed auth so unknown-user paths look the same as wrong-password.
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		return false, false
+	}
+	key := OrgUserKey{OrgID: orgID, Username: username}
+	storedHash, ok := cs.snapshot.OrgUserPassword[key]
+	if !ok {
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		return false, false
+	}
+	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		return false, false
+	}
+	return true, cs.snapshot.OrgUserPassthrough[key]
 }
 
 // FindAndValidateUser scans all orgs to find and authenticate a user by username/password.

@@ -204,6 +204,48 @@ func TestIsOrgUserPassthrough(t *testing.T) {
 	}
 }
 
+func TestValidateOrgUserAndGetPassthrough(t *testing.T) {
+	hash := mustHash(t, "secret1")
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			OrgUserPassword: map[OrgUserKey]string{
+				{OrgID: "analytics", Username: "alice"}: hash,
+				{OrgID: "analytics", Username: "raw"}:   hash,
+			},
+			OrgUserPassthrough: map[OrgUserKey]bool{
+				{OrgID: "analytics", Username: "raw"}: true,
+			},
+		},
+	}
+
+	// Valid creds + passthrough flag set -> (true, true).
+	valid, pt := cs.ValidateOrgUserAndGetPassthrough("analytics", "raw", "secret1")
+	if !valid || !pt {
+		t.Errorf("raw with secret1 = (%v,%v), want (true,true)", valid, pt)
+	}
+	// Valid creds + flag absent -> (true, false).
+	valid, pt = cs.ValidateOrgUserAndGetPassthrough("analytics", "alice", "secret1")
+	if !valid || pt {
+		t.Errorf("alice with secret1 = (%v,%v), want (true,false)", valid, pt)
+	}
+	// Wrong password -> (false, false). Passthrough must NOT leak through.
+	valid, pt = cs.ValidateOrgUserAndGetPassthrough("analytics", "raw", "wrong")
+	if valid || pt {
+		t.Errorf("raw with wrong pw = (%v,%v), want (false,false)", valid, pt)
+	}
+	// Unknown user -> (false, false).
+	valid, pt = cs.ValidateOrgUserAndGetPassthrough("analytics", "ghost", "secret1")
+	if valid || pt {
+		t.Errorf("ghost = (%v,%v), want (false,false)", valid, pt)
+	}
+	// nil snapshot -> (false, false), no panic.
+	empty := &ConfigStore{}
+	valid, pt = empty.ValidateOrgUserAndGetPassthrough("analytics", "raw", "secret1")
+	if valid || pt {
+		t.Errorf("empty store = (%v,%v), want (false,false)", valid, pt)
+	}
+}
+
 func TestHashPassword(t *testing.T) {
 	hash, err := HashPassword("testpass")
 	if err != nil {
