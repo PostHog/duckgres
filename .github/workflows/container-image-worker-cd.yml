@@ -137,22 +137,57 @@ jobs:
                   echo "✓ --version OK"
                   echo "::endgroup::"
 
+                  # Worker's TCP listen path requires TLS — duckdbservice.Serve
+                  # always loads certs from cfg.TLSCertFile/KeyFile (default
+                  # ./certs/server.crt + .key) when listener.Network()=="tcp".
+                  # In prod the K8s pool mounts these via a Secret. For smoke
+                  # we generate an ephemeral self-signed pair and bind-mount
+                  # it; DUCKGRES_CERT / DUCKGRES_KEY env feed configresolve.
+                  # Without this, the binary boots far enough to log
+                  # "Starting DuckDB service" then dies in Serve(), which
+                  # the prior version of this step false-passed under (see
+                  # PR #528 follow-up).
+                  echo "::group::generate ephemeral TLS pair"
+                  CERT_DIR="$(mktemp -d)"
+                  openssl req -x509 -newkey rsa:2048 -nodes \
+                      -keyout "$CERT_DIR/server.key" \
+                      -out "$CERT_DIR/server.crt" \
+                      -days 1 -subj '/CN=worker-smoke' >/dev/null 2>&1
+                  chmod 644 "$CERT_DIR"/server.crt "$CERT_DIR"/server.key
+                  echo "::endgroup::"
+
                   echo "::group::boot smoke"
-                  docker run -d --name worker-smoke "$IMAGE" \
+                  docker run -d --name worker-smoke \
+                      -v "$CERT_DIR:/etc/worker-smoke-tls:ro" \
+                      -e DUCKGRES_CERT=/etc/worker-smoke-tls/server.crt \
+                      -e DUCKGRES_KEY=/etc/worker-smoke-tls/server.key \
+                      "$IMAGE" \
                       --mode duckdb-service \
                       --duckdb-listen :8816
-                  trap 'docker rm -f worker-smoke >/dev/null 2>&1 || true' EXIT
+                  trap 'docker rm -f worker-smoke >/dev/null 2>&1 || true; rm -rf "$CERT_DIR"' EXIT
 
+                  # Three exit paths: ok, container-exited, 30s timeout.
+                  # The level=ERROR substring check defends against the race
+                  # where the binary logs "Starting DuckDB service" and then
+                  # crashes inside Serve() before docker ps notices — the
+                  # previous version of this step false-passed under that
+                  # exact pattern.
                   status=fail
                   for i in $(seq 1 30); do
-                      if ! docker ps --format '{{.Names}}' | grep -qx worker-smoke; then
-                          echo "✗ worker-smoke exited before listening:"
-                          docker logs worker-smoke 2>&1 | tail -80
+                      logs=$(docker logs worker-smoke 2>&1)
+                      if grep -q "level=ERROR" <<<"$logs"; then
+                          echo "✗ worker logged level=ERROR before reaching ready state:"
+                          tail -80 <<<"$logs"
                           break
                       fi
-                      if docker logs worker-smoke 2>&1 | grep -q "Starting DuckDB service"; then
+                      if ! docker ps --format '{{.Names}}' | grep -qx worker-smoke; then
+                          echo "✗ worker-smoke exited before listening:"
+                          tail -80 <<<"$logs"
+                          break
+                      fi
+                      if grep -q "Starting DuckDB service" <<<"$logs"; then
                           echo "✓ worker reached 'Starting DuckDB service' after ${i}s"
-                          docker logs worker-smoke 2>&1 | tail -20
+                          tail -20 <<<"$logs"
                           status=ok
                           break
                       fi
