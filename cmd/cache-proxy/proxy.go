@@ -96,38 +96,82 @@ func (p *CacheProxy) shouldCache(r *http.Request) bool {
 // handleConnect tunnels an HTTPS CONNECT request. We don't cache — just copy
 // bytes between client and origin. Required because SET GLOBAL http_proxy
 // makes DuckDB tunnel all HTTPS through us, including external sources.
+//
+// What we CAN log: tunnel open (Info), dial / hijack errors (Warn / Error),
+// final byte counts and duration on close (Info). What we CANNOT log: the
+// actual HTTP request / response inside the tunnel — TLS terminates between
+// the worker and the origin, so the encrypted bytes flowing past us are
+// opaque. An S3 501 with an XML error envelope going through CONNECT is
+// invisible to us at the body level; only "CONNECT to s3:443 → N bytes
+// in / M bytes out / closed in T ms" is recoverable.
+//
+// We log this anyway because a black hole is worse than a partial trail —
+// at least we can confirm a request was attempted, see the target host,
+// and spot dial failures. For full request/response visibility on writes,
+// DuckDB has to actually use plain HTTP via forwardUncached (s3_use_ssl =
+// false), which httpfs has been observed ignoring for some PUT paths.
 func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
-	upstream, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	connectStart := time.Now()
+	target := r.Host
+	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
+		slog.Warn("Forward-proxy CONNECT dial failed.", "target", target, "error", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		_ = upstream.Close()
+		slog.Error("Forward-proxy CONNECT hijack unsupported.", "target", target)
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 	client, _, err := hijacker.Hijack()
 	if err != nil {
 		_ = upstream.Close()
+		slog.Warn("Forward-proxy CONNECT hijack failed.", "target", target, "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		_ = upstream.Close()
 		_ = client.Close()
+		slog.Warn("Forward-proxy CONNECT 200 write failed.", "target", target, "error", err)
 		return
 	}
+	slog.Info("Forward-proxy CONNECT opened.", "target", target)
+
+	// Track byte counts in both directions and emit a single closed log
+	// once both legs finish, so a single CONNECT produces exactly one
+	// opened + one closed pair with the bytes transferred. Wait on both
+	// goroutines so the close-log fires once, not racy.
+	var sentToUpstream, recvFromUpstream int64
+	upstreamDone := make(chan struct{})
+	clientDone := make(chan struct{})
+
 	go func() {
-		defer func() { _ = upstream.Close() }()
-		defer func() { _ = client.Close() }()
-		_, _ = io.Copy(upstream, client)
+		defer close(upstreamDone)
+		n, _ := io.Copy(upstream, client)
+		sentToUpstream = n
+		_ = upstream.Close()
+		_ = client.Close()
 	}()
 	go func() {
-		defer func() { _ = upstream.Close() }()
-		defer func() { _ = client.Close() }()
-		_, _ = io.Copy(client, upstream)
+		defer close(clientDone)
+		n, _ := io.Copy(client, upstream)
+		recvFromUpstream = n
+		_ = upstream.Close()
+		_ = client.Close()
+	}()
+
+	go func() {
+		<-upstreamDone
+		<-clientDone
+		slog.Info("Forward-proxy CONNECT closed.",
+			"target", target,
+			"sent_bytes", sentToUpstream,
+			"recv_bytes", recvFromUpstream,
+			"duration_ms", time.Since(connectStart).Milliseconds())
 	}()
 }
 
