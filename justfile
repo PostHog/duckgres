@@ -260,7 +260,7 @@ test:
 # Run unit tests only
 [group('test')]
 test-unit:
-    go test -v -p 1 . ./duckdbservice/... ./server/... ./transpiler/...
+    go test -v -p 1 . ./duckdbservice/... ./server/... ./transpiler/... ./internal/...
 
 # Run integration tests
 [group('test')]

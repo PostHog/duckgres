@@ -1,4 +1,4 @@
-package main
+package cliboot
 
 import (
 	"context"
@@ -13,12 +13,12 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-// initTracing configures an OTLP trace exporter when
+// InitTracing configures an OTLP trace exporter when
 // OTEL_EXPORTER_OTLP_TRACES_ENDPOINT (or DUCKGRES_TRACE_ENDPOINT) is set.
 // When no endpoint is configured, the global TracerProvider remains the
 // default no-op, adding zero overhead.
 // Returns a shutdown function that flushes the batch span processor.
-func initTracing() func() {
+func InitTracing() func() {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
 	if endpoint == "" {
 		endpoint = os.Getenv("DUCKGRES_TRACE_ENDPOINT")

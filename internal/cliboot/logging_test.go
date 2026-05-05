@@ -1,4 +1,4 @@
-package main
+package cliboot
 
 import (
 	"bytes"
@@ -15,10 +15,10 @@ import (
 // which break key=value parsers downstream.
 func TestStampedHandlerQuotesValuesWithSpaces(t *testing.T) {
 	tests := []struct {
-		name      string
-		attrs     []slog.Attr
-		wantSub   string
-		notWant   string
+		name    string
+		attrs   []slog.Attr
+		wantSub string
+		notWant string
 	}{
 		{
 			name:    "error with spaces is quoted",
@@ -47,7 +47,7 @@ func TestStampedHandlerQuotesValuesWithSpaces(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			h := &stampedHandler{out: &buf, level: slog.LevelDebug}
+			h := &StampedHandler{out: &buf, level: slog.LevelDebug}
 			logger := slog.New(h)
 			logger.LogAttrs(context.Background(), slog.LevelInfo, "msg", tt.attrs...)
 			out := buf.String()
@@ -114,7 +114,7 @@ func TestRedactingHandler(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			inner := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
-			handler := &redactingHandler{inner: inner}
+			handler := &RedactingHandler{Inner: inner}
 			logger := slog.New(handler)
 
 			logger.LogAttrs(context.Background(), slog.LevelInfo, tt.msg, tt.attrs...)
