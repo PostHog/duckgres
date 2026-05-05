@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,7 +18,6 @@ import (
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/server"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // FileConfig is the YAML configuration schema, sourced from the
@@ -49,29 +47,6 @@ var (
 	env            = configloader.Env
 )
 
-// initMetrics starts the Prometheus metrics HTTP server on :9090/metrics.
-// Returns the http.Server instance so it can be shut down during handover.
-func initMetrics() *http.Server {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	srv := &http.Server{
-		Addr:    ":9090",
-		Handler: mux,
-	}
-	go func() {
-		for {
-			slog.Info("Starting metrics server", "addr", srv.Addr)
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				slog.Warn("Metrics server error, retrying in 1s.", "error", err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			return
-		}
-	}()
-	return srv
-}
-
 func main() {
 	// Ignore SIGPIPE to prevent DuckDB's C++ code (and libraries like libpq
 	// inside DuckLake) from crashing the process when a network connection
@@ -94,78 +69,24 @@ func main() {
 		return // RunChildMode calls os.Exit
 	}
 
-	// Define CLI flags with environment variable fallbacks
+	// CLIInputs-backed flags (host/port/data-dir/k8s-*/etc) live in
+	// configresolve so cmd/duckgres-controlplane can register the same set
+	// without two copies of the table drifting. The harvest closure
+	// produces a populated CLIInputs (with cli.Set) post-Parse.
+	harvestCLIInputs := configresolve.RegisterCLIInputsFlags(flag.CommandLine)
+
+	// Bespoke flags: not in CLIInputs because they don't flow through
+	// ResolveEffective. --mode/--repl/--psql/--socket-dir/--duckdb-* are
+	// consumed directly below; --config/--log-level/--version/--help are
+	// pre-resolver runtime knobs.
 	configFile := flag.String("config", env("DUCKGRES_CONFIG", ""), "Path to YAML config file (env: DUCKGRES_CONFIG)")
-	host := flag.String("host", "", "Host to bind to (env: DUCKGRES_HOST)")
-	port := flag.Int("port", 0, "Port to listen on (env: DUCKGRES_PORT)")
-	flightPort := flag.Int("flight-port", 0, "Control-plane Arrow Flight SQL ingress port, 0=disabled (env: DUCKGRES_FLIGHT_PORT)")
-	flightSessionIdleTTL := flag.String("flight-session-idle-ttl", "", "Flight auth session idle TTL (e.g., '10m') (env: DUCKGRES_FLIGHT_SESSION_IDLE_TTL)")
-	flightSessionReapInterval := flag.String("flight-session-reap-interval", "", "Flight auth session reap interval (e.g., '1m') (env: DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL)")
-	flightHandleIdleTTL := flag.String("flight-handle-idle-ttl", "", "Flight prepared/query handle idle TTL (e.g., '15m') (env: DUCKGRES_FLIGHT_HANDLE_IDLE_TTL)")
-	flightSessionTokenTTL := flag.String("flight-session-token-ttl", "", "Flight issued session token absolute TTL (e.g., '1h') (env: DUCKGRES_FLIGHT_SESSION_TOKEN_TTL)")
-	dataDir := flag.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
-	certFile := flag.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
-	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
-	filePersistence := flag.Bool("file-persistence", false, "Persist DuckDB to <data-dir>/<username>.duckdb instead of in-memory (env: DUCKGRES_FILE_PERSISTENCE)")
-	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
-	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
-	sessionInitTimeout := flag.String("session-init-timeout", "", "Session startup metadata/probe timeout (e.g., '10s', '30s') (env: DUCKGRES_SESSION_INIT_TIMEOUT)")
-	memoryLimit := flag.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
-	threads := flag.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
-	memoryBudget := flag.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
-	memoryRebalance := flag.Bool("memory-rebalance", false, "Enable dynamic per-connection memory reallocation (control-plane mode) (env: DUCKGRES_MEMORY_REBALANCE)")
-	duckLakeDeltaCatalogEnabled := flag.Bool("ducklake-delta-catalog-enabled", false, "Attach a Delta Lake catalog during DuckLake worker boot (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
-	duckLakeDeltaCatalogPath := flag.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach, defaults to sibling delta/ prefix at DuckLake object-store root (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
-	duckLakeDefaultSpecVersion := flag.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
 	logLevel := flag.String("log-level", "", "Log level: debug, info, warn, error (env: DUCKGRES_LOG_LEVEL)")
 	repl := flag.Bool("repl", false, "Start an interactive SQL shell instead of the server")
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
-
-	// Rate limiting flags
-	maxConnections := flag.Int("max-connections", 0, "Max concurrent connections, 0=unlimited (env: DUCKGRES_MAX_CONNECTIONS)")
-
-	// Control plane flags
 	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
-	processMinWorkers := flag.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
-	processMaxWorkers := flag.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
-	processRetireOnSessionEnd := flag.Bool("process-retire-on-session-end", false, "Retire a process worker immediately after its last session ends instead of keeping it warm for reuse (control-plane mode) (env: DUCKGRES_PROCESS_RETIRE_ON_SESSION_END)")
-	workerQueueTimeout := flag.String("worker-queue-timeout", "", "How long to wait for an available worker slot (e.g., '5m') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
-	workerIdleTimeout := flag.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
-	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for planned shutdowns/upgrades to drain before forcing exit (default: '24h' in process mode, '15m' in remote mode) (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
-	workerBackend := flag.String("worker-backend", "", "Worker backend: process (default) or remote for config-store-backed K8s multitenant mode (env: DUCKGRES_WORKER_BACKEND)")
-	k8sWorkerImage := flag.String("k8s-worker-image", "", "Container image for K8s worker pods (env: DUCKGRES_K8S_WORKER_IMAGE)")
-	k8sWorkerNamespace := flag.String("k8s-worker-namespace", "", "K8s namespace for worker pods (env: DUCKGRES_K8S_WORKER_NAMESPACE)")
-	k8sControlPlaneID := flag.String("k8s-control-plane-id", "", "Unique CP identifier for labeling worker pods (env: DUCKGRES_K8S_CONTROL_PLANE_ID)")
-	k8sWorkerPort := flag.Int("k8s-worker-port", 0, "gRPC port on K8s worker pods (default: 8816) (env: DUCKGRES_K8S_WORKER_PORT)")
-	k8sWorkerSecret := flag.String("k8s-worker-secret", "", "K8s Secret name for worker bearer token (env: DUCKGRES_K8S_WORKER_SECRET)")
-	k8sWorkerConfigMap := flag.String("k8s-worker-configmap", "", "ConfigMap name for worker duckgres.yaml (env: DUCKGRES_K8S_WORKER_CONFIGMAP)")
-	k8sWorkerImagePullPolicy := flag.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
-	k8sWorkerServiceAccount := flag.String("k8s-worker-service-account", "", "Neutral ServiceAccount name for K8s worker pods (default: duckgres-worker) (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
-	k8sMaxWorkers := flag.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=auto-derived (env: DUCKGRES_K8S_MAX_WORKERS)")
-	k8sSharedWarmTarget := flag.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
-	awsRegion := flag.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
-
-	// Config store flags (multi-tenant mode)
-	configStore := flag.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
-	configPollInterval := flag.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
-	internalSecret := flag.String("internal-secret", "", "Shared secret for API authentication (env: DUCKGRES_INTERNAL_SECRET)")
-	sniRoutingMode := flag.String("sni-routing-mode", "", "Hostname-based org routing: 'off' (default), 'passthrough' (prefer SNI, log legacy), 'enforce' (reject without managed hostname). Multi-tenant only. (env: DUCKGRES_SNI_ROUTING_MODE)")
-	managedHostnameSuffixes := flag.String("managed-hostname-suffixes", "", "Comma-separated DNS suffixes (each starting with '.') treated as authoritative for org routing, e.g. '.dw.us.postwh.com'. (env: DUCKGRES_MANAGED_HOSTNAME_SUFFIXES)")
-
-	// ACME/Let's Encrypt flags
-	acmeDomain := flag.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
-	acmeEmail := flag.String("acme-email", "", "Contact email for Let's Encrypt notifications (env: DUCKGRES_ACME_EMAIL)")
-	acmeCacheDir := flag.String("acme-cache-dir", "", "Directory for ACME certificate cache (env: DUCKGRES_ACME_CACHE_DIR)")
-	acmeDNSProvider := flag.String("acme-dns-provider", "", "DNS provider for ACME DNS-01 challenges, e.g. 'route53' (env: DUCKGRES_ACME_DNS_PROVIDER)")
-	acmeDNSZoneID := flag.String("acme-dns-zone-id", "", "Route53 hosted zone ID for ACME DNS-01 challenges (env: DUCKGRES_ACME_DNS_ZONE_ID)")
-
-	// Query log flags
-	queryLog := flag.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
-
-	// DuckDB service flags
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
 	duckdbListenFD := flag.Int("duckdb-listen-fd", 0, "Inherit a pre-bound listener FD instead of creating a new socket (duckdb-service mode, set by control plane)")
 	duckdbToken := flag.String("duckdb-token", "", "Bearer token for DuckDB service auth (duckdb-service mode, env: DUCKGRES_DUCKDB_TOKEN)")
@@ -235,12 +156,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Track explicitly-set CLI flags so precedence is consistent.
-	cliSet := make(map[string]bool)
-	flag.Visit(func(f *flag.Flag) {
-		cliSet[f.Name] = true
-	})
-
 	// Auto-detect duckgres.yaml if no config file was explicitly specified
 	if *configFile == "" {
 		if _, err := os.Stat("duckgres.yaml"); err == nil {
@@ -291,60 +206,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
-		Set:                         cliSet,
-		Host:                        *host,
-		Port:                        *port,
-		FlightPort:                  *flightPort,
-		FlightSessionIdleTTL:        *flightSessionIdleTTL,
-		FlightSessionReapInterval:   *flightSessionReapInterval,
-		FlightHandleIdleTTL:         *flightHandleIdleTTL,
-		FlightSessionTokenTTL:       *flightSessionTokenTTL,
-		DataDir:                     *dataDir,
-		CertFile:                    *certFile,
-		KeyFile:                     *keyFile,
-		FilePersistence:             *filePersistence,
-		ProcessIsolation:            *processIsolation,
-		IdleTimeout:                 *idleTimeout,
-		SessionInitTimeout:          *sessionInitTimeout,
-		MemoryLimit:                 *memoryLimit,
-		Threads:                     *threads,
-		MemoryBudget:                *memoryBudget,
-		MemoryRebalance:             *memoryRebalance,
-		DuckLakeDeltaCatalogEnabled: *duckLakeDeltaCatalogEnabled,
-		DuckLakeDeltaCatalogPath:    *duckLakeDeltaCatalogPath,
-		DuckLakeDefaultSpecVersion:  *duckLakeDefaultSpecVersion,
-		ProcessMinWorkers:           *processMinWorkers,
-		ProcessMaxWorkers:           *processMaxWorkers,
-		ProcessRetireOnSessionEnd:   *processRetireOnSessionEnd,
-		WorkerQueueTimeout:          *workerQueueTimeout,
-		WorkerIdleTimeout:           *workerIdleTimeout,
-		HandoverDrainTimeout:        *handoverDrainTimeout,
-		ACMEDomain:                  *acmeDomain,
-		ACMEEmail:                   *acmeEmail,
-		ACMECacheDir:                *acmeCacheDir,
-		ACMEDNSProvider:             *acmeDNSProvider,
-		ACMEDNSZoneID:               *acmeDNSZoneID,
-		MaxConnections:              *maxConnections,
-		ConfigStoreConn:             *configStore,
-		ConfigPollInterval:          *configPollInterval,
-		InternalSecret:              *internalSecret,
-		SNIRoutingMode:              *sniRoutingMode,
-		ManagedHostnameSuffixes:     *managedHostnameSuffixes,
-		WorkerBackend:               *workerBackend,
-		K8sWorkerImage:              *k8sWorkerImage,
-		K8sWorkerNamespace:          *k8sWorkerNamespace,
-		K8sControlPlaneID:           *k8sControlPlaneID,
-		K8sWorkerPort:               *k8sWorkerPort,
-		K8sWorkerSecret:             *k8sWorkerSecret,
-		K8sWorkerConfigMap:          *k8sWorkerConfigMap,
-		K8sWorkerImagePullPolicy:    *k8sWorkerImagePullPolicy,
-		K8sWorkerServiceAccount:     *k8sWorkerServiceAccount,
-		K8sMaxWorkers:               *k8sMaxWorkers,
-		K8sSharedWarmTarget:         *k8sSharedWarmTarget,
-		AWSRegion:                   *awsRegion,
-		QueryLog:                    *queryLog,
-	}, os.Getenv, func(msg string) {
+	resolved := configresolve.ResolveEffective(fileCfg, harvestCLIInputs(), os.Getenv, func(msg string) {
 		slog.Warn(msg)
 	})
 	cfg := resolved.Server
@@ -439,7 +301,7 @@ func main() {
 		return
 	}
 
-	metricsSrv := initMetrics()
+	metricsSrv := cliboot.InitMetrics()
 
 	// Create data directory if it doesn't exist
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
