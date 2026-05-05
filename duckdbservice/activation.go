@@ -110,13 +110,30 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	if p.workerID > 0 && payload.WorkerID != p.workerID {
 		return fmt.Errorf("stale worker_id %d (current %d)", payload.WorkerID, p.workerID)
 	}
+	// Idempotent same-payload check FIRST, before the epoch guard. This is
+	// the dup-call race: two concurrent ActivateTenant goroutines can both
+	// pass Phase 1 (currentOwnerEpoch=0), both run Phase 2 (the slow
+	// activateDBConnection), then race Phase 3. Whichever lands second
+	// observes p.ownerEpoch already bumped to its own payload value and,
+	// without this early-return, would fall through to the epoch guard
+	// below and return "stale owner epoch N (current N)" — even though
+	// the activation it intended to commit is *byte-identical* to the one
+	// already committed. The CP would then treat the failure as fatal and
+	// retire a perfectly-good worker (rollout-race incident on dev
+	// 2026-05-05).
+	//
+	// Genuine takeover races (different cp_instance_ids / different
+	// payloads) still fall through to the epoch guard and are arbitrated
+	// by "highest epoch wins" as before.
+	if p.activation != nil &&
+		sameTenantActivationRuntime(p.activation.payload, payload) &&
+		reflect.DeepEqual(p.activation.payload, payload) {
+		return nil
+	}
 	if payload.OwnerEpoch <= p.ownerEpoch {
 		return fmt.Errorf("stale owner epoch %d (current %d)", payload.OwnerEpoch, p.ownerEpoch)
 	}
 	if p.activation != nil {
-		if sameTenantActivationRuntime(p.activation.payload, payload) && reflect.DeepEqual(p.activation.payload, payload) {
-			return nil
-		}
 		return fmt.Errorf("worker already activated for org %q", p.activation.payload.OrgID)
 	}
 
