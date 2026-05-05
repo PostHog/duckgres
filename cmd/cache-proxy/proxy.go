@@ -349,9 +349,17 @@ func (p *CacheProxy) serveBody(w http.ResponseWriter, data []byte, rangeHeader, 
 
 // forwardUncached forwards a request to the origin without caching. Used for
 // HEAD and other non-GET methods that shouldn't consume cache space.
+//
+// Logs symmetrically with HandleProxy's GET path so a non-2xx PUT/POST
+// (e.g. an S3 501 on a parquet write) is visible in Loki — without this,
+// the non-cached path was a black hole and an upstream-rejected write
+// surfaced only as a DuckDB-side "HTTP code 501" with no proxy-side
+// breadcrumb to correlate against.
 func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
 	if err != nil {
+		slog.Warn("Forward-proxy request build failed.",
+			"method", r.Method, "url", r.URL.String(), "error", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -367,6 +375,8 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		slog.Warn("Forward-proxy origin transport failed.",
+			"method", r.Method, "url", r.URL.String(), "error", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -380,8 +390,27 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
+
+	// Capture the body for the log preview on non-2xx responses so the
+	// origin's error envelope (e.g. S3's <Error><Code>...</Code>...) is
+	// available without an additional debug round-trip. On 2xx we pass the
+	// body straight through to the client without buffering — successful
+	// writes can be large.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		w.WriteHeader(resp.StatusCode)
+		n, _ := io.Copy(w, resp.Body)
+		slog.Info("Forward-proxy served.",
+			"method", r.Method, "url", r.URL.String(),
+			"status", resp.StatusCode, "bytes", n)
+		return
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	slog.Warn("Forward-proxy origin returned non-2xx.",
+		"method", r.Method, "url", r.URL.String(),
+		"status", resp.StatusCode, "body_preview", previewBody(body))
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	_, _ = w.Write(body)
 }
 
 // HandlePeerHas responds to "do you have this cache key?" from peers.
