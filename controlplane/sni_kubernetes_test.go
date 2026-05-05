@@ -90,13 +90,15 @@ func TestManagedHostnameHint(t *testing.T) {
 // returns. Only methods used by cpFlightCredentialValidator are exercised;
 // the rest are stubbed to fail loudly if hit.
 type fakeConfigStore struct {
-	resolveDatabase     func(string) string
-	validateOrgUser     func(orgID, user, pass string) bool
-	findAndValidateUser func(user, pass string) (string, bool)
+	resolveDatabase          func(string) string
+	databaseNameForSNIPrefix func(string) string
+	validateOrgUser          func(orgID, user, pass string) bool
+	findAndValidateUser      func(user, pass string) (string, bool)
 
-	resolveDatabaseCalls     int
-	validateOrgUserCalls     int
-	findAndValidateUserCalls int
+	resolveDatabaseCalls          int
+	databaseNameForSNIPrefixCalls int
+	validateOrgUserCalls          int
+	findAndValidateUserCalls      int
 }
 
 func (f *fakeConfigStore) ResolveDatabase(database string) string {
@@ -105,6 +107,13 @@ func (f *fakeConfigStore) ResolveDatabase(database string) string {
 		return ""
 	}
 	return f.resolveDatabase(database)
+}
+func (f *fakeConfigStore) DatabaseNameForSNIPrefix(prefix string) string {
+	f.databaseNameForSNIPrefixCalls++
+	if f.databaseNameForSNIPrefix == nil {
+		return prefix // back-compat default: prefix is its own dbname
+	}
+	return f.databaseNameForSNIPrefix(prefix)
 }
 func (f *fakeConfigStore) ValidateOrgUser(orgID, user, pass string) bool {
 	f.validateOrgUserCalls++

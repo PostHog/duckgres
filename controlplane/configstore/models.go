@@ -3,9 +3,16 @@ package configstore
 import "time"
 
 // Org represents a tenant with per-org resource limits.
+//
+// HostnameAlias decouples the SNI hostname prefix from database_name so an org
+// can be reachable at <alias>.<managed-suffix> while clients still connect
+// with dbname=<database_name>. *string + sparse-unique index: NULL means "no
+// alias", multiple orgs can share the NULL state, but any non-NULL alias must
+// be unique across orgs (Postgres ignores NULL in UNIQUE).
 type Org struct {
 	Name                string            `gorm:"primaryKey;size:255" json:"name"`
 	DatabaseName        string            `gorm:"size:255;uniqueIndex" json:"database_name"`
+	HostnameAlias       *string           `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
 	MaxWorkers          int               `gorm:"default:0" json:"max_workers"`
 	MemoryBudget        string            `gorm:"size:32" json:"memory_budget"`
 	IdleTimeoutS        int               `gorm:"default:0" json:"idle_timeout_s"`
@@ -313,6 +320,7 @@ func (FlightSessionRecord) TableName() string { return "flight_session_records" 
 type OrgConfig struct {
 	Name                string
 	DatabaseName        string
+	HostnameAlias       string // empty when no alias is configured
 	MaxWorkers          int
 	MemoryBudget        string
 	IdleTimeoutS        int

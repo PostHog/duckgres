@@ -170,6 +170,12 @@ func (s *gormAPIStore) ListOrgs() ([]configstore.Org, error) {
 
 func (s *gormAPIStore) CreateOrg(org *configstore.Org) error {
 	org.Warehouse = nil
+	// Normalize empty hostname_alias to NULL so the unique index doesn't
+	// reject a second org with an explicit empty string. Callers should send
+	// nil/absent or a non-empty value; "" is treated as "no alias".
+	if org.HostnameAlias != nil && *org.HostnameAlias == "" {
+		org.HostnameAlias = nil
+	}
 	return s.db().Omit("Warehouse").Create(org).Error
 }
 
@@ -194,6 +200,15 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	}
 	if updates.WorkerMemoryRequest != "" {
 		fields["worker_memory_request"] = updates.WorkerMemoryRequest
+	}
+	// HostnameAlias is *string: nil = preserve, "" = clear (NULL), "x" = set.
+	// NULL releases the unique-index slot so other orgs can take that alias.
+	if updates.HostnameAlias != nil {
+		if *updates.HostnameAlias == "" {
+			fields["hostname_alias"] = nil
+		} else {
+			fields["hostname_alias"] = *updates.HostnameAlias
+		}
 	}
 	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
 	if result.Error != nil {

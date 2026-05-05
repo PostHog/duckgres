@@ -31,6 +31,7 @@ var ErrWorkerOwnerEpochMismatch = errors.New("worker owner epoch mismatch")
 type Snapshot struct {
 	Orgs               map[string]*OrgConfig
 	DatabaseOrg        map[string]string     // database name -> org ID
+	HostnameAliasOrg   map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
 	OrgUserPassword    map[OrgUserKey]string // (orgID, username) -> bcrypt hash
 	OrgUserPassthrough map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
 	Global             GlobalConfig
@@ -171,6 +172,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	snap := &Snapshot{
 		Orgs:               make(map[string]*OrgConfig),
 		DatabaseOrg:        make(map[string]string),
+		HostnameAliasOrg:   make(map[string]string),
 		OrgUserPassword:    make(map[OrgUserKey]string),
 		OrgUserPassthrough: make(map[OrgUserKey]bool),
 		Global:             global,
@@ -180,9 +182,14 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	}
 
 	for _, o := range orgs {
+		alias := ""
+		if o.HostnameAlias != nil {
+			alias = *o.HostnameAlias
+		}
 		oc := &OrgConfig{
 			Name:                o.Name,
 			DatabaseName:        o.DatabaseName,
+			HostnameAlias:       alias,
 			MaxWorkers:          o.MaxWorkers,
 			MemoryBudget:        o.MemoryBudget,
 			IdleTimeoutS:        o.IdleTimeoutS,
@@ -193,6 +200,9 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		}
 		if o.DatabaseName != "" {
 			snap.DatabaseOrg[o.DatabaseName] = o.Name
+		}
+		if alias != "" {
+			snap.HostnameAliasOrg[alias] = o.Name
 		}
 		for _, u := range o.Users {
 			oc.Users[u.Username] = u.Password
@@ -223,6 +233,31 @@ func (cs *ConfigStore) ResolveDatabase(database string) string {
 		return ""
 	}
 	return cs.snapshot.DatabaseOrg[database]
+}
+
+// DatabaseNameForSNIPrefix translates an SNI hostname prefix (the single label
+// before a managed suffix, e.g. "entirely-chief-wildcat") into the canonical
+// database_name for the org it routes to. If the prefix matches a registered
+// hostname_alias, returns that org's database_name. Otherwise returns the
+// prefix as-is so legacy tenants (no alias configured, prefix == database_name)
+// keep working.
+//
+// Returns "" only when the input is empty.
+func (cs *ConfigStore) DatabaseNameForSNIPrefix(prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return prefix
+	}
+	if orgID, ok := cs.snapshot.HostnameAliasOrg[prefix]; ok {
+		if oc, ok := cs.snapshot.Orgs[orgID]; ok && oc.DatabaseName != "" {
+			return oc.DatabaseName
+		}
+	}
+	return prefix
 }
 
 // ValidateOrgUser checks username/password scoped to a specific org.
