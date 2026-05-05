@@ -80,6 +80,64 @@ jobs:
                   cache-from: type=gha,scope=cp-${{ steps.slug.outputs.arch }}
                   cache-to: type=gha,mode=max,scope=cp-${{ steps.slug.outputs.arch }}
 
+            # Smoke test the freshly-pushed image. Same shape as the
+            # worker-cd smoke step (which see for full rationale): pull
+            # from GHCR, run the binary on the runner's native arch, assert
+            # `--version` works, then boot the binary in process-backend
+            # control-plane mode and confirm "Control plane listening" lands
+            # in the logs within 30s. If smoke fails the dependent
+            # `manifest` job is skipped so the unsuffixed multi-arch tag
+            # never gets produced.
+            - name: Smoke test pushed image
+              env:
+                  IMAGE: ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ steps.slug.outputs.arch }}
+                  EXPECTED_VERSION: build-${{ github.sha }}
+              run: |
+                  set -euo pipefail
+                  docker pull "$IMAGE"
+
+                  echo "::group::--version"
+                  out=$(docker run --rm "$IMAGE" --version)
+                  echo "$out"
+                  if ! grep -qF "duckgres version $EXPECTED_VERSION" <<<"$out"; then
+                      echo "✗ --version output did not include 'duckgres version $EXPECTED_VERSION'"
+                      exit 1
+                  fi
+                  echo "✓ --version OK"
+                  echo "::endgroup::"
+
+                  echo "::group::boot smoke"
+                  docker run -d --name cp-smoke "$IMAGE" \
+                      --mode control-plane \
+                      --host 127.0.0.1 \
+                      --port 25432 \
+                      --socket-dir /tmp/sockets \
+                      --process-min-workers 0 \
+                      --process-max-workers 1
+                  trap 'docker rm -f cp-smoke >/dev/null 2>&1 || true' EXIT
+
+                  status=fail
+                  for i in $(seq 1 30); do
+                      if ! docker ps --format '{{.Names}}' | grep -qx cp-smoke; then
+                          echo "✗ cp-smoke exited before listening:"
+                          docker logs cp-smoke 2>&1 | tail -80
+                          break
+                      fi
+                      if docker logs cp-smoke 2>&1 | grep -q "Control plane listening"; then
+                          echo "✓ cp reached 'Control plane listening' after ${i}s"
+                          docker logs cp-smoke 2>&1 | tail -20
+                          status=ok
+                          break
+                      fi
+                      sleep 1
+                  done
+                  if [ "$status" != "ok" ] && [ "$i" = "30" ]; then
+                      echo "✗ cp did not log 'Control plane listening' within 30s"
+                      docker logs cp-smoke 2>&1 | tail -80
+                  fi
+                  echo "::endgroup::"
+                  [ "$status" = "ok" ]
+
     manifest:
         name: Multi-arch manifest controlplane
         needs: build
