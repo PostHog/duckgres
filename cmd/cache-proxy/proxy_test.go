@@ -1,14 +1,28 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 )
+
+// captureSlog redirects slog.Default to a buffer for the duration of a test
+// and returns the buffer + a restore function. Used by the forward-uncached
+// logging tests to assert presence of the request/response log lines that
+// were missing pre-PR (every PUT/POST through the proxy was a black hole).
+func captureSlog(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+	prev := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return &buf, func() { slog.SetDefault(prev) }
+}
 
 // newTestProxy wires a CacheProxy with no peers and a tempdir-backed store.
 func newTestProxy(t *testing.T) *CacheProxy {
@@ -397,5 +411,95 @@ func TestServeBodyContentLength(t *testing.T) {
 	got, _ := io.ReadAll(rec.Body)
 	if string(got) != string(payload) {
 		t.Errorf("body = %q, want %q", got, payload)
+	}
+}
+
+// TestForwardUncachedLogsSuccess locks in the invariant that a successful
+// PUT/POST through the forward-proxy path produces a log line. Pre-PR this
+// path was completely silent, leaving operators with no proxy-side
+// breadcrumb to correlate against a downstream client error.
+func TestForwardUncachedLogsSuccess(t *testing.T) {
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	proxy := newTestProxy(t)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ack"))
+	})
+
+	rec := doForwardProxyRequest(proxy, http.MethodPut, originURL+"/b/k", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `msg="Forward-proxy served."`) {
+		t.Errorf("expected Forward-proxy served. log on success, got:\n%s", out)
+	}
+	if !strings.Contains(out, `method=PUT`) {
+		t.Errorf("expected method=PUT in log, got:\n%s", out)
+	}
+	if !strings.Contains(out, `status=200`) {
+		t.Errorf("expected status=200 in log, got:\n%s", out)
+	}
+}
+
+// TestForwardUncachedLogsNon2xxWithBodyPreview is the symptomatic case
+// the PR addresses: when an upstream rejects a PUT/POST (e.g. an S3
+// endpoint returning 501 Not Implemented for a parquet write), the proxy
+// must surface the status AND the response body preview so the
+// client-side "HTTP code 501" error has a matching server-side
+// breadcrumb. The previewBody helper truncates at 256 bytes to keep log
+// volume bounded.
+func TestForwardUncachedLogsNon2xxWithBodyPreview(t *testing.T) {
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	proxy := newTestProxy(t)
+	originBody := `<?xml version="1.0"?><Error><Code>NotImplemented</Code><Message>A header you provided implies functionality that is not implemented</Message></Error>`
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte(originBody))
+	})
+
+	rec := doForwardProxyRequest(proxy, http.MethodPut, originURL+"/b/k.parquet", nil)
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", rec.Code)
+	}
+	if got := rec.Body.String(); got != originBody {
+		t.Errorf("body forwarded as %q, want verbatim origin XML", got)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, `msg="Forward-proxy origin returned non-2xx."`) {
+		t.Errorf("expected non-2xx Warn, got:\n%s", out)
+	}
+	if !strings.Contains(out, `status=501`) {
+		t.Errorf("expected status=501, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<Code>NotImplemented</Code>`) {
+		t.Errorf("expected origin XML <Code> prefix in body_preview, got:\n%s", out)
+	}
+}
+
+// TestForwardUncachedTruncatesLargeBodyInLog verifies previewBody is
+// applied — a multi-KiB error envelope must not flood log storage.
+func TestForwardUncachedTruncatesLargeBodyInLog(t *testing.T) {
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	proxy := newTestProxy(t)
+	huge := strings.Repeat("X", 4096)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(huge))
+	})
+
+	_ = doForwardProxyRequest(proxy, http.MethodPut, originURL+"/b/k", nil)
+
+	out := buf.String()
+	if !strings.Contains(out, `...(truncated)`) {
+		t.Errorf("expected previewBody truncation marker in log, got:\n%s", out)
 	}
 }
