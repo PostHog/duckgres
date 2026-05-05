@@ -399,6 +399,22 @@ func (p *CacheProxy) serveBody(w http.ResponseWriter, data []byte, rangeHeader, 
 // the non-cached path was a black hole and an upstream-rejected write
 // surfaced only as a DuckDB-side "HTTP code 501" with no proxy-side
 // breadcrumb to correlate against.
+//
+// Transparency: the proxy must not silently mutate the request shape DuckDB
+// chose, because AWS Sigv4 signs `host;x-amz-content-sha256;x-amz-date` (see
+// duckdb-httpfs/src/s3fs.cpp:84) — which means Content-Length and
+// Transfer-Encoding are NOT signed and we're free to set them, but we
+// should match what the client sent so the wire shape is preserved.
+//
+// The bug we're fixing here: http.NewRequestWithContext only auto-populates
+// req.ContentLength when the body is *bytes.Buffer / *bytes.Reader /
+// *strings.Reader (per its docstring). For a generic io.ReadCloser like
+// http.Request.Body, ContentLength stays 0 and Go's Transport falls back
+// to Transfer-Encoding: chunked on the outbound. AWS S3 returns
+// 501 NotImplemented for chunked PUT — so even though DuckDB sent a clean
+// Content-Length-bearing PUT, the proxy was rewriting it as chunked and
+// S3 rejected it. The fix is to mirror ContentLength + TransferEncoding +
+// Trailer from the inbound request so the proxy is wire-shape-transparent.
 func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
 	if err != nil {
@@ -407,6 +423,11 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Mirror body-framing fields the inbound request had so Go's Transport
+	// sends the same encoding (Content-Length vs chunked) as DuckDB chose.
+	req.ContentLength = r.ContentLength
+	req.TransferEncoding = r.TransferEncoding
+	req.Trailer = r.Trailer
 	for k, vv := range r.Header {
 		if hopByHop[strings.ToLower(k)] {
 			continue
