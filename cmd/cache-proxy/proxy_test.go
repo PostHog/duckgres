@@ -647,3 +647,249 @@ func TestForwardUncachedTruncatesLargeBodyInLog(t *testing.T) {
 		t.Errorf("expected previewBody truncation marker in log, got:\n%s", out)
 	}
 }
+
+// TestForwardUncachedPropagatesContentLength is the regression test for the
+// AWS S3 "501 Not Implemented" error on parquet PUTs. The proxy used to
+// build its outbound request via http.NewRequestWithContext with the
+// inbound r.Body as the body — and because r.Body is a generic
+// io.ReadCloser (not one of the *bytes.Buffer / *bytes.Reader /
+// *strings.Reader types Go auto-detects), Go's Transport saw ContentLength=0
+// and fell back to Transfer-Encoding: chunked. S3 rejects chunked PUT with
+// 501 even though DuckDB sent a perfectly valid Content-Length-bearing
+// request. After the fix, the outbound request must carry over the inbound's
+// ContentLength so the wire shape is preserved.
+func TestForwardUncachedPropagatesContentLength(t *testing.T) {
+	proxy := newTestProxy(t)
+	payload := []byte("parquet-bytes-of-known-length")
+
+	var (
+		gotMethod        string
+		gotContentLength int64
+		gotTE            string
+		gotBody          []byte
+	)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotContentLength = r.ContentLength
+		gotTE = r.Header.Get("Transfer-Encoding")
+		// httputil sometimes also strips Transfer-Encoding into r.TransferEncoding
+		if gotTE == "" && len(r.TransferEncoding) > 0 {
+			gotTE = strings.Join(r.TransferEncoding, ",")
+		}
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, originURL+"/b/k.parquet", bytes.NewReader(payload))
+	req.Host = req.URL.Host
+	// httptest.NewRequest only auto-sets ContentLength for the special body
+	// types; do it explicitly so we're modeling the inbound shape DuckDB
+	// uses (Content-Length present, no Transfer-Encoding).
+	req.ContentLength = int64(len(payload))
+	rec := httptest.NewRecorder()
+
+	proxy.HandleProxy(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if gotMethod != http.MethodPut {
+		t.Errorf("origin saw method %q, want PUT", gotMethod)
+	}
+	if gotContentLength != int64(len(payload)) {
+		t.Errorf("origin saw ContentLength=%d, want %d (proxy not propagating)", gotContentLength, len(payload))
+	}
+	if gotTE == "chunked" {
+		t.Errorf("origin saw Transfer-Encoding: chunked — proxy is rewriting Content-Length-bearing PUTs as chunked, AWS S3 returns 501 for this")
+	}
+	if !bytes.Equal(gotBody, payload) {
+		t.Errorf("body mismatch:\n  got:  %q\n  want: %q", gotBody, payload)
+	}
+}
+
+// TestForwardUncachedPreservesRequestHeaders verifies that arbitrary
+// non-hop-by-hop request headers (Authorization, x-amz-*, custom) round-trip
+// to the origin unchanged. Critical for AWS Sigv4: any header in the signed
+// list (host;x-amz-content-sha256;x-amz-date) being mutated would invalidate
+// the signature; the rest still matter for content addressability.
+func TestForwardUncachedPreservesRequestHeaders(t *testing.T) {
+	proxy := newTestProxy(t)
+	want := map[string]string{
+		"Authorization":        "AWS4-HMAC-SHA256 Credential=AKIA/...",
+		"X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+		"X-Amz-Date":           "20260505T120000Z",
+		"X-Amz-Security-Token": "FwoGZ...",
+		"Content-Type":         "application/octet-stream",
+		"X-Custom-Header":      "verbatim",
+	}
+
+	got := map[string]string{}
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		for k := range want {
+			got[k] = r.Header.Get(k)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, originURL+"/b/k", bytes.NewReader([]byte("x")))
+	req.Host = req.URL.Host
+	req.ContentLength = 1
+	for k, v := range want {
+		req.Header.Set(k, v)
+	}
+
+	proxy.HandleProxy(httptest.NewRecorder(), req)
+
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("header %s: got %q, want %q", k, got[k], w)
+		}
+	}
+}
+
+// TestForwardUncachedStripsHopByHopBothDirections verifies that
+// hop-by-hop headers (per RFC 7230 §6.1) are NOT forwarded in either
+// direction. Forwarding hop-by-hop headers can confuse origin / client
+// parsers — Connection, Keep-Alive, TE, Trailers, Transfer-Encoding,
+// Upgrade, Proxy-Authorization, Proxy-Authenticate.
+func TestForwardUncachedStripsHopByHopBothDirections(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	var originSawConnection, originSawKeepAlive string
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		originSawConnection = r.Header.Get("Connection")
+		originSawKeepAlive = r.Header.Get("Keep-Alive")
+		w.Header().Set("Connection", "should-not-leak")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.Header().Set("X-Allowed", "yes")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, originURL+"/b/k", bytes.NewReader([]byte("x")))
+	req.Host = req.URL.Host
+	req.ContentLength = 1
+	req.Header.Set("Connection", "close")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	rec := httptest.NewRecorder()
+
+	proxy.HandleProxy(rec, req)
+
+	if originSawConnection != "" {
+		t.Errorf("origin saw Connection header from inbound, hop-by-hop should be stripped: %q", originSawConnection)
+	}
+	if originSawKeepAlive != "" {
+		t.Errorf("origin saw Keep-Alive header from inbound, hop-by-hop should be stripped: %q", originSawKeepAlive)
+	}
+	if got := rec.Header().Get("Connection"); got != "" {
+		t.Errorf("client saw response Connection header from origin, hop-by-hop should be stripped: %q", got)
+	}
+	if got := rec.Header().Get("Keep-Alive"); got != "" {
+		t.Errorf("client saw response Keep-Alive header, hop-by-hop should be stripped: %q", got)
+	}
+	if got := rec.Header().Get("X-Allowed"); got != "yes" {
+		t.Errorf("client lost non-hop-by-hop response header X-Allowed: %q", got)
+	}
+}
+
+// TestForwardUncachedPreservesQueryString covers AWS S3 multipart-upload
+// query params (?uploads, ?partNumber=N&uploadId=...). Sigv4's canonical
+// request includes the query string, so any mutation would 403.
+func TestForwardUncachedPreservesQueryString(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	var gotQuery string
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	})
+
+	url := originURL + "/b/k.parquet?uploads=&partNumber=3&uploadId=ABC%3DDEF"
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("x")))
+	req.Host = req.URL.Host
+	req.ContentLength = 1
+	proxy.HandleProxy(httptest.NewRecorder(), req)
+
+	if gotQuery != "uploads=&partNumber=3&uploadId=ABC%3DDEF" {
+		t.Errorf("query mutated:\n  got:  %q\n  want: %q", gotQuery, "uploads=&partNumber=3&uploadId=ABC%3DDEF")
+	}
+}
+
+// TestForwardUncachedPreservesResponseBodyBytewise locks in that 2xx
+// response bodies are forwarded byte-for-byte (no compression / no
+// transcoding). DuckDB downstream may parse this as XML / parquet and
+// any mutation would corrupt it.
+func TestForwardUncachedPreservesResponseBodyBytewise(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	originBody := []byte("\x00\x01\x02\x03 binary <xml/> body \xff\xfe")
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(originBody)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, originURL+"/b/k", bytes.NewReader([]byte("x")))
+	req.Host = req.URL.Host
+	req.ContentLength = 1
+	rec := httptest.NewRecorder()
+	proxy.HandleProxy(rec, req)
+
+	if !bytes.Equal(rec.Body.Bytes(), originBody) {
+		t.Errorf("response body mutated:\n  got:  %q\n  want: %q", rec.Body.Bytes(), originBody)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("Content-Type lost: got %q", got)
+	}
+}
+
+// TestForwardUncachedPreservesNon2xxResponseBodyBytewise covers the
+// log-preview path on non-2xx — the proxy reads the full body for the
+// body_preview log attr, but must still forward it verbatim to the client.
+// Specifically the AWS S3 XML error envelope has to reach DuckDB so its
+// own error parsing can extract the <Code>...</Code>.
+func TestForwardUncachedPreservesNon2xxResponseBodyBytewise(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	originBody := []byte(`<?xml version="1.0"?><Error><Code>NotImplemented</Code><Message>foo</Message></Error>`)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write(originBody)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, originURL+"/b/k", bytes.NewReader([]byte("x")))
+	req.Host = req.URL.Host
+	req.ContentLength = 1
+	rec := httptest.NewRecorder()
+	proxy.HandleProxy(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), originBody) {
+		t.Errorf("non-2xx body mutated:\n  got:  %q\n  want: %q", rec.Body.Bytes(), originBody)
+	}
+}
+
+// TestForwardUncachedPreservesMethod walks every method that hits the
+// non-GET path and checks the origin saw the same method. Ensures we
+// don't accidentally specialise on PUT/POST and break HEAD/DELETE/etc.
+func TestForwardUncachedPreservesMethod(t *testing.T) {
+	for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			proxy := newTestProxy(t)
+			var gotMethod string
+			_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				w.WriteHeader(http.StatusOK)
+			})
+
+			req := httptest.NewRequest(method, originURL+"/b/k", bytes.NewReader([]byte("x")))
+			req.Host = req.URL.Host
+			req.ContentLength = 1
+			proxy.HandleProxy(httptest.NewRecorder(), req)
+			if gotMethod != method {
+				t.Errorf("method mutated: got %q, want %q", gotMethod, method)
+			}
+		})
+	}
+}
