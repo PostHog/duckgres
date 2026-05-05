@@ -103,6 +103,68 @@ jobs:
                   cache-from: type=gha,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
                   cache-to: type=gha,mode=max,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
 
+            # Smoke test the freshly-pushed image. We pull from GHCR (cheaper
+            # than ECR) and run the binary on the runner's native arch, so no
+            # qemu is needed. Two assertions:
+            #   1. `--version` exits 0 and prints the expected build identity.
+            #      Catches stub-binary regressions like the pre-#521 exit-1
+            #      stub that shipped to ECR for weeks before being noticed.
+            #   2. The binary boots with the same arg shape the K8s pool
+            #      hardcodes (`--mode duckdb-service --duckdb-listen :8816`)
+            #      and reaches the "Starting DuckDB service" log line within
+            #      30s. Catches flag.Parse regressions like the missing
+            #      `--mode` flag fixed in #522, and any boot-time linkage
+            #      failure that only manifests at runtime.
+            # If smoke fails for any matrix cell, the dependent `manifest`
+            # job is skipped (default `needs:` behavior), so the unsuffixed
+            # multi-arch tag is never produced and downstream Charts dispatch
+            # never picks up a broken image.
+            - name: Smoke test pushed image
+              env:
+                  IMAGE: ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}-duckdb${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
+                  EXPECTED_VERSION: build-${{ github.sha }}
+              run: |
+                  set -euo pipefail
+                  docker pull "$IMAGE"
+
+                  echo "::group::--version"
+                  out=$(docker run --rm "$IMAGE" --version)
+                  echo "$out"
+                  if ! grep -qF "duckgres version $EXPECTED_VERSION" <<<"$out"; then
+                      echo "✗ --version output did not include 'duckgres version $EXPECTED_VERSION'"
+                      exit 1
+                  fi
+                  echo "✓ --version OK"
+                  echo "::endgroup::"
+
+                  echo "::group::boot smoke"
+                  docker run -d --name worker-smoke "$IMAGE" \
+                      --mode duckdb-service \
+                      --duckdb-listen :8816
+                  trap 'docker rm -f worker-smoke >/dev/null 2>&1 || true' EXIT
+
+                  status=fail
+                  for i in $(seq 1 30); do
+                      if ! docker ps --format '{{.Names}}' | grep -qx worker-smoke; then
+                          echo "✗ worker-smoke exited before listening:"
+                          docker logs worker-smoke 2>&1 | tail -80
+                          break
+                      fi
+                      if docker logs worker-smoke 2>&1 | grep -q "Starting DuckDB service"; then
+                          echo "✓ worker reached 'Starting DuckDB service' after ${i}s"
+                          docker logs worker-smoke 2>&1 | tail -20
+                          status=ok
+                          break
+                      fi
+                      sleep 1
+                  done
+                  if [ "$status" != "ok" ] && [ "$i" = "30" ]; then
+                      echo "✗ worker did not log 'Starting DuckDB service' within 30s"
+                      docker logs worker-smoke 2>&1 | tail -80
+                  fi
+                  echo "::endgroup::"
+                  [ "$status" = "ok" ]
+
     manifest:
         name: Multi-arch manifest worker ${{ matrix.duckdb.version }}
         needs: build
