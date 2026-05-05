@@ -34,11 +34,13 @@ coverage.html
 duckgres.yaml
 duckgres_local_test.yaml
 artifacts/perf/
+/artifacts/
 
 .gemini/
 gha-creds-*.json
 data-test/
 .claude/scheduled_tasks.lock
+.claude/worktrees/*/
 .worktrees/
 bench-results/
 /cache-proxy
