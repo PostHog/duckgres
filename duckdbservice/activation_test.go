@@ -483,3 +483,128 @@ func TestReuseExistingActivationDoesNotBlockHealthChecks(t *testing.T) {
 		t.Fatalf("expected ownerEpoch=2 after refresh, got %d", pool.ownerEpoch)
 	}
 }
+
+// TestConcurrentActivateTenantSamePayloadBothSucceed reproduces the
+// rollout-race seen on dev 2026-05-05: a single CP can issue two
+// ActivateTenant RPCs concurrently for the same warm worker (e.g. one from
+// startup reconciliation + one from an inbound session-create), with
+// identical payloads. Both pass Phase 1's epoch check (currentOwnerEpoch
+// is still 0), both run the slow Phase 2 (activateDBConnection — the
+// ATTACH DUCKLAKE / SET DEFAULT CATALOG sequence), then race Phase 3.
+//
+// In the buggy ordering, Phase 3's first guard is
+//
+//	if payload.OwnerEpoch <= p.ownerEpoch { return "stale owner epoch" }
+//
+// so the second call observes p.ownerEpoch already bumped to its own
+// payload value by the first call's commit and fails before reaching the
+// `if p.activation != nil` idempotency branch. The CP then treats the
+// failure as fatal, retires the worker, and we lose a perfectly-good
+// just-activated worker — even though the FIRST call succeeded.
+//
+// The fix is to check idempotency before the epoch guard: if the
+// committed activation has the exact same payload, return nil — these are
+// concurrent same-payload calls, not a takeover.
+//
+// Without the worker-side fix, this test fails with one goroutine seeing
+// `stale owner epoch N (current N)`.
+func TestConcurrentActivateTenantSamePayloadBothSucceed(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		cfg:            server.Config{Users: map[string]string{"postgres": "postgres"}},
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		return PairFromMain(db), nil
+	}
+
+	// activateDBConnection is the slow Phase 2. We block it until BOTH
+	// goroutines have entered, then release them simultaneously. That
+	// forces both to observe `currentOwnerEpoch=0` in their Phase 1 RLock
+	// and leaves Phase 3 acquisition order as the only race source —
+	// exactly the production race where two concurrent paths overlap.
+	const N = 2
+	bothEntered := make(chan struct{}, N)
+	releasePhase2 := make(chan struct{})
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		bothEntered <- struct{}{}
+		<-releasePhase2
+		return nil
+	}
+
+	payload := ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			OwnerEpoch:   1,
+			CPInstanceID: "cp-live:boot-a",
+			WorkerID:     17,
+		},
+		OrgID: "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore: "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+			ObjectStore:   "s3://analytics/warehouse/",
+		},
+	}
+
+	errs := make(chan error, N)
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- pool.activateTenant(payload)
+		}()
+	}
+
+	// Wait for both goroutines to be parked at the start of Phase 2.
+	for i := 0; i < N; i++ {
+		select {
+		case <-bothEntered:
+		case <-time.After(2 * time.Second):
+			close(releasePhase2)
+			t.Fatalf("timed out waiting for both goroutines to enter Phase 2 (got %d of %d)", i, N)
+		}
+	}
+	// Both have observed identical pre-Phase-1 state. Release them; they
+	// race Phase 3 next.
+	close(releasePhase2)
+	wg.Wait()
+	close(errs)
+
+	var failures []error
+	for err := range errs {
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if len(failures) != 0 {
+		t.Fatalf("expected both concurrent same-payload activations to succeed, %d failed:\n%v\n\n"+
+			"This is the rollout-race symptom: two concurrent ActivateTenant RPCs for the same\n"+
+			"worker race Phase 3 commit, the epoch check fires before the idempotency check,\n"+
+			"the second call returns 'stale owner epoch N (current N)' even though its payload\n"+
+			"is identical to the just-committed activation.",
+			len(failures), failures)
+	}
+
+	// Final state check — exactly one activation committed, with our payload.
+	pool.mu.RLock()
+	defer pool.mu.RUnlock()
+	if pool.activation == nil {
+		t.Fatal("expected activation to be set after concurrent activations")
+	}
+	if pool.ownerEpoch != payload.OwnerEpoch {
+		t.Errorf("ownerEpoch = %d, want %d", pool.ownerEpoch, payload.OwnerEpoch)
+	}
+	if pool.workerID != payload.WorkerID {
+		t.Errorf("workerID = %d, want %d", pool.workerID, payload.WorkerID)
+	}
+}
