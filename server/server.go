@@ -1375,18 +1375,20 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// read (some settings don't propagate to DuckLake's subcatalogs post-attach,
 	// same gotcha as pg_pool_max_connections).
 	if dlCfg.HTTPProxy != "" {
-		// Force plaintext HTTP + path-style at the session level in addition to
-		// the S3 secret's USE_SSL/URL_STYLE — DuckDB observed to ignore secret
-		// settings and tunnel via HTTPS CONNECT when the endpoint looks like AWS
-		// S3, which the proxy can't cache (encrypted tunnel).
-		for _, stmt := range []string{
-			fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy),
-			"SET GLOBAL s3_use_ssl = false",
-			"SET GLOBAL s3_url_style = 'path'",
-		} {
-			if _, err := db.Exec(stmt); err != nil {
-				slog.Warn("Failed to set httpfs proxy config.", "stmt", stmt, "error", err)
-			}
+		// Only http_proxy is set globally. Session-level SET GLOBAL
+		// s3_use_ssl = false / s3_url_style = 'path' used to live here too,
+		// as a "belt and suspenders" against DuckDB allegedly tunnelling
+		// HTTPS for AWS endpoints — but that read of the bug was wrong:
+		// duckdb-httpfs/src/include/s3fs.hpp's TryGetSecretKeyOrSetting
+		// explicitly *drops* GLOBAL-scope settings when reading the s3
+		// secret's use_ssl/url_style, so those SET GLOBALs were no-ops on
+		// the secret-backed S3 path. The actual fix is to embed
+		// USE_SSL=false / URL_STYLE='path' on the secret itself, which
+		// resolveS3SecretTransport now does whenever HTTPProxy is set —
+		// see buildConfigSecret / buildCredentialChainSecret /
+		// buildAWSSdkSecret.
+		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy)); err != nil {
+			slog.Warn("Failed to set httpfs proxy config.", "stmt", "SET GLOBAL http_proxy", "error", err)
 		}
 		slog.Info("Routed httpfs traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy)
 	}
@@ -1777,6 +1779,37 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 	return nil
 }
 
+// resolveS3SecretTransport picks the URL_STYLE and USE_SSL values to embed in
+// the DuckDB S3 secret. When the cache proxy is in front of the worker
+// (HTTPProxy set), we force url_style=path + use_ssl=false so all S3
+// traffic flows as plain HTTP through forwardUncached/HandleProxy on the
+// proxy side — that's the only path that gives us per-request log lines
+// with method, status, and body preview. Without this override, an S3
+// secret with use_ssl=true makes httpfs tunnel writes via HTTPS CONNECT,
+// where the proxy can only log target+byte counts (handleConnect can't
+// see inside the TLS stream).
+//
+// Per duckdb-httpfs/src/include/s3fs.hpp:30-38, S3KeyValueReader's
+// TryGetSecretKeyOrSetting drops GLOBAL-scope settings unless the
+// use_env_variables_for_secret_settings flag is on. So a session-level
+// SET GLOBAL s3_use_ssl = false is silently ignored on the s3fs path —
+// the only effective place to set USE_SSL is on the secret itself, which
+// is what this helper does.
+func resolveS3SecretTransport(dlCfg DuckLakeConfig) (urlStyle string, useSSL string) {
+	if dlCfg.HTTPProxy != "" {
+		return "path", "false"
+	}
+	urlStyle = dlCfg.S3URLStyle
+	if urlStyle == "" {
+		urlStyle = "path" // default for MinIO compatibility
+	}
+	useSSL = "false"
+	if dlCfg.S3UseSSL {
+		useSSL = "true"
+	}
+	return urlStyle, useSSL
+}
+
 // buildConfigSecret builds a CREATE SECRET statement with explicit credentials
 func buildConfigSecret(dlCfg DuckLakeConfig) string {
 	region := dlCfg.S3Region
@@ -1784,15 +1817,7 @@ func buildConfigSecret(dlCfg DuckLakeConfig) string {
 		region = "us-east-1"
 	}
 
-	urlStyle := dlCfg.S3URLStyle
-	if urlStyle == "" {
-		urlStyle = "path" // Default to path style for MinIO compatibility
-	}
-
-	useSSL := "false"
-	if dlCfg.S3UseSSL {
-		useSSL = "true"
-	}
+	urlStyle, useSSL := resolveS3SecretTransport(dlCfg)
 
 	// Build base secret with explicit credentials
 	secret := fmt.Sprintf(`
@@ -1847,21 +1872,19 @@ func buildCredentialChainSecret(dlCfg DuckLakeConfig) string {
 		secret += fmt.Sprintf(",\n\t\t\tREGION '%s'", dlCfg.S3Region)
 	}
 
-	// Add endpoint if specified (for custom S3-compatible storage)
-	if dlCfg.S3Endpoint != "" {
-		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
-
-		// Also set URL style and SSL for custom endpoints
-		urlStyle := dlCfg.S3URLStyle
-		if urlStyle == "" {
-			urlStyle = "path"
+	// Set URL style and SSL on the secret itself. duckdb-httpfs only honors
+	// these from the secret (or env vars if the env-var-for-secret-settings
+	// flag is on) — `SET GLOBAL s3_use_ssl = ...` at the session level is
+	// dropped by S3KeyValueReader::TryGetSecretKeyOrSetting because it
+	// filters GLOBAL-scope settings unless the env-var path is enabled.
+	// Setting it on the secret is the only knob that actually controls the
+	// http_proto = use_ssl ? "https://" : "http://" decision in s3fs.cpp.
+	if dlCfg.S3Endpoint != "" || dlCfg.HTTPProxy != "" {
+		if dlCfg.S3Endpoint != "" {
+			secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
 		}
+		urlStyle, useSSL := resolveS3SecretTransport(dlCfg)
 		secret += fmt.Sprintf(",\n\t\t\tURL_STYLE '%s'", urlStyle)
-
-		useSSL := "false"
-		if dlCfg.S3UseSSL {
-			useSSL = "true"
-		}
 		secret += fmt.Sprintf(",\n\t\t\tUSE_SSL %s", useSSL)
 	}
 
@@ -1919,17 +1942,12 @@ func buildAWSSdkSecret(ctx context.Context, dlCfg DuckLakeConfig) (string, error
 		secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", creds.SessionToken)
 	}
 
-	if dlCfg.S3Endpoint != "" {
-		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
-		urlStyle := dlCfg.S3URLStyle
-		if urlStyle == "" {
-			urlStyle = "path"
+	if dlCfg.S3Endpoint != "" || dlCfg.HTTPProxy != "" {
+		if dlCfg.S3Endpoint != "" {
+			secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
 		}
+		urlStyle, useSSL := resolveS3SecretTransport(dlCfg)
 		secret += fmt.Sprintf(",\n\t\t\tURL_STYLE '%s'", urlStyle)
-		useSSL := "false"
-		if dlCfg.S3UseSSL {
-			useSSL = "true"
-		}
 		secret += fmt.Sprintf(",\n\t\t\tUSE_SSL %s", useSSL)
 	}
 
