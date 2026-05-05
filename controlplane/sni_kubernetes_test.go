@@ -120,6 +120,11 @@ func (f *fakeConfigStore) FindAndValidateUser(user, pass string) (string, bool) 
 	}
 	return f.findAndValidateUser(user, pass)
 }
+func (f *fakeConfigStore) IsOrgUserPassthrough(string, string) bool {
+	// SNI tests don't exercise passthrough; the real flag lookup is covered
+	// elsewhere. Returning false keeps the existing assertions intact.
+	return false
+}
 func (f *fakeConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
 	panic("UpsertFlightSessionRecord should not be called from SNI tests")
 }

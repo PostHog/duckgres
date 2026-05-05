@@ -125,7 +125,7 @@ type apiStore interface {
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
-	UpdateUser(orgID, username, passwordHash string) (*configstore.OrgUser, bool, error)
+	UpdateUser(orgID, username, passwordHash string, passthrough *bool) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
@@ -248,10 +248,25 @@ func (s *gormAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &user, nil
 }
 
-func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string) (*configstore.OrgUser, bool, error) {
+func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool) (*configstore.OrgUser, bool, error) {
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
+	}
+	if passthrough != nil {
+		updates["passthrough"] = *passthrough
+	}
+	if len(updates) == 0 {
+		// Nothing to change — return the current row so callers can still
+		// distinguish "user not found" from "no-op update".
+		user, err := s.GetUser(orgID, username)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, false, nil
+			}
+			return nil, false, err
+		}
+		return user, true, nil
 	}
 	result := s.db().Model(&configstore.OrgUser{}).Where("org_id = ? AND username = ?", orgID, username).Updates(updates)
 	if result.Error != nil {
@@ -807,9 +822,10 @@ func (h *apiHandler) listUsers(c *gin.Context) {
 func (h *apiHandler) createUser(c *gin.Context) {
 	// Use a raw struct because OrgUser.Password has json:"-"
 	var raw struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		OrgID    string `json:"org_id"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		OrgID       string `json:"org_id"`
+		Passthrough bool   `json:"passthrough"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -829,9 +845,10 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		return
 	}
 	user := configstore.OrgUser{
-		Username: raw.Username,
-		Password: hash,
-		OrgID:    raw.OrgID,
+		Username:    raw.Username,
+		Password:    hash,
+		OrgID:       raw.OrgID,
+		Passthrough: raw.Passthrough,
 	}
 	if err := h.store.CreateUser(&user); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -854,8 +871,11 @@ func (h *apiHandler) getUser(c *gin.Context) {
 func (h *apiHandler) updateUser(c *gin.Context) {
 	orgID := c.Param("id")
 	username := c.Param("username")
+	// Passthrough is *bool so omitting it preserves the stored value; sending
+	// `false` explicitly clears the flag.
 	var raw struct {
-		Password string `json:"password"`
+		Password    string `json:"password"`
+		Passthrough *bool  `json:"passthrough,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -870,7 +890,7 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		}
 		passwordHash = hash
 	}
-	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash)
+	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

@@ -20,12 +20,19 @@ type Org struct {
 func (Org) TableName() string { return "duckgres_orgs" }
 
 // OrgUser maps a username to an org with credentials.
+//
+// Passthrough flips a per-user flag that bypasses the PostgreSQL compatibility
+// layer (SQL transpiler + pg_catalog initialization) and forwards SQL straight
+// to DuckDB. Used by clients that already speak DuckDB SQL natively. Scoped to
+// (org_id, username) so the same login name can be passthrough in one tenant
+// and not in another.
 type OrgUser struct {
-	OrgID     string    `gorm:"primaryKey;size:255" json:"org_id"`
-	Username  string    `gorm:"primaryKey;size:255" json:"username"`
-	Password  string    `gorm:"size:255;not null" json:"-"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	OrgID       string    `gorm:"primaryKey;size:255" json:"org_id"`
+	Username    string    `gorm:"primaryKey;size:255" json:"username"`
+	Password    string    `gorm:"size:255;not null" json:"-"`
+	Passthrough bool      `gorm:"not null;default:false" json:"passthrough"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 func (OrgUser) TableName() string { return "duckgres_org_users" }

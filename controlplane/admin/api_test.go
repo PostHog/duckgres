@@ -109,7 +109,7 @@ func (s *fakeAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &clone, nil
 }
 
-func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string) (*configstore.OrgUser, bool, error) {
+func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool) (*configstore.OrgUser, bool, error) {
 	key := orgID + "/" + username
 	user, ok := s.users[key]
 	if !ok {
@@ -117,6 +117,9 @@ func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string) (*config
 	}
 	if passwordHash != "" {
 		user.Password = passwordHash
+	}
+	if passthrough != nil {
+		user.Passthrough = *passthrough
 	}
 	clone := *user
 	return &clone, true, nil
@@ -1114,6 +1117,110 @@ func TestPatchTenantPinningReturnsNotFoundForMissingOrg(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestCreateUserPersistsPassthroughFlag(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"org_id":"analytics","username":"raw","password":"hunter2","passthrough":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	stored := store.users["analytics/raw"]
+	if stored == nil {
+		t.Fatal("user not stored")
+	}
+	if !stored.Passthrough {
+		t.Errorf("Passthrough = false, want true")
+	}
+}
+
+func TestCreateUserDefaultsPassthroughFalse(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"org_id":"analytics","username":"alice","password":"hunter2"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	stored := store.users["analytics/alice"]
+	if stored == nil {
+		t.Fatal("user not stored")
+	}
+	if stored.Passthrough {
+		t.Error("Passthrough = true, want false (default)")
+	}
+}
+
+func TestUpdateUserClearsPassthroughWithoutTouchingPassword(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.users["analytics/raw"] = &configstore.OrgUser{
+		OrgID:       "analytics",
+		Username:    "raw",
+		Password:    "stored-hash",
+		Passthrough: true,
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"passthrough":false}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/raw", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.users["analytics/raw"]
+	if stored.Passthrough {
+		t.Error("Passthrough not cleared")
+	}
+	if stored.Password != "stored-hash" {
+		t.Errorf("Password = %q, want preserved %q", stored.Password, "stored-hash")
+	}
+}
+
+func TestUpdateUserOmittingPassthroughPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.users["analytics/raw"] = &configstore.OrgUser{
+		OrgID:       "analytics",
+		Username:    "raw",
+		Password:    "stored-hash",
+		Passthrough: true,
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"password":"new-pw"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/raw", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.users["analytics/raw"]
+	if !stored.Passthrough {
+		t.Error("Passthrough cleared by partial update; should preserve when field omitted")
+	}
+	if stored.Password == "stored-hash" {
+		t.Error("Password not updated")
 	}
 }
 

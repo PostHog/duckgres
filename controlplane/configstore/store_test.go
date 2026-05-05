@@ -177,6 +177,33 @@ func TestSnapshotBuild(t *testing.T) {
 	}
 }
 
+func TestIsOrgUserPassthrough(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			OrgUserPassthrough: map[OrgUserKey]bool{
+				{OrgID: "analytics", Username: "raw"}: true,
+			},
+		},
+	}
+
+	if !cs.IsOrgUserPassthrough("analytics", "raw") {
+		t.Error("IsOrgUserPassthrough(raw) = false, want true")
+	}
+	// Unknown user -> false (no false-positive).
+	if cs.IsOrgUserPassthrough("analytics", "alice") {
+		t.Error("IsOrgUserPassthrough(unknown) = true, want false")
+	}
+	// Unknown org -> false.
+	if cs.IsOrgUserPassthrough("other-org", "raw") {
+		t.Error("IsOrgUserPassthrough(other-org/raw) = true, want false")
+	}
+	// nil snapshot -> false (no panic).
+	empty := &ConfigStore{}
+	if empty.IsOrgUserPassthrough("analytics", "raw") {
+		t.Error("IsOrgUserPassthrough on empty store = true, want false")
+	}
+}
+
 func TestHashPassword(t *testing.T) {
 	hash, err := HashPassword("testpass")
 	if err != nil {
