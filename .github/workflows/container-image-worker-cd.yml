@@ -159,6 +159,11 @@ jobs:
                       -keyout "$CERT_DIR/server.key" \
                       -out "$CERT_DIR/server.crt" \
                       -days 1 -subj '/CN=worker-smoke' >/dev/null 2>&1
+                  # mktemp -d defaults to 0700, which the container's
+                  # non-root duckgres UID can't traverse via the bind
+                  # mount → "permission denied" loading the cert. 0755 on
+                  # the dir + 0644 on the files lets any UID read.
+                  chmod 755 "$CERT_DIR"
                   chmod 644 "$CERT_DIR"/server.crt "$CERT_DIR"/server.key
                   echo "::endgroup::"
 
