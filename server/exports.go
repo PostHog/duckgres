@@ -93,6 +93,17 @@ func SetLogicalCatalogMapping(cc *clientConn, enabled bool) {
 	}
 }
 
+// SetPassthrough flips this session into passthrough mode (bypasses the SQL
+// transpiler + pg_catalog). The control plane resolves the per-org flag from
+// the config store after auth and calls this before the message loop starts.
+// Single-tenant mode keeps using server.Config.PassthroughUsers and never
+// calls this.
+func SetPassthrough(cc *clientConn, enabled bool) {
+	if cc != nil {
+		cc.passthrough = enabled
+	}
+}
+
 // HasAttachedCatalog and InitSessionDatabaseMetadata moved to
 // server/sessionmeta. Re-exports kept here for the dozen call sites in
 // the control plane and elsewhere; new code should import server/sessionmeta

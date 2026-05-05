@@ -159,6 +159,11 @@ type ControlPlane struct {
 type ConfigStoreInterface interface {
 	ResolveDatabase(database string) (orgID string)
 	ValidateOrgUser(orgID, username, password string) bool
+	// ValidateOrgUserAndGetPassthrough does both lookups against the same
+	// snapshot — the auth path needs both, and a single read closes the
+	// window where the snapshot could swap between two separate calls.
+	// passthrough is always false when valid is false.
+	ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool)
 	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no database param)
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
@@ -830,7 +835,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Authenticate
 	// In multi-tenant mode, the database name maps to an org.
 	// User uniqueness is scoped to the org.
-	var orgID string
+	var (
+		orgID           string
+		passthroughUser bool
+	)
 	if cp.configStore != nil {
 		// Resolve the effective database name based on SNI routing mode.
 		// "off"         - legacy: use the startup `database` param.
@@ -883,7 +891,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
-		if !cp.configStore.ValidateOrgUser(orgID, username, password) {
+		// Single combined lookup: validate credentials and read the
+		// passthrough flag against the same snapshot so a config-store poll
+		// that swaps the snapshot between two reads can't produce a stale
+		// passthrough flag for an authenticated session.
+		valid, isPassthrough := cp.configStore.ValidateOrgUserAndGetPassthrough(orgID, username, password)
+		if !valid {
 			slog.Warn("Authentication failed.", "user", username, "org", orgID, "database", effectiveDatabase, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
@@ -893,6 +906,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
+		passthroughUser = isPassthrough
 		// From here on, `database` reflects the SNI-resolved org. This is what
 		// gets passed to the worker as the logical database (drives the
 		// `current_database()` macro and pg_database view) so observability
@@ -1013,22 +1027,27 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 	}()
 
-	initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-	err = sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, database)
-	if err != nil {
+	// Passthrough users skip pg_catalog initialization and DuckLake catalog
+	// detection — they bypass the PG compatibility layer entirely, so the
+	// metadata setup that drives logical catalog mapping is unused for them.
+	var duckLakeAttached bool
+	if !passthroughUser {
+		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, database); err != nil {
+			initCancel()
+			slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
+			_ = writer.Flush()
+			return
+		}
+		duckLakeAttached, err = sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
 		initCancel()
-		slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
-		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
-		_ = writer.Flush()
-		return
-	}
-	duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
-	initCancel()
-	if err != nil {
-		slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
-		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
-		_ = writer.Flush()
-		return
+		if err != nil {
+			slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
+			_ = writer.Flush()
+			return
+		}
 	}
 
 	// Register the TCP connection so OnWorkerCrash can close it to unblock
@@ -1038,6 +1057,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Create real clientConn with FlightExecutor and worker assignment
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
 	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
+	server.SetPassthrough(cc, passthroughUser)
+	if orgID != "" {
+		observeOrgPgSessionAccepted(orgID, passthroughUser)
+	}
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {

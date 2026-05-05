@@ -34,6 +34,15 @@ var orgWorkerCrashesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Total worker crashes per org",
 }, []string{"org"})
 
+// orgPgSessionsAcceptedCounter tracks every PG session that completes auth and
+// is dispatched to a worker, partitioned by org and passthrough mode. Useful
+// for spotting unexpected passthrough usage spikes (a misconfigured client) or
+// validating that a newly onboarded org is actually getting traffic.
+var orgPgSessionsAcceptedCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_org_pg_sessions_accepted_total",
+	Help: "Total PG sessions accepted by the control plane, partitioned by org and passthrough mode",
+}, []string{"org", "passthrough"})
+
 func observeOrgWorkersActive(org string, count int) {
 	orgWorkersActiveGauge.WithLabelValues(org).Set(float64(count))
 }
@@ -52,4 +61,12 @@ func observeOrgWorkerSpawn(org string) {
 
 func observeOrgWorkerCrash(org string) {
 	orgWorkerCrashesCounter.WithLabelValues(org).Inc()
+}
+
+func observeOrgPgSessionAccepted(org string, passthrough bool) {
+	mode := "false"
+	if passthrough {
+		mode = "true"
+	}
+	orgPgSessionsAcceptedCounter.WithLabelValues(org, mode).Inc()
 }

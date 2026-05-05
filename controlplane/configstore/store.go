@@ -29,13 +29,14 @@ var ErrWorkerOwnerEpochMismatch = errors.New("worker owner epoch mismatch")
 
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
-	Orgs            map[string]*OrgConfig
-	DatabaseOrg     map[string]string     // database name -> org ID
-	OrgUserPassword map[OrgUserKey]string // (orgID, username) -> bcrypt hash
-	Global          GlobalConfig
-	DuckLake        DuckLakeConfig
-	RateLimit       RateLimitConfig
-	QueryLog        QueryLogConfig
+	Orgs               map[string]*OrgConfig
+	DatabaseOrg        map[string]string     // database name -> org ID
+	OrgUserPassword    map[OrgUserKey]string // (orgID, username) -> bcrypt hash
+	OrgUserPassthrough map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
+	Global             GlobalConfig
+	DuckLake           DuckLakeConfig
+	RateLimit          RateLimitConfig
+	QueryLog           QueryLogConfig
 }
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
@@ -168,13 +169,14 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	cs.db.First(&queryLog, 1)
 
 	snap := &Snapshot{
-		Orgs:            make(map[string]*OrgConfig),
-		DatabaseOrg:     make(map[string]string),
-		OrgUserPassword: make(map[OrgUserKey]string),
-		Global:          global,
-		DuckLake:        duckLake,
-		RateLimit:       rateLimit,
-		QueryLog:        queryLog,
+		Orgs:               make(map[string]*OrgConfig),
+		DatabaseOrg:        make(map[string]string),
+		OrgUserPassword:    make(map[OrgUserKey]string),
+		OrgUserPassthrough: make(map[OrgUserKey]bool),
+		Global:             global,
+		DuckLake:           duckLake,
+		RateLimit:          rateLimit,
+		QueryLog:           queryLog,
 	}
 
 	for _, o := range orgs {
@@ -194,7 +196,11 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		}
 		for _, u := range o.Users {
 			oc.Users[u.Username] = u.Password
-			snap.OrgUserPassword[OrgUserKey{OrgID: o.Name, Username: u.Username}] = u.Password
+			key := OrgUserKey{OrgID: o.Name, Username: u.Username}
+			snap.OrgUserPassword[key] = u.Password
+			if u.Passthrough {
+				snap.OrgUserPassthrough[key] = true
+			}
 		}
 		snap.Orgs[o.Name] = oc
 	}
@@ -233,6 +239,48 @@ func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
 		return false
 	}
 	return bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) == nil
+}
+
+// IsOrgUserPassthrough reports whether the given (org, user) is configured to
+// bypass the PostgreSQL compatibility layer. Returns false for unknown users —
+// callers must validate credentials separately before trusting this.
+//
+// Prefer ValidateOrgUserAndGetPassthrough when both auth and passthrough are
+// needed at the same point; this method is exposed for introspection (e.g.
+// admin dashboards) where credentials aren't being checked.
+func (cs *ConfigStore) IsOrgUserPassthrough(orgID, username string) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return false
+	}
+	return cs.snapshot.OrgUserPassthrough[OrgUserKey{OrgID: orgID, Username: username}]
+}
+
+// ValidateOrgUserAndGetPassthrough validates credentials AND reads the
+// passthrough flag against the same snapshot, eliminating the swap window
+// that two separate ValidateOrgUser + IsOrgUserPassthrough calls would
+// expose. valid=false always returns passthrough=false — never leak the
+// flag for failed auth or unknown users.
+func (cs *ConfigStore) ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		// Match ValidateOrgUser's timing-leak guard: still spend bcrypt time
+		// on failed auth so unknown-user paths look the same as wrong-password.
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		return false, false
+	}
+	key := OrgUserKey{OrgID: orgID, Username: username}
+	storedHash, ok := cs.snapshot.OrgUserPassword[key]
+	if !ok {
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		return false, false
+	}
+	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		return false, false
+	}
+	return true, cs.snapshot.OrgUserPassthrough[key]
 }
 
 // FindAndValidateUser scans all orgs to find and authenticate a user by username/password.
