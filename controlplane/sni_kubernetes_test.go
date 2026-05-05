@@ -236,6 +236,48 @@ func TestFlightValidatorPassthroughMatchedSNI(t *testing.T) {
 	}
 }
 
+// TestFlightValidatorPassthroughHostnameAliasResolves: SNI prefix is the
+// hostname alias for an org whose dbname is something different. The
+// validator must consult DatabaseNameForSNIPrefix to translate prefix →
+// dbname before looking up the orgID.
+func TestFlightValidatorPassthroughHostnameAliasResolves(t *testing.T) {
+	store := &fakeConfigStore{
+		databaseNameForSNIPrefix: func(prefix string) string {
+			if prefix == "entirely-chief-wildcat" {
+				return "portola" // alias-translated dbname
+			}
+			return prefix
+		},
+		resolveDatabase: func(name string) string {
+			if name == "portola" {
+				return "org-portola"
+			}
+			return ""
+		},
+		validateOrgUser: func(orgID, user, pass string) bool {
+			return orgID == "org-portola" && user == "alice" && pass == "secret"
+		},
+		findAndValidateUser: func(string, string) (string, bool) {
+			t.Fatalf("FindAndValidateUser must not be called when SNI alias resolves an org")
+			return "", false
+		},
+	}
+	v := newFlightValidator(t, SNIRoutingPassthrough, store)
+
+	if !v.ValidateCredentialsForSNI("entirely-chief-wildcat.dw.us.postwh.com", "alice", "secret") {
+		t.Fatalf("expected alias-resolved org with valid creds to pass")
+	}
+	if store.databaseNameForSNIPrefixCalls != 1 {
+		t.Fatalf("expected DatabaseNameForSNIPrefix to be consulted exactly once; got %d", store.databaseNameForSNIPrefixCalls)
+	}
+	if store.resolveDatabaseCalls != 1 {
+		t.Fatalf("expected one ResolveDatabase call (against translated dbname); got %d", store.resolveDatabaseCalls)
+	}
+	if got := v.orgProvider.userOrg["alice"]; got != "org-portola" {
+		t.Fatalf("expected userOrg['alice'] = org-portola; got %q", got)
+	}
+}
+
 // TestFlightValidatorPassthroughUnknownOrg: SNI matches the suffix, but the
 // resolved org name doesn't exist in the config store. Must return false
 // WITHOUT falling through to the scan (a managed hostname is authoritative —

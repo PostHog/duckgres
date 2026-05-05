@@ -40,6 +40,12 @@
                 <div class="grid grid-cols-2 gap-4">
                     <input name="name" placeholder="Org name" required
                            class="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100">
+                    <input name="database_name" placeholder="Database name (clients connect with dbname=...)"
+                           class="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100">
+                    <input name="hostname_alias" placeholder="Hostname alias (optional, single DNS label)"
+                           pattern="[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                           title="Single DNS label: alphanumeric + hyphens, no leading/trailing hyphen, ≤63 chars"
+                           class="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100">
                     <input name="max_workers" type="number" placeholder="Max workers (0=unlimited)"
                            class="bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100">
                     <input name="memory_budget" placeholder="Memory budget (e.g. 8GB)"
@@ -72,7 +78,8 @@
                     return;
                 }
                 let html = '<table class="w-full"><thead><tr class="text-left text-gray-400 text-sm border-b border-gray-700">' +
-                    '<th class="p-3">Name</th><th class="p-3">Users</th><th class="p-3">Max Workers</th>' +
+                    '<th class="p-3">Name</th><th class="p-3">Database</th><th class="p-3">Hostname Alias</th>' +
+                    '<th class="p-3">Users</th><th class="p-3">Max Workers</th>' +
                     '<th class="p-3">Memory Budget</th><th class="p-3">Actions</th></tr></thead><tbody>';
                 orgs.forEach(t => {
                     const safeName = esc(t.name);
@@ -84,8 +91,16 @@
                     const userCell = passthroughCount > 0
                         ? `${users.length} <span class="ml-1 px-1.5 py-0.5 rounded text-xs font-medium bg-purple-900 text-purple-300" title="${passthroughCount} passthrough user${passthroughCount === 1 ? '' : 's'}">${passthroughCount} passthrough</span>`
                         : `${users.length}`;
+                    // hostname_alias is *string in the API; null = no alias.
+                    // Render the SNI hostname this alias produces so operators
+                    // can copy-paste it without composing it themselves.
+                    const aliasCell = t.hostname_alias
+                        ? `<span class="font-mono text-xs">${esc(t.hostname_alias)}</span><span class="text-gray-500 text-xs">.&lt;suffix&gt;</span>`
+                        : '<span class="text-gray-500 text-xs">—</span>';
                     html += `<tr class="border-b border-gray-700 hover:bg-gray-750">
                         <td class="p-3 font-medium">${safeName}</td>
+                        <td class="p-3 font-mono text-xs">${esc(t.database_name || '')}</td>
+                        <td class="p-3">${aliasCell}</td>
                         <td class="p-3">${userCell}</td>
                         <td class="p-3">${t.max_workers || 'unlimited'}</td>
                         <td class="p-3">${esc(t.memory_budget || 'default')}</td>

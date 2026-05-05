@@ -317,6 +317,11 @@ type FlightSessionRecord struct {
 func (FlightSessionRecord) TableName() string { return "flight_session_records" }
 
 // OrgConfig is a convenience view combining org metadata with resource limits.
+//
+// HostnameAlias is a plain string here (empty == "no alias") because snapshot
+// consumers uniformly expect non-pointer types. The Org model keeps it as
+// *string to drive sparse-unique semantics in the underlying table; that
+// pointer-ness is irrelevant once the data is loaded into the snapshot.
 type OrgConfig struct {
 	Name                string
 	DatabaseName        string

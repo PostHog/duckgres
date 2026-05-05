@@ -857,6 +857,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		var sniDatabase string
 		if isManaged {
 			sniDatabase = cp.configStore.DatabaseNameForSNIPrefix(sniPrefix)
+			observeSNIRoutingResolution("postgres", sniDatabase != sniPrefix)
 		}
 		effectiveDatabase := database
 		switch cp.cfg.SNIRoutingMode {
@@ -1613,7 +1614,7 @@ func (v *cpFlightCredentialValidator) ValidateCredentials(username, password str
 
 func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, password string) bool {
 	cp := v.cp
-	orgName, isManaged := cp.extractOrgFromSNI(sni)
+	sniPrefix, isManaged := cp.extractOrgFromSNI(sni)
 
 	switch cp.cfg.SNIRoutingMode {
 	case SNIRoutingEnforce:
@@ -1622,10 +1623,10 @@ func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, p
 				"sni", sni, "expected", cp.managedHostnameHint(), "user", username)
 			return false
 		}
-		return v.authForOrgName(sni, orgName, username, password)
+		return v.authForSNIPrefix(sni, sniPrefix, username, password)
 	case SNIRoutingPassthrough:
 		if isManaged {
-			return v.authForOrgName(sni, orgName, username, password)
+			return v.authForSNIPrefix(sni, sniPrefix, username, password)
 		}
 		if sni == "" {
 			slog.Warn("Flight client connected without SNI; please migrate to a managed hostname.",
@@ -1640,18 +1641,25 @@ func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, p
 	}
 }
 
-// authForOrgName validates (username, password) against a single org
+// authForSNIPrefix validates (username, password) against a single org
 // resolved from the SNI-derived hostname prefix. Used by enforce /
 // matched-passthrough. Translates the prefix through the hostname_alias map
 // so callers reach the right org regardless of which form (alias vs. dbname)
 // the client used.
-func (v *cpFlightCredentialValidator) authForOrgName(sni, orgName, username, password string) bool {
+//
+// Alias precedence: if a prefix matches both an org's hostname_alias AND
+// another org's database_name, the alias wins (DatabaseNameForSNIPrefix
+// checks the alias map first). Operators must avoid that collision — the
+// admin API enforces unique aliases and unique dbnames separately, but does
+// not cross-validate that an alias isn't another org's dbname.
+func (v *cpFlightCredentialValidator) authForSNIPrefix(sni, sniPrefix, username, password string) bool {
 	cp := v.cp
-	dbname := cp.configStore.DatabaseNameForSNIPrefix(orgName)
+	dbname := cp.configStore.DatabaseNameForSNIPrefix(sniPrefix)
+	observeSNIRoutingResolution("flight", dbname != sniPrefix)
 	orgID := cp.configStore.ResolveDatabase(dbname)
 	if orgID == "" {
 		slog.Warn("Flight client SNI references unknown org.",
-			"sni", sni, "sni_prefix", orgName, "sni_database", dbname, "user", username)
+			"sni", sni, "sni_prefix", sniPrefix, "sni_database", dbname, "user", username)
 		return false
 	}
 	if !cp.configStore.ValidateOrgUser(orgID, username, password) {

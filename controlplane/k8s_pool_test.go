@@ -834,8 +834,17 @@ func TestK8sPoolSpawnMinWorkersCountsOnlyNeutralIdleWorkersAsWarmCapacity(t *tes
 	}
 
 	var spawned []int
+	var spawnedMu sync.Mutex
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		// SpawnMinWorkers fans out to one goroutine per missing worker; guard
+		// the slice append. Sibling test
+		// TestK8sPoolSpawnMinWorkersTracksWarmCapacityAndSpawnsMissingWorkers
+		// already does this — same race lived here unfixed and only
+		// manifested when unrelated init-time work (a new metric registration)
+		// shifted goroutine scheduling.
+		spawnedMu.Lock()
 		spawned = append(spawned, id)
+		spawnedMu.Unlock()
 		pool.mu.Lock()
 		pool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
 		pool.mu.Unlock()

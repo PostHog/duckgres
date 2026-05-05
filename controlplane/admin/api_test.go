@@ -46,9 +46,6 @@ func (s *fakeAPIStore) CreateOrg(org *configstore.Org) error {
 	}
 	clone := copyOrg(org)
 	clone.Warehouse = nil
-	if clone.HostnameAlias != nil && *clone.HostnameAlias == "" {
-		clone.HostnameAlias = nil
-	}
 	s.orgs[org.Name] = clone
 	return nil
 }
@@ -1201,6 +1198,75 @@ func TestUpdateOrgClearsHostnameAliasWithEmptyString(t *testing.T) {
 	stored := store.orgs["portola-uuid"]
 	if stored.HostnameAlias != nil {
 		t.Errorf("HostnameAlias not cleared: %v", stored.HostnameAlias)
+	}
+}
+
+func TestCreateOrgRejectsInvalidHostnameAlias(t *testing.T) {
+	cases := []struct {
+		name  string
+		alias string
+	}{
+		{"contains dot (would silently fail SNI matching)", "foo.bar"},
+		{"contains underscore", "foo_bar"},
+		{"leading hyphen", "-foo"},
+		{"trailing hyphen", "foo-"},
+		{"contains slash", "foo/bar"},
+		{"contains uppercase A-Z is fine actually", ""}, // skipped — uppercase is allowed
+	}
+	for _, tc := range cases {
+		if tc.alias == "" {
+			continue
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			router := newTestAPIRouter(store)
+
+			body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q}`, tc.alias))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("alias %q: status = %d, want %d: %s", tc.alias, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if _, ok := store.orgs["acme"]; ok {
+				t.Errorf("alias %q: org should NOT have been created", tc.alias)
+			}
+		})
+	}
+}
+
+func TestCreateOrgAcceptsLongValidHostnameAlias(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	// 63 chars exactly — at the RFC 1035 DNS label limit.
+	alias := strings.Repeat("a", 63)
+	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q}`, alias))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("63-char alias should be accepted: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateOrgRejectsHostnameAliasOver63Chars(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	alias := strings.Repeat("a", 64) // one over the limit
+	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q}`, alias))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("64-char alias should be rejected: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
