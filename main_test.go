@@ -647,7 +647,7 @@ func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
 }
 
 func TestResolveEffectiveConfigSessionInitTimeout(t *testing.T) {
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, nil, nil)
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, nil, nil)
 	if resolved.SessionInitTimeout != 10*time.Second {
 		t.Fatalf("expected default session init timeout 10s, got %s", resolved.SessionInitTimeout)
 	}
@@ -665,7 +665,7 @@ func TestResolveEffectiveConfigSessionInitTimeoutPrecedence(t *testing.T) {
 		"DUCKGRES_SESSION_INIT_TIMEOUT": "9s",
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set: map[string]bool{
 			"session-init-timeout": true,
 		},
