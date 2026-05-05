@@ -1,17 +1,17 @@
-package main
+package configresolve
 
 import "testing"
 
-func TestResolveEffectiveConfigDefaultsK8sWorkerServiceAccountToNeutralWorker(t *testing.T) {
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, nil, nil)
+func TestResolveEffectiveDefaultsK8sWorkerServiceAccountToNeutralWorker(t *testing.T) {
+	resolved := ResolveEffective(nil, CLIInputs{}, nil, nil)
 
 	if resolved.K8sWorkerServiceAccount != "duckgres-worker" {
 		t.Fatalf("expected default K8s worker service account duckgres-worker, got %q", resolved.K8sWorkerServiceAccount)
 	}
 }
 
-func TestResolveEffectiveConfigExposesDuckLakeDefaultSpecVersionForControlPlane(t *testing.T) {
-	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, func(key string) string {
+func TestResolveEffectiveExposesDuckLakeDefaultSpecVersionForControlPlane(t *testing.T) {
+	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
 		if key == "DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION" {
 			return "1.1"
 		}

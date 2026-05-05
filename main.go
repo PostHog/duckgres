@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/configloader"
+	"github.com/posthog/duckgres/configresolve"
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/server"
@@ -25,8 +26,10 @@ import (
 // cmd/duckgres-worker binaries parse the same shape.
 type FileConfig = configloader.FileConfig
 
-// Type aliases for the nested configloader types so the rest of main.go's
-// resolveEffectiveConfig logic continues to compile unchanged.
+// Type aliases for the nested configloader types so main.go's flag-binding
+// code continues to refer to FileConfig / ProcessFileConfig / etc. without
+// the configloader. prefix on every line. The actual resolver now lives in
+// the configresolve package and takes *configloader.FileConfig directly.
 type (
 	ProcessFileConfig   = configloader.ProcessFileConfig
 	K8sFileConfig       = configloader.K8sFileConfig
@@ -287,7 +290,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{
+	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
 		Set:                         cliSet,
 		Host:                        *host,
 		Port:                        *port,
