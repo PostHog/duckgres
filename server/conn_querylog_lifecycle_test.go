@@ -286,6 +286,12 @@ func TestExecuteSelectQuery_LogsErrorOnWireWriteFailure(t *testing.T) {
 	if !strings.Contains(out, `level=ERROR msg="Query execution errored."`) {
 		t.Errorf("expected Error-level 'Query execution errored.' in:\n%s", out)
 	}
+	// Error message must explicitly identify this as a pgwire client write
+	// failure, not a generic "write tcp …" string. Operators reading the
+	// alert shouldn't have to know that port 5432 means pgwire.
+	if !strings.Contains(out, "pgwire client write failed") {
+		t.Errorf("expected wrapped 'pgwire client write failed' prefix in error attr:\n%s", out)
+	}
 	// Lifecycle pair must still fire so Loki filters on Started/Finished
 	// catch the failed query.
 	assertLifecyclePair(t, buf, "executeSelectQuery-wire-error")
