@@ -59,7 +59,7 @@ Known working Loki selectors:
 - These scenarios create isolated schemas and drop them at the end.
 - The 25-way concurrency, churn, idle pressure, and hour-boundary tests intentionally stress worker lifecycle behavior.
 - Do not run the one-hour boundary test during a sensitive dev deploy window unless the goal is to test disruption behavior.
-- Each script creates a timestamped artifact directory under `artifacts/dev-deploy-scenarios/`.
+- The replay script creates timestamped artifact directories under `artifacts/dev-deploy-scenarios/`.
 
 ## Preflight
 
@@ -74,10 +74,10 @@ kubectl --context posthog-mw-dev -n monitoring get svc loki-logs-read
 
 ## Replay 1: Full Scenario Suite
 
-Script:
+Command:
 
 ```bash
-bash scripts/dev-test-scenarios/run_dev_deploy_scenarios.sh
+bash scripts/dev-test-scenarios/run.sh full
 ```
 
 Expected duration: about 5-10 minutes.
@@ -122,10 +122,10 @@ artifacts/dev-deploy-scenarios/<RUN_ID>/loki/
 
 ## Replay 2: Long Query Boundary Suite
 
-Script:
+Command:
 
 ```bash
-bash scripts/dev-test-scenarios/run_long_boundary_queries.sh
+bash scripts/dev-test-scenarios/run.sh long-boundaries
 ```
 
 Expected duration: about 10-15 minutes.
@@ -157,10 +157,10 @@ artifacts/dev-deploy-scenarios/<RUN_ID>-long-boundaries/loki/
 
 ## Replay 3: One-Hour Boundary Suite
 
-Script:
+Command:
 
 ```bash
-bash scripts/dev-test-scenarios/run_hour_boundary_query.sh
+bash scripts/dev-test-scenarios/run.sh hour-boundary
 ```
 
 Expected duration: a little over 1 hour if the query remains active until the intended cancel point. It may run longer if the server cancels but the psql client remains blocked.
