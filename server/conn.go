@@ -1696,6 +1696,9 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
+		if !c.isCallerCancellation(err) {
+			c.logQueryError(query, err)
+		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -1708,6 +1711,9 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
+		if !c.isCallerCancellation(err) {
+			c.logQueryError(query, err)
+		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -1718,8 +1724,18 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	_, sendSpan := observe.Tracer().Start(ctx, "duckgres.send_results")
 	defer sendSpan.End()
 
+	// Mid-stream wire-write failures (sendRowDescription / sendDataRowWithFormats)
+	// surface a broken socket — typically the AWS NLB tearing down a stalled
+	// connection, or the kernel collapsing the socket after TCP_USER_TIMEOUT.
+	// They must route through logQueryError so the SQLSTATE-class severity
+	// router fires Error-level "Query execution errored." for alerts.
+	// Pre-fix the only signal was Info-level "Query finished." from the
+	// deferred lifecycle log, which silently disappears below alerting.
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
 		queryFinalErr = err
+		if !c.isCallerCancellation(err) {
+			c.logQueryError(query, err)
+		}
 		return 0, "", "", err
 	}
 
@@ -1740,6 +1756,9 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			queryFinalErr = err
 			errCode := "42000"
 			errMsg := err.Error()
+			if !c.isCallerCancellation(err) {
+				c.logQueryError(query, err)
+			}
 			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
 			_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
@@ -1749,6 +1768,9 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
 			queryFinalErr = err
+			if !c.isCallerCancellation(err) {
+				c.logQueryError(query, err)
+			}
 			return 0, "", "", err
 		}
 		rowCount++
@@ -1762,11 +1784,10 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		if c.isCallerCancellation(err) {
 			errCode = "57014"
 			errMsg = "canceling statement due to user request"
-			c.sendError("ERROR", errCode, errMsg)
 		} else {
-			slog.Error("Row iteration error.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
-			c.sendError("ERROR", errCode, errMsg)
+			c.logQueryError(query, err)
 		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
 		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
 		_ = c.writer.Flush()
