@@ -15,8 +15,8 @@ func TestTuneAcceptedConn_NonTCP(t *testing.T) {
 	// net.Pipe — both ends are *pipe (an in-memory net.Conn) which fails
 	// the *net.TCPConn assertion inside TuneAcceptedConn.
 	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
+	defer func() { _ = a.Close() }()
+	defer func() { _ = b.Close() }()
 
 	TuneAcceptedConn(a)
 }
@@ -31,7 +31,7 @@ func TestTuneAcceptedConn_TCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Listen: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	dialErrCh := make(chan error, 1)
 	go func() {
@@ -48,7 +48,7 @@ func TestTuneAcceptedConn_TCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Accept: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	TuneAcceptedConn(conn)
 

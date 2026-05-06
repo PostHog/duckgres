@@ -30,7 +30,7 @@ func TestTuneAcceptedConn_LinuxSocketOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Listen: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	dialed := make(chan net.Conn, 1)
 	go func() {
@@ -46,7 +46,7 @@ func TestTuneAcceptedConn_LinuxSocketOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Accept: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	defer func() {
 		if c := <-dialed; c != nil {
 			_ = c.Close()
