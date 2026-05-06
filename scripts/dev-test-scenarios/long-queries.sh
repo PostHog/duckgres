@@ -3,7 +3,7 @@ set -u
 
 usage() {
   cat <<USAGE
-Usage: bash scripts/dev-test-scenarios/run-long.sh
+Usage: bash scripts/dev-test-scenarios/long-queries.sh
 
 Runs both long-query suites:
   1. Long-query boundary, cancel, and killed-client scenarios.

@@ -77,7 +77,7 @@ kubectl --context posthog-mw-dev -n monitoring get svc loki-logs-read
 Command:
 
 ```bash
-bash scripts/dev-test-scenarios/run-short.sh
+bash scripts/dev-test-scenarios/short-queries.sh
 ```
 
 Expected duration: about 5-10 minutes.
@@ -125,7 +125,7 @@ artifacts/dev-deploy-scenarios/<RUN_ID>/loki/
 Command:
 
 ```bash
-bash scripts/dev-test-scenarios/run-long.sh
+bash scripts/dev-test-scenarios/long-queries.sh
 ```
 
 Expected duration: a little over 1 hour if the one-hour query remains active until the intended cancel point. It may run longer if the server cancels but the psql client remains blocked.
