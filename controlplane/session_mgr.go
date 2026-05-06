@@ -117,8 +117,27 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 
 func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *flightclient.FlightExecutor, error) {
 	createStart := time.Now()
+	slog.Info("Creating session on worker.",
+		"pid", pid,
+		"worker", worker.ID,
+		"user", username,
+		"protocol", protocol,
+		"memory_limit", memoryLimit,
+		"threads", threads,
+		"owner_cp_instance_id", worker.OwnerCPInstanceID(),
+		"owner_epoch", worker.OwnerEpoch(),
+	)
 	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
 	if err != nil {
+		slog.Warn("Failed to create session on worker.",
+			"pid", pid,
+			"worker", worker.ID,
+			"user", username,
+			"protocol", protocol,
+			"duration", time.Since(createStart),
+			"retire_on_failure", retireOnFailure,
+			"error", err,
+		)
 		if retireOnFailure {
 			sm.pool.RetireWorkerIfNoSessions(worker.ID)
 		}
@@ -143,9 +162,21 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	sm.mu.Lock()
 	sm.sessions[pid] = session
 	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
+	sessionCount := len(sm.sessions)
+	workerSessionCount := len(sm.byWorker[worker.ID])
 	sm.mu.Unlock()
 
-	slog.Debug("Session created on worker.", "pid", pid, "worker", worker.ID, "user", username, "create_duration", time.Since(createStart))
+	slog.Info("Session created on worker.",
+		"pid", pid,
+		"worker", worker.ID,
+		"user", username,
+		"protocol", protocol,
+		"create_duration", time.Since(createStart),
+		"session_count", sessionCount,
+		"worker_session_count", workerSessionCount,
+		"owner_cp_instance_id", worker.OwnerCPInstanceID(),
+		"owner_epoch", worker.OwnerEpoch(),
+	)
 	if sm.rebalancer != nil {
 		sm.rebalancer.RequestRebalance()
 	}
@@ -155,10 +186,12 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 // DestroySession destroys a session, retires its dedicated worker, and rebalances
 // memory/thread limits across remaining sessions.
 func (sm *SessionManager) DestroySession(pid int32) {
+	destroyStart := time.Now()
 	sm.mu.Lock()
 	session, ok := sm.sessions[pid]
 	if !ok {
 		sm.mu.Unlock()
+		slog.Warn("DestroySession called for unknown session.", "pid", pid)
 		return
 	}
 	delete(sm.sessions, pid)
@@ -171,7 +204,17 @@ func (sm *SessionManager) DestroySession(pid int32) {
 			break
 		}
 	}
+	sessionCount := len(sm.sessions)
+	workerSessionCount := len(sm.byWorker[session.WorkerID])
 	sm.mu.Unlock()
+
+	slog.Info("Destroying session.",
+		"pid", pid,
+		"worker", session.WorkerID,
+		"protocol", session.Protocol,
+		"remaining_sessions", sessionCount,
+		"remaining_worker_sessions", workerSessionCount,
+	)
 
 	// Close the executor
 	if session.Executor != nil {
@@ -184,21 +227,43 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	// enforces single-session isolation; releasing early would let a new
 	// session block on db.Conn() or, worse, share catalog state).
 	worker, ok := sm.pool.Worker(session.WorkerID)
+	workerDestroyAttempted := false
+	workerAlreadyDead := false
+	var workerDestroyErr error
 	if ok {
 		select {
 		case <-worker.done:
+			workerAlreadyDead = true
 			// Worker already dead, skip RPC
 		default:
+			workerDestroyAttempted = true
+			workerDestroyStart := time.Now()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_ = worker.DestroySession(ctx, session.SessionToken)
+			workerDestroyErr = worker.DestroySession(ctx, session.SessionToken)
 			cancel()
+			slog.Info("Worker session destroy RPC completed.",
+				"pid", pid,
+				"worker", session.WorkerID,
+				"protocol", session.Protocol,
+				"duration", time.Since(workerDestroyStart),
+				"error", workerDestroyErr,
+			)
 		}
 	}
 
 	// Release the worker for reuse after cleanup is complete.
 	sm.pool.ReleaseWorker(session.WorkerID)
 
-	slog.Debug("Session destroyed.", "pid", pid, "worker", session.WorkerID)
+	slog.Info("Session destroyed.",
+		"pid", pid,
+		"worker", session.WorkerID,
+		"protocol", session.Protocol,
+		"duration", time.Since(destroyStart),
+		"worker_found", ok,
+		"worker_already_dead", workerAlreadyDead,
+		"worker_destroy_attempted", workerDestroyAttempted,
+		"worker_destroy_error", workerDestroyErr,
+	)
 
 	// Rebalance remaining sessions
 	if sm.rebalancer != nil {
@@ -224,9 +289,10 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	}
 	sm.mu.Unlock()
 
-	slog.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids))
+	slog.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids), "pids", pids)
 
 	for _, pid := range pids {
+		cleanupStart := time.Now()
 		errorFn(pid)
 		sm.mu.Lock()
 		session, ok := sm.sessions[pid]
@@ -245,7 +311,15 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 				_ = session.connCloser.Close()
 			}
 		}
+		remainingSessions := len(sm.sessions)
 		sm.mu.Unlock()
+		slog.Info("Worker crash session cleanup completed.",
+			"pid", pid,
+			"worker", workerID,
+			"session_found", ok,
+			"duration", time.Since(cleanupStart),
+			"remaining_sessions", remainingSessions,
+		)
 	}
 
 	sm.mu.Lock()
