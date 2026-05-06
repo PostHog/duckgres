@@ -1734,7 +1734,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	if err := c.sendRowDescription(cols, colTypes); err != nil {
 		queryFinalErr = err
 		if !c.isCallerCancellation(err) {
-			c.logQueryError(query, err)
+			c.logQueryError(query, fmt.Errorf("pgwire client write failed sending row description: %w", err))
 		}
 		return 0, "", "", err
 	}
@@ -1769,7 +1769,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
 			queryFinalErr = err
 			if !c.isCallerCancellation(err) {
-				c.logQueryError(query, err)
+				c.logQueryError(query, fmt.Errorf("pgwire client write failed during result streaming: %w", err))
 			}
 			return 0, "", "", err
 		}
