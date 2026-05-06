@@ -13,7 +13,15 @@ FROM golang:1.25-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY go.mod go.sum ./
+# Copy the full source first. The earlier layout (COPY go.mod go.sum;
+# go get; COPY . .) silently broke per-DuckDB-version pinning: the second
+# COPY overlaid the host's go.mod/go.sum on top of the downgraded ones,
+# undoing the `go get`. Symptom: the duckgres-worker:<sha>-duckdb1.5.1
+# image was actually statically linked against duckdb-go-bindings@v0.10502.0
+# (DuckDB 1.5.2), with bundled 0.4 extensions sitting at /app/extensions/v1.5.1/
+# where the 1.5.2 runtime never looks. Catalog attach failed at runtime
+# with "extension requires version 1.0". COPY-then-pin avoids it.
+COPY . .
 
 ARG VERSION=dev
 ARG COMMIT=unknown
@@ -39,7 +47,6 @@ RUN if [ -n "$DUCKDB_GO_VERSION" ] && [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
     fi
 
 RUN go mod download
-COPY . .
 
 ARG DUCKDB_EXTENSION_VERSION=1.5.2
 ARG HTTPFS_EXTENSION_TAG=v1.5.2-stoi-fix
@@ -50,6 +57,23 @@ RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" \
     -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o duckgres-worker \
     ./cmd/duckgres-worker
+
+# Defense-in-depth: assert the binary actually links against the bindings
+# version the build args asked for. If a future Dockerfile change re-breaks
+# the pinning, this fails the build instead of shipping a silently-wrong
+# image. The DUCKDB_BINDINGS_VERSION arg encodes DuckDB minor (e.g.
+# v0.10501.0 -> DuckDB 1.5.1); the embedded module info in the binary must
+# match exactly.
+RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
+      embedded=$(go version -m ./duckgres-worker | awk '$2 == "github.com/duckdb/duckdb-go-bindings" { print $3 }') ; \
+      if [ "$embedded" != "$DUCKDB_BINDINGS_VERSION" ]; then \
+        echo "ERROR: bindings pin mismatch — wanted $DUCKDB_BINDINGS_VERSION, got $embedded" >&2 ; \
+        echo "       (full embedded module info follows)" >&2 ; \
+        go version -m ./duckgres-worker | grep duckdb >&2 ; \
+        exit 1 ; \
+      fi ; \
+      echo "Verified: duckgres-worker linked against duckdb-go-bindings@$embedded" ; \
+    fi
 
 RUN mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
     && curl -fsSL "https://github.com/benben/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
