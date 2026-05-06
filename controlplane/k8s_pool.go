@@ -1362,7 +1362,18 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 		p.cleanDeadWorkersLocked()
 
-		idle := p.findReservableWarmWorkerLocked()
+		// In-memory warm-pool fallback for the case where pool.workers has
+		// a worker that the runtime store doesn't (e.g. ClaimIdleWorker just
+		// returned nil because of state-transition skew). Filtered by
+		// assignment.Image so a per-org pin is honored: if the assignment
+		// names a specific image and no in-memory warm worker matches, fall
+		// through to the spawn block — which already does the right thing.
+		// Without this filter, MTCP could hand a pinned org a default-image
+		// warm worker, and activation would fail with a DuckLake/extension
+		// version mismatch (observed in prod-us 2026-05-06 for Portola,
+		// which pins to duckgres-worker:<sha>-duckdb1.5.1 while the warm
+		// pool runs the default 1.5.2 image).
+		idle := p.findReservableWarmWorkerLocked(assignment.Image)
 		if idle != nil {
 			nextState, err := idle.SharedState().Transition(WorkerLifecycleReserved, assignment)
 			if err != nil {
@@ -2467,12 +2478,20 @@ func (p *K8sWorkerPool) isWarmIdleWorkerLocked(w *ManagedWorker) bool {
 	return w.activeSessions == 0 && p.isGenericSessionSchedulableWorkerLocked(w)
 }
 
-func (p *K8sWorkerPool) findReservableWarmWorkerLocked() *ManagedWorker {
+// findReservableWarmWorkerLocked returns a warm-idle worker that is safe to
+// reserve. When image is non-empty, only workers whose image matches are
+// considered — used by ReserveSharedWorker so per-org image pins aren't
+// silently bypassed when the in-memory map and runtime store disagree.
+// Pass "" to skip the image filter (legacy non-pinned callers).
+func (p *K8sWorkerPool) findReservableWarmWorkerLocked(image string) *ManagedWorker {
 	for _, w := range p.workers {
 		select {
 		case <-w.done:
 			continue
 		default:
+		}
+		if image != "" && w.image != image {
+			continue
 		}
 		if p.isWarmIdleWorkerLocked(w) {
 			return w

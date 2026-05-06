@@ -15,7 +15,10 @@ func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	}
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
-		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		// Mirror production SpawnWorker behavior: the spawned worker carries
+		// the image it was built from. Required since findReservableWarmWorkerLocked
+		// filters by assignment.Image.
+		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()
 		return nil
 	}
@@ -62,7 +65,10 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
-		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		// Mirror production SpawnWorker behavior: the spawned worker carries
+		// the image it was built from. Required since findReservableWarmWorkerLocked
+		// filters by assignment.Image.
+		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()
 		return nil
 	}
@@ -123,7 +129,10 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	}
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
-		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		// Mirror production SpawnWorker behavior: the spawned worker carries
+		// the image it was built from. Required since findReservableWarmWorkerLocked
+		// filters by assignment.Image.
+		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()
 		return nil
 	}
@@ -157,7 +166,10 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 	}
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
-		shared.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
+		// Mirror production SpawnWorker behavior: the spawned worker carries
+		// the image it was built from. Required since findReservableWarmWorkerLocked
+		// filters by assignment.Image.
+		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
 		shared.mu.Unlock()
 		return nil
 	}
