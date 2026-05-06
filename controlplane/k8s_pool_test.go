@@ -959,6 +959,77 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentIn
 	}
 }
 
+// TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImage ensures the
+// in-memory warm-pool fallback honors per-org image pinning. Without the
+// image filter on findReservableWarmWorkerLocked, ReserveSharedWorker would
+// return a default-image warm worker to a pinned org and the subsequent
+// activation (DuckLake ATTACH inside the worker) would fail with the
+// extension's version-mismatch error. Observed in prod-us 2026-05-06 for
+// Portola, which pins to duckgres-worker:<sha>-duckdb1.5.1 while the warm
+// pool runs the default 1.5.2 single-binary image.
+func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImage(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	// A warm-idle worker built from the cluster default image — a tempting
+	// candidate for ReserveSharedWorker if the image filter is missing.
+	defaultWorker := &ManagedWorker{
+		ID:    7,
+		image: "duckgres:default-1.5.2",
+		done:  make(chan struct{}),
+	}
+	pool.workers[defaultWorker.ID] = defaultWorker
+
+	pinnedImage := "duckgres-worker:abc123-duckdb1.5.1"
+	store := &captureRuntimeWorkerStore{
+		// ClaimIdleWorker returns nil (no DB row matches the pinned image),
+		// CreateSpawningWorkerSlot returns a slot for the pinned image so
+		// the spawn path is what serves the request.
+		spawned: &configstore.WorkerRecord{
+			WorkerID:          42,
+			PodName:           "duckgres-worker-test-cp-42",
+			State:             configstore.WorkerStateSpawning,
+			OrgID:             "portola",
+			Image:             pinnedImage,
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        1,
+		},
+	}
+	pool.runtimeStore = store
+
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		pool.workers[id] = &ManagedWorker{
+			ID:      id,
+			image:   pinnedImage,
+			podName: "duckgres-worker-test-cp-42",
+			done:    make(chan struct{}),
+		}
+		return nil
+	}
+	pool.healthCheckFunc = func(ctx context.Context, w *ManagedWorker) error { return nil }
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "portola",
+		Image:      pinnedImage,
+		MaxWorkers: 2,
+	})
+	if err != nil {
+		t.Fatalf("ReserveSharedWorker: %v", err)
+	}
+
+	if worker.ID == defaultWorker.ID {
+		t.Fatalf("default-image warm worker (id %d) was returned despite image pin %q", defaultWorker.ID, pinnedImage)
+	}
+	if worker.ID != 42 {
+		t.Fatalf("expected spawned worker id 42, got %d", worker.ID)
+	}
+	if store.spawnImage != pinnedImage {
+		t.Fatalf("spawn image = %q, want %q", store.spawnImage, pinnedImage)
+	}
+	if defaultWorker.SharedState().Lifecycle == WorkerLifecycleReserved {
+		t.Fatalf("default-image warm worker was reserved despite image mismatch")
+	}
+}
+
 func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	pool.minWorkers = 0
