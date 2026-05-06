@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
+	"github.com/posthog/duckgres/internal/netkeepalive"
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/chsql"
 	"github.com/posthog/duckgres/server/ducklake"
@@ -488,11 +489,7 @@ func (s *Server) ListenAndServe() error {
 			continue
 		}
 
-		// Enable TCP keepalive to detect dead connections
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			_ = tcpConn.SetKeepAlive(true)
-			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		}
+		netkeepalive.TuneAcceptedConn(conn)
 
 		s.wg.Add(1)
 		go func() {

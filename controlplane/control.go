@@ -22,6 +22,7 @@ import (
 
 	"github.com/cloudflare/tableflip"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/internal/netkeepalive"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightclient"
@@ -625,11 +626,7 @@ func (cp *ControlPlane) acceptLoop() {
 			continue
 		}
 
-		// Enable TCP keepalive
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			_ = tcpConn.SetKeepAlive(true)
-			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		}
+		netkeepalive.TuneAcceptedConn(conn)
 
 		cp.wg.Add(1)
 		go func() {

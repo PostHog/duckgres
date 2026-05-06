@@ -205,6 +205,92 @@ func TestLifecyclePairFiresOnHandleExecuteExec(t *testing.T) {
 	assertLifecyclePair(t, buf, "handleExecute-Exec")
 }
 
+// streamingRowSet is a fake RowSet that yields a fixed number of single-column
+// string rows. Used to drive executeSelectQuery past the rows.Next() gate so
+// the test can exercise mid-stream wire-write failures.
+type streamingRowSet struct {
+	rows      [][]any
+	idx       int
+	cols      []string
+	colTypers []ColumnTyper
+	closed    bool
+}
+
+func (s *streamingRowSet) Columns() ([]string, error)          { return s.cols, nil }
+func (s *streamingRowSet) ColumnTypes() ([]ColumnTyper, error) { return s.colTypers, nil }
+func (s *streamingRowSet) Next() bool {
+	if s.idx >= len(s.rows) {
+		return false
+	}
+	s.idx++
+	return true
+}
+func (s *streamingRowSet) Scan(dest ...any) error {
+	row := s.rows[s.idx-1]
+	for i, v := range row {
+		if p, ok := dest[i].(*interface{}); ok {
+			*p = v
+		}
+	}
+	return nil
+}
+func (s *streamingRowSet) Close() error { s.closed = true; return nil }
+func (s *streamingRowSet) Err() error   { return nil }
+
+// stringColumnTyper is a tiny ColumnTyper that reports VARCHAR. Sufficient for
+// the streaming-write test, which only cares that pgwire encodes a column.
+type stringColumnTyper struct{}
+
+func (stringColumnTyper) DatabaseTypeName() string { return "VARCHAR" }
+
+// failingWriter returns a fixed error on every Write. Wrapped by a small
+// bufio.Writer so a wire-message Write triggers an underlying flush that
+// surfaces the error to the caller — simulating the prod symptom where the
+// AWS NLB tore down a stalled pgwire socket and the pgwire send-row write
+// failed mid-stream.
+type failingWriter struct{ err error }
+
+func (f failingWriter) Write(_ []byte) (int, error) { return 0, f.err }
+
+// TestExecuteSelectQuery_LogsErrorOnWireWriteFailure verifies the regression
+// from the posthog-mw-prod-us TCP-write-timeout incident: when a mid-stream
+// wire write fails (sendRowDescription / sendDataRowWithFormats), the CP must
+// emit Error-level "Query execution errored." so alerts fire. Pre-fix only
+// the deferred Info-level "Query finished." was emitted, hiding the failure
+// below alerting thresholds.
+func TestExecuteSelectQuery_LogsErrorOnWireWriteFailure(t *testing.T) {
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	// 16-byte buffer + failing underlying writer: any wire message larger
+	// than 16 bytes (every real pgwire message) triggers an underlying Write
+	// that returns the configured error.
+	c.writer = bufio.NewWriterSize(failingWriter{err: errors.New("write tcp: broken pipe")}, 16)
+
+	c.executor = &lifecycleExecutor{
+		queryRows: &streamingRowSet{
+			cols:      []string{"c"},
+			colTypers: []ColumnTyper{stringColumnTyper{}},
+			rows:      [][]any{{"hello"}},
+		},
+	}
+	c.username = "alice"
+	c.workerID = 7777
+
+	_, _, _, _ = c.executeSelectQuery("SELECT 'hello'", "SELECT")
+
+	out := buf.String()
+	if !strings.Contains(out, `level=ERROR msg="Query execution errored."`) {
+		t.Errorf("expected Error-level 'Query execution errored.' in:\n%s", out)
+	}
+	// Lifecycle pair must still fire so Loki filters on Started/Finished
+	// catch the failed query.
+	assertLifecyclePair(t, buf, "executeSelectQuery-wire-error")
+}
+
 // TestLifecyclePairFiresOnHandleExecuteQuery covers the extended-query Query
 // path (handleExecute → executor.Query for SELECTs). Same rationale as the
 // Exec test above — modern drivers go through this path for every SELECT.
