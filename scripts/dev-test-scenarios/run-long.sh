@@ -3,12 +3,11 @@ set -u
 
 usage() {
   cat <<USAGE
-Usage: bash scripts/dev-test-scenarios/run-long.sh <suite>
+Usage: bash scripts/dev-test-scenarios/run-long.sh
 
-Suites:
-  long-boundaries  Run long-query boundary, cancel, and killed-client scenarios.
-  hour-boundary    Run the one-hour long-query boundary scenario.
-  all              Run long-boundaries, then hour-boundary in separate processes.
+Runs both long-query suites:
+  1. Long-query boundary, cancel, and killed-client scenarios.
+  2. One-hour long-query boundary scenario.
 USAGE
 }
 run_long_boundaries() {
@@ -405,17 +404,17 @@ loki_query pressure '{namespace="duckgres"} |~ "ERROR|Canceled|cancel|unresponsi
 printf '%s\n' "${REPORT}"
 }
 
-suite="${1:-}"
+suite="${1:-all}"
 case "${suite}" in
-  long-boundaries)
+  __long-boundaries)
     run_long_boundaries
     ;;
-  hour-boundary)
+  __hour-boundary)
     run_hour_boundary
     ;;
   all)
-    "${BASH_SOURCE[0]}" long-boundaries
-    "${BASH_SOURCE[0]}" hour-boundary
+    "${BASH_SOURCE[0]}" __long-boundaries
+    "${BASH_SOURCE[0]}" __hour-boundary
     ;;
   -h|--help|help)
     usage

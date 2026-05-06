@@ -120,15 +120,15 @@ artifacts/dev-deploy-scenarios/<RUN_ID>/activity/
 artifacts/dev-deploy-scenarios/<RUN_ID>/loki/
 ```
 
-## Replay 2: Long Query Boundary Suite
+## Replay 2: Long Query Scenario Suite
 
 Command:
 
 ```bash
-bash scripts/dev-test-scenarios/run-long.sh long-boundaries
+bash scripts/dev-test-scenarios/run-long.sh
 ```
 
-Expected duration: about 10-15 minutes.
+Expected duration: a little over 1 hour if the one-hour query remains active until the intended cancel point. It may run longer if the server cancels but the psql client remains blocked.
 
 Coverage:
 
@@ -141,8 +141,16 @@ Coverage:
 - 4M supplemental active cancel at ~5m.
 - 4M killed-client test at ~2m.
 - Post-cancel and post-kill `SELECT 1`.
+- Isolated schema with 14M synthetic rows.
+- One large self-join intended to cross:
+  - 10 minutes
+  - 30 minutes
+  - 60 minutes
+- `pg_stat_activity` snapshots at checkpoints.
+- Cancel at the 60-minute boundary when still active.
+- Post-boundary `SELECT 1`.
 - Final cleanup.
-- Loki captures around query start/finish/cancel.
+- Loki captures around query start/finish/cancel, the hour marker, and pressure/error terms.
 
 Primary outputs:
 
@@ -153,34 +161,6 @@ artifacts/dev-deploy-scenarios/<RUN_ID>-long-boundaries/sql/
 artifacts/dev-deploy-scenarios/<RUN_ID>-long-boundaries/outputs/
 artifacts/dev-deploy-scenarios/<RUN_ID>-long-boundaries/activity/
 artifacts/dev-deploy-scenarios/<RUN_ID>-long-boundaries/loki/
-```
-
-## Replay 3: One-Hour Boundary Suite
-
-Command:
-
-```bash
-bash scripts/dev-test-scenarios/run-long.sh hour-boundary
-```
-
-Expected duration: a little over 1 hour if the query remains active until the intended cancel point. It may run longer if the server cancels but the psql client remains blocked.
-
-Coverage:
-
-- Isolated schema with 14M synthetic rows.
-- One large self-join intended to cross:
-  - 10 minutes
-  - 30 minutes
-  - 60 minutes
-- `pg_stat_activity` snapshots at checkpoints.
-- Cancel at the 60-minute boundary when still active.
-- Post-boundary `SELECT 1`.
-- Final cleanup.
-- Loki captures for the hour marker and pressure/error terms.
-
-Primary outputs:
-
-```text
 artifacts/dev-deploy-scenarios/<RUN_ID>-hour-boundary/hour-boundary-report.md
 artifacts/dev-deploy-scenarios/<RUN_ID>-hour-boundary/summary.tsv
 artifacts/dev-deploy-scenarios/<RUN_ID>-hour-boundary/sql/
