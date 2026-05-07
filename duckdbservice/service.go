@@ -878,6 +878,48 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 	}
 }
 
+// DoPut peeks at the first FlightData frame and routes a duckgres custom
+// CSV-spool stream to doCopyFromStdin. Anything else is delegated to the
+// standard Flight SQL DoPut router (CommandStatementUpdate etc.).
+//
+// We have to consume the first frame to check the descriptor, so we
+// hand the custom handler a reference to it and the rest of the stream;
+// for non-custom streams we wrap the underlying server with a small
+// adapter that returns the buffered first frame on the first Recv()
+// call so the standard handler sees the full stream.
+func (s *customActionServer) DoPut(stream flight.FlightService_DoPutServer) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if IsCopyFromStdinDescriptor(first.GetFlightDescriptor()) {
+		return s.handler.doCopyFromStdin(stream.Context(), first, stream)
+	}
+	return s.FlightServer.DoPut(&prebufferedDoPutServer{
+		FlightService_DoPutServer: stream,
+		buffered:                  first,
+	})
+}
+
+// prebufferedDoPutServer returns a single buffered FlightData frame on
+// the first Recv() call, then delegates to the wrapped stream. Used by
+// customActionServer.DoPut so that consuming the first frame for
+// descriptor-routing doesn't strip it from the stream the underlying
+// handler sees.
+type prebufferedDoPutServer struct {
+	flight.FlightService_DoPutServer
+	buffered *flight.FlightData
+}
+
+func (p *prebufferedDoPutServer) Recv() (*flight.FlightData, error) {
+	if p.buffered != nil {
+		fd := p.buffered
+		p.buffered = nil
+		return fd, nil
+	}
+	return p.FlightService_DoPutServer.Recv()
+}
+
 // NewFlightSQLHandler creates a new multi-session Flight SQL handler.
 func NewFlightSQLHandler(pool *SessionPool) *FlightSQLHandler {
 	h := &FlightSQLHandler{

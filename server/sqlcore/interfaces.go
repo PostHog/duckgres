@@ -9,7 +9,10 @@
 // import this package without dragging the DuckDB driver in.
 package sqlcore
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 // ColumnTyper provides type name information for a database column.
 // *sql.ColumnType satisfies this interface.
@@ -54,4 +57,20 @@ type QueryExecutor interface {
 	// executed query, or "" if profiling is not enabled or not available
 	// (e.g. Flight SQL mode where the query ran on a remote worker).
 	LastProfilingOutput() string
+}
+
+// CopyFromStdinExecutor is an optional capability implemented by executors
+// that need the CSV bytes shipped to a different filesystem than the one
+// the COPY FROM STDIN handler is running on. The remote (Flight) executor
+// implements this to spool the bytes onto the worker pod, where the
+// worker can then run COPY FROM <path>. Local executors do not need to
+// implement it; the standard local-tempfile path works for them since
+// the executor and the COPY FROM SQL run in the same process / host.
+//
+// copySQLTemplate must contain a path placeholder that the receiver
+// substitutes with the destination spool path before executing. The
+// placeholder string is defined alongside the implementation
+// (flightclient.CopyFromStdinPathPlaceholder).
+type CopyFromStdinExecutor interface {
+	CopyFromStdin(ctx context.Context, copySQLTemplate string, csv io.Reader) (rowCount int64, err error)
 }
