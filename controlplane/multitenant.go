@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -246,12 +247,34 @@ func SetupMultiTenant(
 	}
 	janitor.reconcileWarmCapacity = func() {
 		target := router.sharedPool.WarmCapacityTarget()
-		if target <= 0 {
-			return
+		if target > 0 {
+			observeOrgWorkerSpawn("shared")
+			if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
+				slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
+			}
 		}
-		observeOrgWorkerSpawn("shared")
-		if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
-			slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
+
+		// Per-image warm floor: ensure at least one warm pod for each
+		// distinct DuckDB version image in active use, so per-org pins
+		// always find a hot pod waiting instead of paying a cold spawn.
+		// Run in parallel — SpawnMinWorkersForImage blocks on pod startup,
+		// and a slow image must not block the others (and the next janitor
+		// tick) for N×30s.
+		perImage := router.sharedPool.PerImageWarmTargets()
+		if len(perImage) > 0 {
+			var wg sync.WaitGroup
+			for image, count := range perImage {
+				wg.Add(1)
+				go func(image string, count int) {
+					defer wg.Done()
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					if err := router.sharedPool.SpawnMinWorkersForImage(ctx, image, count); err != nil {
+						slog.Warn("Janitor failed to reconcile per-image warm capacity.", "image", image, "target", count, "error", err)
+					}
+				}(image, count)
+			}
+			wg.Wait()
 		}
 	}
 	janitor.retireMismatchedVersionWorker = func() {

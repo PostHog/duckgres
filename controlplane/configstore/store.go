@@ -1073,6 +1073,77 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 	return created, nil
 }
 
+// CreateNeutralWarmWorkerSlotForImage creates a durable spawning worker row
+// for the shared neutral warm pool, but the per-image target is enforced
+// against workers using the same image only — letting the per-image warm
+// floor coexist with the cluster-default warm pool without one starving the
+// other. Same advisory-lock + global-cap protections as the image-blind
+// sibling. A nil result means the per-image target is already met or the
+// global worker cap blocked the spawn.
+func (cs *ConfigStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*WorkerRecord, error) {
+	if strings.TrimSpace(podNamePrefix) == "" {
+		return nil, fmt.Errorf("pod name prefix is required")
+	}
+	if strings.TrimSpace(image) == "" {
+		return nil, fmt.Errorf("image is required for per-image warm slot")
+	}
+
+	var created *WorkerRecord
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:shared-warm-target")).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:global-worker-capacity")).Error; err != nil {
+			return err
+		}
+
+		if perImageTarget > 0 {
+			count, err := cs.countNeutralWarmWorkersForImage(tx, image)
+			if err != nil {
+				return err
+			}
+			if count >= int64(perImageTarget) {
+				return nil
+			}
+		}
+
+		if maxGlobalWorkers > 0 {
+			count, err := cs.countActiveWorkers(tx)
+			if err != nil {
+				return err
+			}
+			if count >= int64(maxGlobalWorkers) {
+				return nil
+			}
+		}
+
+		var workerID int64
+		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM " + cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		record := &WorkerRecord{
+			WorkerID:          int(workerID),
+			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
+			Image:             image,
+			State:             WorkerStateSpawning,
+			OrgID:             "",
+			OwnerCPInstanceID: ownerCPInstanceID,
+			OwnerEpoch:        0,
+			LastHeartbeatAt:   now,
+		}
+		if err := tx.Table(cs.runtimeTable(record.TableName())).Create(record).Error; err != nil {
+			return err
+		}
+		created = record
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create neutral warm worker slot for image: %w", err)
+	}
+	return created, nil
+}
+
 // CreateNeutralWarmWorkerSlot creates a durable spawning worker row for the shared
 // neutral warm pool under advisory-lock protected cluster-wide warm-target and
 // global capacity checks. A nil result means capacity already satisfies the target
@@ -1288,6 +1359,18 @@ func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB) (int64, error) {
 	var count int64
 	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("org_id = ''").
+		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
+		Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (cs *ConfigStore) countNeutralWarmWorkersForImage(tx *gorm.DB, image string) (int64, error) {
+	var count int64
+	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("org_id = ''").
+		Where("image = ?", image).
 		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
 		Count(&count).Error; err != nil {
 		return 0, err

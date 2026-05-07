@@ -51,6 +51,15 @@ type captureRuntimeWorkerStore struct {
 	neutralSpawnImage                string
 	neutralSpawnTarget               int
 	neutralSpawnMaxGlobal            int
+	perImageSpawned                  *configstore.WorkerRecord
+	perImageSpawnedFunc              func(image string) *configstore.WorkerRecord
+	perImageSpawnErr                 error
+	perImageSpawnCalls               int
+	perImageSpawnOwnerCPID           string
+	perImageSpawnPodPrefix           string
+	perImageSpawnImage               string
+	perImageSpawnTarget              int
+	perImageSpawnMaxGlobal           int
 	hotIdleClaimResult               *configstore.WorkerRecord
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
@@ -187,6 +196,36 @@ func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlot(ownerCPInstanceI
 		return nil, nil
 	}
 	spawned := *s.neutralSpawned
+	return &spawned, nil
+}
+
+func (s *captureRuntimeWorkerStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.perImageSpawnCalls++
+	s.perImageSpawnOwnerCPID = ownerCPInstanceID
+	s.perImageSpawnPodPrefix = podNamePrefix
+	s.perImageSpawnImage = image
+	s.perImageSpawnTarget = perImageTarget
+	s.perImageSpawnMaxGlobal = maxGlobalWorkers
+	if s.perImageSpawnErr != nil {
+		return nil, s.perImageSpawnErr
+	}
+	if s.perImageSpawnedFunc != nil {
+		rec := s.perImageSpawnedFunc(image)
+		if rec == nil {
+			return nil, nil
+		}
+		copy := *rec
+		return &copy, nil
+	}
+	if s.perImageSpawned == nil {
+		return nil, nil
+	}
+	spawned := *s.perImageSpawned
+	if spawned.Image == "" {
+		spawned.Image = image
+	}
 	return &spawned, nil
 }
 
@@ -857,6 +896,190 @@ func TestK8sPoolSpawnMinWorkersCountsOnlyNeutralIdleWorkersAsWarmCapacity(t *tes
 
 	if len(spawned) != 2 {
 		t.Fatalf("expected SpawnMinWorkers to spawn 2 neutral warm workers, got %d", len(spawned))
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersForImageSpawnsWhenIdleCountBelowTarget(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		perImageSpawned: &configstore.WorkerRecord{
+			WorkerID:          71,
+			PodName:           "duckgres-worker-test-cp-71",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+		},
+	}
+	pool.runtimeStore = store
+
+	// Pool already has one warm-idle worker on a DIFFERENT image; the
+	// per-image floor must spawn a fresh pod for "v1.5.1" anyway.
+	otherImageWorker := &ManagedWorker{ID: 1, done: make(chan struct{}), image: "duckgres:test"}
+	pool.workers[1] = otherImageWorker
+
+	var spawnedIDs []int
+	var mu sync.Mutex
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		mu.Lock()
+		spawnedIDs = append(spawnedIDs, id)
+		mu.Unlock()
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkersForImage(context.Background(), "duckgres:v1.5.1", 1); err != nil {
+		t.Fatalf("SpawnMinWorkersForImage: %v", err)
+	}
+	if store.perImageSpawnCalls != 1 {
+		t.Fatalf("expected one per-image slot allocation, got %d", store.perImageSpawnCalls)
+	}
+	if store.perImageSpawnImage != "duckgres:v1.5.1" {
+		t.Fatalf("expected slot image duckgres:v1.5.1, got %q", store.perImageSpawnImage)
+	}
+	if store.perImageSpawnTarget != 1 {
+		t.Fatalf("expected per-image target 1, got %d", store.perImageSpawnTarget)
+	}
+	if len(spawnedIDs) != 1 || spawnedIDs[0] != 71 {
+		t.Fatalf("expected to spawn worker id 71, got %v", spawnedIDs)
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersForImageSpawnsOnlyTheDeficit(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		perImageSpawned: &configstore.WorkerRecord{
+			WorkerID:          82,
+			PodName:           "duckgres-worker-test-cp-82",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+			Image:             "duckgres:v1.5.1",
+		},
+	}
+	pool.runtimeStore = store
+
+	// One warm-idle worker for the requested image already exists. Asking
+	// for target=2 should spawn exactly one more — not two.
+	pool.workers[1] = &ManagedWorker{ID: 1, done: make(chan struct{}), image: "duckgres:v1.5.1"}
+
+	var spawnedIDs []int
+	var mu sync.Mutex
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		mu.Lock()
+		spawnedIDs = append(spawnedIDs, id)
+		mu.Unlock()
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkersForImage(context.Background(), "duckgres:v1.5.1", 2); err != nil {
+		t.Fatalf("SpawnMinWorkersForImage: %v", err)
+	}
+	if store.perImageSpawnCalls != 1 {
+		t.Fatalf("expected one slot allocation for the single-worker deficit, got %d", store.perImageSpawnCalls)
+	}
+	if store.perImageSpawnTarget != 2 {
+		t.Fatalf("expected per-image target 2 forwarded to runtime store, got %d", store.perImageSpawnTarget)
+	}
+	if len(spawnedIDs) != 1 || spawnedIDs[0] != 82 {
+		t.Fatalf("expected to spawn exactly worker id 82, got %v", spawnedIDs)
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersForImageNoOpWhenIdleCountAtTarget(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+
+	// One warm-idle worker already exists for the requested image.
+	pool.workers[1] = &ManagedWorker{ID: 1, done: make(chan struct{}), image: "duckgres:v1.5.1"}
+
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		t.Fatalf("did not expect spawn when target already met (id %d)", id)
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkersForImage(context.Background(), "duckgres:v1.5.1", 1); err != nil {
+		t.Fatalf("SpawnMinWorkersForImage: %v", err)
+	}
+	if store.perImageSpawnCalls != 0 {
+		t.Fatalf("expected no slot allocation when target met, got %d", store.perImageSpawnCalls)
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersForImageRespectsMaxWorkers(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 2)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+
+	// Two workers already running, both for a different image. We're at the
+	// global cap, so no per-image spawn should occur.
+	pool.workers[1] = &ManagedWorker{ID: 1, done: make(chan struct{}), image: "duckgres:test"}
+	pool.workers[2] = &ManagedWorker{ID: 2, done: make(chan struct{}), image: "duckgres:test"}
+
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		t.Fatalf("did not expect spawn when at max workers (id %d)", id)
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkersForImage(context.Background(), "duckgres:v1.5.1", 1); err != nil {
+		t.Fatalf("SpawnMinWorkersForImage: %v", err)
+	}
+	if store.perImageSpawnCalls != 0 {
+		t.Fatalf("expected no slot allocation at max workers, got %d", store.perImageSpawnCalls)
+	}
+}
+
+func TestK8sPoolTriggerPerImageReplenishSpawnsWhenTargetSet(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	spawned := make(chan struct{}, 1)
+	store := &captureRuntimeWorkerStore{
+		perImageSpawnedFunc: func(image string) *configstore.WorkerRecord {
+			defer func() {
+				select {
+				case spawned <- struct{}{}:
+				default:
+				}
+			}()
+			return &configstore.WorkerRecord{
+				WorkerID:          91,
+				PodName:           "duckgres-worker-test-cp-91",
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				Image:             image,
+			}
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error { return nil }
+
+	pool.SetPerImageWarmTargets(map[string]int{"duckgres:v1.5.1": 1})
+
+	pool.triggerPerImageReplenish("duckgres:v1.5.1")
+
+	select {
+	case <-spawned:
+	case <-time.After(time.Second):
+		t.Fatal("expected per-image spawn to fire within 1s")
+	}
+	if store.perImageSpawnImage != "duckgres:v1.5.1" {
+		t.Fatalf("expected spawn for v1.5.1, got %q", store.perImageSpawnImage)
+	}
+}
+
+func TestK8sPoolTriggerPerImageReplenishNoOpWhenImageNotInTargets(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		perImageSpawnedFunc: func(image string) *configstore.WorkerRecord {
+			t.Fatalf("did not expect spawn when image %q has no per-image target", image)
+			return nil
+		},
+	}
+	pool.runtimeStore = store
+
+	// No SetPerImageWarmTargets call → empty floor.
+	pool.triggerPerImageReplenish("duckgres:v1.5.1")
+
+	// Brief wait to let any rogue goroutine fire.
+	time.Sleep(50 * time.Millisecond)
+	if store.perImageSpawnCalls != 0 {
+		t.Fatalf("expected no spawn calls, got %d", store.perImageSpawnCalls)
 	}
 }
 

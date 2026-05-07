@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -380,6 +381,33 @@ func (tr *OrgRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
 	}
 
 	tr.sharedPool.SetWarmCapacityTarget(target)
+	tr.sharedPool.SetPerImageWarmTargets(tr.computePerImageWarmTargets(snap))
+}
+
+// computePerImageWarmTargets returns "keep at least 1 warm worker for each
+// distinct image" — covering the cluster default plus every pinned
+// Warehouse.Image used by an org that currently has an active stack. Orgs
+// without a live stack (e.g. warehouse not yet ready) are skipped so we don't
+// pre-warm pods for images nobody can route to yet.
+func (tr *OrgRouter) computePerImageWarmTargets(snap *configstore.Snapshot) map[string]int {
+	targets := make(map[string]int)
+	if defaultImage := strings.TrimSpace(tr.baseCfg.WorkerImage); defaultImage != "" {
+		targets[defaultImage] = 1
+	}
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	for orgID := range tr.orgs {
+		tc, ok := snap.Orgs[orgID]
+		if !ok || tc == nil {
+			continue
+		}
+		image := strings.TrimSpace(workerImageForOrg(tc, tr.baseCfg.WorkerImage))
+		if image == "" {
+			continue
+		}
+		targets[image] = 1
+	}
+	return targets
 }
 
 func (tr *OrgRouter) onSharedWorkerCrash(workerID int) {

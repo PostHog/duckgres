@@ -583,6 +583,65 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 	}
 }
 
+func TestCreateNeutralWarmWorkerSlotForImageEnforcesPerImageTarget(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 7, 12, 0, 0, 0, time.UTC)
+
+	// One existing warm-idle worker on a DIFFERENT image: should not block
+	// spawning a fresh per-image slot for "duckgres:v1.5.1".
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          20,
+		PodName:           "duckgres-worker-existing-20",
+		Image:             "duckgres:v1.4.0",
+		State:             configstore.WorkerStateIdle,
+		OrgID:             "",
+		OwnerCPInstanceID: "cp-a:boot-1",
+		OwnerEpoch:        0,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(other-image): %v", err)
+	}
+
+	slot, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.5.1", 1, 5)
+	if err != nil {
+		t.Fatalf("CreateNeutralWarmWorkerSlotForImage: %v", err)
+	}
+	if slot == nil {
+		t.Fatal("expected per-image slot to be created when no warm worker for that image exists")
+		return
+	}
+	if slot.Image != "duckgres:v1.5.1" {
+		t.Fatalf("expected slot image duckgres:v1.5.1, got %q", slot.Image)
+	}
+	if slot.State != configstore.WorkerStateSpawning {
+		t.Fatalf("expected spawning state, got %q", slot.State)
+	}
+	if slot.OrgID != "" {
+		t.Fatalf("expected neutral org, got %q", slot.OrgID)
+	}
+
+	// Second call with the same target=1 should be a no-op — the just-spawned
+	// row counts as a warm-or-spawning worker for this image.
+	again, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.5.1", 1, 5)
+	if err != nil {
+		t.Fatalf("CreateNeutralWarmWorkerSlotForImage(repeat): %v", err)
+	}
+	if again != nil {
+		t.Fatalf("expected per-image target to block second spawn, got %#v", again)
+	}
+
+	// Global cap still applies: with maxGlobalWorkers=2 and two existing rows
+	// (the v1.4.0 idle plus the v1.5.1 spawning), a third image's request
+	// must be blocked.
+	capped, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.6.0", 1, 2)
+	if err != nil {
+		t.Fatalf("CreateNeutralWarmWorkerSlotForImage(global cap): %v", err)
+	}
+	if capped != nil {
+		t.Fatalf("expected global cap to block third image spawn, got %#v", capped)
+	}
+}
+
 func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
