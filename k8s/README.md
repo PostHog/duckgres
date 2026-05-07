@@ -130,6 +130,7 @@ Seeded warehouse contract notes:
 - `GET /api/v1/teams/local/warehouse` reads that row.
 - `PUT /api/v1/teams/local/warehouse` replaces that row for the team.
 - `just multitenant-seed-local` is idempotent and updates the same `local` warehouse row rather than creating duplicates.
+- Destructive production teardown is covered by the [Managed Warehouse Deprovision runbook](../docs/runbooks/managed-warehouse-deprovision.md).
 
 Tear down the local environments:
 
