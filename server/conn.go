@@ -3842,9 +3842,19 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	_ = c.writer.Flush()
 	slog.Debug("COPY FROM STDIN sent CopyInResponse, waiting for data.", "user", c.username)
 
-	// Create temp file upfront and stream data directly to it (avoids memory buffering)
+	// Create temp file upfront and stream data directly to it (avoids memory buffering).
 	// This approach leverages DuckDB's highly optimized CSV parser which handles
 	// type conversions automatically and can load millions of rows in seconds.
+	//
+	// KNOWN LIMITATION (remote worker / multitenant mode): the temp file is
+	// written to the *control plane* pod's filesystem, but the worker that
+	// runs the COPY FROM is a separate pod with its own filesystem. The
+	// worker therefore fails to open the path with "No files found that
+	// match the pattern". This path only works in standalone and process-
+	// backend topologies where CP and worker share a filesystem. The fix
+	// requires shipping the bytes to the worker (Flight DoPut, Arrow IPC
+	// ingest, or a worker-side spool RPC). See controlplane/control.go
+	// and duckdbservice/flight_handler.go.
 	tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
 	if err != nil {
 		slog.Error("COPY FROM STDIN failed to create temp file.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
@@ -3923,6 +3933,16 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			if err != nil {
 				slog.Error("COPY FROM STDIN DuckDB COPY failed.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
+				// In remote-worker mode the spool tempfile lives on the
+				// control plane filesystem and is not visible to the
+				// worker pod, so the worker reports "No files found that
+				// match the pattern". Surface a clearer message so this
+				// doesn't get re-debugged.
+				if c.workerPod != "" && strings.Contains(err.Error(), "No files found that match the pattern") {
+					errMsg = "COPY FROM STDIN is not supported in remote-worker (multitenant) mode: " +
+						"the spool file is written to the control plane filesystem, which is not " +
+						"shared with the worker pod. Use INSERT or load data via S3/HTTPFS until this is fixed."
+				}
 				c.sendError("ERROR", "22P02", errMsg)
 				c.setTxError()
 				c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "22P02", errMsg, "simple")
