@@ -225,6 +225,13 @@ type Config struct {
 	// DuckLake configuration
 	DuckLake DuckLakeConfig
 
+	// AlwaysDuckLake forces the SQL transpiler into DuckLake mode for every
+	// session even when the global DuckLake.MetadataStore is empty. The
+	// multitenant control plane sets this because metadata stores are
+	// per-org (loaded from configstore), so the global field stays empty
+	// even though every worker is DuckLake-backed.
+	AlwaysDuckLake bool
+
 	// Graceful shutdown timeout (default: 30s)
 	ShutdownTimeout time.Duration
 

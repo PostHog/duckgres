@@ -375,6 +375,15 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.K8s.SharedWarmTarget = k8sSharedWarmTarget
 	}
 
+	// In remote (multitenant) mode the global DuckLake.MetadataStore is empty
+	// because metadata stores are per-org (loaded from configstore), but every
+	// worker is DuckLake-backed. Force the transpiler into DuckLake mode so
+	// DDL stripping (e.g. ALTER TABLE ADD PRIMARY KEY → no-op) and the other
+	// DuckLake-aware transforms still run.
+	if cfg.WorkerBackend == "remote" {
+		cfg.AlwaysDuckLake = true
+	}
+
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)
