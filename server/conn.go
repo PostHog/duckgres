@@ -5388,7 +5388,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	start := time.Now()
 	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
 
-	_, span := observe.Tracer().Start(c.ctx, "duckgres.query",
+	queryCtx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
 			attribute.String("duckgres.protocol", "extended"),
 			attribute.String("duckgres.org_id", c.orgID),
@@ -5484,7 +5484,11 @@ func (c *clientConn) handleExecute(body []byte) {
 			return result, err
 		}
 
+		execStart := time.Now()
+		execCtx, execSpan := observe.Tracer().Start(queryCtx, "duckgres.execute")
 		result, err := runExec()
+		observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
 		if err != nil {
 			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 				ducklakeConflictTotal.Inc()
@@ -5533,6 +5537,8 @@ func (c *clientConn) handleExecute(body []byte) {
 		return c.executor.Query(convertedQuery, args...)
 	}
 
+	execStart := time.Now()
+	execCtx, execSpan := observe.Tracer().Start(queryCtx, "duckgres.execute")
 	rows, err := runQuery()
 	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 		ducklakeConflictTotal.Inc()
@@ -5549,6 +5555,8 @@ func (c *clientConn) handleExecute(body []byte) {
 			runQuery,
 		)
 	}
+	observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+	execSpan.End()
 	if err != nil {
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
