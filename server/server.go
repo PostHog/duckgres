@@ -876,23 +876,16 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 	// (just clock_gettime per operator boundary).
 	// Output goes to a fixed temp file; in K8s mode the worker reads it
 	// after each query and sends it to the control plane via gRPC trailer.
-	if _, err := db.Exec("SET enable_profiling = 'json'"); err != nil {
-		slog.Warn("Failed to enable DuckDB profiling.", "error", err)
-	}
-	if _, err := db.Exec("SET profiling_mode = 'detailed'"); err != nil {
-		slog.Warn("Failed to set DuckDB profiling mode.", "error", err)
-	}
-	// Default profiling_coverage is 'SELECT', which silently skips writing
-	// the profile file for some non-SELECT statements — INSERT and bare
-	// DDL like CREATE TABLE are the most visible cases. When that happens,
-	// /tmp/duckgres-profiling.json stays unchanged, the worker's gRPC
-	// trailer comes back empty, and EnrichSpanWithProfiling no-ops on the
-	// control plane. See TestProfilingCoverageAllCoversNonSelect.
-	if _, err := db.Exec("SET profiling_coverage = 'ALL'"); err != nil {
-		slog.Warn("Failed to set DuckDB profiling coverage.", "error", err)
-	}
-	if _, err := db.Exec("SET profiling_output = '/tmp/duckgres-profiling.json'"); err != nil {
-		slog.Warn("Failed to set DuckDB profiling output path.", "error", err)
+	//
+	// These SETs are session-scoped in DuckDB and cannot be set globally,
+	// so they only apply to whichever connection runs them now. In cluster
+	// mode (sharedWarmMode) the worker evicts connections between sessions
+	// (see duckdbservice.evictConnFromPool), so per-session re-application
+	// is required — see ApplyProfilingSettings.
+	for _, stmt := range ProfilingSetupSQL(ProfilingOutputPath) {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to apply DuckDB profiling setting.", "stmt", stmt, "error", err)
+		}
 	}
 
 	// Configure cache_httpfs cache directory if the extension is loaded.

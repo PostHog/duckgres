@@ -440,6 +440,13 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 	// Since the DB is shared, we must set session-local parameters here.
 	initSearchPath(conn, username)
 
+	// Re-apply DuckDB profiling settings on the freshly-pooled connection.
+	// ConfigureMainDB sets these once at warmup, but in cluster mode the
+	// per-session evictConnFromPool call discards the settings along with
+	// the conn — so for every session after the first we need to re-apply.
+	// DuckDB rejects `SET GLOBAL` for these keys, so this is the only path.
+	server.ApplyProfilingSettings(context.Background(), conn)
+
 	// Apply initial resource limits if provided (optimizes handshake by avoiding
 	// roundtrips from control plane).
 	if memoryLimit != "" {
