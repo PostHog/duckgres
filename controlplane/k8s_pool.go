@@ -45,9 +45,14 @@ type K8sWorkerPool struct {
 	spawning     int
 	maxWorkers   int
 	minWorkers   int
-	idleTimeout  time.Duration
-	shuttingDown bool
-	shutdownCh   chan struct{}
+	// perImageWarmTarget is an additive floor on top of minWorkers: for each
+	// image listed, the pool aims to keep at least N warm-idle workers of
+	// that exact image alive so a per-org pin always has a hot pod waiting.
+	// minWorkers still drives the cluster-default warm count separately.
+	perImageWarmTarget map[string]int
+	idleTimeout        time.Duration
+	shuttingDown       bool
+	shutdownCh         chan struct{}
 
 	clientset             kubernetes.Interface
 	namespace             string
@@ -1860,6 +1865,102 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 	return stderrors.Join(errs...)
 }
 
+// SpawnMinWorkersForImage ensures at least count warm-idle workers exist for
+// the given image, additive to (and independent of) the cluster-default warm
+// pool managed by SpawnMinWorkers. Per-image floor lets a per-org image pin
+// always find a hot pod waiting instead of paying a cold spawn on first
+// connection.
+//
+// Image-aware DB count and the per-image advisory lock keep this safe for
+// concurrent reconcilers across multiple control planes.
+func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image string, count int) error {
+	if count <= 0 || strings.TrimSpace(image) == "" {
+		return nil
+	}
+	if p.runtimeStore == nil {
+		// Single-CP / no-runtime-store mode is not multi-tenant, so per-image
+		// pinning doesn't apply — caller's image == p.workerImage.
+		return nil
+	}
+
+	p.mu.Lock()
+	if p.shuttingDown {
+		p.mu.Unlock()
+		return nil
+	}
+	p.cleanDeadWorkersLocked()
+	idleByImage := p.idleWarmWorkerCountByImageLocked()
+	missing := count - idleByImage[image]
+	if missing <= 0 {
+		p.mu.Unlock()
+		return nil
+	}
+	if p.maxWorkers > 0 {
+		room := p.maxWorkers - p.liveWorkerCountLocked()
+		if room <= 0 {
+			p.mu.Unlock()
+			return nil
+		}
+		if missing > room {
+			missing = room
+		}
+	}
+	p.mu.Unlock()
+
+	var slots []*configstore.WorkerRecord
+	for i := 0; i < missing; i++ {
+		slot, err := p.runtimeStore.CreateNeutralWarmWorkerSlotForImage(
+			p.cpInstanceID,
+			p.workerPodNamePrefix(),
+			image,
+			count,
+			p.maxWorkers,
+		)
+		if err != nil {
+			for _, s := range slots {
+				p.retireClaimedWorker(s, RetireReasonCrash)
+			}
+			return err
+		}
+		if slot == nil {
+			break
+		}
+		slots = append(slots, slot)
+	}
+
+	if len(slots) == 0 {
+		return nil
+	}
+
+	p.mu.Lock()
+	p.spawning += len(slots)
+	p.mu.Unlock()
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(slots))
+	for i, slot := range slots {
+		wg.Add(1)
+		go func(i int, slot *configstore.WorkerRecord) {
+			defer wg.Done()
+			err := p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image)
+
+			p.mu.Lock()
+			p.spawning--
+			if err == nil {
+				observeWarmPoolLifecycleGauges(p.workers)
+			}
+			p.mu.Unlock()
+
+			if err != nil {
+				p.retireClaimedWorker(slot, RetireReasonCrash)
+				errs[i] = err
+			}
+		}(i, slot)
+	}
+	wg.Wait()
+	return stderrors.Join(errs...)
+}
+
 // HealthCheckLoop periodically checks worker health.
 func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
 	ticker := time.NewTicker(interval)
@@ -2515,6 +2616,24 @@ func (p *K8sWorkerPool) idleWarmWorkerCountLocked() int {
 	return count
 }
 
+// idleWarmWorkerCountByImageLocked returns warm-idle counts bucketed by the
+// image each worker was spawned with. Used by the per-image warm floor to
+// decide whether to spawn a new worker of a specific pinned image.
+func (p *K8sWorkerPool) idleWarmWorkerCountByImageLocked() map[string]int {
+	counts := make(map[string]int)
+	for _, w := range p.workers {
+		select {
+		case <-w.done:
+			continue
+		default:
+		}
+		if p.isWarmIdleWorkerLocked(w) {
+			counts[w.image]++
+		}
+	}
+	return counts
+}
+
 func (p *K8sWorkerPool) shouldReplenishWarmCapacityLocked() bool {
 	if p.runtimeStore != nil {
 		return false
@@ -2739,6 +2858,35 @@ func (p *K8sWorkerPool) WarmCapacityTarget() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.minWorkers
+}
+
+// SetPerImageWarmTargets replaces the per-image warm-worker floor. Each entry
+// asks the pool to keep at least N warm-idle workers running with the given
+// image. This is layered on top of SetWarmCapacityTarget — the per-image floor
+// guarantees coverage for pinned org images that wouldn't otherwise be served
+// by the cluster-default warm pool. Pass an empty map to disable.
+func (p *K8sWorkerPool) SetPerImageWarmTargets(targets map[string]int) {
+	clean := make(map[string]int, len(targets))
+	for image, n := range targets {
+		if image == "" || n <= 0 {
+			continue
+		}
+		clean[image] = n
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.perImageWarmTarget = clean
+}
+
+// PerImageWarmTargets returns a snapshot of the per-image warm floor.
+func (p *K8sWorkerPool) PerImageWarmTargets() map[string]int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]int, len(p.perImageWarmTarget))
+	for k, v := range p.perImageWarmTarget {
+		out[k] = v
+	}
+	return out
 }
 
 func boolPtr(b bool) *bool    { return &b }

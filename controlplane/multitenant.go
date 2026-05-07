@@ -246,12 +246,23 @@ func SetupMultiTenant(
 	}
 	janitor.reconcileWarmCapacity = func() {
 		target := router.sharedPool.WarmCapacityTarget()
-		if target <= 0 {
-			return
+		if target > 0 {
+			observeOrgWorkerSpawn("shared")
+			if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
+				slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
+			}
 		}
-		observeOrgWorkerSpawn("shared")
-		if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
-			slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
+
+		// Per-image warm floor: ensure at least one warm pod for each
+		// distinct DuckDB version image in active use, so per-org pins
+		// always find a hot pod waiting instead of paying a cold spawn.
+		for image, count := range router.sharedPool.PerImageWarmTargets() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := router.sharedPool.SpawnMinWorkersForImage(ctx, image, count)
+			cancel()
+			if err != nil {
+				slog.Warn("Janitor failed to reconcile per-image warm capacity.", "image", image, "target", count, "error", err)
+			}
 		}
 	}
 	janitor.retireMismatchedVersionWorker = func() {
