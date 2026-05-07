@@ -188,7 +188,7 @@ type clientConn struct {
 // newTranspiler creates a transpiler configured for this connection.
 func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
 	return transpiler.New(transpiler.Config{
-		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "",
+		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake,
 		LogicalDatabaseName: c.database,
 		PhysicalCatalogName: "ducklake",
 		ConvertPlaceholders: convertPlaceholders,
