@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"os"
 	"testing"
@@ -150,4 +152,108 @@ func TestProfilingCoverageAllCoversNonSelect(t *testing.T) {
 			t.Errorf("expected positive latency, got %f", m.Latency)
 		}
 	})
+}
+
+// TestProfilingSettingsArePerConnection reproduces the cluster-mode bug:
+// DuckDB profiling settings are session-scoped (DuckDB rejects `SET GLOBAL`
+// for `enable_profiling` etc.), so when the worker's evictConnFromPool
+// discards a session's connection between sessions, the next fresh
+// connection has no profiling configured and the profile file stays
+// untouched. ProfilingSetupSQL applied per-connection is the fix.
+func TestProfilingSettingsArePerConnection(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	// Two slots so we can pin two distinct underlying connections.
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
+
+	ctx := context.Background()
+	tmpFile := t.TempDir() + "/profiling.json"
+	setup := ProfilingSetupSQL(tmpFile)
+
+	// Connection A: full setup, simulates the warmup conn that ConfigureMainDB
+	// ran on. Apply the production setup statements directly so we're testing
+	// the same SQL the real code path uses.
+	connA, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn A: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+	if _, err := connA.ExecContext(ctx, "CREATE TABLE t (x INT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for _, s := range setup {
+		if _, err := connA.ExecContext(ctx, s); err != nil {
+			t.Fatalf("connA %s: %v", s, err)
+		}
+	}
+
+	// Connection B: pretend we've evicted A and the pool handed out a fresh
+	// conn. Without per-session re-application, this conn has no profiling
+	// settings.
+	connB, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn B: %v", err)
+	}
+	defer func() { _ = connB.Close() }()
+
+	_ = os.Remove(tmpFile)
+	if _, err := connB.ExecContext(ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("connB pre-fix INSERT: %v", err)
+	}
+	if data, err := os.ReadFile(tmpFile); err == nil && len(data) > 0 {
+		t.Fatalf("pre-fix sanity: fresh conn should not produce profile JSON, got %d bytes", len(data))
+	}
+
+	// Now apply the same setup to connB and re-run the INSERT — this is what
+	// duckdbservice.CreateSession does via server.ApplyProfilingSettings.
+	for _, s := range setup {
+		if _, err := connB.ExecContext(ctx, s); err != nil {
+			t.Fatalf("connB re-apply %s: %v", s, err)
+		}
+	}
+	_ = os.Remove(tmpFile)
+	if _, err := connB.ExecContext(ctx, "INSERT INTO t VALUES (2)"); err != nil {
+		t.Fatalf("connB post-fix INSERT: %v", err)
+	}
+	data, err := os.ReadFile(tmpFile)
+	if err != nil {
+		t.Fatalf("read profile after re-apply: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("post-fix: profile file is empty after INSERT — re-applying setup should have re-enabled profiling")
+	}
+	m, ok := observe.ParseProfilingOutput(string(data))
+	if !ok {
+		t.Fatalf("failed to parse profile JSON: %s", data[:min(200, len(data))])
+	}
+	if m.Latency <= 0 {
+		t.Errorf("expected positive latency, got %f", m.Latency)
+	}
+
+	// Belt-and-braces: confirm a fresh conn after eviction really has empty
+	// settings — i.e. nothing about ProfilingSetupSQL silently sets state on
+	// the underlying driver/connector that survives across connections.
+	_ = connB.Raw(func(any) error { return driver.ErrBadConn })
+	connC, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn C: %v", err)
+	}
+	defer func() { _ = connC.Close() }()
+	rows, err := connC.QueryContext(ctx, "SELECT value FROM duckdb_settings() WHERE name = 'enable_profiling'")
+	if err != nil {
+		t.Fatalf("connC query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		t.Fatal("expected one row from duckdb_settings()")
+	}
+	var got string
+	_ = rows.Scan(&got)
+	if got != "" {
+		t.Fatalf("fresh conn C should have empty enable_profiling, got %q — settings unexpectedly survived", got)
+	}
 }
