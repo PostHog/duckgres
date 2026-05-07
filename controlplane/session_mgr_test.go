@@ -3,17 +3,38 @@
 package controlplane
 
 import (
+	"bytes"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/posthog/duckgres/server/flightclient"
 )
 
-// mockCloser tracks whether Close was called.
+// mockCloser stands in for the client TCP/TLS conn — captures bytes written
+// (so tests can assert a FATAL ErrorResponse was delivered) and tracks whether
+// Close was called.
 type mockCloser struct {
-	closed atomic.Bool
+	closed  atomic.Bool
+	writeMu sync.Mutex
+	written []byte
+}
+
+func (m *mockCloser) Write(p []byte) (int, error) {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	m.written = append(m.written, p...)
+	return len(p), nil
+}
+
+func (m *mockCloser) Bytes() []byte {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	out := make([]byte, len(m.written))
+	copy(out, m.written)
+	return out
 }
 
 func (m *mockCloser) Close() error {
@@ -75,7 +96,7 @@ func TestOnWorkerCrash_ClosesConnections(t *testing.T) {
 		PID:        pid,
 		WorkerID:   7,
 		Executor:   executor,
-		connCloser: conn,
+		conn:       conn,
 	}
 	sm.byWorker[7] = []int32{pid}
 	sm.mu.Unlock()
@@ -99,8 +120,8 @@ func TestOnWorkerCrash_MultipleSessions(t *testing.T) {
 	conn2 := &mockCloser{}
 
 	sm.mu.Lock()
-	sm.sessions[1001] = &ManagedSession{PID: 1001, WorkerID: 3, Executor: exec1, connCloser: conn1}
-	sm.sessions[1002] = &ManagedSession{PID: 1002, WorkerID: 3, Executor: exec2, connCloser: conn2}
+	sm.sessions[1001] = &ManagedSession{PID: 1001, WorkerID: 3, Executor: exec1, conn:       conn1}
+	sm.sessions[1002] = &ManagedSession{PID: 1002, WorkerID: 3, Executor: exec2, conn:       conn2}
 	sm.byWorker[3] = []int32{1001, 1002}
 	sm.mu.Unlock()
 
@@ -114,6 +135,53 @@ func TestOnWorkerCrash_MultipleSessions(t *testing.T) {
 	}
 	if sm.SessionCount() != 0 {
 		t.Fatalf("expected 0 sessions, got %d", sm.SessionCount())
+	}
+}
+
+func TestOnWorkerCrash_WritesFATALBeforeClose(t *testing.T) {
+	// Asserts the new behavior: when a worker is reaped, the CP delivers a
+	// pgwire FATAL ErrorResponse on the client conn before closing it. This
+	// is the difference between psql cleanly surfacing "connection lost" and
+	// dbt's libpq state machine hanging silently on a half-open socket.
+	pool := &FlightWorkerPool{workers: make(map[int]*ManagedWorker)}
+	sm := NewSessionManager(pool, nil)
+
+	conn := &mockCloser{}
+	pid := int32(1500)
+
+	sm.mu.Lock()
+	sm.sessions[pid] = &ManagedSession{
+		PID:      pid,
+		WorkerID: 42,
+		Executor: &flightclient.FlightExecutor{},
+		conn:     conn,
+	}
+	sm.byWorker[42] = []int32{pid}
+	sm.mu.Unlock()
+
+	sm.OnWorkerCrash(42, func(int32) {})
+
+	if !conn.closed.Load() {
+		t.Fatal("conn was not closed on worker crash")
+	}
+
+	// Inspect the bytes the crash handler wrote: pgwire ErrorResponse starts
+	// with the byte 'E', followed by a 4-byte length, then field-tagged
+	// strings. We just assert FATAL + the worker ID appear so we know a
+	// FATAL packet was emitted before the close — not testing the wire
+	// encoding in detail (server/wire owns that).
+	got := conn.Bytes()
+	if len(got) == 0 {
+		t.Fatal("no bytes written before close — FATAL not delivered")
+	}
+	if got[0] != 'E' {
+		t.Errorf("expected first byte 'E' (ErrorResponse), got %q", got[0])
+	}
+	if !bytes.Contains(got, []byte("FATAL")) {
+		t.Errorf("expected 'FATAL' in payload, got %q", got)
+	}
+	if !bytes.Contains(got, []byte("42")) {
+		t.Errorf("expected worker id '42' in payload, got %q", got)
 	}
 }
 
@@ -236,7 +304,7 @@ func TestDestroySessionAfterOnWorkerCrash(t *testing.T) {
 		PID:        pid,
 		WorkerID:   9,
 		Executor:   executor,
-		connCloser: conn,
+		conn:       conn,
 	}
 	sm.byWorker[9] = []int32{pid}
 	sm.mu.Unlock()

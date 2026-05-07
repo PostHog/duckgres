@@ -21,6 +21,15 @@ type SessionProgress struct {
 	Stalled    bool
 }
 
+// SessionConn is the client transport for a managed session. It supports both
+// writing pgwire packets (used to deliver a FATAL ErrorResponse on worker
+// crash before closing) and closing the underlying TCP. *tls.Conn — the type
+// the pgwire handshake hands us — satisfies this interface naturally.
+type SessionConn interface {
+	io.Writer
+	io.Closer
+}
+
 // ManagedSession tracks a client session bound to a worker.
 type ManagedSession struct {
 	PID          int32
@@ -28,7 +37,12 @@ type ManagedSession struct {
 	Protocol     string // "postgres" or "flight"
 	SessionToken string
 	Executor     *flightclient.FlightExecutor
-	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
+	// conn is the client TCP/TLS connection. Used by the worker-crash path
+	// to deliver a FATAL ErrorResponse and then close the socket — the
+	// FATAL is what lets clients (libpq, dbt's psycopg2 adapter) cleanly
+	// surface "your session was lost" instead of waiting forever on a
+	// half-open TCP that just got reset.
+	conn SessionConn
 
 	// Cached query progress from worker health checks.
 	queryProgress atomic.Value // stores *SessionProgress (or nil)
@@ -301,14 +315,25 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			if session.Executor != nil {
 				_ = session.Executor.Close()
 			}
-			// Close the TCP connection to unblock the message loop's read.
-			// This causes the session goroutine to exit instead of looping
-			// with ErrWorkerDead on every query. The deferred close in
-			// handleConnection will also call Close() on the same conn;
-			// that's harmless (net.Conn.Close on a closed socket returns
-			// an error which is discarded).
-			if session.connCloser != nil {
-				_ = session.connCloser.Close()
+			// Deliver a pgwire FATAL ErrorResponse before closing the TCP.
+			// Without the FATAL, libpq-based clients (psql, dbt's psycopg2
+			// adapter) can hang on a half-open socket — psql happens to
+			// handle the bare TCP close OK because its read loop returns,
+			// but dbt's libpq-async + disabled keepalives setup leaves
+			// PQconsumeInput parked indefinitely. The FATAL gives every
+			// client a structured "your session was lost" they can surface.
+			//
+			// Concurrency: the message loop also writes to this conn via
+			// its own bufio.Writer, but *tls.Conn / net.Conn serialize
+			// underlying Write calls internally — so we may interleave at
+			// the message boundary (corrupting an in-flight DataRow), but
+			// not at the byte level. A client that sees a malformed packet
+			// followed by a FATAL still surfaces an error cleanly, which
+			// is strictly better than a silent half-open socket.
+			if session.conn != nil {
+				_ = server.WriteErrorResponse(session.conn, "FATAL", "08006",
+					fmt.Sprintf("worker %d for this session became unresponsive and was reaped", workerID))
+				_ = session.conn.Close()
 			}
 		}
 		remainingSessions := len(sm.sessions)
@@ -332,16 +357,39 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	}
 }
 
-// SetConnCloser registers the client's TCP connection so it can be closed
-// when the backing worker crashes. This unblocks the message loop's read,
-// causing it to exit cleanly instead of looping on ErrWorkerDead.
-func (sm *SessionManager) SetConnCloser(pid int32, closer io.Closer) {
+// SetSessionConn registers the client's TCP/TLS transport so the worker-crash
+// path can deliver a FATAL ErrorResponse and close the socket. *tls.Conn from
+// the pgwire handshake satisfies SessionConn (io.Writer + io.Closer).
+func (sm *SessionManager) SetSessionConn(pid int32, conn SessionConn) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	if s, ok := sm.sessions[pid]; ok {
-		s.connCloser = closer
+		s.conn = conn
 	}
 }
+
+// SetConnCloser is a back-compat shim for callers that previously passed an
+// io.Closer. The real type they pass (*tls.Conn) is also an io.Writer, so we
+// upcast to SessionConn here. New callers should use SetSessionConn directly.
+//
+// Deprecated: use SetSessionConn.
+func (sm *SessionManager) SetConnCloser(pid int32, closer io.Closer) {
+	conn, ok := closer.(SessionConn)
+	if !ok {
+		// Caller passed a closer that isn't also a Writer — we can still
+		// close on crash, just can't deliver a FATAL. Wrap in a discarding
+		// writer so the type satisfies SessionConn.
+		conn = closeOnlyConn{closer}
+	}
+	sm.SetSessionConn(pid, conn)
+}
+
+// closeOnlyConn adapts an io.Closer with no Writer into a SessionConn whose
+// Write is a no-op. Used by the deprecated SetConnCloser path for callers that
+// genuinely don't have a Writer; modern callers pass *tls.Conn directly.
+type closeOnlyConn struct{ io.Closer }
+
+func (closeOnlyConn) Write(p []byte) (int, error) { return len(p), nil }
 
 // SessionCount returns the number of active sessions.
 func (sm *SessionManager) SessionCount() int {
