@@ -1351,6 +1351,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			if claimed != nil {
 				worker, reserveErr := p.reserveClaimedWorker(ctx, claimed, assignment)
 				if reserveErr == nil {
+					p.triggerPerImageReplenish(claimed.Image)
 					return worker, nil
 				}
 				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "worker_pod", claimed.PodName, "error", reserveErr)
@@ -1417,6 +1418,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			if shouldReplenish {
 				p.spawnWarmWorkerBackground(replenishID, p.workerImage)
 			}
+			p.triggerPerImageReplenish(idle.image)
 			return idle, nil
 		}
 
@@ -1863,6 +1865,29 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 	}
 	wg.Wait()
 	return stderrors.Join(errs...)
+}
+
+// triggerPerImageReplenish kicks off a background spawn for image if the
+// per-image warm floor isn't met. Fire-and-forget; the janitor catches any
+// we miss on its next 5s tick. Cuts the gap between consuming a pinned warm
+// worker and seeing a fresh one in its place from up-to-5s down to ~now.
+func (p *K8sWorkerPool) triggerPerImageReplenish(image string) {
+	if strings.TrimSpace(image) == "" || p.runtimeStore == nil {
+		return
+	}
+	p.mu.RLock()
+	target := p.perImageWarmTarget[image]
+	p.mu.RUnlock()
+	if target <= 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := p.SpawnMinWorkersForImage(ctx, image, target); err != nil {
+			slog.Warn("Per-image warm replenish failed.", "image", image, "error", err)
+		}
+	}()
 }
 
 // SpawnMinWorkersForImage ensures at least count warm-idle workers exist for

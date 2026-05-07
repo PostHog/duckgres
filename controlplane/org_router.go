@@ -381,15 +381,15 @@ func (tr *OrgRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
 	}
 
 	tr.sharedPool.SetWarmCapacityTarget(target)
-	tr.sharedPool.SetPerImageWarmTargets(tr.computePerImageWarmTargetsLocked(snap))
+	tr.sharedPool.SetPerImageWarmTargets(tr.computePerImageWarmTargets(snap))
 }
 
-// computePerImageWarmTargetsLocked returns "keep at least 1 warm worker for
-// each distinct image" — covering the cluster default plus every pinned
+// computePerImageWarmTargets returns "keep at least 1 warm worker for each
+// distinct image" — covering the cluster default plus every pinned
 // Warehouse.Image used by an org that currently has an active stack. Orgs
 // without a live stack (e.g. warehouse not yet ready) are skipped so we don't
 // pre-warm pods for images nobody can route to yet.
-func (tr *OrgRouter) computePerImageWarmTargetsLocked(snap *configstore.Snapshot) map[string]int {
+func (tr *OrgRouter) computePerImageWarmTargets(snap *configstore.Snapshot) map[string]int {
 	targets := make(map[string]int)
 	if defaultImage := strings.TrimSpace(tr.baseCfg.WorkerImage); defaultImage != "" {
 		targets[defaultImage] = 1
@@ -405,9 +405,7 @@ func (tr *OrgRouter) computePerImageWarmTargetsLocked(snap *configstore.Snapshot
 		if image == "" {
 			continue
 		}
-		if _, exists := targets[image]; !exists {
-			targets[image] = 1
-		}
+		targets[image] = 1
 	}
 	return targets
 }
