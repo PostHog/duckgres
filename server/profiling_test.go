@@ -73,3 +73,81 @@ func TestProfilingOutputToFile(t *testing.T) {
 		}
 	}
 }
+
+// TestProfilingCoverageAllCoversNonSelect pins the behavior that motivates
+// `SET profiling_coverage = 'ALL'` in ConfigureMainDB: with the default
+// coverage ('SELECT') DuckDB silently skips writing the profile file for
+// some non-SELECT statements (notably INSERT and bare CREATE TABLE), so
+// the worker's gRPC trailer comes back empty and EnrichSpanWithProfiling
+// no-ops on the control plane. INSERT is used here because in DuckDB
+// v1.5.2 it's the cleanest reproduction — CTAS already gets profiled
+// under the default because of its embedded SELECT.
+func TestProfilingCoverageAllCoversNonSelect(t *testing.T) {
+	mustExec := func(t *testing.T, db *sql.DB, stmts ...string) {
+		t.Helper()
+		for _, s := range stmts {
+			if _, err := db.Exec(s); err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+		}
+	}
+
+	// Default coverage ('SELECT'): INSERT must NOT produce profile JSON.
+	// If DuckDB ever changes the default to cover INSERT this will catch it
+	// and we can re-evaluate whether the explicit 'ALL' is still needed.
+	t.Run("default coverage skips INSERT", func(t *testing.T) {
+		db, err := sql.Open("duckdb", ":memory:")
+		if err != nil {
+			t.Fatalf("open duckdb: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+
+		tmpFile := t.TempDir() + "/profiling.json"
+		mustExec(t, db,
+			"CREATE TABLE t (x INT)",
+			"SET enable_profiling = 'json'",
+			"SET profiling_mode = 'detailed'",
+			"SET profiling_output = '"+tmpFile+"'",
+		)
+		mustExec(t, db, "INSERT INTO t VALUES (1), (2), (3)")
+
+		data, err := os.ReadFile(tmpFile)
+		if err == nil && len(data) > 0 {
+			t.Fatalf("expected no profile JSON for INSERT under default coverage, got %d bytes", len(data))
+		}
+	})
+
+	// coverage = 'ALL': INSERT must produce a parseable profile.
+	t.Run("coverage=ALL covers INSERT", func(t *testing.T) {
+		db, err := sql.Open("duckdb", ":memory:")
+		if err != nil {
+			t.Fatalf("open duckdb: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+
+		tmpFile := t.TempDir() + "/profiling.json"
+		mustExec(t, db,
+			"CREATE TABLE t (x INT)",
+			"SET enable_profiling = 'json'",
+			"SET profiling_mode = 'detailed'",
+			"SET profiling_coverage = 'ALL'",
+			"SET profiling_output = '"+tmpFile+"'",
+		)
+		mustExec(t, db, "INSERT INTO t VALUES (1), (2), (3)")
+
+		data, err := os.ReadFile(tmpFile)
+		if err != nil {
+			t.Fatalf("read profiling file: %v", err)
+		}
+		if len(data) == 0 {
+			t.Fatal("profiling output file is empty after INSERT with coverage='ALL'")
+		}
+		m, ok := observe.ParseProfilingOutput(string(data))
+		if !ok {
+			t.Fatalf("failed to parse profiling output: %s", data[:min(200, len(data))])
+		}
+		if m.Latency <= 0 {
+			t.Errorf("expected positive latency, got %f", m.Latency)
+		}
+	})
+}

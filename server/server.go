@@ -882,10 +882,12 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 	if _, err := db.Exec("SET profiling_mode = 'detailed'"); err != nil {
 		slog.Warn("Failed to set DuckDB profiling mode.", "error", err)
 	}
-	// Default profiling_coverage is 'SELECT', which silently skips
-	// CTAS / INSERT / UPDATE / DELETE / DDL — so /tmp/duckgres-profiling.json
-	// stays unchanged for those queries and the gRPC trailer comes back empty,
-	// which makes EnrichSpanWithProfiling no-op on the control plane.
+	// Default profiling_coverage is 'SELECT', which silently skips writing
+	// the profile file for some non-SELECT statements — INSERT and bare
+	// DDL like CREATE TABLE are the most visible cases. When that happens,
+	// /tmp/duckgres-profiling.json stays unchanged, the worker's gRPC
+	// trailer comes back empty, and EnrichSpanWithProfiling no-ops on the
+	// control plane. See TestProfilingCoverageAllCoversNonSelect.
 	if _, err := db.Exec("SET profiling_coverage = 'ALL'"); err != nil {
 		slog.Warn("Failed to set DuckDB profiling coverage.", "error", err)
 	}
