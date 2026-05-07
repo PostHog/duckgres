@@ -98,6 +98,16 @@ fi
 probe DNS   "kube-dns resolution"          allow "dig +time=2 +tries=1 +short @${KUBE_DNS_IP} kubernetes.default.svc.cluster.local"
 probe HTTPS "S3 region endpoint"           allow "curl -sS -o /dev/null -w %{http_code} --max-time 5 https://$S3_HOST/"
 probe HTTPS "public internet (example.com)" allow "curl -sS -o /dev/null -w %{http_code} --max-time 5 https://example.com/"
+# Port-scope regression checks: world egress is allowlisted to TCP 443 +
+# 5432 only, so any other port to a public host must stay blocked. If
+# either of these flips to reachable in a future probe run, somebody
+# widened the world rule and we want to catch it. Targets are chosen so
+# the destination port is genuinely listening pre-policy (otherwise the
+# "block" outcome would be a false positive caused by the host refusing
+# the connection rather than Cilium): example.com:80 is served by
+# Cloudflare's HTTP redirector, github.com:22 is GitHub's SSH endpoint.
+probe TCP   "public HTTP example.com:80"   block "nc -zv -w 3 example.com 80"
+probe TCP   "public SSH github.com:22"     block "nc -zv -w 3 github.com 22"
 probe TCP   "EC2 IMDS (169.254.169.254)"   block "nc -zv -w 3 169.254.169.254 80"
 probe HTTP  "EC2 IMDS"                     block "curl -sS -o /dev/null -w %{http_code} --max-time 3 http://169.254.169.254/latest/meta-data/"
 probe TCP   "kube-apiserver"               block "nc -zv -w 3 $APISERVER_IP 443"
