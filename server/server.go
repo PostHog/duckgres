@@ -1591,6 +1591,10 @@ var duckLakeMetadataIndexes = []duckLakeMetadataIndex{
 		name: "idx_ducklake_table_col_stats_tbl",
 		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_table_col_stats_tbl ON ducklake_table_column_stats (table_id)",
 	},
+	{
+		name: "idx_ducklake_schema_versions_tbl_schema_version",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_schema_versions_tbl_schema_version ON ducklake_schema_versions (table_id, schema_version)",
+	},
 }
 
 // ensureDuckLakeMetadataIndexes connects directly to the DuckLake PostgreSQL
