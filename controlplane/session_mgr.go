@@ -310,34 +310,42 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 		errorFn(pid)
 		sm.mu.Lock()
 		session, ok := sm.sessions[pid]
+		var executor *flightclient.FlightExecutor
+		var conn SessionConn
 		if ok {
 			delete(sm.sessions, pid)
-			if session.Executor != nil {
-				_ = session.Executor.Close()
-			}
-			// Deliver a pgwire FATAL ErrorResponse before closing the TCP.
-			// Without the FATAL, libpq-based clients (psql, dbt's psycopg2
-			// adapter) can hang on a half-open socket — psql happens to
-			// handle the bare TCP close OK because its read loop returns,
-			// but dbt's libpq-async + disabled keepalives setup leaves
-			// PQconsumeInput parked indefinitely. The FATAL gives every
-			// client a structured "your session was lost" they can surface.
-			//
-			// Concurrency: the message loop also writes to this conn via
-			// its own bufio.Writer, but *tls.Conn / net.Conn serialize
-			// underlying Write calls internally — so we may interleave at
-			// the message boundary (corrupting an in-flight DataRow), but
-			// not at the byte level. A client that sees a malformed packet
-			// followed by a FATAL still surfaces an error cleanly, which
-			// is strictly better than a silent half-open socket.
-			if session.conn != nil {
-				_ = server.WriteErrorResponse(session.conn, "FATAL", "08006",
-					fmt.Sprintf("worker %d for this session became unresponsive and was reaped", workerID))
-				_ = session.conn.Close()
-			}
+			executor = session.Executor
+			conn = session.conn
 		}
 		remainingSessions := len(sm.sessions)
 		sm.mu.Unlock()
+
+		if executor != nil {
+			_ = executor.Close()
+		}
+		// Deliver a pgwire FATAL ErrorResponse before closing the TCP.
+		// Without the FATAL, libpq-based clients (psql, dbt's psycopg2
+		// adapter) can hang on a half-open socket — psql happens to
+		// handle the bare TCP close OK because its read loop returns,
+		// but dbt's libpq-async + disabled keepalives setup leaves
+		// PQconsumeInput parked indefinitely. The FATAL gives every
+		// client a structured "your session was lost" they can surface.
+		//
+		// Concurrency: the message loop also writes to this conn via
+		// its own bufio.Writer, but *tls.Conn / net.Conn serialize
+		// underlying Write calls internally — so we may interleave at
+		// the message boundary (corrupting an in-flight DataRow), but
+		// not at the byte level. A client that sees a malformed packet
+		// followed by a FATAL still surfaces an error cleanly, which
+		// is strictly better than a silent half-open socket.
+		//
+		// Write and Close happen outside sm.mu so a slow or wedged client
+		// socket cannot block unrelated session-manager operations.
+		if conn != nil {
+			_ = server.WriteErrorResponse(conn, "FATAL", "08006",
+				fmt.Sprintf("worker %d for this session became unresponsive and was reaped", workerID))
+			_ = conn.Close()
+		}
 		slog.Info("Worker crash session cleanup completed.",
 			"pid", pid,
 			"worker", workerID,

@@ -4,7 +4,9 @@ package controlplane
 
 import (
 	"bytes"
+	"errors"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,11 +22,16 @@ type mockCloser struct {
 	closed  atomic.Bool
 	writeMu sync.Mutex
 	written []byte
+	events  []string
 }
 
 func (m *mockCloser) Write(p []byte) (int, error) {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
+	if m.closed.Load() {
+		return 0, errors.New("write after close")
+	}
+	m.events = append(m.events, "write")
 	m.written = append(m.written, p...)
 	return len(p), nil
 }
@@ -38,8 +45,19 @@ func (m *mockCloser) Bytes() []byte {
 }
 
 func (m *mockCloser) Close() error {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	m.events = append(m.events, "close")
 	m.closed.Store(true)
 	return nil
+}
+
+func (m *mockCloser) Events() []string {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	out := make([]string, len(m.events))
+	copy(out, m.events)
+	return out
 }
 
 func TestOnWorkerCrash_MarksExecutorsDead(t *testing.T) {
@@ -93,10 +111,10 @@ func TestOnWorkerCrash_ClosesConnections(t *testing.T) {
 
 	sm.mu.Lock()
 	sm.sessions[pid] = &ManagedSession{
-		PID:        pid,
-		WorkerID:   7,
-		Executor:   executor,
-		conn:       conn,
+		PID:      pid,
+		WorkerID: 7,
+		Executor: executor,
+		conn:     conn,
 	}
 	sm.byWorker[7] = []int32{pid}
 	sm.mu.Unlock()
@@ -120,8 +138,8 @@ func TestOnWorkerCrash_MultipleSessions(t *testing.T) {
 	conn2 := &mockCloser{}
 
 	sm.mu.Lock()
-	sm.sessions[1001] = &ManagedSession{PID: 1001, WorkerID: 3, Executor: exec1, conn:       conn1}
-	sm.sessions[1002] = &ManagedSession{PID: 1002, WorkerID: 3, Executor: exec2, conn:       conn2}
+	sm.sessions[1001] = &ManagedSession{PID: 1001, WorkerID: 3, Executor: exec1, conn: conn1}
+	sm.sessions[1002] = &ManagedSession{PID: 1002, WorkerID: 3, Executor: exec2, conn: conn2}
 	sm.byWorker[3] = []int32{1001, 1002}
 	sm.mu.Unlock()
 
@@ -182,6 +200,9 @@ func TestOnWorkerCrash_WritesFATALBeforeClose(t *testing.T) {
 	}
 	if !bytes.Contains(got, []byte("42")) {
 		t.Errorf("expected worker id '42' in payload, got %q", got)
+	}
+	if got := conn.Events(); !slices.Equal(got, []string{"write", "write", "write", "close"}) {
+		t.Fatalf("expected FATAL message writes before close, got event order %v", got)
 	}
 }
 
@@ -301,10 +322,10 @@ func TestDestroySessionAfterOnWorkerCrash(t *testing.T) {
 
 	sm.mu.Lock()
 	sm.sessions[pid] = &ManagedSession{
-		PID:        pid,
-		WorkerID:   9,
-		Executor:   executor,
-		conn:       conn,
+		PID:      pid,
+		WorkerID: 9,
+		Executor: executor,
+		conn:     conn,
 	}
 	sm.byWorker[9] = []int32{pid}
 	sm.mu.Unlock()
