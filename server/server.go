@@ -1525,10 +1525,30 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 	attachStmt := ducklake.BuildDeltaAttachStmt(dlCfg)
 	slog.Info("Attaching Delta catalog.", "path", catalogPath)
 	if _, err := db.Exec(attachStmt); err != nil {
+		// Delta is enabled by default. A fresh DuckLake tenant won't have any
+		// Delta data at the sibling delta/ prefix yet, so DeltaKernel returns
+		// "No files in log segment". That's expected — the catalog will start
+		// resolving once Delta data lands at the path. Treat as a benign skip
+		// instead of failing connection setup.
+		if isDeltaCatalogEmptyError(err) {
+			slog.Info("Skipping Delta catalog attach: no Delta data at path yet.", "path", catalogPath)
+			return nil
+		}
 		return fmt.Errorf("failed to attach Delta catalog: %w", err)
 	}
 	slog.Info("Attached Delta catalog successfully.", "path", catalogPath)
 	return nil
+}
+
+// isDeltaCatalogEmptyError reports whether err indicates the Delta location
+// exists but contains no Delta transaction log yet (the common case for a
+// fresh DuckLake tenant under the always-on Delta default). The DuckDB Delta
+// extension surfaces this as "No files in log segment" via DeltaKernel.
+func isDeltaCatalogEmptyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "No files in log segment")
 }
 
 func deltaCatalogNeedsS3Secret(catalogPath string, dlCfg DuckLakeConfig) bool {
