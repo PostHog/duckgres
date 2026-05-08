@@ -145,6 +145,7 @@ func DefaultServerConfig() server.Config {
 			CheckpointInterval:              24 * time.Hour,
 			DataInliningRowLimit:            intPtr(0),
 			DisableMetadataThreadLocalCache: boolPtr(true),
+			DeltaCatalogEnabled:             true,
 		},
 		QueryLog: server.QueryLogConfig{
 			Enabled:              true,
@@ -1091,9 +1092,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if cfg.DuckLake.DeltaCatalogEnabled && cfg.DuckLake.DeltaCatalogPath == "" {
 		cfg.DuckLake.DeltaCatalogPath = ducklake.DefaultDeltaCatalogPath(cfg.DuckLake)
-		if cfg.DuckLake.DeltaCatalogPath == "" {
-			warn("ducklake.delta_catalog_enabled requires ducklake.delta_catalog_path when no ducklake.object_store or ducklake.data_path is configured")
-		}
 	}
 
 	return Resolved{

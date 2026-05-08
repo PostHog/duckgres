@@ -40,7 +40,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	threads := fs.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	memoryBudget := fs.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
 	memoryRebalance := fs.Bool("memory-rebalance", false, "Enable dynamic per-connection memory reallocation (control-plane mode) (env: DUCKGRES_MEMORY_REBALANCE)")
-	duckLakeDeltaCatalogEnabled := fs.Bool("ducklake-delta-catalog-enabled", false, "Attach a Delta Lake catalog during DuckLake worker boot (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
+	duckLakeDeltaCatalogEnabled := fs.Bool("ducklake-delta-catalog-enabled", true, "Attach a Delta Lake catalog during DuckLake worker boot (default true; use --ducklake-delta-catalog-enabled=false to disable; env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
 	duckLakeDeltaCatalogPath := fs.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach, defaults to sibling delta/ prefix at DuckLake object-store root (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
 	duckLakeDefaultSpecVersion := fs.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
 	processMinWorkers := fs.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")

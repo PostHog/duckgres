@@ -1486,13 +1486,17 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 // AttachDeltaCatalog attaches the configured Delta Lake catalog/table alongside
 // DuckLake. It reuses the DuckLake S3 secret settings so Delta scans can access
 // the same object store credentials.
+//
+// Delta is enabled by default. When no path is derivable (e.g. a plain
+// standalone DuckDB instance with no DuckLake object_store/data_path), this is
+// a benign no-op: there's no Delta sibling to attach.
 func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 	if !dlCfg.DeltaCatalogEnabled {
 		return nil
 	}
 	catalogPath := ducklake.DeltaCatalogPath(dlCfg)
 	if catalogPath == "" {
-		return fmt.Errorf("delta catalog path is empty")
+		return nil
 	}
 
 	select {
@@ -1521,10 +1525,47 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 	attachStmt := ducklake.BuildDeltaAttachStmt(dlCfg)
 	slog.Info("Attaching Delta catalog.", "path", catalogPath)
 	if _, err := db.Exec(attachStmt); err != nil {
+		// Delta is enabled by default. A fresh DuckLake tenant won't have any
+		// Delta data at the sibling delta/ prefix yet, so DeltaKernel returns
+		// "No files in log segment". That's expected — the catalog will start
+		// resolving once Delta data lands at the path. Treat as a benign skip
+		// instead of failing connection setup.
+		if isDeltaCatalogEmptyError(err) {
+			slog.Info("Skipping Delta catalog attach: no Delta data at path yet.", "path", catalogPath)
+			return nil
+		}
 		return fmt.Errorf("failed to attach Delta catalog: %w", err)
+	}
+	// ATTACH '...' (TYPE delta) is lazy — it doesn't read the transaction log
+	// until something forces resolution. With Delta attached but the path
+	// empty, every unqualified-table query the user runs against DuckLake will
+	// fail at prepare time when the planner walks all attached catalogs and
+	// Delta tries to read a missing _delta_log/. Probe immediately and detach
+	// if there's no Delta data here yet, so the catalog only sticks around
+	// once it's actually queryable.
+	if _, err := db.Exec("SHOW TABLES FROM delta"); err != nil {
+		if isDeltaCatalogEmptyError(err) {
+			if _, derr := db.Exec("DETACH delta"); derr != nil {
+				slog.Warn("Failed to detach empty Delta catalog after attach probe.", "error", derr)
+			}
+			slog.Info("Detached Delta catalog: no Delta data at path yet.", "path", catalogPath)
+			return nil
+		}
+		return fmt.Errorf("failed to probe Delta catalog: %w", err)
 	}
 	slog.Info("Attached Delta catalog successfully.", "path", catalogPath)
 	return nil
+}
+
+// isDeltaCatalogEmptyError reports whether err indicates the Delta location
+// exists but contains no Delta transaction log yet (the common case for a
+// fresh DuckLake tenant under the always-on Delta default). The DuckDB Delta
+// extension surfaces this as "No files in log segment" via DeltaKernel.
+func isDeltaCatalogEmptyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "No files in log segment")
 }
 
 func deltaCatalogNeedsS3Secret(catalogPath string, dlCfg DuckLakeConfig) bool {

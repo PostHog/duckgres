@@ -214,6 +214,37 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCacheDefaultsTr
 }
 
 func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
+	// Default-on: with no file/env/CLI overrides, Delta is enabled by default.
+	resolvedDefault := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if !resolvedDefault.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected DeltaCatalogEnabled to default to true")
+	}
+
+	// Default-on with DuckLake configured: path auto-derives to a sibling delta/.
+	resolvedDuckLake := configresolve.ResolveEffective(&FileConfig{
+		DuckLake: DuckLakeFileConfig{
+			ObjectStore: "s3://warehouse/ducklake/",
+		},
+	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if !resolvedDuckLake.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected default DeltaCatalogEnabled with DuckLake configured")
+	}
+	if got, want := resolvedDuckLake.Server.DuckLake.DeltaCatalogPath, "s3://warehouse/delta/"; got != want {
+		t.Fatalf("expected derived Delta catalog path %q, got %q", want, got)
+	}
+
+	// Explicit YAML opt-out wins over the new default.
+	fileDisabled := false
+	resolvedOptOut := configresolve.ResolveEffective(&FileConfig{
+		DuckLake: DuckLakeFileConfig{
+			ObjectStore:         "s3://warehouse/ducklake/",
+			DeltaCatalogEnabled: &fileDisabled,
+		},
+	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if resolvedOptOut.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected YAML ducklake.delta_catalog_enabled=false to disable Delta catalog")
+	}
+
 	fileEnabled := true
 	resolved := configresolve.ResolveEffective(&FileConfig{
 		DuckLake: DuckLakeFileConfig{

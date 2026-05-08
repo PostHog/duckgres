@@ -104,7 +104,7 @@ type ManagedWarehouseS3 struct {
 	Endpoint            string `gorm:"size:512" json:"endpoint"`
 	UseSSL              bool   `json:"use_ssl"`
 	URLStyle            string `gorm:"size:16" json:"url_style"`
-	DeltaCatalogEnabled bool   `json:"delta_catalog_enabled"`
+	DeltaCatalogEnabled bool   `gorm:"default:true" json:"delta_catalog_enabled"`
 	DeltaCatalogPath    string `gorm:"size:1024" json:"delta_catalog_path"`
 }
 
@@ -187,7 +187,7 @@ type DuckLakeConfig struct {
 	S3URLStyle          string    `gorm:"size:16" json:"s3_url_style"`
 	S3Chain             string    `gorm:"size:255" json:"s3_chain"`
 	S3Profile           string    `gorm:"size:255" json:"s3_profile"`
-	DeltaCatalogEnabled bool      `json:"delta_catalog_enabled"`
+	DeltaCatalogEnabled bool      `gorm:"default:true" json:"delta_catalog_enabled"`
 	DeltaCatalogPath    string    `gorm:"size:1024" json:"delta_catalog_path"`
 	UpdatedAt           time.Time `json:"updated_at"`
 }
@@ -218,6 +218,16 @@ type QueryLogConfig struct {
 }
 
 func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
+
+// SchemaMigration tracks one-shot data migrations that aren't expressible
+// through GORM's AutoMigrate (e.g., backfills of new column defaults onto
+// existing rows). One row per migration name, inserted exactly once.
+type SchemaMigration struct {
+	Name      string    `gorm:"primaryKey;size:128" json:"name"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
+func (SchemaMigration) TableName() string { return "duckgres_schema_migrations" }
 
 // ControlPlaneInstanceState describes the liveness state of a control-plane instance.
 type ControlPlaneInstanceState string
