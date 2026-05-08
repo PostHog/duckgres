@@ -1536,6 +1536,23 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 		}
 		return fmt.Errorf("failed to attach Delta catalog: %w", err)
 	}
+	// ATTACH '...' (TYPE delta) is lazy — it doesn't read the transaction log
+	// until something forces resolution. With Delta attached but the path
+	// empty, every unqualified-table query the user runs against DuckLake will
+	// fail at prepare time when the planner walks all attached catalogs and
+	// Delta tries to read a missing _delta_log/. Probe immediately and detach
+	// if there's no Delta data here yet, so the catalog only sticks around
+	// once it's actually queryable.
+	if _, err := db.Exec("SHOW TABLES FROM delta"); err != nil {
+		if isDeltaCatalogEmptyError(err) {
+			if _, derr := db.Exec("DETACH delta"); derr != nil {
+				slog.Warn("Failed to detach empty Delta catalog after attach probe.", "error", derr)
+			}
+			slog.Info("Detached Delta catalog: no Delta data at path yet.", "path", catalogPath)
+			return nil
+		}
+		return fmt.Errorf("failed to probe Delta catalog: %w", err)
+	}
 	slog.Info("Attached Delta catalog successfully.", "path", catalogPath)
 	return nil
 }
