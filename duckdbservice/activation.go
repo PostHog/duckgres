@@ -253,7 +253,8 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		return false
 	}
 	a, b := current.DuckLake, next.DuckLake
-	if !(a.MetadataStore == b.MetadataStore &&
+	ai, bi := current.Iceberg, next.Iceberg
+	return a.MetadataStore == b.MetadataStore &&
 		a.ObjectStore == b.ObjectStore &&
 		a.DataPath == b.DataPath &&
 		a.DeltaCatalogEnabled == b.DeltaCatalogEnabled &&
@@ -267,11 +268,8 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		a.S3Profile == b.S3Profile &&
 		a.Migrate == b.Migrate &&
 		reflect.DeepEqual(a.DataInliningRowLimit, b.DataInliningRowLimit) &&
-		a.CheckpointInterval == b.CheckpointInterval) {
-		return false
-	}
-	ai, bi := current.Iceberg, next.Iceberg
-	return ai.Enabled == bi.Enabled &&
+		a.CheckpointInterval == b.CheckpointInterval &&
+		ai.Enabled == bi.Enabled &&
 		ai.TableBucket == bi.TableBucket &&
 		ai.Region == bi.Region &&
 		ai.Namespace == bi.Namespace
