@@ -78,6 +78,10 @@ func main() {
 	duckLakeDeltaCatalogEnabled := flag.Bool("ducklake-delta-catalog-enabled", true, "Attach a Delta Lake catalog during DuckLake worker boot (default true; use --ducklake-delta-catalog-enabled=false to disable; env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
 	duckLakeDeltaCatalogPath := flag.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
 	duckLakeDefaultSpecVersion := flag.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
+	icebergEnabled := flag.Bool("iceberg-enabled", false, "Attach a per-tenant Iceberg catalog (AWS S3 Tables) at session init (env: DUCKGRES_ICEBERG_ENABLED)")
+	icebergTableBucket := flag.String("iceberg-table-bucket", "", "Iceberg S3 Tables bucket ARN (env: DUCKGRES_ICEBERG_TABLE_BUCKET)")
+	icebergRegion := flag.String("iceberg-region", "", "AWS region for the Iceberg table bucket (env: DUCKGRES_ICEBERG_REGION)")
+	icebergNamespace := flag.String("iceberg-namespace", "", "Default Iceberg namespace (env: DUCKGRES_ICEBERG_NAMESPACE)")
 
 	// Query log
 	queryLog := flag.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
@@ -202,6 +206,10 @@ func main() {
 		DuckLakeDeltaCatalogEnabled: *duckLakeDeltaCatalogEnabled,
 		DuckLakeDeltaCatalogPath:    *duckLakeDeltaCatalogPath,
 		DuckLakeDefaultSpecVersion:  *duckLakeDefaultSpecVersion,
+		IcebergEnabled:              *icebergEnabled,
+		IcebergTableBucket:          *icebergTableBucket,
+		IcebergRegion:               *icebergRegion,
+		IcebergNamespace:            *icebergNamespace,
 		QueryLog:                    *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
