@@ -100,12 +100,18 @@ func NewACMEDNSManager(domain, email, zoneID, cacheDir string) (*ACMEDNSManager,
 		DirectoryURL: acmeDirectoryURL,
 	}
 
-	// Register account (idempotent)
+	// Register account (idempotent). Bound the network call so a Let's
+	// Encrypt outage (or any environment without outbound network — incl.
+	// CI runners) doesn't hang duckgres startup indefinitely. Failure is
+	// already handled as warn-and-continue below; the timeout just lets us
+	// reach that path instead of blocking forever.
+	registerCtx, registerCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer registerCancel()
 	acct := &acme.Account{Contact: nil}
 	if email != "" {
 		acct.Contact = []string{"mailto:" + email}
 	}
-	if _, err := client.Register(context.Background(), acct, acme.AcceptTOS); err != nil {
+	if _, err := client.Register(registerCtx, acct, acme.AcceptTOS); err != nil {
 		// ErrAccountAlreadyExists is fine
 		var regErr *acme.Error
 		if !errors.As(err, &regErr) || regErr.StatusCode != 409 {
