@@ -64,6 +64,9 @@ type TenantActivationPayload struct {
 	OrgID     string                `json:"org_id"`
 	Usernames []string              `json:"usernames,omitempty"`
 	DuckLake  server.DuckLakeConfig `json:"ducklake"`
+	// Iceberg is the per-tenant Iceberg catalog (AWS S3 Tables) config.
+	// Empty when the tenant has not opted in or hasn't been provisioned yet.
+	Iceberg server.IcebergConfig `json:"iceberg"`
 	// S3CredentialsExpiresAt is the absolute expiration time of the STS
 	// credentials embedded in DuckLake.{S3AccessKey,S3SecretKey,S3SessionToken}.
 	// nil for non-STS payloads (config-store-driven warehouses use static
@@ -158,6 +161,7 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 			},
 			OrgID:    payload.OrgID,
 			DuckLake: payload.DuckLake,
+			Iceberg:  payload.Iceberg,
 		})
 	}
 
@@ -286,6 +290,7 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 		},
 		OrgID:    payload.OrgID,
 		DuckLake: payload.DuckLake,
+		Iceberg:  payload.Iceberg,
 	}
 	if err := worker.ActivateTenant(ctx, rpcPayload); err != nil {
 		return fmt.Errorf("activate tenant for refresh: %w", err)
@@ -350,10 +355,23 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
+	// Iceberg config is sourced from the configstore in both Duckling-driven
+	// and configstore-driven paths. The TableBucketArn is populated by the
+	// provisioner controller once the Crossplane composition reports
+	// status.iceberg.tableBucketArn; before that, Enabled is true but the
+	// ARN is empty and AttachIcebergCatalog is a no-op.
+	ic := server.IcebergConfig{
+		Enabled:     org.Warehouse.Iceberg.Enabled,
+		TableBucket: org.Warehouse.Iceberg.TableBucketArn,
+		Region:      org.Warehouse.Iceberg.Region,
+		Namespace:   org.Warehouse.Iceberg.Namespace,
+	}
+
 	return TenantActivationPayload{
 		OrgID:                  assignment.OrgID,
 		Usernames:              usernames,
 		DuckLake:               dl,
+		Iceberg:                ic,
 		S3CredentialsExpiresAt: expiresAt,
 	}, nil
 }

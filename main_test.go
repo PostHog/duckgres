@@ -291,6 +291,47 @@ func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigIceberg(t *testing.T) {
+	// Default-off: with no overrides, Iceberg stays disabled (opt-in unlike Delta).
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.Iceberg.Enabled {
+		t.Fatal("expected Iceberg.Enabled to default to false")
+	}
+
+	// File config opts in.
+	fileEnabled := true
+	resolved = configresolve.ResolveEffective(&FileConfig{
+		Iceberg: IcebergFileConfig{
+			Enabled:     &fileEnabled,
+			TableBucket: "arn:aws:s3tables:us-east-1:111:bucket/yaml",
+			Region:      "us-east-1",
+			Namespace:   "main",
+		},
+	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if !resolved.Server.Iceberg.Enabled {
+		t.Fatal("expected YAML iceberg.enabled=true to enable Iceberg")
+	}
+	if got, want := resolved.Server.Iceberg.TableBucket, "arn:aws:s3tables:us-east-1:111:bucket/yaml"; got != want {
+		t.Fatalf("expected YAML table bucket %q, got %q", want, got)
+	}
+
+	// Env overrides YAML; CLI overrides env.
+	resolved = configresolve.ResolveEffective(&FileConfig{
+		Iceberg: IcebergFileConfig{
+			Enabled:     &fileEnabled,
+			TableBucket: "arn:aws:s3tables:us-east-1:111:bucket/yaml",
+		},
+	}, configresolve.CLIInputs{
+		Set:                map[string]bool{"iceberg-table-bucket": true},
+		IcebergTableBucket: "arn:aws:s3tables:us-east-1:333:bucket/cli",
+	}, envFromMap(map[string]string{
+		"DUCKGRES_ICEBERG_TABLE_BUCKET": "arn:aws:s3tables:us-east-1:222:bucket/env",
+	}), nil)
+	if got, want := resolved.Server.Iceberg.TableBucket, "arn:aws:s3tables:us-east-1:333:bucket/cli"; got != want {
+		t.Fatalf("expected CLI table bucket %q to win, got %q", want, got)
+	}
+}
+
 func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL":   "0s",

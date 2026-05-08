@@ -124,11 +124,15 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 	}
 
 	// Create the Duckling CR
-	log.Info("Creating Duckling CR.", "pgbouncer_enabled", w.PgBouncer.Enabled)
+	log.Info("Creating Duckling CR.",
+		"pgbouncer_enabled", w.PgBouncer.Enabled,
+		"iceberg_enabled", w.Iceberg.Enabled)
 	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
 		MinACU:           w.AuroraMinACU,
 		MaxACU:           w.AuroraMaxACU,
 		PgBouncerEnabled: w.PgBouncer.Enabled,
+		IcebergEnabled:   w.Iceberg.Enabled,
+		IcebergNamespace: w.Iceberg.Namespace,
 	}); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
@@ -211,6 +215,27 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		updates["identity_state"] = configstore.ManagedWarehouseStateReady
 	}
 
+	// Iceberg is opt-in per warehouse — only track its state when enabled.
+	// When the composition writes status.iceberg.tableBucketArn, the bucket
+	// (Workspace) is reconciled and we persist the ARN + region back to the
+	// configstore so the worker activator can feed it into IcebergConfig.
+	if w.Iceberg.Enabled {
+		if status.Iceberg.TableBucketArn != "" {
+			if w.Iceberg.TableBucketArn != status.Iceberg.TableBucketArn {
+				updates["iceberg_table_bucket_arn"] = status.Iceberg.TableBucketArn
+			}
+			if w.Iceberg.Region != status.Iceberg.Region && status.Iceberg.Region != "" {
+				updates["iceberg_region"] = status.Iceberg.Region
+			}
+			if w.Iceberg.Namespace != status.Iceberg.NamespaceName && status.Iceberg.NamespaceName != "" {
+				updates["iceberg_namespace"] = status.Iceberg.NamespaceName
+			}
+			if w.IcebergState != configstore.ManagedWarehouseStateReady {
+				updates["iceberg_state"] = configstore.ManagedWarehouseStateReady
+			}
+		}
+	}
+
 	// Infrastructure is ready when all components are provisioned AND the
 	// Crossplane Ready condition is True. The Ready condition ensures all
 	// composed resources (including the Aurora instance) are fully reconciled,
@@ -219,8 +244,12 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	metaReady := w.MetadataStoreState == configstore.ManagedWarehouseStateReady || updates["metadata_store_state"] == configstore.ManagedWarehouseStateReady
 	secretsReady := w.SecretsState == configstore.ManagedWarehouseStateReady || updates["secrets_state"] == configstore.ManagedWarehouseStateReady
 	identReady := w.IdentityState == configstore.ManagedWarehouseStateReady || updates["identity_state"] == configstore.ManagedWarehouseStateReady
+	// Iceberg is only required for Ready when the tenant opted in.
+	icebergReady := !w.Iceberg.Enabled ||
+		w.IcebergState == configstore.ManagedWarehouseStateReady ||
+		updates["iceberg_state"] == configstore.ManagedWarehouseStateReady
 
-	if s3Ready && metaReady && secretsReady && identReady && status.ReadyCondition {
+	if s3Ready && metaReady && secretsReady && identReady && icebergReady && status.ReadyCondition {
 		now := time.Now().UTC()
 		updates["state"] = configstore.ManagedWarehouseStateReady
 		updates["status_message"] = "Infrastructure ready"

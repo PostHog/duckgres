@@ -17,6 +17,10 @@ type ActivationPayload struct {
 	server.WorkerControlMetadata
 	OrgID    string                `json:"org_id"`
 	DuckLake server.DuckLakeConfig `json:"ducklake"`
+	// Iceberg is the per-tenant Iceberg catalog (AWS S3 Tables) config. Empty
+	// (Enabled=false) when the tenant has not opted in or hasn't been
+	// provisioned yet — workers handle that as a no-op at attach time.
+	Iceberg server.IcebergConfig `json:"iceberg"`
 }
 
 type activatedTenantRuntime struct {
@@ -79,6 +83,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 
 	cfg := p.cfg
 	cfg.DuckLake = payload.DuckLake
+	cfg.Iceberg = payload.Iceberg
 	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 
 	<-p.warmupDone
@@ -248,6 +253,7 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		return false
 	}
 	a, b := current.DuckLake, next.DuckLake
+	ai, bi := current.Iceberg, next.Iceberg
 	return a.MetadataStore == b.MetadataStore &&
 		a.ObjectStore == b.ObjectStore &&
 		a.DataPath == b.DataPath &&
@@ -262,7 +268,11 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		a.S3Profile == b.S3Profile &&
 		a.Migrate == b.Migrate &&
 		reflect.DeepEqual(a.DataInliningRowLimit, b.DataInliningRowLimit) &&
-		a.CheckpointInterval == b.CheckpointInterval
+		a.CheckpointInterval == b.CheckpointInterval &&
+		ai.Enabled == bi.Enabled &&
+		ai.TableBucket == bi.TableBucket &&
+		ai.Region == bi.Region &&
+		ai.Namespace == bi.Namespace
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {
@@ -300,6 +310,7 @@ func (p *SessionPool) currentSessionConfig() (server.Config, error) {
 
 	cfg := p.cfg
 	cfg.DuckLake = p.activation.payload.DuckLake
+	cfg.Iceberg = p.activation.payload.Iceberg
 	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 	return cfg, nil
 }
@@ -308,6 +319,7 @@ func (p *SessionPool) sharedWarmupConfig() server.Config {
 	cfg := p.cfg
 	if p.sharedWarmMode {
 		cfg.DuckLake = server.DuckLakeConfig{}
+		cfg.Iceberg = server.IcebergConfig{}
 	}
 	return cfg
 }
