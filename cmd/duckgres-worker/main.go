@@ -75,7 +75,7 @@ func main() {
 	sessionInitTimeout := flag.String("session-init-timeout", "", "Session startup metadata/probe timeout (e.g., '10s', '30s') (env: DUCKGRES_SESSION_INIT_TIMEOUT)")
 
 	// DuckLake (workers attach DuckLake)
-	duckLakeDeltaCatalogEnabled := flag.Bool("ducklake-delta-catalog-enabled", false, "Attach a Delta Lake catalog during DuckLake worker boot (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
+	duckLakeDeltaCatalogEnabled := flag.Bool("ducklake-delta-catalog-enabled", true, "Attach a Delta Lake catalog during DuckLake worker boot (default true; use --ducklake-delta-catalog-enabled=false to disable; env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
 	duckLakeDeltaCatalogPath := flag.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
 	duckLakeDefaultSpecVersion := flag.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
 

@@ -1486,13 +1486,17 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 // AttachDeltaCatalog attaches the configured Delta Lake catalog/table alongside
 // DuckLake. It reuses the DuckLake S3 secret settings so Delta scans can access
 // the same object store credentials.
+//
+// Delta is enabled by default. When no path is derivable (e.g. a plain
+// standalone DuckDB instance with no DuckLake object_store/data_path), this is
+// a benign no-op: there's no Delta sibling to attach.
 func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 	if !dlCfg.DeltaCatalogEnabled {
 		return nil
 	}
 	catalogPath := ducklake.DeltaCatalogPath(dlCfg)
 	if catalogPath == "" {
-		return fmt.Errorf("delta catalog path is empty")
+		return nil
 	}
 
 	select {

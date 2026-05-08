@@ -79,8 +79,14 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 		&DuckLakeConfig{},
 		&RateLimitConfig{},
 		&QueryLogConfig{},
+		&SchemaMigration{},
 	); err != nil {
 		return nil, fmt.Errorf("auto-migrate config store: %w", err)
+	}
+
+	// One-shot data migrations (idempotent — tracked in duckgres_schema_migrations).
+	if err := migrateDeltaCatalogDefaultEnabled(db); err != nil {
+		return nil, fmt.Errorf("migrate delta catalog default: %w", err)
 	}
 
 	runtimeSchema, err := resolveRuntimeSchema(db)
@@ -413,6 +419,46 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
 	}
 	return nil
+}
+
+// migrateDeltaCatalogDefaultEnabled is a one-shot backfill that flips existing
+// rows where delta_catalog_enabled was stored as false (the old default) to
+// true. New rows get true automatically via the gorm:"default:true" column
+// default. Tracked in duckgres_schema_migrations so it runs exactly once;
+// admins can disable per-warehouse via the admin API after the backfill
+// without it being re-flipped on subsequent restarts.
+const deltaCatalogDefaultMigrationName = "2026_05_delta_catalog_default_enabled"
+
+func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
+	var existing SchemaMigration
+	err := db.Where("name = ?", deltaCatalogDefaultMigrationName).First(&existing).Error
+	if err == nil {
+		return nil // already applied
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("check schema migration: %w", err)
+	}
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(
+			`UPDATE duckgres_ducklake_config SET delta_catalog_enabled = TRUE WHERE delta_catalog_enabled IS DISTINCT FROM TRUE`,
+		).Error; err != nil {
+			return fmt.Errorf("backfill ducklake config: %w", err)
+		}
+		if err := tx.Exec(
+			`UPDATE duckgres_managed_warehouses SET s3_delta_catalog_enabled = TRUE WHERE s3_delta_catalog_enabled IS DISTINCT FROM TRUE`,
+		).Error; err != nil {
+			return fmt.Errorf("backfill managed warehouses: %w", err)
+		}
+		if err := tx.Create(&SchemaMigration{
+			Name:      deltaCatalogDefaultMigrationName,
+			AppliedAt: time.Now().UTC(),
+		}).Error; err != nil {
+			return fmt.Errorf("record schema migration: %w", err)
+		}
+		slog.Info("Backfilled delta_catalog_enabled=true on existing config rows.")
+		return nil
+	})
 }
 
 func migrateOrgUserPK(db *gorm.DB) error {
