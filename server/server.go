@@ -1613,9 +1613,10 @@ func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}) error
 	}
 
 	var count int
+	// Inlining 'iceberg' (a code constant) matches the Delta probe's pattern
+	// and avoids depending on driver param-binding for QueryRow.
 	err := db.QueryRow(
-		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = ?",
-		iceberg.CatalogName,
+		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = '" + iceberg.CatalogName + "'",
 	).Scan(&count)
 	if err == nil && count > 0 {
 		return nil
