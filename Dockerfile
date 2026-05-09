@@ -12,16 +12,17 @@ ARG BUILD_TAGS=""
 ARG TARGETARCH
 ARG DUCKDB_EXTENSION_VERSION=1.5.2
 ARG HTTPFS_EXTENSION_TAG=v1.5.2-stoi-fix
+ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.1
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 ARG DUCKDB_NIGHTLY_EXTENSION_REPOSITORY=http://nightly-extensions.duckdb.org
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 RUN mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
     && curl -fsSL "https://github.com/benben/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
       -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension" \
-    && for ext in ducklake json; do \
-         curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/${ext}.duckdb_extension.gz" \
-           | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/${ext}.duckdb_extension"; \
-       done \
+    && curl -fsSL "https://github.com/PostHog/ducklake/releases/download/${DUCKLAKE_EXTENSION_TAG}/ducklake-linux-${TARGETARCH}.duckdb_extension" \
+      -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/ducklake.duckdb_extension" \
+    && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension.gz" \
+      | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension" \
     && curl -fsSL "${DUCKDB_NIGHTLY_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension.gz" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension"
 

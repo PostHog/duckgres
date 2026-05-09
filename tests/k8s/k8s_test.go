@@ -188,6 +188,36 @@ func TestK8sSharedWarmWorkerActivation(t *testing.T) {
 	}
 }
 
+// expectedDucklakeExtensionVersion is the short SHA of the commit
+// PostHog/ducklake's v1.0-posthog.1 tag points at. DuckDB's
+// EXT_VERSION_DUCKLAKE macro embeds this string at build time and exposes
+// it via duckdb_extensions().extension_version. Bump this in lock-step
+// with DUCKLAKE_EXTENSION_TAG in Dockerfile / Dockerfile.worker.
+const expectedDucklakeExtensionVersion = "90dc1f24"
+
+// TestK8sDucklakeExtensionIsBundledFork asserts the worker pods load the
+// PostHog ducklake fork bundled by Dockerfile.worker, not the upstream
+// build that DuckDB would otherwise fetch from extensions.duckdb.org.
+// The version string is the short SHA of the fork's tagged commit.
+func TestK8sDucklakeExtensionIsBundledFork(t *testing.T) {
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
+		t.Fatalf("warm-up query failed: %v", err)
+	}
+
+	var version string
+	if err := retryScanStringWithReconnect(
+		"SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake' AND loaded",
+		60*time.Second, &version,
+	); err != nil {
+		t.Fatalf("query ducklake extension_version: %v", err)
+	}
+	if version != expectedDucklakeExtensionVersion {
+		t.Fatalf("ducklake extension_version = %q, want %q (PostHog fork v1.0-posthog.1). "+
+			"If the bundled fork was upgraded, update expectedDucklakeExtensionVersion alongside DUCKLAKE_EXTENSION_TAG.",
+			version, expectedDucklakeExtensionVersion)
+	}
+}
+
 func TestK8sWorkerCrashRecovery(t *testing.T) {
 	// Run a query to ensure a worker exists
 	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
@@ -734,6 +764,12 @@ func retryQueryWithReconnect(query string, timeout time.Duration) error {
 }
 
 func retryScanIntWithReconnect(query string, timeout time.Duration, dest *int) error {
+	return retryDBOperationWithReconnectAs("postgres", "postgres", timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
+		return db.QueryRowContext(ctx, query).Scan(dest)
+	})
+}
+
+func retryScanStringWithReconnect(query string, timeout time.Duration, dest *string) error {
 	return retryDBOperationWithReconnectAs("postgres", "postgres", timeout, fmt.Sprintf("query %q", query), func(ctx context.Context, db *sql.DB) error {
 		return db.QueryRowContext(ctx, query).Scan(dest)
 	})

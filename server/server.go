@@ -983,7 +983,11 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 }
 
 func shouldRefreshBundledExtension(srcPath string) bool {
-	return filepath.Base(srcPath) == "postgres_scanner.duckdb_extension"
+	switch filepath.Base(srcPath) {
+	case "postgres_scanner.duckdb_extension", "ducklake.duckdb_extension":
+		return true
+	}
+	return false
 }
 
 func copyFile(srcPath, dstPath string, mode os.FileMode) error {
