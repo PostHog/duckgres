@@ -114,41 +114,6 @@ func TestSeedBundledExtensionsReplacesExistingFilesWithUpdatedContents(t *testin
 	}
 }
 
-func TestSeedBundledExtensionsRefreshesDucklake(t *testing.T) {
-	srcRoot := t.TempDir()
-	dstRoot := t.TempDir()
-
-	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
-	if err := os.MkdirAll(srcDir, 0o755); err != nil {
-		t.Fatalf("mkdir src: %v", err)
-	}
-	srcExt := filepath.Join(srcDir, "ducklake.duckdb_extension")
-	if err := os.WriteFile(srcExt, []byte("posthog-fork"), 0o644); err != nil {
-		t.Fatalf("write src extension: %v", err)
-	}
-
-	dstDir := filepath.Join(dstRoot, "v1.5.2", "linux_arm64")
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		t.Fatalf("mkdir dst: %v", err)
-	}
-	dstExt := filepath.Join(dstDir, "ducklake.duckdb_extension")
-	if err := os.WriteFile(dstExt, []byte("upstream"), 0o644); err != nil {
-		t.Fatalf("write dst extension: %v", err)
-	}
-
-	if err := seedBundledExtensions(srcRoot, dstRoot); err != nil {
-		t.Fatalf("seedBundledExtensions: %v", err)
-	}
-
-	got, err := os.ReadFile(dstExt)
-	if err != nil {
-		t.Fatalf("read dst extension: %v", err)
-	}
-	if string(got) != "posthog-fork" {
-		t.Fatalf("expected cached ducklake to be replaced by bundled fork, got %q", string(got))
-	}
-}
-
 func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
 	srcRoot := t.TempDir()
 	dstRoot := t.TempDir()
