@@ -264,18 +264,23 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	}
 }
 
-// reconcileReady handles drift correction for Ready warehouses. Today the
-// only post-create-mutable spec field is metadataStore.pgbouncer.enabled;
-// if an operator flips it in the config store (admin API), we patch the CR
-// so the Crossplane composition provisions / tears down the pooler.
+// reconcileReady handles drift correction for Ready warehouses. The
+// post-create-mutable spec fields are metadataStore.pgbouncer.enabled and
+// iceberg.enabled; if an operator flips either in the config store (admin
+// API), we patch the CR so the Crossplane composition provisions / tears
+// down the affected resource.
 //
 // Scope is intentionally narrow: we do NOT reconcile ACU, image, or other
 // spec fields. Those aren't user-mutable via the admin API today, and
 // aggressive drift correction would conflict with manual kubectl patches.
+//
+// iceberg.namespace is NOT drift-corrected — the XRD's CEL admission rule
+// rejects post-create namespace changes, so a drift attempt would just hit
+// a 422 from the API server. Namespace changes require warehouse re-creation.
 func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "ready")
 
-	currentEnabled, err := c.duckling.GetPgBouncerEnabled(ctx, w.OrgID)
+	currentPgB, err := c.duckling.GetPgBouncerEnabled(ctx, w.OrgID)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// CR is gone but the warehouse is still marked Ready. Don't try
@@ -286,14 +291,26 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 		log.Warn("Failed to read Duckling CR for drift check.", "error", err)
 		return
 	}
-	if currentEnabled == w.PgBouncer.Enabled {
-		return
+
+	if currentPgB != w.PgBouncer.Enabled {
+		log.Info("PgBouncer drift detected, patching Duckling CR.",
+			"desired", w.PgBouncer.Enabled, "current", currentPgB)
+		if err := c.duckling.SetPgBouncerEnabled(ctx, w.OrgID, w.PgBouncer.Enabled); err != nil {
+			log.Warn("Failed to patch Duckling CR pgbouncer.enabled.", "error", err)
+		}
 	}
 
-	log.Info("PgBouncer drift detected, patching Duckling CR.",
-		"desired", w.PgBouncer.Enabled, "current", currentEnabled)
-	if err := c.duckling.SetPgBouncerEnabled(ctx, w.OrgID, w.PgBouncer.Enabled); err != nil {
-		log.Warn("Failed to patch Duckling CR pgbouncer.enabled.", "error", err)
+	currentIceberg, err := c.duckling.GetIcebergEnabled(ctx, w.OrgID)
+	if err != nil {
+		log.Warn("Failed to read Duckling CR iceberg.enabled for drift check.", "error", err)
+		return
+	}
+	if currentIceberg != w.Iceberg.Enabled {
+		log.Info("Iceberg drift detected, patching Duckling CR.",
+			"desired", w.Iceberg.Enabled, "current", currentIceberg)
+		if err := c.duckling.SetIcebergEnabled(ctx, w.OrgID, w.Iceberg.Enabled); err != nil {
+			log.Warn("Failed to patch Duckling CR iceberg.enabled.", "error", err)
+		}
 	}
 }
 

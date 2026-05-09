@@ -221,6 +221,57 @@ func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, 
 	return nil
 }
 
+// GetIcebergEnabled reads spec.iceberg.enabled from the Duckling CR. Missing
+// blocks (composition at an older schema, CR predates iceberg support) are
+// reported as false — same as an explicit opt-out — so the caller can just
+// compare against the desired value.
+func (d *DucklingClient) GetIcebergEnabled(ctx context.Context, orgID string) (bool, error) {
+	name := ducklingName(orgID)
+	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	iceberg, ok := spec["iceberg"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	enabled, _ := iceberg["enabled"].(bool)
+	return enabled, nil
+}
+
+// SetIcebergEnabled patches spec.iceberg.enabled on the Duckling CR for the
+// given org. Uses a JSON merge patch (RFC 7396) so the call is idempotent and
+// only touches the iceberg block — sibling fields under spec (metadataStore,
+// dataStore) are left untouched.
+//
+// Note: iceberg.namespace is enforced immutable by the XRD's CEL rule, so
+// this method intentionally only patches enabled — namespace changes have
+// to go through warehouse re-creation.
+func (d *DucklingClient) SetIcebergEnabled(ctx context.Context, orgID string, enabled bool) error {
+	name := ducklingName(orgID)
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"iceberg": map[string]interface{}{
+				"enabled": enabled,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal iceberg patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q iceberg: %w", name, err)
+	}
+	return nil
+}
+
 func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error) {
 	status, ok := cr.Object["status"].(map[string]interface{})
 	if !ok {
