@@ -532,6 +532,25 @@ func TestPutWarehouseDisablesPgBouncerWhenSetToFalse(t *testing.T) {
 	}
 }
 
+func TestPutWarehouseEnablesIcebergWhenSetToTrue(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"iceberg": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !store.warehouses["analytics"].Iceberg.Enabled {
+		t.Fatal("expected iceberg.enabled=true after PUT")
+	}
+}
+
 func TestPutWarehousePreservesNestedFieldsOnPartialUpdate(t *testing.T) {
 	store := newFakeAPIStore()
 	seedOrgWithWarehouse(store, "analytics")
