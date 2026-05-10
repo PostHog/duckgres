@@ -523,6 +523,7 @@ type managedWarehouseRequest struct {
 	MetadataStore                  configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
 	PgBouncer                      configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
 	S3                             configstore.ManagedWarehouseS3                `json:"s3"`
+	Iceberg                        configstore.ManagedWarehouseIceberg           `json:"iceberg"`
 	WorkerIdentity                 configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
 	WarehouseDatabaseCredentials   configstore.SecretRef                         `json:"warehouse_database_credentials"`
 	MetadataStoreCredentials       configstore.SecretRef                         `json:"metadata_store_credentials"`
@@ -536,6 +537,8 @@ type managedWarehouseRequest struct {
 	MetadataStoreStatusMessage     string                                        `json:"metadata_store_status_message"`
 	S3State                        configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
 	S3StatusMessage                string                                        `json:"s3_status_message"`
+	IcebergState                   configstore.ManagedWarehouseProvisioningState `json:"iceberg_state"`
+	IcebergStatusMessage           string                                        `json:"iceberg_status_message"`
 	IdentityState                  configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
 	IdentityStatusMessage          string                                        `json:"identity_status_message"`
 	SecretsState                   configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
