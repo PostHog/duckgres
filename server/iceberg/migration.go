@@ -14,16 +14,26 @@ const DefaultRegion = "us-east-1"
 // worker) would require generalizing this.
 const CatalogName = "iceberg"
 
-// BuildIcebergSecretStmt builds the CREATE SECRET statement for SigV4 auth
-// against AWS S3 Tables. The DuckDB iceberg extension picks up the secret by
-// type (TYPE ICEBERG) when there's no SECRET name on the ATTACH.
+// BuildIcebergSecretStmt builds the CREATE SECRET statement that the
+// DuckDB iceberg extension uses to sign AWS S3 Tables requests when an
+// `ATTACH ... (TYPE iceberg, ENDPOINT_TYPE 's3_tables')` is opened.
+//
+// DuckDB's TYPE ICEBERG secret is OAuth2-only — it has a single provider
+// ('config') registered by OAuth2Authorization::CreateCatalogSecretFunction.
+// Trying to pass AUTHORIZATION_TYPE/REGION on TYPE ICEBERG fails with
+// "Unknown parameter ... with default provider 'config'".
+//
+// For s3_tables the iceberg extension internally signs with SigV4 and pulls
+// the AWS credentials from any TYPE S3 secret in scope. credential_chain
+// lets us reuse whatever the worker pod already has (IRSA web identity, EKS
+// Pod Identity container creds, or env vars) without baking access keys in.
 func BuildIcebergSecretStmt(cfg Config) string {
 	region := cfg.Region
 	if region == "" {
 		region = DefaultRegion
 	}
 	return fmt.Sprintf(
-		"CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE ICEBERG, AUTHORIZATION_TYPE 'SIGV4', REGION '%s')",
+		"CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER credential_chain, REGION '%s')",
 		escapeSQLStringLiteral(region),
 	)
 }

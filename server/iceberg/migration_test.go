@@ -25,7 +25,7 @@ func TestBuildIcebergAttachStmtEscapesSingleQuotes(t *testing.T) {
 
 func TestBuildIcebergSecretStmt(t *testing.T) {
 	got := BuildIcebergSecretStmt(Config{Region: "us-west-2"})
-	want := "CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE ICEBERG, AUTHORIZATION_TYPE 'SIGV4', REGION 'us-west-2')"
+	want := "CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER credential_chain, REGION 'us-west-2')"
 	if got != want {
 		t.Fatalf("BuildIcebergSecretStmt mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -33,7 +33,7 @@ func TestBuildIcebergSecretStmt(t *testing.T) {
 
 func TestBuildIcebergSecretStmtDefaultsRegion(t *testing.T) {
 	got := BuildIcebergSecretStmt(Config{})
-	want := "CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE ICEBERG, AUTHORIZATION_TYPE 'SIGV4', REGION 'us-east-1')"
+	want := "CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER credential_chain, REGION 'us-east-1')"
 	if got != want {
 		t.Fatalf("BuildIcebergSecretStmt should default to us-east-1:\n got: %s\nwant: %s", got, want)
 	}
