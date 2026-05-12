@@ -219,22 +219,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	// When the composition writes status.iceberg.tableBucketArn, the bucket
 	// (Workspace) is reconciled and we persist the ARN + region back to the
 	// configstore so the worker activator can feed it into IcebergConfig.
-	if w.Iceberg.Enabled {
-		if status.Iceberg.TableBucketArn != "" {
-			if w.Iceberg.TableBucketArn != status.Iceberg.TableBucketArn {
-				updates["iceberg_table_bucket_arn"] = status.Iceberg.TableBucketArn
-			}
-			if w.Iceberg.Region != status.Iceberg.Region && status.Iceberg.Region != "" {
-				updates["iceberg_region"] = status.Iceberg.Region
-			}
-			if w.Iceberg.Namespace != status.Iceberg.NamespaceName && status.Iceberg.NamespaceName != "" {
-				updates["iceberg_namespace"] = status.Iceberg.NamespaceName
-			}
-			if w.IcebergState != configstore.ManagedWarehouseStateReady {
-				updates["iceberg_state"] = configstore.ManagedWarehouseStateReady
-			}
-		}
-	}
+	addIcebergStatusUpdates(updates, w, status)
 
 	// Infrastructure is ready when all components are provisioned AND the
 	// Crossplane Ready condition is True. The Ready condition ensures all
@@ -311,6 +296,57 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 		if err := c.duckling.SetIcebergEnabled(ctx, w.OrgID, w.Iceberg.Enabled); err != nil {
 			log.Warn("Failed to patch Duckling CR iceberg.enabled.", "error", err)
 		}
+	}
+
+	// Propagate the Duckling's status.iceberg.tableBucketArn back to the
+	// configstore even after the warehouse has transitioned to Ready. This
+	// covers the late-enable case: the iceberg block can be flipped on via
+	// the admin API long after the warehouse first became Ready, and the
+	// Crossplane composition will only emit the bucket Workspace + populate
+	// status.iceberg.tableBucketArn after that flip. Without this, the ARN
+	// would only land in the configstore if the warehouse was still in
+	// Provisioning when the composition completed — never on a re-enable.
+	if w.Iceberg.Enabled {
+		status, err := c.duckling.Get(ctx, w.OrgID)
+		if err != nil {
+			log.Warn("Failed to read Duckling status for iceberg propagation.", "error", err)
+			return
+		}
+		updates := map[string]interface{}{}
+		addIcebergStatusUpdates(updates, w, status)
+		if len(updates) > 0 {
+			if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateReady, updates); err != nil {
+				log.Warn("Failed to persist iceberg status to configstore.", "error", err)
+			} else {
+				log.Info("Iceberg status persisted to configstore.", "updates", updates)
+			}
+		}
+	}
+}
+
+// addIcebergStatusUpdates copies the Duckling's reported iceberg status
+// (ARN, region, namespace) into the configstore update map when fields
+// differ. Idempotent. Called from both reconcileProvisioning (initial
+// turn-up) and reconcileReady (late iceberg enable on an existing
+// warehouse). Without the reconcileReady call site, a warehouse that
+// became Ready before iceberg was opted in would never get its ARN
+// propagated to the configstore — the worker activator would then run
+// AttachIcebergCatalog with an empty TableBucket and skip the attach.
+func addIcebergStatusUpdates(updates map[string]interface{}, w *configstore.ManagedWarehouse, status *DucklingStatus) {
+	if !w.Iceberg.Enabled || status.Iceberg.TableBucketArn == "" {
+		return
+	}
+	if w.Iceberg.TableBucketArn != status.Iceberg.TableBucketArn {
+		updates["iceberg_table_bucket_arn"] = status.Iceberg.TableBucketArn
+	}
+	if w.Iceberg.Region != status.Iceberg.Region && status.Iceberg.Region != "" {
+		updates["iceberg_region"] = status.Iceberg.Region
+	}
+	if w.Iceberg.Namespace != status.Iceberg.NamespaceName && status.Iceberg.NamespaceName != "" {
+		updates["iceberg_namespace"] = status.Iceberg.NamespaceName
+	}
+	if w.IcebergState != configstore.ManagedWarehouseStateReady {
+		updates["iceberg_state"] = configstore.ManagedWarehouseStateReady
 	}
 }
 
