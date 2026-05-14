@@ -1086,7 +1086,7 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		}
 		slog.Warn("Failed to attach Delta catalog.", "user", username, "error", err)
 	}
-	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem); err != nil {
+	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
 		if cfg.Iceberg.Enabled {
 			return fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
 		}
@@ -1124,7 +1124,7 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 	if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
 		return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
 	}
-	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem); err != nil {
+	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
 		return fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
 	}
 
@@ -1180,7 +1180,7 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 		}
 		slog.Warn("Failed to attach Delta catalog.", "user", username, "error", err)
 	}
-	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem); err != nil {
+	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
 		if cfg.Iceberg.Enabled {
 			_ = db.Close()
 			return nil, fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
@@ -1604,7 +1604,14 @@ func isDeltaCatalogEmptyError(err error) bool {
 // Iceberg.Enabled, idempotent if the catalog is already attached, and
 // fail-soft for the "fresh tenant, no namespaces yet" case so a worker
 // activation isn't blocked by an empty catalog.
-func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}) error {
+//
+// keyID/secret/sessionToken are short-lived AWS credentials produced by the
+// control plane's STS AssumeRole on the per-tenant IAM role. They are the
+// same credentials DuckLake uses (see buildConfigSecret) — the per-tenant
+// role has both s3:* and s3tables:* permissions, so reusing them here is
+// correct. When empty, BuildIcebergSecretStmt falls back to
+// PROVIDER credential_chain (for standalone/host-AWS-identity deployments).
+func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
 	if !ic.Enabled || ic.TableBucket == "" {
 		return nil
 	}
@@ -1630,7 +1637,7 @@ func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}) error
 		return fmt.Errorf("load iceberg extension: %w", err)
 	}
 
-	if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic)); err != nil {
+	if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic, keyID, secret, sessionToken)); err != nil {
 		return fmt.Errorf("create Iceberg secret: %w", err)
 	}
 

@@ -21,21 +21,47 @@ const CatalogName = "iceberg"
 // DuckDB's TYPE ICEBERG secret is OAuth2-only — it has a single provider
 // ('config') registered by OAuth2Authorization::CreateCatalogSecretFunction.
 // Trying to pass AUTHORIZATION_TYPE/REGION on TYPE ICEBERG fails with
-// "Unknown parameter ... with default provider 'config'".
+// "Unknown parameter ... with default provider 'config'". For s3_tables
+// the iceberg extension internally signs with SigV4 and pulls credentials
+// from any TYPE S3 secret in scope.
 //
-// For s3_tables the iceberg extension internally signs with SigV4 and pulls
-// the AWS credentials from any TYPE S3 secret in scope. credential_chain
-// lets us reuse whatever the worker pod already has (IRSA web identity, EKS
-// Pod Identity container creds, or env vars) without baking access keys in.
-func BuildIcebergSecretStmt(cfg Config) string {
+// When keyID is non-empty the secret is built with PROVIDER config and the
+// supplied short-lived credentials inlined directly. This is the multitenant
+// production path: the control plane assumes the per-tenant IAM role via
+// STS and ships the resulting temporary credentials in the worker
+// activation payload, identical to how the DuckLake S3 secret is built (see
+// buildConfigSecret in server/server.go). The same role has both s3:* and
+// s3tables:* permissions on the tenant's data and table buckets, so reusing
+// the credentials here is correct.
+//
+// When keyID is empty the secret falls back to PROVIDER credential_chain.
+// This preserves the legacy/standalone path where the host running the
+// worker has its own AWS identity reachable via env vars, ~/.aws, or IMDS.
+// On EKS deployments without IRSA/Pod Identity on the worker pod (the
+// PostHog production topology) this fallback will fail at create time —
+// callers in that topology must supply explicit credentials.
+func BuildIcebergSecretStmt(cfg Config, keyID, secret, sessionToken string) string {
 	region := cfg.Region
 	if region == "" {
 		region = DefaultRegion
 	}
-	return fmt.Sprintf(
-		"CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER credential_chain, REGION '%s')",
+	if keyID == "" {
+		return fmt.Sprintf(
+			"CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER credential_chain, REGION '%s')",
+			escapeSQLStringLiteral(region),
+		)
+	}
+	stmt := fmt.Sprintf(
+		"CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER config, KEY_ID '%s', SECRET '%s', REGION '%s'",
+		escapeSQLStringLiteral(keyID),
+		escapeSQLStringLiteral(secret),
 		escapeSQLStringLiteral(region),
 	)
+	if sessionToken != "" {
+		stmt += fmt.Sprintf(", SESSION_TOKEN '%s'", escapeSQLStringLiteral(sessionToken))
+	}
+	stmt += ")"
+	return stmt
 }
 
 // BuildIcebergAttachStmt builds the ATTACH statement for the Iceberg
