@@ -170,8 +170,17 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		return false
 	}
 
+	// needsRefresh is keyed on DuckLake creds because the activator
+	// populates DuckLake.S3* with the STS-minted credentials for the
+	// per-tenant IAM role, and the iceberg_sigv4 secret reuses the same
+	// values. So a single change-detection covers both downstream
+	// consumers. The guard "something is actually using S3" expands here
+	// to include iceberg — there are tenants (e.g. metadata-only DuckLake)
+	// where ObjectStore is empty but Iceberg.Enabled is true, and on
+	// those the iceberg secret still needs to be rotated.
 	needsRefresh := false
-	if p.activation.db != nil && payload.DuckLake.ObjectStore != "" &&
+	if p.activation.db != nil &&
+		(payload.DuckLake.ObjectStore != "" || payload.Iceberg.Enabled) &&
 		!reflect.DeepEqual(current.DuckLake, payload.DuckLake) {
 		needsRefresh = s3CredentialsChanged(current.DuckLake, payload.DuckLake)
 		if !needsRefresh {
@@ -193,6 +202,7 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		refreshDB = p.activation.db
 	}
 	refreshFn := p.refreshS3Secret
+	refreshIcebergFn := p.refreshIcebergSecret
 	sem := p.duckLakeSem
 	p.mu.Unlock()
 
@@ -206,9 +216,24 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		if refreshFn == nil {
 			refreshFn = server.RefreshS3Secret
 		}
-		if err := refreshFn(refreshDB, payload.DuckLake, sem); err != nil {
-			slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
-			return false
+		if refreshIcebergFn == nil {
+			refreshIcebergFn = server.RefreshIcebergSecret
+		}
+		if payload.DuckLake.ObjectStore != "" {
+			if err := refreshFn(refreshDB, payload.DuckLake, sem); err != nil {
+				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
+				return false
+			}
+		}
+		if payload.Iceberg.Enabled {
+			if err := refreshIcebergFn(refreshDB, payload.Iceberg, sem,
+				payload.DuckLake.S3AccessKey,
+				payload.DuckLake.S3SecretKey,
+				payload.DuckLake.S3SessionToken,
+			); err != nil {
+				slog.Warn("Failed to refresh Iceberg credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
+				return false
+			}
 		}
 	}
 
