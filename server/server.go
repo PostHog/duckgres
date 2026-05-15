@@ -1957,6 +1957,52 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 	return nil
 }
 
+// RefreshIcebergSecret replaces the DuckDB iceberg-extension S3 secret
+// (iceberg_sigv4) with updated credentials. Used when a hot-idle worker
+// is reclaimed and the STS credentials minted by the control plane have
+// rotated. Without this, iceberg queries on a long-lived worker would
+// start 403'ing after the first STS rotation (~1h) while DuckLake stays
+// fresh.
+//
+// Unlike AttachIcebergCatalog this does NOT short-circuit when the
+// iceberg catalog is already attached — the whole point is to overwrite
+// the existing secret in place. ATTACH state on the catalog itself is
+// unaffected; DuckDB resolves the secret at request time, so the new
+// credentials take effect for the next iceberg query without an
+// explicit reattach.
+//
+// Same auth model as AttachIcebergCatalog: explicit credentials are the
+// only supported path. A refresh with missing credentials is a config
+// bug (the activator failed to populate fresh STS credentials in the
+// payload) and surfaces as an explicit error rather than a silent
+// fallback to credential_chain.
+func RefreshIcebergSecret(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secretKey, sessionToken string) error {
+	if !ic.Enabled {
+		return nil
+	}
+	if keyID == "" || secretKey == "" {
+		return fmt.Errorf("iceberg refresh: no AWS credentials in activation payload — control plane STS broker did not populate DuckLake S3 credentials")
+	}
+	if sem != nil {
+		sem <- struct{}{}
+		defer func() { <-sem }()
+	}
+
+	secretStmt := iceberg.BuildIcebergSecretStmt(ic, keyID, secretKey, sessionToken)
+	if _, err := db.Exec(secretStmt); err != nil {
+		if isTransactionAborted(err) {
+			_, _ = db.Exec("ROLLBACK")
+			if _, retryErr := db.Exec(secretStmt); retryErr != nil {
+				return fmt.Errorf("refresh iceberg secret after rollback: %w", retryErr)
+			}
+		} else {
+			return fmt.Errorf("refresh iceberg secret: %w", err)
+		}
+	}
+	slog.Debug("Refreshed iceberg secret for hot-idle reuse.", "table_bucket", ic.TableBucket)
+	return nil
+}
+
 // resolveS3SecretTransport picks the URL_STYLE and USE_SSL values to embed in
 // the DuckDB S3 secret. When the cache proxy is in front of the worker
 // (HTTPProxy set), we force url_style=path + use_ssl=false so all S3
