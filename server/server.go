@@ -1605,15 +1605,21 @@ func isDeltaCatalogEmptyError(err error) bool {
 // fail-soft for the "fresh tenant, no namespaces yet" case so a worker
 // activation isn't blocked by an empty catalog.
 //
-// keyID/secret/sessionToken are short-lived AWS credentials produced by the
-// control plane's STS AssumeRole on the per-tenant IAM role. They are the
-// same credentials DuckLake uses (see buildConfigSecret) — the per-tenant
+// keyID/secret/sessionToken are short-lived AWS credentials produced by
+// the control plane's STS AssumeRole on the per-tenant IAM role — the
+// same credentials DuckLake uses (see buildConfigSecret). The per-tenant
 // role has both s3:* and s3tables:* permissions, so reusing them here is
-// correct. When empty, BuildIcebergSecretStmt falls back to
-// PROVIDER credential_chain (for standalone/host-AWS-identity deployments).
+// correct. This is the only supported auth model for iceberg: we do NOT
+// fall back to DuckDB's credential_chain because the worker pod has no
+// AWS identity of its own on the multitenant production topology. Missing
+// credentials when iceberg is enabled is a configuration bug and surfaces
+// as an explicit error rather than a silent fallback.
 func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
 	if !ic.Enabled || ic.TableBucket == "" {
 		return nil
+	}
+	if keyID == "" || secret == "" {
+		return fmt.Errorf("iceberg catalog enabled (table_bucket=%q) but no AWS credentials in activation payload — control plane STS broker did not populate DuckLake S3 credentials", ic.TableBucket)
 	}
 
 	select {

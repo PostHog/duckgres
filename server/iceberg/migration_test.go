@@ -39,17 +39,9 @@ func TestBuildIcebergSecretStmtWithoutSessionToken(t *testing.T) {
 	}
 }
 
-func TestBuildIcebergSecretStmtFallsBackToCredentialChain(t *testing.T) {
-	got := BuildIcebergSecretStmt(Config{Region: "us-west-2"}, "", "", "")
-	want := "CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER credential_chain, REGION 'us-west-2')"
-	if got != want {
-		t.Fatalf("BuildIcebergSecretStmt should fall back to credential_chain when keyID is empty:\n got: %s\nwant: %s", got, want)
-	}
-}
-
 func TestBuildIcebergSecretStmtDefaultsRegion(t *testing.T) {
-	got := BuildIcebergSecretStmt(Config{}, "", "", "")
-	want := "CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER credential_chain, REGION 'us-east-1')"
+	got := BuildIcebergSecretStmt(Config{}, "AKIA_TEST", "shh", "tok")
+	want := "CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER config, KEY_ID 'AKIA_TEST', SECRET 'shh', REGION 'us-east-1', SESSION_TOKEN 'tok')"
 	if got != want {
 		t.Fatalf("BuildIcebergSecretStmt should default to us-east-1:\n got: %s\nwant: %s", got, want)
 	}

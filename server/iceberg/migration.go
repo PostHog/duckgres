@@ -25,31 +25,24 @@ const CatalogName = "iceberg"
 // the iceberg extension internally signs with SigV4 and pulls credentials
 // from any TYPE S3 secret in scope.
 //
-// When keyID is non-empty the secret is built with PROVIDER config and the
-// supplied short-lived credentials inlined directly. This is the multitenant
-// production path: the control plane assumes the per-tenant IAM role via
-// STS and ships the resulting temporary credentials in the worker
-// activation payload, identical to how the DuckLake S3 secret is built (see
+// The secret is always built with PROVIDER config and the supplied
+// short-lived credentials inlined directly. This is the only supported
+// auth model: the control plane assumes the per-tenant IAM role via STS
+// and ships the resulting temporary credentials in the worker activation
+// payload, identical to how the DuckLake S3 secret is built (see
 // buildConfigSecret in server/server.go). The same role has both s3:* and
-// s3tables:* permissions on the tenant's data and table buckets, so reusing
-// the credentials here is correct.
+// s3tables:* permissions on the tenant's data and table buckets, so
+// reusing the credentials here is correct.
 //
-// When keyID is empty the secret falls back to PROVIDER credential_chain.
-// This preserves the legacy/standalone path where the host running the
-// worker has its own AWS identity reachable via env vars, ~/.aws, or IMDS.
-// On EKS deployments without IRSA/Pod Identity on the worker pod (the
-// PostHog production topology) this fallback will fail at create time —
-// callers in that topology must supply explicit credentials.
+// keyID and secret are required — callers must validate upstream and emit
+// a clear error if the activation payload is missing them when iceberg is
+// enabled. sessionToken is optional (omitted from the DDL when empty) to
+// support the rare static-IAM-user case, though STS:AssumeRole always
+// returns one in production.
 func BuildIcebergSecretStmt(cfg Config, keyID, secret, sessionToken string) string {
 	region := cfg.Region
 	if region == "" {
 		region = DefaultRegion
-	}
-	if keyID == "" {
-		return fmt.Sprintf(
-			"CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER credential_chain, REGION '%s')",
-			escapeSQLStringLiteral(region),
-		)
 	}
 	stmt := fmt.Sprintf(
 		"CREATE OR REPLACE SECRET iceberg_sigv4 (TYPE S3, PROVIDER config, KEY_ID '%s', SECRET '%s', REGION '%s'",
