@@ -8,7 +8,18 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/posthog/duckgres/server"
 )
+
+type remoteAddrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c remoteAddrConn) RemoteAddr() net.Addr {
+	return c.remote
+}
 
 func TestReadStartupFromRaw_SSLRequest(t *testing.T) {
 	client, server := net.Pipe()
@@ -27,6 +38,48 @@ func TestReadStartupFromRaw_SSLRequest(t *testing.T) {
 	}
 	if !result.sslRequest {
 		t.Error("should detect SSL request")
+	}
+}
+
+func TestHandleConnectionNonSSLStartupDoesNotRecordFailedAuth(t *testing.T) {
+	addr := &net.TCPAddr{IP: net.ParseIP("198.51.100.10"), Port: 54321}
+	rateLimiter := server.NewRateLimiter(server.RateLimitConfig{
+		MaxFailedAttempts:   2,
+		FailedAttemptWindow: time.Minute,
+		BanDuration:         time.Hour,
+		MaxConnectionsPerIP: 10,
+		MaxConnections:      10,
+	})
+	cp := &ControlPlane{rateLimiter: rateLimiter}
+
+	for range 2 {
+		client, serverConn := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			cp.handleConnection(remoteAddrConn{Conn: serverConn, remote: addr})
+			close(done)
+		}()
+
+		// Protocol version 3.0 without a preceding SSLRequest, equivalent to
+		// a client using sslmode=disable.
+		if err := binary.Write(client, binary.BigEndian, int32(8)); err != nil {
+			t.Fatalf("write startup length: %v", err)
+		}
+		if err := binary.Write(client, binary.BigEndian, uint32(196608)); err != nil {
+			t.Fatalf("write startup protocol: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, client)
+		_ = client.Close()
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("handleConnection did not return")
+		}
+	}
+
+	if rateLimiter.IsBanned(addr) {
+		t.Fatal("non-SSL startup rejections should not ban the source address")
 	}
 }
 
