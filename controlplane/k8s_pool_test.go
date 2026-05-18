@@ -1358,7 +1358,7 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 	}
 }
 
-func TestK8sPoolReserveClaimedWorkerIsIdempotentForSameActivatingClaim(t *testing.T) {
+func TestK8sPoolReserveClaimedWorkerRejectsDuplicateActivatingClaim(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	assignment := &WorkerAssignment{OrgID: "analytics"}
 	worker := &ManagedWorker{ID: 44, podName: "duckgres-worker-test-cp-44", done: make(chan struct{})}
@@ -1371,14 +1371,8 @@ func TestK8sPoolReserveClaimedWorkerIsIdempotentForSameActivatingClaim(t *testin
 		t.Fatalf("SetSharedState: %v", err)
 	}
 	pool.workers[worker.ID] = worker
-	pool.healthCheckFunc = func(ctx context.Context, got *ManagedWorker) error {
-		if got.ID != worker.ID {
-			t.Fatalf("expected liveness check for worker %d, got %d", worker.ID, got.ID)
-		}
-		return nil
-	}
 
-	got, err := pool.reserveClaimedWorker(context.Background(), &configstore.WorkerRecord{
+	_, err := pool.reserveClaimedWorker(context.Background(), &configstore.WorkerRecord{
 		WorkerID:          worker.ID,
 		PodName:           worker.PodName(),
 		State:             configstore.WorkerStateReserved,
@@ -1386,17 +1380,14 @@ func TestK8sPoolReserveClaimedWorkerIsIdempotentForSameActivatingClaim(t *testin
 		OwnerCPInstanceID: pool.cpInstanceID,
 		OwnerEpoch:        5,
 	}, assignment)
-	if err != nil {
-		t.Fatalf("reserveClaimedWorker: %v", err)
+	if !errors.Is(err, errStaleRuntimeWorkerClaim) {
+		t.Fatalf("expected stale claim error, got %v", err)
 	}
-	if got != worker {
-		t.Fatalf("expected same worker instance")
+	if worker.SharedState().Lifecycle != WorkerLifecycleActivating {
+		t.Fatalf("expected lifecycle to remain activating, got %q", worker.SharedState().Lifecycle)
 	}
-	if got.SharedState().Lifecycle != WorkerLifecycleActivating {
-		t.Fatalf("expected lifecycle to remain activating, got %q", got.SharedState().Lifecycle)
-	}
-	if got.OwnerEpoch() != 5 {
-		t.Fatalf("expected owner epoch 5, got %d", got.OwnerEpoch())
+	if worker.OwnerEpoch() != 5 {
+		t.Fatalf("expected owner epoch 5, got %d", worker.OwnerEpoch())
 	}
 }
 

@@ -1578,16 +1578,9 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 		p.mu.Unlock()
 		return nil, fmt.Errorf("worker %d claimed with stale owner epoch %d behind current %d: %w", claimed.WorkerID, claimed.OwnerEpoch, currentEpoch, errStaleRuntimeWorkerClaim)
 	}
-	if isSameRuntimeWorkerClaim(worker, claimed, assignment) {
-		worker.reservedAt = time.Now()
-		observeWarmPoolLifecycleGauges(p.workers)
+	if isDuplicateRuntimeWorkerClaim(worker, claimed, assignment) {
 		p.mu.Unlock()
-		if err := p.checkReservedWorkerLiveness(ctx, worker); err != nil {
-			slog.Warn("Claimed worker failed liveness recheck.", "worker", worker.ID, "worker_pod", worker.PodName(), "error", err)
-			p.retireWorkerWithReason(worker.ID, RetireReasonCrash)
-			return nil, err
-		}
-		return worker, nil
+		return nil, fmt.Errorf("worker %d already has in-flight claim for owner epoch %d: %w", claimed.WorkerID, claimed.OwnerEpoch, errStaleRuntimeWorkerClaim)
 	}
 	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
 	worker.SetOwnerEpoch(claimed.OwnerEpoch)
@@ -1617,7 +1610,7 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	return worker, nil
 }
 
-func isSameRuntimeWorkerClaim(worker *ManagedWorker, claimed *configstore.WorkerRecord, assignment *WorkerAssignment) bool {
+func isDuplicateRuntimeWorkerClaim(worker *ManagedWorker, claimed *configstore.WorkerRecord, assignment *WorkerAssignment) bool {
 	if worker == nil || claimed == nil || assignment == nil {
 		return false
 	}
