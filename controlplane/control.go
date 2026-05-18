@@ -757,7 +757,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = server.WriteErrorResponse(conn, "FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
 		}
 		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
-		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 		_ = conn.Close()
 		return
 	}
