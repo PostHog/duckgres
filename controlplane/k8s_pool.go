@@ -37,6 +37,8 @@ import (
 
 const defaultActivatingTimeout = 2 * time.Minute
 
+var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
+
 // K8sWorkerPool manages worker pods in Kubernetes.
 type K8sWorkerPool struct {
 	mu           sync.RWMutex
@@ -511,6 +513,20 @@ func (p *K8sWorkerPool) onPodTerminated(pod *corev1.Pod) {
 // It acquires the spawn semaphore to limit concurrent K8s API calls and
 // retries transient API errors with exponential backoff.
 func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int, image string) error {
+	return p.spawnWorker(ctx, id, image, true)
+}
+
+func (p *K8sWorkerPool) spawnReservedWorker(ctx context.Context, slot *configstore.WorkerRecord) error {
+	if slot == nil {
+		return fmt.Errorf("missing reserved worker slot")
+	}
+	if p.spawnWarmWorkerFunc != nil {
+		return p.spawnWarmWorkerFunc(ctx, slot.WorkerID)
+	}
+	return p.spawnWorker(ctx, slot.WorkerID, slot.Image, false)
+}
+
+func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, publishIdle bool) error {
 	// Acquire spawn semaphore to limit concurrent pod creates.
 	select {
 	case p.spawnSem <- struct{}{}:
@@ -741,7 +757,9 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int, image string) e
 		GracePeriodSeconds: int64Ptr(0),
 	})
 
-	p.persistWorkerRecord(p.workerRecordFor(id, nil, 0, configstore.WorkerStateSpawning, "", nil))
+	if publishIdle {
+		p.persistWorkerRecord(p.workerRecordFor(id, nil, 0, configstore.WorkerStateSpawning, "", nil))
+	}
 
 	// Create pod with exponential backoff on transient errors.
 	if err := p.createPodWithBackoff(ctx, pod); err != nil {
@@ -791,7 +809,9 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int, image string) e
 	workerCount := len(p.workers)
 	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
-	p.persistWorkerRecord(p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil))
+	if publishIdle {
+		p.persistWorkerRecord(p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil))
+	}
 	observeControlPlaneWorkers(workerCount)
 
 	slog.Info("K8s worker spawned.", "id", id, "worker_pod", podName, "addr", addr)
@@ -1338,6 +1358,10 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 							worker.hotIdleReclaimed = true
 							return worker, nil
 						}
+						if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
+							slog.Warn("Hot-idle worker claim was stale, retrying.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
+							continue
+						}
 						slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
 						p.retireClaimedWorker(hotClaimed, RetireReasonCrash)
 						// Fall through to neutral idle claim
@@ -1354,6 +1378,10 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				if reserveErr == nil {
 					p.triggerPerImageReplenish(claimed.Image)
 					return worker, nil
+				}
+				if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
+					slog.Warn("Idle worker claim was stale, retrying.", "worker_id", claimed.WorkerID, "worker_pod", claimed.PodName, "error", reserveErr)
+					continue
 				}
 				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "worker_pod", claimed.PodName, "error", reserveErr)
 				p.retireClaimedWorker(claimed, RetireReasonCrash)
@@ -1455,7 +1483,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				p.spawning++
 				p.mu.Unlock()
 
-				err = p.spawnWarmWorker(ctx, slot.WorkerID, slot.Image)
+				err = p.spawnReservedWorker(ctx, slot)
 
 				p.mu.Lock()
 				p.spawning--
@@ -1468,7 +1496,15 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					p.retireClaimedWorker(slot, RetireReasonCrash)
 					return nil, err
 				}
-				return p.reserveClaimedWorker(ctx, slot, assignment)
+				worker, reserveErr := p.reserveClaimedWorker(ctx, slot, assignment)
+				if reserveErr == nil {
+					return worker, nil
+				}
+				if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
+					slog.Warn("Spawned worker claim was stale, retrying.", "worker_id", slot.WorkerID, "worker_pod", slot.PodName, "error", reserveErr)
+					continue
+				}
+				return nil, reserveErr
 			}
 
 			id := p.allocateWorkerIDLocked()
@@ -1537,6 +1573,22 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 	if claimed.PodName != "" {
 		worker.podName = claimed.PodName
 	}
+	if worker.OwnerEpoch() > 0 && claimed.OwnerEpoch < worker.OwnerEpoch() {
+		currentEpoch := worker.OwnerEpoch()
+		p.mu.Unlock()
+		return nil, fmt.Errorf("worker %d claimed with stale owner epoch %d behind current %d: %w", claimed.WorkerID, claimed.OwnerEpoch, currentEpoch, errStaleRuntimeWorkerClaim)
+	}
+	if isSameRuntimeWorkerClaim(worker, claimed, assignment) {
+		worker.reservedAt = time.Now()
+		observeWarmPoolLifecycleGauges(p.workers)
+		p.mu.Unlock()
+		if err := p.checkReservedWorkerLiveness(ctx, worker); err != nil {
+			slog.Warn("Claimed worker failed liveness recheck.", "worker", worker.ID, "worker_pod", worker.PodName(), "error", err)
+			p.retireWorkerWithReason(worker.ID, RetireReasonCrash)
+			return nil, err
+		}
+		return worker, nil
+	}
 	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
 	worker.SetOwnerEpoch(claimed.OwnerEpoch)
 	nextState, err := worker.SharedState().Transition(WorkerLifecycleReserved, assignment)
@@ -1563,6 +1615,25 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 		return nil, err
 	}
 	return worker, nil
+}
+
+func isSameRuntimeWorkerClaim(worker *ManagedWorker, claimed *configstore.WorkerRecord, assignment *WorkerAssignment) bool {
+	if worker == nil || claimed == nil || assignment == nil {
+		return false
+	}
+	if worker.OwnerCPInstanceID() != claimed.OwnerCPInstanceID || worker.OwnerEpoch() != claimed.OwnerEpoch {
+		return false
+	}
+	state := worker.SharedState()
+	switch state.NormalizedLifecycle() {
+	case WorkerLifecycleReserved, WorkerLifecycleActivating:
+	default:
+		return false
+	}
+	if state.Assignment == nil {
+		return false
+	}
+	return state.Assignment.OrgID == assignment.OrgID
 }
 
 func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, expectedOwnerEpoch int64, assignment *WorkerAssignment) (*ManagedWorker, error) {
