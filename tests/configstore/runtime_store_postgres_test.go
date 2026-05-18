@@ -1005,6 +1005,52 @@ func TestListWorkersDueForCredentialRefreshTreatsNullAsDue(t *testing.T) {
 	}
 }
 
+// TestListWorkersDueForCredentialRefreshSkipsReservedAndActivatingRows
+// protects the initial activation path. Reserved/activating rows are org-bound
+// before the first ActivateTenant RPC has finished and before the activation
+// path stamps s3_credentials_expires_at. If the refresh scheduler treats those
+// NULL-expiry rows as due, it can bump owner_epoch under the in-flight
+// activation and cause the worker to reject the original owner_epoch as stale.
+func TestListWorkersDueForCredentialRefreshSkipsReservedAndActivatingRows(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
+	pastDue := now.Add(-1 * time.Minute)
+
+	rows := []*configstore.WorkerRecord{
+		{
+			WorkerID: 8, PodName: "duckgres-worker-8",
+			State: configstore.WorkerStateReserved, OrgID: "acme",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now,
+		},
+		{
+			WorkerID: 9, PodName: "duckgres-worker-9",
+			State: configstore.WorkerStateActivating, OrgID: "acme",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now, S3CredentialsExpiresAt: &pastDue,
+		},
+		{
+			WorkerID: 10, PodName: "duckgres-worker-10",
+			State: configstore.WorkerStateHot, OrgID: "acme",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now, S3CredentialsExpiresAt: &pastDue,
+		},
+	}
+	for _, w := range rows {
+		if err := store.UpsertWorkerRecord(w); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", w.WorkerID, err)
+		}
+	}
+
+	due, err := store.ListWorkersDueForCredentialRefresh("cp-me:boot-a", now)
+	if err != nil {
+		t.Fatalf("ListWorkersDueForCredentialRefresh: %v", err)
+	}
+	if len(due) != 1 || due[0].WorkerID != 10 {
+		t.Fatalf("expected only activated hot worker 10 to be due, got %#v", due)
+	}
+}
+
 // TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral:
 //   - Healthy row (expiry comfortably in the future): not returned.
 //   - Neutral warm row (org_id=”): not returned regardless of expiry.

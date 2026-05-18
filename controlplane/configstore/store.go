@@ -854,16 +854,17 @@ func (cs *ConfigStore) RetireOrphanWorker(workerID int, reason string) (bool, er
 // and pre-migration rows that existed before this column was introduced
 // (these get refreshed eagerly so we converge to the new state).
 //
-// Only active states are considered: retired/lost/draining(-out) rows
-// don't need creds. We include `idle` deliberately — an idle worker that
-// belongs to an org (post-activation) still has live creds in DuckDB and
-// will need them on the next session.
+// Only already-activated states are considered: retired/lost/draining rows
+// don't need creds, and reserved/activating rows must not be refreshed because
+// their first ActivateTenant RPC may still be in flight. Refreshing them would
+// bump owner_epoch underneath the activation path and make the original
+// owner_epoch look stale to the worker. We include `idle` deliberately — an
+// idle worker that belongs to an org (post-activation) still has live creds in
+// DuckDB and will need them on the next session.
 func (cs *ConfigStore) ListWorkersDueForCredentialRefresh(ownerCPInstanceID string, cutoff time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
 	credEligibleStates := []WorkerState{
 		WorkerStateIdle,
-		WorkerStateReserved,
-		WorkerStateActivating,
 		WorkerStateHot,
 		WorkerStateHotIdle,
 	}
