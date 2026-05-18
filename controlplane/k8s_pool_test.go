@@ -1135,6 +1135,81 @@ func TestK8sPoolReserveSharedWorkerClaimsRuntimeWorkerAndAdoptsPod(t *testing.T)
 	}
 }
 
+func TestK8sPoolReserveClaimedWorkerIsIdempotentForSameActivatingClaim(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	assignment := &WorkerAssignment{OrgID: "analytics"}
+	worker := &ManagedWorker{ID: 44, podName: "duckgres-worker-test-cp-44", done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(5)
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleActivating,
+		Assignment: assignment,
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+	pool.healthCheckFunc = func(ctx context.Context, got *ManagedWorker) error {
+		if got.ID != worker.ID {
+			t.Fatalf("expected liveness check for worker %d, got %d", worker.ID, got.ID)
+		}
+		return nil
+	}
+
+	got, err := pool.reserveClaimedWorker(context.Background(), &configstore.WorkerRecord{
+		WorkerID:          worker.ID,
+		PodName:           worker.PodName(),
+		State:             configstore.WorkerStateReserved,
+		OrgID:             assignment.OrgID,
+		OwnerCPInstanceID: pool.cpInstanceID,
+		OwnerEpoch:        5,
+	}, assignment)
+	if err != nil {
+		t.Fatalf("reserveClaimedWorker: %v", err)
+	}
+	if got != worker {
+		t.Fatalf("expected same worker instance")
+	}
+	if got.SharedState().Lifecycle != WorkerLifecycleActivating {
+		t.Fatalf("expected lifecycle to remain activating, got %q", got.SharedState().Lifecycle)
+	}
+	if got.OwnerEpoch() != 5 {
+		t.Fatalf("expected owner epoch 5, got %d", got.OwnerEpoch())
+	}
+}
+
+func TestK8sPoolReserveClaimedWorkerRejectsStaleInMemoryEpoch(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	assignment := &WorkerAssignment{OrgID: "analytics"}
+	worker := &ManagedWorker{ID: 45, podName: "duckgres-worker-test-cp-45", done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(6)
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleActivating,
+		Assignment: assignment,
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
+	}
+	pool.workers[worker.ID] = worker
+
+	_, err := pool.reserveClaimedWorker(context.Background(), &configstore.WorkerRecord{
+		WorkerID:          worker.ID,
+		PodName:           worker.PodName(),
+		State:             configstore.WorkerStateReserved,
+		OrgID:             assignment.OrgID,
+		OwnerCPInstanceID: pool.cpInstanceID,
+		OwnerEpoch:        1,
+	}, assignment)
+	if !errors.Is(err, errStaleRuntimeWorkerClaim) {
+		t.Fatalf("expected stale claim error, got %v", err)
+	}
+	if worker.OwnerEpoch() != 6 {
+		t.Fatalf("stale claim should not overwrite owner epoch, got %d", worker.OwnerEpoch())
+	}
+	if worker.SharedState().Lifecycle != WorkerLifecycleActivating {
+		t.Fatalf("stale claim should not change lifecycle, got %q", worker.SharedState().Lifecycle)
+	}
+}
+
 func TestK8sPoolReserveSharedWorkerFallsBackWhenRuntimeClaimReturnsNil(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{}
