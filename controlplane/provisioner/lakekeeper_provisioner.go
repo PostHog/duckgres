@@ -69,6 +69,21 @@ type ProvisioningInputs struct {
 	// When set, the provisioner also writes a non-empty
 	// LakekeeperOAuth2ServerURI to the warehouse row so the worker's
 	// in-process broker becomes DuckDB's OAuth2 server.
+	//
+	// **Flag-day deploy ordering.** Once any org gets a non-empty value
+	// here, its activation payload carries LakekeeperOAuth2ServerURI=
+	// http://127.0.0.1:9876/token, which the worker's iceberg extension
+	// tries to POST to. If the duckling pod spec hasn't yet been updated
+	// to (a) mount the projected SA token at DUCKGRES_LAKEKEEPER_TOKEN_PATH
+	// and (b) expose the broker on 9876, the POST hits a closed port and
+	// the ATTACH fails. There is no path that clears the URI once written
+	// (re-running with empty audiences would leave the old value behind).
+	// Deploy order MUST be:
+	//   1. Roll out the duckling pod spec change with the projected SA
+	//      volume + env var.
+	//   2. Apply the operator chart change that flips the CR's
+	//      authentication.kubernetes.enabled (PR4 already plumbs this).
+	//   3. Only then flip KubernetesAuthAudiences in the inputs resolver.
 	KubernetesAuthAudiences []string
 }
 
