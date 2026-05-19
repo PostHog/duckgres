@@ -253,7 +253,7 @@ jobs:
     timeout-minutes: 30
     # id-token: write lets this job request a GitHub OIDC token, which
     # aws-actions/configure-aws-credentials trades for STS-vended AWS
-    # credentials by assuming github-duckgres-iceberg-test-role in mw-dev.
+    # credentials by assuming github-duckgres-iceberg-ci-testing-role in mw-dev.
     # The role's trust policy is scoped to repo:PostHog/duckgres:*; its
     # IAM policy is scoped to the iceberg test buckets only. Provisioned
     # by PostHog/posthog-cloud-infra#8124.
@@ -320,14 +320,14 @@ jobs:
           exit 1
       - name: Configure AWS credentials via OIDC
         # Trades the GitHub-issued OIDC token for STS credentials by
-        # assuming github-duckgres-iceberg-test-role in mw-dev. Exposes
+        # assuming github-duckgres-iceberg-ci-testing-role in mw-dev. Exposes
         # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
         # in the job env, which iceberg_test.go reads via os.Getenv.
         # Pinned to the same commit cloud-infra workflows use.
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v4.0.2
         with:
           aws-region: us-east-1
-          role-to-assume: arn:aws:iam::373313242555:role/github-duckgres-iceberg-test-role
+          role-to-assume: arn:aws:iam::373313242555:role/github-duckgres-iceberg-ci-testing-role
           role-duration-seconds: 3600
       - name: Run Kubernetes integration tests
         run: just test-k8s-integration
