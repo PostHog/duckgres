@@ -534,22 +534,28 @@ func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID st
 		Backend:   src.Backend,
 		Namespace: src.Namespace,
 		Region:    src.Region,
-
-		// S3 Tables fields
-		TableBucket: src.TableBucketArn,
-
-		// Lakekeeper fields
-		LakekeeperEndpoint:        src.LakekeeperEndpoint,
-		LakekeeperWarehouse:       src.LakekeeperWarehouse,
-		LakekeeperClientID:        src.LakekeeperClientID,
-		LakekeeperOAuth2ServerURI: src.LakekeeperOAuth2ServerURI,
 	}
-	if ic.ResolvedBackend() == iceberg.BackendLakekeeper && src.LakekeeperClientCredentials.Name != "" {
-		val, err := a.readSecretValue(ctx, src.LakekeeperClientCredentials)
-		if err != nil {
-			return server.IcebergConfig{}, fmt.Errorf("resolve lakekeeper client credentials for org %q: %w", orgID, err)
+	// Populate only the fields the selected backend actually uses. Avoids
+	// leaking stale TableBucketArn from a pre-migration row into a
+	// lakekeeper activation payload (or vice versa). The worker-side
+	// dispatcher gates on ResolvedBackend anyway, but zeroing here is
+	// cheap defense-in-depth and keeps the payload free of orphaned
+	// credentials.
+	switch ic.ResolvedBackend() {
+	case iceberg.BackendLakekeeper:
+		ic.LakekeeperEndpoint = src.LakekeeperEndpoint
+		ic.LakekeeperWarehouse = src.LakekeeperWarehouse
+		ic.LakekeeperClientID = src.LakekeeperClientID
+		ic.LakekeeperOAuth2ServerURI = src.LakekeeperOAuth2ServerURI
+		if src.LakekeeperClientCredentials.Name != "" {
+			val, err := a.readSecretValue(ctx, src.LakekeeperClientCredentials)
+			if err != nil {
+				return server.IcebergConfig{}, fmt.Errorf("resolve lakekeeper client credentials for org %q: %w", orgID, err)
+			}
+			ic.LakekeeperClientSecret = val
 		}
-		ic.LakekeeperClientSecret = val
+	case iceberg.BackendS3Tables:
+		ic.TableBucket = src.TableBucketArn
 	}
 	return ic, nil
 }

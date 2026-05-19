@@ -1753,6 +1753,16 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}) er
 // table bucket. Pattern-matching on the surface error string is fragile,
 // so we cover the known signals from the DuckDB iceberg extension talking
 // to AWS S3 Tables.
+//
+// TODO(PR3): the patterns here were observed against S3 Tables. The
+// Lakekeeper REST catalog returns different error shapes on empty
+// namespace lists (the prototype confirmed `GET /v1/namespaces` returns
+// `{"namespaces":[]}` rather than an error, so SHOW TABLES on an
+// attached-but-empty Lakekeeper catalog likely returns 0 rows rather
+// than erroring). The probe-and-detach below handles the no-error path
+// already; the substring matches here are S3-Tables-specific until
+// proven otherwise. Add a real-DuckDB integration test against a live
+// Lakekeeper warehouse to confirm the empty-state behavior.
 func isIcebergCatalogEmptyError(err error) bool {
 	if err == nil {
 		return false
@@ -2052,6 +2062,15 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 // fallback to credential_chain.
 func RefreshIcebergSecret(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secretKey, sessionToken string) error {
 	if !ic.Enabled {
+		return nil
+	}
+	// Lakekeeper backend: Lakekeeper itself vends short-lived STS creds to
+	// DuckDB at table-load time via ACCESS_DELEGATION_MODE 'vended_credentials'.
+	// The OAuth2 client_secret in iceberg_oauth is a long-lived config, not
+	// an STS-minted blob — nothing to rotate on the worker's STS schedule.
+	// Returning nil here keeps Lakekeeper orgs from spuriously failing the
+	// hourly credential-refresh cycle.
+	if ic.ResolvedBackend() == iceberg.BackendLakekeeper {
 		return nil
 	}
 	if keyID == "" || secretKey == "" {
