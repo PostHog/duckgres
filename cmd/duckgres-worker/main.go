@@ -22,6 +22,7 @@ import (
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/server/lakekeeperbroker"
 )
 
 // Each duckgres binary owns its own package-main version/commit/date because
@@ -247,6 +248,23 @@ func main() {
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create data directory %q: %s\n", cfg.DataDir, err)
 		os.Exit(1)
+	}
+
+	// Lakekeeper OIDC SA-token broker. Started when DUCKGRES_LAKEKEEPER_TOKEN_PATH
+	// is set (typically by the duckling pod spec, mounting a projected SA
+	// token volume at /var/run/secrets/lakekeeper/token). DuckDB's iceberg
+	// extension POSTs to OAUTH2_SERVER_URI=http://127.0.0.1:9876/token to
+	// fetch a bearer; the broker reads the projected file and hands it back.
+	// When the env var is unset, no broker is started — preserves the
+	// allowall + NetworkPolicy posture for clusters that haven't enabled
+	// OIDC on Lakekeeper yet.
+	if tokenPath := configloader.Env("DUCKGRES_LAKEKEEPER_TOKEN_PATH", ""); tokenPath != "" {
+		broker := lakekeeperbroker.New(tokenPath)
+		if err := broker.ListenAndServe(lakekeeperbroker.DefaultAddr); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start lakekeeper broker on %s: %s\n", lakekeeperbroker.DefaultAddr, err)
+			os.Exit(1)
+		}
+		slog.Info("Lakekeeper OIDC broker started.", "addr", lakekeeperbroker.DefaultAddr, "token_path", tokenPath)
 	}
 
 	// No initMetrics() here. In control-plane mode all worker pods would

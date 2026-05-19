@@ -145,6 +145,57 @@ func TestEnsureCR_CreateAndShape(t *testing.T) {
 	}
 }
 
+func TestEnsureCR_KubernetesAuthOff_OmitsAuthenticationBlock(t *testing.T) {
+	c, dc, _ := newFakeLakekeeperClient()
+	ctx := context.Background()
+	spec := LakekeeperCRSpec{
+		OrgID: "acme", Image: "img:v1", PGHost: "h", PGDatabase: "lakekeeper_acme",
+		SecretName: "lakekeeper-acme", BaseURI: "http://x",
+		// KubernetesAuthAudiences left empty
+	}
+	if err := c.EnsureCR(ctx, spec); err != nil {
+		t.Fatalf("EnsureCR: %v", err)
+	}
+	got, _ := dc.Resource(lakekeeperGVR).Namespace("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{})
+	specMap := got.Object["spec"].(map[string]interface{})
+	if _, present := specMap["authentication"]; present {
+		t.Errorf("authentication block should be absent when KubernetesAuthAudiences is empty")
+	}
+}
+
+func TestEnsureCR_KubernetesAuthOn_EmitsAuthenticationBlock(t *testing.T) {
+	c, dc, _ := newFakeLakekeeperClient()
+	ctx := context.Background()
+	spec := LakekeeperCRSpec{
+		OrgID: "acme", Image: "img:v1", PGHost: "h", PGDatabase: "lakekeeper_acme",
+		SecretName: "lakekeeper-acme", BaseURI: "http://x",
+		KubernetesAuthAudiences: []string{"lakekeeper", "lakekeeper-prod"},
+	}
+	if err := c.EnsureCR(ctx, spec); err != nil {
+		t.Fatalf("EnsureCR: %v", err)
+	}
+	got, _ := dc.Resource(lakekeeperGVR).Namespace("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{})
+	specMap := got.Object["spec"].(map[string]interface{})
+	auth, ok := specMap["authentication"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("authentication block missing or wrong type: %T", specMap["authentication"])
+	}
+	k8sAuth, ok := auth["kubernetes"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("authentication.kubernetes missing")
+	}
+	if k8sAuth["enabled"] != true {
+		t.Errorf("authentication.kubernetes.enabled = %v, want true", k8sAuth["enabled"])
+	}
+	auds, ok := k8sAuth["audiences"].([]interface{})
+	if !ok || len(auds) != 2 {
+		t.Fatalf("audiences = %v, want [lakekeeper lakekeeper-prod]", k8sAuth["audiences"])
+	}
+	if auds[0] != "lakekeeper" || auds[1] != "lakekeeper-prod" {
+		t.Errorf("audiences contents = %v", auds)
+	}
+}
+
 func TestEnsureCR_IdempotentUpdate(t *testing.T) {
 	c, dc, _ := newFakeLakekeeperClient()
 	ctx := context.Background()
