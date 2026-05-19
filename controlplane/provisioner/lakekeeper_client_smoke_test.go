@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,7 +35,7 @@ func TestSmoke_InfoAgainstLiveLakekeeper(t *testing.T) {
 	if err != nil {
 		// Distinguish auth from connectivity.
 		var apiErr *APIError
-		if asAPIErr(err, &apiErr) && apiErr.Status == http.StatusUnauthorized {
+		if errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized {
 			t.Fatalf("Lakekeeper requires bearer (set LAKEKEEPER_SMOKE_BEARER): %v", err)
 		}
 		t.Fatalf("Info: %v", err)
@@ -43,16 +44,4 @@ func TestSmoke_InfoAgainstLiveLakekeeper(t *testing.T) {
 		t.Fatalf("expected non-empty version, got %+v", info)
 	}
 	t.Logf("live lakekeeper info: version=%s authz=%s bootstrapped=%v", info.Version, info.AuthzBackend, info.Bootstrapped)
-}
-
-// helper so this file doesn't need errors.As import duplication
-func asAPIErr(err error, target **APIError) bool {
-	if err == nil {
-		return false
-	}
-	if e, ok := err.(*APIError); ok {
-		*target = e
-		return true
-	}
-	return false
 }

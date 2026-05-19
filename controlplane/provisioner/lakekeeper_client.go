@@ -35,6 +35,13 @@ func NewLakekeeperClient(baseURL string) *LakekeeperClient {
 	}
 }
 
+// WithBearer sets the bearer token used on subsequent requests. The token
+// must be a single-line string (no CR/LF) — Go's http.Header.Set won't error
+// on construction but http.Client.Do will reject malformed headers at send.
+//
+// NOT safe to call concurrently with in-flight requests. Build the client
+// once, configure it, then share read-only across goroutines. PR3 will add
+// proper rotation primitives when OIDC refresh lands.
 func (c *LakekeeperClient) WithBearer(token string) *LakekeeperClient {
 	c.bearer = token
 	return c
@@ -134,21 +141,42 @@ type listWarehousesResponse struct {
 
 // EnsureWarehouse creates the warehouse if it doesn't exist, otherwise returns
 // the existing one. Match is by warehouse-name within the default project.
+//
+// Idempotent under concurrent callers: if two callers both observe an empty
+// list and both POST, the second POST will 409 and we re-list to return the
+// winner. Callers that need stronger ordering should hold a per-org lock
+// outside this method.
 func (c *LakekeeperClient) EnsureWarehouse(ctx context.Context, req CreateWarehouseRequest) (*Warehouse, error) {
-	existing, err := c.findWarehouseByName(ctx, req.WarehouseName)
-	if err != nil {
+	if existing, err := c.findWarehouseByName(ctx, req.WarehouseName); err != nil {
 		return nil, err
-	}
-	if existing != nil {
+	} else if existing != nil {
 		return existing, nil
 	}
 	var out Warehouse
-	if err := c.do(ctx, http.MethodPost, "/management/v1/warehouse", req, &out); err != nil {
-		return nil, fmt.Errorf("create warehouse %q: %w", req.WarehouseName, err)
+	err := c.do(ctx, http.MethodPost, "/management/v1/warehouse", req, &out)
+	if err == nil {
+		return &out, nil
 	}
-	return &out, nil
+	// 409 → another caller (or a previous attempt) won the race. Re-list and
+	// return the existing warehouse rather than surface the conflict.
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusConflict {
+		existing, lookupErr := c.findWarehouseByName(ctx, req.WarehouseName)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("create warehouse %q hit 409, lookup failed: %w", req.WarehouseName, lookupErr)
+		}
+		if existing != nil {
+			return existing, nil
+		}
+		// 409 but nothing matches by name — pass the original error through.
+	}
+	return nil, fmt.Errorf("create warehouse %q: %w", req.WarehouseName, err)
 }
 
+// findWarehouseByName scans the first page of the warehouse list for a name
+// match. Lakekeeper paginates the list endpoint; we assume one warehouse per
+// per-org Lakekeeper instance, so a single page is enough today. If we ever
+// host multiple warehouses per instance, revisit to honor `next-page-token`.
 func (c *LakekeeperClient) findWarehouseByName(ctx context.Context, name string) (*Warehouse, error) {
 	var resp listWarehousesResponse
 	if err := c.do(ctx, http.MethodGet, "/management/v1/warehouse", nil, &resp); err != nil {

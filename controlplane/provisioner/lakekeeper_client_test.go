@@ -116,6 +116,36 @@ func TestEnsureWarehouse_CreatesWhenAbsent(t *testing.T) {
 	}
 }
 
+func TestEnsureWarehouse_ResolvesRaceOn409(t *testing.T) {
+	// Simulate concurrent reconcilers: first GET sees empty list, POST loses
+	// the race (409), follow-up GET returns the winner's warehouse.
+	step := 0
+	c, stop := newTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && step == 0:
+			step = 1
+			_, _ = io.WriteString(w, `{"warehouses":[]}`)
+		case r.Method == http.MethodPost && step == 1:
+			step = 2
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":{"message":"warehouse exists"}}`)
+		case r.Method == http.MethodGet && step == 2:
+			_, _ = io.WriteString(w, `{"warehouses":[{"warehouse-id":"winner","name":"org-acme","status":"active"}]}`)
+		default:
+			t.Fatalf("unexpected request at step %d: %s %s", step, r.Method, r.URL.Path)
+		}
+	}))
+	defer stop()
+
+	wh, err := c.EnsureWarehouse(context.Background(), CreateWarehouseRequest{WarehouseName: "org-acme"})
+	if err != nil {
+		t.Fatalf("EnsureWarehouse should resolve 409 via re-list: %v", err)
+	}
+	if wh.WarehouseID != "winner" {
+		t.Fatalf("expected winner warehouse, got %+v", wh)
+	}
+}
+
 func TestEnsureWarehouse_NoOpWhenPresent(t *testing.T) {
 	c, stop := newTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
