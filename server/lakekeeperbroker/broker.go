@@ -66,6 +66,11 @@ func New(tokenPath string) *Broker {
 // response. Default 60. Lower values increase /token QPS but reduce the
 // window in which DuckDB could be holding a stale token after kubelet
 // rotation.
+//
+// TODO(PR5): the worker binary doesn't expose this override via env yet
+// — the duckling pod spec work that lands the projected SA volume
+// should also wire DUCKGRES_LAKEKEEPER_TOKEN_EXPIRES_IN. Until then,
+// every duckling uses the default 60s.
 func (b *Broker) WithExpiresIn(s int) *Broker {
 	b.expiresInSeconds = s
 	return b
@@ -169,7 +174,12 @@ func (b *Broker) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// RFC 6749 §5.1: token responses must include both Cache-Control: no-store
+	// and Pragma: no-cache. The latter is an HTTP/1.0 remnant that won't matter
+	// on a loopback connection to DuckDB, but the broker is otherwise spec-
+	// compliant and the header is one line.
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	_ = json.NewEncoder(w).Encode(tokenResponse{
 		AccessToken: token,
 		TokenType:   "Bearer",

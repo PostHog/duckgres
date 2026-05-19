@@ -57,6 +57,9 @@ func TestTokenEndpointReturnsFileContents(t *testing.T) {
 	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
 		t.Errorf("cache-control = %q, want no-store", cc)
 	}
+	if pr := resp.Header.Get("Pragma"); pr != "no-cache" {
+		t.Errorf("pragma = %q, want no-cache (RFC 6749 §5.1)", pr)
+	}
 	var tr tokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
 		t.Fatalf("decode: %v", err)
