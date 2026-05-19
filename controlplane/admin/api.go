@@ -184,9 +184,10 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 
 func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
 	fields := map[string]interface{}{
-		"max_workers":    updates.MaxWorkers,
-		"memory_budget":  updates.MemoryBudget,
-		"idle_timeout_s": updates.IdleTimeoutS,
+		"max_workers":     updates.MaxWorkers,
+		"memory_budget":   updates.MemoryBudget,
+		"idle_timeout_s":  updates.IdleTimeoutS,
+		"max_connections": updates.MaxConnections,
 	}
 	// Only update resource fields when explicitly provided to avoid clearing
 	// previously-set values when the caller omits them from the JSON payload.
