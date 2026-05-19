@@ -73,7 +73,7 @@ func isNil(i contextQueryer) bool {
 		return true
 	}
 	v := reflect.ValueOf(i)
-	return v.Kind() == reflect.Ptr && v.IsNil()
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
 // GetQuerySchema executes a query with LIMIT 0 to discover the result schema.

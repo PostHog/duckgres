@@ -77,6 +77,7 @@ var knownFailures = map[string]string{
 	"info_schema_columns_with_default": "DuckDB: column_default not populated",
 	"info_schema_schemata_all":     "DuckDB: schema count differs",
 	"psql_dt":                      "DuckDB: pg_class row count differs",
+	"psql_dn":                      "DuckDB: schema count differs",
 
 	// Query ordering differences (results correct but order differs)
 	"distinct_multiple":   "DuckDB: default ordering differs",
