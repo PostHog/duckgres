@@ -59,11 +59,69 @@ func BuildIcebergSecretStmt(cfg Config, keyID, secret, sessionToken string) stri
 
 // BuildIcebergAttachStmt builds the ATTACH statement for the Iceberg
 // extension catalog, addressing the per-tenant S3 Tables bucket ARN.
+//
+// Kept as the S3 Tables-specific builder. The dispatcher in
+// server.AttachIcebergCatalog picks between this and
+// BuildLakekeeperAttachStmt based on Config.ResolvedBackend.
 func BuildIcebergAttachStmt(cfg Config) string {
 	return fmt.Sprintf(
 		"ATTACH '%s' AS %s (TYPE iceberg, ENDPOINT_TYPE 's3_tables')",
 		escapeSQLStringLiteral(cfg.TableBucket),
 		CatalogName,
+	)
+}
+
+// LakekeeperSecretName is the DuckDB SECRET name used when ATTACHing a
+// Lakekeeper REST catalog with OAuth2 client credentials. Distinct from
+// iceberg_sigv4 so a worker that has both backends configured (post-migration)
+// doesn't collide.
+const LakekeeperSecretName = "iceberg_oauth"
+
+// BuildLakekeeperSecretStmt builds a CREATE SECRET statement for the
+// Lakekeeper REST catalog using the OAuth2 client_credentials flow. The
+// DuckDB iceberg extension fetches an access token from OAUTH2_SERVER_URI
+// using these CLIENT_ID/CLIENT_SECRET and caches it for subsequent REST
+// calls.
+//
+// Returns "" when OAuth2 is not configured (allowall mode). Callers must
+// then emit BuildLakekeeperAttachStmt with empty SECRET name + the
+// AUTHORIZATION_TYPE 'none' option (handled inside the helper).
+func BuildLakekeeperSecretStmt(cfg Config) string {
+	if cfg.LakekeeperOAuth2ServerURI == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"CREATE OR REPLACE SECRET %s (TYPE ICEBERG, CLIENT_ID '%s', CLIENT_SECRET '%s', OAUTH2_SERVER_URI '%s')",
+		LakekeeperSecretName,
+		escapeSQLStringLiteral(cfg.LakekeeperClientID),
+		escapeSQLStringLiteral(cfg.LakekeeperClientSecret),
+		escapeSQLStringLiteral(cfg.LakekeeperOAuth2ServerURI),
+	)
+}
+
+// BuildLakekeeperAttachStmt builds the ATTACH statement for the Iceberg
+// REST catalog vended by Lakekeeper. ACCESS_DELEGATION_MODE 'vended_credentials'
+// tells DuckDB to ask Lakekeeper for short-lived STS creds for the
+// underlying S3 storage rather than signing requests itself.
+//
+// When OAUTH2_SERVER_URI is empty (allowall mode), AUTHORIZATION_TYPE 'none'
+// is set instead of SECRET. When OAuth2 is configured, SECRET references
+// the secret built by BuildLakekeeperSecretStmt.
+func BuildLakekeeperAttachStmt(cfg Config) string {
+	if cfg.LakekeeperOAuth2ServerURI == "" {
+		return fmt.Sprintf(
+			"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', ACCESS_DELEGATION_MODE 'vended_credentials', AUTHORIZATION_TYPE 'none')",
+			escapeSQLStringLiteral(cfg.LakekeeperWarehouse),
+			CatalogName,
+			escapeSQLStringLiteral(cfg.LakekeeperEndpoint),
+		)
+	}
+	return fmt.Sprintf(
+		"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials')",
+		escapeSQLStringLiteral(cfg.LakekeeperWarehouse),
+		CatalogName,
+		escapeSQLStringLiteral(cfg.LakekeeperEndpoint),
+		LakekeeperSecretName,
 	)
 }
 
