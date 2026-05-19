@@ -723,9 +723,12 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	}
 	pool.workers[stale.ID] = stale
 
-	spawnCalls := 0
+	backfillStarted := make(chan struct{}, 1)
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		spawnCalls++
+		select {
+		case backfillStarted <- struct{}{}:
+		default:
+		}
 		return nil
 	}
 
@@ -754,8 +757,10 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	if _, ok := pool.Worker(stale.ID); ok {
 		t.Fatal("expected stale worker to be retired")
 	}
-	if spawnCalls != 0 {
-		t.Fatalf("did not expect warm backfill spawn, got %d calls", spawnCalls)
+	select {
+	case <-backfillStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected stale worker miss to trigger warm backfill")
 	}
 }
 
@@ -1163,12 +1168,10 @@ func TestK8sPoolReserveSharedWorkerRuntimeMissDoesNotUseInMemoryFallback(t *test
 	}
 }
 
-// TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRuntimeStore
-// ensures the runtime-store-less warm-pool path honors per-org image pinning.
-// Without the image filter on findReservableWarmWorkerLocked,
-// ReserveSharedWorker would return a default-image warm worker to a pinned org
-// and the subsequent activation would fail with a version-mismatch error.
-func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRuntimeStore(t *testing.T) {
+// TestK8sPoolReserveSharedWorkerPinnedImageRuntimeMissBackfillsWithoutLocalFallback
+// ensures runtime-store mode does not reserve a mismatched local warm worker
+// after a durable claim miss, but still starts pinned-image warm backfill.
+func TestK8sPoolReserveSharedWorkerPinnedImageRuntimeMissBackfillsWithoutLocalFallback(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
 	// A warm-idle worker built from the cluster default image — a tempting
@@ -1181,9 +1184,25 @@ func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRunt
 	pool.workers[defaultWorker.ID] = defaultWorker
 
 	pinnedImage := "duckgres-worker:abc123-duckdb1.5.1"
-	spawnCalls := 0
+	backfillStarted := make(chan struct{}, 1)
+	store := &captureRuntimeWorkerStore{
+		perImageSpawnedFunc: func(image string) *configstore.WorkerRecord {
+			select {
+			case backfillStarted <- struct{}{}:
+			default:
+			}
+			return &configstore.WorkerRecord{
+				WorkerID:          42,
+				PodName:           "duckgres-worker-test-cp-42",
+				State:             configstore.WorkerStateSpawning,
+				Image:             image,
+				OwnerCPInstanceID: pool.cpInstanceID,
+			}
+		},
+	}
+	pool.runtimeStore = store
+
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		spawnCalls++
 		return nil
 	}
 
@@ -1199,8 +1218,16 @@ func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRunt
 	if worker != nil {
 		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
-	if spawnCalls != 0 {
-		t.Fatalf("did not expect foreground or async spawn, got %d calls", spawnCalls)
+	select {
+	case <-backfillStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected pinned-image miss to trigger per-image warm backfill")
+	}
+	if store.perImageSpawnImage != pinnedImage {
+		t.Fatalf("per-image backfill image = %q, want %q", store.perImageSpawnImage, pinnedImage)
+	}
+	if store.spawnCalls != 0 {
+		t.Fatalf("did not expect foreground org-bound spawn, got %d calls", store.spawnCalls)
 	}
 	if defaultWorker.SharedState().Lifecycle == WorkerLifecycleReserved {
 		t.Fatalf("default-image warm worker was reserved despite image mismatch")
@@ -1565,10 +1592,24 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 	}
 	pool.workers[7] = w
 
+	backfillStarted := make(chan struct{}, 1)
 	store := &captureRuntimeWorkerStore{
 		hotIdleClaimResult: &configstore.WorkerRecord{
 			WorkerID: 7,
 			Image:    "duckgres:v1",
+		},
+		perImageSpawnedFunc: func(image string) *configstore.WorkerRecord {
+			select {
+			case backfillStarted <- struct{}{}:
+			default:
+			}
+			return &configstore.WorkerRecord{
+				WorkerID:          42,
+				PodName:           "test-cp-worker-42",
+				Image:             image,
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: pool.cpInstanceID,
+			}
 		},
 	}
 	pool.runtimeStore = store
@@ -1597,14 +1638,38 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 	if store.retireIdleOrHotIdleCalledReasons[0] != RetireReasonMismatchedVersion {
 		t.Fatalf("expected reason %q, got %q", RetireReasonMismatchedVersion, store.retireIdleOrHotIdleCalledReasons[0])
 	}
-	if store.spawnCalls != 0 || store.perImageSpawnCalls != 0 {
-		t.Fatalf("did not expect foreground or async spawn, got foreground=%d per_image=%d", store.spawnCalls, store.perImageSpawnCalls)
+	select {
+	case <-backfillStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected mismatched image miss to trigger per-image warm backfill")
+	}
+	if store.perImageSpawnImage != "duckgres:v2" {
+		t.Fatalf("expected per-image backfill for v2, got %q", store.perImageSpawnImage)
+	}
+	if store.spawnCalls != 0 {
+		t.Fatalf("did not expect foreground org-bound spawn, got %d calls", store.spawnCalls)
 	}
 }
 
-func TestK8sPoolReserveSharedWorkerColdRuntimeBackpressuresWithoutSpawning(t *testing.T) {
+func TestK8sPoolReserveSharedWorkerColdRuntimeBackpressuresAndTriggersNeutralWarmup(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	store := &captureRuntimeWorkerStore{}
+	pool.SetWarmCapacityTarget(1)
+	backfillStarted := make(chan struct{}, 1)
+	store := &captureRuntimeWorkerStore{
+		neutralSpawnedFunc: func() *configstore.WorkerRecord {
+			select {
+			case backfillStarted <- struct{}{}:
+			default:
+			}
+			return &configstore.WorkerRecord{
+				WorkerID:          31,
+				PodName:           "duckgres-worker-test-cp-31",
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				Image:             pool.workerImage,
+			}
+		},
+	}
 	pool.runtimeStore = store
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error { return nil }
 
@@ -1622,8 +1687,19 @@ func TestK8sPoolReserveSharedWorkerColdRuntimeBackpressuresWithoutSpawning(t *te
 	if store.spawnCalls != 0 {
 		t.Fatalf("did not expect foreground org-bound spawn, got %d calls", store.spawnCalls)
 	}
-	if store.neutralSpawnCalls != 0 || store.perImageSpawnCalls != 0 {
-		t.Fatalf("did not expect async warm backfill, got neutral=%d per_image=%d", store.neutralSpawnCalls, store.perImageSpawnCalls)
+	select {
+	case <-backfillStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected runtime cold miss to trigger neutral warm backfill")
+	}
+	if store.neutralSpawnOwnerCPID != pool.cpInstanceID {
+		t.Fatalf("expected warm owner cp-instance %q, got %q", pool.cpInstanceID, store.neutralSpawnOwnerCPID)
+	}
+	if store.neutralSpawnTarget != 2 {
+		t.Fatalf("expected neutral warm target 2, got %d", store.neutralSpawnTarget)
+	}
+	if store.neutralSpawnImage != pool.workerImage {
+		t.Fatalf("expected neutral warm image %q, got %q", pool.workerImage, store.neutralSpawnImage)
 	}
 }
 
@@ -1655,6 +1731,66 @@ func TestK8sPoolReserveSharedWorkerColdBackpressuresWhenWarmupBlockedByGlobalCap
 	}
 	if store.spawnCalls != 0 || store.neutralSpawnCalls != 0 || store.perImageSpawnCalls != 0 {
 		t.Fatalf("did not expect any foreground or async spawn while at cap: spawn=%d neutral=%d per_image=%d", store.spawnCalls, store.neutralSpawnCalls, store.perImageSpawnCalls)
+	}
+}
+
+func TestK8sPoolNeutralWarmDemandCoalescesRetriesWhileBackfillInFlight(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+
+	target, shouldStart := pool.bumpNeutralWarmDemandTarget()
+	if target != 1 || !shouldStart {
+		t.Fatalf("first miss target/start = %d/%v, want 1/true", target, shouldStart)
+	}
+
+	target, shouldStart = pool.bumpNeutralWarmDemandTarget()
+	if target != 1 || shouldStart {
+		t.Fatalf("retry while in flight target/start = %d/%v, want 1/false", target, shouldStart)
+	}
+
+	pool.mu.Lock()
+	pool.warmDemandLastBump = time.Now().Add(-warmCapacityDemandBumpInterval - time.Second)
+	pool.mu.Unlock()
+
+	target, shouldStart = pool.bumpNeutralWarmDemandTarget()
+	if target != 1 || shouldStart {
+		t.Fatalf("old retry while in flight target/start = %d/%v, want 1/false", target, shouldStart)
+	}
+
+	pool.finishNeutralWarmBackfill()
+	target, shouldStart = pool.bumpNeutralWarmDemandTarget()
+	if target != 2 || !shouldStart {
+		t.Fatalf("retry after backfill target/start = %d/%v, want 2/true", target, shouldStart)
+	}
+}
+
+func TestK8sPoolPerImageWarmDemandCoalescesRetriesWhileBackfillInFlight(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	image := "duckgres:v2"
+	pool.SetPerImageWarmTargets(map[string]int{image: 1})
+
+	target, shouldStart := pool.bumpPerImageWarmDemandTarget(image)
+	if target != 2 || !shouldStart {
+		t.Fatalf("first miss target/start = %d/%v, want 2/true", target, shouldStart)
+	}
+
+	target, shouldStart = pool.bumpPerImageWarmDemandTarget(image)
+	if target != 2 || shouldStart {
+		t.Fatalf("retry while in flight target/start = %d/%v, want 2/false", target, shouldStart)
+	}
+
+	pool.mu.Lock()
+	pool.perImageWarmDemandLastBump[image] = time.Now().Add(-warmCapacityDemandBumpInterval - time.Second)
+	pool.mu.Unlock()
+
+	target, shouldStart = pool.bumpPerImageWarmDemandTarget(image)
+	if target != 2 || shouldStart {
+		t.Fatalf("old retry while in flight target/start = %d/%v, want 2/false", target, shouldStart)
+	}
+
+	pool.finishPerImageWarmBackfill(image)
+	target, shouldStart = pool.bumpPerImageWarmDemandTarget(image)
+	if target != 3 || !shouldStart {
+		t.Fatalf("retry after backfill target/start = %d/%v, want 3/true", target, shouldStart)
 	}
 }
 
@@ -1901,11 +2037,14 @@ func TestK8sPoolHealthCheckLoopReplenishesWarmCapacityAfterIdleWorkerCrash(t *te
 	}
 }
 
-func TestK8sPoolReserveSharedWorkerColdPoolBackpressuresWithoutSpawning(t *testing.T) {
+func TestK8sPoolReserveSharedWorkerColdPoolBackpressuresAndTriggersWarmup(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	spawnCalls := 0
+	backfillStarted := make(chan struct{}, 1)
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		spawnCalls++
+		select {
+		case backfillStarted <- struct{}{}:
+		default:
+		}
 		return nil
 	}
 
@@ -1922,8 +2061,10 @@ func TestK8sPoolReserveSharedWorkerColdPoolBackpressuresWithoutSpawning(t *testi
 	if worker != nil {
 		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
-	if spawnCalls != 0 {
-		t.Fatalf("did not expect warm backfill spawn, got %d calls", spawnCalls)
+	select {
+	case <-backfillStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected cold miss to trigger warm backfill")
 	}
 }
 

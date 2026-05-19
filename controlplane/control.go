@@ -675,7 +675,7 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 			retryAfter = DefaultWarmCapacityRetryAfter
 		}
 		retrySeconds := int((retryAfter + time.Second - 1) / time.Second)
-		return "53300", fmt.Sprintf("no warm Duckgres worker is currently available; retry in about %d seconds", retrySeconds)
+		return "53300", fmt.Sprintf("no warm Duckgres worker is currently available; additional capacity is starting, retry in about %d seconds", retrySeconds)
 	case errors.Is(err, context.Canceled):
 		return "57014", "canceling authentication due to user request"
 	case errors.Is(err, context.DeadlineExceeded):

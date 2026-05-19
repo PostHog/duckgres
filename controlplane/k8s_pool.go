@@ -35,26 +35,40 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-const defaultActivatingTimeout = 2 * time.Minute
+const (
+	defaultActivatingTimeout       = 2 * time.Minute
+	warmCapacityDemandTTL          = 10 * time.Minute
+	warmCapacityDemandBumpInterval = DefaultWarmCapacityRetryAfter
+)
 
 var errStaleRuntimeWorkerClaim = stderrors.New("stale runtime worker claim")
 
 // K8sWorkerPool manages worker pods in Kubernetes.
 type K8sWorkerPool struct {
-	mu           sync.RWMutex
-	workers      map[int]*ManagedWorker
-	nextWorkerID int
-	spawning     int
-	maxWorkers   int
-	minWorkers   int
+	mu                   sync.RWMutex
+	workers              map[int]*ManagedWorker
+	nextWorkerID         int
+	spawning             int
+	maxWorkers           int
+	minWorkers           int
+	warmBaseTarget       int
+	warmDemandTarget     int
+	warmDemandUntil      time.Time
+	warmDemandLastBump   time.Time
+	warmBackfillInFlight bool
 	// perImageWarmTarget is an additive floor on top of minWorkers: for each
 	// image listed, the pool aims to keep at least N warm-idle workers of
 	// that exact image alive so a per-org pin always has a hot pod waiting.
 	// minWorkers still drives the cluster-default warm count separately.
-	perImageWarmTarget map[string]int
-	idleTimeout        time.Duration
-	shuttingDown       bool
-	shutdownCh         chan struct{}
+	perImageWarmTarget           map[string]int
+	perImageWarmBaseTarget       map[string]int
+	perImageWarmDemandTarget     map[string]int
+	perImageWarmDemandUntil      map[string]time.Time
+	perImageWarmDemandLastBump   map[string]time.Time
+	perImageWarmBackfillInFlight map[string]bool
+	idleTimeout                  time.Duration
+	shuttingDown                 bool
+	shutdownCh                   chan struct{}
 
 	clientset             kubernetes.Interface
 	namespace             string
@@ -1388,6 +1402,14 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				continue
 			}
 
+			p.mu.Lock()
+			liveCount := p.liveWorkerCountLocked()
+			canSpawn := p.maxWorkers == 0 || liveCount < p.maxWorkers
+			p.mu.Unlock()
+			if canSpawn {
+				p.triggerWarmCapacityBackfill(assignment)
+			}
+
 			return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
 		}
 
@@ -1451,7 +1473,13 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			return idle, nil
 		}
 
+		liveCount := p.liveWorkerCountLocked()
+		canSpawn := p.maxWorkers == 0 || liveCount < p.maxWorkers
 		p.mu.Unlock()
+
+		if canSpawn {
+			p.triggerWarmCapacityBackfill(assignment)
+		}
 
 		return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
 	}
@@ -1852,6 +1880,168 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 	}
 	wg.Wait()
 	return stderrors.Join(errs...)
+}
+
+func (p *K8sWorkerPool) triggerWarmCapacityBackfill(assignment *WorkerAssignment) {
+	if assignment == nil {
+		return
+	}
+	image := strings.TrimSpace(assignment.Image)
+	if image != "" {
+		target, shouldStart := p.bumpPerImageWarmDemandTarget(image)
+		if target <= 0 || !shouldStart {
+			return
+		}
+		go func() {
+			defer p.finishPerImageWarmBackfill(image)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := p.SpawnMinWorkersForImage(ctx, image, target); err != nil {
+				slog.Warn("Warm-capacity backfill failed.", "image", image, "target", target, "error", err)
+			}
+		}()
+		return
+	}
+
+	target, shouldStart := p.bumpNeutralWarmDemandTarget()
+	if target <= 0 || !shouldStart {
+		return
+	}
+	go func() {
+		defer p.finishNeutralWarmBackfill()
+		if err := p.SpawnMinWorkers(target); err != nil {
+			slog.Warn("Warm-capacity backfill failed.", "target", target, "error", err)
+		}
+	}()
+}
+
+func (p *K8sWorkerPool) bumpNeutralWarmDemandTarget() (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if p.warmBackfillInFlight {
+		if p.warmDemandTarget > 0 {
+			p.warmDemandUntil = now.Add(warmCapacityDemandTTL)
+		}
+		p.recomputeWarmTargetsLocked()
+		return p.minWorkers, false
+	}
+	if p.warmDemandTarget == 0 || now.Sub(p.warmDemandLastBump) >= warmCapacityDemandBumpInterval {
+		current := maxInt(p.warmBaseTarget, p.warmDemandTarget)
+		next := current + 1
+		if next < 1 {
+			next = 1
+		}
+		if p.maxWorkers > 0 && next > p.maxWorkers {
+			next = p.maxWorkers
+		}
+		if next > p.warmDemandTarget {
+			p.warmDemandTarget = next
+		}
+		p.warmDemandLastBump = now
+	}
+	p.warmDemandUntil = now.Add(warmCapacityDemandTTL)
+	p.recomputeWarmTargetsLocked()
+	if p.minWorkers <= 0 {
+		return p.minWorkers, false
+	}
+	p.warmBackfillInFlight = true
+	return p.minWorkers, true
+}
+
+func (p *K8sWorkerPool) bumpPerImageWarmDemandTarget(image string) (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if image == "" {
+		return 0, false
+	}
+	if p.perImageWarmDemandTarget == nil {
+		p.perImageWarmDemandTarget = make(map[string]int)
+	}
+	if p.perImageWarmDemandUntil == nil {
+		p.perImageWarmDemandUntil = make(map[string]time.Time)
+	}
+	if p.perImageWarmDemandLastBump == nil {
+		p.perImageWarmDemandLastBump = make(map[string]time.Time)
+	}
+	if p.perImageWarmBackfillInFlight == nil {
+		p.perImageWarmBackfillInFlight = make(map[string]bool)
+	}
+	now := time.Now()
+	if p.perImageWarmBackfillInFlight[image] {
+		if p.perImageWarmDemandTarget[image] > 0 {
+			p.perImageWarmDemandUntil[image] = now.Add(warmCapacityDemandTTL)
+		}
+		p.recomputeWarmTargetsLocked()
+		return p.perImageWarmTarget[image], false
+	}
+	if p.perImageWarmDemandTarget[image] == 0 || now.Sub(p.perImageWarmDemandLastBump[image]) >= warmCapacityDemandBumpInterval {
+		current := maxInt(p.perImageWarmBaseTarget[image], p.perImageWarmDemandTarget[image])
+		next := current + 1
+		if next < 1 {
+			next = 1
+		}
+		if p.maxWorkers > 0 && next > p.maxWorkers {
+			next = p.maxWorkers
+		}
+		if next > p.perImageWarmDemandTarget[image] {
+			p.perImageWarmDemandTarget[image] = next
+		}
+		p.perImageWarmDemandLastBump[image] = now
+	}
+	p.perImageWarmDemandUntil[image] = now.Add(warmCapacityDemandTTL)
+	p.recomputeWarmTargetsLocked()
+	target := p.perImageWarmTarget[image]
+	if target <= 0 {
+		return target, false
+	}
+	p.perImageWarmBackfillInFlight[image] = true
+	return target, true
+}
+
+func (p *K8sWorkerPool) finishNeutralWarmBackfill() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.warmBackfillInFlight = false
+}
+
+func (p *K8sWorkerPool) finishPerImageWarmBackfill(image string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.perImageWarmBackfillInFlight != nil {
+		delete(p.perImageWarmBackfillInFlight, image)
+	}
+}
+
+func (p *K8sWorkerPool) recomputeWarmTargetsLocked() {
+	p.expireWarmDemandLocked(time.Now())
+	p.minWorkers = maxInt(p.warmBaseTarget, p.warmDemandTarget)
+
+	effective := make(map[string]int, len(p.perImageWarmBaseTarget)+len(p.perImageWarmDemandTarget))
+	for image, target := range p.perImageWarmBaseTarget {
+		if image != "" && target > 0 {
+			effective[image] = target
+		}
+	}
+	for image, target := range p.perImageWarmDemandTarget {
+		if image != "" && target > effective[image] {
+			effective[image] = target
+		}
+	}
+	p.perImageWarmTarget = effective
+}
+
+func (p *K8sWorkerPool) expireWarmDemandLocked(now time.Time) {
+	if p.warmDemandTarget > 0 && !p.warmDemandUntil.IsZero() && !now.Before(p.warmDemandUntil) {
+		p.warmDemandTarget = 0
+		p.warmDemandUntil = time.Time{}
+	}
+	for image, until := range p.perImageWarmDemandUntil {
+		if !until.IsZero() && !now.Before(until) {
+			delete(p.perImageWarmDemandTarget, image)
+			delete(p.perImageWarmDemandUntil, image)
+		}
+	}
 }
 
 // triggerPerImageReplenish kicks off a background spawn for image if the
@@ -2863,12 +3053,14 @@ func (p *K8sWorkerPool) SetWarmCapacityTarget(n int) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.minWorkers = n
+	p.warmBaseTarget = n
+	p.recomputeWarmTargetsLocked()
 }
 
 func (p *K8sWorkerPool) WarmCapacityTarget() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recomputeWarmTargetsLocked()
 	return p.minWorkers
 }
 
@@ -2887,13 +3079,15 @@ func (p *K8sWorkerPool) SetPerImageWarmTargets(targets map[string]int) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.perImageWarmTarget = clean
+	p.perImageWarmBaseTarget = clean
+	p.recomputeWarmTargetsLocked()
 }
 
 // PerImageWarmTargets returns a snapshot of the per-image warm floor.
 func (p *K8sWorkerPool) PerImageWarmTargets() map[string]int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.recomputeWarmTargetsLocked()
 	out := make(map[string]int, len(p.perImageWarmTarget))
 	for k, v := range p.perImageWarmTarget {
 		out[k] = v
@@ -2903,6 +3097,12 @@ func (p *K8sWorkerPool) PerImageWarmTargets() map[string]int {
 
 func boolPtr(b bool) *bool    { return &b }
 func int64Ptr(i int64) *int64 { return &i }
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 // Compile-time interface check.
 var _ WorkerPool = (*K8sWorkerPool)(nil)

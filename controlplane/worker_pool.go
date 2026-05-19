@@ -24,7 +24,7 @@ func (e *WarmCapacityExhaustedError) Error() string {
 	if retryAfter <= 0 {
 		retryAfter = DefaultWarmCapacityRetryAfter
 	}
-	return fmt.Sprintf("warm worker capacity exhausted; retry in about %s", retryAfter.Round(time.Second))
+	return fmt.Sprintf("warm worker capacity exhausted; additional capacity is starting, retry in about %s", retryAfter.Round(time.Second))
 }
 
 func NewWarmCapacityExhaustedError(retryAfter time.Duration) error {

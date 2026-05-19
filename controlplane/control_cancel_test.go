@@ -88,7 +88,7 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		if code != "53300" {
 			t.Fatalf("code = %q, want 53300", code)
 		}
-		want := "no warm Duckgres worker is currently available; retry in about 45 seconds"
+		want := "no warm Duckgres worker is currently available; additional capacity is starting, retry in about 45 seconds"
 		if message != want {
 			t.Fatalf("message = %q, want %q", message, want)
 		}
