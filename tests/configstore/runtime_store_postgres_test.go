@@ -583,6 +583,65 @@ func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
 	}
 }
 
+func TestCreateNeutralWarmWorkerSlotForImageEnforcesPerImageTarget(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 7, 12, 0, 0, 0, time.UTC)
+
+	// One existing warm-idle worker on a DIFFERENT image: should not block
+	// spawning a fresh per-image slot for "duckgres:v1.5.1".
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          20,
+		PodName:           "duckgres-worker-existing-20",
+		Image:             "duckgres:v1.4.0",
+		State:             configstore.WorkerStateIdle,
+		OrgID:             "",
+		OwnerCPInstanceID: "cp-a:boot-1",
+		OwnerEpoch:        0,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(other-image): %v", err)
+	}
+
+	slot, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.5.1", 1, 5)
+	if err != nil {
+		t.Fatalf("CreateNeutralWarmWorkerSlotForImage: %v", err)
+	}
+	if slot == nil {
+		t.Fatal("expected per-image slot to be created when no warm worker for that image exists")
+		return
+	}
+	if slot.Image != "duckgres:v1.5.1" {
+		t.Fatalf("expected slot image duckgres:v1.5.1, got %q", slot.Image)
+	}
+	if slot.State != configstore.WorkerStateSpawning {
+		t.Fatalf("expected spawning state, got %q", slot.State)
+	}
+	if slot.OrgID != "" {
+		t.Fatalf("expected neutral org, got %q", slot.OrgID)
+	}
+
+	// Second call with the same target=1 should be a no-op — the just-spawned
+	// row counts as a warm-or-spawning worker for this image.
+	again, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.5.1", 1, 5)
+	if err != nil {
+		t.Fatalf("CreateNeutralWarmWorkerSlotForImage(repeat): %v", err)
+	}
+	if again != nil {
+		t.Fatalf("expected per-image target to block second spawn, got %#v", again)
+	}
+
+	// Global cap still applies: with maxGlobalWorkers=2 and two existing rows
+	// (the v1.4.0 idle plus the v1.5.1 spawning), a third image's request
+	// must be blocked.
+	capped, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.6.0", 1, 2)
+	if err != nil {
+		t.Fatalf("CreateNeutralWarmWorkerSlotForImage(global cap): %v", err)
+	}
+	if capped != nil {
+		t.Fatalf("expected global cap to block third image spawn, got %#v", capped)
+	}
+}
+
 func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
@@ -943,6 +1002,52 @@ func TestListWorkersDueForCredentialRefreshTreatsNullAsDue(t *testing.T) {
 	}
 	if len(due) != 1 || due[0].WorkerID != 7 {
 		t.Fatalf("expected worker 7 (NULL expiry treated as due), got %#v", due)
+	}
+}
+
+// TestListWorkersDueForCredentialRefreshSkipsReservedAndActivatingRows
+// protects the initial activation path. Reserved/activating rows are org-bound
+// before the first ActivateTenant RPC has finished and before the activation
+// path stamps s3_credentials_expires_at. If the refresh scheduler treats those
+// NULL-expiry rows as due, it can bump owner_epoch under the in-flight
+// activation and cause the worker to reject the original owner_epoch as stale.
+func TestListWorkersDueForCredentialRefreshSkipsReservedAndActivatingRows(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
+	pastDue := now.Add(-1 * time.Minute)
+
+	rows := []*configstore.WorkerRecord{
+		{
+			WorkerID: 8, PodName: "duckgres-worker-8",
+			State: configstore.WorkerStateReserved, OrgID: "acme",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now,
+		},
+		{
+			WorkerID: 9, PodName: "duckgres-worker-9",
+			State: configstore.WorkerStateActivating, OrgID: "acme",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now, S3CredentialsExpiresAt: &pastDue,
+		},
+		{
+			WorkerID: 10, PodName: "duckgres-worker-10",
+			State: configstore.WorkerStateHot, OrgID: "acme",
+			OwnerCPInstanceID: "cp-me:boot-a", OwnerEpoch: 1,
+			LastHeartbeatAt: now, S3CredentialsExpiresAt: &pastDue,
+		},
+	}
+	for _, w := range rows {
+		if err := store.UpsertWorkerRecord(w); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", w.WorkerID, err)
+		}
+	}
+
+	due, err := store.ListWorkersDueForCredentialRefresh("cp-me:boot-a", now)
+	if err != nil {
+		t.Fatalf("ListWorkersDueForCredentialRefresh: %v", err)
+	}
+	if len(due) != 1 || due[0].WorkerID != 10 {
+		t.Fatalf("expected only activated hot worker 10 to be due, got %#v", due)
 	}
 }
 

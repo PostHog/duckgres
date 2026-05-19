@@ -314,3 +314,87 @@ func TestWorkerImageForOrg(t *testing.T) {
 		})
 	}
 }
+
+func TestOrgRouterReconcileWarmCapacityFloorsOnePerActiveImage(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+
+	tr := &OrgRouter{
+		sharedPool: sharedPool,
+		baseCfg: K8sWorkerPoolConfig{
+			WorkerImage: "posthog/duckgres:default",
+		},
+		globalCfg: ControlPlaneConfig{},
+		orgs: map[string]*OrgStack{
+			"analytics": {Config: &configstore.OrgConfig{Name: "analytics"}},
+			"billing":   {Config: &configstore.OrgConfig{Name: "billing"}},
+			// orphans-without-stack — should NOT contribute to per-image floor
+		},
+	}
+
+	snap := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"analytics": {
+				Name: "analytics",
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					Image: "posthog/duckgres:v1.5.1",
+				},
+			},
+			"billing": {
+				Name: "billing",
+				// no Warehouse pin → falls back to cluster default
+			},
+			"dormant": {
+				Name: "dormant",
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					Image: "posthog/duckgres:v1.4.0",
+				},
+				// not in tr.orgs → skipped
+			},
+		},
+	}
+
+	tr.reconcileWarmCapacity(snap)
+
+	got := sharedPool.PerImageWarmTargets()
+	want := map[string]int{
+		"posthog/duckgres:default": 1,
+		"posthog/duckgres:v1.5.1":  1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected per-image targets %v, got %v", want, got)
+	}
+}
+
+func TestOrgRouterReconcileWarmCapacitySkipsEmptyClusterDefault(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+
+	tr := &OrgRouter{
+		sharedPool: sharedPool,
+		baseCfg:    K8sWorkerPoolConfig{}, // WorkerImage unset
+		globalCfg:  ControlPlaneConfig{},
+		orgs: map[string]*OrgStack{
+			"analytics": {Config: &configstore.OrgConfig{Name: "analytics"}},
+		},
+	}
+
+	snap := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"analytics": {
+				Name: "analytics",
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					Image: "posthog/duckgres:v1.5.1",
+				},
+			},
+		},
+	}
+
+	tr.reconcileWarmCapacity(snap)
+
+	got := sharedPool.PerImageWarmTargets()
+	want := map[string]int{
+		"posthog/duckgres:v1.5.1": 1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected per-image targets %v, got %v", want, got)
+	}
+}

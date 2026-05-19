@@ -104,7 +104,7 @@ type ManagedWarehouseS3 struct {
 	Endpoint            string `gorm:"size:512" json:"endpoint"`
 	UseSSL              bool   `json:"use_ssl"`
 	URLStyle            string `gorm:"size:16" json:"url_style"`
-	DeltaCatalogEnabled bool   `json:"delta_catalog_enabled"`
+	DeltaCatalogEnabled bool   `gorm:"default:true" json:"delta_catalog_enabled"`
 	DeltaCatalogPath    string `gorm:"size:1024" json:"delta_catalog_path"`
 }
 
@@ -113,6 +113,19 @@ type ManagedWarehouseWorkerIdentity struct {
 	Namespace          string `gorm:"size:255" json:"namespace"`
 	ServiceAccountName string `gorm:"size:255" json:"service_account_name"`
 	IAMRoleARN         string `gorm:"size:512" json:"iam_role_arn"`
+}
+
+// ManagedWarehouseIceberg captures per-org opt-in state for the per-tenant
+// Iceberg catalog (AWS S3 Tables). When Enabled is true, the provisioner
+// controller sets spec.iceberg.enabled on the Duckling CR; the composition
+// provisions a fresh table bucket and the controller writes TableBucketArn
+// back here once the bucket is Ready. The worker activator reads these
+// fields and feeds them into server.IcebergConfig at activation time.
+type ManagedWarehouseIceberg struct {
+	Enabled        bool   `json:"enabled"`
+	TableBucketArn string `gorm:"size:512" json:"table_bucket_arn"`
+	Region         string `gorm:"size:64" json:"region"`
+	Namespace      string `gorm:"size:255" json:"namespace"`
 }
 
 // ManagedWarehouse is the config-store source of truth for an org's managed warehouse metadata.
@@ -128,6 +141,7 @@ type ManagedWarehouse struct {
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
 	PgBouncer         ManagedWarehousePgBouncer      `gorm:"embedded;embeddedPrefix:pgbouncer_" json:"pgbouncer"`
 	S3                ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
+	Iceberg           ManagedWarehouseIceberg        `gorm:"embedded;embeddedPrefix:iceberg_" json:"iceberg"`
 	WorkerIdentity    ManagedWarehouseWorkerIdentity `gorm:"embedded;embeddedPrefix:worker_identity_" json:"worker_identity"`
 
 	WarehouseDatabaseCredentials SecretRef `gorm:"embedded;embeddedPrefix:warehouse_database_credentials_" json:"warehouse_database_credentials"`
@@ -143,6 +157,8 @@ type ManagedWarehouse struct {
 	MetadataStoreStatusMessage     string                            `gorm:"size:1024" json:"metadata_store_status_message"`
 	S3State                        ManagedWarehouseProvisioningState `gorm:"size:32" json:"s3_state"`
 	S3StatusMessage                string                            `gorm:"size:1024" json:"s3_status_message"`
+	IcebergState                   ManagedWarehouseProvisioningState `gorm:"size:32" json:"iceberg_state"`
+	IcebergStatusMessage           string                            `gorm:"size:1024" json:"iceberg_status_message"`
 	IdentityState                  ManagedWarehouseProvisioningState `gorm:"size:32" json:"identity_state"`
 	IdentityStatusMessage          string                            `gorm:"size:1024" json:"identity_status_message"`
 	SecretsState                   ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
@@ -187,7 +203,7 @@ type DuckLakeConfig struct {
 	S3URLStyle          string    `gorm:"size:16" json:"s3_url_style"`
 	S3Chain             string    `gorm:"size:255" json:"s3_chain"`
 	S3Profile           string    `gorm:"size:255" json:"s3_profile"`
-	DeltaCatalogEnabled bool      `json:"delta_catalog_enabled"`
+	DeltaCatalogEnabled bool      `gorm:"default:true" json:"delta_catalog_enabled"`
 	DeltaCatalogPath    string    `gorm:"size:1024" json:"delta_catalog_path"`
 	UpdatedAt           time.Time `json:"updated_at"`
 }
@@ -218,6 +234,16 @@ type QueryLogConfig struct {
 }
 
 func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
+
+// SchemaMigration tracks one-shot data migrations that aren't expressible
+// through GORM's AutoMigrate (e.g., backfills of new column defaults onto
+// existing rows). One row per migration name, inserted exactly once.
+type SchemaMigration struct {
+	Name      string    `gorm:"primaryKey;size:128" json:"name"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
+func (SchemaMigration) TableName() string { return "duckgres_schema_migrations" }
 
 // ControlPlaneInstanceState describes the liveness state of a control-plane instance.
 type ControlPlaneInstanceState string
@@ -348,6 +374,7 @@ type ManagedWarehouseConfig struct {
 	MetadataStore     ManagedWarehouseMetadataStore
 	PgBouncer         ManagedWarehousePgBouncer
 	S3                ManagedWarehouseS3
+	Iceberg           ManagedWarehouseIceberg
 	WorkerIdentity    ManagedWarehouseWorkerIdentity
 
 	WarehouseDatabaseCredentials SecretRef
@@ -363,6 +390,8 @@ type ManagedWarehouseConfig struct {
 	MetadataStoreStatusMessage     string
 	S3State                        ManagedWarehouseProvisioningState
 	S3StatusMessage                string
+	IcebergState                   ManagedWarehouseProvisioningState
+	IcebergStatusMessage           string
 	IdentityState                  ManagedWarehouseProvisioningState
 	IdentityStatusMessage          string
 	SecretsState                   ManagedWarehouseProvisioningState
@@ -386,6 +415,7 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 		MetadataStore:                  warehouse.MetadataStore,
 		PgBouncer:                      warehouse.PgBouncer,
 		S3:                             warehouse.S3,
+		Iceberg:                        warehouse.Iceberg,
 		WorkerIdentity:                 warehouse.WorkerIdentity,
 		WarehouseDatabaseCredentials:   warehouse.WarehouseDatabaseCredentials,
 		MetadataStoreCredentials:       warehouse.MetadataStoreCredentials,
@@ -399,6 +429,8 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 		MetadataStoreStatusMessage:     warehouse.MetadataStoreStatusMessage,
 		S3State:                        warehouse.S3State,
 		S3StatusMessage:                warehouse.S3StatusMessage,
+		IcebergState:                   warehouse.IcebergState,
+		IcebergStatusMessage:           warehouse.IcebergStatusMessage,
 		IdentityState:                  warehouse.IdentityState,
 		IdentityStatusMessage:          warehouse.IdentityStatusMessage,
 		SecretsState:                   warehouse.SecretsState,

@@ -40,9 +40,13 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	threads := fs.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	memoryBudget := fs.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
 	memoryRebalance := fs.Bool("memory-rebalance", false, "Enable dynamic per-connection memory reallocation (control-plane mode) (env: DUCKGRES_MEMORY_REBALANCE)")
-	duckLakeDeltaCatalogEnabled := fs.Bool("ducklake-delta-catalog-enabled", false, "Attach a Delta Lake catalog during DuckLake worker boot (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
+	duckLakeDeltaCatalogEnabled := fs.Bool("ducklake-delta-catalog-enabled", true, "Attach a Delta Lake catalog during DuckLake worker boot (default true; use --ducklake-delta-catalog-enabled=false to disable; env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
 	duckLakeDeltaCatalogPath := fs.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach, defaults to sibling delta/ prefix at DuckLake object-store root (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
 	duckLakeDefaultSpecVersion := fs.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
+	icebergEnabled := fs.Bool("iceberg-enabled", false, "Attach a per-tenant Iceberg catalog (AWS S3 Tables) at session init (env: DUCKGRES_ICEBERG_ENABLED)")
+	icebergTableBucket := fs.String("iceberg-table-bucket", "", "Iceberg S3 Tables bucket ARN, e.g. arn:aws:s3tables:us-east-1:<acct>:bucket/<name> (env: DUCKGRES_ICEBERG_TABLE_BUCKET)")
+	icebergRegion := fs.String("iceberg-region", "", "AWS region for the Iceberg table bucket (default: us-east-1) (env: DUCKGRES_ICEBERG_REGION)")
+	icebergNamespace := fs.String("iceberg-namespace", "", "Default Iceberg namespace (informational; default: main) (env: DUCKGRES_ICEBERG_NAMESPACE)")
 	processMinWorkers := fs.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
 	processMaxWorkers := fs.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
 	processRetireOnSessionEnd := fs.Bool("process-retire-on-session-end", false, "Retire a process worker immediately after its last session ends instead of keeping it warm for reuse (control-plane mode) (env: DUCKGRES_PROCESS_RETIRE_ON_SESSION_END)")
@@ -100,6 +104,10 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.DuckLakeDeltaCatalogEnabled = *duckLakeDeltaCatalogEnabled
 		cli.DuckLakeDeltaCatalogPath = *duckLakeDeltaCatalogPath
 		cli.DuckLakeDefaultSpecVersion = *duckLakeDefaultSpecVersion
+		cli.IcebergEnabled = *icebergEnabled
+		cli.IcebergTableBucket = *icebergTableBucket
+		cli.IcebergRegion = *icebergRegion
+		cli.IcebergNamespace = *icebergNamespace
 		cli.ProcessMinWorkers = *processMinWorkers
 		cli.ProcessMaxWorkers = *processMaxWorkers
 		cli.ProcessRetireOnSessionEnd = *processRetireOnSessionEnd

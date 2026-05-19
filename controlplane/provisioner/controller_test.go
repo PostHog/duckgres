@@ -89,6 +89,14 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 		case "provisioning_started_at":
 			t := v.(time.Time)
 			w.ProvisioningStartedAt = &t
+		case "iceberg_table_bucket_arn":
+			w.Iceberg.TableBucketArn = v.(string)
+		case "iceberg_region":
+			w.Iceberg.Region = v.(string)
+		case "iceberg_namespace":
+			w.Iceberg.Namespace = v.(string)
+		case "iceberg_state":
+			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
 		}
 	}
 	return nil
@@ -298,6 +306,164 @@ func TestReconcileReadyPatchesCRWhenPgBouncerFlippedOff(t *testing.T) {
 	pgb := ms["pgbouncer"].(map[string]interface{})
 	if pgb["enabled"] != false {
 		t.Fatalf("expected pgbouncer.enabled=false after drift patch, got %v", pgb["enabled"])
+	}
+}
+
+func TestReconcileReadyPatchesCRWhenIcebergFlippedOn(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-iceberg-on"] = &configstore.ManagedWarehouse{
+		OrgID:   "org-iceberg-on",
+		State:   configstore.ManagedWarehouseStateReady,
+		Iceberg: configstore.ManagedWarehouseIceberg{Enabled: true},
+	}
+	// Seed a CR with no iceberg block — represents a warehouse that
+	// existed before iceberg was opted into.
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata": map[string]interface{}{
+			"name":      ducklingName("org-iceberg-on"),
+			"namespace": ducklingNamespace,
+		},
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type": "aurora",
+				"aurora": map[string]interface{}{
+					"minACU": 0.5,
+					"maxACU": 2.0,
+				},
+			},
+			"dataStore": map[string]interface{}{"type": "s3bucket"},
+		},
+	}}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-iceberg-on"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("re-fetch CR: %v", err)
+	}
+	spec := got.Object["spec"].(map[string]interface{})
+	iceberg, ok := spec["iceberg"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected iceberg block after drift patch, got spec=%v", spec)
+	}
+	if iceberg["enabled"] != true {
+		t.Fatalf("expected iceberg.enabled=true, got %v", iceberg["enabled"])
+	}
+	// Merge-patch must not wipe sibling spec fields (metadataStore / dataStore).
+	if _, ok := spec["metadataStore"].(map[string]interface{}); !ok {
+		t.Fatalf("expected metadataStore preserved after iceberg patch")
+	}
+	if _, ok := spec["dataStore"].(map[string]interface{}); !ok {
+		t.Fatalf("expected dataStore preserved after iceberg patch")
+	}
+}
+
+func TestReconcileReadyPatchesCRWhenIcebergFlippedOff(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-iceberg-off"] = &configstore.ManagedWarehouse{
+		OrgID:   "org-iceberg-off",
+		State:   configstore.ManagedWarehouseStateReady,
+		Iceberg: configstore.ManagedWarehouseIceberg{Enabled: false},
+	}
+	// Seed a CR that currently has iceberg enabled — expect drift back to false.
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata": map[string]interface{}{
+			"name":      ducklingName("org-iceberg-off"),
+			"namespace": ducklingNamespace,
+		},
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{"type": "aurora"},
+			"dataStore":     map[string]interface{}{"type": "s3bucket"},
+			"iceberg":       map[string]interface{}{"enabled": true},
+		},
+	}}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+
+	got, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), ducklingName("org-iceberg-off"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("re-fetch CR: %v", err)
+	}
+	spec := got.Object["spec"].(map[string]interface{})
+	iceberg := spec["iceberg"].(map[string]interface{})
+	if iceberg["enabled"] != false {
+		t.Fatalf("expected iceberg.enabled=false after drift patch, got %v", iceberg["enabled"])
+	}
+}
+
+func TestReconcileReadyPropagatesIcebergStatusToConfigstore(t *testing.T) {
+	// Covers the late-iceberg-enable case: warehouse is already Ready,
+	// then iceberg gets opted in via admin API. The Crossplane composition
+	// eventually populates status.iceberg.tableBucketArn on the Duckling.
+	// reconcileReady must copy that back to the configstore — otherwise
+	// the worker activator's IcebergConfig.TableBucket stays empty and
+	// AttachIcebergCatalog skips the attach.
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-iceberg-late"] = &configstore.ManagedWarehouse{
+		OrgID: "org-iceberg-late",
+		State: configstore.ManagedWarehouseStateReady,
+		Iceberg: configstore.ManagedWarehouseIceberg{
+			Enabled: true,
+			// TableBucketArn / Region / Namespace are intentionally empty —
+			// this is the configstore state right after an admin API PUT
+			// that just flipped iceberg.enabled=true.
+		},
+	}
+	const tableBucketArn = "arn:aws:s3tables:us-east-1:123456789012:bucket/org-iceberg-late-iceberg"
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata": map[string]interface{}{
+			"name":      ducklingName("org-iceberg-late"),
+			"namespace": ducklingNamespace,
+		},
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{"type": "aurora"},
+			"dataStore":     map[string]interface{}{"type": "s3bucket"},
+			"iceberg":       map[string]interface{}{"enabled": true},
+		},
+		"status": map[string]interface{}{
+			"iceberg": map[string]interface{}{
+				"tableBucketArn": tableBucketArn,
+				"region":         "us-east-1",
+				"namespaceName":  "main",
+			},
+		},
+	}}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+
+	got := fs.warehouses["org-iceberg-late"]
+	if got.Iceberg.TableBucketArn != tableBucketArn {
+		t.Fatalf("expected configstore iceberg.table_bucket_arn=%q, got %q", tableBucketArn, got.Iceberg.TableBucketArn)
+	}
+	if got.Iceberg.Region != "us-east-1" {
+		t.Fatalf("expected iceberg.region=us-east-1, got %q", got.Iceberg.Region)
+	}
+	if got.Iceberg.Namespace != "main" {
+		t.Fatalf("expected iceberg.namespace=main, got %q", got.Iceberg.Namespace)
+	}
+	if got.IcebergState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected iceberg_state=ready, got %q", got.IcebergState)
 	}
 }
 

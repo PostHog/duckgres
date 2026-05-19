@@ -370,6 +370,9 @@ func TestDuckLakeMetadataIndexesNamesMatchStatements(t *testing.T) {
 		}
 		seen[ix.name] = struct{}{}
 	}
+	if _, ok := seen["idx_ducklake_schema_versions_tbl_schema_version"]; !ok {
+		t.Errorf("expected ducklake_schema_versions table/schema_version index")
+	}
 }
 
 func TestStartCredentialRefresh_NoOpForStaticCredentials(t *testing.T) {

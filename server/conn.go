@@ -24,6 +24,7 @@ import (
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
+	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
@@ -188,7 +189,7 @@ type clientConn struct {
 // newTranspiler creates a transpiler configured for this connection.
 func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpiler {
 	return transpiler.New(transpiler.Config{
-		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "",
+		DuckLakeMode:        c.server.cfg.DuckLake.MetadataStore != "" || c.server.cfg.AlwaysDuckLake,
 		LogicalDatabaseName: c.database,
 		PhysicalCatalogName: "ducklake",
 		ConvertPlaceholders: convertPlaceholders,
@@ -3842,7 +3843,16 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	_ = c.writer.Flush()
 	slog.Debug("COPY FROM STDIN sent CopyInResponse, waiting for data.", "user", c.username)
 
-	// Create temp file upfront and stream data directly to it (avoids memory buffering)
+	// Remote-worker (Flight) executors implement CopyFromStdinExecutor so the
+	// CSV bytes are streamed to the worker pod via DoPut and spooled to the
+	// worker's filesystem there. The legacy local-tempfile path below works
+	// only when CP and worker share a filesystem (standalone / process
+	// backend), so prefer the streaming path when it's available.
+	if streamer, ok := c.executor.(sqlcore.CopyFromStdinExecutor); ok {
+		return c.handleCopyInRemoteStreaming(query, opts, copyStartTime, streamer)
+	}
+
+	// Create temp file upfront and stream data directly to it (avoids memory buffering).
 	// This approach leverages DuckDB's highly optimized CSV parser which handles
 	// type conversions automatically and can load millions of rows in seconds.
 	tmpFile, err := os.CreateTemp("", "duckgres-copy-*.csv")
@@ -3964,6 +3974,156 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 			return nil
 		}
 	}
+}
+
+// handleCopyInRemoteStreaming handles COPY FROM STDIN when the executor is
+// remote (e.g. Flight, multitenant K8s worker). The control plane does not
+// share a filesystem with the worker pod, so the legacy "spool to local
+// /tmp, run COPY FROM <path>" approach fails with "No files found". This
+// path streams the wire CopyData bytes through the executor's
+// CopyFromStdin method, which ships them to the worker via Flight DoPut
+// and runs the COPY against a worker-local spool file.
+func (c *clientConn) handleCopyInRemoteStreaming(
+	query string,
+	opts *CopyFromOptions,
+	copyStartTime time.Time,
+	streamer sqlcore.CopyFromStdinExecutor,
+) error {
+	tableName := opts.TableName
+	columnList := opts.ColumnList
+
+	// Build the COPY SQL with the path placeholder; the worker substitutes
+	// in its own tempfile path before executing.
+	copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
+	slog.Debug("COPY FROM STDIN streaming to remote worker.",
+		"user", c.username, "sql", copySQL, "worker", c.workerID, "worker_pod", c.workerPod)
+
+	r := &copyDataWireReader{c: c}
+
+	loadStart := time.Now()
+	c.logQueryStarted(copySQL)
+	rowCount, err := streamer.CopyFromStdin(c.ctx, copySQL, r)
+	c.logQueryFinished(copySQL, loadStart, rowCount, err)
+
+	// On wire-level CopyFail / unexpected message, the reader returns a
+	// non-EOF error so the streamer aborts the gRPC stream (its deferred
+	// cancel() prevents the worker from running COPY on partial bytes).
+	// We then surface the precise cause via the sticky flags below before
+	// falling through to the generic transport-error branch.
+	if r.cancelled {
+		exception := fmt.Sprintf("COPY failed: %s", r.cancelMsg)
+		c.sendError("ERROR", "57014", exception)
+		c.setTxError()
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", exception, "simple")
+		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+	if r.protoErr != "" {
+		c.sendError("ERROR", "08P01", r.protoErr)
+		c.setTxError()
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "08P01", r.protoErr, "simple")
+		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+	if err != nil {
+		slog.Error("COPY FROM STDIN remote streaming failed.",
+			"user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+		errMsg := fmt.Sprintf("COPY failed: %v", err)
+		c.sendError("ERROR", "22P02", errMsg)
+		c.setTxError()
+		c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "22P02", errMsg, "simple")
+		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
+
+	totalElapsed := time.Since(copyStartTime)
+	loadElapsed := time.Since(loadStart)
+	slog.Info("COPY FROM STDIN completed (remote streaming).",
+		"user", c.username, "rows", rowCount, "bytes", r.bytesRead,
+		"total_duration", totalElapsed, "load_duration", loadElapsed,
+		"worker", c.workerID, "worker_pod", c.workerPod)
+
+	_ = wire.WriteCommandComplete(c.writer, fmt.Sprintf("COPY %d", rowCount))
+	c.logQuery(copyStartTime, query, query, "COPY", 0, rowCount, "", "", "simple")
+	_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
+	_ = c.writer.Flush()
+	return nil
+}
+
+// errCopyAborted is returned from copyDataWireReader.Read when the client
+// signalled CopyFail or sent an unexpected wire message mid-stream. The
+// streamer propagates this; the deferred gRPC context cancel then fires,
+// which causes the worker's Recv to fail with Canceled and skip running
+// the partially-uploaded COPY. handleCopyInRemoteStreaming inspects the
+// reader's sticky flags to decide the client-facing error code (57014 for
+// cancellation vs 08P01 for protocol error).
+var errCopyAborted = errors.New("copy data stream aborted")
+
+// copyDataWireReader adapts the PostgreSQL wire CopyData stream into an
+// io.Reader so it can be fed straight into a remote-worker upload. Behavior:
+//   - CopyDone           → io.EOF (clean end-of-stream)
+//   - CopyFail           → errCopyAborted, with cancelled / cancelMsg sticky
+//   - unexpected message → errCopyAborted, with protoErr sticky
+//   - wire transport err → that error is returned verbatim
+//
+// Returning a non-EOF error on cancellation matters for correctness:
+// if the reader pretended cancellation was a clean EOF, the streamer would
+// CloseSend cleanly and the worker would happily run COPY on the partial
+// bytes already received.
+type copyDataWireReader struct {
+	c *clientConn
+
+	pending   []byte
+	bytesRead int64
+
+	done      bool
+	cancelled bool
+	cancelMsg string
+	protoErr  string
+}
+
+func (r *copyDataWireReader) Read(p []byte) (int, error) {
+	for len(r.pending) == 0 {
+		if r.done {
+			if r.cancelled || r.protoErr != "" {
+				return 0, errCopyAborted
+			}
+			return 0, io.EOF
+		}
+		msgType, body, err := wire.ReadMessage(r.c.reader)
+		if err != nil {
+			r.done = true
+			return 0, err
+		}
+		switch msgType {
+		case wire.MsgCopyData:
+			// Skip the PostgreSQL text COPY end-of-data marker (\.\n).
+			if (len(body) == 3 && body[0] == '\\' && body[1] == '.' && body[2] == '\n') ||
+				(len(body) == 2 && body[0] == '\\' && body[1] == '.') {
+				continue
+			}
+			r.pending = body
+		case wire.MsgCopyDone:
+			r.done = true
+			return 0, io.EOF
+		case wire.MsgCopyFail:
+			r.done = true
+			r.cancelled = true
+			r.cancelMsg = string(bytes.TrimRight(body, "\x00"))
+			return 0, errCopyAborted
+		default:
+			r.done = true
+			r.protoErr = fmt.Sprintf("unexpected message type during COPY: %c", msgType)
+			return 0, errCopyAborted
+		}
+	}
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
+	r.bytesRead += int64(n)
+	return n, nil
 }
 
 // handleCopyInCSVWithBlob handles COPY FROM STDIN for tables that contain BLOB columns.
@@ -5388,7 +5548,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	start := time.Now()
 	defer func() { queryDurationHistogram.WithLabelValues(c.orgID).Observe(time.Since(start).Seconds()) }()
 
-	_, span := observe.Tracer().Start(c.ctx, "duckgres.query",
+	queryCtx, span := observe.Tracer().Start(c.ctx, "duckgres.query",
 		trace.WithAttributes(
 			attribute.String("duckgres.protocol", "extended"),
 			attribute.String("duckgres.org_id", c.orgID),
@@ -5484,7 +5644,11 @@ func (c *clientConn) handleExecute(body []byte) {
 			return result, err
 		}
 
+		execStart := time.Now()
+		execCtx, execSpan := observe.Tracer().Start(queryCtx, "duckgres.execute")
 		result, err := runExec()
+		observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
 		if err != nil {
 			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 				ducklakeConflictTotal.Inc()
@@ -5533,6 +5697,8 @@ func (c *clientConn) handleExecute(body []byte) {
 		return c.executor.Query(convertedQuery, args...)
 	}
 
+	execStart := time.Now()
+	execCtx, execSpan := observe.Tracer().Start(queryCtx, "duckgres.execute")
 	rows, err := runQuery()
 	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
 		ducklakeConflictTotal.Inc()
@@ -5549,6 +5715,8 @@ func (c *clientConn) handleExecute(body []byte) {
 			runQuery,
 		)
 	}
+	observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+	execSpan.End()
 	if err != nil {
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)

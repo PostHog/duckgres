@@ -20,8 +20,16 @@ import (
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
+
+// activeOrgLabelKey is the pod label that per-warehouse Cilium policies
+// select on. The Crossplane Duckling composition pre-creates a
+// CiliumClusterwideNetworkPolicy keyed on this label + the org name, so
+// stamping the label at activation time is what causes the policy to
+// snap onto the worker pod via label selector — no per-pod CRD writes.
+const activeOrgLabelKey = "duckgres/active-org"
 
 type SharedWorkerActivator struct {
 	clientset              kubernetes.Interface
@@ -56,6 +64,9 @@ type TenantActivationPayload struct {
 	OrgID     string                `json:"org_id"`
 	Usernames []string              `json:"usernames,omitempty"`
 	DuckLake  server.DuckLakeConfig `json:"ducklake"`
+	// Iceberg is the per-tenant Iceberg catalog (AWS S3 Tables) config.
+	// Empty when the tenant has not opted in or hasn't been provisioned yet.
+	Iceberg server.IcebergConfig `json:"iceberg"`
 	// S3CredentialsExpiresAt is the absolute expiration time of the STS
 	// credentials embedded in DuckLake.{S3AccessKey,S3SecretKey,S3SessionToken}.
 	// nil for non-STS payloads (config-store-driven warehouses use static
@@ -150,10 +161,22 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 			},
 			OrgID:    payload.OrgID,
 			DuckLake: payload.DuckLake,
+			Iceberg:  payload.Iceberg,
 		})
 	}
 
 	err = activate()
+
+	// Stamp the active-org label on the worker pod so the per-warehouse
+	// CiliumClusterwideNetworkPolicy (pre-created by the Crossplane
+	// Duckling composition) snaps onto this pod via label selector.
+	// Best-effort and idempotent: a failure here does not fail activation;
+	// the worker still functions, it just won't have its per-tenant
+	// network policy applied until something patches the label later.
+	// See also docs on activeOrgLabelKey.
+	if err == nil {
+		a.stampActiveOrgLabel(ctx, worker.PodName(), payload.OrgID)
+	}
 
 	// Clear the migration lock after the worker finishes activation
 	// (whether it succeeded or failed). New connections can proceed.
@@ -186,6 +209,28 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 	}
 
 	return err
+}
+
+// stampActiveOrgLabel patches the worker pod with `duckgres/active-org=<org>`.
+// Strategic-merge so re-activations (e.g. credential refresh) are no-ops
+// once the label is set. Logs and swallows errors; the activation has
+// already completed by the time we get here, and the label is a security
+// optimisation rather than a functional requirement.
+func (a *SharedWorkerActivator) stampActiveOrgLabel(ctx context.Context, podName, orgID string) {
+	if a.clientset == nil || podName == "" || orgID == "" {
+		return
+	}
+	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, activeOrgLabelKey, orgID)
+	if _, err := a.clientset.CoreV1().Pods(a.defaultNamespace).Patch(
+		ctx,
+		podName,
+		types.StrategicMergePatchType,
+		[]byte(patch),
+		metav1.PatchOptions{},
+	); err != nil {
+		slog.Warn("Failed to stamp active-org label on worker pod.",
+			"pod", podName, "org", orgID, "error", err)
+	}
 }
 
 // RefreshCredentials brokers a fresh STS session for the worker's org and
@@ -245,6 +290,7 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 		},
 		OrgID:    payload.OrgID,
 		DuckLake: payload.DuckLake,
+		Iceberg:  payload.Iceberg,
 	}
 	if err := worker.ActivateTenant(ctx, rpcPayload); err != nil {
 		return fmt.Errorf("activate tenant for refresh: %w", err)
@@ -309,10 +355,23 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
+	// Iceberg config is sourced from the configstore in both Duckling-driven
+	// and configstore-driven paths. The TableBucketArn is populated by the
+	// provisioner controller once the Crossplane composition reports
+	// status.iceberg.tableBucketArn; before that, Enabled is true but the
+	// ARN is empty and AttachIcebergCatalog is a no-op.
+	ic := server.IcebergConfig{
+		Enabled:     org.Warehouse.Iceberg.Enabled,
+		TableBucket: org.Warehouse.Iceberg.TableBucketArn,
+		Region:      org.Warehouse.Iceberg.Region,
+		Namespace:   org.Warehouse.Iceberg.Namespace,
+	}
+
 	return TenantActivationPayload{
 		OrgID:                  assignment.OrgID,
 		Usernames:              usernames,
 		DuckLake:               dl,
+		Iceberg:                ic,
 		S3CredentialsExpiresAt: expiresAt,
 	}, nil
 }

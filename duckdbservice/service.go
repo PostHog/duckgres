@@ -77,6 +77,13 @@ type SessionPool struct {
 	// inject a stub to verify the credential-refresh path is non-blocking
 	// (see TestReuseExistingActivationDoesNotBlockHealthChecks).
 	refreshS3Secret func(*sql.DB, server.DuckLakeConfig, chan struct{}) error
+	// refreshIcebergSecret is the sibling indirection for rotating the
+	// iceberg_sigv4 secret. Runs alongside refreshS3Secret on hot-idle
+	// reuse whenever the tenant has iceberg enabled — without it, iceberg
+	// queries on a long-lived worker would 403 after STS rotation while
+	// DuckLake stays fresh. Defaults to server.RefreshIcebergSecret;
+	// stubbed by tests the same way refreshS3Secret is.
+	refreshIcebergSecret func(*sql.DB, server.IcebergConfig, chan struct{}, string, string, string) error
 }
 
 type trackedTx struct {
@@ -134,6 +141,7 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		createDBPair:         CreateWorkerDBPair,
 		activateDBConnection: server.ActivateDBConnection,
 		refreshS3Secret:      server.RefreshS3Secret,
+		refreshIcebergSecret: server.RefreshIcebergSecret,
 	}
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
@@ -439,6 +447,13 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 	// Initialize the session connection with username-specific state if needed.
 	// Since the DB is shared, we must set session-local parameters here.
 	initSearchPath(conn, username)
+
+	// Re-apply DuckDB profiling settings on the freshly-pooled connection.
+	// ConfigureMainDB sets these once at warmup, but in cluster mode the
+	// per-session evictConnFromPool call discards the settings along with
+	// the conn — so for every session after the first we need to re-apply.
+	// DuckDB rejects `SET GLOBAL` for these keys, so this is the only path.
+	server.ApplyProfilingSettings(context.Background(), conn)
 
 	// Apply initial resource limits if provided (optimizes handshake by avoiding
 	// roundtrips from control plane).
@@ -869,6 +884,48 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 		// Fall through to standard flightsql action router (BeginTransaction, etc.)
 		return s.FlightServer.DoAction(cmd, stream)
 	}
+}
+
+// DoPut peeks at the first FlightData frame and routes a duckgres custom
+// CSV-spool stream to doCopyFromStdin. Anything else is delegated to the
+// standard Flight SQL DoPut router (CommandStatementUpdate etc.).
+//
+// We have to consume the first frame to check the descriptor, so we
+// hand the custom handler a reference to it and the rest of the stream;
+// for non-custom streams we wrap the underlying server with a small
+// adapter that returns the buffered first frame on the first Recv()
+// call so the standard handler sees the full stream.
+func (s *customActionServer) DoPut(stream flight.FlightService_DoPutServer) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if IsCopyFromStdinDescriptor(first.GetFlightDescriptor()) {
+		return s.handler.doCopyFromStdin(stream.Context(), first, stream)
+	}
+	return s.FlightServer.DoPut(&prebufferedDoPutServer{
+		FlightService_DoPutServer: stream,
+		buffered:                  first,
+	})
+}
+
+// prebufferedDoPutServer returns a single buffered FlightData frame on
+// the first Recv() call, then delegates to the wrapped stream. Used by
+// customActionServer.DoPut so that consuming the first frame for
+// descriptor-routing doesn't strip it from the stream the underlying
+// handler sees.
+type prebufferedDoPutServer struct {
+	flight.FlightService_DoPutServer
+	buffered *flight.FlightData
+}
+
+func (p *prebufferedDoPutServer) Recv() (*flight.FlightData, error) {
+	if p.buffered != nil {
+		fd := p.buffered
+		p.buffered = nil
+		return fd, nil
+	}
+	return p.FlightService_DoPutServer.Recv()
 }
 
 // NewFlightSQLHandler creates a new multi-session Flight SQL handler.

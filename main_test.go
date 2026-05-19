@@ -214,6 +214,37 @@ func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCacheDefaultsTr
 }
 
 func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
+	// Default-on: with no file/env/CLI overrides, Delta is enabled by default.
+	resolvedDefault := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if !resolvedDefault.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected DeltaCatalogEnabled to default to true")
+	}
+
+	// Default-on with DuckLake configured: path auto-derives to a sibling delta/.
+	resolvedDuckLake := configresolve.ResolveEffective(&FileConfig{
+		DuckLake: DuckLakeFileConfig{
+			ObjectStore: "s3://warehouse/ducklake/",
+		},
+	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if !resolvedDuckLake.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected default DeltaCatalogEnabled with DuckLake configured")
+	}
+	if got, want := resolvedDuckLake.Server.DuckLake.DeltaCatalogPath, "s3://warehouse/delta/"; got != want {
+		t.Fatalf("expected derived Delta catalog path %q, got %q", want, got)
+	}
+
+	// Explicit YAML opt-out wins over the new default.
+	fileDisabled := false
+	resolvedOptOut := configresolve.ResolveEffective(&FileConfig{
+		DuckLake: DuckLakeFileConfig{
+			ObjectStore:         "s3://warehouse/ducklake/",
+			DeltaCatalogEnabled: &fileDisabled,
+		},
+	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if resolvedOptOut.Server.DuckLake.DeltaCatalogEnabled {
+		t.Fatal("expected YAML ducklake.delta_catalog_enabled=false to disable Delta catalog")
+	}
+
 	fileEnabled := true
 	resolved := configresolve.ResolveEffective(&FileConfig{
 		DuckLake: DuckLakeFileConfig{
@@ -257,6 +288,47 @@ func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
 	}
 	if got, want := resolved.Server.DuckLake.DeltaCatalogPath, "s3://warehouse/cli-delta/"; got != want {
 		t.Fatalf("expected CLI Delta catalog path %q, got %q", want, got)
+	}
+}
+
+func TestResolveEffectiveConfigIceberg(t *testing.T) {
+	// Default-off: with no overrides, Iceberg stays disabled (opt-in unlike Delta).
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.Iceberg.Enabled {
+		t.Fatal("expected Iceberg.Enabled to default to false")
+	}
+
+	// File config opts in.
+	fileEnabled := true
+	resolved = configresolve.ResolveEffective(&FileConfig{
+		Iceberg: IcebergFileConfig{
+			Enabled:     &fileEnabled,
+			TableBucket: "arn:aws:s3tables:us-east-1:111:bucket/yaml",
+			Region:      "us-east-1",
+			Namespace:   "main",
+		},
+	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if !resolved.Server.Iceberg.Enabled {
+		t.Fatal("expected YAML iceberg.enabled=true to enable Iceberg")
+	}
+	if got, want := resolved.Server.Iceberg.TableBucket, "arn:aws:s3tables:us-east-1:111:bucket/yaml"; got != want {
+		t.Fatalf("expected YAML table bucket %q, got %q", want, got)
+	}
+
+	// Env overrides YAML; CLI overrides env.
+	resolved = configresolve.ResolveEffective(&FileConfig{
+		Iceberg: IcebergFileConfig{
+			Enabled:     &fileEnabled,
+			TableBucket: "arn:aws:s3tables:us-east-1:111:bucket/yaml",
+		},
+	}, configresolve.CLIInputs{
+		Set:                map[string]bool{"iceberg-table-bucket": true},
+		IcebergTableBucket: "arn:aws:s3tables:us-east-1:333:bucket/cli",
+	}, envFromMap(map[string]string{
+		"DUCKGRES_ICEBERG_TABLE_BUCKET": "arn:aws:s3tables:us-east-1:222:bucket/env",
+	}), nil)
+	if got, want := resolved.Server.Iceberg.TableBucket, "arn:aws:s3tables:us-east-1:333:bucket/cli"; got != want {
+		t.Fatalf("expected CLI table bucket %q to win, got %q", want, got)
 	}
 }
 

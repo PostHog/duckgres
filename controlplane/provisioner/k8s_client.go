@@ -41,6 +41,16 @@ type DucklingStatus struct {
 		BucketName string
 		S3Region   string
 	}
+	// Iceberg is populated when spec.iceberg.enabled=true and the
+	// composition has reconciled the per-tenant S3 Tables bucket. Empty
+	// when the tenant has not opted in. TableBucketArn arrives last
+	// (after the bucket is reconciled); the controller uses its presence
+	// as the trigger to flip iceberg_state to Ready in the configstore.
+	Iceberg struct {
+		TableBucketArn string
+		NamespaceName  string
+		Region         string
+	}
 	IAMRoleARN         string
 	ReadyCondition     bool
 	SyncedFalseMessage string
@@ -81,6 +91,14 @@ type CreateOptions struct {
 	MinACU           float64
 	MaxACU           float64
 	PgBouncerEnabled bool
+	// IcebergEnabled toggles spec.iceberg.enabled on the Duckling CR. The
+	// composition only provisions a per-tenant S3 Tables bucket when this
+	// is true; flipping it post-create is handled by the controller's
+	// Ready-state drift logic.
+	IcebergEnabled bool
+	// IcebergNamespace is the Iceberg namespace within the tenant's catalog.
+	// Empty falls back to the XRD default ("main").
+	IcebergNamespace string
 }
 
 // Create creates a Duckling CR for the given org.
@@ -98,6 +116,19 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 			"enabled": true,
 		}
 	}
+	spec := map[string]interface{}{
+		"metadataStore": metadataStore,
+		"dataStore": map[string]interface{}{
+			"type": "s3bucket",
+		},
+	}
+	if opts.IcebergEnabled {
+		iceberg := map[string]interface{}{"enabled": true}
+		if ns := opts.IcebergNamespace; ns != "" {
+			iceberg["namespace"] = ns
+		}
+		spec["iceberg"] = iceberg
+	}
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "k8s.posthog.com/v1alpha1",
@@ -106,12 +137,7 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 				"name":      name,
 				"namespace": ducklingNamespace,
 			},
-			"spec": map[string]interface{}{
-				"metadataStore": metadataStore,
-				"dataStore": map[string]interface{}{
-					"type": "s3bucket",
-				},
-			},
+			"spec": spec,
 		},
 	}
 
@@ -195,6 +221,57 @@ func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, 
 	return nil
 }
 
+// GetIcebergEnabled reads spec.iceberg.enabled from the Duckling CR. Missing
+// blocks (composition at an older schema, CR predates iceberg support) are
+// reported as false — same as an explicit opt-out — so the caller can just
+// compare against the desired value.
+func (d *DucklingClient) GetIcebergEnabled(ctx context.Context, orgID string) (bool, error) {
+	name := ducklingName(orgID)
+	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	iceberg, ok := spec["iceberg"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	enabled, _ := iceberg["enabled"].(bool)
+	return enabled, nil
+}
+
+// SetIcebergEnabled patches spec.iceberg.enabled on the Duckling CR for the
+// given org. Uses a JSON merge patch (RFC 7396) so the call is idempotent and
+// only touches the iceberg block — sibling fields under spec (metadataStore,
+// dataStore) are left untouched.
+//
+// Note: iceberg.namespace is enforced immutable by the XRD's CEL rule, so
+// this method intentionally only patches enabled — namespace changes have
+// to go through warehouse re-creation.
+func (d *DucklingClient) SetIcebergEnabled(ctx context.Context, orgID string, enabled bool) error {
+	name := ducklingName(orgID)
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"iceberg": map[string]interface{}{
+				"enabled": enabled,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal iceberg patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q iceberg: %w", name, err)
+	}
+	return nil
+}
+
 func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error) {
 	status, ok := cr.Object["status"].(map[string]interface{})
 	if !ok {
@@ -220,6 +297,13 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 		ds.DataStore.Type = getNestedString(store, "type")
 		ds.DataStore.BucketName = getNestedString(store, "bucketName")
 		ds.DataStore.S3Region = getNestedString(store, "s3Region")
+	}
+
+	// Parse status.iceberg (only populated when spec.iceberg.enabled=true)
+	if ic, ok := status["iceberg"].(map[string]interface{}); ok {
+		ds.Iceberg.TableBucketArn = getNestedString(ic, "tableBucketArn")
+		ds.Iceberg.NamespaceName = getNestedString(ic, "namespaceName")
+		ds.Iceberg.Region = getNestedString(ic, "region")
 	}
 
 	// Parse conditions

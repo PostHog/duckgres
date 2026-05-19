@@ -242,8 +242,14 @@ func (e *FlightExecutor) ExecContext(ctx context.Context, query string, args ...
 
 	reqCtx = e.withSession(reqCtx)
 
-	var trailer metadata.MD
-	affected, err := e.client.ExecuteUpdate(reqCtx, query, grpc.Trailer(&trailer))
+	// Note: we hand-roll the DoPut here instead of calling
+	// flightsql.Client.ExecuteUpdate so we can capture the gRPC trailer.
+	// ExecuteUpdate is a bidi-streaming RPC and grpc.Trailer(&md) as a
+	// CallOption only works for unary RPCs — for streams the trailer is
+	// only reachable via stream.Trailer() after Recv returns io.EOF.
+	// Without that capture the worker's per-query profiling JSON is
+	// silently dropped on this side. See executeUpdateWithTrailer.
+	affected, trailer, err := executeUpdateWithTrailer(reqCtx, e.client, query)
 	e.storeProfilingFromTrailer(trailer)
 	if err != nil {
 		return nil, fmt.Errorf("flight execute update: %w", err)

@@ -79,8 +79,14 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 		&DuckLakeConfig{},
 		&RateLimitConfig{},
 		&QueryLogConfig{},
+		&SchemaMigration{},
 	); err != nil {
 		return nil, fmt.Errorf("auto-migrate config store: %w", err)
+	}
+
+	// One-shot data migrations (idempotent — tracked in duckgres_schema_migrations).
+	if err := migrateDeltaCatalogDefaultEnabled(db); err != nil {
+		return nil, fmt.Errorf("migrate delta catalog default: %w", err)
 	}
 
 	runtimeSchema, err := resolveRuntimeSchema(db)
@@ -413,6 +419,46 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
 	}
 	return nil
+}
+
+// migrateDeltaCatalogDefaultEnabled is a one-shot backfill that flips existing
+// rows where delta_catalog_enabled was stored as false (the old default) to
+// true. New rows get true automatically via the gorm:"default:true" column
+// default. Tracked in duckgres_schema_migrations so it runs exactly once;
+// admins can disable per-warehouse via the admin API after the backfill
+// without it being re-flipped on subsequent restarts.
+const deltaCatalogDefaultMigrationName = "2026_05_delta_catalog_default_enabled"
+
+func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
+	var existing SchemaMigration
+	err := db.Where("name = ?", deltaCatalogDefaultMigrationName).First(&existing).Error
+	if err == nil {
+		return nil // already applied
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("check schema migration: %w", err)
+	}
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(
+			`UPDATE duckgres_ducklake_config SET delta_catalog_enabled = TRUE WHERE delta_catalog_enabled IS DISTINCT FROM TRUE`,
+		).Error; err != nil {
+			return fmt.Errorf("backfill ducklake config: %w", err)
+		}
+		if err := tx.Exec(
+			`UPDATE duckgres_managed_warehouses SET s3_delta_catalog_enabled = TRUE WHERE s3_delta_catalog_enabled IS DISTINCT FROM TRUE`,
+		).Error; err != nil {
+			return fmt.Errorf("backfill managed warehouses: %w", err)
+		}
+		if err := tx.Create(&SchemaMigration{
+			Name:      deltaCatalogDefaultMigrationName,
+			AppliedAt: time.Now().UTC(),
+		}).Error; err != nil {
+			return fmt.Errorf("record schema migration: %w", err)
+		}
+		slog.Info("Backfilled delta_catalog_enabled=true on existing config rows.")
+		return nil
+	})
 }
 
 func migrateOrgUserPK(db *gorm.DB) error {
@@ -808,16 +854,17 @@ func (cs *ConfigStore) RetireOrphanWorker(workerID int, reason string) (bool, er
 // and pre-migration rows that existed before this column was introduced
 // (these get refreshed eagerly so we converge to the new state).
 //
-// Only active states are considered: retired/lost/draining(-out) rows
-// don't need creds. We include `idle` deliberately — an idle worker that
-// belongs to an org (post-activation) still has live creds in DuckDB and
-// will need them on the next session.
+// Only already-activated states are considered: retired/lost/draining rows
+// don't need creds, and reserved/activating rows must not be refreshed because
+// their first ActivateTenant RPC may still be in flight. Refreshing them would
+// bump owner_epoch underneath the activation path and make the original
+// owner_epoch look stale to the worker. We include `idle` deliberately — an
+// idle worker that belongs to an org (post-activation) still has live creds in
+// DuckDB and will need them on the next session.
 func (cs *ConfigStore) ListWorkersDueForCredentialRefresh(ownerCPInstanceID string, cutoff time.Time) ([]WorkerRecord, error) {
 	var workers []WorkerRecord
 	credEligibleStates := []WorkerState{
 		WorkerStateIdle,
-		WorkerStateReserved,
-		WorkerStateActivating,
 		WorkerStateHot,
 		WorkerStateHotIdle,
 	}
@@ -1073,6 +1120,77 @@ func (cs *ConfigStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image 
 	return created, nil
 }
 
+// CreateNeutralWarmWorkerSlotForImage creates a durable spawning worker row
+// for the shared neutral warm pool, but the per-image target is enforced
+// against workers using the same image only — letting the per-image warm
+// floor coexist with the cluster-default warm pool without one starving the
+// other. Same advisory-lock + global-cap protections as the image-blind
+// sibling. A nil result means the per-image target is already met or the
+// global worker cap blocked the spawn.
+func (cs *ConfigStore) CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*WorkerRecord, error) {
+	if strings.TrimSpace(podNamePrefix) == "" {
+		return nil, fmt.Errorf("pod name prefix is required")
+	}
+	if strings.TrimSpace(image) == "" {
+		return nil, fmt.Errorf("image is required for per-image warm slot")
+	}
+
+	var created *WorkerRecord
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:shared-warm-target")).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:global-worker-capacity")).Error; err != nil {
+			return err
+		}
+
+		if perImageTarget > 0 {
+			count, err := cs.countNeutralWarmWorkersForImage(tx, image)
+			if err != nil {
+				return err
+			}
+			if count >= int64(perImageTarget) {
+				return nil
+			}
+		}
+
+		if maxGlobalWorkers > 0 {
+			count, err := cs.countActiveWorkers(tx)
+			if err != nil {
+				return err
+			}
+			if count >= int64(maxGlobalWorkers) {
+				return nil
+			}
+		}
+
+		var workerID int64
+		if err := tx.Raw("SELECT COALESCE(MAX(worker_id), 0) + 1 FROM " + cs.runtimeTable((&WorkerRecord{}).TableName())).Scan(&workerID).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		record := &WorkerRecord{
+			WorkerID:          int(workerID),
+			PodName:           fmt.Sprintf("%s-%d", podNamePrefix, workerID),
+			Image:             image,
+			State:             WorkerStateSpawning,
+			OrgID:             "",
+			OwnerCPInstanceID: ownerCPInstanceID,
+			OwnerEpoch:        0,
+			LastHeartbeatAt:   now,
+		}
+		if err := tx.Table(cs.runtimeTable(record.TableName())).Create(record).Error; err != nil {
+			return err
+		}
+		created = record
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create neutral warm worker slot for image: %w", err)
+	}
+	return created, nil
+}
+
 // CreateNeutralWarmWorkerSlot creates a durable spawning worker row for the shared
 // neutral warm pool under advisory-lock protected cluster-wide warm-target and
 // global capacity checks. A nil result means capacity already satisfies the target
@@ -1288,6 +1406,18 @@ func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB) (int64, error) {
 	var count int64
 	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
 		Where("org_id = ''").
+		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
+		Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (cs *ConfigStore) countNeutralWarmWorkersForImage(tx *gorm.DB, image string) (int64, error) {
+	var count int64
+	if err := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("org_id = ''").
+		Where("image = ?", image).
 		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
 		Count(&count).Error; err != nil {
 		return 0, err

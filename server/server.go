@@ -25,6 +25,7 @@ import (
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/chsql"
 	"github.com/posthog/duckgres/server/ducklake"
+	"github.com/posthog/duckgres/server/iceberg"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sysinfo"
 	"github.com/posthog/duckgres/server/wire"
@@ -37,6 +38,11 @@ import (
 // to compile after the migration code moved to server/ducklake. New code
 // should import server/ducklake and use ducklake.Config directly.
 type DuckLakeConfig = ducklake.Config
+
+// IcebergConfig is an alias for iceberg.Config so callers that already
+// import "github.com/posthog/duckgres/server" can reach it as
+// server.IcebergConfig without a second import.
+type IcebergConfig = iceberg.Config
 
 // DefaultDuckLakeSpecVersion is re-exported for callers that referenced the
 // constant under the server package before the migration code moved.
@@ -224,6 +230,18 @@ type Config struct {
 
 	// DuckLake configuration
 	DuckLake DuckLakeConfig
+
+	// Iceberg catalog (AWS S3 Tables) configuration. Per-tenant in
+	// multitenant mode (sourced from the configstore via shared_worker_activator);
+	// optional opt-in for standalone instances via --iceberg-* flags.
+	Iceberg IcebergConfig
+
+	// AlwaysDuckLake forces the SQL transpiler into DuckLake mode for every
+	// session even when the global DuckLake.MetadataStore is empty. The
+	// multitenant control plane sets this because metadata stores are
+	// per-org (loaded from configstore), so the global field stays empty
+	// even though every worker is DuckLake-backed.
+	AlwaysDuckLake bool
 
 	// Graceful shutdown timeout (default: 30s)
 	ShutdownTimeout time.Duration
@@ -876,14 +894,16 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 	// (just clock_gettime per operator boundary).
 	// Output goes to a fixed temp file; in K8s mode the worker reads it
 	// after each query and sends it to the control plane via gRPC trailer.
-	if _, err := db.Exec("SET enable_profiling = 'json'"); err != nil {
-		slog.Warn("Failed to enable DuckDB profiling.", "error", err)
-	}
-	if _, err := db.Exec("SET profiling_mode = 'detailed'"); err != nil {
-		slog.Warn("Failed to set DuckDB profiling mode.", "error", err)
-	}
-	if _, err := db.Exec("SET profiling_output = '/tmp/duckgres-profiling.json'"); err != nil {
-		slog.Warn("Failed to set DuckDB profiling output path.", "error", err)
+	//
+	// These SETs are session-scoped in DuckDB and cannot be set globally,
+	// so they only apply to whichever connection runs them now. In cluster
+	// mode (sharedWarmMode) the worker evicts connections between sessions
+	// (see duckdbservice.evictConnFromPool), so per-session re-application
+	// is required — see ApplyProfilingSettings.
+	for _, stmt := range ProfilingSetupSQL(ProfilingOutputPath) {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to apply DuckDB profiling setting.", "stmt", stmt, "error", err)
+		}
 	}
 
 	// Configure cache_httpfs cache directory if the extension is loaded.
@@ -963,7 +983,11 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 }
 
 func shouldRefreshBundledExtension(srcPath string) bool {
-	return filepath.Base(srcPath) == "postgres_scanner.duckdb_extension"
+	switch filepath.Base(srcPath) {
+	case "postgres_scanner.duckdb_extension", "ducklake.duckdb_extension":
+		return true
+	}
+	return false
 }
 
 func copyFile(srcPath, dstPath string, mode os.FileMode) error {
@@ -1062,6 +1086,12 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		}
 		slog.Warn("Failed to attach Delta catalog.", "user", username, "error", err)
 	}
+	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
+		if cfg.Iceberg.Enabled {
+			return fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
+		}
+		slog.Warn("Failed to attach Iceberg catalog.", "user", username, "error", err)
+	}
 
 	// Initialize information_schema compatibility views in memory.main
 	// Must be done AFTER attaching DuckLake (so views can reference ducklake.information_schema)
@@ -1093,6 +1123,9 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 	}
 	if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
 		return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
+	}
+	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
+		return fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
 	}
 
 	if err := recreatePgClassForDuckLake(db); err != nil {
@@ -1146,6 +1179,13 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 			return nil, fmt.Errorf("delta catalog configured but attachment failed: %w", err)
 		}
 		slog.Warn("Failed to attach Delta catalog.", "user", username, "error", err)
+	}
+	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
+		if cfg.Iceberg.Enabled {
+			_ = db.Close()
+			return nil, fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
+		}
+		slog.Warn("Failed to attach Iceberg catalog.", "user", username, "error", err)
 	}
 
 	return db, nil
@@ -1477,13 +1517,17 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 // AttachDeltaCatalog attaches the configured Delta Lake catalog/table alongside
 // DuckLake. It reuses the DuckLake S3 secret settings so Delta scans can access
 // the same object store credentials.
+//
+// Delta is enabled by default. When no path is derivable (e.g. a plain
+// standalone DuckDB instance with no DuckLake object_store/data_path), this is
+// a benign no-op: there's no Delta sibling to attach.
 func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) error {
 	if !dlCfg.DeltaCatalogEnabled {
 		return nil
 	}
 	catalogPath := ducklake.DeltaCatalogPath(dlCfg)
 	if catalogPath == "" {
-		return fmt.Errorf("delta catalog path is empty")
+		return nil
 	}
 
 	select {
@@ -1512,10 +1556,143 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 	attachStmt := ducklake.BuildDeltaAttachStmt(dlCfg)
 	slog.Info("Attaching Delta catalog.", "path", catalogPath)
 	if _, err := db.Exec(attachStmt); err != nil {
+		// Delta is enabled by default. A fresh DuckLake tenant won't have any
+		// Delta data at the sibling delta/ prefix yet, so DeltaKernel returns
+		// "No files in log segment". That's expected — the catalog will start
+		// resolving once Delta data lands at the path. Treat as a benign skip
+		// instead of failing connection setup.
+		if isDeltaCatalogEmptyError(err) {
+			slog.Info("Skipping Delta catalog attach: no Delta data at path yet.", "path", catalogPath)
+			return nil
+		}
 		return fmt.Errorf("failed to attach Delta catalog: %w", err)
+	}
+	// ATTACH '...' (TYPE delta) is lazy — it doesn't read the transaction log
+	// until something forces resolution. With Delta attached but the path
+	// empty, every unqualified-table query the user runs against DuckLake will
+	// fail at prepare time when the planner walks all attached catalogs and
+	// Delta tries to read a missing _delta_log/. Probe immediately and detach
+	// if there's no Delta data here yet, so the catalog only sticks around
+	// once it's actually queryable.
+	if _, err := db.Exec("SHOW TABLES FROM delta"); err != nil {
+		if isDeltaCatalogEmptyError(err) {
+			if _, derr := db.Exec("DETACH delta"); derr != nil {
+				slog.Warn("Failed to detach empty Delta catalog after attach probe.", "error", derr)
+			}
+			slog.Info("Detached Delta catalog: no Delta data at path yet.", "path", catalogPath)
+			return nil
+		}
+		return fmt.Errorf("failed to probe Delta catalog: %w", err)
 	}
 	slog.Info("Attached Delta catalog successfully.", "path", catalogPath)
 	return nil
+}
+
+// isDeltaCatalogEmptyError reports whether err indicates the Delta location
+// exists but contains no Delta transaction log yet (the common case for a
+// fresh DuckLake tenant under the always-on Delta default). The DuckDB Delta
+// extension surfaces this as "No files in log segment" via DeltaKernel.
+func isDeltaCatalogEmptyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "No files in log segment")
+}
+
+// AttachIcebergCatalog attaches the per-tenant Iceberg catalog (AWS S3
+// Tables) alongside DuckLake. Mirrors AttachDeltaCatalog: it's gated on
+// Iceberg.Enabled, idempotent if the catalog is already attached, and
+// fail-soft for the "fresh tenant, no namespaces yet" case so a worker
+// activation isn't blocked by an empty catalog.
+//
+// keyID/secret/sessionToken are short-lived AWS credentials produced by
+// the control plane's STS AssumeRole on the per-tenant IAM role — the
+// same credentials DuckLake uses (see buildConfigSecret). The per-tenant
+// role has both s3:* and s3tables:* permissions, so reusing them here is
+// correct. This is the only supported auth model for iceberg: we do NOT
+// fall back to DuckDB's credential_chain because the worker pod has no
+// AWS identity of its own on the multitenant production topology. Missing
+// credentials when iceberg is enabled is a configuration bug and surfaces
+// as an explicit error rather than a silent fallback.
+func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
+	if !ic.Enabled || ic.TableBucket == "" {
+		return nil
+	}
+	if keyID == "" || secret == "" {
+		return fmt.Errorf("iceberg catalog enabled (table_bucket=%q) but no AWS credentials in activation payload — control plane STS broker did not populate DuckLake S3 credentials", ic.TableBucket)
+	}
+
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for Iceberg catalog attachment lock")
+	}
+
+	var count int
+	// Inlining 'iceberg' (a code constant) matches the Delta probe's pattern
+	// and avoids depending on driver param-binding for QueryRow.
+	err := db.QueryRow(
+		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = '" + iceberg.CatalogName + "'",
+	).Scan(&count)
+	if err == nil && count > 0 {
+		return nil
+	}
+
+	if err := LoadExtensions(db, []string{"iceberg"}); err != nil {
+		return fmt.Errorf("load iceberg extension: %w", err)
+	}
+
+	if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic, keyID, secret, sessionToken)); err != nil {
+		return fmt.Errorf("create Iceberg secret: %w", err)
+	}
+
+	attachStmt := iceberg.BuildIcebergAttachStmt(ic)
+	slog.Info("Attaching Iceberg catalog.", "table_bucket", ic.TableBucket, "region", ic.Region)
+	if _, err := db.Exec(attachStmt); err != nil {
+		if isIcebergCatalogEmptyError(err) {
+			slog.Info("Skipping Iceberg catalog attach: no namespaces at table bucket yet.", "table_bucket", ic.TableBucket)
+			return nil
+		}
+		return fmt.Errorf("failed to attach Iceberg catalog: %w", err)
+	}
+	// Probe-and-detach (same posture as Delta): force a list against the
+	// catalog so any lazy "empty Iceberg catalog" error surfaces here, not
+	// at the next user query's prepare time.
+	if _, err := db.Exec("SHOW TABLES FROM " + iceberg.CatalogName); err != nil {
+		if isIcebergCatalogEmptyError(err) {
+			if _, derr := db.Exec("DETACH " + iceberg.CatalogName); derr != nil {
+				slog.Warn("Failed to detach empty Iceberg catalog after attach probe.", "error", derr)
+			}
+			slog.Info("Detached Iceberg catalog: no namespaces at table bucket yet.", "table_bucket", ic.TableBucket)
+			return nil
+		}
+		return fmt.Errorf("failed to probe Iceberg catalog: %w", err)
+	}
+	slog.Info("Attached Iceberg catalog successfully.", "table_bucket", ic.TableBucket)
+	return nil
+}
+
+// isIcebergCatalogEmptyError reports whether err indicates the Iceberg
+// catalog is reachable but the table bucket contains no namespaces or
+// tables yet — the expected state for a freshly-provisioned per-tenant
+// table bucket. Pattern-matching on the surface error string is fragile,
+// so we cover the known signals from the DuckDB iceberg extension talking
+// to AWS S3 Tables.
+func isIcebergCatalogEmptyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "no namespace"),
+		strings.Contains(msg, "no namespaces"),
+		strings.Contains(msg, "NamespaceNotFound"),
+		strings.Contains(msg, "NoSuchNamespace"),
+		strings.Contains(msg, "NoSuchTable"):
+		return true
+	}
+	return false
 }
 
 func deltaCatalogNeedsS3Secret(catalogPath string, dlCfg DuckLakeConfig) bool {
@@ -1588,6 +1765,10 @@ var duckLakeMetadataIndexes = []duckLakeMetadataIndex{
 	{
 		name: "idx_ducklake_table_col_stats_tbl",
 		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_table_col_stats_tbl ON ducklake_table_column_stats (table_id)",
+	},
+	{
+		name: "idx_ducklake_schema_versions_tbl_schema_version",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_schema_versions_tbl_schema_version ON ducklake_schema_versions (table_id, schema_version)",
 	},
 }
 
@@ -1773,6 +1954,52 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 		}
 	}
 	slog.Debug("Refreshed S3 secret for hot-idle reuse.", "provider", provider)
+	return nil
+}
+
+// RefreshIcebergSecret replaces the DuckDB iceberg-extension S3 secret
+// (iceberg_sigv4) with updated credentials. Used when a hot-idle worker
+// is reclaimed and the STS credentials minted by the control plane have
+// rotated. Without this, iceberg queries on a long-lived worker would
+// start 403'ing after the first STS rotation (~1h) while DuckLake stays
+// fresh.
+//
+// Unlike AttachIcebergCatalog this does NOT short-circuit when the
+// iceberg catalog is already attached — the whole point is to overwrite
+// the existing secret in place. ATTACH state on the catalog itself is
+// unaffected; DuckDB resolves the secret at request time, so the new
+// credentials take effect for the next iceberg query without an
+// explicit reattach.
+//
+// Same auth model as AttachIcebergCatalog: explicit credentials are the
+// only supported path. A refresh with missing credentials is a config
+// bug (the activator failed to populate fresh STS credentials in the
+// payload) and surfaces as an explicit error rather than a silent
+// fallback to credential_chain.
+func RefreshIcebergSecret(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secretKey, sessionToken string) error {
+	if !ic.Enabled {
+		return nil
+	}
+	if keyID == "" || secretKey == "" {
+		return fmt.Errorf("iceberg refresh: no AWS credentials in activation payload — control plane STS broker did not populate DuckLake S3 credentials")
+	}
+	if sem != nil {
+		sem <- struct{}{}
+		defer func() { <-sem }()
+	}
+
+	secretStmt := iceberg.BuildIcebergSecretStmt(ic, keyID, secretKey, sessionToken)
+	if _, err := db.Exec(secretStmt); err != nil {
+		if isTransactionAborted(err) {
+			_, _ = db.Exec("ROLLBACK")
+			if _, retryErr := db.Exec(secretStmt); retryErr != nil {
+				return fmt.Errorf("refresh iceberg secret after rollback: %w", retryErr)
+			}
+		} else {
+			return fmt.Errorf("refresh iceberg secret: %w", err)
+		}
+	}
+	slog.Debug("Refreshed iceberg secret for hot-idle reuse.", "table_bucket", ic.TableBucket)
 	return nil
 }
 

@@ -17,6 +17,10 @@ type ActivationPayload struct {
 	server.WorkerControlMetadata
 	OrgID    string                `json:"org_id"`
 	DuckLake server.DuckLakeConfig `json:"ducklake"`
+	// Iceberg is the per-tenant Iceberg catalog (AWS S3 Tables) config. Empty
+	// (Enabled=false) when the tenant has not opted in or hasn't been
+	// provisioned yet — workers handle that as a no-op at attach time.
+	Iceberg server.IcebergConfig `json:"iceberg"`
 }
 
 type activatedTenantRuntime struct {
@@ -79,6 +83,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 
 	cfg := p.cfg
 	cfg.DuckLake = payload.DuckLake
+	cfg.Iceberg = payload.Iceberg
 	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 
 	<-p.warmupDone
@@ -165,8 +170,17 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		return false
 	}
 
+	// needsRefresh is keyed on DuckLake creds because the activator
+	// populates DuckLake.S3* with the STS-minted credentials for the
+	// per-tenant IAM role, and the iceberg_sigv4 secret reuses the same
+	// values. So a single change-detection covers both downstream
+	// consumers. The guard "something is actually using S3" expands here
+	// to include iceberg — there are tenants (e.g. metadata-only DuckLake)
+	// where ObjectStore is empty but Iceberg.Enabled is true, and on
+	// those the iceberg secret still needs to be rotated.
 	needsRefresh := false
-	if p.activation.db != nil && payload.DuckLake.ObjectStore != "" &&
+	if p.activation.db != nil &&
+		(payload.DuckLake.ObjectStore != "" || payload.Iceberg.Enabled) &&
 		!reflect.DeepEqual(current.DuckLake, payload.DuckLake) {
 		needsRefresh = s3CredentialsChanged(current.DuckLake, payload.DuckLake)
 		if !needsRefresh {
@@ -188,6 +202,7 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		refreshDB = p.activation.db
 	}
 	refreshFn := p.refreshS3Secret
+	refreshIcebergFn := p.refreshIcebergSecret
 	sem := p.duckLakeSem
 	p.mu.Unlock()
 
@@ -201,9 +216,24 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		if refreshFn == nil {
 			refreshFn = server.RefreshS3Secret
 		}
-		if err := refreshFn(refreshDB, payload.DuckLake, sem); err != nil {
-			slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
-			return false
+		if refreshIcebergFn == nil {
+			refreshIcebergFn = server.RefreshIcebergSecret
+		}
+		if payload.DuckLake.ObjectStore != "" {
+			if err := refreshFn(refreshDB, payload.DuckLake, sem); err != nil {
+				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
+				return false
+			}
+		}
+		if payload.Iceberg.Enabled {
+			if err := refreshIcebergFn(refreshDB, payload.Iceberg, sem,
+				payload.DuckLake.S3AccessKey,
+				payload.DuckLake.S3SecretKey,
+				payload.DuckLake.S3SessionToken,
+			); err != nil {
+				slog.Warn("Failed to refresh Iceberg credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
+				return false
+			}
 		}
 	}
 
@@ -248,6 +278,7 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		return false
 	}
 	a, b := current.DuckLake, next.DuckLake
+	ai, bi := current.Iceberg, next.Iceberg
 	return a.MetadataStore == b.MetadataStore &&
 		a.ObjectStore == b.ObjectStore &&
 		a.DataPath == b.DataPath &&
@@ -262,7 +293,11 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		a.S3Profile == b.S3Profile &&
 		a.Migrate == b.Migrate &&
 		reflect.DeepEqual(a.DataInliningRowLimit, b.DataInliningRowLimit) &&
-		a.CheckpointInterval == b.CheckpointInterval
+		a.CheckpointInterval == b.CheckpointInterval &&
+		ai.Enabled == bi.Enabled &&
+		ai.TableBucket == bi.TableBucket &&
+		ai.Region == bi.Region &&
+		ai.Namespace == bi.Namespace
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {
@@ -300,6 +335,7 @@ func (p *SessionPool) currentSessionConfig() (server.Config, error) {
 
 	cfg := p.cfg
 	cfg.DuckLake = p.activation.payload.DuckLake
+	cfg.Iceberg = p.activation.payload.Iceberg
 	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 	return cfg, nil
 }
@@ -308,6 +344,7 @@ func (p *SessionPool) sharedWarmupConfig() server.Config {
 	cfg := p.cfg
 	if p.sharedWarmMode {
 		cfg.DuckLake = server.DuckLakeConfig{}
+		cfg.Iceberg = server.IcebergConfig{}
 	}
 	return cfg
 }

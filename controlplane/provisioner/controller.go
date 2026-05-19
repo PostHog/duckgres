@@ -124,11 +124,15 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 	}
 
 	// Create the Duckling CR
-	log.Info("Creating Duckling CR.", "pgbouncer_enabled", w.PgBouncer.Enabled)
+	log.Info("Creating Duckling CR.",
+		"pgbouncer_enabled", w.PgBouncer.Enabled,
+		"iceberg_enabled", w.Iceberg.Enabled)
 	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
 		MinACU:           w.AuroraMinACU,
 		MaxACU:           w.AuroraMaxACU,
 		PgBouncerEnabled: w.PgBouncer.Enabled,
+		IcebergEnabled:   w.Iceberg.Enabled,
+		IcebergNamespace: w.Iceberg.Namespace,
 	}); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
@@ -211,6 +215,12 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		updates["identity_state"] = configstore.ManagedWarehouseStateReady
 	}
 
+	// Iceberg is opt-in per warehouse — only track its state when enabled.
+	// When the composition writes status.iceberg.tableBucketArn, the bucket
+	// (Workspace) is reconciled and we persist the ARN + region back to the
+	// configstore so the worker activator can feed it into IcebergConfig.
+	addIcebergStatusUpdates(updates, w, status)
+
 	// Infrastructure is ready when all components are provisioned AND the
 	// Crossplane Ready condition is True. The Ready condition ensures all
 	// composed resources (including the Aurora instance) are fully reconciled,
@@ -219,8 +229,12 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	metaReady := w.MetadataStoreState == configstore.ManagedWarehouseStateReady || updates["metadata_store_state"] == configstore.ManagedWarehouseStateReady
 	secretsReady := w.SecretsState == configstore.ManagedWarehouseStateReady || updates["secrets_state"] == configstore.ManagedWarehouseStateReady
 	identReady := w.IdentityState == configstore.ManagedWarehouseStateReady || updates["identity_state"] == configstore.ManagedWarehouseStateReady
+	// Iceberg is only required for Ready when the tenant opted in.
+	icebergReady := !w.Iceberg.Enabled ||
+		w.IcebergState == configstore.ManagedWarehouseStateReady ||
+		updates["iceberg_state"] == configstore.ManagedWarehouseStateReady
 
-	if s3Ready && metaReady && secretsReady && identReady && status.ReadyCondition {
+	if s3Ready && metaReady && secretsReady && identReady && icebergReady && status.ReadyCondition {
 		now := time.Now().UTC()
 		updates["state"] = configstore.ManagedWarehouseStateReady
 		updates["status_message"] = "Infrastructure ready"
@@ -235,18 +249,23 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	}
 }
 
-// reconcileReady handles drift correction for Ready warehouses. Today the
-// only post-create-mutable spec field is metadataStore.pgbouncer.enabled;
-// if an operator flips it in the config store (admin API), we patch the CR
-// so the Crossplane composition provisions / tears down the pooler.
+// reconcileReady handles drift correction for Ready warehouses. The
+// post-create-mutable spec fields are metadataStore.pgbouncer.enabled and
+// iceberg.enabled; if an operator flips either in the config store (admin
+// API), we patch the CR so the Crossplane composition provisions / tears
+// down the affected resource.
 //
 // Scope is intentionally narrow: we do NOT reconcile ACU, image, or other
 // spec fields. Those aren't user-mutable via the admin API today, and
 // aggressive drift correction would conflict with manual kubectl patches.
+//
+// iceberg.namespace is NOT drift-corrected — the XRD's CEL admission rule
+// rejects post-create namespace changes, so a drift attempt would just hit
+// a 422 from the API server. Namespace changes require warehouse re-creation.
 func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "ready")
 
-	currentEnabled, err := c.duckling.GetPgBouncerEnabled(ctx, w.OrgID)
+	currentPgB, err := c.duckling.GetPgBouncerEnabled(ctx, w.OrgID)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// CR is gone but the warehouse is still marked Ready. Don't try
@@ -257,14 +276,77 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 		log.Warn("Failed to read Duckling CR for drift check.", "error", err)
 		return
 	}
-	if currentEnabled == w.PgBouncer.Enabled {
-		return
+
+	if currentPgB != w.PgBouncer.Enabled {
+		log.Info("PgBouncer drift detected, patching Duckling CR.",
+			"desired", w.PgBouncer.Enabled, "current", currentPgB)
+		if err := c.duckling.SetPgBouncerEnabled(ctx, w.OrgID, w.PgBouncer.Enabled); err != nil {
+			log.Warn("Failed to patch Duckling CR pgbouncer.enabled.", "error", err)
+		}
 	}
 
-	log.Info("PgBouncer drift detected, patching Duckling CR.",
-		"desired", w.PgBouncer.Enabled, "current", currentEnabled)
-	if err := c.duckling.SetPgBouncerEnabled(ctx, w.OrgID, w.PgBouncer.Enabled); err != nil {
-		log.Warn("Failed to patch Duckling CR pgbouncer.enabled.", "error", err)
+	currentIceberg, err := c.duckling.GetIcebergEnabled(ctx, w.OrgID)
+	if err != nil {
+		log.Warn("Failed to read Duckling CR iceberg.enabled for drift check.", "error", err)
+		return
+	}
+	if currentIceberg != w.Iceberg.Enabled {
+		log.Info("Iceberg drift detected, patching Duckling CR.",
+			"desired", w.Iceberg.Enabled, "current", currentIceberg)
+		if err := c.duckling.SetIcebergEnabled(ctx, w.OrgID, w.Iceberg.Enabled); err != nil {
+			log.Warn("Failed to patch Duckling CR iceberg.enabled.", "error", err)
+		}
+	}
+
+	// Propagate the Duckling's status.iceberg.tableBucketArn back to the
+	// configstore even after the warehouse has transitioned to Ready. This
+	// covers the late-enable case: the iceberg block can be flipped on via
+	// the admin API long after the warehouse first became Ready, and the
+	// Crossplane composition will only emit the bucket Workspace + populate
+	// status.iceberg.tableBucketArn after that flip. Without this, the ARN
+	// would only land in the configstore if the warehouse was still in
+	// Provisioning when the composition completed — never on a re-enable.
+	if w.Iceberg.Enabled {
+		status, err := c.duckling.Get(ctx, w.OrgID)
+		if err != nil {
+			log.Warn("Failed to read Duckling status for iceberg propagation.", "error", err)
+			return
+		}
+		updates := map[string]interface{}{}
+		addIcebergStatusUpdates(updates, w, status)
+		if len(updates) > 0 {
+			if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateReady, updates); err != nil {
+				log.Warn("Failed to persist iceberg status to configstore.", "error", err)
+			} else {
+				log.Info("Iceberg status persisted to configstore.", "updates", updates)
+			}
+		}
+	}
+}
+
+// addIcebergStatusUpdates copies the Duckling's reported iceberg status
+// (ARN, region, namespace) into the configstore update map when fields
+// differ. Idempotent. Called from both reconcileProvisioning (initial
+// turn-up) and reconcileReady (late iceberg enable on an existing
+// warehouse). Without the reconcileReady call site, a warehouse that
+// became Ready before iceberg was opted in would never get its ARN
+// propagated to the configstore — the worker activator would then run
+// AttachIcebergCatalog with an empty TableBucket and skip the attach.
+func addIcebergStatusUpdates(updates map[string]interface{}, w *configstore.ManagedWarehouse, status *DucklingStatus) {
+	if !w.Iceberg.Enabled || status.Iceberg.TableBucketArn == "" {
+		return
+	}
+	if w.Iceberg.TableBucketArn != status.Iceberg.TableBucketArn {
+		updates["iceberg_table_bucket_arn"] = status.Iceberg.TableBucketArn
+	}
+	if w.Iceberg.Region != status.Iceberg.Region && status.Iceberg.Region != "" {
+		updates["iceberg_region"] = status.Iceberg.Region
+	}
+	if w.Iceberg.Namespace != status.Iceberg.NamespaceName && status.Iceberg.NamespaceName != "" {
+		updates["iceberg_namespace"] = status.Iceberg.NamespaceName
+	}
+	if w.IcebergState != configstore.ManagedWarehouseStateReady {
+		updates["iceberg_state"] = configstore.ManagedWarehouseStateReady
 	}
 }
 
