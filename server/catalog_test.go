@@ -306,7 +306,6 @@ func TestUptimeMacros(t *testing.T) {
 	}
 }
 
-
 func TestUtilityMacrosWithoutPgCatalog(t *testing.T) {
 	// Verify that initUtilityMacros works independently of initPgCatalog,
 	// so passthrough users get uptime/version macros.

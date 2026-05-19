@@ -2425,7 +2425,12 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 			c.sendError("ERROR", "42000", err.Error())
 			return
 		}
-		defer func() { _ = rows.Close() }()
+		// Defensive nil-check before deferring close. Although rows should not be nil
+		// when err is nil, this pattern makes the code more robust against unexpected
+		// executor implementations and prevents close errors from being suppressed.
+		if rows != nil {
+			defer func() { _ = rows.Close() }()
+		}
 
 		// Execute cleanup while cursor is open (data is materialized in cursor)
 		c.executeCleanup(cleanup)
@@ -5478,9 +5483,12 @@ func (c *clientConn) handleDescribe(body []byte) {
 		// RowDescription. Without this, JDBC drivers that reuse named statements
 		// (Bind/Execute without re-Describing) get an unexpected RowDescription
 		// and desync their message queue.
-		p.described = true
-		p.stmt.described = true
-		_ = c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats)
+		// NOTE: Set described=true AFTER successful write to prevent portal state corruption
+		// if the wire write fails due to network error. This preserves at-least-once message semantics.
+		if err := c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats); err == nil {
+			p.described = true
+			p.stmt.described = true
+		}
 
 	default:
 		c.sendError("ERROR", "08P01", "invalid Describe type")

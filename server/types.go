@@ -18,11 +18,11 @@ import (
 const (
 	OidBool        int32 = 16
 	OidBytea       int32 = 17
-	OidChar        int32 = 18   // "char" - single-byte internal type
-	OidName        int32 = 19   // name - 64-byte internal type for identifiers
-	OidInt8        int32 = 20   // bigint
-	OidInt2        int32 = 21   // smallint
-	OidInt4        int32 = 23   // integer
+	OidChar        int32 = 18 // "char" - single-byte internal type
+	OidName        int32 = 19 // name - 64-byte internal type for identifiers
+	OidInt8        int32 = 20 // bigint
+	OidInt2        int32 = 21 // smallint
+	OidInt4        int32 = 23 // integer
 	OidText        int32 = 25
 	OidOid         int32 = 26
 	OidFloat4      int32 = 700  // real
@@ -81,14 +81,14 @@ var pgCatalogColumnOIDs = map[string]int32{
 	"table_schem":   OidName,
 	"table_name":    OidName,
 	// "char" type columns (OID 18) - single-byte internal type
-	"typtype":       OidChar,
-	"typcategory":   OidChar,
-	"typalign":      OidChar,
-	"typstorage":    OidChar,
-	"relkind":       OidChar,
+	"typtype":        OidChar,
+	"typcategory":    OidChar,
+	"typalign":       OidChar,
+	"typstorage":     OidChar,
+	"relkind":        OidChar,
 	"relpersistence": OidChar,
-	"attidentity":   OidChar,
-	"attgenerated":  OidChar,
+	"attidentity":    OidChar,
+	"attgenerated":   OidChar,
 	// text type columns (OID 25)
 	"table_type":  OidText,
 	"adsrc":       OidText,
@@ -130,7 +130,7 @@ var elementToArrayOID = map[int32]int32{
 	OidDate:        OidDateArray,
 	OidTime:        OidTimeArray,
 	OidTimetz:      OidTimetzArray,
-	OidTimestamp:    OidTimestampArray,
+	OidTimestamp:   OidTimestampArray,
 	OidTimestamptz: OidTimestamptzArray,
 	OidInterval:    OidIntervalArray,
 	OidNumeric:     OidNumericArray,
@@ -249,7 +249,7 @@ func parseNumericTypmod(typeName string) int32 {
 	if p <= 0 || s < 0 || p > 38 {
 		return -1
 	}
-	return int32((p << 16) | s) + 4
+	return int32((p<<16)|s) + 4
 }
 
 // encodeBinary encodes a value in PostgreSQL binary format

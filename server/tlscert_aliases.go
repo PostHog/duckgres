@@ -14,8 +14,8 @@ type (
 )
 
 var (
-	NewACMEManager        = tlscert.NewACMEManager
-	NewACMEDNSManager     = tlscert.NewACMEDNSManager
-	EnsureCertificates    = tlscert.EnsureCertificates
+	NewACMEManager         = tlscert.NewACMEManager
+	NewACMEDNSManager      = tlscert.NewACMEDNSManager
+	EnsureCertificates     = tlscert.EnsureCertificates
 	generateSelfSignedCert = tlscert.GenerateSelfSignedCert // server_test.go calls this directly
 )

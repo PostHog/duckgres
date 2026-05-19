@@ -56,12 +56,23 @@ type staticCountRowSet struct {
 	returned bool
 }
 
-func (r *staticCountRowSet) Columns() ([]string, error)                     { return []string{"count"}, nil }
-func (r *staticCountRowSet) ColumnTypes() ([]ColumnTyper, error)            { return []ColumnTyper{describeColumnType("BIGINT")}, nil }
-func (r *staticCountRowSet) Next() bool                                     { if r.returned { return false }; r.returned = true; return true }
-func (r *staticCountRowSet) Scan(dest ...any) error                         { *(dest[0].(*interface{})) = int64(r.count); return nil }
-func (r *staticCountRowSet) Close() error                                   { return nil }
-func (r *staticCountRowSet) Err() error                                     { return nil }
+func (r *staticCountRowSet) Columns() ([]string, error) { return []string{"count"}, nil }
+func (r *staticCountRowSet) ColumnTypes() ([]ColumnTyper, error) {
+	return []ColumnTyper{describeColumnType("BIGINT")}, nil
+}
+func (r *staticCountRowSet) Next() bool {
+	if r.returned {
+		return false
+	}
+	r.returned = true
+	return true
+}
+func (r *staticCountRowSet) Scan(dest ...any) error {
+	*(dest[0].(*interface{})) = int64(r.count)
+	return nil
+}
+func (r *staticCountRowSet) Close() error { return nil }
+func (r *staticCountRowSet) Err() error   { return nil }
 
 func TestHasAttachedCatalogEmbedsCatalogNameWithoutBoundArgs(t *testing.T) {
 	exec := &recordingQueryExecutor{

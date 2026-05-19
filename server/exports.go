@@ -109,8 +109,8 @@ func SetPassthrough(cc *clientConn, enabled bool) {
 // the control plane and elsewhere; new code should import server/sessionmeta
 // directly.
 var (
-	HasAttachedCatalog           = sessionmeta.HasAttachedCatalog
-	InitSessionDatabaseMetadata  = sessionmeta.InitSessionDatabaseMetadata
+	HasAttachedCatalog          = sessionmeta.HasAttachedCatalog
+	InitSessionDatabaseMetadata = sessionmeta.InitSessionDatabaseMetadata
 )
 
 // SendInitialParams sends the initial parameter status messages and backend key data.
@@ -143,7 +143,6 @@ func InitMinimalServer(s *Server, cfg Config, queryCancelCh <-chan struct{}) {
 // that imported it from server keep compiling. New code should use
 // server/wire directly.
 var GenerateSecretKey = wire.GenerateSecretKey
-
 
 // SetQueryLogger sets the query logger on a Server. Used by the control plane
 // to attach a query logger to the minimal server after creation.

@@ -32,9 +32,9 @@ func init() {
 
 func TestMapDuckDBType(t *testing.T) {
 	tests := []struct {
-		name        string
-		typeName    string
-		expectedOID int32
+		name         string
+		typeName     string
+		expectedOID  int32
 		expectedSize int16
 	}{
 		// Boolean types
@@ -121,8 +121,8 @@ func TestMapDuckDBTypeTypmod(t *testing.T) {
 	// default precision (microseconds). Sending the wrong typmod breaks JDBC
 	// metadata and can cause client-side errors.
 	tests := []struct {
-		typeName      string
-		wantTypmod    int32
+		typeName   string
+		wantTypmod int32
 	}{
 		// Types without modifiers should have typmod=-1
 		{"BOOLEAN", -1},
@@ -424,8 +424,8 @@ func TestEncodeTimestamp(t *testing.T) {
 	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	tests := []struct {
-		name          string
-		input         interface{}
+		name           string
+		input          interface{}
 		expectedMicros int64
 	}{
 		{"2000-01-01 00:00:00 (epoch)", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), 0},
@@ -721,7 +721,11 @@ func TestDecodeFloat8(t *testing.T) {
 		expected float64
 		wantErr  bool
 	}{
-		{"3.14159", func() []byte { b := make([]byte, 8); binary.BigEndian.PutUint64(b, math.Float64bits(3.14159)); return b }(), 3.14159, false},
+		{"3.14159", func() []byte {
+			b := make([]byte, 8)
+			binary.BigEndian.PutUint64(b, math.Float64bits(3.14159))
+			return b
+		}(), 3.14159, false},
 		{"zero", []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 0, false},
 		{"-1e100", func() []byte { b := make([]byte, 8); binary.BigEndian.PutUint64(b, math.Float64bits(-1e100)); return b }(), -1e100, false},
 		{"insufficient data", []byte{0x00, 0x00, 0x00, 0x00}, 0, true},
@@ -884,13 +888,13 @@ func TestDecodeBinary(t *testing.T) {
 
 func TestEncodeNumeric(t *testing.T) {
 	tests := []struct {
-		name           string
-		input          duckdb.Decimal
-		expectNdigits  uint16
-		expectWeight   int16
-		expectSign     uint16
-		expectDscale   uint16
-		expectDigits   []uint16
+		name          string
+		input         duckdb.Decimal
+		expectNdigits uint16
+		expectWeight  int16
+		expectSign    uint16
+		expectDscale  uint16
+		expectDigits  []uint16
 	}{
 		{
 			name:          "99.99",
@@ -1108,11 +1112,11 @@ func TestDecodeNumericRaw(t *testing.T) {
 	// ndigits=2, weight=0, sign=0x0000, dscale=2, digits=[99, 9900]
 	data := make([]byte, 12)
 	binary.BigEndian.PutUint16(data[0:], 2)      // ndigits
-	binary.BigEndian.PutUint16(data[2:], 0)       // weight
-	binary.BigEndian.PutUint16(data[4:], 0x0000)  // sign (positive)
-	binary.BigEndian.PutUint16(data[6:], 2)       // dscale
-	binary.BigEndian.PutUint16(data[8:], 99)      // digit[0]
-	binary.BigEndian.PutUint16(data[10:], 9900)   // digit[1]
+	binary.BigEndian.PutUint16(data[2:], 0)      // weight
+	binary.BigEndian.PutUint16(data[4:], 0x0000) // sign (positive)
+	binary.BigEndian.PutUint16(data[6:], 2)      // dscale
+	binary.BigEndian.PutUint16(data[8:], 99)     // digit[0]
+	binary.BigEndian.PutUint16(data[10:], 9900)  // digit[1]
 
 	result, err := decodeNumeric(data)
 	if err != nil {
@@ -1361,8 +1365,8 @@ func TestDecodeTimestampAncient(t *testing.T) {
 	// Bug 8: timestamps before ~1700 were corrupted due to time.Duration overflow.
 	// This test verifies the fix works for ancient dates.
 	tests := []struct {
-		name     string
-		input    time.Time
+		name  string
+		input time.Time
 	}{
 		{"2024-01-15", time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)},
 		{"1970-01-01", time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)},
@@ -1407,7 +1411,7 @@ func TestEncodeJSON(t *testing.T) {
 		{"boolean true", true, "true"},
 		{"boolean false", false, "false"},
 		{"null", nil, "null"},
-		{"object", map[string]interface{}{"name": "Alice", "age": float64(30)}, ""},  // checked separately
+		{"object", map[string]interface{}{"name": "Alice", "age": float64(30)}, ""}, // checked separately
 		{"array", []interface{}{float64(1), float64(2), float64(3)}, "[1,2,3]"},
 	}
 

@@ -1392,7 +1392,7 @@ func (e *queryErrorExecutor) PingContext(context.Context) error {
 func (e *queryErrorExecutor) Close() error { return nil }
 
 type abortedSelectRecoveryExecutor struct {
-	queryCalls    int
+	queryCalls int
 	noopProfiling
 	rollbackCalls int
 }
@@ -1434,9 +1434,9 @@ func (e *abortedSelectRecoveryExecutor) Close() error { return nil }
 type abortedExecAlterViewRecoveryExecutor struct {
 	originalQuery string
 	noopProfiling
-	rewritten     string
-	execCalls     []string
-	execCtxCalls  []string
+	rewritten    string
+	execCalls    []string
+	execCtxCalls []string
 }
 
 func (e *abortedExecAlterViewRecoveryExecutor) execResult(query string, callIndex int) (ExecResult, error) {
@@ -1487,7 +1487,7 @@ func (e *abortedExecAlterViewRecoveryExecutor) Close() error { return nil }
 type abortedAlterViewRecoveryExecutor struct {
 	execContextQueries []string
 	noopProfiling
-	execQueries        []string
+	execQueries []string
 }
 
 func (e *abortedAlterViewRecoveryExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {

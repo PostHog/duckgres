@@ -13,10 +13,10 @@ type (
 )
 
 var (
-	NewRateLimiter             = auth.NewRateLimiter
-	DefaultRateLimitConfig     = auth.DefaultRateLimitConfig
+	NewRateLimiter              = auth.NewRateLimiter
+	DefaultRateLimitConfig      = auth.DefaultRateLimitConfig
 	BeginRateLimitedAuthAttempt = auth.BeginRateLimitedAuthAttempt
-	RecordFailedAuthAttempt    = auth.RecordFailedAuthAttempt
+	RecordFailedAuthAttempt     = auth.RecordFailedAuthAttempt
 	RecordSuccessfulAuthAttempt = auth.RecordSuccessfulAuthAttempt
-	ValidateUserPassword       = auth.ValidateUserPassword
+	ValidateUserPassword        = auth.ValidateUserPassword
 )

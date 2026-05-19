@@ -71,13 +71,13 @@ func TestExecuteQueryDirectPassthroughPreservesUse(t *testing.T) {
 	}, nil)
 
 	c := &clientConn{
-		server:     server,
-		conn:       stubConn{},
-		reader:     bufio.NewReader(bytes.NewBufferString("x")),
-		writer:     bufio.NewWriter(io.Discard),
-		executor:   exec,
-		passthrough:true,
-		database:   "test",
+		server:      server,
+		conn:        stubConn{},
+		reader:      bufio.NewReader(bytes.NewBufferString("x")),
+		writer:      bufio.NewWriter(io.Discard),
+		executor:    exec,
+		passthrough: true,
+		database:    "test",
 	}
 
 	if err := c.executeQueryDirect("USE test", "USE"); err != nil {
