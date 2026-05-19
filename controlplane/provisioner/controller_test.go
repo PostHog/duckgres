@@ -4,6 +4,8 @@ package provisioner
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -41,10 +43,10 @@ func (s *fakeStore) ListWarehousesByStates(states []configstore.ManagedWarehouse
 func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore.ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	w, ok := s.warehouses[orgID]
 	if !ok {
-		return nil
+		return fmt.Errorf("warehouse %q: %w", orgID, configstore.ErrWarehouseStateMismatch)
 	}
 	if w.State != expectedState {
-		return nil
+		return fmt.Errorf("warehouse %q expected %q got %q: %w", orgID, expectedState, w.State, configstore.ErrWarehouseStateMismatch)
 	}
 	for k, v := range updates {
 		switch k {
@@ -751,12 +753,13 @@ func TestFakeStoreUpdateWarehouseState(t *testing.T) {
 		t.Fatalf("expected provisioning state, got %q", fs.warehouses["org-x"].State)
 	}
 
-	// CAS update with wrong expected state should be no-op
+	// CAS update with wrong expected state should return ErrWarehouseStateMismatch
+	// and leave the row unchanged.
 	err = fs.UpdateWarehouseState("org-x", configstore.ManagedWarehouseStatePending, map[string]interface{}{
 		"state": configstore.ManagedWarehouseStateFailed,
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, configstore.ErrWarehouseStateMismatch) {
+		t.Fatalf("expected ErrWarehouseStateMismatch, got: %v", err)
 	}
 	if fs.warehouses["org-x"].State != configstore.ManagedWarehouseStateProvisioning {
 		t.Fatalf("expected state to remain provisioning, got %q", fs.warehouses["org-x"].State)

@@ -5,6 +5,7 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -212,28 +213,9 @@ func TestEnsureForOrg_BootstrapTimeoutReturnsTransient(t *testing.T) {
 			StaticAccessKeyID: "minioadmin", StaticAccessKeySecret: "minioadmin",
 		},
 	})
-	if err == nil {
-		t.Fatal("expected ErrBootstrapPending")
-	}
-	// Use errors.Is so wrapped errors also match.
-	if !isErrBootstrap(err) {
+	if !errors.Is(err, ErrBootstrapPending) {
 		t.Fatalf("expected ErrBootstrapPending, got: %v", err)
 	}
-}
-
-func isErrBootstrap(err error) bool {
-	for cur := err; cur != nil; {
-		if cur == ErrBootstrapPending {
-			return true
-		}
-		type u interface{ Unwrap() error }
-		if v, ok := cur.(u); ok {
-			cur = v.Unwrap()
-			continue
-		}
-		break
-	}
-	return false
 }
 
 func TestEnsureForOrg_RejectsInvalidInputs(t *testing.T) {
@@ -254,6 +236,57 @@ func TestEnsureForOrg_RejectsInvalidInputs(t *testing.T) {
 				t.Errorf("expected validation error for %s", name)
 			}
 		})
+	}
+}
+
+// TestEnsureForOrg_StateMismatchIsBenign covers the case where the warehouse
+// row transitions out of the expected state between when the caller fetched
+// w and when EnsureForOrg's persist step runs. The Lakekeeper resources are
+// provisioned; the persist step fails the CAS; EnsureForOrg returns nil so
+// the next reconcile iteration can retry with the fresh state.
+func TestEnsureForOrg_StateMismatchIsBenign(t *testing.T) {
+	dsn := os.Getenv("PG_ADMIN_DSN")
+	if dsn == "" {
+		t.Skip("PG_ADMIN_DSN not set")
+	}
+	c, _, _ := newFakeLakekeeperClient()
+	fake := newFakeLakekeeperServer(t)
+	store := newFakeProvisionerStore("cas-test", configstore.ManagedWarehouseStateProvisioning)
+	// Caller's view of the warehouse, with stale state.
+	staleW := &configstore.ManagedWarehouse{
+		OrgID: "cas-test",
+		State: configstore.ManagedWarehouseStateProvisioning,
+	}
+	// Simulate concurrent transition: the actual row is now `ready`.
+	store.warehouses["cas-test"].State = configstore.ManagedWarehouseStateReady
+
+	if err := c.EnsureCR(context.Background(), LakekeeperCRSpec{
+		OrgID: "cas-test", Image: "stub", PGHost: "stub", PGDatabase: "stub", SecretName: "stub", BaseURI: "http://stub",
+	}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+	markBootstrapped(t, c, "cas-test")
+
+	p := NewLakekeeperProvisioner(store, c,
+		WithBootstrapTimeout(2*time.Second),
+		WithClientFactory(func(string) *LakekeeperClient { return NewLakekeeperClient(fake.srv.URL) }),
+	)
+	t.Cleanup(func() { dropDatabase(t, dsn, "lakekeeper_castest") })
+
+	err := p.EnsureForOrg(context.Background(), staleW, ProvisioningInputs{
+		AdminDSN: dsn, PGHost: "localhost", PGPort: 5434,
+		S3: S3StorageConfig{
+			Bucket: "warehouse", KeyPrefix: "cas-test", Region: "us-east-1", Flavor: "s3-compat",
+			StaticAccessKeyID: "minioadmin", StaticAccessKeySecret: "minioadmin",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected nil on benign CAS mismatch, got: %v", err)
+	}
+	// Lakekeeper-side write should have happened (warehouse created) even
+	// though the row update was skipped.
+	if len(fake.warehouses) != 1 {
+		t.Errorf("warehouse create count = %d, want 1", len(fake.warehouses))
 	}
 }
 

@@ -225,7 +225,16 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		"iceberg_state": configstore.ManagedWarehouseStateReady,
 	}
 	_ = creds // creds are written into the Secret; the row only references them
-	if err := p.store.UpdateWarehouseState(w.OrgID, w.State, updates); err != nil {
+	err = p.store.UpdateWarehouseState(w.OrgID, w.State, updates)
+	if err != nil {
+		// Another writer (e.g. the top-level Duckling state machine)
+		// transitioned the row out from under us between when the caller
+		// fetched w and now. The Lakekeeper resources are already
+		// provisioned — the next reconcile loop iteration will retry
+		// the persist step with the fresh state. Not fatal.
+		if errors.Is(err, configstore.ErrWarehouseStateMismatch) {
+			return nil
+		}
 		return fmt.Errorf("persist lakekeeper config: %w", err)
 	}
 	return nil
@@ -234,9 +243,15 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 // waitForBootstrap polls the Lakekeeper CR status until bootstrappedAt is
 // non-empty or the configured timeout elapses. Returns ErrBootstrapPending on
 // timeout so the caller can requeue.
+//
+// Uses a single time.Timer reused across iterations rather than time.After,
+// which would allocate a fresh timer channel per poll (a minor leak that
+// accumulates over the bootstrap window).
 func (p *LakekeeperProvisioner) waitForBootstrap(ctx context.Context, orgID string) error {
 	deadline := time.Now().Add(p.bootstrapTimeout)
 	const pollInterval = 500 * time.Millisecond
+	t := time.NewTimer(pollInterval)
+	defer t.Stop()
 	for {
 		st, err := p.k8s.GetCR(ctx, orgID)
 		if err != nil {
@@ -248,10 +263,11 @@ func (p *LakekeeperProvisioner) waitForBootstrap(ctx context.Context, orgID stri
 		if time.Now().After(deadline) {
 			return ErrBootstrapPending
 		}
+		t.Reset(pollInterval)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(pollInterval):
+		case <-t.C:
 		}
 	}
 }
@@ -281,18 +297,18 @@ func (p *LakekeeperProvisioner) resolveOrGenerateSecret(ctx context.Context, org
 	return data, nil
 }
 
+// secretFromExisting decodes the per-org Secret keys back into a typed
+// value. Reads only from Data — the K8s API server clears StringData on
+// read and base64-decodes everything into Data, so checking StringData
+// first would be dead code in production. The fake clientset echoes
+// StringData back; assertSecretData in the unit tests covers both, so
+// coverage is unchanged.
 func secretFromExisting(s *corev1.Secret) LakekeeperSecretData {
-	get := func(k string) string {
-		if v, ok := s.StringData[k]; ok {
-			return v
-		}
-		return string(s.Data[k])
-	}
 	return LakekeeperSecretData{
-		DBUser:             get(SecretKeyDBUser),
-		DBPassword:         get(SecretKeyDBPassword),
-		EncryptionKey:      get(SecretKeyEncryptionKey),
-		OAuth2ClientSecret: get(SecretKeyOAuth2ClientSecret),
+		DBUser:             string(s.Data[SecretKeyDBUser]),
+		DBPassword:         string(s.Data[SecretKeyDBPassword]),
+		EncryptionKey:      string(s.Data[SecretKeyEncryptionKey]),
+		OAuth2ClientSecret: string(s.Data[SecretKeyOAuth2ClientSecret]),
 	}
 }
 

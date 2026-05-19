@@ -408,6 +408,13 @@ func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvision
 
 // UpdateWarehouseState performs a compare-and-swap update on a warehouse row.
 // Only updates if the current state matches expectedState, preventing races.
+// ErrWarehouseStateMismatch is returned (wrapped) by UpdateWarehouseState
+// when the CAS guard fails — the row is missing or no longer in the
+// expected state. Callers that want to treat that as benign (because
+// another writer has already advanced the state machine) can detect via
+// errors.Is(err, configstore.ErrWarehouseStateMismatch).
+var ErrWarehouseStateMismatch = errors.New("warehouse not in expected state")
+
 func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	result := cs.db.Model(&ManagedWarehouse{}).
 		Where("org_id = ? AND state = ?", orgID, expectedState).
@@ -416,7 +423,7 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("update warehouse state: %w", result.Error)
 	}
 	if result.RowsAffected == 0 {
-		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
+		return fmt.Errorf("warehouse %q expected state %q: %w", orgID, expectedState, ErrWarehouseStateMismatch)
 	}
 	return nil
 }
