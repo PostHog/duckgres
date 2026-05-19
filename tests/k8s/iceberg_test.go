@@ -254,8 +254,22 @@ func seedIcebergTenantFixture(cfg icebergTestConfig) error {
 // iceberg-test org + warehouse + user. Mirrors the column set used by
 // k8s/kind/config-store.seed.sql and tenant-isolation.seed.sql; diverges
 // only where iceberg matters (iceberg_enabled, table bucket ARN/region,
-// state='ready' so the activator doesn't wait on the provisioner) and in
-// the S3 endpoint (real AWS regional endpoint instead of MinIO).
+// state='ready' so the activator doesn't wait on the provisioner), in
+// the S3 endpoint (real AWS regional endpoint instead of MinIO), and in
+// having s3_delta_catalog_enabled = false.
+//
+// Why disable Delta: ManagedWarehouseS3.DeltaCatalogEnabled defaults to
+// true (GORM `default:true` on the column), and during activation the
+// worker runs a `_delta_log/_last_checkpoint` probe via the DuckDB
+// delta extension to discover whether the catalog exists. On this
+// tenant the probe issues a GET that resolves to a URL whose bucket
+// segment isn't the tenant's data bucket — first observed as a
+// 403 against `https://s3.us-east-1.amazonaws.com/orgs/delta/_delta_log/_last_checkpoint`
+// despite the IAM role granting s3:GetObject on the data bucket. The
+// iceberg integration test doesn't need Delta (it tests
+// iceberg-on-S3-Tables + DuckLake only), so we turn the probe off
+// rather than chase the URL-construction bug here. Re-enable + chase
+// the underlying delta path bug when this test grows a delta scenario.
 func buildIcebergConfigStoreSeed(cfg icebergTestConfig) string {
 	return fmt.Sprintf(`
 INSERT INTO duckgres_orgs (name, database_name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
@@ -269,6 +283,7 @@ INSERT INTO duckgres_managed_warehouses (
     metadata_store_kind, metadata_store_engine, metadata_store_region,
     metadata_store_endpoint, metadata_store_port, metadata_store_database_name, metadata_store_username,
     s3_provider, s3_region, s3_bucket, s3_path_prefix, s3_endpoint, s3_use_ssl, s3_url_style,
+    s3_delta_catalog_enabled,
     iceberg_enabled, iceberg_table_bucket_arn, iceberg_region, iceberg_namespace,
     worker_identity_namespace, worker_identity_service_account_name, worker_identity_iam_role_arn,
     warehouse_database_credentials_namespace, warehouse_database_credentials_name, warehouse_database_credentials_key,
@@ -290,6 +305,7 @@ INSERT INTO duckgres_managed_warehouses (
     'duckgres-local-ducklake-metadata', 5432, 'ducklake_metadata_iceberg', 'ducklake',
     'aws', '%s', '%s', 'orgs/iceberg-test/',
     's3.%s.amazonaws.com', true, 'vhost',
+    false,
     true, '%s', '%s', '%s',
     'duckgres', 'duckgres-local-worker', 'arn:aws:iam::000000000000:role/duckgres-iceberg-test',
     'duckgres', 'iceberg-test-warehouse-db', 'dsn',
@@ -307,6 +323,7 @@ INSERT INTO duckgres_managed_warehouses (
     s3_endpoint = EXCLUDED.s3_endpoint,
     s3_use_ssl = EXCLUDED.s3_use_ssl,
     s3_url_style = EXCLUDED.s3_url_style,
+    s3_delta_catalog_enabled = EXCLUDED.s3_delta_catalog_enabled,
     iceberg_enabled = EXCLUDED.iceberg_enabled,
     iceberg_table_bucket_arn = EXCLUDED.iceberg_table_bucket_arn,
     iceberg_region = EXCLUDED.iceberg_region,
