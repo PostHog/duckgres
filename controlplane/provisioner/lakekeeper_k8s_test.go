@@ -80,13 +80,7 @@ func TestEnsureSecret_CreateThenUpdate(t *testing.T) {
 
 func assertSecretData(t *testing.T, s *corev1.Secret, want LakekeeperSecretData) {
 	t.Helper()
-	// kubefake honors StringData by populating Data with the same bytes.
-	get := func(k string) string {
-		if v, ok := s.StringData[k]; ok {
-			return v
-		}
-		return string(s.Data[k])
-	}
+	get := func(k string) string { return string(s.Data[k]) }
 	if get(SecretKeyDBUser) != want.DBUser {
 		t.Errorf("db-user = %q, want %q", get(SecretKeyDBUser), want.DBUser)
 	}

@@ -16,6 +16,13 @@ import (
 type WarehouseStore interface {
 	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
 	UpdateWarehouseState(orgID string, expectedState configstore.ManagedWarehouseProvisioningState, updates map[string]interface{}) error
+	// UpdateIcebergConfig writes per-org Iceberg/Lakekeeper config without
+	// CAS'ing on the top-level warehouse state. The Lakekeeper provisioner
+	// uses this because Iceberg provisioning runs in parallel with the
+	// top-level Duckling state machine — by the time we're ready to persist
+	// the Lakekeeper endpoint, the warehouse may already have transitioned
+	// to Ready, and a state-CAS update would silently no-op.
+	UpdateIcebergConfig(orgID string, updates map[string]interface{}) error
 }
 
 // Controller polls the config store for actionable warehouses and reconciles

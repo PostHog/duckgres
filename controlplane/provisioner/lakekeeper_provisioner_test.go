@@ -12,7 +12,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,7 +108,6 @@ func TestEnsureForOrg_HappyPath_Fakes(t *testing.T) {
 	store := newFakeProvisionerStore("acme", configstore.ManagedWarehouseStateProvisioning)
 	p := NewLakekeeperProvisioner(store, c,
 		WithImage("img:test"),
-		WithBootstrapTimeout(2*time.Second),
 		WithClientFactory(func(baseURL string) *LakekeeperClient {
 			// Redirect "in-cluster" base URL to the fake test server.
 			return NewLakekeeperClient(fake.srv.URL)
@@ -194,16 +192,17 @@ func TestEnsureForOrg_HappyPath_Fakes(t *testing.T) {
 	}
 }
 
-func TestEnsureForOrg_BootstrapTimeoutReturnsTransient(t *testing.T) {
+// EnsureForOrg returns ErrBootstrapPending when the operator hasn't yet
+// flipped status.bootstrappedAt — caller (the warehouse-reconcile loop)
+// is responsible for requeueing without blocking other orgs.
+func TestEnsureForOrg_NotBootstrappedReturnsTransient(t *testing.T) {
 	dsn := os.Getenv("PG_ADMIN_DSN")
 	if dsn == "" {
 		t.Skip("PG_ADMIN_DSN not set")
 	}
 	c, _, _ := newFakeLakekeeperClient()
 	store := newFakeProvisionerStore("acme2", configstore.ManagedWarehouseStateProvisioning)
-	p := NewLakekeeperProvisioner(store, c,
-		WithBootstrapTimeout(200*time.Millisecond), // short
-	)
+	p := NewLakekeeperProvisioner(store, c)
 	t.Cleanup(func() { dropDatabase(t, dsn, "lakekeeper_acme2") })
 
 	err := p.EnsureForOrg(context.Background(), store.warehouses["acme2"], ProvisioningInputs{
@@ -239,54 +238,51 @@ func TestEnsureForOrg_RejectsInvalidInputs(t *testing.T) {
 	}
 }
 
-// TestEnsureForOrg_StateMismatchIsBenign covers the case where the warehouse
-// row transitions out of the expected state between when the caller fetched
-// w and when EnsureForOrg's persist step runs. The Lakekeeper resources are
-// provisioned; the persist step fails the CAS; EnsureForOrg returns nil so
-// the next reconcile iteration can retry with the fresh state.
-func TestEnsureForOrg_StateMismatchIsBenign(t *testing.T) {
+// TestEnsureForOrg_PersistsAfterTopLevelStateMoved covers the case where
+// the warehouse row's top-level state has already transitioned to Ready
+// (e.g. the Duckling controller moved it ahead of us). The new persist
+// path uses UpdateIcebergConfig which doesn't CAS on top-level state, so
+// Lakekeeper config still lands.
+func TestEnsureForOrg_PersistsAfterTopLevelStateMoved(t *testing.T) {
 	dsn := os.Getenv("PG_ADMIN_DSN")
 	if dsn == "" {
 		t.Skip("PG_ADMIN_DSN not set")
 	}
 	c, _, _ := newFakeLakekeeperClient()
 	fake := newFakeLakekeeperServer(t)
-	store := newFakeProvisionerStore("cas-test", configstore.ManagedWarehouseStateProvisioning)
-	// Caller's view of the warehouse, with stale state.
+	store := newFakeProvisionerStore("ready-test", configstore.ManagedWarehouseStateProvisioning)
+	// Simulate the Duckling state machine racing ahead.
+	store.warehouses["ready-test"].State = configstore.ManagedWarehouseStateReady
+	// Caller's snapshot of w is stale.
 	staleW := &configstore.ManagedWarehouse{
-		OrgID: "cas-test",
+		OrgID: "ready-test",
 		State: configstore.ManagedWarehouseStateProvisioning,
 	}
-	// Simulate concurrent transition: the actual row is now `ready`.
-	store.warehouses["cas-test"].State = configstore.ManagedWarehouseStateReady
 
 	if err := c.EnsureCR(context.Background(), LakekeeperCRSpec{
-		OrgID: "cas-test", Image: "stub", PGHost: "stub", PGDatabase: "stub", SecretName: "stub", BaseURI: "http://stub",
+		OrgID: "ready-test", Image: "stub", PGHost: "stub", PGDatabase: "stub", SecretName: "stub", BaseURI: "http://stub",
 	}); err != nil {
 		t.Fatalf("seed CR: %v", err)
 	}
-	markBootstrapped(t, c, "cas-test")
+	markBootstrapped(t, c, "ready-test")
 
 	p := NewLakekeeperProvisioner(store, c,
-		WithBootstrapTimeout(2*time.Second),
 		WithClientFactory(func(string) *LakekeeperClient { return NewLakekeeperClient(fake.srv.URL) }),
 	)
-	t.Cleanup(func() { dropDatabase(t, dsn, "lakekeeper_castest") })
+	t.Cleanup(func() { dropDatabase(t, dsn, "lakekeeper_readytest") })
 
 	err := p.EnsureForOrg(context.Background(), staleW, ProvisioningInputs{
 		AdminDSN: dsn, PGHost: "localhost", PGPort: 5434,
 		S3: S3StorageConfig{
-			Bucket: "warehouse", KeyPrefix: "cas-test", Region: "us-east-1", Flavor: "s3-compat",
+			Bucket: "warehouse", KeyPrefix: "ready-test", Region: "us-east-1", Flavor: "s3-compat",
 			StaticAccessKeyID: "minioadmin", StaticAccessKeySecret: "minioadmin",
 		},
 	})
 	if err != nil {
-		t.Fatalf("expected nil on benign CAS mismatch, got: %v", err)
+		t.Fatalf("expected nil, got: %v", err)
 	}
-	// Lakekeeper-side write should have happened (warehouse created) even
-	// though the row update was skipped.
-	if len(fake.warehouses) != 1 {
-		t.Errorf("warehouse create count = %d, want 1", len(fake.warehouses))
+	if w := store.warehouses["ready-test"]; w.Iceberg.LakekeeperEndpoint == "" {
+		t.Errorf("expected LakekeeperEndpoint persisted even though top-level state was Ready")
 	}
 }
 

@@ -415,6 +415,32 @@ func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvision
 // errors.Is(err, configstore.ErrWarehouseStateMismatch).
 var ErrWarehouseStateMismatch = errors.New("warehouse not in expected state")
 
+// ErrWarehouseNotFound is returned by row-targeted updates when the orgID
+// has no row in duckgres_managed_warehouses.
+var ErrWarehouseNotFound = errors.New("warehouse not found")
+
+// UpdateIcebergConfig writes the supplied column updates to the org's
+// warehouse row without CAS'ing on the top-level state. Used by the
+// Lakekeeper provisioner — Iceberg sub-state runs in parallel with the
+// main warehouse state machine, so persisting the Lakekeeper endpoint
+// after a top-level state transition shouldn't silently no-op.
+//
+// Caller-side discipline: the updates map should only contain
+// iceberg_* columns. Untyped to keep the controller's WarehouseStore
+// interface independent of the column list.
+func (cs *ConfigStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
+	result := cs.db.Model(&ManagedWarehouse{}).
+		Where("org_id = ?", orgID).
+		Updates(updates)
+	if result.Error != nil {
+		return fmt.Errorf("update iceberg config: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("warehouse %q: %w", orgID, ErrWarehouseNotFound)
+	}
+	return nil
+}
+
 func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	result := cs.db.Model(&ManagedWarehouse{}).
 		Where("org_id = ? AND state = ?", orgID, expectedState).

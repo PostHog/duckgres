@@ -38,6 +38,10 @@ metadata:
   name: lakekeeper-ingress-from-duckgres-workers
   namespace: lakekeeper
 spec:
+  # `app.kubernetes.io/name: lakekeeper` is what the lakekeeper-operator
+  # stamps on its Deployment pods (see operator's getLabels). The CR and
+  # the K8s Secret we create alongside it use `app: lakekeeper`, but
+  # those are non-pod objects so they don't intersect with this selector.
   podSelector:
     matchLabels:
       app.kubernetes.io/name: lakekeeper

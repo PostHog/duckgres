@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	corev1 "k8s.io/api/core/v1"
@@ -28,11 +27,10 @@ import (
 // caller so the provisioner doesn't bake in secret-lookup logic — PR2 wiring
 // will compute them from the Duckling CR status + K8s Secrets.
 type LakekeeperProvisioner struct {
-	store            WarehouseStore
-	k8s              *LakekeeperK8sClient
-	image            string
-	bootstrapTimeout time.Duration
-	clientFor        ClientFactory
+	store     WarehouseStore
+	k8s       *LakekeeperK8sClient
+	image     string
+	clientFor ClientFactory
 }
 
 // ClientFactory builds a LakekeeperClient for a base URL. Lets tests inject
@@ -83,13 +81,6 @@ func WithImage(img string) LakekeeperProvisionerOption {
 	return func(p *LakekeeperProvisioner) { p.image = img }
 }
 
-// WithBootstrapTimeout sets the max wait for status.bootstrappedAt.
-// Default 30s — the operator's bootstrap typically completes in <10s once
-// the Deployment is ready.
-func WithBootstrapTimeout(d time.Duration) LakekeeperProvisionerOption {
-	return func(p *LakekeeperProvisioner) { p.bootstrapTimeout = d }
-}
-
 // WithClientFactory overrides how LakekeeperClient instances are built.
 // Tests use this to point at httptest.Server.
 func WithClientFactory(f ClientFactory) LakekeeperProvisionerOption {
@@ -105,11 +96,10 @@ const DefaultLakekeeperImage = "quay.io/lakekeeper/catalog:0.11.6"
 // same interface the existing controller uses for persistence.
 func NewLakekeeperProvisioner(store WarehouseStore, k8s *LakekeeperK8sClient, opts ...LakekeeperProvisionerOption) *LakekeeperProvisioner {
 	p := &LakekeeperProvisioner{
-		store:            store,
-		k8s:              k8s,
-		image:            DefaultLakekeeperImage,
-		bootstrapTimeout: 30 * time.Second,
-		clientFor:        NewLakekeeperClient,
+		store:     store,
+		k8s:       k8s,
+		image:     DefaultLakekeeperImage,
+		clientFor: NewLakekeeperClient,
 	}
 	for _, o := range opts {
 		o(p)
@@ -156,6 +146,15 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		return fmt.Errorf("ensure lakekeeper secret: %w", err)
 	}
 
+	// 2b. Ensure the Postgres role exists with the password matching the
+	// Secret. A freshly-created database has no users by default; without
+	// this, the Lakekeeper pod's CreateAdminUser-style startup would fail
+	// with "role does not exist". EnsureRole is idempotent and rotates the
+	// password to match the Secret on re-runs.
+	if err := EnsureRole(ctx, in.AdminDSN, creds.DBUser, creds.DBPassword, dbName); err != nil {
+		return fmt.Errorf("ensure lakekeeper pg role: %w", err)
+	}
+
 	// 3. Apply the Lakekeeper CR pointing at the org's PG + the Secret.
 	pgPort := in.PGPort
 	if pgPort == 0 {
@@ -174,10 +173,10 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		return fmt.Errorf("ensure lakekeeper cr: %w", err)
 	}
 
-	// 4. Wait for the operator to mark bootstrap complete. We don't drive
-	// bootstrap from here — `spec.bootstrap.enabled=true` on the CR tells
-	// the operator to do it, and status.bootstrappedAt flips when done.
-	if err := p.waitForBootstrap(ctx, w.OrgID); err != nil {
+	// 4. Check whether the operator has marked bootstrap complete. If not,
+	// return ErrBootstrapPending so the outer reconcile loop can requeue
+	// without blocking other orgs.
+	if err := p.checkBootstrap(ctx, w.OrgID); err != nil {
 		return err
 	}
 
@@ -225,51 +224,29 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		"iceberg_state": configstore.ManagedWarehouseStateReady,
 	}
 	_ = creds // creds are written into the Secret; the row only references them
-	err = p.store.UpdateWarehouseState(w.OrgID, w.State, updates)
-	if err != nil {
-		// Another writer (e.g. the top-level Duckling state machine)
-		// transitioned the row out from under us between when the caller
-		// fetched w and now. The Lakekeeper resources are already
-		// provisioned — the next reconcile loop iteration will retry
-		// the persist step with the fresh state. Not fatal.
-		if errors.Is(err, configstore.ErrWarehouseStateMismatch) {
-			return nil
-		}
+	if err := p.store.UpdateIcebergConfig(w.OrgID, updates); err != nil {
 		return fmt.Errorf("persist lakekeeper config: %w", err)
 	}
 	return nil
 }
 
-// waitForBootstrap polls the Lakekeeper CR status until bootstrappedAt is
-// non-empty or the configured timeout elapses. Returns ErrBootstrapPending on
-// timeout so the caller can requeue.
-//
-// Uses a single time.Timer reused across iterations rather than time.After,
-// which would allocate a fresh timer channel per poll (a minor leak that
-// accumulates over the bootstrap window).
-func (p *LakekeeperProvisioner) waitForBootstrap(ctx context.Context, orgID string) error {
-	deadline := time.Now().Add(p.bootstrapTimeout)
-	const pollInterval = 500 * time.Millisecond
-	t := time.NewTimer(pollInterval)
-	defer t.Stop()
-	for {
-		st, err := p.k8s.GetCR(ctx, orgID)
-		if err != nil {
-			return fmt.Errorf("get lakekeeper cr status: %w", err)
-		}
-		if st != nil && st.Bootstrapped {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return ErrBootstrapPending
-		}
-		t.Reset(pollInterval)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
-		}
+// checkBootstrap reads the Lakekeeper CR status once. Returns nil when
+// bootstrappedAt is non-empty, ErrBootstrapPending otherwise. The caller —
+// typically the warehouse-reconcile loop — is responsible for requeueing on
+// ErrBootstrapPending. We intentionally don't poll here: the outer loop
+// iterates over many orgs per tick, and a per-org sleep would stall every
+// other org behind a slow bootstrap. The operator's bootstrap typically
+// completes in <10s once the Deployment is ready, well within a normal
+// reconcile cadence.
+func (p *LakekeeperProvisioner) checkBootstrap(ctx context.Context, orgID string) error {
+	st, err := p.k8s.GetCR(ctx, orgID)
+	if err != nil {
+		return fmt.Errorf("get lakekeeper cr status: %w", err)
 	}
+	if st == nil || !st.Bootstrapped {
+		return ErrBootstrapPending
+	}
+	return nil
 }
 
 // resolveOrGenerateSecret reads the existing per-org Secret if present, or
@@ -287,8 +264,8 @@ func (p *LakekeeperProvisioner) resolveOrGenerateSecret(ctx context.Context, org
 	// Generate fresh credentials.
 	data := LakekeeperSecretData{
 		DBUser:             dbName, // Lakekeeper connects as a role named after its DB
-		DBPassword:         mustRandomHex(16),
-		EncryptionKey:      mustRandomHex(16),
+		DBPassword:         mustRandomHex(32),
+		EncryptionKey:      mustRandomHex(32), // 32 bytes ⇒ 64 hex chars; safely covers any 256-bit key expectation
 		OAuth2ClientSecret: mustRandomHex(32),
 	}
 	if err := p.k8s.EnsureSecret(ctx, orgID, data); err != nil {

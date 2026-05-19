@@ -150,9 +150,20 @@ type ManagedWarehouseIceberg struct {
 
 	// Lakekeeper fields (Backend == "lakekeeper"). Populated by the
 	// provisioner after the per-org Lakekeeper is ready.
-	LakekeeperEndpoint        string `gorm:"size:512" json:"lakekeeper_endpoint,omitempty"`
+	LakekeeperEndpoint string `gorm:"size:512" json:"lakekeeper_endpoint,omitempty"`
+
+	// LakekeeperWarehouse is the warehouse NAME (e.g. "org-acme"), not the
+	// UUID. Iceberg REST clients pass this as the `warehouse` parameter to
+	// /v1/config and the server returns the UUID as a prefix for subsequent
+	// calls. PR2's worker-side ATTACH SQL uses this value directly.
 	LakekeeperWarehouse       string `gorm:"size:128" json:"lakekeeper_warehouse,omitempty"`
 	LakekeeperClientID        string `gorm:"size:128" json:"lakekeeper_client_id,omitempty"`
+
+	// LakekeeperOAuth2ServerURI is the OAuth2 token endpoint URI for the
+	// duckling-side CREATE SECRET. Empty during PR1 (allowall mode);
+	// populated by PR3 once OIDC SA-token auth is wired. PR2 worker code
+	// must guard against empty and either skip the OAuth2 fields on the
+	// CREATE SECRET statement or emit a different secret shape.
 	LakekeeperOAuth2ServerURI string `gorm:"size:512" json:"lakekeeper_oauth2_server_uri,omitempty"`
 
 	// LakekeeperClientCredentials holds the OAuth2 client_secret used by

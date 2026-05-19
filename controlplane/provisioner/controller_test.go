@@ -122,6 +122,46 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 	return nil
 }
 
+// UpdateIcebergConfig writes per-org Iceberg/Lakekeeper fields without a
+// top-level state CAS. Mirrors the real configstore method's contract.
+func (s *fakeStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
+	w, ok := s.warehouses[orgID]
+	if !ok {
+		return fmt.Errorf("warehouse %q: %w", orgID, configstore.ErrWarehouseNotFound)
+	}
+	for k, v := range updates {
+		switch k {
+		case "iceberg_enabled":
+			w.Iceberg.Enabled = v.(bool)
+		case "iceberg_backend":
+			w.Iceberg.Backend = v.(string)
+		case "iceberg_namespace":
+			w.Iceberg.Namespace = v.(string)
+		case "iceberg_region":
+			w.Iceberg.Region = v.(string)
+		case "iceberg_table_bucket_arn":
+			w.Iceberg.TableBucketArn = v.(string)
+		case "iceberg_state":
+			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
+		case "iceberg_lakekeeper_endpoint":
+			w.Iceberg.LakekeeperEndpoint = v.(string)
+		case "iceberg_lakekeeper_warehouse":
+			w.Iceberg.LakekeeperWarehouse = v.(string)
+		case "iceberg_lakekeeper_client_id":
+			w.Iceberg.LakekeeperClientID = v.(string)
+		case "iceberg_lakekeeper_oauth2_server_uri":
+			w.Iceberg.LakekeeperOAuth2ServerURI = v.(string)
+		case "iceberg_lakekeeper_client_credentials_namespace":
+			w.Iceberg.LakekeeperClientCredentials.Namespace = v.(string)
+		case "iceberg_lakekeeper_client_credentials_name":
+			w.Iceberg.LakekeeperClientCredentials.Name = v.(string)
+		case "iceberg_lakekeeper_client_credentials_key":
+			w.Iceberg.LakekeeperClientCredentials.Key = v.(string)
+		}
+	}
+	return nil
+}
+
 // Compile-time check that fakeStore satisfies WarehouseStore.
 var _ WarehouseStore = (*fakeStore)(nil)
 

@@ -124,6 +124,12 @@ func (c *LakekeeperK8sClient) EnsureSecret(ctx context.Context, orgID string, da
 		return fmt.Errorf("EnsureSecret: orgID %q is not a valid K8s label value", orgID)
 	}
 	name := LakekeeperResourceName(orgID)
+	// Write to Data (bytes) rather than StringData (strings). The K8s API
+	// server converts StringData → Data on write and clears StringData on
+	// read, so production code that reads the Secret only ever sees Data
+	// populated. The dynamic-fake clientset doesn't do that conversion, so
+	// writing Data directly makes the fake's behavior match real K8s for
+	// downstream readers like secretFromExisting.
 	desired := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -134,11 +140,11 @@ func (c *LakekeeperK8sClient) EnsureSecret(ctx context.Context, orgID string, da
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
-		StringData: map[string]string{
-			SecretKeyDBUser:             data.DBUser,
-			SecretKeyDBPassword:         data.DBPassword,
-			SecretKeyEncryptionKey:      data.EncryptionKey,
-			SecretKeyOAuth2ClientSecret: data.OAuth2ClientSecret,
+		Data: map[string][]byte{
+			SecretKeyDBUser:             []byte(data.DBUser),
+			SecretKeyDBPassword:         []byte(data.DBPassword),
+			SecretKeyEncryptionKey:      []byte(data.EncryptionKey),
+			SecretKeyOAuth2ClientSecret: []byte(data.OAuth2ClientSecret),
 		},
 	}
 
