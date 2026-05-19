@@ -48,6 +48,28 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to load K8s test environment: %v", err)
 	}
 	namespace = testEnv.Namespace
+
+	// SAFETY: kubeconfig must be loaded, parsed, and confirmed-local
+	// BEFORE setupMultiTenant runs. setupMultiTenant begins with
+	// `kubectl delete namespace duckgres` against whatever kubeconfig
+	// kubectl picks up — if that's the user's default context (e.g.
+	// mw-dev), production-adjacent data goes with it. This exact
+	// incident has happened twice now (2025 and 2026-05-19); the second
+	// one happened because the safety check was placed AFTER
+	// setupMultiTenant. Anything destructive must live below this
+	// block. Do not move it back.
+	kubeconfig = os.Getenv("DUCKGRES_K8S_TEST_KUBECONFIG")
+	if kubeconfig == "" {
+		log.Fatalf("DUCKGRES_K8S_TEST_KUBECONFIG is required. Run via `just test-k8s-integration` (which sets it to a kind kubeconfig) or set it explicitly. Refusing to fall back to the user's default kubeconfig because this suite is destructive.")
+	}
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		log.Fatalf("Failed to load kubeconfig: %v", err)
+	}
+	if err := requireLocalKindCluster(kubeconfig, config); err != nil {
+		log.Fatalf("REFUSING to run k8s integration tests: %v", err)
+	}
+
 	skipSetup := envOr("DUCKGRES_K8S_TEST_SKIP_SETUP", "") == "true"
 	if !skipSetup {
 		if namespace != "duckgres" {
@@ -58,23 +80,6 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	// SAFETY: require an explicit kubeconfig path. Falling back to
-	// ~/.kube/config is how this suite once ran against the live mw-dev
-	// cluster and wiped the duckgres namespace via setupMultiTenant's
-	// `kubectl delete namespace duckgres`. Always fail loudly instead.
-	kubeconfig = os.Getenv("DUCKGRES_K8S_TEST_KUBECONFIG")
-	if kubeconfig == "" {
-		log.Fatalf("DUCKGRES_K8S_TEST_KUBECONFIG is required. Run via `just test-k8s-integration` (which sets it to a kind kubeconfig) or set it explicitly. Refusing to fall back to the user's default kubeconfig because this suite is destructive.")
-	}
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		log.Fatalf("Failed to load kubeconfig: %v", err)
-	}
-	// SAFETY: confirm the resolved kubeconfig actually points at a local
-	// kind cluster before running anything destructive.
-	if err := requireLocalKindCluster(kubeconfig, config); err != nil {
-		log.Fatalf("REFUSING to run k8s integration tests: %v", err)
-	}
 	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("Failed to create k8s client: %v", err)
