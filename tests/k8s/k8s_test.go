@@ -89,12 +89,30 @@ kubeconfig was not touched.
 ========================================================================
 `)
 	}
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
-	if err != nil {
-		log.Fatalf("Failed to load kubeconfig: %v", err)
-	}
-	if err := requireLocalKindCluster(kubeconfig, config); err != nil {
-		log.Fatalf("REFUSING to run k8s integration tests: %v", err)
+
+	// Pre-flight validation: if the kubeconfig FILE already exists at
+	// this point (warm local run, or rerun after a previous successful
+	// bootstrap), validate it BEFORE the destructive setupMultiTenant
+	// call. This is the line that would have stopped the mw-dev incident:
+	// the user had no DUCKGRES_K8S_TEST_KUBECONFIG set (caught above),
+	// but if they had pointed it at ~/.kube/config we'd still need to
+	// reject it before kubectl ran.
+	//
+	// On a cold CI bootstrap the file legitimately doesn't exist yet
+	// (kind-cluster-reset inside setupMultiTenant creates it). In that
+	// case the destructive `kubectl delete namespace` inside
+	// setupMultiTenant runs against a missing kubeconfig and fails with
+	// "stat ...: no such file or directory" — no damage is possible
+	// because kubectl can't connect. The post-bootstrap validation
+	// below is the mandatory check for that path.
+	if _, statErr := os.Stat(kubeconfig); statErr == nil {
+		preBootstrapCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			log.Fatalf("Failed to load kubeconfig %q: %v", kubeconfig, err)
+		}
+		if err := requireLocalKindCluster(kubeconfig, preBootstrapCfg); err != nil {
+			log.Fatalf("REFUSING to run k8s integration tests: %v", err)
+		}
 	}
 
 	skipSetup := envOr("DUCKGRES_K8S_TEST_SKIP_SETUP", "") == "true"
@@ -105,6 +123,20 @@ kubeconfig was not touched.
 		if err := setupMultiTenant(); err != nil {
 			log.Fatalf("Failed to set up multi-tenant environment: %v", err)
 		}
+	}
+
+	// Mandatory post-bootstrap validation. setupMultiTenant has now run
+	// (or been skipped), so the kubeconfig file MUST exist and MUST
+	// point at a local kind cluster. This is the last line of defence
+	// against any cold-bootstrap path that slipped past the pre-flight
+	// check above (e.g. file didn't exist at startup, setupMultiTenant
+	// wrote one). Failure here aborts before any test body runs.
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		log.Fatalf("Failed to load kubeconfig %q after setup: %v", kubeconfig, err)
+	}
+	if err := requireLocalKindCluster(kubeconfig, config); err != nil {
+		log.Fatalf("REFUSING to run k8s integration tests: %v", err)
 	}
 
 	clientset, err = kubernetes.NewForConfig(config)
