@@ -8,11 +8,18 @@ import (
 	"time"
 )
 
+func addNeutralWarmWorker(shared *K8sWorkerPool, id int) *ManagedWorker {
+	worker := &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
+	shared.workers[id] = worker
+	return worker
+}
+
 func TestOrgReservedPoolAcquireReservesOrgWorker(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
+	addNeutralWarmWorker(shared, 1)
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
 		// Mirror production SpawnWorker behavior: the spawned worker carries
@@ -62,6 +69,7 @@ func TestOrgReservedPoolAcquireSkipsOtherOrgsWorkers(t *testing.T) {
 		t.Fatalf("SetSharedState(other): %v", err)
 	}
 	shared.workers[other.ID] = other
+	addNeutralWarmWorker(shared, 2)
 
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
@@ -127,6 +135,7 @@ func TestOrgReservedWorkerPoolAcquireActivatesReservedWorkerWhenEnabledWithOrgCo
 	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
+	addNeutralWarmWorker(shared, 1)
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
 		// Mirror production SpawnWorker behavior: the spawned worker carries
@@ -164,6 +173,7 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
+	addNeutralWarmWorker(shared, 1)
 	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
 		shared.mu.Lock()
 		// Mirror production SpawnWorker behavior: the spawned worker carries

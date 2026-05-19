@@ -3,12 +3,16 @@
 package controlplane
 
 import (
+	"context"
+	"errors"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/server/flightclient"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // mockCloser tracks whether Close was called.
@@ -19,6 +23,62 @@ type mockCloser struct {
 func (m *mockCloser) Close() error {
 	m.closed.Store(true)
 	return nil
+}
+
+type acquireErrorPool struct {
+	err error
+}
+
+func (p *acquireErrorPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+	return nil, p.err
+}
+
+func (p *acquireErrorPool) ReleaseWorker(id int) {}
+
+func (p *acquireErrorPool) RetireWorker(id int) {}
+
+func (p *acquireErrorPool) RetireWorkerIfNoSessions(id int) bool {
+	return false
+}
+
+func (p *acquireErrorPool) Worker(id int) (*ManagedWorker, bool) {
+	return nil, false
+}
+
+func (p *acquireErrorPool) SpawnMinWorkers(count int) error {
+	return nil
+}
+
+func (p *acquireErrorPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
+}
+
+func (p *acquireErrorPool) SetMaxWorkers(n int) {}
+
+func (p *acquireErrorPool) ShutdownAll() {}
+
+func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
+	controlPlaneWorkerAcquireFailuresCounter.Reset()
+	sm := NewSessionManager(&acquireErrorPool{
+		err: NewWarmCapacityExhaustedError(30 * time.Second),
+	}, nil)
+
+	_, _, err := sm.CreateSession(context.Background(), "root", 1001, "", 0)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity error, got %v", err)
+	}
+
+	counter, counterErr := controlPlaneWorkerAcquireFailuresCounter.GetMetricWithLabelValues("warm_capacity_exhausted")
+	if counterErr != nil {
+		t.Fatalf("failed to read warm capacity counter: %v", counterErr)
+	}
+	metric := &dto.Metric{}
+	if err := counter.Write(metric); err != nil {
+		t.Fatalf("failed to write warm capacity counter: %v", err)
+	}
+	if got := metric.GetCounter().GetValue(); got != 1 {
+		t.Fatalf("expected one warm capacity acquisition failure, got %v", got)
+	}
 }
 
 func TestOnWorkerCrash_MarksExecutorsDead(t *testing.T) {

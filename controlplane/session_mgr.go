@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -66,14 +67,14 @@ func (sm *SessionManager) ReservePID() int32 {
 	return sm.nextPID.Add(1)
 }
 
-// CreateSession acquires a worker (reusing an idle one or spawning a new one),
-// creates a session on it, and rebalances memory/thread limits across all active sessions.
+// CreateSession acquires a worker from the configured pool, creates a session
+// on it, and rebalances memory/thread limits across all active sessions.
 // If pid is 0, a new one is generated.
 func (sm *SessionManager) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 	memoryLimit, threads = sm.resolveSessionLimits(memoryLimit, threads)
 
-	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
-	// When a backend-specific max worker cap is set, this blocks until a slot is available.
+	// Acquire a worker. Backend implementations may reuse warm workers, queue,
+	// spawn, or return a typed capacity error when no worker is immediately available.
 	observeControlPlaneWorkerQueueDepthDelta(1)
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 
@@ -83,6 +84,18 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	worker, err := sm.pool.AcquireWorker(ctx)
 	acquireSpan.End()
 	if err != nil {
+		var capacityErr *WarmCapacityExhaustedError
+		if errors.As(err, &capacityErr) {
+			observeControlPlaneWorkerAcquireFailure("warm_capacity_exhausted")
+			slog.Warn("Worker acquisition failed.",
+				"pid", pid,
+				"user", username,
+				"duration", time.Since(acquireStart),
+				"reason", "warm_capacity_exhausted",
+				"retry_after", capacityErr.RetryAfter,
+				"error", err,
+			)
+		}
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
 	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))

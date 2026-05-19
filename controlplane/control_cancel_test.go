@@ -83,6 +83,17 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		}
 	})
 
+	t.Run("warm capacity exhausted", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedError(45 * time.Second))
+		if code != "53300" {
+			t.Fatalf("code = %q, want 53300", code)
+		}
+		want := "no warm Duckgres worker is currently available; retry in about 45 seconds"
+		if message != want {
+			t.Fatalf("message = %q, want %q", message, want)
+		}
+	})
+
 	t.Run("generic error", func(t *testing.T) {
 		code, message := sessionCreationErrorResponse(errors.New("worker activation failed"))
 		if code != "58000" {

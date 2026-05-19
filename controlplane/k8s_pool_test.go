@@ -723,14 +723,9 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	}
 	pool.workers[stale.ID] = stale
 
+	spawnCalls := 0
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		pool.mu.Lock()
-		defer pool.mu.Unlock()
-		worker := &ManagedWorker{ID: id, done: make(chan struct{})}
-		if err := worker.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleIdle}); err != nil {
-			return err
-		}
-		pool.workers[id] = worker
+		spawnCalls++
 		return nil
 	}
 
@@ -746,11 +741,12 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	got, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
 		OrgID: "analytics",
 	})
-	if err != nil {
-		t.Fatalf("ReserveSharedWorker: %v", err)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion after stale worker, got worker=%#v err=%v", got, err)
 	}
-	if got.ID == stale.ID {
-		t.Fatalf("expected stale worker to be skipped, got %d", got.ID)
+	if got != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", got.ID)
 	}
 	if checks == 0 {
 		t.Fatal("expected liveness recheck before reservation")
@@ -758,8 +754,8 @@ func TestK8sPoolReserveSharedWorkerSkipsUnhealthyIdleWorker(t *testing.T) {
 	if _, ok := pool.Worker(stale.ID); ok {
 		t.Fatal("expected stale worker to be retired")
 	}
-	if got.SharedState().Assignment == nil || got.SharedState().Assignment.OrgID != "analytics" {
-		t.Fatalf("expected returned worker reserved for analytics, got %#v", got.SharedState().Assignment)
+	if spawnCalls != 0 {
+		t.Fatalf("did not expect warm backfill spawn, got %d calls", spawnCalls)
 	}
 }
 
@@ -1106,17 +1102,16 @@ func TestK8sPoolFindIdleWorkerSkipsReservedSharedWorker(t *testing.T) {
 	}
 }
 
-func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentInRuntimeMode(t *testing.T) {
+func TestK8sPoolReserveSharedWorkerRuntimeMissDoesNotUseInMemoryFallback(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	pool.minWorkers = 1
 	store := &captureRuntimeWorkerStore{}
 	pool.runtimeStore = store
 	idle := &ManagedWorker{ID: 7, done: make(chan struct{})}
 	pool.workers[idle.ID] = idle
+	healthChecks := 0
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
-		if worker != idle {
-			t.Fatalf("expected liveness check for idle worker %d, got %#v", idle.ID, worker)
-		}
+		healthChecks++
 		return nil
 	}
 
@@ -1136,43 +1131,29 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentIn
 	worker, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
 		OrgID: "analytics",
 	})
-	if err != nil {
-		t.Fatalf("ReserveSharedWorker: %v", err)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}
-	if worker.ID != idle.ID {
-		t.Fatalf("expected worker %d, got %d", idle.ID, worker.ID)
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
-
-	state := worker.SharedState()
-	if state.Lifecycle != WorkerLifecycleReserved {
-		t.Fatalf("expected reserved lifecycle, got %q", state.Lifecycle)
+	if store.claimCalls != 1 {
+		t.Fatalf("expected one runtime idle claim, got %d", store.claimCalls)
 	}
-	if state.Assignment == nil || state.Assignment.OrgID != "analytics" {
-		t.Fatalf("expected analytics assignment, got %#v", state.Assignment)
+	if idle.SharedState().Assignment != nil {
+		t.Fatalf("local idle worker should not have been reserved, got assignment %#v", idle.SharedState().Assignment)
 	}
-	if worker.ownerEpoch != 1 {
-		t.Fatalf("expected owner epoch 1 after reservation, got %d", worker.ownerEpoch)
+	if idle.ownerEpoch != 0 {
+		t.Fatalf("local idle worker owner epoch should not change, got %d", idle.ownerEpoch)
+	}
+	if healthChecks != 0 {
+		t.Fatalf("did not expect liveness check for unclaimed local worker, got %d checks", healthChecks)
 	}
 
 	records := store.snapshot()
-	if len(records) == 0 {
-		t.Fatal("expected reservation to persist a worker record")
-	}
-	last := records[len(records)-1]
-	if last.WorkerID != worker.ID {
-		t.Fatalf("expected worker_id %d, got %d", worker.ID, last.WorkerID)
-	}
-	if last.State != configstore.WorkerStateReserved {
-		t.Fatalf("expected reserved worker record, got %q", last.State)
-	}
-	if last.OwnerCPInstanceID != pool.cpInstanceID {
-		t.Fatalf("expected owner_cp_instance_id %q, got %q", pool.cpInstanceID, last.OwnerCPInstanceID)
-	}
-	if last.OwnerEpoch != 1 {
-		t.Fatalf("expected owner_epoch 1, got %d", last.OwnerEpoch)
-	}
-	if last.OrgID != "analytics" {
-		t.Fatalf("expected org_id analytics, got %q", last.OrgID)
+	if len(records) != 0 {
+		t.Fatalf("did not expect runtime records from local fallback, got %#v", records)
 	}
 
 	select {
@@ -1182,15 +1163,12 @@ func TestK8sPoolReserveSharedWorkerReservesIdleWorkerWithoutLocalReplenishmentIn
 	}
 }
 
-// TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImage ensures the
-// in-memory warm-pool fallback honors per-org image pinning. Without the
-// image filter on findReservableWarmWorkerLocked, ReserveSharedWorker would
-// return a default-image warm worker to a pinned org and the subsequent
-// activation (DuckLake ATTACH inside the worker) would fail with the
-// extension's version-mismatch error. Observed in prod-us 2026-05-06 for
-// Portola, which pins to duckgres-worker:<sha>-duckdb1.5.1 while the warm
-// pool runs the default 1.5.2 single-binary image.
-func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImage(t *testing.T) {
+// TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRuntimeStore
+// ensures the runtime-store-less warm-pool path honors per-org image pinning.
+// Without the image filter on findReservableWarmWorkerLocked,
+// ReserveSharedWorker would return a default-image warm worker to a pinned org
+// and the subsequent activation would fail with a version-mismatch error.
+func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImageWithoutRuntimeStore(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
 	// A warm-idle worker built from the cluster default image — a tempting
@@ -1203,50 +1181,26 @@ func TestK8sPoolReserveSharedWorkerSkipsWarmWorkerWithMismatchedImage(t *testing
 	pool.workers[defaultWorker.ID] = defaultWorker
 
 	pinnedImage := "duckgres-worker:abc123-duckdb1.5.1"
-	store := &captureRuntimeWorkerStore{
-		// ClaimIdleWorker returns nil (no DB row matches the pinned image),
-		// CreateSpawningWorkerSlot returns a slot for the pinned image so
-		// the spawn path is what serves the request.
-		spawned: &configstore.WorkerRecord{
-			WorkerID:          42,
-			PodName:           "duckgres-worker-test-cp-42",
-			State:             configstore.WorkerStateSpawning,
-			OrgID:             "portola",
-			Image:             pinnedImage,
-			OwnerCPInstanceID: pool.cpInstanceID,
-			OwnerEpoch:        1,
-		},
-	}
-	pool.runtimeStore = store
-
+	spawnCalls := 0
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		pool.workers[id] = &ManagedWorker{
-			ID:      id,
-			image:   pinnedImage,
-			podName: "duckgres-worker-test-cp-42",
-			done:    make(chan struct{}),
-		}
+		spawnCalls++
 		return nil
 	}
-	pool.healthCheckFunc = func(ctx context.Context, w *ManagedWorker) error { return nil }
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
 		OrgID:      "portola",
 		Image:      pinnedImage,
 		MaxWorkers: 2,
 	})
-	if err != nil {
-		t.Fatalf("ReserveSharedWorker: %v", err)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}
-
-	if worker.ID == defaultWorker.ID {
-		t.Fatalf("default-image warm worker (id %d) was returned despite image pin %q", defaultWorker.ID, pinnedImage)
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
-	if worker.ID != 42 {
-		t.Fatalf("expected spawned worker id 42, got %d", worker.ID)
-	}
-	if store.spawnImage != pinnedImage {
-		t.Fatalf("spawn image = %q, want %q", store.spawnImage, pinnedImage)
+	if spawnCalls != 0 {
+		t.Fatalf("did not expect foreground or async spawn, got %d calls", spawnCalls)
 	}
 	if defaultWorker.SharedState().Lifecycle == WorkerLifecycleReserved {
 		t.Fatalf("default-image warm worker was reserved despite image mismatch")
@@ -1424,27 +1378,36 @@ func TestK8sPoolReserveClaimedWorkerRejectsStaleInMemoryEpoch(t *testing.T) {
 	}
 }
 
-func TestK8sPoolReserveSharedWorkerFallsBackWhenRuntimeClaimReturnsNil(t *testing.T) {
+func TestK8sPoolReserveSharedWorkerBackpressuresWhenRuntimeClaimReturnsNil(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{}
 	pool.runtimeStore = store
 	idle := &ManagedWorker{ID: 8, done: make(chan struct{})}
 	pool.workers[idle.ID] = idle
+	healthChecks := 0
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		healthChecks++
 		return nil
 	}
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
 		OrgID: "analytics",
 	})
-	if err != nil {
-		t.Fatalf("ReserveSharedWorker: %v", err)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}
-	if worker.ID != idle.ID {
-		t.Fatalf("expected fallback idle worker %d, got %d", idle.ID, worker.ID)
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
 	if store.claimCalls != 1 {
-		t.Fatalf("expected one claim attempt before fallback, got %d", store.claimCalls)
+		t.Fatalf("expected one claim attempt before backpressure, got %d", store.claimCalls)
+	}
+	if idle.SharedState().Assignment != nil {
+		t.Fatalf("local idle worker should not have been reserved, got assignment %#v", idle.SharedState().Assignment)
+	}
+	if healthChecks != 0 {
+		t.Fatalf("did not expect liveness check for unclaimed local worker, got %d checks", healthChecks)
 	}
 }
 
@@ -1456,15 +1419,22 @@ func TestK8sPoolReserveSharedWorkerPassesOrgCapToRuntimeClaim(t *testing.T) {
 	pool.workers[idle.ID] = idle
 	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error { return nil }
 
-	_, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
 		OrgID:      "analytics",
 		MaxWorkers: 3,
 	})
-	if err != nil {
-		t.Fatalf("ReserveSharedWorker: %v", err)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
 	if store.claimMaxOrgWorkers != 3 {
 		t.Fatalf("expected claim max org workers 3, got %d", store.claimMaxOrgWorkers)
+	}
+	if idle.SharedState().Assignment != nil {
+		t.Fatalf("local idle worker should not have been reserved, got assignment %#v", idle.SharedState().Assignment)
 	}
 }
 
@@ -1600,11 +1570,6 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 			WorkerID: 7,
 			Image:    "duckgres:v1",
 		},
-		spawned: &configstore.WorkerRecord{
-			WorkerID: 42,
-			PodName:  "test-cp-worker-42",
-			Image:    "duckgres:v2",
-		},
 	}
 	pool.runtimeStore = store
 
@@ -1614,52 +1579,15 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 		Image: "duckgres:v2",
 	}
 
-	// Mock spawnWarmWorker since we don't have real pods
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error { return nil }
-	// Mock health check since we don't have real worker binaries
-	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error { return nil }
-	// Mock connection since we don't have real pods
-	pool.connectWorkerFunc = func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {
-		return nil, nil
-	}
-
-	// Provide a mock secret for the spawned pod (worker 42)
-	podName := "test-cp-worker-42"
-	secretName := pool.workerRPCSecretName(podName)
-
-	// Minimal valid PEM blocks for a self-signed cert/key to satisfy parsing.
-	certPEM := []byte("-----BEGIN CERTIFICATE-----\nMIICojCCAYqgAwIBAgIQI6v5m9mN6L3Xv8O5/0u/2zANBgkqhkiG9w0BAQsFADAV\nMRMwEQYDVQQDEwpkdWNra2dyZXMwHhcNMjYwNDI3MDEwODIyWhcNMjYwNTI3MDEw\nODIyWjAVMRMwEQYDVQQDEwpkdWNra2dyZXMwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC8u9+9\n-----END CERTIFICATE-----\n")
-	keyPEM := []byte("-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEAvLvf\n-----END RSA PRIVATE KEY-----\n")
-
-	_, _ = pool.clientset.CoreV1().Secrets(pool.namespace).Create(context.Background(), &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: secretName},
-		Data: map[string][]byte{
-			"bearer-token":      []byte("secret"),
-			"tls.crt":           certPEM,
-			"tls.key":           keyPEM,
-			"worker-rpc-ca.crt": certPEM,
-		},
-	}, metav1.CreateOptions{})
-
-	// Provide mock pod
-	_, _ = pool.clientset.CoreV1().Pods(pool.namespace).Create(context.Background(), &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   podName,
-			Labels: map[string]string{"duckgres/worker-id": "42"},
-		},
-		Status: corev1.PodStatus{
-			Phase: corev1.PodRunning,
-			PodIP: "10.0.0.42",
-		},
-	}, metav1.CreateOptions{})
 
 	got, err := pool.ReserveSharedWorker(context.Background(), assignment)
-	if err != nil {
-		t.Fatalf("ReserveSharedWorker: %v", err)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", got, err)
 	}
-
-	if got.ID != 42 {
-		t.Fatalf("expected to spawn new worker 42, got %d (v1 worker was incorrectly reclaimed)", got.ID)
+	if got != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", got.ID)
 	}
 
 	// Verify v1 worker was retired
@@ -1669,69 +1597,64 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 	if store.retireIdleOrHotIdleCalledReasons[0] != RetireReasonMismatchedVersion {
 		t.Fatalf("expected reason %q, got %q", RetireReasonMismatchedVersion, store.retireIdleOrHotIdleCalledReasons[0])
 	}
+	if store.spawnCalls != 0 || store.perImageSpawnCalls != 0 {
+		t.Fatalf("did not expect foreground or async spawn, got foreground=%d per_image=%d", store.spawnCalls, store.perImageSpawnCalls)
+	}
 }
 
-func TestK8sPoolReserveSharedWorkerCreatesRuntimeSpawningSlotWhenPoolIsCold(t *testing.T) {
+func TestK8sPoolReserveSharedWorkerColdRuntimeBackpressuresWithoutSpawning(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	store := &captureRuntimeWorkerStore{
-		spawned: &configstore.WorkerRecord{
-			WorkerID:          31,
-			PodName:           "duckgres-worker-test-cp-31",
-			State:             configstore.WorkerStateSpawning,
-			OrgID:             "analytics",
-			OwnerCPInstanceID: pool.cpInstanceID,
-			OwnerEpoch:        1,
-		},
-	}
+	store := &captureRuntimeWorkerStore{}
 	pool.runtimeStore = store
-	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		worker := &ManagedWorker{ID: id, podName: "duckgres-worker-test-cp-31", done: make(chan struct{})}
-		pool.workers[id] = worker
-		return nil
-	}
-	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
-		if worker == nil || worker.ID != 31 {
-			t.Fatalf("expected spawned runtime worker 31, got %#v", worker)
-		}
-		return nil
-	}
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error { return nil }
 
 	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
 		OrgID:      "analytics",
 		MaxWorkers: 2,
 	})
-	if err != nil {
-		t.Fatalf("ReserveSharedWorker: %v", err)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}
-	if worker.ID != 31 {
-		t.Fatalf("expected spawned worker 31, got %d", worker.ID)
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
-	if store.spawnCalls != 1 {
-		t.Fatalf("expected one spawning slot allocation, got %d", store.spawnCalls)
+	if store.spawnCalls != 0 {
+		t.Fatalf("did not expect foreground org-bound spawn, got %d calls", store.spawnCalls)
 	}
-	if store.spawnOwnerCPID != pool.cpInstanceID {
-		t.Fatalf("expected spawn owner cp-instance %q, got %q", pool.cpInstanceID, store.spawnOwnerCPID)
+	if store.neutralSpawnCalls != 0 || store.perImageSpawnCalls != 0 {
+		t.Fatalf("did not expect async warm backfill, got neutral=%d per_image=%d", store.neutralSpawnCalls, store.perImageSpawnCalls)
 	}
-	if store.spawnOrgID != "analytics" {
-		t.Fatalf("expected spawn org analytics, got %q", store.spawnOrgID)
+}
+
+func TestK8sPoolReserveSharedWorkerColdBackpressuresWhenWarmupBlockedByGlobalCap(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 1)
+	pool.SetWarmCapacityTarget(1)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+
+	worker := &ManagedWorker{ID: 7, done: make(chan struct{}), activeSessions: 1}
+	if err := worker.SetSharedState(SharedWorkerState{
+		Lifecycle:  WorkerLifecycleHot,
+		Assignment: &WorkerAssignment{OrgID: "analytics"},
+	}); err != nil {
+		t.Fatalf("SetSharedState: %v", err)
 	}
-	if store.spawnOwnerEpoch != 1 {
-		t.Fatalf("expected spawn owner epoch 1, got %d", store.spawnOwnerEpoch)
+	pool.workers[7] = worker
+
+	got, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "billing",
+		MaxWorkers: 1,
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", got, err)
 	}
-	if store.spawnPodNamePrefix != "test-cp-worker" {
-		t.Fatalf("expected pod name prefix test-cp-worker, got %q", store.spawnPodNamePrefix)
+	if got != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", got.ID)
 	}
-	if store.spawnMaxOrgWorkers != 2 {
-		t.Fatalf("expected max org workers 2, got %d", store.spawnMaxOrgWorkers)
-	}
-	if store.spawnMaxGlobalWorks != 5 {
-		t.Fatalf("expected max global workers 5, got %d", store.spawnMaxGlobalWorks)
-	}
-	if worker.OwnerEpoch() != 1 {
-		t.Fatalf("expected owner epoch 1, got %d", worker.OwnerEpoch())
-	}
-	if worker.SharedState().Lifecycle != WorkerLifecycleReserved {
-		t.Fatalf("expected reserved lifecycle, got %q", worker.SharedState().Lifecycle)
+	if store.spawnCalls != 0 || store.neutralSpawnCalls != 0 || store.perImageSpawnCalls != 0 {
+		t.Fatalf("did not expect any foreground or async spawn while at cap: spawn=%d neutral=%d per_image=%d", store.spawnCalls, store.neutralSpawnCalls, store.perImageSpawnCalls)
 	}
 }
 
@@ -1978,15 +1901,11 @@ func TestK8sPoolHealthCheckLoopReplenishesWarmCapacityAfterIdleWorkerCrash(t *te
 	}
 }
 
-func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
+func TestK8sPoolReserveSharedWorkerColdPoolBackpressuresWithoutSpawning(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
-	pool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
-		return nil
-	}
+	spawnCalls := 0
 	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		pool.mu.Lock()
-		pool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
-		pool.mu.Unlock()
+		spawnCalls++
 		return nil
 	}
 
@@ -1996,15 +1915,15 @@ func TestK8sPoolReserveSharedWorkerSpawnsWhenPoolIsCold(t *testing.T) {
 	worker, err := pool.ReserveSharedWorker(ctx, &WorkerAssignment{
 		OrgID: "billing",
 	})
-	if err != nil {
-		t.Fatalf("ReserveSharedWorker: %v", err)
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}
-	if worker == nil {
-		t.Fatal("expected reserved worker")
-		return
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
-	if got := worker.SharedState().Lifecycle; got != WorkerLifecycleReserved {
-		t.Fatalf("expected reserved lifecycle after cold start, got %q", got)
+	if spawnCalls != 0 {
+		t.Fatalf("did not expect warm backfill spawn, got %d calls", spawnCalls)
 	}
 }
 
