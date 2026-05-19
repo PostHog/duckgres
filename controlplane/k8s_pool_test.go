@@ -2193,6 +2193,140 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	}
 }
 
+// When iceboom is enabled the spawned worker pod must carry the iceboom
+// sidecar container, an iceboom-config ConfigMap volume, and a read-only
+// mount at /etc/iceboom on the sidecar. Pod-level QoS depends on every
+// container carrying matching request/limit pairs, so this also asserts
+// that the sidecar resources block is what we configured.
+func TestK8sPool_SpawnWorkerInjectsIceboomSidecarWhenEnabled(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.iceboom = IceboomPoolConfig{
+		Enabled:         true,
+		Image:           "iceboom:test",
+		Port:            8181,
+		ConfigMap:       "duckgres-iceboom-config",
+		CPURequest:      "200m",
+		CPULimit:        "200m",
+		MemoryRequest:   "128Mi",
+		MemoryLimit:     "256Mi",
+		ImagePullPolicy: "IfNotPresent",
+	}
+
+	var createdWorkerPod *corev1.Pod
+	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		pod, ok := createAction.GetObject().(*corev1.Pod)
+		if !ok {
+			return false, nil, nil
+		}
+		if pod.Labels["app"] == "duckgres-worker" {
+			createdWorkerPod = pod.DeepCopy()
+		}
+		return false, nil, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = pool.SpawnWorker(ctx, 0, pool.workerImage)
+
+	if createdWorkerPod == nil {
+		t.Fatal("expected worker pod create to be attempted")
+	}
+
+	if got, want := len(createdWorkerPod.Spec.Containers), 2; got != want {
+		t.Fatalf("expected %d containers (worker + iceboom), got %d", want, got)
+	}
+	var iceboom *corev1.Container
+	for i := range createdWorkerPod.Spec.Containers {
+		if createdWorkerPod.Spec.Containers[i].Name == "iceboom" {
+			iceboom = &createdWorkerPod.Spec.Containers[i]
+			break
+		}
+	}
+	if iceboom == nil {
+		t.Fatal("iceboom container not found in pod spec")
+	}
+	if iceboom.Image != "iceboom:test" {
+		t.Fatalf("expected iceboom image iceboom:test, got %q", iceboom.Image)
+	}
+	if string(iceboom.ImagePullPolicy) != "IfNotPresent" {
+		t.Fatalf("expected pullPolicy IfNotPresent, got %q", iceboom.ImagePullPolicy)
+	}
+	if len(iceboom.Args) != 2 || iceboom.Args[0] != "--config" || iceboom.Args[1] != "/etc/iceboom/config.toml" {
+		t.Fatalf("expected args [--config /etc/iceboom/config.toml], got %v", iceboom.Args)
+	}
+	if iceboom.SecurityContext == nil || iceboom.SecurityContext.AllowPrivilegeEscalation == nil || *iceboom.SecurityContext.AllowPrivilegeEscalation {
+		t.Fatal("expected allowPrivilegeEscalation=false on iceboom container")
+	}
+	foundMount := false
+	for _, vm := range iceboom.VolumeMounts {
+		if vm.Name == "iceboom-config" && vm.MountPath == "/etc/iceboom" && vm.ReadOnly {
+			foundMount = true
+		}
+	}
+	if !foundMount {
+		t.Fatalf("expected read-only iceboom-config mount at /etc/iceboom, got %+v", iceboom.VolumeMounts)
+	}
+	if iceboom.Resources.Requests.Cpu().String() != "200m" {
+		t.Fatalf("expected iceboom cpu request 200m, got %s", iceboom.Resources.Requests.Cpu().String())
+	}
+	if iceboom.Resources.Limits.Memory().String() != "256Mi" {
+		t.Fatalf("expected iceboom memory limit 256Mi, got %s", iceboom.Resources.Limits.Memory().String())
+	}
+
+	foundVol := false
+	for _, v := range createdWorkerPod.Spec.Volumes {
+		if v.Name == "iceboom-config" && v.ConfigMap != nil && v.ConfigMap.Name == "duckgres-iceboom-config" {
+			foundVol = true
+		}
+	}
+	if !foundVol {
+		t.Fatal("expected iceboom-config ConfigMap volume on pod spec")
+	}
+}
+
+// Default disabled iceboom must not perturb the spawned pod spec: still
+// exactly one container, no iceboom volume.
+func TestK8sPool_SpawnWorkerDoesNotInjectIceboomWhenDisabled(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	// iceboom left zero-valued (Enabled=false).
+
+	var createdWorkerPod *corev1.Pod
+	cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		createAction, ok := action.(k8stesting.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		pod, ok := createAction.GetObject().(*corev1.Pod)
+		if !ok {
+			return false, nil, nil
+		}
+		if pod.Labels["app"] == "duckgres-worker" {
+			createdWorkerPod = pod.DeepCopy()
+		}
+		return false, nil, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = pool.SpawnWorker(ctx, 0, pool.workerImage)
+
+	if createdWorkerPod == nil {
+		t.Fatal("expected worker pod create to be attempted")
+	}
+	if got := len(createdWorkerPod.Spec.Containers); got != 1 {
+		t.Fatalf("expected 1 container when iceboom disabled, got %d", got)
+	}
+	for _, v := range createdWorkerPod.Spec.Volumes {
+		if v.Name == "iceboom-config" {
+			t.Fatal("did not expect iceboom-config volume when iceboom is disabled")
+		}
+	}
+}
+
 func TestK8sPool_RetireWorkerDeletesWorkerRPCSecret(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 1, podName: "duckgres-worker-test-cp-1", done: make(chan struct{})}

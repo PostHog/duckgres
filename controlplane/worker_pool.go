@@ -72,6 +72,22 @@ type K8sWorkerPoolConfig struct {
 	WorkerIDGenerator   func() int                       // Shared ID generator across orgs (nil = internal counter)
 	ResolveOrgConfig    func(string) (*configstore.OrgConfig, error) // Optional: resolve org config for version-aware reaping
 	RuntimeStore        RuntimeWorkerStore
+	Iceboom             IceboomPoolConfig // Optional iceboom sidecar; enabled when Iceboom.Enabled is true.
+}
+
+// IceboomPoolConfig mirrors IceboomConfig at the pool layer. Kept as a
+// separate type so the pool package doesn't need to reach into the higher-
+// level ControlPlaneConfig.
+type IceboomPoolConfig struct {
+	Enabled         bool
+	Image           string
+	Port            int
+	ConfigMap       string
+	CPURequest      string
+	CPULimit        string
+	MemoryRequest   string
+	MemoryLimit     string
+	ImagePullPolicy string
 }
 
 type RuntimeWorkerStore interface {

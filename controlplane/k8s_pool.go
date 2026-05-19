@@ -74,6 +74,7 @@ type K8sWorkerPool struct {
 	workerTolerationKey   string                                       // taint key for NoSchedule toleration
 	workerTolerationValue string                                       // taint value for NoSchedule toleration
 	workerExclusiveNode   bool                                         // one worker per node via anti-affinity
+	iceboom               IceboomPoolConfig                            // optional iceboom sidecar (Iceberg REST catalog proxy)
 	orgID                 string                                       // org ID for pod labels (multi-tenant mode)
 	workerIDGenerator     func() int                                   // shared ID generator across orgs (nil = internal counter)
 	resolveOrgConfig      func(string) (*configstore.OrgConfig, error) // resolve org config for per-tenant image reaping
@@ -143,6 +144,20 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	if strings.TrimSpace(cfg.ServiceAccount) == "" {
 		cfg.ServiceAccount = DefaultK8sWorkerServiceAccount
 	}
+	if cfg.Iceboom.Enabled {
+		if cfg.Iceboom.Image == "" {
+			return nil, fmt.Errorf("iceboom.image is required when iceboom is enabled")
+		}
+		if cfg.Iceboom.ConfigMap == "" {
+			return nil, fmt.Errorf("iceboom.configMap is required when iceboom is enabled")
+		}
+		if cfg.Iceboom.Port == 0 {
+			cfg.Iceboom.Port = 8181
+		}
+		if cfg.Iceboom.ImagePullPolicy == "" {
+			cfg.Iceboom.ImagePullPolicy = cfg.ImagePullPolicy
+		}
+	}
 
 	// Limit concurrent K8s API calls to avoid overwhelming the API server.
 	spawnConcurrency := 3
@@ -170,6 +185,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerTolerationKey:   cfg.WorkerTolerationKey,
 		workerTolerationValue: cfg.WorkerTolerationValue,
 		workerExclusiveNode:   cfg.WorkerExclusiveNode,
+		iceboom:               cfg.Iceboom,
 		orgID:                 cfg.OrgID,
 		workerIDGenerator:     cfg.WorkerIDGenerator,
 		resolveOrgConfig:      cfg.ResolveOrgConfig,
@@ -749,6 +765,24 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			Name:      "duckgres-config",
 			MountPath: "/etc/duckgres",
 			ReadOnly:  true,
+		})
+	}
+
+	// Iceboom sidecar: Iceberg REST catalog proxy on 127.0.0.1:<port>. The
+	// container starts with a bootable upstream-disabled config; the control
+	// plane reconfigures it per tenant at activation time via an HTTP RPC
+	// (iceboom roadmap phase 8). Adding it here keeps the worker pod's QoS
+	// class consistent — iceboom carries its own request==limit when those
+	// values are populated.
+	if p.iceboom.Enabled {
+		pod.Spec.Containers = append(pod.Spec.Containers, p.buildIceboomContainer())
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: "iceboom-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: p.iceboom.ConfigMap},
+				},
+			},
 		})
 	}
 
@@ -2622,6 +2656,75 @@ func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 		limits[k] = v.DeepCopy()
 	}
 	return corev1.ResourceRequirements{Requests: requests, Limits: limits}
+}
+
+// buildIceboomContainer assembles the iceboom sidecar container for a
+// worker pod. iceboom listens on 127.0.0.1:<port> (loopback only — the
+// duckdb-worker container in the same pod reaches it via localhost) and
+// reads its bootable config from the mounted ConfigMap. The control
+// plane reconfigures the upstream / per-tenant warehouse ARN / STS creds
+// at activation time over a separate RPC.
+//
+// The container intentionally:
+//   - runs with allowPrivilegeEscalation=false to match the worker.
+//   - mounts the iceboom-config volume read-only at /etc/iceboom.
+//   - takes the same imagePullPolicy as the worker when unset.
+//   - emits a livenessProbe but no readinessProbe (the worker pod's
+//     readiness is driven by duckdb-worker; iceboom's /readyz depends on
+//     the upstream, which isn't configured until activation).
+func (p *K8sWorkerPool) buildIceboomContainer() corev1.Container {
+	c := corev1.Container{
+		Name:            "iceboom",
+		Image:           p.iceboom.Image,
+		ImagePullPolicy: corev1.PullPolicy(p.iceboom.ImagePullPolicy),
+		Args:            []string{"--config", "/etc/iceboom/config.toml"},
+		Ports: []corev1.ContainerPort{
+			{
+				Name:          "iceberg",
+				ContainerPort: int32(p.iceboom.Port),
+				Protocol:      corev1.ProtocolTCP,
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: boolPtr(false),
+		},
+		VolumeMounts: []corev1.VolumeMount{{
+			Name:      "iceboom-config",
+			MountPath: "/etc/iceboom",
+			ReadOnly:  true,
+		}},
+		Resources: p.iceboomResources(),
+	}
+	return c
+}
+
+// iceboomResources returns the resource block for the iceboom sidecar.
+// Mirrors workerResources's BestEffort-when-empty semantics; when CPU /
+// memory limits are set independently from requests, both are honored so
+// Guaranteed QoS only kicks in when the operator opts in.
+func (p *K8sWorkerPool) iceboomResources() corev1.ResourceRequirements {
+	requests := corev1.ResourceList{}
+	if p.iceboom.CPURequest != "" {
+		requests[corev1.ResourceCPU] = resource.MustParse(p.iceboom.CPURequest)
+	}
+	if p.iceboom.MemoryRequest != "" {
+		requests[corev1.ResourceMemory] = resource.MustParse(p.iceboom.MemoryRequest)
+	}
+	limits := corev1.ResourceList{}
+	if p.iceboom.CPULimit != "" {
+		limits[corev1.ResourceCPU] = resource.MustParse(p.iceboom.CPULimit)
+	}
+	if p.iceboom.MemoryLimit != "" {
+		limits[corev1.ResourceMemory] = resource.MustParse(p.iceboom.MemoryLimit)
+	}
+	out := corev1.ResourceRequirements{}
+	if len(requests) > 0 {
+		out.Requests = requests
+	}
+	if len(limits) > 0 {
+		out.Limits = limits
+	}
+	return out
 }
 
 // --- Helpers ---

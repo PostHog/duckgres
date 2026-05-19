@@ -116,6 +116,15 @@ type Resolved struct {
 	K8sWorkerTolerationKey     string
 	K8sWorkerTolerationValue   string
 	K8sWorkerExclusiveNode     bool
+	K8sIceboomEnabled          bool
+	K8sIceboomImage            string
+	K8sIceboomPort             int
+	K8sIceboomConfigMap        string
+	K8sIceboomCPURequest       string
+	K8sIceboomCPULimit         string
+	K8sIceboomMemoryRequest    string
+	K8sIceboomMemoryLimit      string
+	K8sIceboomImagePullPolicy  string
 	AWSRegion                  string
 	ConfigStoreConn            string
 	ConfigPollInterval         time.Duration
@@ -192,6 +201,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
 	var k8sWorkerExclusiveNode bool
+	var k8sIceboomEnabled bool
+	var k8sIceboomImage, k8sIceboomConfigMap, k8sIceboomImagePullPolicy string
+	var k8sIceboomCPURequest, k8sIceboomCPULimit string
+	var k8sIceboomMemoryRequest, k8sIceboomMemoryLimit string
+	var k8sIceboomPort int
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -836,6 +850,41 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			k8sWorkerExclusiveNode = b
 		}
 	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			k8sIceboomEnabled = b
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_ICEBOOM_ENABLED: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_IMAGE"); v != "" {
+		k8sIceboomImage = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sIceboomPort = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_ICEBOOM_PORT: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_CONFIGMAP"); v != "" {
+		k8sIceboomConfigMap = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_CPU_REQUEST"); v != "" {
+		k8sIceboomCPURequest = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_CPU_LIMIT"); v != "" {
+		k8sIceboomCPULimit = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_MEMORY_REQUEST"); v != "" {
+		k8sIceboomMemoryRequest = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_MEMORY_LIMIT"); v != "" {
+		k8sIceboomMemoryLimit = v
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ICEBOOM_IMAGE_PULL_POLICY"); v != "" {
+		k8sIceboomImagePullPolicy = v
+	}
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
 		awsRegion = v
 	}
@@ -1164,6 +1213,15 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerTolerationKey:     k8sWorkerTolerationKey,
 		K8sWorkerTolerationValue:   k8sWorkerTolerationValue,
 		K8sWorkerExclusiveNode:     k8sWorkerExclusiveNode,
+		K8sIceboomEnabled:          k8sIceboomEnabled,
+		K8sIceboomImage:            k8sIceboomImage,
+		K8sIceboomPort:             k8sIceboomPort,
+		K8sIceboomConfigMap:        k8sIceboomConfigMap,
+		K8sIceboomCPURequest:       k8sIceboomCPURequest,
+		K8sIceboomCPULimit:         k8sIceboomCPULimit,
+		K8sIceboomMemoryRequest:    k8sIceboomMemoryRequest,
+		K8sIceboomMemoryLimit:      k8sIceboomMemoryLimit,
+		K8sIceboomImagePullPolicy:  k8sIceboomImagePullPolicy,
 		AWSRegion:                  awsRegion,
 		ConfigStoreConn:            configStoreConn,
 		ConfigPollInterval:         configPollInterval,

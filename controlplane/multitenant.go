@@ -185,6 +185,17 @@ func SetupMultiTenant(
 		WorkerTolerationKey:   cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue: cfg.K8s.WorkerTolerationValue,
 		WorkerExclusiveNode:   cfg.K8s.WorkerExclusiveNode,
+		Iceboom: IceboomPoolConfig{
+			Enabled:         cfg.K8s.Iceboom.Enabled,
+			Image:           cfg.K8s.Iceboom.Image,
+			Port:            cfg.K8s.Iceboom.Port,
+			ConfigMap:       cfg.K8s.Iceboom.ConfigMap,
+			CPURequest:      cfg.K8s.Iceboom.CPURequest,
+			CPULimit:        cfg.K8s.Iceboom.CPULimit,
+			MemoryRequest:   cfg.K8s.Iceboom.MemoryRequest,
+			MemoryLimit:     cfg.K8s.Iceboom.MemoryLimit,
+			ImagePullPolicy: cfg.K8s.Iceboom.ImagePullPolicy,
+		},
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()
 			if snap == nil {
