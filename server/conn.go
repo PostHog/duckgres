@@ -2425,12 +2425,15 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 			c.sendError("ERROR", "42000", err.Error())
 			return
 		}
-		// Defensive nil-check before deferring close. Although rows should not be nil
-		// when err is nil, this pattern makes the code more robust against unexpected
-		// executor implementations and prevents close errors from being suppressed.
-		if rows != nil {
-			defer func() { _ = rows.Close() }()
+		if rows == nil {
+			finalErr = errors.New("executor returned nil rows without error")
+			slog.Error("Multi-stmt-ext final query returned nil rows.", "user", c.username, "query", finalStmt, "error", finalErr, "worker", c.workerID, "worker_pod", c.workerPod)
+			c.setTxError()
+			c.executeCleanup(cleanup)
+			c.sendError("ERROR", "42000", finalErr.Error())
+			return
 		}
+		defer func() { _ = rows.Close() }()
 
 		// Execute cleanup while cursor is open (data is materialized in cursor)
 		c.executeCleanup(cleanup)
