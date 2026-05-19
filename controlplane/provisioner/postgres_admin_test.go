@@ -77,7 +77,7 @@ func TestEnsureDatabase_AgainstLivePG(t *testing.T) {
 			t.Logf("cleanup open: %v", err)
 			return
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		if _, err := db.Exec("DROP DATABASE IF EXISTS " + quoteIdent(dbName)); err != nil {
 			t.Logf("cleanup drop: %v", err)
 		}
@@ -96,7 +96,7 @@ func TestEnsureDatabase_AgainstLivePG(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	var exists bool
 	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", dbName).Scan(&exists); err != nil {
 		t.Fatalf("verify query: %v", err)
@@ -119,7 +119,7 @@ func TestEnsureRole_AgainstLivePG(t *testing.T) {
 	pw2 := "fedcba9876543210"
 	t.Cleanup(func() {
 		db, _ := sql.Open("pgx", dsn)
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		// Order matters: drop privs before dropping the role.
 		_, _ = db.Exec("REASSIGN OWNED BY " + quoteIdent(roleName) + " TO CURRENT_USER")
 		_, _ = db.Exec("DROP OWNED BY " + quoteIdent(roleName))
@@ -147,7 +147,7 @@ func TestEnsureRole_AgainstLivePG(t *testing.T) {
 		if err := connDB.QueryRow("SELECT 1").Scan(&one); err != nil {
 			t.Errorf("connect+query as role with pw1 failed: %v", err)
 		}
-		connDB.Close()
+		_ = connDB.Close()
 	}
 	// Rotate the password and verify the new one connects.
 	if err := EnsureRole(ctx, dsn, roleName, pw2, dbName); err != nil {
@@ -161,7 +161,7 @@ func TestEnsureRole_AgainstLivePG(t *testing.T) {
 		if err := connDB.QueryRow("SELECT 1").Scan(&one); err != nil {
 			t.Errorf("connect+query with rotated password failed: %v", err)
 		}
-		connDB.Close()
+		_ = connDB.Close()
 	}
 }
 

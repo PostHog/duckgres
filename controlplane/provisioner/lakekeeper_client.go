@@ -227,7 +227,7 @@ func (c *LakekeeperClient) do(ctx context.Context, method, path string, body, ou
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", method, path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &APIError{Status: resp.StatusCode, Method: method, Path: path, Body: string(respBody)}

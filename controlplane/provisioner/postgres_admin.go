@@ -28,7 +28,7 @@ func EnsureDatabase(ctx context.Context, adminDSN, dbName string) error {
 	if err != nil {
 		return fmt.Errorf("open admin connection: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", dbName).Scan(&exists); err != nil {
@@ -76,7 +76,7 @@ func EnsureRole(ctx context.Context, adminDSN, role, password, ownedDB string) e
 	if err != nil {
 		return fmt.Errorf("open admin connection: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	var exists bool
 	if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", role).Scan(&exists); err != nil {
@@ -130,7 +130,7 @@ func EnsureRole(ctx context.Context, adminDSN, role, password, ownedDB string) e
 	if err != nil {
 		return fmt.Errorf("open admin connection to %s: %w", ownedDB, err)
 	}
-	defer dbScoped.Close()
+	defer func() { _ = dbScoped.Close() }()
 	if _, err := dbScoped.ExecContext(ctx, "ALTER SCHEMA public OWNER TO "+quoteIdent(role)); err != nil {
 		return fmt.Errorf("alter schema public owner -> %s: %w", role, err)
 	}
