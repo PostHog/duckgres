@@ -60,7 +60,34 @@ func TestMain(m *testing.M) {
 	// block. Do not move it back.
 	kubeconfig = os.Getenv("DUCKGRES_K8S_TEST_KUBECONFIG")
 	if kubeconfig == "" {
-		log.Fatalf("DUCKGRES_K8S_TEST_KUBECONFIG is required. Run via `just test-k8s-integration` (which sets it to a kind kubeconfig) or set it explicitly. Refusing to fall back to the user's default kubeconfig because this suite is destructive.")
+		log.Fatalf(`
+========================================================================
+REFUSING to run k8s integration tests: DUCKGRES_K8S_TEST_KUBECONFIG is not set.
+
+THIS TEST SUITE IS DESTRUCTIVE.
+It begins by running ` + "`kubectl delete namespace duckgres`" + ` against
+whatever cluster the kubeconfig points at. If that's your local default
+context, a dev cluster, or any shared environment, real workloads will
+be wiped. The only safe target is a throwaway local kind cluster that
+this suite owns end-to-end.
+
+DO NOT run this suite directly on a local machine, a dev cluster, or
+production. Do not work around this guard by exporting
+DUCKGRES_K8S_TEST_KUBECONFIG to your default ~/.kube/config — the
+second guard (requireLocalKindCluster) will catch that, but it is the
+last line of defence, not the first.
+
+The supported way to run is:
+
+    just test-k8s-integration
+
+which provisions a fresh kind cluster, sets DUCKGRES_K8S_TEST_KUBECONFIG
+to that cluster's kubeconfig, and tears the cluster down afterward.
+
+If you are seeing this message, this guard just saved you — your active
+kubeconfig was not touched.
+========================================================================
+`)
 	}
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
@@ -541,8 +568,18 @@ func requireLocalKindCluster(kubeconfigPath string, cfg *rest.Config) error {
 	case "127.0.0.1", "localhost", "::1":
 		// loopback — kind cluster, proceed.
 	default:
-		return fmt.Errorf(
-			"API server at %q is not loopback. The k8s integration suite is destructive (it deletes the duckgres namespace at startup) and must only run against a local kind cluster. Run via `just test-k8s-integration` or point DUCKGRES_K8S_TEST_KUBECONFIG at a kind kubeconfig",
+		return fmt.Errorf(`API server at %q is NOT a loopback address.
+
+This test suite is destructive — it deletes the entire duckgres
+namespace at startup — and must NEVER run against a real cluster
+(local dev, shared dev, staging, production, or anything in between).
+The only safe target is a throwaway local kind cluster.
+
+Run via:
+    just test-k8s-integration
+
+which provisions a fresh kind cluster and points
+DUCKGRES_K8S_TEST_KUBECONFIG at it`,
 			cfg.Host)
 	}
 
@@ -551,8 +588,15 @@ func requireLocalKindCluster(kubeconfigPath string, cfg *rest.Config) error {
 		return fmt.Errorf("load kubeconfig %q: %w", kubeconfigPath, err)
 	}
 	if !strings.Contains(strings.ToLower(raw.CurrentContext), "kind") {
-		return fmt.Errorf(
-			"current-context %q in %s does not look like a kind cluster (expected name containing \"kind\")",
+		return fmt.Errorf(`current-context %q in %s does not look like a kind cluster
+(the safety guard requires the context name to contain "kind").
+
+This test suite is destructive — it deletes the entire duckgres
+namespace at startup — and must NEVER run against a real cluster.
+The only safe target is a throwaway local kind cluster.
+
+Run via:
+    just test-k8s-integration`,
 			raw.CurrentContext, kubeconfigPath)
 	}
 	return nil
