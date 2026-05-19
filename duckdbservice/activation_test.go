@@ -283,6 +283,87 @@ func TestSessionPoolActivateTenantRejectsSameEpochOwnerChange(t *testing.T) {
 	}
 }
 
+func TestSessionPoolActivateTenantAllowsSameOwnerSameEpochCredentialRetry(t *testing.T) {
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		cfg:            server.Config{Users: map[string]string{"postgres": "postgres"}},
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	var opened *sql.DB
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		opened = db
+		return PairFromMain(db), nil
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		return nil
+	}
+	defer func() {
+		if opened != nil {
+			_ = opened.Close()
+		}
+	}()
+
+	first := ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			OwnerEpoch:   2,
+			CPInstanceID: "cp-live:boot-a",
+			WorkerID:     17,
+		},
+		OrgID: "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore:  "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+			ObjectStore:    "s3://analytics/warehouse/",
+			S3AccessKey:    "OLD_ACCESS_KEY",
+			S3SecretKey:    "OLD_SECRET_KEY",
+			S3SessionToken: "OLD_SESSION_TOKEN",
+		},
+	}
+	if err := pool.activateTenant(first); err != nil {
+		t.Fatalf("first ActivateTenant: %v", err)
+	}
+
+	var refreshCalls int
+	pool.refreshS3Secret = func(db *sql.DB, dlCfg server.DuckLakeConfig, sem chan struct{}) error {
+		refreshCalls++
+		if dlCfg.S3AccessKey != "NEW_ACCESS_KEY" {
+			t.Fatalf("expected refresh with new credentials, got %q", dlCfg.S3AccessKey)
+		}
+		return nil
+	}
+
+	second := first
+	second.DuckLake.S3AccessKey = "NEW_ACCESS_KEY"
+	second.DuckLake.S3SecretKey = "NEW_SECRET_KEY"
+	second.DuckLake.S3SessionToken = "NEW_SESSION_TOKEN"
+	if err := pool.activateTenant(second); err != nil {
+		t.Fatalf("same-owner same-epoch credential retry should be accepted: %v", err)
+	}
+
+	if refreshCalls != 1 {
+		t.Fatalf("expected one credential refresh, got %d", refreshCalls)
+	}
+	current := pool.currentActivation()
+	if current == nil {
+		t.Fatal("expected activation to remain present")
+	}
+	if current.payload.DuckLake.S3AccessKey != "NEW_ACCESS_KEY" {
+		t.Fatalf("expected activation payload to be refreshed, got %q", current.payload.DuckLake.S3AccessKey)
+	}
+	if current.payload.OwnerEpoch != 2 {
+		t.Fatalf("expected owner epoch to remain 2, got %d", current.payload.OwnerEpoch)
+	}
+}
+
 func TestSessionPoolValidateControlMetadataAcceptsMismatchedCPInstanceID(t *testing.T) {
 	pool := &SessionPool{
 		sharedWarmMode:    true,
