@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -113,7 +114,74 @@ func EnsureRole(ctx context.Context, adminDSN, role, password, ownedDB string) e
 	if _, err := db.ExecContext(ctx, "GRANT ALL PRIVILEGES ON DATABASE "+quoteIdent(ownedDB)+" TO "+quoteIdent(role)); err != nil {
 		return fmt.Errorf("grant on database %s to %s: %w", ownedDB, role, err)
 	}
+
+	// Postgres 15+ revokes CREATE on the public schema for non-owner roles.
+	// Lakekeeper's `migrate` step needs DDL inside that schema, so make the
+	// role the database OWNER (which carries schema-creation privileges by
+	// default). Also ALTER SCHEMA public OWNER as belt-and-suspenders for
+	// older PG versions where the database OWNER doesn't automatically own
+	// pre-existing schemas in the new DB.
+	if _, err := db.ExecContext(ctx, "ALTER DATABASE "+quoteIdent(ownedDB)+" OWNER TO "+quoteIdent(role)); err != nil {
+		return fmt.Errorf("alter database owner %s -> %s: %w", ownedDB, role, err)
+	}
+	// Run the schema-owner ALTER inside the target database — schema
+	// ownership is local to each database.
+	dbScoped, err := sql.Open("pgx", reDSN(adminDSN, ownedDB))
+	if err != nil {
+		return fmt.Errorf("open admin connection to %s: %w", ownedDB, err)
+	}
+	defer dbScoped.Close()
+	if _, err := dbScoped.ExecContext(ctx, "ALTER SCHEMA public OWNER TO "+quoteIdent(role)); err != nil {
+		return fmt.Errorf("alter schema public owner -> %s: %w", role, err)
+	}
 	return nil
+}
+
+// reDSN rewrites the dbname component of a Postgres URL-style DSN. Used to
+// connect to a specific database with the same admin credentials.
+func reDSN(dsn, dbName string) string {
+	// pgx accepts both URL and keyword/value DSNs. Detect the URL form by
+	// the postgres:// prefix.
+	const urlPrefix = "postgres://"
+	const urlPrefix2 = "postgresql://"
+	if strings.HasPrefix(dsn, urlPrefix) || strings.HasPrefix(dsn, urlPrefix2) {
+		// Find the last "/" after the "@" — that's the path component.
+		at := strings.Index(dsn, "@")
+		slash := -1
+		if at >= 0 {
+			slash = strings.Index(dsn[at:], "/")
+			if slash >= 0 {
+				slash += at
+			}
+		}
+		if slash < 0 {
+			// No dbname segment; append one.
+			if q := strings.Index(dsn, "?"); q >= 0 {
+				return dsn[:q] + "/" + dbName + dsn[q:]
+			}
+			return dsn + "/" + dbName
+		}
+		// Replace the segment between slash+1 and the next "?" (or end).
+		rest := dsn[slash+1:]
+		q := strings.Index(rest, "?")
+		if q < 0 {
+			return dsn[:slash+1] + dbName
+		}
+		return dsn[:slash+1] + dbName + rest[q:]
+	}
+	// Keyword/value form: replace dbname=... or append.
+	return strings.NewReplacer("dbname="+extractDBName(dsn), "dbname="+dbName).Replace(dsn)
+}
+
+func extractDBName(dsn string) string {
+	// Best-effort extract for the keyword/value form. We only use this when
+	// pgx URL prefix isn't present, which is rare in our codebase.
+	for _, kv := range strings.Fields(dsn) {
+		if strings.HasPrefix(kv, "dbname=") {
+			return strings.TrimPrefix(kv, "dbname=")
+		}
+	}
+	return ""
 }
 
 // isSafePGPassword restricts passwords we generate to a printable ASCII

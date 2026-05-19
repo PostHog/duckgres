@@ -185,6 +185,10 @@ type LakekeeperCRSpec struct {
 	// BaseURI is the externally-visible URL clients (ducklings) use to reach
 	// Lakekeeper. In-cluster: http://lakekeeper-<orgid>.lakekeeper.svc:8181
 	BaseURI string
+	// PGSSLMode is the Postgres SSL mode the Lakekeeper pod uses to connect.
+	// Defaults to "require" (the operator's default). Set to "disable" for
+	// local/dev where PG runs without TLS.
+	PGSSLMode string
 }
 
 // EnsureCR creates the Lakekeeper CR for the given org or patches it to match
@@ -227,23 +231,29 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 				"replicas": int64(spec.Replicas),
 				"database": map[string]interface{}{
 					"type": "postgres",
-					"postgres": map[string]interface{}{
-						"host":     spec.PGHost,
-						"port":     int64(spec.PGPort),
-						"database": spec.PGDatabase,
-						"userSecretRef": map[string]interface{}{
-							"name": spec.SecretName,
-							"key":  SecretKeyDBUser,
-						},
-						"passwordSecretRef": map[string]interface{}{
-							"name": spec.SecretName,
-							"key":  SecretKeyDBPassword,
-						},
-						"encryptionKeySecretRef": map[string]interface{}{
-							"name": spec.SecretName,
-							"key":  SecretKeyEncryptionKey,
-						},
-					},
+					"postgres": func() map[string]interface{} {
+						pg := map[string]interface{}{
+							"host":     spec.PGHost,
+							"port":     int64(spec.PGPort),
+							"database": spec.PGDatabase,
+							"userSecretRef": map[string]interface{}{
+								"name": spec.SecretName,
+								"key":  SecretKeyDBUser,
+							},
+							"passwordSecretRef": map[string]interface{}{
+								"name": spec.SecretName,
+								"key":  SecretKeyDBPassword,
+							},
+							"encryptionKeySecretRef": map[string]interface{}{
+								"name": spec.SecretName,
+								"key":  SecretKeyEncryptionKey,
+							},
+						}
+						if spec.PGSSLMode != "" {
+							pg["sslMode"] = spec.PGSSLMode
+						}
+						return pg
+					}(),
 				},
 				"authorization": map[string]interface{}{
 					"backend": "allowall",

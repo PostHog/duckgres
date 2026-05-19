@@ -51,6 +51,10 @@ type ProvisioningInputs struct {
 	PGHost string
 	PGPort int32
 
+	// PGSSLMode the Lakekeeper pod sets when connecting. Default "require".
+	// Set to "disable" for local/dev environments where PG has no TLS.
+	PGSSLMode string
+
 	// S3 storage profile for the warehouse Lakekeeper hands out. For prod
 	// AWS, leave Endpoint empty and Flavor "aws". For MinIO / s3-compat,
 	// set Endpoint and Flavor "s3-compat".
@@ -169,6 +173,7 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		PGDatabase: dbName,
 		SecretName: secretName,
 		BaseURI:    baseURL,
+		PGSSLMode:  in.PGSSLMode,
 	}); err != nil {
 		return fmt.Errorf("ensure lakekeeper cr: %w", err)
 	}
@@ -181,7 +186,11 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	}
 
 	// 5. Idempotently create the org's warehouse via Lakekeeper's REST API.
-	lkClient := p.clientFor(baseURL + "/catalog")
+	// LakekeeperClient calls /management/v1/* which are at the server root,
+	// NOT under /catalog. The /catalog prefix is only for the Iceberg REST
+	// API that ducklings hit later — that's the value we persist in
+	// LakekeeperEndpoint below.
+	lkClient := p.clientFor(baseURL)
 	whReq := CreateWarehouseRequest{
 		WarehouseName: lakekeeperWarehouseName(w.OrgID),
 		StorageProfile: WarehouseStorageProfile{
