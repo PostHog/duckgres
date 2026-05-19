@@ -329,19 +329,5 @@ jobs:
           aws-region: us-east-1
           role-to-assume: arn:aws:iam::373313242555:role/github-duckgres-iceberg-ci-testing-role
           role-duration-seconds: 3600
-      - name: DEBUG probe iceberg REST endpoint as OIDC role
-        # Temporary diagnostic: same signed call to the S3 Tables iceberg
-        # REST endpoint we know returns 200 for SSO admin, run here from the
-        # OIDC role's STS session. Dumps full response so we can see the
-        # exact AWS error message and the calling principal ARN.
-        run: |
-          set -x
-          aws sts get-caller-identity
-          curl -sS --aws-sigv4 "aws:amz:us-east-1:s3tables" \
-            --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
-            -H "x-amz-security-token: $AWS_SESSION_TOKEN" \
-            -i \
-            "https://s3tables.us-east-1.amazonaws.com/iceberg/v1/config?warehouse=arn%3Aaws%3As3tables%3Aus-east-1%3A373313242555%3Abucket%2Fposthog-duckgres-iceberg-test-mw-dev" \
-            -w "\nHTTP_STATUS=%{http_code}\n" || true
       - name: Run Kubernetes integration tests
         run: just test-k8s-integration
