@@ -88,6 +88,9 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	if err := migrateDeltaCatalogDefaultEnabled(db); err != nil {
 		return nil, fmt.Errorf("migrate delta catalog default: %w", err)
 	}
+	if err := migrateIcebergBackendBackfill(db); err != nil {
+		return nil, fmt.Errorf("migrate iceberg backend backfill: %w", err)
+	}
 
 	runtimeSchema, err := resolveRuntimeSchema(db)
 	if err != nil {
@@ -490,6 +493,53 @@ func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
 			return fmt.Errorf("record schema migration: %w", err)
 		}
 		slog.Info("Backfilled delta_catalog_enabled=true on existing config rows.")
+		return nil
+	})
+}
+
+// migrateIcebergBackendBackfill stamps iceberg_backend = 's3_tables' on any
+// existing row whose iceberg_table_bucket_arn is populated but whose
+// iceberg_backend is empty. Without this, ResolvedBackend() on those rows
+// would return "lakekeeper" (the empty-default semantics) and the worker
+// activator + controller reconcile loop would treat them as Lakekeeper
+// orgs — silently breaking S3 Tables ATTACH AND firing redundant
+// Lakekeeper provisioning attempts.
+//
+// New rows inserted after the GORM `default:'lakekeeper'` migration get
+// the default at insert time, so this migration only matters for rows
+// that predate the column. One-shot, tracked in duckgres_schema_migrations.
+const icebergBackendBackfillMigrationName = "2026_05_iceberg_backend_backfill"
+
+func migrateIcebergBackendBackfill(db *gorm.DB) error {
+	var existing SchemaMigration
+	err := db.Where("name = ?", icebergBackendBackfillMigrationName).First(&existing).Error
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("check schema migration: %w", err)
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		// Backfill rows that have a populated S3 Tables ARN but no
+		// explicit backend — these are pre-feature rows whose semantics
+		// would change without this stamp.
+		res := tx.Exec(
+			`UPDATE duckgres_managed_warehouses
+			   SET iceberg_backend = 's3_tables'
+			 WHERE COALESCE(iceberg_table_bucket_arn, '') <> ''
+			   AND COALESCE(iceberg_backend, '') = ''`,
+		)
+		if res.Error != nil {
+			return fmt.Errorf("backfill iceberg_backend: %w", res.Error)
+		}
+		if err := tx.Create(&SchemaMigration{
+			Name:      icebergBackendBackfillMigrationName,
+			AppliedAt: time.Now().UTC(),
+		}).Error; err != nil {
+			return fmt.Errorf("record schema migration: %w", err)
+		}
+		slog.Info("Backfilled iceberg_backend=s3_tables on pre-Lakekeeper rows.",
+			"rows", res.RowsAffected)
 		return nil
 	})
 }

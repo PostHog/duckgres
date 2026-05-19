@@ -45,3 +45,6 @@ data-test/
 bench-results/
 /cache-proxy
 /cmd/cache-proxy/cache-proxy
+
+# Local prototype/scratch dirs (e.g. tmp/lakekeeper-proto/)
+tmp/
