@@ -251,9 +251,26 @@ jobs:
     needs: unit-tests
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
+    # id-token: write lets this job request a GitHub OIDC token, which
+    # aws-actions/configure-aws-credentials trades for STS-vended AWS
+    # credentials by assuming github-duckgres-iceberg-test-role in mw-dev.
+    # The role's trust policy is scoped to repo:PostHog/duckgres:*; its
+    # IAM policy is scoped to the iceberg test buckets only. Provisioned
+    # by PostHog/posthog-cloud-infra#8124.
+    permissions:
+      id-token: write
+      contents: read
     env:
       DUCKGRES_KIND_CLUSTER_NAME: duckgres
       DUCKGRES_KIND_NODE_IMAGE: kindest/node:v1.31.0@sha256:53df588e04085fd41ae12de0c3fe4c72f7013bba32a20e7325357a1ac94ba865
+      # Iceberg integration test (tests/k8s/iceberg_test.go) fails openly
+      # when any of these is unset — see its godoc for the rationale. The
+      # AWS_* credentials are populated by configure-aws-credentials below
+      # via OIDC; the three iceberg-specific values are bucket coordinates
+      # provisioned in mw-dev.
+      DUCKGRES_K8S_ICEBERG_TABLE_BUCKET_ARN: arn:aws:s3tables:us-east-1:373313242555:bucket/posthog-duckgres-iceberg-test-mw-dev
+      DUCKGRES_K8S_ICEBERG_REGION: us-east-1
+      DUCKGRES_K8S_ICEBERG_DATA_BUCKET: posthog-duckgres-iceberg-test-data-mw-dev
 
     services:
       postgres:
@@ -301,5 +318,16 @@ jobs:
             sleep $((attempt * 5))
           done
           exit 1
+      - name: Configure AWS credentials via OIDC
+        # Trades the GitHub-issued OIDC token for STS credentials by
+        # assuming github-duckgres-iceberg-test-role in mw-dev. Exposes
+        # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+        # in the job env, which iceberg_test.go reads via os.Getenv.
+        # Pinned to the same commit cloud-infra workflows use.
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v4.0.2
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::373313242555:role/github-duckgres-iceberg-test-role
+          role-duration-seconds: 3600
       - name: Run Kubernetes integration tests
         run: just test-k8s-integration
