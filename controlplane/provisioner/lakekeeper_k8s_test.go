@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -151,7 +152,7 @@ func TestEnsureCR_CreateAndShape(t *testing.T) {
 }
 
 func TestEnsureCR_IdempotentUpdate(t *testing.T) {
-	c, _, _ := newFakeLakekeeperClient()
+	c, dc, _ := newFakeLakekeeperClient()
 	ctx := context.Background()
 	spec := LakekeeperCRSpec{
 		OrgID: "acme", Image: "img:v1", PGHost: "h", PGDatabase: "lakekeeper_acme",
@@ -163,6 +164,69 @@ func TestEnsureCR_IdempotentUpdate(t *testing.T) {
 	spec.Image = "img:v2"
 	if err := c.EnsureCR(ctx, spec); err != nil {
 		t.Fatalf("second EnsureCR (update): %v", err)
+	}
+	// Read back the CR and confirm the update actually landed.
+	got, err := dc.Resource(lakekeeperGVR).Namespace("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR after update: %v", err)
+	}
+	if image := got.Object["spec"].(map[string]interface{})["image"]; image != "img:v2" {
+		t.Errorf("image after update = %v, want img:v2", image)
+	}
+}
+
+func TestEnsureCR_RejectsEmptyOrgID(t *testing.T) {
+	c, _, _ := newFakeLakekeeperClient()
+	err := c.EnsureCR(context.Background(), LakekeeperCRSpec{
+		Image: "img:v1", PGHost: "h", PGDatabase: "lakekeeper_x",
+		SecretName: "lakekeeper-x", BaseURI: "http://x",
+	})
+	if err == nil || !strings.Contains(err.Error(), "OrgID is required") {
+		t.Fatalf("expected OrgID-required error, got: %v", err)
+	}
+}
+
+func TestEnsureCR_RejectsUnsafeOrgID(t *testing.T) {
+	c, _, _ := newFakeLakekeeperClient()
+	for _, bad := range []string{"With Space", "trailing-", "-leading", "UPPER ok but space bad"} {
+		err := c.EnsureCR(context.Background(), LakekeeperCRSpec{
+			OrgID: bad, Image: "img:v1", PGHost: "h", PGDatabase: "x",
+			SecretName: "lakekeeper-x", BaseURI: "http://x",
+		})
+		if err == nil {
+			t.Errorf("expected error for orgID %q, got nil", bad)
+		}
+	}
+}
+
+func TestEnsureSecret_RejectsUnsafeOrgID(t *testing.T) {
+	c, _, _ := newFakeLakekeeperClient()
+	err := c.EnsureSecret(context.Background(), "bad value", LakekeeperSecretData{
+		DBUser: "u", DBPassword: "p", EncryptionKey: "k", OAuth2ClientSecret: "s",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a valid K8s label value") {
+		t.Fatalf("expected label-value error, got: %v", err)
+	}
+}
+
+func TestIsValidOrgIDLabel(t *testing.T) {
+	cases := map[string]bool{
+		"acme":                                    true,
+		"019e417b-18c4-7a41-bfec-e9ae3a02deb8":    true, // UUID
+		"a":                                       true,
+		"a.b_c-d":                                 true,
+		"":                                        false,
+		"-leading":                                false,
+		"trailing-":                               false,
+		".":                                       false,
+		"has space":                               false,
+		// 64 chars (over the 63 limit)
+		"a234567890123456789012345678901234567890123456789012345678901234": false,
+	}
+	for in, want := range cases {
+		if got := isValidOrgIDLabel(in); got != want {
+			t.Errorf("isValidOrgIDLabel(%q) = %v, want %v", in, got, want)
+		}
 	}
 }
 

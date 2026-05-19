@@ -5,6 +5,7 @@ package provisioner
 import (
 	"context"
 	"fmt"
+	"regexp"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -15,6 +16,16 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+// k8sLabelValue matches the Kubernetes label-value grammar
+// (([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])? with ≤63 chars. We use it to
+// validate org IDs before stamping them on labels, so a malformed ID
+// surfaces as a clear error rather than an opaque API server rejection.
+var k8sLabelValue = regexp.MustCompile(`^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)$`)
+
+func isValidOrgIDLabel(orgID string) bool {
+	return len(orgID) > 0 && len(orgID) <= 63 && k8sLabelValue.MatchString(orgID)
+}
 
 // LakekeeperNamespace is the Kubernetes namespace where per-org Lakekeeper
 // instances live. The lakekeeper-operator and its CRD watch every namespace
@@ -103,7 +114,15 @@ const (
 // updates it if it already exists. Update semantics: the four keys are
 // replaced wholesale on every call — callers must pass the full desired
 // state, not a delta.
+//
+// On a Get/Update resourceVersion conflict (concurrent recreator between
+// our IsAlreadyExists branch and our Update), the returned error wraps the
+// apierrors.IsConflict-detectable original so the reconciler can treat it
+// as transient and requeue.
 func (c *LakekeeperK8sClient) EnsureSecret(ctx context.Context, orgID string, data LakekeeperSecretData) error {
+	if !isValidOrgIDLabel(orgID) {
+		return fmt.Errorf("EnsureSecret: orgID %q is not a valid K8s label value", orgID)
+	}
 	name := LakekeeperResourceName(orgID)
 	desired := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -163,8 +182,17 @@ type LakekeeperCRSpec struct {
 }
 
 // EnsureCR creates the Lakekeeper CR for the given org or patches it to match
-// spec if it already exists. We use Server-Side Apply for idempotency.
+// spec if it already exists.
+//
+// Like EnsureSecret, Update conflicts surface as apierrors.IsConflict-detectable
+// errors so the reconciler can treat them as transient and requeue.
 func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpec) error {
+	if spec.OrgID == "" {
+		return fmt.Errorf("EnsureCR: spec.OrgID is required")
+	}
+	if !isValidOrgIDLabel(spec.OrgID) {
+		return fmt.Errorf("EnsureCR: orgID %q is not a valid K8s label value", spec.OrgID)
+	}
 	if spec.Image == "" || spec.PGHost == "" || spec.PGDatabase == "" || spec.SecretName == "" {
 		return fmt.Errorf("EnsureCR: missing required field in spec: %+v", spec)
 	}

@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 
@@ -72,24 +73,10 @@ func quoteIdent(s string) string {
 }
 
 // isDuplicateDatabase reports whether err is a Postgres 42P04 (database
-// already exists) — the only race outcome we consider benign.
+// already exists) — the only race outcome we consider benign. Uses
+// errors.As so multi-error chains (e.g. errors.Join) are handled too.
 func isDuplicateDatabase(err error) bool {
-	if err == nil {
-		return false
-	}
 	type sqlStater interface{ SQLState() string }
 	var s sqlStater
-	for cur := err; cur != nil; {
-		if v, ok := cur.(sqlStater); ok {
-			s = v
-			break
-		}
-		type unwrapper interface{ Unwrap() error }
-		if u, ok := cur.(unwrapper); ok {
-			cur = u.Unwrap()
-			continue
-		}
-		break
-	}
-	return s != nil && s.SQLState() == "42P04"
+	return errors.As(err, &s) && s.SQLState() == "42P04"
 }
