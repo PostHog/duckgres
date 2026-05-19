@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -31,7 +32,24 @@ type Controller struct {
 	store        WarehouseStore
 	duckling     *DucklingClient
 	pollInterval time.Duration
+
+	// Lakekeeper-side reconcile dependencies. All optional: if any is nil
+	// (e.g. in older deployments or unit tests that don't exercise the
+	// Lakekeeper path), reconcileLakekeeper is skipped silently.
+	lakekeeperProvisioner *LakekeeperProvisioner
+	lakekeeperInputs      LakekeeperInputsResolver
 }
+
+// LakekeeperInputsResolver is the function shape the controller uses to
+// build ProvisioningInputs for a given warehouse. Resolves things the
+// configstore doesn't carry directly: the admin Postgres DSN (from a
+// K8s Secret managed by Crossplane), the PG host the Lakekeeper pod uses
+// to reach the cluster, and the S3 storage profile.
+//
+// Defined as a function rather than a method on Controller so tests can
+// substitute a fake and so the convention for sourcing the admin DSN
+// (Crossplane-emitted Secret name pattern) lives outside this package.
+type LakekeeperInputsResolver func(ctx context.Context, w *configstore.ManagedWarehouse) (ProvisioningInputs, error)
 
 // NewController creates a provisioning controller. Returns an error if the
 // Kubernetes client cannot be initialized (e.g., not running in-cluster).
@@ -54,6 +72,16 @@ func NewControllerWithClient(store WarehouseStore, dc *DucklingClient, pollInter
 		duckling:     dc,
 		pollInterval: pollInterval,
 	}
+}
+
+// WithLakekeeperProvisioner enables the Lakekeeper reconcile branch.
+// Both p and inputs must be non-nil; otherwise the controller's
+// Lakekeeper reconcile step stays inert. inputs is the function the
+// controller calls to build ProvisioningInputs for a given warehouse.
+func (c *Controller) WithLakekeeperProvisioner(p *LakekeeperProvisioner, inputs LakekeeperInputsResolver) *Controller {
+	c.lakekeeperProvisioner = p
+	c.lakekeeperInputs = inputs
+	return c
 }
 
 // Run starts the reconciliation loop. Blocks until ctx is cancelled.
@@ -329,6 +357,57 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 			}
 		}
 	}
+
+	// Lakekeeper reconcile runs after the iceberg status propagation so we
+	// have the most recent view of w.Iceberg in memory. Independent of the
+	// Duckling state machine — provisioning a Lakekeeper for an org doesn't
+	// depend on, and doesn't block, the warehouse top-level state.
+	c.reconcileLakekeeper(ctx, w)
+}
+
+// reconcileLakekeeper provisions a per-org Lakekeeper instance when the
+// warehouse selects the lakekeeper backend and isn't yet provisioned.
+// Idempotent: a warehouse with LakekeeperEndpoint already populated is a
+// no-op. ErrBootstrapPending from the underlying EnsureForOrg is logged
+// at debug and treated as "retry on the next tick" — the controller's
+// poll loop is the requeue mechanism.
+//
+// Skipped silently when the controller wasn't built with
+// WithLakekeeperProvisioner (e.g. in deployments where the operator
+// isn't installed, or in tests).
+func (c *Controller) reconcileLakekeeper(ctx context.Context, w *configstore.ManagedWarehouse) {
+	if c.lakekeeperProvisioner == nil || c.lakekeeperInputs == nil {
+		return
+	}
+	if !w.Iceberg.Enabled {
+		return
+	}
+	if w.Iceberg.ResolvedBackend() != configstore.IcebergBackendLakekeeper {
+		return
+	}
+	if w.Iceberg.LakekeeperEndpoint != "" {
+		// Already provisioned. Future drift correction (e.g. image bumps)
+		// will be handled by the operator's reconcile loop reading the CR
+		// spec on every tick; nothing to do here.
+		return
+	}
+
+	log := slog.With("org", w.OrgID, "phase", "lakekeeper")
+
+	inputs, err := c.lakekeeperInputs(ctx, w)
+	if err != nil {
+		log.Warn("Failed to resolve lakekeeper provisioning inputs.", "error", err)
+		return
+	}
+	if err := c.lakekeeperProvisioner.EnsureForOrg(ctx, w, inputs); err != nil {
+		if errors.Is(err, ErrBootstrapPending) {
+			log.Debug("Lakekeeper bootstrap still pending; next tick will retry.")
+			return
+		}
+		log.Warn("Lakekeeper provisioning failed.", "error", err)
+		return
+	}
+	log.Info("Lakekeeper provisioning completed.")
 }
 
 // addIcebergStatusUpdates copies the Duckling's reported iceberg status
