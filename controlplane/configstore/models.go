@@ -14,6 +14,7 @@ type Org struct {
 	DatabaseName        string            `gorm:"size:255;uniqueIndex" json:"database_name"`
 	HostnameAlias       *string           `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
 	MaxWorkers          int               `gorm:"default:0" json:"max_workers"`
+	MaxConnections      int               `gorm:"default:0" json:"max_connections"`
 	MemoryBudget        string            `gorm:"size:32" json:"memory_budget"`
 	IdleTimeoutS        int               `gorm:"default:0" json:"idle_timeout_s"`
 	WorkerCPURequest    string            `gorm:"size:32" json:"worker_cpu_request"`
@@ -353,6 +354,7 @@ type OrgConfig struct {
 	DatabaseName        string
 	HostnameAlias       string // empty when no alias is configured
 	MaxWorkers          int
+	MaxConnections      int
 	MemoryBudget        string
 	IdleTimeoutS        int
 	WorkerCPURequest    string

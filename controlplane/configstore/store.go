@@ -197,6 +197,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			DatabaseName:        o.DatabaseName,
 			HostnameAlias:       alias,
 			MaxWorkers:          o.MaxWorkers,
+			MaxConnections:      o.MaxConnections,
 			MemoryBudget:        o.MemoryBudget,
 			IdleTimeoutS:        o.IdleTimeoutS,
 			WorkerCPURequest:    o.WorkerCPURequest,

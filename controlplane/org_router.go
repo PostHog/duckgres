@@ -138,6 +138,8 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	// Pass 0/false to disable budget-based rebalancing.
 	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
 	sessions := NewSessionManager(pool, rebalancer)
+	sessions.SetOrgID(tc.Name)
+	sessions.SetMaxConnections(tc.MaxConnections)
 	rebalancer.SetSessionLister(sessions)
 
 	// Periodic per-org metrics emission
@@ -282,6 +284,7 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			continue
 		}
 		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers
+		connLimitChanged := oldTC.MaxConnections != newTC.MaxConnections
 		imageChanged := workerImageForOrg(oldTC, tr.baseCfg.WorkerImage) != workerImageForOrg(newTC, tr.baseCfg.WorkerImage)
 		resourcesChanged := oldTC.WorkerCPURequest != newTC.WorkerCPURequest ||
 			oldTC.WorkerMemoryRequest != newTC.WorkerMemoryRequest
@@ -289,6 +292,11 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 		tr.mu.Lock()
 		if stack, ok := tr.orgs[name]; ok {
 			stack.Config = newTC
+			if connLimitChanged {
+				slog.Info("Org connection limit changed.", "org", name,
+					"old_max_connections", oldTC.MaxConnections, "new_max_connections", newTC.MaxConnections)
+				stack.Sessions.SetMaxConnections(newTC.MaxConnections)
+			}
 			if limitsChanged {
 				slog.Info("Org config changed.", "org", name,
 					"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)

@@ -43,6 +43,11 @@ type SessionManager struct {
 	rebalancer *MemoryRebalancer
 
 	nextPID atomic.Int32
+
+	orgID          string
+	maxConnections int
+	activeSlots    int
+	waiters        []chan struct{}
 }
 
 type flightReconnectPool interface {
@@ -61,15 +66,100 @@ func NewSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer) *SessionMa
 	return sm
 }
 
+// SetOrgID sets the org ID for this SessionManager.
+func (sm *SessionManager) SetOrgID(orgID string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.orgID = orgID
+}
+
+// SetMaxConnections sets the maximum connections for this SessionManager.
+func (sm *SessionManager) SetMaxConnections(n int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.maxConnections = n
+	// Wake up as many waiters as allowed under the new limit
+	for len(sm.waiters) > 0 && (sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections) {
+		next := sm.waiters[0]
+		sm.waiters = sm.waiters[1:]
+		sm.activeSlots++
+		close(next)
+	}
+	observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
+}
+
 // ReservePID generates a new unique PID for a session.
 func (sm *SessionManager) ReservePID() int32 {
 	return sm.nextPID.Add(1)
+}
+
+func (sm *SessionManager) acquireSlot(ctx context.Context) error {
+	sm.mu.Lock()
+
+	if sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections {
+		sm.activeSlots++
+		sm.mu.Unlock()
+		return nil
+	}
+
+	waitCh := make(chan struct{})
+	sm.waiters = append(sm.waiters, waitCh)
+	observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
+	sm.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		sm.mu.Lock()
+		for i, w := range sm.waiters {
+			if w == waitCh {
+				sm.waiters = append(sm.waiters[:i], sm.waiters[i+1:]...)
+				break
+			}
+		}
+		observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
+		sm.mu.Unlock()
+		return ctx.Err()
+
+	case <-waitCh:
+		// Woken up by releaseSlot / SetMaxConnections, slot already accounted for
+		return nil
+	}
+}
+
+func (sm *SessionManager) releaseSlot() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.activeSlots--
+	sm.notifyNextWaiterLocked()
+}
+
+func (sm *SessionManager) notifyNextWaiterLocked() {
+	if sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections {
+		if len(sm.waiters) > 0 {
+			next := sm.waiters[0]
+			sm.waiters = sm.waiters[1:]
+			sm.activeSlots++
+			close(next)
+		}
+	}
+	observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
 }
 
 // CreateSession acquires a worker (reusing an idle one or spawning a new one),
 // creates a session on it, and rebalances memory/thread limits across all active sessions.
 // If pid is 0, a new one is generated.
 func (sm *SessionManager) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
+	if err := sm.acquireSlot(ctx); err != nil {
+		return 0, nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			sm.releaseSlot()
+		}
+	}()
+
 	memoryLimit, threads = sm.resolveSessionLimits(memoryLimit, threads)
 
 	// Acquire a worker: reuses idle pre-warmed workers or spawns a new one.
@@ -87,7 +177,12 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	}
 	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
-	return sm.createSessionOnWorker(ctx, username, pid, memoryLimit, threads, worker, "postgres", true)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, pid, memoryLimit, threads, worker, "postgres", true)
+	if err != nil {
+		return 0, nil, err
+	}
+	success = true
+	return pid, exec, nil
 }
 
 func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) (string, int) {
@@ -104,6 +199,16 @@ func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) 
 }
 
 func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (int32, *flightclient.FlightExecutor, error) {
+	if err := sm.acquireSlot(ctx); err != nil {
+		return 0, nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			sm.releaseSlot()
+		}
+	}()
+
 	reconnector, ok := sm.pool.(flightReconnectPool)
 	if !ok {
 		return 0, nil, fmt.Errorf("worker pool does not support flight reconnect")
@@ -112,7 +217,12 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	if err != nil {
 		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
 	}
-	return sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false)
+	if err != nil {
+		return 0, nil, err
+	}
+	success = true
+	return pid, exec, nil
 }
 
 func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *flightclient.FlightExecutor, error) {
@@ -206,6 +316,8 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	}
 	sessionCount := len(sm.sessions)
 	workerSessionCount := len(sm.byWorker[session.WorkerID])
+	sm.activeSlots--
+	sm.notifyNextWaiterLocked()
 	sm.mu.Unlock()
 
 	slog.Info("Destroying session.",
@@ -310,6 +422,8 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			if session.connCloser != nil {
 				_ = session.connCloser.Close()
 			}
+			sm.activeSlots--
+			sm.notifyNextWaiterLocked()
 		}
 		remainingSessions := len(sm.sessions)
 		sm.mu.Unlock()
