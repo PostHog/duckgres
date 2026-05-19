@@ -24,13 +24,20 @@ import (
 // derived from the ARN's region and goes straight to AWS; no environment
 // flag overrides it.
 //
-// CI mechanics: the test is hard-gated on a persistent sandbox S3 Tables
-// bucket (the recommended setup — see below). Skips locally and in any
-// CI job that doesn't set DUCKGRES_K8S_ICEBERG_TABLE_BUCKET_ARN, so PR CI
-// stays fast and free; a dedicated job (nightly or "iceberg" lane) sets
-// the env vars and gets the real signal.
+// This test is INTENTIONALLY NOT SKIPPABLE. If the required env vars
+// aren't set in whatever CI lane runs the k8s integration suite, the
+// test fails openly with a clear diagnostic. A silent skip would hide
+// two failure modes that matter more than the test itself:
 //
-// Required env vars (test skips with a clear message when any is empty):
+//   1. CI misconfiguration — a secret rotates, an env var name changes,
+//      the sandbox bucket gets renamed, and the test silently stops
+//      running. With a skip, nobody notices until someone actively
+//      looks at the test output; with a fatal, the next PR catches it.
+//   2. A real iceberg regression that happens to coincide with an
+//      env-var gap — even worse, because the regression hides behind
+//      the same "skipped — missing env vars" line.
+//
+// Required env vars (test fails the whole job when any is empty):
 //
 //	DUCKGRES_K8S_ICEBERG_TABLE_BUCKET_ARN   — arn:aws:s3tables:<region>:<acct>:bucket/<name>
 //	DUCKGRES_K8S_ICEBERG_REGION             — must match the ARN's region
@@ -57,10 +64,7 @@ import (
 //   - DO NOT reuse a production bucket. The test creates and drops tables;
 //     a leaked DROP would target whatever bucket the env var pointed at.
 func TestK8sIcebergRoundTrip(t *testing.T) {
-	cfg, ok := loadIcebergTestConfigOrSkip(t)
-	if !ok {
-		return
-	}
+	cfg := loadIcebergTestConfig(t)
 
 	if err := seedIcebergTenantFixture(cfg); err != nil {
 		t.Fatalf("seed iceberg tenant fixture: %v", err)
@@ -139,7 +143,16 @@ type icebergTestConfig struct {
 	sessionToken   string
 }
 
-func loadIcebergTestConfigOrSkip(t *testing.T) (icebergTestConfig, bool) {
+// loadIcebergTestConfig reads the required env vars and fails the test
+// loudly if any are missing. There is no skip path — see the
+// TestK8sIcebergRoundTrip godoc for the rationale.
+//
+// Note that the env vars must be present *and non-empty*; an empty
+// value is treated as missing. This matters when CI passes secrets
+// through templated workflow files: a rotated-out secret typically
+// renders as empty rather than absent, and an empty value here would
+// silently fail the AWS call rather than the env check.
+func loadIcebergTestConfig(t *testing.T) icebergTestConfig {
 	t.Helper()
 	required := map[string]string{
 		"DUCKGRES_K8S_ICEBERG_TABLE_BUCKET_ARN": os.Getenv("DUCKGRES_K8S_ICEBERG_TABLE_BUCKET_ARN"),
@@ -155,8 +168,23 @@ func loadIcebergTestConfigOrSkip(t *testing.T) (icebergTestConfig, bool) {
 		}
 	}
 	if len(missing) > 0 {
-		t.Skipf("real-AWS iceberg test skipped — missing env vars: %s. Set them in the iceberg CI lane against a sandbox S3 Tables bucket; see TestK8sIcebergRoundTrip godoc for setup.", strings.Join(missing, ", "))
-		return icebergTestConfig{}, false
+		t.Fatalf(`iceberg integration test cannot run — required env vars are unset or empty: %s.
+
+This test is intentionally NOT skippable: a silent skip would hide CI
+misconfiguration (rotated secret, renamed bucket, dropped env var) and,
+worse, would mask any real iceberg regression that happened to land at
+the same time as the env-var gap.
+
+To wire the iceberg CI lane:
+  - provision a persistent sandbox S3 Tables bucket + companion data bucket
+    in your sandbox AWS account
+  - grant the CI IAM principal s3tables:* on the table bucket and
+    s3:GetObject/PutObject on the data bucket
+  - set all of the env vars above as CI secrets
+
+See TestK8sIcebergRoundTrip godoc for the full setup notes. Until the
+iceberg lane is wired, this failure is the correct signal that work
+remains.`, strings.Join(missing, ", "))
 	}
 	ns := os.Getenv("DUCKGRES_K8S_ICEBERG_NAMESPACE")
 	if ns == "" {
@@ -170,7 +198,7 @@ func loadIcebergTestConfigOrSkip(t *testing.T) (icebergTestConfig, bool) {
 		accessKeyID:    required["AWS_ACCESS_KEY_ID"],
 		secretKey:      required["AWS_SECRET_ACCESS_KEY"],
 		sessionToken:   os.Getenv("AWS_SESSION_TOKEN"),
-	}, true
+	}
 }
 
 // seedIcebergTenantFixture installs everything the iceberg tenant needs:
