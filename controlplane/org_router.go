@@ -138,7 +138,6 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	// Pass 0/false to disable budget-based rebalancing.
 	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
 	sessions := NewSessionManager(pool, rebalancer)
-	sessions.SetOrgID(tc.Name)
 	sessions.SetMaxConnections(tc.MaxConnections)
 	rebalancer.SetSessionLister(sessions)
 

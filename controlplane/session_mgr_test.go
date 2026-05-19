@@ -4,12 +4,11 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/posthog/duckgres/server/flightclient"
 )
@@ -22,42 +21,6 @@ type mockCloser struct {
 func (m *mockCloser) Close() error {
 	m.closed.Store(true)
 	return nil
-}
-
-type grantRaceContext struct {
-	context.Context
-
-	enteredDone chan struct{}
-	allowDone   chan struct{}
-	done        chan struct{}
-	closeOnce   sync.Once
-}
-
-func newGrantRaceContext() *grantRaceContext {
-	return &grantRaceContext{
-		Context:     context.Background(),
-		enteredDone: make(chan struct{}),
-		allowDone:   make(chan struct{}),
-		done:        make(chan struct{}),
-	}
-}
-
-func (c *grantRaceContext) Done() <-chan struct{} {
-	c.closeOnce.Do(func() {
-		close(c.enteredDone)
-		<-c.allowDone
-		close(c.done)
-	})
-	return c.done
-}
-
-func (c *grantRaceContext) Err() error {
-	select {
-	case <-c.done:
-		return context.Canceled
-	default:
-		return nil
-	}
 }
 
 func TestOnWorkerCrash_MarksExecutorsDead(t *testing.T) {
@@ -325,7 +288,6 @@ func TestResolveSessionLimits_PreservesExplicitValues(t *testing.T) {
 func TestSessionManager_ConnectionLimits_Basic(t *testing.T) {
 	ctx := context.Background()
 	sm := NewSessionManager(nil, nil)
-	sm.SetOrgID("test-org")
 	sm.SetMaxConnections(2)
 
 	// Acquire slot 1
@@ -351,10 +313,9 @@ func TestSessionManager_ConnectionLimits_Basic(t *testing.T) {
 	}
 }
 
-func TestSessionManager_ConnectionLimits_Queuing(t *testing.T) {
+func TestSessionManager_ConnectionLimits_RejectsImmediatelyAtCapacity(t *testing.T) {
 	ctx := context.Background()
 	sm := NewSessionManager(nil, nil)
-	sm.SetOrgID("test-org")
 	sm.SetMaxConnections(1)
 
 	// Acquire slot 1
@@ -362,152 +323,23 @@ func TestSessionManager_ConnectionLimits_Queuing(t *testing.T) {
 		t.Fatalf("unexpected error acquiring slot 1: %v", err)
 	}
 
-	// Acquire slot 2 (should block since max is 1)
-	blockedCh := make(chan struct{})
-	doneCh := make(chan error, 1)
-	go func() {
-		close(blockedCh)
-		err := sm.acquireSlot(ctx)
-		doneCh <- err
-	}()
-
-	<-blockedCh
-	// Sleep briefly to ensure the goroutine has called acquireSlot and is waiting
-	time.Sleep(50 * time.Millisecond)
-
-	sm.mu.Lock()
-	waitersLen := len(sm.waiters)
-	sm.mu.Unlock()
-	if waitersLen != 1 {
-		t.Fatalf("expected 1 waiter, got %d", waitersLen)
+	err := sm.acquireSlot(ctx)
+	if !errors.Is(err, ErrTooManyConnections) {
+		t.Fatalf("expected ErrTooManyConnections, got %v", err)
+	}
+	if sm.activeSlots != 1 {
+		t.Fatalf("expected activeSlots=1, got %d", sm.activeSlots)
 	}
 
-	// Release slot 1, should unblock waiter 2
 	sm.releaseSlot()
-
-	select {
-	case err := <-doneCh:
-		if err != nil {
-			t.Fatalf("waiter received error: %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timed out waiting for queued request to be unblocked")
-	}
-
-	if sm.activeSlots != 1 {
-		t.Fatalf("expected activeSlots=1, got %d", sm.activeSlots)
+	if err := sm.acquireSlot(ctx); err != nil {
+		t.Fatalf("expected slot to be available after release, got %v", err)
 	}
 }
 
-func TestSessionManager_ConnectionLimits_Timeout(t *testing.T) {
-	sm := NewSessionManager(nil, nil)
-	sm.SetOrgID("test-org")
-	sm.SetMaxConnections(1)
-
-	// Acquire slot 1
-	if err := sm.acquireSlot(context.Background()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Acquire slot 2 with a cancellable context
-	ctx, cancel := context.WithCancel(context.Background())
-	blockedCh := make(chan struct{})
-	doneCh := make(chan error, 1)
-	go func() {
-		close(blockedCh)
-		err := sm.acquireSlot(ctx)
-		doneCh <- err
-	}()
-
-	<-blockedCh
-	time.Sleep(50 * time.Millisecond)
-
-	// Cancel context of waiter
-	cancel()
-
-	select {
-	case err := <-doneCh:
-		if err == nil || !strings.Contains(err.Error(), "context canceled") {
-			t.Fatalf("expected context canceled error, got: %v", err)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timed out waiting for canceled waiter to exit")
-	}
-
-	sm.mu.Lock()
-	waitersLen := len(sm.waiters)
-	sm.mu.Unlock()
-	if waitersLen != 0 {
-		t.Fatalf("expected 0 waiters after cancel, got %d", waitersLen)
-	}
-
-	// Slot count should still be 1 (held by first session)
-	if sm.activeSlots != 1 {
-		t.Fatalf("expected activeSlots=1, got %d", sm.activeSlots)
-	}
-}
-
-func TestSessionManager_ConnectionLimits_CancelAfterGrantDoesNotLeakSlot(t *testing.T) {
-	oldProcs := runtime.GOMAXPROCS(1)
-	defer runtime.GOMAXPROCS(oldProcs)
-
-	for attempt := 0; attempt < 100; attempt++ {
-		sm := NewSessionManager(nil, nil)
-		sm.SetOrgID("test-org")
-		sm.SetMaxConnections(1)
-
-		if err := sm.acquireSlot(context.Background()); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		ctx := newGrantRaceContext()
-		doneCh := make(chan error, 1)
-		go func() {
-			doneCh <- sm.acquireSlot(ctx)
-		}()
-
-		select {
-		case <-ctx.enteredDone:
-		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for queued request")
-		}
-
-		// Simulate the release/limit-change grant path while the waiter is
-		// blocked evaluating ctx.Done(). When allowDone closes, both select cases
-		// are ready; if cancellation wins, the pre-accounted slot must be released.
-		sm.mu.Lock()
-		next := sm.waiters[0]
-		sm.waiters = sm.waiters[1:]
-		sm.activeSlots++
-		close(next)
-		sm.mu.Unlock()
-		close(ctx.allowDone)
-
-		select {
-		case err := <-doneCh:
-			if err != nil {
-				sm.mu.Lock()
-				activeSlots := sm.activeSlots
-				waitersLen := len(sm.waiters)
-				sm.mu.Unlock()
-				if activeSlots != 1 {
-					t.Fatalf("canceled granted waiter leaked slot: activeSlots=%d waiters=%d", activeSlots, waitersLen)
-				}
-				return
-			}
-			sm.releaseSlot()
-		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for queued request")
-		}
-	}
-
-	t.Fatal("test did not exercise cancellation after grant")
-}
-
-func TestSessionManager_ConnectionLimits_DynamicLimit(t *testing.T) {
+func TestSessionManager_ConnectionLimits_DynamicLimitIncreaseAdmitsNewSession(t *testing.T) {
 	ctx := context.Background()
 	sm := NewSessionManager(nil, nil)
-	sm.SetOrgID("test-org")
 	sm.SetMaxConnections(1)
 
 	// Acquire slot 1
@@ -515,44 +347,11 @@ func TestSessionManager_ConnectionLimits_DynamicLimit(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Waiters 1 & 2
-	done1 := make(chan error, 1)
-	go func() {
-		done1 <- sm.acquireSlot(ctx)
-	}()
-	done2 := make(chan error, 1)
-	go func() {
-		done2 <- sm.acquireSlot(ctx)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-
-	sm.mu.Lock()
-	waitersLen := len(sm.waiters)
-	sm.mu.Unlock()
-	if waitersLen != 2 {
-		t.Fatalf("expected 2 waiters, got %d", waitersLen)
-	}
-
-	// Dynamically increase MaxConnections to 3, should wake up both waiters
 	sm.SetMaxConnections(3)
-
-	for i := 0; i < 2; i++ {
-		select {
-		case err := <-done1:
-			if err != nil {
-				t.Fatalf("waiter 1 failed: %v", err)
-			}
-		case err := <-done2:
-			if err != nil {
-				t.Fatalf("waiter 2 failed: %v", err)
-			}
-		case <-time.After(1 * time.Second):
-			t.Fatal("timed out waiting for waiters to be unblocked by dynamic limit increase")
-		}
+	if err := sm.acquireSlot(ctx); err != nil {
+		t.Fatalf("expected new slot after dynamic limit increase, got %v", err)
 	}
-
-	if sm.activeSlots != 3 {
-		t.Fatalf("expected activeSlots=3, got %d", sm.activeSlots)
+	if sm.activeSlots != 2 {
+		t.Fatalf("expected activeSlots=2, got %d", sm.activeSlots)
 	}
 }

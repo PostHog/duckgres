@@ -666,6 +666,8 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 		return "57014", "canceling authentication due to user request"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "53300", "timed out waiting for an available worker"
+	case errors.Is(err, ErrTooManyConnections):
+		return "53300", "too many connections"
 	default:
 		return "58000", fmt.Sprintf("failed to create session: %v", err)
 	}

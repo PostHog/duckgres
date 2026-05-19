@@ -24,11 +24,6 @@ var orgSessionsActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Number of active sessions per org",
 }, []string{"org"})
 
-var orgSessionQueueDepthGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_org_session_queue_depth",
-	Help: "Number of sessions waiting in queue per org",
-}, []string{"org"})
-
 var orgWorkerSpawnsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_org_worker_spawns_total",
 	Help: "Total worker spawns per org",
@@ -92,8 +87,4 @@ func observeSNIRoutingResolution(protocol string, aliasUsed bool) {
 		used = "true"
 	}
 	sniRoutingResolutionsCounter.WithLabelValues(protocol, used).Inc()
-}
-
-func observeOrgSessionQueueDepth(org string, depth int) {
-	orgSessionQueueDepthGauge.WithLabelValues(org).Set(float64(depth))
 }

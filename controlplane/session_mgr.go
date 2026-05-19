@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,8 @@ import (
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 )
+
+var ErrTooManyConnections = errors.New("too many connections")
 
 // SessionProgress holds cached query progress from a worker health check.
 type SessionProgress struct {
@@ -44,10 +47,8 @@ type SessionManager struct {
 
 	nextPID atomic.Int32
 
-	orgID          string
 	maxConnections int
 	activeSlots    int
-	waiters        []chan struct{}
 }
 
 type flightReconnectPool interface {
@@ -66,26 +67,11 @@ func NewSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer) *SessionMa
 	return sm
 }
 
-// SetOrgID sets the org ID for this SessionManager.
-func (sm *SessionManager) SetOrgID(orgID string) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.orgID = orgID
-}
-
 // SetMaxConnections sets the maximum connections for this SessionManager.
 func (sm *SessionManager) SetMaxConnections(n int) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.maxConnections = n
-	// Wake up as many waiters as allowed under the new limit
-	for len(sm.waiters) > 0 && (sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections) {
-		next := sm.waiters[0]
-		sm.waiters = sm.waiters[1:]
-		sm.activeSlots++
-		close(next)
-	}
-	observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
 }
 
 // ReservePID generates a new unique PID for a session.
@@ -93,66 +79,25 @@ func (sm *SessionManager) ReservePID() int32 {
 	return sm.nextPID.Add(1)
 }
 
-func (sm *SessionManager) acquireSlot(ctx context.Context) error {
+func (sm *SessionManager) acquireSlot(_ context.Context) error {
 	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
 	if sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections {
 		sm.activeSlots++
-		sm.mu.Unlock()
 		return nil
 	}
 
-	waitCh := make(chan struct{})
-	sm.waiters = append(sm.waiters, waitCh)
-	observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
-	sm.mu.Unlock()
-
-	select {
-	case <-ctx.Done():
-		sm.mu.Lock()
-		removedWaiter := false
-		for i, w := range sm.waiters {
-			if w == waitCh {
-				sm.waiters = append(sm.waiters[:i], sm.waiters[i+1:]...)
-				removedWaiter = true
-				break
-			}
-		}
-		if removedWaiter {
-			observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
-		} else {
-			if sm.activeSlots > 0 {
-				sm.activeSlots--
-			}
-			sm.notifyNextWaiterLocked()
-		}
-		sm.mu.Unlock()
-		return ctx.Err()
-
-	case <-waitCh:
-		// Woken up by releaseSlot / SetMaxConnections, slot already accounted for
-		return nil
-	}
+	return ErrTooManyConnections
 }
 
 func (sm *SessionManager) releaseSlot() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	sm.activeSlots--
-	sm.notifyNextWaiterLocked()
-}
-
-func (sm *SessionManager) notifyNextWaiterLocked() {
-	if sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections {
-		if len(sm.waiters) > 0 {
-			next := sm.waiters[0]
-			sm.waiters = sm.waiters[1:]
-			sm.activeSlots++
-			close(next)
-		}
+	if sm.activeSlots > 0 {
+		sm.activeSlots--
 	}
-	observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
 }
 
 // CreateSession acquires a worker (reusing an idle one or spawning a new one),
@@ -325,8 +270,9 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	}
 	sessionCount := len(sm.sessions)
 	workerSessionCount := len(sm.byWorker[session.WorkerID])
-	sm.activeSlots--
-	sm.notifyNextWaiterLocked()
+	if sm.activeSlots > 0 {
+		sm.activeSlots--
+	}
 	sm.mu.Unlock()
 
 	slog.Info("Destroying session.",
@@ -431,8 +377,9 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			if session.connCloser != nil {
 				_ = session.connCloser.Close()
 			}
-			sm.activeSlots--
-			sm.notifyNextWaiterLocked()
+			if sm.activeSlots > 0 {
+				sm.activeSlots--
+			}
 		}
 		remainingSessions := len(sm.sessions)
 		sm.mu.Unlock()
