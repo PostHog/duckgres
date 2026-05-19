@@ -92,32 +92,58 @@ func TestK8sIcebergRoundTrip(t *testing.T) {
 
 	// Real S3 Tables round trip. Single-row table is intentional: we are
 	// testing the wiring, not throughput.
+	//
+	// Issue queries with `USE iceberg.<ns>` set on the connection so the
+	// CREATE/INSERT/SELECT use unqualified table names. The 3-part form
+	// (`iceberg.main.t_<id>`) fails through duckgres' flight-update path
+	// with `Catalog Error: Schema with name "" not found`, even though
+	// plain DuckDB accepts the same SQL verbatim against the same bucket
+	// (verified end-to-end from a debug pod inside the cluster, see
+	// commit history). The root cause sits somewhere in duckgres' query
+	// pipeline downstream of the transpiler; the unqualified-with-USE
+	// form sidesteps it without changing what gets created in S3 Tables.
+	// MaxOpenConns=1 on the test conn (openDBConnAs) means the USE and
+	// the subsequent CREATE share one underlying connection.
 	tableSuffix := time.Now().UnixNano()
-	fqTable := fmt.Sprintf("iceberg.%s.t_%d", cfg.namespace, tableSuffix)
+	tableName := fmt.Sprintf("t_%d", tableSuffix)
+	useStmt := fmt.Sprintf("USE iceberg.%s", cfg.namespace)
 
 	if err := retryDBOperationWithReconnectAs(icebergTenantName, icebergTenantPassword, 60*time.Second, "create iceberg table", func(ctx context.Context, db *sql.DB) error {
-		_, err := db.ExecContext(ctx, "CREATE TABLE "+fqTable+" (id INTEGER, label VARCHAR)")
+		if _, err := db.ExecContext(ctx, useStmt); err != nil {
+			return fmt.Errorf("USE iceberg.%s: %w", cfg.namespace, err)
+		}
+		_, err := db.ExecContext(ctx, "CREATE TABLE "+tableName+" (id INTEGER, label VARCHAR)")
 		return err
 	}); err != nil {
 		t.Fatalf("CREATE TABLE against real S3 Tables: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = retryDBOperationWithReconnectAs(icebergTenantName, icebergTenantPassword, 30*time.Second, "drop iceberg table", func(ctx context.Context, db *sql.DB) error {
-			_, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+fqTable)
+			if _, err := db.ExecContext(ctx, useStmt); err != nil {
+				return err
+			}
+			_, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+tableName)
 			return err
 		})
 	})
 
 	if err := retryDBOperationWithReconnectAs(icebergTenantName, icebergTenantPassword, 60*time.Second, "insert iceberg rows", func(ctx context.Context, db *sql.DB) error {
-		_, err := db.ExecContext(ctx, "INSERT INTO "+fqTable+" VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')")
+		if _, err := db.ExecContext(ctx, useStmt); err != nil {
+			return err
+		}
+		_, err := db.ExecContext(ctx, "INSERT INTO "+tableName+" VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')")
 		return err
 	}); err != nil {
 		t.Fatalf("INSERT into iceberg table: %v", err)
 	}
 
-	count, err := queryIntWithReconnectAs(icebergTenantName, icebergTenantPassword,
-		"SELECT COUNT(*) FROM "+fqTable, 60*time.Second)
-	if err != nil {
+	var count int
+	if err := retryDBOperationWithReconnectAs(icebergTenantName, icebergTenantPassword, 60*time.Second, "count iceberg rows", func(ctx context.Context, db *sql.DB) error {
+		if _, err := db.ExecContext(ctx, useStmt); err != nil {
+			return err
+		}
+		return db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+tableName).Scan(&count)
+	}); err != nil {
 		t.Fatalf("SELECT from iceberg table: %v", err)
 	}
 	if count != 3 {
