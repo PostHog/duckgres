@@ -65,7 +65,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 		if reflect.DeepEqual(current.payload, payload) {
 			return nil
 		}
-		if payload.OwnerEpoch <= currentOwnerEpoch {
+		if payload.OwnerEpoch <= currentOwnerEpoch && !sameOwnerActivationAttempt(current.payload, payload) {
 			return fmt.Errorf("same-tenant takeover requires newer owner epoch %d (current %d)", payload.OwnerEpoch, currentOwnerEpoch)
 		}
 		if p.reuseExistingActivation(payload) {
@@ -166,8 +166,10 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		return false
 	}
 	if !reflect.DeepEqual(current, payload) && payload.OwnerEpoch <= current.OwnerEpoch {
-		p.mu.Unlock()
-		return false
+		if !sameOwnerActivationAttempt(current, payload) {
+			p.mu.Unlock()
+			return false
+		}
 	}
 
 	// needsRefresh is keyed on DuckLake creds because the activator
@@ -251,7 +253,9 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		return false
 	}
 	if !reflect.DeepEqual(live, payload) && payload.OwnerEpoch <= live.OwnerEpoch {
-		return false
+		if !sameOwnerActivationAttempt(live, payload) {
+			return false
+		}
 	}
 
 	p.activation.payload = payload
@@ -266,6 +270,12 @@ func s3CredentialsChanged(a, b server.DuckLakeConfig) bool {
 	return a.S3AccessKey != b.S3AccessKey ||
 		a.S3SecretKey != b.S3SecretKey ||
 		a.S3SessionToken != b.S3SessionToken
+}
+
+func sameOwnerActivationAttempt(current, next ActivationPayload) bool {
+	return current.WorkerID == next.WorkerID &&
+		current.CPInstanceID == next.CPInstanceID &&
+		current.OwnerEpoch == next.OwnerEpoch
 }
 
 // sameTenantActivationRuntime compares all structural DuckLake fields except
