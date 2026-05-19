@@ -6,6 +6,7 @@ import (
 	"context"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,42 @@ type mockCloser struct {
 func (m *mockCloser) Close() error {
 	m.closed.Store(true)
 	return nil
+}
+
+type grantRaceContext struct {
+	context.Context
+
+	enteredDone chan struct{}
+	allowDone   chan struct{}
+	done        chan struct{}
+	closeOnce   sync.Once
+}
+
+func newGrantRaceContext() *grantRaceContext {
+	return &grantRaceContext{
+		Context:     context.Background(),
+		enteredDone: make(chan struct{}),
+		allowDone:   make(chan struct{}),
+		done:        make(chan struct{}),
+	}
+}
+
+func (c *grantRaceContext) Done() <-chan struct{} {
+	c.closeOnce.Do(func() {
+		close(c.enteredDone)
+		<-c.allowDone
+		close(c.done)
+	})
+	return c.done
+}
+
+func (c *grantRaceContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
 }
 
 func TestOnWorkerCrash_MarksExecutorsDead(t *testing.T) {
@@ -408,6 +445,63 @@ func TestSessionManager_ConnectionLimits_Timeout(t *testing.T) {
 	if sm.activeSlots != 1 {
 		t.Fatalf("expected activeSlots=1, got %d", sm.activeSlots)
 	}
+}
+
+func TestSessionManager_ConnectionLimits_CancelAfterGrantDoesNotLeakSlot(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	for attempt := 0; attempt < 100; attempt++ {
+		sm := NewSessionManager(nil, nil)
+		sm.SetOrgID("test-org")
+		sm.SetMaxConnections(1)
+
+		if err := sm.acquireSlot(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		ctx := newGrantRaceContext()
+		doneCh := make(chan error, 1)
+		go func() {
+			doneCh <- sm.acquireSlot(ctx)
+		}()
+
+		select {
+		case <-ctx.enteredDone:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for queued request")
+		}
+
+		// Simulate the release/limit-change grant path while the waiter is
+		// blocked evaluating ctx.Done(). When allowDone closes, both select cases
+		// are ready; if cancellation wins, the pre-accounted slot must be released.
+		sm.mu.Lock()
+		next := sm.waiters[0]
+		sm.waiters = sm.waiters[1:]
+		sm.activeSlots++
+		close(next)
+		sm.mu.Unlock()
+		close(ctx.allowDone)
+
+		select {
+		case err := <-doneCh:
+			if err != nil {
+				sm.mu.Lock()
+				activeSlots := sm.activeSlots
+				waitersLen := len(sm.waiters)
+				sm.mu.Unlock()
+				if activeSlots != 1 {
+					t.Fatalf("canceled granted waiter leaked slot: activeSlots=%d waiters=%d", activeSlots, waitersLen)
+				}
+				return
+			}
+			sm.releaseSlot()
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for queued request")
+		}
+	}
+
+	t.Fatal("test did not exercise cancellation after grant")
 }
 
 func TestSessionManager_ConnectionLimits_DynamicLimit(t *testing.T) {

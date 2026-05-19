@@ -110,13 +110,22 @@ func (sm *SessionManager) acquireSlot(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		sm.mu.Lock()
+		removedWaiter := false
 		for i, w := range sm.waiters {
 			if w == waitCh {
 				sm.waiters = append(sm.waiters[:i], sm.waiters[i+1:]...)
+				removedWaiter = true
 				break
 			}
 		}
-		observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
+		if removedWaiter {
+			observeOrgSessionQueueDepth(sm.orgID, len(sm.waiters))
+		} else {
+			if sm.activeSlots > 0 {
+				sm.activeSlots--
+			}
+			sm.notifyNextWaiterLocked()
+		}
 		sm.mu.Unlock()
 		return ctx.Err()
 

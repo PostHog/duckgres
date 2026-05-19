@@ -611,8 +611,13 @@ func (h *apiHandler) getOrg(c *gin.Context) {
 
 func (h *apiHandler) updateOrg(c *gin.Context) {
 	name := c.Param("id")
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	var updates configstore.Org
-	if err := c.ShouldBindJSON(&updates); err != nil {
+	if err := json.Unmarshal(body, &updates); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -620,7 +625,43 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	org, ok, err := h.store.UpdateOrg(name, updates)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	existing, err := h.store.GetOrg(name)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	merged := *existing
+	if _, ok := fields["max_workers"]; ok {
+		merged.MaxWorkers = updates.MaxWorkers
+	}
+	if _, ok := fields["memory_budget"]; ok {
+		merged.MemoryBudget = updates.MemoryBudget
+	}
+	if _, ok := fields["idle_timeout_s"]; ok {
+		merged.IdleTimeoutS = updates.IdleTimeoutS
+	}
+	if _, ok := fields["max_connections"]; ok {
+		merged.MaxConnections = updates.MaxConnections
+	}
+	if _, ok := fields["worker_cpu_request"]; ok {
+		merged.WorkerCPURequest = updates.WorkerCPURequest
+	}
+	if _, ok := fields["worker_memory_request"]; ok {
+		merged.WorkerMemoryRequest = updates.WorkerMemoryRequest
+	}
+	if _, ok := fields["hostname_alias"]; ok {
+		merged.HostnameAlias = updates.HostnameAlias
+	}
+	org, ok, err := h.store.UpdateOrg(name, merged)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
