@@ -262,12 +262,20 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 	if !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create lakekeeper CR %s: %w", name, err)
 	}
-	// Update path. Fetch the existing CR to carry over resourceVersion.
+	// Update path. Fetch the existing CR to carry over resourceVersion and
+	// status. Real K8s separates status into a subresource, so an Update
+	// against the main resource shouldn't touch status — but the fake
+	// dynamic client doesn't honor that split, and the behaviour we want
+	// either way is "spec drift correction never overwrites the operator's
+	// status." So copy the existing status into the desired CR.
 	existing, getErr := resource.Get(ctx, name, metav1.GetOptions{})
 	if getErr != nil {
 		return fmt.Errorf("get lakekeeper CR %s for update: %w", name, getErr)
 	}
 	cr.SetResourceVersion(existing.GetResourceVersion())
+	if status, ok := existing.Object["status"]; ok {
+		cr.Object["status"] = status
+	}
 	if _, err := resource.Update(ctx, cr, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("update lakekeeper CR %s: %w", name, err)
 	}

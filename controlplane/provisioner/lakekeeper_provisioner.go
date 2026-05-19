@@ -1,0 +1,350 @@
+//go:build kubernetes
+
+package provisioner
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// LakekeeperProvisioner advances an org's Lakekeeper through a fixed pipeline:
+//
+//	create lakekeeper_<orgid> DB → ensure K8s Secret with creds →
+//	ensure Lakekeeper CR → wait for operator bootstrap →
+//	ensure Iceberg warehouse via REST → persist endpoint+client_id back to
+//	the warehouse row.
+//
+// Every step is idempotent so EnsureForOrg can be called repeatedly. The
+// pure dependencies (admin DSN, PG host, S3 config) are passed in by the
+// caller so the provisioner doesn't bake in secret-lookup logic — PR2 wiring
+// will compute them from the Duckling CR status + K8s Secrets.
+type LakekeeperProvisioner struct {
+	store            WarehouseStore
+	k8s              *LakekeeperK8sClient
+	image            string
+	bootstrapTimeout time.Duration
+	clientFor        ClientFactory
+}
+
+// ClientFactory builds a LakekeeperClient for a base URL. Lets tests inject
+// httptest.Server URLs without rebuilding the provisioner.
+type ClientFactory func(baseURL string) *LakekeeperClient
+
+// ProvisioningInputs are everything the provisioner needs about the org's
+// environment that doesn't live in the warehouse row yet.
+type ProvisioningInputs struct {
+	// AdminDSN is a pgx-compatible DSN with permission to CREATE DATABASE
+	// on the org's Aurora cluster. Caller resolves this from a K8s Secret
+	// managed by Crossplane.
+	AdminDSN string
+
+	// PG host/port the Lakekeeper pod uses to reach the same cluster. Often
+	// the same hostname as AdminDSN but routed differently (e.g. through
+	// PgBouncer). Empty Port defaults to 5432.
+	PGHost string
+	PGPort int32
+
+	// S3 storage profile for the warehouse Lakekeeper hands out. For prod
+	// AWS, leave Endpoint empty and Flavor "aws". For MinIO / s3-compat,
+	// set Endpoint and Flavor "s3-compat".
+	S3 S3StorageConfig
+}
+
+// S3StorageConfig captures the bucket + credentials Lakekeeper uses.
+type S3StorageConfig struct {
+	Bucket    string
+	KeyPrefix string
+	Endpoint  string
+	Region    string
+	// Flavor is "aws" or "s3-compat".
+	Flavor string
+
+	// Static creds — present for MinIO/dev. For prod AWS, leave empty and
+	// Lakekeeper uses its pod IRSA identity (allow-direct-system-credentials
+	// in the operator config).
+	StaticAccessKeyID     string
+	StaticAccessKeySecret string
+}
+
+// LakekeeperProvisionerOption tunes the provisioner.
+type LakekeeperProvisionerOption func(*LakekeeperProvisioner)
+
+// WithImage sets the Lakekeeper container image. Defaults to a pinned tag.
+func WithImage(img string) LakekeeperProvisionerOption {
+	return func(p *LakekeeperProvisioner) { p.image = img }
+}
+
+// WithBootstrapTimeout sets the max wait for status.bootstrappedAt.
+// Default 30s — the operator's bootstrap typically completes in <10s once
+// the Deployment is ready.
+func WithBootstrapTimeout(d time.Duration) LakekeeperProvisionerOption {
+	return func(p *LakekeeperProvisioner) { p.bootstrapTimeout = d }
+}
+
+// WithClientFactory overrides how LakekeeperClient instances are built.
+// Tests use this to point at httptest.Server.
+func WithClientFactory(f ClientFactory) LakekeeperProvisionerOption {
+	return func(p *LakekeeperProvisioner) { p.clientFor = f }
+}
+
+// DefaultLakekeeperImage is the pinned image we deploy by default.
+// Bumps to this constant should be paired with a Lakekeeper-operator
+// version compatibility check.
+const DefaultLakekeeperImage = "quay.io/lakekeeper/catalog:0.11.6"
+
+// NewLakekeeperProvisioner builds a provisioner. The WarehouseStore is the
+// same interface the existing controller uses for persistence.
+func NewLakekeeperProvisioner(store WarehouseStore, k8s *LakekeeperK8sClient, opts ...LakekeeperProvisionerOption) *LakekeeperProvisioner {
+	p := &LakekeeperProvisioner{
+		store:            store,
+		k8s:              k8s,
+		image:            DefaultLakekeeperImage,
+		bootstrapTimeout: 30 * time.Second,
+		clientFor:        NewLakekeeperClient,
+	}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
+}
+
+// ErrBootstrapPending signals "the operator hasn't finished initial bootstrap
+// of the Lakekeeper CR yet". Callers should requeue rather than treat this
+// as a failure.
+var ErrBootstrapPending = errors.New("lakekeeper bootstrap pending")
+
+// EnsureForOrg drives the pipeline. Idempotent: re-running on an
+// already-provisioned org reads existing state and only emits writes for
+// genuine drift.
+func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore.ManagedWarehouse, in ProvisioningInputs) error {
+	if w == nil {
+		return errors.New("EnsureForOrg: warehouse is nil")
+	}
+	if !isValidOrgIDLabel(w.OrgID) {
+		return fmt.Errorf("EnsureForOrg: orgID %q is not a valid K8s label value", w.OrgID)
+	}
+	if err := validateInputs(in); err != nil {
+		return err
+	}
+
+	dbName := lakekeeperDBName(w.OrgID)
+	secretName := LakekeeperResourceName(w.OrgID)
+	resourceName := LakekeeperResourceName(w.OrgID)
+	// In-cluster Service DNS — operator names the Service after the CR.
+	baseURL := fmt.Sprintf("http://%s.%s.svc:8181", resourceName, p.k8s.namespace)
+
+	// 1. CREATE DATABASE lakekeeper_<orgid> if absent.
+	if err := EnsureDatabase(ctx, in.AdminDSN, dbName); err != nil {
+		return fmt.Errorf("ensure lakekeeper db: %w", err)
+	}
+
+	// 2. Resolve or generate the per-org credentials, and ensure the K8s
+	// Secret holds them. On re-runs we read the existing Secret rather than
+	// rotating its values — Lakekeeper's DB password would otherwise drift
+	// from the Postgres user's actual password.
+	creds, err := p.resolveOrGenerateSecret(ctx, w.OrgID, dbName, secretName)
+	if err != nil {
+		return fmt.Errorf("ensure lakekeeper secret: %w", err)
+	}
+
+	// 3. Apply the Lakekeeper CR pointing at the org's PG + the Secret.
+	pgPort := in.PGPort
+	if pgPort == 0 {
+		pgPort = 5432
+	}
+	if err := p.k8s.EnsureCR(ctx, LakekeeperCRSpec{
+		OrgID:      w.OrgID,
+		Image:      p.image,
+		Replicas:   1,
+		PGHost:     in.PGHost,
+		PGPort:     pgPort,
+		PGDatabase: dbName,
+		SecretName: secretName,
+		BaseURI:    baseURL,
+	}); err != nil {
+		return fmt.Errorf("ensure lakekeeper cr: %w", err)
+	}
+
+	// 4. Wait for the operator to mark bootstrap complete. We don't drive
+	// bootstrap from here — `spec.bootstrap.enabled=true` on the CR tells
+	// the operator to do it, and status.bootstrappedAt flips when done.
+	if err := p.waitForBootstrap(ctx, w.OrgID); err != nil {
+		return err
+	}
+
+	// 5. Idempotently create the org's warehouse via Lakekeeper's REST API.
+	lkClient := p.clientFor(baseURL + "/catalog")
+	whReq := CreateWarehouseRequest{
+		WarehouseName: lakekeeperWarehouseName(w.OrgID),
+		StorageProfile: WarehouseStorageProfile{
+			Type:                 "s3",
+			Bucket:               in.S3.Bucket,
+			KeyPrefix:            in.S3.KeyPrefix,
+			Endpoint:             in.S3.Endpoint,
+			Region:               in.S3.Region,
+			PathStyleAccess:      in.S3.Flavor == "s3-compat",
+			Flavor:               in.S3.Flavor,
+			STSEnabled:           true,
+			RemoteSigningEnabled: false,
+		},
+		StorageCredential: storageCredFor(in.S3),
+	}
+	wh, err := lkClient.EnsureWarehouse(ctx, whReq)
+	if err != nil {
+		return fmt.Errorf("ensure lakekeeper warehouse: %w", err)
+	}
+
+	// 6. Persist endpoint+credentials back into the warehouse row. Iceberg
+	// state flips to Ready as part of the same write. Callers that don't
+	// own the row (e.g. integration tests) pass a fake store; production
+	// uses configstore's Compare-And-Swap UpdateWarehouseState.
+	// In PR1, Lakekeeper runs in allowall mode and the OAuth2 server URI is
+	// not used at the wire layer (the duckling's CREATE SECRET sends
+	// CLIENT_ID/CLIENT_SECRET but Lakekeeper accepts unauthenticated
+	// requests from within the org's NetworkPolicy). PR3 fills in the
+	// real token endpoint when OIDC SA-token auth lands.
+	updates := map[string]interface{}{
+		"iceberg_enabled":                                 true,
+		"iceberg_backend":                                 configstore.IcebergBackendLakekeeper,
+		"iceberg_lakekeeper_endpoint":                     baseURL + "/catalog",
+		"iceberg_lakekeeper_warehouse":                    wh.Name,
+		"iceberg_lakekeeper_client_id":                    oauthClientID(w.OrgID),
+		"iceberg_lakekeeper_oauth2_server_uri":            "", // PR3
+		"iceberg_lakekeeper_client_credentials_namespace": p.k8s.namespace,
+		"iceberg_lakekeeper_client_credentials_name":      secretName,
+		"iceberg_lakekeeper_client_credentials_key":       SecretKeyOAuth2ClientSecret,
+		"iceberg_state": configstore.ManagedWarehouseStateReady,
+	}
+	_ = creds // creds are written into the Secret; the row only references them
+	if err := p.store.UpdateWarehouseState(w.OrgID, w.State, updates); err != nil {
+		return fmt.Errorf("persist lakekeeper config: %w", err)
+	}
+	return nil
+}
+
+// waitForBootstrap polls the Lakekeeper CR status until bootstrappedAt is
+// non-empty or the configured timeout elapses. Returns ErrBootstrapPending on
+// timeout so the caller can requeue.
+func (p *LakekeeperProvisioner) waitForBootstrap(ctx context.Context, orgID string) error {
+	deadline := time.Now().Add(p.bootstrapTimeout)
+	const pollInterval = 500 * time.Millisecond
+	for {
+		st, err := p.k8s.GetCR(ctx, orgID)
+		if err != nil {
+			return fmt.Errorf("get lakekeeper cr status: %w", err)
+		}
+		if st != nil && st.Bootstrapped {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return ErrBootstrapPending
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
+// resolveOrGenerateSecret reads the existing per-org Secret if present, or
+// generates fresh credentials and writes a new Secret. Generating ONLY on
+// first run keeps the Postgres user's password stable across re-runs —
+// rotating the Secret would silently de-sync it from the actual PG password.
+func (p *LakekeeperProvisioner) resolveOrGenerateSecret(ctx context.Context, orgID, dbName, secretName string) (LakekeeperSecretData, error) {
+	existing, err := p.k8s.kubernetes.CoreV1().Secrets(p.k8s.namespace).Get(ctx, secretName, metav1.GetOptions{})
+	if err == nil {
+		return secretFromExisting(existing), nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return LakekeeperSecretData{}, fmt.Errorf("get existing secret: %w", err)
+	}
+	// Generate fresh credentials.
+	data := LakekeeperSecretData{
+		DBUser:             dbName, // Lakekeeper connects as a role named after its DB
+		DBPassword:         mustRandomHex(16),
+		EncryptionKey:      mustRandomHex(16),
+		OAuth2ClientSecret: mustRandomHex(32),
+	}
+	if err := p.k8s.EnsureSecret(ctx, orgID, data); err != nil {
+		return LakekeeperSecretData{}, err
+	}
+	return data, nil
+}
+
+func secretFromExisting(s *corev1.Secret) LakekeeperSecretData {
+	get := func(k string) string {
+		if v, ok := s.StringData[k]; ok {
+			return v
+		}
+		return string(s.Data[k])
+	}
+	return LakekeeperSecretData{
+		DBUser:             get(SecretKeyDBUser),
+		DBPassword:         get(SecretKeyDBPassword),
+		EncryptionKey:      get(SecretKeyEncryptionKey),
+		OAuth2ClientSecret: get(SecretKeyOAuth2ClientSecret),
+	}
+}
+
+func validateInputs(in ProvisioningInputs) error {
+	if in.AdminDSN == "" {
+		return errors.New("ProvisioningInputs.AdminDSN is required")
+	}
+	if in.PGHost == "" {
+		return errors.New("ProvisioningInputs.PGHost is required")
+	}
+	if in.S3.Bucket == "" || in.S3.Region == "" {
+		return errors.New("ProvisioningInputs.S3 Bucket+Region are required")
+	}
+	if in.S3.Flavor == "" {
+		return errors.New("ProvisioningInputs.S3.Flavor is required (\"aws\" or \"s3-compat\")")
+	}
+	return nil
+}
+
+func storageCredFor(s3 S3StorageConfig) WarehouseStorageCredential {
+	if s3.StaticAccessKeyID != "" {
+		return WarehouseStorageCredential{
+			Type:               "s3",
+			CredentialType:     "access-key",
+			AWSAccessKeyID:     s3.StaticAccessKeyID,
+			AWSSecretAccessKey: s3.StaticAccessKeySecret,
+		}
+	}
+	return WarehouseStorageCredential{
+		Type:           "s3",
+		CredentialType: "aws-system-identity",
+	}
+}
+
+func lakekeeperDBName(orgID string) string {
+	return "lakekeeper_" + lakekeeperResourceSuffix(orgID)
+}
+
+func lakekeeperWarehouseName(orgID string) string {
+	return "org-" + lakekeeperResourceSuffix(orgID)
+}
+
+func oauthClientID(orgID string) string {
+	return "duckling-" + lakekeeperResourceSuffix(orgID)
+}
+
+func mustRandomHex(byteLen int) string {
+	b := make([]byte, byteLen)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand on Linux/macOS doesn't fail in practice; if it does,
+		// we cannot proceed safely.
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return hex.EncodeToString(b)
+}
