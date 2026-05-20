@@ -286,6 +286,126 @@ func TestEnsureForOrg_PersistsAfterTopLevelStateMoved(t *testing.T) {
 	}
 }
 
+// TestEnsureForOrg_PersistsOAuth2URIWhenKubernetesAuthOn confirms that
+// KubernetesAuthAudiences on the inputs flows through to:
+//
+//   - the Lakekeeper CR's spec.authentication.kubernetes block
+//   - the warehouse row's LakekeeperOAuth2ServerURI (pointing at the
+//     worker's local broker on 127.0.0.1)
+//
+// This is the wire-level handshake PR4 unlocks: the worker emits an
+// OAuth2 secret + ATTACH because the URI is non-empty.
+func TestEnsureForOrg_PersistsOAuth2URIWhenKubernetesAuthOn(t *testing.T) {
+	dsn := os.Getenv("PG_ADMIN_DSN")
+	if dsn == "" {
+		t.Skip("PG_ADMIN_DSN not set")
+	}
+	c, _, _ := newFakeLakekeeperClient()
+	fake := newFakeLakekeeperServer(t)
+	store := newFakeProvisionerStore("oidc-org", configstore.ManagedWarehouseStateProvisioning)
+
+	if err := c.EnsureCR(context.Background(), LakekeeperCRSpec{
+		OrgID: "oidc-org", Image: "stub", PGHost: "stub", PGDatabase: "stub",
+		SecretName: "stub", BaseURI: "http://stub",
+	}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+	markBootstrapped(t, c, "oidc-org")
+
+	p := NewLakekeeperProvisioner(store, c,
+		WithClientFactory(func(string) *LakekeeperClient { return NewLakekeeperClient(fake.srv.URL) }),
+	)
+	t.Cleanup(func() { dropDatabase(t, dsn, "lakekeeper_oidcorg") })
+
+	err := p.EnsureForOrg(context.Background(), store.warehouses["oidc-org"], ProvisioningInputs{
+		AdminDSN: dsn, PGHost: "localhost", PGPort: 5434, PGSSLMode: "disable",
+		S3: S3StorageConfig{
+			Bucket: "warehouse", KeyPrefix: "oidc-org", Region: "us-east-1", Flavor: "s3-compat",
+			StaticAccessKeyID: "minioadmin", StaticAccessKeySecret: "minioadmin",
+		},
+		KubernetesAuthAudiences: []string{"lakekeeper"},
+	})
+	if err != nil {
+		t.Fatalf("EnsureForOrg: %v", err)
+	}
+
+	w := store.warehouses["oidc-org"]
+	if w.Iceberg.LakekeeperOAuth2ServerURI == "" {
+		t.Errorf("LakekeeperOAuth2ServerURI should be populated in OIDC mode")
+	}
+	if w.Iceberg.LakekeeperOAuth2ServerURI != "http://127.0.0.1:9876/token" {
+		t.Errorf("OAUTH2_SERVER_URI = %q, want http://127.0.0.1:9876/token (worker-local broker)",
+			w.Iceberg.LakekeeperOAuth2ServerURI)
+	}
+
+	// Cross-check that the CR's authentication.kubernetes block was set in
+	// the SAME EnsureForOrg call. Without this read-back, the DB row and
+	// the CR could drift — a future refactor that threads
+	// KubernetesAuthAudiences into ProvisioningInputs but forgets to pass
+	// it to LakekeeperCRSpec would leave Lakekeeper in allowall mode while
+	// the worker tells DuckDB to POST to the broker. Lakekeeper would
+	// then reject the token because k8s auth wasn't actually enabled.
+	cr, err := c.dynamic.Resource(lakekeeperGVR).Namespace(c.namespace).
+		Get(context.Background(), LakekeeperResourceName("oidc-org"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR for cross-check: %v", err)
+	}
+	specMap := cr.Object["spec"].(map[string]interface{})
+	auth, ok := specMap["authentication"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("spec.authentication missing on CR — would be allowall in prod")
+	}
+	k8sAuth, ok := auth["kubernetes"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("spec.authentication.kubernetes missing on CR")
+	}
+	if k8sAuth["enabled"] != true {
+		t.Errorf("spec.authentication.kubernetes.enabled = %v, want true", k8sAuth["enabled"])
+	}
+	auds, ok := k8sAuth["audiences"].([]interface{})
+	if !ok || len(auds) != 1 || auds[0] != "lakekeeper" {
+		t.Errorf("audiences = %v, want [lakekeeper]", k8sAuth["audiences"])
+	}
+}
+
+func TestEnsureForOrg_OAuth2URIEmptyInAllowallMode(t *testing.T) {
+	dsn := os.Getenv("PG_ADMIN_DSN")
+	if dsn == "" {
+		t.Skip("PG_ADMIN_DSN not set")
+	}
+	c, _, _ := newFakeLakekeeperClient()
+	fake := newFakeLakekeeperServer(t)
+	store := newFakeProvisionerStore("allowall-org", configstore.ManagedWarehouseStateProvisioning)
+
+	if err := c.EnsureCR(context.Background(), LakekeeperCRSpec{
+		OrgID: "allowall-org", Image: "stub", PGHost: "stub", PGDatabase: "stub",
+		SecretName: "stub", BaseURI: "http://stub",
+	}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+	markBootstrapped(t, c, "allowall-org")
+
+	p := NewLakekeeperProvisioner(store, c,
+		WithClientFactory(func(string) *LakekeeperClient { return NewLakekeeperClient(fake.srv.URL) }),
+	)
+	t.Cleanup(func() { dropDatabase(t, dsn, "lakekeeper_allowallorg") })
+
+	// KubernetesAuthAudiences left empty → allowall mode.
+	err := p.EnsureForOrg(context.Background(), store.warehouses["allowall-org"], ProvisioningInputs{
+		AdminDSN: dsn, PGHost: "localhost", PGPort: 5434, PGSSLMode: "disable",
+		S3: S3StorageConfig{
+			Bucket: "warehouse", KeyPrefix: "allowall-org", Region: "us-east-1", Flavor: "s3-compat",
+			StaticAccessKeyID: "minioadmin", StaticAccessKeySecret: "minioadmin",
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureForOrg: %v", err)
+	}
+	if w := store.warehouses["allowall-org"]; w.Iceberg.LakekeeperOAuth2ServerURI != "" {
+		t.Errorf("OAUTH2_SERVER_URI = %q, want empty (allowall mode)", w.Iceberg.LakekeeperOAuth2ServerURI)
+	}
+}
+
 func TestEnsureForOrg_RejectsInvalidOrgID(t *testing.T) {
 	c, _, _ := newFakeLakekeeperClient()
 	store := newFakeProvisionerStore("bad org", configstore.ManagedWarehouseStateProvisioning)

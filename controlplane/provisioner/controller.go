@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -36,7 +37,24 @@ type Controller struct {
 	duckling     *DucklingClient
 	pollInterval time.Duration
 	probe        MetadataProbe
+
+	// Lakekeeper-side reconcile dependencies. All optional: if any is nil
+	// (e.g. in older deployments or unit tests that don't exercise the
+	// Lakekeeper path), reconcileLakekeeper is skipped silently.
+	lakekeeperProvisioner *LakekeeperProvisioner
+	lakekeeperInputs      LakekeeperInputsResolver
 }
+
+// LakekeeperInputsResolver is the function shape the controller uses to
+// build ProvisioningInputs for a given warehouse. Resolves things the
+// configstore doesn't carry directly: the admin Postgres DSN (from a
+// K8s Secret managed by Crossplane), the PG host the Lakekeeper pod uses
+// to reach the cluster, and the S3 storage profile.
+//
+// Defined as a function rather than a method on Controller so tests can
+// substitute a fake and so the convention for sourcing the admin DSN
+// (Crossplane-emitted Secret name pattern) lives outside this package.
+type LakekeeperInputsResolver func(ctx context.Context, w *configstore.ManagedWarehouse) (ProvisioningInputs, error)
 
 // NewController creates a provisioning controller. Returns an error if the
 // Kubernetes client cannot be initialized (e.g., not running in-cluster).
@@ -66,6 +84,22 @@ func NewControllerWithClient(store WarehouseStore, dc *DucklingClient, pollInter
 // SetProbe overrides the metadata-store probe. Used by tests.
 func (c *Controller) SetProbe(p MetadataProbe) {
 	c.probe = p
+}
+
+// WithLakekeeperProvisioner enables the Lakekeeper reconcile branch.
+// Both p and inputs must be non-nil — partial wiring would silently
+// disable the reconcile step and that's a misconfiguration we'd rather
+// surface at startup than at the first activation.
+func (c *Controller) WithLakekeeperProvisioner(p *LakekeeperProvisioner, inputs LakekeeperInputsResolver) *Controller {
+	if p == nil {
+		panic("WithLakekeeperProvisioner: provisioner is nil; call NewLakekeeperProvisioner first")
+	}
+	if inputs == nil {
+		panic("WithLakekeeperProvisioner: inputs resolver is nil")
+	}
+	c.lakekeeperProvisioner = p
+	c.lakekeeperInputs = inputs
+	return c
 }
 
 // Run starts the reconciliation loop. Blocks until ctx is cancelled.
@@ -362,6 +396,11 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 	// would only land in the configstore if the warehouse was still in
 	// Provisioning when the composition completed — never on a re-enable.
 	if w.Iceberg.Enabled {
+		// TODO: this is the third c.duckling.Get-equivalent call in this
+		// function (after GetPgBouncerEnabled + GetIcebergEnabled). All
+		// three parse the same CR. Worth consolidating to a single fetch
+		// once another caller adds a fourth — for now the extra
+		// round-trips only hit warehouses where iceberg is enabled.
 		status, err := c.duckling.Get(ctx, w.OrgID)
 		if err != nil {
 			log.Warn("Failed to read Duckling status for iceberg propagation.", "error", err)
@@ -374,9 +413,87 @@ func (c *Controller) reconcileReady(ctx context.Context, w *configstore.ManagedW
 				log.Warn("Failed to persist iceberg status to configstore.", "error", err)
 			} else {
 				log.Info("Iceberg status persisted to configstore.", "updates", updates)
+				// Mirror the persisted updates onto the in-memory w so
+				// downstream reconcile steps (notably reconcileLakekeeper)
+				// see the fresh values without a re-read round-trip.
+				applyIcebergUpdatesToWarehouse(w, updates)
 			}
 		}
 	}
+
+	// Lakekeeper reconcile is independent of the Duckling state machine —
+	// provisioning a Lakekeeper for an org doesn't depend on, and doesn't
+	// block, the warehouse top-level state.
+	c.reconcileLakekeeper(ctx, w)
+}
+
+// applyIcebergUpdatesToWarehouse mirrors the column-update map onto the
+// in-memory warehouse struct so subsequent reconcile steps in the same
+// tick see the values that were just persisted, without a second store
+// read. Mirrors the column → field mapping used by the configstore's
+// UpdateWarehouseState GORM call (which writes by column name).
+//
+// Only the iceberg_* columns reconcileReady actually writes are handled
+// here; if a future caller passes other column names through this
+// function, extend the switch alongside.
+func applyIcebergUpdatesToWarehouse(w *configstore.ManagedWarehouse, updates map[string]interface{}) {
+	for k, v := range updates {
+		switch k {
+		case "iceberg_table_bucket_arn":
+			w.Iceberg.TableBucketArn = v.(string)
+		case "iceberg_region":
+			w.Iceberg.Region = v.(string)
+		case "iceberg_namespace":
+			w.Iceberg.Namespace = v.(string)
+		case "iceberg_state":
+			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
+		}
+	}
+}
+
+// reconcileLakekeeper provisions a per-org Lakekeeper instance when the
+// warehouse selects the lakekeeper backend and isn't yet provisioned.
+// Idempotent: a warehouse with LakekeeperEndpoint already populated is a
+// no-op. ErrBootstrapPending from the underlying EnsureForOrg is logged
+// at debug and treated as "retry on the next tick" — the controller's
+// poll loop is the requeue mechanism.
+//
+// Skipped silently when the controller wasn't built with
+// WithLakekeeperProvisioner (e.g. in deployments where the operator
+// isn't installed, or in tests).
+func (c *Controller) reconcileLakekeeper(ctx context.Context, w *configstore.ManagedWarehouse) {
+	if c.lakekeeperProvisioner == nil || c.lakekeeperInputs == nil {
+		return
+	}
+	if !w.Iceberg.Enabled {
+		return
+	}
+	if w.Iceberg.ResolvedBackend() != configstore.IcebergBackendLakekeeper {
+		return
+	}
+	if w.Iceberg.LakekeeperEndpoint != "" {
+		// Already provisioned. Future drift correction (e.g. image bumps)
+		// will be handled by the operator's reconcile loop reading the CR
+		// spec on every tick; nothing to do here.
+		return
+	}
+
+	log := slog.With("org", w.OrgID, "phase", "lakekeeper")
+
+	inputs, err := c.lakekeeperInputs(ctx, w)
+	if err != nil {
+		log.Warn("Failed to resolve lakekeeper provisioning inputs.", "error", err)
+		return
+	}
+	if err := c.lakekeeperProvisioner.EnsureForOrg(ctx, w, inputs); err != nil {
+		if errors.Is(err, ErrBootstrapPending) {
+			log.Debug("Lakekeeper bootstrap still pending; next tick will retry.")
+			return
+		}
+		log.Warn("Lakekeeper provisioning failed.", "error", err)
+		return
+	}
+	log.Info("Lakekeeper provisioning completed.")
 }
 
 // addIcebergStatusUpdates copies the Duckling's reported iceberg status
