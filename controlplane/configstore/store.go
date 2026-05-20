@@ -895,8 +895,9 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // The selected row is locked with SKIP LOCKED and transitioned to reserved while
 // incrementing owner_epoch. When maxOrgWorkers is set, org claims are serialized
 // under the same advisory lock used for spawn-slot allocation.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*WorkerRecord, error) {
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
+	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
 		if orgID != "" {
 			if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:org:"+orgID)).Error; err != nil {
@@ -909,6 +910,7 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, m
 				return err
 			}
 			if count >= int64(maxOrgWorkers) {
+				missReason = WorkerClaimMissReasonOrgCap
 				return nil
 			}
 		}
@@ -925,6 +927,7 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, m
 		err := query.Order("worker_id ASC").Take(&current).Error
 		if err != nil {
 			if err == gorm.ErrRecordNotFound {
+				missReason = WorkerClaimMissReasonNoIdle
 				return nil
 			}
 			return err
@@ -951,16 +954,17 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, m
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claim idle worker: %w", err)
+		return nil, WorkerClaimMissReasonNone, fmt.Errorf("claim idle worker: %w", err)
 	}
-	return claimed, nil
+	return claimed, missReason, nil
 }
 
 // ClaimHotIdleWorker atomically claims one hot-idle worker row that was
 // previously activated for the given org. The selected row is locked with
 // SKIP LOCKED and transitioned to reserved while incrementing owner_epoch.
-func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*WorkerRecord, error) {
+func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
+	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
 		var current WorkerRecord
 		err := tx.Table(cs.runtimeTable(current.TableName())).
@@ -970,6 +974,7 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*Wor
 			Take(&current).Error
 		if err != nil {
 			if err == gorm.ErrRecordNotFound {
+				missReason = WorkerClaimMissReasonNoIdle
 				return nil
 			}
 			return err
@@ -995,9 +1000,9 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*Wor
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("claim hot-idle worker: %w", err)
+		return nil, WorkerClaimMissReasonNone, fmt.Errorf("claim hot-idle worker: %w", err)
 	}
-	return claimed, nil
+	return claimed, missReason, nil
 }
 
 // ListExpiredHotIdleWorkers returns hot-idle workers whose updated_at timestamp

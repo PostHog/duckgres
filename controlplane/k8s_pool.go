@@ -1342,7 +1342,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			// Try reclaiming a hot-idle worker for the same org first (fast path:
 			// DuckLake is already attached, only needs epoch bump).
 			if assignment.OrgID != "" {
-				hotClaimed, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID)
+				hotClaimed, _, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID)
 				if err != nil {
 					return nil, err
 				}
@@ -1369,7 +1369,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				}
 			}
 
-			claimed, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, assignment.MaxWorkers)
+			claimed, missReason, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, assignment.MaxWorkers)
 			if err != nil {
 				return nil, err
 			}
@@ -1388,7 +1388,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				continue
 			}
 
-			return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
+			return nil, NewWarmCapacityExhaustedErrorForReason(missReason, DefaultWarmCapacityRetryAfter)
 		}
 
 		p.mu.Lock()

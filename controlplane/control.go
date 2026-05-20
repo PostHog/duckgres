@@ -678,6 +678,9 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 	var capacityErr *WarmCapacityExhaustedError
 	switch {
 	case errors.As(err, &capacityErr):
+		if capacityErr.missReason() == configstore.WorkerClaimMissReasonOrgCap {
+			return "53300", "Duckgres worker capacity for this organization is currently exhausted; retry later"
+		}
 		retryAfter := capacityErr.RetryAfter
 		if retryAfter <= 0 {
 			retryAfter = DefaultWarmCapacityRetryAfter

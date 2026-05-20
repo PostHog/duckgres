@@ -126,13 +126,16 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
 	if claimed == nil {
 		t.Fatal("expected idle worker claim to succeed")
 		return
+	}
+	if missReason != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("expected no miss reason on successful claim, got %q", missReason)
 	}
 	if claimed.WorkerID != 7 {
 		t.Fatalf("expected worker id 7, got %d", claimed.WorkerID)
@@ -164,12 +167,15 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
 	if claimed != nil {
 		t.Fatalf("expected no claim, got %#v", claimed)
+	}
+	if missReason != configstore.WorkerClaimMissReasonNoIdle {
+		t.Fatalf("expected no-idle miss reason, got %q", missReason)
 	}
 }
 
@@ -199,12 +205,15 @@ func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
 	if claimed != nil {
 		t.Fatalf("expected org cap to block claim, got %#v", claimed)
+	}
+	if missReason != configstore.WorkerClaimMissReasonOrgCap {
+		t.Fatalf("expected org-cap miss reason, got %q", missReason)
 	}
 
 	persisted, err := store.GetWorkerRecord(7)
@@ -240,30 +249,170 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Try claiming v2
-	claimed, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
 	if claimed == nil || claimed.WorkerID != 8 {
 		t.Fatalf("expected to claim worker 8 (v2), got %#v", claimed)
 	}
+	if missReason != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("expected no miss reason on successful image claim, got %q", missReason)
+	}
 
 	// Try claiming v3 (none exist)
-	claimed, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", 0)
+	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
 	if claimed != nil {
 		t.Fatalf("expected no claim for v3, got %#v", claimed)
 	}
+	if missReason != configstore.WorkerClaimMissReasonNoIdle {
+		t.Fatalf("expected no-idle miss reason for unmatched image, got %q", missReason)
+	}
 
 	// Neutral claim (no image filter) - should get v1 (lowest ID)
-	claimed, err = store.ClaimIdleWorker("cp-1", "org-1", "", 0)
+	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
 	if claimed == nil || claimed.WorkerID != 7 {
 		t.Fatalf("expected to claim worker 7 (neutral), got %#v", claimed)
+	}
+	if missReason != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("expected no miss reason on successful neutral claim, got %q", missReason)
+	}
+}
+
+func TestClaimHotIdleWorkerPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 14, 0, 0, 0, time.UTC)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          9,
+		PodName:           "duckgres-worker-hot-idle",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        5,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          10,
+		PodName:           "duckgres-worker-hot-idle-later",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        3,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(second): %v", err)
+	}
+
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics")
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected hot-idle worker claim to succeed")
+		return
+	}
+	if missReason != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("expected no miss reason on successful hot-idle claim, got %q", missReason)
+	}
+	if claimed.WorkerID != 9 {
+		t.Fatalf("expected worker id 9, got %d", claimed.WorkerID)
+	}
+	if claimed.State != configstore.WorkerStateReserved {
+		t.Fatalf("expected reserved state, got %q", claimed.State)
+	}
+	if claimed.OwnerCPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected owner cp-instance cp-new:boot-b, got %q", claimed.OwnerCPInstanceID)
+	}
+	if claimed.OwnerEpoch != 6 {
+		t.Fatalf("expected owner epoch 6, got %d", claimed.OwnerEpoch)
+	}
+	if claimed.OrgID != "analytics" {
+		t.Fatalf("expected org analytics, got %q", claimed.OrgID)
+	}
+	if claimed.Image != "duckgres:v2" {
+		t.Fatalf("expected image to be preserved, got %q", claimed.Image)
+	}
+
+	unclaimed, err := store.GetWorkerRecord(10)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord(unclaimed): %v", err)
+	}
+	if unclaimed.State != configstore.WorkerStateHotIdle {
+		t.Fatalf("expected later hot-idle worker to remain hot_idle, got %q", unclaimed.State)
+	}
+}
+
+func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 14, 15, 0, 0, time.UTC)
+	for _, record := range []configstore.WorkerRecord{
+		{
+			WorkerID:          11,
+			PodName:           "duckgres-worker-other-org-hot-idle",
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "billing",
+			OwnerCPInstanceID: "cp-old:boot-a",
+			OwnerEpoch:        2,
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          12,
+			PodName:           "duckgres-worker-requested-org-idle",
+			State:             configstore.WorkerStateIdle,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-old:boot-a",
+			OwnerEpoch:        2,
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          13,
+			PodName:           "duckgres-worker-requested-org-hot",
+			State:             configstore.WorkerStateHot,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-old:boot-a",
+			OwnerEpoch:        2,
+			LastHeartbeatAt:   now,
+		},
+	} {
+		if err := store.UpsertWorkerRecord(&record); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", record.WorkerID, err)
+		}
+	}
+
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics")
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claim, got %#v", claimed)
+	}
+	if missReason != configstore.WorkerClaimMissReasonNoIdle {
+		t.Fatalf("expected no-idle miss reason, got %q", missReason)
+	}
+
+	for _, workerID := range []int{11, 12, 13} {
+		persisted, err := store.GetWorkerRecord(workerID)
+		if err != nil {
+			t.Fatalf("GetWorkerRecord(%d): %v", workerID, err)
+		}
+		if persisted.OwnerCPInstanceID != "cp-old:boot-a" {
+			t.Fatalf("expected worker %d owner to remain unchanged, got %q", workerID, persisted.OwnerCPInstanceID)
+		}
+		if persisted.OwnerEpoch != 2 {
+			t.Fatalf("expected worker %d owner epoch to remain 2, got %d", workerID, persisted.OwnerEpoch)
+		}
 	}
 }
 
