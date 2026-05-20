@@ -119,8 +119,9 @@ func WithClientFactory(f ClientFactory) LakekeeperProvisionerOption {
 
 // DefaultLakekeeperImage is the pinned image we deploy by default.
 // Bumps to this constant should be paired with a Lakekeeper-operator
-// version compatibility check.
-const DefaultLakekeeperImage = "quay.io/lakekeeper/catalog:0.11.6"
+// version compatibility check. The published tags carry a "v" prefix
+// (quay.io/lakekeeper/catalog:v0.11.6) — without it the pull 404s.
+const DefaultLakekeeperImage = "quay.io/lakekeeper/catalog:v0.11.6"
 
 // NewLakekeeperProvisioner builds a provisioner. The WarehouseStore is the
 // same interface the existing controller uses for persistence.
