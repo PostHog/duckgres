@@ -189,6 +189,14 @@ type LakekeeperCRSpec struct {
 	// Defaults to "require" (the operator's default). Set to "disable" for
 	// local/dev where PG runs without TLS.
 	PGSSLMode string
+
+	// KubernetesAuthAudiences, when non-empty, enables the operator's
+	// `authentication.kubernetes` mode with the given audiences. The
+	// duckling's projected SA token must carry one of these audiences for
+	// Lakekeeper to accept it. Empty disables kubernetes auth (Lakekeeper
+	// runs in allowall mode behind NetworkPolicy — the PR1+PR2 deployment
+	// shape).
+	KubernetesAuthAudiences []string
 }
 
 // EnsureCR creates the Lakekeeper CR for the given org or patches it to match
@@ -268,6 +276,22 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 				},
 			},
 		},
+	}
+	// Optional: enable Kubernetes SA-token authentication. The operator
+	// turns this into LAKEKEEPER__K8S_AUTH_ENABLED=true +
+	// LAKEKEEPER__K8S_AUTH_AUDIENCES=<csv>, which makes Lakekeeper validate
+	// incoming bearer tokens against the K8s TokenReview API.
+	if len(spec.KubernetesAuthAudiences) > 0 {
+		audiences := make([]interface{}, 0, len(spec.KubernetesAuthAudiences))
+		for _, a := range spec.KubernetesAuthAudiences {
+			audiences = append(audiences, a)
+		}
+		cr.Object["spec"].(map[string]interface{})["authentication"] = map[string]interface{}{
+			"kubernetes": map[string]interface{}{
+				"enabled":   true,
+				"audiences": audiences,
+			},
+		}
 	}
 
 	resource := c.dynamic.Resource(lakekeeperGVR).Namespace(c.namespace)

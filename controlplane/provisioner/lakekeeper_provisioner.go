@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server/lakekeeperbroker"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,6 +60,31 @@ type ProvisioningInputs struct {
 	// AWS, leave Endpoint empty and Flavor "aws". For MinIO / s3-compat,
 	// set Endpoint and Flavor "s3-compat".
 	S3 S3StorageConfig
+
+	// KubernetesAuthAudiences enables the OIDC SA-token auth path on the
+	// Lakekeeper CR. The duckling's projected SA token must carry one of
+	// these audiences. Empty disables — Lakekeeper runs in allowall +
+	// NetworkPolicy mode (the PR1+PR2 deployment shape).
+	//
+	// When set, the provisioner also writes a non-empty
+	// LakekeeperOAuth2ServerURI to the warehouse row so the worker's
+	// in-process broker becomes DuckDB's OAuth2 server.
+	//
+	// **Flag-day deploy ordering.** Once any org gets a non-empty value
+	// here, its activation payload carries LakekeeperOAuth2ServerURI=
+	// http://127.0.0.1:9876/token, which the worker's iceberg extension
+	// tries to POST to. If the duckling pod spec hasn't yet been updated
+	// to (a) mount the projected SA token at DUCKGRES_LAKEKEEPER_TOKEN_PATH
+	// and (b) expose the broker on 9876, the POST hits a closed port and
+	// the ATTACH fails. There is no path that clears the URI once written
+	// (re-running with empty audiences would leave the old value behind).
+	// Deploy order MUST be:
+	//   1. Roll out the duckling pod spec change with the projected SA
+	//      volume + env var.
+	//   2. Apply the operator chart change that flips the CR's
+	//      authentication.kubernetes.enabled (PR4 already plumbs this).
+	//   3. Only then flip KubernetesAuthAudiences in the inputs resolver.
+	KubernetesAuthAudiences []string
 }
 
 // S3StorageConfig captures the bucket + credentials Lakekeeper uses.
@@ -165,15 +191,16 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		pgPort = 5432
 	}
 	if err := p.k8s.EnsureCR(ctx, LakekeeperCRSpec{
-		OrgID:      w.OrgID,
-		Image:      p.image,
-		Replicas:   1,
-		PGHost:     in.PGHost,
-		PGPort:     pgPort,
-		PGDatabase: dbName,
-		SecretName: secretName,
-		BaseURI:    baseURL,
-		PGSSLMode:  in.PGSSLMode,
+		OrgID:                   w.OrgID,
+		Image:                   p.image,
+		Replicas:                1,
+		PGHost:                  in.PGHost,
+		PGPort:                  pgPort,
+		PGDatabase:              dbName,
+		SecretName:              secretName,
+		BaseURI:                 baseURL,
+		PGSSLMode:               in.PGSSLMode,
+		KubernetesAuthAudiences: in.KubernetesAuthAudiences,
 	}); err != nil {
 		return fmt.Errorf("ensure lakekeeper cr: %w", err)
 	}
@@ -212,21 +239,24 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	}
 
 	// 6. Persist endpoint+credentials back into the warehouse row. Iceberg
-	// state flips to Ready as part of the same write. Callers that don't
-	// own the row (e.g. integration tests) pass a fake store; production
-	// uses configstore's Compare-And-Swap UpdateWarehouseState.
-	// In PR1, Lakekeeper runs in allowall mode and the OAuth2 server URI is
-	// not used at the wire layer (the duckling's CREATE SECRET sends
-	// CLIENT_ID/CLIENT_SECRET but Lakekeeper accepts unauthenticated
-	// requests from within the org's NetworkPolicy). PR3 fills in the
-	// real token endpoint when OIDC SA-token auth lands.
+	// state flips to Ready as part of the same write.
+	//
+	// OAUTH2_SERVER_URI is populated only when KubernetesAuthAudiences was
+	// passed (PR4 OIDC mode). Without it, Lakekeeper runs in allowall +
+	// NetworkPolicy mode and the worker emits an ATTACH with
+	// AUTHORIZATION_TYPE 'none' — the empty URI value signals that path
+	// downstream via server/iceberg.BuildLakekeeperAttachStmt.
+	oauth2URI := ""
+	if len(in.KubernetesAuthAudiences) > 0 {
+		oauth2URI = lakekeeperbroker.DefaultOAuth2ServerURI
+	}
 	updates := map[string]interface{}{
 		"iceberg_enabled":                                 true,
 		"iceberg_backend":                                 configstore.IcebergBackendLakekeeper,
 		"iceberg_lakekeeper_endpoint":                     baseURL + "/catalog",
 		"iceberg_lakekeeper_warehouse":                    wh.Name,
 		"iceberg_lakekeeper_client_id":                    oauthClientID(w.OrgID),
-		"iceberg_lakekeeper_oauth2_server_uri":            "", // PR3
+		"iceberg_lakekeeper_oauth2_server_uri":            oauth2URI,
 		"iceberg_lakekeeper_client_credentials_namespace": p.k8s.namespace,
 		"iceberg_lakekeeper_client_credentials_name":      secretName,
 		"iceberg_lakekeeper_client_credentials_key":       SecretKeyOAuth2ClientSecret,
