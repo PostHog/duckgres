@@ -622,7 +622,7 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
 	// Substitute a passing probe — the real one would try to dial the
 	// duckling's pgbouncer service, which doesn't exist in this unit test.
-	ctrl.SetProbe(func(context.Context, string, string, string, string) error { return nil })
+	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error { return nil })
 	ctrl.reconcile(ctx)
 
 	// Verify state transitioned to ready with component states set
@@ -698,7 +698,16 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 	}
 
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
-	ctrl.SetProbe(func(context.Context, string, string, string, string) error {
+	ctrl.SetProbe(func(_ context.Context, endpoint, _, _, _, sslMode string) error {
+		// PgBouncer is disabled by default (ManagedWarehousePgBouncer.Enabled
+		// zero value), so the controller should probe the direct Aurora
+		// endpoint with sslmode=require — not the pgbouncer Service.
+		if endpoint != "org-probe.cluster.us-east-1.rds.amazonaws.com" {
+			t.Errorf("expected direct endpoint, got %q", endpoint)
+		}
+		if sslMode != "require" {
+			t.Errorf("expected sslmode=require for direct probe, got %q", sslMode)
+		}
 		return fmt.Errorf("dial tcp: no such host")
 	})
 	ctrl.reconcile(ctx)
@@ -722,10 +731,75 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 	}
 
 	// A subsequent reconcile with a passing probe should flip to ready.
-	ctrl.SetProbe(func(context.Context, string, string, string, string) error { return nil })
+	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error { return nil })
 	ctrl.reconcile(ctx)
 	if fs.warehouses["org-probe"].State != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("expected state ready after probe recovered, got %q", fs.warehouses["org-probe"].State)
+	}
+}
+
+// TestReconcileProvisioningProbesPgBouncerWhenEnabled asserts that warehouses
+// with pgbouncer.enabled=true have their end-to-end probe directed at the
+// pgbouncer Service (sslmode=disable), not the direct Aurora endpoint —
+// pgbouncer's resolver is the slow lookup that motivated the probe.
+func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-pgb"] = &configstore.ManagedWarehouse{
+		OrgID:     "org-pgb",
+		State:     configstore.ManagedWarehouseStateProvisioning,
+		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: true},
+		CreatedAt: time.Now(),
+	}
+
+	cr := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.posthog.com/v1alpha1",
+			"kind":       "Duckling",
+			"metadata": map[string]interface{}{
+				"name":      ducklingName("org-pgb"),
+				"namespace": ducklingNamespace,
+			},
+			"status": map[string]interface{}{
+				"metadataStore": map[string]interface{}{
+					"type":              "aurora",
+					"endpoint":          "org-pgb.cluster.us-east-1.rds.amazonaws.com",
+					"pgbouncerEndpoint": "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543",
+					"password":          "supersecret123",
+					"user":              "postgres",
+					"database":          "postgres",
+				},
+				"dataStore":  map[string]interface{}{"type": "s3bucket", "bucketName": "org-pgb-bucket"},
+				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-pgb",
+				"conditions": []interface{}{
+					map[string]interface{}{"type": "Ready", "status": "True"},
+					map[string]interface{}{"type": "Synced", "status": "True"},
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create test CR: %v", err)
+	}
+
+	var seenEndpoint, seenSSLMode string
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.SetProbe(func(_ context.Context, endpoint, _, _, _, sslMode string) error {
+		seenEndpoint, seenSSLMode = endpoint, sslMode
+		return nil
+	})
+	ctrl.reconcile(ctx)
+
+	if seenEndpoint != "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543" {
+		t.Errorf("expected probe to use pgbouncer endpoint, got %q", seenEndpoint)
+	}
+	if seenSSLMode != "disable" {
+		t.Errorf("expected sslmode=disable for pgbouncer probe, got %q", seenSSLMode)
+	}
+	if fs.warehouses["org-pgb"].State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected state ready, got %q", fs.warehouses["org-pgb"].State)
 	}
 }
 

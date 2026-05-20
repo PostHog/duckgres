@@ -27,7 +27,7 @@ type WarehouseStore interface {
 
 // MetadataProbe is the signature for an end-to-end metadata-store probe. The
 // production implementation is ProbeMetadataStore; tests inject a stub.
-type MetadataProbe func(ctx context.Context, pgbouncerEndpoint, user, password, database string) error
+type MetadataProbe func(ctx context.Context, endpoint, user, password, database, sslMode string) error
 
 // Controller polls the config store for actionable warehouses and reconciles
 // their state against Duckling CRs in Kubernetes.
@@ -259,26 +259,41 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		// before pgbouncer's resolver picks it up. Flipping to Ready on
 		// AWS-Available alone produces a 3-5 minute window where worker
 		// activations fail with "DuckLake migration check failed → DNS
-		// lookup failed". Confirm the whole CP → pgbouncer → RDS path works
+		// lookup failed". Confirm the path workers will actually use works
 		// before we tell the rest of the system the warehouse is usable.
+		//
+		// PgBouncer is opt-in per duckling: when enabled, workers connect
+		// through the pgbouncer Service (plaintext); when disabled they
+		// connect to the Aurora endpoint directly (TLS required). The probe
+		// has to match that — otherwise we'd be testing a path nobody uses.
 		probe := c.probe
 		if probe == nil {
 			probe = ProbeMetadataStore
 		}
+		var probeEndpoint, probeSSLMode string
+		if w.PgBouncer.Enabled {
+			probeEndpoint = status.MetadataStore.PgBouncerEndpoint
+			probeSSLMode = "disable"
+		} else {
+			probeEndpoint = status.MetadataStore.Endpoint
+			probeSSLMode = "require"
+		}
 		if err := probe(ctx,
-			status.MetadataStore.PgBouncerEndpoint,
+			probeEndpoint,
 			status.MetadataStore.User,
 			status.MetadataStore.Password,
 			status.MetadataStore.Database,
+			probeSSLMode,
 		); err != nil {
-			log.Info("Infrastructure provisioned but end-to-end probe still failing — staying in provisioning.", "error", err)
+			log.Info("Infrastructure provisioned but end-to-end probe still failing — staying in provisioning.",
+				"pgbouncer_enabled", w.PgBouncer.Enabled, "error", err)
 			updates["status_message"] = fmt.Sprintf("Waiting for metadata store reachability: %v", err)
 		} else {
 			now := time.Now().UTC()
 			updates["state"] = configstore.ManagedWarehouseStateReady
 			updates["status_message"] = "Infrastructure ready"
 			updates["ready_at"] = now
-			log.Info("Infrastructure ready, transitioning to ready.")
+			log.Info("Infrastructure ready, transitioning to ready.", "pgbouncer_enabled", w.PgBouncer.Enabled)
 		}
 	}
 
