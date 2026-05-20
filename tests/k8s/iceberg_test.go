@@ -153,8 +153,55 @@ func TestK8sIcebergRoundTrip(t *testing.T) {
 	// activation failures while tolerating the ordinary multi-second
 	// ATTACH latency.
 	if err := pollIcebergAttached(60 * time.Second); err != nil {
-		t.Fatalf("iceberg catalog not attached after activation: %v (ATTACH against %s probably failed — check control-plane logs)", err, cfg.tableBucketARN)
+		// Surface the worker + control-plane logs inline so the CI
+		// failure message contains everything needed to diagnose the
+		// activation failure without re-running anything. The bucket
+		// only attaches once per CI run, so a follow-up run can't
+		// reproduce the same state.
+		diag := captureIcebergActivationDiagnostics()
+		t.Fatalf("iceberg catalog not attached after activation: %v (ATTACH against %s probably failed)\n%s", err, cfg.tableBucketARN, diag)
 	}
+}
+
+// captureIcebergActivationDiagnostics dumps the control-plane and
+// worker pod logs (filtered to iceberg / attach lines first, then full
+// tail) plus the live row from the warehouse table so the test failure
+// in CI contains enough context to diagnose why activation didn't
+// produce an attached catalog. The kind cluster gets torn down right
+// after the test exits, so anything not surfaced here is gone.
+func captureIcebergActivationDiagnostics() string {
+	const ns = "duckgres"
+	var b strings.Builder
+	b.WriteString("--- activation diagnostics ---\n")
+
+	if pods, err := kubectlCommandOutput("-n", ns, "get", "pods", "-l", "app=duckgres-worker", "-o", "wide"); err != nil {
+		fmt.Fprintf(&b, "kubectl get pods (worker): %v\n", err)
+	} else {
+		fmt.Fprintf(&b, "worker pods:\n%s\n", pods)
+	}
+
+	if cpLogs, err := kubectlCommandOutput("-n", ns, "logs", "deployment/duckgres-control-plane", "--tail=200"); err != nil {
+		fmt.Fprintf(&b, "control-plane logs: %v\n", err)
+	} else {
+		fmt.Fprintf(&b, "control-plane logs (last 200 lines):\n%s\n", cpLogs)
+	}
+
+	if workerLogs, err := kubectlCommandOutput("-n", ns, "logs", "-l", "app=duckgres-worker", "--tail=200", "--prefix=true"); err != nil {
+		fmt.Fprintf(&b, "worker logs: %v\n", err)
+	} else {
+		fmt.Fprintf(&b, "worker logs (last 200 lines):\n%s\n", workerLogs)
+	}
+
+	row, err := queryRuntimeStoreText(
+		"SELECT org_id, state, status_message, iceberg_state, iceberg_status_message, s3_state, s3_status_message, ready_at, updated_at " +
+			"FROM duckgres_managed_warehouses WHERE org_id = '" + icebergTenantName + "'")
+	if err != nil {
+		fmt.Fprintf(&b, "warehouse row query: %v\n", err)
+	} else {
+		fmt.Fprintf(&b, "duckgres_managed_warehouses[%s]:\n%s\n", icebergTenantName, row)
+	}
+
+	return b.String()
 }
 
 // pollIcebergAttached polls the iceberg tenant's session for the
