@@ -178,7 +178,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 
 	cfg := DefaultServerConfig()
 	defaultQueryLog := cfg.QueryLog
-	var workerQueueTimeout time.Duration
+	workerQueueTimeout := 60 * time.Second
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
 	var processMinWorkers, processMaxWorkers int

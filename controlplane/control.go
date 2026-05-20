@@ -40,7 +40,7 @@ type ControlPlaneConfig struct {
 	SocketDir            string
 	ConfigPath           string // Path to config file, passed to workers
 	HealthCheckInterval  time.Duration
-	WorkerQueueTimeout   time.Duration // How long to wait for an available worker slot (default: 5m)
+	WorkerQueueTimeout   time.Duration // How long to wait for an available worker/org connection slot (default: 60s)
 	WorkerIdleTimeout    time.Duration // How long to keep an idle worker alive (default: 5m)
 	RetireOnSessionEnd   bool          // When true, process workers are retired immediately after their last session ends.
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade. 0 = unbounded (wait until k8s SIGKILL via terminationGracePeriodSeconds). Default: 0 in remote mode (so a CP rolling out doesn't kill in-flight customer queries at a self-imposed wall — see drainAndShutdown), 24h in process mode.
@@ -205,7 +205,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.HealthCheckInterval = 2 * time.Second
 	}
 	if cfg.WorkerQueueTimeout == 0 {
-		cfg.WorkerQueueTimeout = 5 * time.Minute
+		cfg.WorkerQueueTimeout = 60 * time.Second
 	}
 	if cfg.WorkerIdleTimeout == 0 {
 		cfg.WorkerIdleTimeout = 5 * time.Minute
@@ -688,6 +688,8 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 		return "57014", "canceling authentication due to user request"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "53300", "timed out waiting for an available worker"
+	case errors.Is(err, ErrTooManyConnections):
+		return "53300", "too many connections"
 	default:
 		return "58000", fmt.Sprintf("failed to create session: %v", err)
 	}

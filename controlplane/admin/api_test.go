@@ -66,6 +66,7 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.MaxWorkers = updates.MaxWorkers
 	org.MemoryBudget = updates.MemoryBudget
 	org.IdleTimeoutS = updates.IdleTimeoutS
+	org.MaxConnections = updates.MaxConnections
 	if updates.WorkerCPURequest != "" {
 		org.WorkerCPURequest = updates.WorkerCPURequest
 	}
@@ -1337,5 +1338,42 @@ func TestIsValidDuckLakeSpecVersion(t *testing.T) {
 		if got := isValidDuckLakeSpecVersion(tc.v); got != tc.want {
 			t.Errorf("isValidDuckLakeSpecVersion(%q) = %v, want %v", tc.v, got, tc.want)
 		}
+	}
+}
+
+func TestUpdateOrgMaxConnections(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:           "analytics",
+		MaxWorkers:     2,
+		MaxConnections: 5,
+		MemoryBudget:   "8GB",
+		IdleTimeoutS:   30,
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"max_connections": 10
+	}`)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxConnections != 10 {
+		t.Fatalf("expected org max_connections to be updated, got %d", store.orgs["analytics"].MaxConnections)
+	}
+	if store.orgs["analytics"].MaxWorkers != 2 {
+		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
+	}
+	if store.orgs["analytics"].MemoryBudget != "8GB" {
+		t.Fatalf("expected memory_budget to be preserved, got %q", store.orgs["analytics"].MemoryBudget)
+	}
+	if store.orgs["analytics"].IdleTimeoutS != 30 {
+		t.Fatalf("expected idle_timeout_s to be preserved, got %d", store.orgs["analytics"].IdleTimeoutS)
 	}
 }

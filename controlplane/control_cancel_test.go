@@ -83,6 +83,16 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		}
 	})
 
+	t.Run("too many connections", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(ErrTooManyConnections)
+		if code != "53300" {
+			t.Fatalf("code = %q, want 53300", code)
+		}
+		if message != "too many connections" {
+			t.Fatalf("message = %q", message)
+		}
+	})
+
 	t.Run("warm capacity exhausted", func(t *testing.T) {
 		code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedError(45 * time.Second))
 		if code != "53300" {

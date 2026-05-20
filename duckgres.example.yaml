@@ -13,6 +13,10 @@ port: 5432
 # flight_handle_idle_ttl: "15m"
 # flight_session_token_ttl: "1h"
 
+# Max time to wait for worker acquisition and per-org connection-limit queue admission.
+# Default: 60s
+# worker_queue_timeout: "60s"
+
 # Directory for DuckDB database files (one per user)
 data_dir: "./data"
 

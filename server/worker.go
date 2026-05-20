@@ -360,6 +360,9 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		}
 	}()
 
+	clientConn.ensureConnectionContext()
+	defer clientConn.cancel()
+
 	// Send initial parameters
 	clientConn.sendInitialParams()
 
