@@ -95,6 +95,86 @@ func assertSecretData(t *testing.T, s *corev1.Secret, want LakekeeperSecretData)
 	}
 }
 
+func TestEnsureServiceAccount_CreateAndIdempotent(t *testing.T) {
+	c, _, kc := newFakeLakekeeperClient()
+	ctx := context.Background()
+
+	if err := c.EnsureServiceAccount(ctx, "acme"); err != nil {
+		t.Fatalf("EnsureServiceAccount: %v", err)
+	}
+	sa, err := kc.CoreV1().ServiceAccounts("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get SA: %v", err)
+	}
+	if sa.Labels["duckgres/active-org"] != "acme" {
+		t.Errorf("active-org label = %q, want acme", sa.Labels["duckgres/active-org"])
+	}
+	// Re-run must not error (AlreadyExists is swallowed).
+	if err := c.EnsureServiceAccount(ctx, "acme"); err != nil {
+		t.Fatalf("EnsureServiceAccount re-run: %v", err)
+	}
+}
+
+func TestEnsureServiceAccount_RejectsBadOrgID(t *testing.T) {
+	c, _, _ := newFakeLakekeeperClient()
+	if err := c.EnsureServiceAccount(context.Background(), "bad/org id"); err == nil {
+		t.Fatal("expected error for invalid org ID")
+	}
+}
+
+func TestEnsureCR_SetsServiceAccountNameWhenProvided(t *testing.T) {
+	c, dc, _ := newFakeLakekeeperClient()
+	ctx := context.Background()
+	base := LakekeeperCRSpec{
+		OrgID:      "acme",
+		Image:      "quay.io/lakekeeper/catalog:0.11.6",
+		PGHost:     "acme-pg.local",
+		PGDatabase: "lakekeeper_acme",
+		SecretName: "lakekeeper-acme",
+		BaseURI:    "http://lakekeeper-acme.lakekeeper.svc:8181",
+	}
+
+	// With SA set → rendered into spec.
+	withSA := base
+	withSA.ServiceAccountName = "lakekeeper-acme"
+	if err := c.EnsureCR(ctx, withSA); err != nil {
+		t.Fatalf("EnsureCR: %v", err)
+	}
+	got, err := dc.Resource(lakekeeperGVR).Namespace("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	specMap := got.Object["spec"].(map[string]interface{})
+	if specMap["serviceAccountName"] != "lakekeeper-acme" {
+		t.Errorf("spec.serviceAccountName = %v, want lakekeeper-acme", specMap["serviceAccountName"])
+	}
+}
+
+func TestEnsureCR_OmitsServiceAccountNameWhenEmpty(t *testing.T) {
+	c, dc, _ := newFakeLakekeeperClient()
+	ctx := context.Background()
+	spec := LakekeeperCRSpec{
+		OrgID:      "acme",
+		Image:      "quay.io/lakekeeper/catalog:0.11.6",
+		PGHost:     "acme-pg.local",
+		PGDatabase: "lakekeeper_acme",
+		SecretName: "lakekeeper-acme",
+		BaseURI:    "http://lakekeeper-acme.lakekeeper.svc:8181",
+		// ServiceAccountName intentionally empty.
+	}
+	if err := c.EnsureCR(ctx, spec); err != nil {
+		t.Fatalf("EnsureCR: %v", err)
+	}
+	got, err := dc.Resource(lakekeeperGVR).Namespace("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR: %v", err)
+	}
+	specMap := got.Object["spec"].(map[string]interface{})
+	if _, present := specMap["serviceAccountName"]; present {
+		t.Errorf("spec.serviceAccountName should be omitted when empty, got %v", specMap["serviceAccountName"])
+	}
+}
+
 func TestEnsureCR_ValidatesRequiredFields(t *testing.T) {
 	c, _, _ := newFakeLakekeeperClient()
 	err := c.EnsureCR(context.Background(), LakekeeperCRSpec{OrgID: "acme"})
