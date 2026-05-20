@@ -322,6 +322,15 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 					"listenPort":           int64(8181),
 					"enableDefaultProject": true,
 					"baseURI":              spec.BaseURI,
+					// Let Lakekeeper use the pod's ambient (EKS Pod Identity)
+					// credentials for S3 — needed so it can assume the
+					// warehouse's sts-role-arn to vend. Lakekeeper defaults this
+					// OFF; the operator only emits the enabling env when the
+					// object is present, so we set it explicitly (a nil parent
+					// wouldn't pick up the CRD's default=true).
+					"storageSystemCredentials": map[string]interface{}{
+						"allowDirectSystemCredentials": true,
+					},
 				},
 			},
 		},
