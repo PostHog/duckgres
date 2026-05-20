@@ -127,7 +127,7 @@ func TestEnsureCR_SetsServiceAccountNameWhenProvided(t *testing.T) {
 	ctx := context.Background()
 	base := LakekeeperCRSpec{
 		OrgID:      "acme",
-		Image:      "quay.io/lakekeeper/catalog:v0.11.6",
+		Image:      "quay.io/lakekeeper/catalog:v0.12.2",
 		PGHost:     "acme-pg.local",
 		PGDatabase: "lakekeeper_acme",
 		SecretName: "lakekeeper-acme",
@@ -155,7 +155,7 @@ func TestEnsureCR_OmitsServiceAccountNameWhenEmpty(t *testing.T) {
 	ctx := context.Background()
 	spec := LakekeeperCRSpec{
 		OrgID:      "acme",
-		Image:      "quay.io/lakekeeper/catalog:v0.11.6",
+		Image:      "quay.io/lakekeeper/catalog:v0.12.2",
 		PGHost:     "acme-pg.local",
 		PGDatabase: "lakekeeper_acme",
 		SecretName: "lakekeeper-acme",
@@ -188,7 +188,7 @@ func TestEnsureCR_CreateAndShape(t *testing.T) {
 	ctx := context.Background()
 	spec := LakekeeperCRSpec{
 		OrgID:      "acme",
-		Image:      "quay.io/lakekeeper/catalog:v0.11.6",
+		Image:      "quay.io/lakekeeper/catalog:v0.12.2",
 		PGHost:     "acme-pg.local",
 		PGDatabase: "lakekeeper_acme",
 		SecretName: "lakekeeper-acme",

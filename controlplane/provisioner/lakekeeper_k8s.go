@@ -216,7 +216,7 @@ func (c *LakekeeperK8sClient) EnsureServiceAccount(ctx context.Context, orgID st
 // EnsureDatabase.
 type LakekeeperCRSpec struct {
 	OrgID      string
-	Image      string // e.g. quay.io/lakekeeper/catalog:v0.11.6
+	Image      string // e.g. quay.io/lakekeeper/catalog:v0.12.2
 	Replicas   int32
 	PGHost     string
 	PGPort     int32
