@@ -168,6 +168,48 @@ func (c *LakekeeperK8sClient) EnsureSecret(ctx context.Context, orgID string, da
 	return nil
 }
 
+// LakekeeperServiceAccountName is the per-org ServiceAccount the Lakekeeper
+// Deployment + migration Job run under. It matches the CR/Secret resource
+// name. The posthog-cloud-infra EKS Pod Identity association keys on this
+// exact (namespace, name) pair to bind a per-org IAM role, so changing this
+// convention requires a matching Terraform change.
+func LakekeeperServiceAccountName(orgID string) string {
+	return LakekeeperResourceName(orgID)
+}
+
+// EnsureServiceAccount creates the per-org ServiceAccount that the Lakekeeper
+// workload runs under. One SA per org — in a single shared namespace — so each
+// org's Lakekeeper can carry a distinct cloud identity (EKS Pod Identity)
+// scoped to its own object store.
+//
+// The SA is intentionally bare: EKS Pod Identity binds the IAM role to the
+// (namespace, serviceAccount) pair on the AWS side, so no IRSA role-arn
+// annotation is needed here. On re-runs we leave an existing SA untouched
+// rather than overwriting it, so any annotations added out-of-band (e.g. an
+// IRSA role-arn, if a cluster uses IRSA instead of Pod Identity) survive.
+func (c *LakekeeperK8sClient) EnsureServiceAccount(ctx context.Context, orgID string) error {
+	if !isValidOrgIDLabel(orgID) {
+		return fmt.Errorf("EnsureServiceAccount: orgID %q is not a valid K8s label value", orgID)
+	}
+	name := LakekeeperServiceAccountName(orgID)
+	desired := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: c.namespace,
+			Labels: map[string]string{
+				"app":                 "lakekeeper",
+				"duckgres/active-org": orgID,
+			},
+		},
+	}
+	sas := c.kubernetes.CoreV1().ServiceAccounts(c.namespace)
+	_, err := sas.Create(ctx, desired, metav1.CreateOptions{})
+	if err == nil || apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return fmt.Errorf("create service account %s: %w", name, err)
+}
+
 // LakekeeperCRSpec carries the inputs we need to render a Lakekeeper CR.
 // One CR per org. PG connection points at the org's existing managed-warehouse
 // Aurora cluster, with the lakekeeper_<orgid> database created by
@@ -189,6 +231,13 @@ type LakekeeperCRSpec struct {
 	// Defaults to "require" (the operator's default). Set to "disable" for
 	// local/dev where PG runs without TLS.
 	PGSSLMode string
+
+	// ServiceAccountName binds the Lakekeeper pod (and migration Job) to a
+	// specific ServiceAccount via the operator's spec.serviceAccountName
+	// field (a PostHog-fork addition). Empty falls back to the namespace
+	// default. We set it to the per-org SA so each org's Lakekeeper carries
+	// its own EKS Pod Identity for isolated object-store access.
+	ServiceAccountName string
 
 	// KubernetesAuthAudiences, when non-empty, enables the operator's
 	// `authentication.kubernetes` mode with the given audiences. The
@@ -276,6 +325,12 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 				},
 			},
 		},
+	}
+	// Bind the workload to the per-org ServiceAccount when set. Maps to the
+	// operator's spec.serviceAccountName (PostHog-fork field); empty leaves it
+	// unset so the operator falls back to the namespace default.
+	if spec.ServiceAccountName != "" {
+		cr.Object["spec"].(map[string]interface{})["serviceAccountName"] = spec.ServiceAccountName
 	}
 	// Optional: enable Kubernetes SA-token authentication. The operator
 	// turns this into LAKEKEEPER__K8S_AUTH_ENABLED=true +

@@ -185,6 +185,14 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		return fmt.Errorf("ensure lakekeeper pg role: %w", err)
 	}
 
+	// 2c. Ensure the per-org ServiceAccount the Lakekeeper pod runs under.
+	// Must exist before the CR so the operator's Deployment + migration Job
+	// can mount it. Each org gets its own SA (in the shared namespace) so it
+	// can carry a distinct EKS Pod Identity scoped to that org's bucket.
+	if err := p.k8s.EnsureServiceAccount(ctx, w.OrgID); err != nil {
+		return fmt.Errorf("ensure lakekeeper service account: %w", err)
+	}
+
 	// 3. Apply the Lakekeeper CR pointing at the org's PG + the Secret.
 	pgPort := in.PGPort
 	if pgPort == 0 {
@@ -200,6 +208,7 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		SecretName:              secretName,
 		BaseURI:                 baseURL,
 		PGSSLMode:               in.PGSSLMode,
+		ServiceAccountName:      LakekeeperServiceAccountName(w.OrgID),
 		KubernetesAuthAudiences: in.KubernetesAuthAudiences,
 	}); err != nil {
 		return fmt.Errorf("ensure lakekeeper cr: %w", err)
