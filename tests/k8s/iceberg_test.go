@@ -193,7 +193,7 @@ func captureIcebergActivationDiagnostics() string {
 	}
 
 	row, err := queryRuntimeStoreText(
-		"SELECT org_id, state, iceberg_enabled, iceberg_table_bucket_arn, iceberg_region, iceberg_namespace, iceberg_state, iceberg_status_message, s3_state " +
+		"SELECT org_id, state, iceberg_enabled, iceberg_backend, iceberg_table_bucket_arn, iceberg_region, iceberg_namespace, iceberg_state, iceberg_status_message, s3_state " +
 			"FROM duckgres_managed_warehouses WHERE org_id = '" + icebergTenantName + "'")
 	if err != nil {
 		fmt.Fprintf(&b, "warehouse row query: %v\n", err)
@@ -395,7 +395,7 @@ INSERT INTO duckgres_managed_warehouses (
     metadata_store_endpoint, metadata_store_port, metadata_store_database_name, metadata_store_username,
     s3_provider, s3_region, s3_bucket, s3_path_prefix, s3_endpoint, s3_use_ssl, s3_url_style,
     s3_delta_catalog_enabled,
-    iceberg_enabled, iceberg_table_bucket_arn, iceberg_region, iceberg_namespace,
+    iceberg_enabled, iceberg_backend, iceberg_table_bucket_arn, iceberg_region, iceberg_namespace,
     worker_identity_namespace, worker_identity_service_account_name, worker_identity_iam_role_arn,
     warehouse_database_credentials_namespace, warehouse_database_credentials_name, warehouse_database_credentials_key,
     metadata_store_credentials_namespace, metadata_store_credentials_name, metadata_store_credentials_key,
@@ -417,7 +417,7 @@ INSERT INTO duckgres_managed_warehouses (
     'aws', '%s', '%s', 'orgs/iceberg-test/',
     's3.%s.amazonaws.com', true, 'vhost',
     false,
-    true, '%s', '%s', '%s',
+    true, 's3_tables', '%s', '%s', '%s',
     'duckgres', 'duckgres-local-worker', 'arn:aws:iam::000000000000:role/duckgres-iceberg-test',
     'duckgres', 'iceberg-test-warehouse-db', 'dsn',
     'duckgres', 'iceberg-test-metadata', 'dsn',
@@ -436,6 +436,7 @@ INSERT INTO duckgres_managed_warehouses (
     s3_url_style = EXCLUDED.s3_url_style,
     s3_delta_catalog_enabled = EXCLUDED.s3_delta_catalog_enabled,
     iceberg_enabled = EXCLUDED.iceberg_enabled,
+    iceberg_backend = EXCLUDED.iceberg_backend,
     iceberg_table_bucket_arn = EXCLUDED.iceberg_table_bucket_arn,
     iceberg_region = EXCLUDED.iceberg_region,
     iceberg_namespace = EXCLUDED.iceberg_namespace,
