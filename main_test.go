@@ -112,6 +112,13 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigWorkerQueueTimeoutDefault(t *testing.T) {
+	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(nil), nil)
+	if resolved.WorkerQueueTimeout != 60*time.Second {
+		t.Fatalf("expected worker queue timeout default 60s, got %s", resolved.WorkerQueueTimeout)
+	}
+}
+
 func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	enabled := true
 	fileCfg := &FileConfig{

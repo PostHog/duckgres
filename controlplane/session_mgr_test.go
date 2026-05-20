@@ -7,6 +7,7 @@ import (
 	"errors"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -371,27 +372,41 @@ func TestSessionManager_ConnectionLimits_Basic(t *testing.T) {
 	}
 }
 
-func TestSessionManager_ConnectionLimits_RejectsImmediatelyAtCapacity(t *testing.T) {
+func TestSessionManager_ConnectionLimits_WaitsUntilSlotReleased(t *testing.T) {
 	ctx := context.Background()
 	sm := NewSessionManager(nil, nil)
 	sm.SetMaxConnections(1)
 
-	// Acquire slot 1
 	if err := sm.acquireSlot(ctx); err != nil {
 		t.Fatalf("unexpected error acquiring slot 1: %v", err)
 	}
 
-	err := sm.acquireSlot(ctx)
-	if !errors.Is(err, ErrTooManyConnections) {
-		t.Fatalf("expected ErrTooManyConnections, got %v", err)
+	acquired := make(chan error, 1)
+	go func() {
+		acquired <- sm.acquireSlot(ctx)
+	}()
+
+	select {
+	case err := <-acquired:
+		t.Fatalf("expected second acquire to wait, got %v", err)
+	case <-time.After(25 * time.Millisecond):
 	}
+
 	if sm.activeSlots != 1 {
 		t.Fatalf("expected activeSlots=1, got %d", sm.activeSlots)
 	}
 
 	sm.releaseSlot()
-	if err := sm.acquireSlot(ctx); err != nil {
-		t.Fatalf("expected slot to be available after release, got %v", err)
+	select {
+	case err := <-acquired:
+		if err != nil {
+			t.Fatalf("expected waiting acquire to succeed after release, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for queued acquire")
+	}
+	if sm.activeSlots != 1 {
+		t.Fatalf("expected activeSlots=1 after queued acquire, got %d", sm.activeSlots)
 	}
 }
 
@@ -411,5 +426,191 @@ func TestSessionManager_ConnectionLimits_DynamicLimitIncreaseAdmitsNewSession(t 
 	}
 	if sm.activeSlots != 2 {
 		t.Fatalf("expected activeSlots=2, got %d", sm.activeSlots)
+	}
+}
+
+func waitForConnectionWaiters(t *testing.T, sm *SessionManager, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		sm.mu.RLock()
+		got := len(sm.waiters)
+		sm.mu.RUnlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	sm.mu.RLock()
+	got := len(sm.waiters)
+	sm.mu.RUnlock()
+	t.Fatalf("timed out waiting for %d connection waiters, got %d", want, got)
+}
+
+func TestSessionManager_ConnectionLimits_FIFO(t *testing.T) {
+	ctx := context.Background()
+	sm := NewSessionManager(nil, nil)
+	sm.SetMaxConnections(1)
+
+	if err := sm.acquireSlot(ctx); err != nil {
+		t.Fatalf("unexpected error acquiring initial slot: %v", err)
+	}
+
+	const waiters = 3
+	ready := make(chan struct{}, waiters)
+	order := make(chan int, waiters)
+	var wg sync.WaitGroup
+	for i := 0; i < waiters; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ready <- struct{}{}
+			if err := sm.acquireSlot(ctx); err != nil {
+				t.Errorf("waiter %d acquire: %v", i, err)
+				return
+			}
+			order <- i
+		}()
+		<-ready
+		waitForConnectionWaiters(t, sm, i+1)
+	}
+	for i := 0; i < waiters; i++ {
+		sm.releaseSlot()
+		select {
+		case got := <-order:
+			if got != i {
+				t.Fatalf("grant order[%d] = %d, want %d", i, got, i)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for waiter %d", i)
+		}
+	}
+	wg.Wait()
+}
+
+func TestSessionManager_ConnectionLimits_DeadlineWhileQueuedReturnsTooManyConnections(t *testing.T) {
+	sm := NewSessionManager(nil, nil)
+	sm.SetMaxConnections(1)
+
+	if err := sm.acquireSlot(context.Background()); err != nil {
+		t.Fatalf("unexpected initial acquire error: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := sm.acquireSlot(ctx)
+	if !errors.Is(err, ErrTooManyConnections) {
+		t.Fatalf("expected ErrTooManyConnections, got %v", err)
+	}
+	if sm.activeSlots != 1 {
+		t.Fatalf("expected activeSlots=1 after deadline, got %d", sm.activeSlots)
+	}
+
+	sm.releaseSlot()
+	if sm.activeSlots != 0 {
+		t.Fatalf("expected activeSlots=0 after release, got %d", sm.activeSlots)
+	}
+}
+
+func TestSessionManager_ConnectionLimits_CancelWhileQueuedDoesNotBlockNextWaiter(t *testing.T) {
+	sm := NewSessionManager(nil, nil)
+	sm.SetMaxConnections(1)
+
+	if err := sm.acquireSlot(context.Background()); err != nil {
+		t.Fatalf("unexpected initial acquire error: %v", err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancelErr := make(chan error, 1)
+	go func() {
+		cancelErr <- sm.acquireSlot(cancelCtx)
+	}()
+	waitForConnectionWaiters(t, sm, 1)
+
+	nextAcquired := make(chan error, 1)
+	go func() {
+		nextAcquired <- sm.acquireSlot(context.Background())
+	}()
+	waitForConnectionWaiters(t, sm, 2)
+
+	cancel()
+	select {
+	case err := <-cancelErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for canceled waiter")
+	}
+
+	sm.releaseSlot()
+	select {
+	case err := <-nextAcquired:
+		if err != nil {
+			t.Fatalf("expected next waiter to acquire after canceled waiter, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for next waiter")
+	}
+}
+
+func TestSessionManager_ConnectionLimits_DestroySessionGrantsQueuedWaiter(t *testing.T) {
+	pool := &FlightWorkerPool{workers: make(map[int]*ManagedWorker)}
+	sm := NewSessionManager(pool, nil)
+	sm.SetMaxConnections(1)
+
+	if err := sm.acquireSlot(context.Background()); err != nil {
+		t.Fatalf("unexpected initial acquire error: %v", err)
+	}
+	sm.mu.Lock()
+	sm.sessions[101] = &ManagedSession{PID: 101, WorkerID: 7}
+	sm.byWorker[7] = []int32{101}
+	sm.mu.Unlock()
+
+	acquired := make(chan error, 1)
+	go func() {
+		acquired <- sm.acquireSlot(context.Background())
+	}()
+	waitForConnectionWaiters(t, sm, 1)
+
+	sm.DestroySession(101)
+	select {
+	case err := <-acquired:
+		if err != nil {
+			t.Fatalf("expected queued waiter to acquire after DestroySession, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for queued waiter after DestroySession")
+	}
+}
+
+func TestSessionManager_ConnectionLimits_WorkerCrashGrantsQueuedWaiter(t *testing.T) {
+	pool := &FlightWorkerPool{workers: make(map[int]*ManagedWorker)}
+	sm := NewSessionManager(pool, nil)
+	sm.SetMaxConnections(1)
+
+	if err := sm.acquireSlot(context.Background()); err != nil {
+		t.Fatalf("unexpected initial acquire error: %v", err)
+	}
+	sm.mu.Lock()
+	sm.sessions[101] = &ManagedSession{PID: 101, WorkerID: 7, Executor: &flightclient.FlightExecutor{}}
+	sm.byWorker[7] = []int32{101}
+	sm.mu.Unlock()
+
+	acquired := make(chan error, 1)
+	go func() {
+		acquired <- sm.acquireSlot(context.Background())
+	}()
+	waitForConnectionWaiters(t, sm, 1)
+
+	sm.OnWorkerCrash(7, func(pid int32) {})
+	select {
+	case err := <-acquired:
+		if err != nil {
+			t.Fatalf("expected queued waiter to acquire after OnWorkerCrash, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for queued waiter after OnWorkerCrash")
 	}
 }

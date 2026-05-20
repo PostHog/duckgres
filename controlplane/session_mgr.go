@@ -49,10 +49,16 @@ type SessionManager struct {
 
 	maxConnections int
 	activeSlots    int
+	waiters        []*connectionWaiter
 }
 
 type flightReconnectPool interface {
 	ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error)
+}
+
+type connectionWaiter struct {
+	ready   chan struct{}
+	granted bool
 }
 
 // NewSessionManager creates a new session manager.
@@ -72,6 +78,7 @@ func (sm *SessionManager) SetMaxConnections(n int) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.maxConnections = n
+	sm.grantWaitersLocked()
 }
 
 // ReservePID generates a new unique PID for a session.
@@ -79,16 +86,32 @@ func (sm *SessionManager) ReservePID() int32 {
 	return sm.nextPID.Add(1)
 }
 
-func (sm *SessionManager) acquireSlot(_ context.Context) error {
+func (sm *SessionManager) acquireSlot(ctx context.Context) error {
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
 	if sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections {
 		sm.activeSlots++
+		sm.mu.Unlock()
 		return nil
 	}
+	waiter := &connectionWaiter{ready: make(chan struct{})}
+	sm.waiters = append(sm.waiters, waiter)
+	sm.mu.Unlock()
 
-	return ErrTooManyConnections
+	select {
+	case <-waiter.ready:
+		return nil
+	case <-ctx.Done():
+		sm.mu.Lock()
+		defer sm.mu.Unlock()
+		if waiter.granted {
+			return nil
+		}
+		sm.removeWaiterLocked(waiter)
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ErrTooManyConnections
+		}
+		return ctx.Err()
+	}
 }
 
 func (sm *SessionManager) releaseSlot() {
@@ -97,6 +120,30 @@ func (sm *SessionManager) releaseSlot() {
 
 	if sm.activeSlots > 0 {
 		sm.activeSlots--
+	}
+	sm.grantWaitersLocked()
+}
+
+func (sm *SessionManager) grantWaitersLocked() {
+	for len(sm.waiters) > 0 && (sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections) {
+		waiter := sm.waiters[0]
+		copy(sm.waiters, sm.waiters[1:])
+		sm.waiters[len(sm.waiters)-1] = nil
+		sm.waiters = sm.waiters[:len(sm.waiters)-1]
+		sm.activeSlots++
+		waiter.granted = true
+		close(waiter.ready)
+	}
+}
+
+func (sm *SessionManager) removeWaiterLocked(waiter *connectionWaiter) {
+	for i, candidate := range sm.waiters {
+		if candidate == waiter {
+			copy(sm.waiters[i:], sm.waiters[i+1:])
+			sm.waiters[len(sm.waiters)-1] = nil
+			sm.waiters = sm.waiters[:len(sm.waiters)-1]
+			return
+		}
 	}
 }
 
@@ -285,6 +332,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	if sm.activeSlots > 0 {
 		sm.activeSlots--
 	}
+	sm.grantWaitersLocked()
 	sm.mu.Unlock()
 
 	slog.Info("Destroying session.",
@@ -392,6 +440,7 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			if sm.activeSlots > 0 {
 				sm.activeSlots--
 			}
+			sm.grantWaitersLocked()
 		}
 		remainingSessions := len(sm.sessions)
 		sm.mu.Unlock()

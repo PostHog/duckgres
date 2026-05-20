@@ -50,7 +50,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	processMinWorkers := fs.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
 	processMaxWorkers := fs.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
 	processRetireOnSessionEnd := fs.Bool("process-retire-on-session-end", false, "Retire a process worker immediately after its last session ends instead of keeping it warm for reuse (control-plane mode) (env: DUCKGRES_PROCESS_RETIRE_ON_SESSION_END)")
-	workerQueueTimeout := fs.String("worker-queue-timeout", "", "How long to wait for an available worker slot (e.g., '5m') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
+	workerQueueTimeout := fs.String("worker-queue-timeout", "", "How long to wait for an available worker/org connection slot (e.g., '60s') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
 	workerIdleTimeout := fs.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
 	handoverDrainTimeout := fs.String("handover-drain-timeout", "", "How long to wait for planned shutdowns/upgrades to drain before forcing exit (default: '24h' in process mode, '15m' in remote mode) (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
 	acmeDomain := fs.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
