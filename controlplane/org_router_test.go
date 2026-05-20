@@ -135,6 +135,7 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 		sharedPool.mu.Unlock()
 		return nil
 	}
+	sharedPool.workers[1] = &ManagedWorker{ID: 1, done: make(chan struct{})}
 
 	for name, value := range map[string]string{
 		"analytics-metadata-old": "old-password",
