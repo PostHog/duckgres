@@ -116,6 +116,24 @@ type K8sConfig struct {
 	WorkerTolerationValue string // Taint value for worker pod NoSchedule toleration
 	WorkerExclusiveNode   bool   // One worker per node via pod anti-affinity
 	AWSRegion             string // AWS region for STS client
+	Iceboom               IceboomConfig
+}
+
+// IceboomConfig configures the optional iceboom sidecar injected into each
+// worker pod. iceboom is an Iceberg REST catalog proxy that fronts AWS S3
+// Tables; the control plane reconfigures it per tenant at activation time,
+// reusing the same STS-broker path used for DuckLake S3 creds. Chart wiring
+// lives in PostHog/charts charts/duckgres.
+type IceboomConfig struct {
+	Enabled         bool
+	Image           string
+	Port            int    // Loopback port iceboom listens on inside the worker pod
+	ConfigMap       string // ConfigMap mounted at /etc/iceboom (must define config.toml)
+	CPURequest      string // CPU request (e.g., "200m"). Empty = no resources block.
+	CPULimit        string // CPU limit; should equal request for Guaranteed QoS.
+	MemoryRequest   string // Memory request (e.g., "128Mi").
+	MemoryLimit     string // Memory limit; should equal request for Guaranteed QoS.
+	ImagePullPolicy string
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.

@@ -361,6 +361,17 @@ func main() {
 				WorkerTolerationValue: resolved.K8sWorkerTolerationValue,
 				WorkerExclusiveNode:   resolved.K8sWorkerExclusiveNode,
 				AWSRegion:             resolved.AWSRegion,
+				Iceboom: controlplane.IceboomConfig{
+					Enabled:         resolved.K8sIceboomEnabled,
+					Image:           resolved.K8sIceboomImage,
+					Port:            resolved.K8sIceboomPort,
+					ConfigMap:       resolved.K8sIceboomConfigMap,
+					CPURequest:      resolved.K8sIceboomCPURequest,
+					CPULimit:        resolved.K8sIceboomCPULimit,
+					MemoryRequest:   resolved.K8sIceboomMemoryRequest,
+					MemoryLimit:     resolved.K8sIceboomMemoryLimit,
+					ImagePullPolicy: resolved.K8sIceboomImagePullPolicy,
+				},
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)
