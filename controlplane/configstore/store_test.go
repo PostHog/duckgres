@@ -230,6 +230,42 @@ func TestHashPassword(t *testing.T) {
 	}
 }
 
+func TestOrgWarehouseStatus(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"no-warehouse": {Name: "no-warehouse", DatabaseName: "no_warehouse"},
+				"with-ready": {
+					Name: "with-ready", DatabaseName: "with_ready",
+					Warehouse: &ManagedWarehouseConfig{OrgID: "with-ready", State: ManagedWarehouseStateReady},
+				},
+				"with-provisioning": {
+					Name: "with-provisioning", DatabaseName: "with_provisioning",
+					Warehouse: &ManagedWarehouseConfig{OrgID: "with-provisioning", State: ManagedWarehouseStateProvisioning},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID      string
+		wantState  string
+		wantExists bool
+	}{
+		{"unknown", "", false},
+		{"no-warehouse", "", true},
+		{"with-ready", "ready", true},
+		{"with-provisioning", "provisioning", true},
+	}
+	for _, tt := range tests {
+		gotState, gotExists := cs.OrgWarehouseStatus(tt.orgID)
+		if gotState != tt.wantState || gotExists != tt.wantExists {
+			t.Errorf("OrgWarehouseStatus(%q) = (%q, %v); want (%q, %v)",
+				tt.orgID, gotState, gotExists, tt.wantState, tt.wantExists)
+		}
+	}
+}
+
 func TestTableNames(t *testing.T) {
 	// Verify all models use the correct table names
 	tests := []struct {

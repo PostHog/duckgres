@@ -140,6 +140,10 @@ func (f *fakeConfigStore) ValidateOrgUserAndGetPassthrough(orgID, user, pass str
 	// validateOrgUser still work unchanged.
 	return f.ValidateOrgUser(orgID, user, pass), false
 }
+func (f *fakeConfigStore) OrgWarehouseStatus(string) (string, bool) {
+	// SNI tests don't exercise the warehouse-status connection-error path.
+	return "", false
+}
 func (f *fakeConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
 	panic("UpsertFlightSessionRecord should not be called from SNI tests")
 }
