@@ -218,6 +218,8 @@ Run with config file:
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
+| `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and the resolved org's database is used only when dbname is empty. | `off` |
+| `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
 | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Global neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm; subject to `DUCKGRES_K8S_MAX_WORKERS`) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
@@ -275,6 +277,9 @@ Options:
   -memory-budget string    Total memory for all DuckDB sessions (e.g., '24GB')
   -socket-dir string       Unix socket directory (control-plane mode)
   -handover-socket string  Handover socket for graceful deployment (control-plane mode)
+  -sni-routing-mode string Hostname routing: off, passthrough, or enforce
+  -managed-hostname-suffixes string
+                          Comma-separated managed tenant hostname suffixes
 ```
 
 ## DuckDB Extensions
@@ -645,6 +650,8 @@ kill -USR2 <control-plane-pid>
 ### Remote Worker Backend
 
 In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may reconnect with a durable session token if the worker survives and the token is still valid.
+
+Managed-hostname routing is controlled by `--sni-routing-mode` and `--managed-hostname-suffixes`. Managed hostname prefixes resolve by `hostname_alias` or DNS-safe org name, not by `database_name`. For Postgres, an explicit startup `database`/`dbname` takes priority, but when SNI matches a managed suffix the hostname prefix and requested database must resolve to the same org. If the startup database is empty, the resolved org's database is used as the fallback. Unknown `--sni-routing-mode` values behave like `off`.
 
 When a shared warm-worker target is configured (`--k8s-shared-warm-target`, default `0`), the pool keeps neutral workers ready at startup. On demand, a neutral worker is reserved for an org, activated over the worker control RPC, and becomes hot for that org. When its last session ends, the worker moves to `hot_idle` instead of being retired immediately: it keeps the org assignment and DuckLake attachment so any control-plane replica can reclaim it for the same org without full reactivation. Hot-idle reuse is image/version strict; a worker whose image no longer matches the org target is retired instead of reused. The janitor retires unreclaimed hot-idle workers after 5 minutes. The main lifecycle is: idle → reserved → activating → hot → hot_idle → retired. Workers can also move through `draining` during shutdown, rollout, or cleanup.
 

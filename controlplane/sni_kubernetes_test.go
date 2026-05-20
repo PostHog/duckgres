@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestExtractOrgFromSNI(t *testing.T) {
@@ -87,18 +88,20 @@ func TestManagedHostnameHint(t *testing.T) {
 }
 
 // fakeConfigStore captures calls and lets each test choose what each method
-// returns. Only methods used by cpFlightCredentialValidator are exercised;
-// the rest are stubbed to fail loudly if hit.
+// returns. Only methods used by SNI routing tests are implemented; the rest are
+// stubbed to fail loudly if hit.
 type fakeConfigStore struct {
-	resolveDatabase          func(string) string
-	databaseNameForSNIPrefix func(string) string
-	validateOrgUser          func(orgID, user, pass string) bool
-	findAndValidateUser      func(user, pass string) (string, bool)
+	resolveDatabase           func(string) string
+	resolveSNIPrefix          func(string) (string, string)
+	resolvePostgresConnection func(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) configstore.PostgresConnectionResolution
+	validateOrgUser           func(orgID, user, pass string) bool
+	findAndValidateUser       func(user, pass string) (string, bool)
 
-	resolveDatabaseCalls          int
-	databaseNameForSNIPrefixCalls int
-	validateOrgUserCalls          int
-	findAndValidateUserCalls      int
+	resolveDatabaseCalls           int
+	resolveSNIPrefixCalls          int
+	resolvePostgresConnectionCalls int
+	validateOrgUserCalls           int
+	findAndValidateUserCalls       int
 }
 
 func (f *fakeConfigStore) ResolveDatabase(database string) string {
@@ -108,12 +111,23 @@ func (f *fakeConfigStore) ResolveDatabase(database string) string {
 	}
 	return f.resolveDatabase(database)
 }
-func (f *fakeConfigStore) DatabaseNameForSNIPrefix(prefix string) string {
-	f.databaseNameForSNIPrefixCalls++
-	if f.databaseNameForSNIPrefix == nil {
-		return prefix // back-compat default: prefix is its own dbname
+func (f *fakeConfigStore) ResolveSNIPrefix(prefix string) (string, string) {
+	f.resolveSNIPrefixCalls++
+	if f.resolveSNIPrefix == nil {
+		return "", ""
 	}
-	return f.databaseNameForSNIPrefix(prefix)
+	return f.resolveSNIPrefix(prefix)
+}
+func (f *fakeConfigStore) ResolveSNIPrefixWithAlias(prefix string) (string, string, bool) {
+	orgID, databaseName := f.ResolveSNIPrefix(prefix)
+	return orgID, databaseName, false
+}
+func (f *fakeConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) configstore.PostgresConnectionResolution {
+	f.resolvePostgresConnectionCalls++
+	if f.resolvePostgresConnection == nil {
+		return configstore.PostgresConnectionResolution{}
+	}
+	return f.resolvePostgresConnection(startupDatabase, sniPrefix, useManagedSNI, username, password)
 }
 func (f *fakeConfigStore) ValidateOrgUser(orgID, user, pass string) bool {
 	f.validateOrgUserCalls++
@@ -172,6 +186,93 @@ func newFlightValidator(t *testing.T, mode string, store *fakeConfigStore) *cpFl
 	return &cpFlightCredentialValidator{cp: cp, orgProvider: provider}
 }
 
+func newSNIControlPlane(store *fakeConfigStore) *ControlPlane {
+	return &ControlPlane{
+		cfg: ControlPlaneConfig{
+			ManagedHostnameSuffixes: []string{".dw.us.postwh.com"},
+		},
+		configStore: store,
+	}
+}
+
+func TestPostgresSNIRequiresManagedOrgMatch(t *testing.T) {
+	store := &fakeConfigStore{}
+	cp := newSNIControlPlane(store)
+
+	resolution := cp.resolvePostgresSNI(
+		SNIRoutingEnforce,
+		"test-org-smoke-1778167994.dw.us.postwh.com",
+	)
+
+	if !resolution.isManaged {
+		t.Fatalf("expected SNI to match managed hostname")
+	}
+	if !resolution.useManagedSNI {
+		t.Fatalf("managed SNI with explicit database should require same-org validation")
+	}
+	if store.resolveSNIPrefixCalls != 0 {
+		t.Fatalf("ResolveSNIPrefix calls = %d, want 0", store.resolveSNIPrefixCalls)
+	}
+}
+
+func TestPostgresSNIManagedModeRecognizesMatchedHostname(t *testing.T) {
+	store := &fakeConfigStore{}
+	cp := newSNIControlPlane(store)
+
+	resolution := cp.resolvePostgresSNI(
+		SNIRoutingEnforce,
+		"test-org-smoke-1778167994.dw.us.postwh.com",
+	)
+
+	if resolution.sniPrefix != "test-org-smoke-1778167994" || !resolution.useManagedSNI {
+		t.Fatalf("resolvePostgresSNI = %+v, want managed test-org prefix", resolution)
+	}
+}
+
+func TestPostgresSNIOffIgnoresSNI(t *testing.T) {
+	store := &fakeConfigStore{
+		resolveSNIPrefix: func(prefix string) (string, string) {
+			t.Fatalf("ResolveSNIPrefix should not be called in off mode; got %q", prefix)
+			return "", ""
+		},
+	}
+	cp := newSNIControlPlane(store)
+
+	resolution := cp.resolvePostgresSNI(
+		SNIRoutingOff,
+		"test-org-smoke-1778167994.dw.us.postwh.com",
+	)
+
+	if resolution.useManagedSNI {
+		t.Fatalf("off mode should not require SNI org validation")
+	}
+	if store.resolveSNIPrefixCalls != 0 {
+		t.Fatalf("ResolveSNIPrefix calls = %d, want 0", store.resolveSNIPrefixCalls)
+	}
+}
+
+func TestPostgresSNIUnknownModeIgnoresSNI(t *testing.T) {
+	store := &fakeConfigStore{
+		resolveSNIPrefix: func(prefix string) (string, string) {
+			t.Fatalf("ResolveSNIPrefix should not be called for unknown mode; got %q", prefix)
+			return "", ""
+		},
+	}
+	cp := newSNIControlPlane(store)
+
+	resolution := cp.resolvePostgresSNI(
+		"passthru",
+		"test-org-smoke-1778167994.dw.us.postwh.com",
+	)
+
+	if resolution.useManagedSNI {
+		t.Fatalf("unknown mode should not require SNI org validation")
+	}
+	if store.resolveSNIPrefixCalls != 0 {
+		t.Fatalf("ResolveSNIPrefix calls = %d, want 0", store.resolveSNIPrefixCalls)
+	}
+}
+
 // TestFlightValidatorOff: SNI ignored entirely. Both legacy and new
 // hostnames go through FindAndValidateUser; ResolveDatabase / ValidateOrgUser
 // are never called regardless of SNI.
@@ -212,11 +313,11 @@ func TestFlightValidatorOff(t *testing.T) {
 // validate against a single org, never falling through to the scan.
 func TestFlightValidatorPassthroughMatchedSNI(t *testing.T) {
 	store := &fakeConfigStore{
-		resolveDatabase: func(name string) string {
-			if name == "acme" {
-				return "org-acme"
+		resolveSNIPrefix: func(prefix string) (string, string) {
+			if prefix == "acme-org" {
+				return "org-acme", "acme_db"
 			}
-			return ""
+			return "", ""
 		},
 		validateOrgUser: func(orgID, user, pass string) bool {
 			return orgID == "org-acme" && user == "alice" && pass == "secret"
@@ -228,12 +329,12 @@ func TestFlightValidatorPassthroughMatchedSNI(t *testing.T) {
 	}
 	v := newFlightValidator(t, SNIRoutingPassthrough, store)
 
-	if !v.ValidateCredentialsForSNI("acme.dw.us.postwh.com", "alice", "secret") {
+	if !v.ValidateCredentialsForSNI("acme-org.dw.us.postwh.com", "alice", "secret") {
 		t.Fatalf("expected SNI-resolved org with valid creds to pass")
 	}
-	if store.resolveDatabaseCalls != 1 || store.validateOrgUserCalls != 1 {
-		t.Fatalf("expected one ResolveDatabase + one ValidateOrgUser; got %d / %d",
-			store.resolveDatabaseCalls, store.validateOrgUserCalls)
+	if store.resolveSNIPrefixCalls != 1 || store.validateOrgUserCalls != 1 {
+		t.Fatalf("expected one ResolveSNIPrefix + one ValidateOrgUser; got %d / %d",
+			store.resolveSNIPrefixCalls, store.validateOrgUserCalls)
 	}
 	if got := v.orgProvider.userOrg["alice"]; got != "org-acme" {
 		t.Fatalf("expected userOrg['alice'] = org-acme; got %q", got)
@@ -241,22 +342,15 @@ func TestFlightValidatorPassthroughMatchedSNI(t *testing.T) {
 }
 
 // TestFlightValidatorPassthroughHostnameAliasResolves: SNI prefix is the
-// hostname alias for an org whose dbname is something different. The
-// validator must consult DatabaseNameForSNIPrefix to translate prefix →
-// dbname before looking up the orgID.
+// hostname alias for an org whose dbname is something different. The validator
+// must translate prefix → orgID/dbname before validating credentials.
 func TestFlightValidatorPassthroughHostnameAliasResolves(t *testing.T) {
 	store := &fakeConfigStore{
-		databaseNameForSNIPrefix: func(prefix string) string {
+		resolveSNIPrefix: func(prefix string) (string, string) {
 			if prefix == "entirely-chief-wildcat" {
-				return "portola" // alias-translated dbname
+				return "org-portola", "portola"
 			}
-			return prefix
-		},
-		resolveDatabase: func(name string) string {
-			if name == "portola" {
-				return "org-portola"
-			}
-			return ""
+			return "", ""
 		},
 		validateOrgUser: func(orgID, user, pass string) bool {
 			return orgID == "org-portola" && user == "alice" && pass == "secret"
@@ -271,14 +365,37 @@ func TestFlightValidatorPassthroughHostnameAliasResolves(t *testing.T) {
 	if !v.ValidateCredentialsForSNI("entirely-chief-wildcat.dw.us.postwh.com", "alice", "secret") {
 		t.Fatalf("expected alias-resolved org with valid creds to pass")
 	}
-	if store.databaseNameForSNIPrefixCalls != 1 {
-		t.Fatalf("expected DatabaseNameForSNIPrefix to be consulted exactly once; got %d", store.databaseNameForSNIPrefixCalls)
-	}
-	if store.resolveDatabaseCalls != 1 {
-		t.Fatalf("expected one ResolveDatabase call (against translated dbname); got %d", store.resolveDatabaseCalls)
+	if store.resolveSNIPrefixCalls != 1 {
+		t.Fatalf("expected ResolveSNIPrefix to be consulted exactly once; got %d", store.resolveSNIPrefixCalls)
 	}
 	if got := v.orgProvider.userOrg["alice"]; got != "org-portola" {
 		t.Fatalf("expected userOrg['alice'] = org-portola; got %q", got)
+	}
+}
+
+func TestFlightValidatorPassthroughOrgNameResolves(t *testing.T) {
+	store := &fakeConfigStore{
+		resolveSNIPrefix: func(prefix string) (string, string) {
+			if prefix == "test-org-smoke-1778167994" {
+				return "test-org-smoke-1778167994", "test_org_smoke_1778167994"
+			}
+			return "", ""
+		},
+		validateOrgUser: func(orgID, user, pass string) bool {
+			return orgID == "test-org-smoke-1778167994" && user == "alice" && pass == "secret"
+		},
+		findAndValidateUser: func(string, string) (string, bool) {
+			t.Fatalf("FindAndValidateUser must not be called when SNI org name resolves an org")
+			return "", false
+		},
+	}
+	v := newFlightValidator(t, SNIRoutingPassthrough, store)
+
+	if !v.ValidateCredentialsForSNI("test-org-smoke-1778167994.dw.us.postwh.com", "alice", "secret") {
+		t.Fatalf("expected org-name-resolved SNI with valid creds to pass")
+	}
+	if got := v.orgProvider.userOrg["alice"]; got != "test-org-smoke-1778167994" {
+		t.Fatalf("expected userOrg['alice'] = test-org-smoke-1778167994; got %q", got)
 	}
 }
 
@@ -287,8 +404,9 @@ func TestFlightValidatorPassthroughHostnameAliasResolves(t *testing.T) {
 // WITHOUT falling through to the scan (a managed hostname is authoritative —
 // silently routing to a different org would defeat the boundary).
 func TestFlightValidatorPassthroughUnknownOrg(t *testing.T) {
+	sniRoutingResolutionsCounter.Reset()
 	store := &fakeConfigStore{
-		resolveDatabase: func(string) string { return "" }, // unknown
+		resolveSNIPrefix: func(string) (string, string) { return "", "" }, // unknown
 		findAndValidateUser: func(string, string) (string, bool) {
 			t.Fatalf("FindAndValidateUser must not be called for unknown SNI org")
 			return "", false
@@ -299,6 +417,25 @@ func TestFlightValidatorPassthroughUnknownOrg(t *testing.T) {
 	if v.ValidateCredentialsForSNI("ghostorg.dw.us.postwh.com", "alice", "secret") {
 		t.Fatalf("unknown SNI org must not authenticate")
 	}
+	if got := sniRoutingResolutionMetricValue(t, "flight", "true"); got != 0 {
+		t.Fatalf("unknown SNI prefix should not count as alias_used=true; got %v", got)
+	}
+	if got := sniRoutingResolutionMetricValue(t, "flight", "false"); got != 0 {
+		t.Fatalf("unknown SNI prefix should not count as alias_used=false; got %v", got)
+	}
+}
+
+func sniRoutingResolutionMetricValue(t *testing.T, protocol, aliasUsed string) float64 {
+	t.Helper()
+	counter, err := sniRoutingResolutionsCounter.GetMetricWithLabelValues(protocol, aliasUsed)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues(%q, %q): %v", protocol, aliasUsed, err)
+	}
+	metric := &dto.Metric{}
+	if err := counter.Write(metric); err != nil {
+		t.Fatalf("write sni routing metric: %v", err)
+	}
+	return metric.GetCounter().GetValue()
 }
 
 // TestFlightValidatorPassthroughLegacyHostname: SNI doesn't match a managed
@@ -325,18 +462,18 @@ func TestFlightValidatorPassthroughLegacyHostname(t *testing.T) {
 // TestFlightValidatorEnforceMatchedSNI: same as passthrough+matched.
 func TestFlightValidatorEnforceMatchedSNI(t *testing.T) {
 	store := &fakeConfigStore{
-		resolveDatabase: func(name string) string {
-			if name == "acme" {
-				return "org-acme"
+		resolveSNIPrefix: func(prefix string) (string, string) {
+			if prefix == "acme-org" {
+				return "org-acme", "acme_db"
 			}
-			return ""
+			return "", ""
 		},
 		validateOrgUser: func(orgID, user, pass string) bool {
 			return orgID == "org-acme" && user == "alice" && pass == "secret"
 		},
 	}
 	v := newFlightValidator(t, SNIRoutingEnforce, store)
-	if !v.ValidateCredentialsForSNI("acme.dw.us.postwh.com", "alice", "secret") {
+	if !v.ValidateCredentialsForSNI("acme-org.dw.us.postwh.com", "alice", "secret") {
 		t.Fatalf("expected enforce+matched to pass")
 	}
 }

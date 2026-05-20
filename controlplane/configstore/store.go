@@ -40,6 +40,23 @@ type Snapshot struct {
 	QueryLog           QueryLogConfig
 }
 
+// PostgresConnectionResolution is the result of resolving and authenticating a
+// Postgres startup packet against one immutable config snapshot.
+type PostgresConnectionResolution struct {
+	EffectiveDatabase   string
+	OrgID               string
+	SNIOrgID            string
+	SNIDatabase         string
+	SNIAliasUsed        bool
+	UsedSNIDatabase     bool
+	RequiresSNIOrgMatch bool
+	SNIResolved         bool
+	DatabaseExists      bool
+	HostnameMatches     bool
+	Valid               bool
+	Passthrough         bool
+}
+
 // ConfigStore manages configuration stored in a PostgreSQL database.
 type ConfigStore struct {
 	db            *gorm.DB
@@ -244,29 +261,124 @@ func (cs *ConfigStore) ResolveDatabase(database string) string {
 	return cs.snapshot.DatabaseOrg[database]
 }
 
-// DatabaseNameForSNIPrefix translates an SNI hostname prefix (the single label
-// before a managed suffix, e.g. "entirely-chief-wildcat") into the canonical
-// database_name for the org it routes to. If the prefix matches a registered
-// hostname_alias, returns that org's database_name. Otherwise returns the
-// prefix as-is so legacy tenants (no alias configured, prefix == database_name)
-// keep working.
+// ResolveSNIPrefix maps a managed-hostname prefix to the org/database it names.
+// It accepts the supported public hostname labels:
+//   - hostname_alias, when configured
+//   - org name, for DNS-safe org IDs
 //
-// Returns "" only when the input is empty.
-func (cs *ConfigStore) DatabaseNameForSNIPrefix(prefix string) string {
+// database_name is intentionally not a managed-hostname identity: it belongs to
+// the Postgres startup dbname path, where it can safely use underscores.
+// If a label collides with another org's name, the explicit hostname_alias wins.
+func (cs *ConfigStore) ResolveSNIPrefix(prefix string) (orgID, databaseName string) {
 	if prefix == "" {
-		return ""
+		return "", ""
 	}
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if cs.snapshot == nil {
-		return prefix
+		return "", ""
 	}
-	if orgID, ok := cs.snapshot.HostnameAliasOrg[prefix]; ok {
-		if oc, ok := cs.snapshot.Orgs[orgID]; ok && oc.DatabaseName != "" {
-			return oc.DatabaseName
+	orgID, databaseName, _ = resolveSNIPrefixFromSnapshot(cs.snapshot, prefix)
+	return orgID, databaseName
+}
+
+func (cs *ConfigStore) ResolveSNIPrefixWithAlias(prefix string) (orgID, databaseName string, aliasUsed bool) {
+	if prefix == "" {
+		return "", "", false
+	}
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return resolveSNIPrefixFromSnapshot(cs.snapshot, prefix)
+}
+
+func resolveSNIPrefixFromSnapshot(snap *Snapshot, prefix string) (orgID, databaseName string, aliasUsed bool) {
+	if snap == nil || prefix == "" {
+		return "", "", false
+	}
+	if orgID, ok := snap.HostnameAliasOrg[prefix]; ok {
+		if oc, ok := snap.Orgs[orgID]; ok {
+			return orgID, oc.DatabaseName, true
+		}
+		return "", "", false
+	}
+	if isDNSLabel(prefix) {
+		if oc, ok := snap.Orgs[prefix]; ok {
+			return oc.Name, oc.DatabaseName, false
 		}
 	}
-	return prefix
+	return "", "", false
+}
+
+func isDNSLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+	for i, r := range label {
+		isAlnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		isHyphen := r == '-'
+		if !isAlnum && !isHyphen {
+			return false
+		}
+		if isHyphen && (i == 0 || i == len(label)-1) {
+			return false
+		}
+	}
+	return true
+}
+
+func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) PostgresConnectionResolution {
+	result := PostgresConnectionResolution{
+		EffectiveDatabase: startupDatabase,
+		HostnameMatches:   true,
+	}
+
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return result
+	}
+
+	if useManagedSNI {
+		result.RequiresSNIOrgMatch = true
+		result.SNIOrgID, result.SNIDatabase, result.SNIAliasUsed = resolveSNIPrefixFromSnapshot(cs.snapshot, sniPrefix)
+		result.SNIResolved = result.SNIOrgID != ""
+		if result.SNIDatabase == "" {
+			result.SNIDatabase = sniPrefix
+		}
+		if startupDatabase == "" {
+			result.EffectiveDatabase = result.SNIDatabase
+			result.UsedSNIDatabase = true
+		}
+	}
+
+	if result.EffectiveDatabase == "" {
+		return result
+	}
+
+	orgID := cs.snapshot.DatabaseOrg[result.EffectiveDatabase]
+	if orgID == "" {
+		return result
+	}
+	result.DatabaseExists = true
+	result.OrgID = orgID
+
+	if result.RequiresSNIOrgMatch && result.SNIOrgID != orgID {
+		result.HostnameMatches = false
+		return result
+	}
+
+	key := OrgUserKey{OrgID: orgID, Username: username}
+	storedHash, ok := cs.snapshot.OrgUserPassword[key]
+	if !ok {
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		return result
+	}
+	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		return result
+	}
+	result.Valid = true
+	result.Passthrough = cs.snapshot.OrgUserPassthrough[key]
+	return result
 }
 
 // OrgWarehouseStatus reports the current warehouse provisioning state for an

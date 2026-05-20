@@ -177,16 +177,20 @@ func TestSnapshotBuild(t *testing.T) {
 	}
 }
 
-func TestDatabaseNameForSNIPrefix(t *testing.T) {
+func TestResolveSNIPrefix(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
 			Orgs: map[string]*OrgConfig{
 				"portola-uuid": {Name: "portola-uuid", DatabaseName: "portola"},
+				"team-hyphen":  {Name: "team-hyphen", DatabaseName: "team_hyphen"},
+				"db-only-org":  {Name: "db-only-org", DatabaseName: "dbonly"},
 				"acme":         {Name: "acme", DatabaseName: "acme"},
 			},
 			DatabaseOrg: map[string]string{
-				"portola": "portola-uuid",
-				"acme":    "acme",
+				"portola":     "portola-uuid",
+				"team_hyphen": "team-hyphen",
+				"dbonly":      "db-only-org",
+				"acme":        "acme",
 			},
 			HostnameAliasOrg: map[string]string{
 				"entirely-chief-wildcat": "portola-uuid",
@@ -194,27 +198,152 @@ func TestDatabaseNameForSNIPrefix(t *testing.T) {
 		},
 	}
 
-	// Alias resolves to the org's database_name (the security-through-obscurity case).
-	if got := cs.DatabaseNameForSNIPrefix("entirely-chief-wildcat"); got != "portola" {
-		t.Errorf("DatabaseNameForSNIPrefix(alias) = %q, want %q", got, "portola")
+	cases := []struct {
+		name    string
+		prefix  string
+		wantOrg string
+		wantDB  string
+	}{
+		{"hostname alias", "entirely-chief-wildcat", "portola-uuid", "portola"},
+		{"org name", "acme", "acme", "acme"},
+		{"database name is not hostname identity", "dbonly", "", ""},
+		{"hyphenated org name", "team-hyphen", "team-hyphen", "team_hyphen"},
+		{"non DNS-safe org name", "team_underscore", "", ""},
+		{"unknown", "nobody", "", ""},
+		{"empty", "", "", ""},
 	}
-	// Plain prefix passes through unchanged so legacy tenants (no alias) keep working.
-	if got := cs.DatabaseNameForSNIPrefix("acme"); got != "acme" {
-		t.Errorf("DatabaseNameForSNIPrefix(dbname) = %q, want %q", got, "acme")
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotOrg, gotDB := cs.ResolveSNIPrefix(tc.prefix)
+			if gotOrg != tc.wantOrg || gotDB != tc.wantDB {
+				t.Fatalf("ResolveSNIPrefix(%q) = (%q, %q), want (%q, %q)",
+					tc.prefix, gotOrg, gotDB, tc.wantOrg, tc.wantDB)
+			}
+		})
 	}
-	// Unknown prefix passes through too — caller (ResolveDatabase) is the gate.
-	if got := cs.DatabaseNameForSNIPrefix("nobody"); got != "nobody" {
-		t.Errorf("DatabaseNameForSNIPrefix(unknown) = %q, want %q", got, "nobody")
-	}
-	// Empty input returns empty (don't masquerade as an unknown prefix).
-	if got := cs.DatabaseNameForSNIPrefix(""); got != "" {
-		t.Errorf("DatabaseNameForSNIPrefix(\"\") = %q, want \"\"", got)
-	}
-	// nil snapshot -> returns prefix (no panic).
+
 	empty := &ConfigStore{}
-	if got := empty.DatabaseNameForSNIPrefix("x"); got != "x" {
-		t.Errorf("DatabaseNameForSNIPrefix on empty store = %q, want %q", got, "x")
+	if gotOrg, gotDB := empty.ResolveSNIPrefix("x"); gotOrg != "" || gotDB != "" {
+		t.Fatalf("ResolveSNIPrefix on empty store = (%q, %q), want empty", gotOrg, gotDB)
 	}
+}
+
+func TestResolvePostgresConnection(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"test-org-smoke-1778167994": {
+					Name:         "test-org-smoke-1778167994",
+					DatabaseName: "test_org_smoke_1778167994",
+				},
+				"billing": {
+					Name:         "billing",
+					DatabaseName: "billing_db",
+				},
+			},
+			DatabaseOrg: map[string]string{
+				"test_org_smoke_1778167994": "test-org-smoke-1778167994",
+				"billing_db":                "billing",
+			},
+			HostnameAliasOrg: map[string]string{
+				"billing-alias": "billing",
+			},
+			OrgUserPassword: map[OrgUserKey]string{
+				{OrgID: "test-org-smoke-1778167994", Username: "root"}: mustHash(t, "secret"),
+				{OrgID: "billing", Username: "root"}:                   mustHash(t, "secret"),
+			},
+			OrgUserPassthrough: map[OrgUserKey]bool{
+				{OrgID: "test-org-smoke-1778167994", Username: "root"}: true,
+			},
+		},
+	}
+
+	t.Run("explicit database must match managed SNI org", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection(
+			"test_org_smoke_1778167994",
+			"test-org-smoke-1778167994",
+			true,
+			"root",
+			"secret",
+		)
+		if got.EffectiveDatabase != "test_org_smoke_1778167994" || got.OrgID != "test-org-smoke-1778167994" {
+			t.Fatalf("effective route = (%q, %q), want explicit db/org", got.EffectiveDatabase, got.OrgID)
+		}
+		if got.UsedSNIDatabase {
+			t.Fatalf("explicit database should take priority over resolved SNI database fallback")
+		}
+		if !got.DatabaseExists || !got.HostnameMatches || !got.Valid || !got.Passthrough {
+			t.Fatalf("unexpected result: %+v", got)
+		}
+	})
+
+	t.Run("empty database falls back to managed SNI", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection(
+			"",
+			"test-org-smoke-1778167994",
+			true,
+			"root",
+			"secret",
+		)
+		if got.EffectiveDatabase != "test_org_smoke_1778167994" || !got.UsedSNIDatabase {
+			t.Fatalf("resolved SNI database fallback result = (%q, used=%v), want test db/used", got.EffectiveDatabase, got.UsedSNIDatabase)
+		}
+		if !got.DatabaseExists || !got.HostnameMatches || !got.Valid {
+			t.Fatalf("unexpected result: %+v", got)
+		}
+	})
+
+	t.Run("two existing orgs mismatch is rejected before auth", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection(
+			"test_org_smoke_1778167994",
+			"billing",
+			true,
+			"root",
+			"secret",
+		)
+		if !got.DatabaseExists {
+			t.Fatalf("expected requested database to exist: %+v", got)
+		}
+		if got.HostnameMatches {
+			t.Fatalf("expected SNI org billing to mismatch requested database org: %+v", got)
+		}
+		if got.Valid {
+			t.Fatalf("mismatched managed hostname must not authenticate: %+v", got)
+		}
+	})
+
+	t.Run("database name is not accepted as managed SNI identity", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection(
+			"test_org_smoke_1778167994",
+			"test_org_smoke_1778167994",
+			true,
+			"root",
+			"secret",
+		)
+		if !got.DatabaseExists {
+			t.Fatalf("expected requested database to exist: %+v", got)
+		}
+		if got.HostnameMatches {
+			t.Fatalf("expected database_name SNI prefix to mismatch requested database org: %+v", got)
+		}
+		if got.Valid {
+			t.Fatalf("database_name SNI prefix must not authenticate as hostname identity: %+v", got)
+		}
+	})
+
+	t.Run("unknown SNI fallback keeps database-style error target", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection(
+			"",
+			"ghostorg",
+			true,
+			"root",
+			"secret",
+		)
+		if got.EffectiveDatabase != "ghostorg" || got.DatabaseExists {
+			t.Fatalf("unknown SNI fallback = (%q, exists=%v), want ghostorg missing", got.EffectiveDatabase, got.DatabaseExists)
+		}
+	})
 }
 
 func TestHashPassword(t *testing.T) {
