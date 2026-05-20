@@ -88,6 +88,9 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	if err := migrateDeltaCatalogDefaultEnabled(db); err != nil {
 		return nil, fmt.Errorf("migrate delta catalog default: %w", err)
 	}
+	if err := migrateIcebergBackendBackfill(db); err != nil {
+		return nil, fmt.Errorf("migrate iceberg backend backfill: %w", err)
+	}
 
 	runtimeSchema, err := resolveRuntimeSchema(db)
 	if err != nil {
@@ -408,6 +411,39 @@ func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvision
 
 // UpdateWarehouseState performs a compare-and-swap update on a warehouse row.
 // Only updates if the current state matches expectedState, preventing races.
+// ErrWarehouseStateMismatch is returned (wrapped) by UpdateWarehouseState
+// when the CAS guard fails — the row is missing or no longer in the
+// expected state. Callers that want to treat that as benign (because
+// another writer has already advanced the state machine) can detect via
+// errors.Is(err, configstore.ErrWarehouseStateMismatch).
+var ErrWarehouseStateMismatch = errors.New("warehouse not in expected state")
+
+// ErrWarehouseNotFound is returned by row-targeted updates when the orgID
+// has no row in duckgres_managed_warehouses.
+var ErrWarehouseNotFound = errors.New("warehouse not found")
+
+// UpdateIcebergConfig writes the supplied column updates to the org's
+// warehouse row without CAS'ing on the top-level state. Used by the
+// Lakekeeper provisioner — Iceberg sub-state runs in parallel with the
+// main warehouse state machine, so persisting the Lakekeeper endpoint
+// after a top-level state transition shouldn't silently no-op.
+//
+// Caller-side discipline: the updates map should only contain
+// iceberg_* columns. Untyped to keep the controller's WarehouseStore
+// interface independent of the column list.
+func (cs *ConfigStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
+	result := cs.db.Model(&ManagedWarehouse{}).
+		Where("org_id = ?", orgID).
+		Updates(updates)
+	if result.Error != nil {
+		return fmt.Errorf("update iceberg config: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("warehouse %q: %w", orgID, ErrWarehouseNotFound)
+	}
+	return nil
+}
+
 func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	result := cs.db.Model(&ManagedWarehouse{}).
 		Where("org_id = ? AND state = ?", orgID, expectedState).
@@ -416,7 +452,7 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("update warehouse state: %w", result.Error)
 	}
 	if result.RowsAffected == 0 {
-		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
+		return fmt.Errorf("warehouse %q expected state %q: %w", orgID, expectedState, ErrWarehouseStateMismatch)
 	}
 	return nil
 }
@@ -457,6 +493,53 @@ func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
 			return fmt.Errorf("record schema migration: %w", err)
 		}
 		slog.Info("Backfilled delta_catalog_enabled=true on existing config rows.")
+		return nil
+	})
+}
+
+// migrateIcebergBackendBackfill stamps iceberg_backend = 's3_tables' on any
+// existing row whose iceberg_table_bucket_arn is populated but whose
+// iceberg_backend is empty. Without this, ResolvedBackend() on those rows
+// would return "lakekeeper" (the empty-default semantics) and the worker
+// activator + controller reconcile loop would treat them as Lakekeeper
+// orgs — silently breaking S3 Tables ATTACH AND firing redundant
+// Lakekeeper provisioning attempts.
+//
+// New rows inserted after the GORM `default:'lakekeeper'` migration get
+// the default at insert time, so this migration only matters for rows
+// that predate the column. One-shot, tracked in duckgres_schema_migrations.
+const icebergBackendBackfillMigrationName = "2026_05_iceberg_backend_backfill"
+
+func migrateIcebergBackendBackfill(db *gorm.DB) error {
+	var existing SchemaMigration
+	err := db.Where("name = ?", icebergBackendBackfillMigrationName).First(&existing).Error
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("check schema migration: %w", err)
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		// Backfill rows that have a populated S3 Tables ARN but no
+		// explicit backend — these are pre-feature rows whose semantics
+		// would change without this stamp.
+		res := tx.Exec(
+			`UPDATE duckgres_managed_warehouses
+			   SET iceberg_backend = 's3_tables'
+			 WHERE COALESCE(iceberg_table_bucket_arn, '') <> ''
+			   AND COALESCE(iceberg_backend, '') = ''`,
+		)
+		if res.Error != nil {
+			return fmt.Errorf("backfill iceberg_backend: %w", res.Error)
+		}
+		if err := tx.Create(&SchemaMigration{
+			Name:      icebergBackendBackfillMigrationName,
+			AppliedAt: time.Now().UTC(),
+		}).Error; err != nil {
+			return fmt.Errorf("record schema migration: %w", err)
+		}
+		slog.Info("Backfilled iceberg_backend=s3_tables on pre-Lakekeeper rows.",
+			"rows", res.RowsAffected)
 		return nil
 	})
 }

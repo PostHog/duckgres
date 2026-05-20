@@ -4,6 +4,8 @@ package provisioner
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -41,10 +43,10 @@ func (s *fakeStore) ListWarehousesByStates(states []configstore.ManagedWarehouse
 func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore.ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	w, ok := s.warehouses[orgID]
 	if !ok {
-		return nil
+		return fmt.Errorf("warehouse %q: %w", orgID, configstore.ErrWarehouseStateMismatch)
 	}
 	if w.State != expectedState {
-		return nil
+		return fmt.Errorf("warehouse %q expected %q got %q: %w", orgID, expectedState, w.State, configstore.ErrWarehouseStateMismatch)
 	}
 	for k, v := range updates {
 		switch k {
@@ -97,6 +99,64 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 			w.Iceberg.Namespace = v.(string)
 		case "iceberg_state":
 			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
+		case "iceberg_enabled":
+			w.Iceberg.Enabled = v.(bool)
+		case "iceberg_backend":
+			w.Iceberg.Backend = v.(string)
+		case "iceberg_lakekeeper_endpoint":
+			w.Iceberg.LakekeeperEndpoint = v.(string)
+		case "iceberg_lakekeeper_warehouse":
+			w.Iceberg.LakekeeperWarehouse = v.(string)
+		case "iceberg_lakekeeper_client_id":
+			w.Iceberg.LakekeeperClientID = v.(string)
+		case "iceberg_lakekeeper_oauth2_server_uri":
+			w.Iceberg.LakekeeperOAuth2ServerURI = v.(string)
+		case "iceberg_lakekeeper_client_credentials_namespace":
+			w.Iceberg.LakekeeperClientCredentials.Namespace = v.(string)
+		case "iceberg_lakekeeper_client_credentials_name":
+			w.Iceberg.LakekeeperClientCredentials.Name = v.(string)
+		case "iceberg_lakekeeper_client_credentials_key":
+			w.Iceberg.LakekeeperClientCredentials.Key = v.(string)
+		}
+	}
+	return nil
+}
+
+// UpdateIcebergConfig writes per-org Iceberg/Lakekeeper fields without a
+// top-level state CAS. Mirrors the real configstore method's contract.
+func (s *fakeStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
+	w, ok := s.warehouses[orgID]
+	if !ok {
+		return fmt.Errorf("warehouse %q: %w", orgID, configstore.ErrWarehouseNotFound)
+	}
+	for k, v := range updates {
+		switch k {
+		case "iceberg_enabled":
+			w.Iceberg.Enabled = v.(bool)
+		case "iceberg_backend":
+			w.Iceberg.Backend = v.(string)
+		case "iceberg_namespace":
+			w.Iceberg.Namespace = v.(string)
+		case "iceberg_region":
+			w.Iceberg.Region = v.(string)
+		case "iceberg_table_bucket_arn":
+			w.Iceberg.TableBucketArn = v.(string)
+		case "iceberg_state":
+			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
+		case "iceberg_lakekeeper_endpoint":
+			w.Iceberg.LakekeeperEndpoint = v.(string)
+		case "iceberg_lakekeeper_warehouse":
+			w.Iceberg.LakekeeperWarehouse = v.(string)
+		case "iceberg_lakekeeper_client_id":
+			w.Iceberg.LakekeeperClientID = v.(string)
+		case "iceberg_lakekeeper_oauth2_server_uri":
+			w.Iceberg.LakekeeperOAuth2ServerURI = v.(string)
+		case "iceberg_lakekeeper_client_credentials_namespace":
+			w.Iceberg.LakekeeperClientCredentials.Namespace = v.(string)
+		case "iceberg_lakekeeper_client_credentials_name":
+			w.Iceberg.LakekeeperClientCredentials.Name = v.(string)
+		case "iceberg_lakekeeper_client_credentials_key":
+			w.Iceberg.LakekeeperClientCredentials.Key = v.(string)
 		}
 	}
 	return nil
@@ -733,12 +793,13 @@ func TestFakeStoreUpdateWarehouseState(t *testing.T) {
 		t.Fatalf("expected provisioning state, got %q", fs.warehouses["org-x"].State)
 	}
 
-	// CAS update with wrong expected state should be no-op
+	// CAS update with wrong expected state should return ErrWarehouseStateMismatch
+	// and leave the row unchanged.
 	err = fs.UpdateWarehouseState("org-x", configstore.ManagedWarehouseStatePending, map[string]interface{}{
 		"state": configstore.ManagedWarehouseStateFailed,
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, configstore.ErrWarehouseStateMismatch) {
+		t.Fatalf("expected ErrWarehouseStateMismatch, got: %v", err)
 	}
 	if fs.warehouses["org-x"].State != configstore.ManagedWarehouseStateProvisioning {
 		t.Fatalf("expected state to remain provisioning, got %q", fs.warehouses["org-x"].State)
