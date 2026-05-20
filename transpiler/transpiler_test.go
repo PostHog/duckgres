@@ -182,6 +182,18 @@ func TestTranspile_InformationSchema(t *testing.T) {
 			excludes: "information_schema.columns",
 		},
 		{
+			name:     "quoted public compat view from Tableau metadata cache",
+			input:    `SELECT * FROM "public"."information_schema_views_compat" WHERE 1 = 0 LIMIT 0`,
+			contains: "memory.main.information_schema_views_compat",
+			excludes: "public.information_schema_views_compat",
+		},
+		{
+			name:     "main compat-like table name is not hijacked",
+			input:    "SELECT * FROM main.information_schema_views_compat",
+			contains: "FROM main.information_schema_views_compat",
+			excludes: "memory.main.information_schema_views_compat",
+		},
+		{
 			name:     "string literal NOT rewritten",
 			input:    "SELECT 'information_schema.columns' AS name",
 			contains: "information_schema.columns",

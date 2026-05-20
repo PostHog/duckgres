@@ -76,6 +76,17 @@ func (t *InformationSchemaTransform) walkAndTransform(node *pg_query.Node, chang
 				*changed = true
 			}
 			// If no mapping, leave as-is (DuckDB will handle it)
+		} else if n.RangeVar != nil && n.RangeVar.Catalogname == "" && strings.EqualFold(n.RangeVar.Schemaname, "public") {
+			// Some clients cache or re-query the compat view names that duckgres
+			// exposes through metadata, often as "public"."information_schema_*_compat".
+			// Those views physically live in memory.main, so route direct references
+			// back to their real location.
+			if compatName, ok := t.compatViewName(n.RangeVar.Relname); ok {
+				n.RangeVar.Relname = compatName
+				n.RangeVar.Catalogname = "memory"
+				n.RangeVar.Schemaname = "main"
+				*changed = true
+			}
 		}
 
 	case *pg_query.Node_SelectStmt:
@@ -210,6 +221,16 @@ func (t *InformationSchemaTransform) walkAndTransform(node *pg_query.Node, chang
 			}
 		}
 	}
+}
+
+func (t *InformationSchemaTransform) compatViewName(relname string) (string, bool) {
+	relname = strings.ToLower(relname)
+	for _, compatName := range t.ViewMappings {
+		if relname == strings.ToLower(compatName) {
+			return compatName, true
+		}
+	}
+	return "", false
 }
 
 func (t *InformationSchemaTransform) walkSelectStmt(stmt *pg_query.SelectStmt, changed *bool) {
