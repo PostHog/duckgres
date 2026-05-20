@@ -142,13 +142,39 @@ func TestK8sIcebergRoundTrip(t *testing.T) {
 	// reached the listing endpoint without a detach-on-empty error, and
 	// a client session's flight call to `duckdb_databases()` was routed
 	// to the activated worker.
-	attached, err := queryIntWithReconnectAs(icebergTenantName, icebergTenantPassword,
-		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'iceberg'", 60*time.Second)
-	if err != nil {
-		t.Fatalf("query iceberg attach state: %v", err)
+	//
+	// Why we poll instead of a one-shot query: waitForTenantDBReady
+	// returns as soon as `SELECT 1` succeeds, which can race the worker
+	// activation's AttachIcebergCatalog step — the auth/SELECT path
+	// completes before the iceberg ext finishes its
+	// install+secret+ATTACH+probe sequence against AWS. A one-shot count
+	// query against that window returns 0 spuriously. Retrying until
+	// the catalog shows up (with a hard upper bound) catches genuine
+	// activation failures while tolerating the ordinary multi-second
+	// ATTACH latency.
+	if err := pollIcebergAttached(60 * time.Second); err != nil {
+		t.Fatalf("iceberg catalog not attached after activation: %v (ATTACH against %s probably failed — check control-plane logs)", err, cfg.tableBucketARN)
 	}
-	if attached != 1 {
-		t.Fatalf("iceberg catalog not attached (count=%d); ATTACH against %s probably failed — check control-plane logs", attached, cfg.tableBucketARN)
+}
+
+// pollIcebergAttached polls the iceberg tenant's session for the
+// attached-catalog count until it reads 1 or the timeout elapses. See
+// the call site for the race this paves over.
+func pollIcebergAttached(timeout time.Duration) error {
+	const q = "SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'iceberg'"
+	deadline := time.Now().Add(timeout)
+	for {
+		got, err := queryIntWithReconnectAs(icebergTenantName, icebergTenantPassword, q, timeout)
+		if err == nil && got == 1 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("last query error: %w", err)
+			}
+			return fmt.Errorf("catalog still not attached (last count=%d)", got)
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
 
