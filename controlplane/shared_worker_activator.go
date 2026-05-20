@@ -478,13 +478,21 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 
 	switch {
 	case warehouse.S3Credentials.Name != "":
-		accessKey, secretKey, err := a.readS3Credentials(ctx, warehouse.S3Credentials)
+		accessKey, secretKey, sessionToken, err := a.readS3Credentials(ctx, warehouse.S3Credentials)
 		if err != nil {
 			return server.DuckLakeConfig{}, fmt.Errorf("s3 credentials: %w", err)
 		}
 		dl.S3Provider = "config"
 		dl.S3AccessKey = accessKey
 		dl.S3SecretKey = secretKey
+		// session_token is optional in the secret payload — long-term IAM
+		// user keys don't have one. STS-vended temporary credentials
+		// (AccessKeyId starting with ASIA…) require it: AWS rejects the
+		// signing identity without the token and the iceberg REST endpoint
+		// returns 403. Letting the field through lets sandbox/CI fixtures
+		// that source creds from STS use the same secret-ref schema as
+		// production's long-term keys.
+		dl.S3SessionToken = sessionToken
 	case strings.EqualFold(warehouse.S3.Provider, "aws"):
 		roleARN := warehouse.WorkerIdentity.IAMRoleARN
 		if roleARN == "" {
@@ -586,23 +594,24 @@ func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configs
 	return string(raw), nil
 }
 
-func (a *SharedWorkerActivator) readS3Credentials(ctx context.Context, ref configstore.SecretRef) (string, string, error) {
+func (a *SharedWorkerActivator) readS3Credentials(ctx context.Context, ref configstore.SecretRef) (string, string, string, error) {
 	value, err := a.readSecretValue(ctx, ref)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	var payload struct {
 		AccessKeyID     string `json:"access_key_id"`
 		SecretAccessKey string `json:"secret_access_key"`
+		SessionToken    string `json:"session_token"`
 	}
 	if err := json.Unmarshal([]byte(value), &payload); err != nil {
-		return "", "", fmt.Errorf("parse s3 credential payload: %w", err)
+		return "", "", "", fmt.Errorf("parse s3 credential payload: %w", err)
 	}
 	if payload.AccessKeyID == "" || payload.SecretAccessKey == "" {
-		return "", "", fmt.Errorf("s3 credential payload requires access_key_id and secret_access_key")
+		return "", "", "", fmt.Errorf("s3 credential payload requires access_key_id and secret_access_key")
 	}
-	return payload.AccessKeyID, payload.SecretAccessKey, nil
+	return payload.AccessKeyID, payload.SecretAccessKey, payload.SessionToken, nil
 }
 
 func buildDuckLakeMetadataStoreDSN(host string, port int, username, password, database string) string {
