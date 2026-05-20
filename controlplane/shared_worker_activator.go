@@ -19,6 +19,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
+	"github.com/posthog/duckgres/server/iceberg"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -355,16 +356,9 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
-	// Iceberg config is sourced from the configstore in both Duckling-driven
-	// and configstore-driven paths. The TableBucketArn is populated by the
-	// provisioner controller once the Crossplane composition reports
-	// status.iceberg.tableBucketArn; before that, Enabled is true but the
-	// ARN is empty and AttachIcebergCatalog is a no-op.
-	ic := server.IcebergConfig{
-		Enabled:     org.Warehouse.Iceberg.Enabled,
-		TableBucket: org.Warehouse.Iceberg.TableBucketArn,
-		Region:      org.Warehouse.Iceberg.Region,
-		Namespace:   org.Warehouse.Iceberg.Namespace,
+	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, &org.Warehouse.Iceberg)
+	if err != nil {
+		return TenantActivationPayload{}, err
 	}
 
 	return TenantActivationPayload{
@@ -522,6 +516,48 @@ func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Inte
 		OrgID: orgName(org),
 	}
 	return activator.BuildActivationRequest(ctx, org, assignment)
+}
+
+// buildIcebergConfig maps a stored ManagedWarehouseIceberg into the wire-level
+// iceberg.Config that ships to workers. Per-backend fields are only populated
+// when their backend is selected; the worker-side AttachIcebergCatalog
+// dispatches on ResolvedBackend. Empty per-backend fields are treated as
+// "provisioner hasn't filled this in yet" and the worker returns no-op for
+// that org.
+//
+// For lakekeeper with a non-empty LakekeeperClientCredentials SecretRef, the
+// OAuth2 client_secret is resolved via readSecretValue just before sending.
+// Empty SecretRef is fine (PR1 allowall mode; PR3 wires OIDC SA-token auth).
+func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID string, src *configstore.ManagedWarehouseIceberg) (server.IcebergConfig, error) {
+	ic := server.IcebergConfig{
+		Enabled:   src.Enabled,
+		Backend:   src.Backend,
+		Namespace: src.Namespace,
+		Region:    src.Region,
+	}
+	// Populate only the fields the selected backend actually uses. Avoids
+	// leaking stale TableBucketArn from a pre-migration row into a
+	// lakekeeper activation payload (or vice versa). The worker-side
+	// dispatcher gates on ResolvedBackend anyway, but zeroing here is
+	// cheap defense-in-depth and keeps the payload free of orphaned
+	// credentials.
+	switch ic.ResolvedBackend() {
+	case iceberg.BackendLakekeeper:
+		ic.LakekeeperEndpoint = src.LakekeeperEndpoint
+		ic.LakekeeperWarehouse = src.LakekeeperWarehouse
+		ic.LakekeeperClientID = src.LakekeeperClientID
+		ic.LakekeeperOAuth2ServerURI = src.LakekeeperOAuth2ServerURI
+		if src.LakekeeperClientCredentials.Name != "" {
+			val, err := a.readSecretValue(ctx, src.LakekeeperClientCredentials)
+			if err != nil {
+				return server.IcebergConfig{}, fmt.Errorf("resolve lakekeeper client credentials for org %q: %w", orgID, err)
+			}
+			ic.LakekeeperClientSecret = val
+		}
+	case iceberg.BackendS3Tables:
+		ic.TableBucket = src.TableBucketArn
+	}
+	return ic, nil
 }
 
 func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configstore.SecretRef) (string, error) {

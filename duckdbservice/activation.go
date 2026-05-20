@@ -305,9 +305,19 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		reflect.DeepEqual(a.DataInliningRowLimit, b.DataInliningRowLimit) &&
 		a.CheckpointInterval == b.CheckpointInterval &&
 		ai.Enabled == bi.Enabled &&
+		ai.Backend == bi.Backend &&
 		ai.TableBucket == bi.TableBucket &&
 		ai.Region == bi.Region &&
-		ai.Namespace == bi.Namespace
+		ai.Namespace == bi.Namespace &&
+		// Lakekeeper-side identity. Without this, a hot-idle worker
+		// activated before Lakekeeper provisioning completed would be
+		// reclaimed for the same org without forcing the new ATTACH —
+		// the worker would keep running with no iceberg catalog
+		// attached even though the new payload carries the endpoint.
+		ai.LakekeeperEndpoint == bi.LakekeeperEndpoint &&
+		ai.LakekeeperWarehouse == bi.LakekeeperWarehouse &&
+		ai.LakekeeperClientID == bi.LakekeeperClientID &&
+		ai.LakekeeperOAuth2ServerURI == bi.LakekeeperOAuth2ServerURI
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {
