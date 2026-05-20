@@ -48,6 +48,73 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to load K8s test environment: %v", err)
 	}
 	namespace = testEnv.Namespace
+
+	// SAFETY: kubeconfig must be loaded, parsed, and confirmed-local
+	// BEFORE setupMultiTenant runs. setupMultiTenant begins with
+	// `kubectl delete namespace duckgres` against whatever kubeconfig
+	// kubectl picks up — if that's the user's default context (e.g.
+	// mw-dev), production-adjacent data goes with it. This exact
+	// incident has happened twice now (2025 and 2026-05-19); the second
+	// one happened because the safety check was placed AFTER
+	// setupMultiTenant. Anything destructive must live below this
+	// block. Do not move it back.
+	kubeconfig = os.Getenv("DUCKGRES_K8S_TEST_KUBECONFIG")
+	if kubeconfig == "" {
+		log.Fatalf(`
+========================================================================
+REFUSING to run k8s integration tests: DUCKGRES_K8S_TEST_KUBECONFIG is not set.
+
+THIS TEST SUITE IS DESTRUCTIVE.
+It begins by running ` + "`kubectl delete namespace duckgres`" + ` against
+whatever cluster the kubeconfig points at. If that's your local default
+context, a dev cluster, or any shared environment, real workloads will
+be wiped. The only safe target is a throwaway local kind cluster that
+this suite owns end-to-end.
+
+DO NOT run this suite directly on a local machine, a dev cluster, or
+production. Do not work around this guard by exporting
+DUCKGRES_K8S_TEST_KUBECONFIG to your default ~/.kube/config — the
+second guard (requireLocalKindCluster) will catch that, but it is the
+last line of defence, not the first.
+
+The supported way to run is:
+
+    just test-k8s-integration
+
+which provisions a fresh kind cluster, sets DUCKGRES_K8S_TEST_KUBECONFIG
+to that cluster's kubeconfig, and tears the cluster down afterward.
+
+If you are seeing this message, this guard just saved you — your active
+kubeconfig was not touched.
+========================================================================
+`)
+	}
+
+	// Pre-flight validation: if the kubeconfig FILE already exists at
+	// this point (warm local run, or rerun after a previous successful
+	// bootstrap), validate it BEFORE the destructive setupMultiTenant
+	// call. This is the line that would have stopped the mw-dev incident:
+	// the user had no DUCKGRES_K8S_TEST_KUBECONFIG set (caught above),
+	// but if they had pointed it at ~/.kube/config we'd still need to
+	// reject it before kubectl ran.
+	//
+	// On a cold CI bootstrap the file legitimately doesn't exist yet
+	// (kind-cluster-reset inside setupMultiTenant creates it). In that
+	// case the destructive `kubectl delete namespace` inside
+	// setupMultiTenant runs against a missing kubeconfig and fails with
+	// "stat ...: no such file or directory" — no damage is possible
+	// because kubectl can't connect. The post-bootstrap validation
+	// below is the mandatory check for that path.
+	if _, statErr := os.Stat(kubeconfig); statErr == nil {
+		preBootstrapCfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			log.Fatalf("Failed to load kubeconfig %q: %v", kubeconfig, err)
+		}
+		if err := requireLocalKindCluster(kubeconfig, preBootstrapCfg); err != nil {
+			log.Fatalf("REFUSING to run k8s integration tests: %v", err)
+		}
+	}
+
 	skipSetup := envOr("DUCKGRES_K8S_TEST_SKIP_SETUP", "") == "true"
 	if !skipSetup {
 		if namespace != "duckgres" {
@@ -58,23 +125,20 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	// SAFETY: require an explicit kubeconfig path. Falling back to
-	// ~/.kube/config is how this suite once ran against the live mw-dev
-	// cluster and wiped the duckgres namespace via setupMultiTenant's
-	// `kubectl delete namespace duckgres`. Always fail loudly instead.
-	kubeconfig = os.Getenv("DUCKGRES_K8S_TEST_KUBECONFIG")
-	if kubeconfig == "" {
-		log.Fatalf("DUCKGRES_K8S_TEST_KUBECONFIG is required. Run via `just test-k8s-integration` (which sets it to a kind kubeconfig) or set it explicitly. Refusing to fall back to the user's default kubeconfig because this suite is destructive.")
-	}
+	// Mandatory post-bootstrap validation. setupMultiTenant has now run
+	// (or been skipped), so the kubeconfig file MUST exist and MUST
+	// point at a local kind cluster. This is the last line of defence
+	// against any cold-bootstrap path that slipped past the pre-flight
+	// check above (e.g. file didn't exist at startup, setupMultiTenant
+	// wrote one). Failure here aborts before any test body runs.
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		log.Fatalf("Failed to load kubeconfig: %v", err)
+		log.Fatalf("Failed to load kubeconfig %q after setup: %v", kubeconfig, err)
 	}
-	// SAFETY: confirm the resolved kubeconfig actually points at a local
-	// kind cluster before running anything destructive.
 	if err := requireLocalKindCluster(kubeconfig, config); err != nil {
 		log.Fatalf("REFUSING to run k8s integration tests: %v", err)
 	}
+
 	clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("Failed to create k8s client: %v", err)
@@ -536,8 +600,18 @@ func requireLocalKindCluster(kubeconfigPath string, cfg *rest.Config) error {
 	case "127.0.0.1", "localhost", "::1":
 		// loopback — kind cluster, proceed.
 	default:
-		return fmt.Errorf(
-			"API server at %q is not loopback. The k8s integration suite is destructive (it deletes the duckgres namespace at startup) and must only run against a local kind cluster. Run via `just test-k8s-integration` or point DUCKGRES_K8S_TEST_KUBECONFIG at a kind kubeconfig",
+		return fmt.Errorf(`API server at %q is NOT a loopback address.
+
+This test suite is destructive — it deletes the entire duckgres
+namespace at startup — and must NEVER run against a real cluster
+(local dev, shared dev, staging, production, or anything in between).
+The only safe target is a throwaway local kind cluster.
+
+Run via:
+    just test-k8s-integration
+
+which provisions a fresh kind cluster and points
+DUCKGRES_K8S_TEST_KUBECONFIG at it`,
 			cfg.Host)
 	}
 
@@ -546,8 +620,15 @@ func requireLocalKindCluster(kubeconfigPath string, cfg *rest.Config) error {
 		return fmt.Errorf("load kubeconfig %q: %w", kubeconfigPath, err)
 	}
 	if !strings.Contains(strings.ToLower(raw.CurrentContext), "kind") {
-		return fmt.Errorf(
-			"current-context %q in %s does not look like a kind cluster (expected name containing \"kind\")",
+		return fmt.Errorf(`current-context %q in %s does not look like a kind cluster
+(the safety guard requires the context name to contain "kind").
+
+This test suite is destructive — it deletes the entire duckgres
+namespace at startup — and must NEVER run against a real cluster.
+The only safe target is a throwaway local kind cluster.
+
+Run via:
+    just test-k8s-integration`,
 			raw.CurrentContext, kubeconfigPath)
 	}
 	return nil

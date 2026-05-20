@@ -19,6 +19,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
+	"github.com/posthog/duckgres/server/iceberg"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -355,16 +356,9 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
-	// Iceberg config is sourced from the configstore in both Duckling-driven
-	// and configstore-driven paths. The TableBucketArn is populated by the
-	// provisioner controller once the Crossplane composition reports
-	// status.iceberg.tableBucketArn; before that, Enabled is true but the
-	// ARN is empty and AttachIcebergCatalog is a no-op.
-	ic := server.IcebergConfig{
-		Enabled:     org.Warehouse.Iceberg.Enabled,
-		TableBucket: org.Warehouse.Iceberg.TableBucketArn,
-		Region:      org.Warehouse.Iceberg.Region,
-		Namespace:   org.Warehouse.Iceberg.Namespace,
+	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, &org.Warehouse.Iceberg)
+	if err != nil {
+		return TenantActivationPayload{}, err
 	}
 
 	return TenantActivationPayload{
@@ -484,13 +478,21 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 
 	switch {
 	case warehouse.S3Credentials.Name != "":
-		accessKey, secretKey, err := a.readS3Credentials(ctx, warehouse.S3Credentials)
+		accessKey, secretKey, sessionToken, err := a.readS3Credentials(ctx, warehouse.S3Credentials)
 		if err != nil {
 			return server.DuckLakeConfig{}, fmt.Errorf("s3 credentials: %w", err)
 		}
 		dl.S3Provider = "config"
 		dl.S3AccessKey = accessKey
 		dl.S3SecretKey = secretKey
+		// session_token is optional in the secret payload — long-term IAM
+		// user keys don't have one. STS-vended temporary credentials
+		// (AccessKeyId starting with ASIA…) require it: AWS rejects the
+		// signing identity without the token and the iceberg REST endpoint
+		// returns 403. Letting the field through lets sandbox/CI fixtures
+		// that source creds from STS use the same secret-ref schema as
+		// production's long-term keys.
+		dl.S3SessionToken = sessionToken
 	case strings.EqualFold(warehouse.S3.Provider, "aws"):
 		roleARN := warehouse.WorkerIdentity.IAMRoleARN
 		if roleARN == "" {
@@ -524,6 +526,48 @@ func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Inte
 	return activator.BuildActivationRequest(ctx, org, assignment)
 }
 
+// buildIcebergConfig maps a stored ManagedWarehouseIceberg into the wire-level
+// iceberg.Config that ships to workers. Per-backend fields are only populated
+// when their backend is selected; the worker-side AttachIcebergCatalog
+// dispatches on ResolvedBackend. Empty per-backend fields are treated as
+// "provisioner hasn't filled this in yet" and the worker returns no-op for
+// that org.
+//
+// For lakekeeper with a non-empty LakekeeperClientCredentials SecretRef, the
+// OAuth2 client_secret is resolved via readSecretValue just before sending.
+// Empty SecretRef is fine (PR1 allowall mode; PR3 wires OIDC SA-token auth).
+func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID string, src *configstore.ManagedWarehouseIceberg) (server.IcebergConfig, error) {
+	ic := server.IcebergConfig{
+		Enabled:   src.Enabled,
+		Backend:   src.Backend,
+		Namespace: src.Namespace,
+		Region:    src.Region,
+	}
+	// Populate only the fields the selected backend actually uses. Avoids
+	// leaking stale TableBucketArn from a pre-migration row into a
+	// lakekeeper activation payload (or vice versa). The worker-side
+	// dispatcher gates on ResolvedBackend anyway, but zeroing here is
+	// cheap defense-in-depth and keeps the payload free of orphaned
+	// credentials.
+	switch ic.ResolvedBackend() {
+	case iceberg.BackendLakekeeper:
+		ic.LakekeeperEndpoint = src.LakekeeperEndpoint
+		ic.LakekeeperWarehouse = src.LakekeeperWarehouse
+		ic.LakekeeperClientID = src.LakekeeperClientID
+		ic.LakekeeperOAuth2ServerURI = src.LakekeeperOAuth2ServerURI
+		if src.LakekeeperClientCredentials.Name != "" {
+			val, err := a.readSecretValue(ctx, src.LakekeeperClientCredentials)
+			if err != nil {
+				return server.IcebergConfig{}, fmt.Errorf("resolve lakekeeper client credentials for org %q: %w", orgID, err)
+			}
+			ic.LakekeeperClientSecret = val
+		}
+	case iceberg.BackendS3Tables:
+		ic.TableBucket = src.TableBucketArn
+	}
+	return ic, nil
+}
+
 func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configstore.SecretRef) (string, error) {
 	if strings.TrimSpace(ref.Name) == "" || strings.TrimSpace(ref.Key) == "" {
 		return "", fmt.Errorf("secret ref requires name and key")
@@ -550,23 +594,24 @@ func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configs
 	return string(raw), nil
 }
 
-func (a *SharedWorkerActivator) readS3Credentials(ctx context.Context, ref configstore.SecretRef) (string, string, error) {
+func (a *SharedWorkerActivator) readS3Credentials(ctx context.Context, ref configstore.SecretRef) (string, string, string, error) {
 	value, err := a.readSecretValue(ctx, ref)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	var payload struct {
 		AccessKeyID     string `json:"access_key_id"`
 		SecretAccessKey string `json:"secret_access_key"`
+		SessionToken    string `json:"session_token"`
 	}
 	if err := json.Unmarshal([]byte(value), &payload); err != nil {
-		return "", "", fmt.Errorf("parse s3 credential payload: %w", err)
+		return "", "", "", fmt.Errorf("parse s3 credential payload: %w", err)
 	}
 	if payload.AccessKeyID == "" || payload.SecretAccessKey == "" {
-		return "", "", fmt.Errorf("s3 credential payload requires access_key_id and secret_access_key")
+		return "", "", "", fmt.Errorf("s3 credential payload requires access_key_id and secret_access_key")
 	}
-	return payload.AccessKeyID, payload.SecretAccessKey, nil
+	return payload.AccessKeyID, payload.SecretAccessKey, payload.SessionToken, nil
 }
 
 func buildDuckLakeMetadataStoreDSN(host string, port int, username, password, database string) string {

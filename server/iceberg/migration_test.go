@@ -57,3 +57,72 @@ func TestBuildIcebergSecretStmtEscapesQuotesInCreds(t *testing.T) {
 		t.Fatalf("BuildIcebergSecretStmt did not escape quotes in creds:\n got: %s\nwant: %s", got, want)
 	}
 }
+
+// --- Lakekeeper backend ----------------------------------------------------
+
+func TestBuildLakekeeperSecretStmt_WithOAuth2(t *testing.T) {
+	got := BuildLakekeeperSecretStmt(Config{
+		LakekeeperClientID:        "duckling-acme",
+		LakekeeperClientSecret:    "abc123",
+		LakekeeperOAuth2ServerURI: "http://oidc/token",
+	})
+	want := "CREATE OR REPLACE SECRET iceberg_oauth (TYPE ICEBERG, CLIENT_ID 'duckling-acme', CLIENT_SECRET 'abc123', OAUTH2_SERVER_URI 'http://oidc/token')"
+	if got != want {
+		t.Fatalf("BuildLakekeeperSecretStmt mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestBuildLakekeeperSecretStmt_AllowallReturnsEmpty(t *testing.T) {
+	got := BuildLakekeeperSecretStmt(Config{LakekeeperClientID: "duckling-acme"})
+	if got != "" {
+		t.Fatalf("expected empty secret stmt for allowall mode, got: %q", got)
+	}
+}
+
+func TestBuildLakekeeperAttachStmt_Allowall(t *testing.T) {
+	got := BuildLakekeeperAttachStmt(Config{
+		LakekeeperEndpoint:  "http://lakekeeper-acme.lakekeeper.svc:8181/catalog",
+		LakekeeperWarehouse: "org-acme",
+	})
+	want := "ATTACH 'org-acme' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://lakekeeper-acme.lakekeeper.svc:8181/catalog', ACCESS_DELEGATION_MODE 'vended_credentials', AUTHORIZATION_TYPE 'none')"
+	if got != want {
+		t.Fatalf("BuildLakekeeperAttachStmt (allowall) mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestBuildLakekeeperAttachStmt_OAuth2(t *testing.T) {
+	got := BuildLakekeeperAttachStmt(Config{
+		LakekeeperEndpoint:        "http://lakekeeper-acme.lakekeeper.svc:8181/catalog",
+		LakekeeperWarehouse:       "org-acme",
+		LakekeeperOAuth2ServerURI: "http://oidc/token",
+	})
+	want := "ATTACH 'org-acme' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://lakekeeper-acme.lakekeeper.svc:8181/catalog', SECRET iceberg_oauth, ACCESS_DELEGATION_MODE 'vended_credentials')"
+	if got != want {
+		t.Fatalf("BuildLakekeeperAttachStmt (oauth2) mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestBuildLakekeeperAttachStmt_EscapesQuotes(t *testing.T) {
+	got := BuildLakekeeperAttachStmt(Config{
+		LakekeeperEndpoint:  "http://h/cat?x='y'",
+		LakekeeperWarehouse: "wh'name",
+	})
+	want := "ATTACH 'wh''name' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://h/cat?x=''y''', ACCESS_DELEGATION_MODE 'vended_credentials', AUTHORIZATION_TYPE 'none')"
+	if got != want {
+		t.Fatalf("BuildLakekeeperAttachStmt did not escape quotes:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestResolvedBackend(t *testing.T) {
+	cases := map[string]string{
+		"":                 BackendLakekeeper,
+		BackendLakekeeper:  BackendLakekeeper,
+		BackendS3Tables:    BackendS3Tables,
+		"future":           "future",
+	}
+	for in, want := range cases {
+		if got := (Config{Backend: in}).ResolvedBackend(); got != want {
+			t.Errorf("ResolvedBackend(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -72,3 +72,93 @@ func TestIcebergSecretAcceptedByDuckDB(t *testing.T) {
 		})
 	}
 }
+
+// TestLakekeeperSQLAcceptedByDuckDB verifies that the SQL emitted by
+// BuildLakekeeperSecretStmt and BuildLakekeeperAttachStmt is syntactically
+// accepted by DuckDB's iceberg extension. The ATTACH will fail to connect
+// to the fictitious endpoint, but DuckDB validates option names + types at
+// parse/bind time, BEFORE attempting the connection — so a wrong keyword
+// (e.g. ACCESS_DELEGATION_MODE vs DELEGATION_MODE) shows up here, not at
+// activation time in prod.
+//
+// This is the equivalent of TestIcebergSecretAcceptedByDuckDB for the
+// Lakekeeper backend, closing the gap noted in the PR2 deep review.
+func TestLakekeeperSQLAcceptedByDuckDB(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open in-memory duckdb: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if _, err := db.Exec("INSTALL iceberg"); err != nil {
+		t.Skipf("iceberg extension unavailable (network or sandbox): %v", err)
+	}
+	if _, err := db.Exec("LOAD iceberg"); err != nil {
+		t.Skipf("iceberg extension load failed: %v", err)
+	}
+
+	t.Run("oauth2 secret + attach with SECRET reference", func(t *testing.T) {
+		cfg := iceberg.Config{
+			LakekeeperEndpoint:        "http://lakekeeper.invalid/catalog",
+			LakekeeperWarehouse:       "org-test",
+			LakekeeperClientID:        "duckling-test",
+			LakekeeperClientSecret:    "shh",
+			LakekeeperOAuth2ServerURI: "http://oidc.invalid/token",
+		}
+		// CREATE SECRET (TYPE ICEBERG) eagerly POSTs to OAUTH2_SERVER_URI to
+		// fetch a token; we point at a bogus host so the network step fails
+		// fast. The point of this assertion is: a network/resolution error
+		// proves DuckDB ACCEPTED the option keywords and tried to use them.
+		// What we MUST reject is parse/bind-time errors that would mean
+		// DuckDB never got past keyword validation.
+		secretStmt := iceberg.BuildLakekeeperSecretStmt(cfg)
+		if secretStmt == "" {
+			t.Fatal("expected non-empty secret stmt for OAuth2 mode")
+		}
+		if _, err := db.Exec(secretStmt); err != nil && isParseOrBindError(err) {
+			t.Fatalf("BuildLakekeeperSecretStmt option/syntax error from DuckDB:\n%s\nerr: %v", secretStmt, err)
+		}
+		// ATTACH likewise. May fail on the endpoint connection, but must
+		// not fail at parse/bind time.
+		attachStmt := iceberg.BuildLakekeeperAttachStmt(cfg)
+		_, err := db.Exec(attachStmt)
+		if err != nil && isParseOrBindError(err) {
+			t.Fatalf("BuildLakekeeperAttachStmt option/syntax error from DuckDB:\n%s\nerr: %v", attachStmt, err)
+		}
+		_, _ = db.Exec("DETACH " + iceberg.CatalogName)
+	})
+
+	t.Run("allowall attach with AUTHORIZATION_TYPE 'none'", func(t *testing.T) {
+		cfg := iceberg.Config{
+			LakekeeperEndpoint:  "http://lakekeeper.invalid/catalog",
+			LakekeeperWarehouse: "org-test",
+		}
+		// No SECRET in this mode.
+		if got := iceberg.BuildLakekeeperSecretStmt(cfg); got != "" {
+			t.Fatalf("allowall mode should produce empty secret stmt, got: %s", got)
+		}
+		attachStmt := iceberg.BuildLakekeeperAttachStmt(cfg)
+		_, err := db.Exec(attachStmt)
+		if err != nil && isParseOrBindError(err) {
+			t.Fatalf("BuildLakekeeperAttachStmt (allowall) option/syntax error from DuckDB:\n%s\nerr: %v", attachStmt, err)
+		}
+		_, _ = db.Exec("DETACH " + iceberg.CatalogName)
+	})
+}
+
+// isParseOrBindError reports whether err is a DuckDB parse/bind error —
+// i.e. the statement was rejected before DuckDB attempted any I/O. Tests
+// use this to distinguish "your SQL has a typo" from "your fictitious
+// endpoint didn't resolve", which is the assertion that actually matters
+// when validating the SQL strings produced by Build* helpers.
+func isParseOrBindError(err error) bool {
+	msg := err.Error()
+	for _, marker := range []string{"Parser Error", "Binder Error", "Unknown parameter", "syntax error"} {
+		for i := 0; i+len(marker) <= len(msg); i++ {
+			if msg[i:i+len(marker)] == marker {
+				return true
+			}
+		}
+	}
+	return false
+}

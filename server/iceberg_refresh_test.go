@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+
+	"github.com/posthog/duckgres/server/iceberg"
 )
 
 // TestRefreshIcebergSecretRotatesCredentials exercises the full refresh
@@ -59,15 +61,40 @@ func TestRefreshIcebergSecretNoOpWhenDisabled(t *testing.T) {
 
 // TestRefreshIcebergSecretRejectsEmptyCredentials guards the invariant
 // that "credentials are required when iceberg is enabled" applies to
-// refresh too, not just initial attach. A silent fallback here would
-// either re-introduce credential_chain (the bug fixed by PR #562) or
-// emit an empty-cred config secret that fails opaquely at attach time.
+// refresh too, not just initial attach — for the S3 Tables backend.
+// A silent fallback here would either re-introduce credential_chain (the
+// bug fixed by PR #562) or emit an empty-cred config secret that fails
+// opaquely at attach time.
+//
+// Backend is explicit because empty Backend resolves to "lakekeeper",
+// which legitimately returns nil from RefreshIcebergSecret (Lakekeeper
+// vends its own STS via ACCESS_DELEGATION_MODE; there's nothing to rotate).
 func TestRefreshIcebergSecretRejectsEmptyCredentials(t *testing.T) {
-	err := RefreshIcebergSecret(nil, IcebergConfig{Enabled: true, TableBucket: "arn:..."}, nil, "", "", "")
+	err := RefreshIcebergSecret(nil, IcebergConfig{
+		Enabled:     true,
+		Backend:     iceberg.BackendS3Tables,
+		TableBucket: "arn:...",
+	}, nil, "", "", "")
 	if err == nil {
 		t.Fatal("expected error when iceberg enabled with empty credentials, got nil")
 	}
 	if !strings.Contains(err.Error(), "no AWS credentials") {
 		t.Fatalf("error message should name the missing-credentials cause, got: %v", err)
+	}
+}
+
+// TestRefreshIcebergSecretLakekeeperNoOp covers the new branch: a
+// Lakekeeper-backed config has no S3 credentials in the payload (because
+// Lakekeeper vends them itself), and RefreshIcebergSecret should return
+// nil rather than complain about missing credentials.
+func TestRefreshIcebergSecretLakekeeperNoOp(t *testing.T) {
+	err := RefreshIcebergSecret(nil, IcebergConfig{
+		Enabled:             true,
+		Backend:             iceberg.BackendLakekeeper,
+		LakekeeperEndpoint:  "http://lk/catalog",
+		LakekeeperWarehouse: "org-x",
+	}, nil, "", "", "")
+	if err != nil {
+		t.Fatalf("Lakekeeper backend refresh should be a no-op, got error: %v", err)
 	}
 }

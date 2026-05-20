@@ -12,19 +12,22 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // SNI integration tests rely on the kind manifest at k8s/kind/control-plane.yaml
 // running the control plane with --sni-routing-mode=passthrough and
-// --managed-hostname-suffixes=.dw.test.local. The seeded org has database
-// name "duckgres" with user postgres/postgres (k8s/kind/config-store.seed.sql).
+// --managed-hostname-suffixes=.dw.test.local. The seeded org is "local" with
+// database name "duckgres" and user postgres/postgres
+// (k8s/kind/config-store.seed.sql).
 
 const (
-	sniManagedSuffix      = ".dw.test.local"
-	sniSeedDatabaseName   = "duckgres"
-	sniSeedUser           = "postgres"
-	sniSeedPassword       = "postgres"
-	sniBogusDatabaseParam = "ignored-by-test"
+	sniManagedSuffix    = ".dw.test.local"
+	sniSeedOrgName      = "local"
+	sniSeedDatabaseName = "duckgres"
+	sniSeedUser         = "postgres"
+	sniSeedPassword     = "postgres"
+	sniBogusPrefix      = "ignored-by-test"
 )
 
 // connectWithSNI dials the control plane via port-forward, sets the TLS SNI
@@ -47,6 +50,7 @@ func connectWithSNI(ctx context.Context, sni, database, user, password string) (
 	if err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	cfg.Database = database
 	// Override SNI without changing the dial host. ServerName is the only
 	// knob the control plane reads; InsecureSkipVerify is fine because the
 	// kind cluster uses self-signed certs and port-forward already breaks
@@ -56,11 +60,10 @@ func connectWithSNI(ctx context.Context, sni, database, user, password string) (
 	return pgx.ConnectConfig(ctx, cfg)
 }
 
-// TestSNI_MatchedHostnameOverridesDatabaseParam: the SNI resolves to the
-// seeded org regardless of what database name the client passes in the
-// startup packet. Proves SNI is authoritative when it matches a managed
-// suffix (passthrough mode).
-func TestSNI_MatchedHostnameOverridesDatabaseParam(t *testing.T) {
+// TestSNI_MatchedHostnameUsesDatabaseParam: a managed SNI resolves to the same
+// org as the requested database, and the startup database remains the routing
+// key when present.
+func TestSNI_MatchedHostnameUsesDatabaseParam(t *testing.T) {
 	if err := waitForDBReady(60 * time.Second); err != nil {
 		t.Fatalf("waitForDBReady: %v", err)
 	}
@@ -68,11 +71,11 @@ func TestSNI_MatchedHostnameOverridesDatabaseParam(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	conn, err := connectWithSNI(ctx, sniSeedDatabaseName+sniManagedSuffix,
-		sniBogusDatabaseParam, sniSeedUser, sniSeedPassword)
+	conn, err := connectWithSNI(ctx, sniSeedOrgName+sniManagedSuffix,
+		sniSeedDatabaseName, sniSeedUser, sniSeedPassword)
 	if err != nil {
-		t.Fatalf("expected SNI=%q to override database param %q and authenticate; got: %v",
-			sniSeedDatabaseName+sniManagedSuffix, sniBogusDatabaseParam, err)
+		t.Fatalf("expected managed SNI=%q with database param %q to authenticate; got: %v",
+			sniSeedOrgName+sniManagedSuffix, sniSeedDatabaseName, err)
 	}
 	defer conn.Close(ctx)
 
@@ -81,16 +84,15 @@ func TestSNI_MatchedHostnameOverridesDatabaseParam(t *testing.T) {
 		t.Fatalf("SELECT current_database(): %v", err)
 	}
 	if current != sniSeedDatabaseName {
-		t.Fatalf("SNI routing should land us in the SNI-named database; got %q, want %q",
+		t.Fatalf("explicit database should be the routing database; got %q, want %q",
 			current, sniSeedDatabaseName)
 	}
 }
 
-// TestSNI_MatchedHostnameWithUnknownOrg: SNI matches the managed suffix but
-// the prefix doesn't resolve to a real org. The control plane must reject
-// (no fallback to the database param) — silently routing to a different org
-// would defeat the boundary. Error code is 3D000 (database does not exist).
-func TestSNI_MatchedHostnameWithUnknownOrg(t *testing.T) {
+// TestSNI_MatchedHostnameUsesSNIWhenDatabaseParamEmpty: a client that omits
+// the startup database can still route through a managed hostname that resolves
+// to a configured org.
+func TestSNI_MatchedHostnameUsesSNIWhenDatabaseParamEmpty(t *testing.T) {
 	if err := waitForDBReady(60 * time.Second); err != nil {
 		t.Fatalf("waitForDBReady: %v", err)
 	}
@@ -98,13 +100,49 @@ func TestSNI_MatchedHostnameWithUnknownOrg(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	_, err := connectWithSNI(ctx, "ghostorg"+sniManagedSuffix,
+	conn, err := connectWithSNI(ctx, sniSeedOrgName+sniManagedSuffix,
+		"", sniSeedUser, sniSeedPassword)
+	if err != nil {
+		t.Fatalf("expected managed SNI=%q without database param to authenticate; got: %v",
+			sniSeedOrgName+sniManagedSuffix, err)
+	}
+	defer conn.Close(ctx)
+
+	var current string
+	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
+		t.Fatalf("SELECT current_database(): %v", err)
+	}
+	if current != sniSeedDatabaseName {
+		t.Fatalf("resolved SNI org database should be the routing database; got %q, want %q",
+			current, sniSeedDatabaseName)
+	}
+}
+
+// TestSNI_MatchedHostnameRejectsDifferentDatabaseOrg: a managed hostname
+// cannot be used as a generic valid hostname for a different requested
+// database. The URL and startup database must resolve to the same org.
+func TestSNI_MatchedHostnameRejectsDifferentDatabaseOrg(t *testing.T) {
+	if err := waitForDBReady(60 * time.Second); err != nil {
+		t.Fatalf("waitForDBReady: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := connectWithSNI(ctx, sniBogusPrefix+sniManagedSuffix,
 		sniSeedDatabaseName, sniSeedUser, sniSeedPassword)
 	if err == nil {
-		t.Fatalf("expected unknown SNI org to be rejected even with a valid database param")
+		t.Fatalf("expected managed SNI for a different org to be rejected")
 	}
-	if !strings.Contains(err.Error(), "ghostorg") || !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("expected 'database \"ghostorg\" does not exist' error; got: %v", err)
+	if !strings.Contains(err.Error(), "does not match managed hostname") {
+		t.Fatalf("expected database/hostname mismatch error; got: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected pg error; got: %T %v", err, err)
+	}
+	if pgErr.Code != "28000" {
+		t.Fatalf("SQLSTATE = %q, want 28000", pgErr.Code)
 	}
 }
 

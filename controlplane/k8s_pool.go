@@ -1351,7 +1351,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					if assignment.Image != "" && hotClaimed.Image != assignment.Image {
 						slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
 						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion)
-						// Fall through to neutral idle claim or spawn.
+						// Fall through to neutral idle claim or capacity backpressure.
 					} else {
 						worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)
 						if reserveErr == nil {
@@ -1364,7 +1364,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 						}
 						slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
 						p.retireClaimedWorker(hotClaimed, RetireReasonCrash)
-						// Fall through to neutral idle claim
+						// Fall through to neutral idle claim.
 					}
 				}
 			}
@@ -1387,6 +1387,8 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				p.retireClaimedWorker(claimed, RetireReasonCrash)
 				continue
 			}
+
+			return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
 		}
 
 		p.mu.Lock()
@@ -1397,17 +1399,15 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 		p.cleanDeadWorkersLocked()
 
-		// In-memory warm-pool fallback for the case where pool.workers has
-		// a worker that the runtime store doesn't (e.g. ClaimIdleWorker just
-		// returned nil because of state-transition skew). Filtered by
-		// assignment.Image so a per-org pin is honored: if the assignment
-		// names a specific image and no in-memory warm worker matches, fall
-		// through to the spawn block — which already does the right thing.
-		// Without this filter, MTCP could hand a pinned org a default-image
+		// Runtime-store-less K8s mode uses the local worker map as its source
+		// of truth. Filter by assignment.Image so a per-org pin is honored: if
+		// the assignment names a specific image and no in-memory warm worker
+		// matches, fail fast with warm-capacity backpressure. Warm capacity is
+		// supplied by configured warm reconciliation rather than by the
+		// foreground user connection.
+		// Without this filter, a pinned org could be handed a default-image
 		// warm worker, and activation would fail with a DuckLake/extension
-		// version mismatch (observed in prod-us 2026-05-06 for Portola,
-		// which pins to duckgres-worker:<sha>-duckdb1.5.1 while the warm
-		// pool runs the default 1.5.2 image).
+		// version mismatch.
 		idle := p.findReservableWarmWorkerLocked(assignment.Image)
 		if idle != nil {
 			nextState, err := idle.SharedState().Transition(WorkerLifecycleReserved, assignment)
@@ -1451,87 +1451,9 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			return idle, nil
 		}
 
-		liveCount := p.liveWorkerCountLocked()
-		if p.maxWorkers == 0 || liveCount < p.maxWorkers {
-			if p.runtimeStore != nil {
-				image := assignment.Image
-				if image == "" {
-					image = p.workerImage
-				}
-				slot, err := p.runtimeStore.CreateSpawningWorkerSlot(
-					p.cpInstanceID,
-					assignment.OrgID,
-					image,
-					1,
-					p.workerPodNamePrefix(),
-					assignment.MaxWorkers,
-					p.maxWorkers,
-				)
-				if err != nil {
-					p.mu.Unlock()
-					return nil, err
-				}
-				if slot == nil {
-					p.mu.Unlock()
-					select {
-					case <-ctx.Done():
-						return nil, ctx.Err()
-					case <-time.After(100 * time.Millisecond):
-					}
-					continue
-				}
-				p.spawning++
-				p.mu.Unlock()
-
-				err = p.spawnReservedWorker(ctx, slot)
-
-				p.mu.Lock()
-				p.spawning--
-				if err == nil {
-					observeWarmPoolLifecycleGauges(p.workers)
-				}
-				p.mu.Unlock()
-
-				if err != nil {
-					p.retireClaimedWorker(slot, RetireReasonCrash)
-					return nil, err
-				}
-				worker, reserveErr := p.reserveClaimedWorker(ctx, slot, assignment)
-				if reserveErr == nil {
-					return worker, nil
-				}
-				if stderrors.Is(reserveErr, errStaleRuntimeWorkerClaim) {
-					slog.Warn("Spawned worker claim was stale, retrying.", "worker_id", slot.WorkerID, "worker_pod", slot.PodName, "error", reserveErr)
-					continue
-				}
-				return nil, reserveErr
-			}
-
-			id := p.allocateWorkerIDLocked()
-			p.spawning++
-			p.mu.Unlock()
-
-			err := p.spawnWarmWorker(ctx, id, p.workerImage)
-
-			p.mu.Lock()
-			p.spawning--
-			if err == nil {
-				observeWarmPoolLifecycleGauges(p.workers)
-			}
-			p.mu.Unlock()
-
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-
 		p.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
+
+		return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
 	}
 }
 

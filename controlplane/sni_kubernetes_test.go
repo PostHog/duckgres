@@ -3,10 +3,17 @@
 package controlplane
 
 import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/server"
 )
 
 func TestExtractOrgFromSNI(t *testing.T) {
@@ -87,18 +94,22 @@ func TestManagedHostnameHint(t *testing.T) {
 }
 
 // fakeConfigStore captures calls and lets each test choose what each method
-// returns. Only methods used by cpFlightCredentialValidator are exercised;
-// the rest are stubbed to fail loudly if hit.
+// returns. Only methods used by SNI routing tests are implemented; the rest are
+// stubbed to fail loudly if hit.
 type fakeConfigStore struct {
-	resolveDatabase          func(string) string
-	databaseNameForSNIPrefix func(string) string
-	validateOrgUser          func(orgID, user, pass string) bool
-	findAndValidateUser      func(user, pass string) (string, bool)
+	resolveDatabase           func(string) string
+	databaseNameForSNIPrefix  func(string) string
+	resolveSNIPrefix          func(string) (string, string)
+	resolvePostgresConnection func(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) configstore.PostgresConnectionResolution
+	validateOrgUser           func(orgID, user, pass string) bool
+	findAndValidateUser       func(user, pass string) (string, bool)
 
-	resolveDatabaseCalls          int
-	databaseNameForSNIPrefixCalls int
-	validateOrgUserCalls          int
-	findAndValidateUserCalls      int
+	resolveDatabaseCalls           int
+	databaseNameForSNIPrefixCalls  int
+	resolveSNIPrefixCalls          int
+	resolvePostgresConnectionCalls int
+	validateOrgUserCalls           int
+	findAndValidateUserCalls       int
 }
 
 func (f *fakeConfigStore) ResolveDatabase(database string) string {
@@ -114,6 +125,20 @@ func (f *fakeConfigStore) DatabaseNameForSNIPrefix(prefix string) string {
 		return prefix // back-compat default: prefix is its own dbname
 	}
 	return f.databaseNameForSNIPrefix(prefix)
+}
+func (f *fakeConfigStore) ResolveSNIPrefix(prefix string) (string, string) {
+	f.resolveSNIPrefixCalls++
+	if f.resolveSNIPrefix == nil {
+		return "", ""
+	}
+	return f.resolveSNIPrefix(prefix)
+}
+func (f *fakeConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) configstore.PostgresConnectionResolution {
+	f.resolvePostgresConnectionCalls++
+	if f.resolvePostgresConnection == nil {
+		return configstore.PostgresConnectionResolution{}
+	}
+	return f.resolvePostgresConnection(startupDatabase, sniPrefix, useManagedSNI, username, password)
 }
 func (f *fakeConfigStore) ValidateOrgUser(orgID, user, pass string) bool {
 	f.validateOrgUserCalls++
@@ -139,6 +164,10 @@ func (f *fakeConfigStore) ValidateOrgUserAndGetPassthrough(orgID, user, pass str
 	// combined call. Forward to ValidateOrgUser so the test fakes that set
 	// validateOrgUser still work unchanged.
 	return f.ValidateOrgUser(orgID, user, pass), false
+}
+func (f *fakeConfigStore) OrgWarehouseStatus(string) (string, bool) {
+	// SNI tests don't exercise the warehouse-status connection-error path.
+	return "", false
 }
 func (f *fakeConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
 	panic("UpsertFlightSessionRecord should not be called from SNI tests")
@@ -166,6 +195,145 @@ func newFlightValidator(t *testing.T, mode string, store *fakeConfigStore) *cpFl
 		userOrg: make(map[string]string),
 	}
 	return &cpFlightCredentialValidator{cp: cp, orgProvider: provider}
+}
+
+func newSNIControlPlane(store *fakeConfigStore) *ControlPlane {
+	return &ControlPlane{
+		cfg: ControlPlaneConfig{
+			ManagedHostnameSuffixes: []string{".dw.us.postwh.com"},
+		},
+		configStore: store,
+	}
+}
+
+func TestPostgresSNIRequiresManagedOrgMatch(t *testing.T) {
+	store := &fakeConfigStore{}
+	cp := newSNIControlPlane(store)
+
+	resolution := cp.resolvePostgresSNI(
+		SNIRoutingEnforce,
+		"test-org-smoke-1778167994.dw.us.postwh.com",
+	)
+
+	if !resolution.isManaged {
+		t.Fatalf("expected SNI to match managed hostname")
+	}
+	if !resolution.useManagedSNI {
+		t.Fatalf("managed SNI should require same-org validation")
+	}
+	if store.resolveSNIPrefixCalls != 0 {
+		t.Fatalf("ResolveSNIPrefix calls = %d, want 0", store.resolveSNIPrefixCalls)
+	}
+}
+
+func TestPostgresSNIOffIgnoresSNI(t *testing.T) {
+	store := &fakeConfigStore{
+		resolveSNIPrefix: func(prefix string) (string, string) {
+			t.Fatalf("ResolveSNIPrefix should not be called in off mode; got %q", prefix)
+			return "", ""
+		},
+	}
+	cp := newSNIControlPlane(store)
+
+	resolution := cp.resolvePostgresSNI(
+		SNIRoutingOff,
+		"test-org-smoke-1778167994.dw.us.postwh.com",
+	)
+
+	if resolution.useManagedSNI {
+		t.Fatalf("off mode should not require SNI org validation")
+	}
+	if store.resolveSNIPrefixCalls != 0 {
+		t.Fatalf("ResolveSNIPrefix calls = %d, want 0", store.resolveSNIPrefixCalls)
+	}
+}
+
+func TestPostgresSNIUnknownModeIgnoresSNI(t *testing.T) {
+	store := &fakeConfigStore{
+		resolveSNIPrefix: func(prefix string) (string, string) {
+			t.Fatalf("ResolveSNIPrefix should not be called for unknown mode; got %q", prefix)
+			return "", ""
+		},
+	}
+	cp := newSNIControlPlane(store)
+
+	resolution := cp.resolvePostgresSNI(
+		"passthru",
+		"test-org-smoke-1778167994.dw.us.postwh.com",
+	)
+
+	if resolution.useManagedSNI {
+		t.Fatalf("unknown mode should not require SNI org validation")
+	}
+	if store.resolveSNIPrefixCalls != 0 {
+		t.Fatalf("ResolveSNIPrefix calls = %d, want 0", store.resolveSNIPrefixCalls)
+	}
+}
+
+func TestPostgresManagedHostnameMismatchSQLSTATE(t *testing.T) {
+	store := &fakeConfigStore{
+		resolvePostgresConnection: func(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) configstore.PostgresConnectionResolution {
+			if startupDatabase != "requested_db" || sniPrefix != "other-org" || !useManagedSNI || username != "root" || password != "secret" {
+				t.Fatalf("unexpected ResolvePostgresConnection args: db=%q sni=%q use=%v user=%q pass=%q",
+					startupDatabase, sniPrefix, useManagedSNI, username, password)
+			}
+			return configstore.PostgresConnectionResolution{
+				EffectiveDatabase: "requested_db",
+				OrgID:             "requested-org",
+				SNIOrgID:          "other-org",
+				DatabaseExists:    true,
+				HostnameMatches:   false,
+			}
+		},
+	}
+	cp := newSNIControlPlane(store)
+	cp.cfg.SNIRoutingMode = SNIRoutingPassthrough
+	cp.tlsConfig = testControlPlaneTLSConfig(t)
+
+	cfg, err := pgconn.ParseConfig("postgres://root:secret@127.0.0.1/requested_db?sslmode=require")
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	cfg.TLSConfig = &tls.Config{
+		ServerName:         "other-org.dw.us.postwh.com",
+		InsecureSkipVerify: true, // test self-signed cert
+	}
+	cfg.DialFunc = func(context.Context, string, string) (net.Conn, error) {
+		client, serverConn := net.Pipe()
+		go cp.handleConnection(serverConn)
+		return client, nil
+	}
+
+	conn, err := pgconn.ConnectConfig(context.Background(), cfg)
+	if err == nil {
+		_ = conn.Close(context.Background())
+		t.Fatal("expected managed hostname mismatch to reject connection")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("expected pg error; got: %T %v", err, err)
+	}
+	if pgErr.Code != "28000" {
+		t.Fatalf("SQLSTATE = %q, want 28000", pgErr.Code)
+	}
+	if pgErr.Message != "requested database does not match managed hostname" {
+		t.Fatalf("message = %q", pgErr.Message)
+	}
+}
+
+func testControlPlaneTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	if err := server.EnsureCertificates(certFile, keyFile); err != nil {
+		t.Fatalf("EnsureCertificates: %v", err)
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair: %v", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}
 }
 
 // TestFlightValidatorOff: SNI ignored entirely. Both legacy and new

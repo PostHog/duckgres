@@ -35,6 +35,11 @@ var controlPlaneWorkerQueueDepthGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Approximate number of session requests waiting on worker acquisition.",
 })
 
+var controlPlaneWorkerAcquireFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_control_plane_worker_acquire_failures_total",
+	Help: "Total worker acquisition failures by reason.",
+}, []string{"reason"})
+
 var controlPlaneWorkerQueueDepth atomic.Int64
 
 var flightSessionsReapedCounter = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -77,6 +82,10 @@ func observeControlPlaneWorkerQueueDepthDelta(delta int64) {
 		newDepth = 0
 	}
 	controlPlaneWorkerQueueDepthGauge.Set(float64(newDepth))
+}
+
+func observeControlPlaneWorkerAcquireFailure(reason string) {
+	controlPlaneWorkerAcquireFailuresCounter.WithLabelValues(reason).Inc()
 }
 
 func observeFlightSessionsReaped(trigger string, count int) {

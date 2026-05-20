@@ -65,7 +65,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 		if reflect.DeepEqual(current.payload, payload) {
 			return nil
 		}
-		if payload.OwnerEpoch <= currentOwnerEpoch {
+		if payload.OwnerEpoch <= currentOwnerEpoch && !sameOwnerActivationAttempt(current.payload, payload) {
 			return fmt.Errorf("same-tenant takeover requires newer owner epoch %d (current %d)", payload.OwnerEpoch, currentOwnerEpoch)
 		}
 		if p.reuseExistingActivation(payload) {
@@ -166,8 +166,10 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		return false
 	}
 	if !reflect.DeepEqual(current, payload) && payload.OwnerEpoch <= current.OwnerEpoch {
-		p.mu.Unlock()
-		return false
+		if !sameOwnerActivationAttempt(current, payload) {
+			p.mu.Unlock()
+			return false
+		}
 	}
 
 	// needsRefresh is keyed on DuckLake creds because the activator
@@ -251,7 +253,9 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 		return false
 	}
 	if !reflect.DeepEqual(live, payload) && payload.OwnerEpoch <= live.OwnerEpoch {
-		return false
+		if !sameOwnerActivationAttempt(live, payload) {
+			return false
+		}
 	}
 
 	p.activation.payload = payload
@@ -266,6 +270,12 @@ func s3CredentialsChanged(a, b server.DuckLakeConfig) bool {
 	return a.S3AccessKey != b.S3AccessKey ||
 		a.S3SecretKey != b.S3SecretKey ||
 		a.S3SessionToken != b.S3SessionToken
+}
+
+func sameOwnerActivationAttempt(current, next ActivationPayload) bool {
+	return current.WorkerID == next.WorkerID &&
+		current.CPInstanceID == next.CPInstanceID &&
+		current.OwnerEpoch == next.OwnerEpoch
 }
 
 // sameTenantActivationRuntime compares all structural DuckLake fields except
@@ -295,9 +305,19 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		reflect.DeepEqual(a.DataInliningRowLimit, b.DataInliningRowLimit) &&
 		a.CheckpointInterval == b.CheckpointInterval &&
 		ai.Enabled == bi.Enabled &&
+		ai.Backend == bi.Backend &&
 		ai.TableBucket == bi.TableBucket &&
 		ai.Region == bi.Region &&
-		ai.Namespace == bi.Namespace
+		ai.Namespace == bi.Namespace &&
+		// Lakekeeper-side identity. Without this, a hot-idle worker
+		// activated before Lakekeeper provisioning completed would be
+		// reclaimed for the same org without forcing the new ATTACH —
+		// the worker would keep running with no iceberg catalog
+		// attached even though the new payload carries the endpoint.
+		ai.LakekeeperEndpoint == bi.LakekeeperEndpoint &&
+		ai.LakekeeperWarehouse == bi.LakekeeperWarehouse &&
+		ai.LakekeeperClientID == bi.LakekeeperClientID &&
+		ai.LakekeeperOAuth2ServerURI == bi.LakekeeperOAuth2ServerURI
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {

@@ -116,17 +116,77 @@ type ManagedWarehouseWorkerIdentity struct {
 	IAMRoleARN         string `gorm:"size:512" json:"iam_role_arn"`
 }
 
-// ManagedWarehouseIceberg captures per-org opt-in state for the per-tenant
-// Iceberg catalog (AWS S3 Tables). When Enabled is true, the provisioner
-// controller sets spec.iceberg.enabled on the Duckling CR; the composition
-// provisions a fresh table bucket and the controller writes TableBucketArn
-// back here once the bucket is Ready. The worker activator reads these
-// fields and feeds them into server.IcebergConfig at activation time.
+// ManagedWarehouseIceberg captures per-org Iceberg catalog config. Two
+// backends are supported, selected by Backend:
+//
+//   - "lakekeeper" (default): a per-org Lakekeeper instance vends the
+//     Iceberg REST catalog. The provisioner creates the Lakekeeper CR + a
+//     warehouse pointing at the org's existing S3 bucket (path
+//     <s3.path-prefix>/lakekeeper/<orgid>/) and persists the endpoint +
+//     OAuth2 client credentials back here. The worker activator reads
+//     these and emits a (TYPE ICEBERG, CLIENT_ID/CLIENT_SECRET/
+//     OAUTH2_SERVER_URI) DuckDB SECRET + ATTACH at session init.
+//
+//   - "s3_tables" (legacy): provisioner controller sets spec.iceberg.enabled
+//     on the Duckling CR; the composition provisions a fresh S3 Tables
+//     bucket and writes TableBucketArn back here. Kept as a safety net /
+//     escape hatch — new orgs default to Lakekeeper.
 type ManagedWarehouseIceberg struct {
-	Enabled        bool   `json:"enabled"`
-	TableBucketArn string `gorm:"size:512" json:"table_bucket_arn"`
-	Region         string `gorm:"size:64" json:"region"`
-	Namespace      string `gorm:"size:255" json:"namespace"`
+	Enabled bool `json:"enabled"`
+
+	// Backend selects the catalog backend. Empty/unset is treated as
+	// "lakekeeper" by callers.
+	Backend string `gorm:"size:32;default:'lakekeeper'" json:"backend"`
+
+	// Namespace is the default Iceberg namespace inside the catalog. Used
+	// for both backends.
+	Namespace string `gorm:"size:255" json:"namespace"`
+
+	// Region applies to both backends (S3 region for S3 Tables; AWS region
+	// for the Lakekeeper warehouse storage profile).
+	Region string `gorm:"size:64" json:"region"`
+
+	// S3 Tables fields (Backend == "s3_tables"). Empty otherwise.
+	TableBucketArn string `gorm:"size:512" json:"table_bucket_arn,omitempty"`
+
+	// Lakekeeper fields (Backend == "lakekeeper"). Populated by the
+	// provisioner after the per-org Lakekeeper is ready.
+	LakekeeperEndpoint string `gorm:"size:512" json:"lakekeeper_endpoint,omitempty"`
+
+	// LakekeeperWarehouse is the warehouse NAME (e.g. "org-acme"), not the
+	// UUID. Iceberg REST clients pass this as the `warehouse` parameter to
+	// /v1/config and the server returns the UUID as a prefix for subsequent
+	// calls. PR2's worker-side ATTACH SQL uses this value directly.
+	LakekeeperWarehouse       string `gorm:"size:128" json:"lakekeeper_warehouse,omitempty"`
+	LakekeeperClientID        string `gorm:"size:128" json:"lakekeeper_client_id,omitempty"`
+
+	// LakekeeperOAuth2ServerURI is the OAuth2 token endpoint URI for the
+	// duckling-side CREATE SECRET. Empty during PR1 (allowall mode);
+	// populated by PR3 once OIDC SA-token auth is wired. PR2 worker code
+	// must guard against empty and either skip the OAuth2 fields on the
+	// CREATE SECRET statement or emit a different secret shape.
+	LakekeeperOAuth2ServerURI string `gorm:"size:512" json:"lakekeeper_oauth2_server_uri,omitempty"`
+
+	// LakekeeperClientCredentials holds the OAuth2 client_secret used by
+	// the duckling to authenticate to Lakekeeper. The control plane
+	// resolves this just before sending the activation payload.
+	LakekeeperClientCredentials SecretRef `gorm:"embedded;embeddedPrefix:lakekeeper_client_credentials_" json:"lakekeeper_client_credentials"`
+}
+
+// IcebergBackend constants — string-typed to keep the GORM tag happy.
+const (
+	IcebergBackendLakekeeper = "lakekeeper"
+	IcebergBackendS3Tables   = "s3_tables"
+)
+
+// ResolvedBackend returns Backend with the empty-string default applied.
+// Callers should prefer this over reading Backend directly so that rows
+// migrated from earlier schemas (no Backend column) behave correctly.
+func (i ManagedWarehouseIceberg) ResolvedBackend() string {
+	if i.Backend == "" {
+		return IcebergBackendLakekeeper
+	}
+	return i.Backend
 }
 
 // ManagedWarehouse is the config-store source of truth for an org's managed warehouse metadata.

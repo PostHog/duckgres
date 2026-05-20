@@ -4,6 +4,9 @@ package provisioner
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,10 +44,10 @@ func (s *fakeStore) ListWarehousesByStates(states []configstore.ManagedWarehouse
 func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore.ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	w, ok := s.warehouses[orgID]
 	if !ok {
-		return nil
+		return fmt.Errorf("warehouse %q: %w", orgID, configstore.ErrWarehouseStateMismatch)
 	}
 	if w.State != expectedState {
-		return nil
+		return fmt.Errorf("warehouse %q expected %q got %q: %w", orgID, expectedState, w.State, configstore.ErrWarehouseStateMismatch)
 	}
 	for k, v := range updates {
 		switch k {
@@ -97,6 +100,64 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 			w.Iceberg.Namespace = v.(string)
 		case "iceberg_state":
 			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
+		case "iceberg_enabled":
+			w.Iceberg.Enabled = v.(bool)
+		case "iceberg_backend":
+			w.Iceberg.Backend = v.(string)
+		case "iceberg_lakekeeper_endpoint":
+			w.Iceberg.LakekeeperEndpoint = v.(string)
+		case "iceberg_lakekeeper_warehouse":
+			w.Iceberg.LakekeeperWarehouse = v.(string)
+		case "iceberg_lakekeeper_client_id":
+			w.Iceberg.LakekeeperClientID = v.(string)
+		case "iceberg_lakekeeper_oauth2_server_uri":
+			w.Iceberg.LakekeeperOAuth2ServerURI = v.(string)
+		case "iceberg_lakekeeper_client_credentials_namespace":
+			w.Iceberg.LakekeeperClientCredentials.Namespace = v.(string)
+		case "iceberg_lakekeeper_client_credentials_name":
+			w.Iceberg.LakekeeperClientCredentials.Name = v.(string)
+		case "iceberg_lakekeeper_client_credentials_key":
+			w.Iceberg.LakekeeperClientCredentials.Key = v.(string)
+		}
+	}
+	return nil
+}
+
+// UpdateIcebergConfig writes per-org Iceberg/Lakekeeper fields without a
+// top-level state CAS. Mirrors the real configstore method's contract.
+func (s *fakeStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
+	w, ok := s.warehouses[orgID]
+	if !ok {
+		return fmt.Errorf("warehouse %q: %w", orgID, configstore.ErrWarehouseNotFound)
+	}
+	for k, v := range updates {
+		switch k {
+		case "iceberg_enabled":
+			w.Iceberg.Enabled = v.(bool)
+		case "iceberg_backend":
+			w.Iceberg.Backend = v.(string)
+		case "iceberg_namespace":
+			w.Iceberg.Namespace = v.(string)
+		case "iceberg_region":
+			w.Iceberg.Region = v.(string)
+		case "iceberg_table_bucket_arn":
+			w.Iceberg.TableBucketArn = v.(string)
+		case "iceberg_state":
+			w.IcebergState = v.(configstore.ManagedWarehouseProvisioningState)
+		case "iceberg_lakekeeper_endpoint":
+			w.Iceberg.LakekeeperEndpoint = v.(string)
+		case "iceberg_lakekeeper_warehouse":
+			w.Iceberg.LakekeeperWarehouse = v.(string)
+		case "iceberg_lakekeeper_client_id":
+			w.Iceberg.LakekeeperClientID = v.(string)
+		case "iceberg_lakekeeper_oauth2_server_uri":
+			w.Iceberg.LakekeeperOAuth2ServerURI = v.(string)
+		case "iceberg_lakekeeper_client_credentials_namespace":
+			w.Iceberg.LakekeeperClientCredentials.Namespace = v.(string)
+		case "iceberg_lakekeeper_client_credentials_name":
+			w.Iceberg.LakekeeperClientCredentials.Name = v.(string)
+		case "iceberg_lakekeeper_client_credentials_key":
+			w.Iceberg.LakekeeperClientCredentials.Key = v.(string)
 		}
 	}
 	return nil
@@ -559,6 +620,9 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	}
 
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	// Substitute a passing probe — the real one would try to dial the
+	// duckling's pgbouncer service, which doesn't exist in this unit test.
+	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error { return nil })
 	ctrl.reconcile(ctx)
 
 	// Verify state transitioned to ready with component states set
@@ -580,6 +644,162 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	}
 	if w.ReadyAt == nil {
 		t.Fatal("expected ready_at to be set")
+	}
+}
+
+// TestReconcileProvisioningProbeFailsKeepsProvisioning verifies the controller
+// stays in the Provisioning state when the metadata-store probe fails — the
+// case our load test surfaced where Aurora reports Available but its DNS
+// hasn't propagated yet. Flipping to Ready in that window produces a flurry
+// of "Worker activation failed" errors as workers try to connect through
+// pgbouncer.
+func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-probe"] = &configstore.ManagedWarehouse{
+		OrgID:     "org-probe",
+		State:     configstore.ManagedWarehouseStateProvisioning,
+		CreatedAt: time.Now(),
+	}
+
+	cr := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.posthog.com/v1alpha1",
+			"kind":       "Duckling",
+			"metadata": map[string]interface{}{
+				"name":      ducklingName("org-probe"),
+				"namespace": ducklingNamespace,
+			},
+			"status": map[string]interface{}{
+				"metadataStore": map[string]interface{}{
+					"type":              "aurora",
+					"endpoint":          "org-probe.cluster.us-east-1.rds.amazonaws.com",
+					"pgbouncerEndpoint": "pgbouncer-duckling-org-probe.ducklings.svc.cluster.local:6543",
+					"password":          "supersecret123",
+					"user":              "postgres",
+					"database":          "postgres",
+				},
+				"dataStore": map[string]interface{}{
+					"type":       "s3bucket",
+					"bucketName": "org-probe-bucket",
+				},
+				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-probe",
+				"conditions": []interface{}{
+					map[string]interface{}{"type": "Ready", "status": "True"},
+					map[string]interface{}{"type": "Synced", "status": "True"},
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create test CR: %v", err)
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.SetProbe(func(_ context.Context, endpoint, _, _, _, sslMode string) error {
+		// PgBouncer is disabled by default (ManagedWarehousePgBouncer.Enabled
+		// zero value), so the controller should probe the direct Aurora
+		// endpoint with sslmode=require — not the pgbouncer Service.
+		if endpoint != "org-probe.cluster.us-east-1.rds.amazonaws.com" {
+			t.Errorf("expected direct endpoint, got %q", endpoint)
+		}
+		if sslMode != "require" {
+			t.Errorf("expected sslmode=require for direct probe, got %q", sslMode)
+		}
+		return fmt.Errorf("dial tcp: no such host")
+	})
+	ctrl.reconcile(ctx)
+
+	w := fs.warehouses["org-probe"]
+	if w.State != configstore.ManagedWarehouseStateProvisioning {
+		t.Fatalf("expected state to remain provisioning, got %q", w.State)
+	}
+	// Sub-states should still be promoted to ready — only the top-level state stays gated.
+	if w.S3State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected s3_state ready, got %q", w.S3State)
+	}
+	if w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected metadata_store_state ready, got %q", w.MetadataStoreState)
+	}
+	if w.StatusMessage == "" || !strings.Contains(w.StatusMessage, "reachability") {
+		t.Fatalf("expected status_message to mention reachability, got %q", w.StatusMessage)
+	}
+	if w.ReadyAt != nil {
+		t.Fatalf("expected ready_at to remain unset, got %v", w.ReadyAt)
+	}
+
+	// A subsequent reconcile with a passing probe should flip to ready.
+	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error { return nil })
+	ctrl.reconcile(ctx)
+	if fs.warehouses["org-probe"].State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected state ready after probe recovered, got %q", fs.warehouses["org-probe"].State)
+	}
+}
+
+// TestReconcileProvisioningProbesPgBouncerWhenEnabled asserts that warehouses
+// with pgbouncer.enabled=true have their end-to-end probe directed at the
+// pgbouncer Service (sslmode=disable), not the direct Aurora endpoint —
+// pgbouncer's resolver is the slow lookup that motivated the probe.
+func TestReconcileProvisioningProbesPgBouncerWhenEnabled(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-pgb"] = &configstore.ManagedWarehouse{
+		OrgID:     "org-pgb",
+		State:     configstore.ManagedWarehouseStateProvisioning,
+		PgBouncer: configstore.ManagedWarehousePgBouncer{Enabled: true},
+		CreatedAt: time.Now(),
+	}
+
+	cr := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.posthog.com/v1alpha1",
+			"kind":       "Duckling",
+			"metadata": map[string]interface{}{
+				"name":      ducklingName("org-pgb"),
+				"namespace": ducklingNamespace,
+			},
+			"status": map[string]interface{}{
+				"metadataStore": map[string]interface{}{
+					"type":              "aurora",
+					"endpoint":          "org-pgb.cluster.us-east-1.rds.amazonaws.com",
+					"pgbouncerEndpoint": "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543",
+					"password":          "supersecret123",
+					"user":              "postgres",
+					"database":          "postgres",
+				},
+				"dataStore":  map[string]interface{}{"type": "s3bucket", "bucketName": "org-pgb-bucket"},
+				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-pgb",
+				"conditions": []interface{}{
+					map[string]interface{}{"type": "Ready", "status": "True"},
+					map[string]interface{}{"type": "Synced", "status": "True"},
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create test CR: %v", err)
+	}
+
+	var seenEndpoint, seenSSLMode string
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.SetProbe(func(_ context.Context, endpoint, _, _, _, sslMode string) error {
+		seenEndpoint, seenSSLMode = endpoint, sslMode
+		return nil
+	})
+	ctrl.reconcile(ctx)
+
+	if seenEndpoint != "pgbouncer-duckling-org-pgb.ducklings.svc.cluster.local:6543" {
+		t.Errorf("expected probe to use pgbouncer endpoint, got %q", seenEndpoint)
+	}
+	if seenSSLMode != "disable" {
+		t.Errorf("expected sslmode=disable for pgbouncer probe, got %q", seenSSLMode)
+	}
+	if fs.warehouses["org-pgb"].State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected state ready, got %q", fs.warehouses["org-pgb"].State)
 	}
 }
 
@@ -733,12 +953,13 @@ func TestFakeStoreUpdateWarehouseState(t *testing.T) {
 		t.Fatalf("expected provisioning state, got %q", fs.warehouses["org-x"].State)
 	}
 
-	// CAS update with wrong expected state should be no-op
+	// CAS update with wrong expected state should return ErrWarehouseStateMismatch
+	// and leave the row unchanged.
 	err = fs.UpdateWarehouseState("org-x", configstore.ManagedWarehouseStatePending, map[string]interface{}{
 		"state": configstore.ManagedWarehouseStateFailed,
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, configstore.ErrWarehouseStateMismatch) {
+		t.Fatalf("expected ErrWarehouseStateMismatch, got: %v", err)
 	}
 	if fs.warehouses["org-x"].State != configstore.ManagedWarehouseStateProvisioning {
 		t.Fatalf("expected state to remain provisioning, got %q", fs.warehouses["org-x"].State)

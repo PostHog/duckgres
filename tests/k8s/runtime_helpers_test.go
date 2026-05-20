@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -23,6 +23,7 @@ func TestIsTransientDBError(t *testing.T) {
 		{name: "broken pipe", err: errors.New("write: broken pipe"), want: true},
 		{name: "bad connection", err: errors.New("driver: bad connection"), want: true},
 		{name: "connection refused", err: errors.New("dial tcp 127.0.0.1:5432: connect: connection refused"), want: true},
+		{name: "warm capacity", err: errors.New("pq: no warm Duckgres worker is currently available; retry in about 45 seconds"), want: true},
 		{name: "not transient", err: errors.New("authentication failed"), want: false},
 		{name: "nil", err: nil, want: false},
 	}

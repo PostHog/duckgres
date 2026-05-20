@@ -40,6 +40,23 @@ type Snapshot struct {
 	QueryLog           QueryLogConfig
 }
 
+// PostgresConnectionResolution is the result of resolving and authenticating a
+// Postgres startup packet against one immutable config snapshot.
+type PostgresConnectionResolution struct {
+	EffectiveDatabase   string
+	OrgID               string
+	SNIOrgID            string
+	SNIDatabase         string
+	SNIAliasUsed        bool
+	UsedSNIDatabase     bool
+	RequiresSNIOrgMatch bool
+	SNIResolved         bool
+	DatabaseExists      bool
+	HostnameMatches     bool
+	Valid               bool
+	Passthrough         bool
+}
+
 // ConfigStore manages configuration stored in a PostgreSQL database.
 type ConfigStore struct {
 	db            *gorm.DB
@@ -87,6 +104,9 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	// One-shot data migrations (idempotent — tracked in duckgres_schema_migrations).
 	if err := migrateDeltaCatalogDefaultEnabled(db); err != nil {
 		return nil, fmt.Errorf("migrate delta catalog default: %w", err)
+	}
+	if err := migrateIcebergBackendBackfill(db); err != nil {
+		return nil, fmt.Errorf("migrate iceberg backend backfill: %w", err)
 	}
 
 	runtimeSchema, err := resolveRuntimeSchema(db)
@@ -267,6 +287,146 @@ func (cs *ConfigStore) DatabaseNameForSNIPrefix(prefix string) string {
 	return prefix
 }
 
+// ResolveSNIPrefix maps a managed-hostname prefix to the org/database it names.
+// It accepts all supported public hostname labels:
+//   - hostname_alias, when configured
+//   - database_name, for legacy tenants whose hostname label is the database
+//   - org name, for DNS-safe org IDs that differ from database_name
+//
+// Alias precedence matches DatabaseNameForSNIPrefix: if a label collides with
+// another org's database_name or name, the explicit hostname_alias wins.
+func (cs *ConfigStore) ResolveSNIPrefix(prefix string) (orgID, databaseName string) {
+	if prefix == "" {
+		return "", ""
+	}
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return "", ""
+	}
+	orgID, databaseName, _ = resolveSNIPrefixFromSnapshot(cs.snapshot, prefix)
+	return orgID, databaseName
+}
+
+func resolveSNIPrefixFromSnapshot(snap *Snapshot, prefix string) (orgID, databaseName string, aliasUsed bool) {
+	if snap == nil || prefix == "" {
+		return "", "", false
+	}
+	if orgID, ok := snap.HostnameAliasOrg[prefix]; ok {
+		if oc, ok := snap.Orgs[orgID]; ok {
+			return orgID, oc.DatabaseName, true
+		}
+		return "", "", false
+	}
+	if orgID, ok := snap.DatabaseOrg[prefix]; ok {
+		return orgID, prefix, false
+	}
+	if isDNSLabel(prefix) {
+		if oc, ok := snap.Orgs[prefix]; ok {
+			return oc.Name, oc.DatabaseName, false
+		}
+	}
+	return "", "", false
+}
+
+func isDNSLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+	for i, r := range label {
+		isAlnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		isHyphen := r == '-'
+		if !isAlnum && !isHyphen {
+			return false
+		}
+		if isHyphen && (i == 0 || i == len(label)-1) {
+			return false
+		}
+	}
+	return true
+}
+
+func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) PostgresConnectionResolution {
+	result := PostgresConnectionResolution{
+		EffectiveDatabase: startupDatabase,
+		HostnameMatches:   true,
+	}
+
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return result
+	}
+
+	if useManagedSNI {
+		result.RequiresSNIOrgMatch = true
+		result.SNIOrgID, result.SNIDatabase, result.SNIAliasUsed = resolveSNIPrefixFromSnapshot(cs.snapshot, sniPrefix)
+		result.SNIResolved = result.SNIOrgID != ""
+		if result.SNIDatabase == "" {
+			result.SNIDatabase = sniPrefix
+		}
+		if startupDatabase == "" {
+			result.EffectiveDatabase = result.SNIDatabase
+			result.UsedSNIDatabase = true
+		}
+	}
+
+	if result.EffectiveDatabase == "" {
+		return result
+	}
+
+	orgID := cs.snapshot.DatabaseOrg[result.EffectiveDatabase]
+	if orgID == "" {
+		return result
+	}
+	result.DatabaseExists = true
+	result.OrgID = orgID
+
+	if result.RequiresSNIOrgMatch && result.SNIOrgID != orgID {
+		result.HostnameMatches = false
+		return result
+	}
+
+	key := OrgUserKey{OrgID: orgID, Username: username}
+	storedHash, ok := cs.snapshot.OrgUserPassword[key]
+	if !ok {
+		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		return result
+	}
+	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		return result
+	}
+	result.Valid = true
+	result.Passthrough = cs.snapshot.OrgUserPassthrough[key]
+	return result
+}
+
+// OrgWarehouseStatus reports the current warehouse provisioning state for an
+// org from the in-memory snapshot. Used by the connection handler to emit a
+// meaningful error when a client connects while the warehouse is still being
+// stood up (instead of the misleading "no org configured for user" fallback).
+//
+// Returns:
+//   - ("", false) when the org does not exist
+//   - ("", true)  when the org exists but has no warehouse row (legacy tenants)
+//   - (<state>, true) when a warehouse row exists; <state> is one of
+//     pending / provisioning / ready / failed / deleting / deleted.
+func (cs *ConfigStore) OrgWarehouseStatus(orgID string) (string, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return "", false
+	}
+	oc, ok := cs.snapshot.Orgs[orgID]
+	if !ok {
+		return "", false
+	}
+	if oc.Warehouse == nil {
+		return "", true
+	}
+	return string(oc.Warehouse.State), true
+}
+
 // ValidateOrgUser checks username/password scoped to a specific org.
 func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
 	cs.mu.RLock()
@@ -409,6 +569,39 @@ func (cs *ConfigStore) ListWarehousesByStates(states []ManagedWarehouseProvision
 
 // UpdateWarehouseState performs a compare-and-swap update on a warehouse row.
 // Only updates if the current state matches expectedState, preventing races.
+// ErrWarehouseStateMismatch is returned (wrapped) by UpdateWarehouseState
+// when the CAS guard fails — the row is missing or no longer in the
+// expected state. Callers that want to treat that as benign (because
+// another writer has already advanced the state machine) can detect via
+// errors.Is(err, configstore.ErrWarehouseStateMismatch).
+var ErrWarehouseStateMismatch = errors.New("warehouse not in expected state")
+
+// ErrWarehouseNotFound is returned by row-targeted updates when the orgID
+// has no row in duckgres_managed_warehouses.
+var ErrWarehouseNotFound = errors.New("warehouse not found")
+
+// UpdateIcebergConfig writes the supplied column updates to the org's
+// warehouse row without CAS'ing on the top-level state. Used by the
+// Lakekeeper provisioner — Iceberg sub-state runs in parallel with the
+// main warehouse state machine, so persisting the Lakekeeper endpoint
+// after a top-level state transition shouldn't silently no-op.
+//
+// Caller-side discipline: the updates map should only contain
+// iceberg_* columns. Untyped to keep the controller's WarehouseStore
+// interface independent of the column list.
+func (cs *ConfigStore) UpdateIcebergConfig(orgID string, updates map[string]interface{}) error {
+	result := cs.db.Model(&ManagedWarehouse{}).
+		Where("org_id = ?", orgID).
+		Updates(updates)
+	if result.Error != nil {
+		return fmt.Errorf("update iceberg config: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("warehouse %q: %w", orgID, ErrWarehouseNotFound)
+	}
+	return nil
+}
+
 func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedWarehouseProvisioningState, updates map[string]interface{}) error {
 	result := cs.db.Model(&ManagedWarehouse{}).
 		Where("org_id = ? AND state = ?", orgID, expectedState).
@@ -417,7 +610,7 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("update warehouse state: %w", result.Error)
 	}
 	if result.RowsAffected == 0 {
-		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
+		return fmt.Errorf("warehouse %q expected state %q: %w", orgID, expectedState, ErrWarehouseStateMismatch)
 	}
 	return nil
 }
@@ -458,6 +651,53 @@ func migrateDeltaCatalogDefaultEnabled(db *gorm.DB) error {
 			return fmt.Errorf("record schema migration: %w", err)
 		}
 		slog.Info("Backfilled delta_catalog_enabled=true on existing config rows.")
+		return nil
+	})
+}
+
+// migrateIcebergBackendBackfill stamps iceberg_backend = 's3_tables' on any
+// existing row whose iceberg_table_bucket_arn is populated but whose
+// iceberg_backend is empty. Without this, ResolvedBackend() on those rows
+// would return "lakekeeper" (the empty-default semantics) and the worker
+// activator + controller reconcile loop would treat them as Lakekeeper
+// orgs — silently breaking S3 Tables ATTACH AND firing redundant
+// Lakekeeper provisioning attempts.
+//
+// New rows inserted after the GORM `default:'lakekeeper'` migration get
+// the default at insert time, so this migration only matters for rows
+// that predate the column. One-shot, tracked in duckgres_schema_migrations.
+const icebergBackendBackfillMigrationName = "2026_05_iceberg_backend_backfill"
+
+func migrateIcebergBackendBackfill(db *gorm.DB) error {
+	var existing SchemaMigration
+	err := db.Where("name = ?", icebergBackendBackfillMigrationName).First(&existing).Error
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("check schema migration: %w", err)
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		// Backfill rows that have a populated S3 Tables ARN but no
+		// explicit backend — these are pre-feature rows whose semantics
+		// would change without this stamp.
+		res := tx.Exec(
+			`UPDATE duckgres_managed_warehouses
+			   SET iceberg_backend = 's3_tables'
+			 WHERE COALESCE(iceberg_table_bucket_arn, '') <> ''
+			   AND COALESCE(iceberg_backend, '') = ''`,
+		)
+		if res.Error != nil {
+			return fmt.Errorf("backfill iceberg_backend: %w", res.Error)
+		}
+		if err := tx.Create(&SchemaMigration{
+			Name:      icebergBackendBackfillMigrationName,
+			AppliedAt: time.Now().UTC(),
+		}).Error; err != nil {
+			return fmt.Errorf("record schema migration: %w", err)
+		}
+		slog.Info("Backfilled iceberg_backend=s3_tables on pre-Lakekeeper rows.",
+			"rows", res.RowsAffected)
 		return nil
 	})
 }

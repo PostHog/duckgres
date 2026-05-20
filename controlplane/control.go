@@ -71,20 +71,24 @@ type ControlPlaneConfig struct {
 	// SNIRoutingMode controls hostname-based org routing. Values:
 	//   "" or "off"   - SNI is ignored; legacy database-param routing only
 	//                   (default).
-	//   "passthrough" - SNI determines org when it matches a managed suffix;
-	//                   otherwise fall back to legacy with a warn log
-	//                   identifying the legacy caller.
+	//   "passthrough" - Managed Postgres SNI must resolve to the same org as
+	//                   the requested startup database; when startup database is
+	//                   empty, use the SNI-derived database fallback. Legacy
+	//                   hostnames still fall back with a warn log.
 	//   "enforce"     - Reject connections whose SNI doesn't match a managed
-	//                   suffix.
+	//                   suffix. Explicit startup database still takes
+	//                   priority when SNI is present, but must resolve to the
+	//                   same org as the managed hostname.
+	// Unknown values behave like "off" in the connection path.
 	// Only consulted in multi-tenant control-plane builds (kubernetes tag);
 	// other builds always behave as "off".
 	SNIRoutingMode string
 
-	// ManagedHostnameSuffixes lists DNS suffixes (each starting with a dot)
-	// for which the TLS hostname is authoritative for org routing. When the
-	// SNI matches one of these suffixes, the single-label prefix is treated
-	// as the org name (e.g. SNI "acme.dw.us.postwh.com" with suffix
-	// ".dw.us.postwh.com" resolves to org "acme").
+	// ManagedHostnameSuffixes lists DNS suffixes (each starting with a dot) for
+	// managed tenant hostnames. When SNI matches one of these suffixes, the
+	// single-label prefix is resolved as hostname_alias, database_name, or org
+	// name. Postgres still honors an explicit startup database, but only when it
+	// resolves to the same org as the managed hostname.
 	ManagedHostnameSuffixes []string
 
 	// DuckLakeDefaultSpecVersion is the global default DuckLake spec version
@@ -160,6 +164,10 @@ type ControlPlane struct {
 type ConfigStoreInterface interface {
 	ResolveDatabase(database string) (orgID string)
 	DatabaseNameForSNIPrefix(prefix string) string // translates SNI hostname prefix → canonical database_name (alias-aware)
+	// ResolveSNIPrefix maps a managed hostname prefix to its org and database.
+	// It accepts hostname_alias, database_name, and DNS-safe org names.
+	ResolveSNIPrefix(prefix string) (orgID, databaseName string)
+	ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) configstore.PostgresConnectionResolution
 	ValidateOrgUser(orgID, username, password string) bool
 	// ValidateOrgUserAndGetPassthrough does both lookups against the same
 	// snapshot — the auth path needs both, and a single read closes the
@@ -167,6 +175,12 @@ type ConfigStoreInterface interface {
 	// passthrough is always false when valid is false.
 	ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool)
 	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no database param)
+	// OrgWarehouseStatus reports an org's current warehouse provisioning state so
+	// connection-time errors can distinguish "no such org" from "warehouse not
+	// ready yet". Returns (state, orgExists). state is "" when the org has no
+	// warehouse row (legacy single-tenant orgs); otherwise it is the lifecycle
+	// string (pending/provisioning/ready/failed/deleting/deleted).
+	OrgWarehouseStatus(orgID string) (state string, orgExists bool)
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
 	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
@@ -661,7 +675,15 @@ func createSessionWithRegisteredCancel(
 }
 
 func sessionCreationErrorResponse(err error) (code string, message string) {
+	var capacityErr *WarmCapacityExhaustedError
 	switch {
+	case errors.As(err, &capacityErr):
+		retryAfter := capacityErr.RetryAfter
+		if retryAfter <= 0 {
+			retryAfter = DefaultWarmCapacityRetryAfter
+		}
+		retrySeconds := int((retryAfter + time.Second - 1) / time.Second)
+		return "53300", fmt.Sprintf("no warm Duckgres worker is currently available; retry in about %d seconds", retrySeconds)
 	case errors.Is(err, context.Canceled):
 		return "57014", "canceling authentication due to user request"
 	case errors.Is(err, context.DeadlineExceeded):
@@ -676,9 +698,28 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 // SNI routing modes (values for ControlPlaneConfig.SNIRoutingMode).
 const (
 	SNIRoutingOff         = "off"         // ignore SNI entirely (default)
-	SNIRoutingPassthrough = "passthrough" // prefer SNI; fall back + log on miss
-	SNIRoutingEnforce     = "enforce"     // reject connections without a managed hostname
+	SNIRoutingPassthrough = "passthrough" // validate managed SNI, fallback only when database is empty
+	SNIRoutingEnforce     = "enforce"     // require managed SNI and same-org database routing
 )
+
+type postgresSNIResolution struct {
+	sniPrefix     string
+	isManaged     bool
+	useManagedSNI bool
+}
+
+func (cp *ControlPlane) resolvePostgresSNI(mode, sni string) postgresSNIResolution {
+	sniPrefix, isManaged := cp.extractOrgFromSNI(sni)
+	return postgresSNIResolution{
+		sniPrefix:     sniPrefix,
+		isManaged:     isManaged,
+		useManagedSNI: postgresSNIRoutingModeEnabled(mode) && isManaged,
+	}
+}
+
+func postgresSNIRoutingModeEnabled(mode string) bool {
+	return mode == SNIRoutingPassthrough || mode == SNIRoutingEnforce
+}
 
 // managedHostnameHint formats the configured ManagedHostnameSuffixes into a
 // "<org-id>.dw.<env>.postwh.com" string suitable for user-facing error
@@ -849,27 +890,19 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	)
 	if cp.configStore != nil {
 		// Resolve the effective database name based on SNI routing mode.
-		// "off"         - legacy: use the startup `database` param.
-		// "passthrough" - prefer SNI when it matches a managed suffix; fall
-		//                 back to `database` with a warn log otherwise.
-		// "enforce"     - require SNI to match a managed suffix; reject
-		//                 connections that don't.
+		// "off" or unknown - legacy: use the startup `database` param.
+		// "passthrough" - use startup `database` first; for managed SNI,
+		//                 require the hostname and database to resolve to the
+		//                 same org. If the startup database is empty, fall back
+		//                 to the SNI-derived database. Non-managed hostnames
+		//                 still fall back to legacy routing with a warning.
+		// "enforce"     - require managed SNI and same-org validation, while
+		//                 still preferring explicit startup `database`.
 		sni := tlsConn.ConnectionState().ServerName
-		sniPrefix, isManaged := cp.extractOrgFromSNI(sni)
-		// Translate the SNI prefix → canonical database_name. When the prefix
-		// matches a registered hostname_alias, this returns the org's actual
-		// database_name; otherwise it returns the prefix unchanged so legacy
-		// tenants (no alias configured) keep their prefix-as-dbname behavior.
-		// Computed eagerly so logs and downstream lookups see the same value.
-		var sniDatabase string
-		if isManaged {
-			sniDatabase = cp.configStore.DatabaseNameForSNIPrefix(sniPrefix)
-			observeSNIRoutingResolution("postgres", sniDatabase != sniPrefix)
-		}
-		effectiveDatabase := database
+		sniResolution := cp.resolvePostgresSNI(cp.cfg.SNIRoutingMode, sni)
 		switch cp.cfg.SNIRoutingMode {
 		case SNIRoutingEnforce:
-			if !isManaged {
+			if !sniResolution.isManaged {
 				hint := cp.managedHostnameHint()
 				slog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
 					"sni", sni, "expected", hint, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
@@ -878,44 +911,46 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 				_ = writer.Flush()
 				return
 			}
-			effectiveDatabase = sniDatabase
 		case SNIRoutingPassthrough:
-			if isManaged {
-				effectiveDatabase = sniDatabase
-				if database != "" && database != sniDatabase {
-					slog.Info("Postgres SNI overrides database param.",
-						"sni", sni, "sni_prefix", sniPrefix, "sni_database", sniDatabase, "database_param", database, "remote_addr", remoteAddr)
-				}
-			} else if sni == "" {
+			if !sniResolution.isManaged && sni == "" {
 				slog.Warn("Postgres client connected without SNI; please migrate to a managed hostname.",
 					"expected", cp.managedHostnameHint(), "remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
-			} else {
+			} else if !sniResolution.isManaged {
 				slog.Warn("Postgres client using legacy hostname; please migrate to a managed hostname.",
 					"sni", sni, "expected", cp.managedHostnameHint(), "remote_addr", remoteAddr, "database", database, "user", username, "application_name", applicationName)
 			}
 		default: // SNIRoutingOff or unset — legacy behavior, no SNI handling
 		}
 
+		resolution := cp.configStore.ResolvePostgresConnection(database, sniResolution.sniPrefix, sniResolution.useManagedSNI, username, password)
+		if sniResolution.useManagedSNI && resolution.SNIResolved {
+			observeSNIRoutingResolution("postgres", resolution.SNIAliasUsed)
+		}
+		effectiveDatabase := resolution.EffectiveDatabase
 		if effectiveDatabase == "" {
 			slog.Warn("Connection rejected: no database specified.", "remote_addr", remoteAddr)
 			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "database name is required")
 			_ = writer.Flush()
 			return
 		}
-		orgID = cp.configStore.ResolveDatabase(effectiveDatabase)
-		if orgID == "" {
+		if !resolution.DatabaseExists {
 			slog.Warn("Unknown database.", "database", effectiveDatabase, "remote_addr", remoteAddr)
 			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", fmt.Sprintf("database %q does not exist", effectiveDatabase))
 			_ = writer.Flush()
 			return
 		}
-		// Single combined lookup: validate credentials and read the
-		// passthrough flag against the same snapshot so a config-store poll
-		// that swaps the snapshot between two reads can't produce a stale
-		// passthrough flag for an authenticated session.
-		valid, isPassthrough := cp.configStore.ValidateOrgUserAndGetPassthrough(orgID, username, password)
-		if !valid {
-			slog.Warn("Authentication failed.", "user", username, "org", orgID, "database", effectiveDatabase, "remote_addr", remoteAddr)
+		if !resolution.HostnameMatches {
+			slog.Warn("Postgres connection rejected: requested database does not match managed hostname.",
+				"sni", sni, "sni_prefix", sniResolution.sniPrefix, "sni_org", resolution.SNIOrgID,
+				"database", effectiveDatabase, "database_org", resolution.OrgID, "remote_addr", remoteAddr,
+				"user", username, "application_name", applicationName)
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000",
+				"requested database does not match managed hostname")
+			_ = writer.Flush()
+			return
+		}
+		if !resolution.Valid {
+			slog.Warn("Authentication failed.", "user", username, "org", resolution.OrgID, "database", effectiveDatabase, "remote_addr", remoteAddr)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
 				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
@@ -924,12 +959,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = writer.Flush()
 			return
 		}
-		passthroughUser = isPassthrough
-		// From here on, `database` reflects the SNI-resolved org. This is what
-		// gets passed to the worker as the logical database (drives the
-		// `current_database()` macro and pg_database view) so observability
-		// surfaces the actual routing decision rather than whatever the
-		// client typed in the startup packet.
+		orgID = resolution.OrgID
+		passthroughUser = resolution.Passthrough
+		// From here on, `database` reflects the effective routing database.
+		// This is what gets passed to the worker as the logical database
+		// (drives the `current_database()` macro and pg_database view) so
+		// observability surfaces the actual routing decision.
 		database = effectiveDatabase
 	} else {
 		// Single-tenant: static users map
@@ -972,7 +1007,31 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 		_, sess, rebal, ok := cp.orgRouter.StackForOrg(orgID)
 		if !ok {
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
+			// Distinguish "no such org" from "warehouse still provisioning". The
+			// org stack only exists for warehouses in state=ready; before that,
+			// the stack absence is expected and the client should be told to
+			// retry rather than receive a misleading auth-style error.
+			whState, orgExists := cp.configStore.OrgWarehouseStatus(orgID)
+			switch {
+			case !orgExists:
+				_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
+			case whState == "" || whState == string(configstore.ManagedWarehouseStateReady):
+				// Org exists, warehouse says ready, but stack hasn't been built yet — a
+				// transient race the router will resolve. Tell client to retry.
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"warehouse is starting up, please retry in a few seconds")
+			case whState == string(configstore.ManagedWarehouseStateFailed):
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"warehouse provisioning failed; contact support")
+			case whState == string(configstore.ManagedWarehouseStateDeleting) ||
+				whState == string(configstore.ManagedWarehouseStateDeleted):
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"warehouse is being deleted")
+			default:
+				// pending / provisioning
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"warehouse is still provisioning, please retry in a few minutes")
+			}
 			_ = writer.Flush()
 			return
 		}

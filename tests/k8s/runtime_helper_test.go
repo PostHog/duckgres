@@ -22,6 +22,8 @@ func isTransientDBError(err error) bool {
 		"lost connection to pod",
 		"i/o timeout",
 		"no route to host",
+		"no warm duckgres worker",
+		"warm worker capacity exhausted",
 	} {
 		if strings.Contains(msg, fragment) {
 			return true
