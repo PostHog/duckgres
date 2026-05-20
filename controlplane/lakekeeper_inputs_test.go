@@ -69,6 +69,9 @@ func TestResolverFromDucklingCR(t *testing.T) {
 	if in.S3.StaticAccessKeyID != "" || in.S3.StaticAccessKeySecret != "" {
 		t.Errorf("prod S3 must use pod IRSA, not static creds: %+v", in.S3)
 	}
+	if in.S3.RoleARN != "arn:aws:iam::123:role/duckling-acme" {
+		t.Errorf("S3.RoleARN = %q, want the duckling role from CR status (for STS vending)", in.S3.RoleARN)
+	}
 	if len(in.KubernetesAuthAudiences) != 0 {
 		t.Errorf("expected allowall mode (no audiences), got %v", in.KubernetesAuthAudiences)
 	}
