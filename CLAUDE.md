@@ -99,6 +99,27 @@ Note: `--mode` is CLI-only (not loadable from YAML/env). A handful of K8s pod-sc
 
 The project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available recipes for building, testing, running, metrics, and scripts.
 
+## Testing
+
+Three test lanes worth knowing about, in increasing order of blast radius:
+
+- **Unit / package tests** (`go test ./...`): in-process, no external deps. Where most coverage lives.
+- **`tests/integration/`** (`just test-integration`): spins up the standalone server binary against a real MinIO + Postgres metadata store via docker compose. Covers wire protocol, DuckLake on real S3-compatible storage, transpilation against a live server.
+- **`tests/k8s/`** (`just test-k8s-integration`): real kind cluster, real control-plane pod, real worker pods, real config-store Postgres. Multi-tenant activation, worker pool, Flight RPC, k8s pod lifecycle. **The iceberg test in here additionally hits real AWS S3 Tables** in the mw-dev sandbox via GitHub OIDC. See `tests/k8s/CLAUDE.md` before touching anything in there — TestMain is destructive against the current kubeconfig.
+
+### When code changes obligate test changes
+
+The k8s integration suite is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating `tests/k8s/` as part of the change, not a follow-up:
+
+- `controlplane/shared_worker_activator.go`, `controlplane/sts_broker.go`, anything in the activation payload shape (`TenantActivationPayload`, `server.DuckLakeConfig`, `server.IcebergConfig`)
+- `server/server.go::AttachDeltaCatalog`, `server.AttachIcebergCatalog`, `server.attachDuckLake*`, `server.refresh*Secret`
+- `server/iceberg/` (config, dispatcher, backend implementations) — every backend split needs a seed update in `tests/k8s/iceberg_test.go::buildIcebergConfigStoreSeed` (the iceberg_backend column default is "lakekeeper", so omitting it silently routes to the wrong path)
+- `controlplane/configstore/models.go` — new columns on `ManagedWarehouse` / `ManagedWarehouseIceberg` / sub-structs need to be set in the test seed, otherwise GORM defaults take over silently
+- `duckdbservice/activation.go`, `worker_activation.go` — worker-side activation order
+- Any code path that wires AWS credentials through to DuckDB SECRETs
+
+The contract is: if a test that already exists no longer exercises the path you changed, **update it** (don't add a new one that duplicates the setup). If your change removes a path the tests still assert against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers tests in `tests/k8s/ducklake_test.go` and the iceberg activation test in `tests/k8s/iceberg_test.go` are the load-bearing ones for catalog wiring — keep them honest.
+
 ## Dependencies
 
 - `github.com/duckdb/duckdb-go/v2` - DuckDB Go driver
