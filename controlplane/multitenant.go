@@ -347,6 +347,19 @@ func SetupMultiTenant(
 	if err != nil {
 		slog.Warn("Provisioning controller unavailable.", "error", err)
 	} else {
+		// Opt-in: enable the per-org Lakekeeper provisioning branch. Off by
+		// default so existing deploys are unaffected. Best-effort — if the
+		// K8s client can't be built we log and leave the controller running
+		// without the Lakekeeper branch (S3-Tables warehouses still work).
+		if lakekeeperProvisionerEnabled() {
+			if k8sClient, lkErr := provisioner.NewLakekeeperK8sClient(); lkErr != nil {
+				slog.Warn("Lakekeeper provisioner enabled but K8s client unavailable; skipping.", "error", lkErr)
+			} else {
+				lkProv := provisioner.NewLakekeeperProvisioner(store, k8sClient)
+				provCtrl.WithLakekeeperProvisioner(lkProv, newLakekeeperInputsResolver(resolveDucklingStatus))
+				slog.Info("Lakekeeper provisioner enabled (allowall + NetworkPolicy mode).")
+			}
+		}
 		go provCtrl.Run(context.Background())
 	}
 
