@@ -65,6 +65,8 @@ Key flags for Kubernetes multitenant mode:
 | `--config-store` | `DUCKGRES_CONFIG_STORE` | PostgreSQL config-store connection string required for remote mode |
 | `--session-init-timeout` | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout (`10s` default) |
 | `--handover-drain-timeout` | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns/upgrades before forced exit (`15m` default in remote mode) |
+| `--sni-routing-mode` | `DUCKGRES_SNI_ROUTING_MODE` | Managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty |
+| `--managed-hostname-suffixes` | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.test.local` |
 | `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
 | `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |
 | `--k8s-worker-service-account` | `DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT` | Neutral ServiceAccount name for worker pods (`duckgres-worker` default) |
@@ -75,6 +77,8 @@ Key flags for Kubernetes multitenant mode:
 The worker Secret setting is a base name for per-worker RPC Secrets. Each worker pod gets its own derived Secret containing its RPC bearer token and TLS material. If the derived Secret does not exist, the control plane creates it before spawning the pod.
 
 Shared warm workers should use the neutral `duckgres-worker` ServiceAccount with `automountServiceAccountToken: false`. Tenant authority must arrive only through activation-time scoped credentials.
+
+For managed-hostname routing, `passthrough` logs legacy/non-managed callers while allowing them to route by requested dbname. `enforce` rejects Postgres clients whose TLS SNI does not match a configured managed suffix. In both managed modes, when SNI does match a suffix, the hostname prefix and requested Postgres database must resolve to the same org; if the client omits the startup database, the SNI prefix is used as the fallback database source. Unknown routing-mode values behave like `off`.
 
 For seamless planned deployments, use a rolling strategy with overlap and enough termination grace period for drain completion. The provided control-plane manifests now set:
 
