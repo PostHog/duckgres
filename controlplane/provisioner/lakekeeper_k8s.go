@@ -326,10 +326,18 @@ func (c *LakekeeperK8sClient) EnsureCR(ctx context.Context, spec LakekeeperCRSpe
 					// credentials for S3 — needed so it can assume the
 					// warehouse's sts-role-arn to vend. Lakekeeper defaults this
 					// OFF; the operator only emits the enabling env when the
-					// object is present, so we set it explicitly (a nil parent
-					// wouldn't pick up the CRD's default=true).
+					// object is present, so we set it explicitly. The flags live
+					// under .aws (gated by enableAWS) — a nil parent wouldn't
+					// pick up the CRD defaults. assumeRoleRequireExternalID is
+					// false: same-account self-assume needs no external id (and
+					// requiring one would force an external-id in the
+					// storage-credential we don't send).
 					"storageSystemCredentials": map[string]interface{}{
-						"allowDirectSystemCredentials": true,
+						"enableAWS": true,
+						"aws": map[string]interface{}{
+							"allowDirectSystemCredentials": true,
+							"assumeRoleRequireExternalID":  false,
+						},
 					},
 				},
 			},
