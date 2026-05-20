@@ -193,12 +193,23 @@ func captureIcebergActivationDiagnostics() string {
 	}
 
 	row, err := queryRuntimeStoreText(
-		"SELECT org_id, state, status_message, iceberg_state, iceberg_status_message, s3_state, s3_status_message, ready_at, updated_at " +
+		"SELECT org_id, state, iceberg_enabled, iceberg_table_bucket_arn, iceberg_region, iceberg_namespace, iceberg_state, iceberg_status_message, s3_state " +
 			"FROM duckgres_managed_warehouses WHERE org_id = '" + icebergTenantName + "'")
 	if err != nil {
 		fmt.Fprintf(&b, "warehouse row query: %v\n", err)
 	} else {
-		fmt.Fprintf(&b, "duckgres_managed_warehouses[%s]:\n%s\n", icebergTenantName, row)
+		fmt.Fprintf(&b, "duckgres_managed_warehouses[%s] (iceberg cols):\n%s\n", icebergTenantName, row)
+	}
+
+	// Confirm the schema actually has the iceberg_* columns — if the
+	// configstore was provisioned by an older GORM auto-migrate the
+	// INSERT may have silently no-op'd those fields.
+	colRow, colErr := queryRuntimeStoreText(
+		"SELECT column_name FROM information_schema.columns WHERE table_name = 'duckgres_managed_warehouses' AND column_name LIKE 'iceberg_%' ORDER BY column_name")
+	if colErr != nil {
+		fmt.Fprintf(&b, "warehouse iceberg-columns query: %v\n", colErr)
+	} else {
+		fmt.Fprintf(&b, "duckgres_managed_warehouses iceberg_* columns present:\n%s\n", colRow)
 	}
 
 	return b.String()
