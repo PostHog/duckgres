@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -619,6 +620,9 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	}
 
 	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	// Substitute a passing probe — the real one would try to dial the
+	// duckling's pgbouncer service, which doesn't exist in this unit test.
+	ctrl.SetProbe(func(context.Context, string, string, string, string) error { return nil })
 	ctrl.reconcile(ctx)
 
 	// Verify state transitioned to ready with component states set
@@ -640,6 +644,88 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	}
 	if w.ReadyAt == nil {
 		t.Fatal("expected ready_at to be set")
+	}
+}
+
+// TestReconcileProvisioningProbeFailsKeepsProvisioning verifies the controller
+// stays in the Provisioning state when the metadata-store probe fails — the
+// case our load test surfaced where Aurora reports Available but its DNS
+// hasn't propagated yet. Flipping to Ready in that window produces a flurry
+// of "Worker activation failed" errors as workers try to connect through
+// pgbouncer.
+func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-probe"] = &configstore.ManagedWarehouse{
+		OrgID:     "org-probe",
+		State:     configstore.ManagedWarehouseStateProvisioning,
+		CreatedAt: time.Now(),
+	}
+
+	cr := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "k8s.posthog.com/v1alpha1",
+			"kind":       "Duckling",
+			"metadata": map[string]interface{}{
+				"name":      ducklingName("org-probe"),
+				"namespace": ducklingNamespace,
+			},
+			"status": map[string]interface{}{
+				"metadataStore": map[string]interface{}{
+					"type":              "aurora",
+					"endpoint":          "org-probe.cluster.us-east-1.rds.amazonaws.com",
+					"pgbouncerEndpoint": "pgbouncer-duckling-org-probe.ducklings.svc.cluster.local:6543",
+					"password":          "supersecret123",
+					"user":              "postgres",
+					"database":          "postgres",
+				},
+				"dataStore": map[string]interface{}{
+					"type":       "s3bucket",
+					"bucketName": "org-probe-bucket",
+				},
+				"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-probe",
+				"conditions": []interface{}{
+					map[string]interface{}{"type": "Ready", "status": "True"},
+					map[string]interface{}{"type": "Synced", "status": "True"},
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create test CR: %v", err)
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.SetProbe(func(context.Context, string, string, string, string) error {
+		return fmt.Errorf("dial tcp: no such host")
+	})
+	ctrl.reconcile(ctx)
+
+	w := fs.warehouses["org-probe"]
+	if w.State != configstore.ManagedWarehouseStateProvisioning {
+		t.Fatalf("expected state to remain provisioning, got %q", w.State)
+	}
+	// Sub-states should still be promoted to ready — only the top-level state stays gated.
+	if w.S3State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected s3_state ready, got %q", w.S3State)
+	}
+	if w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected metadata_store_state ready, got %q", w.MetadataStoreState)
+	}
+	if w.StatusMessage == "" || !strings.Contains(w.StatusMessage, "reachability") {
+		t.Fatalf("expected status_message to mention reachability, got %q", w.StatusMessage)
+	}
+	if w.ReadyAt != nil {
+		t.Fatalf("expected ready_at to remain unset, got %v", w.ReadyAt)
+	}
+
+	// A subsequent reconcile with a passing probe should flip to ready.
+	ctrl.SetProbe(func(context.Context, string, string, string, string) error { return nil })
+	ctrl.reconcile(ctx)
+	if fs.warehouses["org-probe"].State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("expected state ready after probe recovered, got %q", fs.warehouses["org-probe"].State)
 	}
 }
 

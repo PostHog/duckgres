@@ -269,6 +269,32 @@ func (cs *ConfigStore) DatabaseNameForSNIPrefix(prefix string) string {
 	return prefix
 }
 
+// OrgWarehouseStatus reports the current warehouse provisioning state for an
+// org from the in-memory snapshot. Used by the connection handler to emit a
+// meaningful error when a client connects while the warehouse is still being
+// stood up (instead of the misleading "no org configured for user" fallback).
+//
+// Returns:
+//   - ("", false) when the org does not exist
+//   - ("", true)  when the org exists but has no warehouse row (legacy tenants)
+//   - (<state>, true) when a warehouse row exists; <state> is one of
+//     pending / provisioning / ready / failed / deleting / deleted.
+func (cs *ConfigStore) OrgWarehouseStatus(orgID string) (string, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return "", false
+	}
+	oc, ok := cs.snapshot.Orgs[orgID]
+	if !ok {
+		return "", false
+	}
+	if oc.Warehouse == nil {
+		return "", true
+	}
+	return string(oc.Warehouse.State), true
+}
+
 // ValidateOrgUser checks username/password scoped to a specific org.
 func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
 	cs.mu.RLock()

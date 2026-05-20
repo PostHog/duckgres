@@ -167,6 +167,12 @@ type ConfigStoreInterface interface {
 	// passthrough is always false when valid is false.
 	ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool)
 	FindAndValidateUser(username, password string) (orgID string, ok bool) // for Flight SQL (no database param)
+	// OrgWarehouseStatus reports an org's current warehouse provisioning state so
+	// connection-time errors can distinguish "no such org" from "warehouse not
+	// ready yet". Returns (state, orgExists). state is "" when the org has no
+	// warehouse row (legacy single-tenant orgs); otherwise it is the lifecycle
+	// string (pending/provisioning/ready/failed/deleting/deleted).
+	OrgWarehouseStatus(orgID string) (state string, orgExists bool)
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
 	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
@@ -970,7 +976,31 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 		_, sess, rebal, ok := cp.orgRouter.StackForOrg(orgID)
 		if !ok {
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
+			// Distinguish "no such org" from "warehouse still provisioning". The
+			// org stack only exists for warehouses in state=ready; before that,
+			// the stack absence is expected and the client should be told to
+			// retry rather than receive a misleading auth-style error.
+			whState, orgExists := cp.configStore.OrgWarehouseStatus(orgID)
+			switch {
+			case !orgExists:
+				_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
+			case whState == "" || whState == string(configstore.ManagedWarehouseStateReady):
+				// Org exists, warehouse says ready, but stack hasn't been built yet — a
+				// transient race the router will resolve. Tell client to retry.
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"warehouse is starting up, please retry in a few seconds")
+			case whState == string(configstore.ManagedWarehouseStateFailed):
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"warehouse provisioning failed; contact support")
+			case whState == string(configstore.ManagedWarehouseStateDeleting) ||
+				whState == string(configstore.ManagedWarehouseStateDeleted):
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"warehouse is being deleted")
+			default:
+				// pending / provisioning
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"warehouse is still provisioning, please retry in a few minutes")
+			}
 			_ = writer.Flush()
 			return
 		}

@@ -25,12 +25,17 @@ type WarehouseStore interface {
 	UpdateIcebergConfig(orgID string, updates map[string]interface{}) error
 }
 
+// MetadataProbe is the signature for an end-to-end metadata-store probe. The
+// production implementation is ProbeMetadataStore; tests inject a stub.
+type MetadataProbe func(ctx context.Context, pgbouncerEndpoint, user, password, database string) error
+
 // Controller polls the config store for actionable warehouses and reconciles
 // their state against Duckling CRs in Kubernetes.
 type Controller struct {
 	store        WarehouseStore
 	duckling     *DucklingClient
 	pollInterval time.Duration
+	probe        MetadataProbe
 }
 
 // NewController creates a provisioning controller. Returns an error if the
@@ -44,6 +49,7 @@ func NewController(store WarehouseStore, pollInterval time.Duration) (*Controlle
 		store:        store,
 		duckling:     dc,
 		pollInterval: pollInterval,
+		probe:        ProbeMetadataStore,
 	}, nil
 }
 
@@ -53,7 +59,13 @@ func NewControllerWithClient(store WarehouseStore, dc *DucklingClient, pollInter
 		store:        store,
 		duckling:     dc,
 		pollInterval: pollInterval,
+		probe:        ProbeMetadataStore,
 	}
+}
+
+// SetProbe overrides the metadata-store probe. Used by tests.
+func (c *Controller) SetProbe(p MetadataProbe) {
+	c.probe = p
 }
 
 // Run starts the reconciliation loop. Blocks until ctx is cancelled.
@@ -242,11 +254,32 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 		updates["iceberg_state"] == configstore.ManagedWarehouseStateReady
 
 	if s3Ready && metaReady && secretsReady && identReady && icebergReady && status.ReadyCondition {
-		now := time.Now().UTC()
-		updates["state"] = configstore.ManagedWarehouseStateReady
-		updates["status_message"] = "Infrastructure ready"
-		updates["ready_at"] = now
-		log.Info("Infrastructure ready, transitioning to ready.")
+		// End-to-end probe: AWS reports the Aurora cluster Available before
+		// its DNS record has propagated to in-cluster CoreDNS, and even longer
+		// before pgbouncer's resolver picks it up. Flipping to Ready on
+		// AWS-Available alone produces a 3-5 minute window where worker
+		// activations fail with "DuckLake migration check failed → DNS
+		// lookup failed". Confirm the whole CP → pgbouncer → RDS path works
+		// before we tell the rest of the system the warehouse is usable.
+		probe := c.probe
+		if probe == nil {
+			probe = ProbeMetadataStore
+		}
+		if err := probe(ctx,
+			status.MetadataStore.PgBouncerEndpoint,
+			status.MetadataStore.User,
+			status.MetadataStore.Password,
+			status.MetadataStore.Database,
+		); err != nil {
+			log.Info("Infrastructure provisioned but end-to-end probe still failing — staying in provisioning.", "error", err)
+			updates["status_message"] = fmt.Sprintf("Waiting for metadata store reachability: %v", err)
+		} else {
+			now := time.Now().UTC()
+			updates["state"] = configstore.ManagedWarehouseStateReady
+			updates["status_message"] = "Infrastructure ready"
+			updates["ready_at"] = now
+			log.Info("Infrastructure ready, transitioning to ready.")
+		}
 	}
 
 	if len(updates) > 0 {
