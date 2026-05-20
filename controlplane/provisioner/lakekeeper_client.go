@@ -106,6 +106,12 @@ type WarehouseStorageProfile struct {
 	Flavor               string `json:"flavor"`                  // "s3-compat" for MinIO, "aws" for AWS
 	STSEnabled           bool   `json:"sts-enabled"`
 	RemoteSigningEnabled bool   `json:"remote-signing-enabled"`
+	// STSRoleARN is the IAM role Lakekeeper assumes to mint vended (scoped,
+	// short-lived) S3 credentials for clients. Lakekeeper requires it for the
+	// AWS flavor when sts-enabled. Empty for s3-compat (MinIO). We set it to
+	// the per-org duckling role, which the Lakekeeper pod already runs as via
+	// EKS Pod Identity — so it assumes itself (the role trusts its own ARN).
+	STSRoleARN string `json:"sts-role-arn,omitempty"`
 }
 
 // WarehouseStorageCredential supports access-key creds (dev/MinIO) and

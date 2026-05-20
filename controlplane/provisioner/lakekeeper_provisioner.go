@@ -101,6 +101,12 @@ type S3StorageConfig struct {
 	// in the operator config).
 	StaticAccessKeyID     string
 	StaticAccessKeySecret string
+
+	// RoleARN is the IAM role Lakekeeper assumes to vend scoped S3 credentials
+	// to clients (sts-role-arn). Required for the AWS flavor when STS is on;
+	// the per-org duckling role (Lakekeeper's own Pod Identity, self-assumed).
+	// Empty for s3-compat (MinIO), where STS vending doesn't need a role.
+	RoleARN string
 }
 
 // LakekeeperProvisionerOption tunes the provisioner.
@@ -240,6 +246,10 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 			Flavor:               in.S3.Flavor,
 			STSEnabled:           true,
 			RemoteSigningEnabled: false,
+			// AWS requires a role to assume for STS credential vending. The
+			// per-org duckling role (which the pod runs as) self-assumes.
+			// s3-compat (MinIO) leaves this empty.
+			STSRoleARN: in.S3.RoleARN,
 		},
 		StorageCredential: storageCredFor(in.S3),
 	}

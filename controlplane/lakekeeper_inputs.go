@@ -135,6 +135,11 @@ func lakekeeperInputsFromDuckling(
 			Region:    status.DataStore.S3Region,
 			Flavor:    "aws",
 			// Prod: Lakekeeper uses its pod IRSA identity (no static creds).
+			// RoleARN is the per-org duckling role Lakekeeper assumes to vend
+			// scoped S3 creds (sts-role-arn). It's the same role the Lakekeeper
+			// pod runs as via Pod Identity, self-assumed (the role trusts its
+			// own ARN). Sourced from the Duckling CR status.
+			RoleARN: status.IAMRoleARN,
 		},
 		// Allowall + NetworkPolicy deployment shape — no OIDC audiences yet.
 		KubernetesAuthAudiences: nil,
