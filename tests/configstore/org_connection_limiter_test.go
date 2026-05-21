@@ -548,7 +548,7 @@ func waitForAdvisoryLockWaiter(t *testing.T, db *sql.DB, holderPID int) {
 		  AND ($1 = ANY(pg_blocking_pids(pid)) OR pid = $1)
 	`, holderPID)
 	if err == nil {
-		defer rows.Close()
+		defer func() { _ = rows.Close() }()
 		for rows.Next() {
 			var activity string
 			if err := rows.Scan(&activity); err == nil {
