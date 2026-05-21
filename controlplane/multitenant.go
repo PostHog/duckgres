@@ -246,8 +246,28 @@ func SetupMultiTenant(
 		return router.sharedPool.retireWorkerWithReason(workerID, reason)
 	}
 	janitor.reconcileWarmCapacity = func() {
-		target := router.sharedPool.WarmCapacityTarget()
+		// Demand-aware warm-pool scale-up: drain the warm-capacity miss
+		// counter and add it to the static target. A burst of N cold tenants
+		// (all returning WarmCapacityExhausted on first try) bumps the next
+		// tick's effective target by ~N, so the pool spawns toward demand
+		// in a single tick instead of creeping up at SharedWarmTarget while
+		// clients politely re-arrive on the 45-second retry hint. Karpenter
+		// (~30s) and pod scheduling are the real lower bounds on cold-start
+		// latency, not CP reconciler step size.
+		//
+		// Scale-DOWN is intentionally untouched here — the idle reaper still
+		// runs on its own slower cadence so dipping idle counts don't thrash
+		// the pool. We only ever scale UP off the demand counter.
+		staticTarget := router.sharedPool.WarmCapacityTarget()
+		demand := router.sharedPool.ConsumeWarmCapacityDemand()
+		target := staticTarget + demand
 		if target > 0 {
+			if demand > 0 {
+				slog.Info("Scaling shared warm pool to absorb demand.",
+					"static_target", staticTarget,
+					"observed_demand", demand,
+					"effective_target", target)
+			}
 			observeOrgWorkerSpawn("shared")
 			if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
 				slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
