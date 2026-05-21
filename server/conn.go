@@ -1644,12 +1644,17 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 		// Checked before the iceberg arm so that a customer whose logical DB is
 		// (improbably) named "iceberg" still reaches their DuckLake warehouse.
 		target2part = physicalDuckLakeCatalog + ".main"
-	case c.server.cfg.Iceberg.Enabled && strings.EqualFold(unquoted, iceberg.CatalogName):
+	case strings.EqualFold(unquoted, iceberg.CatalogName):
 		// `USE iceberg` -> the guaranteed default schema. DuckDB can't `USE`
 		// a bare REST catalog (it targets <catalog>.main, which it shadows),
 		// so we land on iceberg.<DefaultSchema> (ensured by attachLakekeeperCatalog).
-		// Gated on Iceberg.Enabled so non-iceberg sessions pass `USE iceberg`
-		// through unchanged.
+		//
+		// NOT gated on cfg.Iceberg.Enabled: rewriteDirectQuery runs on the
+		// control-plane proxy conn (server = the CP, not the per-org worker),
+		// where cfg.Iceberg.Enabled is always false — gating there silently
+		// disabled the rewrite for every tenant. If the tenant doesn't have
+		// iceberg attached, `USE iceberg.public` simply errors at the worker,
+		// same as a bare `USE iceberg` would.
 		target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
 	default:
 		return query
