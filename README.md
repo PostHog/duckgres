@@ -224,6 +224,12 @@ Run with config file:
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
 | `DUCKGRES_K8S_MAX_WORKERS` | Global cap for shared K8s workers (`0` means Duckgres does not impose a cap) | `0` |
 | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Default-image neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm; subject to `DUCKGRES_K8S_MAX_WORKERS`) | `0` |
+| `DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED` | Enable configstore-driven dynamic warm-capacity target computation from recent no-idle misses | `true` |
+| `DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW` | Recent no-idle miss window used for dynamic warm-capacity demand | `2m` |
+| `DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER` | Recent misses required for one extra dynamic warm worker | `8` |
+| `DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL` | Retention TTL for warm-capacity miss buckets; clamped to at least the miss window | `15m` |
+| `DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING` | Max dynamic extra warm workers per image (`0` means unlimited) | `0` |
+| `DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING` | Max dynamic extra warm workers across images (`0` means unlimited) | `0` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
@@ -283,6 +289,21 @@ Options:
   -sni-routing-mode string Hostname routing: off, passthrough, or enforce
   -managed-hostname-suffixes string
                           Comma-separated managed tenant hostname suffixes
+  -k8s-max-workers int    Max K8s workers in the shared pool, 0=unbounded
+  -k8s-shared-warm-target int
+                          Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled
+  -k8s-dynamic-warm-capacity-enabled
+                          Enable configstore-driven dynamic warm-capacity target computation (default true)
+  -k8s-warm-capacity-miss-window string
+                          Recent no-idle miss window for dynamic warm-capacity demand (default 2m)
+  -k8s-warm-capacity-misses-per-worker int
+                          Recent misses required for one extra dynamic warm worker (default 8)
+  -k8s-warm-capacity-demand-ttl string
+                          Retention TTL for warm-capacity miss buckets (default 15m)
+  -k8s-warm-capacity-dynamic-image-ceiling int
+                          Max dynamic extra warm workers per image, 0=unlimited
+  -k8s-warm-capacity-dynamic-total-ceiling int
+                          Max dynamic extra warm workers across images, 0=unlimited
 ```
 
 ## DuckDB Extensions

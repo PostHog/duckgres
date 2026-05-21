@@ -27,67 +27,73 @@ import (
 type CLIInputs struct {
 	Set map[string]bool
 
-	Host                        string
-	Port                        int
-	FlightPort                  int
-	FlightSessionIdleTTL        string
-	FlightSessionReapInterval   string
-	FlightHandleIdleTTL         string
-	FlightSessionTokenTTL       string
-	DataDir                     string
-	CertFile                    string
-	KeyFile                     string
-	FilePersistence             bool
-	ProcessIsolation            bool
-	IdleTimeout                 string
-	SessionInitTimeout          string
-	MemoryLimit                 string
-	Threads                     int
-	MemoryBudget                string
-	MemoryRebalance             bool
-	DuckLakeDeltaCatalogEnabled bool
-	DuckLakeDeltaCatalogPath    string
-	DuckLakeDefaultSpecVersion  string
-	IcebergEnabled              bool
-	IcebergTableBucket          string
-	IcebergRegion               string
-	IcebergNamespace            string
-	ProcessMinWorkers           int
-	ProcessMaxWorkers           int
-	ProcessRetireOnSessionEnd   bool
-	WorkerQueueTimeout          string
-	WorkerIdleTimeout           string
-	HandoverDrainTimeout        string
-	ACMEDomain                  string
-	ACMEEmail                   string
-	ACMECacheDir                string
-	ACMEDNSProvider             string
-	ACMEDNSZoneID               string
-	MaxConnections              int
-	ConfigStoreConn             string
-	ConfigPollInterval          string
-	InternalSecret              string
-	SNIRoutingMode              string
-	ManagedHostnameSuffixes     string
-	WorkerBackend               string
-	K8sWorkerImage              string
-	K8sWorkerNamespace          string
-	K8sControlPlaneID           string
-	K8sWorkerPort               int
-	K8sWorkerSecret             string
-	K8sWorkerConfigMap          string
-	K8sWorkerImagePullPolicy    string
-	K8sWorkerServiceAccount     string
-	K8sMaxWorkers               int
-	K8sSharedWarmTarget         int
-	K8sWorkerCPURequest         string
-	K8sWorkerMemoryRequest      string
-	K8sWorkerNodeSelector       string
-	K8sWorkerTolerationKey      string
-	K8sWorkerTolerationValue    string
-	K8sWorkerExclusiveNode      bool
-	AWSRegion                   string
-	QueryLog                    bool
+	Host                               string
+	Port                               int
+	FlightPort                         int
+	FlightSessionIdleTTL               string
+	FlightSessionReapInterval          string
+	FlightHandleIdleTTL                string
+	FlightSessionTokenTTL              string
+	DataDir                            string
+	CertFile                           string
+	KeyFile                            string
+	FilePersistence                    bool
+	ProcessIsolation                   bool
+	IdleTimeout                        string
+	SessionInitTimeout                 string
+	MemoryLimit                        string
+	Threads                            int
+	MemoryBudget                       string
+	MemoryRebalance                    bool
+	DuckLakeDeltaCatalogEnabled        bool
+	DuckLakeDeltaCatalogPath           string
+	DuckLakeDefaultSpecVersion         string
+	IcebergEnabled                     bool
+	IcebergTableBucket                 string
+	IcebergRegion                      string
+	IcebergNamespace                   string
+	ProcessMinWorkers                  int
+	ProcessMaxWorkers                  int
+	ProcessRetireOnSessionEnd          bool
+	WorkerQueueTimeout                 string
+	WorkerIdleTimeout                  string
+	HandoverDrainTimeout               string
+	ACMEDomain                         string
+	ACMEEmail                          string
+	ACMECacheDir                       string
+	ACMEDNSProvider                    string
+	ACMEDNSZoneID                      string
+	MaxConnections                     int
+	ConfigStoreConn                    string
+	ConfigPollInterval                 string
+	InternalSecret                     string
+	SNIRoutingMode                     string
+	ManagedHostnameSuffixes            string
+	WorkerBackend                      string
+	K8sWorkerImage                     string
+	K8sWorkerNamespace                 string
+	K8sControlPlaneID                  string
+	K8sWorkerPort                      int
+	K8sWorkerSecret                    string
+	K8sWorkerConfigMap                 string
+	K8sWorkerImagePullPolicy           string
+	K8sWorkerServiceAccount            string
+	K8sMaxWorkers                      int
+	K8sSharedWarmTarget                int
+	K8sDynamicWarmCapacityEnabled      bool
+	K8sWarmCapacityMissWindow          string
+	K8sWarmCapacityMissesPerWorker     int
+	K8sWarmCapacityDemandTTL           string
+	K8sWarmCapacityDynamicImageCeiling int
+	K8sWarmCapacityDynamicTotalCeiling int
+	K8sWorkerCPURequest                string
+	K8sWorkerMemoryRequest             string
+	K8sWorkerNodeSelector              string
+	K8sWorkerTolerationKey             string
+	K8sWorkerTolerationValue           string
+	K8sWorkerExclusiveNode             bool
+	AWSRegion                          string
+	QueryLog                           bool
 }
 
 type Resolved struct {
@@ -195,7 +201,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
 	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
 	var k8sMaxWorkers, k8sSharedWarmTarget int
-	var k8sDynamicWarmCapacityEnabled bool
+	k8sDynamicWarmCapacityEnabled := true
 	k8sWarmCapacityMissWindow := controlplane.DefaultWarmCapacityMissWindow
 	k8sWarmCapacityMissesPerWorker := controlplane.DefaultWarmCapacityMissesPerWorker
 	k8sWarmCapacityDemandTTL := controlplane.DefaultWarmCapacityDemandTTL
@@ -1154,6 +1160,32 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if cli.Set["k8s-shared-warm-target"] {
 		k8sSharedWarmTarget = cli.K8sSharedWarmTarget
+	}
+	if cli.Set["k8s-dynamic-warm-capacity-enabled"] {
+		k8sDynamicWarmCapacityEnabled = cli.K8sDynamicWarmCapacityEnabled
+	}
+	if cli.Set["k8s-warm-capacity-miss-window"] {
+		if d, err := time.ParseDuration(cli.K8sWarmCapacityMissWindow); err == nil {
+			k8sWarmCapacityMissWindow = d
+		} else {
+			warn("Invalid --k8s-warm-capacity-miss-window duration: " + err.Error())
+		}
+	}
+	if cli.Set["k8s-warm-capacity-misses-per-worker"] {
+		k8sWarmCapacityMissesPerWorker = cli.K8sWarmCapacityMissesPerWorker
+	}
+	if cli.Set["k8s-warm-capacity-demand-ttl"] {
+		if d, err := time.ParseDuration(cli.K8sWarmCapacityDemandTTL); err == nil {
+			k8sWarmCapacityDemandTTL = d
+		} else {
+			warn("Invalid --k8s-warm-capacity-demand-ttl duration: " + err.Error())
+		}
+	}
+	if cli.Set["k8s-warm-capacity-dynamic-image-ceiling"] {
+		k8sWarmCapacityDynamicImageCeiling = cli.K8sWarmCapacityDynamicImageCeiling
+	}
+	if cli.Set["k8s-warm-capacity-dynamic-total-ceiling"] {
+		k8sWarmCapacityDynamicTotalCeiling = cli.K8sWarmCapacityDynamicTotalCeiling
 	}
 	if cli.Set["aws-region"] {
 		awsRegion = cli.AWSRegion

@@ -75,6 +75,12 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	k8sWorkerServiceAccount := fs.String("k8s-worker-service-account", "", "Neutral ServiceAccount name for K8s worker pods (default: duckgres-worker) (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
 	k8sMaxWorkers := fs.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=unbounded (env: DUCKGRES_K8S_MAX_WORKERS)")
 	k8sSharedWarmTarget := fs.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
+	k8sDynamicWarmCapacityEnabled := fs.Bool("k8s-dynamic-warm-capacity-enabled", true, "Enable configstore-driven dynamic warm-capacity target computation (default true; use --k8s-dynamic-warm-capacity-enabled=false to disable; env: DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED)")
+	k8sWarmCapacityMissWindow := fs.String("k8s-warm-capacity-miss-window", "", "Recent no-idle miss window for dynamic warm-capacity demand (default: 2m) (env: DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW)")
+	k8sWarmCapacityMissesPerWorker := fs.Int("k8s-warm-capacity-misses-per-worker", 0, "Recent misses required for one extra dynamic warm worker (default: 8) (env: DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER)")
+	k8sWarmCapacityDemandTTL := fs.String("k8s-warm-capacity-demand-ttl", "", "Retention TTL for warm-capacity miss buckets (default: 15m) (env: DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL)")
+	k8sWarmCapacityDynamicImageCeiling := fs.Int("k8s-warm-capacity-dynamic-image-ceiling", 0, "Max dynamic extra warm workers per image, 0=unlimited (env: DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING)")
+	k8sWarmCapacityDynamicTotalCeiling := fs.Int("k8s-warm-capacity-dynamic-total-ceiling", 0, "Max dynamic extra warm workers across images, 0=unlimited (env: DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING)")
 	awsRegion := fs.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
 	queryLog := fs.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
 
@@ -136,6 +142,12 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.K8sWorkerServiceAccount = *k8sWorkerServiceAccount
 		cli.K8sMaxWorkers = *k8sMaxWorkers
 		cli.K8sSharedWarmTarget = *k8sSharedWarmTarget
+		cli.K8sDynamicWarmCapacityEnabled = *k8sDynamicWarmCapacityEnabled
+		cli.K8sWarmCapacityMissWindow = *k8sWarmCapacityMissWindow
+		cli.K8sWarmCapacityMissesPerWorker = *k8sWarmCapacityMissesPerWorker
+		cli.K8sWarmCapacityDemandTTL = *k8sWarmCapacityDemandTTL
+		cli.K8sWarmCapacityDynamicImageCeiling = *k8sWarmCapacityDynamicImageCeiling
+		cli.K8sWarmCapacityDynamicTotalCeiling = *k8sWarmCapacityDynamicTotalCeiling
 		cli.AWSRegion = *awsRegion
 		cli.QueryLog = *queryLog
 		return cli
