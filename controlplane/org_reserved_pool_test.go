@@ -209,6 +209,58 @@ func TestOrgReservedWorkerPoolAcquireDelegatesActivationWithoutCachedTenantRunti
 	}
 }
 
+// TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero confirms that
+// MaxWorkers == 0 means "no per-org cap" in K8s mode. The load test that
+// motivated the cap removal stabilised at 11 workers because the CP
+// derived MaxWorkers from CP host memory; the only thing keeping us from
+// scaling further was this synthetic cap. With MaxWorkers == 0, the pool
+// must keep handing out new workers as long as the shared (cluster) pool
+// has room.
+func TestOrgReservedPoolAcquireUnboundedWhenMaxWorkersZero(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 0) // shared pool also unbounded
+	shared.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
+	// Pre-seed many neutral warm workers so AcquireWorker can reserve
+	// each one in turn without blocking on a real spawn path.
+	const target = 30
+	for i := 1; i <= target; i++ {
+		addNeutralWarmWorker(shared, i)
+	}
+	shared.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		shared.mu.Lock()
+		shared.workers[id] = &ManagedWorker{ID: id, image: shared.workerImage, done: make(chan struct{})}
+		shared.mu.Unlock()
+		return nil
+	}
+
+	// maxWorkers = 0 — the change under test. AcquireWorker must NOT
+	// reject on max-workers grounds.
+	pool := NewOrgReservedPool(shared, "analytics", 0, shared.workerImage, nil)
+	pool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	seen := make(map[int]struct{}, target)
+	for i := 0; i < target; i++ {
+		w, err := pool.AcquireWorker(ctx)
+		if err != nil {
+			t.Fatalf("AcquireWorker[%d] failed with maxWorkers=0: %v", i, err)
+		}
+		if _, dup := seen[w.ID]; dup {
+			t.Fatalf("AcquireWorker[%d] returned duplicate worker ID %d", i, w.ID)
+		}
+		seen[w.ID] = struct{}{}
+	}
+
+	if got := pool.assignedWorkerCountLocked(); got < target {
+		t.Fatalf("expected at least %d assigned workers, got %d", target, got)
+	}
+}
+
 func TestOrgReservedPoolAcquireWaitsWhenSharedWarmWorkerBusyAtCapacity(t *testing.T) {
 	shared, _ := newTestK8sPool(t, 5)
 	worker := &ManagedWorker{ID: 3, activeSessions: 1, done: make(chan struct{})}
