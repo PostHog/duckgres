@@ -19,7 +19,7 @@ type connectionLease interface {
 }
 
 type connectionLimiter interface {
-	Acquire(ctx context.Context, pid int32, protocol string, maxConnections int) (connectionLease, error)
+	Acquire(ctx context.Context, pid int32, protocol string, maxConnections func() int) (connectionLease, error)
 }
 
 type runtimeOrgConnectionStore interface {
@@ -54,8 +54,8 @@ func NewRuntimeOrgConnectionLimiter(store runtimeOrgConnectionStore, orgID, cpIn
 	}
 }
 
-func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, pid int32, protocol string, maxConnections int) (connectionLease, error) {
-	if l == nil || l.store == nil || maxConnections <= 0 {
+func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, pid int32, protocol string, maxConnections func() int) (connectionLease, error) {
+	if l == nil || l.store == nil || maxConnections == nil {
 		return nil, nil
 	}
 	requestID, err := l.newID()
@@ -78,6 +78,7 @@ func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, pid int32, pr
 
 	for {
 		now := l.now()
+		currentMaxConnections := maxConnections()
 		if !now.Before(expiresAt) {
 			if err := l.store.CancelOrgConnectionRequest(requestID, now); err != nil {
 				slog.Warn("Failed to cancel expired org connection request.", "org", l.orgID, "request_id", requestID, "error", err)
@@ -85,7 +86,7 @@ func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, pid int32, pr
 			return nil, ErrTooManyConnections
 		}
 
-		lease, err := l.store.TryAcquireOrgConnectionLease(requestID, maxConnections, now)
+		lease, err := l.store.TryAcquireOrgConnectionLease(requestID, currentMaxConnections, now)
 		if err != nil {
 			return nil, err
 		}

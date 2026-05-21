@@ -4,6 +4,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -13,6 +14,90 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+type recordingOrgRouterPool struct {
+	events *[]string
+}
+
+func (p *recordingOrgRouterPool) AcquireWorker(ctx context.Context) (*ManagedWorker, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (p *recordingOrgRouterPool) ReleaseWorker(id int) {
+	*p.events = append(*p.events, "pool ReleaseWorker")
+}
+
+func (p *recordingOrgRouterPool) RetireWorker(id int) {}
+
+func (p *recordingOrgRouterPool) RetireWorkerIfNoSessions(id int) bool {
+	return false
+}
+
+func (p *recordingOrgRouterPool) Worker(id int) (*ManagedWorker, bool) {
+	return nil, false
+}
+
+func (p *recordingOrgRouterPool) SpawnMinWorkers(count int) error {
+	return nil
+}
+
+func (p *recordingOrgRouterPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
+}
+
+func (p *recordingOrgRouterPool) SetMaxWorkers(n int) {}
+
+func (p *recordingOrgRouterPool) ShutdownAll() {
+	*p.events = append(*p.events, "pool ShutdownAll")
+}
+
+type recordingOrgRouterLease struct {
+	events *[]string
+}
+
+func (l *recordingOrgRouterLease) Release(ctx context.Context) error {
+	*l.events = append(*l.events, "lease Release")
+	return nil
+}
+
+func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSessionLeases(t *testing.T) {
+	events := []string{}
+	pool := &recordingOrgRouterPool{events: &events}
+	sessions := NewSessionManager(pool, nil)
+
+	sessions.mu.Lock()
+	sessions.sessions[1010] = &ManagedSession{
+		PID:      1010,
+		WorkerID: 7,
+		lease:    &recordingOrgRouterLease{events: &events},
+	}
+	sessions.byWorker[7] = []int32{1010}
+	sessions.mu.Unlock()
+
+	tr := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {
+				Pool:     pool,
+				Sessions: sessions,
+				cancel: func() {
+					events = append(events, "stack cancel")
+				},
+			},
+		},
+	}
+
+	tr.DestroyOrgStack("analytics")
+
+	want := []string{"stack cancel", "pool ReleaseWorker", "lease Release", "pool ShutdownAll"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("expected destroy order %v, got %v", want, events)
+	}
+	if got := sessions.SessionCount(); got != 0 {
+		t.Fatalf("expected sessions drained, got %d", got)
+	}
+	if _, ok := tr.orgs["analytics"]; ok {
+		t.Fatal("expected org stack to be removed")
+	}
+}
 
 func TestOrgRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
