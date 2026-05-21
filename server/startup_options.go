@@ -76,6 +76,11 @@ func splitStartupOptions(s string) []string {
 // whitespace. It deliberately excludes single quotes, semicolons, and
 // parentheses so the value cannot break out of the single-quoted SET statement
 // it is embedded in.
+//
+// In the class `["\- ]`, `\-` is an ESCAPED LITERAL hyphen (RE2), not a range —
+// so the allowed punctuation is exactly `.` `,` `"` `-` and space. `'` and `;`
+// are NOT admitted (locked down in TestSanitizeSearchPath). Keep `\-` escaped if
+// you edit this: an unescaped `-` between class members would form a range.
 var safeSearchPathPattern = regexp.MustCompile(`^[A-Za-z0-9_.,"\- ]+$`)
 
 // SanitizeSearchPath validates a client-supplied search_path so it can be

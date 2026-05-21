@@ -46,6 +46,14 @@ func TestSanitizeSearchPath(t *testing.T) {
 		"iceberg.public; SELECT 1",
 		"foo' || (SELECT 1)",
 		"a(b)",
+		// Standalone metacharacters: these guard that the `\-` in the allowlist
+		// is an escaped literal hyphen, NOT a range (e.g. `"`..`\`) that would
+		// silently admit ' and ; — the exact thing that would break out of the
+		// single-quoted `SET search_path = '<value>'` statement.
+		"'",
+		";",
+		`x',memory.main`,
+		`a'b`,
 	}
 	for _, s := range bad {
 		if _, valid := SanitizeSearchPath(s); valid {
