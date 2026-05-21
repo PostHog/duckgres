@@ -17,6 +17,8 @@ const DefaultWarmCapacityRetryAfter = 45 * time.Second
 type WarmCapacityExhaustedError struct {
 	// RetryAfter is the client-facing retry hint for protocol-specific error responses.
 	RetryAfter time.Duration
+	// Reason classifies why the warm-capacity claim missed.
+	Reason configstore.WorkerClaimMissReason
 }
 
 func (e *WarmCapacityExhaustedError) Error() string {
@@ -24,14 +26,31 @@ func (e *WarmCapacityExhaustedError) Error() string {
 	if retryAfter <= 0 {
 		retryAfter = DefaultWarmCapacityRetryAfter
 	}
+	if e.missReason() == configstore.WorkerClaimMissReasonOrgCap {
+		return "warm worker capacity exhausted for organization"
+	}
 	return fmt.Sprintf("warm worker capacity exhausted; retry in about %s", retryAfter.Round(time.Second))
 }
 
+func (e *WarmCapacityExhaustedError) missReason() configstore.WorkerClaimMissReason {
+	if e.Reason == configstore.WorkerClaimMissReasonNone {
+		return configstore.WorkerClaimMissReasonNoIdle
+	}
+	return e.Reason
+}
+
 func NewWarmCapacityExhaustedError(retryAfter time.Duration) error {
+	return NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonNoIdle, retryAfter)
+}
+
+func NewWarmCapacityExhaustedErrorForReason(reason configstore.WorkerClaimMissReason, retryAfter time.Duration) error {
 	if retryAfter <= 0 {
 		retryAfter = DefaultWarmCapacityRetryAfter
 	}
-	return &WarmCapacityExhaustedError{RetryAfter: retryAfter}
+	if reason == configstore.WorkerClaimMissReasonNone {
+		reason = configstore.WorkerClaimMissReasonNoIdle
+	}
+	return &WarmCapacityExhaustedError{RetryAfter: retryAfter, Reason: reason}
 }
 
 // WorkerPool abstracts the lifecycle and scheduling of Flight SQL workers.
@@ -100,8 +119,8 @@ type K8sWorkerPoolConfig struct {
 
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
-	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, error)
-	ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, error)
+	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
+	ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error)

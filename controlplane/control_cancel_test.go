@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 )
@@ -99,6 +100,17 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 			t.Fatalf("code = %q, want 53300", code)
 		}
 		want := "no warm Duckgres worker is currently available; retry in about 45 seconds"
+		if message != want {
+			t.Fatalf("message = %q, want %q", message, want)
+		}
+	})
+
+	t.Run("org capacity exhausted", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, 45*time.Second))
+		if code != "53300" {
+			t.Fatalf("code = %q, want 53300", code)
+		}
+		want := "Duckgres worker capacity for this organization is currently exhausted; retry later"
 		if message != want {
 			t.Fatalf("message = %q, want %q", message, want)
 		}

@@ -348,6 +348,18 @@ const (
 	WorkerStateLost       WorkerState = "lost"
 )
 
+// WorkerClaimMissReason classifies why a runtime-store worker claim did not
+// return a worker. The empty reason is reserved for successful claims.
+type WorkerClaimMissReason string
+
+const (
+	WorkerClaimMissReasonNone         WorkerClaimMissReason = ""
+	WorkerClaimMissReasonNoIdle       WorkerClaimMissReason = "no_idle"
+	WorkerClaimMissReasonOrgCap       WorkerClaimMissReason = "org_cap"
+	WorkerClaimMissReasonGlobalCap    WorkerClaimMissReason = "global_cap"
+	WorkerClaimMissReasonShuttingDown WorkerClaimMissReason = "shutting_down"
+)
+
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {
 	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`

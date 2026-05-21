@@ -27,6 +27,7 @@ type captureRuntimeWorkerStore struct {
 	records                          []configstore.WorkerRecord
 	claimed                          *configstore.WorkerRecord
 	claimErr                         error
+	claimMissReason                  configstore.WorkerClaimMissReason
 	claimCalls                       int
 	claimOwnerCPID                   string
 	claimOrgID                       string
@@ -61,6 +62,7 @@ type captureRuntimeWorkerStore struct {
 	perImageSpawnTarget              int
 	perImageSpawnMaxGlobal           int
 	hotIdleClaimResult               *configstore.WorkerRecord
+	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
 	takenOver                        *configstore.WorkerRecord
@@ -120,7 +122,7 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	return out
 }
 
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
@@ -129,25 +131,25 @@ func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, im
 	s.claimImage = image
 	s.claimMaxOrgWorkers = maxOrgWorkers
 	if s.claimErr != nil {
-		return nil, s.claimErr
+		return nil, configstore.WorkerClaimMissReasonNone, s.claimErr
 	}
 	if s.claimed == nil {
-		return nil, nil
+		return nil, s.claimMissReason, nil
 	}
 	claimed := *s.claimed
-	return &claimed, nil
+	return &claimed, configstore.WorkerClaimMissReasonNone, nil
 }
 
-func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, error) {
+func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hotIdleClaimCPID = ownerCPInstanceID
 	s.hotIdleClaimOrgID = orgID
 	if s.hotIdleClaimResult != nil {
 		r := *s.hotIdleClaimResult
-		return &r, nil
+		return &r, configstore.WorkerClaimMissReasonNone, nil
 	}
-	return nil, nil
+	return nil, s.hotIdleClaimMissReason, nil
 }
 
 func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
@@ -1135,6 +1137,9 @@ func TestK8sPoolReserveSharedWorkerRuntimeMissDoesNotUseInMemoryFallback(t *test
 	if !errors.As(err, &capacityErr) {
 		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
 	}
+	if capacityErr.Reason != configstore.WorkerClaimMissReasonNoIdle {
+		t.Fatalf("expected no-idle miss reason, got %q", capacityErr.Reason)
+	}
 	if worker != nil {
 		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
 	}
@@ -1408,6 +1413,33 @@ func TestK8sPoolReserveSharedWorkerBackpressuresWhenRuntimeClaimReturnsNil(t *te
 	}
 	if healthChecks != 0 {
 		t.Fatalf("did not expect liveness check for unclaimed local worker, got %d checks", healthChecks)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerPropagatesRuntimeClaimMissReason(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		claimMissReason: configstore.WorkerClaimMissReasonOrgCap,
+	}
+	pool.runtimeStore = store
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error { return nil }
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 1,
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+	}
+	if capacityErr.Reason != configstore.WorkerClaimMissReasonOrgCap {
+		t.Fatalf("expected org-cap miss reason, got %q", capacityErr.Reason)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
+	}
+	if store.spawnCalls != 0 || store.neutralSpawnCalls != 0 || store.perImageSpawnCalls != 0 {
+		t.Fatalf("did not expect foreground or async spawn, got spawn=%d neutral=%d per_image=%d", store.spawnCalls, store.neutralSpawnCalls, store.perImageSpawnCalls)
 	}
 }
 
