@@ -400,7 +400,8 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 		is_transpiled BOOLEAN,
 		protocol VARCHAR,
 		trace_id VARCHAR,
-		span_id VARCHAR
+		span_id VARCHAR,
+		postgres_scan_ms BIGINT
 	)`)
 	if err != nil {
 		t.Fatalf("create table: %v", err)
@@ -424,6 +425,7 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 		PID:             99,
 		WorkerID:        7,
 		Protocol:        "simple",
+		PostgresScanMs:  123,
 	}})
 
 	var got string
@@ -433,6 +435,14 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	}
 	if got != "analytics" {
 		t.Fatalf("expected org_id analytics, got %q", got)
+	}
+
+	var pgScanMs int64
+	if err := db.QueryRow("SELECT postgres_scan_ms FROM query_log").Scan(&pgScanMs); err != nil {
+		t.Fatalf("query postgres_scan_ms: %v", err)
+	}
+	if pgScanMs != 123 {
+		t.Fatalf("expected postgres_scan_ms 123, got %d", pgScanMs)
 	}
 }
 

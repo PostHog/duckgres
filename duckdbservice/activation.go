@@ -85,6 +85,13 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	cfg.DuckLake = payload.DuckLake
 	cfg.Iceberg = payload.Iceberg
 	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
+	// Tag postgres_scanner libpq connections with an application_name that
+	// includes the org so Aurora's pg_stat_activity / Performance Insights
+	// can attribute metadata-DB load back to a duckgres tenant. Skipped if
+	// the payload already carries one (control-plane override path).
+	if cfg.DuckLake.ApplicationName == "" {
+		cfg.DuckLake.ApplicationName = "duckgres/" + payload.OrgID
+	}
 
 	<-p.warmupDone
 

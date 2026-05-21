@@ -184,6 +184,12 @@ type clientConn struct {
 	queryStart      atomic.Value // stores time.Time — when current query started (lock-free)
 	workerID        int          // control plane worker ID, -1 for standalone
 	workerPod       string       // K8s pod name of the worker, empty for standalone or in-process workers
+
+	// lastProfilingSummary holds the rollup from the most recent
+	// EnrichSpanWithProfiling call on this connection. Consumed by the very
+	// next logQuery and then cleared. Per-connection state is safe because
+	// each connection processes queries serially on a single goroutine.
+	lastProfilingSummary observe.QueryProfilingSummary
 }
 
 // newTranspiler creates a transpiler configured for this connection.
@@ -1442,7 +1448,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 		}
 
 		execResult, err := runExec()
-		observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 		execSpan.End()
 		if err != nil {
 			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
@@ -1673,7 +1679,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 			},
 		)
 	}
-	observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 	execSpan.End()
 	if err != nil {
 		queryFinalErr = err
@@ -5647,7 +5653,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		execStart := time.Now()
 		execCtx, execSpan := observe.Tracer().Start(queryCtx, "duckgres.execute")
 		result, err := runExec()
-		observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 		execSpan.End()
 		if err != nil {
 			if c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
@@ -5715,7 +5721,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			runQuery,
 		)
 	}
-	observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 	execSpan.End()
 	if err != nil {
 		queryFinalErr = err

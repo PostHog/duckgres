@@ -87,34 +87,66 @@ func isScanOperator(name string) bool {
 	return strings.HasSuffix(upper, "_SCAN") || strings.Contains(upper, "SCAN")
 }
 
+// isPostgresScanOperator returns true for postgres_scanner operators —
+// roundtrips into the DuckLake metadata Postgres. DuckDB emits these as
+// POSTGRES_SCAN / POSTGRES_SCAN_PUSHDOWN under the postgres_scanner
+// extension; both are caught by the POSTGRES_ prefix. Tracked separately
+// from S3/parquet scans so we can attribute metadata-DB latency.
+func isPostgresScanOperator(name string) bool {
+	return strings.HasPrefix(strings.ToUpper(name), "POSTGRES_")
+}
+
 // collectOperatorTimings walks the operator tree and sums timings by category.
-func collectOperatorTimings(ops []profilingOperator) (scanTime, scanRows float64, computeTime float64) {
+// pgScanTime/pgScanRows are a strict subset of scanTime/scanRows: postgres_scan
+// counts as a scan operator AND is broken out separately so we can attribute
+// metadata-DB roundtrip time without losing total scan accounting.
+func collectOperatorTimings(ops []profilingOperator) (scanTime, scanRows float64, computeTime float64, pgScanTime, pgScanRows float64) {
 	for _, op := range ops {
 		if isScanOperator(op.OperatorName) {
 			scanTime += op.OperatorTiming
 			scanRows += float64(op.OperatorRowsScanned)
+			if isPostgresScanOperator(op.OperatorName) {
+				pgScanTime += op.OperatorTiming
+				pgScanRows += float64(op.OperatorRowsScanned)
+			}
 		} else {
 			computeTime += op.OperatorTiming
 		}
-		childScan, childScanRows, childCompute := collectOperatorTimings(op.Children)
+		childScan, childScanRows, childCompute, childPgScan, childPgScanRows := collectOperatorTimings(op.Children)
 		scanTime += childScan
 		scanRows += childScanRows
 		computeTime += childCompute
+		pgScanTime += childPgScan
+		pgScanRows += childPgScanRows
 	}
 	return
+}
+
+// QueryProfilingSummary is the per-query profiling rollup that
+// EnrichSpanWithProfiling computes from DuckDB's profiling JSON. Callers
+// (e.g. query_log) use it to persist a few high-signal fields without
+// re-parsing the JSON.
+type QueryProfilingSummary struct {
+	// PostgresScanSeconds is the thread-time spent inside postgres_scan
+	// operators — DuckLake metadata DB roundtrips. Zero means either no
+	// metadata access on this query, or no profiling output.
+	PostgresScanSeconds float64
 }
 
 // EnrichSpanWithProfiling creates child spans from DuckDB profiling output
 // showing where execution time was spent: planning, scanning (I/O), and compute.
 // Also emits Prometheus metrics for baseline measurement.
-func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart time.Time, executor sqlcore.QueryExecutor, orgID string) {
+//
+// Returns a per-query rollup so callers (e.g. query log) can persist key
+// metrics without re-parsing the profiling JSON.
+func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart time.Time, executor sqlcore.QueryExecutor, orgID string) QueryProfilingSummary {
 	output := executor.LastProfilingOutput()
 	if output == "" {
-		return
+		return QueryProfilingSummary{}
 	}
 	m, ok := parseProfilingOutput(output)
 	if !ok {
-		return
+		return QueryProfilingSummary{}
 	}
 
 	span.SetAttributes(
@@ -127,7 +159,7 @@ func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 	)
 
 	planningDur := m.Planner + m.PlannerBinding + m.CumulativeOptimizerTiming + m.PhysicalPlanner
-	scanTime, scanRows, computeTime := collectOperatorTimings(m.Children)
+	scanTime, scanRows, computeTime, pgScanTime, pgScanRows := collectOperatorTimings(m.Children)
 
 	cursor := execStart
 
@@ -153,6 +185,7 @@ func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 
 	S3BytesReadTotal.WithLabelValues(orgID).Add(float64(m.TotalBytesRead))
 	ScanWallSecondsHistogram.WithLabelValues(orgID).Observe(scanWall)
+	PostgresScanSecondsHistogram.WithLabelValues(orgID).Observe(pgScanTime)
 	scanRowsWallEstimate := scanRows
 	if m.CPUTime > 0 && m.Latency > 0 {
 		if p := m.CPUTime / m.Latency; p > 1 {
@@ -177,6 +210,8 @@ func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 			attribute.Float64("duckdb.scan_thread_s", scanTime),
 			attribute.Float64("duckdb.scan_rows_wall", scanRowsWall),
 			attribute.Float64("duckdb.scan_rows_cumulative", scanRows),
+			attribute.Float64("duckdb.postgres_scan_thread_s", pgScanTime),
+			attribute.Float64("duckdb.postgres_scan_rows_cumulative", pgScanRows),
 			attribute.Int64("duckdb.total_bytes_read", int64(m.TotalBytesRead)),
 		)
 		cursor = cursor.Add(time.Duration(scanWall * float64(time.Second)))
@@ -192,6 +227,8 @@ func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		cursor = cursor.Add(time.Duration(computeWall * float64(time.Second)))
 		compSpan.End(trace.WithTimestamp(cursor))
 	}
+
+	return QueryProfilingSummary{PostgresScanSeconds: pgScanTime}
 }
 
 // TraceIDFromContext returns the hex trace ID from the span context, or "".
