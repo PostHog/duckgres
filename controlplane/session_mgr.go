@@ -17,6 +17,11 @@ import (
 var ErrTooManyConnections = errors.New("too many connections")
 var ErrSessionManagerDraining = errors.New("session manager is draining")
 
+const (
+	connectionLeaseReleaseMaxAttempts = 3
+	connectionLeaseReleaseRetryDelay  = 50 * time.Millisecond
+)
+
 // SessionProgress holds cached query progress from a worker health check.
 type SessionProgress struct {
 	Percentage float64
@@ -171,9 +176,7 @@ func (sm *SessionManager) releaseSlot() {
 
 func (sm *SessionManager) releaseConnectionSlot(lease connectionLease) {
 	if lease != nil {
-		if err := lease.Release(context.Background()); err != nil {
-			slog.Warn("Failed to release org connection lease.", "error", err)
-		}
+		releaseConnectionLeaseWithRetry(lease)
 		return
 	}
 
@@ -562,10 +565,23 @@ func (sm *SessionManager) releaseSessionLease(session *ManagedSession, attrs ...
 	if session == nil || session.lease == nil {
 		return
 	}
-	if err := session.lease.Release(context.Background()); err != nil {
-		args := append([]any{"error", err}, attrs...)
-		slog.Warn("Failed to release org connection lease.", args...)
+	releaseConnectionLeaseWithRetry(session.lease, attrs...)
+}
+
+func releaseConnectionLeaseWithRetry(lease connectionLease, attrs ...any) {
+	var err error
+	for attempt := 1; attempt <= connectionLeaseReleaseMaxAttempts; attempt++ {
+		err = lease.Release(context.Background())
+		if err == nil {
+			return
+		}
+		if attempt < connectionLeaseReleaseMaxAttempts {
+			time.Sleep(time.Duration(attempt) * connectionLeaseReleaseRetryDelay)
+		}
 	}
+
+	args := append([]any{"error", err, "attempts", connectionLeaseReleaseMaxAttempts}, attrs...)
+	slog.Warn("Failed to release org connection lease.", args...)
 }
 
 // OnWorkerCrash handles a worker crash by marking all affected executors as

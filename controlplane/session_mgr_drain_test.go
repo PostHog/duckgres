@@ -121,6 +121,19 @@ func (l *blockingReleaseConnectionLease) Release(ctx context.Context) error {
 	return nil
 }
 
+type flakyReleaseConnectionLease struct {
+	failures int32
+	attempts atomic.Int32
+}
+
+func (l *flakyReleaseConnectionLease) Release(ctx context.Context) error {
+	attempt := l.attempts.Add(1)
+	if attempt <= l.failures {
+		return errors.New("transient release failure")
+	}
+	return nil
+}
+
 type blockingCrashConnectionLease struct {
 	entered  chan struct{}
 	allow    chan struct{}
@@ -456,6 +469,28 @@ func TestDestroySession_ReleasesLeaseAfterWorkerRelease(t *testing.T) {
 	want := []string{"pool ReleaseWorker", "lease Release"}
 	if strings.Join(events, ",") != strings.Join(want, ",") {
 		t.Fatalf("expected event order %v, got %v", want, events)
+	}
+}
+
+func TestDestroySessionRetriesTransientLeaseReleaseFailure(t *testing.T) {
+	pool := &recordingWorkerPool{events: &[]string{}}
+	sm := NewSessionManager(pool, nil)
+	lease := &flakyReleaseConnectionLease{failures: 2}
+
+	pid := int32(1010)
+	sm.mu.Lock()
+	sm.sessions[pid] = &ManagedSession{
+		PID:      pid,
+		WorkerID: 7,
+		lease:    lease,
+	}
+	sm.byWorker[7] = []int32{pid}
+	sm.mu.Unlock()
+
+	sm.DestroySession(pid)
+
+	if got := lease.attempts.Load(); got != 3 {
+		t.Fatalf("expected lease release to retry until third attempt succeeds, got %d attempts", got)
 	}
 }
 

@@ -146,6 +146,54 @@ func TestOrgConnectionLeasesPreserveFIFOAcrossControlPlanes(t *testing.T) {
 	}
 }
 
+func TestOrgConnectionQueueUsesDatabaseInsertionTimeForFIFO(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	first := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:    "request-first-inserted",
+		OrgID:        "org-clock-skew",
+		CPInstanceID: "cp-a",
+		PID:          1001,
+		Protocol:     "postgres",
+		EnqueuedAt:   now.Add(10 * time.Minute),
+		ExpiresAt:    now.Add(70 * time.Minute),
+	}
+	second := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:    "request-second-inserted",
+		OrgID:        "org-clock-skew",
+		CPInstanceID: "cp-b",
+		PID:          1002,
+		Protocol:     "postgres",
+		EnqueuedAt:   now.Add(-10 * time.Minute),
+		ExpiresAt:    now.Add(50 * time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(first); err != nil {
+		t.Fatalf("enqueue first request: %v", err)
+	}
+	if err := store.EnqueueOrgConnectionRequest(second); err != nil {
+		t.Fatalf("enqueue second request: %v", err)
+	}
+
+	outOfOrder, err := store.TryAcquireOrgConnectionLease(second.RequestID, 1, now)
+	if err != nil {
+		t.Fatalf("out-of-order acquire: %v", err)
+	}
+	if outOfOrder != nil {
+		t.Fatalf("expected database insertion order to block request-second-inserted, got lease %q", outOfOrder.LeaseID)
+	}
+
+	lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, 1, now)
+	if err != nil {
+		t.Fatalf("acquire first request: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected first inserted request to acquire first")
+	}
+}
+
 func TestOrgConnectionLeasesIgnoreExpiredControlPlaneOwners(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
@@ -200,6 +248,46 @@ func TestOrgConnectionLeasesIgnoreExpiredControlPlaneOwners(t *testing.T) {
 	}
 	if lease == nil {
 		t.Fatal("expected expired cp-a lease to stop counting against org limit")
+	}
+}
+
+func TestTryAcquireOrgConnectionLeasePrunesStaleMissingControlPlaneOwner(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+
+	now := time.Now()
+	staleLease := &cpconfigstore.OrgConnectionLease{
+		LeaseID:      "missing-owner-lease",
+		RequestID:    "missing-owner-request",
+		OrgID:        "org-missing-owner",
+		CPInstanceID: "missing-cp",
+		PID:          1001,
+		Protocol:     "postgres",
+		AcquiredAt:   now.Add(-10 * time.Minute),
+	}
+	if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_leases").Create(staleLease).Error; err != nil {
+		t.Fatalf("insert stale missing-owner lease: %v", err)
+	}
+
+	entry := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:    "replacement-request",
+		OrgID:        staleLease.OrgID,
+		CPInstanceID: "cp-a",
+		PID:          1002,
+		Protocol:     "postgres",
+		EnqueuedAt:   now,
+		ExpiresAt:    now.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
+		t.Fatalf("enqueue replacement request: %v", err)
+	}
+
+	lease, err := store.TryAcquireOrgConnectionLease(entry.RequestID, 1, now)
+	if err != nil {
+		t.Fatalf("acquire replacement request: %v", err)
+	}
+	if lease == nil {
+		t.Fatal("expected stale missing-owner lease not to block replacement request")
 	}
 }
 
@@ -265,8 +353,8 @@ func TestTryAcquireOrgConnectionLeaseTakesOrgLockBeforeExpiredRowLock(t *testing
 		EnqueuedAt:   now.Add(-2 * time.Minute),
 		ExpiresAt:    now.Add(-time.Minute),
 	}
-	if err := store.EnqueueOrgConnectionRequest(entry); err != nil {
-		t.Fatalf("enqueue expired request: %v", err)
+	if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_queue").Create(entry).Error; err != nil {
+		t.Fatalf("insert expired request: %v", err)
 	}
 
 	sqlDB, err := store.DB().DB()

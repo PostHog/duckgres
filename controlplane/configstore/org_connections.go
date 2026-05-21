@@ -10,6 +10,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const missingOwnerOrgConnectionLeaseGrace = 5 * time.Minute
+
 // EnqueueOrgConnectionRequest inserts a pending cluster-wide connection
 // admission request. FIFO ordering is scoped to org_id and ordered by
 // enqueued_at, then request_id.
@@ -29,7 +31,21 @@ func (cs *ConfigStore) EnqueueOrgConnectionRequest(entry *OrgConnectionQueueEntr
 	if entry.ExpiresAt.IsZero() {
 		return fmt.Errorf("org connection request expiry is required")
 	}
-	if err := cs.db.Table(cs.runtimeTable(entry.TableName())).Create(entry).Error; err != nil {
+	ttl := entry.ExpiresAt.Sub(entry.EnqueuedAt)
+	if ttl <= 0 {
+		return fmt.Errorf("org connection request expiry must be after enqueue time")
+	}
+
+	entryCopy := *entry
+	if err := cs.db.Transaction(func(tx *gorm.DB) error {
+		now, err := cs.orgConnectionDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
+		entryCopy.EnqueuedAt = now
+		entryCopy.ExpiresAt = now.Add(ttl)
+		return tx.Table(cs.runtimeTable(entryCopy.TableName())).Create(&entryCopy).Error
+	}); err != nil {
 		return fmt.Errorf("enqueue org connection request: %w", err)
 	}
 	return nil
@@ -38,16 +54,13 @@ func (cs *ConfigStore) EnqueueOrgConnectionRequest(entry *OrgConnectionQueueEntr
 // TryAcquireOrgConnectionLease attempts to grant one queued request under a
 // cluster-wide per-org limit. A nil lease means the request is still waiting
 // behind FIFO order or active capacity.
-func (cs *ConfigStore) TryAcquireOrgConnectionLease(requestID string, maxConnections int, now time.Time) (*OrgConnectionLease, error) {
+func (cs *ConfigStore) TryAcquireOrgConnectionLease(requestID string, maxConnections int, _ time.Time) (*OrgConnectionLease, error) {
 	if strings.TrimSpace(requestID) == "" {
 		return nil, fmt.Errorf("org connection request id is required")
 	}
-	if now.IsZero() {
-		now = time.Now()
-	}
 
 	for {
-		lease, retry, err := cs.tryAcquireOrgConnectionLeaseOnce(requestID, maxConnections, now)
+		lease, retry, err := cs.tryAcquireOrgConnectionLeaseOnce(requestID, maxConnections)
 		if retry {
 			continue
 		}
@@ -70,7 +83,7 @@ func (cs *ConfigStore) orgConnectionRuntimeTables() orgConnectionRuntimeTables {
 	}
 }
 
-func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, maxConnections int, now time.Time) (*OrgConnectionLease, bool, error) {
+func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, maxConnections int) (*OrgConnectionLease, bool, error) {
 	tables := cs.orgConnectionRuntimeTables()
 	var lease *OrgConnectionLease
 	retryWithFreshOrg := false
@@ -81,6 +94,10 @@ func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, maxCon
 			return err
 		}
 		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:org-connections:"+orgID)).Error; err != nil {
+			return err
+		}
+		now, err := cs.orgConnectionDatabaseNow(tx)
+		if err != nil {
 			return err
 		}
 		if err := cs.cleanupOrgConnectionRowsLocked(tx, orgID, now); err != nil {
@@ -126,6 +143,14 @@ func (cs *ConfigStore) tryAcquireOrgConnectionLeaseOnce(requestID string, maxCon
 		return nil
 	})
 	return lease, retryWithFreshOrg, err
+}
+
+func (cs *ConfigStore) orgConnectionDatabaseNow(tx *gorm.DB) (time.Time, error) {
+	var now time.Time
+	if err := tx.Raw("SELECT clock_timestamp()").Scan(&now).Error; err != nil {
+		return time.Time{}, err
+	}
+	return now, nil
 }
 
 func (cs *ConfigStore) orgIDForConnectionRequest(tx *gorm.DB, queueTable, requestID string) (string, bool, error) {
@@ -273,9 +298,18 @@ func (cs *ConfigStore) cleanupOrgConnectionRowsLocked(tx *gorm.DB, orgID string,
 		return err
 	}
 
-	return tx.Exec("DELETE FROM "+leaseTable+" AS l USING "+cpTable+" AS cp "+
+	if err := tx.Exec("DELETE FROM "+leaseTable+" AS l USING "+cpTable+" AS cp "+
 		"WHERE l.cp_instance_id = cp.id AND l.org_id = ? AND cp.state = ?",
-		orgID, ControlPlaneInstanceStateExpired).Error
+		orgID, ControlPlaneInstanceStateExpired).Error; err != nil {
+		return err
+	}
+
+	return tx.Exec(
+		"DELETE FROM "+leaseTable+" AS l "+
+			"WHERE l.org_id = ? AND l.acquired_at <= ? "+
+			"AND NOT EXISTS (SELECT 1 FROM "+cpTable+" AS cp WHERE cp.id = l.cp_instance_id)",
+		orgID, now.Add(-missingOwnerOrgConnectionLeaseGrace),
+	).Error
 }
 
 func (cs *ConfigStore) countActiveOrgConnectionLeases(tx *gorm.DB, orgID string) (int64, error) {
