@@ -762,6 +762,19 @@ func (c *clientConn) safeCleanupDB() {
 		}
 
 		if connHealthy {
+			if c.server.cfg.Iceberg.Enabled {
+				// The iceberg catalog stays attached for the life of the session
+				// (attachLakekeeperCatalog no longer detaches empty warehouses),
+				// so release it here too — otherwise a pooled connection reused by
+				// the next activation hits the count>0 early-return in
+				// attachLakekeeperCatalog and keeps a stale catalog secret.
+				ctxIce, cancelIce := context.WithTimeout(context.Background(), cleanupTimeout)
+				_, err := c.executor.ExecContext(ctxIce, "DETACH "+iceberg.CatalogName)
+				cancelIce()
+				if err != nil {
+					slog.Warn("Failed to detach Iceberg catalog.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+				}
+			}
 			if c.server.cfg.DuckLake.DeltaCatalogEnabled {
 				ctxDelta, cancelDelta := context.WithTimeout(context.Background(), cleanupTimeout)
 				_, err := c.executor.ExecContext(ctxDelta, "DETACH delta")
@@ -1626,14 +1639,18 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 	// for a single identifier), landing on a bogus `iceberg.ducklake`.
 	var target2part string
 	switch {
-	case strings.EqualFold(unquoted, iceberg.CatalogName):
+	case strings.EqualFold(unquoted, c.database) || strings.EqualFold(unquoted, physicalDuckLakeCatalog):
+		// `USE <logical-db-name>` or `USE ducklake` -> the physical ducklake.main.
+		// Checked before the iceberg arm so that a customer whose logical DB is
+		// (improbably) named "iceberg" still reaches their DuckLake warehouse.
+		target2part = physicalDuckLakeCatalog + ".main"
+	case c.server.cfg.Iceberg.Enabled && strings.EqualFold(unquoted, iceberg.CatalogName):
 		// `USE iceberg` -> the guaranteed default schema. DuckDB can't `USE`
 		// a bare REST catalog (it targets <catalog>.main, which it shadows),
 		// so we land on iceberg.<DefaultSchema> (ensured by attachLakekeeperCatalog).
+		// Gated on Iceberg.Enabled so non-iceberg sessions pass `USE iceberg`
+		// through unchanged.
 		target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
-	case strings.EqualFold(unquoted, physicalDuckLakeCatalog) || strings.EqualFold(unquoted, c.database):
-		// `USE ducklake` or `USE <logical-db-name>` -> the physical ducklake.main.
-		target2part = physicalDuckLakeCatalog + ".main"
 	default:
 		return query
 	}
