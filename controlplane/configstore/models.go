@@ -157,8 +157,8 @@ type ManagedWarehouseIceberg struct {
 	// UUID. Iceberg REST clients pass this as the `warehouse` parameter to
 	// /v1/config and the server returns the UUID as a prefix for subsequent
 	// calls. PR2's worker-side ATTACH SQL uses this value directly.
-	LakekeeperWarehouse       string `gorm:"size:128" json:"lakekeeper_warehouse,omitempty"`
-	LakekeeperClientID        string `gorm:"size:128" json:"lakekeeper_client_id,omitempty"`
+	LakekeeperWarehouse string `gorm:"size:128" json:"lakekeeper_warehouse,omitempty"`
+	LakekeeperClientID  string `gorm:"size:128" json:"lakekeeper_client_id,omitempty"`
 
 	// LakekeeperOAuth2ServerURI is the OAuth2 token endpoint URI for the
 	// duckling-side CREATE SECRET. Empty during PR1 (allowall mode);
@@ -359,6 +359,20 @@ const (
 	WorkerClaimMissReasonGlobalCap    WorkerClaimMissReason = "global_cap"
 	WorkerClaimMissReasonShuttingDown WorkerClaimMissReason = "shutting_down"
 )
+
+const WarmCapacityMissBucketSize = 10 * time.Second
+
+// WarmCapacityMissBucket stores foreground warm-capacity misses in coarse time
+// buckets so every control-plane pod contributes to one shared demand signal.
+type WarmCapacityMissBucket struct {
+	Scope       string                `gorm:"primaryKey;type:text" json:"scope"`
+	Reason      WorkerClaimMissReason `gorm:"primaryKey;size:64" json:"reason"`
+	BucketStart time.Time             `gorm:"primaryKey;index" json:"bucket_start"`
+	Count       int64                 `gorm:"not null" json:"count"`
+	UpdatedAt   time.Time             `gorm:"not null;index" json:"updated_at"`
+}
+
+func (WarmCapacityMissBucket) TableName() string { return "warm_capacity_miss_buckets" }
 
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {

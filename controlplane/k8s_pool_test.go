@@ -33,6 +33,7 @@ type captureRuntimeWorkerStore struct {
 	claimOrgID                       string
 	claimImage                       string
 	claimMaxOrgWorkers               int
+	claimMaxGlobalWorkers            int
 	spawned                          *configstore.WorkerRecord
 	spawnErr                         error
 	spawnCalls                       int
@@ -65,6 +66,10 @@ type captureRuntimeWorkerStore struct {
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
+	recordMissCalls                  int
+	recordMissScopes                 []string
+	recordMissReasons                []configstore.WorkerClaimMissReason
+	recordMissErr                    error
 	takenOver                        *configstore.WorkerRecord
 	takeOverErr                      error
 	takeOverWorkerID                 int
@@ -122,7 +127,7 @@ func (s *captureRuntimeWorkerStore) snapshot() []configstore.WorkerRecord {
 	return out
 }
 
-func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimCalls++
@@ -130,6 +135,7 @@ func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, im
 	s.claimOrgID = orgID
 	s.claimImage = image
 	s.claimMaxOrgWorkers = maxOrgWorkers
+	s.claimMaxGlobalWorkers = maxGlobalWorkers
 	if s.claimErr != nil {
 		return nil, configstore.WorkerClaimMissReasonNone, s.claimErr
 	}
@@ -150,6 +156,15 @@ func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID 
 		return &r, configstore.WorkerClaimMissReasonNone, nil
 	}
 	return nil, s.hotIdleClaimMissReason, nil
+}
+
+func (s *captureRuntimeWorkerStore) RecordWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordMissCalls++
+	s.recordMissScopes = append(s.recordMissScopes, scope)
+	s.recordMissReasons = append(s.recordMissReasons, reason)
+	return s.recordMissErr
 }
 
 func (s *captureRuntimeWorkerStore) CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error) {
@@ -1416,6 +1431,145 @@ func TestK8sPoolReserveSharedWorkerBackpressuresWhenRuntimeClaimReturnsNil(t *te
 	}
 }
 
+func TestK8sPoolReserveSharedWorkerRecordsNoIdleMissByResolvedImage(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		claimMissReason: configstore.WorkerClaimMissReasonNoIdle,
+	}
+	pool.runtimeStore = store
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+		Image: "duckgres:v2",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
+	}
+	if store.recordMissCalls != 1 {
+		t.Fatalf("expected one recorded miss, got %d", store.recordMissCalls)
+	}
+	if got := store.recordMissScopes[0]; got != "image:duckgres:v2" {
+		t.Fatalf("expected miss scope image:duckgres:v2, got %q", got)
+	}
+	if got := store.recordMissReasons[0]; got != configstore.WorkerClaimMissReasonNoIdle {
+		t.Fatalf("expected no-idle miss reason, got %q", got)
+	}
+	if store.spawnCalls != 0 || store.neutralSpawnCalls != 0 || store.perImageSpawnCalls != 0 {
+		t.Fatalf("did not expect foreground or async spawn, got spawn=%d neutral=%d per_image=%d", store.spawnCalls, store.neutralSpawnCalls, store.perImageSpawnCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerDoesNotRecordOrgCapMiss(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		claimMissReason: configstore.WorkerClaimMissReasonOrgCap,
+	}
+	pool.runtimeStore = store
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 1,
+		Image:      "duckgres:v2",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
+	}
+	if store.recordMissCalls != 0 {
+		t.Fatalf("expected no recorded miss for org-cap, got %d", store.recordMissCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerDoesNotRecordGlobalCapMiss(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		claimMissReason: configstore.WorkerClaimMissReasonGlobalCap,
+	}
+	pool.runtimeStore = store
+	pool.SetMaxWorkers(7)
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+		Image: "duckgres:v2",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
+	}
+	if capacityErr.Reason != configstore.WorkerClaimMissReasonGlobalCap {
+		t.Fatalf("expected global-cap miss reason, got %q", capacityErr.Reason)
+	}
+	if store.claimMaxGlobalWorkers != 7 {
+		t.Fatalf("expected claim max global workers 7, got %d", store.claimMaxGlobalWorkers)
+	}
+	if store.recordMissCalls != 0 {
+		t.Fatalf("expected no recorded miss for global-cap, got %d", store.recordMissCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerDoesNotRecordShuttingDownMiss(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		claimMissReason: configstore.WorkerClaimMissReasonShuttingDown,
+	}
+	pool.runtimeStore = store
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+		Image: "duckgres:v2",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
+	}
+	if capacityErr.Reason != configstore.WorkerClaimMissReasonShuttingDown {
+		t.Fatalf("expected shutting-down miss reason, got %q", capacityErr.Reason)
+	}
+	if store.recordMissCalls != 0 {
+		t.Fatalf("expected no recorded miss for shutting-down, got %d", store.recordMissCalls)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerIgnoresWarmCapacityMissRecordError(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		claimMissReason: configstore.WorkerClaimMissReasonNoIdle,
+		recordMissErr:   errors.New("recording failed"),
+	}
+	pool.runtimeStore = store
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+		Image: "duckgres:v2",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion despite record error, got worker=%#v err=%v", worker, err)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
+	}
+	if store.recordMissCalls != 1 {
+		t.Fatalf("expected one best-effort record attempt, got %d", store.recordMissCalls)
+	}
+	if capacityErr.Reason != configstore.WorkerClaimMissReasonNoIdle {
+		t.Fatalf("expected capacity miss reason no-idle, got %q", capacityErr.Reason)
+	}
+}
+
 func TestK8sPoolReserveSharedWorkerPropagatesRuntimeClaimMissReason(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{
@@ -1467,6 +1621,28 @@ func TestK8sPoolReserveSharedWorkerPassesOrgCapToRuntimeClaim(t *testing.T) {
 	}
 	if idle.SharedState().Assignment != nil {
 		t.Fatalf("local idle worker should not have been reserved, got assignment %#v", idle.SharedState().Assignment)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerPassesGlobalCapToRuntimeClaim(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{}
+	pool.runtimeStore = store
+	pool.SetMaxWorkers(11)
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID: "analytics",
+		Image: "duckgres:v2",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
+	}
+	if store.claimMaxGlobalWorkers != 11 {
+		t.Fatalf("expected claim max global workers 11, got %d", store.claimMaxGlobalWorkers)
 	}
 }
 

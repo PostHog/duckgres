@@ -11,6 +11,7 @@ import (
 const (
 	janitorRetireReasonOrphaned        = "orphaned"
 	janitorRetireReasonStuckActivating = "stuck_activating"
+	defaultWarmCapacityMissBucketTTL   = 15 * time.Minute
 )
 
 type controlPlaneExpiryStore interface {
@@ -21,6 +22,10 @@ type controlPlaneExpiryStore interface {
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
 	RetireHotIdleWorker(workerID int) (bool, error)
+}
+
+type warmCapacityMissBucketPruner interface {
+	PruneWarmCapacityMissBuckets(before time.Time) (int64, error)
 }
 
 type ControlPlaneJanitor struct {
@@ -160,6 +165,16 @@ func (j *ControlPlaneJanitor) runOnce() {
 
 	if _, err := j.store.ExpireFlightSessionRecords(j.now()); err != nil {
 		slog.Warn("Janitor failed to expire stale Flight sessions.", "error", err)
+	}
+
+	if pruner, ok := j.store.(warmCapacityMissBucketPruner); ok {
+		cutoff := j.now().Add(-defaultWarmCapacityMissBucketTTL)
+		pruned, err := pruner.PruneWarmCapacityMissBuckets(cutoff)
+		if err != nil {
+			slog.Warn("Janitor failed to prune warm capacity miss buckets.", "error", err)
+		} else if pruned > 0 {
+			slog.Info("Janitor pruned warm capacity miss buckets.", "count", pruned, "cutoff", cutoff)
+		}
 	}
 
 	// Gradual rolling replacement of warm workers whose Deployment version

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatal("expected runtime schema to be configured")
 	}
 
-	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records"} {
+	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records", "warm_capacity_miss_buckets"} {
 		var count int64
 		if err := store.DB().Raw(
 			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
@@ -110,6 +111,83 @@ func TestRuntimeStorePostgres(t *testing.T) {
 	}
 }
 
+func TestRecordWarmCapacityMissAggregatesByBucketScopeAndReasonPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	other := newConfigStoreOnSameSchema(t, store)
+
+	now := time.Date(2026, time.March, 26, 14, 0, 5, 0, time.UTC)
+	for _, recorder := range []*configstore.ConfigStore{store, other} {
+		if err := recorder.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, now); err != nil {
+			t.Fatalf("RecordWarmCapacityMiss(default): %v", err)
+		}
+	}
+	if err := store.RecordWarmCapacityMiss("image:duckgres:pinned", configstore.WorkerClaimMissReasonNoIdle, now); err != nil {
+		t.Fatalf("RecordWarmCapacityMiss(pinned): %v", err)
+	}
+	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonGlobalCap, now); err != nil {
+		t.Fatalf("RecordWarmCapacityMiss(default/global-cap): %v", err)
+	}
+
+	bucketStart := now.Truncate(configstore.WarmCapacityMissBucketSize)
+	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, bucketStart, 2)
+	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonGlobalCap, bucketStart, 1)
+	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:pinned", configstore.WorkerClaimMissReasonNoIdle, bucketStart, 1)
+}
+
+func TestRecordWarmCapacityMissConcurrentWritersPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	other := newConfigStoreOnSameSchema(t, store)
+
+	now := time.Date(2026, time.March, 26, 14, 5, 5, 0, time.UTC)
+	recorders := []*configstore.ConfigStore{store, other}
+	errs := make(chan error, 40)
+	var wg sync.WaitGroup
+	for i := 0; i < cap(errs); i++ {
+		wg.Add(1)
+		recorder := recorders[i%len(recorders)]
+		go func() {
+			defer wg.Done()
+			errs <- recorder.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, now)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("RecordWarmCapacityMiss concurrent writer: %v", err)
+		}
+	}
+
+	bucketStart := now.Truncate(configstore.WarmCapacityMissBucketSize)
+	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, bucketStart, 40)
+}
+
+func TestPruneWarmCapacityMissBucketsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	oldNow := time.Date(2026, time.March, 26, 14, 0, 5, 0, time.UTC)
+	newNow := oldNow.Add(15 * time.Minute)
+	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, oldNow); err != nil {
+		t.Fatalf("RecordWarmCapacityMiss(old): %v", err)
+	}
+	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, newNow); err != nil {
+		t.Fatalf("RecordWarmCapacityMiss(new): %v", err)
+	}
+
+	pruned, err := store.PruneWarmCapacityMissBuckets(newNow.Add(-10 * time.Minute))
+	if err != nil {
+		t.Fatalf("PruneWarmCapacityMissBuckets: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("expected one old bucket pruned, got %d", pruned)
+	}
+
+	oldBucketStart := oldNow.Truncate(configstore.WarmCapacityMissBucketSize)
+	newBucketStart := newNow.Truncate(configstore.WarmCapacityMissBucketSize)
+	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, oldBucketStart, 0)
+	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, newBucketStart, 1)
+}
+
 func TestClaimIdleWorkerPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
@@ -126,7 +204,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0, 1)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -167,7 +245,7 @@ func TestClaimIdleWorkerPostgres(t *testing.T) {
 func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -176,6 +254,131 @@ func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
 	}
 	if missReason != configstore.WorkerClaimMissReasonNoIdle {
 		t.Fatalf("expected no-idle miss reason, got %q", missReason)
+	}
+}
+
+func TestClaimIdleWorkerReturnsGlobalCapWhenNoIdleAndGlobalCapReached(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 13, 15, 0, 0, time.UTC)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          8,
+		PodName:           "duckgres-worker-8",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        4,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
+	}
+
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", 0, 1)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claim, got %#v", claimed)
+	}
+	if missReason != configstore.WorkerClaimMissReasonGlobalCap {
+		t.Fatalf("expected global-cap miss reason, got %q", missReason)
+	}
+}
+
+func TestClaimIdleWorkerReturnsNoIdleWhenBelowGlobalCap(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 13, 20, 0, 0, time.UTC)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          8,
+		PodName:           "duckgres-worker-8",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        4,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
+	}
+
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", 0, 2)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claim, got %#v", claimed)
+	}
+	if missReason != configstore.WorkerClaimMissReasonNoIdle {
+		t.Fatalf("expected no-idle miss reason below global cap, got %q", missReason)
+	}
+}
+
+func TestClaimIdleWorkerReturnsGlobalCapForImageMissAtGlobalCap(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 13, 25, 0, 0, time.UTC)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          8,
+		PodName:           "duckgres-worker-v1",
+		State:             configstore.WorkerStateIdle,
+		Image:             "duckgres:v1",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        4,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
+	}
+
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", 0, 1)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected no claim, got %#v", claimed)
+	}
+	if missReason != configstore.WorkerClaimMissReasonGlobalCap {
+		t.Fatalf("expected global-cap miss reason for image miss, got %q", missReason)
+	}
+}
+
+func TestClaimIdleWorkerClaimsMatchingIdleWorkerAtGlobalCap(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 13, 27, 0, 0, time.UTC)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          9,
+		PodName:           "duckgres-worker-v2",
+		State:             configstore.WorkerStateIdle,
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        4,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
+	}
+
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", 0, 1)
+	if err != nil {
+		t.Fatalf("ClaimIdleWorker: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected matching idle worker claim to succeed at global cap")
+		return
+	}
+	if missReason != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("expected no miss reason on successful claim, got %q", missReason)
+	}
+	if claimed.WorkerID != 9 {
+		t.Fatalf("expected worker id 9, got %d", claimed.WorkerID)
+	}
+	if claimed.State != configstore.WorkerStateReserved {
+		t.Fatalf("expected reserved state, got %q", claimed.State)
+	}
+	if claimed.OrgID != "billing" {
+		t.Fatalf("expected org billing, got %q", claimed.OrgID)
+	}
+	if claimed.Image != "duckgres:v2" {
+		t.Fatalf("expected image duckgres:v2, got %q", claimed.Image)
 	}
 }
 
@@ -205,7 +408,7 @@ func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 1)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", 1, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -249,7 +452,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Try claiming v2
-	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", 0)
+	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -261,7 +464,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Try claiming v3 (none exist)
-	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", 0)
+	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}
@@ -273,7 +476,7 @@ func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
 	}
 
 	// Neutral claim (no image filter) - should get v1 (lowest ID)
-	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "", 0)
+	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "", 0, 0)
 	if err != nil {
 		t.Fatalf("ClaimIdleWorker: %v", err)
 	}

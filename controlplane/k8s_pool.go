@@ -1369,7 +1369,11 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				}
 			}
 
-			claimed, missReason, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, assignment.MaxWorkers)
+			p.mu.Lock()
+			maxGlobalWorkers := p.maxWorkers
+			p.mu.Unlock()
+
+			claimed, missReason, err := p.runtimeStore.ClaimIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.Image, assignment.MaxWorkers, maxGlobalWorkers)
 			if err != nil {
 				return nil, err
 			}
@@ -1388,6 +1392,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				continue
 			}
 
+			p.recordWarmCapacityMiss(assignment, missReason)
 			return nil, NewWarmCapacityExhaustedErrorForReason(missReason, DefaultWarmCapacityRetryAfter)
 		}
 
@@ -1454,6 +1459,29 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 		p.mu.Unlock()
 
 		return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
+	}
+}
+
+func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, reason configstore.WorkerClaimMissReason) {
+	policy := warmCapacityMissPolicyForReason(reason)
+	if p.runtimeStore == nil || !policy.recordDynamicDemand {
+		return
+	}
+
+	image := ""
+	if assignment != nil {
+		image = strings.TrimSpace(assignment.Image)
+	}
+	if image == "" {
+		image = strings.TrimSpace(p.workerImage)
+	}
+	if image == "" {
+		return
+	}
+
+	scope := "image:" + image
+	if err := p.runtimeStore.RecordWarmCapacityMiss(scope, policy.reason, time.Now()); err != nil {
+		slog.Warn("Failed to record warm capacity miss.", "scope", scope, "reason", policy.reason, "error", err)
 	}
 }
 

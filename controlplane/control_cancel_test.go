@@ -105,16 +105,37 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("org capacity exhausted", func(t *testing.T) {
-		code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedErrorForReason(configstore.WorkerClaimMissReasonOrgCap, 45*time.Second))
-		if code != "53300" {
-			t.Fatalf("code = %q, want 53300", code)
-		}
-		want := "Duckgres worker capacity for this organization is currently exhausted; retry later"
-		if message != want {
-			t.Fatalf("message = %q, want %q", message, want)
-		}
-	})
+	for _, tt := range []struct {
+		name    string
+		reason  configstore.WorkerClaimMissReason
+		message string
+	}{
+		{
+			name:    "org capacity exhausted",
+			reason:  configstore.WorkerClaimMissReasonOrgCap,
+			message: "Duckgres worker capacity for this organization is currently exhausted; retry later",
+		},
+		{
+			name:    "global capacity exhausted",
+			reason:  configstore.WorkerClaimMissReasonGlobalCap,
+			message: "Duckgres worker capacity is currently exhausted; retry later",
+		},
+		{
+			name:    "control plane shutting down",
+			reason:  configstore.WorkerClaimMissReasonShuttingDown,
+			message: "Duckgres control plane is shutting down; retry later",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedErrorForReason(tt.reason, 45*time.Second))
+			if code != "53300" {
+				t.Fatalf("code = %q, want 53300", code)
+			}
+			if message != tt.message {
+				t.Fatalf("message = %q, want %q", message, tt.message)
+			}
+		})
+	}
 
 	t.Run("generic error", func(t *testing.T) {
 		code, message := sessionCreationErrorResponse(errors.New("worker activation failed"))
@@ -125,4 +146,29 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 			t.Fatalf("message = %q", message)
 		}
 	})
+}
+
+func TestWarmCapacityMissPolicyForKnownReasons(t *testing.T) {
+	for _, tt := range []struct {
+		name                string
+		reason              configstore.WorkerClaimMissReason
+		policyReason        configstore.WorkerClaimMissReason
+		recordDynamicDemand bool
+	}{
+		{name: "none defaults to no_idle", reason: configstore.WorkerClaimMissReasonNone, policyReason: configstore.WorkerClaimMissReasonNoIdle, recordDynamicDemand: true},
+		{name: "no_idle", reason: configstore.WorkerClaimMissReasonNoIdle, policyReason: configstore.WorkerClaimMissReasonNoIdle, recordDynamicDemand: true},
+		{name: "org_cap", reason: configstore.WorkerClaimMissReasonOrgCap, policyReason: configstore.WorkerClaimMissReasonOrgCap, recordDynamicDemand: false},
+		{name: "global_cap", reason: configstore.WorkerClaimMissReasonGlobalCap, policyReason: configstore.WorkerClaimMissReasonGlobalCap, recordDynamicDemand: false},
+		{name: "shutting_down", reason: configstore.WorkerClaimMissReasonShuttingDown, policyReason: configstore.WorkerClaimMissReasonShuttingDown, recordDynamicDemand: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := warmCapacityMissPolicyForReason(tt.reason)
+			if policy.reason != tt.policyReason {
+				t.Fatalf("policy reason = %q, want %q", policy.reason, tt.policyReason)
+			}
+			if policy.recordDynamicDemand != tt.recordDynamicDemand {
+				t.Fatalf("recordDynamicDemand = %v, want %v", policy.recordDynamicDemand, tt.recordDynamicDemand)
+			}
+		})
+	}
 }

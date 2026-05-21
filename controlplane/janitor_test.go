@@ -10,18 +10,21 @@ import (
 )
 
 type captureControlPlaneExpiryStore struct {
-	mu                    sync.Mutex
-	cutoffs               []time.Time
-	count                 int64
-	expireErr             error
-	drainingCutoffs       []time.Time
-	drainingCount         int64
-	orphanedBefore        []time.Time
-	orphanedWorkers       []configstore.WorkerRecord
-	stuckSpawningBefore   []time.Time
-	stuckActivatingBefore []time.Time
-	stuckWorkers          []configstore.WorkerRecord
-	expiredSessionsBefore []time.Time
+	mu                     sync.Mutex
+	cutoffs                []time.Time
+	count                  int64
+	expireErr              error
+	drainingCutoffs        []time.Time
+	drainingCount          int64
+	orphanedBefore         []time.Time
+	orphanedWorkers        []configstore.WorkerRecord
+	stuckSpawningBefore    []time.Time
+	stuckActivatingBefore  []time.Time
+	stuckWorkers           []configstore.WorkerRecord
+	expiredSessionsBefore  []time.Time
+	pruneMissBucketsBefore []time.Time
+	prunedMissBucketCount  int64
+	pruneMissBucketErr     error
 }
 
 func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
@@ -84,6 +87,13 @@ func (s *captureControlPlaneExpiryStore) RetireHotIdleWorker(workerID int) (bool
 	return true, nil
 }
 
+func (s *captureControlPlaneExpiryStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneMissBucketsBefore = append(s.pruneMissBucketsBefore, before)
+	return s.prunedMissBucketCount, s.pruneMissBucketErr
+}
+
 func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{}
 	now := time.Date(2026, time.March, 26, 15, 0, 0, 0, time.UTC)
@@ -112,6 +122,23 @@ func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 		if !cutoff.Equal(wantDrainCutoff) {
 			t.Fatalf("draining call %d expected cutoff %v, got %v", i, wantDrainCutoff, cutoff)
 		}
+	}
+}
+
+func TestControlPlaneJanitorRunPrunesWarmCapacityMissBuckets(t *testing.T) {
+	store := &captureControlPlaneExpiryStore{}
+	now := time.Date(2026, time.March, 26, 15, 0, 0, 0, time.UTC)
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+
+	janitor.runOnce()
+
+	if len(store.pruneMissBucketsBefore) != 1 {
+		t.Fatalf("expected one warm capacity miss bucket prune call, got %d", len(store.pruneMissBucketsBefore))
+	}
+	want := now.Add(-defaultWarmCapacityMissBucketTTL)
+	if got := store.pruneMissBucketsBefore[0]; !got.Equal(want) {
+		t.Fatalf("expected warm capacity miss bucket prune cutoff %v, got %v", want, got)
 	}
 }
 
