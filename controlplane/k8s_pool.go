@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto/x509"
@@ -98,6 +99,14 @@ type K8sWorkerPool struct {
 	runtimeStore                  RuntimeWorkerStore
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
+
+	// warmCapacityMisses counts ReserveSharedWorker calls that returned
+	// WarmCapacityExhaustedError since the last ConsumeWarmCapacityDemand call.
+	// The janitor's warm-capacity reconciler drains this counter each tick and
+	// scales the warm pool to absorb the observed demand in one shot, rather
+	// than creeping up at the static SharedWarmTarget floor while cold tenants
+	// retry on 45-second backoffs. Atomically accessed; no lock needed.
+	warmCapacityMisses atomic.Int64
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -145,7 +154,14 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 	}
 
 	// Limit concurrent K8s API calls to avoid overwhelming the API server.
-	spawnConcurrency := 3
+	// The K8s client above is configured for QPS=50 / Burst=100, so 50 in-flight
+	// pod creates fits comfortably within client-side throttling while letting
+	// the warm-pool reconciler close large demand gaps (e.g. 30-tenant cold
+	// ramp) in one tick instead of creeping up at 3-per-pod-startup. Pod
+	// scheduling latency on the node side is bounded by Karpenter (~30s) and
+	// the kubelet, neither of which cares about how many pods we create
+	// in parallel from the CP.
+	spawnConcurrency := 50
 	retireConcurrency := 5
 	pool := &K8sWorkerPool{
 		workers:               make(map[int]*ManagedWorker),
@@ -1458,13 +1474,18 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 		p.mu.Unlock()
 
+		p.recordWarmCapacityMiss(assignment, configstore.WorkerClaimMissReasonNoIdle)
 		return nil, NewWarmCapacityExhaustedError(DefaultWarmCapacityRetryAfter)
 	}
 }
 
 func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, reason configstore.WorkerClaimMissReason) {
 	policy := warmCapacityMissPolicyForReason(reason)
-	if p.runtimeStore == nil || !policy.recordDynamicDemand {
+	if !policy.recordDynamicDemand {
+		return
+	}
+	p.warmCapacityMisses.Add(1)
+	if p.runtimeStore == nil {
 		return
 	}
 
@@ -2898,6 +2919,22 @@ func (p *K8sWorkerPool) WarmCapacityTarget() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.minWorkers
+}
+
+// ConsumeWarmCapacityDemand returns the number of ReserveSharedWorker calls
+// that have hit WarmCapacityExhausted (excluding per-org cap misses) since
+// the last call, atomically resetting the counter. The warm-pool reconciler
+// adds this to the static target each tick so a cold burst of N tenants
+// scales the pool toward N workers in one or two ticks, instead of creeping
+// up while clients re-arrive on their 45-second retry hints. Scale-down
+// stays under the idle reaper's slower cadence so steady-state idle dips
+// don't thrash the pool.
+func (p *K8sWorkerPool) ConsumeWarmCapacityDemand() int {
+	n := p.warmCapacityMisses.Swap(0)
+	if n < 0 {
+		return 0
+	}
+	return int(n)
 }
 
 // SetPerImageWarmTargets replaces the per-image warm-worker floor. Each entry

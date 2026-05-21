@@ -57,6 +57,61 @@ func TestInjectPostgresKeepalive(t *testing.T) {
 // keepalive suffix appended by injectPostgresKeepalive to postgres connection strings.
 const keepaliveSuffix = " keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5"
 
+func TestInjectPostgresApplicationName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		appNm string
+		want  string
+	}{
+		{
+			name:  "adds application_name to postgres connection",
+			input: "postgres:host=localhost dbname=dl",
+			appNm: "duckgres/acme",
+			want:  "postgres:host=localhost dbname=dl application_name='duckgres/acme'",
+		},
+		{
+			name:  "skips when name is empty",
+			input: "postgres:host=localhost dbname=dl",
+			appNm: "",
+			want:  "postgres:host=localhost dbname=dl",
+		},
+		{
+			name:  "skips if application_name already set",
+			input: "postgres:host=localhost dbname=dl application_name=custom",
+			appNm: "duckgres/acme",
+			want:  "postgres:host=localhost dbname=dl application_name=custom",
+		},
+		{
+			name:  "skips non-postgres metadata stores",
+			input: "sqlite:/tmp/test.db",
+			appNm: "duckgres/acme",
+			want:  "sqlite:/tmp/test.db",
+		},
+		{
+			name:  "escapes single quotes",
+			input: "postgres:host=localhost dbname=dl",
+			appNm: "duckgres/it's",
+			want:  "postgres:host=localhost dbname=dl application_name='duckgres/it''s'",
+		},
+		{
+			name:  "truncates to 63 bytes (libpq application_name ceiling)",
+			input: "postgres:host=localhost dbname=dl",
+			appNm: strings.Repeat("a", 80),
+			want:  "postgres:host=localhost dbname=dl application_name='" + strings.Repeat("a", 63) + "'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := injectPostgresApplicationName(tt.input, tt.appNm)
+			if got != tt.want {
+				t.Errorf("injectPostgresApplicationName(%q, %q) =\n  %s\nwant:\n  %s", tt.input, tt.appNm, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildAttachStmt(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -151,6 +206,15 @@ func TestBuildAttachStmt(t *testing.T) {
 			},
 			migrate: false,
 			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + "' AS ducklake",
+		},
+		{
+			name: "with application_name tags libpq connection",
+			dlCfg: Config{
+				MetadataStore:   "postgres:host=localhost dbname=dl",
+				ApplicationName: "duckgres/acme",
+			},
+			migrate: false,
+			want:    "ATTACH 'ducklake:postgres:host=localhost dbname=dl" + keepaliveSuffix + " application_name=''duckgres/acme''' AS ducklake",
 		},
 	}
 

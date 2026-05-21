@@ -42,6 +42,12 @@ type QueryLogEntry struct {
 	Protocol        string // "simple" or "extended"
 	TraceID         string // OTEL trace ID (empty when tracing is off)
 	SpanID          string // OTEL span ID (empty when tracing is off)
+	// PostgresScanMs is the thread-time spent in postgres_scan operators
+	// during this query — DuckLake metadata DB roundtrips. Zero when DuckDB
+	// returned no profiling output (cancelled / errored before exec /
+	// profiling disabled). Lets us answer "which query shape pounds the
+	// metadata DB?" against `system.query_log` without re-parsing profiling.
+	PostgresScanMs int64
 }
 
 // QueryLogger batches query log entries and writes them to a DuckLake table.
@@ -225,18 +231,18 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 	}
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(table)
-	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id) VALUES ")
+	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms) VALUES ")
 
-	const colsPerRow = 23
+	const colsPerRow = 24
 	args := make([]any, 0, len(batch)*colsPerRow)
 	for i, e := range batch {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
 		base := i * colsPerRow
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23)
+			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23, base+24)
 
 		args = append(args,
 			e.EventTime,
@@ -262,6 +268,7 @@ func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
 			e.Protocol,
 			e.TraceID,
 			e.SpanID,
+			e.PostgresScanMs,
 		)
 	}
 
@@ -331,6 +338,18 @@ func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName strin
 		}
 	}
 
+	// Backfill postgres_scan_ms column on tables created before metadata-DB
+	// observability landed. New tables already get it from CREATE TABLE.
+	hasPgScan, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, "postgres_scan_ms")
+	if err != nil {
+		return fmt.Errorf("inspect postgres_scan_ms column: %w", err)
+	}
+	if !hasPgScan {
+		if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN postgres_scan_ms BIGINT"); err != nil {
+			return fmt.Errorf("add postgres_scan_ms column: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -358,7 +377,8 @@ func queryLogCreateTableSQL(fullTableName string) string {
 		is_transpiled       BOOLEAN,
 		protocol            VARCHAR,
 		trace_id            VARCHAR,
-		span_id             VARCHAR
+		span_id             VARCHAR,
+		postgres_scan_ms    BIGINT
 	)`, fullTableName)
 }
 
@@ -499,6 +519,13 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		}
 	}
 
+	// Consume the profiling rollup left behind by the most recent
+	// EnrichSpanWithProfiling on this connection and reset it so a later
+	// logQuery without a fresh exec (e.g. parse-failure path) doesn't
+	// reuse stale timings from a previous query.
+	pgScanMs := int64(c.lastProfilingSummary.PostgresScanSeconds * 1000)
+	c.lastProfilingSummary = observe.QueryProfilingSummary{}
+
 	ql.Log(QueryLogEntry{
 		EventTime:       start,
 		QueryDurationMs: time.Since(start).Milliseconds(),
@@ -523,6 +550,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		Protocol:        protocol,
 		TraceID:         observe.TraceIDFromContext(c.ctx),
 		SpanID:          observe.SpanIDFromContext(c.ctx),
+		PostgresScanMs:  pgScanMs,
 	})
 }
 

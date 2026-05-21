@@ -99,16 +99,31 @@ func BuildLakekeeperSecretStmt(cfg Config) string {
 	)
 }
 
+// LakekeeperAccessDelegationNone disables Iceberg REST credential vending on
+// the ATTACH. This MUST be set explicitly: DuckDB's iceberg extension defaults
+// ACCESS_DELEGATION_MODE to 'vended_credentials', so simply *omitting* the
+// option does NOT turn vending off (the lesson from the first live write test).
+const LakekeeperAccessDelegationNone = "ACCESS_DELEGATION_MODE 'none'"
+
 // BuildLakekeeperAttachStmt builds the ATTACH statement for the Iceberg
 // REST catalog served by Lakekeeper.
 //
-// We deliberately do NOT use ACCESS_DELEGATION_MODE 'vended_credentials':
-// Lakekeeper's STS vending overflows AWS's packed-policy limit
-// (PackedPolicyTooLarge), and it's unnecessary — the worker already holds S3
-// creds for the warehouse bucket via the iceberg_sigv4 secret (built from the
-// duckling's brokered STS creds, same per-org role/bucket; see
-// attachLakekeeperCatalog). DuckDB uses that secret to read/write table data;
-// Lakekeeper serves only catalog metadata.
+// We explicitly set ACCESS_DELEGATION_MODE 'none' (NOT 'vended_credentials',
+// and crucially NOT omitted — see below). Two reasons vending is wrong here:
+//   - Lakekeeper's STS vending overflows AWS's packed-policy limit
+//     (PackedPolicyTooLarge), so vending is disabled on the warehouse anyway.
+//   - With vending disabled server-side, a delegation-requesting client still
+//     gets a per-table storage *config* (region/endpoint) back with NO
+//     credentials. DuckDB turns that into a path-scoped S3 secret with empty
+//     creds, and because its scope (the table's S3 prefix) is MORE SPECIFIC
+//     than iceberg_sigv4's (s3://), it SHADOWS our working secret — every data
+//     read/write then goes out anonymous and S3 returns 403. Verified live on
+//     `ben` in managed-warehouse-dev: omitting the option 403'd; 'none' fixed it.
+//
+// With delegation off, DuckDB falls back to the ambient iceberg_sigv4 secret,
+// which holds the duckling's own brokered S3 creds for the warehouse bucket
+// (built in attachLakekeeperCatalog from the same per-org role/bucket). DuckDB
+// uses that to read/write table data; Lakekeeper serves only catalog metadata.
 //
 // When OAUTH2_SERVER_URI is empty (allowall mode), AUTHORIZATION_TYPE 'none'
 // is set instead of SECRET. When OAuth2 is configured, SECRET references
@@ -116,18 +131,20 @@ func BuildLakekeeperSecretStmt(cfg Config) string {
 func BuildLakekeeperAttachStmt(cfg Config) string {
 	if cfg.LakekeeperOAuth2ServerURI == "" {
 		return fmt.Sprintf(
-			"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', AUTHORIZATION_TYPE 'none')",
+			"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', AUTHORIZATION_TYPE 'none', %s)",
 			escapeSQLStringLiteral(cfg.LakekeeperWarehouse),
 			CatalogName,
 			escapeSQLStringLiteral(cfg.LakekeeperEndpoint),
+			LakekeeperAccessDelegationNone,
 		)
 	}
 	return fmt.Sprintf(
-		"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', SECRET %s)",
+		"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', SECRET %s, %s)",
 		escapeSQLStringLiteral(cfg.LakekeeperWarehouse),
 		CatalogName,
 		escapeSQLStringLiteral(cfg.LakekeeperEndpoint),
 		LakekeeperSecretName,
+		LakekeeperAccessDelegationNone,
 	)
 }
 

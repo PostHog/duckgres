@@ -92,4 +92,13 @@ type Config struct {
 	// See duckdb/ducklake#1031: behind a network pooler, client-side pooling
 	// is redundant and prevents the pooler from reclaiming idle connections.
 	ViaPgBouncer bool `json:"via_pgbouncer,omitempty" yaml:"-"`
+
+	// ApplicationName tags the libpq connections that postgres_scanner opens
+	// against the metadata Postgres. Appears in pg_stat_activity.application_name
+	// on the Aurora/RDS side, so Performance Insights and pg_stat_activity
+	// can attribute connections and queries back to a specific duckgres
+	// org/worker. Recommended format: "duckgres/<org-id>". Ignored for
+	// non-"postgres:" metadata stores. If empty, no application_name is
+	// injected (libpq picks its own default, usually "psql").
+	ApplicationName string `json:"application_name,omitempty" yaml:"-"`
 }

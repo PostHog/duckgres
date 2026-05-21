@@ -598,10 +598,43 @@ func injectPostgresKeepalive(metadataStore string) string {
 	return metadataStore + " keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5"
 }
 
+// injectPostgresApplicationName adds an application_name= libpq parameter to
+// a postgres metadata store connection string so the metadata DB can attribute
+// connections via pg_stat_activity / Performance Insights. Only modifies
+// strings with the "postgres:" prefix; leaves user-set application_name alone.
+//
+// libpq applies a 64-byte ceiling to application_name and silently truncates.
+// We pre-trim to 63 bytes here (plus the leading space + key) so the value we
+// log/store on the Aurora side matches what we sent. A "duckgres/<uuid>" or
+// "duckgres/<slug>/<worker-id>" form is the intended shape.
+func injectPostgresApplicationName(metadataStore, name string) string {
+	if name == "" {
+		return metadataStore
+	}
+	if !strings.HasPrefix(metadataStore, "postgres:") {
+		return metadataStore
+	}
+	connPart := metadataStore[len("postgres:"):]
+	if strings.Contains(connPart, "application_name") {
+		return metadataStore
+	}
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	// libpq accepts application_name as a bareword for ASCII alnum/dash/slash;
+	// quote the value defensively so any chars outside that set still parse.
+	return metadataStore + " application_name='" + strings.ReplaceAll(name, "'", "''") + "'"
+}
+
 // BuildAttachStmt builds the ATTACH statement for DuckLake.
 // If migrate is true, adds AUTOMATIC_MIGRATION TRUE to the options.
 func BuildAttachStmt(dlCfg Config, migrate bool) string {
-	connStr := escapeSQLStringLiteral(injectPostgresKeepalive(dlCfg.MetadataStore))
+	connStr := escapeSQLStringLiteral(
+		injectPostgresApplicationName(
+			injectPostgresKeepalive(dlCfg.MetadataStore),
+			dlCfg.ApplicationName,
+		),
+	)
 	dataPath := dlCfg.ObjectStore
 	if dataPath == "" {
 		dataPath = dlCfg.DataPath

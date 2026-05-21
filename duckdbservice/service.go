@@ -12,6 +12,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -23,6 +25,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/observe"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -145,6 +148,7 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 	}
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
+	go pool.metadataMetricsLoop()
 
 	return &DuckDBService{
 		cfg:  cfg,
@@ -187,8 +191,9 @@ func (p *SessionPool) Warmup() error {
 }
 
 const (
-	txnIdleTimeout = 10 * time.Minute
-	reapInterval   = 1 * time.Minute
+	txnIdleTimeout          = 10 * time.Minute
+	reapInterval            = 1 * time.Minute
+	metadataMetricsInterval = 30 * time.Second
 )
 
 func (p *SessionPool) reapLoop() {
@@ -223,6 +228,78 @@ func (p *SessionPool) reapLoop() {
 			return
 		}
 	}
+}
+
+// metadataMetricsLoop periodically scrapes observability signals about the
+// DuckLake metadata Postgres from the worker's DuckDB instance and emits them
+// as Prometheus gauges. Scrapes only run once the worker has been activated
+// (so an org is known and metadata is attached). Ticks are best-effort: any
+// query failure is logged once and the next tick retries — we never want this
+// loop to hold any locks or block user queries.
+func (p *SessionPool) metadataMetricsLoop() {
+	ticker := time.NewTicker(metadataMetricsInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.scrapeMetadataMetrics()
+		case <-p.stopCh:
+			return
+		}
+	}
+}
+
+func (p *SessionPool) scrapeMetadataMetrics() {
+	act := p.currentActivation()
+	if act == nil || act.db == nil {
+		return
+	}
+	orgID := act.payload.OrgID
+
+	// Prefer controlDB (side connection sharing the same DuckDB instance with
+	// its own pool) so a long-running user query on the main DB does not
+	// queue our scrape. Falls back to the activation DB only when controlDB
+	// has not been wired (test paths).
+	p.mu.RLock()
+	scrapeDB := p.controlDB
+	p.mu.RUnlock()
+	if scrapeDB == nil {
+		scrapeDB = act.db
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if v, ok := scrapeMetadataPoolMax(ctx, scrapeDB); ok {
+		observe.MetadataPoolMaxConnections.WithLabelValues(orgID).Set(v)
+	}
+}
+
+// scrapeMetadataPoolMax reads DuckDB's pg_pool_max_connections setting via
+// duckdb_settings(). A value of 0 means the in-process pool is disabled (we
+// set this when ViaPgBouncer is true) — still useful to emit as a gauge.
+//
+// Aurora-side load (active/idle connections, slow queries) is observed via
+// pg_stat_activity / Performance Insights, attributed back to duckgres by
+// the application_name we tag at ATTACH time (ducklake.Config.ApplicationName).
+// We deliberately don't try to scrape pg_stat_activity from the worker via
+// postgres_query — an earlier attempt silently no-op'd in our DuckDB build
+// and Performance Insights is the better tool for that view anyway.
+func scrapeMetadataPoolMax(ctx context.Context, db *sql.DB) (float64, bool) {
+	var raw string
+	err := db.QueryRowContext(ctx,
+		"SELECT value FROM duckdb_settings() WHERE name = 'pg_pool_max_connections'").Scan(&raw)
+	if err != nil {
+		// Setting may be unavailable until postgres_scanner is loaded; skip
+		// silently rather than spamming logs every 30s.
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 // Run starts the DuckDB service, blocking until shutdown.
