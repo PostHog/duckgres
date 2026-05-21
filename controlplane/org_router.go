@@ -139,6 +139,7 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
 	sessions := NewSessionManager(pool, rebalancer)
 	sessions.SetMaxConnections(tc.MaxConnections)
+	sessions.SetConnectionLimiter(NewRuntimeOrgConnectionLimiter(tr.configStore, tc.Name, tr.baseCfg.CPInstanceID, tr.globalCfg.WorkerQueueTimeout))
 	rebalancer.SetSessionLister(sessions)
 
 	// Periodic per-org metrics emission
