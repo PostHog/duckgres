@@ -1743,15 +1743,19 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, ke
 		}
 		return fmt.Errorf("failed to attach Lakekeeper iceberg catalog: %w", err)
 	}
-	if _, err := db.Exec("SHOW TABLES FROM " + iceberg.CatalogName); err != nil {
-		if isIcebergCatalogEmptyError(err) {
-			if _, derr := db.Exec("DETACH " + iceberg.CatalogName); derr != nil {
-				slog.Warn("Failed to detach empty Lakekeeper iceberg catalog after attach probe.", "error", derr)
-			}
-			slog.Info("Detached Lakekeeper iceberg catalog: no namespaces yet.", "warehouse", ic.LakekeeperWarehouse)
-			return nil
-		}
-		return fmt.Errorf("failed to probe Lakekeeper iceberg catalog: %w", err)
+
+	// Guarantee a default schema in the Iceberg catalog. This serves two
+	// purposes: (1) it makes a freshly-provisioned warehouse non-empty so the
+	// catalog stays attached and immediately usable, replacing the old
+	// "probe SHOW TABLES, detach if empty" behavior; and (2) it gives a bare
+	// `USE iceberg` somewhere to land — rewriteDirectQuery rewrites that to
+	// `USE iceberg.<DefaultSchema>` because DuckDB shadows `main` on a REST
+	// catalog (see iceberg.DefaultSchema). Idempotent and best-effort: an
+	// attached catalog without it still works via explicit schema references,
+	// so a transient failure here must not fail activation.
+	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS " + iceberg.CatalogName + "." + iceberg.DefaultSchema); err != nil {
+		slog.Warn("Failed to ensure default Iceberg schema; catalog attached without it.",
+			"schema", iceberg.DefaultSchema, "warehouse", ic.LakekeeperWarehouse, "error", err)
 	}
 	slog.Info("Attached Iceberg catalog successfully.", "backend", "lakekeeper", "warehouse", ic.LakekeeperWarehouse)
 	return nil

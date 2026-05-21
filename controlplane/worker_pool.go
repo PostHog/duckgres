@@ -22,14 +22,7 @@ type WarmCapacityExhaustedError struct {
 }
 
 func (e *WarmCapacityExhaustedError) Error() string {
-	retryAfter := e.RetryAfter
-	if retryAfter <= 0 {
-		retryAfter = DefaultWarmCapacityRetryAfter
-	}
-	if e.missReason() == configstore.WorkerClaimMissReasonOrgCap {
-		return "warm worker capacity exhausted for organization"
-	}
-	return fmt.Sprintf("warm worker capacity exhausted; retry in about %s", retryAfter.Round(time.Second))
+	return warmCapacityMissPolicyForReason(e.missReason()).errorString(e.RetryAfter)
 }
 
 func (e *WarmCapacityExhaustedError) missReason() configstore.WorkerClaimMissReason {
@@ -119,8 +112,9 @@ type K8sWorkerPoolConfig struct {
 
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
-	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
+	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
 	ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
+	RecordWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason, now time.Time) error
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error)

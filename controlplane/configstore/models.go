@@ -360,6 +360,20 @@ const (
 	WorkerClaimMissReasonShuttingDown WorkerClaimMissReason = "shutting_down"
 )
 
+const WarmCapacityMissBucketSize = 10 * time.Second
+
+// WarmCapacityMissBucket stores foreground warm-capacity misses in coarse time
+// buckets so every control-plane pod contributes to one shared demand signal.
+type WarmCapacityMissBucket struct {
+	Scope       string                `gorm:"primaryKey;type:text" json:"scope"`
+	Reason      WorkerClaimMissReason `gorm:"primaryKey;size:64" json:"reason"`
+	BucketStart time.Time             `gorm:"primaryKey;index" json:"bucket_start"`
+	Count       int64                 `gorm:"not null" json:"count"`
+	UpdatedAt   time.Time             `gorm:"not null;index" json:"updated_at"`
+}
+
+func (WarmCapacityMissBucket) TableName() string { return "warm_capacity_miss_buckets" }
+
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {
 	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`

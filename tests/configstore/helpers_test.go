@@ -55,6 +55,42 @@ func newIsolatedConfigStore(t *testing.T) *cpconfigstore.ConfigStore {
 	return store
 }
 
+func newConfigStoreOnSameSchema(t *testing.T, store *cpconfigstore.ConfigStore) *cpconfigstore.ConfigStore {
+	t.Helper()
+
+	var schema string
+	if err := store.DB().Raw("SELECT current_schema()").Scan(&schema).Error; err != nil {
+		t.Fatalf("current schema: %v", err)
+	}
+	other, err := cpconfigstore.NewConfigStore("host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable search_path="+schema, time.Hour)
+	if err != nil {
+		t.Fatalf("new config store on schema %s: %v", schema, err)
+	}
+	sqlDB, err := other.DB().DB()
+	if err != nil {
+		t.Fatalf("other store sql db: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+	return other
+}
+
+func assertWarmCapacityMissBucketCount(t *testing.T, store *cpconfigstore.ConfigStore, scope string, reason cpconfigstore.WorkerClaimMissReason, bucketStart time.Time, want int64) {
+	t.Helper()
+
+	var got int64
+	if err := store.DB().Table(store.RuntimeSchema()+".warm_capacity_miss_buckets").
+		Where("scope = ? AND reason = ? AND bucket_start = ?", scope, string(reason), bucketStart).
+		Select("COALESCE(SUM(count), 0)").
+		Scan(&got).Error; err != nil {
+		t.Fatalf("lookup warm capacity miss bucket: %v", err)
+	}
+	if got != want {
+		t.Fatalf("expected bucket count %d for scope=%q reason=%q bucket=%s, got %d", want, scope, reason, bucketStart.Format(time.RFC3339), got)
+	}
+}
+
 func ensureIntegrationPostgres(t *testing.T) {
 	t.Helper()
 
