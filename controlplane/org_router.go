@@ -389,7 +389,15 @@ func (tr *OrgRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
 	}
 
 	tr.sharedPool.SetWarmCapacityTarget(target)
-	tr.sharedPool.SetPerImageWarmTargets(tr.computePerImageWarmTargets(snap))
+	tr.sharedPool.SetPerImageWarmTargets(tr.computeBaseWarmCapacityTargets(snap))
+}
+
+func (tr *OrgRouter) computeBaseWarmCapacityTargets(snap *configstore.Snapshot) map[string]int {
+	return computeBaseWarmCapacityTargets(
+		tr.baseCfg.WorkerImage,
+		tr.globalCfg.K8s.SharedWarmTarget,
+		tr.computePerImageWarmTargets(snap),
+	)
 }
 
 // computePerImageWarmTargets returns "keep at least 1 warm worker for each

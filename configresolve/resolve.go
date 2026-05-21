@@ -91,38 +91,44 @@ type CLIInputs struct {
 }
 
 type Resolved struct {
-	Server                     server.Config
-	ProcessMinWorkers          int
-	ProcessMaxWorkers          int
-	ProcessRetireOnSessionEnd  bool
-	SessionInitTimeout         time.Duration
-	WorkerQueueTimeout         time.Duration
-	WorkerIdleTimeout          time.Duration
-	HandoverDrainTimeout       time.Duration
-	WorkerBackend              string
-	K8sWorkerImage             string
-	K8sWorkerNamespace         string
-	K8sControlPlaneID          string
-	K8sWorkerPort              int
-	K8sWorkerSecret            string
-	K8sWorkerConfigMap         string
-	K8sWorkerImagePullPolicy   string
-	K8sWorkerServiceAccount    string
-	K8sMaxWorkers              int
-	K8sSharedWarmTarget        int
-	K8sWorkerCPURequest        string
-	K8sWorkerMemoryRequest     string
-	K8sWorkerNodeSelector      string
-	K8sWorkerTolerationKey     string
-	K8sWorkerTolerationValue   string
-	K8sWorkerExclusiveNode     bool
-	AWSRegion                  string
-	ConfigStoreConn            string
-	ConfigPollInterval         time.Duration
-	InternalSecret             string
-	SNIRoutingMode             string
-	ManagedHostnameSuffixes    []string
-	DuckLakeDefaultSpecVersion string
+	Server                             server.Config
+	ProcessMinWorkers                  int
+	ProcessMaxWorkers                  int
+	ProcessRetireOnSessionEnd          bool
+	SessionInitTimeout                 time.Duration
+	WorkerQueueTimeout                 time.Duration
+	WorkerIdleTimeout                  time.Duration
+	HandoverDrainTimeout               time.Duration
+	WorkerBackend                      string
+	K8sWorkerImage                     string
+	K8sWorkerNamespace                 string
+	K8sControlPlaneID                  string
+	K8sWorkerPort                      int
+	K8sWorkerSecret                    string
+	K8sWorkerConfigMap                 string
+	K8sWorkerImagePullPolicy           string
+	K8sWorkerServiceAccount            string
+	K8sMaxWorkers                      int
+	K8sSharedWarmTarget                int
+	K8sDynamicWarmCapacityEnabled      bool
+	K8sWarmCapacityMissWindow          time.Duration
+	K8sWarmCapacityMissesPerWorker     int
+	K8sWarmCapacityDemandTTL           time.Duration
+	K8sWarmCapacityDynamicImageCeiling int
+	K8sWarmCapacityDynamicTotalCeiling int
+	K8sWorkerCPURequest                string
+	K8sWorkerMemoryRequest             string
+	K8sWorkerNodeSelector              string
+	K8sWorkerTolerationKey             string
+	K8sWorkerTolerationValue           string
+	K8sWorkerExclusiveNode             bool
+	AWSRegion                          string
+	ConfigStoreConn                    string
+	ConfigPollInterval                 time.Duration
+	InternalSecret                     string
+	SNIRoutingMode                     string
+	ManagedHostnameSuffixes            []string
+	DuckLakeDefaultSpecVersion         string
 }
 
 func intPtr(n int) *int    { return &n }
@@ -189,6 +195,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
 	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
 	var k8sMaxWorkers, k8sSharedWarmTarget int
+	var k8sDynamicWarmCapacityEnabled bool
+	k8sWarmCapacityMissWindow := controlplane.DefaultWarmCapacityMissWindow
+	k8sWarmCapacityMissesPerWorker := controlplane.DefaultWarmCapacityMissesPerWorker
+	k8sWarmCapacityDemandTTL := controlplane.DefaultWarmCapacityDemandTTL
+	var k8sWarmCapacityDynamicImageCeiling, k8sWarmCapacityDynamicTotalCeiling int
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
 	var k8sWorkerExclusiveNode bool
@@ -486,6 +497,32 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.K8s.SharedWarmTarget != 0 {
 			k8sSharedWarmTarget = fileCfg.K8s.SharedWarmTarget
+		}
+		if fileCfg.K8s.DynamicWarmCapacityEnabled != nil {
+			k8sDynamicWarmCapacityEnabled = *fileCfg.K8s.DynamicWarmCapacityEnabled
+		}
+		if fileCfg.K8s.WarmCapacityMissWindow != "" {
+			if d, err := time.ParseDuration(fileCfg.K8s.WarmCapacityMissWindow); err == nil {
+				k8sWarmCapacityMissWindow = d
+			} else {
+				warn("Invalid k8s.warm_capacity_miss_window duration: " + err.Error())
+			}
+		}
+		if fileCfg.K8s.WarmCapacityMissesPerWorker != 0 {
+			k8sWarmCapacityMissesPerWorker = fileCfg.K8s.WarmCapacityMissesPerWorker
+		}
+		if fileCfg.K8s.WarmCapacityDemandTTL != "" {
+			if d, err := time.ParseDuration(fileCfg.K8s.WarmCapacityDemandTTL); err == nil {
+				k8sWarmCapacityDemandTTL = d
+			} else {
+				warn("Invalid k8s.warm_capacity_demand_ttl duration: " + err.Error())
+			}
+		}
+		if fileCfg.K8s.WarmCapacityDynamicImageCeiling != 0 {
+			k8sWarmCapacityDynamicImageCeiling = fileCfg.K8s.WarmCapacityDynamicImageCeiling
+		}
+		if fileCfg.K8s.WarmCapacityDynamicTotalCeiling != 0 {
+			k8sWarmCapacityDynamicTotalCeiling = fileCfg.K8s.WarmCapacityDynamicTotalCeiling
 		}
 		if fileCfg.DuckLake.DefaultSpecVersion != "" {
 			cfg.DuckLake.SpecVersion = fileCfg.DuckLake.DefaultSpecVersion
@@ -816,6 +853,48 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_K8S_SHARED_WARM_TARGET: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			k8sDynamicWarmCapacityEnabled = b
+		} else {
+			warn("Invalid DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			k8sWarmCapacityMissWindow = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sWarmCapacityMissesPerWorker = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			k8sWarmCapacityDemandTTL = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sWarmCapacityDynamicImageCeiling = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			k8sWarmCapacityDynamicTotalCeiling = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_K8S_WORKER_CPU_REQUEST"); v != "" {
 		k8sWorkerCPURequest = v
 	}
@@ -1137,40 +1216,70 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if cfg.DuckLake.DeltaCatalogEnabled && cfg.DuckLake.DeltaCatalogPath == "" {
 		cfg.DuckLake.DeltaCatalogPath = ducklake.DefaultDeltaCatalogPath(cfg.DuckLake)
 	}
+	if k8sWarmCapacityMissWindow <= 0 {
+		warn("k8s warm_capacity_miss_window must be > 0; using default")
+		k8sWarmCapacityMissWindow = controlplane.DefaultWarmCapacityMissWindow
+	}
+	if k8sWarmCapacityMissesPerWorker <= 0 {
+		warn("k8s warm_capacity_misses_per_worker must be > 0; using default")
+		k8sWarmCapacityMissesPerWorker = controlplane.DefaultWarmCapacityMissesPerWorker
+	}
+	if k8sWarmCapacityDemandTTL <= 0 {
+		warn("k8s warm_capacity_demand_ttl must be > 0; using default")
+		k8sWarmCapacityDemandTTL = controlplane.DefaultWarmCapacityDemandTTL
+	}
+	if k8sWarmCapacityDemandTTL < k8sWarmCapacityMissWindow {
+		warn("k8s warm_capacity_demand_ttl must be >= warm_capacity_miss_window; using warm_capacity_miss_window")
+		k8sWarmCapacityDemandTTL = k8sWarmCapacityMissWindow
+	}
+	if k8sWarmCapacityDynamicImageCeiling < 0 {
+		warn("k8s warm_capacity_dynamic_image_ceiling must be >= 0; disabling image ceiling")
+		k8sWarmCapacityDynamicImageCeiling = 0
+	}
+	if k8sWarmCapacityDynamicTotalCeiling < 0 {
+		warn("k8s warm_capacity_dynamic_total_ceiling must be >= 0; disabling total ceiling")
+		k8sWarmCapacityDynamicTotalCeiling = 0
+	}
 
 	return Resolved{
-		Server:                     cfg,
-		ProcessMinWorkers:          processMinWorkers,
-		ProcessMaxWorkers:          processMaxWorkers,
-		ProcessRetireOnSessionEnd:  processRetireOnSessionEnd,
-		SessionInitTimeout:         cfg.SessionInitTimeout,
-		WorkerQueueTimeout:         workerQueueTimeout,
-		WorkerIdleTimeout:          workerIdleTimeout,
-		HandoverDrainTimeout:       handoverDrainTimeout,
-		WorkerBackend:              workerBackend,
-		K8sWorkerImage:             k8sWorkerImage,
-		K8sWorkerNamespace:         k8sWorkerNamespace,
-		K8sControlPlaneID:          k8sControlPlaneID,
-		K8sWorkerPort:              k8sWorkerPort,
-		K8sWorkerSecret:            k8sWorkerSecret,
-		K8sWorkerConfigMap:         k8sWorkerConfigMap,
-		K8sWorkerImagePullPolicy:   k8sWorkerImagePullPolicy,
-		K8sWorkerServiceAccount:    k8sWorkerServiceAccount,
-		K8sMaxWorkers:              k8sMaxWorkers,
-		K8sSharedWarmTarget:        k8sSharedWarmTarget,
-		K8sWorkerCPURequest:        k8sWorkerCPURequest,
-		K8sWorkerMemoryRequest:     k8sWorkerMemoryRequest,
-		K8sWorkerNodeSelector:      k8sWorkerNodeSelector,
-		K8sWorkerTolerationKey:     k8sWorkerTolerationKey,
-		K8sWorkerTolerationValue:   k8sWorkerTolerationValue,
-		K8sWorkerExclusiveNode:     k8sWorkerExclusiveNode,
-		AWSRegion:                  awsRegion,
-		ConfigStoreConn:            configStoreConn,
-		ConfigPollInterval:         configPollInterval,
-		InternalSecret:             internalSecret,
-		SNIRoutingMode:             sniRoutingMode,
-		ManagedHostnameSuffixes:    managedHostnameSuffixes,
-		DuckLakeDefaultSpecVersion: cfg.DuckLake.SpecVersion,
+		Server:                             cfg,
+		ProcessMinWorkers:                  processMinWorkers,
+		ProcessMaxWorkers:                  processMaxWorkers,
+		ProcessRetireOnSessionEnd:          processRetireOnSessionEnd,
+		SessionInitTimeout:                 cfg.SessionInitTimeout,
+		WorkerQueueTimeout:                 workerQueueTimeout,
+		WorkerIdleTimeout:                  workerIdleTimeout,
+		HandoverDrainTimeout:               handoverDrainTimeout,
+		WorkerBackend:                      workerBackend,
+		K8sWorkerImage:                     k8sWorkerImage,
+		K8sWorkerNamespace:                 k8sWorkerNamespace,
+		K8sControlPlaneID:                  k8sControlPlaneID,
+		K8sWorkerPort:                      k8sWorkerPort,
+		K8sWorkerSecret:                    k8sWorkerSecret,
+		K8sWorkerConfigMap:                 k8sWorkerConfigMap,
+		K8sWorkerImagePullPolicy:           k8sWorkerImagePullPolicy,
+		K8sWorkerServiceAccount:            k8sWorkerServiceAccount,
+		K8sMaxWorkers:                      k8sMaxWorkers,
+		K8sSharedWarmTarget:                k8sSharedWarmTarget,
+		K8sDynamicWarmCapacityEnabled:      k8sDynamicWarmCapacityEnabled,
+		K8sWarmCapacityMissWindow:          k8sWarmCapacityMissWindow,
+		K8sWarmCapacityMissesPerWorker:     k8sWarmCapacityMissesPerWorker,
+		K8sWarmCapacityDemandTTL:           k8sWarmCapacityDemandTTL,
+		K8sWarmCapacityDynamicImageCeiling: k8sWarmCapacityDynamicImageCeiling,
+		K8sWarmCapacityDynamicTotalCeiling: k8sWarmCapacityDynamicTotalCeiling,
+		K8sWorkerCPURequest:                k8sWorkerCPURequest,
+		K8sWorkerMemoryRequest:             k8sWorkerMemoryRequest,
+		K8sWorkerNodeSelector:              k8sWorkerNodeSelector,
+		K8sWorkerTolerationKey:             k8sWorkerTolerationKey,
+		K8sWorkerTolerationValue:           k8sWorkerTolerationValue,
+		K8sWorkerExclusiveNode:             k8sWorkerExclusiveNode,
+		AWSRegion:                          awsRegion,
+		ConfigStoreConn:                    configStoreConn,
+		ConfigPollInterval:                 configPollInterval,
+		InternalSecret:                     internalSecret,
+		SNIRoutingMode:                     sniRoutingMode,
+		ManagedHostnameSuffixes:            managedHostnameSuffixes,
+		DuckLakeDefaultSpecVersion:         cfg.DuckLake.SpecVersion,
 	}
 }
 

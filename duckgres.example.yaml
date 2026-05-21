@@ -119,11 +119,10 @@ ducklake:
 
 # Kubernetes multi-tenant shared warm-pool settings
 # k8s:
-#   # Global cap for shared K8s workers. 0 auto-derives from memory_budget.
+#   # Global cap for shared K8s workers. 0 leaves Duckgres uncapped.
 #   max_workers: 0
-#   # Neutral shared warm-worker target. Separate from per-org limits and
-#   # process.min_workers. 0 disables shared prewarming. When > 0, the pool
-#   # maintains this many idle workers and activates them on-demand per org.
+#   # Neutral shared warm-worker target for the default worker image. Separate
+#   # from per-org limits and process.min_workers. 0 disables shared prewarming.
 #   shared_warm_target: 0
 
 # Process isolation (default: true)

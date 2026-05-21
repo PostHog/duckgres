@@ -28,7 +28,7 @@ func TestInitSearchPath(t *testing.T) {
 		defer func() { _ = conn.Close() }()
 
 		// "nonexistent_user" is not a schema — should fall back to 'main' without error
-		initSearchPath(conn, "nonexistent_user")
+		initSearchPath(conn, "nonexistent_user", "")
 
 		var searchPath string
 		if err := conn.QueryRowContext(context.Background(), "SELECT current_setting('search_path')").Scan(&searchPath); err != nil {
@@ -51,7 +51,7 @@ func TestInitSearchPath(t *testing.T) {
 			t.Fatalf("failed to create schema: %v", err)
 		}
 
-		initSearchPath(conn, "myuser")
+		initSearchPath(conn, "myuser", "")
 
 		var searchPath string
 		if err := conn.QueryRowContext(context.Background(), "SELECT current_setting('search_path')").Scan(&searchPath); err != nil {
@@ -59,6 +59,48 @@ func TestInitSearchPath(t *testing.T) {
 		}
 		if searchPath != "myuser,main,memory.main" {
 			t.Errorf("expected search_path 'myuser,main,memory.main', got %q", searchPath)
+		}
+	})
+
+	t.Run("honors client search_path and appends memory.main", func(t *testing.T) {
+		conn, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("failed to get connection: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		if _, err := conn.ExecContext(context.Background(), "CREATE SCHEMA IF NOT EXISTS chosen"); err != nil {
+			t.Fatalf("failed to create schema: %v", err)
+		}
+
+		// Client picked `chosen` at connect; memory.main must be appended.
+		initSearchPath(conn, "ignored_user", "chosen")
+
+		var searchPath string
+		if err := conn.QueryRowContext(context.Background(), "SELECT current_setting('search_path')").Scan(&searchPath); err != nil {
+			t.Fatalf("failed to query search_path: %v", err)
+		}
+		if searchPath != "chosen,memory.main" {
+			t.Errorf("expected search_path 'chosen,memory.main', got %q", searchPath)
+		}
+	})
+
+	t.Run("falls back to default when client search_path is invalid", func(t *testing.T) {
+		conn, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("failed to get connection: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		// A schema that doesn't exist: SET fails, fall back to the username default.
+		initSearchPath(conn, "nonexistent_user", "no_such_schema")
+
+		var searchPath string
+		if err := conn.QueryRowContext(context.Background(), "SELECT current_setting('search_path')").Scan(&searchPath); err != nil {
+			t.Fatalf("failed to query search_path: %v", err)
+		}
+		if searchPath != "main,memory.main" {
+			t.Errorf("expected fallback search_path 'main,memory.main', got %q", searchPath)
 		}
 	})
 }

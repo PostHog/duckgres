@@ -374,6 +374,14 @@ type WarmCapacityMissBucket struct {
 
 func (WarmCapacityMissBucket) TableName() string { return "warm_capacity_miss_buckets" }
 
+// WarmCapacityMissAggregate is the grouped demand signal read by warm-capacity
+// target computation.
+type WarmCapacityMissAggregate struct {
+	Scope  string                `json:"scope"`
+	Reason WorkerClaimMissReason `json:"reason"`
+	Count  int64                 `json:"count"`
+}
+
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {
 	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`

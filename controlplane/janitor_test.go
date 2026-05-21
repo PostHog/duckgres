@@ -142,6 +142,24 @@ func TestControlPlaneJanitorRunPrunesWarmCapacityMissBuckets(t *testing.T) {
 	}
 }
 
+func TestControlPlaneJanitorRunPrunesWarmCapacityMissBucketsWithConfiguredTTL(t *testing.T) {
+	store := &captureControlPlaneExpiryStore{}
+	now := time.Date(2026, time.March, 26, 15, 0, 5, 0, time.UTC)
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.warmCapacityMissBucketTTL = 7 * time.Minute
+
+	janitor.runOnce()
+
+	if len(store.pruneMissBucketsBefore) != 1 {
+		t.Fatalf("expected one warm capacity miss bucket prune call, got %d", len(store.pruneMissBucketsBefore))
+	}
+	want := now.Add(-7 * time.Minute).Truncate(configstore.WarmCapacityMissBucketSize)
+	if got := store.pruneMissBucketsBefore[0]; !got.Equal(want) {
+		t.Fatalf("expected warm capacity miss bucket prune cutoff %v, got %v", want, got)
+	}
+}
+
 func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{
 		orphanedWorkers: []configstore.WorkerRecord{
