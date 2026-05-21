@@ -279,13 +279,20 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	if len(in.KubernetesAuthAudiences) > 0 {
 		oauth2URI = lakekeeperbroker.DefaultOAuth2ServerURI
 	}
+	// NOTE: these are raw DB column names — GORM's Updates(map) uses keys
+	// verbatim, bypassing struct field→column mapping. They MUST match the
+	// columns AutoMigrate generated from ManagedWarehouseIceberg. GORM
+	// snake-cases the field LakekeeperOAuth2ServerURI to "o_auth2_server_uri"
+	// (it splits the OAuth2 acronym), so the column is
+	// iceberg_lakekeeper_o_auth2_server_uri — NOT ...oauth2.... A mismatch
+	// here fails the persist with "column does not exist" (SQLSTATE 42703).
 	updates := map[string]interface{}{
 		"iceberg_enabled":                                 true,
 		"iceberg_backend":                                 configstore.IcebergBackendLakekeeper,
 		"iceberg_lakekeeper_endpoint":                     baseURL + "/catalog",
 		"iceberg_lakekeeper_warehouse":                    wh.Name,
 		"iceberg_lakekeeper_client_id":                    oauthClientID(w.OrgID),
-		"iceberg_lakekeeper_oauth2_server_uri":            oauth2URI,
+		"iceberg_lakekeeper_o_auth2_server_uri":           oauth2URI,
 		"iceberg_lakekeeper_client_credentials_namespace": p.k8s.namespace,
 		"iceberg_lakekeeper_client_credentials_name":      secretName,
 		"iceberg_lakekeeper_client_credentials_key":       SecretKeyOAuth2ClientSecret,
