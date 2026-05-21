@@ -56,16 +56,22 @@ type ProcessFileConfig struct {
 
 // K8sFileConfig holds Kubernetes worker configuration from YAML.
 type K8sFileConfig struct {
-	WorkerImage           string `yaml:"worker_image"`
-	WorkerNamespace       string `yaml:"worker_namespace"`
-	ControlPlaneID        string `yaml:"control_plane_id"`
-	WorkerPort            int    `yaml:"worker_port"`
-	WorkerSecret          string `yaml:"worker_secret"`
-	WorkerConfigMap       string `yaml:"worker_configmap"`
-	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
-	WorkerServiceAccount  string `yaml:"worker_service_account"`
-	MaxWorkers            int    `yaml:"max_workers"`
-	SharedWarmTarget      int    `yaml:"shared_warm_target"`
+	WorkerImage                     string `yaml:"worker_image"`
+	WorkerNamespace                 string `yaml:"worker_namespace"`
+	ControlPlaneID                  string `yaml:"control_plane_id"`
+	WorkerPort                      int    `yaml:"worker_port"`
+	WorkerSecret                    string `yaml:"worker_secret"`
+	WorkerConfigMap                 string `yaml:"worker_configmap"`
+	WorkerImagePullPolicy           string `yaml:"worker_image_pull_policy"`
+	WorkerServiceAccount            string `yaml:"worker_service_account"`
+	MaxWorkers                      int    `yaml:"max_workers"`
+	SharedWarmTarget                int    `yaml:"shared_warm_target"`
+	DynamicWarmCapacityEnabled      *bool  `yaml:"dynamic_warm_capacity_enabled"`
+	WarmCapacityMissWindow          string `yaml:"warm_capacity_miss_window"`
+	WarmCapacityMissesPerWorker     int    `yaml:"warm_capacity_misses_per_worker"`
+	WarmCapacityDemandTTL           string `yaml:"warm_capacity_demand_ttl"`
+	WarmCapacityDynamicImageCeiling int    `yaml:"warm_capacity_dynamic_image_ceiling"`
+	WarmCapacityDynamicTotalCeiling int    `yaml:"warm_capacity_dynamic_total_ceiling"`
 }
 
 type QueryLogFileConfig struct {

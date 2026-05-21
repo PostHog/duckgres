@@ -7,12 +7,10 @@ import (
 	"testing"
 )
 
-// envOnlyCLIInputsFields lists CLIInputs struct fields that are intentionally
-// not registered as CLI flags — they are populated from env vars only by
-// design. CLAUDE.md ("K8s pod scheduling knobs are env-only") owns this list.
-// If you add a flag for one of these, remove it from the set; if you add a
-// new env-only field to CLIInputs, add it here.
-var envOnlyCLIInputsFields = map[string]bool{
+// nonFlagCLIInputsFields lists CLIInputs struct fields that are intentionally
+// not registered as CLI flags. The K8s pod scheduling knobs are env-only by
+// design.
+var nonFlagCLIInputsFields = map[string]bool{
 	"K8sWorkerCPURequest":      true,
 	"K8sWorkerMemoryRequest":   true,
 	"K8sWorkerNodeSelector":    true,
@@ -108,14 +106,14 @@ func TestRegisterCLIInputsFlagsCoversEveryCLIBackedField(t *testing.T) {
 		registered[f.Name] = true
 	})
 
-	// Walk CLIInputs; every non-Set, non-env-only field must be registered.
+	// Walk CLIInputs; every non-Set, CLI-backed field must be registered.
 	cliType := reflect.TypeOf(CLIInputs{})
 	for i := 0; i < cliType.NumField(); i++ {
 		field := cliType.Field(i)
 		if field.Name == "Set" {
 			continue
 		}
-		if envOnlyCLIInputsFields[field.Name] {
+		if nonFlagCLIInputsFields[field.Name] {
 			continue
 		}
 		flagName := fieldNameToFlagName(field.Name)

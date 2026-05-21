@@ -812,6 +812,35 @@ func (cs *ConfigStore) RecordWarmCapacityMiss(scope string, reason WorkerClaimMi
 	return nil
 }
 
+// ListWarmCapacityMissesSince returns aggregated warm-capacity miss counts by
+// scope and reason for buckets at or after the bucket containing since. Passing
+// reasons narrows the aggregation to those miss reasons.
+func (cs *ConfigStore) ListWarmCapacityMissesSince(since time.Time, reasons ...WorkerClaimMissReason) ([]WarmCapacityMissAggregate, error) {
+	reasonFilters := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		if reason == WorkerClaimMissReasonNone {
+			continue
+		}
+		reasonFilters = append(reasonFilters, string(reason))
+	}
+
+	sinceBucket := since.UTC().Truncate(WarmCapacityMissBucketSize)
+	query := cs.db.Table(cs.runtimeTable((&WarmCapacityMissBucket{}).TableName())).
+		Select("scope, reason, COALESCE(SUM(count), 0)::bigint AS count").
+		Where("bucket_start >= ?", sinceBucket).
+		Group("scope, reason").
+		Order("scope ASC, reason ASC")
+	if len(reasonFilters) > 0 {
+		query = query.Where("reason IN ?", reasonFilters)
+	}
+
+	var out []WarmCapacityMissAggregate
+	if err := query.Scan(&out).Error; err != nil {
+		return nil, fmt.Errorf("list warm capacity misses: %w", err)
+	}
+	return out, nil
+}
+
 // PruneWarmCapacityMissBuckets removes buckets older than the caller-provided
 // cutoff and returns the number of deleted rows.
 func (cs *ConfigStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, error) {

@@ -37,6 +37,7 @@ type ControlPlaneJanitor struct {
 	activateTimeout               time.Duration
 	maxDrainTimeout               time.Duration
 	hotIdleTTL                    time.Duration
+	warmCapacityMissBucketTTL     time.Duration
 	now                           func() time.Time
 	retireWorker                  func(record configstore.WorkerRecord, reason string)
 	retireOrphanWorker            func(record configstore.WorkerRecord, reason string) // orphan-cleanup variant: handles any active state, skips local-pool bookkeeping
@@ -54,14 +55,15 @@ func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeo
 		expiryTimeout = 20 * time.Second
 	}
 	return &ControlPlaneJanitor{
-		store:           store,
-		interval:        interval,
-		expiryTimeout:   expiryTimeout,
-		orphanGrace:     30 * time.Second,
-		spawnTimeout:    2 * time.Minute,
-		activateTimeout: 2 * time.Minute,
-		maxDrainTimeout: 15 * time.Minute,
-		now:             time.Now,
+		store:                     store,
+		interval:                  interval,
+		expiryTimeout:             expiryTimeout,
+		orphanGrace:               30 * time.Second,
+		spawnTimeout:              2 * time.Minute,
+		activateTimeout:           2 * time.Minute,
+		maxDrainTimeout:           15 * time.Minute,
+		warmCapacityMissBucketTTL: DefaultWarmCapacityDemandTTL,
+		now:                       time.Now,
 	}
 }
 
@@ -168,7 +170,11 @@ func (j *ControlPlaneJanitor) runOnce() {
 	}
 
 	if pruner, ok := j.store.(warmCapacityMissBucketPruner); ok {
-		cutoff := j.now().Add(-defaultWarmCapacityMissBucketTTL)
+		ttl := j.warmCapacityMissBucketTTL
+		if ttl <= 0 {
+			ttl = defaultWarmCapacityMissBucketTTL
+		}
+		cutoff := j.now().Add(-ttl).UTC().Truncate(configstore.WarmCapacityMissBucketSize)
 		pruned, err := pruner.PruneWarmCapacityMissBuckets(cutoff)
 		if err != nil {
 			slog.Warn("Janitor failed to prune warm capacity miss buckets.", "error", err)

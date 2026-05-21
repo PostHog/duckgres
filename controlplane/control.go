@@ -103,23 +103,29 @@ type ProcessConfig struct {
 
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage           string // Container image for worker pods (required)
-	WorkerNamespace       string // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID        string // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort            int    // gRPC port on worker pods (default: 8816)
-	WorkerSecret          string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
-	WorkerConfigMap       string // ConfigMap name for duckgres.yaml
-	ImagePullPolicy       string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount        string // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
-	MaxWorkers            int    // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
-	SharedWarmTarget      int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
-	WorkerCPURequest      string // CPU request for worker pods (e.g., "500m")
-	WorkerMemoryRequest   string // Memory request for worker pods (e.g., "1Gi")
-	WorkerNodeSelector    string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
-	WorkerTolerationKey   string // Taint key for worker pod NoSchedule toleration
-	WorkerTolerationValue string // Taint value for worker pod NoSchedule toleration
-	WorkerExclusiveNode   bool   // One worker per node via pod anti-affinity
-	AWSRegion             string // AWS region for STS client
+	WorkerImage                     string        // Container image for worker pods (required)
+	WorkerNamespace                 string        // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID                  string        // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort                      int           // gRPC port on worker pods (default: 8816)
+	WorkerSecret                    string        // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	WorkerConfigMap                 string        // ConfigMap name for duckgres.yaml
+	ImagePullPolicy                 string        // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount                  string        // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
+	MaxWorkers                      int           // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
+	SharedWarmTarget                int           // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
+	DynamicWarmCapacityEnabled      bool          // Enable configstore-driven dynamic warm-capacity target computation
+	WarmCapacityMissWindow          time.Duration // Window of recent no-idle misses that contributes to dynamic targets
+	WarmCapacityMissesPerWorker     int           // Number of recent misses that translate to one extra warm worker
+	WarmCapacityDemandTTL           time.Duration // Retention TTL for warm-capacity miss buckets
+	WarmCapacityDynamicImageCeiling int           // Max dynamic extra warm workers per image (0 = unlimited)
+	WarmCapacityDynamicTotalCeiling int           // Max dynamic extra warm workers across images (0 = unlimited)
+	WorkerCPURequest                string        // CPU request for worker pods (e.g., "500m")
+	WorkerMemoryRequest             string        // Memory request for worker pods (e.g., "1Gi")
+	WorkerNodeSelector              string        // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
+	WorkerTolerationKey             string        // Taint key for worker pod NoSchedule toleration
+	WorkerTolerationValue           string        // Taint value for worker pod NoSchedule toleration
+	WorkerExclusiveNode             bool          // One worker per node via pod anti-affinity
+	AWSRegion                       string        // AWS region for STS client
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.

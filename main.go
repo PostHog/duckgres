@@ -135,7 +135,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool (0=unbounded)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
@@ -344,23 +344,29 @@ func main() {
 			ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
 			DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
 			K8s: controlplane.K8sConfig{
-				WorkerImage:           resolved.K8sWorkerImage,
-				WorkerNamespace:       resolved.K8sWorkerNamespace,
-				ControlPlaneID:        resolved.K8sControlPlaneID,
-				WorkerPort:            resolved.K8sWorkerPort,
-				WorkerSecret:          resolved.K8sWorkerSecret,
-				WorkerConfigMap:       resolved.K8sWorkerConfigMap,
-				ImagePullPolicy:       resolved.K8sWorkerImagePullPolicy,
-				ServiceAccount:        resolved.K8sWorkerServiceAccount,
-				MaxWorkers:            resolved.K8sMaxWorkers,
-				SharedWarmTarget:      resolved.K8sSharedWarmTarget,
-				WorkerCPURequest:      resolved.K8sWorkerCPURequest,
-				WorkerMemoryRequest:   resolved.K8sWorkerMemoryRequest,
-				WorkerNodeSelector:    resolved.K8sWorkerNodeSelector,
-				WorkerTolerationKey:   resolved.K8sWorkerTolerationKey,
-				WorkerTolerationValue: resolved.K8sWorkerTolerationValue,
-				WorkerExclusiveNode:   resolved.K8sWorkerExclusiveNode,
-				AWSRegion:             resolved.AWSRegion,
+				WorkerImage:                     resolved.K8sWorkerImage,
+				WorkerNamespace:                 resolved.K8sWorkerNamespace,
+				ControlPlaneID:                  resolved.K8sControlPlaneID,
+				WorkerPort:                      resolved.K8sWorkerPort,
+				WorkerSecret:                    resolved.K8sWorkerSecret,
+				WorkerConfigMap:                 resolved.K8sWorkerConfigMap,
+				ImagePullPolicy:                 resolved.K8sWorkerImagePullPolicy,
+				ServiceAccount:                  resolved.K8sWorkerServiceAccount,
+				MaxWorkers:                      resolved.K8sMaxWorkers,
+				SharedWarmTarget:                resolved.K8sSharedWarmTarget,
+				DynamicWarmCapacityEnabled:      resolved.K8sDynamicWarmCapacityEnabled,
+				WarmCapacityMissWindow:          resolved.K8sWarmCapacityMissWindow,
+				WarmCapacityMissesPerWorker:     resolved.K8sWarmCapacityMissesPerWorker,
+				WarmCapacityDemandTTL:           resolved.K8sWarmCapacityDemandTTL,
+				WarmCapacityDynamicImageCeiling: resolved.K8sWarmCapacityDynamicImageCeiling,
+				WarmCapacityDynamicTotalCeiling: resolved.K8sWarmCapacityDynamicTotalCeiling,
+				WorkerCPURequest:                resolved.K8sWorkerCPURequest,
+				WorkerMemoryRequest:             resolved.K8sWorkerMemoryRequest,
+				WorkerNodeSelector:              resolved.K8sWorkerNodeSelector,
+				WorkerTolerationKey:             resolved.K8sWorkerTolerationKey,
+				WorkerTolerationValue:           resolved.K8sWorkerTolerationValue,
+				WorkerExclusiveNode:             resolved.K8sWorkerExclusiveNode,
+				AWSRegion:                       resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)
