@@ -995,6 +995,45 @@ func TestK8sPoolSpawnMinWorkersForImageSpawnsOnlyTheDeficit(t *testing.T) {
 	}
 }
 
+func TestK8sPoolSpawnMinWorkersForImageCountsMixedSpawnResults(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	image := "duckgres:metrics-mixed"
+	scope := warmCapacityImageScope(image)
+	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(scope, "success")
+	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(scope, "error")
+
+	nextID := 100
+	store := &captureRuntimeWorkerStore{
+		perImageSpawnedFunc: func(image string) *configstore.WorkerRecord {
+			nextID++
+			return &configstore.WorkerRecord{
+				WorkerID:          nextID,
+				PodName:           fmt.Sprintf("duckgres-worker-test-cp-%d", nextID),
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				Image:             image,
+			}
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		if id == 102 {
+			return errors.New("spawn failed")
+		}
+		return nil
+	}
+
+	if err := pool.SpawnMinWorkersForImage(context.Background(), image, 2); err == nil {
+		t.Fatal("expected mixed spawn batch to return an error")
+	}
+	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, scope, "success"); got != 1 {
+		t.Fatalf("expected one successful reconcile spawn, got %v", got)
+	}
+	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, scope, "error"); got != 1 {
+		t.Fatalf("expected one failed reconcile spawn, got %v", got)
+	}
+}
+
 func TestK8sPoolSpawnMinWorkersForImageNoOpWhenIdleCountAtTarget(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{}

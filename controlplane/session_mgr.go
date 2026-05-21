@@ -173,7 +173,6 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username, searchPat
 	ctx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
 	slog.Debug("Acquiring worker for session.", "pid", pid, "user", username)
 	worker, err := sm.pool.AcquireWorker(ctx)
-	acquireSpan.End()
 	if err != nil {
 		var capacityErr *WarmCapacityExhaustedError
 		if errors.As(err, &capacityErr) {
@@ -194,8 +193,10 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username, searchPat
 				"error", err,
 			)
 		}
+		acquireSpan.End()
 		return 0, nil, fmt.Errorf("acquire worker: %w", err)
 	}
+	acquireSpan.End()
 	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
 	pid, exec, err := sm.createSessionOnWorker(ctx, username, searchPath, pid, memoryLimit, threads, worker, "postgres", true)

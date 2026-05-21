@@ -281,7 +281,7 @@ func SetupMultiTenant(
 		logWarmCapacityTargetChanges(lastWarmCapacityTargets, targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets)
 		lastWarmCapacityTargets = cloneWarmCapacityTargets(targetSnapshot.EffectiveTargets)
 
-		globalCapBlocked := warmCapacityGlobalCapBlocksDemand(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, targetSnapshot.RecentMisses, cfg.K8s.MaxWorkers)
+		globalCapBlocked := warmCapacityGlobalCapBlocksDemand(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, targetSnapshot.RecentMisses, cfg.K8s)
 		if globalCapBlocked && !lastWarmCapacityGlobalCapBlocked {
 			slog.Info("Global worker cap prevents dynamic warm capacity.", "max_workers", cfg.K8s.MaxWorkers, "base_target_total", sumIntMap(targetSnapshot.BaseTargets), "effective_target_total", sumIntMap(targetSnapshot.EffectiveTargets))
 		}
@@ -528,29 +528,21 @@ func cloneWarmCapacityWorkerStats(stats []configstore.WarmCapacityWorkerStats) [
 	return out
 }
 
-func warmCapacityGlobalCapBlocksDemand(baseTargets, effectiveTargets map[string]int, aggregates []configstore.WarmCapacityMissAggregate, maxWorkers int) bool {
-	if maxWorkers <= 0 || len(aggregates) == 0 {
+func warmCapacityGlobalCapBlocksDemand(baseTargets, effectiveTargets map[string]int, aggregates []configstore.WarmCapacityMissAggregate, cfg K8sConfig) bool {
+	if cfg.MaxWorkers <= 0 || len(aggregates) == 0 {
 		return false
 	}
-	if sumIntMap(baseTargets) < maxWorkers {
+	effectiveTotal := sumIntMap(effectiveTargets)
+	if effectiveTotal < cfg.MaxWorkers {
 		return false
 	}
-	for _, aggregate := range aggregates {
-		if aggregate.Count <= 0 {
-			continue
-		}
-		if !warmCapacityMissPolicyForReason(aggregate.Reason).recordDynamicDemand {
-			continue
-		}
-		image, ok := strings.CutPrefix(strings.TrimSpace(aggregate.Scope), "image:")
-		if !ok || strings.TrimSpace(image) == "" {
-			continue
-		}
-		if positiveMapValue(effectiveTargets, image) <= positiveMapValue(baseTargets, image) {
-			return true
-		}
+	dynamicCfg := dynamicWarmCapacityConfigFromK8s(cfg)
+	if !dynamicCfg.Enabled {
+		return false
 	}
-	return false
+	dynamicCfg.MaxWorkers = 0
+	uncappedTargets := computeDynamicWarmCapacityTargets(baseTargets, aggregates, dynamicCfg)
+	return sumIntMap(uncappedTargets) > effectiveTotal
 }
 
 func reconcileWarmCapacityImageTargets(pool *K8sWorkerPool, targets map[string]int) {

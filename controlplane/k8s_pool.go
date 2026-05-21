@@ -2012,11 +2012,17 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 	}
 	wg.Wait()
 	err := stderrors.Join(errs...)
-	result := "success"
-	if err != nil {
-		result = "error"
+	successes := 0
+	failures := 0
+	for _, spawnErr := range errs {
+		if spawnErr != nil {
+			failures++
+		} else {
+			successes++
+		}
 	}
-	observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), result, len(slots))
+	observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "success", successes)
+	observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "error", failures)
 	return err
 }
 
