@@ -250,56 +250,22 @@ func SetupMultiTenant(
 		return router.sharedPool.retireWorkerWithReason(workerID, reason)
 	}
 	janitor.reconcileWarmCapacity = func() {
-		// Demand-aware warm-pool scale-up: drain the warm-capacity miss
-		// counter and add it to the static target. A burst of N cold tenants
-		// (all returning WarmCapacityExhausted on first try) bumps the next
-		// tick's effective target by ~N, so the pool spawns toward demand
-		// in a single tick instead of creeping up at SharedWarmTarget while
-		// clients politely re-arrive on the 45-second retry hint. Karpenter
-		// (~30s) and pod scheduling are the real lower bounds on cold-start
-		// latency, not CP reconciler step size.
-		//
-		// Scale-DOWN is intentionally untouched here — the idle reaper still
-		// runs on its own slower cadence so dipping idle counts don't thrash
-		// the pool. We only ever scale UP off the demand counter.
-		staticTarget := router.sharedPool.WarmCapacityTarget()
-		demand := router.sharedPool.ConsumeWarmCapacityDemand()
-		target := staticTarget + demand
-		if target > 0 {
-			if demand > 0 {
-				slog.Info("Scaling shared warm pool to absorb demand.",
-					"static_target", staticTarget,
-					"observed_demand", demand,
-					"effective_target", target)
-			}
-			observeOrgWorkerSpawn("shared")
-			if err := router.sharedPool.SpawnMinWorkers(target); err != nil {
-				slog.Warn("Janitor failed to reconcile shared warm capacity.", "target", target, "error", err)
-			}
+		snap := store.Snapshot()
+		if snap == nil {
+			return
 		}
-
-		// Per-image warm floor: ensure at least one warm pod for each
-		// distinct DuckDB version image in active use, so per-org pins
-		// always find a hot pod waiting instead of paying a cold spawn.
-		// Run in parallel — SpawnMinWorkersForImage blocks on pod startup,
-		// and a slow image must not block the others (and the next janitor
-		// tick) for N×30s.
-		perImage := router.sharedPool.PerImageWarmTargets()
-		if len(perImage) > 0 {
-			var wg sync.WaitGroup
-			for image, count := range perImage {
-				wg.Add(1)
-				go func(image string, count int) {
-					defer wg.Done()
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					if err := router.sharedPool.SpawnMinWorkersForImage(ctx, image, count); err != nil {
-						slog.Warn("Janitor failed to reconcile per-image warm capacity.", "image", image, "target", count, "error", err)
-					}
-				}(image, count)
-			}
-			wg.Wait()
+		baseTargets := router.computeBaseWarmCapacityTargets(snap)
+		targets, err := computeEffectiveWarmCapacityTargets(
+			baseTargets,
+			store,
+			cfg.K8s,
+			janitor.now(),
+		)
+		if err != nil {
+			slog.Warn("Janitor failed to read dynamic warm-capacity demand; reconciling base warm targets only.", "error", err)
 		}
+		router.sharedPool.SetPerImageWarmTargets(targets)
+		reconcileWarmCapacityImageTargets(router.sharedPool, targets)
 	}
 	janitor.retireMismatchedVersionWorker = func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -433,6 +399,54 @@ func SetupMultiTenant(
 	}()
 
 	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
+}
+
+type warmCapacityMissAggregateLister interface {
+	ListWarmCapacityMissesSince(since time.Time, reasons ...configstore.WorkerClaimMissReason) ([]configstore.WarmCapacityMissAggregate, error)
+}
+
+func computeEffectiveWarmCapacityTargets(baseTargets map[string]int, lister warmCapacityMissAggregateLister, cfg K8sConfig, now time.Time) (map[string]int, error) {
+	dynamicCfg := dynamicWarmCapacityConfigFromK8s(cfg)
+	if !dynamicCfg.Enabled {
+		return sanitizeWarmCapacityTargets(baseTargets), nil
+	}
+	if lister == nil {
+		return sanitizeWarmCapacityTargets(baseTargets), nil
+	}
+	window := cfg.WarmCapacityMissWindow
+	if window <= 0 {
+		window = DefaultWarmCapacityMissWindow
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	aggregates, err := lister.ListWarmCapacityMissesSince(now.Add(-window), configstore.WorkerClaimMissReasonNoIdle)
+	if err != nil {
+		return sanitizeWarmCapacityTargets(baseTargets), err
+	}
+	return computeDynamicWarmCapacityTargets(baseTargets, aggregates, dynamicCfg), nil
+}
+
+func reconcileWarmCapacityImageTargets(pool *K8sWorkerPool, targets map[string]int) {
+	if pool == nil || len(targets) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	for image, count := range targets {
+		if count <= 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(image string, count int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := pool.SpawnMinWorkersForImage(ctx, image, count); err != nil {
+				slog.Warn("Janitor failed to reconcile image warm capacity.", "image", image, "target", count, "error", err)
+			}
+		}(image, count)
+	}
+	wg.Wait()
 }
 
 func resolveK8sNamespace(namespace string) (string, error) {

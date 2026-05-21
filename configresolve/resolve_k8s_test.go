@@ -33,8 +33,8 @@ func TestResolveEffectiveExposesDuckLakeDefaultSpecVersionForControlPlane(t *tes
 func TestResolveEffectiveDefaultsK8sDynamicWarmCapacityConfig(t *testing.T) {
 	resolved := ResolveEffective(nil, CLIInputs{}, nil, nil)
 
-	if resolved.K8sDynamicWarmCapacityEnabled {
-		t.Fatal("expected dynamic warm capacity to default disabled")
+	if !resolved.K8sDynamicWarmCapacityEnabled {
+		t.Fatal("expected dynamic warm capacity to default enabled")
 	}
 	if resolved.K8sWarmCapacityMissWindow != controlplane.DefaultWarmCapacityMissWindow {
 		t.Fatalf("expected miss window %s, got %s", controlplane.DefaultWarmCapacityMissWindow, resolved.K8sWarmCapacityMissWindow)
@@ -53,8 +53,8 @@ func TestResolveEffectiveDefaultsK8sDynamicWarmCapacityConfig(t *testing.T) {
 	}
 }
 
-func TestResolveEffectiveK8sDynamicWarmCapacityEnvOverridesFile(t *testing.T) {
-	fileEnabled := false
+func TestResolveEffectiveK8sDynamicWarmCapacityPrecedence(t *testing.T) {
+	fileEnabled := true
 	fileCfg := &configloader.FileConfig{
 		K8s: configloader.K8sFileConfig{
 			DynamicWarmCapacityEnabled:      &fileEnabled,
@@ -73,28 +73,44 @@ func TestResolveEffectiveK8sDynamicWarmCapacityEnvOverridesFile(t *testing.T) {
 		"DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING": "3",
 		"DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING": "5",
 	}
+	cli := CLIInputs{
+		Set: map[string]bool{
+			"k8s-dynamic-warm-capacity-enabled":       true,
+			"k8s-warm-capacity-miss-window":           true,
+			"k8s-warm-capacity-misses-per-worker":     true,
+			"k8s-warm-capacity-demand-ttl":            true,
+			"k8s-warm-capacity-dynamic-image-ceiling": true,
+			"k8s-warm-capacity-dynamic-total-ceiling": true,
+		},
+		K8sDynamicWarmCapacityEnabled:      false,
+		K8sWarmCapacityMissWindow:          "5m",
+		K8sWarmCapacityMissesPerWorker:     7,
+		K8sWarmCapacityDemandTTL:           "14m",
+		K8sWarmCapacityDynamicImageCeiling: 8,
+		K8sWarmCapacityDynamicTotalCeiling: 9,
+	}
 
-	resolved := ResolveEffective(fileCfg, CLIInputs{}, func(key string) string {
+	resolved := ResolveEffective(fileCfg, cli, func(key string) string {
 		return env[key]
 	}, nil)
 
-	if !resolved.K8sDynamicWarmCapacityEnabled {
-		t.Fatal("expected env true to override file false")
+	if resolved.K8sDynamicWarmCapacityEnabled {
+		t.Fatal("expected explicit CLI false to override file/env true")
 	}
-	if resolved.K8sWarmCapacityMissWindow != 4*time.Minute {
-		t.Fatalf("expected miss window 4m, got %s", resolved.K8sWarmCapacityMissWindow)
+	if resolved.K8sWarmCapacityMissWindow != 5*time.Minute {
+		t.Fatalf("expected miss window 5m, got %s", resolved.K8sWarmCapacityMissWindow)
 	}
-	if resolved.K8sWarmCapacityMissesPerWorker != 6 {
-		t.Fatalf("expected misses per worker 6, got %d", resolved.K8sWarmCapacityMissesPerWorker)
+	if resolved.K8sWarmCapacityMissesPerWorker != 7 {
+		t.Fatalf("expected misses per worker 7, got %d", resolved.K8sWarmCapacityMissesPerWorker)
 	}
-	if resolved.K8sWarmCapacityDemandTTL != 13*time.Minute {
-		t.Fatalf("expected demand TTL 13m, got %s", resolved.K8sWarmCapacityDemandTTL)
+	if resolved.K8sWarmCapacityDemandTTL != 14*time.Minute {
+		t.Fatalf("expected demand TTL 14m, got %s", resolved.K8sWarmCapacityDemandTTL)
 	}
-	if resolved.K8sWarmCapacityDynamicImageCeiling != 3 {
-		t.Fatalf("expected image ceiling 3, got %d", resolved.K8sWarmCapacityDynamicImageCeiling)
+	if resolved.K8sWarmCapacityDynamicImageCeiling != 8 {
+		t.Fatalf("expected image ceiling 8, got %d", resolved.K8sWarmCapacityDynamicImageCeiling)
 	}
-	if resolved.K8sWarmCapacityDynamicTotalCeiling != 5 {
-		t.Fatalf("expected total ceiling 5, got %d", resolved.K8sWarmCapacityDynamicTotalCeiling)
+	if resolved.K8sWarmCapacityDynamicTotalCeiling != 9 {
+		t.Fatalf("expected total ceiling 9, got %d", resolved.K8sWarmCapacityDynamicTotalCeiling)
 	}
 }
 

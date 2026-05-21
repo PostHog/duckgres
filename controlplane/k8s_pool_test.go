@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3539,111 +3538,5 @@ func TestReapIdleWorkersSkipsWorkersWithinIdleTimeout(t *testing.T) {
 
 	if len(pool.workers) != 2 {
 		t.Errorf("expected both workers to survive (under idleTimeout); got %d remaining", len(pool.workers))
-	}
-}
-
-// TestK8sPoolWarmCapacityDemandScalesPoolInOneTick reproduces the 30-tenant
-// cold-ramp regression: with the static SharedWarmTarget set low (5) and 30
-// orgs racing in simultaneously, the warm pool used to creep up by ~2-3
-// workers per janitor tick because the reconciler only ever filled to the
-// static floor. The demand counter on ReserveSharedWorker now surfaces the
-// observed shortage so a single reconcile pass scales to ~staticTarget +
-// observed_demand = 35, closing the gap in one tick instead of many.
-//
-// Drives 30 concurrent ReserveSharedWorker calls against a store that
-// always returns NoIdle, then simulates one janitor tick by calling
-// SpawnMinWorkers(static + ConsumeWarmCapacityDemand()) and asserts the
-// pool tried to spawn ~30 fresh slots in that single tick.
-func TestK8sPoolWarmCapacityDemandScalesPoolInOneTick(t *testing.T) {
-	pool, _ := newTestK8sPool(t, 0) // unbounded — matches the post-cap K8s mode
-	store := &captureRuntimeWorkerStore{
-		claimMissReason: configstore.WorkerClaimMissReasonNoIdle,
-	}
-	pool.runtimeStore = store
-
-	// Allocate distinct worker IDs for each spawn slot the reconciler will
-	// request. Real ConfigStore generates these from a sequence; here we
-	// just hand back monotonically increasing ids so the parallel spawn
-	// fan-out has unique records to drive.
-	var slotIdx int64
-	store.neutralSpawnedFunc = func() *configstore.WorkerRecord {
-		id := int(atomic.AddInt64(&slotIdx, 1))
-		return &configstore.WorkerRecord{
-			WorkerID:          1000 + id,
-			PodName:           fmt.Sprintf("duckgres-worker-test-cp-%d", 1000+id),
-			State:             configstore.WorkerStateSpawning,
-			OwnerCPInstanceID: pool.cpInstanceID,
-		}
-	}
-
-	// Capture every spawn the reconciler kicks off. We don't actually start
-	// pods — the fake clientset can't, and the test only cares that the
-	// reconciler asked for ~30 spawns in one pass.
-	var spawnedMu sync.Mutex
-	var spawnedIDs []int
-	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		spawnedMu.Lock()
-		spawnedIDs = append(spawnedIDs, id)
-		spawnedMu.Unlock()
-		return nil
-	}
-
-	// Step 1: a static warm-pool floor (the operator-configured
-	// SharedWarmTarget) — matches the production "5 initial warm" baseline.
-	const staticTarget = 5
-	pool.SetWarmCapacityTarget(staticTarget)
-
-	// Step 2: 30 cold tenants race in simultaneously. Each ReserveSharedWorker
-	// claim misses (store returns NoIdle), each call records one demand miss.
-	const burst = 30
-	var reserveWG sync.WaitGroup
-	reserveWG.Add(burst)
-	for i := 0; i < burst; i++ {
-		go func(i int) {
-			defer reserveWG.Done()
-			worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
-				OrgID: fmt.Sprintf("org-%d", i),
-				Image: pool.workerImage,
-			})
-			var capacityErr *WarmCapacityExhaustedError
-			if !errors.As(err, &capacityErr) {
-				t.Errorf("org-%d: expected WarmCapacityExhausted, got worker=%v err=%v", i, worker, err)
-			}
-		}(i)
-	}
-	reserveWG.Wait()
-
-	// Step 3: drain the demand counter (this is what the janitor's
-	// reconcileWarmCapacity closure does each tick).
-	demand := pool.ConsumeWarmCapacityDemand()
-	if demand != burst {
-		t.Fatalf("expected ConsumeWarmCapacityDemand=%d, got %d", burst, demand)
-	}
-	// And confirm the counter actually reset — a second read must see zero.
-	if again := pool.ConsumeWarmCapacityDemand(); again != 0 {
-		t.Fatalf("expected counter reset to 0 after consume, got %d", again)
-	}
-
-	// Step 4: one janitor tick. Effective target = static + observed demand.
-	effectiveTarget := staticTarget + demand
-	if err := pool.SpawnMinWorkers(effectiveTarget); err != nil {
-		t.Fatalf("SpawnMinWorkers(%d): %v", effectiveTarget, err)
-	}
-
-	// Step 5: the reconciler must have asked for ~`effectiveTarget` fresh
-	// slots in this single tick — not crept up by 2-3 per minute the way it
-	// did before the demand counter was wired up. The exact count depends
-	// on whether any pre-existing workers were idle (none here, so it
-	// should be exactly effectiveTarget = 35).
-	spawnedMu.Lock()
-	got := len(spawnedIDs)
-	spawnedMu.Unlock()
-	if got != effectiveTarget {
-		t.Fatalf("expected %d spawns in one tick (static %d + demand %d), got %d",
-			effectiveTarget, staticTarget, demand, got)
-	}
-	if store.neutralSpawnCalls != effectiveTarget {
-		t.Fatalf("expected %d neutral spawn slot allocations, got %d",
-			effectiveTarget, store.neutralSpawnCalls)
 	}
 }

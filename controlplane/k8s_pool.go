@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"crypto/x509"
@@ -100,13 +99,6 @@ type K8sWorkerPool struct {
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 
-	// warmCapacityMisses counts ReserveSharedWorker calls that returned
-	// WarmCapacityExhaustedError since the last ConsumeWarmCapacityDemand call.
-	// The janitor's warm-capacity reconciler drains this counter each tick and
-	// scales the warm pool to absorb the observed demand in one shot, rather
-	// than creeping up at the static SharedWarmTarget floor while cold tenants
-	// retry on 45-second backoffs. Atomically accessed; no lock needed.
-	warmCapacityMisses atomic.Int64
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -1484,7 +1476,6 @@ func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, rea
 	if !policy.recordDynamicDemand {
 		return
 	}
-	p.warmCapacityMisses.Add(1)
 	if p.runtimeStore == nil {
 		return
 	}
@@ -2919,22 +2910,6 @@ func (p *K8sWorkerPool) WarmCapacityTarget() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.minWorkers
-}
-
-// ConsumeWarmCapacityDemand returns the number of ReserveSharedWorker calls
-// that have hit WarmCapacityExhausted (excluding per-org cap misses) since
-// the last call, atomically resetting the counter. The warm-pool reconciler
-// adds this to the static target each tick so a cold burst of N tenants
-// scales the pool toward N workers in one or two ticks, instead of creeping
-// up while clients re-arrive on their 45-second retry hints. Scale-down
-// stays under the idle reaper's slower cadence so steady-state idle dips
-// don't thrash the pool.
-func (p *K8sWorkerPool) ConsumeWarmCapacityDemand() int {
-	n := p.warmCapacityMisses.Swap(0)
-	if n < 0 {
-		return 0
-	}
-	return int(n)
 }
 
 // SetPerImageWarmTargets replaces the per-image warm-worker floor. Each entry
