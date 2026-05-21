@@ -435,8 +435,10 @@ func (svc *DuckDBService) Shutdown() {
 	svc.pool.CloseAll()
 }
 
-// CreateSession creates a new DuckDB session for the given username.
-func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (*Session, error) {
+// CreateSession creates a new DuckDB session for the given username. When
+// searchPath is non-empty it is the client's connect-time search_path
+// (sanitized control-plane side) and overrides the username-based default.
+func (p *SessionPool) CreateSession(username, memoryLimit, searchPath string, threads int) (*Session, error) {
 	start := time.Now()
 	// Reserve a slot under the lock to prevent TOCTOU race on maxSessions.
 	p.mu.Lock()
@@ -523,7 +525,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 
 	// Initialize the session connection with username-specific state if needed.
 	// Since the DB is shared, we must set session-local parameters here.
-	initSearchPath(conn, username)
+	initSearchPath(conn, username, searchPath)
 
 	// Re-apply DuckDB profiling settings on the freshly-pooled connection.
 	// ConfigureMainDB sets these once at warmup, but in cluster mode the
@@ -920,7 +922,27 @@ func dropTemporary(conn *sql.Conn, query, dropFmt string) bool {
 // format_type, etc.) remain resolvable when the default catalog is ducklake.
 // Without it, DuckDB restricts function resolution to the ducklake catalog
 // and psql commands like \dt fail.
-func initSearchPath(conn *sql.Conn, username string) {
+func initSearchPath(conn *sql.Conn, username, clientSearchPath string) {
+	// Honor a client-supplied connect-time search_path (from the startup
+	// `options` parameter, e.g. `options=-c search_path=iceberg.public`) so a
+	// session can pick its default catalog/schema at connect — the standard
+	// mechanism BI tools and JDBC (currentSchema) use. The value is sanitized
+	// control-plane side. memory.main is appended so pg_catalog macros stay
+	// resolvable. On failure (e.g. the schema doesn't exist) we fall through to
+	// the username-based default rather than leaving the session unconfigured.
+	if clientSearchPath != "" {
+		sp := clientSearchPath
+		if !strings.Contains(strings.ToLower(sp), "memory.main") {
+			sp += ",memory.main"
+		}
+		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET search_path = '%s'", sp)); err == nil {
+			return
+		} else {
+			slog.Warn("Client-requested search_path rejected; using default.", "user", username, "search_path", clientSearchPath, "error", err)
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}
+
 	if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET search_path = '%s,main,memory.main'", username)); err != nil {
 		slog.Debug("User schema not found, using default search_path.", "user", username)
 		// Clear the aborted transaction state before retrying.

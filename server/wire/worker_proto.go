@@ -31,6 +31,10 @@ type WorkerCreateSessionPayload struct {
 	Username    string `json:"username"`
 	MemoryLimit string `json:"memory_limit"`
 	Threads     int    `json:"threads"`
+	// SearchPath, when set, is the client's connect-time search_path (parsed
+	// from the startup `options` parameter, e.g. `-c search_path=iceberg.public`).
+	// Empty means use the worker's default. Sanitized control-plane side.
+	SearchPath string `json:"search_path,omitempty"`
 }
 
 // WorkerDestroySessionPayload is the control plane request body for

@@ -150,7 +150,7 @@ func (sm *SessionManager) removeWaiterLocked(waiter *connectionWaiter) {
 // CreateSession acquires a worker from the configured pool, creates a session
 // on it, and rebalances memory/thread limits across all active sessions.
 // If pid is 0, a new one is generated.
-func (sm *SessionManager) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
+func (sm *SessionManager) CreateSession(ctx context.Context, username, searchPath string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
 	if err := sm.acquireSlot(ctx); err != nil {
 		return 0, nil, err
 	}
@@ -190,7 +190,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	}
 	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, pid, memoryLimit, threads, worker, "postgres", true)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, searchPath, pid, memoryLimit, threads, worker, "postgres", true)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -230,7 +230,7 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	if err != nil {
 		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
 	}
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, "", 0, "", 0, worker, "flight", false)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -238,7 +238,7 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	return pid, exec, nil
 }
 
-func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *flightclient.FlightExecutor, error) {
+func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username, searchPath string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *flightclient.FlightExecutor, error) {
 	createStart := time.Now()
 	slog.Info("Creating session on worker.",
 		"pid", pid,
@@ -250,7 +250,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		"owner_cp_instance_id", worker.OwnerCPInstanceID(),
 		"owner_epoch", worker.OwnerEpoch(),
 	)
-	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
+	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, searchPath, threads)
 	if err != nil {
 		slog.Warn("Failed to create session on worker.",
 			"pid", pid,
