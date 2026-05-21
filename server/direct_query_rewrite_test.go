@@ -90,9 +90,11 @@ func TestRewriteDirectQuery(t *testing.T) {
 	}
 }
 
-// When iceberg is NOT enabled for the session, `USE iceberg` must pass through
-// unchanged (no rewrite to a schema that isn't attached).
-func TestRewriteDirectQueryUseIcebergPassthroughWhenDisabled(t *testing.T) {
+// `USE iceberg` is rewritten regardless of cfg.Iceberg.Enabled, because the
+// rewrite runs on the control-plane proxy conn where cfg.Iceberg.Enabled is
+// always false (the per-org flag lives on the worker). Gating on it there
+// silently disabled the rewrite for every tenant.
+func TestRewriteDirectQueryUseIcebergRewrittenEvenWhenCfgDisabled(t *testing.T) {
 	c := &clientConn{
 		server: &Server{cfg: Config{
 			DuckLake: DuckLakeConfig{MetadataStore: "postgres:host=127.0.0.1 dbname=ducklake"},
@@ -101,7 +103,7 @@ func TestRewriteDirectQueryUseIcebergPassthroughWhenDisabled(t *testing.T) {
 		database:              "test",
 		logicalCatalogMapping: true,
 	}
-	if got, want := c.rewriteDirectQuery("USE iceberg"), "USE iceberg"; got != want {
+	if got, want := c.rewriteDirectQuery("USE iceberg"), "USE iceberg.public"; got != want {
 		t.Fatalf("rewriteDirectQuery(USE iceberg) = %q, want %q", got, want)
 	}
 }
