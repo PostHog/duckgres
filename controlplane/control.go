@@ -111,7 +111,7 @@ type K8sConfig struct {
 	WorkerConfigMap       string // ConfigMap name for duckgres.yaml
 	ImagePullPolicy       string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
 	ServiceAccount        string // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
-	MaxWorkers            int    // Global cap for the shared K8s worker pool (0 = auto-derived)
+	MaxWorkers            int    // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
 	SharedWarmTarget      int    // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
 	WorkerCPURequest      string // CPU request for worker pods (e.g., "500m")
 	WorkerMemoryRequest   string // Memory request for worker pods (e.g., "1Gi")
@@ -346,7 +346,12 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	memBudget := server.ParseMemoryBytes(cfg.MemoryBudget)
 
 	// Use a temporary rebalancer to auto-detect the budget and derive
-	// backend-specific default max_workers if not explicitly set.
+	// process-mode default max_workers if not explicitly set. The K8s
+	// backend does NOT derive max_workers from this budget — worker pods
+	// run on separate nodes, so the CP's RAM tells us nothing about how
+	// many worker pods the cluster can host. For K8s mode, MaxWorkers=0
+	// means "unbounded" and the cluster's NodePool/autoscaler is the
+	// natural ceiling.
 	tempRebalancer := NewMemoryRebalancer(memBudget, 0, nil, false)
 	memBudget = tempRebalancer.memoryBudget // capture auto-detected value
 
@@ -354,10 +359,8 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if processMaxWorkers == 0 {
 		processMaxWorkers = tempRebalancer.DefaultMaxWorkers()
 	}
+	// K8s max_workers: 0 = unbounded (no cap derived from CP memory).
 	k8sMaxWorkers := cfg.K8s.MaxWorkers
-	if k8sMaxWorkers == 0 {
-		k8sMaxWorkers = tempRebalancer.DefaultMaxWorkers()
-	}
 
 	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance)
 
@@ -366,10 +369,8 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			"process_max_workers", processMaxWorkers,
 			"memory_budget", formatBytes(memBudget))
 	}
-	if isK8s && cfg.K8s.MaxWorkers == 0 {
-		slog.Info("Derived k8s.max_workers from memory budget.",
-			"k8s_max_workers", k8sMaxWorkers,
-			"memory_budget", formatBytes(memBudget))
+	if isK8s && k8sMaxWorkers == 0 {
+		slog.Info("k8s.max_workers unset; worker pool is unbounded — cluster autoscaler (e.g. Karpenter) is the ceiling.")
 	}
 
 	processMinWorkers := cfg.Process.MinWorkers
@@ -381,7 +382,10 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	}
 
 	k8sSharedWarmTarget := cfg.K8s.SharedWarmTarget
-	if isK8s && k8sSharedWarmTarget > k8sMaxWorkers {
+	// Only cap the warm target if k8sMaxWorkers is an actual upper bound
+	// (>0). When k8sMaxWorkers == 0 the pool is unbounded and the warm
+	// target stands on its own.
+	if isK8s && k8sMaxWorkers > 0 && k8sSharedWarmTarget > k8sMaxWorkers {
 		slog.Warn("k8s.shared_warm_target exceeds k8s.max_workers; capping to k8s.max_workers.",
 			"k8s_shared_warm_target", k8sSharedWarmTarget,
 			"k8s_max_workers", k8sMaxWorkers)
