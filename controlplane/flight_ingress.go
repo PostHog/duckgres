@@ -88,12 +88,10 @@ func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username s
 
 	// SessionManager.resolveSessionLimits handles rebalancer defaults,
 	// so pass memoryLimit/threads through as-is.
-	workerPID, executor, err := sessions.CreateSession(ctx, username, "", pid, memoryLimit, threads)
+	workerPID, executor, err := sessions.CreateSessionWithProtocol(ctx, username, "", pid, memoryLimit, threads, "flight")
 	if err != nil {
 		return 0, nil, err
 	}
-
-	sessions.SetProtocol(workerPID, "flight")
 
 	p.mu.Lock()
 	p.pidSession[workerPID] = flightOwnedSession{orgID: orgID, sessions: sessions}

@@ -437,6 +437,41 @@ type FlightSessionRecord struct {
 
 func (FlightSessionRecord) TableName() string { return "flight_session_records" }
 
+// OrgConnectionQueueEntry is a cluster-wide FIFO admission request for one org
+// connection. Rows expire quickly; they coordinate fairness across CP replicas.
+type OrgConnectionQueueEntry struct {
+	RequestID    string     `gorm:"primaryKey;size:64" json:"request_id"`
+	OrgID        string     `gorm:"size:255;not null;index:idx_org_connection_queue_pending,priority:1" json:"org_id"`
+	CPInstanceID string     `gorm:"size:255;not null;index" json:"cp_instance_id"`
+	PID          int32      `gorm:"not null" json:"pid"`
+	Protocol     string     `gorm:"size:32;not null" json:"protocol"`
+	EnqueuedAt   time.Time  `gorm:"not null;index:idx_org_connection_queue_pending,priority:2" json:"enqueued_at"`
+	ExpiresAt    time.Time  `gorm:"not null;index" json:"expires_at"`
+	GrantedAt    *time.Time `gorm:"index" json:"granted_at,omitempty"`
+	CanceledAt   *time.Time `gorm:"index" json:"canceled_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
+func (OrgConnectionQueueEntry) TableName() string { return "org_connection_queue" }
+
+// OrgConnectionLease is the durable cluster-wide admission lease for a live
+// session. Capacity checks count active leases, ignoring owners whose CP row
+// has expired.
+type OrgConnectionLease struct {
+	LeaseID      string    `gorm:"primaryKey;size:64" json:"lease_id"`
+	RequestID    string    `gorm:"size:64;not null;uniqueIndex" json:"request_id"`
+	OrgID        string    `gorm:"size:255;not null;index" json:"org_id"`
+	CPInstanceID string    `gorm:"size:255;not null;index" json:"cp_instance_id"`
+	PID          int32     `gorm:"not null" json:"pid"`
+	Protocol     string    `gorm:"size:32;not null" json:"protocol"`
+	AcquiredAt   time.Time `gorm:"not null" json:"acquired_at"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func (OrgConnectionLease) TableName() string { return "org_connection_leases" }
+
 // OrgConfig is a convenience view combining org metadata with resource limits.
 //
 // HostnameAlias is a plain string here (empty == "no alias") because snapshot

@@ -746,6 +746,8 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 		{table: runtimeSchema + ".cp_instances", model: &ControlPlaneInstance{}},
 		{table: runtimeSchema + ".worker_records", model: &WorkerRecord{}},
 		{table: runtimeSchema + ".flight_session_records", model: &FlightSessionRecord{}},
+		{table: runtimeSchema + ".org_connection_queue", model: &OrgConnectionQueueEntry{}},
+		{table: runtimeSchema + ".org_connection_leases", model: &OrgConnectionLease{}},
 		{table: runtimeSchema + ".warm_capacity_miss_buckets", model: &WarmCapacityMissBucket{}},
 	} {
 		if err := db.Table(spec.table).AutoMigrate(spec.model); err != nil {

@@ -218,7 +218,7 @@ Run with config file:
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
-| `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org connection-limit queue admission | `60s` |
+| `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org connection-limit queue admission; the managed K8s queue TTL uses this value | `60s` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
@@ -534,7 +534,7 @@ cfg := server.Config{
 Built-in rate limiting protects against brute-force authentication attacks:
 
 - **Failed attempt tracking**: Bans IPs after too many failed auth attempts
-- **Connection limits**: Limits concurrent connections per IP
+- **Connection limits**: Limits concurrent connections per IP and, when configured, total concurrent sessions. In K8s multi-tenant mode, org `max_connections` is enforced cluster-wide through runtime-store leases.
 - **Auto-cleanup**: Expired records are automatically cleaned up
 
 ```yaml
@@ -543,6 +543,7 @@ rate_limit:
   failed_attempt_window: "5m"   # Within 5 minutes
   ban_duration: "15m"           # Ban lasts 15 minutes
   max_connections_per_ip: 100   # Max concurrent connections
+  max_connections: 16           # Max total concurrent sessions (0 = unlimited)
 ```
 
 ## Usage Examples

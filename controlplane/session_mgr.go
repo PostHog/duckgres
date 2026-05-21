@@ -15,6 +15,12 @@ import (
 )
 
 var ErrTooManyConnections = errors.New("too many connections")
+var ErrSessionManagerDraining = errors.New("session manager is draining")
+
+const (
+	connectionLeaseReleaseMaxAttempts = 3
+	connectionLeaseReleaseRetryDelay  = 50 * time.Millisecond
+)
 
 // SessionProgress holds cached query progress from a worker health check.
 type SessionProgress struct {
@@ -32,6 +38,7 @@ type ManagedSession struct {
 	SessionToken string
 	Executor     *flightclient.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
+	lease        connectionLease
 
 	// Cached query progress from worker health checks.
 	queryProgress atomic.Value // stores *SessionProgress (or nil)
@@ -44,12 +51,14 @@ type SessionManager struct {
 	byWorker   map[int][]int32           // workerID → PIDs
 	pool       WorkerPool
 	rebalancer *MemoryRebalancer
+	lifecycle  *sessionLifecycle
 
 	nextPID atomic.Int32
 
 	maxConnections int
 	activeSlots    int
 	waiters        []*connectionWaiter
+	limiter        connectionLimiter
 }
 
 type flightReconnectPool interface {
@@ -59,6 +68,7 @@ type flightReconnectPool interface {
 type connectionWaiter struct {
 	ready   chan struct{}
 	granted bool
+	err     error
 }
 
 // NewSessionManager creates a new session manager.
@@ -68,6 +78,7 @@ func NewSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer) *SessionMa
 		byWorker:   make(map[int][]int32),
 		pool:       pool,
 		rebalancer: rebalancer,
+		lifecycle:  newSessionLifecycle(),
 	}
 	sm.nextPID.Store(1000) // Start PIDs above typical OS PIDs
 	return sm
@@ -81,17 +92,59 @@ func (sm *SessionManager) SetMaxConnections(n int) {
 	sm.grantWaitersLocked()
 }
 
+// SetConnectionLimiter replaces the local process limiter with a cluster-wide
+// admission limiter. Local session maps still track only this control-plane's
+// live sessions.
+func (sm *SessionManager) SetConnectionLimiter(limiter connectionLimiter) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.limiter = limiter
+}
+
 // ReservePID generates a new unique PID for a session.
 func (sm *SessionManager) ReservePID() int32 {
 	return sm.nextPID.Add(1)
 }
 
 func (sm *SessionManager) acquireSlot(ctx context.Context) error {
+	_, err := sm.acquireConnectionSlot(ctx, 0, "postgres")
+	return err
+}
+
+func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, protocol string) (connectionLease, error) {
 	sm.mu.Lock()
+	if sm.lifecycle.isClosed() {
+		sm.mu.Unlock()
+		return nil, ErrSessionManagerDraining
+	}
+	limiter := sm.limiter
+	sm.mu.Unlock()
+	if limiter != nil {
+		maxConnections := func() int {
+			sm.mu.RLock()
+			defer sm.mu.RUnlock()
+			return sm.maxConnections
+		}
+		lease, err := limiter.Acquire(ctx, pid, protocol, maxConnections)
+		if err != nil {
+			return nil, err
+		}
+		if sm.lifecycle.isClosed() {
+			sm.releaseConnectionSlot(lease)
+			return nil, ErrSessionManagerDraining
+		}
+		return lease, nil
+	}
+
+	sm.mu.Lock()
+	if sm.lifecycle.isClosed() {
+		sm.mu.Unlock()
+		return nil, ErrSessionManagerDraining
+	}
 	if sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections {
 		sm.activeSlots++
 		sm.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	waiter := &connectionWaiter{ready: make(chan struct{})}
 	sm.waiters = append(sm.waiters, waiter)
@@ -99,22 +152,34 @@ func (sm *SessionManager) acquireSlot(ctx context.Context) error {
 
 	select {
 	case <-waiter.ready:
-		return nil
+		if waiter.err != nil {
+			return nil, waiter.err
+		}
+		return nil, nil
 	case <-ctx.Done():
 		sm.mu.Lock()
 		defer sm.mu.Unlock()
 		if waiter.granted {
-			return nil
+			return nil, nil
 		}
 		sm.removeWaiterLocked(waiter)
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return ErrTooManyConnections
+			return nil, ErrTooManyConnections
 		}
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 
 func (sm *SessionManager) releaseSlot() {
+	sm.releaseConnectionSlot(nil)
+}
+
+func (sm *SessionManager) releaseConnectionSlot(lease connectionLease) {
+	if lease != nil {
+		releaseConnectionLeaseWithRetry(lease)
+		return
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -125,6 +190,9 @@ func (sm *SessionManager) releaseSlot() {
 }
 
 func (sm *SessionManager) grantWaitersLocked() {
+	if sm.lifecycle.isClosed() {
+		return
+	}
 	for len(sm.waiters) > 0 && (sm.maxConnections <= 0 || sm.activeSlots < sm.maxConnections) {
 		waiter := sm.waiters[0]
 		copy(sm.waiters, sm.waiters[1:])
@@ -134,6 +202,15 @@ func (sm *SessionManager) grantWaitersLocked() {
 		waiter.granted = true
 		close(waiter.ready)
 	}
+}
+
+func (sm *SessionManager) failWaitersLocked(err error) {
+	for _, waiter := range sm.waiters {
+		waiter.err = err
+		close(waiter.ready)
+	}
+	clear(sm.waiters)
+	sm.waiters = nil
 }
 
 func (sm *SessionManager) removeWaiterLocked(waiter *connectionWaiter) {
@@ -151,13 +228,24 @@ func (sm *SessionManager) removeWaiterLocked(waiter *connectionWaiter) {
 // on it, and rebalances memory/thread limits across all active sessions.
 // If pid is 0, a new one is generated.
 func (sm *SessionManager) CreateSession(ctx context.Context, username, searchPath string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
-	if err := sm.acquireSlot(ctx); err != nil {
+	return sm.CreateSessionWithProtocol(ctx, username, searchPath, pid, memoryLimit, threads, "postgres")
+}
+
+func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, username, searchPath string, pid int32, memoryLimit string, threads int, protocol string) (int32, *flightclient.FlightExecutor, error) {
+	ctx, endCreation, err := sm.beginSessionCreation(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer endCreation()
+
+	lease, err := sm.acquireConnectionSlot(ctx, pid, protocol)
+	if err != nil {
 		return 0, nil, err
 	}
 	success := false
 	defer func() {
 		if !success {
-			sm.releaseSlot()
+			sm.releaseConnectionSlot(lease)
 		}
 	}()
 
@@ -190,7 +278,7 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username, searchPat
 	}
 	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, searchPath, pid, memoryLimit, threads, worker, "postgres", true)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, searchPath, pid, memoryLimit, threads, worker, protocol, true, lease)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -212,13 +300,20 @@ func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) 
 }
 
 func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (int32, *flightclient.FlightExecutor, error) {
-	if err := sm.acquireSlot(ctx); err != nil {
+	ctx, endCreation, err := sm.beginSessionCreation(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer endCreation()
+
+	lease, err := sm.acquireConnectionSlot(ctx, 0, "flight")
+	if err != nil {
 		return 0, nil, err
 	}
 	success := false
 	defer func() {
 		if !success {
-			sm.releaseSlot()
+			sm.releaseConnectionSlot(lease)
 		}
 	}()
 
@@ -230,7 +325,7 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	if err != nil {
 		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
 	}
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, "", 0, "", 0, worker, "flight", false)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, "", 0, "", 0, worker, "flight", false, lease)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -238,7 +333,11 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	return pid, exec, nil
 }
 
-func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username, searchPath string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool) (int32, *flightclient.FlightExecutor, error) {
+func (sm *SessionManager) beginSessionCreation(ctx context.Context) (context.Context, func(), error) {
+	return sm.lifecycle.begin(ctx)
+}
+
+func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username, searchPath string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool, lease connectionLease) (int32, *flightclient.FlightExecutor, error) {
 	createStart := time.Now()
 	slog.Info("Creating session on worker.",
 		"pid", pid,
@@ -280,9 +379,15 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username, s
 		Protocol:     protocol,
 		SessionToken: sessionToken,
 		Executor:     executor,
+		lease:        lease,
 	}
 
 	sm.mu.Lock()
+	if sm.lifecycle.isClosed() {
+		sm.mu.Unlock()
+		sm.cleanupUnregisteredWorkerSession(worker, session.SessionToken)
+		return 0, nil, ErrSessionManagerDraining
+	}
 	sm.sessions[pid] = session
 	sm.byWorker[worker.ID] = append(sm.byWorker[worker.ID], pid)
 	sessionCount := len(sm.sessions)
@@ -306,34 +411,35 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username, s
 	return pid, executor, nil
 }
 
+func (sm *SessionManager) cleanupUnregisteredWorkerSession(worker *ManagedWorker, sessionToken string) {
+	if worker != nil {
+		select {
+		case <-worker.done:
+		default:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := worker.DestroySession(ctx, sessionToken); err != nil {
+				slog.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", err)
+			}
+			cancel()
+		}
+		sm.pool.ReleaseWorker(worker.ID)
+	}
+}
+
 // DestroySession destroys a session, retires its dedicated worker, and rebalances
 // memory/thread limits across remaining sessions.
 func (sm *SessionManager) DestroySession(pid int32) {
 	destroyStart := time.Now()
 	sm.mu.Lock()
-	session, ok := sm.sessions[pid]
+	session, sessionCount, workerSessionCount, ok := sm.detachSessionLocked(pid)
 	if !ok {
 		sm.mu.Unlock()
 		slog.Warn("DestroySession called for unknown session.", "pid", pid)
 		return
 	}
-	delete(sm.sessions, pid)
-
-	// Remove from byWorker
-	pids := sm.byWorker[session.WorkerID]
-	for i, p := range pids {
-		if p == pid {
-			sm.byWorker[session.WorkerID] = append(pids[:i], pids[i+1:]...)
-			break
-		}
-	}
-	sessionCount := len(sm.sessions)
-	workerSessionCount := len(sm.byWorker[session.WorkerID])
-	if sm.activeSlots > 0 {
-		sm.activeSlots--
-	}
-	sm.grantWaitersLocked()
+	finishCleanup := sm.lifecycle.beginCleanup()
 	sm.mu.Unlock()
+	defer finishCleanup()
 
 	slog.Info("Destroying session.",
 		"pid", pid,
@@ -380,6 +486,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 
 	// Release the worker for reuse after cleanup is complete.
 	sm.pool.ReleaseWorker(session.WorkerID)
+	sm.releaseSessionLease(session, "pid", pid)
 
 	slog.Info("Session destroyed.",
 		"pid", pid,
@@ -396,6 +503,85 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	if sm.rebalancer != nil {
 		sm.rebalancer.RequestRebalance()
 	}
+}
+
+// DestroyAllSessions destroys every active session without holding the manager
+// lock while running per-session cleanup.
+func (sm *SessionManager) DestroyAllSessions() {
+	for {
+		sm.lifecycle.close()
+		sm.mu.Lock()
+		sm.failWaitersLocked(ErrSessionManagerDraining)
+		pids := sm.sessionPIDsLocked()
+		sm.mu.Unlock()
+		if len(pids) == 0 {
+			sm.lifecycle.closeAndWait()
+			return
+		}
+		for _, pid := range pids {
+			sm.DestroySession(pid)
+		}
+	}
+}
+
+func (sm *SessionManager) sessionPIDsLocked() []int32 {
+	pids := make([]int32, 0, len(sm.sessions))
+	for pid := range sm.sessions {
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+func (sm *SessionManager) detachSessionLocked(pid int32) (*ManagedSession, int, int, bool) {
+	session, ok := sm.sessions[pid]
+	if !ok {
+		return nil, len(sm.sessions), 0, false
+	}
+	delete(sm.sessions, pid)
+	sm.removeSessionFromWorkerLocked(session.WorkerID, pid)
+	if session.lease == nil && sm.activeSlots > 0 {
+		sm.activeSlots--
+	}
+	sm.grantWaitersLocked()
+	return session, len(sm.sessions), len(sm.byWorker[session.WorkerID]), true
+}
+
+func (sm *SessionManager) removeSessionFromWorkerLocked(workerID int, pid int32) {
+	pids := sm.byWorker[workerID]
+	for i, p := range pids {
+		if p == pid {
+			pids = append(pids[:i], pids[i+1:]...)
+			break
+		}
+	}
+	if len(pids) == 0 {
+		delete(sm.byWorker, workerID)
+		return
+	}
+	sm.byWorker[workerID] = pids
+}
+
+func (sm *SessionManager) releaseSessionLease(session *ManagedSession, attrs ...any) {
+	if session == nil || session.lease == nil {
+		return
+	}
+	releaseConnectionLeaseWithRetry(session.lease, attrs...)
+}
+
+func releaseConnectionLeaseWithRetry(lease connectionLease, attrs ...any) {
+	var err error
+	for attempt := 1; attempt <= connectionLeaseReleaseMaxAttempts; attempt++ {
+		err = lease.Release(context.Background())
+		if err == nil {
+			return
+		}
+		if attempt < connectionLeaseReleaseMaxAttempts {
+			time.Sleep(time.Duration(attempt) * connectionLeaseReleaseRetryDelay)
+		}
+	}
+
+	args := append([]any{"error", err, "attempts", connectionLeaseReleaseMaxAttempts}, attrs...)
+	slog.Warn("Failed to release org connection lease.", args...)
 }
 
 // OnWorkerCrash handles a worker crash by marking all affected executors as
@@ -421,29 +607,32 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	for _, pid := range pids {
 		cleanupStart := time.Now()
 		errorFn(pid)
+		var executor *flightclient.FlightExecutor
+		var connCloser io.Closer
+		var session *ManagedSession
+		var finishCleanup func()
 		sm.mu.Lock()
-		session, ok := sm.sessions[pid]
+		detached, remainingSessions, _, ok := sm.detachSessionLocked(pid)
 		if ok {
-			delete(sm.sessions, pid)
-			if session.Executor != nil {
-				_ = session.Executor.Close()
-			}
-			// Close the TCP connection to unblock the message loop's read.
-			// This causes the session goroutine to exit instead of looping
-			// with ErrWorkerDead on every query. The deferred close in
-			// handleConnection will also call Close() on the same conn;
-			// that's harmless (net.Conn.Close on a closed socket returns
-			// an error which is discarded).
-			if session.connCloser != nil {
-				_ = session.connCloser.Close()
-			}
-			if sm.activeSlots > 0 {
-				sm.activeSlots--
-			}
-			sm.grantWaitersLocked()
+			session = detached
+			executor = detached.Executor
+			connCloser = detached.connCloser
+			finishCleanup = sm.lifecycle.beginCleanup()
 		}
-		remainingSessions := len(sm.sessions)
 		sm.mu.Unlock()
+		if executor != nil {
+			_ = executor.Close()
+		}
+		// Close the TCP connection to unblock the message loop's read.
+		// This causes the session goroutine to exit instead of looping
+		// with ErrWorkerDead on every query. The deferred close in
+		// handleConnection will also call Close() on the same conn;
+		// that's harmless (net.Conn.Close on a closed socket returns
+		// an error which is discarded).
+		if connCloser != nil {
+			_ = connCloser.Close()
+		}
+		sm.releaseSessionLease(session, "pid", pid)
 		slog.Info("Worker crash session cleanup completed.",
 			"pid", pid,
 			"worker", workerID,
@@ -451,6 +640,9 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			"duration", time.Since(cleanupStart),
 			"remaining_sessions", remainingSessions,
 		)
+		if ok {
+			finishCleanup()
+		}
 	}
 
 	sm.mu.Lock()
