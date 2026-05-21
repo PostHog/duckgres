@@ -746,6 +746,7 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 		{table: runtimeSchema + ".cp_instances", model: &ControlPlaneInstance{}},
 		{table: runtimeSchema + ".worker_records", model: &WorkerRecord{}},
 		{table: runtimeSchema + ".flight_session_records", model: &FlightSessionRecord{}},
+		{table: runtimeSchema + ".warm_capacity_miss_buckets", model: &WarmCapacityMissBucket{}},
 	} {
 		if err := db.Table(spec.table).AutoMigrate(spec.model); err != nil {
 			return err
@@ -770,6 +771,57 @@ func (cs *ConfigStore) RuntimeSchema() string {
 
 func (cs *ConfigStore) runtimeTable(base string) string {
 	return cs.runtimeSchema + "." + base
+}
+
+// RecordWarmCapacityMiss increments the shared bucket for a foreground warm
+// capacity miss. The insert/upsert is atomic so concurrent control-plane pods
+// can all contribute to the same scope/reason/bucket row without coordination.
+func (cs *ConfigStore) RecordWarmCapacityMiss(scope string, reason WorkerClaimMissReason, now time.Time) error {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return fmt.Errorf("record warm capacity miss: scope is required")
+	}
+	if reason == WorkerClaimMissReasonNone {
+		return fmt.Errorf("record warm capacity miss: reason is required")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	now = now.UTC()
+
+	bucket := WarmCapacityMissBucket{
+		Scope:       scope,
+		Reason:      reason,
+		BucketStart: now.Truncate(WarmCapacityMissBucketSize),
+		Count:       1,
+		UpdatedAt:   now,
+	}
+	if err := cs.db.Table(cs.runtimeTable(bucket.TableName())).Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "scope"},
+			{Name: "reason"},
+			{Name: "bucket_start"},
+		},
+		DoUpdates: clause.Assignments(map[string]any{
+			"count":      gorm.Expr(`"warm_capacity_miss_buckets"."count" + EXCLUDED."count"`),
+			"updated_at": now,
+		}),
+	}).Create(&bucket).Error; err != nil {
+		return fmt.Errorf("record warm capacity miss: %w", err)
+	}
+	return nil
+}
+
+// PruneWarmCapacityMissBuckets removes buckets older than the caller-provided
+// cutoff and returns the number of deleted rows.
+func (cs *ConfigStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, error) {
+	result := cs.db.Table(cs.runtimeTable((&WarmCapacityMissBucket{}).TableName())).
+		Where("bucket_start < ?", before.UTC()).
+		Delete(&WarmCapacityMissBucket{})
+	if result.Error != nil {
+		return 0, fmt.Errorf("prune warm capacity miss buckets: %w", result.Error)
+	}
+	return result.RowsAffected, nil
 }
 
 // UpsertControlPlaneInstance inserts or updates a runtime control-plane instance row.
@@ -895,8 +947,11 @@ func (cs *ConfigStore) GetWorkerRecord(workerID int) (*WorkerRecord, error) {
 // ClaimIdleWorker atomically claims one idle worker row for a control-plane instance.
 // The selected row is locked with SKIP LOCKED and transitioned to reserved while
 // incrementing owner_epoch. When maxOrgWorkers is set, org claims are serialized
-// under the same advisory lock used for spawn-slot allocation.
-func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
+// under the same advisory lock used for spawn-slot allocation. maxGlobalWorkers
+// is only used to classify an unfulfilled claim after no suitable idle worker
+// exists; an existing idle worker remains claimable even when the global pool is
+// at capacity.
+func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers, maxGlobalWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
@@ -928,6 +983,16 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, m
 		err := query.Order("worker_id ASC").Take(&current).Error
 		if err != nil {
 			if err == gorm.ErrRecordNotFound {
+				if maxGlobalWorkers > 0 {
+					count, err := cs.countActiveWorkers(tx)
+					if err != nil {
+						return err
+					}
+					if count >= int64(maxGlobalWorkers) {
+						missReason = WorkerClaimMissReasonGlobalCap
+						return nil
+					}
+				}
 				missReason = WorkerClaimMissReasonNoIdle
 				return nil
 			}
