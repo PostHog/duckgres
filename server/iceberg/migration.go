@@ -100,9 +100,15 @@ func BuildLakekeeperSecretStmt(cfg Config) string {
 }
 
 // BuildLakekeeperAttachStmt builds the ATTACH statement for the Iceberg
-// REST catalog vended by Lakekeeper. ACCESS_DELEGATION_MODE 'vended_credentials'
-// tells DuckDB to ask Lakekeeper for short-lived STS creds for the
-// underlying S3 storage rather than signing requests itself.
+// REST catalog served by Lakekeeper.
+//
+// We deliberately do NOT use ACCESS_DELEGATION_MODE 'vended_credentials':
+// Lakekeeper's STS vending overflows AWS's packed-policy limit
+// (PackedPolicyTooLarge), and it's unnecessary — the worker already holds S3
+// creds for the warehouse bucket via the iceberg_sigv4 secret (built from the
+// duckling's brokered STS creds, same per-org role/bucket; see
+// attachLakekeeperCatalog). DuckDB uses that secret to read/write table data;
+// Lakekeeper serves only catalog metadata.
 //
 // When OAUTH2_SERVER_URI is empty (allowall mode), AUTHORIZATION_TYPE 'none'
 // is set instead of SECRET. When OAuth2 is configured, SECRET references
@@ -110,14 +116,14 @@ func BuildLakekeeperSecretStmt(cfg Config) string {
 func BuildLakekeeperAttachStmt(cfg Config) string {
 	if cfg.LakekeeperOAuth2ServerURI == "" {
 		return fmt.Sprintf(
-			"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', ACCESS_DELEGATION_MODE 'vended_credentials', AUTHORIZATION_TYPE 'none')",
+			"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', AUTHORIZATION_TYPE 'none')",
 			escapeSQLStringLiteral(cfg.LakekeeperWarehouse),
 			CatalogName,
 			escapeSQLStringLiteral(cfg.LakekeeperEndpoint),
 		)
 	}
 	return fmt.Sprintf(
-		"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', SECRET %s, ACCESS_DELEGATION_MODE 'vended_credentials')",
+		"ATTACH '%s' AS %s (TYPE ICEBERG, ENDPOINT '%s', SECRET %s)",
 		escapeSQLStringLiteral(cfg.LakekeeperWarehouse),
 		CatalogName,
 		escapeSQLStringLiteral(cfg.LakekeeperEndpoint),

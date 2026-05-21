@@ -84,7 +84,7 @@ func TestBuildLakekeeperAttachStmt_Allowall(t *testing.T) {
 		LakekeeperEndpoint:  "http://lakekeeper-acme.lakekeeper.svc:8181/catalog",
 		LakekeeperWarehouse: "org-acme",
 	})
-	want := "ATTACH 'org-acme' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://lakekeeper-acme.lakekeeper.svc:8181/catalog', ACCESS_DELEGATION_MODE 'vended_credentials', AUTHORIZATION_TYPE 'none')"
+	want := "ATTACH 'org-acme' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://lakekeeper-acme.lakekeeper.svc:8181/catalog', AUTHORIZATION_TYPE 'none')"
 	if got != want {
 		t.Fatalf("BuildLakekeeperAttachStmt (allowall) mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -96,7 +96,7 @@ func TestBuildLakekeeperAttachStmt_OAuth2(t *testing.T) {
 		LakekeeperWarehouse:       "org-acme",
 		LakekeeperOAuth2ServerURI: "http://oidc/token",
 	})
-	want := "ATTACH 'org-acme' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://lakekeeper-acme.lakekeeper.svc:8181/catalog', SECRET iceberg_oauth, ACCESS_DELEGATION_MODE 'vended_credentials')"
+	want := "ATTACH 'org-acme' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://lakekeeper-acme.lakekeeper.svc:8181/catalog', SECRET iceberg_oauth)"
 	if got != want {
 		t.Fatalf("BuildLakekeeperAttachStmt (oauth2) mismatch:\n got: %s\nwant: %s", got, want)
 	}
@@ -107,7 +107,7 @@ func TestBuildLakekeeperAttachStmt_EscapesQuotes(t *testing.T) {
 		LakekeeperEndpoint:  "http://h/cat?x='y'",
 		LakekeeperWarehouse: "wh'name",
 	})
-	want := "ATTACH 'wh''name' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://h/cat?x=''y''', ACCESS_DELEGATION_MODE 'vended_credentials', AUTHORIZATION_TYPE 'none')"
+	want := "ATTACH 'wh''name' AS iceberg (TYPE ICEBERG, ENDPOINT 'http://h/cat?x=''y''', AUTHORIZATION_TYPE 'none')"
 	if got != want {
 		t.Fatalf("BuildLakekeeperAttachStmt did not escape quotes:\n got: %s\nwant: %s", got, want)
 	}
