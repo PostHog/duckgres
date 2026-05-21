@@ -9,6 +9,7 @@ func TestRewriteDirectQuery(t *testing.T) {
 				DuckLake: DuckLakeConfig{
 					MetadataStore: "postgres:host=127.0.0.1 dbname=ducklake",
 				},
+				Iceberg: IcebergConfig{Enabled: true},
 			},
 		},
 		database:              "test",
@@ -21,19 +22,42 @@ func TestRewriteDirectQuery(t *testing.T) {
 		want  string
 	}{
 		{
-			name:  "rewrites logical use command",
+			name:  "rewrites logical use command to two-part ducklake.main",
 			query: "USE test",
-			want:  "USE ducklake",
+			want:  "USE ducklake.main",
 		},
 		{
-			name:  "rewrites quoted logical use command",
+			name:  "rewrites quoted logical use command to two-part ducklake.main",
 			query: `USE "test"`,
-			want:  `USE "ducklake"`,
+			want:  "USE ducklake.main",
 		},
 		{
 			name:  "rewrites commented logical use command",
 			query: "/* switch */ USE test;",
-			want:  "USE ducklake;",
+			want:  "USE ducklake.main;",
+		},
+		{
+			// `USE ducklake` while currently in the iceberg catalog would
+			// otherwise resolve to a bogus iceberg.ducklake — two-part fixes it.
+			name:  "rewrites bare ducklake to two-part ducklake.main",
+			query: "USE ducklake",
+			want:  "USE ducklake.main",
+		},
+		{
+			name:  "rewrites bare iceberg to its default schema",
+			query: "USE iceberg",
+			want:  "USE iceberg.public",
+		},
+		{
+			name:  "rewrites quoted iceberg to its default schema",
+			query: `USE "iceberg";`,
+			want:  "USE iceberg.public;",
+		},
+		{
+			// already two-part — left untouched.
+			name:  "preserves two-part iceberg use",
+			query: "USE iceberg.billing",
+			want:  "USE iceberg.billing",
 		},
 		{
 			name:  "preserves physical use command",
@@ -63,6 +87,38 @@ func TestRewriteDirectQuery(t *testing.T) {
 				t.Fatalf("rewriteDirectQuery(%q) = %q, want %q", tc.query, got, tc.want)
 			}
 		})
+	}
+}
+
+// When iceberg is NOT enabled for the session, `USE iceberg` must pass through
+// unchanged (no rewrite to a schema that isn't attached).
+func TestRewriteDirectQueryUseIcebergPassthroughWhenDisabled(t *testing.T) {
+	c := &clientConn{
+		server: &Server{cfg: Config{
+			DuckLake: DuckLakeConfig{MetadataStore: "postgres:host=127.0.0.1 dbname=ducklake"},
+			Iceberg:  IcebergConfig{Enabled: false},
+		}},
+		database:              "test",
+		logicalCatalogMapping: true,
+	}
+	if got, want := c.rewriteDirectQuery("USE iceberg"), "USE iceberg"; got != want {
+		t.Fatalf("rewriteDirectQuery(USE iceberg) = %q, want %q", got, want)
+	}
+}
+
+// A customer whose logical DB name is literally "iceberg" must still reach
+// their DuckLake warehouse on `USE iceberg`, not the Iceberg REST catalog.
+func TestRewriteDirectQueryLogicalDBNamedIcebergGoesToDuckLake(t *testing.T) {
+	c := &clientConn{
+		server: &Server{cfg: Config{
+			DuckLake: DuckLakeConfig{MetadataStore: "postgres:host=127.0.0.1 dbname=ducklake"},
+			Iceberg:  IcebergConfig{Enabled: true},
+		}},
+		database:              "iceberg",
+		logicalCatalogMapping: true,
+	}
+	if got, want := c.rewriteDirectQuery("USE iceberg"), "USE ducklake.main"; got != want {
+		t.Fatalf("rewriteDirectQuery(USE iceberg) with logical db 'iceberg' = %q, want %q", got, want)
 	}
 }
 

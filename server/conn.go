@@ -25,6 +25,7 @@ import (
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/iceberg"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
@@ -761,6 +762,19 @@ func (c *clientConn) safeCleanupDB() {
 		}
 
 		if connHealthy {
+			if c.server.cfg.Iceberg.Enabled {
+				// The iceberg catalog stays attached for the life of the session
+				// (attachLakekeeperCatalog no longer detaches empty warehouses),
+				// so release it here too — otherwise a pooled connection reused by
+				// the next activation hits the count>0 early-return in
+				// attachLakekeeperCatalog and keeps a stale catalog secret.
+				ctxIce, cancelIce := context.WithTimeout(context.Background(), cleanupTimeout)
+				_, err := c.executor.ExecContext(ctxIce, "DETACH "+iceberg.CatalogName)
+				cancelIce()
+				if err != nil {
+					slog.Warn("Failed to detach Iceberg catalog.", "user", c.username, "error", err, "worker", c.workerID, "worker_pod", c.workerPod)
+				}
+			}
 			if c.server.cfg.DuckLake.DeltaCatalogEnabled {
 				ctxDelta, cancelDelta := context.WithTimeout(context.Background(), cleanupTimeout)
 				_, err := c.executor.ExecContext(ctxDelta, "DETACH delta")
@@ -1614,28 +1628,42 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 	}
 
 	unquoted := target
-	quoteResult := false
 	if len(target) >= 2 && target[0] == '"' && target[len(target)-1] == '"' {
 		unquoted = strings.ReplaceAll(target[1:len(target)-1], `""`, `"`)
-		quoteResult = true
 	}
 
-	if !strings.EqualFold(unquoted, c.database) {
+	// Rewrite a bare catalog `USE` to a two-part `catalog.schema` target.
+	// Two-part is required for reliable switching: a bare `USE ducklake`
+	// issued while the session is in the iceberg catalog resolves `ducklake`
+	// as a schema *within* iceberg (DuckDB prefers schema-in-current-catalog
+	// for a single identifier), landing on a bogus `iceberg.ducklake`.
+	var target2part string
+	switch {
+	case strings.EqualFold(unquoted, c.database) || strings.EqualFold(unquoted, physicalDuckLakeCatalog):
+		// `USE <logical-db-name>` or `USE ducklake` -> the physical ducklake.main.
+		// Checked before the iceberg arm so that a customer whose logical DB is
+		// (improbably) named "iceberg" still reaches their DuckLake warehouse.
+		target2part = physicalDuckLakeCatalog + ".main"
+	case c.server.cfg.Iceberg.Enabled && strings.EqualFold(unquoted, iceberg.CatalogName):
+		// `USE iceberg` -> the guaranteed default schema. DuckDB can't `USE`
+		// a bare REST catalog (it targets <catalog>.main, which it shadows),
+		// so we land on iceberg.<DefaultSchema> (ensured by attachLakekeeperCatalog).
+		// Gated on Iceberg.Enabled so non-iceberg sessions pass `USE iceberg`
+		// through unchanged.
+		target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
+	default:
 		return query
 	}
 
-	physicalCatalog := "ducklake"
-	replacement := physicalCatalog
-	if quoteResult {
-		replacement = `"` + strings.ReplaceAll(physicalCatalog, `"`, `""`) + `"`
-	}
-
-	rewritten := "USE " + replacement
+	rewritten := "USE " + target2part
 	if hasSemicolon {
 		rewritten += ";"
 	}
 	return rewritten
 }
+
+// physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
+const physicalDuckLakeCatalog = "ducklake"
 
 // executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.
