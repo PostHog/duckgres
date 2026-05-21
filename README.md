@@ -93,6 +93,7 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
+- [Lakekeeper Iceberg Catalog](docs/runbooks/lakekeeper-iceberg-catalog.md): Per-org Lakekeeper Iceberg REST catalog backend — architecture, the no-vending credential model, activation, and the `ACCESS_DELEGATION_MODE 'none'` gotcha.
 
 ## Quick Start
 
