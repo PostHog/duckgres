@@ -25,6 +25,7 @@ import (
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/iceberg"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
@@ -1614,28 +1615,38 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 	}
 
 	unquoted := target
-	quoteResult := false
 	if len(target) >= 2 && target[0] == '"' && target[len(target)-1] == '"' {
 		unquoted = strings.ReplaceAll(target[1:len(target)-1], `""`, `"`)
-		quoteResult = true
 	}
 
-	if !strings.EqualFold(unquoted, c.database) {
+	// Rewrite a bare catalog `USE` to a two-part `catalog.schema` target.
+	// Two-part is required for reliable switching: a bare `USE ducklake`
+	// issued while the session is in the iceberg catalog resolves `ducklake`
+	// as a schema *within* iceberg (DuckDB prefers schema-in-current-catalog
+	// for a single identifier), landing on a bogus `iceberg.ducklake`.
+	var target2part string
+	switch {
+	case strings.EqualFold(unquoted, iceberg.CatalogName):
+		// `USE iceberg` -> the guaranteed default schema. DuckDB can't `USE`
+		// a bare REST catalog (it targets <catalog>.main, which it shadows),
+		// so we land on iceberg.<DefaultSchema> (ensured by attachLakekeeperCatalog).
+		target2part = iceberg.CatalogName + "." + iceberg.DefaultSchema
+	case strings.EqualFold(unquoted, physicalDuckLakeCatalog) || strings.EqualFold(unquoted, c.database):
+		// `USE ducklake` or `USE <logical-db-name>` -> the physical ducklake.main.
+		target2part = physicalDuckLakeCatalog + ".main"
+	default:
 		return query
 	}
 
-	physicalCatalog := "ducklake"
-	replacement := physicalCatalog
-	if quoteResult {
-		replacement = `"` + strings.ReplaceAll(physicalCatalog, `"`, `""`) + `"`
-	}
-
-	rewritten := "USE " + replacement
+	rewritten := "USE " + target2part
 	if hasSemicolon {
 		rewritten += ";"
 	}
 	return rewritten
 }
+
+// physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
+const physicalDuckLakeCatalog = "ducklake"
 
 // executeSelectQuery runs a result-returning query against DuckDB and streams results to the client.
 // Sends RowDescription, DataRow messages, CommandComplete, and ReadyForQuery.

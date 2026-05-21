@@ -14,6 +14,17 @@ const DefaultRegion = "us-east-1"
 // worker) would require generalizing this.
 const CatalogName = "iceberg"
 
+// DefaultSchema is the schema the worker guarantees exists in the Iceberg
+// catalog so customers can switch to it with a bare `USE iceberg` (rewritten
+// to `USE iceberg.<DefaultSchema>` in server.rewriteDirectQuery).
+//
+// DuckLake uses `main` for this role, but we cannot: DuckDB reserves `main` as
+// a catalog's implicit local schema and shadows the REST catalog's real `main`
+// namespace, so `iceberg.main` never resolves (it's absent from
+// information_schema even when Lakekeeper has a `main` namespace). `public`
+// (the Postgres convention) is a safe, unshadowed default.
+const DefaultSchema = "public"
+
 // BuildIcebergSecretStmt builds the CREATE SECRET statement that the
 // DuckDB iceberg extension uses to sign AWS S3 Tables requests when an
 // `ATTACH ... (TYPE iceberg, ENDPOINT_TYPE 's3_tables')` is opened.
