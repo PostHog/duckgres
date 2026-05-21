@@ -73,7 +73,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	k8sWorkerConfigMap := fs.String("k8s-worker-configmap", "", "ConfigMap name for worker duckgres.yaml (env: DUCKGRES_K8S_WORKER_CONFIGMAP)")
 	k8sWorkerImagePullPolicy := fs.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
 	k8sWorkerServiceAccount := fs.String("k8s-worker-service-account", "", "Neutral ServiceAccount name for K8s worker pods (default: duckgres-worker) (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
-	k8sMaxWorkers := fs.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=auto-derived (env: DUCKGRES_K8S_MAX_WORKERS)")
+	k8sMaxWorkers := fs.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=unbounded (env: DUCKGRES_K8S_MAX_WORKERS)")
 	k8sSharedWarmTarget := fs.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
 	awsRegion := fs.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
 	queryLog := fs.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")

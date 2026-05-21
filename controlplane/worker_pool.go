@@ -10,6 +10,9 @@ import (
 
 const DefaultK8sWorkerServiceAccount = "duckgres-worker"
 const DefaultWarmCapacityRetryAfter = 45 * time.Second
+const DefaultWarmCapacityMissWindow = 2 * time.Minute
+const DefaultWarmCapacityMissesPerWorker = 8
+const DefaultWarmCapacityDemandTTL = 15 * time.Minute
 
 // WarmCapacityExhaustedError is returned when a user request misses the ready
 // warm pool. The caller should fail fast with a retryable capacity response

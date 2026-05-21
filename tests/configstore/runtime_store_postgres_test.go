@@ -5,6 +5,7 @@ package configstore_test
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -162,6 +163,58 @@ func TestRecordWarmCapacityMissConcurrentWritersPostgres(t *testing.T) {
 	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, bucketStart, 40)
 }
 
+func TestListWarmCapacityMissesSinceAggregatesByScopeAndReasonPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	other := newConfigStoreOnSameSchema(t, store)
+
+	now := time.Date(2026, time.March, 26, 14, 10, 5, 0, time.UTC)
+	old := now.Add(-5 * time.Minute)
+	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, old); err != nil {
+		t.Fatalf("RecordWarmCapacityMiss(old): %v", err)
+	}
+	for _, recorder := range []*configstore.ConfigStore{store, other} {
+		if err := recorder.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, now); err != nil {
+			t.Fatalf("RecordWarmCapacityMiss(default): %v", err)
+		}
+	}
+	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, now.Add(11*time.Second)); err != nil {
+		t.Fatalf("RecordWarmCapacityMiss(default next bucket): %v", err)
+	}
+	if err := store.RecordWarmCapacityMiss("image:duckgres:pinned", configstore.WorkerClaimMissReasonNoIdle, now); err != nil {
+		t.Fatalf("RecordWarmCapacityMiss(pinned): %v", err)
+	}
+	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonGlobalCap, now); err != nil {
+		t.Fatalf("RecordWarmCapacityMiss(global cap): %v", err)
+	}
+
+	aggregates, err := store.ListWarmCapacityMissesSince(now.Add(-time.Minute), configstore.WorkerClaimMissReasonNoIdle)
+	if err != nil {
+		t.Fatalf("ListWarmCapacityMissesSince: %v", err)
+	}
+	got := warmCapacityMissAggregateCounts(aggregates)
+	want := map[string]int64{
+		"image:duckgres:default|no_idle": 3,
+		"image:duckgres:pinned|no_idle":  1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected no-idle aggregates %v, got %v", want, got)
+	}
+
+	aggregates, err = store.ListWarmCapacityMissesSince(now.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("ListWarmCapacityMissesSince unfiltered: %v", err)
+	}
+	got = warmCapacityMissAggregateCounts(aggregates)
+	want = map[string]int64{
+		"image:duckgres:default|global_cap": 1,
+		"image:duckgres:default|no_idle":    3,
+		"image:duckgres:pinned|no_idle":     1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected unfiltered aggregates %v, got %v", want, got)
+	}
+}
+
 func TestPruneWarmCapacityMissBucketsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
@@ -186,6 +239,14 @@ func TestPruneWarmCapacityMissBucketsPostgres(t *testing.T) {
 	newBucketStart := newNow.Truncate(configstore.WarmCapacityMissBucketSize)
 	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, oldBucketStart, 0)
 	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, newBucketStart, 1)
+}
+
+func warmCapacityMissAggregateCounts(aggregates []configstore.WarmCapacityMissAggregate) map[string]int64 {
+	out := make(map[string]int64, len(aggregates))
+	for _, aggregate := range aggregates {
+		out[fmt.Sprintf("%s|%s", aggregate.Scope, aggregate.Reason)] = aggregate.Count
+	}
+	return out
 }
 
 func TestClaimIdleWorkerPostgres(t *testing.T) {

@@ -47,6 +47,9 @@ func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 
 func (a *orgRouterAdapter) SetWarmCapacityTarget(n int) {
 	a.router.sharedPool.SetWarmCapacityTarget(n)
+	if n <= 0 {
+		a.router.sharedPool.SetPerImageWarmTargets(nil)
+	}
 }
 
 func (a *orgRouterAdapter) ShutdownAll() {
@@ -236,6 +239,7 @@ func SetupMultiTenant(
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
 	janitor.hotIdleTTL = defaultHotIdleTTL
+	janitor.warmCapacityMissBucketTTL = cfg.K8s.WarmCapacityDemandTTL
 	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
 		router.sharedPool.retireClaimedWorker(&record, reason)
 	}
