@@ -61,14 +61,11 @@ func TestRefreshIcebergSecretNoOpWhenDisabled(t *testing.T) {
 
 // TestRefreshIcebergSecretRejectsEmptyCredentials guards the invariant
 // that "credentials are required when iceberg is enabled" applies to
-// refresh too, not just initial attach — for the S3 Tables backend.
-// A silent fallback here would either re-introduce credential_chain (the
-// bug fixed by PR #562) or emit an empty-cred config secret that fails
-// opaquely at attach time.
-//
-// Backend is explicit because empty Backend resolves to "lakekeeper",
-// which legitimately returns nil from RefreshIcebergSecret (Lakekeeper
-// vends its own STS via ACCESS_DELEGATION_MODE; there's nothing to rotate).
+// refresh too, not just initial attach. A silent fallback here would either
+// re-introduce credential_chain (the bug fixed by PR #562) or emit an
+// empty-cred config secret that fails opaquely at attach time. Applies to
+// BOTH backends: Lakekeeper no longer vends (PackedPolicyTooLarge), so the
+// worker rotates its own iceberg_sigv4 S3 secret for Lakekeeper too.
 func TestRefreshIcebergSecretRejectsEmptyCredentials(t *testing.T) {
 	err := RefreshIcebergSecret(nil, IcebergConfig{
 		Enabled:     true,
@@ -83,18 +80,22 @@ func TestRefreshIcebergSecretRejectsEmptyCredentials(t *testing.T) {
 	}
 }
 
-// TestRefreshIcebergSecretLakekeeperNoOp covers the new branch: a
-// Lakekeeper-backed config has no S3 credentials in the payload (because
-// Lakekeeper vends them itself), and RefreshIcebergSecret should return
-// nil rather than complain about missing credentials.
-func TestRefreshIcebergSecretLakekeeperNoOp(t *testing.T) {
+// TestRefreshIcebergSecretLakekeeperRequiresCreds: Lakekeeper no longer vends
+// credentials (its STS session policy overflowed AWS's packed-policy limit),
+// so the worker reads/writes S3 data with its own brokered creds and must
+// rotate that secret on the STS schedule — same as S3 Tables. An empty-cred
+// refresh is therefore an error, not a no-op.
+func TestRefreshIcebergSecretLakekeeperRequiresCreds(t *testing.T) {
 	err := RefreshIcebergSecret(nil, IcebergConfig{
 		Enabled:             true,
 		Backend:             iceberg.BackendLakekeeper,
 		LakekeeperEndpoint:  "http://lk/catalog",
 		LakekeeperWarehouse: "org-x",
 	}, nil, "", "", "")
-	if err != nil {
-		t.Fatalf("Lakekeeper backend refresh should be a no-op, got error: %v", err)
+	if err == nil {
+		t.Fatal("expected error: Lakekeeper refresh now needs the worker's S3 creds")
+	}
+	if !strings.Contains(err.Error(), "no AWS credentials") {
+		t.Fatalf("error message should name the missing-credentials cause, got: %v", err)
 	}
 }

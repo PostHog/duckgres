@@ -35,7 +35,7 @@ func TestDispatcher_BackendSelection(t *testing.T) {
 				LakekeeperEndpoint:  "http://lk/catalog",
 				LakekeeperWarehouse: "org-x",
 			},
-			wantSQL: "ACCESS_DELEGATION_MODE 'vended_credentials'",
+			wantSQL: "AUTHORIZATION_TYPE 'none'",
 		},
 		{
 			name: "empty Backend defaults to lakekeeper even with stale TableBucket",
@@ -45,7 +45,7 @@ func TestDispatcher_BackendSelection(t *testing.T) {
 				LakekeeperEndpoint:  "http://lk/catalog",
 				LakekeeperWarehouse: "org-x",
 			},
-			wantSQL: "ACCESS_DELEGATION_MODE 'vended_credentials'",
+			wantSQL: "AUTHORIZATION_TYPE 'none'",
 		},
 	}
 	for _, tc := range cases {

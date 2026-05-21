@@ -247,14 +247,18 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 			KeyPrefix:            in.S3.KeyPrefix,
 			Endpoint:             in.S3.Endpoint,
 			Region:               in.S3.Region,
-			PathStyleAccess:      in.S3.Flavor == "s3-compat",
-			Flavor:               in.S3.Flavor,
-			STSEnabled:           true,
+			PathStyleAccess: in.S3.Flavor == "s3-compat",
+			Flavor:          in.S3.Flavor,
+			// STS credential vending is OFF: Lakekeeper would assume a role
+			// and hand DuckDB short-lived creds, but its downscoping session
+			// policy overflows AWS's packed-policy limit (PackedPolicyTooLarge),
+			// and it's unnecessary — the duckling worker already holds STS creds
+			// for this bucket (brokered by the control plane for DuckLake, same
+			// per-org role). The worker attaches the catalog with its own S3
+			// secret and Lakekeeper serves metadata only (using its pod identity
+			// for catalog-metadata IO via allowDirectSystemCredentials).
+			STSEnabled:           false,
 			RemoteSigningEnabled: false,
-			// AWS requires a role to assume for STS credential vending. The
-			// per-org duckling role (which the pod runs as) self-assumes.
-			// s3-compat (MinIO) leaves this empty.
-			STSRoleARN: in.S3.RoleARN,
 		},
 		StorageCredential: storageCredFor(in.S3),
 	}
@@ -285,7 +289,10 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 		"iceberg_lakekeeper_client_credentials_namespace": p.k8s.namespace,
 		"iceberg_lakekeeper_client_credentials_name":      secretName,
 		"iceberg_lakekeeper_client_credentials_key":       SecretKeyOAuth2ClientSecret,
-		"iceberg_state": configstore.ManagedWarehouseStateReady,
+		// Persist the S3 region so the worker's iceberg S3 secret (built from
+		// the duckling's brokered creds) targets the right region for data IO.
+		"iceberg_region": in.S3.Region,
+		"iceberg_state":  configstore.ManagedWarehouseStateReady,
 	}
 	_ = creds // creds are written into the Secret; the row only references them
 	if err := p.store.UpdateIcebergConfig(w.OrgID, updates); err != nil {

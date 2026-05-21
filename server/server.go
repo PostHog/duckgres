@@ -1616,7 +1616,7 @@ func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID
 	}
 	switch ic.ResolvedBackend() {
 	case iceberg.BackendLakekeeper:
-		return attachLakekeeperCatalog(db, ic, sem)
+		return attachLakekeeperCatalog(db, ic, sem, keyID, secret, sessionToken)
 	case iceberg.BackendS3Tables:
 		return attachS3TablesIcebergCatalog(db, ic, sem, keyID, secret, sessionToken)
 	default:
@@ -1684,7 +1684,7 @@ func attachS3TablesIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{
 // attachLakekeeperCatalog attaches the per-tenant Lakekeeper REST catalog.
 // Skipped (returns nil) when LakekeeperEndpoint is empty — the provisioner
 // hasn't run yet for this org and the next activation will retry.
-func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}) error {
+func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
 	if ic.LakekeeperEndpoint == "" || ic.LakekeeperWarehouse == "" {
 		// Provisioner hasn't populated the row yet. Don't fail the
 		// activation; subsequent activations after provisioning will
@@ -1711,9 +1711,19 @@ func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}) er
 		return fmt.Errorf("load iceberg extension: %w", err)
 	}
 
-	// CREATE SECRET only when OAuth2 is configured (PR3). PR1 deploys
-	// Lakekeeper in allowall + NetworkPolicy mode, where the ATTACH uses
-	// AUTHORIZATION_TYPE 'none' and no SECRET.
+	// S3 data secret: Lakekeeper does NOT vend credentials (PackedPolicyTooLarge),
+	// so DuckDB needs its own creds to read/write the warehouse's S3 data. Reuse
+	// the duckling's brokered STS creds (same per-org role + bucket as DuckLake)
+	// to build the iceberg_sigv4 secret. Refreshed on STS expiry by
+	// RefreshIcebergSecret. Skipped if creds absent (e.g. local/dev).
+	if keyID != "" && secret != "" {
+		if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic, keyID, secret, sessionToken)); err != nil {
+			return fmt.Errorf("create Lakekeeper S3 data secret: %w", err)
+		}
+	}
+
+	// Catalog auth secret: only when OAuth2 is configured. In allowall mode
+	// the ATTACH uses AUTHORIZATION_TYPE 'none' and no catalog secret.
 	if stmt := iceberg.BuildLakekeeperSecretStmt(ic); stmt != "" {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("create Lakekeeper iceberg secret: %w", err)
@@ -2064,15 +2074,10 @@ func RefreshIcebergSecret(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID
 	if !ic.Enabled {
 		return nil
 	}
-	// Lakekeeper backend: Lakekeeper itself vends short-lived STS creds to
-	// DuckDB at table-load time via ACCESS_DELEGATION_MODE 'vended_credentials'.
-	// The OAuth2 client_secret in iceberg_oauth is a long-lived config, not
-	// an STS-minted blob — nothing to rotate on the worker's STS schedule.
-	// Returning nil here keeps Lakekeeper orgs from spuriously failing the
-	// hourly credential-refresh cycle.
-	if ic.ResolvedBackend() == iceberg.BackendLakekeeper {
-		return nil
-	}
+	// Both backends now use the worker's own brokered STS creds for S3 data
+	// (the iceberg_sigv4 secret) — Lakekeeper no longer vends — so both need
+	// the secret rotated on the worker's STS schedule. BuildIcebergSecretStmt
+	// produces the same iceberg_sigv4 secret regardless of backend.
 	if keyID == "" || secretKey == "" {
 		return fmt.Errorf("iceberg refresh: no AWS credentials in activation payload — control plane STS broker did not populate DuckLake S3 credentials")
 	}
