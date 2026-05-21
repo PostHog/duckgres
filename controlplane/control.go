@@ -847,6 +847,20 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	database := startupParams["database"]
 	applicationName := startupParams["application_name"]
 
+	// Honor a client-supplied connect-time search_path from the startup
+	// `options` parameter (libpq `options=-c search_path=...`, PGOPTIONS, or
+	// pgjdbc `currentSchema`), so a session can pick its default catalog at
+	// connect (e.g. iceberg.public). Sanitized here at the trust boundary;
+	// empty/invalid falls back to the worker's default search_path.
+	var clientSearchPath string
+	if raw := server.ParseStartupOptions(startupParams["options"])["search_path"]; raw != "" {
+		if sp, ok := server.SanitizeSearchPath(raw); ok {
+			clientSearchPath = sp
+		} else {
+			slog.Warn("Ignoring unsafe client search_path option.", "remote_addr", remoteAddr, "search_path", raw)
+		}
+	}
+
 	if username == "" {
 		server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no user specified")
@@ -1080,7 +1094,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
 		func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
-			return sessions.CreateSession(ctx, username, pid, memLimit, threads)
+			return sessions.CreateSession(ctx, username, clientSearchPath, pid, memLimit, threads)
 		},
 	)
 	if err != nil {

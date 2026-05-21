@@ -1200,7 +1200,7 @@ func recoverWorkerPanic(err *error) {
 }
 
 // CreateSession creates a new session on the given worker.
-func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit string, threads int) (token string, err error) {
+func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit, searchPath string, threads int) (token string, err error) {
 	defer recoverWorkerPanic(&err)
 
 	body, _ := json.Marshal(server.WorkerCreateSessionPayload{
@@ -1211,6 +1211,7 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit
 		},
 		Username:    username,
 		MemoryLimit: memoryLimit,
+		SearchPath:  searchPath,
 		Threads:     threads,
 	})
 

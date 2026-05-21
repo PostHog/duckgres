@@ -109,7 +109,7 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 		}
 	}
 
-	session, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads)
+	session, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.SearchPath, req.Threads)
 	if err != nil {
 		return status.Errorf(codes.ResourceExhausted, "create session: %v", err)
 	}
