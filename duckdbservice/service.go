@@ -274,13 +274,18 @@ func (p *SessionPool) scrapeMetadataMetrics() {
 	if v, ok := scrapeMetadataPoolMax(ctx, scrapeDB); ok {
 		observe.MetadataPoolMaxConnections.WithLabelValues(orgID).Set(v)
 	}
-
-	scrapeMetadataConnectionsByState(ctx, scrapeDB, orgID)
 }
 
 // scrapeMetadataPoolMax reads DuckDB's pg_pool_max_connections setting via
 // duckdb_settings(). A value of 0 means the in-process pool is disabled (we
 // set this when ViaPgBouncer is true) — still useful to emit as a gauge.
+//
+// Aurora-side load (active/idle connections, slow queries) is observed via
+// pg_stat_activity / Performance Insights, attributed back to duckgres by
+// the application_name we tag at ATTACH time (ducklake.Config.ApplicationName).
+// We deliberately don't try to scrape pg_stat_activity from the worker via
+// postgres_query — an earlier attempt silently no-op'd in our DuckDB build
+// and Performance Insights is the better tool for that view anyway.
 func scrapeMetadataPoolMax(ctx context.Context, db *sql.DB) (float64, bool) {
 	var raw string
 	err := db.QueryRowContext(ctx,
@@ -295,45 +300,6 @@ func scrapeMetadataPoolMax(ctx context.Context, db *sql.DB) (float64, bool) {
 		return 0, false
 	}
 	return v, true
-}
-
-// scrapeMetadataConnectionsByState issues a single pg_stat_activity query
-// against the ATTACHed DuckLake metadata DB via postgres_query() and emits a
-// gauge per Postgres connection state. Connections are filtered by the
-// application_name we injected at attach time so we report only duckgres'
-// own connections, not whatever else is sharing the metadata Postgres.
-//
-// We deliberately do not log on failure: if postgres_query is unavailable
-// (extension load order, version skew) or the metadata user lacks
-// pg_stat_activity visibility, the gauge simply stops updating, and the
-// per-org missing-data signal in Grafana is more useful than a recurring
-// warn on every worker.
-func scrapeMetadataConnectionsByState(ctx context.Context, db *sql.DB, orgID string) {
-	const q = `SELECT state, n FROM postgres_query(
-		'__ducklake_metadata_ducklake',
-		'SELECT COALESCE(state, ''unknown'') AS state, count(*) AS n FROM pg_stat_activity WHERE application_name LIKE ''duckgres/%'' GROUP BY state'
-	)`
-	rows, err := db.QueryContext(ctx, q)
-	if err != nil {
-		return
-	}
-	defer func() { _ = rows.Close() }()
-
-	seen := map[string]float64{}
-	for rows.Next() {
-		var state string
-		var n int64
-		if err := rows.Scan(&state, &n); err != nil {
-			return
-		}
-		seen[state] = float64(n)
-	}
-	if err := rows.Err(); err != nil {
-		return
-	}
-	for state, n := range seen {
-		observe.MetadataConnectionsByState.WithLabelValues(orgID, state).Set(n)
-	}
 }
 
 // Run starts the DuckDB service, blocking until shutdown.

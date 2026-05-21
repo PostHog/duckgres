@@ -63,14 +63,3 @@ var MetadataPoolMaxConnections = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_ducklake_metadata_pool_max_connections",
 	Help: "Configured postgres_scanner pool ceiling for DuckLake metadata (pg_pool_max_connections).",
 }, []string{"org"})
-
-// MetadataConnectionsByState is the live count of metadata DB connections
-// from pg_stat_activity on the DuckLake metadata DB, grouped by Postgres
-// connection state (active, idle, idle in transaction, etc.). Scraped via
-// postgres_query against the ATTACHed metadata catalog every metadata
-// metrics tick. Only populated when the metadata DB tags duckgres
-// connections via application_name (see ducklake.Config.ApplicationName).
-var MetadataConnectionsByState = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_ducklake_metadata_connections",
-	Help: "DuckLake metadata DB connection count by state, scraped from pg_stat_activity (filtered by application_name).",
-}, []string{"org", "state"})
