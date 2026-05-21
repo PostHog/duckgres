@@ -12,6 +12,7 @@ import (
 
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 var ErrTooManyConnections = errors.New("too many connections")
@@ -176,13 +177,20 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username, searchPat
 	if err != nil {
 		var capacityErr *WarmCapacityExhaustedError
 		if errors.As(err, &capacityErr) {
+			missReason := capacityErr.missReason()
 			observeControlPlaneWorkerAcquireFailure("warm_capacity_exhausted")
+			observeControlPlaneWorkerAcquireFailure("warm_capacity_" + string(missReason))
+			acquireSpan.SetAttributes(
+				attribute.String("warm_capacity.reason", string(missReason)),
+				attribute.Int("warm_capacity.retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter)),
+			)
 			slog.Warn("Worker acquisition failed.",
 				"pid", pid,
 				"user", username,
 				"duration", time.Since(acquireStart),
-				"reason", "warm_capacity_exhausted",
+				"reason", missReason,
 				"retry_after", capacityErr.RetryAfter,
+				"retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter),
 				"error", err,
 			)
 		}

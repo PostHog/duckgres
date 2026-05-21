@@ -1473,13 +1473,6 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 
 func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, reason configstore.WorkerClaimMissReason) {
 	policy := warmCapacityMissPolicyForReason(reason)
-	if !policy.recordDynamicDemand {
-		return
-	}
-	if p.runtimeStore == nil {
-		return
-	}
-
 	image := ""
 	if assignment != nil {
 		image = strings.TrimSpace(assignment.Image)
@@ -1492,6 +1485,13 @@ func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, rea
 	}
 
 	scope := "image:" + image
+	observeWarmCapacityMiss(scope, policy.reason)
+	if !policy.recordDynamicDemand {
+		return
+	}
+	if p.runtimeStore == nil {
+		return
+	}
 	if err := p.runtimeStore.RecordWarmCapacityMiss(scope, policy.reason, time.Now()); err != nil {
 		slog.Warn("Failed to record warm capacity miss.", "scope", scope, "reason", policy.reason, "error", err)
 	}
@@ -1969,6 +1969,7 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 			p.maxWorkers,
 		)
 		if err != nil {
+			observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "error", len(slots))
 			for _, s := range slots {
 				p.retireClaimedWorker(s, RetireReasonCrash)
 			}
@@ -2010,7 +2011,13 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 		}(i, slot)
 	}
 	wg.Wait()
-	return stderrors.Join(errs...)
+	err := stderrors.Join(errs...)
+	result := "success"
+	if err != nil {
+		result = "error"
+	}
+	observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), result, len(slots))
+	return err
 }
 
 // HealthCheckLoop periodically checks worker health.
