@@ -480,7 +480,7 @@ func (p *K8sWorkerPool) startInformer() {
 				}
 			}
 			if ch, loaded := p.podReady.LoadAndDelete(pod.Name); loaded {
-				close(ch.(chan string))
+				close(ch.(chan podReadyInfo))
 			}
 			p.onPodTerminated(pod)
 		},
@@ -789,6 +789,12 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	addr := fmt.Sprintf("%s:%d", ready.ip, p.workerPort)
 	token, serverCertPEM, err := p.readWorkerRPCSecurity(ctx, podName)
 	if err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{
+			GracePeriodSeconds: int64Ptr(0),
+		})
+		_ = p.deleteWorkerRPCSecret(cleanupCtx, podName)
 		return fmt.Errorf("read worker RPC security: %w", err)
 	}
 	client, err := waitForWorkerTCP(addr, token, serverCertPEM, 90*time.Second)
