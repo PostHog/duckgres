@@ -911,7 +911,6 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	p.workers[id] = w
 	p.stampNodeFirstSeenLocked(ready.nodeName)
 	workerCount := len(p.workers)
-	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
 	if publishIdle {
 		p.persistWorkerRecord(p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil))
@@ -1330,7 +1329,6 @@ func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	}
 	w.lastUsed = time.Now()
 	hotIdleRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateHotIdle, "", nil)
-	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
 	p.persistWorkerRecord(hotIdleRecord)
 	return true
@@ -1423,7 +1421,6 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		return setErr
 	}
 	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
-	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
 	p.persistWorkerRecord(hotRecord)
 	return nil
@@ -1536,7 +1533,6 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			idle.IncrementOwnerEpoch()
 			idle.reservedAt = time.Now()
 			reservedRecord := p.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
-			observeWarmPoolLifecycleGauges(p.workers)
 			shouldReplenish := p.shouldReplenishWarmCapacityLocked()
 			var replenishID int
 			if shouldReplenish {
@@ -1656,7 +1652,6 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 		return nil, err
 	}
 	worker.reservedAt = time.Now()
-	observeWarmPoolLifecycleGauges(p.workers)
 	if claimed.State != configstore.WorkerStateReserved {
 		reservedRecord = p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
 	}
@@ -2021,7 +2016,6 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				p.mu.Lock()
 				p.spawning--
 				if err == nil {
-					observeWarmPoolLifecycleGauges(p.workers)
 				}
 				p.mu.Unlock()
 
@@ -2068,7 +2062,6 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 			p.mu.Lock()
 			p.spawning--
 			if err == nil {
-				observeWarmPoolLifecycleGauges(p.workers)
 			}
 			p.mu.Unlock()
 
@@ -2185,7 +2178,6 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 			p.mu.Lock()
 			p.spawning--
 			if err == nil {
-				observeWarmPoolLifecycleGauges(p.workers)
 			}
 			p.mu.Unlock()
 
@@ -3019,7 +3011,6 @@ func (p *K8sWorkerPool) dropLocalWorkerIfSameLeaseLocked(lease workerLeaseSnapsh
 		return nil, len(p.workers)
 	}
 	delete(p.workers, current.ID)
-	observeWarmPoolLifecycleGauges(p.workers)
 	return current, len(p.workers)
 }
 
@@ -3161,7 +3152,6 @@ func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker, reason
 	}
 	_ = w.SetSharedState(nextState)
 	observeWorkerRetirement(reason)
-	observeWarmPoolLifecycleGauges(p.workers)
 }
 
 func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) {

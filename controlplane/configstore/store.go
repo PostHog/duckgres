@@ -883,6 +883,32 @@ func (cs *ConfigStore) ListWarmCapacityWorkerStats() ([]WarmCapacityWorkerStats,
 	return out, nil
 }
 
+// ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
+// state by image and ownership for Prometheus observability.
+func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
+	const ownershipExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_owned' END"
+	var out []WorkerLifecycleStats
+	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Select("image, state, "+ownershipExpr+" AS ownership, COUNT(*)::bigint AS count").
+		Where("image <> ''").
+		Where("state IN ?", []WorkerState{
+			WorkerStateSpawning,
+			WorkerStateIdle,
+			WorkerStateReserved,
+			WorkerStateActivating,
+			WorkerStateHot,
+			WorkerStateHotIdle,
+			WorkerStateDraining,
+		}).
+		Group("image, state, " + ownershipExpr).
+		Order("image ASC, state ASC, ownership ASC").
+		Scan(&out).Error
+	if err != nil {
+		return nil, fmt.Errorf("list worker lifecycle stats: %w", err)
+	}
+	return out, nil
+}
+
 // UpsertControlPlaneInstance inserts or updates a runtime control-plane instance row.
 func (cs *ConfigStore) UpsertControlPlaneInstance(instance *ControlPlaneInstance) error {
 	if err := cs.db.Table(cs.runtimeTable(instance.TableName())).Clauses(clause.OnConflict{

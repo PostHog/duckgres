@@ -2,7 +2,7 @@
 
 ## When to use
 
-- `duckgres_activating_workers` gauge is non-zero for more than 2 minutes
+- `sum(duckgres_worker_lifecycle_count{state="activating"})` is non-zero for more than 2 minutes
 - `duckgres_activation_failures_total` is increasing
 - Sessions are timing out because no hot workers are available
 
@@ -16,8 +16,8 @@ The automatic stuck-worker reaper runs every minute and retires workers that hav
 
 | Metric | What it means |
 |--------|---------------|
-| `duckgres_activating_workers` | Workers currently activating (should be 0 or briefly 1-2) |
-| `duckgres_reserved_workers` | Workers reserved but not yet activating |
+| `sum(duckgres_worker_lifecycle_count{state="activating"})` | Workers currently activating (should be 0 or briefly 1-2) |
+| `sum(duckgres_worker_lifecycle_count{state="reserved"})` | Workers reserved but not yet activating |
 | `duckgres_activation_failures_total` | Total failed activations; use control-plane logs for failure details |
 | `duckgres_worker_retirements_total{reason="stuck_activating"}` | How many workers have been auto-reaped |
 
@@ -36,7 +36,7 @@ The automatic stuck-worker reaper runs every minute and retires workers that hav
    kubectl delete pod <pod-name> --grace-period=10
    ```
 
-4. **Verify recovery.** After stuck workers are cleaned up, check that `duckgres_warm_workers` replenishes to `minWorkers`.
+4. **Verify recovery.** After stuck workers are cleaned up, check that `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` replenishes to `minWorkers`.
 
 ## Prevention
 

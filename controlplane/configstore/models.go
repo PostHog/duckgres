@@ -390,6 +390,15 @@ type WarmCapacityWorkerStats struct {
 	SpawningWorkers int64  `json:"spawning_workers"`
 }
 
+// WorkerLifecycleStats is the grouped worker lifecycle state used for
+// cluster-wide worker observability.
+type WorkerLifecycleStats struct {
+	Image     string      `json:"image"`
+	State     WorkerState `json:"state"`
+	Ownership string      `json:"ownership"`
+	Count     int64       `json:"count"`
+}
+
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {
 	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`

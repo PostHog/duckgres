@@ -2,7 +2,7 @@
 
 ## When to use
 
-- `duckgres_warm_workers` is 0 and sessions are queuing
+- `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` is 0 and sessions are queuing
 - After a mass retirement event (planned control-plane rollout, crash storm)
 - Scaling up for anticipated traffic
 
@@ -14,8 +14,8 @@ The shared warm pool maintains `minWorkers` idle workers at all times. When a wo
 
 | Metric | Alert threshold | What it means |
 |--------|----------------|---------------|
-| `duckgres_warm_workers` | < 1 for > 30s | No idle capacity, new sessions must wait for a spawn |
-| `duckgres_hot_workers` | Near `maxWorkers` | Pool is at capacity, may need to scale `maxWorkers` |
+| `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` | < 1 for > 30s | No idle capacity, new sessions must wait for a spawn |
+| `sum(duckgres_worker_lifecycle_count{state="hot"})` | Near `maxWorkers` | Pool is at capacity, may need to scale `maxWorkers` |
 | `duckgres_worker_retirements_total{reason="crash"}` | Spike | Workers are crashing, replacements may also crash |
 
 ## Procedure
@@ -38,7 +38,7 @@ The shared warm pool maintains `minWorkers` idle workers at all times. When a wo
    - Scale the Kubernetes node pool if scheduling is the bottleneck
 
 4. **Verify recovery.** After scaling, confirm:
-   - `duckgres_warm_workers` returns to `minWorkers`
+   - `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` returns to `minWorkers`
    - New sessions are no longer queuing (check `duckgres_worker_acquire_duration_seconds` if available)
 
 ## Emergency: Force-spawn workers

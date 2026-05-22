@@ -56,6 +56,11 @@ var warmCapacityReconcileSpawnsCounter = promauto.NewCounterVec(prometheus.Count
 	Help: "Warm-capacity worker spawn slots accepted by reconciliation, partitioned by scope and result.",
 }, []string{"scope", "result"})
 
+var workerLifecycleCountGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_worker_lifecycle_count",
+	Help: "Cluster-wide active worker count by image, lifecycle state, and ownership.",
+}, []string{"image", "state", "ownership"})
+
 func observeWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason) {
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
@@ -131,6 +136,29 @@ func observeWarmCapacityWorkerStats(stats []configstore.WarmCapacityWorkerStats,
 		}
 		warmCapacityReadyWorkersGauge.WithLabelValues(scope).Set(float64(nonNegativeInt64(stat.ReadyWorkers)))
 		warmCapacitySpawningWorkersGauge.WithLabelValues(scope).Set(float64(nonNegativeInt64(stat.SpawningWorkers)))
+	}
+}
+
+func observeWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats, previous ...[]configstore.WorkerLifecycleStats) {
+	for _, prev := range previous {
+		for _, stat := range prev {
+			image := strings.TrimSpace(stat.Image)
+			state := strings.TrimSpace(string(stat.State))
+			ownership := strings.TrimSpace(stat.Ownership)
+			if image == "" || state == "" || ownership == "" {
+				continue
+			}
+			workerLifecycleCountGauge.WithLabelValues(image, state, ownership).Set(0)
+		}
+	}
+	for _, stat := range stats {
+		image := strings.TrimSpace(stat.Image)
+		state := strings.TrimSpace(string(stat.State))
+		ownership := strings.TrimSpace(stat.Ownership)
+		if image == "" || state == "" || ownership == "" {
+			continue
+		}
+		workerLifecycleCountGauge.WithLabelValues(image, state, ownership).Set(float64(nonNegativeInt64(stat.Count)))
 	}
 }
 
