@@ -249,7 +249,6 @@ func SetupMultiTenant(
 	janitor.lifecycle = router.sharedPool.lifecycle
 	lastWarmCapacityTargets := map[string]int{}
 	var lastWarmCapacityRecentMisses []configstore.WarmCapacityMissAggregate
-	var lastWarmCapacityWorkerStats []configstore.WarmCapacityWorkerStats
 	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats
 	lastWarmCapacityGlobalCapBlocked := false
 	janitor.reconcileWarmCapacity = func() {
@@ -270,12 +269,6 @@ func SetupMultiTenant(
 		observeWarmCapacityRecentMisses(targetSnapshot.RecentMisses, lastWarmCapacityRecentMisses)
 		lastWarmCapacityRecentMisses = cloneWarmCapacityMissAggregates(targetSnapshot.RecentMisses)
 		observeWarmCapacityTargets(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, cfg.K8s.MaxWorkers, lastWarmCapacityTargets)
-		if stats, statsErr := listWarmCapacityWorkerStats(store); statsErr != nil {
-			slog.Warn("Janitor failed to read warm-capacity worker stats.", "error", statsErr)
-		} else {
-			observeWarmCapacityWorkerStats(stats, lastWarmCapacityWorkerStats)
-			lastWarmCapacityWorkerStats = cloneWarmCapacityWorkerStats(stats)
-		}
 		if stats, statsErr := listWorkerLifecycleStats(store); statsErr != nil {
 			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", statsErr)
 		} else {
@@ -446,10 +439,6 @@ type warmCapacityMissAggregateLister interface {
 	ListWarmCapacityMissesSince(since time.Time, reasons ...configstore.WorkerClaimMissReason) ([]configstore.WarmCapacityMissAggregate, error)
 }
 
-type warmCapacityWorkerStatsLister interface {
-	ListWarmCapacityWorkerStats() ([]configstore.WarmCapacityWorkerStats, error)
-}
-
 type workerLifecycleStatsLister interface {
 	ListWorkerLifecycleStats() ([]configstore.WorkerLifecycleStats, error)
 }
@@ -491,13 +480,6 @@ func computeEffectiveWarmCapacityTargetSnapshot(baseTargets map[string]int, list
 	snap.RecentMisses = aggregates
 	snap.EffectiveTargets = computeDynamicWarmCapacityTargets(snap.BaseTargets, aggregates, dynamicCfg)
 	return snap, nil
-}
-
-func listWarmCapacityWorkerStats(lister warmCapacityWorkerStatsLister) ([]configstore.WarmCapacityWorkerStats, error) {
-	if lister == nil {
-		return nil, nil
-	}
-	return lister.ListWarmCapacityWorkerStats()
 }
 
 func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.WorkerLifecycleStats, error) {
@@ -544,15 +526,6 @@ func cloneWarmCapacityMissAggregates(aggregates []configstore.WarmCapacityMissAg
 	}
 	out := make([]configstore.WarmCapacityMissAggregate, len(aggregates))
 	copy(out, aggregates)
-	return out
-}
-
-func cloneWarmCapacityWorkerStats(stats []configstore.WarmCapacityWorkerStats) []configstore.WarmCapacityWorkerStats {
-	if len(stats) == 0 {
-		return nil
-	}
-	out := make([]configstore.WarmCapacityWorkerStats, len(stats))
-	copy(out, stats)
 	return out
 }
 

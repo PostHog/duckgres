@@ -223,17 +223,6 @@ func TestObserveWarmCapacityMetrics(t *testing.T) {
 	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 5, scope)
 	assertGaugeVecValue(t, warmCapacityHeadroomGauge, 5, "global")
 
-	observeWarmCapacityWorkerStats([]configstore.WarmCapacityWorkerStats{
-		{Scope: scope, ReadyWorkers: 2, SpawningWorkers: 1},
-	})
-	assertGaugeVecValue(t, warmCapacityReadyWorkersGauge, 2, scope)
-	assertGaugeVecValue(t, warmCapacitySpawningWorkersGauge, 1, scope)
-	observeWarmCapacityWorkerStats(nil, []configstore.WarmCapacityWorkerStats{
-		{Scope: scope, ReadyWorkers: 2, SpawningWorkers: 1},
-	})
-	assertGaugeVecValue(t, warmCapacityReadyWorkersGauge, 0, scope)
-	assertGaugeVecValue(t, warmCapacitySpawningWorkersGauge, 0, scope)
-
 	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
 	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHot), "org_owned")
 	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHotIdle), "org_owned")

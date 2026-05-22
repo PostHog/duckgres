@@ -36,16 +36,6 @@ var warmCapacityEffectiveTargetGauge = promauto.NewGaugeVec(prometheus.GaugeOpts
 	Help: "Effective warm-capacity target after applying dynamic demand and caps by scope.",
 }, []string{"scope"})
 
-var warmCapacityReadyWorkersGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_warm_capacity_ready_workers",
-	Help: "Cluster-wide ready neutral warm workers by scope.",
-}, []string{"scope"})
-
-var warmCapacitySpawningWorkersGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_warm_capacity_spawning_workers",
-	Help: "Cluster-wide spawning neutral warm workers by scope.",
-}, []string{"scope"})
-
 var warmCapacityHeadroomGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_warm_capacity_headroom",
 	Help: "Remaining global warm-capacity target headroom by scope; -1 means unbounded.",
@@ -116,27 +106,6 @@ func observeWarmCapacityTargets(baseTargets, effectiveTargets map[string]int, ma
 		}
 	}
 	warmCapacityHeadroomGauge.WithLabelValues("global").Set(headroom)
-}
-
-func observeWarmCapacityWorkerStats(stats []configstore.WarmCapacityWorkerStats, previous ...[]configstore.WarmCapacityWorkerStats) {
-	for _, prev := range previous {
-		for _, stat := range prev {
-			scope := strings.TrimSpace(stat.Scope)
-			if scope == "" {
-				continue
-			}
-			warmCapacityReadyWorkersGauge.WithLabelValues(scope).Set(0)
-			warmCapacitySpawningWorkersGauge.WithLabelValues(scope).Set(0)
-		}
-	}
-	for _, stat := range stats {
-		scope := strings.TrimSpace(stat.Scope)
-		if scope == "" {
-			continue
-		}
-		warmCapacityReadyWorkersGauge.WithLabelValues(scope).Set(float64(nonNegativeInt64(stat.ReadyWorkers)))
-		warmCapacitySpawningWorkersGauge.WithLabelValues(scope).Set(float64(nonNegativeInt64(stat.SpawningWorkers)))
-	}
 }
 
 func observeWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats, previous ...[]configstore.WorkerLifecycleStats) {

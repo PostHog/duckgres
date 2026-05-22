@@ -859,30 +859,6 @@ func (cs *ConfigStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, er
 	return result.RowsAffected, nil
 }
 
-// ListWarmCapacityWorkerStats returns grouped cluster-wide warm-worker state
-// for image-scoped warm-capacity observability.
-func (cs *ConfigStore) ListWarmCapacityWorkerStats() ([]WarmCapacityWorkerStats, error) {
-	var out []WarmCapacityWorkerStats
-	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Select(
-			"('image:' || image) AS scope, "+
-				"COALESCE(SUM(CASE WHEN state = ? THEN 1 ELSE 0 END), 0)::bigint AS ready_workers, "+
-				"COALESCE(SUM(CASE WHEN state = ? THEN 1 ELSE 0 END), 0)::bigint AS spawning_workers",
-			WorkerStateIdle,
-			WorkerStateSpawning,
-		).
-		Where("org_id = ''").
-		Where("image <> ''").
-		Where("state IN ?", []WorkerState{WorkerStateIdle, WorkerStateSpawning}).
-		Group("image").
-		Order("scope ASC").
-		Scan(&out).Error
-	if err != nil {
-		return nil, fmt.Errorf("list warm capacity worker stats: %w", err)
-	}
-	return out, nil
-}
-
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
 // state by image and ownership for Prometheus observability.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
