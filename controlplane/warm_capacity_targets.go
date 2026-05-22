@@ -90,10 +90,11 @@ func imageWarmCapacityMissCounts(aggregates []configstore.WarmCapacityMissAggreg
 		if !policy.recordDynamicDemand {
 			continue
 		}
-		image, ok := strings.CutPrefix(strings.TrimSpace(aggregate.Scope), "image:")
-		if !ok {
+		image := strings.TrimSpace(aggregate.Scope)
+		if strings.HasPrefix(image, "org:") {
 			continue
 		}
+		image = strings.TrimPrefix(image, "image:")
 		image = strings.TrimSpace(image)
 		if image == "" {
 			continue

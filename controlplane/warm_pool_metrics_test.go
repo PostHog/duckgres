@@ -195,33 +195,33 @@ func TestReapStuckActivatingWorkers_RecentlyReservedNotReaped(t *testing.T) {
 
 func TestObserveWarmCapacityMetrics(t *testing.T) {
 	image := "duckgres:metrics-test"
-	scope := "image:" + image
-	warmCapacityMissesCounter.DeleteLabelValues(scope, string(configstore.WorkerClaimMissReasonGlobalCap))
-	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(scope, "success")
+	scope := warmCapacityScopeForImage(image)
+	warmCapacityMissesCounter.DeleteLabelValues(image, string(configstore.WorkerClaimMissReasonGlobalCap))
+	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(image, "success")
 
-	observeWarmCapacityMiss(scope, configstore.WorkerClaimMissReasonGlobalCap)
-	if got := counterLabelValues(warmCapacityMissesCounter, scope, string(configstore.WorkerClaimMissReasonGlobalCap)); got != 1 {
+	observeWarmCapacityMiss(image, configstore.WorkerClaimMissReasonGlobalCap)
+	if got := counterLabelValues(warmCapacityMissesCounter, image, string(configstore.WorkerClaimMissReasonGlobalCap)); got != 1 {
 		t.Fatalf("expected one global-cap warm capacity miss, got %v", got)
 	}
 
 	observeWarmCapacityRecentMisses([]configstore.WarmCapacityMissAggregate{
 		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
 	})
-	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 4, scope, string(configstore.WorkerClaimMissReasonNoIdle))
+	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 4, image, string(configstore.WorkerClaimMissReasonNoIdle))
 	observeWarmCapacityRecentMisses(nil, []configstore.WarmCapacityMissAggregate{
 		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
 	})
-	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 0, scope, string(configstore.WorkerClaimMissReasonNoIdle))
+	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 0, image, string(configstore.WorkerClaimMissReasonNoIdle))
 
 	observeWarmCapacityTargets(
 		map[string]int{image: 2},
 		map[string]int{image: 5},
 		10,
 	)
-	assertGaugeVecValue(t, warmCapacityBaseTargetGauge, 2, scope)
-	assertGaugeVecValue(t, warmCapacityDemandTargetGauge, 3, scope)
-	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 5, scope)
-	assertGaugeVecValue(t, warmCapacityHeadroomGauge, 5, "global")
+	assertGaugeVecValue(t, warmCapacityBaseTargetGauge, 2, image)
+	assertGaugeVecValue(t, warmCapacityDemandTargetGauge, 3, image)
+	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 5, image)
+	assertGaugeValue(t, warmCapacityHeadroomGauge, 5)
 
 	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
 	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHot), "org_bound")
@@ -243,15 +243,15 @@ func TestObserveWarmCapacityMetrics(t *testing.T) {
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHot), "org_bound")
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHotIdle), "org_bound")
 
-	observeWarmCapacityReconcileSpawns(scope, "success", 3)
-	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, scope, "success"); got != 3 {
+	observeWarmCapacityReconcileSpawns(image, "success", 3)
+	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, image, "success"); got != 3 {
 		t.Fatalf("expected three warm capacity reconcile spawns, got %v", got)
 	}
 }
 
 func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 	image := "duckgres:leader-reset-test"
-	scope := "image:" + image
+	scope := warmCapacityScopeForImage(image)
 
 	observeWarmCapacityRecentMisses([]configstore.WarmCapacityMissAggregate{
 		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
@@ -267,11 +267,11 @@ func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 
 	resetLeaderOwnedClusterMetrics()
 
-	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 0, scope, string(configstore.WorkerClaimMissReasonNoIdle))
-	assertGaugeVecValue(t, warmCapacityBaseTargetGauge, 0, scope)
-	assertGaugeVecValue(t, warmCapacityDemandTargetGauge, 0, scope)
-	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 0, scope)
-	assertGaugeVecValue(t, warmCapacityHeadroomGauge, 0, "global")
+	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 0, image, string(configstore.WorkerClaimMissReasonNoIdle))
+	assertGaugeVecValue(t, warmCapacityBaseTargetGauge, 0, image)
+	assertGaugeVecValue(t, warmCapacityDemandTargetGauge, 0, image)
+	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 0, image)
+	assertGaugeValue(t, warmCapacityHeadroomGauge, 0)
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
 }
 
