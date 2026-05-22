@@ -123,6 +123,41 @@ func TestComputeEffectiveWarmCapacityTargetsFallsBackToBaseOnReadError(t *testin
 	}
 }
 
+func TestWarmCapacityGlobalCapBlocksDemandDetectsPartialHeadroom(t *testing.T) {
+	base := map[string]int{"posthog/duckgres:default": 2}
+	aggregates := []configstore.WarmCapacityMissAggregate{
+		warmCapacityMissAggregate("image:posthog/duckgres:default", configstore.WorkerClaimMissReasonNoIdle, 32),
+	}
+	cfg := K8sConfig{
+		DynamicWarmCapacityEnabled:  true,
+		WarmCapacityMissesPerWorker: 8,
+		MaxWorkers:                  3,
+	}
+	effective := computeDynamicWarmCapacityTargets(base, aggregates, dynamicWarmCapacityConfigFromK8s(cfg))
+
+	if !warmCapacityGlobalCapBlocksDemand(base, effective, aggregates, cfg) {
+		t.Fatal("expected global cap block when one free slot cannot satisfy all dynamic demand")
+	}
+}
+
+func TestWarmCapacityGlobalCapBlocksDemandIgnoresDynamicCeiling(t *testing.T) {
+	base := map[string]int{"posthog/duckgres:default": 2}
+	aggregates := []configstore.WarmCapacityMissAggregate{
+		warmCapacityMissAggregate("image:posthog/duckgres:default", configstore.WorkerClaimMissReasonNoIdle, 32),
+	}
+	cfg := K8sConfig{
+		DynamicWarmCapacityEnabled:      true,
+		WarmCapacityMissesPerWorker:     8,
+		WarmCapacityDynamicTotalCeiling: 1,
+		MaxWorkers:                      10,
+	}
+	effective := computeDynamicWarmCapacityTargets(base, aggregates, dynamicWarmCapacityConfigFromK8s(cfg))
+
+	if warmCapacityGlobalCapBlocksDemand(base, effective, aggregates, cfg) {
+		t.Fatal("did not expect global cap block when only the dynamic total ceiling limits demand")
+	}
+}
+
 func TestReconcileWarmCapacityImageTargetsSpawnsPerImageTargets(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 0)
 	store := &captureRuntimeWorkerStore{}

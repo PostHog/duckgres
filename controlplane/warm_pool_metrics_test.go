@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -267,6 +268,53 @@ func TestReapStuckActivatingWorkers_RecentlyReservedNotReaped(t *testing.T) {
 	}
 }
 
+func TestObserveWarmCapacityMetrics(t *testing.T) {
+	image := "duckgres:metrics-test"
+	scope := "image:" + image
+	warmCapacityMissesCounter.DeleteLabelValues(scope, string(configstore.WorkerClaimMissReasonGlobalCap))
+	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(scope, "success")
+
+	observeWarmCapacityMiss(scope, configstore.WorkerClaimMissReasonGlobalCap)
+	if got := counterLabelValues(warmCapacityMissesCounter, scope, string(configstore.WorkerClaimMissReasonGlobalCap)); got != 1 {
+		t.Fatalf("expected one global-cap warm capacity miss, got %v", got)
+	}
+
+	observeWarmCapacityRecentMisses([]configstore.WarmCapacityMissAggregate{
+		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
+	})
+	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 4, scope, string(configstore.WorkerClaimMissReasonNoIdle))
+	observeWarmCapacityRecentMisses(nil, []configstore.WarmCapacityMissAggregate{
+		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
+	})
+	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 0, scope, string(configstore.WorkerClaimMissReasonNoIdle))
+
+	observeWarmCapacityTargets(
+		map[string]int{image: 2},
+		map[string]int{image: 5},
+		10,
+	)
+	assertGaugeVecValue(t, warmCapacityBaseTargetGauge, 2, scope)
+	assertGaugeVecValue(t, warmCapacityDemandTargetGauge, 3, scope)
+	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 5, scope)
+	assertGaugeVecValue(t, warmCapacityHeadroomGauge, 5, "global")
+
+	observeWarmCapacityWorkerStats([]configstore.WarmCapacityWorkerStats{
+		{Scope: scope, ReadyWorkers: 2, SpawningWorkers: 1},
+	})
+	assertGaugeVecValue(t, warmCapacityReadyWorkersGauge, 2, scope)
+	assertGaugeVecValue(t, warmCapacitySpawningWorkersGauge, 1, scope)
+	observeWarmCapacityWorkerStats(nil, []configstore.WarmCapacityWorkerStats{
+		{Scope: scope, ReadyWorkers: 2, SpawningWorkers: 1},
+	})
+	assertGaugeVecValue(t, warmCapacityReadyWorkersGauge, 0, scope)
+	assertGaugeVecValue(t, warmCapacitySpawningWorkersGauge, 0, scope)
+
+	observeWarmCapacityReconcileSpawns(scope, "success", 3)
+	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, scope, "success"); got != 3 {
+		t.Fatalf("expected three warm capacity reconcile spawns, got %v", got)
+	}
+}
+
 // --- Helpers ---
 
 func makeTestWorker(lifecycle WorkerLifecycleState, assignment *WorkerAssignment) *ManagedWorker {
@@ -290,8 +338,12 @@ func assertGaugeValue(t *testing.T, gauge prometheus.Gauge, expected float64) {
 }
 
 func counterLabelValue(cv *prometheus.CounterVec, label string) float64 {
+	return counterLabelValues(cv, label)
+}
+
+func counterLabelValues(cv *prometheus.CounterVec, labels ...string) float64 {
 	m := &dto.Metric{}
-	counter, err := cv.GetMetricWithLabelValues(label)
+	counter, err := cv.GetMetricWithLabelValues(labels...)
 	if err != nil {
 		return 0
 	}
@@ -299,4 +351,19 @@ func counterLabelValue(cv *prometheus.CounterVec, label string) float64 {
 		return 0
 	}
 	return m.GetCounter().GetValue()
+}
+
+func assertGaugeVecValue(t *testing.T, gv *prometheus.GaugeVec, expected float64, labels ...string) {
+	t.Helper()
+	gauge, err := gv.GetMetricWithLabelValues(labels...)
+	if err != nil {
+		t.Fatalf("failed to read gauge labels %v: %v", labels, err)
+	}
+	m := &dto.Metric{}
+	if err := gauge.Write(m); err != nil {
+		t.Fatalf("failed to write gauge labels %v: %v", labels, err)
+	}
+	if got := m.GetGauge().GetValue(); got != expected {
+		t.Fatalf("expected gauge labels %v value %v, got %v", labels, expected, got)
+	}
 }

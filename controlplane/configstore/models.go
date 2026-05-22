@@ -382,6 +382,14 @@ type WarmCapacityMissAggregate struct {
 	Count  int64                 `json:"count"`
 }
 
+// WarmCapacityWorkerStats is the grouped warm-worker state used for
+// warm-capacity observability.
+type WarmCapacityWorkerStats struct {
+	Scope           string `json:"scope"`
+	ReadyWorkers    int64  `json:"ready_workers"`
+	SpawningWorkers int64  `json:"spawning_workers"`
+}
+
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {
 	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`

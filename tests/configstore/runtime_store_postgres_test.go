@@ -241,6 +241,75 @@ func TestPruneWarmCapacityMissBucketsPostgres(t *testing.T) {
 	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, newBucketStart, 1)
 }
 
+func TestListWarmCapacityWorkerStatsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 26, 14, 30, 0, 0, time.UTC)
+	records := []configstore.WorkerRecord{
+		{
+			WorkerID:          1001,
+			PodName:           "duckgres-worker-test-cp-1001",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateIdle,
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1002,
+			PodName:           "duckgres-worker-test-cp-1002",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1003,
+			PodName:           "duckgres-worker-test-cp-1003",
+			Image:             "duckgres:pinned",
+			State:             configstore.WorkerStateIdle,
+			OwnerCPInstanceID: "cp-b",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1004,
+			PodName:           "duckgres-worker-test-cp-1004",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateHot,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1005,
+			PodName:           "duckgres-worker-test-cp-1005",
+			State:             configstore.WorkerStateIdle,
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+	}
+	for _, record := range records {
+		if err := store.UpsertWorkerRecord(&record); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", record.WorkerID, err)
+		}
+	}
+
+	stats, err := store.ListWarmCapacityWorkerStats()
+	if err != nil {
+		t.Fatalf("ListWarmCapacityWorkerStats: %v", err)
+	}
+
+	got := map[string][2]int64{}
+	for _, stat := range stats {
+		got[stat.Scope] = [2]int64{stat.ReadyWorkers, stat.SpawningWorkers}
+	}
+	want := map[string][2]int64{
+		"image:duckgres:default": {1, 1},
+		"image:duckgres:pinned":  {1, 0},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected warm worker stats %v, got %v", want, got)
+	}
+}
+
 func warmCapacityMissAggregateCounts(aggregates []configstore.WarmCapacityMissAggregate) map[string]int64 {
 	out := make(map[string]int64, len(aggregates))
 	for _, aggregate := range aggregates {
