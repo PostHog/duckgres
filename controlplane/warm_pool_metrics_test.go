@@ -17,40 +17,6 @@ func resetMetrics() {
 	workerRetirementsCounter.Reset()
 }
 
-func TestObserveWarmPoolLifecycleGauges(t *testing.T) {
-	workers := map[int]*ManagedWorker{
-		1: makeTestWorker(WorkerLifecycleIdle, nil),
-		2: makeTestWorker(WorkerLifecycleIdle, nil),
-		3: makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{OrgID: "org-1"}),
-		4: makeTestWorker(WorkerLifecycleActivating, &WorkerAssignment{OrgID: "org-1"}),
-		5: makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-2"}),
-		6: makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-2"}),
-		7: makeTestWorker(WorkerLifecycleDraining, &WorkerAssignment{OrgID: "org-3"}),
-	}
-
-	observeWarmPoolLifecycleGauges(workers)
-
-	assertGaugeValue(t, warmWorkersGauge, 2)
-	assertGaugeValue(t, reservedWorkersGauge, 1)
-	assertGaugeValue(t, activatingWorkersGauge, 1)
-	assertGaugeValue(t, hotWorkersGauge, 2)
-	assertGaugeValue(t, drainingWorkersGauge, 1)
-}
-
-func TestObserveWarmPoolLifecycleGauges_SkipsDeadWorkers(t *testing.T) {
-	dead := makeTestWorker(WorkerLifecycleIdle, nil)
-	close(dead.done) // mark as dead
-
-	workers := map[int]*ManagedWorker{
-		1: makeTestWorker(WorkerLifecycleIdle, nil),
-		2: dead,
-	}
-
-	observeWarmPoolLifecycleGauges(workers)
-
-	assertGaugeValue(t, warmWorkersGauge, 1)
-}
-
 func TestMarkWorkerRetiredLocked_RecordsRetirementMetric(t *testing.T) {
 	resetMetrics()
 	pool, _ := newTestK8sPool(t, 5)
@@ -134,48 +100,7 @@ func TestPeakSessionsTracking(t *testing.T) {
 	}
 }
 
-func TestSpawnMinWorkersUpdatesWarmWorkersGauge(t *testing.T) {
-	observeWarmPoolLifecycleGauges(map[int]*ManagedWorker{})
-	pool, _ := newTestK8sPool(t, 5)
-
-	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		pool.mu.Lock()
-		pool.workers[id] = makeTestWorker(WorkerLifecycleIdle, nil)
-		pool.mu.Unlock()
-		return nil
-	}
-
-	if err := pool.SpawnMinWorkers(1); err != nil {
-		t.Fatalf("SpawnMinWorkers failed: %v", err)
-	}
-
-	assertGaugeValue(t, warmWorkersGauge, 1)
-}
-
-func TestActivateWorkerForOrgUpdatesActivatingGauge(t *testing.T) {
-	observeWarmPoolLifecycleGauges(map[int]*ManagedWorker{})
-	pool, _ := newTestK8sPool(t, 5)
-	worker := makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{
-		OrgID: "org-1",
-	})
-	worker.reservedAt = time.Now()
-	pool.workers[1] = worker
-	observeWarmPoolLifecycleGauges(pool.workers)
-
-	orgPool := NewOrgReservedPool(pool, "org-1", 1, pool.workerImage, nil)
-	orgPool.activateReservedWorker = func(ctx context.Context, worker *ManagedWorker) error {
-		assertGaugeValue(t, reservedWorkersGauge, 0)
-		assertGaugeValue(t, activatingWorkersGauge, 1)
-		return nil
-	}
-
-	if err := orgPool.activateWorkerForOrg(context.Background(), worker); err != nil {
-		t.Fatalf("activateWorkerForOrg failed: %v", err)
-	}
-}
-
 func TestActivateWorkerForOrgRecordsActivationDurationWhenWorkerAlreadyHot(t *testing.T) {
-	observeWarmPoolLifecycleGauges(map[int]*ManagedWorker{})
 	pool, _ := newTestK8sPool(t, 5)
 	worker := makeTestWorker(WorkerLifecycleReserved, &WorkerAssignment{
 		OrgID: "org-1",
@@ -308,6 +233,26 @@ func TestObserveWarmCapacityMetrics(t *testing.T) {
 	})
 	assertGaugeVecValue(t, warmCapacityReadyWorkersGauge, 0, scope)
 	assertGaugeVecValue(t, warmCapacitySpawningWorkersGauge, 0, scope)
+
+	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
+	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHot), "org_owned")
+	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHotIdle), "org_owned")
+	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
+		{Image: image, State: configstore.WorkerStateIdle, Ownership: "neutral", Count: 2},
+		{Image: image, State: configstore.WorkerStateHot, Ownership: "org_owned", Count: 1},
+		{Image: image, State: configstore.WorkerStateHotIdle, Ownership: "org_owned", Count: 3},
+	})
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 2, image, string(configstore.WorkerStateIdle), "neutral")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 1, image, string(configstore.WorkerStateHot), "org_owned")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 3, image, string(configstore.WorkerStateHotIdle), "org_owned")
+	observeWorkerLifecycleStats(nil, []configstore.WorkerLifecycleStats{
+		{Image: image, State: configstore.WorkerStateIdle, Ownership: "neutral", Count: 2},
+		{Image: image, State: configstore.WorkerStateHot, Ownership: "org_owned", Count: 1},
+		{Image: image, State: configstore.WorkerStateHotIdle, Ownership: "org_owned", Count: 3},
+	})
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHot), "org_owned")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHotIdle), "org_owned")
 
 	observeWarmCapacityReconcileSpawns(scope, "success", 3)
 	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, scope, "success"); got != 3 {

@@ -310,6 +310,97 @@ func TestListWarmCapacityWorkerStatsPostgres(t *testing.T) {
 	}
 }
 
+func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 26, 14, 45, 0, 0, time.UTC)
+	records := []configstore.WorkerRecord{
+		{
+			WorkerID:          1101,
+			PodName:           "duckgres-worker-test-cp-1101",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateIdle,
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1102,
+			PodName:           "duckgres-worker-test-cp-1102",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1103,
+			PodName:           "duckgres-worker-test-cp-1103",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateHot,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1104,
+			PodName:           "duckgres-worker-test-cp-1104",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1105,
+			PodName:           "duckgres-worker-test-cp-1105",
+			Image:             "duckgres:pinned",
+			State:             configstore.WorkerStateDraining,
+			OrgID:             "science",
+			OwnerCPInstanceID: "cp-b",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1106,
+			PodName:           "duckgres-worker-test-cp-1106",
+			Image:             "duckgres:pinned",
+			State:             configstore.WorkerStateLost,
+			OwnerCPInstanceID: "cp-b",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1107,
+			PodName:           "duckgres-worker-test-cp-1107",
+			State:             configstore.WorkerStateHot,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+	}
+	for _, record := range records {
+		if err := store.UpsertWorkerRecord(&record); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", record.WorkerID, err)
+		}
+	}
+
+	stats, err := store.ListWorkerLifecycleStats()
+	if err != nil {
+		t.Fatalf("ListWorkerLifecycleStats: %v", err)
+	}
+
+	got := map[string]int64{}
+	for _, stat := range stats {
+		got[fmt.Sprintf("%s|%s|%s", stat.Image, stat.State, stat.Ownership)] = stat.Count
+	}
+	want := map[string]int64{
+		"duckgres:default|idle|neutral":       1,
+		"duckgres:default|spawning|neutral":   1,
+		"duckgres:default|hot|org_owned":      1,
+		"duckgres:default|hot_idle|org_owned": 1,
+		"duckgres:pinned|draining|org_owned":  1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected worker lifecycle stats %v, got %v", want, got)
+	}
+}
+
 func warmCapacityMissAggregateCounts(aggregates []configstore.WarmCapacityMissAggregate) map[string]int64 {
 	out := make(map[string]int64, len(aggregates))
 	for _, aggregate := range aggregates {

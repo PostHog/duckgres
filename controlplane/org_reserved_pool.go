@@ -250,7 +250,6 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 			p.shared.mu.Unlock()
 			return err
 		}
-		observeWarmPoolLifecycleGauges(p.shared.workers)
 	}
 	p.shared.mu.Unlock()
 
@@ -272,7 +271,6 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 		if !worker.reservedAt.IsZero() {
 			observeActivationDuration(time.Since(worker.reservedAt))
 		}
-		observeWarmPoolLifecycleGauges(p.shared.workers)
 		return nil
 	case WorkerLifecycleHot:
 		if !worker.reservedAt.IsZero() {

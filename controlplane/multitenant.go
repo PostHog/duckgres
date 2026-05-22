@@ -253,6 +253,7 @@ func SetupMultiTenant(
 	lastWarmCapacityTargets := map[string]int{}
 	var lastWarmCapacityRecentMisses []configstore.WarmCapacityMissAggregate
 	var lastWarmCapacityWorkerStats []configstore.WarmCapacityWorkerStats
+	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats
 	lastWarmCapacityGlobalCapBlocked := false
 	janitor.reconcileWarmCapacity = func() {
 		snap := store.Snapshot()
@@ -277,6 +278,12 @@ func SetupMultiTenant(
 		} else {
 			observeWarmCapacityWorkerStats(stats, lastWarmCapacityWorkerStats)
 			lastWarmCapacityWorkerStats = cloneWarmCapacityWorkerStats(stats)
+		}
+		if stats, statsErr := listWorkerLifecycleStats(store); statsErr != nil {
+			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", statsErr)
+		} else {
+			observeWorkerLifecycleStats(stats, lastWorkerLifecycleStats)
+			lastWorkerLifecycleStats = cloneWorkerLifecycleStats(stats)
 		}
 		logWarmCapacityTargetChanges(lastWarmCapacityTargets, targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets)
 		lastWarmCapacityTargets = cloneWarmCapacityTargets(targetSnapshot.EffectiveTargets)
@@ -433,6 +440,10 @@ type warmCapacityWorkerStatsLister interface {
 	ListWarmCapacityWorkerStats() ([]configstore.WarmCapacityWorkerStats, error)
 }
 
+type workerLifecycleStatsLister interface {
+	ListWorkerLifecycleStats() ([]configstore.WorkerLifecycleStats, error)
+}
+
 type warmCapacityTargetSnapshot struct {
 	BaseTargets      map[string]int
 	EffectiveTargets map[string]int
@@ -477,6 +488,13 @@ func listWarmCapacityWorkerStats(lister warmCapacityWorkerStatsLister) ([]config
 		return nil, nil
 	}
 	return lister.ListWarmCapacityWorkerStats()
+}
+
+func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.WorkerLifecycleStats, error) {
+	if lister == nil {
+		return nil, nil
+	}
+	return lister.ListWorkerLifecycleStats()
 }
 
 func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[string]int) {
@@ -524,6 +542,15 @@ func cloneWarmCapacityWorkerStats(stats []configstore.WarmCapacityWorkerStats) [
 		return nil
 	}
 	out := make([]configstore.WarmCapacityWorkerStats, len(stats))
+	copy(out, stats)
+	return out
+}
+
+func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []configstore.WorkerLifecycleStats {
+	if len(stats) == 0 {
+		return nil
+	}
+	out := make([]configstore.WorkerLifecycleStats, len(stats))
 	copy(out, stats)
 	return out
 }
