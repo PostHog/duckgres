@@ -860,12 +860,12 @@ func (cs *ConfigStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, er
 }
 
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
-// state by image and ownership for Prometheus observability.
+// state by image and tenant binding for Prometheus observability.
 func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
-	const ownershipExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_owned' END"
+	const bindingExpr = "CASE WHEN NULLIF(org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
 	var out []WorkerLifecycleStats
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Select("image, state, "+ownershipExpr+" AS ownership, COUNT(*)::bigint AS count").
+		Select("image, state, "+bindingExpr+" AS binding, COUNT(*)::bigint AS count").
 		Where("image <> ''").
 		Where("state IN ?", []WorkerState{
 			WorkerStateSpawning,
@@ -876,8 +876,8 @@ func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error
 			WorkerStateHotIdle,
 			WorkerStateDraining,
 		}).
-		Group("image, state, " + ownershipExpr).
-		Order("image ASC, state ASC, ownership ASC").
+		Group("image, state, " + bindingExpr).
+		Order("image ASC, state ASC, binding ASC").
 		Scan(&out).Error
 	if err != nil {
 		return nil, fmt.Errorf("list worker lifecycle stats: %w", err)

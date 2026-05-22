@@ -318,14 +318,14 @@ func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 
 	got := map[string]int64{}
 	for _, stat := range stats {
-		got[fmt.Sprintf("%s|%s|%s", stat.Image, stat.State, stat.Ownership)] = stat.Count
+		got[fmt.Sprintf("%s|%s|%s", stat.Image, stat.State, stat.Binding)] = stat.Count
 	}
 	want := map[string]int64{
 		"duckgres:default|idle|neutral":       1,
 		"duckgres:default|spawning|neutral":   1,
-		"duckgres:default|hot|org_owned":      1,
-		"duckgres:default|hot_idle|org_owned": 1,
-		"duckgres:pinned|draining|org_owned":  1,
+		"duckgres:default|hot|org_bound":      1,
+		"duckgres:default|hot_idle|org_bound": 1,
+		"duckgres:pinned|draining|org_bound":  1,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("expected worker lifecycle stats %v, got %v", want, got)

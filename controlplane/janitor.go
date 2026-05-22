@@ -42,6 +42,7 @@ type ControlPlaneJanitor struct {
 	lifecycle                     *WorkerLifecycle // every per-worker transition flows through this; nil disables per-worker reaping for that tick.
 	lifecycleNilWarned            sync.Once        // one-shot guard so the misconfiguration error doesn't flood at the janitor tick rate.
 	reconcileWarmCapacity         func()
+	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 }
@@ -70,6 +71,11 @@ func (j *ControlPlaneJanitor) Run(ctx context.Context) {
 	if j == nil || j.store == nil {
 		return
 	}
+	defer func() {
+		if j.onStop != nil {
+			j.onStop()
+		}
+	}()
 
 	j.runOnce()
 

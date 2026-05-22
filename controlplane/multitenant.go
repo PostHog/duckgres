@@ -83,15 +83,10 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 		for _, s := range sessions {
 			sessionsByWorker[s.WorkerID]++
 		}
-		activeCount := 0
-		idleCount := 0
 		for wID, count := range sessionsByWorker {
 			status := "active"
 			if count == 0 {
 				status = "idle"
-				idleCount++
-			} else {
-				activeCount++
 			}
 			result = append(result, admin.WorkerStatus{
 				ID:             wID,
@@ -100,9 +95,6 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 				Status:         status,
 			})
 		}
-		// Emit per-org worker Prometheus metrics
-		observeOrgWorkersActive(name, activeCount)
-		observeOrgWorkersIdle(name, idleCount)
 	}
 	return result
 }
@@ -247,6 +239,10 @@ func SetupMultiTenant(
 	// lambda chain is gone — the snapshot/lease-typed API is the only
 	// path now.
 	janitor.lifecycle = router.sharedPool.lifecycle
+	// Reset leader-owned cluster-wide gauges when this janitor stops
+	// being the leader, so stale per-image counts from this CP don't
+	// linger in Prometheus while a peer takes over.
+	janitor.onStop = resetLeaderOwnedClusterMetrics
 	lastWarmCapacityTargets := map[string]int{}
 	var lastWarmCapacityRecentMisses []configstore.WarmCapacityMissAggregate
 	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats

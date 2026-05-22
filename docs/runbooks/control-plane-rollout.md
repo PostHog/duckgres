@@ -46,7 +46,7 @@ Unplanned control-plane failure is different:
    ```
 
 4. Confirm the new pod is serving traffic and warm capacity recovers.
-   - `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` returns to target
+   - `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` returns to target
    - `sum(duckgres_worker_lifecycle_count{state="hot"})` does not drop unexpectedly
    - client reconnect errors do not spike
 

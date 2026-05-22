@@ -12,7 +12,7 @@
 |--------|----------------|---------------|
 | `sum(duckgres_worker_lifecycle_count{state="hot"})` | Dropping faster than expected | Workers are retiring before replacements come up |
 | `sum(duckgres_worker_lifecycle_count{state="draining"})` | > 0 sustained | Workers are stuck draining (sessions not ending) |
-| `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` | < `minWorkers` | Replacement pool is depleted |
+| `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` | < `minWorkers` | Replacement pool is depleted |
 
 ## Procedure
 
@@ -20,14 +20,14 @@
 
 2. **Delete the worker pod.** The control plane treats the worker as retired/crashed and replaces it if the pool is below `minWorkers`.
 
-3. **Watch replacement capacity.** Monitor `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` and `sum(duckgres_worker_lifecycle_count{state="hot"})` while the replacement comes up.
+3. **Watch replacement capacity.** Monitor `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` and `sum(duckgres_worker_lifecycle_count{state="hot"})` while the replacement comes up.
 
-4. **Verify replacement capacity.** After the worker retires, confirm that `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` returns to the expected level. The pool auto-replenishes when idle count drops below `minWorkers`.
+4. **Verify replacement capacity.** After the worker retires, confirm that `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` returns to the expected level. The pool auto-replenishes when idle count drops below `minWorkers`.
 
 ## Rollback
 
 If draining causes capacity issues:
 
-1. Check `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` — if it's 0, the pool is depleted and new sessions will block.
+1. Check `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` — if it's 0, the pool is depleted and new sessions will block.
 2. Increase `minWorkers` temporarily to force more pre-warmed capacity.
 3. If a drain is stuck (worker stays in draining > 5 minutes), force-retire it by deleting the pod. The control plane will detect the crash and replenish.
