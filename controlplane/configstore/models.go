@@ -382,14 +382,6 @@ type WarmCapacityMissAggregate struct {
 	Count  int64                 `json:"count"`
 }
 
-// WarmCapacityWorkerStats is the grouped warm-worker state used for
-// warm-capacity observability.
-type WarmCapacityWorkerStats struct {
-	Scope           string `json:"scope"`
-	ReadyWorkers    int64  `json:"ready_workers"`
-	SpawningWorkers int64  `json:"spawning_workers"`
-}
-
 // WorkerLifecycleStats is the grouped worker lifecycle state used for
 // cluster-wide worker observability.
 type WorkerLifecycleStats struct {
