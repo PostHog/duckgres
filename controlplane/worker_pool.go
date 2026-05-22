@@ -126,6 +126,7 @@ type RuntimeWorkerStore interface {
 	RetireIdleWorker(workerID int, reason string) (bool, error)
 	RetireIdleOrHotIdleWorker(workerID int, reason string) (bool, error)
 	RetireOrphanWorker(workerID int, reason string) (bool, error)
+	MarkWorkerLostIfCurrentLease(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error)
 	MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error)
 	RetireDrainingWorker(workerID int, reason string) (bool, error)
 }
