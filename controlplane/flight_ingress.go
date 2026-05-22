@@ -47,7 +47,7 @@ type flightSessionProvider struct {
 }
 
 func (p *flightSessionProvider) CreateSession(ctx context.Context, username string, pid int32, memoryLimit string, threads int) (int32, *flightclient.FlightExecutor, error) {
-	workerPID, executor, err := p.sm.CreateSession(ctx, username, "", pid, memoryLimit, threads)
+	workerPID, executor, err := p.sm.CreateSession(ctx, username, pid, memoryLimit, threads)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -88,7 +88,7 @@ func (p *orgRoutedSessionProvider) CreateSession(ctx context.Context, username s
 
 	// SessionManager.resolveSessionLimits handles rebalancer defaults,
 	// so pass memoryLimit/threads through as-is.
-	workerPID, executor, err := sessions.CreateSessionWithProtocol(ctx, username, "", pid, memoryLimit, threads, "flight")
+	workerPID, executor, err := sessions.CreateSessionWithProtocol(ctx, username, pid, memoryLimit, threads, "flight")
 	if err != nil {
 		return 0, nil, err
 	}

@@ -1100,7 +1100,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
 		func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
-			return sessions.CreateSession(ctx, username, clientSearchPath, pid, memLimit, threads)
+			return sessions.CreateSession(ctx, username, pid, memLimit, threads)
 		},
 	)
 	if err != nil {
@@ -1143,6 +1143,26 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
 			_ = writer.Flush()
 			return
+		}
+
+		// Apply the client's connect-time search_path (from the startup `options`
+		// parameter, e.g. `options=-c search_path=iceberg.public`) AFTER metadata
+		// init. It must run here, not on the worker at session create: (1)
+		// InitSessionDatabaseMetadata's defer resets search_path to the ducklake
+		// default, so an earlier value is clobbered; and (2) running metadata init
+		// while the session default points at the iceberg REST catalog fails. We
+		// append memory.main so pg_catalog macros stay resolvable; on failure
+		// (e.g. the schema doesn't exist) we log and keep the default.
+		if clientSearchPath != "" {
+			sp := clientSearchPath
+			if !strings.Contains(strings.ToLower(sp), "memory.main") {
+				sp += ",memory.main"
+			}
+			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+			if _, err := executor.ExecContext(spCtx, fmt.Sprintf("SET search_path = '%s'", sp)); err != nil {
+				slog.Warn("Failed to apply client connect-time search_path; using default.", "user", username, "org", orgID, "search_path", clientSearchPath, "error", err)
+			}
+			spCancel()
 		}
 	}
 
