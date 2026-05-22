@@ -953,9 +953,13 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 
 // UpsertWorkerRecord inserts or updates a runtime worker row.
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
+	protectedStates := []WorkerState{WorkerStateDraining, WorkerStateRetired, WorkerStateLost}
 	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "worker_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at"}),
+		Where: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: `"worker_records"."state" NOT IN ?`, Vars: []any{protectedStates}},
+		}},
 	}).Create(record).Error; err != nil {
 		return fmt.Errorf("upsert worker record: %w", err)
 	}
@@ -1325,6 +1329,32 @@ func (cs *ConfigStore) RetireIdleOrHotIdleWorker(workerID int, reason string) (b
 	return result.RowsAffected > 0, nil
 }
 
+// MarkWorkerLostIfCurrentLease atomically marks a worker lost only when the
+// caller still owns the same lease observed by its local health checker. A
+// false return means another CP or lifecycle path has already moved the row.
+func (cs *ConfigStore) MarkWorkerLostIfCurrentLease(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error) {
+	lostEligibleStates := []WorkerState{
+		WorkerStateSpawning,
+		WorkerStateIdle,
+		WorkerStateReserved,
+		WorkerStateActivating,
+		WorkerStateHot,
+		WorkerStateHotIdle,
+	}
+	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
+		Where("worker_id = ? AND owner_cp_instance_id = ? AND owner_epoch = ? AND state IN ?",
+			workerID, ownerCPInstanceID, expectedOwnerEpoch, lostEligibleStates).
+		Updates(map[string]any{
+			"state":         WorkerStateLost,
+			"retire_reason": reason,
+			"updated_at":    time.Now(),
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("mark worker %d lost: %w", workerID, result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
 // MarkWorkerDraining atomically transitions a worker into the draining state
 // if and only if it is still owned by the caller and not already terminal. It
 // returns true when the transition happened.
@@ -1396,8 +1426,11 @@ func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID str
 		if current.OwnerEpoch != expectedOwnerEpoch {
 			return ErrWorkerOwnerEpochMismatch
 		}
+		if current.State != WorkerStateHot {
+			return nil
+		}
 		now := time.Now()
-		if err := tx.Table(cs.runtimeTable(current.TableName())).
+		result := tx.Table(cs.runtimeTable(current.TableName())).
 			Where("worker_id = ?", current.WorkerID).
 			Updates(map[string]any{
 				"state":                WorkerStateReserved,
@@ -1405,8 +1438,12 @@ func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID str
 				"owner_cp_instance_id": ownerCPInstanceID,
 				"owner_epoch":          gorm.Expr("owner_epoch + 1"),
 				"updated_at":           now,
-			}).Error; err != nil {
-			return err
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return nil
 		}
 		if err := tx.Table(cs.runtimeTable(current.TableName())).
 			First(&current, "worker_id = ?", current.WorkerID).Error; err != nil {

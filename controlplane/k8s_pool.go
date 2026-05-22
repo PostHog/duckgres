@@ -2032,7 +2032,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 	defer ticker.Stop()
 
 	var mu sync.Mutex
-	failures := make(map[int]int)
+	failures := make(map[workerLeaseSnapshot]int)
 
 	for {
 		select {
@@ -2044,16 +2044,23 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 				p.mu.RUnlock()
 				return
 			}
-			workers := make([]*ManagedWorker, 0, len(p.workers))
+			type healthCheckTarget struct {
+				worker *ManagedWorker
+				lease  workerLeaseSnapshot
+			}
+			targets := make([]healthCheckTarget, 0, len(p.workers))
 			for _, w := range p.workers {
-				workers = append(workers, w)
+				targets = append(targets, healthCheckTarget{
+					worker: w,
+					lease:  p.workerLeaseSnapshot(w),
+				})
 			}
 			p.mu.RUnlock()
 
 			var wg sync.WaitGroup
-			for _, w := range workers {
+			for _, target := range targets {
 				wg.Add(1)
-				go func(w *ManagedWorker) {
+				go func(w *ManagedWorker, lease workerLeaseSnapshot) {
 					defer wg.Done()
 
 					select {
@@ -2062,25 +2069,49 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 					case <-w.done:
 						// Pod terminated (detected by informer)
 						mu.Lock()
-						delete(failures, w.ID)
+						delete(failures, lease)
 						mu.Unlock()
 
+						lostDisposition, err := p.markWorkerLostForHealthLease(lease)
+						if err != nil {
+							slog.Error("K8s worker terminated but lease validation failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+							return
+						}
+						if lostDisposition == workerLostLeaseRetry {
+							slog.Warn("K8s worker terminated while runtime lease is newer for this CP; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch)
+							return
+						}
+						if lostDisposition == workerLostLeaseStale {
+							p.mu.Lock()
+							removedWorker, workerCount := p.dropLocalWorkerIfSameLeaseLocked(lease)
+							p.mu.Unlock()
+							if removedWorker == nil {
+								return
+							}
+							observeControlPlaneWorkers(workerCount)
+							slog.Warn("K8s worker terminated under stale lease; dropping local worker without pod delete.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch)
+							if removedWorker.client != nil {
+								_ = removedWorker.client.Close()
+							}
+							return
+						}
+
 						p.mu.Lock()
-						removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerLocked(w.ID)
+						removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerAfterLostLeaseLocked(lease)
 						p.mu.Unlock()
 						if removedWorker == nil {
 							return
 						}
 						observeControlPlaneWorkers(workerCount)
-						slog.Warn("K8s worker crashed.", "id", w.ID)
+						slog.Warn("K8s worker crashed.", "id", lease.workerID)
 						if onCrash != nil {
-							onCrash(w.ID)
+							onCrash(lease.workerID)
 						}
-						if w.client != nil {
-							_ = w.client.Close()
+						if removedWorker.client != nil {
+							_ = removedWorker.client.Close()
 						}
 						// Delete the failed pod from K8s
-						podName := p.podNameForWorker(w.ID)
+						podName := p.workerPodName(removedWorker)
 						delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
 						_ = p.clientset.CoreV1().Pods(p.namespace).Delete(delCtx, podName, metav1.DeleteOptions{
 							GracePeriodSeconds: int64Ptr(0),
@@ -2096,42 +2127,68 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						func() {
 							defer recoverWorkerPanic(&healthErr)
 							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForWorker(w))
+							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForLease(lease))
 							cancel()
 						}()
 
 						if healthErr != nil {
 							mu.Lock()
-							failures[w.ID]++
-							count := failures[w.ID]
+							failures[lease]++
+							count := failures[lease]
 							mu.Unlock()
 
-							slog.Warn("K8s worker health check failed.", "id", w.ID, "error", healthErr, "consecutive_failures", count)
+							slog.Warn("K8s worker health check failed.", "id", lease.workerID, "error", healthErr, "consecutive_failures", count)
 
 							if count >= maxConsecutiveHealthFailures {
+								lostDisposition, err := p.markWorkerLostForHealthLease(lease)
+								if err != nil {
+									slog.Error("K8s worker unresponsive but lease validation failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count, "error", err)
+									return
+								}
+
+								if lostDisposition == workerLostLeaseRetry {
+									slog.Warn("K8s worker unresponsive while runtime lease is newer for this CP; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
+									return
+								}
+
 								mu.Lock()
-								delete(failures, w.ID)
+								delete(failures, lease)
 								mu.Unlock()
 
+								if lostDisposition == workerLostLeaseStale {
+									p.mu.Lock()
+									removedWorker, workerCount := p.dropLocalWorkerIfSameLeaseLocked(lease)
+									p.mu.Unlock()
+									if removedWorker == nil {
+										return
+									}
+									observeControlPlaneWorkers(workerCount)
+									slog.Warn("K8s worker unresponsive under stale lease; dropping local worker without crash notification or pod delete.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
+									if removedWorker.client != nil {
+										_ = removedWorker.client.Close()
+									}
+									return
+								}
+
 								p.mu.Lock()
-								removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerLocked(w.ID)
+								removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerAfterLostLeaseLocked(lease)
 								p.mu.Unlock()
 								if removedWorker == nil {
 									return
 								}
 								observeControlPlaneWorkers(workerCount)
 
-								slog.Error("K8s worker unresponsive, deleting pod.", "id", w.ID, "consecutive_failures", count)
+								slog.Error("K8s worker unresponsive, deleting pod.", "id", lease.workerID, "consecutive_failures", count)
 								if onCrash != nil {
-									onCrash(w.ID)
+									onCrash(lease.workerID)
 								}
 								// Delete the pod to force cleanup
-								podName := p.podNameForWorker(w.ID)
+								podName := p.workerPodName(removedWorker)
 								_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 									GracePeriodSeconds: int64Ptr(10),
 								})
-								if w.client != nil {
-									_ = w.client.Close()
+								if removedWorker.client != nil {
+									_ = removedWorker.client.Close()
 								}
 								if shouldReplenish {
 									p.spawnWarmWorkerBackground(replacementID, p.workerImage)
@@ -2139,18 +2196,18 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							}
 						} else {
 							mu.Lock()
-							delete(failures, w.ID)
+							delete(failures, lease)
 							mu.Unlock()
 
 							// Forward progress data to the control plane.
 							if onProgress != nil && hcResult != nil {
 								if sp := hcResult.toSessionProgress(); len(sp) > 0 {
-									onProgress(w.ID, sp)
+									onProgress(lease.workerID, sp)
 								}
 							}
 						}
 					}
-				}(w)
+				}(target.worker, target.lease)
 			}
 			wg.Wait()
 		}
@@ -2546,7 +2603,28 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	for id, w := range p.workers {
 		select {
 		case <-w.done:
-			removedWorker, _, replacementID, shouldReplenish := p.removeWorkerLocked(id)
+			var removedWorker *ManagedWorker
+			var replacementID int
+			var shouldReplenish bool
+			deletePod := true
+			if p.runtimeStore != nil {
+				lease := p.workerLeaseSnapshot(w)
+				lostDisposition, err := p.markWorkerLostForHealthLease(lease)
+				if err != nil {
+					slog.Warn("Clean dead worker: lease validation failed; leaving cleanup to retry.",
+						"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+					continue
+				}
+				switch lostDisposition {
+				case workerLostLeaseStale:
+					deletePod = false
+					removedWorker, _ = p.dropLocalWorkerIfSameLeaseLocked(lease)
+				case workerLostLeaseCurrent, workerLostLeaseAlreadyLost, workerLostLeaseRetry:
+					continue
+				}
+			} else {
+				removedWorker, _, replacementID, shouldReplenish = p.removeWorkerLocked(id)
+			}
 			if removedWorker == nil {
 				continue
 			}
@@ -2554,8 +2632,11 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 			if shouldReplenish {
 				spawnIDs = append(spawnIDs, replacementID)
 			}
-			if w.client != nil {
-				go func(c *flightsql.Client) { _ = c.Close() }(w.client)
+			if removedWorker.client != nil {
+				go func(c *flightsql.Client) { _ = c.Close() }(removedWorker.client)
+			}
+			if !deletePod {
+				continue
 			}
 			// Delete the failed pod from K8s to avoid accumulating terminated pods
 			go func(worker *ManagedWorker) {
@@ -2565,7 +2646,7 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 				_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 					GracePeriodSeconds: int64Ptr(0),
 				})
-			}(w)
+			}(removedWorker)
 		default:
 		}
 	}
@@ -2634,6 +2715,104 @@ func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bo
 	replacementID := p.allocateBackgroundSpawnIDLocked()
 	p.spawning++
 	return w, workerCount, replacementID, true
+}
+
+type workerLeaseSnapshot struct {
+	workerID          int
+	ownerCPInstanceID string
+	ownerEpoch        int64
+}
+
+func (p *K8sWorkerPool) workerLeaseSnapshot(w *ManagedWorker) workerLeaseSnapshot {
+	ownerCPInstanceID := w.OwnerCPInstanceID()
+	if ownerCPInstanceID == "" {
+		ownerCPInstanceID = p.cpInstanceID
+	}
+	return workerLeaseSnapshot{
+		workerID:          w.ID,
+		ownerCPInstanceID: ownerCPInstanceID,
+		ownerEpoch:        w.OwnerEpoch(),
+	}
+}
+
+func (p *K8sWorkerPool) workerMatchesLease(w *ManagedWorker, lease workerLeaseSnapshot) bool {
+	return w != nil && p.workerLeaseSnapshot(w) == lease
+}
+
+type workerLostLeaseDisposition int
+
+const (
+	workerLostLeaseCurrent workerLostLeaseDisposition = iota
+	workerLostLeaseStale
+	workerLostLeaseRetry
+	workerLostLeaseAlreadyLost
+)
+
+func (p *K8sWorkerPool) markWorkerLostForHealthLease(lease workerLeaseSnapshot) (workerLostLeaseDisposition, error) {
+	if p.runtimeStore == nil {
+		return workerLostLeaseCurrent, nil
+	}
+	if lease.ownerCPInstanceID != p.cpInstanceID {
+		return workerLostLeaseStale, nil
+	}
+	currentLease, err := p.markWorkerLostIfCurrentLease(lease)
+	if err != nil {
+		return workerLostLeaseRetry, err
+	}
+	if currentLease {
+		return workerLostLeaseCurrent, nil
+	}
+
+	record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+	if err != nil {
+		return workerLostLeaseRetry, err
+	}
+	if record == nil || record.OwnerCPInstanceID != p.cpInstanceID {
+		return workerLostLeaseStale, nil
+	}
+	if record.OwnerEpoch != lease.ownerEpoch {
+		return workerLostLeaseRetry, nil
+	}
+	if record.State == configstore.WorkerStateLost && record.RetireReason == RetireReasonCrash {
+		return workerLostLeaseAlreadyLost, nil
+	}
+	return workerLostLeaseStale, nil
+}
+
+func (p *K8sWorkerPool) markWorkerLostIfCurrentLease(lease workerLeaseSnapshot) (bool, error) {
+	if p.runtimeStore == nil {
+		return true, nil
+	}
+	if lease.ownerCPInstanceID != p.cpInstanceID {
+		return false, nil
+	}
+	return p.runtimeStore.MarkWorkerLostIfCurrentLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, RetireReasonCrash)
+}
+
+func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int, int, bool) {
+	current, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(current, lease) {
+		return nil, len(p.workers), 0, false
+	}
+	p.markWorkerRetiredInMemoryLocked(current, RetireReasonCrash)
+	delete(p.workers, current.ID)
+	workerCount := len(p.workers)
+	if !p.shouldReplenishWarmCapacityLocked() {
+		return current, workerCount, 0, false
+	}
+	replacementID := p.allocateBackgroundSpawnIDLocked()
+	p.spawning++
+	return current, workerCount, replacementID, true
+}
+
+func (p *K8sWorkerPool) dropLocalWorkerIfSameLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int) {
+	current, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(current, lease) {
+		return nil, len(p.workers)
+	}
+	delete(p.workers, current.ID)
+	observeWarmPoolLifecycleGauges(p.workers)
+	return current, len(p.workers)
 }
 
 func (p *K8sWorkerPool) isGenericSessionSchedulableWorkerLocked(w *ManagedWorker) bool {
@@ -2827,11 +3006,15 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 }
 
 func (p *K8sWorkerPool) healthCheckPayloadForWorker(worker *ManagedWorker) server.WorkerHealthCheckPayload {
+	return p.healthCheckPayloadForLease(p.workerLeaseSnapshot(worker))
+}
+
+func (p *K8sWorkerPool) healthCheckPayloadForLease(lease workerLeaseSnapshot) server.WorkerHealthCheckPayload {
 	payload := server.WorkerHealthCheckPayload{
 		WorkerControlMetadata: server.WorkerControlMetadata{
-			WorkerID:     worker.ID,
-			OwnerEpoch:   worker.OwnerEpoch(),
-			CPInstanceID: worker.OwnerCPInstanceID(),
+			WorkerID:     lease.workerID,
+			OwnerEpoch:   lease.ownerEpoch,
+			CPInstanceID: lease.ownerCPInstanceID,
 		},
 	}
 	return payload

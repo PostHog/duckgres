@@ -90,6 +90,13 @@ type captureRuntimeWorkerStore struct {
 	retireOrphanCalledIDs            []int
 	retireOrphanCalledReasons        []string
 	retireOrphanErr                  error
+	markLostCalls                    int
+	markLostCalledIDs                []int
+	markLostCalledCPs                []string
+	markLostCalledEpochs             []int64
+	markLostCalledReasons            []string
+	markLostMisses                   map[int]bool
+	markLostErr                      error
 	preloadedRecords                 map[int]*configstore.WorkerRecord
 	getRecordErrIDs                  map[int]error
 	markDrainingCalls                int
@@ -333,6 +340,48 @@ func (s *captureRuntimeWorkerStore) RetireOrphanWorker(workerID int, reason stri
 	return true, nil
 }
 
+func lostEligibleState(state configstore.WorkerState) bool {
+	switch state {
+	case configstore.WorkerStateSpawning,
+		configstore.WorkerStateIdle,
+		configstore.WorkerStateReserved,
+		configstore.WorkerStateActivating,
+		configstore.WorkerStateHot,
+		configstore.WorkerStateHotIdle:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *captureRuntimeWorkerStore) MarkWorkerLostIfCurrentLease(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markLostCalls++
+	s.markLostCalledIDs = append(s.markLostCalledIDs, workerID)
+	s.markLostCalledCPs = append(s.markLostCalledCPs, ownerCPInstanceID)
+	s.markLostCalledEpochs = append(s.markLostCalledEpochs, expectedOwnerEpoch)
+	s.markLostCalledReasons = append(s.markLostCalledReasons, reason)
+	if s.markLostErr != nil {
+		return false, s.markLostErr
+	}
+	if s.markLostMisses[workerID] {
+		return false, nil
+	}
+	rec := s.preloadedRecords[workerID]
+	if rec == nil {
+		return false, nil
+	}
+	if rec.OwnerCPInstanceID != ownerCPInstanceID || rec.OwnerEpoch != expectedOwnerEpoch || !lostEligibleState(rec.State) {
+		return false, nil
+	}
+	rec.State = configstore.WorkerStateLost
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
+	s.recordEvent(fmt.Sprintf("lost:%d", workerID))
+	return true, nil
+}
+
 func (s *captureRuntimeWorkerStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -363,6 +412,31 @@ func (s *captureRuntimeWorkerStore) RetireDrainingWorker(workerID int, reason st
 		return false, nil
 	}
 	return true, nil
+}
+
+func podDeleteActionCount(cs *fake.Clientset) int {
+	count := 0
+	for _, action := range cs.Actions() {
+		if action.Matches("delete", "pods") {
+			count++
+		}
+	}
+	return count
+}
+
+func podDeleteActionNames(cs *fake.Clientset) []string {
+	var names []string
+	for _, action := range cs.Actions() {
+		if !action.Matches("delete", "pods") {
+			continue
+		}
+		deleteAction, ok := action.(k8stesting.DeleteAction)
+		if !ok {
+			continue
+		}
+		names = append(names, deleteAction.GetName())
+	}
+	return names
 }
 
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
@@ -2145,6 +2219,511 @@ func TestK8sPoolHealthCheckLoopReplenishesWarmCapacityAfterIdleWorkerCrash(t *te
 	case <-replacementSpawned:
 	case <-time.After(time.Second):
 		t.Fatal("expected idle worker crash to trigger warm-pool replenishment")
+	}
+}
+
+func TestK8sPoolHealthCheckLoopDropsStaleLeaseWithoutDeletingPod(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			7: {
+				WorkerID:          7,
+				PodName:           "test-cp-worker-7",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: "other-cp:boot",
+				OwnerEpoch:        12,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	worker := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(3)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-7", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.7"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	deadline := time.After(time.Second)
+	for {
+		if _, ok := pool.Worker(worker.ID); !ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected stale local worker to be dropped")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("stale lease must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	if got := podDeleteActionCount(cs); got != 0 {
+		t.Fatalf("stale lease must not delete pod, got %d delete actions", got)
+	}
+	store.mu.Lock()
+	markLostCalls := store.markLostCalls
+	markLostCalledIDs := append([]int(nil), store.markLostCalledIDs...)
+	markLostCalledCPs := append([]string(nil), store.markLostCalledCPs...)
+	markLostCalledEpochs := append([]int64(nil), store.markLostCalledEpochs...)
+	markLostCalledReasons := append([]string(nil), store.markLostCalledReasons...)
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if markLostCalls != 1 {
+		t.Fatalf("expected 1 lease-fenced lost CAS, got %d", markLostCalls)
+	}
+	if markLostCalledIDs[0] != worker.ID || markLostCalledCPs[0] != pool.cpInstanceID || markLostCalledEpochs[0] != 3 || markLostCalledReasons[0] != RetireReasonCrash {
+		t.Fatalf("unexpected lost CAS args: ids=%v cps=%v epochs=%v reasons=%v", markLostCalledIDs, markLostCalledCPs, markLostCalledEpochs, markLostCalledReasons)
+	}
+	if recordState != configstore.WorkerStateHot {
+		t.Fatalf("stale lease must not mutate worker record, got state %q", recordState)
+	}
+	if records := store.snapshot(); len(records) != 0 {
+		t.Fatalf("stale lease must not write unconditional worker records, got %#v", records)
+	}
+}
+
+func TestK8sPoolHealthCheckLoopRetriesSameOwnerNewerRuntimeEpoch(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			10: {
+				WorkerID:          10,
+				PodName:           "test-cp-worker-10",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        12,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	worker := &ManagedWorker{ID: 10, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(3)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-10", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.10"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	deadline := time.After(time.Second)
+	for {
+		store.mu.Lock()
+		markLostCalls := store.markLostCalls
+		store.mu.Unlock()
+		if markLostCalls > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected health loop to attempt lease-fenced lost CAS")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	if _, ok := pool.Worker(worker.ID); !ok {
+		t.Fatal("same-owner newer runtime epoch must not drop the local worker")
+	}
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("same-owner newer runtime epoch must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	if got := podDeleteActionCount(cs); got != 0 {
+		t.Fatalf("same-owner newer runtime epoch must not delete pod, got %d delete actions", got)
+	}
+	store.mu.Lock()
+	recordState := store.preloadedRecords[worker.ID].State
+	store.mu.Unlock()
+	if recordState != configstore.WorkerStateHot {
+		t.Fatalf("same-owner newer runtime epoch must not mutate worker record, got state %q", recordState)
+	}
+	if records := store.snapshot(); len(records) != 0 {
+		t.Fatalf("same-owner newer runtime epoch must not write unconditional worker records, got %#v", records)
+	}
+}
+
+func TestK8sPoolHealthCheckLoopCompletesSameLeaseAlreadyLost(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			13: {
+				WorkerID:          13,
+				PodName:           "test-cp-worker-13",
+				State:             configstore.WorkerStateLost,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+				RetireReason:      RetireReasonCrash,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	worker := &ManagedWorker{ID: 13, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-13", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.13"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	select {
+	case workerID := <-crashed:
+		if workerID != worker.ID {
+			t.Fatalf("expected crash notification for worker %d, got %d", worker.ID, workerID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected already-lost current lease to complete crash notification")
+	}
+	if _, ok := pool.Worker(worker.ID); ok {
+		t.Fatal("expected already-lost current lease to remove local worker")
+	}
+	if got := podDeleteActionNames(cs); len(got) != 1 || got[0] != "test-cp-worker-13" {
+		t.Fatalf("expected already-lost current lease to delete pod, got %v", got)
+	}
+}
+
+func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "adopted-worker-8",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	worker := &ManagedWorker{ID: 8, podName: "adopted-worker-8", done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "adopted-worker-8", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.8"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	select {
+	case workerID := <-crashed:
+		if workerID != worker.ID {
+			t.Fatalf("expected crash notification for worker %d, got %d", worker.ID, workerID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected current lease health-check failure to notify crash")
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		if got := podDeleteActionCount(cs); got > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected current lease health-check failure to delete pod")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if got := podDeleteActionNames(cs); len(got) != 1 || got[0] != "adopted-worker-8" {
+		t.Fatalf("expected health-check failure to delete adopted pod, got %v", got)
+	}
+
+	store.mu.Lock()
+	markLostCalls := store.markLostCalls
+	markLostCalledIDs := append([]int(nil), store.markLostCalledIDs...)
+	markLostCalledCPs := append([]string(nil), store.markLostCalledCPs...)
+	markLostCalledEpochs := append([]int64(nil), store.markLostCalledEpochs...)
+	markLostCalledReasons := append([]string(nil), store.markLostCalledReasons...)
+	recordState := store.preloadedRecords[worker.ID].State
+	recordReason := store.preloadedRecords[worker.ID].RetireReason
+	store.mu.Unlock()
+	if markLostCalls != 1 {
+		t.Fatalf("expected 1 lease-fenced lost CAS, got %d", markLostCalls)
+	}
+	if markLostCalledIDs[0] != worker.ID || markLostCalledCPs[0] != pool.cpInstanceID || markLostCalledEpochs[0] != 4 || markLostCalledReasons[0] != RetireReasonCrash {
+		t.Fatalf("unexpected lost CAS args: ids=%v cps=%v epochs=%v reasons=%v", markLostCalledIDs, markLostCalledCPs, markLostCalledEpochs, markLostCalledReasons)
+	}
+	if recordState != configstore.WorkerStateLost || recordReason != RetireReasonCrash {
+		t.Fatalf("current lease should be marked lost/crash, got state=%q reason=%q", recordState, recordReason)
+	}
+	if records := store.snapshot(); len(records) != 0 {
+		t.Fatalf("current lease path must not write unconditional worker records, got %#v", records)
+	}
+}
+
+func TestK8sPoolMarkWorkerLostIfCurrentLeaseAllowsUnstampedLocalWorker(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			9: {
+				WorkerID:          9,
+				PodName:           "test-cp-worker-9",
+				State:             configstore.WorkerStateIdle,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        0,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	worker := &ManagedWorker{ID: 9, done: make(chan struct{})}
+	currentLease, err := pool.markWorkerLostIfCurrentLease(pool.workerLeaseSnapshot(worker))
+	if err != nil {
+		t.Fatalf("mark lost: %v", err)
+	}
+	if !currentLease {
+		t.Fatal("unstamped local worker should use the pool owner for the lease CAS")
+	}
+	if got := store.preloadedRecords[worker.ID].State; got != configstore.WorkerStateLost {
+		t.Fatalf("expected worker record marked lost, got %q", got)
+	}
+}
+
+func TestK8sPoolRemoveWorkerAfterLostLeaseRejectsNewerLocalEpoch(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	worker := &ManagedWorker{ID: 11, done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(3)
+	lease := pool.workerLeaseSnapshot(worker)
+
+	worker.SetOwnerEpoch(4)
+	pool.workers[worker.ID] = worker
+
+	removed, _, _, _ := pool.removeWorkerAfterLostLeaseLocked(lease)
+	if removed != nil {
+		t.Fatalf("expected old lease snapshot not to remove newer local worker")
+	}
+	if _, ok := pool.workers[worker.ID]; !ok {
+		t.Fatal("newer local worker must remain in the pool")
+	}
+}
+
+func TestK8sPoolCleanDeadWorkersDropsStaleRuntimeLeaseWithoutDeletingPod(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			12: {
+				WorkerID:          12,
+				PodName:           "test-cp-worker-12",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: "other-cp:boot",
+				OwnerEpoch:        9,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	done := make(chan struct{})
+	close(done)
+	worker := &ManagedWorker{ID: 12, done: done}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(3)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-12", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.12"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	pool.cleanDeadWorkersLocked()
+
+	if _, ok := pool.workers[worker.ID]; ok {
+		t.Fatal("expected stale closed worker to be dropped locally")
+	}
+	if got := podDeleteActionCount(cs); got != 0 {
+		t.Fatalf("stale clean-dead lease must not delete pod, got %d delete actions", got)
+	}
+	if state := store.preloadedRecords[worker.ID].State; state != configstore.WorkerStateHot {
+		t.Fatalf("stale clean-dead lease must not mutate record, got state %q", state)
+	}
+	if records := store.snapshot(); len(records) != 0 {
+		t.Fatalf("stale clean-dead lease must not write unconditional worker records, got %#v", records)
+	}
+}
+
+func TestK8sPoolCleanDeadWorkersLeavesSameOwnerNewerRuntimeEpoch(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			15: {
+				WorkerID:          15,
+				PodName:           "test-cp-worker-15",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        9,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	done := make(chan struct{})
+	close(done)
+	worker := &ManagedWorker{ID: 15, done: done}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(3)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-15", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.15"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	pool.cleanDeadWorkersLocked()
+
+	if _, ok := pool.workers[worker.ID]; !ok {
+		t.Fatal("cleanDeadWorkersLocked must not drop same-owner newer runtime epoch")
+	}
+	if got := podDeleteActionCount(cs); got != 0 {
+		t.Fatalf("same-owner newer runtime epoch clean-dead path must not delete pod, got %d delete actions", got)
+	}
+	if state := store.preloadedRecords[worker.ID].State; state != configstore.WorkerStateHot {
+		t.Fatalf("same-owner newer runtime epoch clean-dead path must not mutate record, got state %q", state)
+	}
+	if records := store.snapshot(); len(records) != 0 {
+		t.Fatalf("same-owner newer runtime epoch clean-dead path must not write unconditional worker records, got %#v", records)
+	}
+}
+
+func TestK8sPoolCleanDeadWorkersLeavesCurrentRuntimeLeaseForHealthLoop(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			16: {
+				WorkerID:          16,
+				PodName:           "test-cp-worker-16",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	done := make(chan struct{})
+	close(done)
+	worker := &ManagedWorker{ID: 16, done: done}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-16", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.16"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	pool.cleanDeadWorkersLocked()
+
+	if _, ok := pool.workers[worker.ID]; !ok {
+		t.Fatal("cleanDeadWorkersLocked must leave current runtime lease for HealthCheckLoop crash notification")
+	}
+	if got := podDeleteActionCount(cs); got != 0 {
+		t.Fatalf("current runtime lease clean-dead path must not delete pod, got %d delete actions", got)
+	}
+	store.mu.Lock()
+	recordState := store.preloadedRecords[worker.ID].State
+	recordReason := store.preloadedRecords[worker.ID].RetireReason
+	store.mu.Unlock()
+	if recordState != configstore.WorkerStateLost || recordReason != RetireReasonCrash {
+		t.Fatalf("cleanDeadWorkersLocked should fence current runtime lease as lost/crash, got state=%q reason=%q", recordState, recordReason)
+	}
+	if records := store.snapshot(); len(records) != 0 {
+		t.Fatalf("current runtime lease clean-dead path must not write unconditional worker records, got %#v", records)
+	}
+}
+
+func TestK8sPoolCleanDeadWorkersLeavesSameLeaseAlreadyLostForHealthLoop(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			14: {
+				WorkerID:          14,
+				PodName:           "test-cp-worker-14",
+				State:             configstore.WorkerStateLost,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+				RetireReason:      RetireReasonCrash,
+			},
+		},
+	}
+	pool.runtimeStore = store
+
+	done := make(chan struct{})
+	close(done)
+	worker := &ManagedWorker{ID: 14, done: done}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cp-worker-14", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.14"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	pool.cleanDeadWorkersLocked()
+
+	if _, ok := pool.workers[worker.ID]; !ok {
+		t.Fatal("cleanDeadWorkersLocked must not consume an already-lost same-lease worker before HealthCheckLoop can notify crash")
+	}
+	if got := podDeleteActionCount(cs); got != 0 {
+		t.Fatalf("already-lost same-lease clean-dead path must not delete pod, got %d delete actions", got)
 	}
 }
 

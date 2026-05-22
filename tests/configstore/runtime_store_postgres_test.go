@@ -1965,6 +1965,141 @@ func TestGetFlightSessionRecordReturnsNilWhenMissing(t *testing.T) {
 	}
 }
 
+func TestMarkWorkerLostIfCurrentLeasePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 12, 0, 0, 0, time.UTC)
+
+	liveStates := []configstore.WorkerState{
+		configstore.WorkerStateSpawning,
+		configstore.WorkerStateIdle,
+		configstore.WorkerStateReserved,
+		configstore.WorkerStateActivating,
+		configstore.WorkerStateHot,
+		configstore.WorkerStateHotIdle,
+	}
+	for i, state := range liveStates {
+		t.Run(string(state), func(t *testing.T) {
+			workerID := 3100 + i
+			upsertMarkLostWorker(t, store, workerID, state, "cp-me:boot-a", 4, "", now)
+
+			updated, err := store.MarkWorkerLostIfCurrentLease(workerID, "cp-me:boot-a", 4, "crash")
+			if err != nil {
+				t.Fatalf("MarkWorkerLostIfCurrentLease(%s): %v", state, err)
+			}
+			if !updated {
+				t.Fatalf("expected current %s lease to mark worker lost", state)
+			}
+			assertWorkerStateAndReason(t, store, workerID, configstore.WorkerStateLost, "crash")
+		})
+	}
+
+	upsertMarkLostWorker(t, store, 3200, configstore.WorkerStateHot, "cp-other:boot-b", 9, "", now)
+	updated, err := store.MarkWorkerLostIfCurrentLease(3200, "cp-me:boot-a", 9, "crash")
+	if err != nil {
+		t.Fatalf("MarkWorkerLostIfCurrentLease owner mismatch: %v", err)
+	}
+	if updated {
+		t.Fatal("expected owner mismatch to return false")
+	}
+	assertWorkerStateAndReason(t, store, 3200, configstore.WorkerStateHot, "")
+
+	upsertMarkLostWorker(t, store, 3201, configstore.WorkerStateHot, "cp-me:boot-a", 4, "", now)
+	updated, err = store.MarkWorkerLostIfCurrentLease(3201, "cp-me:boot-a", 3, "crash")
+	if err != nil {
+		t.Fatalf("MarkWorkerLostIfCurrentLease epoch mismatch: %v", err)
+	}
+	if updated {
+		t.Fatal("expected epoch mismatch to return false")
+	}
+	assertWorkerStateAndReason(t, store, 3201, configstore.WorkerStateHot, "")
+
+	noOpStates := []configstore.WorkerState{
+		configstore.WorkerStateDraining,
+		configstore.WorkerStateRetired,
+		configstore.WorkerStateLost,
+	}
+	for i, state := range noOpStates {
+		t.Run("noop_"+string(state), func(t *testing.T) {
+			workerID := 3300 + i
+			upsertMarkLostWorker(t, store, workerID, state, "cp-me:boot-a", 4, "original", now)
+
+			updated, err := store.MarkWorkerLostIfCurrentLease(workerID, "cp-me:boot-a", 4, "crash")
+			if err != nil {
+				t.Fatalf("MarkWorkerLostIfCurrentLease(%s): %v", state, err)
+			}
+			if updated {
+				t.Fatalf("expected %s worker to remain owned by its current lifecycle path", state)
+			}
+			assertWorkerStateAndReason(t, store, workerID, state, "original")
+		})
+	}
+}
+
+func TestUpsertWorkerRecordDoesNotResurrectTerminalWorkerPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 12, 30, 0, 0, time.UTC)
+
+	cases := []struct {
+		name  string
+		state configstore.WorkerState
+	}{
+		{"draining", configstore.WorkerStateDraining},
+		{"lost", configstore.WorkerStateLost},
+		{"retired", configstore.WorkerStateRetired},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workerID := 3400 + i
+			upsertMarkLostWorker(t, store, workerID, tc.state, "cp-me:boot-a", 4, "original", now)
+
+			if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+				WorkerID:          workerID,
+				PodName:           fmt.Sprintf("duckgres-worker-%d", workerID),
+				State:             configstore.WorkerStateHot,
+				OrgID:             "acme",
+				OwnerCPInstanceID: "cp-me:boot-a",
+				OwnerEpoch:        5,
+				RetireReason:      "",
+				LastHeartbeatAt:   now.Add(time.Minute),
+			}); err != nil {
+				t.Fatalf("UpsertWorkerRecord(%d): %v", workerID, err)
+			}
+
+			assertWorkerStateAndReason(t, store, workerID, tc.state, "original")
+		})
+	}
+}
+
+func upsertMarkLostWorker(t *testing.T, store *configstore.ConfigStore, workerID int, state configstore.WorkerState, ownerCPInstanceID string, ownerEpoch int64, retireReason string, lastHeartbeatAt time.Time) {
+	t.Helper()
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          workerID,
+		PodName:           fmt.Sprintf("duckgres-worker-%d", workerID),
+		State:             state,
+		OrgID:             "acme",
+		OwnerCPInstanceID: ownerCPInstanceID,
+		OwnerEpoch:        ownerEpoch,
+		RetireReason:      retireReason,
+		LastHeartbeatAt:   lastHeartbeatAt,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(%d): %v", workerID, err)
+	}
+}
+
+func assertWorkerStateAndReason(t *testing.T, store *configstore.ConfigStore, workerID int, wantState configstore.WorkerState, wantReason string) {
+	t.Helper()
+	record, err := store.GetWorkerRecord(workerID)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord(%d): %v", workerID, err)
+	}
+	if record == nil {
+		t.Fatalf("expected worker %d to exist", workerID)
+	}
+	if record.State != wantState || record.RetireReason != wantReason {
+		t.Fatalf("worker %d = state %q reason %q, want state %q reason %q", workerID, record.State, record.RetireReason, wantState, wantReason)
+	}
+}
+
 func TestTakeOverWorkerPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 17, 0, 0, 0, time.UTC)
@@ -2008,6 +2143,35 @@ func TestTakeOverWorkerPostgres(t *testing.T) {
 	}
 	if missed != nil {
 		t.Fatalf("expected stale takeover attempt to fail, got %#v", missed)
+	}
+}
+
+func TestTakeOverWorkerSkipsNonReclaimableStatesPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 12, 45, 0, 0, time.UTC)
+
+	cases := []struct {
+		name  string
+		state configstore.WorkerState
+	}{
+		{"draining", configstore.WorkerStateDraining},
+		{"retired", configstore.WorkerStateRetired},
+		{"lost", configstore.WorkerStateLost},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workerID := 3500 + i
+			upsertMarkLostWorker(t, store, workerID, tc.state, "cp-old:boot-a", 5, "original", now)
+
+			claimed, err := store.TakeOverWorker(workerID, "cp-new:boot-b", "analytics", 5)
+			if err != nil {
+				t.Fatalf("TakeOverWorker(%s): %v", tc.state, err)
+			}
+			if claimed != nil {
+				t.Fatalf("expected %s worker not to be claimed, got %#v", tc.state, claimed)
+			}
+			assertWorkerStateAndReason(t, store, workerID, tc.state, "original")
+		})
 	}
 }
 
