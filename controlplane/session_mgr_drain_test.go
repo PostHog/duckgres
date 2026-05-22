@@ -671,7 +671,7 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 
 	createErr := make(chan error, 1)
 	go func() {
-		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", "", 1010, "", 0, "postgres")
+		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres")
 		createErr <- err
 	}()
 
@@ -722,7 +722,7 @@ func TestDestroyAllSessionsWaitsForCreateBlockedInLimiterAcquire(t *testing.T) {
 
 	createErr := make(chan error, 1)
 	go func() {
-		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", "", 1010, "", 0, "postgres")
+		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres")
 		createErr <- err
 	}()
 
@@ -771,7 +771,7 @@ func TestDestroyAllSessionsCancelsCreateBlockedInAcquireWorker(t *testing.T) {
 
 	createErr := make(chan error, 1)
 	go func() {
-		_, _, err := sm.CreateSessionWithProtocol(callerCtx, "root", "", 1010, "", 0, "postgres")
+		_, _, err := sm.CreateSessionWithProtocol(callerCtx, "root", 1010, "", 0, "postgres")
 		createErr <- err
 	}()
 

@@ -63,7 +63,7 @@ func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
 		err: NewWarmCapacityExhaustedError(30 * time.Second),
 	}, nil)
 
-	_, _, err := sm.CreateSession(context.Background(), "root", "", 1001, "", 0)
+	_, _, err := sm.CreateSession(context.Background(), "root", 1001, "", 0)
 	var capacityErr *WarmCapacityExhaustedError
 	if !errors.As(err, &capacityErr) {
 		t.Fatalf("expected warm capacity error, got %v", err)
