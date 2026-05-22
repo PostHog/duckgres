@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -439,6 +441,16 @@ func podDeleteActionNames(cs *fake.Clientset) []string {
 	return names
 }
 
+func secretDeleteActionCount(cs *fake.Clientset) int {
+	count := 0
+	for _, action := range cs.Actions() {
+		if action.Matches("delete", "secrets") {
+			count++
+		}
+	}
+	return count
+}
+
 func newTestK8sPool(t *testing.T, maxWorkers int) (*K8sWorkerPool, *fake.Clientset) {
 	t.Helper()
 	cs := fake.NewSimpleClientset()
@@ -611,6 +623,146 @@ func TestK8sPool_ReadWorkerRPCSecurity(t *testing.T) {
 	}
 	if string(certPEM) != "my-cert" {
 		t.Fatalf("unexpected cert: %s", certPEM)
+	}
+}
+
+func TestK8sPool_InformerDeleteClosesPodReadyWaiter(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	pool.startInformer()
+	t.Cleanup(func() { close(pool.stopInform) })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !pool.informer.HasSynced() {
+		if time.Now().After(deadline) {
+			t.Fatal("informer did not sync")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	podName := "duckgres-worker-test-cp-0"
+	_, err := cs.CoreV1().Pods(pool.namespace).Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: pool.namespace,
+			Labels: map[string]string{
+				"duckgres/control-plane": pool.cpID,
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+
+	ch := make(chan podReadyInfo)
+	pool.podReady.Store(podName, ch)
+
+	if err := cs.CoreV1().Pods(pool.namespace).Delete(context.Background(), podName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete pod: %v", err)
+	}
+
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("podReady waiter received a value; want closed channel")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("podReady waiter was not closed after pod delete")
+	}
+}
+
+func TestK8sPool_SpawnWorkerCleansUpPodAndSecretWhenRPCSecurityReadFails(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	workerID := 7
+	podName := pool.podNameForWorker(workerID)
+	secretName := pool.workerRPCSecretName(podName)
+
+	cs.Fake.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction, ok := action.(k8stesting.GetAction)
+		if !ok || getAction.GetName() != podName {
+			return false, nil, nil
+		}
+		return true, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: pool.namespace},
+			Spec:       corev1.PodSpec{NodeName: "node-a"},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				PodIP: "10.0.0.7",
+			},
+		}, nil
+	})
+	cs.Fake.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction, ok := action.(k8stesting.GetAction)
+		if !ok || getAction.GetName() != secretName {
+			return false, nil, nil
+		}
+		return true, nil, k8serrors.NewNotFound(schema.GroupResource{Resource: "secrets"}, secretName)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := pool.spawnWorker(ctx, workerID, "duckgres:test", false)
+	if err == nil {
+		t.Fatal("spawnWorker succeeded; want readWorkerRPCSecurity failure")
+	}
+	if !strings.Contains(err.Error(), "read worker RPC security") {
+		t.Fatalf("spawnWorker error = %v, want readWorkerRPCSecurity failure", err)
+	}
+	if podDeleteActionCount(cs) < 2 {
+		t.Fatalf("pod delete actions = %d, want stale-pod delete plus cleanup delete", podDeleteActionCount(cs))
+	}
+	if secretDeleteActionCount(cs) < 2 {
+		t.Fatalf("secret delete actions = %d, want stale-secret delete plus cleanup delete", secretDeleteActionCount(cs))
+	}
+}
+
+func TestK8sPool_SpawnWorkerCleansUpWhenRPCSecurityReadCancelsContext(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	workerID := 8
+	podName := pool.podNameForWorker(workerID)
+	secretName := pool.workerRPCSecretName(podName)
+	ctx, cancel := context.WithCancel(context.Background())
+	secretGets := 0
+
+	cs.Fake.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction, ok := action.(k8stesting.GetAction)
+		if !ok || getAction.GetName() != podName {
+			return false, nil, nil
+		}
+		return true, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: pool.namespace},
+			Spec:       corev1.PodSpec{NodeName: "node-a"},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				PodIP: "10.0.0.8",
+			},
+		}, nil
+	})
+	cs.Fake.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction, ok := action.(k8stesting.GetAction)
+		if !ok || getAction.GetName() != secretName {
+			return false, nil, nil
+		}
+		secretGets++
+		if secretGets == 1 {
+			return false, nil, nil
+		}
+		cancel()
+		return true, nil, context.Canceled
+	})
+
+	err := pool.spawnWorker(ctx, workerID, "duckgres:test", false)
+	if err == nil {
+		t.Fatal("spawnWorker succeeded; want readWorkerRPCSecurity failure")
+	}
+	if !strings.Contains(err.Error(), "read worker RPC security") {
+		t.Fatalf("spawnWorker error = %v, want readWorkerRPCSecurity failure", err)
+	}
+	if podDeleteActionCount(cs) < 2 {
+		t.Fatalf("pod delete actions = %d, want cleanup delete despite canceled spawn context", podDeleteActionCount(cs))
+	}
+	if secretDeleteActionCount(cs) < 2 {
+		t.Fatalf("secret delete actions = %d, want cleanup delete despite canceled spawn context", secretDeleteActionCount(cs))
 	}
 }
 
