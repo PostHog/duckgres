@@ -83,15 +83,10 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 		for _, s := range sessions {
 			sessionsByWorker[s.WorkerID]++
 		}
-		activeCount := 0
-		idleCount := 0
 		for wID, count := range sessionsByWorker {
 			status := "active"
 			if count == 0 {
 				status = "idle"
-				idleCount++
-			} else {
-				activeCount++
 			}
 			result = append(result, admin.WorkerStatus{
 				ID:             wID,
@@ -100,9 +95,6 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 				Status:         status,
 			})
 		}
-		// Emit per-org worker Prometheus metrics
-		observeOrgWorkersActive(name, activeCount)
-		observeOrgWorkersIdle(name, idleCount)
 	}
 	return result
 }
@@ -241,6 +233,7 @@ func SetupMultiTenant(
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
 	janitor.hotIdleTTL = defaultHotIdleTTL
 	janitor.warmCapacityMissBucketTTL = cfg.K8s.WarmCapacityDemandTTL
+	janitor.onStop = resetLeaderOwnedClusterMetrics
 	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
 		router.sharedPool.retireClaimedWorker(&record, reason)
 	}

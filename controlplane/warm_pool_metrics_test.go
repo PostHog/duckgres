@@ -224,29 +224,55 @@ func TestObserveWarmCapacityMetrics(t *testing.T) {
 	assertGaugeVecValue(t, warmCapacityHeadroomGauge, 5, "global")
 
 	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHot), "org_owned")
-	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHotIdle), "org_owned")
+	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHot), "org_bound")
+	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateHotIdle), "org_bound")
 	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Ownership: "neutral", Count: 2},
-		{Image: image, State: configstore.WorkerStateHot, Ownership: "org_owned", Count: 1},
-		{Image: image, State: configstore.WorkerStateHotIdle, Ownership: "org_owned", Count: 3},
+		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
+		{Image: image, State: configstore.WorkerStateHot, Binding: "org_bound", Count: 1},
+		{Image: image, State: configstore.WorkerStateHotIdle, Binding: "org_bound", Count: 3},
 	})
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 2, image, string(configstore.WorkerStateIdle), "neutral")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 1, image, string(configstore.WorkerStateHot), "org_owned")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 3, image, string(configstore.WorkerStateHotIdle), "org_owned")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 1, image, string(configstore.WorkerStateHot), "org_bound")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 3, image, string(configstore.WorkerStateHotIdle), "org_bound")
 	observeWorkerLifecycleStats(nil, []configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Ownership: "neutral", Count: 2},
-		{Image: image, State: configstore.WorkerStateHot, Ownership: "org_owned", Count: 1},
-		{Image: image, State: configstore.WorkerStateHotIdle, Ownership: "org_owned", Count: 3},
+		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
+		{Image: image, State: configstore.WorkerStateHot, Binding: "org_bound", Count: 1},
+		{Image: image, State: configstore.WorkerStateHotIdle, Binding: "org_bound", Count: 3},
 	})
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHot), "org_owned")
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHotIdle), "org_owned")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHot), "org_bound")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHotIdle), "org_bound")
 
 	observeWarmCapacityReconcileSpawns(scope, "success", 3)
 	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, scope, "success"); got != 3 {
 		t.Fatalf("expected three warm capacity reconcile spawns, got %v", got)
 	}
+}
+
+func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
+	image := "duckgres:leader-reset-test"
+	scope := "image:" + image
+
+	observeWarmCapacityRecentMisses([]configstore.WarmCapacityMissAggregate{
+		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
+	})
+	observeWarmCapacityTargets(
+		map[string]int{image: 2},
+		map[string]int{image: 5},
+		10,
+	)
+	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
+		{Image: image, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 2},
+	})
+
+	resetLeaderOwnedClusterMetrics()
+
+	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 0, scope, string(configstore.WorkerClaimMissReasonNoIdle))
+	assertGaugeVecValue(t, warmCapacityBaseTargetGauge, 0, scope)
+	assertGaugeVecValue(t, warmCapacityDemandTargetGauge, 0, scope)
+	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 0, scope)
+	assertGaugeVecValue(t, warmCapacityHeadroomGauge, 0, "global")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
 }
 
 // --- Helpers ---

@@ -385,10 +385,10 @@ type WarmCapacityMissAggregate struct {
 // WorkerLifecycleStats is the grouped worker lifecycle state used for
 // cluster-wide worker observability.
 type WorkerLifecycleStats struct {
-	Image     string      `json:"image"`
-	State     WorkerState `json:"state"`
-	Ownership string      `json:"ownership"`
-	Count     int64       `json:"count"`
+	Image   string      `json:"image"`
+	State   WorkerState `json:"state"`
+	Binding string      `json:"binding"`
+	Count   int64       `json:"count"`
 }
 
 // WorkerRecord is the durable runtime coordination record for one worker pod.

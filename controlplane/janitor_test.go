@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -122,6 +123,35 @@ func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 		if !cutoff.Equal(wantDrainCutoff) {
 			t.Fatalf("draining call %d expected cutoff %v, got %v", i, wantDrainCutoff, cutoff)
 		}
+	}
+}
+
+func TestControlPlaneJanitorRunInvokesOnStop(t *testing.T) {
+	store := &captureControlPlaneExpiryStore{}
+	janitor := NewControlPlaneJanitor(store, time.Hour, 20*time.Second)
+	stopped := make(chan struct{})
+	janitor.onStop = func() {
+		close(stopped)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		janitor.Run(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("expected janitor onStop callback")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected janitor run loop to exit")
 	}
 }
 

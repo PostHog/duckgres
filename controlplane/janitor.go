@@ -43,6 +43,7 @@ type ControlPlaneJanitor struct {
 	retireOrphanWorker            func(record configstore.WorkerRecord, reason string) // orphan-cleanup variant: handles any active state, skips local-pool bookkeeping
 	retireLocalWorker             func(workerID int, reason string) bool               // retires from in-memory pool + pod, returns false if not local
 	reconcileWarmCapacity         func()
+	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 }
@@ -71,6 +72,11 @@ func (j *ControlPlaneJanitor) Run(ctx context.Context) {
 	if j == nil || j.store == nil {
 		return
 	}
+	defer func() {
+		if j.onStop != nil {
+			j.onStop()
+		}
+	}()
 
 	j.runOnce()
 

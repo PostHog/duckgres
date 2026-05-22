@@ -2950,7 +2950,7 @@ func TestRetireOneMismatchedVersionWorker_NoopWhenCPIDHasNoHashSuffix(t *testing
 // These tests pin the expected behavior of the K8s-label-based reconciler.
 
 // strandedReconcilerPool wires a K8sWorkerPool with a fake clientset and store
-// for reconciler tests. Ownership labels aren't checked by the reconciler, so
+// for reconciler tests. Owner labels aren't checked by the reconciler, so
 // we keep the setup minimal.
 func strandedReconcilerPool(t *testing.T, store RuntimeWorkerStore) (*K8sWorkerPool, *fake.Clientset) {
 	t.Helper()

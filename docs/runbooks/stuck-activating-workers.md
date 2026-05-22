@@ -36,7 +36,7 @@ The automatic stuck-worker reaper runs every minute and retires workers that hav
    kubectl delete pod <pod-name> --grace-period=10
    ```
 
-4. **Verify recovery.** After stuck workers are cleaned up, check that `sum(duckgres_worker_lifecycle_count{state="idle",ownership="neutral"})` replenishes to `minWorkers`.
+4. **Verify recovery.** After stuck workers are cleaned up, check that `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` replenishes to `minWorkers`.
 
 ## Prevention
 

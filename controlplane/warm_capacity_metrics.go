@@ -48,8 +48,8 @@ var warmCapacityReconcileSpawnsCounter = promauto.NewCounterVec(prometheus.Count
 
 var workerLifecycleCountGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_worker_lifecycle_count",
-	Help: "Cluster-wide active worker count by image, lifecycle state, and ownership.",
-}, []string{"image", "state", "ownership"})
+	Help: "Cluster-wide active worker count by image, lifecycle state, and tenant binding.",
+}, []string{"image", "state", "binding"})
 
 func observeWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason) {
 	scope = strings.TrimSpace(scope)
@@ -113,22 +113,31 @@ func observeWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats, previ
 		for _, stat := range prev {
 			image := strings.TrimSpace(stat.Image)
 			state := strings.TrimSpace(string(stat.State))
-			ownership := strings.TrimSpace(stat.Ownership)
-			if image == "" || state == "" || ownership == "" {
+			binding := strings.TrimSpace(stat.Binding)
+			if image == "" || state == "" || binding == "" {
 				continue
 			}
-			workerLifecycleCountGauge.WithLabelValues(image, state, ownership).Set(0)
+			workerLifecycleCountGauge.WithLabelValues(image, state, binding).Set(0)
 		}
 	}
 	for _, stat := range stats {
 		image := strings.TrimSpace(stat.Image)
 		state := strings.TrimSpace(string(stat.State))
-		ownership := strings.TrimSpace(stat.Ownership)
-		if image == "" || state == "" || ownership == "" {
+		binding := strings.TrimSpace(stat.Binding)
+		if image == "" || state == "" || binding == "" {
 			continue
 		}
-		workerLifecycleCountGauge.WithLabelValues(image, state, ownership).Set(float64(nonNegativeInt64(stat.Count)))
+		workerLifecycleCountGauge.WithLabelValues(image, state, binding).Set(float64(nonNegativeInt64(stat.Count)))
 	}
+}
+
+func resetLeaderOwnedClusterMetrics() {
+	warmCapacityRecentMissesGauge.Reset()
+	warmCapacityBaseTargetGauge.Reset()
+	warmCapacityDemandTargetGauge.Reset()
+	warmCapacityEffectiveTargetGauge.Reset()
+	warmCapacityHeadroomGauge.Reset()
+	workerLifecycleCountGauge.Reset()
 }
 
 func observeWarmCapacityReconcileSpawns(scope, result string, count int) {
