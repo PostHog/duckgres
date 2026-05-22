@@ -13,89 +13,88 @@ import (
 
 var warmCapacityMissesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_warm_capacity_misses_total",
-	Help: "Total foreground warm-capacity misses, partitioned by image scope and reason.",
-}, []string{"scope", "reason"})
+	Help: "Total foreground warm-capacity misses, partitioned by image and reason.",
+}, []string{"image", "reason"})
 
 var warmCapacityRecentMissesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_warm_capacity_recent_misses",
-	Help: "Recent warm-capacity misses read by dynamic target reconciliation, partitioned by scope and reason.",
-}, []string{"scope", "reason"})
+	Help: "Recent warm-capacity misses read by dynamic target reconciliation, partitioned by image and reason.",
+}, []string{"image", "reason"})
 
 var warmCapacityBaseTargetGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_warm_capacity_base_target",
-	Help: "Configured/base warm-capacity target by scope.",
-}, []string{"scope"})
+	Help: "Configured/base warm-capacity target by image.",
+}, []string{"image"})
 
 var warmCapacityDemandTargetGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_warm_capacity_demand_target",
-	Help: "Dynamic warm-capacity target added above the base target by scope.",
-}, []string{"scope"})
+	Help: "Dynamic warm-capacity target added above the base target by image.",
+}, []string{"image"})
 
 var warmCapacityEffectiveTargetGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_warm_capacity_effective_target",
-	Help: "Effective warm-capacity target after applying dynamic demand and caps by scope.",
-}, []string{"scope"})
+	Help: "Effective warm-capacity target after applying dynamic demand and caps by image.",
+}, []string{"image"})
 
-var warmCapacityHeadroomGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+var warmCapacityHeadroomGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "duckgres_warm_capacity_headroom",
-	Help: "Remaining global warm-capacity target headroom by scope; -1 means unbounded.",
-}, []string{"scope"})
+	Help: "Remaining global warm-capacity target headroom; -1 means unbounded.",
+})
 
 var warmCapacityReconcileSpawnsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_warm_capacity_reconcile_spawns_total",
-	Help: "Warm-capacity worker spawn slots accepted by reconciliation, partitioned by scope and result.",
-}, []string{"scope", "result"})
+	Help: "Warm-capacity worker spawn slots accepted by reconciliation, partitioned by image and result.",
+}, []string{"image", "result"})
 
 var workerLifecycleCountGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_worker_lifecycle_count",
 	Help: "Cluster-wide active worker count by image, lifecycle state, and tenant binding.",
 }, []string{"image", "state", "binding"})
 
-func observeWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason) {
-	scope = strings.TrimSpace(scope)
-	if scope == "" {
+func observeWarmCapacityMiss(image string, reason configstore.WorkerClaimMissReason) {
+	image = strings.TrimSpace(image)
+	if image == "" {
 		return
 	}
 	policy := warmCapacityMissPolicyForReason(reason)
-	warmCapacityMissesCounter.WithLabelValues(scope, string(policy.reason)).Inc()
+	warmCapacityMissesCounter.WithLabelValues(image, string(policy.reason)).Inc()
 }
 
 func observeWarmCapacityRecentMisses(aggregates []configstore.WarmCapacityMissAggregate, previous ...[]configstore.WarmCapacityMissAggregate) {
 	for _, prev := range previous {
 		for _, aggregate := range prev {
-			scope := strings.TrimSpace(aggregate.Scope)
-			if scope == "" {
+			image := warmCapacityImageFromScope(aggregate.Scope)
+			if image == "" {
 				continue
 			}
 			policy := warmCapacityMissPolicyForReason(aggregate.Reason)
-			warmCapacityRecentMissesGauge.WithLabelValues(scope, string(policy.reason)).Set(0)
+			warmCapacityRecentMissesGauge.WithLabelValues(image, string(policy.reason)).Set(0)
 		}
 	}
 	for _, aggregate := range aggregates {
-		scope := strings.TrimSpace(aggregate.Scope)
-		if scope == "" || aggregate.Count < 0 {
+		image := warmCapacityImageFromScope(aggregate.Scope)
+		if image == "" || aggregate.Count < 0 {
 			continue
 		}
 		policy := warmCapacityMissPolicyForReason(aggregate.Reason)
-		warmCapacityRecentMissesGauge.WithLabelValues(scope, string(policy.reason)).Set(float64(aggregate.Count))
+		warmCapacityRecentMissesGauge.WithLabelValues(image, string(policy.reason)).Set(float64(aggregate.Count))
 	}
 }
 
 func observeWarmCapacityTargets(baseTargets, effectiveTargets map[string]int, maxWorkers int, previousTargets ...map[string]int) {
-	scopeMaps := []map[string]int{baseTargets, effectiveTargets}
-	scopeMaps = append(scopeMaps, previousTargets...)
-	scopes := warmCapacityTargetScopes(scopeMaps...)
-	for _, image := range scopes {
-		scope := warmCapacityImageScope(image)
+	targetMaps := []map[string]int{baseTargets, effectiveTargets}
+	targetMaps = append(targetMaps, previousTargets...)
+	images := warmCapacityTargetImages(targetMaps...)
+	for _, image := range images {
 		base := positiveMapValue(baseTargets, image)
 		effective := positiveMapValue(effectiveTargets, image)
 		demand := effective - base
 		if demand < 0 {
 			demand = 0
 		}
-		warmCapacityBaseTargetGauge.WithLabelValues(scope).Set(float64(base))
-		warmCapacityDemandTargetGauge.WithLabelValues(scope).Set(float64(demand))
-		warmCapacityEffectiveTargetGauge.WithLabelValues(scope).Set(float64(effective))
+		warmCapacityBaseTargetGauge.WithLabelValues(image).Set(float64(base))
+		warmCapacityDemandTargetGauge.WithLabelValues(image).Set(float64(demand))
+		warmCapacityEffectiveTargetGauge.WithLabelValues(image).Set(float64(effective))
 	}
 
 	headroom := -1.0
@@ -105,7 +104,7 @@ func observeWarmCapacityTargets(baseTargets, effectiveTargets map[string]int, ma
 			headroom = 0
 		}
 	}
-	warmCapacityHeadroomGauge.WithLabelValues("global").Set(headroom)
+	warmCapacityHeadroomGauge.Set(headroom)
 }
 
 func observeWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats, previous ...[]configstore.WorkerLifecycleStats) {
@@ -136,20 +135,20 @@ func resetLeaderOwnedClusterMetrics() {
 	warmCapacityBaseTargetGauge.Reset()
 	warmCapacityDemandTargetGauge.Reset()
 	warmCapacityEffectiveTargetGauge.Reset()
-	warmCapacityHeadroomGauge.Reset()
+	warmCapacityHeadroomGauge.Set(0)
 	workerLifecycleCountGauge.Reset()
 }
 
-func observeWarmCapacityReconcileSpawns(scope, result string, count int) {
-	scope = strings.TrimSpace(scope)
+func observeWarmCapacityReconcileSpawns(image, result string, count int) {
+	image = strings.TrimSpace(image)
 	result = strings.TrimSpace(result)
-	if scope == "" || result == "" || count <= 0 {
+	if image == "" || result == "" || count <= 0 {
 		return
 	}
-	warmCapacityReconcileSpawnsCounter.WithLabelValues(scope, result).Add(float64(count))
+	warmCapacityReconcileSpawnsCounter.WithLabelValues(image, result).Add(float64(count))
 }
 
-func warmCapacityImageScope(image string) string {
+func warmCapacityScopeForImage(image string) string {
 	image = strings.TrimSpace(image)
 	if image == "" {
 		return ""
@@ -157,7 +156,16 @@ func warmCapacityImageScope(image string) string {
 	return "image:" + image
 }
 
-func warmCapacityTargetScopes(maps ...map[string]int) []string {
+func warmCapacityImageFromScope(scope string) string {
+	image := strings.TrimSpace(scope)
+	if strings.HasPrefix(image, "org:") {
+		return ""
+	}
+	image = strings.TrimPrefix(image, "image:")
+	return strings.TrimSpace(image)
+}
+
+func warmCapacityTargetImages(maps ...map[string]int) []string {
 	seen := make(map[string]struct{})
 	for _, values := range maps {
 		for image, value := range values {

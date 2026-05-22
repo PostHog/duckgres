@@ -473,7 +473,7 @@ func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.
 }
 
 func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[string]int) {
-	for _, image := range warmCapacityTargetScopes(previous, baseTargets, effectiveTargets) {
+	for _, image := range warmCapacityTargetImages(previous, baseTargets, effectiveTargets) {
 		effective := positiveMapValue(effectiveTargets, image)
 		if positiveMapValue(previous, image) == effective {
 			continue
@@ -484,7 +484,7 @@ func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[st
 			demand = 0
 		}
 		slog.Info("Warm capacity target changed.",
-			"scope", warmCapacityImageScope(image),
+			"image", image,
 			"base_target", base,
 			"demand_target", demand,
 			"effective_target", effective,

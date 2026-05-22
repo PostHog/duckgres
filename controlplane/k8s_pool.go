@@ -1480,16 +1480,16 @@ func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, rea
 		return
 	}
 
-	scope := "image:" + image
-	observeWarmCapacityMiss(scope, policy.reason)
+	observeWarmCapacityMiss(image, policy.reason)
 	if !policy.recordDynamicDemand {
 		return
 	}
 	if p.runtimeStore == nil {
 		return
 	}
+	scope := warmCapacityScopeForImage(image)
 	if err := p.runtimeStore.RecordWarmCapacityMiss(scope, policy.reason, time.Now()); err != nil {
-		slog.Warn("Failed to record warm capacity miss.", "scope", scope, "reason", policy.reason, "error", err)
+		slog.Warn("Failed to record warm capacity miss.", "image", image, "reason", policy.reason, "error", err)
 	}
 }
 
@@ -1962,7 +1962,7 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 			p.maxWorkers,
 		)
 		if err != nil {
-			observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "error", len(slots))
+			observeWarmCapacityReconcileSpawns(image, "error", len(slots))
 			for _, s := range slots {
 				p.retireClaimedWorker(s, RetireReasonCrash)
 			}
@@ -2013,8 +2013,8 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 			successes++
 		}
 	}
-	observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "success", successes)
-	observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "error", failures)
+	observeWarmCapacityReconcileSpawns(image, "success", successes)
+	observeWarmCapacityReconcileSpawns(image, "error", failures)
 	return err
 }
 
