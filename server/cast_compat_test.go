@@ -14,7 +14,7 @@ func TestDuckDBAcceptsTranspiledCasts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	queries := []string{
 		`SELECT (current_timestamp + CAST('2' || ' day' AS "interval"))`,
