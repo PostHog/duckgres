@@ -329,14 +329,13 @@ func (s *captureRuntimeWorkerStore) RetireIdleWorker(record *configstore.WorkerR
 	if record.State != configstore.WorkerStateIdle {
 		return false, nil
 	}
-	if rec := s.preloadedRecords[record.WorkerID]; rec != nil {
-		if !observedWorkerRecordMatchesCurrent(record, rec) {
-			return false, nil
-		}
-		rec.State = configstore.WorkerStateRetired
-		rec.RetireReason = reason
-		rec.UpdatedAt = time.Now()
+	rec := s.preloadedRecords[record.WorkerID]
+	if rec == nil || !observedWorkerRecordMatchesCurrent(record, rec) {
+		return false, nil
 	}
+	rec.State = configstore.WorkerStateRetired
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
 	return true, nil
 }
 
@@ -358,14 +357,13 @@ func (s *captureRuntimeWorkerStore) RetireIdleOrHotIdleWorker(record *configstor
 	if record.State != configstore.WorkerStateIdle && record.State != configstore.WorkerStateHotIdle {
 		return false, nil
 	}
-	if rec := s.preloadedRecords[record.WorkerID]; rec != nil {
-		if !observedWorkerRecordMatchesCurrent(record, rec) {
-			return false, nil
-		}
-		rec.State = configstore.WorkerStateRetired
-		rec.RetireReason = reason
-		rec.UpdatedAt = time.Now()
+	rec := s.preloadedRecords[record.WorkerID]
+	if rec == nil || !observedWorkerRecordMatchesCurrent(record, rec) {
+		return false, nil
 	}
+	rec.State = configstore.WorkerStateRetired
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
 	return true, nil
 }
 
@@ -384,14 +382,13 @@ func (s *captureRuntimeWorkerStore) RetireOrphanWorker(record *configstore.Worke
 	if !terminalEligibleState(configstore.WorkerStateRetired, record.State) {
 		return false, nil
 	}
-	if rec := s.preloadedRecords[record.WorkerID]; rec != nil {
-		if !observedWorkerRecordMatchesCurrent(record, rec) {
-			return false, nil
-		}
-		rec.State = configstore.WorkerStateRetired
-		rec.RetireReason = reason
-		rec.UpdatedAt = time.Now()
+	rec := s.preloadedRecords[record.WorkerID]
+	if rec == nil || !observedWorkerRecordMatchesCurrent(record, rec) {
+		return false, nil
 	}
+	rec.State = configstore.WorkerStateRetired
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
 	return true, nil
 }
 
@@ -411,18 +408,15 @@ func (s *captureRuntimeWorkerStore) MarkWorkerTerminalIfCurrent(record *configst
 	if s.markTerminalMisses[record.WorkerID] {
 		return false, nil
 	}
-	if rec := s.preloadedRecords[record.WorkerID]; rec != nil {
-		if rec.State != record.State ||
-			rec.OwnerCPInstanceID != record.OwnerCPInstanceID ||
-			rec.OwnerEpoch != record.OwnerEpoch ||
-			(!record.UpdatedAt.IsZero() && rec.UpdatedAt.After(record.UpdatedAt)) ||
-			!terminalEligibleState(targetState, rec.State) {
-			return false, nil
-		}
-		rec.State = targetState
-		rec.RetireReason = reason
-		rec.UpdatedAt = time.Now()
+	rec := s.preloadedRecords[record.WorkerID]
+	if rec == nil ||
+		!observedWorkerRecordMatchesCurrent(record, rec) ||
+		!terminalEligibleState(targetState, rec.State) {
+		return false, nil
 	}
+	rec.State = targetState
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
 	return true, nil
 }
 
@@ -527,13 +521,12 @@ func (s *captureRuntimeWorkerStore) MarkWorkerDraining(workerID int, ownerCPInst
 	if s.markDrainingMisses[workerID] {
 		return false, nil
 	}
-	if rec := s.preloadedRecords[workerID]; rec != nil {
-		if rec.OwnerCPInstanceID != ownerCPInstanceID || rec.OwnerEpoch != expectedOwnerEpoch || !drainingEligibleState(rec.State) {
-			return false, nil
-		}
-		rec.State = configstore.WorkerStateDraining
-		rec.UpdatedAt = time.Now()
+	rec := s.preloadedRecords[workerID]
+	if rec == nil || rec.OwnerCPInstanceID != ownerCPInstanceID || rec.OwnerEpoch != expectedOwnerEpoch || !drainingEligibleState(rec.State) {
+		return false, nil
 	}
+	rec.State = configstore.WorkerStateDraining
+	rec.UpdatedAt = time.Now()
 	s.recordEvent(fmt.Sprintf("draining:%d", workerID))
 	return true, nil
 }
@@ -552,14 +545,13 @@ func (s *captureRuntimeWorkerStore) RetireDrainingWorker(workerID int, ownerCPIn
 	if s.retireDrainingMisses[workerID] {
 		return false, nil
 	}
-	if rec := s.preloadedRecords[workerID]; rec != nil {
-		if rec.OwnerCPInstanceID != ownerCPInstanceID || rec.OwnerEpoch != expectedOwnerEpoch || rec.State != configstore.WorkerStateDraining {
-			return false, nil
-		}
-		rec.State = configstore.WorkerStateRetired
-		rec.RetireReason = reason
-		rec.UpdatedAt = time.Now()
+	rec := s.preloadedRecords[workerID]
+	if rec == nil || rec.OwnerCPInstanceID != ownerCPInstanceID || rec.OwnerEpoch != expectedOwnerEpoch || rec.State != configstore.WorkerStateDraining {
+		return false, nil
 	}
+	rec.State = configstore.WorkerStateRetired
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
 	s.recordEvent(fmt.Sprintf("retired:%d", workerID))
 	return true, nil
 }
@@ -2252,6 +2244,16 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 			Image:             "duckgres:v1",
 			OwnerCPInstanceID: pool.cpInstanceID,
 			OwnerEpoch:        2,
+		},
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			7: {
+				WorkerID:          7,
+				PodName:           w.podName,
+				State:             configstore.WorkerStateReserved,
+				Image:             "duckgres:v1",
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        2,
+			},
 		},
 	}
 	pool.runtimeStore = store

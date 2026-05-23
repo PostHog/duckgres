@@ -2255,18 +2255,22 @@ func TestUpsertWorkerRecordDoesNotOverwriteNewerLeasePostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.May, 22, 13, 0, 0, 0, time.UTC)
 
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          3600,
-		PodName:           "duckgres-worker-3600",
-		State:             configstore.WorkerStateReserved,
-		OrgID:             "analytics",
-		OwnerCPInstanceID: "cp-new:boot-b",
-		OwnerEpoch:        10,
-		LastHeartbeatAt:   now,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(current): %v", err)
+	insertCurrent := func(workerID int) {
+		t.Helper()
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          workerID,
+			PodName:           fmt.Sprintf("duckgres-worker-%d", workerID),
+			State:             configstore.WorkerStateReserved,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-new:boot-b",
+			OwnerEpoch:        10,
+			LastHeartbeatAt:   now,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(current %d): %v", workerID, err)
+		}
 	}
 
+	insertCurrent(3600)
 	err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          3600,
 		PodName:           "duckgres-worker-3600",
@@ -2288,6 +2292,30 @@ func TestUpsertWorkerRecordDoesNotOverwriteNewerLeasePostgres(t *testing.T) {
 		persisted.OwnerCPInstanceID != "cp-new:boot-b" ||
 		persisted.OwnerEpoch != 10 {
 		t.Fatalf("stale upsert overwrote newer lease: state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+
+	insertCurrent(3606)
+	err = store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3606,
+		PodName:           "duckgres-worker-3606",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        10,
+		LastHeartbeatAt:   now.Add(time.Minute),
+	})
+	if !errors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+		t.Fatalf("expected equal-epoch different-owner upsert fence miss, got %v", err)
+	}
+
+	persisted, err = store.GetWorkerRecord(3606)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord(equal epoch): %v", err)
+	}
+	if persisted.State != configstore.WorkerStateReserved ||
+		persisted.OwnerCPInstanceID != "cp-new:boot-b" ||
+		persisted.OwnerEpoch != 10 {
+		t.Fatalf("equal-epoch different-owner upsert overwrote lease: state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
 	}
 }
 
@@ -2478,6 +2506,56 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 		persisted.OwnerCPInstanceID != "cp-new:boot-b" ||
 		persisted.OwnerEpoch != 3 {
 		t.Fatalf("expected reclaimed hot-idle lease to survive, got state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+}
+
+func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterTouchPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 35, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3607,
+		PodName:           "duckgres-worker-3607",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
+	}
+
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	if len(expired) != 1 || expired[0].WorkerID != 3607 {
+		t.Fatalf("expected worker 3607 hot-idle snapshot, got %#v", expired)
+	}
+
+	advancedUpdatedAt := expired[0].UpdatedAt.Add(time.Second)
+	if err := store.DB().Table(store.RuntimeSchema()+".worker_records").
+		Where("worker_id = ?", 3607).
+		Update("updated_at", advancedUpdatedAt).Error; err != nil {
+		t.Fatalf("advance worker updated_at: %v", err)
+	}
+
+	retired, err := store.RetireHotIdleWorker(&expired[0])
+	if err != nil {
+		t.Fatalf("RetireHotIdleWorker(stale updated_at): %v", err)
+	}
+	if retired {
+		t.Fatal("expected stale hot-idle snapshot not to retire after same-owner touch")
+	}
+
+	persisted, err := store.GetWorkerRecord(3607)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHotIdle ||
+		persisted.OwnerCPInstanceID != "cp-old:boot-a" ||
+		persisted.OwnerEpoch != 2 {
+		t.Fatalf("expected touched hot-idle lease to survive, got state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
 	}
 }
 

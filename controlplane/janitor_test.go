@@ -23,8 +23,8 @@ type captureControlPlaneExpiryStore struct {
 	stuckWorkers           []configstore.WorkerRecord
 	expiredSessionsBefore  []time.Time
 	expiredHotIdleWorkers  []configstore.WorkerRecord
+	retireHotIdleCurrent   map[int]*configstore.WorkerRecord
 	retireHotIdleRecords   []configstore.WorkerRecord
-	retireHotIdleMisses    map[int]bool
 	pruneMissBucketsBefore []time.Time
 	prunedMissBucketCount  int64
 	pruneMissBucketErr     error
@@ -95,10 +95,24 @@ func (s *captureControlPlaneExpiryStore) RetireHotIdleWorker(record *configstore
 	if record == nil || record.State != configstore.WorkerStateHotIdle {
 		return false, nil
 	}
-	if s.retireHotIdleMisses[record.WorkerID] {
+	current := s.retireHotIdleCurrent[record.WorkerID]
+	if current == nil || !janitorObservedWorkerRecordMatchesCurrent(record, current) || current.State != configstore.WorkerStateHotIdle {
 		return false, nil
 	}
+	current.State = configstore.WorkerStateRetired
+	current.RetireReason = "hot_idle_ttl_expired"
+	current.UpdatedAt = time.Now()
 	return true, nil
+}
+
+func janitorObservedWorkerRecordMatchesCurrent(observed, current *configstore.WorkerRecord) bool {
+	if observed == nil || current == nil {
+		return false
+	}
+	return current.State == observed.State &&
+		current.OwnerCPInstanceID == observed.OwnerCPInstanceID &&
+		current.OwnerEpoch == observed.OwnerEpoch &&
+		(observed.UpdatedAt.IsZero() || !current.UpdatedAt.After(observed.UpdatedAt))
 }
 
 func (s *captureControlPlaneExpiryStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, error) {
@@ -255,12 +269,20 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 }
 
 func TestControlPlaneJanitorDeletesHotIdlePodAfterStoreRetire(t *testing.T) {
-	store := &captureControlPlaneExpiryStore{
-		expiredHotIdleWorkers: []configstore.WorkerRecord{
-			{WorkerID: 11, PodName: "duckgres-worker-11", State: configstore.WorkerStateHotIdle},
-		},
-	}
 	now := time.Date(2026, time.May, 22, 14, 0, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          11,
+		PodName:           "duckgres-worker-11",
+		State:             configstore.WorkerStateHotIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	current := listed
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{listed},
+		retireHotIdleCurrent:  map[int]*configstore.WorkerRecord{11: &current},
+	}
 	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
 	janitor.now = func() time.Time { return now }
 	janitor.hotIdleTTL = time.Minute
@@ -295,13 +317,21 @@ func TestControlPlaneJanitorDeletesHotIdlePodAfterStoreRetire(t *testing.T) {
 }
 
 func TestControlPlaneJanitorSkipsHotIdlePodDeleteAfterStoreMiss(t *testing.T) {
-	store := &captureControlPlaneExpiryStore{
-		expiredHotIdleWorkers: []configstore.WorkerRecord{
-			{WorkerID: 12, PodName: "duckgres-worker-12", State: configstore.WorkerStateHotIdle},
-		},
-		retireHotIdleMisses: map[int]bool{12: true},
-	}
 	now := time.Date(2026, time.May, 22, 14, 5, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          12,
+		PodName:           "duckgres-worker-12",
+		State:             configstore.WorkerStateHotIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	current := listed
+	current.UpdatedAt = listed.UpdatedAt.Add(time.Second)
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{listed},
+		retireHotIdleCurrent:  map[int]*configstore.WorkerRecord{12: &current},
+	}
 	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
 	janitor.now = func() time.Time { return now }
 	janitor.hotIdleTTL = time.Minute
