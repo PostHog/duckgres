@@ -96,6 +96,7 @@ type K8sWorkerPool struct {
 	healthCheckFunc               func(context.Context, *ManagedWorker) error
 	connectWorkerFunc             func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error)
 	runtimeStore                  RuntimeWorkerStore
+	lifecycle                     *WorkerLifecycle // typed lifecycle transitions; nil safe (callers fall back to legacy paths)
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 
@@ -186,6 +187,14 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		retireSem:             make(chan struct{}, retireConcurrency),
 		nodeFirstSeen:         make(map[string]time.Time),
 	}
+	if cfg.RuntimeStore != nil {
+		// The lifecycle service is the typed seam for all post-CAS pod
+		// cleanup. Wire it to the pool's own DeleteWorkerArtifacts (which
+		// shares plumbing with the legacy deleteRetiredRuntimeWorker
+		// path) so migrated and legacy callers schedule the same K8s
+		// cleanup goroutine.
+		pool.lifecycle = NewWorkerLifecycle(cfg.RuntimeStore, pool)
+	}
 
 	// Resolve CP pod UID for owner references
 	if err := pool.resolveCPUID(context.Background()); err != nil {
@@ -255,13 +264,9 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			continue
 		}
 
-		var record *configstore.WorkerRecord
-		if p.runtimeStore != nil {
-			var err error
-			record, err = p.runtimeStore.GetWorkerRecord(workerID)
-			if err != nil {
-				slog.Warn("Version-aware reaper failed to load worker record.", "worker_id", workerID, "error", err)
-			}
+		snap, err := p.runtimeStore.ObserveWorker(workerID)
+		if err != nil {
+			slog.Warn("Version-aware reaper failed to observe worker.", "worker_id", workerID, "error", err)
 		}
 
 		// Resolve the target version for this specific pod.
@@ -269,8 +274,8 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		// For assigned workers, the target is the tenant's configured image.
 		var isMismatched bool
 		podOrgID := pod.Labels["duckgres/org"]
-		if podOrgID == "" && record != nil {
-			podOrgID = record.OrgID
+		if podOrgID == "" && snap != nil {
+			podOrgID = snap.OrgID()
 		}
 
 		if podOrgID != "" && p.resolveOrgConfig != nil {
@@ -286,8 +291,8 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			}
 
 			actualImage := workerImageForPod(&pod)
-			if actualImage == "" && record != nil {
-				actualImage = record.Image
+			if actualImage == "" && snap != nil {
+				actualImage = snap.Image()
 			}
 			if actualImage != "" && actualImage != targetImage {
 				isMismatched = true
@@ -305,17 +310,18 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			continue
 		}
 
-		if record == nil {
+		if snap == nil || p.lifecycle == nil {
 			continue
 		}
-		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(record, RetireReasonMismatchedVersion)
+		outcome, err := p.lifecycle.RetireIdleVariantFromSnapshot(*snap, RetireReasonMismatchedVersion)
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
 		}
-		if !retired {
+		if !outcome.Transitioned {
 			// Not currently idle or hot-idle (busy, reserved, or already
-			// retired). Leave it for a later tick.
+			// retired). Leave it for a later tick. The lifecycle service
+			// also skips physical pod delete on a CAS miss.
 			continue
 		}
 		slog.Info("Retiring mismatched-version worker pod.",
@@ -323,6 +329,13 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			"org", podOrgID,
 			"worker_pod", pod.Name,
 		)
+		// The lifecycle service already scheduled an async pod + secret
+		// delete via DeleteWorkerArtifacts. We additionally issue a
+		// synchronous Delete here so the reaper's one-per-call contract
+		// is observable to callers (and to tests) without waiting for
+		// the async cleanup goroutine. The second async Delete is
+		// idempotent — it returns NotFound on the already-gone pod and
+		// just logs at Warn, which is harmless.
 		gracePeriod := int64(10)
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
@@ -1785,6 +1798,16 @@ func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, r
 	}
 
 	p.deleteRetiredRuntimeWorker(claimed, reason)
+}
+
+// DeleteWorkerArtifacts implements WorkerPhysicalCleanup. Schedules pod
+// + RPC secret + local-pool cleanup for the named worker, called by
+// WorkerLifecycle after a durable CAS to terminal has landed. The
+// existing deleteRetiredRuntimeWorker carries the same behavior under a
+// *WorkerRecord arg; this method is the typed-API entry point used by
+// the lifecycle service.
+func (p *K8sWorkerPool) DeleteWorkerArtifacts(workerID int, podName, reason string) {
+	p.deleteRetiredRuntimeWorker(&configstore.WorkerRecord{WorkerID: workerID, PodName: podName}, reason)
 }
 
 // deleteRetiredRuntimeWorker performs the post-CAS cleanup for a worker whose

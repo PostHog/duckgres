@@ -142,7 +142,14 @@ func (c *fakePhysicalCleanup) snapshot() []cleanupCall {
 
 func newTestSnapshot(t *testing.T, workerID int, state configstore.WorkerState, cpID string, epoch int64) configstore.WorkerSnapshot {
 	t.Helper()
-	return configstore.NewWorkerSnapshotForTesting(workerID, state, cpID, epoch, "pod-"+t.Name(), time.Now())
+	return configstore.NewWorkerSnapshotForTesting(configstore.WorkerRecord{
+		WorkerID:          workerID,
+		PodName:           "pod-" + t.Name(),
+		State:             state,
+		OwnerCPInstanceID: cpID,
+		OwnerEpoch:        epoch,
+		UpdatedAt:         time.Now(),
+	})
 }
 
 func TestRetireFromSnapshotSucceedsAndSchedulesCleanup(t *testing.T) {
