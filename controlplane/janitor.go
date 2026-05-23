@@ -21,7 +21,7 @@ type controlPlaneExpiryStore interface {
 	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
-	RetireHotIdleWorker(workerID int) (bool, error)
+	RetireHotIdleWorker(record *configstore.WorkerRecord) (bool, error)
 }
 
 type warmCapacityMissBucketPruner interface {
@@ -42,6 +42,7 @@ type ControlPlaneJanitor struct {
 	retireWorker                  func(record configstore.WorkerRecord, reason string)
 	retireOrphanWorker            func(record configstore.WorkerRecord, reason string) // orphan-cleanup variant: handles any active state, skips local-pool bookkeeping
 	retireLocalWorker             func(workerID int, reason string) bool               // retires from in-memory pool + pod, returns false if not local
+	deleteRetiredWorker           func(record configstore.WorkerRecord, reason string) // post-CAS cleanup: only remove local state / delete pod
 	reconcileWarmCapacity         func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
@@ -148,13 +149,17 @@ func (j *ControlPlaneJanitor) runOnce() {
 			// Atomically transition from hot_idle to retired in the DB.
 			// If the worker was concurrently reclaimed (no longer hot_idle),
 			// the conditional update returns false and we skip retirement.
-			retired, err := j.store.RetireHotIdleWorker(record.WorkerID)
+			retired, err := j.store.RetireHotIdleWorker(&record)
 			if err != nil {
 				slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", record.WorkerID, "error", err)
 				continue
 			}
 			if !retired {
 				continue // Worker was reclaimed concurrently
+			}
+			if j.deleteRetiredWorker != nil {
+				j.deleteRetiredWorker(record, "hot_idle_ttl_expired")
+				continue
 			}
 			// Try local retire first (removes from in-memory pool + deletes pod).
 			// Falls back to remote retire if the worker isn't in our local pool.

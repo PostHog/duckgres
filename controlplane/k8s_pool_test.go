@@ -68,6 +68,7 @@ type captureRuntimeWorkerStore struct {
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
+	hotIdleClaimMaxOrgWorkers        int
 	recordMissCalls                  int
 	recordMissScopes                 []string
 	recordMissReasons                []configstore.WorkerClaimMissReason
@@ -92,6 +93,12 @@ type captureRuntimeWorkerStore struct {
 	retireOrphanCalledIDs            []int
 	retireOrphanCalledReasons        []string
 	retireOrphanErr                  error
+	markTerminalCalls                int
+	markTerminalCalledIDs            []int
+	markTerminalStates               []configstore.WorkerState
+	markTerminalReasons              []string
+	markTerminalErr                  error
+	markTerminalMisses               map[int]bool
 	markLostCalls                    int
 	markLostCalledIDs                []int
 	markLostCalledCPs                []string
@@ -104,10 +111,13 @@ type captureRuntimeWorkerStore struct {
 	markDrainingCalls                int
 	markDrainingCalledIDs            []int
 	markDrainingCalledCPs            []string
+	markDrainingCalledEpochs         []int64
 	markDrainingMisses               map[int]bool
 	markDrainingErr                  error
 	retireDrainingCalls              int
 	retireDrainingCalledIDs          []int
+	retireDrainingCalledCPs          []string
+	retireDrainingCalledEpochs       []int64
 	retireDrainingReasons            []string
 	retireDrainingMisses             map[int]bool
 	retireDrainingErr                error
@@ -155,11 +165,12 @@ func (s *captureRuntimeWorkerStore) ClaimIdleWorker(ownerCPInstanceID, orgID, im
 	return &claimed, configstore.WorkerClaimMissReasonNone, nil
 }
 
-func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
+func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hotIdleClaimCPID = ownerCPInstanceID
 	s.hotIdleClaimOrgID = orgID
+	s.hotIdleClaimMaxOrgWorkers = maxOrgWorkers
 	if s.hotIdleClaimResult != nil {
 		r := *s.hotIdleClaimResult
 		return &r, configstore.WorkerClaimMissReasonNone, nil
@@ -300,49 +311,162 @@ func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstance
 	return &record, nil
 }
 
-func (s *captureRuntimeWorkerStore) RetireIdleWorker(workerID int, reason string) (bool, error) {
+func (s *captureRuntimeWorkerStore) RetireIdleWorker(record *configstore.WorkerRecord, reason string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if record == nil {
+		return false, nil
+	}
 	s.retireIdleCalls++
-	s.retireIdleCalledIDs = append(s.retireIdleCalledIDs, workerID)
+	s.retireIdleCalledIDs = append(s.retireIdleCalledIDs, record.WorkerID)
 	s.retireIdleCalledReasons = append(s.retireIdleCalledReasons, reason)
 	if s.retireIdleErr != nil {
 		return false, s.retireIdleErr
 	}
-	if s.retireIdleMisses[workerID] {
+	if s.retireIdleMisses[record.WorkerID] {
 		return false, nil
 	}
+	if record.State != configstore.WorkerStateIdle {
+		return false, nil
+	}
+	rec := s.preloadedRecords[record.WorkerID]
+	if rec == nil || !observedWorkerRecordMatchesCurrent(record, rec) {
+		return false, nil
+	}
+	rec.State = configstore.WorkerStateRetired
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
 	return true, nil
 }
 
-func (s *captureRuntimeWorkerStore) RetireIdleOrHotIdleWorker(workerID int, reason string) (bool, error) {
+func (s *captureRuntimeWorkerStore) RetireIdleOrHotIdleWorker(record *configstore.WorkerRecord, reason string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if record == nil {
+		return false, nil
+	}
 	s.retireIdleOrHotIdleCalls++
-	s.retireIdleOrHotIdleCalledIDs = append(s.retireIdleOrHotIdleCalledIDs, workerID)
+	s.retireIdleOrHotIdleCalledIDs = append(s.retireIdleOrHotIdleCalledIDs, record.WorkerID)
 	s.retireIdleOrHotIdleCalledReasons = append(s.retireIdleOrHotIdleCalledReasons, reason)
 	if s.retireIdleOrHotIdleErr != nil {
 		return false, s.retireIdleOrHotIdleErr
 	}
-	if s.retireIdleOrHotIdleMisses[workerID] {
+	if s.retireIdleOrHotIdleMisses[record.WorkerID] {
 		return false, nil
 	}
+	if record.State != configstore.WorkerStateIdle && record.State != configstore.WorkerStateHotIdle {
+		return false, nil
+	}
+	rec := s.preloadedRecords[record.WorkerID]
+	if rec == nil || !observedWorkerRecordMatchesCurrent(record, rec) {
+		return false, nil
+	}
+	rec.State = configstore.WorkerStateRetired
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
 	return true, nil
 }
 
-func (s *captureRuntimeWorkerStore) RetireOrphanWorker(workerID int, reason string) (bool, error) {
+func (s *captureRuntimeWorkerStore) RetireOrphanWorker(record *configstore.WorkerRecord, reason string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if record == nil {
+		return false, nil
+	}
 	s.retireOrphanCalls++
-	s.retireOrphanCalledIDs = append(s.retireOrphanCalledIDs, workerID)
+	s.retireOrphanCalledIDs = append(s.retireOrphanCalledIDs, record.WorkerID)
 	s.retireOrphanCalledReasons = append(s.retireOrphanCalledReasons, reason)
 	if s.retireOrphanErr != nil {
 		return false, s.retireOrphanErr
 	}
+	if !terminalEligibleState(configstore.WorkerStateRetired, record.State) {
+		return false, nil
+	}
+	rec := s.preloadedRecords[record.WorkerID]
+	if rec == nil || !observedWorkerRecordMatchesCurrent(record, rec) {
+		return false, nil
+	}
+	rec.State = configstore.WorkerStateRetired
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
+	return true, nil
+}
+
+func (s *captureRuntimeWorkerStore) MarkWorkerTerminalIfCurrent(record *configstore.WorkerRecord, targetState configstore.WorkerState, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if record == nil {
+		return false, nil
+	}
+	s.markTerminalCalls++
+	s.markTerminalCalledIDs = append(s.markTerminalCalledIDs, record.WorkerID)
+	s.markTerminalStates = append(s.markTerminalStates, targetState)
+	s.markTerminalReasons = append(s.markTerminalReasons, reason)
+	if s.markTerminalErr != nil {
+		return false, s.markTerminalErr
+	}
+	if s.markTerminalMisses[record.WorkerID] {
+		return false, nil
+	}
+	rec := s.preloadedRecords[record.WorkerID]
+	if rec == nil ||
+		!observedWorkerRecordMatchesCurrent(record, rec) ||
+		!terminalEligibleState(targetState, rec.State) {
+		return false, nil
+	}
+	rec.State = targetState
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
 	return true, nil
 }
 
 func lostEligibleState(state configstore.WorkerState) bool {
+	switch state {
+	case configstore.WorkerStateSpawning,
+		configstore.WorkerStateIdle,
+		configstore.WorkerStateReserved,
+		configstore.WorkerStateActivating,
+		configstore.WorkerStateHot,
+		configstore.WorkerStateHotIdle:
+		return true
+	default:
+		return false
+	}
+}
+
+func terminalEligibleState(targetState configstore.WorkerState, currentState configstore.WorkerState) bool {
+	switch targetState {
+	case configstore.WorkerStateLost:
+		return lostEligibleState(currentState)
+	case configstore.WorkerStateRetired:
+		switch currentState {
+		case configstore.WorkerStateSpawning,
+			configstore.WorkerStateIdle,
+			configstore.WorkerStateReserved,
+			configstore.WorkerStateActivating,
+			configstore.WorkerStateHot,
+			configstore.WorkerStateHotIdle,
+			configstore.WorkerStateDraining:
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func observedWorkerRecordMatchesCurrent(observed, current *configstore.WorkerRecord) bool {
+	if observed == nil || current == nil {
+		return false
+	}
+	return current.State == observed.State &&
+		current.OwnerCPInstanceID == observed.OwnerCPInstanceID &&
+		current.OwnerEpoch == observed.OwnerEpoch &&
+		(observed.UpdatedAt.IsZero() || !current.UpdatedAt.After(observed.UpdatedAt))
+}
+
+func drainingEligibleState(state configstore.WorkerState) bool {
 	switch state {
 	case configstore.WorkerStateSpawning,
 		configstore.WorkerStateIdle,
@@ -384,35 +508,51 @@ func (s *captureRuntimeWorkerStore) MarkWorkerLostIfCurrentLease(workerID int, o
 	return true, nil
 }
 
-func (s *captureRuntimeWorkerStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error) {
+func (s *captureRuntimeWorkerStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.markDrainingCalls++
 	s.markDrainingCalledIDs = append(s.markDrainingCalledIDs, workerID)
 	s.markDrainingCalledCPs = append(s.markDrainingCalledCPs, ownerCPInstanceID)
-	s.recordEvent(fmt.Sprintf("draining:%d", workerID))
+	s.markDrainingCalledEpochs = append(s.markDrainingCalledEpochs, expectedOwnerEpoch)
 	if s.markDrainingErr != nil {
 		return false, s.markDrainingErr
 	}
 	if s.markDrainingMisses[workerID] {
 		return false, nil
 	}
+	rec := s.preloadedRecords[workerID]
+	if rec == nil || rec.OwnerCPInstanceID != ownerCPInstanceID || rec.OwnerEpoch != expectedOwnerEpoch || !drainingEligibleState(rec.State) {
+		return false, nil
+	}
+	rec.State = configstore.WorkerStateDraining
+	rec.UpdatedAt = time.Now()
+	s.recordEvent(fmt.Sprintf("draining:%d", workerID))
 	return true, nil
 }
 
-func (s *captureRuntimeWorkerStore) RetireDrainingWorker(workerID int, reason string) (bool, error) {
+func (s *captureRuntimeWorkerStore) RetireDrainingWorker(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.retireDrainingCalls++
 	s.retireDrainingCalledIDs = append(s.retireDrainingCalledIDs, workerID)
+	s.retireDrainingCalledCPs = append(s.retireDrainingCalledCPs, ownerCPInstanceID)
+	s.retireDrainingCalledEpochs = append(s.retireDrainingCalledEpochs, expectedOwnerEpoch)
 	s.retireDrainingReasons = append(s.retireDrainingReasons, reason)
-	s.recordEvent(fmt.Sprintf("retired:%d", workerID))
 	if s.retireDrainingErr != nil {
 		return false, s.retireDrainingErr
 	}
 	if s.retireDrainingMisses[workerID] {
 		return false, nil
 	}
+	rec := s.preloadedRecords[workerID]
+	if rec == nil || rec.OwnerCPInstanceID != ownerCPInstanceID || rec.OwnerEpoch != expectedOwnerEpoch || rec.State != configstore.WorkerStateDraining {
+		return false, nil
+	}
+	rec.State = configstore.WorkerStateRetired
+	rec.RetireReason = reason
+	rec.UpdatedAt = time.Now()
+	s.recordEvent(fmt.Sprintf("retired:%d", workerID))
 	return true, nil
 }
 
@@ -439,6 +579,20 @@ func podDeleteActionNames(cs *fake.Clientset) []string {
 		names = append(names, deleteAction.GetName())
 	}
 	return names
+}
+
+func waitForPodDeleteAction(t *testing.T, cs *fake.Clientset, name string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		for _, deletedName := range podDeleteActionNames(cs) {
+			if deletedName == name {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected pod delete action for %q, got %v", name, podDeleteActionNames(cs))
 }
 
 func secretDeleteActionCount(cs *fake.Clientset) int {
@@ -1884,8 +2038,41 @@ func TestK8sPoolReserveSharedWorkerPassesOrgCapToRuntimeClaim(t *testing.T) {
 	if store.claimMaxOrgWorkers != 3 {
 		t.Fatalf("expected claim max org workers 3, got %d", store.claimMaxOrgWorkers)
 	}
+	if store.hotIdleClaimMaxOrgWorkers != 3 {
+		t.Fatalf("expected hot-idle claim max org workers 3, got %d", store.hotIdleClaimMaxOrgWorkers)
+	}
 	if idle.SharedState().Assignment != nil {
 		t.Fatalf("local idle worker should not have been reserved, got assignment %#v", idle.SharedState().Assignment)
+	}
+}
+
+func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	store := &captureRuntimeWorkerStore{
+		hotIdleClaimMissReason: configstore.WorkerClaimMissReasonOrgCap,
+	}
+	pool.runtimeStore = store
+
+	worker, err := pool.ReserveSharedWorker(context.Background(), &WorkerAssignment{
+		OrgID:      "analytics",
+		MaxWorkers: 1,
+		Image:      "duckgres:v2",
+	})
+	var capacityErr *WarmCapacityExhaustedError
+	if !errors.As(err, &capacityErr) {
+		t.Fatalf("expected warm capacity exhaustion, got worker=%#v err=%v", worker, err)
+	}
+	if capacityErr.Reason != configstore.WorkerClaimMissReasonOrgCap {
+		t.Fatalf("expected org-cap miss reason, got %q", capacityErr.Reason)
+	}
+	if worker != nil {
+		t.Fatalf("expected no worker on capacity miss, got %d", worker.ID)
+	}
+	if store.claimCalls != 0 {
+		t.Fatalf("expected hot-idle org cap to skip neutral idle claim, got %d idle claims", store.claimCalls)
+	}
+	if store.recordMissCalls != 0 {
+		t.Fatalf("expected no recorded miss for org-cap, got %d", store.recordMissCalls)
 	}
 }
 
@@ -2026,10 +2213,12 @@ func TestK8sPoolClaimSpecificWorkerRetiresUnhealthyWorker(t *testing.T) {
 }
 
 func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
-	pool, _ := newTestK8sPool(t, 5)
+	pool, cs := newTestK8sPool(t, 5)
 
 	// Setup a hot-idle worker with "v1" image
-	w := &ManagedWorker{ID: 7, done: make(chan struct{})}
+	w := &ManagedWorker{ID: 7, podName: "duckgres-worker-test-cp-7", done: make(chan struct{})}
+	w.SetOwnerCPInstanceID(pool.cpInstanceID)
+	w.SetOwnerEpoch(1)
 	if err := w.SetSharedState(SharedWorkerState{
 		Lifecycle:  WorkerLifecycleHot,
 		Assignment: &WorkerAssignment{OrgID: "analytics", Image: "duckgres:v1"},
@@ -2037,11 +2226,34 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 		t.Fatalf("SetSharedState: %v", err)
 	}
 	pool.workers[7] = w
+	if _, err := cs.CoreV1().Pods(pool.namespace).Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      w.podName,
+			Namespace: pool.namespace,
+			Labels:    map[string]string{"app": "duckgres-worker", "duckgres/worker-id": "7"},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
 
 	store := &captureRuntimeWorkerStore{
 		hotIdleClaimResult: &configstore.WorkerRecord{
-			WorkerID: 7,
-			Image:    "duckgres:v1",
+			WorkerID:          7,
+			PodName:           w.podName,
+			State:             configstore.WorkerStateReserved,
+			Image:             "duckgres:v1",
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        2,
+		},
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			7: {
+				WorkerID:          7,
+				PodName:           w.podName,
+				State:             configstore.WorkerStateReserved,
+				Image:             "duckgres:v1",
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        2,
+			},
 		},
 	}
 	pool.runtimeStore = store
@@ -2063,13 +2275,20 @@ func TestK8sPoolHotIdleMismatchedImageCorrectlyHandled(t *testing.T) {
 		t.Fatalf("expected no worker on capacity miss, got %d", got.ID)
 	}
 
-	// Verify v1 worker was retired
-	if store.retireIdleOrHotIdleCalls != 1 || store.retireIdleOrHotIdleCalledIDs[0] != 7 {
-		t.Fatalf("expected mismatched hot-idle worker 7 to be retired, got calls=%d ids=%v", store.retireIdleOrHotIdleCalls, store.retireIdleOrHotIdleCalledIDs)
+	// Verify v1 worker was retired through the observed-row terminal CAS.
+	if store.markTerminalCalls != 1 || store.markTerminalCalledIDs[0] != 7 {
+		t.Fatalf("expected mismatched hot-idle worker 7 to be retired, got calls=%d ids=%v", store.markTerminalCalls, store.markTerminalCalledIDs)
 	}
-	if store.retireIdleOrHotIdleCalledReasons[0] != RetireReasonMismatchedVersion {
-		t.Fatalf("expected reason %q, got %q", RetireReasonMismatchedVersion, store.retireIdleOrHotIdleCalledReasons[0])
+	if store.markTerminalStates[0] != configstore.WorkerStateRetired {
+		t.Fatalf("expected terminal state retired, got %q", store.markTerminalStates[0])
 	}
+	if store.markTerminalReasons[0] != RetireReasonMismatchedVersion {
+		t.Fatalf("expected reason %q, got %q", RetireReasonMismatchedVersion, store.markTerminalReasons[0])
+	}
+	if _, ok := pool.Worker(7); ok {
+		t.Fatal("expected retired mismatched hot-idle worker to be removed from the local pool")
+	}
+	waitForPodDeleteAction(t, cs, w.podName)
 	if store.spawnCalls != 0 || store.perImageSpawnCalls != 0 {
 		t.Fatalf("did not expect foreground or async spawn, got foreground=%d per_image=%d", store.spawnCalls, store.perImageSpawnCalls)
 	}
@@ -2213,6 +2432,144 @@ func TestK8sPoolSpawnMinWorkersUsesRuntimeSlots(t *testing.T) {
 	}
 	if !spawnedIDs[51] || !spawnedIDs[52] {
 		t.Fatalf("expected worker ids 51 and 52 to be spawned, got %v", spawnedIDs)
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersRetiresRefreshedSlotOnSpawnFailure(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	slotTime := time.Date(2026, time.May, 22, 14, 20, 0, 0, time.UTC)
+	store := &captureRuntimeWorkerStore{
+		neutralSpawned: &configstore.WorkerRecord{
+			WorkerID:          61,
+			PodName:           "duckgres-worker-test-cp-61",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        0,
+			UpdatedAt:         slotTime,
+		},
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			61: {
+				WorkerID:          61,
+				PodName:           "duckgres-worker-test-cp-61",
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        0,
+				UpdatedAt:         slotTime,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		store.mu.Lock()
+		store.preloadedRecords[id].UpdatedAt = slotTime.Add(time.Second)
+		store.mu.Unlock()
+		return errors.New("spawn failed after publishing runtime row")
+	}
+
+	if err := pool.SpawnMinWorkers(1); err == nil {
+		t.Fatal("expected SpawnMinWorkers to return the spawn error")
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.markTerminalCalls != 1 || store.markTerminalCalledIDs[0] != 61 {
+		t.Fatalf("expected one terminal CAS for worker 61, got calls=%d ids=%v", store.markTerminalCalls, store.markTerminalCalledIDs)
+	}
+	rec := store.preloadedRecords[61]
+	if rec.State != configstore.WorkerStateLost || rec.RetireReason != RetireReasonCrash {
+		t.Fatalf("expected refreshed failed slot to be marked lost/crash, got state=%q reason=%q", rec.State, rec.RetireReason)
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersSkipsRefreshedSlotAfterOwnershipChange(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	slotTime := time.Date(2026, time.May, 22, 14, 22, 0, 0, time.UTC)
+	store := &captureRuntimeWorkerStore{
+		neutralSpawned: &configstore.WorkerRecord{
+			WorkerID:          63,
+			PodName:           "duckgres-worker-test-cp-63",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        0,
+			UpdatedAt:         slotTime,
+		},
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			63: {
+				WorkerID:          63,
+				PodName:           "duckgres-worker-test-cp-63",
+				State:             configstore.WorkerStateReserved,
+				OwnerCPInstanceID: "cp-other:boot-a",
+				OwnerEpoch:        1,
+				UpdatedAt:         slotTime.Add(time.Second),
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		return errors.New("spawn failed after ownership changed")
+	}
+
+	if err := pool.SpawnMinWorkers(1); err == nil {
+		t.Fatal("expected SpawnMinWorkers to return the spawn error")
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.markTerminalCalls != 0 {
+		t.Fatalf("expected no terminal CAS after ownership changed, got calls=%d ids=%v", store.markTerminalCalls, store.markTerminalCalledIDs)
+	}
+	rec := store.preloadedRecords[63]
+	if rec.State != configstore.WorkerStateReserved || rec.OwnerCPInstanceID != "cp-other:boot-a" || rec.OwnerEpoch != 1 {
+		t.Fatalf("expected changed-owner row to survive, got state=%q owner=%q epoch=%d", rec.State, rec.OwnerCPInstanceID, rec.OwnerEpoch)
+	}
+}
+
+func TestK8sPoolSpawnMinWorkersForImageRetiresRefreshedSlotOnSpawnFailure(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	image := "duckgres:spawn-fail"
+	slotTime := time.Date(2026, time.May, 22, 14, 25, 0, 0, time.UTC)
+	store := &captureRuntimeWorkerStore{
+		perImageSpawned: &configstore.WorkerRecord{
+			WorkerID:          62,
+			PodName:           "duckgres-worker-test-cp-62",
+			State:             configstore.WorkerStateSpawning,
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        0,
+			Image:             image,
+			UpdatedAt:         slotTime,
+		},
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			62: {
+				WorkerID:          62,
+				PodName:           "duckgres-worker-test-cp-62",
+				State:             configstore.WorkerStateSpawning,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        0,
+				Image:             image,
+				UpdatedAt:         slotTime,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+		store.mu.Lock()
+		store.preloadedRecords[id].UpdatedAt = slotTime.Add(time.Second)
+		store.mu.Unlock()
+		return errors.New("image spawn failed after publishing runtime row")
+	}
+
+	if err := pool.SpawnMinWorkersForImage(context.Background(), image, 1); err == nil {
+		t.Fatal("expected SpawnMinWorkersForImage to return the spawn error")
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.markTerminalCalls != 1 || store.markTerminalCalledIDs[0] != 62 {
+		t.Fatalf("expected one terminal CAS for worker 62, got calls=%d ids=%v", store.markTerminalCalls, store.markTerminalCalledIDs)
+	}
+	rec := store.preloadedRecords[62]
+	if rec.State != configstore.WorkerStateLost || rec.RetireReason != RetireReasonCrash {
+		t.Fatalf("expected refreshed failed image slot to be marked lost/crash, got state=%q reason=%q", rec.State, rec.RetireReason)
 	}
 }
 
@@ -3511,7 +3868,15 @@ func createMismatchWorkerPodWithImage(t *testing.T, cs *fake.Clientset, name, co
 }
 
 func TestRetireOneMismatchedVersionWorker_RetiresOlderVersionIdleWorker(t *testing.T) {
-	store := &captureRuntimeWorkerStore{}
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			7: {
+				WorkerID: 7,
+				PodName:  "duckgres-oldhash-worker-7",
+				State:    configstore.WorkerStateIdle,
+			},
+		},
+	}
 	pool, cs := mismatchVersionTestPool(t, "duckgres-newhash-aaaaa", store)
 	createMismatchWorkerPod(t, cs, "duckgres-oldhash-worker-7", "duckgres-oldhash-zzzzz", "7")
 
@@ -3533,7 +3898,15 @@ func TestRetireOneMismatchedVersionWorker_RetiresOlderVersionIdleWorker(t *testi
 func TestRetireOneMismatchedVersionWorker_RetiresHotIdleWorker(t *testing.T) {
 	// hot-idle workers have handled a session but are currently idle. They
 	// are safe to reap during a rolling update.
-	store := &captureRuntimeWorkerStore{}
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			9: {
+				WorkerID: 9,
+				PodName:  "duckgres-old-worker-9",
+				State:    configstore.WorkerStateHotIdle,
+			},
+		},
+	}
 	pool, cs := mismatchVersionTestPool(t, "duckgres-new-aaaaa", store)
 	createMismatchWorkerPod(t, cs, "duckgres-old-worker-9", "duckgres-old-zzzzz", "9")
 
@@ -3606,7 +3979,13 @@ func TestRetireOneMismatchedVersionWorker_LeavesSameVersionWorkersAlone(t *testi
 }
 
 func TestRetireOneMismatchedVersionWorker_RetiresOnePerCall(t *testing.T) {
-	store := &captureRuntimeWorkerStore{}
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			10: {WorkerID: 10, PodName: "duckgres-old-worker-10", State: configstore.WorkerStateIdle},
+			11: {WorkerID: 11, PodName: "duckgres-old-worker-11", State: configstore.WorkerStateIdle},
+			12: {WorkerID: 12, PodName: "duckgres-old-worker-12", State: configstore.WorkerStateIdle},
+		},
+	}
 	pool, cs := mismatchVersionTestPool(t, "duckgres-new-aaaaa", store)
 	createMismatchWorkerPod(t, cs, "duckgres-old-worker-10", "duckgres-old-xxxxx", "10")
 	createMismatchWorkerPod(t, cs, "duckgres-old-worker-11", "duckgres-old-yyyyy", "11")
@@ -3632,7 +4011,10 @@ func TestRetireOneMismatchedVersionWorker_SkipsWhenNotIdle(t *testing.T) {
 	// reserved, etc.). The reaper must skip those pods and leave
 	// them running — it will try again on the next tick.
 	store := &captureRuntimeWorkerStore{
-		retireIdleOrHotIdleMisses: map[int]bool{5: true},
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			5: {WorkerID: 5, PodName: "duckgres-old-worker-5", State: configstore.WorkerStateReserved},
+			6: {WorkerID: 6, PodName: "duckgres-old-worker-6", State: configstore.WorkerStateIdle},
+		},
 	}
 	pool, cs := mismatchVersionTestPool(t, "duckgres-new-aaaaa", store)
 	createMismatchWorkerPod(t, cs, "duckgres-old-worker-5", "duckgres-old-zzzzz", "5")
@@ -3925,7 +4307,22 @@ func addShutdownWorker(t *testing.T, p *K8sWorkerPool, cs *fake.Clientset, id in
 		podName: fmt.Sprintf("worker-%d", id),
 		done:    make(chan struct{}),
 	}
+	w.SetOwnerCPInstanceID(p.cpInstanceID)
 	p.workers[id] = w
+	if store, ok := p.runtimeStore.(*captureRuntimeWorkerStore); ok {
+		store.mu.Lock()
+		if store.preloadedRecords == nil {
+			store.preloadedRecords = make(map[int]*configstore.WorkerRecord)
+		}
+		store.preloadedRecords[id] = &configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           w.podName,
+			State:             configstore.WorkerStateIdle,
+			OwnerCPInstanceID: p.cpInstanceID,
+			OwnerEpoch:        w.OwnerEpoch(),
+		}
+		store.mu.Unlock()
+	}
 	_, err := cs.CoreV1().Pods(p.namespace).Create(context.Background(), &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      w.podName,
@@ -4022,6 +4419,35 @@ func TestShutdownAll_SkipsWorkerWhenMarkDrainingCASMisses(t *testing.T) {
 	}
 	if podExists(t, cs, "worker-100") {
 		t.Fatal("expected worker-100 pod to be deleted")
+	}
+}
+
+func TestShutdownAll_SkipsWorkerWhenStoredEpochDiffers(t *testing.T) {
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := shutdownTestPool(t, store)
+	addShutdownWorker(t, pool, cs, 55)
+
+	store.mu.Lock()
+	store.preloadedRecords = map[int]*configstore.WorkerRecord{
+		55: {
+			WorkerID:          55,
+			PodName:           "worker-55",
+			State:             configstore.WorkerStateIdle,
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        99,
+		},
+	}
+	store.mu.Unlock()
+
+	pool.ShutdownAll()
+
+	if !podExists(t, cs, "worker-55") {
+		t.Fatal("expected pod worker-55 to survive when stored owner epoch does not match")
+	}
+	for _, id := range store.retireDrainingCalledIDs {
+		if id == 55 {
+			t.Fatal("expected no RetireDrainingWorker call after owner epoch CAS miss")
+		}
 	}
 }
 

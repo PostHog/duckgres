@@ -22,6 +22,9 @@ type captureControlPlaneExpiryStore struct {
 	stuckActivatingBefore  []time.Time
 	stuckWorkers           []configstore.WorkerRecord
 	expiredSessionsBefore  []time.Time
+	expiredHotIdleWorkers  []configstore.WorkerRecord
+	retireHotIdleCurrent   map[int]*configstore.WorkerRecord
+	retireHotIdleRecords   []configstore.WorkerRecord
 	pruneMissBucketsBefore []time.Time
 	prunedMissBucketCount  int64
 	pruneMissBucketErr     error
@@ -78,13 +81,38 @@ func (s *captureControlPlaneExpiryStore) ExpireFlightSessionRecords(before time.
 func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return nil, nil
+	out := make([]configstore.WorkerRecord, len(s.expiredHotIdleWorkers))
+	copy(out, s.expiredHotIdleWorkers)
+	return out, nil
 }
 
-func (s *captureControlPlaneExpiryStore) RetireHotIdleWorker(workerID int) (bool, error) {
+func (s *captureControlPlaneExpiryStore) RetireHotIdleWorker(record *configstore.WorkerRecord) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if record != nil {
+		s.retireHotIdleRecords = append(s.retireHotIdleRecords, *record)
+	}
+	if record == nil || record.State != configstore.WorkerStateHotIdle {
+		return false, nil
+	}
+	current := s.retireHotIdleCurrent[record.WorkerID]
+	if current == nil || !janitorObservedWorkerRecordMatchesCurrent(record, current) || current.State != configstore.WorkerStateHotIdle {
+		return false, nil
+	}
+	current.State = configstore.WorkerStateRetired
+	current.RetireReason = "hot_idle_ttl_expired"
+	current.UpdatedAt = time.Now()
 	return true, nil
+}
+
+func janitorObservedWorkerRecordMatchesCurrent(observed, current *configstore.WorkerRecord) bool {
+	if observed == nil || current == nil {
+		return false
+	}
+	return current.State == observed.State &&
+		current.OwnerCPInstanceID == observed.OwnerCPInstanceID &&
+		current.OwnerEpoch == observed.OwnerEpoch &&
+		(observed.UpdatedAt.IsZero() || !current.UpdatedAt.After(observed.UpdatedAt))
 }
 
 func (s *captureControlPlaneExpiryStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, error) {
@@ -237,6 +265,89 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 	defer mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("expected janitor to reconcile warm capacity exactly once, got %d", calls)
+	}
+}
+
+func TestControlPlaneJanitorDeletesHotIdlePodAfterStoreRetire(t *testing.T) {
+	now := time.Date(2026, time.May, 22, 14, 0, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          11,
+		PodName:           "duckgres-worker-11",
+		State:             configstore.WorkerStateHotIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	current := listed
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{listed},
+		retireHotIdleCurrent:  map[int]*configstore.WorkerRecord{11: &current},
+	}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.hotIdleTTL = time.Minute
+
+	var mu sync.Mutex
+	var deleted []struct {
+		id     int
+		reason string
+	}
+	janitor.deleteRetiredWorker = func(record configstore.WorkerRecord, reason string) {
+		mu.Lock()
+		defer mu.Unlock()
+		deleted = append(deleted, struct {
+			id     int
+			reason string
+		}{id: record.WorkerID, reason: reason})
+	}
+	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
+		t.Fatalf("hot-idle post-CAS cleanup must not call the CAS-owning retireWorker callback: worker=%d reason=%s", record.WorkerID, reason)
+	}
+
+	janitor.runOnce()
+
+	if len(store.retireHotIdleRecords) != 1 || store.retireHotIdleRecords[0].WorkerID != 11 {
+		t.Fatalf("expected one RetireHotIdleWorker call for worker 11, got %#v", store.retireHotIdleRecords)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deleted) != 1 || deleted[0].id != 11 || deleted[0].reason != "hot_idle_ttl_expired" {
+		t.Fatalf("expected post-CAS delete for hot-idle worker 11, got %#v", deleted)
+	}
+}
+
+func TestControlPlaneJanitorSkipsHotIdlePodDeleteAfterStoreMiss(t *testing.T) {
+	now := time.Date(2026, time.May, 22, 14, 5, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          12,
+		PodName:           "duckgres-worker-12",
+		State:             configstore.WorkerStateHotIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	current := listed
+	current.UpdatedAt = listed.UpdatedAt.Add(time.Second)
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{listed},
+		retireHotIdleCurrent:  map[int]*configstore.WorkerRecord{12: &current},
+	}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.hotIdleTTL = time.Minute
+
+	var deleted []int
+	janitor.deleteRetiredWorker = func(record configstore.WorkerRecord, reason string) {
+		deleted = append(deleted, record.WorkerID)
+	}
+
+	janitor.runOnce()
+
+	if len(store.retireHotIdleRecords) != 1 || store.retireHotIdleRecords[0].WorkerID != 12 {
+		t.Fatalf("expected one RetireHotIdleWorker call for worker 12, got %#v", store.retireHotIdleRecords)
+	}
+	if len(deleted) != 0 {
+		t.Fatalf("expected no pod delete after hot-idle CAS miss, got %#v", deleted)
 	}
 }
 
