@@ -1738,10 +1738,19 @@ func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRe
 	}
 	current := claimed
 	if p.runtimeStore != nil {
-		if refreshed, err := p.runtimeStore.GetWorkerRecord(claimed.WorkerID); err != nil {
+		refreshed, err := p.runtimeStore.GetWorkerRecord(claimed.WorkerID)
+		switch {
+		case err != nil:
 			slog.Warn("Failed to refresh worker runtime row before retirement.",
 				"worker_id", claimed.WorkerID, "reason", reason, "error", err)
-		} else if refreshed != nil {
+		case refreshed == nil:
+			// Row was hard-deleted or never existed — no CAS target. The
+			// downstream CAS would miss anyway; skip the wasted round-trip
+			// and the pod delete (no row to authorize cleanup against).
+			slog.Debug("Worker runtime row missing before retirement; skipping cleanup.",
+				"worker_id", claimed.WorkerID, "reason", reason)
+			return
+		default:
 			if refreshed.OwnerCPInstanceID != claimed.OwnerCPInstanceID || refreshed.OwnerEpoch != claimed.OwnerEpoch {
 				slog.Debug("Worker ownership changed before retirement; skipping cleanup.",
 					"worker_id", claimed.WorkerID, "reason", reason)
@@ -3041,6 +3050,14 @@ func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) {
 		return
 	}
 	if err := p.runtimeStore.UpsertWorkerRecord(record); err != nil {
+		// Fence misses are expected when a peer CP has already advanced the
+		// worker's lease (terminal state, newer owner_epoch, or different
+		// owner at the same epoch). They prove the fence is doing its job —
+		// log at Debug so they don't masquerade as persistence failures.
+		if stderrors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+			slog.Debug("Worker runtime upsert fenced by newer lease.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+			return
+		}
 		slog.Warn("Persisting worker runtime record failed.", "worker_id", record.WorkerID, "state", record.State, "error", err)
 	}
 }

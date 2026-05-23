@@ -1859,6 +1859,12 @@ func workerActiveStates() []WorkerState {
 	}
 }
 
+// workerLostEligibleStates lists the worker states from which a worker may be
+// moved to `lost`. `draining` is intentionally excluded: a draining row is
+// already mid-shutdown under an owning CP's CAS chain, and the right terminal
+// for it is `retired` via RetireDrainingWorker (or the orphan sweep if its CP
+// died). Calling MarkWorkerTerminalIfCurrent with target=lost on a draining
+// snapshot is therefore a silent no-op by design.
 func workerLostEligibleStates() []WorkerState {
 	return []WorkerState{
 		WorkerStateSpawning,
