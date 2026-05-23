@@ -2410,9 +2410,29 @@ func (p *K8sWorkerPool) ShutdownAll() {
 
 		slog.Info("Shutting down K8s worker.", "id", w.ID, "worker_pod", podName)
 
+		// Lease minted from the worker's cached owner identity. The
+		// lifecycle CAS will fence against the durable row: a peer
+		// takeover (or a self-bump-then-not-restamp race) makes the
+		// lease stale and the Drain misses, which is the right thing
+		// — the orphan sweep on the new owner CP reconciles.
+		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
+
 		// Step 1: CAS to draining. Skip the worker on CAS miss or error —
 		// there's no safe way to proceed if we don't own the row.
-		if p.runtimeStore != nil {
+		if p.lifecycle != nil {
+			outcome, err := p.lifecycle.Drain(lease)
+			if err != nil {
+				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
+					"worker_id", w.ID, "error", err)
+				continue
+			}
+			if !outcome.Transitioned {
+				slog.Debug("ShutdownAll: worker not owned by us or already terminal; skipping.",
+					"worker_id", w.ID)
+				continue
+			}
+		} else if p.runtimeStore != nil {
+			// Legacy path retained for builds without a lifecycle.
 			transitioned, err := p.runtimeStore.MarkWorkerDraining(w.ID, p.cpInstanceID, w.OwnerEpoch())
 			if err != nil {
 				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
@@ -2427,7 +2447,9 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		}
 
 		// Step 2: delete pod. Leave the row in draining on any error other
-		// than NotFound so recovery paths pick it up.
+		// than NotFound so recovery paths pick it up. Caller-orchestrated
+		// here (between the two lifecycle CAS steps) so the no-pod-delete
+		// case can keep the row in draining for orphan reconciliation.
 		gracePeriod := int64(10)
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
@@ -2444,7 +2466,13 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// Step 3: final CAS to retired. If this fails (network blip during
 		// shutdown) the row stays in draining and the orphan sweep handles
 		// it once this CP's heartbeat expires.
-		if p.runtimeStore != nil {
+		if p.lifecycle != nil {
+			if _, err := p.lifecycle.RetireDrained(lease, RetireReasonShutdown); err != nil {
+				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
+					"worker_id", w.ID, "error", err)
+				continue
+			}
+		} else if p.runtimeStore != nil {
 			if _, err := p.runtimeStore.RetireDrainingWorker(w.ID, p.cpInstanceID, w.OwnerEpoch(), RetireReasonShutdown); err != nil {
 				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
 					"worker_id", w.ID, "error", err)
