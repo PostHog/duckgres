@@ -116,19 +116,20 @@ type K8sWorkerPoolConfig struct {
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
 	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
-	ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
+	ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
 	RecordWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason, now time.Time) error
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
-	RetireIdleWorker(workerID int, reason string) (bool, error)
-	RetireIdleOrHotIdleWorker(workerID int, reason string) (bool, error)
-	RetireOrphanWorker(workerID int, reason string) (bool, error)
+	RetireIdleWorker(record *configstore.WorkerRecord, reason string) (bool, error)
+	RetireIdleOrHotIdleWorker(record *configstore.WorkerRecord, reason string) (bool, error)
+	RetireOrphanWorker(record *configstore.WorkerRecord, reason string) (bool, error)
+	MarkWorkerTerminalIfCurrent(record *configstore.WorkerRecord, targetState configstore.WorkerState, reason string) (bool, error)
 	MarkWorkerLostIfCurrentLease(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error)
-	MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error)
-	RetireDrainingWorker(workerID int, reason string) (bool, error)
+	MarkWorkerDraining(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64) (bool, error)
+	RetireDrainingWorker(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

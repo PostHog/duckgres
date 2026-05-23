@@ -27,6 +27,10 @@ type OrgUserKey struct {
 
 var ErrWorkerOwnerEpochMismatch = errors.New("worker owner epoch mismatch")
 
+// ErrWorkerRecordUpsertFenceMiss indicates an UpsertWorkerRecord conflict was
+// rejected by the monotonic owner/terminal-state fence and did not persist.
+var ErrWorkerRecordUpsertFenceMiss = errors.New("worker record upsert fence miss")
+
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
 	Orgs               map[string]*OrgConfig
@@ -954,14 +958,19 @@ func (cs *ConfigStore) ExpireDrainingControlPlaneInstances(before time.Time) (in
 // UpsertWorkerRecord inserts or updates a runtime worker row.
 func (cs *ConfigStore) UpsertWorkerRecord(record *WorkerRecord) error {
 	protectedStates := []WorkerState{WorkerStateDraining, WorkerStateRetired, WorkerStateLost}
-	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
+	result := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "worker_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"pod_name", "image", "state", "org_id", "owner_cp_instance_id", "owner_epoch", "activation_started_at", "last_heartbeat_at", "retire_reason", "s3_credentials_expires_at", "updated_at"}),
 		Where: clause.Where{Exprs: []clause.Expression{
 			clause.Expr{SQL: `"worker_records"."state" NOT IN ?`, Vars: []any{protectedStates}},
+			clause.Expr{SQL: `(excluded."owner_epoch" > "worker_records"."owner_epoch" OR (excluded."owner_epoch" = "worker_records"."owner_epoch" AND excluded."owner_cp_instance_id" = "worker_records"."owner_cp_instance_id"))`},
 		}},
-	}).Create(record).Error; err != nil {
-		return fmt.Errorf("upsert worker record: %w", err)
+	}).Create(record)
+	if result.Error != nil {
+		return fmt.Errorf("upsert worker record: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("%w: worker_id=%d owner=%q epoch=%d state=%q", ErrWorkerRecordUpsertFenceMiss, record.WorkerID, record.OwnerCPInstanceID, record.OwnerEpoch, record.State)
 	}
 	return nil
 }
@@ -1087,10 +1096,29 @@ func (cs *ConfigStore) ClaimIdleWorker(ownerCPInstanceID, orgID, image string, m
 // ClaimHotIdleWorker atomically claims one hot-idle worker row that was
 // previously activated for the given org. The selected row is locked with
 // SKIP LOCKED and transitioned to reserved while incrementing owner_epoch.
-func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*WorkerRecord, WorkerClaimMissReason, error) {
+// When maxOrgWorkers is set, the org cap is checked under the same advisory
+// lock as neutral idle claims, excluding hot-idle rows from the count so a
+// cached worker can be reclaimed as the org's only active slot.
+func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*WorkerRecord, WorkerClaimMissReason, error) {
 	var claimed *WorkerRecord
 	missReason := WorkerClaimMissReasonNone
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		if orgID != "" {
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", advisoryLockKey("duckgres:org:"+orgID)).Error; err != nil {
+				return err
+			}
+		}
+		if maxOrgWorkers > 0 && orgID != "" {
+			count, err := cs.countActiveWorkers(tx, "org_id = ? AND state <> ?", orgID, WorkerStateHotIdle)
+			if err != nil {
+				return err
+			}
+			if count >= int64(maxOrgWorkers) {
+				missReason = WorkerClaimMissReasonOrgCap
+				return nil
+			}
+		}
+
 		var current WorkerRecord
 		err := tx.Table(cs.runtimeTable(current.TableName())).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
@@ -1143,38 +1171,55 @@ func (cs *ConfigStore) ListExpiredHotIdleWorkers(before time.Time) ([]WorkerReco
 	return workers, nil
 }
 
-// RetireHotIdleWorker atomically transitions a worker from hot_idle to retired.
-// Returns true if the transition happened, false if the worker was no longer hot_idle
-// (e.g. it was reclaimed by another CP pod between the list query and this call).
-func (cs *ConfigStore) RetireHotIdleWorker(workerID int) (bool, error) {
-	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("worker_id = ? AND state = ?", workerID, WorkerStateHotIdle).
-		Updates(map[string]any{
-			"state":         WorkerStateRetired,
-			"retire_reason": "hot_idle_ttl_expired",
-			"updated_at":    time.Now(),
-		})
+// MarkWorkerTerminalIfCurrent moves an observed active worker row to a terminal
+// state only if the durable row still matches that observation. It is the shared
+// CAS for list-then-cleanup paths where a worker id alone is not enough to prove
+// the listed worker was not reclaimed by another CP.
+func (cs *ConfigStore) MarkWorkerTerminalIfCurrent(record *WorkerRecord, targetState WorkerState, reason string) (bool, error) {
+	if record == nil {
+		return false, nil
+	}
+	if targetState != WorkerStateRetired && targetState != WorkerStateLost {
+		return false, fmt.Errorf("worker %d unsupported terminal state %q", record.WorkerID, targetState)
+	}
+
+	eligibleStates := workerTerminalEligibleStates(targetState)
+	query := cs.db.Table(cs.runtimeTable(record.TableName())).
+		Where("worker_id = ? AND state = ? AND owner_epoch = ?", record.WorkerID, record.State, record.OwnerEpoch).
+		Where("(owner_cp_instance_id = ? OR (? = '' AND owner_cp_instance_id IS NULL))", record.OwnerCPInstanceID, record.OwnerCPInstanceID).
+		Where("state IN ?", eligibleStates)
+	if !record.UpdatedAt.IsZero() {
+		query = query.Where("updated_at <= ?", record.UpdatedAt)
+	}
+
+	result := query.Updates(map[string]any{
+		"state":         targetState,
+		"retire_reason": reason,
+		"updated_at":    time.Now(),
+	})
 	if result.Error != nil {
-		return false, fmt.Errorf("retire hot-idle worker %d: %w", workerID, result.Error)
+		return false, fmt.Errorf("mark worker %d terminal: %w", record.WorkerID, result.Error)
 	}
 	return result.RowsAffected > 0, nil
+}
+
+// RetireHotIdleWorker atomically transitions the observed hot-idle row to
+// retired. Returns false if the row no longer matches the listed snapshot.
+func (cs *ConfigStore) RetireHotIdleWorker(record *WorkerRecord) (bool, error) {
+	if record == nil || record.State != WorkerStateHotIdle {
+		return false, nil
+	}
+	return cs.MarkWorkerTerminalIfCurrent(record, WorkerStateRetired, "hot_idle_ttl_expired")
 }
 
 // RetireIdleWorker atomically transitions a worker from idle to retired.
 // Returns true if the transition happened, false if the worker was no longer
 // idle (e.g. claimed by another CP between the list query and this call).
-func (cs *ConfigStore) RetireIdleWorker(workerID int, reason string) (bool, error) {
-	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("worker_id = ? AND state = ?", workerID, WorkerStateIdle).
-		Updates(map[string]any{
-			"state":         WorkerStateRetired,
-			"retire_reason": reason,
-			"updated_at":    time.Now(),
-		})
-	if result.Error != nil {
-		return false, fmt.Errorf("retire idle worker %d: %w", workerID, result.Error)
+func (cs *ConfigStore) RetireIdleWorker(record *WorkerRecord, reason string) (bool, error) {
+	if record == nil || record.State != WorkerStateIdle {
+		return false, nil
 	}
-	return result.RowsAffected > 0, nil
+	return cs.MarkWorkerTerminalIfCurrent(record, WorkerStateRetired, reason)
 }
 
 // RetireOrphanWorker is the orphan-cleanup counterpart to
@@ -1186,27 +1231,37 @@ func (cs *ConfigStore) RetireIdleWorker(workerID int, reason string) (bool, erro
 // it (the owner CP is expired or absent) — so we can short-circuit the
 // state-machine guards and just terminate the row.
 //
-// Returns true if a row transitioned, false if the row was already
-// terminal (`retired` / `lost`) or no row matches the given worker_id.
-func (cs *ConfigStore) RetireOrphanWorker(workerID int, reason string) (bool, error) {
-	cleanupStates := []WorkerState{
-		WorkerStateSpawning,
-		WorkerStateIdle,
-		WorkerStateReserved,
-		WorkerStateActivating,
-		WorkerStateHot,
-		WorkerStateHotIdle,
-		WorkerStateDraining,
+// Returns true if a row transitioned, false if the observed row was already
+// terminal (`retired` / `lost`) or has changed since it was listed.
+func (cs *ConfigStore) RetireOrphanWorker(record *WorkerRecord, reason string) (bool, error) {
+	if record == nil {
+		return false, nil
 	}
-	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("worker_id = ? AND state IN ?", workerID, cleanupStates).
-		Updates(map[string]any{
-			"state":         WorkerStateRetired,
-			"retire_reason": reason,
-			"updated_at":    time.Now(),
-		})
+
+	workerTable := cs.runtimeTable(record.TableName())
+	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	query := cs.db.Table(workerTable).
+		Where("worker_id = ? AND state = ? AND owner_epoch = ?", record.WorkerID, record.State, record.OwnerEpoch).
+		Where("(owner_cp_instance_id = ? OR (? = '' AND owner_cp_instance_id IS NULL))", record.OwnerCPInstanceID, record.OwnerCPInstanceID).
+		Where("state IN ?", workerTerminalEligibleStates(WorkerStateRetired))
+	if !record.UpdatedAt.IsZero() {
+		query = query.Where("updated_at <= ?", record.UpdatedAt)
+	}
+	if record.OwnerCPInstanceID != "" {
+		query = query.Where(
+			"NOT EXISTS (SELECT 1 FROM "+cpTable+" AS cp WHERE cp.id = ? AND cp.state <> ?)",
+			record.OwnerCPInstanceID,
+			ControlPlaneInstanceStateExpired,
+		)
+	}
+
+	result := query.Updates(map[string]any{
+		"state":         WorkerStateRetired,
+		"retire_reason": reason,
+		"updated_at":    time.Now(),
+	})
 	if result.Error != nil {
-		return false, fmt.Errorf("retire orphan worker %d: %w", workerID, result.Error)
+		return false, fmt.Errorf("retire orphan worker %d: %w", record.WorkerID, result.Error)
 	}
 	return result.RowsAffected > 0, nil
 }
@@ -1315,18 +1370,14 @@ func (cs *ConfigStore) MarkCredentialsRefreshed(workerID int, ownerCPInstanceID 
 // RetireIdleOrHotIdleWorker atomically transitions a worker from idle or hot_idle
 // to retired. Returns true if the transition happened, false if the worker was
 // in some other state (e.g. claimed/activating/hot).
-func (cs *ConfigStore) RetireIdleOrHotIdleWorker(workerID int, reason string) (bool, error) {
-	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("worker_id = ? AND state IN ?", workerID, []WorkerState{WorkerStateIdle, WorkerStateHotIdle}).
-		Updates(map[string]any{
-			"state":         WorkerStateRetired,
-			"retire_reason": reason,
-			"updated_at":    time.Now(),
-		})
-	if result.Error != nil {
-		return false, fmt.Errorf("retire idle/hot_idle worker %d: %w", workerID, result.Error)
+func (cs *ConfigStore) RetireIdleOrHotIdleWorker(record *WorkerRecord, reason string) (bool, error) {
+	if record == nil {
+		return false, nil
 	}
-	return result.RowsAffected > 0, nil
+	if record.State != WorkerStateIdle && record.State != WorkerStateHotIdle {
+		return false, nil
+	}
+	return cs.MarkWorkerTerminalIfCurrent(record, WorkerStateRetired, reason)
 }
 
 // MarkWorkerLostIfCurrentLease atomically marks a worker lost only when the
@@ -1369,7 +1420,7 @@ func (cs *ConfigStore) MarkWorkerLostIfCurrentLease(workerID int, ownerCPInstanc
 //
 // The ownerCPInstanceID guard prevents a stale CP from moving a worker that
 // has already been taken over by a successor.
-func (cs *ConfigStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error) {
+func (cs *ConfigStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64) (bool, error) {
 	drainableStates := []WorkerState{
 		WorkerStateSpawning,
 		WorkerStateIdle,
@@ -1379,7 +1430,7 @@ func (cs *ConfigStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string
 		WorkerStateHotIdle,
 	}
 	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("worker_id = ? AND owner_cp_instance_id = ? AND state IN ?", workerID, ownerCPInstanceID, drainableStates).
+		Where("worker_id = ? AND owner_cp_instance_id = ? AND owner_epoch = ? AND state IN ?", workerID, ownerCPInstanceID, expectedOwnerEpoch, drainableStates).
 		Updates(map[string]any{
 			"state":      WorkerStateDraining,
 			"updated_at": time.Now(),
@@ -1393,9 +1444,9 @@ func (cs *ConfigStore) MarkWorkerDraining(workerID int, ownerCPInstanceID string
 // RetireDrainingWorker atomically transitions a draining worker to retired.
 // Returns true if the transition happened, false if the worker was no longer
 // in draining (e.g. already retired by an orphan sweep after a CP restart).
-func (cs *ConfigStore) RetireDrainingWorker(workerID int, reason string) (bool, error) {
+func (cs *ConfigStore) RetireDrainingWorker(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error) {
 	result := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).
-		Where("worker_id = ? AND state = ?", workerID, WorkerStateDraining).
+		Where("worker_id = ? AND owner_cp_instance_id = ? AND owner_epoch = ? AND state = ?", workerID, ownerCPInstanceID, expectedOwnerEpoch, WorkerStateDraining).
 		Updates(map[string]any{
 			"state":         WorkerStateRetired,
 			"retire_reason": reason,
@@ -1784,16 +1835,7 @@ func (cs *ConfigStore) ExpireFlightSessionRecords(before time.Time) (int64, erro
 
 func (cs *ConfigStore) countActiveWorkers(tx *gorm.DB, where ...any) (int64, error) {
 	var count int64
-	activeStates := []WorkerState{
-		WorkerStateSpawning,
-		WorkerStateIdle,
-		WorkerStateReserved,
-		WorkerStateActivating,
-		WorkerStateHot,
-		WorkerStateHotIdle,
-		WorkerStateDraining,
-	}
-	query := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).Where("state IN ?", activeStates)
+	query := tx.Table(cs.runtimeTable((&WorkerRecord{}).TableName())).Where("state IN ?", workerActiveStates())
 	if len(where) > 0 {
 		if clauseStr, ok := where[0].(string); ok {
 			query = query.Where(clauseStr, where[1:]...)
@@ -1803,6 +1845,36 @@ func (cs *ConfigStore) countActiveWorkers(tx *gorm.DB, where ...any) (int64, err
 		return 0, err
 	}
 	return count, nil
+}
+
+func workerActiveStates() []WorkerState {
+	return []WorkerState{
+		WorkerStateSpawning,
+		WorkerStateIdle,
+		WorkerStateReserved,
+		WorkerStateActivating,
+		WorkerStateHot,
+		WorkerStateHotIdle,
+		WorkerStateDraining,
+	}
+}
+
+func workerLostEligibleStates() []WorkerState {
+	return []WorkerState{
+		WorkerStateSpawning,
+		WorkerStateIdle,
+		WorkerStateReserved,
+		WorkerStateActivating,
+		WorkerStateHot,
+		WorkerStateHotIdle,
+	}
+}
+
+func workerTerminalEligibleStates(targetState WorkerState) []WorkerState {
+	if targetState == WorkerStateLost {
+		return workerLostEligibleStates()
+	}
+	return workerActiveStates()
 }
 
 func (cs *ConfigStore) countNeutralWarmWorkers(tx *gorm.DB) (int64, error) {

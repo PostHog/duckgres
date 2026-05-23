@@ -305,7 +305,10 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			continue
 		}
 
-		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(workerID, RetireReasonMismatchedVersion)
+		if record == nil {
+			continue
+		}
+		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(record, RetireReasonMismatchedVersion)
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
@@ -1356,9 +1359,13 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			// Try reclaiming a hot-idle worker for the same org first (fast path:
 			// DuckLake is already attached, only needs epoch bump).
 			if assignment.OrgID != "" {
-				hotClaimed, _, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID)
+				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.MaxWorkers)
 				if err != nil {
 					return nil, err
+				}
+				if hotClaimed == nil && hotMissReason != configstore.WorkerClaimMissReasonNone && hotMissReason != configstore.WorkerClaimMissReasonNoIdle {
+					p.recordWarmCapacityMiss(assignment, hotMissReason)
+					return nil, NewWarmCapacityExhaustedErrorForReason(hotMissReason, DefaultWarmCapacityRetryAfter)
 				}
 				if hotClaimed != nil {
 					// Check if image matches (hot-idle reclamation is strict on version)
@@ -1725,24 +1732,85 @@ func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podNam
 	return client, nil
 }
 
-func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string) {
+func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRecord, reason string) {
+	if claimed == nil {
+		return
+	}
+	current := claimed
 	if p.runtimeStore != nil {
-		// Mark retired in DB immediately so the next capacity check doesn't
-		// count this slot.
-		_, _ = p.runtimeStore.RetireIdleOrHotIdleWorker(claimed.WorkerID, reason)
+		if refreshed, err := p.runtimeStore.GetWorkerRecord(claimed.WorkerID); err != nil {
+			slog.Warn("Failed to refresh worker runtime row before retirement.",
+				"worker_id", claimed.WorkerID, "reason", reason, "error", err)
+		} else if refreshed != nil {
+			if refreshed.OwnerCPInstanceID != claimed.OwnerCPInstanceID || refreshed.OwnerEpoch != claimed.OwnerEpoch {
+				slog.Debug("Worker ownership changed before retirement; skipping cleanup.",
+					"worker_id", claimed.WorkerID, "reason", reason)
+				return
+			}
+			current = refreshed
+		}
+	}
+	p.retireClaimedWorker(current, reason)
+}
+
+func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string) {
+	if claimed == nil {
+		return
+	}
+	terminalState := configstore.WorkerStateRetired
+	if reason == RetireReasonCrash {
+		terminalState = configstore.WorkerStateLost
+	}
+	if p.runtimeStore != nil {
+		updated, err := p.runtimeStore.MarkWorkerTerminalIfCurrent(claimed, terminalState, reason)
+		if err != nil {
+			slog.Warn("Failed to retire claimed worker.",
+				"worker_id", claimed.WorkerID, "reason", reason, "error", err)
+			return
+		}
+		if !updated {
+			slog.Debug("Claimed worker changed before retirement; skipping pod delete.",
+				"worker_id", claimed.WorkerID, "reason", reason)
+			return
+		}
+	}
+
+	p.deleteRetiredRuntimeWorker(claimed, reason)
+}
+
+// deleteRetiredRuntimeWorker performs the post-CAS cleanup for a worker whose
+// runtime-store row is already terminal. It intentionally avoids another DB
+// transition so janitor paths can retire once, then reliably remove local state
+// and delete the pod.
+func (p *K8sWorkerPool) deleteRetiredRuntimeWorker(record *configstore.WorkerRecord, reason string) {
+	if record == nil {
+		return
 	}
 
 	worker := &ManagedWorker{
-		ID:      claimed.WorkerID,
-		podName: claimed.PodName,
+		ID:      record.WorkerID,
+		podName: record.PodName,
 		done:    make(chan struct{}),
 	}
-	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
-	worker.SetOwnerEpoch(claimed.OwnerEpoch)
+	worker.SetOwnerCPInstanceID(record.OwnerCPInstanceID)
+	worker.SetOwnerEpoch(record.OwnerEpoch)
+
+	removedLocal := false
+	workerCount := 0
 	p.mu.Lock()
-	p.markWorkerRetiredLocked(worker, reason)
+	if local, ok := p.workers[record.WorkerID]; ok {
+		worker = local
+		p.markWorkerRetiredInMemoryLocked(worker, reason)
+		delete(p.workers, record.WorkerID)
+		workerCount = len(p.workers)
+		removedLocal = true
+	}
 	p.mu.Unlock()
-	go p.retireWorkerPod(worker.ID, worker)
+	if removedLocal {
+		observeControlPlaneWorkers(workerCount)
+	}
+
+	go p.retireWorkerPod(record.WorkerID, worker)
 }
 
 // retireOrphanWorker retires a worker the orphan janitor has identified
@@ -1756,9 +1824,15 @@ func (p *K8sWorkerPool) retireOrphanWorker(record *configstore.WorkerRecord, rea
 	if p.runtimeStore == nil || record == nil {
 		return
 	}
-	if _, err := p.runtimeStore.RetireOrphanWorker(record.WorkerID, reason); err != nil {
+	retired, err := p.runtimeStore.RetireOrphanWorker(record, reason)
+	if err != nil {
 		slog.Warn("Failed to retire orphan worker.",
 			"worker_id", record.WorkerID, "reason", reason, "error", err)
+		return
+	}
+	if !retired {
+		slog.Debug("Orphan worker changed before retirement; skipping pod delete.",
+			"worker_id", record.WorkerID, "reason", reason)
 		return
 	}
 	worker := &ManagedWorker{
@@ -1812,7 +1886,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				// Retire already-claimed slots so they don't strand
 				// as durable spawning rows with no pod behind them.
 				for _, s := range slots {
-					p.retireClaimedWorker(s, RetireReasonCrash)
+					p.retireCurrentRuntimeWorker(s, RetireReasonCrash)
 				}
 				return err
 			}
@@ -1847,7 +1921,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				p.mu.Unlock()
 
 				if err != nil {
-					p.retireClaimedWorker(slot, RetireReasonCrash)
+					p.retireCurrentRuntimeWorker(slot, RetireReasonCrash)
 					errs[i] = err
 				}
 			}(i, slot)
@@ -1977,7 +2051,7 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 		if err != nil {
 			observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "error", len(slots))
 			for _, s := range slots {
-				p.retireClaimedWorker(s, RetireReasonCrash)
+				p.retireCurrentRuntimeWorker(s, RetireReasonCrash)
 			}
 			return err
 		}
@@ -2011,7 +2085,7 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 			p.mu.Unlock()
 
 			if err != nil {
-				p.retireClaimedWorker(slot, RetireReasonCrash)
+				p.retireCurrentRuntimeWorker(slot, RetireReasonCrash)
 				errs[i] = err
 			}
 		}(i, slot)
@@ -2287,7 +2361,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// Step 1: CAS to draining. Skip the worker on CAS miss or error —
 		// there's no safe way to proceed if we don't own the row.
 		if p.runtimeStore != nil {
-			transitioned, err := p.runtimeStore.MarkWorkerDraining(w.ID, p.cpInstanceID)
+			transitioned, err := p.runtimeStore.MarkWorkerDraining(w.ID, p.cpInstanceID, w.OwnerEpoch())
 			if err != nil {
 				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
 					"worker_id", w.ID, "error", err)
@@ -2319,7 +2393,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// shutdown) the row stays in draining and the orphan sweep handles
 		// it once this CP's heartbeat expires.
 		if p.runtimeStore != nil {
-			if _, err := p.runtimeStore.RetireDrainingWorker(w.ID, RetireReasonShutdown); err != nil {
+			if _, err := p.runtimeStore.RetireDrainingWorker(w.ID, p.cpInstanceID, w.OwnerEpoch(), RetireReasonShutdown); err != nil {
 				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
 					"worker_id", w.ID, "error", err)
 				continue
