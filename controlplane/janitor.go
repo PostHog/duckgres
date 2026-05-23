@@ -18,6 +18,7 @@ type controlPlaneExpiryStore interface {
 	ExpireControlPlaneInstances(cutoff time.Time) (int64, error)
 	ExpireDrainingControlPlaneInstances(before time.Time) (int64, error)
 	ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error)
+	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
 	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
@@ -110,22 +111,42 @@ func (j *ControlPlaneJanitor) runOnce() {
 	}
 
 	orphanedBefore := j.now().Add(-j.orphanGrace)
-	orphaned, err := j.store.ListOrphanedWorkers(orphanedBefore)
-	if err != nil {
-		slog.Warn("Janitor failed to list orphaned workers.", "error", err)
-	} else {
-		if len(orphaned) > 0 {
-			slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
+	if j.lifecycle != nil {
+		// Lifecycle path: snapshot-typed list + RetireOrphanFromSnapshot,
+		// which carries the orphan-specific CP-revival fence already.
+		orphaned, err := j.store.ListOrphanedWorkerSnapshots(orphanedBefore)
+		if err != nil {
+			slog.Warn("Janitor failed to list orphaned workers.", "error", err)
+		} else {
+			if len(orphaned) > 0 {
+				slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
+			}
+			for _, snap := range orphaned {
+				outcome, err := j.lifecycle.RetireOrphanFromSnapshot(snap, janitorRetireReasonOrphaned)
+				if err != nil {
+					slog.Warn("Janitor failed to retire orphan worker.", "worker_id", snap.WorkerID(), "error", err)
+					continue
+				}
+				_ = outcome // metrics-bearing outcome consumed once PR 6 lands.
+			}
 		}
-		for _, worker := range orphaned {
-			// Prefer the orphan-specific retire path so workers in any
-			// active state transition to retired (not just idle/hot_idle
-			// like the older retireRuntimeWorker chain). Fall back to the
-			// legacy path if a caller hasn't wired the new lambda.
-			if j.retireOrphanWorker != nil {
-				j.retireOrphanWorker(worker, janitorRetireReasonOrphaned)
-			} else {
-				j.retireRuntimeWorker(worker, janitorRetireReasonOrphaned)
+	} else {
+		orphaned, err := j.store.ListOrphanedWorkers(orphanedBefore)
+		if err != nil {
+			slog.Warn("Janitor failed to list orphaned workers.", "error", err)
+		} else {
+			if len(orphaned) > 0 {
+				slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
+			}
+			for _, worker := range orphaned {
+				// Legacy path retained for deployments that don't wire a
+				// lifecycle service. PR 4 prunes once every deployment
+				// uses the lifecycle path.
+				if j.retireOrphanWorker != nil {
+					j.retireOrphanWorker(worker, janitorRetireReasonOrphaned)
+				} else {
+					j.retireRuntimeWorker(worker, janitorRetireReasonOrphaned)
+				}
 			}
 		}
 	}

@@ -52,6 +52,24 @@ func (s *captureControlPlaneExpiryStore) snapshot() []time.Time {
 	return out
 }
 
+// ListOrphanedWorkerSnapshots is the lifecycle-typed counterpart used
+// by the migrated janitor orphan path. The mock wraps the same orphan
+// slice through NewWorkerSnapshotForTesting so existing fixtures that
+// populate orphanedWorkers also drive the lifecycle path when a
+// lifecycle is wired.
+func (s *captureControlPlaneExpiryStore) ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.orphanedWorkers) == 0 {
+		return nil, nil
+	}
+	out := make([]configstore.WorkerSnapshot, 0, len(s.orphanedWorkers))
+	for _, rec := range s.orphanedWorkers {
+		out = append(out, configstore.NewWorkerSnapshotForTesting(rec))
+	}
+	return out, nil
+}
+
 func (s *captureControlPlaneExpiryStore) ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
