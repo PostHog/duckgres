@@ -54,7 +54,7 @@ func (s *captureControlPlaneExpiryStore) snapshot() []time.Time {
 
 // ListOrphanedWorkerSnapshots is the lifecycle-typed counterpart used
 // by the migrated janitor orphan path. The mock wraps the same orphan
-// slice through NewWorkerSnapshotForTesting so existing fixtures that
+// slice through NewWorkerSnapshot so existing fixtures that
 // populate orphanedWorkers also drive the lifecycle path when a
 // lifecycle is wired.
 func (s *captureControlPlaneExpiryStore) ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
@@ -65,7 +65,7 @@ func (s *captureControlPlaneExpiryStore) ListOrphanedWorkerSnapshots(before time
 	}
 	out := make([]configstore.WorkerSnapshot, 0, len(s.orphanedWorkers))
 	for _, rec := range s.orphanedWorkers {
-		out = append(out, configstore.NewWorkerSnapshotForTesting(rec))
+		out = append(out, configstore.NewWorkerSnapshot(rec))
 	}
 	return out, nil
 }
@@ -106,7 +106,7 @@ func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleWorkers(before time.T
 
 // ListExpiredHotIdleSnapshots is the lifecycle-typed counterpart used
 // by the migrated janitor hot-idle path. The mock wraps the same
-// underlying slice through NewWorkerSnapshotForTesting so existing
+// underlying slice through NewWorkerSnapshot so existing
 // tests can opt into the lifecycle path by setting expiredHotIdleWorkers.
 func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
 	s.mu.Lock()
@@ -116,7 +116,7 @@ func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(before time
 	}
 	out := make([]configstore.WorkerSnapshot, 0, len(s.expiredHotIdleWorkers))
 	for _, rec := range s.expiredHotIdleWorkers {
-		out = append(out, configstore.NewWorkerSnapshotForTesting(rec))
+		out = append(out, configstore.NewWorkerSnapshot(rec))
 	}
 	return out, nil
 }

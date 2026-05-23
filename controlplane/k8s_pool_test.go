@@ -312,7 +312,7 @@ func (s *captureRuntimeWorkerStore) ObserveWorker(workerID int) (*configstore.Wo
 	if record == nil {
 		return nil, nil
 	}
-	snap := configstore.NewWorkerSnapshotForTesting(*record)
+	snap := configstore.NewWorkerSnapshot(*record)
 	return &snap, nil
 }
 

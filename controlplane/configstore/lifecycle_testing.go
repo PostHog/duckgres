@@ -2,17 +2,27 @@ package configstore
 
 import "time"
 
-// NewWorkerSnapshotForTesting wraps a WorkerRecord into a WorkerSnapshot.
-// This is the sanctioned escape hatch for tests in other packages that
-// need to drive lifecycle code with specific observed fields — production
-// code MUST go through ObserveWorker or the snapshot-returning List*
-// methods, which is what makes WorkerSnapshot a real "freshly observed
-// from the store" type.
+// NewWorkerSnapshot wraps a WorkerRecord into a WorkerSnapshot. The
+// preferred way to obtain a snapshot is still through ObserveWorker or
+// the snapshot-returning List* methods — those guarantee the snapshot
+// reflects a real durable read at a specific instant. This constructor
+// exists for two specific call sites:
 //
-// The "ForTesting" suffix exists so linters and reviewers can flag any
-// accidental production import. It is the only externally-visible way
-// to construct a WorkerSnapshot.
-func NewWorkerSnapshotForTesting(record WorkerRecord) WorkerSnapshot {
+//   - Production callers that already hold a freshly-issued record
+//     from a CAS-producing store call (Claim*/TakeOver/Create*Slot).
+//     The record is as fresh as a fresh observation would have been,
+//     and an extra ObserveWorker round-trip just to wrap it would burn
+//     a query.
+//
+//   - Tests in other packages that need to drive lifecycle code with
+//     specific observed-field values, without standing up a real
+//     ConfigStore.
+//
+// Callers passing in a stale record will simply CAS-miss downstream;
+// the snapshot is the fence either way, so the safety property
+// holds. The compiler distinction between WorkerSnapshot and
+// WorkerLease is the load-bearing protection here.
+func NewWorkerSnapshot(record WorkerRecord) WorkerSnapshot {
 	if record.UpdatedAt.IsZero() {
 		record.UpdatedAt = time.Now()
 	}

@@ -1751,25 +1751,30 @@ func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRe
 	}
 	current := claimed
 	if p.runtimeStore != nil {
-		refreshed, err := p.runtimeStore.GetWorkerRecord(claimed.WorkerID)
+		// Refresh the row so the snapshot we hand to retireClaimedWorker
+		// (and through it, lifecycle.RetireFromSnapshot) carries the
+		// latest updated_at — without this, an inter-spawn touch could
+		// CAS-miss even though we still own the row at the right epoch.
+		// We could rely solely on the CAS to fence (and it does), but
+		// the extra read is cheap and lets us short-circuit before
+		// scheduling pod cleanup against a moved row.
+		refreshed, err := p.runtimeStore.ObserveWorker(claimed.WorkerID)
 		switch {
 		case err != nil:
 			slog.Warn("Failed to refresh worker runtime row before retirement.",
 				"worker_id", claimed.WorkerID, "reason", reason, "error", err)
 		case refreshed == nil:
-			// Row was hard-deleted or never existed — no CAS target. The
-			// downstream CAS would miss anyway; skip the wasted round-trip
-			// and the pod delete (no row to authorize cleanup against).
 			slog.Debug("Worker runtime row missing before retirement; skipping cleanup.",
 				"worker_id", claimed.WorkerID, "reason", reason)
 			return
 		default:
-			if refreshed.OwnerCPInstanceID != claimed.OwnerCPInstanceID || refreshed.OwnerEpoch != claimed.OwnerEpoch {
+			if refreshed.OwnerCPInstanceID() != claimed.OwnerCPInstanceID || refreshed.OwnerEpoch() != claimed.OwnerEpoch {
 				slog.Debug("Worker ownership changed before retirement; skipping cleanup.",
 					"worker_id", claimed.WorkerID, "reason", reason)
 				return
 			}
-			current = refreshed
+			rec := refreshed.Record()
+			current = &rec
 		}
 	}
 	p.retireClaimedWorker(current, reason)
@@ -1783,7 +1788,22 @@ func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, r
 	if reason == RetireReasonCrash {
 		terminalState = configstore.WorkerStateLost
 	}
+	if p.lifecycle != nil {
+		// Lifecycle path: snapshot-fenced CAS + post-CAS cleanup in one
+		// call. The claimed record is fresh enough to act as a
+		// snapshot — it came back from a claim/reserve and any
+		// concurrent change will simply CAS-miss here.
+		snap := configstore.NewWorkerSnapshot(*claimed)
+		if _, err := p.lifecycle.RetireFromSnapshot(snap, terminalState, reason); err != nil {
+			slog.Warn("Failed to retire claimed worker.",
+				"worker_id", claimed.WorkerID, "reason", reason, "error", err)
+		}
+		return
+	}
 	if p.runtimeStore != nil {
+		// Legacy path retained until PR 4 prunes the worker-id-only
+		// store methods; only reached when the pool is constructed
+		// without a runtime store (process backend).
 		updated, err := p.runtimeStore.MarkWorkerTerminalIfCurrent(claimed, terminalState, reason)
 		if err != nil {
 			slog.Warn("Failed to retire claimed worker.",
