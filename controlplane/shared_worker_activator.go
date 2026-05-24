@@ -282,26 +282,20 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 		return nil
 	}
 
+	if a.lifecycle == nil {
+		return fmt.Errorf("refresh worker credentials requires a lifecycle service (worker %d)", worker.ID)
+	}
 	currentEpoch := worker.OwnerEpoch()
 	cpInstanceID := worker.OwnerCPInstanceID()
-	var newEpoch int64
-	if a.lifecycle != nil {
-		newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch))
-		if err != nil {
-			// Keep the legacy "bump owner epoch for refresh" wrapper
-			// wording even though the lifecycle method is named
-			// RefreshLease, so log-grep / dashboard filters that
-			// pattern-match on the previous string still work.
-			return fmt.Errorf("bump owner epoch for refresh: %w", err)
-		}
-		newEpoch = newLease.OwnerEpoch()
-	} else {
-		var err error
-		newEpoch, err = a.runtimeStore.BumpWorkerEpoch(worker.ID, cpInstanceID, currentEpoch)
-		if err != nil {
-			return fmt.Errorf("bump owner epoch for refresh: %w", err)
-		}
+	newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch))
+	if err != nil {
+		// Keep the legacy "bump owner epoch for refresh" wrapper wording
+		// even though the lifecycle method is named RefreshLease, so
+		// log-grep / dashboard filters that pattern-match on the
+		// previous string still work.
+		return fmt.Errorf("bump owner epoch for refresh: %w", err)
 	}
+	newEpoch := newLease.OwnerEpoch()
 	worker.SetOwnerEpoch(newEpoch)
 
 	rpcPayload := server.WorkerActivationPayload{
