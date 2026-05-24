@@ -237,7 +237,10 @@ func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 	resetLeaderOwnedClusterMetrics()
 
 	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 0, image)
-	assertGaugeValue(t, warmCapacityHeadroomGauge, 0)
+	// Headroom resets to the unbounded sentinel (-1) on leader
+	// handoff, not 0 — 0 is the alertable capacity-exhausted state
+	// and would page spuriously every rollout if we reset to it.
+	assertGaugeValue(t, warmCapacityHeadroomGauge, -1)
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
 }
 

@@ -23,6 +23,14 @@ const (
 	LifecycleOpDrain                         LifecycleOperation = "drain"
 	LifecycleOpRetireDrained                 LifecycleOperation = "retire_drained"
 	LifecycleOpRefreshLease                  LifecycleOperation = "refresh_lease"
+	// LifecycleOpRetireLocal covers the in-memory retirement chain
+	// (markWorkerRetiredLocked → persistWorkerRecord via UpsertWorkerRecord)
+	// which doesn't go through the lifecycle CAS service. Used by
+	// public RetireWorker, idle-timeout reaping, stuck-activating
+	// reaping, and activation-failure / liveness-recheck fallbacks.
+	// outcome is always transitioned for this op — there's no CAS
+	// fence to miss; the upsert always lands.
+	LifecycleOpRetireLocal LifecycleOperation = "retire_local"
 )
 
 // LifecycleOrigin identifies the caller that asked WorkerLifecycle for a
@@ -47,12 +55,54 @@ const (
 	// ReserveSharedWorker observes a claim that cannot be activated
 	// (stale-claim retries excepted) and falls back to retire-and-retry.
 	LifecycleOriginReserveFailure LifecycleOrigin = "reserve_failure"
+	// LifecycleOriginIdleTimeout marks retire paths from the idle-worker
+	// reaper (reapIdleWorkers).
+	LifecycleOriginIdleTimeout LifecycleOrigin = "idle_timeout"
+	// LifecycleOriginPublicAPI marks retire paths invoked through the
+	// public RetireWorker / RetireWorkerIfNoSessions / RetireIfDrainingAndEmpty
+	// surface (admin tooling, orchestration callbacks).
+	LifecycleOriginPublicAPI LifecycleOrigin = "public_api"
+	// LifecycleOriginActivationFailure marks retire paths fired after a
+	// worker activation returned an error (org pool's
+	// activateWorkerForOrg / ReconnectFlightWorker).
+	LifecycleOriginActivationFailure LifecycleOrigin = "activation_failure"
+	// LifecycleOriginOrgShutdown marks per-org ShutdownAll on
+	// OrgReservedPool (distinct from the pool-wide LifecycleOriginShutdownAll).
+	LifecycleOriginOrgShutdown LifecycleOrigin = "org_shutdown"
 	// LifecycleOriginUnknown is the fallback label applied when an empty
 	// origin reaches the observer. We always emit a sample rather than
 	// silently drop it; an "unknown" bucket showing up on dashboards is
 	// the signal that a new call site forgot to thread the origin.
 	LifecycleOriginUnknown LifecycleOrigin = "unknown"
 )
+
+// lifecycleOriginForRetireReason maps a RetireReason* constant to the
+// canonical origin for in-memory retire paths (the markWorkerRetired*
+// chain that bypasses the CAS service). Callers that already know a
+// more specific origin should pass it directly rather than rely on this
+// mapping.
+func lifecycleOriginForRetireReason(reason string) LifecycleOrigin {
+	switch reason {
+	case RetireReasonIdleTimeout:
+		return LifecycleOriginIdleTimeout
+	case RetireReasonStuckActivating:
+		return LifecycleOriginJanitorStuckActivating
+	case RetireReasonActivationFailure:
+		return LifecycleOriginActivationFailure
+	case RetireReasonCrash:
+		return LifecycleOriginHealthCheckCrash
+	case RetireReasonShutdown:
+		return LifecycleOriginShutdownAll
+	case RetireReasonMismatchedVersion:
+		return LifecycleOriginMismatchedVersionReaper
+	case RetireReasonOrphaned:
+		return LifecycleOriginJanitorOrphan
+	case RetireReasonNormal:
+		return LifecycleOriginPublicAPI
+	default:
+		return LifecycleOriginUnknown
+	}
+}
 
 // StrandedOutcome categorizes what the janitor recovery sweep did with
 // each stranded pod it observed. "kept" means the artifact was claimed
@@ -97,6 +147,24 @@ const (
 	HealthCheckResultFail HealthCheckResult = "fail"
 )
 
+// Retirement reason constants. Passed as the `reason` argument to
+// WorkerLifecycle.* methods and surfaced on
+// duckgres_worker_lifecycle_transitions_total as part of the operation
+// context (also fed into lifecycleOriginForRetireReason for retire_local
+// observations). Defined here (no build tag) rather than in
+// warm_pool_metrics.go (kubernetes-tagged) so the no-tag lifecycle
+// observation helpers can reference them.
+const (
+	RetireReasonNormal            = "normal"
+	RetireReasonActivationFailure = "activation_failure"
+	RetireReasonOrphaned          = "orphaned"
+	RetireReasonCrash             = "crash"
+	RetireReasonShutdown          = "shutdown"
+	RetireReasonIdleTimeout       = "idle_timeout"
+	RetireReasonStuckActivating   = "stuck_activating"
+	RetireReasonMismatchedVersion = "mismatched_version"
+)
+
 // --- Metric definitions ---
 
 var workerLifecycleTransitionsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -113,6 +181,11 @@ var workerLifecycleTransitionDurationHistogram = promauto.NewHistogramVec(promet
 var workerStrandedPodsReconciledCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_worker_stranded_pods_reconciled_total",
 	Help: "Stranded worker pods inspected by the janitor recovery sweep, partitioned by reconciliation outcome.",
+}, []string{"outcome"})
+
+var workerStrandedSecretsReconciledCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_worker_stranded_secrets_reconciled_total",
+	Help: "Stranded worker RPC secrets inspected by the janitor recovery sweep, partitioned by reconciliation outcome. Restored after review pointed out that secret-leak detection isn't reachable from the pods counter — the two reapers cover disjoint failure modes (orphan secret with no pod vs. orphan pod with retired durable row).",
 }, []string{"outcome"})
 
 var workerSpawnFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -184,6 +257,16 @@ func observeStrandedPodReconciled(outcome StrandedOutcome) {
 		return
 	}
 	workerStrandedPodsReconciledCounter.WithLabelValues(v).Inc()
+}
+
+// observeStrandedSecretReconciled records one outcome of the janitor's
+// stranded-secret sweep.
+func observeStrandedSecretReconciled(outcome StrandedOutcome) {
+	v := strings.TrimSpace(string(outcome))
+	if v == "" {
+		return
+	}
+	workerStrandedSecretsReconciledCounter.WithLabelValues(v).Inc()
 }
 
 // observeSpawnFailure increments the spawn-failure counter for the

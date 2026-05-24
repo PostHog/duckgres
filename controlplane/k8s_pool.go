@@ -426,6 +426,11 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 		dbState := "missing"
 		if rec != nil {
 			if rec.State != configstore.WorkerStateRetired && rec.State != configstore.WorkerStateLost {
+				// Pod is still claimed by an active runtime row — not
+				// stranded. Record it under "kept" so dashboards can
+				// see reconciler saturation (large kept counts =
+				// reaper iterating many healthy pods per tick).
+				observeStrandedPodReconciled(StrandedOutcomeKept)
 				continue
 			}
 			dbState = string(rec.State)
@@ -499,9 +504,11 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge
 		}
 		if err := p.clientset.CoreV1().Secrets(p.namespace).Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 			slog.Warn("Stranded-secret reconciler failed to delete secret.", "secret", secret.Name, "worker_pod", podName, "error", err)
+			observeStrandedSecretReconciled(StrandedOutcomeDeleteFailed)
 			continue
 		}
 		slog.Info("Stranded worker RPC secret reconciled.", "secret", secret.Name, "worker_pod", podName)
+		observeStrandedSecretReconciled(StrandedOutcomeDeleted)
 		deleted++
 	}
 	return deleted
@@ -2307,7 +2314,16 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForLease(lease))
 							cancel()
 						}()
-						if healthErr != nil {
+						// Skip metric emission when the parent loop ctx
+						// was canceled (CP shutting down). Without this
+						// guard every graceful rollout would spike
+						// duckgres_worker_health_checks_total{result=fail}
+						// indistinguishably from real worker crashes.
+						// Per-probe deadline (DeadlineExceeded) is a
+						// real failure and still counted.
+						if stderrors.Is(healthErr, context.Canceled) {
+							// shutdown path; don't pollute pass/fail rate
+						} else if healthErr != nil {
 							observeHealthCheck(HealthCheckResultFail, lease.image)
 						} else {
 							observeHealthCheck(HealthCheckResultPass, lease.image)
@@ -2470,52 +2486,75 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		if lifecycle == nil {
 			continue
 		}
-		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
-		drainStart := time.Now()
-		outcome, err := lifecycle.Drain(lease, LifecycleOriginShutdownAll)
-		if err != nil {
-			slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
-				"worker_id", w.ID, "error", err)
-			continue
-		}
-		if !outcome.Transitioned {
-			slog.Debug("ShutdownAll: worker not owned by us or already terminal; skipping.",
-				"worker_id", w.ID)
+		// Wrap the per-worker drain in a closure so a single defer can
+		// observe duration on every exit path (CAS miss, pod-delete
+		// failure, RetireDrained miss) — not just the fully-successful
+		// chain. Returns true when the chain completed and the
+		// in-memory state should also flip to retired; false when
+		// anything along the way prevented terminal CAS and the
+		// orphan sweep should pick it up.
+		retired := func() bool {
+			drainStart := time.Now()
+			defer func() { observeDrainTotalDuration(time.Since(drainStart)) }()
+
+			lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+			outcome, err := lifecycle.Drain(lease, LifecycleOriginShutdownAll)
+			if err != nil {
+				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
+					"worker_id", w.ID, "error", err)
+				return false
+			}
+			if !outcome.Transitioned {
+				slog.Debug("ShutdownAll: worker not owned by us or already terminal; skipping.",
+					"worker_id", w.ID)
+				return false
+			}
+
+			// Step 2: delete pod. Leave the row in draining on any error
+			// other than NotFound so recovery paths pick it up.
+			gracePeriod := int64(10)
+			if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriod,
+			}); err != nil && !errors.IsNotFound(err) {
+				slog.Warn("ShutdownAll: pod delete failed; worker left in draining for orphan sweep/reconciler.",
+					"id", w.ID, "worker_pod", podName, "error", err)
+				return false
+			}
+			_ = p.deleteWorkerRPCSecret(ctx, podName)
+			if w.client != nil {
+				_ = w.client.Close()
+			}
+
+			// Step 3: final CAS to retired. Re-read w.OwnerEpoch() so a
+			// cred-refresh bump that landed between Step 1 and now uses
+			// the fresh epoch.
+			lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+			retireOutcome, err := lifecycle.RetireDrained(lateLease, RetireReasonShutdown, LifecycleOriginShutdownAll)
+			if err != nil {
+				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
+					"worker_id", w.ID, "error", err)
+				return false
+			}
+			if !retireOutcome.Transitioned {
+				// CAS missed — durable row stays in draining for the
+				// orphan sweep. Do NOT flip the in-memory state to
+				// retired; the in-memory lease must keep matching the
+				// durable row so subsequent reconciliation can see it.
+				slog.Debug("ShutdownAll: retire-drained CAS missed; leaving worker in draining for orphan sweep.",
+					"worker_id", w.ID)
+				return false
+			}
+			return true
+		}()
+
+		if !retired {
 			continue
 		}
 
-		// Step 2: delete pod. Leave the row in draining on any error other
-		// than NotFound so recovery paths pick it up. Caller-orchestrated
-		// here (between the two lifecycle CAS steps) so the no-pod-delete
-		// case can keep the row in draining for orphan reconciliation.
-		gracePeriod := int64(10)
-		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
-			GracePeriodSeconds: &gracePeriod,
-		}); err != nil && !errors.IsNotFound(err) {
-			slog.Warn("ShutdownAll: pod delete failed; worker left in draining for orphan sweep/reconciler.",
-				"id", w.ID, "worker_pod", podName, "error", err)
-			continue
-		}
-		_ = p.deleteWorkerRPCSecret(ctx, podName)
-		if w.client != nil {
-			_ = w.client.Close()
-		}
-
-		// Step 3: final CAS to retired. If this fails (network blip during
-		// shutdown) the row stays in draining and the orphan sweep handles
-		// it once this CP's heartbeat expires. Re-read w.OwnerEpoch() so a
-		// cred-refresh bump that landed between Step 1 and now uses the
-		// fresh epoch.
-		lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
-		if _, err := lifecycle.RetireDrained(lateLease, RetireReasonShutdown, LifecycleOriginShutdownAll); err != nil {
-			slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
-				"worker_id", w.ID, "error", err)
-			continue
-		}
-		observeDrainTotalDuration(time.Since(drainStart))
-
-		// In-memory lifecycle + metrics. Intentionally skips persistence
-		// (we've already persisted the retired state via the CAS chain).
+		// In-memory lifecycle bookkeeping. Intentionally skips
+		// persistence (the CAS chain already persisted retired) and the
+		// retire_local metric (lifecycle.RetireDrained already
+		// observed retire_drained for this transition).
 		p.mu.Lock()
 		p.markWorkerRetiredInMemoryLocked(w)
 		p.mu.Unlock()
@@ -3137,28 +3176,53 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int, image string) {
 	go p.spawnWorkerBackground(id, image)
 }
 
+// markWorkerRetiredLocked is the in-memory retire wrapper for paths
+// that bypass the WorkerLifecycle CAS service: it transitions the
+// shared state, upserts the durable row, and emits a
+// duckgres_worker_lifecycle_transitions_total sample under
+// operation=retire_local so retire paths through retireWorkerWithReason
+// (idle reaper, stuck-activating reaper, public RetireWorker,
+// activation-failure / liveness-recheck fallbacks, per-org ShutdownAll)
+// still show up on dashboards. Callers that have already gone through
+// the lifecycle service (deleteRetiredRuntimeWorker, ShutdownAll's
+// drain chain, removeWorkerAfterLostLeaseLocked) call
+// markWorkerRetiredInMemoryLocked directly to avoid double-counting.
 func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
-	p.markWorkerRetiredInMemoryLocked(w)
+	if !p.markWorkerRetiredInMemoryLocked(w) {
+		return
+	}
 	workerState := configstore.WorkerStateRetired
 	if reason == RetireReasonCrash {
 		workerState = configstore.WorkerStateLost
 	}
 	p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil))
+	observeLifecycleTransition(
+		LifecycleOpRetireLocal,
+		configstore.TransitionOutcomeTransitioned,
+		w.image,
+		lifecycleOriginForRetireReason(reason),
+	)
 }
 
 // markWorkerRetiredInMemoryLocked performs only the in-memory lifecycle
 // transition for a worker retirement, without persisting to the runtime
-// store. Used by callers that have already advanced the DB state via a
-// scoped CAS (e.g. ShutdownAll's draining chain) and don't want an
-// unconditional UpsertWorkerRecord to overwrite fields set by that CAS.
-// The retire reason is recorded on the durable side via the lifecycle
-// service's CAS path, not here.
-func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker) {
+// store and without emitting any metric. Used by callers that have
+// already advanced the DB state via a scoped CAS (e.g. ShutdownAll's
+// draining chain, the lifecycle service's post-CAS cleanup hook,
+// removeWorkerAfterLostLease) and don't want an unconditional
+// UpsertWorkerRecord to overwrite fields set by that CAS. Returns true
+// when the transition actually happened.
+//
+// Metric emission lives in markWorkerRetiredLocked (the wrapper that
+// also persists) because the CAS-bypassing path is the only one not
+// already observed via the lifecycle service.
+func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker) bool {
 	nextState, err := w.SharedState().Transition(WorkerLifecycleRetired, nil)
 	if err != nil {
-		return
+		return false
 	}
 	_ = w.SetSharedState(nextState)
+	return true
 }
 
 func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) {

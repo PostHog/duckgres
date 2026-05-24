@@ -150,6 +150,15 @@ const (
 	// because the supposed-orphan's owner CP was no longer expired.
 	TransitionOutcomeFenceMissCPRevived TransitionOutcomeReason = "fence_miss_cp_revived"
 
+	// TransitionOutcomeFenceMissLease indicates a lease-fenced CAS
+	// (Drain / RetireDrained / MarkLostFromLease) missed without an
+	// extra read to distinguish state vs. owner_epoch vs. state-
+	// restriction causes. The label is intentionally generic: lease
+	// CAS WHERE clauses combine state + owner + epoch, and a single
+	// boolean rowsAffected can't tell them apart. Tighter labels
+	// require a follow-up GetWorkerRecord round-trip.
+	TransitionOutcomeFenceMissLease TransitionOutcomeReason = "fence_miss_lease"
+
 	// TransitionOutcomeRowMissing indicates the row could not be found in
 	// the runtime store (hard-deleted or never created).
 	TransitionOutcomeRowMissing TransitionOutcomeReason = "row_missing"

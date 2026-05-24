@@ -513,15 +513,6 @@ func cloneWarmCapacityTargets(targets map[string]int) map[string]int {
 	return out
 }
 
-func cloneWarmCapacityMissAggregates(aggregates []configstore.WarmCapacityMissAggregate) []configstore.WarmCapacityMissAggregate {
-	if len(aggregates) == 0 {
-		return nil
-	}
-	out := make([]configstore.WarmCapacityMissAggregate, len(aggregates))
-	copy(out, aggregates)
-	return out
-}
-
 func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []configstore.WorkerLifecycleStats {
 	if len(stats) == 0 {
 		return nil

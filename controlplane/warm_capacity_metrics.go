@@ -89,7 +89,10 @@ func observeWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats, previ
 
 func resetLeaderOwnedClusterMetrics() {
 	warmCapacityEffectiveTargetGauge.Reset()
-	warmCapacityHeadroomGauge.Set(0)
+	// Reset headroom to the "unbounded / unknown" sentinel rather than
+	// 0 — 0 is the alertable capacity-exhausted state and would page
+	// spuriously every time leadership hands off during a rollout.
+	warmCapacityHeadroomGauge.Set(-1)
 	workerLifecycleCountGauge.Reset()
 }
 
@@ -99,15 +102,6 @@ func warmCapacityScopeForImage(image string) string {
 		return ""
 	}
 	return "image:" + image
-}
-
-func warmCapacityImageFromScope(scope string) string {
-	image := strings.TrimSpace(scope)
-	if strings.HasPrefix(image, "org:") {
-		return ""
-	}
-	image = strings.TrimPrefix(image, "image:")
-	return strings.TrimSpace(image)
 }
 
 func warmCapacityTargetImages(maps ...map[string]int) []string {

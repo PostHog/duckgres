@@ -19,11 +19,11 @@ The automatic stuck-worker reaper runs every minute and retires workers that hav
 | `sum(duckgres_worker_lifecycle_count{state="activating"})` | Workers currently activating (should be 0 or briefly 1-2) |
 | `sum(duckgres_worker_lifecycle_count{state="reserved"})` | Workers reserved but not yet activating |
 | `duckgres_activation_failures_total` | Total failed activations; use control-plane logs for failure details |
-| `duckgres_worker_retirements_total{reason="stuck_activating"}` | How many workers have been auto-reaped |
+| `duckgres_worker_lifecycle_transitions_total{operation="retire_from_snapshot",origin="janitor_stuck_activating",outcome="transitioned"}` | How many stuck workers have been auto-reaped |
 
 ## Procedure
 
-1. **Check if the reaper is working.** Look for `duckgres_worker_retirements_total{reason="stuck_activating"}` increasing. If it is, the system is self-healing — focus on why activations are failing.
+1. **Check if the reaper is working.** Look for `rate(duckgres_worker_lifecycle_transitions_total{operation="retire_from_snapshot",origin="janitor_stuck_activating",outcome="transitioned"}[5m])` increasing. If it is, the system is self-healing — focus on why activations are failing.
 
 2. **Diagnose activation failures.** Check control-plane logs for activation errors. Common causes:
    - Org config resolver failing (missing config in configstore)

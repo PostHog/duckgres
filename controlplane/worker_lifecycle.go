@@ -255,7 +255,10 @@ func (l *WorkerLifecycle) MarkLostFromLease(lease configstore.WorkerLease, reaso
 	if !transitioned {
 		slog.Debug("Lifecycle mark-lost CAS missed.",
 			"worker_id", lease.WorkerID(), "reason", reason, "origin", origin)
-		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}
+		// Lease-fenced CAS missed: state vs. owner_epoch vs.
+		// state-restriction can't be distinguished from rowsAffected
+		// alone. See TransitionOutcomeFenceMissLease.
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissLease}
 		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
 		return outcome, nil
 	}
@@ -289,7 +292,10 @@ func (l *WorkerLifecycle) Drain(lease configstore.WorkerLease, origin LifecycleO
 		return outcome, err
 	}
 	if !transitioned {
-		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}
+		// MarkWorkerDraining's WHERE clause filters by both state and
+		// (owner, epoch); rowsAffected==0 can mean any of them. Use
+		// the generic lease-miss label.
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissLease}
 		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
 		return outcome, nil
 	}
@@ -323,7 +329,9 @@ func (l *WorkerLifecycle) RetireDrained(lease configstore.WorkerLease, reason st
 		return outcome, err
 	}
 	if !transitioned {
-		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}
+		// Lease-fenced; either the row moved out of draining (e.g.
+		// orphan sweep already retired it) or the lease aged out.
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissLease}
 		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
 		return outcome, nil
 	}
@@ -355,16 +363,16 @@ func (l *WorkerLifecycle) RefreshLease(lease configstore.WorkerLease, origin Lif
 	}
 	newEpoch, err := l.store.BumpWorkerEpoch(lease.WorkerID(), lease.OwnerCPInstanceID(), lease.OwnerEpoch())
 	if err != nil {
-		// BumpWorkerEpoch returns ErrWorkerOwnerEpochMismatch on a lease
-		// mismatch (which is a fence miss, not a store error) and a real
-		// store error otherwise. The wrapper layer that calls RefreshLease
-		// already inspects the error to discriminate; for the metric we
-		// only need a stable outcome bucket — record everything that came
-		// back with an error as fence_miss_owner if the error is a known
-		// CAS miss, else store_error. We don't have the typed error here
-		// without importing more, so default to fence_miss_owner since
-		// that is the dominant case.
-		observeLifecycleTransition(op, configstore.TransitionOutcomeFenceMissOwner, lease.Image(), origin)
+		// BumpWorkerEpoch returns ErrWorkerOwnerEpochMismatch only when
+		// rowsAffected == 0 (a real lease mismatch). Any other error
+		// bubbled up from GORM/the driver — DB unavailable, statement
+		// timeout, etc. — is a store error. Conflating them under
+		// fence_miss_owner would hide outages on dashboards.
+		outcome := configstore.TransitionOutcomeStoreError
+		if errors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
+			outcome = configstore.TransitionOutcomeFenceMissOwner
+		}
+		observeLifecycleTransition(op, outcome, lease.Image(), origin)
 		return configstore.WorkerLease{}, err
 	}
 	observeLifecycleTransition(op, configstore.TransitionOutcomeTransitioned, lease.Image(), origin)

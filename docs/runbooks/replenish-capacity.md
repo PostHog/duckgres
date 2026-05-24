@@ -16,14 +16,14 @@ The shared warm pool maintains `minWorkers` idle workers at all times. When a wo
 |--------|----------------|---------------|
 | `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` | < 1 for > 30s | No idle capacity, new sessions must wait for a spawn |
 | `sum(duckgres_worker_lifecycle_count{state="hot"})` | Near `maxWorkers` | Pool is at capacity, may need to scale `maxWorkers` |
-| `duckgres_worker_retirements_total{reason="crash"}` | Spike | Workers are crashing, replacements may also crash |
+| `duckgres_worker_lifecycle_transitions_total{origin="health_check_crash",outcome="transitioned"}` | Spike | Workers are crashing, replacements may also crash |
 
 ## Procedure
 
-1. **Check why capacity is low.** Look at retirement reasons:
-   - `crash` — workers are dying, check pod logs and OOM events
+1. **Check why capacity is low.** Use `sum by (origin)(rate(duckgres_worker_lifecycle_transitions_total{operation=~"retire_.*|mark_lost_from_lease",outcome="transitioned"}[5m]))` to see the dominant retirement origin:
+   - `health_check_crash` — workers are dying, check pod logs and OOM events
    - `idle_timeout` — workers are being reaped, increase `minWorkers` or decrease `idleTimeout`
-   - `stuck_activating` — activation is broken, see [stuck-activating-workers](stuck-activating-workers.md)
+   - `janitor_stuck_activating` — activation is broken, see [stuck-activating-workers](stuck-activating-workers.md)
 
 2. **Check Kubernetes scheduling.** If pods are Pending:
    ```bash

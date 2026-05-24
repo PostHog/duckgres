@@ -23,21 +23,6 @@ var activationFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Worker activations that failed before reaching hot, partitioned by image. The companion lifecycle transition fires at retireWorkerWithReason with reason=activation_failure.",
 }, []string{"image"})
 
-// Retirement reason constants. Passed as the `reason` argument to
-// WorkerLifecycle.* methods and surfaced on
-// duckgres_worker_lifecycle_transitions_total{outcome=transitioned}
-// as part of the operation context.
-const (
-	RetireReasonNormal            = "normal"
-	RetireReasonActivationFailure = "activation_failure"
-	RetireReasonOrphaned          = "orphaned"
-	RetireReasonCrash             = "crash"
-	RetireReasonShutdown          = "shutdown"
-	RetireReasonIdleTimeout       = "idle_timeout"
-	RetireReasonStuckActivating   = "stuck_activating"
-	RetireReasonMismatchedVersion = "mismatched_version"
-)
-
 func observeActivationDuration(d time.Duration, image string) {
 	img := strings.TrimSpace(image)
 	if img == "" {
