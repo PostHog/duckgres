@@ -53,13 +53,14 @@ type SharedWorkerActivator struct {
 }
 
 // credentialExpiryStore is the slice of the runtime store the activator uses
-// to record when STS-brokered S3 credentials expire on a worker, and to
-// bump the owner epoch atomically when re-activating a worker for refresh.
-// Defined as an interface so tests can substitute a fake without standing
-// up Postgres.
+// to record when STS-brokered S3 credentials expire on a worker.
+// Owner-epoch bumping for credential refresh now flows through
+// lifecycle.RefreshLease, which uses a separate workerLifecycleStore
+// interface internally — this surface stays narrow.
+// Defined as an interface so tests can substitute a fake without
+// standing up Postgres.
 type credentialExpiryStore interface {
 	MarkCredentialsRefreshed(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, expiresAt time.Time) (bool, error)
-	BumpWorkerEpoch(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64) (int64, error)
 }
 
 type TenantActivationPayload struct {

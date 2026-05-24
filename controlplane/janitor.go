@@ -104,11 +104,16 @@ func (j *ControlPlaneJanitor) runOnce() {
 	}
 
 	// Per-worker reaping paths (orphan, stuck, hot-idle) all flow
-	// through the lifecycle service. When no lifecycle is wired (older
-	// non-K8s deployments) we skip them — the rest of runOnce (flight
-	// session expiry, bucket pruning, warm-capacity reconciliation)
-	// still runs.
-	if j.lifecycle != nil {
+	// through the lifecycle service. A nil lifecycle here is a wiring
+	// bug — the only janitor constructor (multitenant.go) sets it
+	// unconditionally. The guard remains as a fail-soft so that
+	// misconfiguration doesn't NPE the entire tick (the rest of
+	// runOnce — flight session expiry, bucket pruning,
+	// warm-capacity reconciliation — still runs); the slog.Error
+	// makes the misconfiguration loud rather than silent.
+	if j.lifecycle == nil {
+		slog.Error("Janitor running without a lifecycle service; per-worker reaping disabled this tick.")
+	} else {
 		orphanedBefore := j.now().Add(-j.orphanGrace)
 		orphaned, err := j.store.ListOrphanedWorkerSnapshots(orphanedBefore)
 		if err != nil {

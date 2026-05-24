@@ -3541,16 +3541,30 @@ ducklake:
 
 func TestK8sPool_ShutdownAll(t *testing.T) {
 	pool, cs := newTestK8sPool(t, 5)
+	// Wire a runtime store so the lifecycle-using ShutdownAll path
+	// actually executes its CAS chain and pod deletes. Without this
+	// every worker's loop body would early-out at the lifecycle nil
+	// check, leaving the test vacuously passing on the in-memory map
+	// emptied by the trailing `p.workers = preserved` line.
+	store := &captureRuntimeWorkerStore{preloadedRecords: map[int]*configstore.WorkerRecord{}}
+	pool.runtimeStore = store
 
-	// Add some workers
 	for i := 0; i < 3; i++ {
 		done := make(chan struct{})
-		pool.workers[i] = &ManagedWorker{ID: i, podName: "duckgres-worker-test-cp-" + strconv.Itoa(i), done: done}
-
-		// Create corresponding pods
+		podName := "duckgres-worker-test-cp-" + strconv.Itoa(i)
+		w := &ManagedWorker{ID: i, podName: podName, done: done}
+		w.SetOwnerCPInstanceID(pool.cpInstanceID)
+		pool.workers[i] = w
+		store.preloadedRecords[i] = &configstore.WorkerRecord{
+			WorkerID:          i,
+			PodName:           podName,
+			State:             configstore.WorkerStateIdle,
+			OwnerCPInstanceID: pool.cpInstanceID,
+			OwnerEpoch:        w.OwnerEpoch(),
+		}
 		_, _ = cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "duckgres-worker-test-cp-" + strconv.Itoa(i),
+				Name:      podName,
 				Namespace: "default",
 				Labels: map[string]string{
 					"duckgres/control-plane": "test-cp",
@@ -3567,6 +3581,15 @@ func TestK8sPool_ShutdownAll(t *testing.T) {
 	pool.mu.RUnlock()
 	if count != 0 {
 		t.Fatalf("expected 0 workers after shutdown, got %d", count)
+	}
+	if store.markDrainingCalls != 3 || store.retireDrainingCalls != 3 {
+		t.Fatalf("expected 3 Drain + 3 RetireDrained CAS calls, got drain=%d retire=%d", store.markDrainingCalls, store.retireDrainingCalls)
+	}
+	for i := 0; i < 3; i++ {
+		podName := "duckgres-worker-test-cp-" + strconv.Itoa(i)
+		if podExists(t, cs, podName) {
+			t.Fatalf("expected pod %q to be deleted", podName)
+		}
 	}
 }
 

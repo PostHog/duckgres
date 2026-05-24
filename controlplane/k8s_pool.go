@@ -96,7 +96,8 @@ type K8sWorkerPool struct {
 	healthCheckFunc               func(context.Context, *ManagedWorker) error
 	connectWorkerFunc             func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error)
 	runtimeStore                  RuntimeWorkerStore
-	lifecycle                     *WorkerLifecycle // typed lifecycle transitions; nil safe (callers fall back to legacy paths)
+	lifecycle                     *WorkerLifecycle // typed lifecycle transitions; lazily wired via ensureLifecycle().
+	lifecycleOnce                 sync.Once        // guards lazy initialization of lifecycle from concurrent first-callers.
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 
@@ -1831,12 +1832,23 @@ func (p *K8sWorkerPool) DeleteWorkerArtifacts(workerID int, podName, reason stri
 // Returns nil when no runtime store is available, or when the store
 // doesn't satisfy workerLifecycleStore (process backend / minimal
 // mocks that intentionally don't implement the CAS methods).
+//
+// Guarded by sync.Once so concurrent first-callers (e.g. idleReaper
+// and janitor goroutines) don't race on the field assignment. The Once
+// is per-pool, so test pools that build a fresh pool per test still
+// get fresh lifecycle initialization.
 func (p *K8sWorkerPool) ensureLifecycle() *WorkerLifecycle {
-	if p.lifecycle == nil && p.runtimeStore != nil {
+	p.lifecycleOnce.Do(func() {
+		if p.lifecycle != nil {
+			return
+		}
+		if p.runtimeStore == nil {
+			return
+		}
 		if ls, ok := p.runtimeStore.(workerLifecycleStore); ok {
 			p.lifecycle = NewWorkerLifecycle(ls, p)
 		}
-	}
+	})
 	return p.lifecycle
 }
 
@@ -1873,36 +1885,6 @@ func (p *K8sWorkerPool) deleteRetiredRuntimeWorker(record *configstore.WorkerRec
 	}
 
 	go p.retireWorkerPod(record.WorkerID, worker)
-}
-
-// retireOrphanWorker retires a worker the orphan janitor has identified
-// (its owning CP is expired, missing, or never existed). Unlike
-// retireClaimedWorker, this path skips the in-memory pool bookkeeping
-// (the worker isn't owned by this CP) and uses the broader
-// RetireOrphanWorker DB transition that handles every active state, not
-// just idle/hot_idle. The K8s pod delete is fire-and-forget and harmless
-// if the pod is already gone.
-func (p *K8sWorkerPool) retireOrphanWorker(record *configstore.WorkerRecord, reason string) {
-	if p.runtimeStore == nil || record == nil {
-		return
-	}
-	retired, err := p.runtimeStore.RetireOrphanWorker(record, reason)
-	if err != nil {
-		slog.Warn("Failed to retire orphan worker.",
-			"worker_id", record.WorkerID, "reason", reason, "error", err)
-		return
-	}
-	if !retired {
-		slog.Debug("Orphan worker changed before retirement; skipping pod delete.",
-			"worker_id", record.WorkerID, "reason", reason)
-		return
-	}
-	worker := &ManagedWorker{
-		ID:      record.WorkerID,
-		podName: record.PodName,
-		done:    make(chan struct{}),
-	}
-	go p.retireWorkerPod(worker.ID, worker)
 }
 
 func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker *ManagedWorker) error {

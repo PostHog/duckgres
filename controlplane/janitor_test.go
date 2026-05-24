@@ -200,8 +200,20 @@ func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	if got := lifecycleStore.orphanTransitions; len(got) != 1 || got[0].workerID != 7 || got[0].reason != janitorRetireReasonOrphaned {
 		t.Fatalf("expected one orphan CAS via lifecycle for worker 7, got %#v", got)
 	}
+	// The snapshot the janitor passed to RetireOrphanFromSnapshot must
+	// carry the listed row's identity verbatim — owner_cp_instance_id +
+	// state are what the underlying SQL fence keys off. The mock
+	// records both so a regression that strips fields from the
+	// snapshot in transit gets caught here, not just by the postgres
+	// integration tests.
+	if got := lifecycleStore.orphanTransitions[0]; got.state != configstore.WorkerStateHot {
+		t.Fatalf("expected orphan snapshot to carry state=hot, got %q", got.state)
+	}
 	if got := lifecycleStore.terminalTransitions; len(got) != 1 || got[0].workerID != 9 || got[0].reason != janitorRetireReasonStuckActivating || got[0].target != configstore.WorkerStateRetired {
 		t.Fatalf("expected one terminal CAS via lifecycle for stuck worker 9 → retired, got %#v", got)
+	}
+	if got := lifecycleStore.terminalTransitions[0]; got.state != configstore.WorkerStateActivating {
+		t.Fatalf("expected stuck snapshot to carry state=activating, got %q", got.state)
 	}
 	if got := cleanup.snapshot(); len(got) != 2 {
 		t.Fatalf("expected two cleanup calls (orphan + stuck), got %#v", got)
