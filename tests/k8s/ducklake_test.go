@@ -116,6 +116,13 @@ func TestK8sDuckLakeDurabilityAcrossWorkerRestart(t *testing.T) {
 	if count != rows {
 		t.Fatalf("post-restart row count = %d, want %d (data did not survive worker restart)", count, rows)
 	}
+
+	// Wait for the CP to finish housekeeping the killed worker (cleanup
+	// of the orphan pod/secret, warm-pool replenishment activation)
+	// before returning. Without this, the trailing apiserver activity
+	// drops the next test's port-forward at an arbitrary point and the
+	// retry layer can re-issue in-flight queries.
+	waitForControlPlaneIdle(t, 60*time.Second)
 }
 
 // TestK8sDuckLakeConcurrentWriters exercises the PostHog DuckLake fork's
@@ -123,22 +130,14 @@ func TestK8sDuckLakeDurabilityAcrossWorkerRestart(t *testing.T) {
 // own connection, INSERT into the same table. With the fork's retry
 // semantics every commit should eventually land; without retries (or with
 // a regression that suppresses retries on certain SQLSTATEs) the test
-// would either fail with a conflict error or end up with fewer (writer,
-// id) tuples than expected.
+// would either fail with a conflict error or end up with fewer rows than
+// expected.
 //
 // We deliberately don't assert no-conflicts-occurred: that's the wrong
 // invariant. The invariant is no-rows-lost — conflicts are fine as long
-// as the retry layer makes every writer eventually succeed.
-//
-// We assert on COUNT(DISTINCT (writer, id)) rather than COUNT(*) so the
-// test is resilient to the at-least-once retry semantics in
-// retryDBOperationWithReconnect: that helper retries on any error,
-// including post-commit connection drops where the server already
-// applied the INSERT. A re-INSERT under those conditions produces an
-// exact-duplicate (writer, id) tuple, so the distinct count is still
-// 100 even when the raw row count is higher. The load-bearing
-// property is "every (writer, id) is present at least once," not
-// "exactly one copy of every row."
+// as the retry layer makes every writer eventually succeed, and we
+// assert on COUNT(*) so a regression that produces duplicate rows is
+// caught here rather than silently masked.
 func TestK8sDuckLakeConcurrentWriters(t *testing.T) {
 	tableName := fmt.Sprintf("ducklake.dl_concurrent_%d", time.Now().UnixNano())
 	const writers = 4
@@ -190,12 +189,12 @@ func TestK8sDuckLakeConcurrentWriters(t *testing.T) {
 		return
 	}
 
-	var distinct int
-	if err := retryScanIntWithReconnect("SELECT COUNT(*) FROM (SELECT DISTINCT writer, id FROM "+tableName+")", 30*time.Second, &distinct); err != nil {
-		t.Fatalf("count distinct concurrent tuples: %v", err)
+	var count int
+	if err := retryScanIntWithReconnect("SELECT COUNT(*) FROM "+tableName, 30*time.Second, &count); err != nil {
+		t.Fatalf("count concurrent rows: %v", err)
 	}
 	want := writers * rowsPerWriter
-	if distinct != want {
-		t.Fatalf("concurrent distinct (writer, id) tuples = %d, want %d — DuckLake fork's conflict retry did not preserve all writes", distinct, want)
+	if count != want {
+		t.Fatalf("concurrent row count = %d, want %d — DuckLake fork's conflict retry did not preserve all writes", count, want)
 	}
 }
