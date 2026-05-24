@@ -315,13 +315,23 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 		return fmt.Errorf("activate tenant for refresh: %w", err)
 	}
 
-	if _, err := a.runtimeStore.MarkCredentialsRefreshed(
-		worker.ID, cpInstanceID, newEpoch, *payload.S3CredentialsExpiresAt,
-	); err != nil {
-		// The worker has new creds in DuckDB; we just couldn't record the
-		// new expiry. Next tick will see a stale expiry and refresh again.
-		slog.Warn("Failed to record refreshed credential expiry.",
-			"worker_id", worker.ID, "org", payload.OrgID, "error", err)
+	if a.runtimeStore != nil {
+		// Guarded against a future store implementation that satisfies
+		// workerLifecycleStore (for the RefreshLease above) but not
+		// credentialExpiryStore. Production ConfigStore satisfies
+		// both, but the two type assertions in NewSharedWorkerActivator
+		// are independent and a partial mock could leave runtimeStore
+		// nil while lifecycle is set. The expiry stamp is best-effort
+		// — skipping it just means the next refresh tick sees a stale
+		// expiry and refreshes again.
+		if _, err := a.runtimeStore.MarkCredentialsRefreshed(
+			worker.ID, cpInstanceID, newEpoch, *payload.S3CredentialsExpiresAt,
+		); err != nil {
+			// The worker has new creds in DuckDB; we just couldn't record the
+			// new expiry. Next tick will see a stale expiry and refresh again.
+			slog.Warn("Failed to record refreshed credential expiry.",
+				"worker_id", worker.ID, "org", payload.OrgID, "error", err)
+		}
 	}
 	return nil
 }
