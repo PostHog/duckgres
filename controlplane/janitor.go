@@ -18,9 +18,11 @@ type controlPlaneExpiryStore interface {
 	ExpireControlPlaneInstances(cutoff time.Time) (int64, error)
 	ExpireDrainingControlPlaneInstances(before time.Time) (int64, error)
 	ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error)
+	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
 	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
 	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
+	ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
 	RetireHotIdleWorker(record *configstore.WorkerRecord) (bool, error)
 }
 
@@ -43,6 +45,7 @@ type ControlPlaneJanitor struct {
 	retireOrphanWorker            func(record configstore.WorkerRecord, reason string) // orphan-cleanup variant: handles any active state, skips local-pool bookkeeping
 	retireLocalWorker             func(workerID int, reason string) bool               // retires from in-memory pool + pod, returns false if not local
 	deleteRetiredWorker           func(record configstore.WorkerRecord, reason string) // post-CAS cleanup: only remove local state / delete pod
+	lifecycle                     *WorkerLifecycle                                     // typed lifecycle transitions; when set, hot-idle path goes through it
 	reconcileWarmCapacity         func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
@@ -108,22 +111,42 @@ func (j *ControlPlaneJanitor) runOnce() {
 	}
 
 	orphanedBefore := j.now().Add(-j.orphanGrace)
-	orphaned, err := j.store.ListOrphanedWorkers(orphanedBefore)
-	if err != nil {
-		slog.Warn("Janitor failed to list orphaned workers.", "error", err)
-	} else {
-		if len(orphaned) > 0 {
-			slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
+	if j.lifecycle != nil {
+		// Lifecycle path: snapshot-typed list + RetireOrphanFromSnapshot,
+		// which carries the orphan-specific CP-revival fence already.
+		orphaned, err := j.store.ListOrphanedWorkerSnapshots(orphanedBefore)
+		if err != nil {
+			slog.Warn("Janitor failed to list orphaned workers.", "error", err)
+		} else {
+			if len(orphaned) > 0 {
+				slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
+			}
+			for _, snap := range orphaned {
+				outcome, err := j.lifecycle.RetireOrphanFromSnapshot(snap, janitorRetireReasonOrphaned)
+				if err != nil {
+					slog.Warn("Janitor failed to retire orphan worker.", "worker_id", snap.WorkerID(), "error", err)
+					continue
+				}
+				_ = outcome // metrics-bearing outcome consumed once PR 6 lands.
+			}
 		}
-		for _, worker := range orphaned {
-			// Prefer the orphan-specific retire path so workers in any
-			// active state transition to retired (not just idle/hot_idle
-			// like the older retireRuntimeWorker chain). Fall back to the
-			// legacy path if a caller hasn't wired the new lambda.
-			if j.retireOrphanWorker != nil {
-				j.retireOrphanWorker(worker, janitorRetireReasonOrphaned)
-			} else {
-				j.retireRuntimeWorker(worker, janitorRetireReasonOrphaned)
+	} else {
+		orphaned, err := j.store.ListOrphanedWorkers(orphanedBefore)
+		if err != nil {
+			slog.Warn("Janitor failed to list orphaned workers.", "error", err)
+		} else {
+			if len(orphaned) > 0 {
+				slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
+			}
+			for _, worker := range orphaned {
+				// Legacy path retained for deployments that don't wire a
+				// lifecycle service. PR 4 prunes once every deployment
+				// uses the lifecycle path.
+				if j.retireOrphanWorker != nil {
+					j.retireOrphanWorker(worker, janitorRetireReasonOrphaned)
+				} else {
+					j.retireRuntimeWorker(worker, janitorRetireReasonOrphaned)
+				}
 			}
 		}
 	}
@@ -141,31 +164,50 @@ func (j *ControlPlaneJanitor) runOnce() {
 
 	if j.hotIdleTTL > 0 {
 		cutoff := j.now().Add(-j.hotIdleTTL)
-		expired, err := j.store.ListExpiredHotIdleWorkers(cutoff)
-		if err != nil {
-			slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
-		}
-		for _, record := range expired {
-			// Atomically transition from hot_idle to retired in the DB.
-			// If the worker was concurrently reclaimed (no longer hot_idle),
-			// the conditional update returns false and we skip retirement.
-			retired, err := j.store.RetireHotIdleWorker(&record)
+		if j.lifecycle != nil {
+			// Lifecycle path: one snapshot-fenced call per expired row.
+			// The lifecycle service handles both the durable CAS and the
+			// post-CAS pod/secret cleanup, so the janitor no longer has
+			// to choose between retireLocalWorker / retireWorker /
+			// deleteRetiredWorker fallbacks.
+			expired, err := j.store.ListExpiredHotIdleSnapshots(cutoff)
 			if err != nil {
-				slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", record.WorkerID, "error", err)
-				continue
+				slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 			}
-			if !retired {
-				continue // Worker was reclaimed concurrently
+			for _, snap := range expired {
+				outcome, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "hot_idle_ttl_expired")
+				if err != nil {
+					slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", snap.WorkerID(), "error", err)
+					continue
+				}
+				_ = outcome // metrics-bearing outcome consumed once PR 6 lands.
 			}
-			if j.deleteRetiredWorker != nil {
-				j.deleteRetiredWorker(record, "hot_idle_ttl_expired")
-				continue
+		} else {
+			// Legacy path retained for process-pool / non-lifecycle
+			// deployments. Removed entirely once PR 4 prunes the
+			// retireWorker / retireLocalWorker / deleteRetiredWorker
+			// lambdas after every lifecycle-bearing caller is migrated.
+			expired, err := j.store.ListExpiredHotIdleWorkers(cutoff)
+			if err != nil {
+				slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 			}
-			// Try local retire first (removes from in-memory pool + deletes pod).
-			// Falls back to remote retire if the worker isn't in our local pool.
-			localRetired := j.retireLocalWorker != nil && j.retireLocalWorker(record.WorkerID, "hot_idle_ttl_expired")
-			if !localRetired {
-				j.retireRuntimeWorker(record, "hot_idle_ttl_expired")
+			for _, record := range expired {
+				retired, err := j.store.RetireHotIdleWorker(&record)
+				if err != nil {
+					slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", record.WorkerID, "error", err)
+					continue
+				}
+				if !retired {
+					continue
+				}
+				if j.deleteRetiredWorker != nil {
+					j.deleteRetiredWorker(record, "hot_idle_ttl_expired")
+					continue
+				}
+				localRetired := j.retireLocalWorker != nil && j.retireLocalWorker(record.WorkerID, "hot_idle_ttl_expired")
+				if !localRetired {
+					j.retireRuntimeWorker(record, "hot_idle_ttl_expired")
+				}
 			}
 		}
 	}

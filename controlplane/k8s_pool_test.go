@@ -121,6 +121,13 @@ type captureRuntimeWorkerStore struct {
 	retireDrainingReasons            []string
 	retireDrainingMisses             map[int]bool
 	retireDrainingErr                error
+	// Tracking for BumpWorkerEpoch (added with the lifecycle service in PR 3).
+	bumpEpochCalls            int
+	bumpEpochCalledIDs        []int
+	bumpEpochCalledCPs        []string
+	bumpEpochCalledExpected   []int64
+	bumpEpochNewEpochOverride int64 // when non-zero, returned instead of expectedEpoch+1
+	bumpEpochErr              error
 	// events records a unified, ordered timeline of state transitions on
 	// this store so tests can assert happens-before relationships (e.g.
 	// that pod-delete occurs between markDraining and retireDraining).
@@ -292,6 +299,41 @@ func (s *captureRuntimeWorkerStore) GetWorkerRecord(workerID int) (*configstore.
 		return &record, nil
 	}
 	return nil, nil
+}
+
+// ObserveWorker satisfies the RuntimeWorkerStore extension added in PR 3.
+// Wraps GetWorkerRecord into a snapshot so lifecycle-service code paths
+// can be exercised without the test caring about the wrapping detail.
+func (s *captureRuntimeWorkerStore) ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error) {
+	record, err := s.GetWorkerRecord(workerID)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil {
+		return nil, nil
+	}
+	snap := configstore.NewWorkerSnapshot(*record)
+	return &snap, nil
+}
+
+// BumpWorkerEpoch satisfies the RuntimeWorkerStore extension added in
+// PR 3. Track-and-return-newepoch so tests can exercise the lifecycle
+// service's RefreshLease method without standing up a real ConfigStore.
+func (s *captureRuntimeWorkerStore) BumpWorkerEpoch(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bumpEpochCalls++
+	s.bumpEpochCalledIDs = append(s.bumpEpochCalledIDs, workerID)
+	s.bumpEpochCalledCPs = append(s.bumpEpochCalledCPs, ownerCPInstanceID)
+	s.bumpEpochCalledExpected = append(s.bumpEpochCalledExpected, expectedOwnerEpoch)
+	if s.bumpEpochErr != nil {
+		return 0, s.bumpEpochErr
+	}
+	newEpoch := expectedOwnerEpoch + 1
+	if s.bumpEpochNewEpochOverride != 0 {
+		newEpoch = s.bumpEpochNewEpochOverride
+	}
+	return newEpoch, nil
 }
 
 func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error) {
@@ -3831,6 +3873,9 @@ func mismatchVersionTestPool(t *testing.T, cpID string, store RuntimeWorkerStore
 		runtimeStore: store,
 		retireSem:    make(chan struct{}, 5),
 	}
+	if store != nil {
+		pool.lifecycle = NewWorkerLifecycle(store, pool)
+	}
 	return pool, cs
 }
 
@@ -4288,6 +4333,13 @@ func shutdownTestPool(t *testing.T, store *captureRuntimeWorkerStore) (*K8sWorke
 	t.Helper()
 	pool, cs := newTestK8sPool(t, 5)
 	pool.runtimeStore = store
+	// Wire the lifecycle service so every ShutdownAll test drives the
+	// migrated Drain → pod-delete → RetireDrained chain (the path that
+	// commit f1afa61 introduced). The lifecycle delegates to the same
+	// store methods the legacy path called, so the existing
+	// markDrainingCalls / retireDrainingCalls / events assertions still
+	// observe the right calls — but now via the typed seam.
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
 	// Intercept pod deletions so the test can assert that Delete is invoked
 	// strictly between MarkWorkerDraining and RetireDrainingWorker.
 	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {

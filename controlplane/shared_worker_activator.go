@@ -38,6 +38,7 @@ type SharedWorkerActivator struct {
 	defaultSpecVersion     string
 	stsBroker              *STSBroker
 	runtimeStore           credentialExpiryStore
+	lifecycle              *WorkerLifecycle // typed RefreshLease entry point; same epoch-bump CAS as direct BumpWorkerEpoch
 	resolveOrgConfig       func(string) (*configstore.OrgConfig, error)
 	resolveDucklingStatus  func(context.Context, string) (*provisioner.DucklingStatus, error)
 	activateReservedWorker func(context.Context, *ManagedWorker, TenantActivationPayload) error
@@ -98,6 +99,12 @@ func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, defau
 	if rs, ok := shared.runtimeStore.(credentialExpiryStore); ok {
 		a.runtimeStore = rs
 	}
+	// Borrow the pool's lifecycle service when available so the
+	// cred-refresh path can mint a typed WorkerLease via RefreshLease
+	// instead of calling BumpWorkerEpoch directly. Tests that construct
+	// a pool without a lifecycle get a nil here and fall back to the
+	// legacy direct-store path.
+	a.lifecycle = shared.lifecycle
 	return a
 }
 
@@ -277,9 +284,23 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 
 	currentEpoch := worker.OwnerEpoch()
 	cpInstanceID := worker.OwnerCPInstanceID()
-	newEpoch, err := a.runtimeStore.BumpWorkerEpoch(worker.ID, cpInstanceID, currentEpoch)
-	if err != nil {
-		return fmt.Errorf("bump owner epoch for refresh: %w", err)
+	var newEpoch int64
+	if a.lifecycle != nil {
+		newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch))
+		if err != nil {
+			// Keep the legacy "bump owner epoch for refresh" wrapper
+			// wording even though the lifecycle method is named
+			// RefreshLease, so log-grep / dashboard filters that
+			// pattern-match on the previous string still work.
+			return fmt.Errorf("bump owner epoch for refresh: %w", err)
+		}
+		newEpoch = newLease.OwnerEpoch()
+	} else {
+		var err error
+		newEpoch, err = a.runtimeStore.BumpWorkerEpoch(worker.ID, cpInstanceID, currentEpoch)
+		if err != nil {
+			return fmt.Errorf("bump owner epoch for refresh: %w", err)
+		}
 	}
 	worker.SetOwnerEpoch(newEpoch)
 

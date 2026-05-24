@@ -52,6 +52,24 @@ func (s *captureControlPlaneExpiryStore) snapshot() []time.Time {
 	return out
 }
 
+// ListOrphanedWorkerSnapshots is the lifecycle-typed counterpart used
+// by the migrated janitor orphan path. The mock wraps the same orphan
+// slice through NewWorkerSnapshot so existing fixtures that
+// populate orphanedWorkers also drive the lifecycle path when a
+// lifecycle is wired.
+func (s *captureControlPlaneExpiryStore) ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.orphanedWorkers) == 0 {
+		return nil, nil
+	}
+	out := make([]configstore.WorkerSnapshot, 0, len(s.orphanedWorkers))
+	for _, rec := range s.orphanedWorkers {
+		out = append(out, configstore.NewWorkerSnapshot(rec))
+	}
+	return out, nil
+}
+
 func (s *captureControlPlaneExpiryStore) ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -83,6 +101,23 @@ func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleWorkers(before time.T
 	defer s.mu.Unlock()
 	out := make([]configstore.WorkerRecord, len(s.expiredHotIdleWorkers))
 	copy(out, s.expiredHotIdleWorkers)
+	return out, nil
+}
+
+// ListExpiredHotIdleSnapshots is the lifecycle-typed counterpart used
+// by the migrated janitor hot-idle path. The mock wraps the same
+// underlying slice through NewWorkerSnapshot so existing
+// tests can opt into the lifecycle path by setting expiredHotIdleWorkers.
+func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.expiredHotIdleWorkers) == 0 {
+		return nil, nil
+	}
+	out := make([]configstore.WorkerSnapshot, 0, len(s.expiredHotIdleWorkers))
+	for _, rec := range s.expiredHotIdleWorkers {
+		out = append(out, configstore.NewWorkerSnapshot(rec))
+	}
 	return out, nil
 }
 
@@ -348,6 +383,92 @@ func TestControlPlaneJanitorSkipsHotIdlePodDeleteAfterStoreMiss(t *testing.T) {
 	}
 	if len(deleted) != 0 {
 		t.Fatalf("expected no pod delete after hot-idle CAS miss, got %#v", deleted)
+	}
+}
+
+func TestControlPlaneJanitorHotIdleGoesThroughLifecycleWhenWired(t *testing.T) {
+	now := time.Date(2026, time.May, 22, 14, 10, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          21,
+		PodName:           "duckgres-worker-21",
+		State:             configstore.WorkerStateHotIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{listed},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.hotIdleTTL = time.Minute
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+	// The lifecycle path must not touch the legacy delete callback —
+	// the cleanup goes through the lifecycle's WorkerPhysicalCleanup.
+	janitor.deleteRetiredWorker = func(record configstore.WorkerRecord, reason string) {
+		t.Fatalf("lifecycle hot-idle path must not invoke deleteRetiredWorker fallback: worker=%d", record.WorkerID)
+	}
+	janitor.retireLocalWorker = func(int, string) bool {
+		t.Fatal("lifecycle hot-idle path must not invoke retireLocalWorker fallback")
+		return false
+	}
+	janitor.retireWorker = func(configstore.WorkerRecord, string) {
+		t.Fatal("lifecycle hot-idle path must not invoke retireWorker fallback")
+	}
+
+	janitor.runOnce()
+
+	if got := lifecycleStore.terminalTransitions; len(got) != 1 || got[0].workerID != 21 || got[0].target != configstore.WorkerStateRetired {
+		t.Fatalf("expected one terminal CAS via lifecycle for worker 21 → retired, got %#v", got)
+	}
+	if got := cleanup.snapshot(); len(got) != 1 || got[0].workerID != 21 || got[0].reason != "hot_idle_ttl_expired" {
+		t.Fatalf("expected lifecycle cleanup for worker 21, got %#v", got)
+	}
+}
+
+func TestControlPlaneJanitorOrphanGoesThroughLifecycleWhenWired(t *testing.T) {
+	// Symmetric to the hot-idle lifecycle test: when a lifecycle service is
+	// wired, the orphan path must flow through lifecycle.RetireOrphanFromSnapshot
+	// rather than the legacy retireOrphanWorker / retireWorker lambda chain.
+	// Guards against the orphan migration silently falling back to legacy
+	// because a future refactor accidentally clears the lifecycle field or
+	// adds a new fallback branch above the lifecycle check.
+	now := time.Date(2026, time.May, 22, 15, 20, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          31,
+		PodName:           "duckgres-worker-31",
+		State:             configstore.WorkerStateHot,
+		OwnerCPInstanceID: "cp-expired:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	store := &captureControlPlaneExpiryStore{
+		orphanedWorkers: []configstore.WorkerRecord{listed},
+	}
+	lifecycleStore := &fakeLifecycleStore{orphanReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+	janitor.retireWorker = func(configstore.WorkerRecord, string) {
+		t.Fatal("lifecycle orphan path must not invoke retireWorker fallback")
+	}
+	janitor.retireOrphanWorker = func(record configstore.WorkerRecord, reason string) {
+		t.Fatalf("lifecycle orphan path must not invoke retireOrphanWorker fallback: worker=%d reason=%s", record.WorkerID, reason)
+	}
+	janitor.deleteRetiredWorker = func(configstore.WorkerRecord, string) {
+		t.Fatal("lifecycle orphan path must not invoke deleteRetiredWorker fallback")
+	}
+
+	janitor.runOnce()
+
+	if got := lifecycleStore.orphanTransitions; len(got) != 1 || got[0].workerID != 31 || got[0].reason != janitorRetireReasonOrphaned {
+		t.Fatalf("expected one orphan CAS via lifecycle for worker 31, got %#v", got)
+	}
+	if got := cleanup.snapshot(); len(got) != 1 || got[0].workerID != 31 || got[0].reason != janitorRetireReasonOrphaned {
+		t.Fatalf("expected lifecycle cleanup for orphan worker 31, got %#v", got)
 	}
 }
 

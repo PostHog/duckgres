@@ -253,6 +253,11 @@ func SetupMultiTenant(
 	janitor.deleteRetiredWorker = func(record configstore.WorkerRecord, reason string) {
 		router.sharedPool.deleteRetiredRuntimeWorker(&record, reason)
 	}
+	// Hand the shared pool's lifecycle service to the janitor so the
+	// hot-idle reaper path goes through one snapshot-fenced CAS-and-cleanup
+	// call instead of the older retireLocalWorker / retireWorker /
+	// deleteRetiredWorker fallback chain.
+	janitor.lifecycle = router.sharedPool.lifecycle
 	lastWarmCapacityTargets := map[string]int{}
 	var lastWarmCapacityRecentMisses []configstore.WarmCapacityMissAggregate
 	var lastWarmCapacityWorkerStats []configstore.WarmCapacityWorkerStats
