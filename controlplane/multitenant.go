@@ -299,6 +299,13 @@ func SetupMultiTenant(
 		if n := router.sharedPool.cleanupOrphanedWorkerPods(ctx, 2*time.Minute); n > 0 {
 			slog.Info("Stranded worker pods reconciled.", "count", n)
 		}
+		// Sibling reconciler that catches a secret created without a
+		// pod (spawn crashed between createSecret and createPod). The
+		// pod-cleanup loop above only iterates pods, so this is the
+		// only place that reclaims those orphans.
+		if n := router.sharedPool.cleanupOrphanedWorkerSecrets(ctx, 2*time.Minute); n > 0 {
+			slog.Info("Stranded worker RPC secrets reconciled.", "count", n)
+		}
 	}
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance
