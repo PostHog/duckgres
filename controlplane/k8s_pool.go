@@ -455,12 +455,17 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge
 	if p.clientset == nil {
 		return 0
 	}
-	// Worker RPC secrets are labeled at creation with
-	// app=duckgres + duckgres/worker-pod=<podName>. The label
-	// selector restricts the list to secrets we own; the
-	// per-secret pod lookup decides whether to reap.
+	// Worker RPC secrets are labeled at creation (worker_rpc_security.go
+	// ensureWorkerRPCSecret) with app=duckgres +
+	// duckgres/control-plane=<p.cpID> + duckgres/worker-pod=<podName>.
+	// The selector narrows by control-plane so each CP only reaps
+	// its own secrets — critical during rolling restarts and blue/green
+	// deployments where multiple CP replicas share the namespace and
+	// a peer's freshly-created secret (whose pod hasn't been spawned
+	// yet) must not be reaped. p.cpID is used unsanitized to match
+	// the value the creation path stamps.
 	secrets, err := p.clientset.CoreV1().Secrets(p.namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: "app=duckgres,duckgres/worker-pod",
+		LabelSelector: fmt.Sprintf("app=duckgres,duckgres/control-plane=%s,duckgres/worker-pod", p.cpID),
 	})
 	if err != nil {
 		slog.Warn("Stranded-secret reconciler failed to list worker RPC secrets.", "error", err)

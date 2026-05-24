@@ -4386,6 +4386,69 @@ func TestCleanupOrphanedWorkerSecrets_KeepsSecretsForLivePods(t *testing.T) {
 	}
 }
 
+func TestCleanupOrphanedWorkerSecrets_SkipsEmptyPodLabel(t *testing.T) {
+	// The selector "duckgres/worker-pod" matches any secret with that
+	// label key (including empty value). Guard against deleting
+	// secrets whose worker-pod label is malformed — we can't look up
+	// a pod with no name. The reaper continues past such secrets
+	// rather than attempting an empty-name Get.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := strandedReconcilerPool(t, store)
+	createdAt := metav1.NewTime(time.Now().Add(-time.Hour))
+	if _, err := cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "weird-secret-with-empty-worker-pod",
+			Namespace:         "default",
+			CreationTimestamp: createdAt,
+			Labels: map[string]string{
+				"app":                    "duckgres",
+				"duckgres/control-plane": pool.cpID,
+				"duckgres/worker-pod":    "",
+			},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create secret: %v", err)
+	}
+
+	if deleted := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
+		t.Fatalf("expected reaper to skip secret with empty worker-pod label, got %d deletions", deleted)
+	}
+	if _, err := cs.CoreV1().Secrets("default").Get(context.Background(), "weird-secret-with-empty-worker-pod", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected malformed secret to survive: %v", err)
+	}
+}
+
+func TestCleanupOrphanedWorkerSecrets_OnlyReapsOwnControlPlane(t *testing.T) {
+	// Multi-CP namespace: each CP must only reap secrets it created.
+	// A peer CP's freshly-orphaned-looking secret (no matching pod
+	// from this CP's view, but actually still managed by the peer)
+	// must NOT be deleted.
+	store := &captureRuntimeWorkerStore{}
+	pool, cs := strandedReconcilerPool(t, store)
+	createdAt := metav1.NewTime(time.Now().Add(-time.Hour))
+	if _, err := cs.CoreV1().Secrets("default").Create(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "peer-cp-secret",
+			Namespace:         "default",
+			CreationTimestamp: createdAt,
+			Labels: map[string]string{
+				"app":                    "duckgres",
+				"duckgres/control-plane": "some-other-cp",
+				"duckgres/worker-pod":    "peer-worker",
+			},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create peer-cp secret: %v", err)
+	}
+
+	if deleted := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
+		t.Fatalf("expected zero deletions of peer-CP secrets, got %d", deleted)
+	}
+	if _, err := cs.CoreV1().Secrets("default").Get(context.Background(), "peer-cp-secret", metav1.GetOptions{}); err != nil {
+		t.Fatalf("expected peer-CP secret to survive: %v", err)
+	}
+}
+
 func TestCleanupOrphanedWorkerSecrets_RespectsMinAge(t *testing.T) {
 	// minAge protects newly-created secrets that the spawn flow is
 	// still using (createSecret completed but createPod hasn't yet).

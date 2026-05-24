@@ -34,19 +34,19 @@ func TestManagedWorkerRefreshOwnerEpochAtomicSerializesWithReaders(t *testing.T)
 	}()
 
 	<-dbCalled
-	// The refresh callback is now running under the lock. A concurrent
-	// OwnerEpoch() must block — kick it off and watch for that.
+	// The refresh callback is now running under the lock. The positive
+	// assertion below is what proves the mutex is doing its job: after
+	// the callback completes, the concurrent OwnerEpoch() must return
+	// the post-CAS value (6), not a torn or pre-CAS read. If the
+	// mutex regressed, the goroutine that started before
+	// close(dbComplete) could capture the pre-CAS value (5) into
+	// readDone before the in-memory store. We don't bother with a
+	// timing-based "is the goroutine blocked right now?" check — that
+	// race-detects scheduler delay rather than mutex correctness.
 	readDone := make(chan int64, 1)
 	go func() {
 		readDone <- w.OwnerEpoch()
 	}()
-
-	select {
-	case got := <-readDone:
-		t.Fatalf("OwnerEpoch() returned %d while RefreshOwnerEpochAtomic held the lock; expected blocked read", got)
-	default:
-		// Expected: read is blocked.
-	}
 
 	close(dbComplete)
 	if err := <-refreshDone; err != nil {

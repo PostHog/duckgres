@@ -103,8 +103,19 @@ func (w *ManagedWorker) IncrementOwnerEpoch() int64 {
 // epoch between the durable bump and the in-memory set, build a stale
 // lease, and CAS-miss against the now-advanced row.
 //
-// The callback runs under the lock — keep its work tightly scoped to
-// the durable round-trip. If the callback returns an error the
+// Latency note: the callback runs under the lock, and the
+// credential-refresh callback does a single DB round-trip
+// (BumpWorkerEpoch). Worst-case stall for any concurrent
+// OwnerEpoch() reader on the same worker is one round-trip
+// (~10ms in practice). Because the lock is per-worker, refreshing
+// worker A does not block reads on worker B — but readers that
+// hold the pool-wide K8sWorkerPool.mu (e.g. iterations in
+// cleanDeadWorkersLocked) will serialize behind any in-flight
+// refresh on the worker they're inspecting. If this latency budget
+// ever becomes a problem, the path forward is to bound cred-refresh
+// concurrency or move to a "refresh-in-progress" sentinel rather
+// than a held mutex. Keep callback work tightly scoped to the
+// durable round-trip. If the callback returns an error the
 // in-memory epoch is left unchanged.
 func (w *ManagedWorker) RefreshOwnerEpochAtomic(fn func(current int64) (int64, error)) error {
 	w.epochMu.Lock()
