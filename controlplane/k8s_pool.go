@@ -387,23 +387,21 @@ func workerImageForPod(pod *corev1.Pod) string {
 // upserting the DB row, so there's a brief window where a live pod has no DB
 // record. Without the age gate the reconciler would race the spawner.
 //
-// Returns the number of pods deleted this call and an error if the
-// initial pod-list step failed (in which case the sweep was incomplete
-// and the caller should NOT mark the recovery loop as successful).
-// Per-pod delete failures are recorded against
+// Returns the number of pods deleted this call. Per-pod delete failures
+// are recorded against
 // duckgres_worker_stranded_pods_reconciled_total{outcome="delete_failed"}
 // and do not bubble up here — they don't disqualify the sweep, just one
 // candidate.
-func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge time.Duration) (int, error) {
+func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge time.Duration) int {
 	if p.runtimeStore == nil || p.clientset == nil {
-		return 0, nil
+		return 0
 	}
 	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=duckgres-worker",
 	})
 	if err != nil {
 		slog.Warn("Stranded-pod reconciler failed to list worker pods.", "error", err)
-		return 0, err
+		return 0
 	}
 	cutoff := time.Now().Add(-minAge)
 	deleted := 0
@@ -445,7 +443,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 		observeStrandedPodReconciled(StrandedOutcomeDeleted)
 		deleted++
 	}
-	return deleted, nil
+	return deleted
 }
 
 // cleanupOrphanedWorkerSecrets deletes worker RPC secrets whose pod
@@ -458,15 +456,10 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 // minAge protects newly-created secrets the spawner is still using
 // (the spawn flow creates the secret first, then the pod).
 //
-// Returns the number of secrets deleted this call and an error if the
-// initial secret-list step failed (in which case the sweep was
-// incomplete; see cleanupOrphanedWorkerPods for the same contract).
-// Per-secret delete failures are recorded against
-// duckgres_worker_stranded_secrets_reconciled_total{outcome="delete_failed"}
-// and do not bubble up.
-func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge time.Duration) (int, error) {
+// Returns the number of secrets deleted this call.
+func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge time.Duration) int {
 	if p.clientset == nil {
-		return 0, nil
+		return 0
 	}
 	// Worker RPC secrets are labeled at creation (worker_rpc_security.go
 	// ensureWorkerRPCSecret) with app=duckgres +
@@ -482,7 +475,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge
 	})
 	if err != nil {
 		slog.Warn("Stranded-secret reconciler failed to list worker RPC secrets.", "error", err)
-		return 0, err
+		return 0
 	}
 	cutoff := time.Now().Add(-minAge)
 	deleted := 0
@@ -506,14 +499,12 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge
 		}
 		if err := p.clientset.CoreV1().Secrets(p.namespace).Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 			slog.Warn("Stranded-secret reconciler failed to delete secret.", "secret", secret.Name, "worker_pod", podName, "error", err)
-			observeStrandedSecretReconciled(StrandedOutcomeDeleteFailed)
 			continue
 		}
 		slog.Info("Stranded worker RPC secret reconciled.", "secret", secret.Name, "worker_pod", podName)
-		observeStrandedSecretReconciled(StrandedOutcomeDeleted)
 		deleted++
 	}
-	return deleted, nil
+	return deleted
 }
 
 func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
@@ -1902,27 +1893,6 @@ func (p *K8sWorkerPool) DeleteWorkerArtifacts(workerID int, podName, reason stri
 	p.deleteRetiredRuntimeWorker(&configstore.WorkerRecord{WorkerID: workerID, PodName: podName}, reason)
 }
 
-// SnapshotInMemoryWorkerIDs returns the set of worker IDs currently
-// tracked in this CP's in-memory ManagedWorker map. Used by the
-// janitor's inventory-divergence sweep to compare against the durable
-// runtime store. Returns nil for non-K8s pools or before the map is
-// initialized.
-func (p *K8sWorkerPool) SnapshotInMemoryWorkerIDs() map[int]struct{} {
-	if p == nil {
-		return nil
-	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if len(p.workers) == 0 {
-		return map[int]struct{}{}
-	}
-	out := make(map[int]struct{}, len(p.workers))
-	for id := range p.workers {
-		out[id] = struct{}{}
-	}
-	return out
-}
-
 // ensureLifecycle returns the pool's lifecycle service, lazily wiring
 // it on first use when a runtimeStore is set but lifecycle is nil.
 // Production paths go through newK8sWorkerPool which initializes
@@ -1973,7 +1943,7 @@ func (p *K8sWorkerPool) deleteRetiredRuntimeWorker(record *configstore.WorkerRec
 	p.mu.Lock()
 	if local, ok := p.workers[record.WorkerID]; ok {
 		worker = local
-		p.markWorkerRetiredInMemoryLocked(worker, reason)
+		p.markWorkerRetiredInMemoryLocked(worker)
 		delete(p.workers, record.WorkerID)
 		workerCount = len(p.workers)
 		removedLocal = true
@@ -2190,7 +2160,6 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 			p.maxWorkers,
 		)
 		if err != nil {
-			observeWarmCapacityReconcileSpawns(image, "error", len(slots))
 			for _, s := range slots {
 				p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
 			}
@@ -2231,19 +2200,7 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 		}(i, slot)
 	}
 	wg.Wait()
-	err := stderrors.Join(errs...)
-	successes := 0
-	failures := 0
-	for _, spawnErr := range errs {
-		if spawnErr != nil {
-			failures++
-		} else {
-			successes++
-		}
-	}
-	observeWarmCapacityReconcileSpawns(image, "success", successes)
-	observeWarmCapacityReconcileSpawns(image, "error", failures)
-	return err
+	return stderrors.Join(errs...)
 }
 
 // HealthCheckLoop periodically checks worker health.
@@ -2560,7 +2517,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// In-memory lifecycle + metrics. Intentionally skips persistence
 		// (we've already persisted the retired state via the CAS chain).
 		p.mu.Lock()
-		p.markWorkerRetiredInMemoryLocked(w, RetireReasonShutdown)
+		p.markWorkerRetiredInMemoryLocked(w)
 		p.mu.Unlock()
 	}
 
@@ -3047,7 +3004,7 @@ func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapsh
 	if !ok || !p.workerMatchesLease(current, lease) {
 		return nil, len(p.workers), 0, false
 	}
-	p.markWorkerRetiredInMemoryLocked(current, RetireReasonCrash)
+	p.markWorkerRetiredInMemoryLocked(current)
 	delete(p.workers, current.ID)
 	workerCount := len(p.workers)
 	if !p.shouldReplenishWarmCapacityLocked() {
@@ -3181,7 +3138,7 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int, image string) {
 }
 
 func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
-	p.markWorkerRetiredInMemoryLocked(w, reason)
+	p.markWorkerRetiredInMemoryLocked(w)
 	workerState := configstore.WorkerStateRetired
 	if reason == RetireReasonCrash {
 		workerState = configstore.WorkerStateLost
@@ -3190,22 +3147,18 @@ func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string)
 }
 
 // markWorkerRetiredInMemoryLocked performs only the in-memory lifecycle
-// transition and metrics bookkeeping for a worker retirement, without
-// persisting to the runtime store. Used by callers that have already
-// advanced the DB state via a scoped CAS (e.g. ShutdownAll's draining
-// chain) and don't want an unconditional UpsertWorkerRecord to overwrite
-// fields set by that CAS.
-func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker, reason string) {
-	lifecycle := w.SharedState().NormalizedLifecycle()
-	if lifecycle == WorkerLifecycleHot || lifecycle == WorkerLifecycleHotIdle {
-		observeHotWorkerSessions(w.peakSessions)
-	}
+// transition for a worker retirement, without persisting to the runtime
+// store. Used by callers that have already advanced the DB state via a
+// scoped CAS (e.g. ShutdownAll's draining chain) and don't want an
+// unconditional UpsertWorkerRecord to overwrite fields set by that CAS.
+// The retire reason is recorded on the durable side via the lifecycle
+// service's CAS path, not here.
+func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker) {
 	nextState, err := w.SharedState().Transition(WorkerLifecycleRetired, nil)
 	if err != nil {
 		return
 	}
 	_ = w.SetSharedState(nextState)
-	observeWorkerRetirement(reason)
 }
 
 func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) {

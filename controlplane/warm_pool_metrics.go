@@ -23,24 +23,10 @@ var activationFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Worker activations that failed before reaching hot, partitioned by image. The companion lifecycle transition fires at retireWorkerWithReason with reason=activation_failure.",
 }, []string{"image"})
 
-// --- Retirement metrics ---
-
-// DEPRECATED: use duckgres_worker_lifecycle_transitions_total with
-// operation=retire_* and outcome=transitioned for the same data
-// dimensioned by image + origin. Retained for runbook continuity; will
-// be removed once Grafana dashboards have migrated.
-var workerRetirementsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_worker_retirements_total",
-	Help: "DEPRECATED: use duckgres_worker_lifecycle_transitions_total{operation=retire_*,outcome=transitioned} for the same data with image + origin labels. Total number of worker retirements partitioned by reason.",
-}, []string{"reason"})
-
-var hotWorkerSessionsHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "duckgres_hot_worker_sessions_total",
-	Help:    "Number of sessions served per hot worker at retirement time",
-	Buckets: []float64{0, 1, 2, 5, 10, 25, 50, 100},
-})
-
-// Retirement reason constants.
+// Retirement reason constants. Passed as the `reason` argument to
+// WorkerLifecycle.* methods and surfaced on
+// duckgres_worker_lifecycle_transitions_total{outcome=transitioned}
+// as part of the operation context.
 const (
 	RetireReasonNormal            = "normal"
 	RetireReasonActivationFailure = "activation_failure"
@@ -69,12 +55,4 @@ func observeActivationFailure(image string) {
 		img = "unknown"
 	}
 	activationFailuresCounter.WithLabelValues(img).Inc()
-}
-
-func observeWorkerRetirement(reason string) {
-	workerRetirementsCounter.WithLabelValues(reason).Inc()
-}
-
-func observeHotWorkerSessions(sessionCount int) {
-	hotWorkerSessionsHistogram.Observe(float64(sessionCount))
 }

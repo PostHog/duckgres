@@ -244,7 +244,6 @@ func SetupMultiTenant(
 	// linger in Prometheus while a peer takes over.
 	janitor.onStop = resetLeaderOwnedClusterMetrics
 	lastWarmCapacityTargets := map[string]int{}
-	var lastWarmCapacityRecentMisses []configstore.WarmCapacityMissAggregate
 	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats
 	lastWarmCapacityGlobalCapBlocked := false
 	janitor.reconcileWarmCapacity = func() {
@@ -262,8 +261,6 @@ func SetupMultiTenant(
 		if err != nil {
 			slog.Warn("Janitor failed to read dynamic warm-capacity demand; reconciling base warm targets only.", "error", err)
 		}
-		observeWarmCapacityRecentMisses(targetSnapshot.RecentMisses, lastWarmCapacityRecentMisses)
-		lastWarmCapacityRecentMisses = cloneWarmCapacityMissAggregates(targetSnapshot.RecentMisses)
 		observeWarmCapacityTargets(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, cfg.K8s.MaxWorkers, lastWarmCapacityTargets)
 		if stats, statsErr := listWorkerLifecycleStats(store); statsErr != nil {
 			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", statsErr)
@@ -294,8 +291,7 @@ func SetupMultiTenant(
 		// pod-list (large namespace) can't starve the secret reaper
 		// behind it, and vice versa.
 		podCtx, podCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		n, podListErr := router.sharedPool.cleanupOrphanedWorkerPods(podCtx, 2*time.Minute)
-		if n > 0 {
+		if n := router.sharedPool.cleanupOrphanedWorkerPods(podCtx, 2*time.Minute); n > 0 {
 			slog.Info("Stranded worker pods reconciled.", "count", n)
 		}
 		podCancel()
@@ -305,72 +301,10 @@ func SetupMultiTenant(
 		// pod-cleanup loop above only iterates pods, so this is the
 		// only place that reclaims those orphans.
 		secretCtx, secretCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		n, secretListErr := router.sharedPool.cleanupOrphanedWorkerSecrets(secretCtx, 2*time.Minute)
-		if n > 0 {
+		if n := router.sharedPool.cleanupOrphanedWorkerSecrets(secretCtx, 2*time.Minute); n > 0 {
 			slog.Info("Stranded worker RPC secrets reconciled.", "count", n)
 		}
 		secretCancel()
-
-		// Record the recovery-sweep success only when both listing
-		// steps completed. Per-item delete failures don't disqualify
-		// the sweep: they're already counted as
-		// duckgres_worker_stranded_*_reconciled_total{outcome="delete_failed"}
-		// by the reapers themselves, and the next tick will retry them.
-		// The gauge alerts on "no successful sweep in N minutes" — i.e.
-		// the listing layer (K8s apiserver) is unreachable, which is
-		// the operational thing we cannot recover from automatically.
-		if podListErr == nil && secretListErr == nil {
-			recordJanitorRecoverySuccess(time.Now())
-		}
-	}
-	janitor.observeInventoryDivergence = func() {
-		if router.sharedPool == nil {
-			return
-		}
-		inMemory := router.sharedPool.SnapshotInMemoryWorkerIDs()
-		activeStates := []configstore.WorkerState{
-			configstore.WorkerStateSpawning,
-			configstore.WorkerStateIdle,
-			configstore.WorkerStateReserved,
-			configstore.WorkerStateActivating,
-			configstore.WorkerStateHot,
-			configstore.WorkerStateHotIdle,
-			configstore.WorkerStateDraining,
-		}
-		// `updated_at <= now+1h` matches every active row in practice;
-		// the store method takes a cutoff because most other callers want
-		// "rows that have been idle a while", but for the divergence check
-		// we want everything currently active so use a far-future bound.
-		snaps, err := store.ListWorkerRecordSnapshotsByStatesBefore(activeStates, time.Now().Add(time.Hour))
-		if err != nil {
-			slog.Warn("Inventory divergence sweep: failed to list durable workers.", "error", err)
-			return
-		}
-		durable := make(map[int]struct{}, len(snaps))
-		for _, snap := range snaps {
-			// Limit to rows owned by this CP — the in-memory map is
-			// per-CP, so divergence has to be computed against the
-			// matching per-CP slice of the durable store. Without this
-			// filter every peer CP's row would show as durable_only.
-			if snap.OwnerCPInstanceID() != cpInstanceID {
-				continue
-			}
-			durable[snap.WorkerID()] = struct{}{}
-		}
-		inMemoryOnly := 0
-		for id := range inMemory {
-			if _, ok := durable[id]; !ok {
-				inMemoryOnly++
-			}
-		}
-		durableOnly := 0
-		for id := range durable {
-			if _, ok := inMemory[id]; !ok {
-				durableOnly++
-			}
-		}
-		recordInventoryDivergence(InventoryDivergenceKindInMemoryOnly, inMemoryOnly)
-		recordInventoryDivergence(InventoryDivergenceKindDurableOnly, durableOnly)
 	}
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance

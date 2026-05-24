@@ -54,24 +54,11 @@ const (
 	LifecycleOriginUnknown LifecycleOrigin = "unknown"
 )
 
-// EpochLockOp identifies which ManagedWorker.epochMu accessor is being
-// observed for wait time. Cred-refresh holds the lock across a DB
-// round-trip, so we want to see whether that wait bleeds into
-// hot-path readers.
-type EpochLockOp string
-
-const (
-	EpochLockOpGet           EpochLockOp = "get"
-	EpochLockOpSet           EpochLockOp = "set"
-	EpochLockOpIncrement     EpochLockOp = "increment"
-	EpochLockOpRefreshAtomic EpochLockOp = "refresh_atomic"
-)
-
 // StrandedOutcome categorizes what the janitor recovery sweep did with
-// each stranded pod or secret it observed. "kept" means the artifact
-// was claimed by a current runtime row (i.e. it wasn't actually
-// stranded); "deleted" means the API delete succeeded; "delete_failed"
-// means the delete returned an error and the artifact is still around.
+// each stranded pod it observed. "kept" means the artifact was claimed
+// by a current runtime row (i.e. it wasn't actually stranded); "deleted"
+// means the API delete succeeded; "delete_failed" means the delete
+// returned an error and the artifact is still around.
 type StrandedOutcome string
 
 const (
@@ -110,19 +97,6 @@ const (
 	HealthCheckResultFail HealthCheckResult = "fail"
 )
 
-// InventoryDivergenceKind identifies which side of the in-memory ↔
-// durable comparison has the extra worker. "in_memory_only" means a
-// ManagedWorker exists with no matching durable row in an active
-// state (suggests a missed CAS to terminal); "durable_only" means a
-// durable row in an active state has no in-memory worker on this CP
-// (suggests a missed claim/takeover or a CP that should be reaping).
-type InventoryDivergenceKind string
-
-const (
-	InventoryDivergenceKindInMemoryOnly InventoryDivergenceKind = "in_memory_only"
-	InventoryDivergenceKindDurableOnly  InventoryDivergenceKind = "durable_only"
-)
-
 // --- Metric definitions ---
 
 var workerLifecycleTransitionsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -141,22 +115,6 @@ var workerStrandedPodsReconciledCounter = promauto.NewCounterVec(prometheus.Coun
 	Help: "Stranded worker pods inspected by the janitor recovery sweep, partitioned by reconciliation outcome.",
 }, []string{"outcome"})
 
-var workerStrandedSecretsReconciledCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_worker_stranded_secrets_reconciled_total",
-	Help: "Stranded worker RPC secrets inspected by the janitor recovery sweep, partitioned by reconciliation outcome.",
-}, []string{"outcome"})
-
-var janitorRecoveryLastSuccessGauge = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "duckgres_janitor_recovery_last_success_seconds",
-	Help: "Unix timestamp of the most recent fully-successful janitor recovery sweep. Stays at 0 until the first success, then advances on every clean run; staleness is the alert signal.",
-})
-
-var workerEpochLockWaitHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "duckgres_worker_epoch_lock_wait_seconds",
-	Help:    "Time spent waiting to acquire ManagedWorker.epochMu before performing the accessor, partitioned by accessor. Cred-refresh holds the lock across a DB round-trip; this histogram exposes whether that wait stalls hot-path readers.",
-	Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1},
-}, []string{"op"})
-
 var workerSpawnFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_worker_spawn_failures_total",
 	Help: "Worker spawn failures partitioned by failure reason (which spawn stage returned the error) and image. The companion lifecycle transition fires under origin=spawn_failure; this counter localizes the root cause.",
@@ -172,11 +130,6 @@ var workerHealthChecksCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_worker_health_checks_total",
 	Help: "Worker RPC health-check probes partitioned by result (pass|fail) and image. Pass-rate complements the mark-lost transitions counter: a worker that's intermittently failing health checks but not yet crossing the consecutive-failure threshold is invisible without this.",
 }, []string{"result", "image"})
-
-var workerInventoryDivergenceGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_worker_inventory_divergence",
-	Help: "Workers present on exactly one side of the in-memory map / durable runtime store comparison, partitioned by kind. Non-zero values indicate a missed CAS to terminal (in_memory_only) or a missed claim/takeover (durable_only).",
-}, []string{"kind"})
 
 // --- Observation helpers ---
 
@@ -233,39 +186,6 @@ func observeStrandedPodReconciled(outcome StrandedOutcome) {
 	workerStrandedPodsReconciledCounter.WithLabelValues(v).Inc()
 }
 
-// observeStrandedSecretReconciled records one outcome of the janitor's
-// stranded-secret sweep. Empty outcomes are dropped.
-func observeStrandedSecretReconciled(outcome StrandedOutcome) {
-	v := strings.TrimSpace(string(outcome))
-	if v == "" {
-		return
-	}
-	workerStrandedSecretsReconciledCounter.WithLabelValues(v).Inc()
-}
-
-// recordJanitorRecoverySuccess sets the last-success gauge to the given
-// timestamp's Unix-seconds. Called by the janitor only when the
-// recovery sweep completed without an error so that alerts can fire on
-// staleness ("recovery hasn't succeeded in N minutes") rather than on
-// absolute liveness.
-func recordJanitorRecoverySuccess(now time.Time) {
-	janitorRecoveryLastSuccessGauge.Set(float64(now.Unix()))
-}
-
-// observeEpochLockWait records how long a caller waited on
-// ManagedWorker.epochMu before acquiring it. Negative durations are
-// coerced to zero. Wired by Step 5 of the observability migration.
-func observeEpochLockWait(op EpochLockOp, d time.Duration) {
-	v := strings.TrimSpace(string(op))
-	if v == "" {
-		return
-	}
-	if d < 0 {
-		d = 0
-	}
-	workerEpochLockWaitHistogram.WithLabelValues(v).Observe(d.Seconds())
-}
-
 // observeSpawnFailure increments the spawn-failure counter for the
 // given (reason, image) tuple. Empty reason drops the sample (the
 // counter would be useless without a category); empty image falls
@@ -306,19 +226,4 @@ func observeHealthCheck(result HealthCheckResult, image string) {
 		img = "unknown"
 	}
 	workerHealthChecksCounter.WithLabelValues(r, img).Inc()
-}
-
-// recordInventoryDivergence sets the divergence gauge for the given
-// kind. Negative counts coerce to zero. Callers compute the count
-// from a single comparison pass and call this twice per tick (once
-// per kind) so the gauge always reflects the most recent sweep.
-func recordInventoryDivergence(kind InventoryDivergenceKind, count int) {
-	k := strings.TrimSpace(string(kind))
-	if k == "" {
-		return
-	}
-	if count < 0 {
-		count = 0
-	}
-	workerInventoryDivergenceGauge.WithLabelValues(k).Set(float64(count))
 }

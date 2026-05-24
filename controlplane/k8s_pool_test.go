@@ -1389,11 +1389,9 @@ func TestK8sPoolSpawnMinWorkersForImageSpawnsOnlyTheDeficit(t *testing.T) {
 	}
 }
 
-func TestK8sPoolSpawnMinWorkersForImageCountsMixedSpawnResults(t *testing.T) {
+func TestK8sPoolSpawnMinWorkersForImageReturnsErrorOnMixedResults(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	image := "duckgres:metrics-mixed"
-	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(image, "success")
-	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(image, "error")
 
 	nextID := 100
 	store := &captureRuntimeWorkerStore{
@@ -1418,12 +1416,6 @@ func TestK8sPoolSpawnMinWorkersForImageCountsMixedSpawnResults(t *testing.T) {
 
 	if err := pool.SpawnMinWorkersForImage(context.Background(), image, 2); err == nil {
 		t.Fatal("expected mixed spawn batch to return an error")
-	}
-	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, image, "success"); got != 1 {
-		t.Fatalf("expected one successful reconcile spawn, got %v", got)
-	}
-	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, image, "error"); got != 1 {
-		t.Fatalf("expected one failed reconcile spawn, got %v", got)
 	}
 }
 
@@ -4167,7 +4159,7 @@ func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBStateRetired(t *testing.T) {
 	pool, cs := strandedReconcilerPool(t, store)
 	createStrandedWorkerPod(t, cs, "duckgres-old-worker-31758", "31758", 10*time.Minute)
 
-	deleted, _ := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute)
+	deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute)
 	if deleted != 1 {
 		t.Fatalf("expected 1 pod deleted, got %d", deleted)
 	}
@@ -4188,7 +4180,7 @@ func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBStateLost(t *testing.T) {
 	pool, cs := strandedReconcilerPool(t, store)
 	createStrandedWorkerPod(t, cs, "duckgres-lost-worker-42", "42", 10*time.Minute)
 
-	if deleted, _ := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 1 {
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 1 {
 		t.Fatalf("expected 1 pod deleted, got %d", deleted)
 	}
 	if podExists(t, cs, "duckgres-lost-worker-42") {
@@ -4204,7 +4196,7 @@ func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBRecordMissing(t *testing.T) {
 	pool, cs := strandedReconcilerPool(t, store)
 	createStrandedWorkerPod(t, cs, "duckgres-ghost-worker-99", "99", 10*time.Minute)
 
-	if deleted, _ := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 1 {
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 1 {
 		t.Fatalf("expected 1 pod deleted, got %d", deleted)
 	}
 	if podExists(t, cs, "duckgres-ghost-worker-99") {
@@ -4225,7 +4217,7 @@ func TestCleanupOrphanedWorkerPods_LeavesLivePodAlone(t *testing.T) {
 	pool, cs := strandedReconcilerPool(t, store)
 	createStrandedWorkerPod(t, cs, "duckgres-live-worker-7", "7", 10*time.Minute)
 
-	if deleted, _ := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
 		t.Fatalf("expected no pods deleted for live worker, got %d", deleted)
 	}
 	if !podExists(t, cs, "duckgres-live-worker-7") {
@@ -4241,7 +4233,7 @@ func TestCleanupOrphanedWorkerPods_SkipsYoungPod(t *testing.T) {
 	pool, cs := strandedReconcilerPool(t, store)
 	createStrandedWorkerPod(t, cs, "duckgres-newborn-worker-11", "11", 30*time.Second)
 
-	if deleted, _ := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
 		t.Fatalf("expected young pod to be skipped, got deleted=%d", deleted)
 	}
 	if !podExists(t, cs, "duckgres-newborn-worker-11") {
@@ -4272,7 +4264,7 @@ func TestCleanupOrphanedWorkerPods_TreatsNotFoundAsSuccess(t *testing.T) {
 		return false, nil, nil
 	})
 
-	if deleted, _ := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 2 {
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 2 {
 		t.Fatalf("expected 2 pods deleted (NotFound counts as success), got %d", deleted)
 	}
 	if podExists(t, cs, "duckgres-stale-worker-51") {
@@ -4299,7 +4291,7 @@ func TestCleanupOrphanedWorkerPods_IgnoresNonWorkerPods(t *testing.T) {
 		t.Fatalf("create other pod: %v", err)
 	}
 
-	if deleted, _ := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
+	if deleted := pool.cleanupOrphanedWorkerPods(context.Background(), 2*time.Minute); deleted != 0 {
 		t.Fatalf("expected no deletions, got %d", deleted)
 	}
 	if !podExists(t, cs, "some-other-pod") {
@@ -4332,7 +4324,7 @@ func TestCleanupOrphanedWorkerSecrets_DeletesSecretsWithoutPods(t *testing.T) {
 		}
 	}
 
-	deleted, _ := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute)
+	deleted := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute)
 	if deleted != 2 {
 		t.Fatalf("expected both orphan secrets deleted, got %d", deleted)
 	}
@@ -4377,7 +4369,7 @@ func TestCleanupOrphanedWorkerSecrets_KeepsSecretsForLivePods(t *testing.T) {
 		t.Fatalf("create secret: %v", err)
 	}
 
-	if deleted, _ := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
+	if deleted := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
 		t.Fatalf("expected zero deletions for live-pod secret, got %d", deleted)
 	}
 	if _, err := cs.CoreV1().Secrets("default").Get(context.Background(), pool.workerRPCSecretName(podName), metav1.GetOptions{}); err != nil {
@@ -4409,7 +4401,7 @@ func TestCleanupOrphanedWorkerSecrets_SkipsEmptyPodLabel(t *testing.T) {
 		t.Fatalf("create secret: %v", err)
 	}
 
-	if deleted, _ := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
+	if deleted := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
 		t.Fatalf("expected reaper to skip secret with empty worker-pod label, got %d deletions", deleted)
 	}
 	if _, err := cs.CoreV1().Secrets("default").Get(context.Background(), "weird-secret-with-empty-worker-pod", metav1.GetOptions{}); err != nil {
@@ -4440,7 +4432,7 @@ func TestCleanupOrphanedWorkerSecrets_OnlyReapsOwnControlPlane(t *testing.T) {
 		t.Fatalf("create peer-cp secret: %v", err)
 	}
 
-	if deleted, _ := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
+	if deleted := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
 		t.Fatalf("expected zero deletions of peer-CP secrets, got %d", deleted)
 	}
 	if _, err := cs.CoreV1().Secrets("default").Get(context.Background(), "peer-cp-secret", metav1.GetOptions{}); err != nil {
@@ -4470,7 +4462,7 @@ func TestCleanupOrphanedWorkerSecrets_RespectsMinAge(t *testing.T) {
 		t.Fatalf("create secret: %v", err)
 	}
 
-	if deleted, _ := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
+	if deleted := pool.cleanupOrphanedWorkerSecrets(context.Background(), 2*time.Minute); deleted != 0 {
 		t.Fatalf("expected fresh secret to survive minAge gate, got %d deletions", deleted)
 	}
 }

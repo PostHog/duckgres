@@ -12,13 +12,10 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
-// resetMetrics resets all warm pool counters/histograms for test isolation.
-func resetMetrics() {
-	workerRetirementsCounter.Reset()
-}
-
-func TestMarkWorkerRetiredLocked_RecordsRetirementMetric(t *testing.T) {
-	resetMetrics()
+func TestMarkWorkerRetiredLocked_TransitionsToRetired(t *testing.T) {
+	// Retirement reason is recorded on the durable side via the
+	// lifecycle service's CAS path; in-memory bookkeeping just flips
+	// the lifecycle state, which is what this test pins.
 	pool, _ := newTestK8sPool(t, 5)
 
 	w := makeTestWorker(WorkerLifecycleIdle, nil)
@@ -29,15 +26,9 @@ func TestMarkWorkerRetiredLocked_RecordsRetirementMetric(t *testing.T) {
 	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleRetired {
 		t.Fatalf("expected retired, got %s", w.SharedState().NormalizedLifecycle())
 	}
-
-	val := counterLabelValue(workerRetirementsCounter, RetireReasonIdleTimeout)
-	if val != 1 {
-		t.Fatalf("expected 1 retirement with reason idle_timeout, got %v", val)
-	}
 }
 
 func TestMarkWorkerRetiredLocked_RecordsHotWorkerSessions(t *testing.T) {
-	resetMetrics()
 	pool, _ := newTestK8sPool(t, 5)
 
 	w := makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-1"})
@@ -195,31 +186,18 @@ func TestReapStuckActivatingWorkers_RecentlyReservedNotReaped(t *testing.T) {
 
 func TestObserveWarmCapacityMetrics(t *testing.T) {
 	image := "duckgres:metrics-test"
-	scope := warmCapacityScopeForImage(image)
 	warmCapacityMissesCounter.DeleteLabelValues(image, string(configstore.WorkerClaimMissReasonGlobalCap))
-	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(image, "success")
 
 	observeWarmCapacityMiss(image, configstore.WorkerClaimMissReasonGlobalCap)
 	if got := counterLabelValues(warmCapacityMissesCounter, image, string(configstore.WorkerClaimMissReasonGlobalCap)); got != 1 {
 		t.Fatalf("expected one global-cap warm capacity miss, got %v", got)
 	}
 
-	observeWarmCapacityRecentMisses([]configstore.WarmCapacityMissAggregate{
-		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
-	})
-	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 4, image, string(configstore.WorkerClaimMissReasonNoIdle))
-	observeWarmCapacityRecentMisses(nil, []configstore.WarmCapacityMissAggregate{
-		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
-	})
-	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 0, image, string(configstore.WorkerClaimMissReasonNoIdle))
-
 	observeWarmCapacityTargets(
 		map[string]int{image: 2},
 		map[string]int{image: 5},
 		10,
 	)
-	assertGaugeVecValue(t, warmCapacityBaseTargetGauge, 2, image)
-	assertGaugeVecValue(t, warmCapacityDemandTargetGauge, 3, image)
 	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 5, image)
 	assertGaugeValue(t, warmCapacityHeadroomGauge, 5)
 
@@ -242,20 +220,11 @@ func TestObserveWarmCapacityMetrics(t *testing.T) {
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHot), "org_bound")
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHotIdle), "org_bound")
-
-	observeWarmCapacityReconcileSpawns(image, "success", 3)
-	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, image, "success"); got != 3 {
-		t.Fatalf("expected three warm capacity reconcile spawns, got %v", got)
-	}
 }
 
 func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 	image := "duckgres:leader-reset-test"
-	scope := warmCapacityScopeForImage(image)
 
-	observeWarmCapacityRecentMisses([]configstore.WarmCapacityMissAggregate{
-		{Scope: scope, Reason: configstore.WorkerClaimMissReasonNoIdle, Count: 4},
-	})
 	observeWarmCapacityTargets(
 		map[string]int{image: 2},
 		map[string]int{image: 5},
@@ -267,9 +236,6 @@ func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 
 	resetLeaderOwnedClusterMetrics()
 
-	assertGaugeVecValue(t, warmCapacityRecentMissesGauge, 0, image, string(configstore.WorkerClaimMissReasonNoIdle))
-	assertGaugeVecValue(t, warmCapacityBaseTargetGauge, 0, image)
-	assertGaugeVecValue(t, warmCapacityDemandTargetGauge, 0, image)
 	assertGaugeVecValue(t, warmCapacityEffectiveTargetGauge, 0, image)
 	assertGaugeValue(t, warmCapacityHeadroomGauge, 0)
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "neutral")

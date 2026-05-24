@@ -127,37 +127,6 @@ func TestObserveStrandedPodReconciled(t *testing.T) {
 	}
 }
 
-func TestObserveStrandedSecretReconciled(t *testing.T) {
-	before := counterVecLabelValue(t, workerStrandedSecretsReconciledCounter, string(StrandedOutcomeKept))
-	observeStrandedSecretReconciled(StrandedOutcomeKept)
-	after := counterVecLabelValue(t, workerStrandedSecretsReconciledCounter, string(StrandedOutcomeKept))
-	if after-before != 1 {
-		t.Fatalf("expected one stranded-secret-kept increment, got delta %v", after-before)
-	}
-
-	// Empty outcome is a no-op — family total must not move.
-	familyBefore := metricCounterFamilyTotal(t, "duckgres_worker_stranded_secrets_reconciled_total")
-	observeStrandedSecretReconciled("")
-	familyAfter := metricCounterFamilyTotal(t, "duckgres_worker_stranded_secrets_reconciled_total")
-	if familyAfter != familyBefore {
-		t.Fatalf("expected empty stranded-secret outcome to be dropped; family total moved %v → %v", familyBefore, familyAfter)
-	}
-}
-
-func TestRecordJanitorRecoverySuccess(t *testing.T) {
-	ts := time.Unix(1_700_000_000, 0)
-	recordJanitorRecoverySuccess(ts)
-	if got := gaugeValue(t, janitorRecoveryLastSuccessGauge); got != float64(ts.Unix()) {
-		t.Fatalf("expected gauge=%d, got %v", ts.Unix(), got)
-	}
-
-	later := time.Unix(1_700_000_500, 0)
-	recordJanitorRecoverySuccess(later)
-	if got := gaugeValue(t, janitorRecoveryLastSuccessGauge); got != float64(later.Unix()) {
-		t.Fatalf("expected gauge=%d after second call, got %v", later.Unix(), got)
-	}
-}
-
 func TestObserveSpawnFailure(t *testing.T) {
 	image := "duckgres:spawn-fail-test"
 	before := counterVecLabelValue(t, workerSpawnFailuresCounter, string(SpawnFailureReasonPodCreate), image)
@@ -225,59 +194,3 @@ func TestObserveHealthCheck(t *testing.T) {
 	}
 }
 
-func TestRecordInventoryDivergence(t *testing.T) {
-	recordInventoryDivergence(InventoryDivergenceKindInMemoryOnly, 3)
-	if got, _ := workerInventoryDivergenceGauge.GetMetricWithLabelValues(string(InventoryDivergenceKindInMemoryOnly)); got == nil {
-		t.Fatal("expected in-memory-only divergence gauge to be set")
-	}
-	// Use the existing helper via a small wrapper since assertGaugeVecValue
-	// lives in the k8s-tagged test file.
-	if g, _ := workerInventoryDivergenceGauge.GetMetricWithLabelValues(string(InventoryDivergenceKindInMemoryOnly)); g != nil {
-		if v := gaugeValue(t, g); v != 3 {
-			t.Fatalf("expected in_memory_only=3, got %v", v)
-		}
-	}
-
-	// Negative coerces to zero.
-	recordInventoryDivergence(InventoryDivergenceKindDurableOnly, -5)
-	if g, _ := workerInventoryDivergenceGauge.GetMetricWithLabelValues(string(InventoryDivergenceKindDurableOnly)); g != nil {
-		if v := gaugeValue(t, g); v != 0 {
-			t.Fatalf("expected negative count to coerce to 0, got %v", v)
-		}
-	}
-
-	// Empty kind drops (no panic; gauge unaffected).
-	recordInventoryDivergence("", 42)
-	if g, _ := workerInventoryDivergenceGauge.GetMetricWithLabelValues(string(InventoryDivergenceKindDurableOnly)); g != nil {
-		if v := gaugeValue(t, g); v != 0 {
-			t.Fatalf("empty-kind call should not have touched durable_only gauge; got %v", v)
-		}
-	}
-}
-
-func TestObserveEpochLockWait(t *testing.T) {
-	op := EpochLockOpRefreshAtomic
-
-	before := histogramVecLabelSampleCount(t, workerEpochLockWaitHistogram, string(op))
-	observeEpochLockWait(op, 2*time.Millisecond)
-	after := histogramVecLabelSampleCount(t, workerEpochLockWaitHistogram, string(op))
-	if after-before != 1 {
-		t.Fatalf("expected one wait sample for %s, got delta %d", op, after-before)
-	}
-
-	// Negative durations coerce to zero rather than dropping.
-	beforeZero := histogramVecLabelSampleCount(t, workerEpochLockWaitHistogram, string(EpochLockOpGet))
-	observeEpochLockWait(EpochLockOpGet, -time.Hour)
-	afterZero := histogramVecLabelSampleCount(t, workerEpochLockWaitHistogram, string(EpochLockOpGet))
-	if afterZero-beforeZero != 1 {
-		t.Fatalf("expected negative duration to be coerced to 0 and recorded; delta %d", afterZero-beforeZero)
-	}
-
-	// Empty op is dropped — family total must not move.
-	familyBefore := metricHistogramCount(t, "duckgres_worker_epoch_lock_wait_seconds")
-	observeEpochLockWait("  ", 5*time.Millisecond)
-	familyAfter := metricHistogramCount(t, "duckgres_worker_epoch_lock_wait_seconds")
-	if familyAfter != familyBefore {
-		t.Fatalf("expected empty-op epoch wait call to be dropped; family samples moved %d → %d", familyBefore, familyAfter)
-	}
-}
