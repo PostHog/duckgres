@@ -320,21 +320,25 @@ func TestDrainAndRetireDrainedSequence(t *testing.T) {
 	}
 }
 
-func TestMarkLostFromLeaseSchedulesCleanupOnSuccess(t *testing.T) {
+func TestMarkLostFromLeaseDoesNotScheduleCleanup(t *testing.T) {
+	// Lease-based transitions (Drain, RetireDrained, MarkLost,
+	// RefreshLease) leave physical cleanup to the caller so it can
+	// interleave the right replenishment + local-pool decisions.
+	// Snapshot-based variants bundle cleanup; lease-based do not.
 	store := &fakeLifecycleStore{markLostReturn: true}
 	cleanup := &fakePhysicalCleanup{}
 	lifecycle := NewWorkerLifecycle(store, cleanup)
 	lease := configstore.NewWorkerLease(51, "cp-a", 7)
 
-	outcome, err := lifecycle.MarkLostFromLease(lease, "duckgres-worker-51", "health_check_crash")
+	outcome, err := lifecycle.MarkLostFromLease(lease, "health_check_crash")
 	if err != nil {
 		t.Fatalf("MarkLostFromLease: %v", err)
 	}
 	if !outcome.Transitioned {
 		t.Fatalf("expected transition, got %+v", outcome)
 	}
-	if calls := cleanup.snapshot(); len(calls) != 1 || calls[0].podName != "duckgres-worker-51" {
-		t.Fatalf("expected one cleanup call for pod duckgres-worker-51, got %#v", calls)
+	if calls := cleanup.snapshot(); len(calls) != 0 {
+		t.Fatalf("expected zero cleanup calls (caller orchestrates), got %#v", calls)
 	}
 }
 

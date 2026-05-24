@@ -2914,13 +2914,26 @@ func (p *K8sWorkerPool) markWorkerLostForHealthLease(lease workerLeaseSnapshot) 
 }
 
 func (p *K8sWorkerPool) markWorkerLostIfCurrentLease(lease workerLeaseSnapshot) (bool, error) {
-	if p.runtimeStore == nil {
+	lc := p.ensureLifecycle()
+	if lc == nil {
+		// No durable store wired (process backend / minimal test pool).
+		// The health-check caller treats true here as "CAS landed";
+		// for the no-store case we let it proceed to its in-memory
+		// cleanup path, which is the same behavior the old direct-
+		// store call had when runtimeStore was nil.
 		return true, nil
 	}
 	if lease.ownerCPInstanceID != p.cpInstanceID {
 		return false, nil
 	}
-	return p.runtimeStore.MarkWorkerLostIfCurrentLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, RetireReasonCrash)
+	outcome, err := lc.MarkLostFromLease(
+		configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch),
+		RetireReasonCrash,
+	)
+	if err != nil {
+		return false, err
+	}
+	return outcome.Transitioned, nil
 }
 
 func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int, int, bool) {

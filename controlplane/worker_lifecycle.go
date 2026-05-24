@@ -177,15 +177,17 @@ func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerS
 	}, nil
 }
 
-// MarkLostFromLease marks a lease-owned worker as lost. Intended for
-// the health-checker path once it migrates off the direct
-// MarkWorkerLostIfCurrentLease + retireWorkerPod choreography in
-// markWorkerLostForHealthLease — that migration is deliberately not in
-// PR 3 because the existing flow's separate "remove from local pool +
-// pick a replacement" step needs threading through the lifecycle's
-// PhysicalCleanup before this method can replace it cleanly.
-// Triggers pod cleanup on success.
-func (l *WorkerLifecycle) MarkLostFromLease(lease configstore.WorkerLease, podName, reason string) (configstore.TransitionOutcome, error) {
+// MarkLostFromLease performs the lease-fenced CAS that transitions a
+// worker row to lost. Used by the health-checker after it has
+// confirmed the worker is unresponsive. Does NOT schedule pod
+// cleanup — consistent with the other lease-based transitions
+// (Drain, RetireDrained, RefreshLease), the caller orchestrates
+// physical cleanup so it can interleave replenishment decisions,
+// in-memory pool removal, and pod delete in the right order. (The
+// snapshot-based variants RetireFromSnapshot/RetireOrphanFromSnapshot/
+// RetireIdleVariantFromSnapshot do bundle cleanup because their
+// callers don't have post-CAS choreography.)
+func (l *WorkerLifecycle) MarkLostFromLease(lease configstore.WorkerLease, reason string) (configstore.TransitionOutcome, error) {
 	if l == nil {
 		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, errors.New("worker lifecycle service not configured")
 	}
@@ -196,15 +198,13 @@ func (l *WorkerLifecycle) MarkLostFromLease(lease configstore.WorkerLease, podNa
 		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, err
 	}
 	if !transitioned {
-		slog.Debug("Lifecycle mark-lost CAS missed; pod cleanup skipped.",
+		slog.Debug("Lifecycle mark-lost CAS missed.",
 			"worker_id", lease.WorkerID(), "reason", reason)
 		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}, nil
 	}
-	l.scheduleCleanup(lease.WorkerID(), podName, reason)
 	return configstore.TransitionOutcome{
-		Transitioned:             true,
-		PhysicalCleanupScheduled: l.cleanup != nil,
-		Reason:                   configstore.TransitionOutcomeTransitioned,
+		Transitioned: true,
+		Reason:       configstore.TransitionOutcomeTransitioned,
 	}, nil
 }
 
