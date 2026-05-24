@@ -194,6 +194,31 @@ func TestRetireFromSnapshotSkipsCleanupOnCASMiss(t *testing.T) {
 	}
 }
 
+func TestRetireFromSnapshotTargetingLostSchedulesCleanup(t *testing.T) {
+	// retireClaimedWorker maps reason=RetireReasonCrash → target=Lost.
+	// Cover that branch separately from the Retired-target test so a
+	// regression in the Lost-eligible state set or in the cleanup
+	// scheduling for crashed workers can't slip past unit coverage.
+	store := &fakeLifecycleStore{terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	lifecycle := NewWorkerLifecycle(store, cleanup)
+	snap := newTestSnapshot(t, 14, configstore.WorkerStateReserved, "cp-a", 5)
+
+	outcome, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateLost, "crash")
+	if err != nil {
+		t.Fatalf("RetireFromSnapshot(lost): %v", err)
+	}
+	if !outcome.Transitioned {
+		t.Fatalf("expected Transitioned=true for lost target, got %+v", outcome)
+	}
+	if len(store.terminalTransitions) != 1 || store.terminalTransitions[0].target != configstore.WorkerStateLost {
+		t.Fatalf("expected one terminal CAS targeting lost, got %#v", store.terminalTransitions)
+	}
+	if calls := cleanup.snapshot(); len(calls) != 1 || calls[0].workerID != 14 || calls[0].reason != "crash" {
+		t.Fatalf("expected one cleanup call for crashed worker 14, got %#v", calls)
+	}
+}
+
 func TestRetireFromSnapshotRejectsNonTerminalTarget(t *testing.T) {
 	store := &fakeLifecycleStore{terminalReturn: true}
 	cleanup := &fakePhysicalCleanup{}

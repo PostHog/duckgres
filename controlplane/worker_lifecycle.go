@@ -140,9 +140,13 @@ func (l *WorkerLifecycle) RetireOrphanFromSnapshot(snap configstore.WorkerSnapsh
 }
 
 // RetireIdleVariantFromSnapshot retires a worker observed as idle or
-// hot_idle, fenced by the snapshot. Used by the version-aware reaper
-// and the hot-idle TTL reaper, both of which only act on workers in
-// those two states.
+// hot_idle, fenced by the snapshot. The state restriction maps onto
+// the legacy RetireIdleOrHotIdleWorker store CAS. Today's only caller
+// is the mismatched-version reaper, which deliberately reaps only
+// idle/hot_idle pods so a busy worker isn't yanked mid-session. The
+// hot-idle TTL janitor previously used this helper but was promoted to
+// the broader RetireFromSnapshot once the snapshot already narrowed
+// the candidate set to state=hot_idle by virtue of ListExpiredHotIdleSnapshots.
 func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerSnapshot, reason string) (configstore.TransitionOutcome, error) {
 	if l == nil {
 		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, errors.New("worker lifecycle service not configured")

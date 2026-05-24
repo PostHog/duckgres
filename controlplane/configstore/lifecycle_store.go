@@ -77,25 +77,12 @@ func workerSnapshotsFromRecords(records []WorkerRecord) []WorkerSnapshot {
 	return snaps
 }
 
-// NewWorkerLease constructs a WorkerLease from explicit identity fields.
-// This is the controlled escape hatch for callers that already hold
-// ownership information out-of-band — most notably the K8sWorkerPool,
-// whose in-memory ManagedWorker caches owner_cp_instance_id and
-// owner_epoch from the most recent claim/takeover/refresh. The lifecycle
-// CAS itself is what enforces freshness: a stale lease will simply miss.
-//
-// New ownership-establishing call sites (claim, takeover, refresh) get
-// their lease back from the store method directly via
-// LeaseFromClaimedRecord — they should not be calling NewWorkerLease.
+// NewWorkerLease constructs a WorkerLease from explicit identity
+// fields. The expected callers are paths that already hold ownership
+// information out-of-band — most notably the K8sWorkerPool, whose
+// in-memory ManagedWorker caches owner_cp_instance_id and owner_epoch
+// from the most recent claim/takeover/refresh. The lifecycle CAS itself
+// is what enforces freshness: a stale lease will simply miss.
 func NewWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64) WorkerLease {
 	return newWorkerLease(workerID, ownerCPInstanceID, ownerEpoch)
-}
-
-// LeaseFromClaimedRecord mints a lease from a record that was just
-// returned by a claim/takeover/create-slot store call. Returns nil if
-// the record is nil (e.g. a claim that missed). Package-exported so
-// k8s_pool.go can keep its claim → in-memory ManagedWorker plumbing in
-// one place while still flowing through the typed API.
-func LeaseFromClaimedRecord(record *WorkerRecord) *WorkerLease {
-	return newWorkerLeaseFromRecord(record)
 }
