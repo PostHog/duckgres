@@ -264,9 +264,13 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			continue
 		}
 
-		snap, err := p.runtimeStore.ObserveWorker(workerID)
-		if err != nil {
-			slog.Warn("Version-aware reaper failed to observe worker.", "worker_id", workerID, "error", err)
+		var snap *configstore.WorkerSnapshot
+		if p.runtimeStore != nil {
+			var err error
+			snap, err = p.runtimeStore.ObserveWorker(workerID)
+			if err != nil {
+				slog.Warn("Version-aware reaper failed to observe worker.", "worker_id", workerID, "error", err)
+			}
 		}
 
 		// Resolve the target version for this specific pod.
@@ -2410,16 +2414,14 @@ func (p *K8sWorkerPool) ShutdownAll() {
 
 		slog.Info("Shutting down K8s worker.", "id", w.ID, "worker_pod", podName)
 
-		// Lease minted from the worker's cached owner identity. The
-		// lifecycle CAS will fence against the durable row: a peer
-		// takeover (or a self-bump-then-not-restamp race) makes the
-		// lease stale and the Drain misses, which is the right thing
-		// — the orphan sweep on the new owner CP reconciles.
-		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
-
 		// Step 1: CAS to draining. Skip the worker on CAS miss or error —
 		// there's no safe way to proceed if we don't own the row.
+		// Mint the lease right before the CAS so the in-memory epoch
+		// reflects any concurrent cred-refresh bump that landed between
+		// the workers-list snapshot above and now. Step 3 below re-mints
+		// for the same reason — see the comment there.
 		if p.lifecycle != nil {
+			lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
 			outcome, err := p.lifecycle.Drain(lease)
 			if err != nil {
 				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
@@ -2465,9 +2467,14 @@ func (p *K8sWorkerPool) ShutdownAll() {
 
 		// Step 3: final CAS to retired. If this fails (network blip during
 		// shutdown) the row stays in draining and the orphan sweep handles
-		// it once this CP's heartbeat expires.
+		// it once this CP's heartbeat expires. Re-read w.OwnerEpoch() so a
+		// cred-refresh bump that landed between Step 1 and now uses the
+		// fresh epoch — without this, the legacy direct-store path's
+		// per-step w.OwnerEpoch() lookup would succeed here while the
+		// lifecycle path with a captured lease would CAS-miss.
 		if p.lifecycle != nil {
-			if _, err := p.lifecycle.RetireDrained(lease, RetireReasonShutdown); err != nil {
+			lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
+			if _, err := p.lifecycle.RetireDrained(lateLease, RetireReasonShutdown); err != nil {
 				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
 					"worker_id", w.ID, "error", err)
 				continue

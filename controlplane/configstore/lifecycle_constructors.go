@@ -1,7 +1,5 @@
 package configstore
 
-import "time"
-
 // NewWorkerSnapshot wraps a WorkerRecord into a WorkerSnapshot. The
 // preferred way to obtain a snapshot is still through ObserveWorker or
 // the snapshot-returning List* methods — those guarantee the snapshot
@@ -18,13 +16,16 @@ import "time"
 //     specific observed-field values, without standing up a real
 //     ConfigStore.
 //
-// Callers passing in a stale record will simply CAS-miss downstream;
-// the snapshot is the fence either way, so the safety property
-// holds. The compiler distinction between WorkerSnapshot and
-// WorkerLease is the load-bearing protection here.
+// Callers passing in a stale record will simply CAS-miss downstream
+// because the snapshot's owner_cp_instance_id / owner_epoch / state
+// won't match. A zero UpdatedAt is preserved verbatim and means
+// "no updated_at fence" — MarkWorkerTerminalIfCurrent only adds the
+// updated_at predicate when the snapshot's UpdatedAt is non-zero, so
+// callers without a meaningful updated_at observation can pass it
+// through without polluting the fence.
+//
+// The compiler distinction between WorkerSnapshot and WorkerLease is
+// the load-bearing protection here.
 func NewWorkerSnapshot(record WorkerRecord) WorkerSnapshot {
-	if record.UpdatedAt.IsZero() {
-		record.UpdatedAt = time.Now()
-	}
 	return WorkerSnapshot{record: record}
 }

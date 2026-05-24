@@ -249,11 +249,14 @@ func (l *WorkerLifecycle) RetireDrained(lease configstore.WorkerLease, reason st
 }
 
 // RefreshLease bumps the durable owner_epoch under the current lease
-// and returns the new lease. Replaces the previous two-step pattern of
-// BumpWorkerEpoch + worker.SetOwnerEpoch where a concurrent ShutdownAll
-// could observe a stale in-memory epoch between the two operations.
-// Returns ErrWorkerOwnerEpochMismatch (via the error return) when the
-// lease no longer matches the durable row.
+// and returns a fresh lease at the new epoch. Equivalent to calling
+// BumpWorkerEpoch directly; the value is the typed lease passing, not
+// race avoidance — the caller still has to mirror the new epoch onto
+// the in-memory worker (and the window between BumpWorkerEpoch
+// returning and that mirror update is unchanged). PR 5 is where the
+// in-memory-epoch race actually gets closed. Returns
+// ErrWorkerOwnerEpochMismatch (via the error return) when the lease no
+// longer matches the durable row.
 func (l *WorkerLifecycle) RefreshLease(lease configstore.WorkerLease) (configstore.WorkerLease, error) {
 	if l == nil {
 		return configstore.WorkerLease{}, errors.New("worker lifecycle service not configured")
