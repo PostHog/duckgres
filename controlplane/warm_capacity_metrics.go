@@ -137,6 +137,13 @@ func resetLeaderOwnedClusterMetrics() {
 	warmCapacityEffectiveTargetGauge.Reset()
 	warmCapacityHeadroomGauge.Set(0)
 	workerLifecycleCountGauge.Reset()
+	// Both gauges below are leader-only: the recovery sweep + the
+	// inventory divergence comparison run from the janitor lambdas
+	// which only fire when this CP holds the leader lease. Resetting
+	// on lease loss prevents a stale value lingering after a peer takes
+	// over (the new leader's first sweep will repopulate them).
+	janitorRecoveryLastSuccessGauge.Set(0)
+	workerInventoryDivergenceGauge.Reset()
 }
 
 func observeWarmCapacityReconcileSpawns(image, result string, count int) {

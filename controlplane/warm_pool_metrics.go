@@ -3,6 +3,7 @@
 package controlplane
 
 import (
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,22 +12,26 @@ import (
 
 // --- Activation latency and failure counters ---
 
-var activationDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+var activationDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_activation_duration_seconds",
-	Help:    "Time from worker reservation to the worker becoming hot",
+	Help:    "Time from worker reservation to the worker becoming hot, partitioned by image.",
 	Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
-})
+}, []string{"image"})
 
-var activationFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
+var activationFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_activation_failures_total",
-	Help: "Total number of failed worker activations",
-})
+	Help: "Worker activations that failed before reaching hot, partitioned by image. The companion lifecycle transition fires at retireWorkerWithReason with reason=activation_failure.",
+}, []string{"image"})
 
 // --- Retirement metrics ---
 
+// DEPRECATED: use duckgres_worker_lifecycle_transitions_total with
+// operation=retire_* and outcome=transitioned for the same data
+// dimensioned by image + origin. Retained for runbook continuity; will
+// be removed once Grafana dashboards have migrated.
 var workerRetirementsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_worker_retirements_total",
-	Help: "Total number of worker retirements",
+	Help: "DEPRECATED: use duckgres_worker_lifecycle_transitions_total{operation=retire_*,outcome=transitioned} for the same data with image + origin labels. Total number of worker retirements partitioned by reason.",
 }, []string{"reason"})
 
 var hotWorkerSessionsHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
@@ -47,12 +52,23 @@ const (
 	RetireReasonMismatchedVersion = "mismatched_version"
 )
 
-func observeActivationDuration(d time.Duration) {
-	activationDurationHistogram.Observe(d.Seconds())
+func observeActivationDuration(d time.Duration, image string) {
+	img := strings.TrimSpace(image)
+	if img == "" {
+		img = "unknown"
+	}
+	if d < 0 {
+		d = 0
+	}
+	activationDurationHistogram.WithLabelValues(img).Observe(d.Seconds())
 }
 
-func observeActivationFailure() {
-	activationFailuresCounter.Inc()
+func observeActivationFailure(image string) {
+	img := strings.TrimSpace(image)
+	if img == "" {
+		img = "unknown"
+	}
+	activationFailuresCounter.WithLabelValues(img).Inc()
 }
 
 func observeWorkerRetirement(reason string) {

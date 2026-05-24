@@ -158,6 +158,103 @@ func TestRecordJanitorRecoverySuccess(t *testing.T) {
 	}
 }
 
+func TestObserveSpawnFailure(t *testing.T) {
+	image := "duckgres:spawn-fail-test"
+	before := counterVecLabelValue(t, workerSpawnFailuresCounter, string(SpawnFailureReasonPodCreate), image)
+	observeSpawnFailure(SpawnFailureReasonPodCreate, image)
+	after := counterVecLabelValue(t, workerSpawnFailuresCounter, string(SpawnFailureReasonPodCreate), image)
+	if after-before != 1 {
+		t.Fatalf("expected one spawn-failure increment for (pod_create, %s), got delta %v", image, after-before)
+	}
+
+	// Empty image falls back to "unknown".
+	beforeUnknown := counterVecLabelValue(t, workerSpawnFailuresCounter, string(SpawnFailureReasonGRPCConnect), "unknown")
+	observeSpawnFailure(SpawnFailureReasonGRPCConnect, "  ")
+	afterUnknown := counterVecLabelValue(t, workerSpawnFailuresCounter, string(SpawnFailureReasonGRPCConnect), "unknown")
+	if afterUnknown-beforeUnknown != 1 {
+		t.Fatalf("expected empty image to fall back to unknown; delta %v", afterUnknown-beforeUnknown)
+	}
+
+	// Empty reason drops the sample.
+	familyBefore := metricCounterFamilyTotal(t, "duckgres_worker_spawn_failures_total")
+	observeSpawnFailure("", image)
+	familyAfter := metricCounterFamilyTotal(t, "duckgres_worker_spawn_failures_total")
+	if familyAfter != familyBefore {
+		t.Fatalf("expected empty-reason spawn-failure to drop; family total moved %v → %v", familyBefore, familyAfter)
+	}
+}
+
+func TestObserveDrainTotalDuration(t *testing.T) {
+	before := metricHistogramCount(t, "duckgres_worker_drain_total_duration_seconds")
+	observeDrainTotalDuration(150 * time.Millisecond)
+	mid := metricHistogramCount(t, "duckgres_worker_drain_total_duration_seconds")
+	if mid-before != 1 {
+		t.Fatalf("expected one drain-duration sample, got delta %d", mid-before)
+	}
+
+	// Negative durations coerce to zero rather than drop.
+	observeDrainTotalDuration(-time.Second)
+	after := metricHistogramCount(t, "duckgres_worker_drain_total_duration_seconds")
+	if after-mid != 1 {
+		t.Fatalf("expected negative duration to record one sample at 0; delta %d", after-mid)
+	}
+}
+
+func TestObserveHealthCheck(t *testing.T) {
+	image := "duckgres:hc-test"
+	before := counterVecLabelValue(t, workerHealthChecksCounter, string(HealthCheckResultPass), image)
+	observeHealthCheck(HealthCheckResultPass, image)
+	after := counterVecLabelValue(t, workerHealthChecksCounter, string(HealthCheckResultPass), image)
+	if after-before != 1 {
+		t.Fatalf("expected one HC pass increment, got delta %v", after-before)
+	}
+
+	failBefore := counterVecLabelValue(t, workerHealthChecksCounter, string(HealthCheckResultFail), image)
+	observeHealthCheck(HealthCheckResultFail, image)
+	failAfter := counterVecLabelValue(t, workerHealthChecksCounter, string(HealthCheckResultFail), image)
+	if failAfter-failBefore != 1 {
+		t.Fatalf("expected one HC fail increment, got delta %v", failAfter-failBefore)
+	}
+
+	// Empty result drops.
+	familyBefore := metricCounterFamilyTotal(t, "duckgres_worker_health_checks_total")
+	observeHealthCheck("", image)
+	familyAfter := metricCounterFamilyTotal(t, "duckgres_worker_health_checks_total")
+	if familyAfter != familyBefore {
+		t.Fatalf("expected empty-result HC to drop; family total moved %v → %v", familyBefore, familyAfter)
+	}
+}
+
+func TestRecordInventoryDivergence(t *testing.T) {
+	recordInventoryDivergence(InventoryDivergenceKindInMemoryOnly, 3)
+	if got, _ := workerInventoryDivergenceGauge.GetMetricWithLabelValues(string(InventoryDivergenceKindInMemoryOnly)); got == nil {
+		t.Fatal("expected in-memory-only divergence gauge to be set")
+	}
+	// Use the existing helper via a small wrapper since assertGaugeVecValue
+	// lives in the k8s-tagged test file.
+	if g, _ := workerInventoryDivergenceGauge.GetMetricWithLabelValues(string(InventoryDivergenceKindInMemoryOnly)); g != nil {
+		if v := gaugeValue(t, g); v != 3 {
+			t.Fatalf("expected in_memory_only=3, got %v", v)
+		}
+	}
+
+	// Negative coerces to zero.
+	recordInventoryDivergence(InventoryDivergenceKindDurableOnly, -5)
+	if g, _ := workerInventoryDivergenceGauge.GetMetricWithLabelValues(string(InventoryDivergenceKindDurableOnly)); g != nil {
+		if v := gaugeValue(t, g); v != 0 {
+			t.Fatalf("expected negative count to coerce to 0, got %v", v)
+		}
+	}
+
+	// Empty kind drops (no panic; gauge unaffected).
+	recordInventoryDivergence("", 42)
+	if g, _ := workerInventoryDivergenceGauge.GetMetricWithLabelValues(string(InventoryDivergenceKindDurableOnly)); g != nil {
+		if v := gaugeValue(t, g); v != 0 {
+			t.Fatalf("empty-kind call should not have touched durable_only gauge; got %v", v)
+		}
+	}
+}
+
 func TestObserveEpochLockWait(t *testing.T) {
 	op := EpochLockOpRefreshAtomic
 

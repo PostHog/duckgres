@@ -645,10 +645,12 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	case p.spawnSem <- struct{}{}:
 		defer func() { <-p.spawnSem }()
 	case <-ctx.Done():
+		observeSpawnFailure(SpawnFailureReasonContextCanceled, image)
 		return ctx.Err()
 	}
 
 	if err := p.validateSharedStartupConfigMap(ctx); err != nil {
+		observeSpawnFailure(SpawnFailureReasonConfigMap, image)
 		return err
 	}
 
@@ -656,6 +658,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	_ = p.deleteWorkerRPCSecret(ctx, podName)
 	secretName, err := p.ensureWorkerRPCSecret(ctx, podName)
 	if err != nil {
+		observeSpawnFailure(SpawnFailureReasonSecretCreate, image)
 		return fmt.Errorf("ensure worker RPC secret: %w", err)
 	}
 
@@ -877,6 +880,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	// Create pod with exponential backoff on transient errors.
 	if err := p.createPodWithBackoff(ctx, pod); err != nil {
 		_ = p.deleteWorkerRPCSecret(ctx, podName)
+		observeSpawnFailure(SpawnFailureReasonPodCreate, image)
 		return err
 	}
 
@@ -887,6 +891,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			GracePeriodSeconds: int64Ptr(0),
 		})
 		_ = p.deleteWorkerRPCSecret(ctx, podName)
+		observeSpawnFailure(SpawnFailureReasonPodReady, image)
 		return fmt.Errorf("worker pod %s failed to start: %w", podName, err)
 	}
 
@@ -900,6 +905,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			GracePeriodSeconds: int64Ptr(0),
 		})
 		_ = p.deleteWorkerRPCSecret(cleanupCtx, podName)
+		observeSpawnFailure(SpawnFailureReasonSecretRead, image)
 		return fmt.Errorf("read worker RPC security: %w", err)
 	}
 	client, err := waitForWorkerTCP(addr, token, serverCertPEM, 90*time.Second)
@@ -908,6 +914,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			GracePeriodSeconds: int64Ptr(0),
 		})
 		_ = p.deleteWorkerRPCSecret(ctx, podName)
+		observeSpawnFailure(SpawnFailureReasonGRPCConnect, image)
 		return fmt.Errorf("worker %d gRPC connection failed: %w", id, err)
 	}
 
@@ -1895,6 +1902,27 @@ func (p *K8sWorkerPool) DeleteWorkerArtifacts(workerID int, podName, reason stri
 	p.deleteRetiredRuntimeWorker(&configstore.WorkerRecord{WorkerID: workerID, PodName: podName}, reason)
 }
 
+// SnapshotInMemoryWorkerIDs returns the set of worker IDs currently
+// tracked in this CP's in-memory ManagedWorker map. Used by the
+// janitor's inventory-divergence sweep to compare against the durable
+// runtime store. Returns nil for non-K8s pools or before the map is
+// initialized.
+func (p *K8sWorkerPool) SnapshotInMemoryWorkerIDs() map[int]struct{} {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.workers) == 0 {
+		return map[int]struct{}{}
+	}
+	out := make(map[int]struct{}, len(p.workers))
+	for id := range p.workers {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
 // ensureLifecycle returns the pool's lifecycle service, lazily wiring
 // it on first use when a runtimeStore is set but lifecycle is nil.
 // Production paths go through newK8sWorkerPool which initializes
@@ -2322,6 +2350,11 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForLease(lease))
 							cancel()
 						}()
+						if healthErr != nil {
+							observeHealthCheck(HealthCheckResultFail, lease.image)
+						} else {
+							observeHealthCheck(HealthCheckResultPass, lease.image)
+						}
 
 						if healthErr != nil {
 							mu.Lock()
@@ -2481,6 +2514,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 			continue
 		}
 		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+		drainStart := time.Now()
 		outcome, err := lifecycle.Drain(lease, LifecycleOriginShutdownAll)
 		if err != nil {
 			slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
@@ -2521,6 +2555,7 @@ func (p *K8sWorkerPool) ShutdownAll() {
 				"worker_id", w.ID, "error", err)
 			continue
 		}
+		observeDrainTotalDuration(time.Since(drainStart))
 
 		// In-memory lifecycle + metrics. Intentionally skips persistence
 		// (we've already persisted the retired state via the CAS chain).
@@ -3122,6 +3157,7 @@ func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int, image strin
 			p.maxWorkers,
 		)
 		if err != nil {
+			observeSpawnFailure(SpawnFailureReasonRuntimeStore, image)
 			return err
 		}
 		if slot == nil {

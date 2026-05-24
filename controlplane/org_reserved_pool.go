@@ -75,7 +75,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 
 			if err := p.activateWorkerForOrg(ctx, worker); err != nil {
 				slog.Warn("Worker activation failed.", "worker", worker.ID, "org", p.orgID, "error", err)
-				observeActivationFailure()
+				observeActivationFailure(worker.image)
 				p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
 				return nil, err
 			}
@@ -269,12 +269,12 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 			return err
 		}
 		if !worker.reservedAt.IsZero() {
-			observeActivationDuration(time.Since(worker.reservedAt))
+			observeActivationDuration(time.Since(worker.reservedAt), worker.image)
 		}
 		return nil
 	case WorkerLifecycleHot:
 		if !worker.reservedAt.IsZero() {
-			observeActivationDuration(time.Since(worker.reservedAt))
+			observeActivationDuration(time.Since(worker.reservedAt), worker.image)
 		}
 		return nil
 	default:

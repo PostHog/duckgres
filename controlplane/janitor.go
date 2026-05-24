@@ -45,6 +45,7 @@ type ControlPlaneJanitor struct {
 	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
+	observeInventoryDivergence    func() // compares in-memory ManagedWorker map with durable rows and updates the divergence gauge (leader-only)
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -198,6 +199,13 @@ func (j *ControlPlaneJanitor) runOnce() {
 	// the row retired before the K8s delete completed).
 	if j.cleanupOrphanedWorkerPods != nil {
 		j.cleanupOrphanedWorkerPods()
+	}
+
+	// Update the in-memory ↔ durable inventory divergence gauge. Runs on
+	// the leader only because the per-CP comparison would otherwise
+	// emit conflicting samples — one CP sees workers another doesn't.
+	if j.observeInventoryDivergence != nil {
+		j.observeInventoryDivergence()
 	}
 
 	if j.reconcileWarmCapacity != nil {

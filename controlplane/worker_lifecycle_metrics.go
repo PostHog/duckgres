@@ -80,6 +80,49 @@ const (
 	StrandedOutcomeDeleteFailed StrandedOutcome = "delete_failed"
 )
 
+// SpawnFailureReason categorizes why a worker spawn returned an error.
+// Buckets follow the spawnWorker control-flow stages so dashboards
+// can localize regressions: an uptick in "pod_ready" points at the
+// scheduler / image-pull, an uptick in "secret_create" points at
+// Kubernetes API auth, and so on.
+type SpawnFailureReason string
+
+const (
+	SpawnFailureReasonRuntimeStore    SpawnFailureReason = "runtime_store"
+	SpawnFailureReasonConfigMap       SpawnFailureReason = "config_map"
+	SpawnFailureReasonSecretCreate    SpawnFailureReason = "secret_create"
+	SpawnFailureReasonPodCreate       SpawnFailureReason = "pod_create"
+	SpawnFailureReasonPodReady        SpawnFailureReason = "pod_ready"
+	SpawnFailureReasonSecretRead      SpawnFailureReason = "secret_read"
+	SpawnFailureReasonGRPCConnect     SpawnFailureReason = "grpc_connect"
+	SpawnFailureReasonContextCanceled SpawnFailureReason = "context_canceled"
+	SpawnFailureReasonOther           SpawnFailureReason = "other"
+)
+
+// HealthCheckResult records the outcome of a single worker health
+// check probe. "pass" and "fail" are the only first-class outcomes;
+// recoverWorkerPanic-caught panics surface as "fail" because the
+// caller sees them as an error return.
+type HealthCheckResult string
+
+const (
+	HealthCheckResultPass HealthCheckResult = "pass"
+	HealthCheckResultFail HealthCheckResult = "fail"
+)
+
+// InventoryDivergenceKind identifies which side of the in-memory ↔
+// durable comparison has the extra worker. "in_memory_only" means a
+// ManagedWorker exists with no matching durable row in an active
+// state (suggests a missed CAS to terminal); "durable_only" means a
+// durable row in an active state has no in-memory worker on this CP
+// (suggests a missed claim/takeover or a CP that should be reaping).
+type InventoryDivergenceKind string
+
+const (
+	InventoryDivergenceKindInMemoryOnly InventoryDivergenceKind = "in_memory_only"
+	InventoryDivergenceKindDurableOnly  InventoryDivergenceKind = "durable_only"
+)
+
 // --- Metric definitions ---
 
 var workerLifecycleTransitionsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -113,6 +156,27 @@ var workerEpochLockWaitHistogram = promauto.NewHistogramVec(prometheus.Histogram
 	Help:    "Time spent waiting to acquire ManagedWorker.epochMu before performing the accessor, partitioned by accessor. Cred-refresh holds the lock across a DB round-trip; this histogram exposes whether that wait stalls hot-path readers.",
 	Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1},
 }, []string{"op"})
+
+var workerSpawnFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_worker_spawn_failures_total",
+	Help: "Worker spawn failures partitioned by failure reason (which spawn stage returned the error) and image. The companion lifecycle transition fires under origin=spawn_failure; this counter localizes the root cause.",
+}, []string{"reason", "image"})
+
+var workerDrainTotalDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "duckgres_worker_drain_total_duration_seconds",
+	Help:    "End-to-end wall-clock duration of a single worker drain (Drain CAS + pod delete + RetireDrained CAS) within ShutdownAll. Complements the per-CAS _transition_duration_seconds, which can't show the pod-delete window between the two CAS steps.",
+	Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+})
+
+var workerHealthChecksCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_worker_health_checks_total",
+	Help: "Worker RPC health-check probes partitioned by result (pass|fail) and image. Pass-rate complements the mark-lost transitions counter: a worker that's intermittently failing health checks but not yet crossing the consecutive-failure threshold is invisible without this.",
+}, []string{"result", "image"})
+
+var workerInventoryDivergenceGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_worker_inventory_divergence",
+	Help: "Workers present on exactly one side of the in-memory map / durable runtime store comparison, partitioned by kind. Non-zero values indicate a missed CAS to terminal (in_memory_only) or a missed claim/takeover (durable_only).",
+}, []string{"kind"})
 
 // --- Observation helpers ---
 
@@ -200,4 +264,61 @@ func observeEpochLockWait(op EpochLockOp, d time.Duration) {
 		d = 0
 	}
 	workerEpochLockWaitHistogram.WithLabelValues(v).Observe(d.Seconds())
+}
+
+// observeSpawnFailure increments the spawn-failure counter for the
+// given (reason, image) tuple. Empty reason drops the sample (the
+// counter would be useless without a category); empty image falls
+// back to "unknown" so a forgotten image at the call site still
+// records something.
+func observeSpawnFailure(reason SpawnFailureReason, image string) {
+	r := strings.TrimSpace(string(reason))
+	if r == "" {
+		return
+	}
+	img := strings.TrimSpace(image)
+	if img == "" {
+		img = "unknown"
+	}
+	workerSpawnFailuresCounter.WithLabelValues(r, img).Inc()
+}
+
+// observeDrainTotalDuration records the wall-clock duration of one
+// complete worker drain (Drain CAS + pod delete + RetireDrained CAS)
+// inside ShutdownAll. Negative durations coerce to zero rather than
+// drop, mirroring the other histogram helpers.
+func observeDrainTotalDuration(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	workerDrainTotalDurationHistogram.Observe(d.Seconds())
+}
+
+// observeHealthCheck records the result of one health-check probe.
+// Empty result drops the sample.
+func observeHealthCheck(result HealthCheckResult, image string) {
+	r := strings.TrimSpace(string(result))
+	if r == "" {
+		return
+	}
+	img := strings.TrimSpace(image)
+	if img == "" {
+		img = "unknown"
+	}
+	workerHealthChecksCounter.WithLabelValues(r, img).Inc()
+}
+
+// recordInventoryDivergence sets the divergence gauge for the given
+// kind. Negative counts coerce to zero. Callers compute the count
+// from a single comparison pass and call this twice per tick (once
+// per kind) so the gauge always reflects the most recent sweep.
+func recordInventoryDivergence(kind InventoryDivergenceKind, count int) {
+	k := strings.TrimSpace(string(kind))
+	if k == "" {
+		return
+	}
+	if count < 0 {
+		count = 0
+	}
+	workerInventoryDivergenceGauge.WithLabelValues(k).Set(float64(count))
 }

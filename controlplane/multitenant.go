@@ -323,6 +323,55 @@ func SetupMultiTenant(
 			recordJanitorRecoverySuccess(time.Now())
 		}
 	}
+	janitor.observeInventoryDivergence = func() {
+		if router.sharedPool == nil {
+			return
+		}
+		inMemory := router.sharedPool.SnapshotInMemoryWorkerIDs()
+		activeStates := []configstore.WorkerState{
+			configstore.WorkerStateSpawning,
+			configstore.WorkerStateIdle,
+			configstore.WorkerStateReserved,
+			configstore.WorkerStateActivating,
+			configstore.WorkerStateHot,
+			configstore.WorkerStateHotIdle,
+			configstore.WorkerStateDraining,
+		}
+		// `updated_at <= now+1h` matches every active row in practice;
+		// the store method takes a cutoff because most other callers want
+		// "rows that have been idle a while", but for the divergence check
+		// we want everything currently active so use a far-future bound.
+		snaps, err := store.ListWorkerRecordSnapshotsByStatesBefore(activeStates, time.Now().Add(time.Hour))
+		if err != nil {
+			slog.Warn("Inventory divergence sweep: failed to list durable workers.", "error", err)
+			return
+		}
+		durable := make(map[int]struct{}, len(snaps))
+		for _, snap := range snaps {
+			// Limit to rows owned by this CP — the in-memory map is
+			// per-CP, so divergence has to be computed against the
+			// matching per-CP slice of the durable store. Without this
+			// filter every peer CP's row would show as durable_only.
+			if snap.OwnerCPInstanceID() != cpInstanceID {
+				continue
+			}
+			durable[snap.WorkerID()] = struct{}{}
+		}
+		inMemoryOnly := 0
+		for id := range inMemory {
+			if _, ok := durable[id]; !ok {
+				inMemoryOnly++
+			}
+		}
+		durableOnly := 0
+		for id := range durable {
+			if _, ok := inMemory[id]; !ok {
+				durableOnly++
+			}
+		}
+		recordInventoryDivergence(InventoryDivergenceKindInMemoryOnly, inMemoryOnly)
+		recordInventoryDivergence(InventoryDivergenceKindDurableOnly, durableOnly)
+	}
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance
 	// that the credential-refresh tick uses to re-broker STS sessions for

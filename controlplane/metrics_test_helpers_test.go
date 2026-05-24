@@ -48,7 +48,10 @@ func metricHistogramCount(t *testing.T, metricName string) uint64 {
 		}
 		return total
 	}
-	t.Fatalf("metric %q not found", metricName)
+	// HistogramVec families don't appear in Gather() output until a label
+	// combination has been observed. Returning 0 here lets "before / after"
+	// comparisons work against a fresh metric without forcing callers to
+	// prime it.
 	return 0
 }
 
