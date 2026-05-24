@@ -241,22 +241,11 @@ func SetupMultiTenant(
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
 	janitor.hotIdleTTL = defaultHotIdleTTL
 	janitor.warmCapacityMissBucketTTL = cfg.K8s.WarmCapacityDemandTTL
-	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
-		router.sharedPool.retireClaimedWorker(&record, reason)
-	}
-	janitor.retireOrphanWorker = func(record configstore.WorkerRecord, reason string) {
-		router.sharedPool.retireOrphanWorker(&record, reason)
-	}
-	janitor.retireLocalWorker = func(workerID int, reason string) bool {
-		return router.sharedPool.retireWorkerWithReason(workerID, reason)
-	}
-	janitor.deleteRetiredWorker = func(record configstore.WorkerRecord, reason string) {
-		router.sharedPool.deleteRetiredRuntimeWorker(&record, reason)
-	}
-	// Hand the shared pool's lifecycle service to the janitor so the
-	// hot-idle reaper path goes through one snapshot-fenced CAS-and-cleanup
-	// call instead of the older retireLocalWorker / retireWorker /
-	// deleteRetiredWorker fallback chain.
+	// Per-worker transitions (orphan retire, stuck reaper, hot-idle TTL)
+	// all flow through this lifecycle service. The legacy retireWorker /
+	// retireOrphanWorker / retireLocalWorker / deleteRetiredWorker
+	// lambda chain is gone — the snapshot/lease-typed API is the only
+	// path now.
 	janitor.lifecycle = router.sharedPool.lifecycle
 	lastWarmCapacityTargets := map[string]int{}
 	var lastWarmCapacityRecentMisses []configstore.WarmCapacityMissAggregate

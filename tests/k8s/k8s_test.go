@@ -413,8 +413,8 @@ func TestK8sVersionMismatchedWorkerIsReaped(t *testing.T) {
 	}
 
 	// Brief idle window so the worker settles back into idle state in the
-	// configstore — RetireIdleWorker is a state-conditional CAS that no-ops
-	// on busy/reserved/hot rows.
+	// configstore — RetireIdleOrHotIdleWorker is a state-conditional CAS
+	// that no-ops on busy/reserved/hot rows.
 	time.Sleep(3 * time.Second)
 
 	workerPods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{

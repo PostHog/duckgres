@@ -96,7 +96,8 @@ type K8sWorkerPool struct {
 	healthCheckFunc               func(context.Context, *ManagedWorker) error
 	connectWorkerFunc             func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error)
 	runtimeStore                  RuntimeWorkerStore
-	lifecycle                     *WorkerLifecycle // typed lifecycle transitions; nil safe (callers fall back to legacy paths)
+	lifecycle                     *WorkerLifecycle // typed lifecycle transitions; lazily wired via ensureLifecycle().
+	lifecycleOnce                 sync.Once        // guards lazy initialization of lifecycle from concurrent first-callers.
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 
@@ -188,12 +189,19 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		nodeFirstSeen:         make(map[string]time.Time),
 	}
 	if cfg.RuntimeStore != nil {
-		// The lifecycle service is the typed seam for all post-CAS pod
-		// cleanup. Wire it to the pool's own DeleteWorkerArtifacts (which
-		// shares plumbing with the legacy deleteRetiredRuntimeWorker
-		// path) so migrated and legacy callers schedule the same K8s
-		// cleanup goroutine.
-		pool.lifecycle = NewWorkerLifecycle(cfg.RuntimeStore, pool)
+		// The lifecycle service is the typed seam for every post-CAS
+		// pod cleanup. Wire it to the pool's own DeleteWorkerArtifacts
+		// so callers schedule the standard K8s cleanup goroutine.
+		// RuntimeWorkerStore intentionally omits the worker-id-only
+		// CAS methods (MarkWorkerDraining/RetireDrainingWorker/
+		// BumpWorkerEpoch) — they're reachable only through the
+		// lifecycle. We extract them here via a type assertion against
+		// the concrete store. Tests that bypass this constructor and
+		// set runtimeStore directly trigger lazy initialization via
+		// ensureLifecycle().
+		if ls, ok := cfg.RuntimeStore.(workerLifecycleStore); ok {
+			pool.lifecycle = NewWorkerLifecycle(ls, pool)
+		}
 	}
 
 	// Resolve CP pod UID for owner references
@@ -314,10 +322,11 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			continue
 		}
 
-		if snap == nil || p.lifecycle == nil {
+		lifecycle := p.ensureLifecycle()
+		if snap == nil || lifecycle == nil {
 			continue
 		}
-		outcome, err := p.lifecycle.RetireIdleVariantFromSnapshot(*snap, RetireReasonMismatchedVersion)
+		outcome, err := lifecycle.RetireIdleVariantFromSnapshot(*snap, RetireReasonMismatchedVersion)
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
@@ -1788,50 +1797,59 @@ func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, r
 	if claimed == nil {
 		return
 	}
+	lifecycle := p.ensureLifecycle()
+	if lifecycle == nil {
+		return
+	}
 	terminalState := configstore.WorkerStateRetired
 	if reason == RetireReasonCrash {
 		terminalState = configstore.WorkerStateLost
 	}
-	if p.lifecycle != nil {
-		// Lifecycle path: snapshot-fenced CAS + post-CAS cleanup in one
-		// call. The claimed record is fresh enough to act as a
-		// snapshot — it came back from a claim/reserve and any
-		// concurrent change will simply CAS-miss here.
-		snap := configstore.NewWorkerSnapshot(*claimed)
-		if _, err := p.lifecycle.RetireFromSnapshot(snap, terminalState, reason); err != nil {
-			slog.Warn("Failed to retire claimed worker.",
-				"worker_id", claimed.WorkerID, "reason", reason, "error", err)
-		}
-		return
+	// The claimed record is fresh enough to act as a snapshot — it came
+	// back from a Claim*/TakeOver*/Create*Slot call and any concurrent
+	// change will simply CAS-miss inside MarkWorkerTerminalIfCurrent.
+	// Pod cleanup is scheduled by the lifecycle on a successful CAS via
+	// the WorkerPhysicalCleanup (this pool's DeleteWorkerArtifacts).
+	snap := configstore.NewWorkerSnapshot(*claimed)
+	if _, err := lifecycle.RetireFromSnapshot(snap, terminalState, reason); err != nil {
+		slog.Warn("Failed to retire claimed worker.",
+			"worker_id", claimed.WorkerID, "reason", reason, "error", err)
 	}
-	if p.runtimeStore != nil {
-		// Legacy path retained until PR 4 prunes the worker-id-only
-		// store methods; only reached when the pool is constructed
-		// without a runtime store (process backend).
-		updated, err := p.runtimeStore.MarkWorkerTerminalIfCurrent(claimed, terminalState, reason)
-		if err != nil {
-			slog.Warn("Failed to retire claimed worker.",
-				"worker_id", claimed.WorkerID, "reason", reason, "error", err)
-			return
-		}
-		if !updated {
-			slog.Debug("Claimed worker changed before retirement; skipping pod delete.",
-				"worker_id", claimed.WorkerID, "reason", reason)
-			return
-		}
-	}
-
-	p.deleteRetiredRuntimeWorker(claimed, reason)
 }
 
 // DeleteWorkerArtifacts implements WorkerPhysicalCleanup. Schedules pod
 // + RPC secret + local-pool cleanup for the named worker, called by
-// WorkerLifecycle after a durable CAS to terminal has landed. The
-// existing deleteRetiredRuntimeWorker carries the same behavior under a
-// *WorkerRecord arg; this method is the typed-API entry point used by
-// the lifecycle service.
+// WorkerLifecycle after a durable CAS to terminal has landed.
 func (p *K8sWorkerPool) DeleteWorkerArtifacts(workerID int, podName, reason string) {
 	p.deleteRetiredRuntimeWorker(&configstore.WorkerRecord{WorkerID: workerID, PodName: podName}, reason)
+}
+
+// ensureLifecycle returns the pool's lifecycle service, lazily wiring
+// it on first use when a runtimeStore is set but lifecycle is nil.
+// Production paths go through newK8sWorkerPool which initializes
+// lifecycle eagerly; this lazy path exists for tests that construct
+// the pool struct directly and set runtimeStore after the fact.
+// Returns nil when no runtime store is available, or when the store
+// doesn't satisfy workerLifecycleStore (process backend / minimal
+// mocks that intentionally don't implement the CAS methods).
+//
+// Guarded by sync.Once so concurrent first-callers (e.g. idleReaper
+// and janitor goroutines) don't race on the field assignment. The Once
+// is per-pool, so test pools that build a fresh pool per test still
+// get fresh lifecycle initialization.
+func (p *K8sWorkerPool) ensureLifecycle() *WorkerLifecycle {
+	p.lifecycleOnce.Do(func() {
+		if p.lifecycle != nil {
+			return
+		}
+		if p.runtimeStore == nil {
+			return
+		}
+		if ls, ok := p.runtimeStore.(workerLifecycleStore); ok {
+			p.lifecycle = NewWorkerLifecycle(ls, p)
+		}
+	})
+	return p.lifecycle
 }
 
 // deleteRetiredRuntimeWorker performs the post-CAS cleanup for a worker whose
@@ -1867,36 +1885,6 @@ func (p *K8sWorkerPool) deleteRetiredRuntimeWorker(record *configstore.WorkerRec
 	}
 
 	go p.retireWorkerPod(record.WorkerID, worker)
-}
-
-// retireOrphanWorker retires a worker the orphan janitor has identified
-// (its owning CP is expired, missing, or never existed). Unlike
-// retireClaimedWorker, this path skips the in-memory pool bookkeeping
-// (the worker isn't owned by this CP) and uses the broader
-// RetireOrphanWorker DB transition that handles every active state, not
-// just idle/hot_idle. The K8s pod delete is fire-and-forget and harmless
-// if the pod is already gone.
-func (p *K8sWorkerPool) retireOrphanWorker(record *configstore.WorkerRecord, reason string) {
-	if p.runtimeStore == nil || record == nil {
-		return
-	}
-	retired, err := p.runtimeStore.RetireOrphanWorker(record, reason)
-	if err != nil {
-		slog.Warn("Failed to retire orphan worker.",
-			"worker_id", record.WorkerID, "reason", reason, "error", err)
-		return
-	}
-	if !retired {
-		slog.Debug("Orphan worker changed before retirement; skipping pod delete.",
-			"worker_id", record.WorkerID, "reason", reason)
-		return
-	}
-	worker := &ManagedWorker{
-		ID:      record.WorkerID,
-		podName: record.PodName,
-		done:    make(chan struct{}),
-	}
-	go p.retireWorkerPod(worker.ID, worker)
 }
 
 func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker *ManagedWorker) error {
@@ -2420,32 +2408,21 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// reflects any concurrent cred-refresh bump that landed between
 		// the workers-list snapshot above and now. Step 3 below re-mints
 		// for the same reason — see the comment there.
-		if p.lifecycle != nil {
-			lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
-			outcome, err := p.lifecycle.Drain(lease)
-			if err != nil {
-				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
-					"worker_id", w.ID, "error", err)
-				continue
-			}
-			if !outcome.Transitioned {
-				slog.Debug("ShutdownAll: worker not owned by us or already terminal; skipping.",
-					"worker_id", w.ID)
-				continue
-			}
-		} else if p.runtimeStore != nil {
-			// Legacy path retained for builds without a lifecycle.
-			transitioned, err := p.runtimeStore.MarkWorkerDraining(w.ID, p.cpInstanceID, w.OwnerEpoch())
-			if err != nil {
-				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
-					"worker_id", w.ID, "error", err)
-				continue
-			}
-			if !transitioned {
-				slog.Debug("ShutdownAll: worker not owned by us or already terminal; skipping.",
-					"worker_id", w.ID)
-				continue
-			}
+		lifecycle := p.ensureLifecycle()
+		if lifecycle == nil {
+			continue
+		}
+		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
+		outcome, err := lifecycle.Drain(lease)
+		if err != nil {
+			slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
+				"worker_id", w.ID, "error", err)
+			continue
+		}
+		if !outcome.Transitioned {
+			slog.Debug("ShutdownAll: worker not owned by us or already terminal; skipping.",
+				"worker_id", w.ID)
+			continue
 		}
 
 		// Step 2: delete pod. Leave the row in draining on any error other
@@ -2469,22 +2446,12 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// shutdown) the row stays in draining and the orphan sweep handles
 		// it once this CP's heartbeat expires. Re-read w.OwnerEpoch() so a
 		// cred-refresh bump that landed between Step 1 and now uses the
-		// fresh epoch — without this, the legacy direct-store path's
-		// per-step w.OwnerEpoch() lookup would succeed here while the
-		// lifecycle path with a captured lease would CAS-miss.
-		if p.lifecycle != nil {
-			lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
-			if _, err := p.lifecycle.RetireDrained(lateLease, RetireReasonShutdown); err != nil {
-				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
-					"worker_id", w.ID, "error", err)
-				continue
-			}
-		} else if p.runtimeStore != nil {
-			if _, err := p.runtimeStore.RetireDrainingWorker(w.ID, p.cpInstanceID, w.OwnerEpoch(), RetireReasonShutdown); err != nil {
-				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
-					"worker_id", w.ID, "error", err)
-				continue
-			}
+		// fresh epoch.
+		lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
+		if _, err := lifecycle.RetireDrained(lateLease, RetireReasonShutdown); err != nil {
+			slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
+				"worker_id", w.ID, "error", err)
+			continue
 		}
 
 		// In-memory lifecycle + metrics. Intentionally skips persistence

@@ -1212,16 +1212,6 @@ func (cs *ConfigStore) RetireHotIdleWorker(record *WorkerRecord) (bool, error) {
 	return cs.MarkWorkerTerminalIfCurrent(record, WorkerStateRetired, "hot_idle_ttl_expired")
 }
 
-// RetireIdleWorker atomically transitions a worker from idle to retired.
-// Returns true if the transition happened, false if the worker was no longer
-// idle (e.g. claimed by another CP between the list query and this call).
-func (cs *ConfigStore) RetireIdleWorker(record *WorkerRecord, reason string) (bool, error) {
-	if record == nil || record.State != WorkerStateIdle {
-		return false, nil
-	}
-	return cs.MarkWorkerTerminalIfCurrent(record, WorkerStateRetired, reason)
-}
-
 // RetireOrphanWorker is the orphan-cleanup counterpart to
 // RetireIdleOrHotIdleWorker. Whereas the latter only handles `idle` /
 // `hot_idle`, this method transitions a worker to `retired` from any

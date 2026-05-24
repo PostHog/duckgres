@@ -53,13 +53,14 @@ type SharedWorkerActivator struct {
 }
 
 // credentialExpiryStore is the slice of the runtime store the activator uses
-// to record when STS-brokered S3 credentials expire on a worker, and to
-// bump the owner epoch atomically when re-activating a worker for refresh.
-// Defined as an interface so tests can substitute a fake without standing
-// up Postgres.
+// to record when STS-brokered S3 credentials expire on a worker.
+// Owner-epoch bumping for credential refresh now flows through
+// lifecycle.RefreshLease, which uses a separate workerLifecycleStore
+// interface internally — this surface stays narrow.
+// Defined as an interface so tests can substitute a fake without
+// standing up Postgres.
 type credentialExpiryStore interface {
 	MarkCredentialsRefreshed(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, expiresAt time.Time) (bool, error)
-	BumpWorkerEpoch(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64) (int64, error)
 }
 
 type TenantActivationPayload struct {
@@ -99,12 +100,14 @@ func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, defau
 	if rs, ok := shared.runtimeStore.(credentialExpiryStore); ok {
 		a.runtimeStore = rs
 	}
-	// Borrow the pool's lifecycle service when available so the
-	// cred-refresh path can mint a typed WorkerLease via RefreshLease
-	// instead of calling BumpWorkerEpoch directly. Tests that construct
-	// a pool without a lifecycle get a nil here and fall back to the
-	// legacy direct-store path.
-	a.lifecycle = shared.lifecycle
+	// Borrow the pool's lifecycle service via ensureLifecycle() so we
+	// pick up the lazy initialization path the pool uses when
+	// runtimeStore was wired after construction (test fixtures). With
+	// PR 4's legacy-fallback deletion, the activator now refuses to
+	// refresh credentials when lifecycle is nil — going through
+	// ensureLifecycle gives us the same wiring discipline the
+	// K8sWorkerPool itself uses.
+	a.lifecycle = shared.ensureLifecycle()
 	return a
 }
 
@@ -282,26 +285,20 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 		return nil
 	}
 
+	if a.lifecycle == nil {
+		return fmt.Errorf("refresh worker credentials requires a lifecycle service (worker %d)", worker.ID)
+	}
 	currentEpoch := worker.OwnerEpoch()
 	cpInstanceID := worker.OwnerCPInstanceID()
-	var newEpoch int64
-	if a.lifecycle != nil {
-		newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch))
-		if err != nil {
-			// Keep the legacy "bump owner epoch for refresh" wrapper
-			// wording even though the lifecycle method is named
-			// RefreshLease, so log-grep / dashboard filters that
-			// pattern-match on the previous string still work.
-			return fmt.Errorf("bump owner epoch for refresh: %w", err)
-		}
-		newEpoch = newLease.OwnerEpoch()
-	} else {
-		var err error
-		newEpoch, err = a.runtimeStore.BumpWorkerEpoch(worker.ID, cpInstanceID, currentEpoch)
-		if err != nil {
-			return fmt.Errorf("bump owner epoch for refresh: %w", err)
-		}
+	newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch))
+	if err != nil {
+		// Keep the legacy "bump owner epoch for refresh" wrapper wording
+		// even though the lifecycle method is named RefreshLease, so
+		// log-grep / dashboard filters that pattern-match on the
+		// previous string still work.
+		return fmt.Errorf("bump owner epoch for refresh: %w", err)
 	}
+	newEpoch := newLease.OwnerEpoch()
 	worker.SetOwnerEpoch(newEpoch)
 
 	rpcPayload := server.WorkerActivationPayload{
@@ -318,13 +315,23 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 		return fmt.Errorf("activate tenant for refresh: %w", err)
 	}
 
-	if _, err := a.runtimeStore.MarkCredentialsRefreshed(
-		worker.ID, cpInstanceID, newEpoch, *payload.S3CredentialsExpiresAt,
-	); err != nil {
-		// The worker has new creds in DuckDB; we just couldn't record the
-		// new expiry. Next tick will see a stale expiry and refresh again.
-		slog.Warn("Failed to record refreshed credential expiry.",
-			"worker_id", worker.ID, "org", payload.OrgID, "error", err)
+	if a.runtimeStore != nil {
+		// Guarded against a future store implementation that satisfies
+		// workerLifecycleStore (for the RefreshLease above) but not
+		// credentialExpiryStore. Production ConfigStore satisfies
+		// both, but the two type assertions in NewSharedWorkerActivator
+		// are independent and a partial mock could leave runtimeStore
+		// nil while lifecycle is set. The expiry stamp is best-effort
+		// — skipping it just means the next refresh tick sees a stale
+		// expiry and refreshes again.
+		if _, err := a.runtimeStore.MarkCredentialsRefreshed(
+			worker.ID, cpInstanceID, newEpoch, *payload.S3CredentialsExpiresAt,
+		); err != nil {
+			// The worker has new creds in DuckDB; we just couldn't record the
+			// new expiry. Next tick will see a stale expiry and refresh again.
+			slog.Warn("Failed to record refreshed credential expiry.",
+				"worker_id", worker.ID, "org", payload.OrgID, "error", err)
+		}
 	}
 	return nil
 }
