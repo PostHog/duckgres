@@ -288,18 +288,30 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 	if a.lifecycle == nil {
 		return fmt.Errorf("refresh worker credentials requires a lifecycle service (worker %d)", worker.ID)
 	}
-	currentEpoch := worker.OwnerEpoch()
 	cpInstanceID := worker.OwnerCPInstanceID()
-	newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch))
-	if err != nil {
+	// RefreshOwnerEpochAtomic holds the worker's epoch lock across the
+	// durable RefreshLease CAS. Without this, a concurrent
+	// ShutdownAll's OwnerEpoch() read could land between the durable
+	// bump and the in-memory SetOwnerEpoch, building a stale lease
+	// that CAS-misses (leaving the row in draining for the orphan
+	// sweep to reconcile later). The lock is held during the DB
+	// round-trip; that's the right trade-off — the round-trip is
+	// O(10ms) and ShutdownAll iterates workers serially anyway.
+	var newEpoch int64
+	if err := worker.RefreshOwnerEpochAtomic(func(currentEpoch int64) (int64, error) {
+		newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch))
+		if err != nil {
+			return 0, err
+		}
+		newEpoch = newLease.OwnerEpoch()
+		return newEpoch, nil
+	}); err != nil {
 		// Keep the legacy "bump owner epoch for refresh" wrapper wording
-		// even though the lifecycle method is named RefreshLease, so
-		// log-grep / dashboard filters that pattern-match on the
-		// previous string still work.
+		// so log-grep / dashboard filters that pattern-match on the
+		// previous string still work. ErrWorkerOwnerEpochMismatch is
+		// preserved via %w.
 		return fmt.Errorf("bump owner epoch for refresh: %w", err)
 	}
-	newEpoch := newLease.OwnerEpoch()
-	worker.SetOwnerEpoch(newEpoch)
 
 	rpcPayload := server.WorkerActivationPayload{
 		WorkerControlMetadata: server.WorkerControlMetadata{

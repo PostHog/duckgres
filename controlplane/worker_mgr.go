@@ -44,7 +44,14 @@ type ManagedWorker struct {
 	sharedState             SharedWorkerState
 	reservedAt              time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
 	peakSessions            int       // High-water mark of concurrent sessions (for retirement metrics)
+	// ownerEpoch is guarded by epochMu so cred-refresh's
+	// "RefreshLease then SetOwnerEpoch" sequence appears atomic to
+	// concurrent readers (notably ShutdownAll's lease minting).
+	// Without the mutex, ShutdownAll could read the in-memory epoch
+	// between the DB bump and the in-memory set, build a stale lease,
+	// and CAS-miss against the now-advanced durable row.
 	ownerEpoch              int64
+	epochMu                 sync.Mutex
 	ownerCPInstanceID       string
 	hotIdleReclaimed        bool //nolint:unused // only set in kubernetes hot-idle reclaim path
 	cachedActivationPayload any  //nolint:unused // *TenantActivationPayload, cached in kubernetes activation path
@@ -67,16 +74,47 @@ func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
 }
 
 func (w *ManagedWorker) OwnerEpoch() int64 {
+	w.epochMu.Lock()
+	defer w.epochMu.Unlock()
 	return w.ownerEpoch
 }
 
 func (w *ManagedWorker) SetOwnerEpoch(epoch int64) {
+	w.epochMu.Lock()
+	defer w.epochMu.Unlock()
 	w.ownerEpoch = epoch
 }
 
 func (w *ManagedWorker) IncrementOwnerEpoch() int64 {
+	w.epochMu.Lock()
+	defer w.epochMu.Unlock()
 	w.ownerEpoch++
 	return w.ownerEpoch
+}
+
+// RefreshOwnerEpochAtomic holds the per-worker epoch lock across the
+// callback so the durable bump and the in-memory update appear atomic
+// to concurrent readers. Used by the credential-refresh path: the
+// callback performs the lifecycle.RefreshLease CAS and returns the new
+// epoch; readers blocked on OwnerEpoch() during the callback see the
+// new value the moment it lands.
+//
+// This closes the race where ShutdownAll could read the in-memory
+// epoch between the durable bump and the in-memory set, build a stale
+// lease, and CAS-miss against the now-advanced row.
+//
+// The callback runs under the lock — keep its work tightly scoped to
+// the durable round-trip. If the callback returns an error the
+// in-memory epoch is left unchanged.
+func (w *ManagedWorker) RefreshOwnerEpochAtomic(fn func(current int64) (int64, error)) error {
+	w.epochMu.Lock()
+	defer w.epochMu.Unlock()
+	newEpoch, err := fn(w.ownerEpoch)
+	if err != nil {
+		return err
+	}
+	w.ownerEpoch = newEpoch
+	return nil
 }
 
 func (w *ManagedWorker) OwnerCPInstanceID() string {
