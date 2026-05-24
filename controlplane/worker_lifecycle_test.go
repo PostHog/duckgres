@@ -208,7 +208,13 @@ func TestRetireFromSnapshotRejectsNonTerminalTarget(t *testing.T) {
 	}
 }
 
-func TestRetireOrphanFromSnapshotClassifiesCPRevival(t *testing.T) {
+func TestRetireOrphanFromSnapshotReportsGenericMissWithoutExtraRead(t *testing.T) {
+	// Until PR 6 wires a follow-up GetWorkerRecord, the orphan CAS-miss
+	// label is deliberately generic (state vs owner vs epoch vs
+	// updated_at vs CP-revival is indistinguishable from a CAS bool).
+	// The test pins the contract so a future refactor that re-promotes
+	// the label has to update both the implementation and this
+	// expectation in lockstep.
 	store := &fakeLifecycleStore{orphanReturn: false}
 	cleanup := &fakePhysicalCleanup{}
 	lifecycle := NewWorkerLifecycle(store, cleanup)
@@ -221,8 +227,8 @@ func TestRetireOrphanFromSnapshotClassifiesCPRevival(t *testing.T) {
 	if outcome.Transitioned {
 		t.Fatalf("expected no transition on orphan CAS miss, got %+v", outcome)
 	}
-	if outcome.Reason != configstore.TransitionOutcomeFenceMissCPRevived {
-		t.Fatalf("expected CP-revived reason for owned snapshot miss, got %q", outcome.Reason)
+	if outcome.Reason != configstore.TransitionOutcomeFenceMissOwner {
+		t.Fatalf("expected generic fence-miss reason for unknown-cause orphan miss, got %q", outcome.Reason)
 	}
 }
 

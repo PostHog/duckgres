@@ -4333,6 +4333,13 @@ func shutdownTestPool(t *testing.T, store *captureRuntimeWorkerStore) (*K8sWorke
 	t.Helper()
 	pool, cs := newTestK8sPool(t, 5)
 	pool.runtimeStore = store
+	// Wire the lifecycle service so every ShutdownAll test drives the
+	// migrated Drain → pod-delete → RetireDrained chain (the path that
+	// commit f1afa61 introduced). The lifecycle delegates to the same
+	// store methods the legacy path called, so the existing
+	// markDrainingCalls / retireDrainingCalls / events assertions still
+	// observe the right calls — but now via the typed seam.
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
 	// Intercept pod deletions so the test can assert that Delete is invoked
 	// strictly between MarkWorkerDraining and RetireDrainingWorker.
 	cs.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {

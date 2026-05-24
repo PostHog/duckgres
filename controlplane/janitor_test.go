@@ -428,6 +428,50 @@ func TestControlPlaneJanitorHotIdleGoesThroughLifecycleWhenWired(t *testing.T) {
 	}
 }
 
+func TestControlPlaneJanitorOrphanGoesThroughLifecycleWhenWired(t *testing.T) {
+	// Symmetric to the hot-idle lifecycle test: when a lifecycle service is
+	// wired, the orphan path must flow through lifecycle.RetireOrphanFromSnapshot
+	// rather than the legacy retireOrphanWorker / retireWorker lambda chain.
+	// Guards against the orphan migration silently falling back to legacy
+	// because a future refactor accidentally clears the lifecycle field or
+	// adds a new fallback branch above the lifecycle check.
+	now := time.Date(2026, time.May, 22, 15, 20, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          31,
+		PodName:           "duckgres-worker-31",
+		State:             configstore.WorkerStateHot,
+		OwnerCPInstanceID: "cp-expired:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	store := &captureControlPlaneExpiryStore{
+		orphanedWorkers: []configstore.WorkerRecord{listed},
+	}
+	lifecycleStore := &fakeLifecycleStore{orphanReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+	janitor.retireWorker = func(configstore.WorkerRecord, string) {
+		t.Fatal("lifecycle orphan path must not invoke retireWorker fallback")
+	}
+	janitor.retireOrphanWorker = func(record configstore.WorkerRecord, reason string) {
+		t.Fatalf("lifecycle orphan path must not invoke retireOrphanWorker fallback: worker=%d reason=%s", record.WorkerID, reason)
+	}
+	janitor.deleteRetiredWorker = func(configstore.WorkerRecord, string) {
+		t.Fatal("lifecycle orphan path must not invoke deleteRetiredWorker fallback")
+	}
+
+	janitor.runOnce()
+
+	if got := lifecycleStore.orphanTransitions; len(got) != 1 || got[0].workerID != 31 || got[0].reason != janitorRetireReasonOrphaned {
+		t.Fatalf("expected one orphan CAS via lifecycle for worker 31, got %#v", got)
+	}
+	if got := cleanup.snapshot(); len(got) != 1 || got[0].workerID != 31 || got[0].reason != janitorRetireReasonOrphaned {
+		t.Fatalf("expected lifecycle cleanup for orphan worker 31, got %#v", got)
+	}
+}
+
 func TestControlPlaneJanitorRunInvokesStrandedPodReconciler(t *testing.T) {
 	// Every tick the janitor must invoke the stranded-pod reconciler so that
 	// pods leaked by a previous CP (which marked its workers retired but

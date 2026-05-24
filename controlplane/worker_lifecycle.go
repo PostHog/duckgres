@@ -120,13 +120,13 @@ func (l *WorkerLifecycle) RetireOrphanFromSnapshot(snap configstore.WorkerSnapsh
 		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, err
 	}
 	if !transitioned {
-		// Could be a regular snapshot miss or the CP-revival fence;
-		// classifySnapshotMiss handles the former, and we layer the
-		// orphan-specific case on top.
+		// The orphan CAS rejects on any of: state changed, owner changed,
+		// epoch advanced, updated_at advanced, or the supposed-orphan's
+		// owner CP is no longer expired. Without an extra round-trip we
+		// can't tell which — report the generic snapshot-miss label and
+		// let PR 6 add a follow-up classifier once metrics need the
+		// finer dimensions.
 		miss := classifySnapshotMiss(snap)
-		if miss == configstore.TransitionOutcomeFenceMissOwner && snap.OwnerCPInstanceID() != "" {
-			miss = configstore.TransitionOutcomeFenceMissCPRevived
-		}
 		slog.Debug("Lifecycle orphan retire CAS missed; pod cleanup skipped.",
 			"worker_id", snap.WorkerID(), "reason", reason, "miss", miss)
 		return configstore.TransitionOutcome{Reason: miss}, nil
@@ -173,8 +173,13 @@ func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerS
 	}, nil
 }
 
-// MarkLostFromLease marks a lease-owned worker as lost. Used by the
-// health checker after it has confirmed the worker is unresponsive.
+// MarkLostFromLease marks a lease-owned worker as lost. Intended for
+// the health-checker path once it migrates off the direct
+// MarkWorkerLostIfCurrentLease + retireWorkerPod choreography in
+// markWorkerLostForHealthLease — that migration is deliberately not in
+// PR 3 because the existing flow's separate "remove from local pool +
+// pick a replacement" step needs threading through the lifecycle's
+// PhysicalCleanup before this method can replace it cleanly.
 // Triggers pod cleanup on success.
 func (l *WorkerLifecycle) MarkLostFromLease(lease configstore.WorkerLease, podName, reason string) (configstore.TransitionOutcome, error) {
 	if l == nil {
@@ -274,13 +279,14 @@ func (l *WorkerLifecycle) scheduleCleanup(workerID int, podName, reason string) 
 // snapshot-fenced CAS miss. Without an extra round-trip to read the
 // current row we cannot distinguish which fence (state, owner, epoch,
 // updated_at) rejected the update, so the label is intentionally
-// generic — PR 6 can add a follow-up read for better classification if
-// the lifecycle metrics need finer-grained miss accounting.
+// generic. PR 6 can replace this with a follow-up GetWorkerRecord +
+// field-by-field comparison when the lifecycle metrics need
+// per-fence-cause dimensions.
 //
-// Variants that have more information available (e.g. the orphan-path
-// CP-revival case, or callers that already know their snapshot was
-// constructed with a non-eligible state) refine the label at their
-// call site.
+// Callers that already have more information (e.g. they know the
+// snapshot's observed state was not in the target's eligible set)
+// override the label at their call site with a specific
+// TransitionOutcomeFenceMiss* constant.
 func classifySnapshotMiss(snap configstore.WorkerSnapshot) configstore.TransitionOutcomeReason {
 	_ = snap
 	return configstore.TransitionOutcomeFenceMissOwner

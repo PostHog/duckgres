@@ -71,14 +71,6 @@ func (s WorkerSnapshot) UpdatedAt() time.Time { return s.record.UpdatedAt }
 // the lifecycle migration; new code should rely on the typed accessors.
 func (s WorkerSnapshot) Record() WorkerRecord { return s.record }
 
-// recordPtr is the package-internal accessor used by lifecycle CAS methods
-// that take a *WorkerRecord. Keeps the unexported field truly unexported
-// outside this package while still letting in-package CAS code use it.
-func (s WorkerSnapshot) recordPtr() *WorkerRecord {
-	rec := s.record
-	return &rec
-}
-
 // WorkerLease is an opaque proof that the holder currently owns a worker
 // row at a specific epoch. It is the only argument accepted by lifecycle
 // transitions that act on a row the caller already owns — Drain on
