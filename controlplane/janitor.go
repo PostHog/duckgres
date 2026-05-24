@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -39,6 +40,7 @@ type ControlPlaneJanitor struct {
 	warmCapacityMissBucketTTL     time.Duration
 	now                           func() time.Time
 	lifecycle                     *WorkerLifecycle // every per-worker transition flows through this; nil disables per-worker reaping for that tick.
+	lifecycleNilWarned            sync.Once        // one-shot guard so the misconfiguration error doesn't flood at the janitor tick rate.
 	reconcileWarmCapacity         func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
@@ -112,7 +114,9 @@ func (j *ControlPlaneJanitor) runOnce() {
 	// warm-capacity reconciliation — still runs); the slog.Error
 	// makes the misconfiguration loud rather than silent.
 	if j.lifecycle == nil {
-		slog.Error("Janitor running without a lifecycle service; per-worker reaping disabled this tick.")
+		j.lifecycleNilWarned.Do(func() {
+			slog.Error("Janitor running without a lifecycle service; per-worker reaping disabled. This is a wiring bug — fix the constructor.")
+		})
 	} else {
 		orphanedBefore := j.now().Add(-j.orphanGrace)
 		orphaned, err := j.store.ListOrphanedWorkerSnapshots(orphanedBefore)

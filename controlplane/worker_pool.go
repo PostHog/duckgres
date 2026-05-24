@@ -114,17 +114,17 @@ type K8sWorkerPoolConfig struct {
 }
 
 // RuntimeWorkerStore is the durable-store surface exposed to the K8s
-// worker pool. Worker-id-only lifecycle CAS methods (MarkWorkerDraining,
-// RetireDrainingWorker, BumpWorkerEpoch) are intentionally absent — they
+// worker pool. Lifecycle CAS methods are intentionally absent — they
 // are reachable only through WorkerLifecycle so callers cannot bypass
-// the typed lease seam. MarkWorkerLostIfCurrentLease remains for now
-// because the health-checker path hasn't been migrated to
+// the typed snapshot/lease seam. MarkWorkerLostIfCurrentLease remains
+// for now because the health-checker path hasn't been migrated to
 // lifecycle.MarkLostFromLease yet (deferred to PR 5).
 //
 // The lifecycle service uses workerLifecycleStore (defined in
-// worker_lifecycle.go), which is a larger interface. Production wires
-// it via a type assertion in newK8sWorkerPool / ensureLifecycle,
-// because *configstore.ConfigStore satisfies both interfaces.
+// worker_lifecycle.go), which is a larger interface that includes the
+// CAS methods. Production wires it via a type assertion in
+// newK8sWorkerPool / ensureLifecycle, because *configstore.ConfigStore
+// satisfies both interfaces.
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
 	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
@@ -136,9 +136,6 @@ type RuntimeWorkerStore interface {
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error)
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
-	RetireIdleOrHotIdleWorker(record *configstore.WorkerRecord, reason string) (bool, error)
-	RetireOrphanWorker(record *configstore.WorkerRecord, reason string) (bool, error)
-	MarkWorkerTerminalIfCurrent(record *configstore.WorkerRecord, targetState configstore.WorkerState, reason string) (bool, error)
 	MarkWorkerLostIfCurrentLease(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error)
 }
 

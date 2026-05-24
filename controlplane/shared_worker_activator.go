@@ -100,12 +100,14 @@ func NewSharedWorkerActivator(shared *K8sWorkerPool, stsBroker *STSBroker, defau
 	if rs, ok := shared.runtimeStore.(credentialExpiryStore); ok {
 		a.runtimeStore = rs
 	}
-	// Borrow the pool's lifecycle service when available so the
-	// cred-refresh path can mint a typed WorkerLease via RefreshLease
-	// instead of calling BumpWorkerEpoch directly. Tests that construct
-	// a pool without a lifecycle get a nil here and fall back to the
-	// legacy direct-store path.
-	a.lifecycle = shared.lifecycle
+	// Borrow the pool's lifecycle service via ensureLifecycle() so we
+	// pick up the lazy initialization path the pool uses when
+	// runtimeStore was wired after construction (test fixtures). With
+	// PR 4's legacy-fallback deletion, the activator now refuses to
+	// refresh credentials when lifecycle is nil — going through
+	// ensureLifecycle gives us the same wiring discipline the
+	// K8sWorkerPool itself uses.
+	a.lifecycle = shared.ensureLifecycle()
 	return a
 }
 
