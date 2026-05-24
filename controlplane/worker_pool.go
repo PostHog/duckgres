@@ -114,15 +114,13 @@ type K8sWorkerPoolConfig struct {
 }
 
 // RuntimeWorkerStore is the durable-store surface exposed to the K8s
-// worker pool. Lifecycle CAS methods are intentionally absent — they
-// are reachable only through WorkerLifecycle so callers cannot bypass
-// the typed snapshot/lease seam. MarkWorkerLostIfCurrentLease remains
-// for now because the health-checker path hasn't been migrated to
-// lifecycle.MarkLostFromLease yet (deferred to PR 5).
+// worker pool. Every lifecycle CAS method is now absent from this
+// interface — they are reachable only through WorkerLifecycle so
+// callers physically cannot bypass the typed snapshot/lease seam.
 //
 // The lifecycle service uses workerLifecycleStore (defined in
-// worker_lifecycle.go), which is a larger interface that includes the
-// CAS methods. Production wires it via a type assertion in
+// worker_lifecycle.go), which is the larger interface that includes
+// the CAS methods. Production wires it via a type assertion in
 // newK8sWorkerPool / ensureLifecycle, because *configstore.ConfigStore
 // satisfies both interfaces.
 type RuntimeWorkerStore interface {
@@ -136,7 +134,6 @@ type RuntimeWorkerStore interface {
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error)
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
-	MarkWorkerLostIfCurrentLease(workerID int, ownerCPInstanceID string, expectedOwnerEpoch int64, reason string) (bool, error)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

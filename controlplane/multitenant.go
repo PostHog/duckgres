@@ -294,11 +294,24 @@ func SetupMultiTenant(
 		router.sharedPool.RetireOneMismatchedVersionWorker(ctx)
 	}
 	janitor.cleanupOrphanedWorkerPods = func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if n := router.sharedPool.cleanupOrphanedWorkerPods(ctx, 2*time.Minute); n > 0 {
+		// Pods and secrets each get their own 30s deadline so a slow
+		// pod-list (large namespace) can't starve the secret reaper
+		// behind it, and vice versa.
+		podCtx, podCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if n := router.sharedPool.cleanupOrphanedWorkerPods(podCtx, 2*time.Minute); n > 0 {
 			slog.Info("Stranded worker pods reconciled.", "count", n)
 		}
+		podCancel()
+
+		// Sibling reconciler that catches a secret created without a
+		// pod (spawn crashed between createSecret and createPod). The
+		// pod-cleanup loop above only iterates pods, so this is the
+		// only place that reclaims those orphans.
+		secretCtx, secretCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if n := router.sharedPool.cleanupOrphanedWorkerSecrets(secretCtx, 2*time.Minute); n > 0 {
+			slog.Info("Stranded worker RPC secrets reconciled.", "count", n)
+		}
+		secretCancel()
 	}
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance

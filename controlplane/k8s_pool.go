@@ -440,6 +440,67 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 	return deleted
 }
 
+// cleanupOrphanedWorkerSecrets deletes worker RPC secrets whose pod
+// no longer exists. Closes the recovery gap where a CP crashes
+// between secret creation and pod creation — the secret would
+// otherwise leak indefinitely because cleanupOrphanedWorkerPods
+// only iterates pods. Runs from the janitor leader on the same
+// tick as cleanupOrphanedWorkerPods.
+//
+// minAge protects newly-created secrets the spawner is still using
+// (the spawn flow creates the secret first, then the pod).
+//
+// Returns the number of secrets deleted this call.
+func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge time.Duration) int {
+	if p.clientset == nil {
+		return 0
+	}
+	// Worker RPC secrets are labeled at creation (worker_rpc_security.go
+	// ensureWorkerRPCSecret) with app=duckgres +
+	// duckgres/control-plane=<p.cpID> + duckgres/worker-pod=<podName>.
+	// The selector narrows by control-plane so each CP only reaps
+	// its own secrets — critical during rolling restarts and blue/green
+	// deployments where multiple CP replicas share the namespace and
+	// a peer's freshly-created secret (whose pod hasn't been spawned
+	// yet) must not be reaped. p.cpID is used unsanitized to match
+	// the value the creation path stamps.
+	secrets, err := p.clientset.CoreV1().Secrets(p.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=duckgres,duckgres/control-plane=%s,duckgres/worker-pod", p.cpID),
+	})
+	if err != nil {
+		slog.Warn("Stranded-secret reconciler failed to list worker RPC secrets.", "error", err)
+		return 0
+	}
+	cutoff := time.Now().Add(-minAge)
+	deleted := 0
+	for i := range secrets.Items {
+		secret := &secrets.Items[i]
+		if secret.CreationTimestamp.Time.After(cutoff) {
+			continue
+		}
+		podName := secret.Labels["duckgres/worker-pod"]
+		if podName == "" {
+			continue
+		}
+		if _, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{}); err == nil {
+			// Pod exists — leave the secret alone, the regular
+			// cleanupOrphanedWorkerPods path will reap both
+			// together when the pod's DB row is terminal.
+			continue
+		} else if !errors.IsNotFound(err) {
+			slog.Warn("Stranded-secret reconciler failed to load worker pod.", "worker_pod", podName, "error", err)
+			continue
+		}
+		if err := p.clientset.CoreV1().Secrets(p.namespace).Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+			slog.Warn("Stranded-secret reconciler failed to delete secret.", "secret", secret.Name, "worker_pod", podName, "error", err)
+			continue
+		}
+		slog.Info("Stranded worker RPC secret reconciled.", "secret", secret.Name, "worker_pod", podName)
+		deleted++
+	}
+	return deleted
+}
+
 func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
 	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, p.cpID, metav1.GetOptions{})
 	if err != nil {
@@ -2914,13 +2975,26 @@ func (p *K8sWorkerPool) markWorkerLostForHealthLease(lease workerLeaseSnapshot) 
 }
 
 func (p *K8sWorkerPool) markWorkerLostIfCurrentLease(lease workerLeaseSnapshot) (bool, error) {
-	if p.runtimeStore == nil {
+	lc := p.ensureLifecycle()
+	if lc == nil {
+		// No durable store wired (process backend / minimal test pool).
+		// The health-check caller treats true here as "CAS landed";
+		// for the no-store case we let it proceed to its in-memory
+		// cleanup path, which is the same behavior the old direct-
+		// store call had when runtimeStore was nil.
 		return true, nil
 	}
 	if lease.ownerCPInstanceID != p.cpInstanceID {
 		return false, nil
 	}
-	return p.runtimeStore.MarkWorkerLostIfCurrentLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, RetireReasonCrash)
+	outcome, err := lc.MarkLostFromLease(
+		configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch),
+		RetireReasonCrash,
+	)
+	if err != nil {
+		return false, err
+	}
+	return outcome.Transitioned, nil
 }
 
 func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int, int, bool) {
