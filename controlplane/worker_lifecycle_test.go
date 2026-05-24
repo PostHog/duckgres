@@ -258,17 +258,16 @@ func TestRetireOrphanFromSnapshotReportsGenericMissWithoutExtraRead(t *testing.T
 }
 
 func TestRetireIdleVariantSkipsWhenSnapshotNotEligible(t *testing.T) {
-	store := &fakeLifecycleStore{idleVariantReturn: true}
+	// When the observed snapshot is not idle/hot_idle and the underlying
+	// store CAS reports !transitioned, the lifecycle service overrides
+	// the generic owner-miss label with FenceMissState — that's how
+	// callers see "the state restriction is why we skipped" in metric
+	// labels rather than misreading the CAS miss as an ownership change.
+	store := &fakeLifecycleStore{idleVariantReturn: false}
 	cleanup := &fakePhysicalCleanup{}
 	lifecycle := NewWorkerLifecycle(store, cleanup)
 	snap := newTestSnapshot(t, 31, configstore.WorkerStateReserved, "cp-a", 5)
 
-	// Store says it would have transitioned but the snapshot is not
-	// idle/hot_idle — service must classify as a state-fence miss even
-	// though the underlying store call returned true (the store mock
-	// is intentionally permissive; the lifecycle service is the layer
-	// that surfaces the state restriction in metric labels).
-	store.idleVariantReturn = false
 	outcome, err := lifecycle.RetireIdleVariantFromSnapshot(snap, "mismatched_version")
 	if err != nil {
 		t.Fatalf("RetireIdleVariantFromSnapshot: %v", err)

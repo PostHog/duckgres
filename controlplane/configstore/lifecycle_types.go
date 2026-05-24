@@ -99,16 +99,6 @@ func newWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64) Wo
 	}
 }
 
-// newWorkerLeaseFromRecord constructs a lease from a record whose
-// ownership fields are trusted (i.e. just-returned by a claim or takeover
-// inside this package). Returns nil if the record is nil.
-func newWorkerLeaseFromRecord(record *WorkerRecord) *WorkerLease {
-	if record == nil {
-		return nil
-	}
-	lease := newWorkerLease(record.WorkerID, record.OwnerCPInstanceID, record.OwnerEpoch)
-	return &lease
-}
 
 // WorkerID returns the worker id this lease is for.
 func (l WorkerLease) WorkerID() int { return l.workerID }
