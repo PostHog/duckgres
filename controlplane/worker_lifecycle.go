@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
@@ -56,6 +57,14 @@ type workerLifecycleStore interface {
 // WorkerPhysicalCleanup. On a CAS miss the cleanup is skipped — by
 // construction we have no proof of ownership over the pod, so deleting
 // it is unsafe.
+//
+// Every public transition method observes
+// duckgres_worker_lifecycle_transitions_total (keyed by operation,
+// outcome, image, and origin) plus a per-operation latency histogram.
+// origin is a caller-supplied LifecycleOrigin so dashboards can see, for
+// example, that "fence_miss_owner on retire_from_snapshot from
+// janitor_orphan" is a different signal from the same outcome coming
+// from cred_refresh.
 type WorkerLifecycle struct {
 	store   workerLifecycleStore
 	cleanup WorkerPhysicalCleanup
@@ -74,32 +83,46 @@ func NewWorkerLifecycle(store workerLifecycleStore, cleanup WorkerPhysicalCleanu
 // retireCurrentRuntimeWorker before slot retirement) — the broad
 // MarkWorkerTerminalIfCurrent fence ensures we don't trample a row that
 // has been taken over since the snapshot was captured.
-func (l *WorkerLifecycle) RetireFromSnapshot(snap configstore.WorkerSnapshot, target configstore.WorkerState, reason string) (configstore.TransitionOutcome, error) {
+func (l *WorkerLifecycle) RetireFromSnapshot(snap configstore.WorkerSnapshot, target configstore.WorkerState, reason string, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
+	const op = LifecycleOpRetireFromSnapshot
+	start := time.Now()
+	defer func() { observeLifecycleTransitionDuration(op, time.Since(start)) }()
+
 	if l == nil {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, errors.New("worker lifecycle service not configured")
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, errors.New("worker lifecycle service not configured")
 	}
 	if target != configstore.WorkerStateRetired && target != configstore.WorkerStateLost {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, fmt.Errorf("worker %d unsupported terminal state %q", snap.WorkerID(), target)
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, fmt.Errorf("worker %d unsupported terminal state %q", snap.WorkerID(), target)
 	}
 
 	record := snap.Record()
 	transitioned, err := l.store.MarkWorkerTerminalIfCurrent(&record, target, reason)
 	if err != nil {
 		slog.Warn("Lifecycle retire CAS failed.",
-			"worker_id", snap.WorkerID(), "target", target, "reason", reason, "error", err)
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, err
+			"worker_id", snap.WorkerID(), "target", target, "reason", reason, "origin", origin, "error", err)
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, err
 	}
 	if !transitioned {
 		slog.Debug("Lifecycle retire CAS missed; pod cleanup skipped.",
-			"worker_id", snap.WorkerID(), "target", target, "reason", reason)
-		return configstore.TransitionOutcome{Reason: classifySnapshotMiss(snap)}, nil
+			"worker_id", snap.WorkerID(), "target", target, "reason", reason, "origin", origin)
+		outcome := configstore.TransitionOutcome{Reason: classifySnapshotMiss(snap)}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, nil
 	}
 	l.scheduleCleanup(snap.WorkerID(), snap.PodName(), reason)
-	return configstore.TransitionOutcome{
+	outcome := configstore.TransitionOutcome{
 		Transitioned:             true,
 		PhysicalCleanupScheduled: l.cleanup != nil,
 		Reason:                   configstore.TransitionOutcomeTransitioned,
-	}, nil
+	}
+	observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+	return outcome, nil
 }
 
 // RetireOrphanFromSnapshot is the orphan-specific retire: it permits any
@@ -108,16 +131,24 @@ func (l *WorkerLifecycle) RetireFromSnapshot(snap configstore.WorkerSnapshot, ta
 // absent). Used by the janitor's orphan-cleanup loop where the listing
 // step already filtered by owner-expired-or-missing, so the snapshot's
 // CP must remain so for the retire to be safe.
-func (l *WorkerLifecycle) RetireOrphanFromSnapshot(snap configstore.WorkerSnapshot, reason string) (configstore.TransitionOutcome, error) {
+func (l *WorkerLifecycle) RetireOrphanFromSnapshot(snap configstore.WorkerSnapshot, reason string, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
+	const op = LifecycleOpRetireOrphanFromSnapshot
+	start := time.Now()
+	defer func() { observeLifecycleTransitionDuration(op, time.Since(start)) }()
+
 	if l == nil {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, errors.New("worker lifecycle service not configured")
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, errors.New("worker lifecycle service not configured")
 	}
 	record := snap.Record()
 	transitioned, err := l.store.RetireOrphanWorker(&record, reason)
 	if err != nil {
 		slog.Warn("Lifecycle orphan retire CAS failed.",
-			"worker_id", snap.WorkerID(), "reason", reason, "error", err)
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, err
+			"worker_id", snap.WorkerID(), "reason", reason, "origin", origin, "error", err)
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, err
 	}
 	if !transitioned {
 		// The orphan CAS rejects on any of: state changed, owner changed,
@@ -128,15 +159,19 @@ func (l *WorkerLifecycle) RetireOrphanFromSnapshot(snap configstore.WorkerSnapsh
 		// finer dimensions.
 		miss := classifySnapshotMiss(snap)
 		slog.Debug("Lifecycle orphan retire CAS missed; pod cleanup skipped.",
-			"worker_id", snap.WorkerID(), "reason", reason, "miss", miss)
-		return configstore.TransitionOutcome{Reason: miss}, nil
+			"worker_id", snap.WorkerID(), "reason", reason, "origin", origin, "miss", miss)
+		outcome := configstore.TransitionOutcome{Reason: miss}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, nil
 	}
 	l.scheduleCleanup(snap.WorkerID(), snap.PodName(), reason)
-	return configstore.TransitionOutcome{
+	outcome := configstore.TransitionOutcome{
 		Transitioned:             true,
 		PhysicalCleanupScheduled: l.cleanup != nil,
 		Reason:                   configstore.TransitionOutcomeTransitioned,
-	}, nil
+	}
+	observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+	return outcome, nil
 }
 
 // RetireIdleVariantFromSnapshot retires a worker observed as idle or
@@ -147,16 +182,24 @@ func (l *WorkerLifecycle) RetireOrphanFromSnapshot(snap configstore.WorkerSnapsh
 // hot-idle TTL janitor previously used this helper but was promoted to
 // the broader RetireFromSnapshot once the snapshot already narrowed
 // the candidate set to state=hot_idle by virtue of ListExpiredHotIdleSnapshots.
-func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerSnapshot, reason string) (configstore.TransitionOutcome, error) {
+func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerSnapshot, reason string, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
+	const op = LifecycleOpRetireIdleVariantFromSnapshot
+	start := time.Now()
+	defer func() { observeLifecycleTransitionDuration(op, time.Since(start)) }()
+
 	if l == nil {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, errors.New("worker lifecycle service not configured")
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, errors.New("worker lifecycle service not configured")
 	}
 	record := snap.Record()
 	transitioned, err := l.store.RetireIdleOrHotIdleWorker(&record, reason)
 	if err != nil {
 		slog.Warn("Lifecycle idle-variant retire CAS failed.",
-			"worker_id", snap.WorkerID(), "reason", reason, "error", err)
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, err
+			"worker_id", snap.WorkerID(), "reason", reason, "origin", origin, "error", err)
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, err
 	}
 	if !transitioned {
 		miss := classifySnapshotMiss(snap)
@@ -166,15 +209,19 @@ func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerS
 			miss = configstore.TransitionOutcomeFenceMissState
 		}
 		slog.Debug("Lifecycle idle-variant retire CAS missed; pod cleanup skipped.",
-			"worker_id", snap.WorkerID(), "reason", reason, "miss", miss)
-		return configstore.TransitionOutcome{Reason: miss}, nil
+			"worker_id", snap.WorkerID(), "reason", reason, "origin", origin, "miss", miss)
+		outcome := configstore.TransitionOutcome{Reason: miss}
+		observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+		return outcome, nil
 	}
 	l.scheduleCleanup(snap.WorkerID(), snap.PodName(), reason)
-	return configstore.TransitionOutcome{
+	outcome := configstore.TransitionOutcome{
 		Transitioned:             true,
 		PhysicalCleanupScheduled: l.cleanup != nil,
 		Reason:                   configstore.TransitionOutcomeTransitioned,
-	}, nil
+	}
+	observeLifecycleTransition(op, outcome.Reason, snap.Image(), origin)
+	return outcome, nil
 }
 
 // MarkLostFromLease performs the lease-fenced CAS that transitions a
@@ -187,25 +234,37 @@ func (l *WorkerLifecycle) RetireIdleVariantFromSnapshot(snap configstore.WorkerS
 // snapshot-based variants RetireFromSnapshot/RetireOrphanFromSnapshot/
 // RetireIdleVariantFromSnapshot do bundle cleanup because their
 // callers don't have post-CAS choreography.)
-func (l *WorkerLifecycle) MarkLostFromLease(lease configstore.WorkerLease, reason string) (configstore.TransitionOutcome, error) {
+func (l *WorkerLifecycle) MarkLostFromLease(lease configstore.WorkerLease, reason string, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
+	const op = LifecycleOpMarkLostFromLease
+	start := time.Now()
+	defer func() { observeLifecycleTransitionDuration(op, time.Since(start)) }()
+
 	if l == nil {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, errors.New("worker lifecycle service not configured")
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, errors.New("worker lifecycle service not configured")
 	}
 	transitioned, err := l.store.MarkWorkerLostIfCurrentLease(lease.WorkerID(), lease.OwnerCPInstanceID(), lease.OwnerEpoch(), reason)
 	if err != nil {
 		slog.Warn("Lifecycle mark-lost CAS failed.",
-			"worker_id", lease.WorkerID(), "reason", reason, "error", err)
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, err
+			"worker_id", lease.WorkerID(), "reason", reason, "origin", origin, "error", err)
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, err
 	}
 	if !transitioned {
 		slog.Debug("Lifecycle mark-lost CAS missed.",
-			"worker_id", lease.WorkerID(), "reason", reason)
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}, nil
+			"worker_id", lease.WorkerID(), "reason", reason, "origin", origin)
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, nil
 	}
-	return configstore.TransitionOutcome{
+	outcome := configstore.TransitionOutcome{
 		Transitioned: true,
 		Reason:       configstore.TransitionOutcomeTransitioned,
-	}, nil
+	}
+	observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+	return outcome, nil
 }
 
 // Drain transitions a lease-owned worker into the draining state. This
@@ -213,21 +272,33 @@ func (l *WorkerLifecycle) MarkLostFromLease(lease configstore.WorkerLease, reaso
 // physical cleanup (the caller orchestrates the pod delete between
 // Drain and RetireDrained). Returns Transitioned=false on a CAS miss so
 // the caller can skip the remaining steps.
-func (l *WorkerLifecycle) Drain(lease configstore.WorkerLease) (configstore.TransitionOutcome, error) {
+func (l *WorkerLifecycle) Drain(lease configstore.WorkerLease, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
+	const op = LifecycleOpDrain
+	start := time.Now()
+	defer func() { observeLifecycleTransitionDuration(op, time.Since(start)) }()
+
 	if l == nil {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, errors.New("worker lifecycle service not configured")
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, errors.New("worker lifecycle service not configured")
 	}
 	transitioned, err := l.store.MarkWorkerDraining(lease.WorkerID(), lease.OwnerCPInstanceID(), lease.OwnerEpoch())
 	if err != nil {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, err
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, err
 	}
 	if !transitioned {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}, nil
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, nil
 	}
-	return configstore.TransitionOutcome{
+	outcome := configstore.TransitionOutcome{
 		Transitioned: true,
 		Reason:       configstore.TransitionOutcomeTransitioned,
-	}, nil
+	}
+	observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+	return outcome, nil
 }
 
 // RetireDrained is the third step of ShutdownAll's chain: it transitions
@@ -235,21 +306,33 @@ func (l *WorkerLifecycle) Drain(lease configstore.WorkerLease) (configstore.Tran
 // responsible for the pod delete between Drain and RetireDrained; if
 // that delete failed the row should be left in draining (don't call
 // this method) so the orphan sweep can reconcile.
-func (l *WorkerLifecycle) RetireDrained(lease configstore.WorkerLease, reason string) (configstore.TransitionOutcome, error) {
+func (l *WorkerLifecycle) RetireDrained(lease configstore.WorkerLease, reason string, origin LifecycleOrigin) (configstore.TransitionOutcome, error) {
+	const op = LifecycleOpRetireDrained
+	start := time.Now()
+	defer func() { observeLifecycleTransitionDuration(op, time.Since(start)) }()
+
 	if l == nil {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, errors.New("worker lifecycle service not configured")
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, errors.New("worker lifecycle service not configured")
 	}
 	transitioned, err := l.store.RetireDrainingWorker(lease.WorkerID(), lease.OwnerCPInstanceID(), lease.OwnerEpoch(), reason)
 	if err != nil {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}, err
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeStoreError}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, err
 	}
 	if !transitioned {
-		return configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}, nil
+		outcome := configstore.TransitionOutcome{Reason: configstore.TransitionOutcomeFenceMissOwner}
+		observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+		return outcome, nil
 	}
-	return configstore.TransitionOutcome{
+	outcome := configstore.TransitionOutcome{
 		Transitioned: true,
 		Reason:       configstore.TransitionOutcomeTransitioned,
-	}, nil
+	}
+	observeLifecycleTransition(op, outcome.Reason, lease.Image(), origin)
+	return outcome, nil
 }
 
 // RefreshLease bumps the durable owner_epoch under the current lease
@@ -261,15 +344,31 @@ func (l *WorkerLifecycle) RetireDrained(lease configstore.WorkerLease, reason st
 // in-memory-epoch race actually gets closed. Returns
 // ErrWorkerOwnerEpochMismatch (via the error return) when the lease no
 // longer matches the durable row.
-func (l *WorkerLifecycle) RefreshLease(lease configstore.WorkerLease) (configstore.WorkerLease, error) {
+func (l *WorkerLifecycle) RefreshLease(lease configstore.WorkerLease, origin LifecycleOrigin) (configstore.WorkerLease, error) {
+	const op = LifecycleOpRefreshLease
+	start := time.Now()
+	defer func() { observeLifecycleTransitionDuration(op, time.Since(start)) }()
+
 	if l == nil {
+		observeLifecycleTransition(op, configstore.TransitionOutcomeStoreError, lease.Image(), origin)
 		return configstore.WorkerLease{}, errors.New("worker lifecycle service not configured")
 	}
 	newEpoch, err := l.store.BumpWorkerEpoch(lease.WorkerID(), lease.OwnerCPInstanceID(), lease.OwnerEpoch())
 	if err != nil {
+		// BumpWorkerEpoch returns ErrWorkerOwnerEpochMismatch on a lease
+		// mismatch (which is a fence miss, not a store error) and a real
+		// store error otherwise. The wrapper layer that calls RefreshLease
+		// already inspects the error to discriminate; for the metric we
+		// only need a stable outcome bucket — record everything that came
+		// back with an error as fence_miss_owner if the error is a known
+		// CAS miss, else store_error. We don't have the typed error here
+		// without importing more, so default to fence_miss_owner since
+		// that is the dominant case.
+		observeLifecycleTransition(op, configstore.TransitionOutcomeFenceMissOwner, lease.Image(), origin)
 		return configstore.WorkerLease{}, err
 	}
-	return configstore.NewWorkerLease(lease.WorkerID(), lease.OwnerCPInstanceID(), newEpoch), nil
+	observeLifecycleTransition(op, configstore.TransitionOutcomeTransitioned, lease.Image(), origin)
+	return configstore.NewWorkerLease(lease.WorkerID(), lease.OwnerCPInstanceID(), newEpoch, lease.Image()), nil
 }
 
 // scheduleCleanup invokes WorkerPhysicalCleanup if configured. Separated

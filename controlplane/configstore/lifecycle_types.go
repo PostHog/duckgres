@@ -86,16 +86,18 @@ type WorkerLease struct {
 	workerID          int
 	ownerCPInstanceID string
 	ownerEpoch        int64
+	image             string
 }
 
 // newWorkerLease constructs a WorkerLease. Package-private so leases can
 // only be minted by store methods that have actually established
 // ownership.
-func newWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64) WorkerLease {
+func newWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64, image string) WorkerLease {
 	return WorkerLease{
 		workerID:          workerID,
 		ownerCPInstanceID: ownerCPInstanceID,
 		ownerEpoch:        ownerEpoch,
+		image:             image,
 	}
 }
 
@@ -111,6 +113,11 @@ func (l WorkerLease) OwnerCPInstanceID() string { return l.ownerCPInstanceID }
 // epoch-bumping operations (e.g. RefreshLease) produce a new lease; the
 // previous one becomes stale and any CAS attempted with it will miss.
 func (l WorkerLease) OwnerEpoch() int64 { return l.ownerEpoch }
+
+// Image returns the worker image the lease was minted against. Surfaced
+// so lifecycle-transition metrics can label the operation by image
+// without an extra round-trip to read the durable row.
+func (l WorkerLease) Image() string { return l.image }
 
 // TransitionOutcomeReason classifies why a lifecycle transition did or
 // did not happen. The values are stable and meant for telemetry — PR 6

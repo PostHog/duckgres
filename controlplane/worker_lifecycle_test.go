@@ -158,7 +158,7 @@ func TestRetireFromSnapshotSucceedsAndSchedulesCleanup(t *testing.T) {
 	lifecycle := NewWorkerLifecycle(store, cleanup)
 	snap := newTestSnapshot(t, 11, configstore.WorkerStateIdle, "cp-a", 4)
 
-	outcome, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "spawn_failure")
+	outcome, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "spawn_failure", LifecycleOriginSpawnFailure)
 	if err != nil {
 		t.Fatalf("RetireFromSnapshot: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestRetireFromSnapshotSkipsCleanupOnCASMiss(t *testing.T) {
 	lifecycle := NewWorkerLifecycle(store, cleanup)
 	snap := newTestSnapshot(t, 12, configstore.WorkerStateIdle, "cp-a", 4)
 
-	outcome, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "spawn_failure")
+	outcome, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "spawn_failure", LifecycleOriginSpawnFailure)
 	if err != nil {
 		t.Fatalf("RetireFromSnapshot: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestRetireFromSnapshotTargetingLostSchedulesCleanup(t *testing.T) {
 	lifecycle := NewWorkerLifecycle(store, cleanup)
 	snap := newTestSnapshot(t, 14, configstore.WorkerStateReserved, "cp-a", 5)
 
-	outcome, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateLost, "crash")
+	outcome, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateLost, "crash", LifecycleOriginHealthCheckCrash)
 	if err != nil {
 		t.Fatalf("RetireFromSnapshot(lost): %v", err)
 	}
@@ -225,7 +225,7 @@ func TestRetireFromSnapshotRejectsNonTerminalTarget(t *testing.T) {
 	lifecycle := NewWorkerLifecycle(store, cleanup)
 	snap := newTestSnapshot(t, 13, configstore.WorkerStateIdle, "cp-a", 4)
 
-	if _, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateDraining, "bad"); err == nil {
+	if _, err := lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateDraining, "bad", LifecycleOriginUnknown); err == nil {
 		t.Fatal("expected error on non-terminal target")
 	}
 	if len(store.terminalTransitions) != 0 {
@@ -245,7 +245,7 @@ func TestRetireOrphanFromSnapshotReportsGenericMissWithoutExtraRead(t *testing.T
 	lifecycle := NewWorkerLifecycle(store, cleanup)
 	snap := newTestSnapshot(t, 21, configstore.WorkerStateHot, "cp-revived", 3)
 
-	outcome, err := lifecycle.RetireOrphanFromSnapshot(snap, "orphaned")
+	outcome, err := lifecycle.RetireOrphanFromSnapshot(snap, "orphaned", LifecycleOriginJanitorOrphan)
 	if err != nil {
 		t.Fatalf("RetireOrphanFromSnapshot: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestRetireIdleVariantSkipsWhenSnapshotNotEligible(t *testing.T) {
 	lifecycle := NewWorkerLifecycle(store, cleanup)
 	snap := newTestSnapshot(t, 31, configstore.WorkerStateReserved, "cp-a", 5)
 
-	outcome, err := lifecycle.RetireIdleVariantFromSnapshot(snap, "mismatched_version")
+	outcome, err := lifecycle.RetireIdleVariantFromSnapshot(snap, "mismatched_version", LifecycleOriginMismatchedVersionReaper)
 	if err != nil {
 		t.Fatalf("RetireIdleVariantFromSnapshot: %v", err)
 	}
@@ -284,9 +284,9 @@ func TestDrainAndRetireDrainedSequence(t *testing.T) {
 	store := &fakeLifecycleStore{drainingReturn: true, retireDrainingReturn: true}
 	cleanup := &fakePhysicalCleanup{}
 	lifecycle := NewWorkerLifecycle(store, cleanup)
-	lease := configstore.NewWorkerLease(41, "cp-a", 6)
+	lease := configstore.NewWorkerLease(41, "cp-a", 6, "duckgres:test")
 
-	drainOutcome, err := lifecycle.Drain(lease)
+	drainOutcome, err := lifecycle.Drain(lease, LifecycleOriginShutdownAll)
 	if err != nil {
 		t.Fatalf("Drain: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestDrainAndRetireDrainedSequence(t *testing.T) {
 		t.Fatalf("expected zero cleanup calls between Drain and RetireDrained, got %#v", calls)
 	}
 
-	retireOutcome, err := lifecycle.RetireDrained(lease, "shutdown")
+	retireOutcome, err := lifecycle.RetireDrained(lease, "shutdown", LifecycleOriginShutdownAll)
 	if err != nil {
 		t.Fatalf("RetireDrained: %v", err)
 	}
@@ -328,9 +328,9 @@ func TestMarkLostFromLeaseDoesNotScheduleCleanup(t *testing.T) {
 	store := &fakeLifecycleStore{markLostReturn: true}
 	cleanup := &fakePhysicalCleanup{}
 	lifecycle := NewWorkerLifecycle(store, cleanup)
-	lease := configstore.NewWorkerLease(51, "cp-a", 7)
+	lease := configstore.NewWorkerLease(51, "cp-a", 7, "duckgres:test")
 
-	outcome, err := lifecycle.MarkLostFromLease(lease, "health_check_crash")
+	outcome, err := lifecycle.MarkLostFromLease(lease, "health_check_crash", LifecycleOriginHealthCheckCrash)
 	if err != nil {
 		t.Fatalf("MarkLostFromLease: %v", err)
 	}
@@ -345,9 +345,9 @@ func TestMarkLostFromLeaseDoesNotScheduleCleanup(t *testing.T) {
 func TestRefreshLeaseReturnsBumpedLease(t *testing.T) {
 	store := &fakeLifecycleStore{bumpNewEpoch: 9}
 	lifecycle := NewWorkerLifecycle(store, nil)
-	lease := configstore.NewWorkerLease(61, "cp-a", 8)
+	lease := configstore.NewWorkerLease(61, "cp-a", 8, "duckgres:test")
 
-	newLease, err := lifecycle.RefreshLease(lease)
+	newLease, err := lifecycle.RefreshLease(lease, LifecycleOriginCredRefresh)
 	if err != nil {
 		t.Fatalf("RefreshLease: %v", err)
 	}
@@ -365,9 +365,9 @@ func TestRefreshLeaseReturnsBumpedLease(t *testing.T) {
 func TestRefreshLeasePropagatesEpochMismatch(t *testing.T) {
 	store := &fakeLifecycleStore{bumpErr: configstore.ErrWorkerOwnerEpochMismatch}
 	lifecycle := NewWorkerLifecycle(store, nil)
-	lease := configstore.NewWorkerLease(62, "cp-a", 1)
+	lease := configstore.NewWorkerLease(62, "cp-a", 1, "duckgres:test")
 
-	_, err := lifecycle.RefreshLease(lease)
+	_, err := lifecycle.RefreshLease(lease, LifecycleOriginCredRefresh)
 	if !errors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
 		t.Fatalf("expected ErrWorkerOwnerEpochMismatch, got %v", err)
 	}

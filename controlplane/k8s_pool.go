@@ -326,7 +326,7 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		if snap == nil || lifecycle == nil {
 			continue
 		}
-		outcome, err := lifecycle.RetireIdleVariantFromSnapshot(*snap, RetireReasonMismatchedVersion)
+		outcome, err := lifecycle.RetireIdleVariantFromSnapshot(*snap, RetireReasonMismatchedVersion, LifecycleOriginMismatchedVersionReaper)
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
@@ -387,17 +387,23 @@ func workerImageForPod(pod *corev1.Pod) string {
 // upserting the DB row, so there's a brief window where a live pod has no DB
 // record. Without the age gate the reconciler would race the spawner.
 //
-// Returns the number of pods deleted this call.
-func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge time.Duration) int {
+// Returns the number of pods deleted this call and an error if the
+// initial pod-list step failed (in which case the sweep was incomplete
+// and the caller should NOT mark the recovery loop as successful).
+// Per-pod delete failures are recorded against
+// duckgres_worker_stranded_pods_reconciled_total{outcome="delete_failed"}
+// and do not bubble up here — they don't disqualify the sweep, just one
+// candidate.
+func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge time.Duration) (int, error) {
 	if p.runtimeStore == nil || p.clientset == nil {
-		return 0
+		return 0, nil
 	}
 	pods, err := p.clientset.CoreV1().Pods(p.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: "app=duckgres-worker",
 	})
 	if err != nil {
 		slog.Warn("Stranded-pod reconciler failed to list worker pods.", "error", err)
-		return 0
+		return 0, err
 	}
 	cutoff := time.Now().Add(-minAge)
 	deleted := 0
@@ -431,13 +437,15 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 			GracePeriodSeconds: &gracePeriod,
 		}); err != nil && !errors.IsNotFound(err) {
 			slog.Warn("Stranded-pod reconciler failed to delete pod.", "worker_pod", pod.Name, "worker_id", workerID, "error", err)
+			observeStrandedPodReconciled(StrandedOutcomeDeleteFailed)
 			continue
 		}
 		_ = p.deleteWorkerRPCSecret(ctx, pod.Name)
 		slog.Info("Stranded worker pod reconciled.", "worker_pod", pod.Name, "worker_id", workerID, "db_state", dbState)
+		observeStrandedPodReconciled(StrandedOutcomeDeleted)
 		deleted++
 	}
-	return deleted
+	return deleted, nil
 }
 
 // cleanupOrphanedWorkerSecrets deletes worker RPC secrets whose pod
@@ -450,10 +458,15 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 // minAge protects newly-created secrets the spawner is still using
 // (the spawn flow creates the secret first, then the pod).
 //
-// Returns the number of secrets deleted this call.
-func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge time.Duration) int {
+// Returns the number of secrets deleted this call and an error if the
+// initial secret-list step failed (in which case the sweep was
+// incomplete; see cleanupOrphanedWorkerPods for the same contract).
+// Per-secret delete failures are recorded against
+// duckgres_worker_stranded_secrets_reconciled_total{outcome="delete_failed"}
+// and do not bubble up.
+func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge time.Duration) (int, error) {
 	if p.clientset == nil {
-		return 0
+		return 0, nil
 	}
 	// Worker RPC secrets are labeled at creation (worker_rpc_security.go
 	// ensureWorkerRPCSecret) with app=duckgres +
@@ -469,7 +482,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge
 	})
 	if err != nil {
 		slog.Warn("Stranded-secret reconciler failed to list worker RPC secrets.", "error", err)
-		return 0
+		return 0, err
 	}
 	cutoff := time.Now().Add(-minAge)
 	deleted := 0
@@ -493,12 +506,14 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge
 		}
 		if err := p.clientset.CoreV1().Secrets(p.namespace).Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 			slog.Warn("Stranded-secret reconciler failed to delete secret.", "secret", secret.Name, "worker_pod", podName, "error", err)
+			observeStrandedSecretReconciled(StrandedOutcomeDeleteFailed)
 			continue
 		}
 		slog.Info("Stranded worker RPC secret reconciled.", "secret", secret.Name, "worker_pod", podName)
+		observeStrandedSecretReconciled(StrandedOutcomeDeleted)
 		deleted++
 	}
-	return deleted
+	return deleted, nil
 }
 
 func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
@@ -1455,7 +1470,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					// Check if image matches (hot-idle reclamation is strict on version)
 					if assignment.Image != "" && hotClaimed.Image != assignment.Image {
 						slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
-						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion)
+						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
 						// Fall through to neutral idle claim or capacity backpressure.
 					} else {
 						worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)
@@ -1468,7 +1483,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 							continue
 						}
 						slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
-						p.retireClaimedWorker(hotClaimed, RetireReasonCrash)
+						p.retireClaimedWorker(hotClaimed, RetireReasonCrash, LifecycleOriginReserveFailure)
 						// Fall through to neutral idle claim.
 					}
 				}
@@ -1493,7 +1508,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					continue
 				}
 				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "worker_pod", claimed.PodName, "error", reserveErr)
-				p.retireClaimedWorker(claimed, RetireReasonCrash)
+				p.retireClaimedWorker(claimed, RetireReasonCrash, LifecycleOriginReserveFailure)
 				continue
 			}
 
@@ -1814,7 +1829,7 @@ func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podNam
 	return client, nil
 }
 
-func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRecord, reason string) {
+func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
 	if claimed == nil {
 		return
 	}
@@ -1831,25 +1846,25 @@ func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRe
 		switch {
 		case err != nil:
 			slog.Warn("Failed to refresh worker runtime row before retirement.",
-				"worker_id", claimed.WorkerID, "reason", reason, "error", err)
+				"worker_id", claimed.WorkerID, "reason", reason, "origin", origin, "error", err)
 		case refreshed == nil:
 			slog.Debug("Worker runtime row missing before retirement; skipping cleanup.",
-				"worker_id", claimed.WorkerID, "reason", reason)
+				"worker_id", claimed.WorkerID, "reason", reason, "origin", origin)
 			return
 		default:
 			if refreshed.OwnerCPInstanceID() != claimed.OwnerCPInstanceID || refreshed.OwnerEpoch() != claimed.OwnerEpoch {
 				slog.Debug("Worker ownership changed before retirement; skipping cleanup.",
-					"worker_id", claimed.WorkerID, "reason", reason)
+					"worker_id", claimed.WorkerID, "reason", reason, "origin", origin)
 				return
 			}
 			rec := refreshed.Record()
 			current = &rec
 		}
 	}
-	p.retireClaimedWorker(current, reason)
+	p.retireClaimedWorker(current, reason, origin)
 }
 
-func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string) {
+func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
 	if claimed == nil {
 		return
 	}
@@ -1867,9 +1882,9 @@ func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, r
 	// Pod cleanup is scheduled by the lifecycle on a successful CAS via
 	// the WorkerPhysicalCleanup (this pool's DeleteWorkerArtifacts).
 	snap := configstore.NewWorkerSnapshot(*claimed)
-	if _, err := lifecycle.RetireFromSnapshot(snap, terminalState, reason); err != nil {
+	if _, err := lifecycle.RetireFromSnapshot(snap, terminalState, reason, origin); err != nil {
 		slog.Warn("Failed to retire claimed worker.",
-			"worker_id", claimed.WorkerID, "reason", reason, "error", err)
+			"worker_id", claimed.WorkerID, "reason", reason, "origin", origin, "error", err)
 	}
 }
 
@@ -1986,7 +2001,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				// Retire already-claimed slots so they don't strand
 				// as durable spawning rows with no pod behind them.
 				for _, s := range slots {
-					p.retireCurrentRuntimeWorker(s, RetireReasonCrash)
+					p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
 				}
 				return err
 			}
@@ -2020,7 +2035,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				p.mu.Unlock()
 
 				if err != nil {
-					p.retireCurrentRuntimeWorker(slot, RetireReasonCrash)
+					p.retireCurrentRuntimeWorker(slot, RetireReasonCrash, LifecycleOriginSpawnFailure)
 					errs[i] = err
 				}
 			}(i, slot)
@@ -2149,7 +2164,7 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 		if err != nil {
 			observeWarmCapacityReconcileSpawns(image, "error", len(slots))
 			for _, s := range slots {
-				p.retireCurrentRuntimeWorker(s, RetireReasonCrash)
+				p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
 			}
 			return err
 		}
@@ -2182,7 +2197,7 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 			p.mu.Unlock()
 
 			if err != nil {
-				p.retireCurrentRuntimeWorker(slot, RetireReasonCrash)
+				p.retireCurrentRuntimeWorker(slot, RetireReasonCrash, LifecycleOriginSpawnFailure)
 				errs[i] = err
 			}
 		}(i, slot)
@@ -2465,8 +2480,8 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		if lifecycle == nil {
 			continue
 		}
-		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
-		outcome, err := lifecycle.Drain(lease)
+		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+		outcome, err := lifecycle.Drain(lease, LifecycleOriginShutdownAll)
 		if err != nil {
 			slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
 				"worker_id", w.ID, "error", err)
@@ -2500,8 +2515,8 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		// it once this CP's heartbeat expires. Re-read w.OwnerEpoch() so a
 		// cred-refresh bump that landed between Step 1 and now uses the
 		// fresh epoch.
-		lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch())
-		if _, err := lifecycle.RetireDrained(lateLease, RetireReasonShutdown); err != nil {
+		lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+		if _, err := lifecycle.RetireDrained(lateLease, RetireReasonShutdown, LifecycleOriginShutdownAll); err != nil {
 			slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
 				"worker_id", w.ID, "error", err)
 			continue
@@ -2908,6 +2923,7 @@ type workerLeaseSnapshot struct {
 	workerID          int
 	ownerCPInstanceID string
 	ownerEpoch        int64
+	image             string
 }
 
 func (p *K8sWorkerPool) workerLeaseSnapshot(w *ManagedWorker) workerLeaseSnapshot {
@@ -2919,6 +2935,7 @@ func (p *K8sWorkerPool) workerLeaseSnapshot(w *ManagedWorker) workerLeaseSnapsho
 		workerID:          w.ID,
 		ownerCPInstanceID: ownerCPInstanceID,
 		ownerEpoch:        w.OwnerEpoch(),
+		image:             w.image,
 	}
 }
 
@@ -2980,8 +2997,9 @@ func (p *K8sWorkerPool) markWorkerLostIfCurrentLease(lease workerLeaseSnapshot) 
 		return false, nil
 	}
 	outcome, err := lc.MarkLostFromLease(
-		configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch),
+		configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, lease.image),
 		RetireReasonCrash,
+		LifecycleOriginHealthCheckCrash,
 	)
 	if err != nil {
 		return false, err

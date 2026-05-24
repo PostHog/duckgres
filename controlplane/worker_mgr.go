@@ -74,19 +74,25 @@ func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
 }
 
 func (w *ManagedWorker) OwnerEpoch() int64 {
+	start := time.Now()
 	w.epochMu.Lock()
+	observeEpochLockWait(EpochLockOpGet, time.Since(start))
 	defer w.epochMu.Unlock()
 	return w.ownerEpoch
 }
 
 func (w *ManagedWorker) SetOwnerEpoch(epoch int64) {
+	start := time.Now()
 	w.epochMu.Lock()
+	observeEpochLockWait(EpochLockOpSet, time.Since(start))
 	defer w.epochMu.Unlock()
 	w.ownerEpoch = epoch
 }
 
 func (w *ManagedWorker) IncrementOwnerEpoch() int64 {
+	start := time.Now()
 	w.epochMu.Lock()
+	observeEpochLockWait(EpochLockOpIncrement, time.Since(start))
 	defer w.epochMu.Unlock()
 	w.ownerEpoch++
 	return w.ownerEpoch
@@ -118,7 +124,9 @@ func (w *ManagedWorker) IncrementOwnerEpoch() int64 {
 // durable round-trip. If the callback returns an error the
 // in-memory epoch is left unchanged.
 func (w *ManagedWorker) RefreshOwnerEpochAtomic(fn func(current int64) (int64, error)) error {
+	start := time.Now()
 	w.epochMu.Lock()
+	observeEpochLockWait(EpochLockOpRefreshAtomic, time.Since(start))
 	defer w.epochMu.Unlock()
 	newEpoch, err := fn(w.ownerEpoch)
 	if err != nil {

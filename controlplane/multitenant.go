@@ -294,7 +294,8 @@ func SetupMultiTenant(
 		// pod-list (large namespace) can't starve the secret reaper
 		// behind it, and vice versa.
 		podCtx, podCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if n := router.sharedPool.cleanupOrphanedWorkerPods(podCtx, 2*time.Minute); n > 0 {
+		n, podListErr := router.sharedPool.cleanupOrphanedWorkerPods(podCtx, 2*time.Minute)
+		if n > 0 {
 			slog.Info("Stranded worker pods reconciled.", "count", n)
 		}
 		podCancel()
@@ -304,10 +305,23 @@ func SetupMultiTenant(
 		// pod-cleanup loop above only iterates pods, so this is the
 		// only place that reclaims those orphans.
 		secretCtx, secretCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if n := router.sharedPool.cleanupOrphanedWorkerSecrets(secretCtx, 2*time.Minute); n > 0 {
+		n, secretListErr := router.sharedPool.cleanupOrphanedWorkerSecrets(secretCtx, 2*time.Minute)
+		if n > 0 {
 			slog.Info("Stranded worker RPC secrets reconciled.", "count", n)
 		}
 		secretCancel()
+
+		// Record the recovery-sweep success only when both listing
+		// steps completed. Per-item delete failures don't disqualify
+		// the sweep: they're already counted as
+		// duckgres_worker_stranded_*_reconciled_total{outcome="delete_failed"}
+		// by the reapers themselves, and the next tick will retry them.
+		// The gauge alerts on "no successful sweep in N minutes" — i.e.
+		// the listing layer (K8s apiserver) is unreachable, which is
+		// the operational thing we cannot recover from automatically.
+		if podListErr == nil && secretListErr == nil {
+			recordJanitorRecoverySuccess(time.Now())
+		}
 	}
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance
