@@ -353,34 +353,6 @@ func (s *captureRuntimeWorkerStore) TakeOverWorker(workerID int, ownerCPInstance
 	return &record, nil
 }
 
-func (s *captureRuntimeWorkerStore) RetireIdleWorker(record *configstore.WorkerRecord, reason string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if record == nil {
-		return false, nil
-	}
-	s.retireIdleCalls++
-	s.retireIdleCalledIDs = append(s.retireIdleCalledIDs, record.WorkerID)
-	s.retireIdleCalledReasons = append(s.retireIdleCalledReasons, reason)
-	if s.retireIdleErr != nil {
-		return false, s.retireIdleErr
-	}
-	if s.retireIdleMisses[record.WorkerID] {
-		return false, nil
-	}
-	if record.State != configstore.WorkerStateIdle {
-		return false, nil
-	}
-	rec := s.preloadedRecords[record.WorkerID]
-	if rec == nil || !observedWorkerRecordMatchesCurrent(record, rec) {
-		return false, nil
-	}
-	rec.State = configstore.WorkerStateRetired
-	rec.RetireReason = reason
-	rec.UpdatedAt = time.Now()
-	return true, nil
-}
-
 func (s *captureRuntimeWorkerStore) RetireIdleOrHotIdleWorker(record *configstore.WorkerRecord, reason string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3874,7 +3846,9 @@ func mismatchVersionTestPool(t *testing.T, cpID string, store RuntimeWorkerStore
 		retireSem:    make(chan struct{}, 5),
 	}
 	if store != nil {
-		pool.lifecycle = NewWorkerLifecycle(store, pool)
+		if ls, ok := interface{}(store).(workerLifecycleStore); ok {
+			pool.lifecycle = NewWorkerLifecycle(ls, pool)
+		}
 	}
 	return pool, cs
 }

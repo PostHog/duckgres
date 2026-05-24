@@ -191,9 +191,16 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		// The lifecycle service is the typed seam for every post-CAS
 		// pod cleanup. Wire it to the pool's own DeleteWorkerArtifacts
 		// so callers schedule the standard K8s cleanup goroutine.
-		// Tests that bypass this constructor and set runtimeStore
-		// directly trigger lazy initialization via ensureLifecycle().
-		pool.lifecycle = NewWorkerLifecycle(cfg.RuntimeStore, pool)
+		// RuntimeWorkerStore intentionally omits the worker-id-only
+		// CAS methods (MarkWorkerDraining/RetireDrainingWorker/
+		// BumpWorkerEpoch) — they're reachable only through the
+		// lifecycle. We extract them here via a type assertion against
+		// the concrete store. Tests that bypass this constructor and
+		// set runtimeStore directly trigger lazy initialization via
+		// ensureLifecycle().
+		if ls, ok := cfg.RuntimeStore.(workerLifecycleStore); ok {
+			pool.lifecycle = NewWorkerLifecycle(ls, pool)
+		}
 	}
 
 	// Resolve CP pod UID for owner references
@@ -1821,11 +1828,14 @@ func (p *K8sWorkerPool) DeleteWorkerArtifacts(workerID int, podName, reason stri
 // Production paths go through newK8sWorkerPool which initializes
 // lifecycle eagerly; this lazy path exists for tests that construct
 // the pool struct directly and set runtimeStore after the fact.
-// Returns nil when no runtime store is available (process backend
-// builds, or test fixtures that haven't wired the durable layer).
+// Returns nil when no runtime store is available, or when the store
+// doesn't satisfy workerLifecycleStore (process backend / minimal
+// mocks that intentionally don't implement the CAS methods).
 func (p *K8sWorkerPool) ensureLifecycle() *WorkerLifecycle {
 	if p.lifecycle == nil && p.runtimeStore != nil {
-		p.lifecycle = NewWorkerLifecycle(p.runtimeStore, p)
+		if ls, ok := p.runtimeStore.(workerLifecycleStore); ok {
+			p.lifecycle = NewWorkerLifecycle(ls, p)
+		}
 	}
 	return p.lifecycle
 }
