@@ -3300,6 +3300,21 @@ func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string,
 		)
 		return false
 	}
+	// markWorkerRetiredInMemoryLocked returns false only when the
+	// SharedState machine refuses Retired (e.g., already terminal).
+	// Under p.mu that's unreachable in practice — the worker is in
+	// p.workers and no one else can have flipped the state — but we
+	// don't gate the return on it for two reasons:
+	// (1) the durable retire HAS landed (persist succeeded above), so
+	//     "transitioned" is honest at the lifecycle level even if the
+	//     local mirror was a no-op;
+	// (2) returning false would strand the now-durably-retired worker
+	//     in p.workers (caller skips delete()) with the K8s pod still
+	//     up — the orphan reconciler would eventually delete the pod
+	//     but never the in-memory entry, breaking local capacity
+	//     accounting.
+	// The discarded bool stays for diagnostic value if the state
+	// machine ever surfaces a real refusal.
 	_ = p.markWorkerRetiredInMemoryLocked(w)
 	observeLifecycleTransition(
 		LifecycleOpRetireLocal,
