@@ -19,11 +19,21 @@ The automatic stuck-worker reaper runs every minute and retires workers that hav
 | `sum(duckgres_worker_lifecycle_count{state="activating"})` | Workers currently activating (should be 0 or briefly 1-2) |
 | `sum(duckgres_worker_lifecycle_count{state="reserved"})` | Workers reserved but not yet activating |
 | `duckgres_activation_failures_total` | Total failed activations; use control-plane logs for failure details |
-| `duckgres_worker_lifecycle_transitions_total{operation=~"retire_.*",origin="janitor_stuck_activating",outcome="transitioned"}` | How many stuck workers have been auto-reaped (both janitor and pool-local reapers) |
+| Stuck-reaper rate (see procedure step 1) | How many stuck workers have been auto-reaped (both janitor and pool-local reapers) |
 
 ## Procedure
 
-1. **Check if the reaper is working.** Look for `rate(duckgres_worker_lifecycle_transitions_total{operation=~"retire_.*",origin="janitor_stuck_activating",outcome="transitioned"}[5m])` increasing. The regex matches `retire_from_snapshot` (janitor-side) and `retire_local` (pool-side `reapStuckActivatingWorkers`); both fire under the same origin label. If either is increasing the system is self-healing — focus on why activations are failing.
+1. **Check if the reaper is working.** Use this PromQL (kept outside the table so the regex alternation isn't escaped by markdown rendering):
+
+   ```promql
+   rate(duckgres_worker_lifecycle_transitions_total{
+     operation=~"retire_.*",
+     origin="janitor_stuck_activating",
+     outcome="transitioned"
+   }[5m])
+   ```
+
+   The regex matches `retire_from_snapshot` (janitor-side) and `retire_local` (pool-side `reapStuckActivatingWorkers`); both fire under the same origin label. If either is increasing the system is self-healing — focus on why activations are failing.
 
 2. **Diagnose activation failures.** Check control-plane logs for activation errors. Common causes:
    - Org config resolver failing (missing config in configstore)

@@ -16,11 +16,28 @@ The shared warm pool maintains `minWorkers` idle workers at all times. When a wo
 |--------|----------------|---------------|
 | `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` | < 1 for > 30s | No idle capacity, new sessions must wait for a spawn |
 | `sum(duckgres_worker_lifecycle_count{state="hot"})` | Near `maxWorkers` | Pool is at capacity, may need to scale `maxWorkers` |
-| `duckgres_worker_lifecycle_transitions_total{origin=~"health_check_crash\|reserve_failure\|spawn_failure\|crash_generic",outcome="transitioned"}` | Spike | Workers are crashing, replacements may also crash |
+| Crash-rate query (see procedure step 1) | Spike | Workers are crashing, replacements may also crash |
 
 ## Procedure
 
-1. **Check why capacity is low.** Use `sum by (origin)(rate(duckgres_worker_lifecycle_transitions_total{operation=~"retire_.*|mark_lost_from_lease",outcome="transitioned"}[5m]))` to see the dominant retirement origin. Crash-like origins:
+1. **Check why capacity is low.** Use this PromQL (kept outside the table so the `|` alternation isn't escaped by markdown rendering):
+
+   ```promql
+   sum by (origin)(
+     rate(duckgres_worker_lifecycle_transitions_total{
+       operation=~"retire_.*|mark_lost_from_lease",
+       outcome="transitioned"
+     }[5m])
+   )
+   ```
+
+   The crash-like origins to filter on:
+
+   ```promql
+   origin=~"health_check_crash|reserve_failure|spawn_failure|crash_generic"
+   ```
+
+   What each origin means:
    - `health_check_crash` — periodic health-check loop tripped consecutive-failure threshold
    - `crash_generic` — reserved-worker liveness recheck failure or no-runtime-store fallback
    - `reserve_failure` — claim succeeded but reservation activation failed
