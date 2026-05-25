@@ -403,5 +403,5 @@ func (l *WorkerLifecycle) scheduleCleanup(workerID int, podName, reason string) 
 // TransitionOutcomeFenceMiss* constant.
 func classifySnapshotMiss(snap configstore.WorkerSnapshot) configstore.TransitionOutcomeReason {
 	_ = snap
-	return configstore.TransitionOutcomeFenceMissOwner
+	return configstore.TransitionOutcomeFenceMissSnapshot
 }

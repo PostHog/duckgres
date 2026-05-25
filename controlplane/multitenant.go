@@ -245,6 +245,7 @@ func SetupMultiTenant(
 	janitor.onStop = resetLeaderOwnedClusterMetrics
 	lastWarmCapacityTargets := map[string]int{}
 	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats
+	var lastWorkerLifecycleTargetImages []string
 	lastWarmCapacityGlobalCapBlocked := false
 	janitor.reconcileWarmCapacity = func() {
 		snap := store.Snapshot()
@@ -262,11 +263,13 @@ func SetupMultiTenant(
 			slog.Warn("Janitor failed to read dynamic warm-capacity demand; reconciling base warm targets only.", "error", err)
 		}
 		observeWarmCapacityTargets(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, cfg.K8s.MaxWorkers, lastWarmCapacityTargets)
+		targetImages := warmCapacityTargetImages(targetSnapshot.EffectiveTargets)
 		if stats, statsErr := listWorkerLifecycleStats(store); statsErr != nil {
 			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", statsErr)
 		} else {
-			observeWorkerLifecycleStats(stats, lastWorkerLifecycleStats)
+			observeWorkerLifecycleStatsForImages(stats, targetImages, lastWorkerLifecycleTargetImages, lastWorkerLifecycleStats)
 			lastWorkerLifecycleStats = cloneWorkerLifecycleStats(stats)
+			lastWorkerLifecycleTargetImages = cloneStringSlice(targetImages)
 		}
 		logWarmCapacityTargetChanges(lastWarmCapacityTargets, targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets)
 		lastWarmCapacityTargets = cloneWarmCapacityTargets(targetSnapshot.EffectiveTargets)
@@ -519,6 +522,15 @@ func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []confi
 	}
 	out := make([]configstore.WorkerLifecycleStats, len(stats))
 	copy(out, stats)
+	return out
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
 	return out
 }
 

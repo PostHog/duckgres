@@ -424,6 +424,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 			continue
 		}
 		dbState := "missing"
+		outcome := StrandedOutcomeDeletedMissingRow
 		if rec != nil {
 			if rec.State != configstore.WorkerStateRetired && rec.State != configstore.WorkerStateLost {
 				// Pod is still claimed by an active runtime row — not
@@ -434,6 +435,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 				continue
 			}
 			dbState = string(rec.State)
+			outcome = StrandedOutcomeDeletedTerminalRow
 		}
 		gracePeriod := int64(10)
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
@@ -445,7 +447,7 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 		}
 		_ = p.deleteWorkerRPCSecret(ctx, pod.Name)
 		slog.Info("Stranded worker pod reconciled.", "worker_pod", pod.Name, "worker_id", workerID, "db_state", dbState)
-		observeStrandedPodReconciled(StrandedOutcomeDeleted)
+		observeStrandedPodReconciled(outcome)
 		deleted++
 	}
 	return deleted
@@ -1262,7 +1264,10 @@ func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string, origin Lif
 		p.mu.Unlock()
 		return false
 	}
-	p.markWorkerRetiredLocked(w, reason, origin)
+	if !p.markWorkerRetiredLocked(w, reason, origin) {
+		p.mu.Unlock()
+		return false
+	}
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	p.mu.Unlock()
@@ -1288,7 +1293,10 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 		w.activeSessions--
 	}
 	if w.activeSessions == 0 {
-		p.markWorkerRetiredLocked(w, reason, origin)
+		if !p.markWorkerRetiredLocked(w, reason, origin) {
+			p.mu.Unlock()
+			return false
+		}
 		delete(p.workers, id)
 		workerCount := len(p.workers)
 		p.mu.Unlock()
@@ -1303,6 +1311,21 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 // RetireIfDrainingAndEmpty retires a worker that is draining and has no active
 // sessions. Does NOT decrement activeSessions (caller must have already done so).
 // Used by ReleaseWorker when TransitionToHotIdleIfNoSessions skips a non-hot worker.
+//
+// The transition is draining → retired, which has to go through the
+// lifecycle service's dedicated RetireDrainingWorker CAS — NOT the
+// generic UpsertWorkerRecord path that markWorkerRetiredLocked uses,
+// because UpsertWorkerRecord's ON CONFLICT WHERE clause rejects
+// updates against existing rows in {draining, retired, lost}. Routing
+// this transition through UpsertWorkerRecord would always fence-miss
+// and (post-P1-gate) leave the drained empty worker stuck in both the
+// in-memory map and on K8s.
+//
+// On CAS miss / DB error the durable row stays in draining for the
+// orphan sweep on a peer leader to reconcile; we don't touch the
+// in-memory worker or the K8s pod because we haven't proven we still
+// own the lease — the same peer-pod-delete safety that motivated the
+// markWorkerRetiredLocked gate.
 func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int, origin LifecycleOrigin) {
 	p.mu.Lock()
 	w, ok := p.workers[id]
@@ -1314,7 +1337,33 @@ func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int, origin LifecycleOrigin)
 		p.mu.Unlock()
 		return
 	}
-	p.markWorkerRetiredLocked(w, RetireReasonNormal, origin)
+	lifecycle := p.ensureLifecycle()
+	if lifecycle == nil {
+		// No durable store wired (process backend / minimal test pool):
+		// fall back to the in-memory + upsert path. persistWorkerRecord
+		// is a no-op when runtimeStore is nil, so there's no fence-miss
+		// to worry about.
+		if !p.markWorkerRetiredLocked(w, RetireReasonNormal, origin) {
+			p.mu.Unlock()
+			return
+		}
+	} else {
+		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+		outcome, err := lifecycle.RetireDrained(lease, RetireReasonNormal, origin)
+		if err != nil {
+			slog.Warn("RetireIfDrainingAndEmpty: CAS to retired failed; orphan sweep will reconcile.",
+				"worker_id", id, "error", err)
+			p.mu.Unlock()
+			return
+		}
+		if !outcome.Transitioned {
+			slog.Debug("RetireIfDrainingAndEmpty: retire-drained CAS missed; orphan sweep will reconcile.",
+				"worker_id", id)
+			p.mu.Unlock()
+			return
+		}
+		p.markWorkerRetiredInMemoryLocked(w)
+	}
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	p.mu.Unlock()
@@ -2042,8 +2091,6 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 				p.mu.Lock()
 				p.spawning--
-				if err == nil {
-				}
 				p.mu.Unlock()
 
 				if err != nil {
@@ -2088,8 +2135,6 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 			p.mu.Lock()
 			p.spawning--
-			if err == nil {
-			}
 			p.mu.Unlock()
 
 			errs[i] = err
@@ -2203,8 +2248,6 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 
 			p.mu.Lock()
 			p.spawning--
-			if err == nil {
-			}
 			p.mu.Unlock()
 
 			if err != nil {
@@ -2680,7 +2723,9 @@ func (p *K8sWorkerPool) reapIdleWorkers() {
 		}
 		{
 			id, w := c.id, c.w
-			p.markWorkerRetiredLocked(w, RetireReasonIdleTimeout, LifecycleOriginIdleTimeout)
+			if !p.markWorkerRetiredLocked(w, RetireReasonIdleTimeout, LifecycleOriginIdleTimeout) {
+				continue
+			}
 			toRetire = append(toRetire, struct {
 				id int
 				w  *ManagedWorker
@@ -2725,7 +2770,9 @@ func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
 		lifecycle := w.SharedState().NormalizedLifecycle()
 		if (lifecycle == WorkerLifecycleReserved || lifecycle == WorkerLifecycleActivating) &&
 			!w.reservedAt.IsZero() && now.Sub(w.reservedAt) > timeout {
-			p.markWorkerRetiredLocked(w, RetireReasonStuckActivating, LifecycleOriginPoolStuckActivating)
+			if !p.markWorkerRetiredLocked(w, RetireReasonStuckActivating, LifecycleOriginPoolStuckActivating) {
+				continue
+			}
 			toRetire = append(toRetire, struct {
 				id int
 				w  *ManagedWorker
@@ -2973,7 +3020,9 @@ func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bo
 	// (informer fired w.done). Not the periodic health-check path —
 	// that goes through markWorkerLostForHealthLease above and never
 	// calls into here.
-	p.markWorkerRetiredLocked(w, RetireReasonCrash, LifecycleOriginInformerCrash)
+	if !p.markWorkerRetiredLocked(w, RetireReasonCrash, LifecycleOriginInformerCrash) {
+		return nil, len(p.workers), 0, false
+	}
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	if !p.shouldReplenishWarmCapacityLocked() {
@@ -3230,25 +3279,35 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int, image string) {
 // Ordering: persist BEFORE the in-memory transition so a fence-miss
 // (peer CP advanced the lease) doesn't leave this CP with a stale
 // in-memory view that pretends we still own the worker. On any
-// persistWorkerRecord error (fence-miss or real DB error) the
-// in-memory state is left untouched and no metric is emitted.
-func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string, origin LifecycleOrigin) {
+// persistWorkerRecord error (fence-miss or real DB error), the
+// in-memory state is left untouched, a retire_local failure outcome is
+// emitted, and callers must skip local removal plus pod deletion.
+func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string, origin LifecycleOrigin) bool {
 	workerState := configstore.WorkerStateRetired
 	if reason == RetireReasonCrash {
 		workerState = configstore.WorkerStateLost
 	}
 	if err := p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil)); err != nil {
-		return
+		outcome := configstore.TransitionOutcomeStoreError
+		if stderrors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+			outcome = configstore.TransitionOutcomeFenceMissLease
+		}
+		observeLifecycleTransition(
+			LifecycleOpRetireLocal,
+			outcome,
+			w.image,
+			origin,
+		)
+		return false
 	}
-	if !p.markWorkerRetiredInMemoryLocked(w) {
-		return
-	}
+	_ = p.markWorkerRetiredInMemoryLocked(w)
 	observeLifecycleTransition(
 		LifecycleOpRetireLocal,
 		configstore.TransitionOutcomeTransitioned,
 		w.image,
 		origin,
 	)
+	return true
 }
 
 // markWorkerRetiredInMemoryLocked performs only the in-memory lifecycle

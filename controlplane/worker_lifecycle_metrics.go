@@ -98,7 +98,6 @@ const (
 	LifecycleOriginUnknown LifecycleOrigin = "unknown"
 )
 
-
 // StrandedOutcome categorizes what the janitor recovery sweep did with
 // each stranded pod it observed. "kept" means the artifact was claimed
 // by a current runtime row (i.e. it wasn't actually stranded); "deleted"
@@ -107,9 +106,11 @@ const (
 type StrandedOutcome string
 
 const (
-	StrandedOutcomeDeleted      StrandedOutcome = "deleted"
-	StrandedOutcomeKept         StrandedOutcome = "kept"
-	StrandedOutcomeDeleteFailed StrandedOutcome = "delete_failed"
+	StrandedOutcomeDeleted            StrandedOutcome = "deleted"
+	StrandedOutcomeDeletedMissingRow  StrandedOutcome = "deleted_missing_row"
+	StrandedOutcomeDeletedTerminalRow StrandedOutcome = "deleted_terminal_row"
+	StrandedOutcomeKept               StrandedOutcome = "kept"
+	StrandedOutcomeDeleteFailed       StrandedOutcome = "delete_failed"
 )
 
 // SpawnFailureReason categorizes why a worker spawn returned an error.

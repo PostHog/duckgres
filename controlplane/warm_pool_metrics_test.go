@@ -28,7 +28,7 @@ func TestMarkWorkerRetiredLocked_TransitionsToRetired(t *testing.T) {
 	}
 }
 
-func TestMarkWorkerRetiredLocked_RecordsHotWorkerSessions(t *testing.T) {
+func TestMarkWorkerRetiredLocked_TransitionsHotWorkerToRetired(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 
 	w := makeTestWorker(WorkerLifecycleHot, &WorkerAssignment{OrgID: "org-1"})
@@ -39,6 +39,50 @@ func TestMarkWorkerRetiredLocked_RecordsHotWorkerSessions(t *testing.T) {
 
 	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleRetired {
 		t.Fatalf("expected retired, got %s", w.SharedState().NormalizedLifecycle())
+	}
+}
+
+func TestRetireWorkerWithReasonSkipsCleanupWhenDurableRetireFenced(t *testing.T) {
+	pool, _ := newTestK8sPool(t, 5)
+	pool.runtimeStore = &captureRuntimeWorkerStore{
+		upsertErr: configstore.ErrWorkerRecordUpsertFenceMiss,
+	}
+
+	w := makeTestWorker(WorkerLifecycleIdle, nil)
+	w.ID = 1
+	w.podName = pool.podNameForWorker(w.ID)
+	w.image = pool.workerImage
+	pool.workers[w.ID] = w
+
+	before := counterVecLabelValue(t, workerLifecycleTransitionsCounter,
+		string(LifecycleOpRetireLocal),
+		string(configstore.TransitionOutcomeFenceMissLease),
+		pool.workerImage,
+		string(LifecycleOriginPublicAPI),
+	)
+
+	if retired := pool.retireWorkerWithReason(w.ID, RetireReasonNormal, LifecycleOriginPublicAPI); retired {
+		t.Fatal("expected retireWorkerWithReason to report false on durable fence miss")
+	}
+
+	pool.mu.RLock()
+	_, stillPresent := pool.workers[w.ID]
+	pool.mu.RUnlock()
+	if !stillPresent {
+		t.Fatal("worker should remain in the local map when durable retire is fenced")
+	}
+	if got := w.SharedState().NormalizedLifecycle(); got != WorkerLifecycleIdle {
+		t.Fatalf("expected lifecycle to remain idle after durable fence miss, got %s", got)
+	}
+
+	after := counterVecLabelValue(t, workerLifecycleTransitionsCounter,
+		string(LifecycleOpRetireLocal),
+		string(configstore.TransitionOutcomeFenceMissLease),
+		pool.workerImage,
+		string(LifecycleOriginPublicAPI),
+	)
+	if delta := after - before; delta != 1 {
+		t.Fatalf("expected one retire_local fence-miss metric, got delta %v", delta)
 	}
 }
 
@@ -222,6 +266,103 @@ func TestObserveWarmCapacityMetrics(t *testing.T) {
 	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateHotIdle), "org_bound")
 }
 
+func TestObserveWarmCapacityTargetsDeletesStaleImage(t *testing.T) {
+	oldImage := "duckgres:old-target"
+	newImage := "duckgres:new-target"
+	warmCapacityEffectiveTargetGauge.DeleteLabelValues(oldImage)
+	warmCapacityEffectiveTargetGauge.DeleteLabelValues(newImage)
+
+	observeWarmCapacityTargets(nil, map[string]int{oldImage: 4}, 10)
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": oldImage}); !ok {
+		t.Fatal("expected old target image series to exist after observation")
+	}
+
+	observeWarmCapacityTargets(nil, map[string]int{newImage: 2}, 10, map[string]int{oldImage: 4})
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": oldImage}); ok {
+		t.Fatal("expected stale target image series to be deleted")
+	}
+	if got, ok := metricGaugeFamilyLabelValue(t, "duckgres_warm_capacity_effective_target", map[string]string{"image": newImage}); !ok || got != 2 {
+		t.Fatalf("expected current target image series value 2, got value=%v ok=%v", got, ok)
+	}
+}
+
+func TestObserveWorkerLifecycleStatsSeedsZerosAndDeletesStaleImages(t *testing.T) {
+	currentImage := "duckgres:current-lifecycle"
+	staleImage := "duckgres:stale-lifecycle"
+	workerLifecycleCountGauge.DeleteLabelValues(currentImage, string(configstore.WorkerStateIdle), "neutral")
+	workerLifecycleCountGauge.DeleteLabelValues(currentImage, string(configstore.WorkerStateHot), "org_bound")
+	workerLifecycleCountGauge.DeleteLabelValues(staleImage, string(configstore.WorkerStateIdle), "neutral")
+
+	previous := []configstore.WorkerLifecycleStats{
+		{Image: staleImage, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 3},
+	}
+	observeWorkerLifecycleStats(previous)
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
+		"image":   staleImage,
+		"state":   string(configstore.WorkerStateIdle),
+		"binding": "neutral",
+	}); !ok {
+		t.Fatal("expected stale image series to exist before replacement observation")
+	}
+
+	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
+		{Image: currentImage, State: configstore.WorkerStateHot, Binding: "org_bound", Count: 1},
+	}, previous)
+
+	if got, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
+		"image":   currentImage,
+		"state":   string(configstore.WorkerStateIdle),
+		"binding": "neutral",
+	}); !ok || got != 0 {
+		t.Fatalf("expected seeded idle/neutral zero series for current image, got value=%v ok=%v", got, ok)
+	}
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
+		"image":   staleImage,
+		"state":   string(configstore.WorkerStateIdle),
+		"binding": "neutral",
+	}); ok {
+		t.Fatal("expected stale lifecycle image series to be deleted")
+	}
+}
+
+func TestObserveWorkerLifecycleStatsSeedsTargetImageWithoutRows(t *testing.T) {
+	image := "duckgres:empty-target-lifecycle"
+	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
+
+	observeWorkerLifecycleStatsForImages(nil, []string{image}, nil)
+
+	if got, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
+		"image":   image,
+		"state":   string(configstore.WorkerStateIdle),
+		"binding": "neutral",
+	}); !ok || got != 0 {
+		t.Fatalf("expected seeded idle/neutral zero series for target image with no rows, got value=%v ok=%v", got, ok)
+	}
+}
+
+func TestObserveWorkerLifecycleStatsDeletesTargetImageWithoutRows(t *testing.T) {
+	image := "duckgres:removed-empty-target-lifecycle"
+	workerLifecycleCountGauge.DeleteLabelValues(image, string(configstore.WorkerStateIdle), "neutral")
+
+	observeWorkerLifecycleStatsForImages(nil, []string{image}, nil)
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
+		"image":   image,
+		"state":   string(configstore.WorkerStateIdle),
+		"binding": "neutral",
+	}); !ok {
+		t.Fatal("expected target image zero series to exist before target removal")
+	}
+
+	observeWorkerLifecycleStatsForImages(nil, nil, []string{image})
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
+		"image":   image,
+		"state":   string(configstore.WorkerStateIdle),
+		"binding": "neutral",
+	}); ok {
+		t.Fatal("expected target image zero series to be deleted after target removal")
+	}
+}
+
 func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 	image := "duckgres:leader-reset-test"
 
@@ -264,6 +405,45 @@ func assertGaugeValue(t *testing.T, gauge prometheus.Gauge, expected float64) {
 	if got := m.GetGauge().GetValue(); got != expected {
 		t.Fatalf("expected gauge value %v, got %v", expected, got)
 	}
+}
+
+func metricGaugeFamilyLabelValue(t *testing.T, metricName string, labels map[string]string) (float64, bool) {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		if fam.GetType() != dto.MetricType_GAUGE {
+			t.Fatalf("metric %q is not a gauge", metricName)
+		}
+		for _, metric := range fam.GetMetric() {
+			if metricHasLabels(metric, labels) {
+				return metric.GetGauge().GetValue(), true
+			}
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+func metricHasLabels(metric *dto.Metric, labels map[string]string) bool {
+	if len(labels) == 0 {
+		return true
+	}
+	seen := make(map[string]string, len(metric.GetLabel()))
+	for _, label := range metric.GetLabel() {
+		seen[label.GetName()] = label.GetValue()
+	}
+	for name, want := range labels {
+		if seen[name] != want {
+			return false
+		}
+	}
+	return true
 }
 
 func counterLabelValue(cv *prometheus.CounterVec, label string) float64 {

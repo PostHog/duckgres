@@ -127,6 +127,22 @@ func TestObserveStrandedPodReconciled(t *testing.T) {
 	}
 }
 
+func TestObserveStrandedSecretReconciled(t *testing.T) {
+	before := counterVecLabelValue(t, workerStrandedSecretsReconciledCounter, string(StrandedOutcomeDeleted))
+	observeStrandedSecretReconciled(StrandedOutcomeDeleted)
+	after := counterVecLabelValue(t, workerStrandedSecretsReconciledCounter, string(StrandedOutcomeDeleted))
+	if after-before != 1 {
+		t.Fatalf("expected one stranded-secret-deleted increment, got delta %v", after-before)
+	}
+
+	familyBefore := metricCounterFamilyTotal(t, "duckgres_worker_stranded_secrets_reconciled_total")
+	observeStrandedSecretReconciled("  ")
+	familyAfter := metricCounterFamilyTotal(t, "duckgres_worker_stranded_secrets_reconciled_total")
+	if familyAfter != familyBefore {
+		t.Fatalf("expected empty stranded-secret outcome to be dropped; family total moved %v -> %v", familyBefore, familyAfter)
+	}
+}
+
 func TestObserveSpawnFailure(t *testing.T) {
 	image := "duckgres:spawn-fail-test"
 	before := counterVecLabelValue(t, workerSpawnFailuresCounter, string(SpawnFailureReasonPodCreate), image)
@@ -193,4 +209,3 @@ func TestObserveHealthCheck(t *testing.T) {
 		t.Fatalf("expected empty-result HC to drop; family total moved %v → %v", familyBefore, familyAfter)
 	}
 }
-

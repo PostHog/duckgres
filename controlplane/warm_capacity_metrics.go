@@ -31,6 +31,10 @@ var workerLifecycleCountGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Cluster-wide active worker count by image, lifecycle state, and tenant binding.",
 }, []string{"image", "state", "binding"})
 
+func init() {
+	warmCapacityHeadroomGauge.Set(-1)
+}
+
 func observeWarmCapacityMiss(image string, reason configstore.WorkerClaimMissReason) {
 	image = strings.TrimSpace(image)
 	if image == "" {
@@ -46,10 +50,15 @@ func observeWarmCapacityMiss(image string, reason configstore.WorkerClaimMissRea
 // against base can be reintroduced cheaply); it is otherwise unused.
 func observeWarmCapacityTargets(baseTargets, effectiveTargets map[string]int, maxWorkers int, previousTargets ...map[string]int) {
 	_ = baseTargets
-	targetMaps := []map[string]int{effectiveTargets}
-	targetMaps = append(targetMaps, previousTargets...)
-	images := warmCapacityTargetImages(targetMaps...)
-	for _, image := range images {
+	currentImages := warmCapacityTargetImages(effectiveTargets)
+	previousImages := warmCapacityTargetImages(previousTargets...)
+	currentSet := stringSet(currentImages)
+	for _, image := range previousImages {
+		if _, ok := currentSet[image]; !ok {
+			warmCapacityEffectiveTargetGauge.DeleteLabelValues(image)
+		}
+	}
+	for _, image := range currentImages {
 		effective := positiveMapValue(effectiveTargets, image)
 		warmCapacityEffectiveTargetGauge.WithLabelValues(image).Set(float64(effective))
 	}
@@ -65,15 +74,46 @@ func observeWarmCapacityTargets(baseTargets, effectiveTargets map[string]int, ma
 }
 
 func observeWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats, previous ...[]configstore.WorkerLifecycleStats) {
+	observeWorkerLifecycleStatsForImages(stats, nil, nil, previous...)
+}
+
+func observeWorkerLifecycleStatsForImages(stats []configstore.WorkerLifecycleStats, targetImages, previousTargetImages []string, previous ...[]configstore.WorkerLifecycleStats) {
+	currentImages := workerLifecycleImages(stats)
+	for _, image := range targetImages {
+		image = strings.TrimSpace(image)
+		if image != "" {
+			currentImages[image] = struct{}{}
+		}
+	}
+	previousImages := map[string]struct{}{}
 	for _, prev := range previous {
 		for _, stat := range prev {
 			image := strings.TrimSpace(stat.Image)
-			state := strings.TrimSpace(string(stat.State))
-			binding := strings.TrimSpace(stat.Binding)
-			if image == "" || state == "" || binding == "" {
-				continue
+			if image != "" {
+				previousImages[image] = struct{}{}
 			}
-			workerLifecycleCountGauge.WithLabelValues(image, state, binding).Set(0)
+		}
+	}
+	for _, image := range previousTargetImages {
+		image = strings.TrimSpace(image)
+		if image != "" {
+			previousImages[image] = struct{}{}
+		}
+	}
+	for image := range previousImages {
+		if _, ok := currentImages[image]; !ok {
+			for _, state := range observedWorkerLifecycleStates {
+				for _, binding := range observedWorkerLifecycleBindings {
+					workerLifecycleCountGauge.DeleteLabelValues(image, string(state), binding)
+				}
+			}
+		}
+	}
+	for image := range currentImages {
+		for _, state := range observedWorkerLifecycleStates {
+			for _, binding := range observedWorkerLifecycleBindings {
+				workerLifecycleCountGauge.WithLabelValues(image, string(state), binding).Set(0)
+			}
 		}
 	}
 	for _, stat := range stats {
@@ -85,6 +125,29 @@ func observeWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats, previ
 		}
 		workerLifecycleCountGauge.WithLabelValues(image, state, binding).Set(float64(nonNegativeInt64(stat.Count)))
 	}
+}
+
+var observedWorkerLifecycleStates = []configstore.WorkerState{
+	configstore.WorkerStateSpawning,
+	configstore.WorkerStateIdle,
+	configstore.WorkerStateReserved,
+	configstore.WorkerStateActivating,
+	configstore.WorkerStateHot,
+	configstore.WorkerStateHotIdle,
+	configstore.WorkerStateDraining,
+}
+
+var observedWorkerLifecycleBindings = []string{"neutral", "org_bound"}
+
+func workerLifecycleImages(stats []configstore.WorkerLifecycleStats) map[string]struct{} {
+	images := make(map[string]struct{})
+	for _, stat := range stats {
+		image := strings.TrimSpace(stat.Image)
+		if image != "" {
+			images[image] = struct{}{}
+		}
+	}
+	return images
 }
 
 func resetLeaderOwnedClusterMetrics() {
@@ -120,6 +183,14 @@ func warmCapacityTargetImages(maps ...map[string]int) []string {
 		out = append(out, image)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func stringSet(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		out[value] = struct{}{}
+	}
 	return out
 }
 

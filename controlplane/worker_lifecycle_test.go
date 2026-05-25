@@ -14,27 +14,27 @@ import (
 type fakeLifecycleStore struct {
 	mu sync.Mutex
 
-	terminalTransitions   []terminalCall
-	terminalReturn        bool
-	terminalErr           error
-	orphanTransitions     []orphanCall
-	orphanReturn          bool
-	orphanErr             error
-	idleVariantCalls      []orphanCall
-	idleVariantReturn     bool
-	idleVariantErr        error
-	markLostCalls         []leaseCall
-	markLostReturn        bool
-	markLostErr           error
-	drainingCalls         []leaseCall
-	drainingReturn        bool
-	drainingErr           error
-	retireDrainingCalls   []leaseCall
-	retireDrainingReturn  bool
-	retireDrainingErr     error
-	bumpCalls             []leaseCall
-	bumpNewEpoch          int64
-	bumpErr               error
+	terminalTransitions  []terminalCall
+	terminalReturn       bool
+	terminalErr          error
+	orphanTransitions    []orphanCall
+	orphanReturn         bool
+	orphanErr            error
+	idleVariantCalls     []orphanCall
+	idleVariantReturn    bool
+	idleVariantErr       error
+	markLostCalls        []leaseCall
+	markLostReturn       bool
+	markLostErr          error
+	drainingCalls        []leaseCall
+	drainingReturn       bool
+	drainingErr          error
+	retireDrainingCalls  []leaseCall
+	retireDrainingReturn bool
+	retireDrainingErr    error
+	bumpCalls            []leaseCall
+	bumpNewEpoch         int64
+	bumpErr              error
 }
 
 type terminalCall struct {
@@ -252,7 +252,7 @@ func TestRetireOrphanFromSnapshotReportsGenericMissWithoutExtraRead(t *testing.T
 	if outcome.Transitioned {
 		t.Fatalf("expected no transition on orphan CAS miss, got %+v", outcome)
 	}
-	if outcome.Reason != configstore.TransitionOutcomeFenceMissOwner {
+	if outcome.Reason != configstore.TransitionOutcomeFenceMissSnapshot {
 		t.Fatalf("expected generic fence-miss reason for unknown-cause orphan miss, got %q", outcome.Reason)
 	}
 }
@@ -317,6 +317,23 @@ func TestDrainAndRetireDrainedSequence(t *testing.T) {
 	}
 	if got := store.retireDrainingCalls; len(got) != 1 || got[0].reason != "shutdown" {
 		t.Fatalf("expected one RetireDrained CAS with shutdown reason, got %#v", got)
+	}
+}
+
+func TestNewWorkerLeaseAllowsLegacyCallersWithoutImage(t *testing.T) {
+	lease := configstore.NewWorkerLease(42, "cp-a", 7)
+	if lease.WorkerID() != 42 || lease.OwnerCPInstanceID() != "cp-a" || lease.OwnerEpoch() != 7 {
+		t.Fatalf("unexpected lease identity: worker=%d owner=%s epoch=%d", lease.WorkerID(), lease.OwnerCPInstanceID(), lease.OwnerEpoch())
+	}
+	if lease.Image() != "" {
+		t.Fatalf("expected empty image for legacy constructor call, got %q", lease.Image())
+	}
+}
+
+func TestClassifySnapshotMissUsesGenericSnapshotOutcome(t *testing.T) {
+	snap := newTestSnapshot(t, 43, configstore.WorkerStateIdle, "cp-a", 8)
+	if got := classifySnapshotMiss(snap); got != configstore.TransitionOutcomeFenceMissSnapshot {
+		t.Fatalf("expected generic snapshot miss outcome, got %s", got)
 	}
 }
 

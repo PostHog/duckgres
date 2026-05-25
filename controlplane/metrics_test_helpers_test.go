@@ -94,16 +94,6 @@ func histogramVecLabelSampleCount(t *testing.T, hv *prometheus.HistogramVec, lab
 	return m.GetHistogram().GetSampleCount()
 }
 
-// gaugeValue reads a single Gauge's current value.
-func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
-	t.Helper()
-	m := &dto.Metric{}
-	if err := g.Write(m); err != nil {
-		t.Fatalf("gauge write: %v", err)
-	}
-	return m.GetGauge().GetValue()
-}
-
 // metricCounterFamilyTotal sums the value across all series of a counter
 // family. Returns 0 if the family has no series yet. Useful for "did
 // anything increment?" assertions where the test doesn't care about

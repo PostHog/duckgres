@@ -101,7 +101,6 @@ func newWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64, im
 	}
 }
 
-
 // WorkerID returns the worker id this lease is for.
 func (l WorkerLease) WorkerID() int { return l.workerID }
 
@@ -149,6 +148,11 @@ const (
 	// TransitionOutcomeFenceMissCPRevived indicates the orphan CAS missed
 	// because the supposed-orphan's owner CP was no longer expired.
 	TransitionOutcomeFenceMissCPRevived TransitionOutcomeReason = "fence_miss_cp_revived"
+
+	// TransitionOutcomeFenceMissSnapshot indicates a snapshot-fenced CAS
+	// missed but the caller did not perform an extra read to distinguish
+	// state, owner, epoch, updated_at, or owner-CP liveness causes.
+	TransitionOutcomeFenceMissSnapshot TransitionOutcomeReason = "fence_miss_snapshot"
 
 	// TransitionOutcomeFenceMissLease indicates a lease-fenced CAS
 	// (Drain / RetireDrained / MarkLostFromLease) missed without an
