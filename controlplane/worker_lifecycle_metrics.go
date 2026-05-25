@@ -28,8 +28,10 @@ const (
 	// which doesn't go through the lifecycle CAS service. Used by
 	// public RetireWorker, idle-timeout reaping, stuck-activating
 	// reaping, and activation-failure / liveness-recheck fallbacks.
-	// outcome is always transitioned for this op — there's no CAS
-	// fence to miss; the upsert always lands.
+	// outcome is normally transitioned, but UpsertWorkerRecord has a
+	// fence-miss path (ErrWorkerRecordUpsertFenceMiss) — markWorkerRetiredLocked
+	// gates the emission on the upsert result, so retire_local
+	// samples reflect transitions that actually landed durably.
 	LifecycleOpRetireLocal LifecycleOperation = "retire_local"
 )
 
@@ -66,9 +68,13 @@ const (
 	// worker activation returned an error (org pool's
 	// activateWorkerForOrg / ReconnectFlightWorker).
 	LifecycleOriginActivationFailure LifecycleOrigin = "activation_failure"
-	// LifecycleOriginOrgShutdown marks per-org ShutdownAll on
-	// OrgReservedPool (distinct from the pool-wide LifecycleOriginShutdownAll).
-	LifecycleOriginOrgShutdown LifecycleOrigin = "org_shutdown"
+	// LifecycleOriginCrashGeneric marks retire paths driven by a generic
+	// "worker died" signal that isn't the dedicated health-check path —
+	// e.g. reserved-worker liveness recheck failure, cleanDeadWorkersLocked
+	// in the no-runtime-store fallback. Distinct from
+	// LifecycleOriginHealthCheckCrash (which is the periodic HealthCheckLoop
+	// path) so dashboards can separate them.
+	LifecycleOriginCrashGeneric LifecycleOrigin = "crash_generic"
 	// LifecycleOriginUnknown is the fallback label applied when an empty
 	// origin reaches the observer. We always emit a sample rather than
 	// silently drop it; an "unknown" bucket showing up on dashboards is
@@ -90,7 +96,17 @@ func lifecycleOriginForRetireReason(reason string) LifecycleOrigin {
 	case RetireReasonActivationFailure:
 		return LifecycleOriginActivationFailure
 	case RetireReasonCrash:
-		return LifecycleOriginHealthCheckCrash
+		// RetireReasonCrash is overloaded across periodic-health-check
+		// crashes, reserved-worker liveness recheck failures, and the
+		// cleanDeadWorkers no-store fallback. The dedicated
+		// HealthCheckLoop path goes through lifecycle.MarkLostFromLease
+		// directly (which passes LifecycleOriginHealthCheckCrash
+		// explicitly), so the fallback mapping must NOT default to
+		// health_check_crash — otherwise non-health-check crashes
+		// would be misattributed to the health checker. Callers that
+		// know a more specific origin should bypass the mapping by
+		// calling markWorkerRetiredLockedWithOrigin instead.
+		return LifecycleOriginCrashGeneric
 	case RetireReasonShutdown:
 		return LifecycleOriginShutdownAll
 	case RetireReasonMismatchedVersion:
@@ -195,7 +211,7 @@ var workerSpawnFailuresCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 
 var workerDrainTotalDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "duckgres_worker_drain_total_duration_seconds",
-	Help:    "End-to-end wall-clock duration of a single worker drain (Drain CAS + pod delete + RetireDrained CAS) within ShutdownAll. Complements the per-CAS _transition_duration_seconds, which can't show the pod-delete window between the two CAS steps.",
+	Help:    "Wall-clock duration of a single worker drain within ShutdownAll, measured from the Drain CAS through successful pod-delete (the pod-gone milestone). Only emitted when the pod was actually deleted — Drain CAS misses and pod-delete failures are excluded so p99 alerts track the operationally meaningful tail rather than being dominated by microsecond fence-misses. The best-effort terminal CAS that follows is intentionally not part of the timing.",
 	Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 })
 

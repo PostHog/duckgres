@@ -16,12 +16,17 @@ The shared warm pool maintains `minWorkers` idle workers at all times. When a wo
 |--------|----------------|---------------|
 | `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` | < 1 for > 30s | No idle capacity, new sessions must wait for a spawn |
 | `sum(duckgres_worker_lifecycle_count{state="hot"})` | Near `maxWorkers` | Pool is at capacity, may need to scale `maxWorkers` |
-| `duckgres_worker_lifecycle_transitions_total{origin="health_check_crash",outcome="transitioned"}` | Spike | Workers are crashing, replacements may also crash |
+| `duckgres_worker_lifecycle_transitions_total{origin=~"health_check_crash\|reserve_failure\|spawn_failure\|crash_generic",outcome="transitioned"}` | Spike | Workers are crashing, replacements may also crash |
 
 ## Procedure
 
-1. **Check why capacity is low.** Use `sum by (origin)(rate(duckgres_worker_lifecycle_transitions_total{operation=~"retire_.*|mark_lost_from_lease",outcome="transitioned"}[5m]))` to see the dominant retirement origin:
-   - `health_check_crash` — workers are dying, check pod logs and OOM events
+1. **Check why capacity is low.** Use `sum by (origin)(rate(duckgres_worker_lifecycle_transitions_total{operation=~"retire_.*|mark_lost_from_lease",outcome="transitioned"}[5m]))` to see the dominant retirement origin. Crash-like origins:
+   - `health_check_crash` — periodic health-check loop tripped consecutive-failure threshold
+   - `crash_generic` — reserved-worker liveness recheck failure or no-runtime-store fallback
+   - `reserve_failure` — claim succeeded but reservation activation failed
+   - `spawn_failure` — pod spawn returned an error (companion: `duckgres_worker_spawn_failures_total{reason}` for stage breakdown)
+   
+   Other dominant origins:
    - `idle_timeout` — workers are being reaped, increase `minWorkers` or decrease `idleTimeout`
    - `janitor_stuck_activating` — activation is broken, see [stuck-activating-workers](stuck-activating-workers.md)
 

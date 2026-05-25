@@ -496,7 +496,11 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge
 		if _, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{}); err == nil {
 			// Pod exists — leave the secret alone, the regular
 			// cleanupOrphanedWorkerPods path will reap both
-			// together when the pod's DB row is terminal.
+			// together when the pod's DB row is terminal. Recorded
+			// as "kept" for symmetry with the pods sweep, so
+			// dashboards comparing the two reapers' kept counts
+			// see parallel behavior.
+			observeStrandedSecretReconciled(StrandedOutcomeKept)
 			continue
 		} else if !errors.IsNotFound(err) {
 			slog.Warn("Stranded-secret reconciler failed to load worker pod.", "worker_pod", podName, "error", err)
@@ -2314,16 +2318,22 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForLease(lease))
 							cancel()
 						}()
-						// Skip metric emission when the parent loop ctx
-						// was canceled (CP shutting down). Without this
-						// guard every graceful rollout would spike
-						// duckgres_worker_health_checks_total{result=fail}
-						// indistinguishably from real worker crashes.
-						// Per-probe deadline (DeadlineExceeded) is a
-						// real failure and still counted.
+						// Skip both metric emission AND failure-counter
+						// increment when the parent loop ctx was canceled
+						// (CP shutting down). Without this guard:
+						// (a) every graceful rollout would spike
+						//     duckgres_worker_health_checks_total{result=fail}
+						//     indistinguishably from real worker crashes;
+						// (b) a worker one failure short of
+						//     maxConsecutiveHealthFailures could be tipped
+						//     over by a shutdown-induced Canceled and
+						//     erroneously marked Lost.
+						// Per-probe deadline (DeadlineExceeded) is a real
+						// failure and still counted via the else branch.
 						if stderrors.Is(healthErr, context.Canceled) {
-							// shutdown path; don't pollute pass/fail rate
-						} else if healthErr != nil {
+							return
+						}
+						if healthErr != nil {
 							observeHealthCheck(HealthCheckResultFail, lease.image)
 						} else {
 							observeHealthCheck(HealthCheckResultPass, lease.image)
@@ -2486,16 +2496,17 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		if lifecycle == nil {
 			continue
 		}
-		// Wrap the per-worker drain in a closure so a single defer can
-		// observe duration on every exit path (CAS miss, pod-delete
-		// failure, RetireDrained miss) — not just the fully-successful
-		// chain. Returns true when the chain completed and the
-		// in-memory state should also flip to retired; false when
-		// anything along the way prevented terminal CAS and the
-		// orphan sweep should pick it up.
-		retired := func() bool {
+		// Wrap the per-worker drain in a closure. Returns true once the
+		// pod has been deleted (and the client closed) — at that point
+		// the worker is dead from this CP's perspective regardless of
+		// what the terminal CAS does, and the in-memory state must be
+		// flipped to Retired so goroutines holding `w` stop reaching
+		// for the closed client. Returns false when Drain itself
+		// missed (we don't own the row) or when pod-delete errored
+		// (pod is still alive; orphan sweep / peer CP handles the
+		// rest).
+		podDeleted := func() bool {
 			drainStart := time.Now()
-			defer func() { observeDrainTotalDuration(time.Since(drainStart)) }()
 
 			lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
 			outcome, err := lifecycle.Drain(lease, LifecycleOriginShutdownAll)
@@ -2510,50 +2521,52 @@ func (p *K8sWorkerPool) ShutdownAll() {
 				return false
 			}
 
-			// Step 2: delete pod. Leave the row in draining on any error
-			// other than NotFound so recovery paths pick it up.
+			// Step 2: delete pod. On API error other than NotFound we
+			// leave the row in draining for the orphan sweep AND close
+			// the client — this CP is going away regardless and the
+			// gRPC client serves no further purpose.
 			gracePeriod := int64(10)
 			if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 				GracePeriodSeconds: &gracePeriod,
 			}); err != nil && !errors.IsNotFound(err) {
 				slog.Warn("ShutdownAll: pod delete failed; worker left in draining for orphan sweep/reconciler.",
 					"id", w.ID, "worker_pod", podName, "error", err)
+				if w.client != nil {
+					_ = w.client.Close()
+				}
 				return false
 			}
 			_ = p.deleteWorkerRPCSecret(ctx, podName)
 			if w.client != nil {
 				_ = w.client.Close()
 			}
+			// Record drain duration at the pod-delete-success
+			// milestone — every sample reflects a real
+			// gone-from-the-cluster event, so p99 alerts track the
+			// operationally meaningful tail. The terminal CAS below
+			// is best-effort cleanup against an already-dead worker.
+			observeDrainTotalDuration(time.Since(drainStart))
 
-			// Step 3: final CAS to retired. Re-read w.OwnerEpoch() so a
-			// cred-refresh bump that landed between Step 1 and now uses
-			// the fresh epoch.
+			// Step 3: best-effort terminal CAS. Re-read w.OwnerEpoch()
+			// so a cred-refresh bump that landed between Step 1 and
+			// now uses the fresh epoch. Whether it lands or misses,
+			// the pod is gone — return true unconditionally so the
+			// caller flips in-memory state.
 			lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
-			retireOutcome, err := lifecycle.RetireDrained(lateLease, RetireReasonShutdown, LifecycleOriginShutdownAll)
-			if err != nil {
-				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
+			if _, err := lifecycle.RetireDrained(lateLease, RetireReasonShutdown, LifecycleOriginShutdownAll); err != nil {
+				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile durable row.",
 					"worker_id", w.ID, "error", err)
-				return false
-			}
-			if !retireOutcome.Transitioned {
-				// CAS missed — durable row stays in draining for the
-				// orphan sweep. Do NOT flip the in-memory state to
-				// retired; the in-memory lease must keep matching the
-				// durable row so subsequent reconciliation can see it.
-				slog.Debug("ShutdownAll: retire-drained CAS missed; leaving worker in draining for orphan sweep.",
-					"worker_id", w.ID)
-				return false
 			}
 			return true
 		}()
 
-		if !retired {
+		if !podDeleted {
 			continue
 		}
 
 		// In-memory lifecycle bookkeeping. Intentionally skips
-		// persistence (the CAS chain already persisted retired) and the
-		// retire_local metric (lifecycle.RetireDrained already
+		// persistence (the CAS chain already persisted retired/draining)
+		// and the retire_local metric (lifecycle.RetireDrained already
 		// observed retire_drained for this transition).
 		p.mu.Lock()
 		p.markWorkerRetiredInMemoryLocked(w)
@@ -3187,6 +3200,11 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int, image string) {
 // the lifecycle service (deleteRetiredRuntimeWorker, ShutdownAll's
 // drain chain, removeWorkerAfterLostLeaseLocked) call
 // markWorkerRetiredInMemoryLocked directly to avoid double-counting.
+//
+// The metric emission is gated on the upsert landing — if
+// persistWorkerRecord returns ErrWorkerRecordUpsertFenceMiss (a peer CP
+// advanced the lease) we don't increment retire_local because the
+// transition didn't actually land durably.
 func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
 	if !p.markWorkerRetiredInMemoryLocked(w) {
 		return
@@ -3195,7 +3213,9 @@ func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string)
 	if reason == RetireReasonCrash {
 		workerState = configstore.WorkerStateLost
 	}
-	p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil))
+	if err := p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil)); err != nil {
+		return
+	}
 	observeLifecycleTransition(
 		LifecycleOpRetireLocal,
 		configstore.TransitionOutcomeTransitioned,
@@ -3225,21 +3245,29 @@ func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker) bool {
 	return true
 }
 
-func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) {
+// persistWorkerRecord upserts the record and returns the underlying
+// error (including ErrWorkerRecordUpsertFenceMiss when the CP no longer
+// owns the lease). Callers that don't care about the result discard it
+// with `_ =`; markWorkerRetiredLocked uses it to gate metric emission
+// so retire_local samples reflect transitions that actually persisted.
+func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) error {
 	if p.runtimeStore == nil || record == nil {
-		return
+		return nil
 	}
-	if err := p.runtimeStore.UpsertWorkerRecord(record); err != nil {
-		// Fence misses are expected when a peer CP has already advanced the
-		// worker's lease (terminal state, newer owner_epoch, or different
-		// owner at the same epoch). They prove the fence is doing its job —
-		// log at Debug so they don't masquerade as persistence failures.
-		if stderrors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
-			slog.Debug("Worker runtime upsert fenced by newer lease.", "worker_id", record.WorkerID, "state", record.State, "error", err)
-			return
-		}
-		slog.Warn("Persisting worker runtime record failed.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+	err := p.runtimeStore.UpsertWorkerRecord(record)
+	if err == nil {
+		return nil
 	}
+	// Fence misses are expected when a peer CP has already advanced the
+	// worker's lease (terminal state, newer owner_epoch, or different
+	// owner at the same epoch). They prove the fence is doing its job —
+	// log at Debug so they don't masquerade as persistence failures.
+	if stderrors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+		slog.Debug("Worker runtime upsert fenced by newer lease.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+		return err
+	}
+	slog.Warn("Persisting worker runtime record failed.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+	return err
 }
 
 func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoch int64, state configstore.WorkerState, retireReason string, activationStartedAt *time.Time) *configstore.WorkerRecord {
