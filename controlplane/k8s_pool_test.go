@@ -3031,7 +3031,7 @@ func TestK8sPoolMarkWorkerLostIfCurrentLeaseAllowsUnstampedLocalWorker(t *testin
 	pool.runtimeStore = store
 
 	worker := &ManagedWorker{ID: 9, done: make(chan struct{})}
-	currentLease, err := pool.markWorkerLostIfCurrentLease(pool.workerLeaseSnapshot(worker))
+	currentLease, err := pool.markWorkerLostIfCurrentLease(pool.workerLeaseSnapshot(worker), LifecycleOriginHealthCheckCrash)
 	if err != nil {
 		t.Fatalf("mark lost: %v", err)
 	}

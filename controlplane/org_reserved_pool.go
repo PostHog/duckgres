@@ -76,7 +76,7 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context) (*ManagedWorker, er
 			if err := p.activateWorkerForOrg(ctx, worker); err != nil {
 				slog.Warn("Worker activation failed.", "worker", worker.ID, "org", p.orgID, "error", err)
 				observeActivationFailure(worker.image)
-				p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
+				p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure, LifecycleOriginActivationFailure)
 				return nil, err
 			}
 
@@ -109,7 +109,7 @@ func (p *OrgReservedPool) ReleaseWorker(id int) {
 	// TransitionToHotIdleIfNoSessions already decremented activeSessions.
 	// If the worker is not hot (e.g. draining during shutdown) and has no
 	// remaining sessions, retire it so the org slot is freed immediately.
-	p.shared.RetireIfDrainingAndEmpty(id)
+	p.shared.RetireIfDrainingAndEmpty(id, LifecycleOriginPublicAPI)
 }
 
 func (p *OrgReservedPool) RetireWorker(id int) {
@@ -166,7 +166,7 @@ func (p *OrgReservedPool) ShutdownAll() {
 	p.shared.mu.RUnlock()
 
 	for _, id := range workers {
-		p.shared.retireWorkerWithReason(id, RetireReasonShutdown)
+		p.shared.retireWorkerWithReason(id, RetireReasonShutdown, LifecycleOriginOrgShutdown)
 	}
 }
 
@@ -297,7 +297,7 @@ func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID in
 		return nil, err
 	}
 	if err := p.activateWorkerForOrg(ctx, worker); err != nil {
-		p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
+		p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure, LifecycleOriginActivationFailure)
 		return nil, err
 	}
 	return worker, nil

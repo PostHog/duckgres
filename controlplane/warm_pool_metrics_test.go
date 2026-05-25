@@ -21,7 +21,7 @@ func TestMarkWorkerRetiredLocked_TransitionsToRetired(t *testing.T) {
 	w := makeTestWorker(WorkerLifecycleIdle, nil)
 	pool.workers[1] = w
 
-	pool.markWorkerRetiredLocked(w, RetireReasonIdleTimeout)
+	pool.markWorkerRetiredLocked(w, RetireReasonIdleTimeout, LifecycleOriginIdleTimeout)
 
 	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleRetired {
 		t.Fatalf("expected retired, got %s", w.SharedState().NormalizedLifecycle())
@@ -35,7 +35,7 @@ func TestMarkWorkerRetiredLocked_RecordsHotWorkerSessions(t *testing.T) {
 	w.peakSessions = 5
 	pool.workers[1] = w
 
-	pool.markWorkerRetiredLocked(w, RetireReasonNormal)
+	pool.markWorkerRetiredLocked(w, RetireReasonNormal, LifecycleOriginPublicAPI)
 
 	if w.SharedState().NormalizedLifecycle() != WorkerLifecycleRetired {
 		t.Fatalf("expected retired, got %s", w.SharedState().NormalizedLifecycle())

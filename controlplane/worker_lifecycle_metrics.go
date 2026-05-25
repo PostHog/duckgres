@@ -69,12 +69,28 @@ const (
 	// activateWorkerForOrg / ReconnectFlightWorker).
 	LifecycleOriginActivationFailure LifecycleOrigin = "activation_failure"
 	// LifecycleOriginCrashGeneric marks retire paths driven by a generic
-	// "worker died" signal that isn't the dedicated health-check path —
-	// e.g. reserved-worker liveness recheck failure, cleanDeadWorkersLocked
-	// in the no-runtime-store fallback. Distinct from
-	// LifecycleOriginHealthCheckCrash (which is the periodic HealthCheckLoop
-	// path) so dashboards can separate them.
+	// "worker died" signal that isn't covered by a more specific origin
+	// (no current callers after the explicit-origin refactor; retained as
+	// a safe fallback bucket for future generic-crash sites).
 	LifecycleOriginCrashGeneric LifecycleOrigin = "crash_generic"
+	// LifecycleOriginInformerCrash marks the cleanDeadWorkersLocked path
+	// driven by the K8s pod-informer firing w.done. Distinct from
+	// LifecycleOriginHealthCheckCrash (which is the periodic
+	// HealthCheckLoop probe) so dashboards can separate cluster-driven
+	// pod terminations (eviction, OOM, manual delete, node drain) from
+	// our own health-check decisions.
+	LifecycleOriginInformerCrash LifecycleOrigin = "informer_crash"
+	// LifecycleOriginPoolStuckActivating marks the pool-local
+	// reapStuckActivatingWorkers loop, which runs every minute on every
+	// CP. Distinct from LifecycleOriginJanitorStuckActivating (which is
+	// the leader-only janitor reaper) so operators can tell whether
+	// pool-side or janitor-side reaping is doing the work.
+	LifecycleOriginPoolStuckActivating LifecycleOrigin = "pool_stuck_activating"
+	// LifecycleOriginOrgShutdown marks per-org ShutdownAll on
+	// OrgReservedPool. Distinct from LifecycleOriginShutdownAll (which is
+	// the pool-wide K8sWorkerPool.ShutdownAll) so operators can tell
+	// org-offboarding events from CP rollouts on dashboards.
+	LifecycleOriginOrgShutdown LifecycleOrigin = "org_shutdown"
 	// LifecycleOriginUnknown is the fallback label applied when an empty
 	// origin reaches the observer. We always emit a sample rather than
 	// silently drop it; an "unknown" bucket showing up on dashboards is
@@ -82,43 +98,6 @@ const (
 	LifecycleOriginUnknown LifecycleOrigin = "unknown"
 )
 
-// lifecycleOriginForRetireReason maps a RetireReason* constant to the
-// canonical origin for in-memory retire paths (the markWorkerRetired*
-// chain that bypasses the CAS service). Callers that already know a
-// more specific origin should pass it directly rather than rely on this
-// mapping.
-func lifecycleOriginForRetireReason(reason string) LifecycleOrigin {
-	switch reason {
-	case RetireReasonIdleTimeout:
-		return LifecycleOriginIdleTimeout
-	case RetireReasonStuckActivating:
-		return LifecycleOriginJanitorStuckActivating
-	case RetireReasonActivationFailure:
-		return LifecycleOriginActivationFailure
-	case RetireReasonCrash:
-		// RetireReasonCrash is overloaded across periodic-health-check
-		// crashes, reserved-worker liveness recheck failures, and the
-		// cleanDeadWorkers no-store fallback. The dedicated
-		// HealthCheckLoop path goes through lifecycle.MarkLostFromLease
-		// directly (which passes LifecycleOriginHealthCheckCrash
-		// explicitly), so the fallback mapping must NOT default to
-		// health_check_crash — otherwise non-health-check crashes
-		// would be misattributed to the health checker. Callers that
-		// know a more specific origin should bypass the mapping by
-		// calling markWorkerRetiredLockedWithOrigin instead.
-		return LifecycleOriginCrashGeneric
-	case RetireReasonShutdown:
-		return LifecycleOriginShutdownAll
-	case RetireReasonMismatchedVersion:
-		return LifecycleOriginMismatchedVersionReaper
-	case RetireReasonOrphaned:
-		return LifecycleOriginJanitorOrphan
-	case RetireReasonNormal:
-		return LifecycleOriginPublicAPI
-	default:
-		return LifecycleOriginUnknown
-	}
-}
 
 // StrandedOutcome categorizes what the janitor recovery sweep did with
 // each stranded pod it observed. "kept" means the artifact was claimed
