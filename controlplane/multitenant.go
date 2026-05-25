@@ -83,15 +83,10 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 		for _, s := range sessions {
 			sessionsByWorker[s.WorkerID]++
 		}
-		activeCount := 0
-		idleCount := 0
 		for wID, count := range sessionsByWorker {
 			status := "active"
 			if count == 0 {
 				status = "idle"
-				idleCount++
-			} else {
-				activeCount++
 			}
 			result = append(result, admin.WorkerStatus{
 				ID:             wID,
@@ -100,9 +95,6 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 				Status:         status,
 			})
 		}
-		// Emit per-org worker Prometheus metrics
-		observeOrgWorkersActive(name, activeCount)
-		observeOrgWorkersIdle(name, idleCount)
 	}
 	return result
 }
@@ -247,9 +239,13 @@ func SetupMultiTenant(
 	// lambda chain is gone — the snapshot/lease-typed API is the only
 	// path now.
 	janitor.lifecycle = router.sharedPool.lifecycle
+	// Reset leader-owned cluster-wide gauges when this janitor stops
+	// being the leader, so stale per-image counts from this CP don't
+	// linger in Prometheus while a peer takes over.
+	janitor.onStop = resetLeaderOwnedClusterMetrics
 	lastWarmCapacityTargets := map[string]int{}
-	var lastWarmCapacityRecentMisses []configstore.WarmCapacityMissAggregate
-	var lastWarmCapacityWorkerStats []configstore.WarmCapacityWorkerStats
+	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats
+	var lastWorkerLifecycleTargetImages []string
 	lastWarmCapacityGlobalCapBlocked := false
 	janitor.reconcileWarmCapacity = func() {
 		snap := store.Snapshot()
@@ -266,14 +262,14 @@ func SetupMultiTenant(
 		if err != nil {
 			slog.Warn("Janitor failed to read dynamic warm-capacity demand; reconciling base warm targets only.", "error", err)
 		}
-		observeWarmCapacityRecentMisses(targetSnapshot.RecentMisses, lastWarmCapacityRecentMisses)
-		lastWarmCapacityRecentMisses = cloneWarmCapacityMissAggregates(targetSnapshot.RecentMisses)
 		observeWarmCapacityTargets(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, cfg.K8s.MaxWorkers, lastWarmCapacityTargets)
-		if stats, statsErr := listWarmCapacityWorkerStats(store); statsErr != nil {
-			slog.Warn("Janitor failed to read warm-capacity worker stats.", "error", statsErr)
+		targetImages := warmCapacityTargetImages(targetSnapshot.EffectiveTargets)
+		if stats, statsErr := listWorkerLifecycleStats(store); statsErr != nil {
+			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", statsErr)
 		} else {
-			observeWarmCapacityWorkerStats(stats, lastWarmCapacityWorkerStats)
-			lastWarmCapacityWorkerStats = cloneWarmCapacityWorkerStats(stats)
+			observeWorkerLifecycleStatsForImages(stats, targetImages, lastWorkerLifecycleTargetImages, lastWorkerLifecycleStats)
+			lastWorkerLifecycleStats = cloneWorkerLifecycleStats(stats)
+			lastWorkerLifecycleTargetImages = cloneStringSlice(targetImages)
 		}
 		logWarmCapacityTargetChanges(lastWarmCapacityTargets, targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets)
 		lastWarmCapacityTargets = cloneWarmCapacityTargets(targetSnapshot.EffectiveTargets)
@@ -439,8 +435,8 @@ type warmCapacityMissAggregateLister interface {
 	ListWarmCapacityMissesSince(since time.Time, reasons ...configstore.WorkerClaimMissReason) ([]configstore.WarmCapacityMissAggregate, error)
 }
 
-type warmCapacityWorkerStatsLister interface {
-	ListWarmCapacityWorkerStats() ([]configstore.WarmCapacityWorkerStats, error)
+type workerLifecycleStatsLister interface {
+	ListWorkerLifecycleStats() ([]configstore.WorkerLifecycleStats, error)
 }
 
 type warmCapacityTargetSnapshot struct {
@@ -482,15 +478,15 @@ func computeEffectiveWarmCapacityTargetSnapshot(baseTargets map[string]int, list
 	return snap, nil
 }
 
-func listWarmCapacityWorkerStats(lister warmCapacityWorkerStatsLister) ([]configstore.WarmCapacityWorkerStats, error) {
+func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.WorkerLifecycleStats, error) {
 	if lister == nil {
 		return nil, nil
 	}
-	return lister.ListWarmCapacityWorkerStats()
+	return lister.ListWorkerLifecycleStats()
 }
 
 func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[string]int) {
-	for _, image := range warmCapacityTargetScopes(previous, baseTargets, effectiveTargets) {
+	for _, image := range warmCapacityTargetImages(previous, baseTargets, effectiveTargets) {
 		effective := positiveMapValue(effectiveTargets, image)
 		if positiveMapValue(previous, image) == effective {
 			continue
@@ -501,7 +497,7 @@ func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[st
 			demand = 0
 		}
 		slog.Info("Warm capacity target changed.",
-			"scope", warmCapacityImageScope(image),
+			"image", image,
 			"base_target", base,
 			"demand_target", demand,
 			"effective_target", effective,
@@ -520,21 +516,21 @@ func cloneWarmCapacityTargets(targets map[string]int) map[string]int {
 	return out
 }
 
-func cloneWarmCapacityMissAggregates(aggregates []configstore.WarmCapacityMissAggregate) []configstore.WarmCapacityMissAggregate {
-	if len(aggregates) == 0 {
-		return nil
-	}
-	out := make([]configstore.WarmCapacityMissAggregate, len(aggregates))
-	copy(out, aggregates)
-	return out
-}
-
-func cloneWarmCapacityWorkerStats(stats []configstore.WarmCapacityWorkerStats) []configstore.WarmCapacityWorkerStats {
+func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []configstore.WorkerLifecycleStats {
 	if len(stats) == 0 {
 		return nil
 	}
-	out := make([]configstore.WarmCapacityWorkerStats, len(stats))
+	out := make([]configstore.WorkerLifecycleStats, len(stats))
 	copy(out, stats)
+	return out
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
 	return out
 }
 

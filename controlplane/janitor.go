@@ -42,6 +42,7 @@ type ControlPlaneJanitor struct {
 	lifecycle                     *WorkerLifecycle // every per-worker transition flows through this; nil disables per-worker reaping for that tick.
 	lifecycleNilWarned            sync.Once        // one-shot guard so the misconfiguration error doesn't flood at the janitor tick rate.
 	reconcileWarmCapacity         func()
+	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 }
@@ -70,6 +71,11 @@ func (j *ControlPlaneJanitor) Run(ctx context.Context) {
 	if j == nil || j.store == nil {
 		return
 	}
+	defer func() {
+		if j.onStop != nil {
+			j.onStop()
+		}
+	}()
 
 	j.runOnce()
 
@@ -127,7 +133,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 				slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
 			}
 			for _, snap := range orphaned {
-				if _, err := j.lifecycle.RetireOrphanFromSnapshot(snap, janitorRetireReasonOrphaned); err != nil {
+				if _, err := j.lifecycle.RetireOrphanFromSnapshot(snap, janitorRetireReasonOrphaned, LifecycleOriginJanitorOrphan); err != nil {
 					slog.Warn("Janitor failed to retire orphan worker.", "worker_id", snap.WorkerID(), "error", err)
 				}
 			}
@@ -140,7 +146,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 			slog.Warn("Janitor failed to list stuck workers.", "error", err)
 		} else {
 			for _, snap := range stuckWorkers {
-				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, janitorRetireReasonStuckActivating); err != nil {
+				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, janitorRetireReasonStuckActivating, LifecycleOriginJanitorStuckActivating); err != nil {
 					slog.Warn("Janitor failed to retire stuck worker.", "worker_id", snap.WorkerID(), "error", err)
 				}
 			}
@@ -153,7 +159,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 				slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 			}
 			for _, snap := range expired {
-				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "hot_idle_ttl_expired"); err != nil {
+				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "hot_idle_ttl_expired", LifecycleOriginJanitorHotIdleTTL); err != nil {
 					slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", snap.WorkerID(), "error", err)
 				}
 			}

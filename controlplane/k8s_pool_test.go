@@ -27,6 +27,7 @@ import (
 type captureRuntimeWorkerStore struct {
 	mu                               sync.Mutex
 	records                          []configstore.WorkerRecord
+	upsertErr                        error
 	claimed                          *configstore.WorkerRecord
 	claimErr                         error
 	claimMissReason                  configstore.WorkerClaimMissReason
@@ -141,6 +142,9 @@ func (s *captureRuntimeWorkerStore) recordEvent(evt string) {
 func (s *captureRuntimeWorkerStore) UpsertWorkerRecord(record *configstore.WorkerRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.upsertErr != nil {
+		return s.upsertErr
+	}
 	s.records = append(s.records, *record)
 	return nil
 }
@@ -1389,12 +1393,9 @@ func TestK8sPoolSpawnMinWorkersForImageSpawnsOnlyTheDeficit(t *testing.T) {
 	}
 }
 
-func TestK8sPoolSpawnMinWorkersForImageCountsMixedSpawnResults(t *testing.T) {
+func TestK8sPoolSpawnMinWorkersForImageReturnsErrorOnMixedResults(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	image := "duckgres:metrics-mixed"
-	scope := warmCapacityImageScope(image)
-	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(scope, "success")
-	warmCapacityReconcileSpawnsCounter.DeleteLabelValues(scope, "error")
 
 	nextID := 100
 	store := &captureRuntimeWorkerStore{
@@ -1419,12 +1420,6 @@ func TestK8sPoolSpawnMinWorkersForImageCountsMixedSpawnResults(t *testing.T) {
 
 	if err := pool.SpawnMinWorkersForImage(context.Background(), image, 2); err == nil {
 		t.Fatal("expected mixed spawn batch to return an error")
-	}
-	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, scope, "success"); got != 1 {
-		t.Fatalf("expected one successful reconcile spawn, got %v", got)
-	}
-	if got := counterLabelValues(warmCapacityReconcileSpawnsCounter, scope, "error"); got != 1 {
-		t.Fatalf("expected one failed reconcile spawn, got %v", got)
 	}
 }
 
@@ -3040,7 +3035,7 @@ func TestK8sPoolMarkWorkerLostIfCurrentLeaseAllowsUnstampedLocalWorker(t *testin
 	pool.runtimeStore = store
 
 	worker := &ManagedWorker{ID: 9, done: make(chan struct{})}
-	currentLease, err := pool.markWorkerLostIfCurrentLease(pool.workerLeaseSnapshot(worker))
+	currentLease, err := pool.markWorkerLostIfCurrentLease(pool.workerLeaseSnapshot(worker), LifecycleOriginHealthCheckCrash)
 	if err != nil {
 		t.Fatalf("mark lost: %v", err)
 	}
@@ -4105,7 +4100,7 @@ func TestRetireOneMismatchedVersionWorker_NoopWhenCPIDHasNoHashSuffix(t *testing
 // These tests pin the expected behavior of the K8s-label-based reconciler.
 
 // strandedReconcilerPool wires a K8sWorkerPool with a fake clientset and store
-// for reconciler tests. Ownership labels aren't checked by the reconciler, so
+// for reconciler tests. Owner labels aren't checked by the reconciler, so
 // we keep the setup minimal.
 func strandedReconcilerPool(t *testing.T, store RuntimeWorkerStore) (*K8sWorkerPool, *fake.Clientset) {
 	t.Helper()
@@ -4160,6 +4155,8 @@ func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBStateRetired(t *testing.T) {
 	// previous CP marked it during ShutdownAll) but the K8s pod survived
 	// because the delete failed or was interrupted. The reconciler must catch
 	// this and delete the pod.
+	terminalBefore := counterVecLabelValue(t, workerStrandedPodsReconciledCounter, string(StrandedOutcomeDeletedTerminalRow))
+	genericBefore := counterVecLabelValue(t, workerStrandedPodsReconciledCounter, string(StrandedOutcomeDeleted))
 	store := &captureRuntimeWorkerStore{
 		preloadedRecords: map[int]*configstore.WorkerRecord{
 			31758: {WorkerID: 31758, State: configstore.WorkerStateRetired},
@@ -4174,6 +4171,14 @@ func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBStateRetired(t *testing.T) {
 	}
 	if podExists(t, cs, "duckgres-old-worker-31758") {
 		t.Fatal("expected stranded pod to be deleted")
+	}
+	terminalAfter := counterVecLabelValue(t, workerStrandedPodsReconciledCounter, string(StrandedOutcomeDeletedTerminalRow))
+	if terminalAfter-terminalBefore != 1 {
+		t.Fatalf("expected one terminal-row stranded-pod metric increment, got delta %v", terminalAfter-terminalBefore)
+	}
+	genericAfter := counterVecLabelValue(t, workerStrandedPodsReconciledCounter, string(StrandedOutcomeDeleted))
+	if genericAfter != genericBefore {
+		t.Fatalf("expected generic deleted metric to remain unchanged, moved %v -> %v", genericBefore, genericAfter)
 	}
 }
 
@@ -4201,6 +4206,8 @@ func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBRecordMissing(t *testing.T) {
 	// No DB row exists at all for this worker-id: fully orphaned pod, likely
 	// from a worker row that was purged while the pod kept running. Treat it
 	// the same as a terminal-state pod.
+	missingBefore := counterVecLabelValue(t, workerStrandedPodsReconciledCounter, string(StrandedOutcomeDeletedMissingRow))
+	genericBefore := counterVecLabelValue(t, workerStrandedPodsReconciledCounter, string(StrandedOutcomeDeleted))
 	store := &captureRuntimeWorkerStore{}
 	pool, cs := strandedReconcilerPool(t, store)
 	createStrandedWorkerPod(t, cs, "duckgres-ghost-worker-99", "99", 10*time.Minute)
@@ -4210,6 +4217,14 @@ func TestCleanupOrphanedWorkerPods_DeletesPodWhenDBRecordMissing(t *testing.T) {
 	}
 	if podExists(t, cs, "duckgres-ghost-worker-99") {
 		t.Fatal("expected ghost pod with no DB row to be deleted")
+	}
+	missingAfter := counterVecLabelValue(t, workerStrandedPodsReconciledCounter, string(StrandedOutcomeDeletedMissingRow))
+	if missingAfter-missingBefore != 1 {
+		t.Fatalf("expected one missing-row stranded-pod metric increment, got delta %v", missingAfter-missingBefore)
+	}
+	genericAfter := counterVecLabelValue(t, workerStrandedPodsReconciledCounter, string(StrandedOutcomeDeleted))
+	if genericAfter != genericBefore {
+		t.Fatalf("expected generic deleted metric to remain unchanged, moved %v -> %v", genericBefore, genericAfter)
 	}
 }
 

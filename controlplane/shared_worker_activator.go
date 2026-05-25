@@ -299,7 +299,7 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 	// O(10ms) and ShutdownAll iterates workers serially anyway.
 	var newEpoch int64
 	if err := worker.RefreshOwnerEpochAtomic(func(currentEpoch int64) (int64, error) {
-		newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch))
+		newLease, err := a.lifecycle.RefreshLease(configstore.NewWorkerLease(worker.ID, cpInstanceID, currentEpoch, worker.image), LifecycleOriginCredRefresh)
 		if err != nil {
 			return 0, err
 		}

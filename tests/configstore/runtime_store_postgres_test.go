@@ -241,37 +241,29 @@ func TestPruneWarmCapacityMissBucketsPostgres(t *testing.T) {
 	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, newBucketStart, 1)
 }
 
-func TestListWarmCapacityWorkerStatsPostgres(t *testing.T) {
+func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
-	now := time.Date(2026, time.March, 26, 14, 30, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 26, 14, 45, 0, 0, time.UTC)
 	records := []configstore.WorkerRecord{
 		{
-			WorkerID:          1001,
-			PodName:           "duckgres-worker-test-cp-1001",
+			WorkerID:          1101,
+			PodName:           "duckgres-worker-test-cp-1101",
 			Image:             "duckgres:default",
 			State:             configstore.WorkerStateIdle,
 			OwnerCPInstanceID: "cp-a",
 			LastHeartbeatAt:   now,
 		},
 		{
-			WorkerID:          1002,
-			PodName:           "duckgres-worker-test-cp-1002",
+			WorkerID:          1102,
+			PodName:           "duckgres-worker-test-cp-1102",
 			Image:             "duckgres:default",
 			State:             configstore.WorkerStateSpawning,
 			OwnerCPInstanceID: "cp-a",
 			LastHeartbeatAt:   now,
 		},
 		{
-			WorkerID:          1003,
-			PodName:           "duckgres-worker-test-cp-1003",
-			Image:             "duckgres:pinned",
-			State:             configstore.WorkerStateIdle,
-			OwnerCPInstanceID: "cp-b",
-			LastHeartbeatAt:   now,
-		},
-		{
-			WorkerID:          1004,
-			PodName:           "duckgres-worker-test-cp-1004",
+			WorkerID:          1103,
+			PodName:           "duckgres-worker-test-cp-1103",
 			Image:             "duckgres:default",
 			State:             configstore.WorkerStateHot,
 			OrgID:             "analytics",
@@ -279,9 +271,36 @@ func TestListWarmCapacityWorkerStatsPostgres(t *testing.T) {
 			LastHeartbeatAt:   now,
 		},
 		{
-			WorkerID:          1005,
-			PodName:           "duckgres-worker-test-cp-1005",
-			State:             configstore.WorkerStateIdle,
+			WorkerID:          1104,
+			PodName:           "duckgres-worker-test-cp-1104",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1105,
+			PodName:           "duckgres-worker-test-cp-1105",
+			Image:             "duckgres:pinned",
+			State:             configstore.WorkerStateDraining,
+			OrgID:             "science",
+			OwnerCPInstanceID: "cp-b",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1106,
+			PodName:           "duckgres-worker-test-cp-1106",
+			Image:             "duckgres:pinned",
+			State:             configstore.WorkerStateLost,
+			OwnerCPInstanceID: "cp-b",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1107,
+			PodName:           "duckgres-worker-test-cp-1107",
+			State:             configstore.WorkerStateHot,
+			OrgID:             "analytics",
 			OwnerCPInstanceID: "cp-a",
 			LastHeartbeatAt:   now,
 		},
@@ -292,21 +311,24 @@ func TestListWarmCapacityWorkerStatsPostgres(t *testing.T) {
 		}
 	}
 
-	stats, err := store.ListWarmCapacityWorkerStats()
+	stats, err := store.ListWorkerLifecycleStats()
 	if err != nil {
-		t.Fatalf("ListWarmCapacityWorkerStats: %v", err)
+		t.Fatalf("ListWorkerLifecycleStats: %v", err)
 	}
 
-	got := map[string][2]int64{}
+	got := map[string]int64{}
 	for _, stat := range stats {
-		got[stat.Scope] = [2]int64{stat.ReadyWorkers, stat.SpawningWorkers}
+		got[fmt.Sprintf("%s|%s|%s", stat.Image, stat.State, stat.Binding)] = stat.Count
 	}
-	want := map[string][2]int64{
-		"image:duckgres:default": {1, 1},
-		"image:duckgres:pinned":  {1, 0},
+	want := map[string]int64{
+		"duckgres:default|idle|neutral":       1,
+		"duckgres:default|spawning|neutral":   1,
+		"duckgres:default|hot|org_bound":      1,
+		"duckgres:default|hot_idle|org_bound": 1,
+		"duckgres:pinned|draining|org_bound":  1,
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("expected warm worker stats %v, got %v", want, got)
+		t.Fatalf("expected worker lifecycle stats %v, got %v", want, got)
 	}
 }
 

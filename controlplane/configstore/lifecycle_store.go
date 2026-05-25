@@ -83,6 +83,18 @@ func workerSnapshotsFromRecords(records []WorkerRecord) []WorkerSnapshot {
 // in-memory ManagedWorker caches owner_cp_instance_id and owner_epoch
 // from the most recent claim/takeover/refresh. The lifecycle CAS itself
 // is what enforces freshness: a stale lease will simply miss.
-func NewWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64) WorkerLease {
-	return newWorkerLease(workerID, ownerCPInstanceID, ownerEpoch)
+//
+// image, when supplied, is the worker image the lease was minted
+// against. It is not part of the CAS fence (the lease's
+// owner_cp_instance_id + owner_epoch already establish identity) — it
+// is carried so the lifecycle service can label transition metrics by
+// image without a separate snapshot/read. The argument is variadic to
+// preserve compatibility with legacy callers that constructed leases
+// before image labeling existed.
+func NewWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64, image ...string) WorkerLease {
+	leaseImage := ""
+	if len(image) > 0 {
+		leaseImage = image[0]
+	}
+	return newWorkerLease(workerID, ownerCPInstanceID, ownerEpoch, leaseImage)
 }

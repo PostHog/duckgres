@@ -86,19 +86,20 @@ type WorkerLease struct {
 	workerID          int
 	ownerCPInstanceID string
 	ownerEpoch        int64
+	image             string
 }
 
 // newWorkerLease constructs a WorkerLease. Package-private so leases can
 // only be minted by store methods that have actually established
 // ownership.
-func newWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64) WorkerLease {
+func newWorkerLease(workerID int, ownerCPInstanceID string, ownerEpoch int64, image string) WorkerLease {
 	return WorkerLease{
 		workerID:          workerID,
 		ownerCPInstanceID: ownerCPInstanceID,
 		ownerEpoch:        ownerEpoch,
+		image:             image,
 	}
 }
-
 
 // WorkerID returns the worker id this lease is for.
 func (l WorkerLease) WorkerID() int { return l.workerID }
@@ -111,6 +112,11 @@ func (l WorkerLease) OwnerCPInstanceID() string { return l.ownerCPInstanceID }
 // epoch-bumping operations (e.g. RefreshLease) produce a new lease; the
 // previous one becomes stale and any CAS attempted with it will miss.
 func (l WorkerLease) OwnerEpoch() int64 { return l.ownerEpoch }
+
+// Image returns the worker image the lease was minted against. Surfaced
+// so lifecycle-transition metrics can label the operation by image
+// without an extra round-trip to read the durable row.
+func (l WorkerLease) Image() string { return l.image }
 
 // TransitionOutcomeReason classifies why a lifecycle transition did or
 // did not happen. The values are stable and meant for telemetry — PR 6
@@ -142,6 +148,20 @@ const (
 	// TransitionOutcomeFenceMissCPRevived indicates the orphan CAS missed
 	// because the supposed-orphan's owner CP was no longer expired.
 	TransitionOutcomeFenceMissCPRevived TransitionOutcomeReason = "fence_miss_cp_revived"
+
+	// TransitionOutcomeFenceMissSnapshot indicates a snapshot-fenced CAS
+	// missed but the caller did not perform an extra read to distinguish
+	// state, owner, epoch, updated_at, or owner-CP liveness causes.
+	TransitionOutcomeFenceMissSnapshot TransitionOutcomeReason = "fence_miss_snapshot"
+
+	// TransitionOutcomeFenceMissLease indicates a lease-fenced CAS
+	// (Drain / RetireDrained / MarkLostFromLease) missed without an
+	// extra read to distinguish state vs. owner_epoch vs. state-
+	// restriction causes. The label is intentionally generic: lease
+	// CAS WHERE clauses combine state + owner + epoch, and a single
+	// boolean rowsAffected can't tell them apart. Tighter labels
+	// require a follow-up GetWorkerRecord round-trip.
+	TransitionOutcomeFenceMissLease TransitionOutcomeReason = "fence_miss_lease"
 
 	// TransitionOutcomeRowMissing indicates the row could not be found in
 	// the runtime store (hard-deleted or never created).
