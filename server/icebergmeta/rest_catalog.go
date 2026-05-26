@@ -54,7 +54,7 @@ func (c Config) restMetadataSource() (restCatalogMetadataSource, error) {
 	endpoint := strings.TrimSpace(c.LakekeeperEndpoint)
 	warehouse := strings.TrimSpace(c.LakekeeperWarehouse)
 	if endpoint == "" || warehouse == "" {
-		return restCatalogMetadataSource{}, fmt.Errorf("Lakekeeper REST catalog metadata requires endpoint and warehouse")
+		return restCatalogMetadataSource{}, fmt.Errorf("lakekeeper REST catalog metadata requires endpoint and warehouse")
 	}
 	return restCatalogMetadataSource{
 		endpoint: strings.TrimRight(endpoint, "/"),

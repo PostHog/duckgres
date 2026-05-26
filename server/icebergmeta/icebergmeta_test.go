@@ -35,7 +35,7 @@ func TestLoadColumnsRequiresLakekeeperRESTConfig(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected missing REST config error")
 	}
-	if !strings.Contains(err.Error(), "Lakekeeper REST catalog metadata requires endpoint and warehouse") {
+	if !strings.Contains(err.Error(), "lakekeeper REST catalog metadata requires endpoint and warehouse") {
 		t.Fatalf("error = %v", err)
 	}
 }
