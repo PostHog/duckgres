@@ -95,6 +95,7 @@ func NewConfigStore(connStr string, pollInterval time.Duration) (*ConfigStore, e
 	if err := db.AutoMigrate(
 		&Org{},
 		&ManagedWarehouse{},
+		&ManagedWarehouseTrino{},
 		&OrgUser{},
 		&GlobalConfig{},
 		&DuckLakeConfig{},
@@ -617,6 +618,104 @@ func (cs *ConfigStore) UpdateWarehouseState(orgID string, expectedState ManagedW
 		return fmt.Errorf("warehouse %q expected state %q: %w", orgID, expectedState, ErrWarehouseStateMismatch)
 	}
 	return nil
+}
+
+// TrinoSettings carries the per-org Trino options EnableTrino persists. New
+// fields can be added without changing call sites — the zero value matches
+// the existing default (no tier, enabled).
+type TrinoSettings struct {
+	// Tier is the resource-group tier label. Empty == default tier.
+	Tier string
+}
+
+// EnableTrino marks the org as Trino-enabled and stores the per-org Trino
+// settings. Idempotent: re-enabling updates Tier without flipping Enabled
+// back through a disabled state. Safe to call as part of the
+// `POST /orgs/:id/provision` path or the standalone
+// `POST /orgs/:id/trino` endpoint.
+func (cs *ConfigStore) EnableTrino(orgID string, settings TrinoSettings) error {
+	if orgID == "" {
+		return errors.New("EnableTrino: orgID is required")
+	}
+	row := ManagedWarehouseTrino{
+		OrgID:   orgID,
+		Enabled: true,
+		Tier:    settings.Tier,
+	}
+	if err := cs.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "org_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"enabled", "tier", "updated_at"}),
+	}).Create(&row).Error; err != nil {
+		return fmt.Errorf("enable trino for %q: %w", orgID, err)
+	}
+	return nil
+}
+
+// DisableTrino marks the org as no longer Trino-enabled. The row is kept
+// (rather than deleted) so the provisioner can observe the transition and
+// clean up the catalog + password file entry on its next reconcile tick.
+// Returns nil if no row exists — disabling something that was never enabled
+// is a no-op, not an error.
+func (cs *ConfigStore) DisableTrino(orgID string) error {
+	if orgID == "" {
+		return errors.New("DisableTrino: orgID is required")
+	}
+	result := cs.db.Model(&ManagedWarehouseTrino{}).
+		Where("org_id = ?", orgID).
+		Updates(map[string]interface{}{
+			"enabled":    false,
+			"updated_at": time.Now().UTC(),
+		})
+	if result.Error != nil {
+		return fmt.Errorf("disable trino for %q: %w", orgID, result.Error)
+	}
+	return nil
+}
+
+// ListTrinoEnabledOrgs returns every org with ManagedWarehouseTrino.Enabled
+// = true joined against its `root` OrgUser row. The provisioner needs the
+// bcrypt hash to project the Trino password file, so this is a single join
+// rather than two round-trips.
+//
+// Orgs that are Trino-enabled but have no `root` OrgUser are skipped — that
+// shape can't legitimately happen via the provisioning API (CreateOrgUser
+// runs in the same handler that toggles Enabled), and silently skipping is
+// safer than projecting a half-built password file.
+func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
+	var out []TrinoEnabledOrg
+	// Inner join with duckgres_org_users on (org_id, username='root') so a
+	// missing OrgUser row drops the org from the result. Then left join with
+	// duckgres_orgs to pick up database_name.
+	err := cs.db.Table("duckgres_managed_warehouse_trino AS t").
+		Select(`t.org_id AS org_id,
+		         COALESCE(o.database_name, '') AS database_name,
+		         t.tier AS tier,
+		         u.password AS root_password_hash`).
+		Joins(`INNER JOIN duckgres_org_users AS u
+		        ON u.org_id = t.org_id AND u.username = 'root'`).
+		Joins(`LEFT JOIN duckgres_orgs AS o ON o.name = t.org_id`).
+		Where("t.enabled = ?", true).
+		Order("t.org_id ASC").
+		Scan(&out).Error
+	if err != nil {
+		return nil, fmt.Errorf("list trino-enabled orgs: %w", err)
+	}
+	return out, nil
+}
+
+// GetManagedWarehouseTrino reads the Trino row for an org. Returns
+// (nil, nil) when no row exists so callers can distinguish "never
+// configured" from a DB error.
+func (cs *ConfigStore) GetManagedWarehouseTrino(orgID string) (*ManagedWarehouseTrino, error) {
+	var row ManagedWarehouseTrino
+	err := cs.db.First(&row, "org_id = ?", orgID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get trino row for %q: %w", orgID, err)
+	}
+	return &row, nil
 }
 
 // migrateDeltaCatalogDefaultEnabled is a one-shot backfill that flips existing
