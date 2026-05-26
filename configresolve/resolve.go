@@ -52,6 +52,7 @@ type CLIInputs struct {
 	IcebergTableBucket                 string
 	IcebergRegion                      string
 	IcebergNamespace                   string
+	IcebergLakekeeperMetadataDSN       string
 	ProcessMinWorkers                  int
 	ProcessMaxWorkers                  int
 	ProcessRetireOnSessionEnd          bool
@@ -321,6 +322,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.Iceberg.Namespace != "" {
 			cfg.Iceberg.Namespace = fileCfg.Iceberg.Namespace
+		}
+		if fileCfg.Iceberg.LakekeeperMetadataDSN != "" {
+			cfg.Iceberg.LakekeeperMetadataDSN = fileCfg.Iceberg.LakekeeperMetadataDSN
 		}
 		if fileCfg.DuckLake.DisableMetadataThreadLocalCache != nil {
 			cfg.DuckLake.DisableMetadataThreadLocalCache = boolPtr(*fileCfg.DuckLake.DisableMetadataThreadLocalCache)
@@ -618,6 +622,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if v := getenv("DUCKGRES_ICEBERG_NAMESPACE"); v != "" {
 		cfg.Iceberg.Namespace = v
+	}
+	if v := getenv("DUCKGRES_ICEBERG_LAKEKEEPER_METADATA_DSN"); v != "" {
+		cfg.Iceberg.LakekeeperMetadataDSN = v
 	}
 	if v := getenv("DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -1057,6 +1064,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if cli.Set["iceberg-namespace"] {
 		cfg.Iceberg.Namespace = cli.IcebergNamespace
+	}
+	if cli.Set["iceberg-lakekeeper-metadata-dsn"] {
+		cfg.Iceberg.LakekeeperMetadataDSN = cli.IcebergLakekeeperMetadataDSN
 	}
 	if cli.Set["ducklake-default-spec-version"] {
 		cfg.DuckLake.SpecVersion = cli.DuckLakeDefaultSpecVersion

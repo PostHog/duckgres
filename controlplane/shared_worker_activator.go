@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -356,7 +357,7 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
-	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, &org.Warehouse.Iceberg)
+	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, org.Warehouse)
 	if err != nil {
 		return TenantActivationPayload{}, err
 	}
@@ -536,7 +537,11 @@ func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Inte
 // For lakekeeper with a non-empty LakekeeperClientCredentials SecretRef, the
 // OAuth2 client_secret is resolved via readSecretValue just before sending.
 // Empty SecretRef is fine (PR1 allowall mode; PR3 wires OIDC SA-token auth).
-func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID string, src *configstore.ManagedWarehouseIceberg) (server.IcebergConfig, error) {
+func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID string, warehouse *configstore.ManagedWarehouseConfig) (server.IcebergConfig, error) {
+	if warehouse == nil {
+		return server.IcebergConfig{}, fmt.Errorf("warehouse config is required")
+	}
+	src := &warehouse.Iceberg
 	ic := server.IcebergConfig{
 		Enabled:   src.Enabled,
 		Backend:   src.Backend,
@@ -562,10 +567,58 @@ func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID st
 			}
 			ic.LakekeeperClientSecret = val
 		}
+		if dsn, err := a.buildLakekeeperMetadataDSN(ctx, orgID, warehouse); err != nil {
+			slog.Warn("Lakekeeper direct metadata DSN unavailable; information_schema.columns will use table metadata loading fallback.",
+				"org", orgID, "error", err)
+		} else {
+			ic.LakekeeperMetadataDSN = dsn
+		}
 	case iceberg.BackendS3Tables:
 		ic.TableBucket = src.TableBucketArn
 	}
 	return ic, nil
+}
+
+func (a *SharedWorkerActivator) buildLakekeeperMetadataDSN(ctx context.Context, orgID string, warehouse *configstore.ManagedWarehouseConfig) (string, error) {
+	if warehouse == nil {
+		return "", fmt.Errorf("warehouse config is required")
+	}
+	ref := warehouse.Iceberg.LakekeeperClientCredentials
+	if strings.TrimSpace(ref.Name) == "" {
+		return "", fmt.Errorf("lakekeeper credentials secret is not configured")
+	}
+	if strings.TrimSpace(warehouse.MetadataStore.Endpoint) == "" {
+		return "", fmt.Errorf("metadata store endpoint is not configured")
+	}
+
+	userRef := ref
+	userRef.Key = provisioner.SecretKeyDBUser
+	dbUser, err := a.readSecretValue(ctx, userRef)
+	if err != nil {
+		return "", fmt.Errorf("lakekeeper db user: %w", err)
+	}
+	passwordRef := ref
+	passwordRef.Key = provisioner.SecretKeyDBPassword
+	dbPassword, err := a.readSecretValue(ctx, passwordRef)
+	if err != nil {
+		return "", fmt.Errorf("lakekeeper db password: %w", err)
+	}
+	if strings.TrimSpace(dbUser) == "" || strings.TrimSpace(dbPassword) == "" {
+		return "", fmt.Errorf("lakekeeper db credentials are incomplete")
+	}
+
+	port := warehouse.MetadataStore.Port
+	if port == 0 {
+		port = 5432
+	}
+	return buildPostgresURLDSN(
+		warehouse.MetadataStore.Endpoint,
+		port,
+		dbUser,
+		dbPassword,
+		provisioner.LakekeeperDatabaseName(orgID),
+		"require",
+	), nil
 }
 
 func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configstore.SecretRef) (string, error) {
@@ -623,6 +676,19 @@ func buildDuckLakeMetadataStoreDSN(host string, port int, username, password, da
 		escapeDuckLakeConnStringValue(password),
 		escapeDuckLakeConnStringValue(database),
 	)
+}
+
+func buildPostgresURLDSN(host string, port int, username, password, database, sslMode string) string {
+	u := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(username, password),
+		Host:   fmt.Sprintf("%s:%d", host, port),
+		Path:   "/" + database,
+	}
+	q := u.Query()
+	q.Set("sslmode", sslMode)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func buildManagedWarehouseObjectStore(s3 configstore.ManagedWarehouseS3) string {

@@ -242,11 +242,11 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	whReq := CreateWarehouseRequest{
 		WarehouseName: lakekeeperWarehouseName(w.OrgID),
 		StorageProfile: WarehouseStorageProfile{
-			Type:                 "s3",
-			Bucket:               in.S3.Bucket,
-			KeyPrefix:            in.S3.KeyPrefix,
-			Endpoint:             in.S3.Endpoint,
-			Region:               in.S3.Region,
+			Type:            "s3",
+			Bucket:          in.S3.Bucket,
+			KeyPrefix:       in.S3.KeyPrefix,
+			Endpoint:        in.S3.Endpoint,
+			Region:          in.S3.Region,
 			PathStyleAccess: in.S3.Flavor == "s3-compat",
 			Flavor:          in.S3.Flavor,
 			// STS credential vending is OFF: Lakekeeper would assume a role
@@ -400,6 +400,12 @@ func storageCredFor(s3 S3StorageConfig) WarehouseStorageCredential {
 
 func lakekeeperDBName(orgID string) string {
 	return "lakekeeper_" + lakekeeperResourceSuffix(orgID)
+}
+
+// LakekeeperDatabaseName derives the per-org Lakekeeper Postgres database
+// name. Exported for activation-time direct metadata readers.
+func LakekeeperDatabaseName(orgID string) string {
+	return lakekeeperDBName(orgID)
 }
 
 func lakekeeperWarehouseName(orgID string) string {

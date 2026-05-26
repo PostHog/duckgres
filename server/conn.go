@@ -1672,7 +1672,10 @@ func (c *clientConn) loadIcebergColumnMetadata(ctx context.Context, query string
 	if c == nil || c.passthrough {
 		return nil
 	}
-	return icebergmeta.LoadColumns(ctx, c.executor, query)
+	return icebergmeta.LoadColumns(ctx, c.executor, query, icebergmeta.Config{
+		LakekeeperMetadataDSN: c.server.cfg.Iceberg.LakekeeperMetadataDSN,
+		LakekeeperWarehouse:   c.server.cfg.Iceberg.LakekeeperWarehouse,
+	})
 }
 
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
