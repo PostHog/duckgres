@@ -71,8 +71,10 @@ func trinoSanitize(orgName string) string {
 }
 
 // TrinoCatalogName returns the catalog identifier for an org.
-// Format: org_<sanitized>_iceberg. Documented as part of the v1
-// catalog-naming contract in the plan.
+// Format: org_<sanitized>_iceberg. The sanitization maps Org.Name
+// to Trino identifier rules ([a-z0-9_]); any other characters
+// collapse to underscores. Catalog name uniqueness across orgs
+// depends on Org.Name uniqueness post-sanitization.
 func TrinoCatalogName(orgName string) string {
 	return "org_" + trinoSanitize(orgName) + "_iceberg"
 }
@@ -144,8 +146,9 @@ type TrinoProvisionerOpts struct {
 	OPA OPABundleClient
 
 	// BundleBuilder builds the OPA bundle from the user→catalogs map.
-	// Stream B replaces opa.NewStubBuilder() here with the real
-	// implementation.
+	// Construct with opa.NewStubBuilder() until the real Rego-backed
+	// builder ships in a sibling PR (which swaps in a real constructor
+	// without touching this call site).
 	BundleBuilder opa.BundleBuilder
 
 	// IAMAccountID is the AWS account id the per-org Iceberg catalogs
@@ -394,7 +397,7 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 // unit tests can exercise the projection without K8s + the rest of
 // the reconcile path.
 //
-// Format conventions (from the plan, "Trino path" section):
+// Format conventions:
 //
 //   password.db: <team_id>:<bcrypt hash from OrgUser.Password>
 //                One line per org. Hash is copied through unchanged
@@ -513,7 +516,7 @@ func tierLimits(tier string) resourceGroupSubGroup {
 // resource-groups.json file from a list of Trino-enabled orgs. Pure
 // function for unit testing.
 //
-// Tree shape (matches the plan's Identity & Naming section):
+// Tree shape:
 //
 //   root
 //     └─ tenants
@@ -565,9 +568,9 @@ func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error
 // reconcileOPABundle builds the user_catalogs map and asks the bundle
 // builder to render a bundle, then pushes it via the OPA bundle API.
 //
-// While Stream B's bundle builder is the stub (returns "{}"), this
-// step still exercises the code path end-to-end so a regression
-// landing alongside Stream B's merge is loud, not silent.
+// While the bundle builder is the stub (returns "{}"), this step still
+// exercises the code path end-to-end so a regression landing alongside
+// the real builder's merge is loud, not silent.
 func (p *TrinoProvisioner) reconcileOPABundle(ctx context.Context, orgs []configstore.TrinoEnabledOrg) error {
 	uc := make(opa.UserCatalogs, len(orgs))
 	for _, o := range orgs {
@@ -881,8 +884,8 @@ func NewOPABundleHTTPClient(baseURL string) OPABundleClient {
 // PushBundle uploads the bundle bytes to the OPA bundle endpoint.
 // We use PUT /v1/policies/duckgres so the bundle replaces the
 // previously-pushed one rather than appending. OPA's bundle API path
-// can vary by configuration; revisit alongside Stream B's bundle
-// builder.
+// can vary by configuration; the path may need to match the real
+// builder PR's PushBundle helper before merge.
 func (c *opaBundleHTTPClient) PushBundle(ctx context.Context, bundle []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/v1/policies/duckgres", bytes.NewReader(bundle))
 	if err != nil {

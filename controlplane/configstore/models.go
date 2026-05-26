@@ -200,9 +200,8 @@ const (
 // v1 is intentionally minimal — Enabled gates the projection, Tier picks
 // resource-group limits. Per-user identity within an org is post-v1.
 //
-// FK'd by OrgID like the other sibling rows; see
-// docs at /Users/gwyang/projects/plans/duckgres-trino-shared-cluster-plan.md
-// for the design.
+// FK'd by OrgID like the other sibling rows; consumed by the Trino
+// provisioner sub-component in controlplane/provisioner/trino_provisioner.go.
 type ManagedWarehouseTrino struct {
 	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
 

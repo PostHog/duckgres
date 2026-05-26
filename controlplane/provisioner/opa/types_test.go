@@ -4,9 +4,9 @@ import (
 	"testing"
 )
 
-// TestStubBuilderReturnsEmptyBundle pins the contract Stream A relies on
-// while Stream B is in flight. When Stream B's PR lands a real builder,
-// this test is replaced (or moved) — but until then it guards the
+// TestStubBuilderReturnsEmptyBundle pins the contract the Trino provisioner
+// relies on while the real Rego builder is in flight. When the real builder
+// lands, this test is replaced (or moved) — but until then it guards the
 // expected behavior so an accidental change here doesn't break the
 // provisioner's reconcile loop.
 func TestStubBuilderReturnsEmptyBundle(t *testing.T) {
@@ -23,9 +23,9 @@ func TestStubBuilderReturnsEmptyBundle(t *testing.T) {
 }
 
 func TestUserCatalogsShape(t *testing.T) {
-	// Compile-time-ish smoke that the map shape is the same as the
-	// plan documents — bumping the alias to a struct in the future
-	// requires touching this test too.
+	// Compile-time-ish smoke that the map shape stays consistent —
+	// bumping the alias to a struct in the future requires touching
+	// this test too.
 	uc := UserCatalogs{
 		"42": {"a": true, "b": true},
 		"43": {"c": true},
