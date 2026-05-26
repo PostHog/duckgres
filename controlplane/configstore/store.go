@@ -703,6 +703,25 @@ func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
 	return out, nil
 }
 
+// GetManagedWarehouseIceberg reads the embedded Iceberg config for an
+// org. Returns (nil, nil) when the org has no warehouse row so callers
+// can distinguish "never provisioned" from a DB error. Used by the
+// Trino provisioner to read LakekeeperEndpoint + LakekeeperWarehouse
+// when building catalog properties — Trino-enabled orgs without an
+// Iceberg row are skipped at the call site (Iceberg isn't ready yet).
+func (cs *ConfigStore) GetManagedWarehouseIceberg(orgID string) (*ManagedWarehouseIceberg, error) {
+	var warehouse ManagedWarehouse
+	err := cs.db.First(&warehouse, "org_id = ?", orgID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get iceberg config for %q: %w", orgID, err)
+	}
+	ic := warehouse.Iceberg
+	return &ic, nil
+}
+
 // GetManagedWarehouseTrino reads the Trino row for an org. Returns
 // (nil, nil) when no row exists so callers can distinguish "never
 // configured" from a DB error.
