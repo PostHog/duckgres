@@ -20,6 +20,13 @@ type Store interface {
 	UpdateOrgUserPassword(orgID, username, passwordHash string) error
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
 	IsDatabaseNameAvailable(name string) (bool, error)
+
+	// Trino lifecycle. EnableTrino is idempotent — re-enabling updates
+	// settings without flipping through a disabled state. DisableTrino
+	// leaves the row in place so the provisioner observes the transition
+	// and cleans up the catalog + password file entry on next reconcile.
+	EnableTrino(orgID string, settings configstore.TrinoSettings) error
+	DisableTrino(orgID string) error
 }
 
 // RegisterAPI registers provisioning endpoints on the given router group.
@@ -29,6 +36,8 @@ func RegisterAPI(r *gin.RouterGroup, store Store) {
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
 	r.POST("/orgs/:id/reset-password", h.resetPassword)
+	r.POST("/orgs/:id/trino", h.enableTrino)
+	r.DELETE("/orgs/:id/trino", h.disableTrino)
 	r.GET("/database-name/check", h.checkDatabaseName)
 }
 
@@ -63,10 +72,40 @@ type connectionDetails struct {
 type provisionRequest struct {
 	DatabaseName  string                `json:"database_name"`
 	MetadataStore *provisionMetadataReq `json:"metadata_store,omitempty"`
+
+	// Trino is the opt-in flag for the customer-facing Trino cluster.
+	// Optional — when nil, the warehouse is provisioned with the existing
+	// PG-only behavior. When non-nil and Enabled=true, the provisioning
+	// handler additionally writes a ManagedWarehouseTrino row so the
+	// provisioner picks it up on the next reconcile.
+	Trino *provisionTrinoReq `json:"trino,omitempty"`
 }
 
 type provisionMetadataReq struct {
 	Type string `json:"type"`
+}
+
+// provisionTrinoReq is the per-request Trino opt-in. Mirrored by the
+// standalone POST /orgs/:id/trino body (trinoRequest below) so both
+// surfaces accept the same shape.
+type provisionTrinoReq struct {
+	// Enabled flips Trino on for this org. False (or omitted) is a no-op:
+	// existing rows are not affected, so the provision endpoint can be
+	// retried with Trino={Enabled:false} without disabling a previously
+	// enabled org.
+	Enabled bool `json:"enabled"`
+
+	// Tier picks the resource-group limits applied to the org. Empty
+	// string is the default tier.
+	Tier string `json:"tier,omitempty"`
+}
+
+// trinoRequest is the body shape for POST /orgs/:id/trino (standalone
+// enable on an existing org). Mirrors provisionTrinoReq so callers can
+// use one schema for both surfaces.
+type trinoRequest struct {
+	Enabled bool   `json:"enabled"`
+	Tier    string `json:"tier,omitempty"`
 }
 
 func (h *handler) provisionWarehouse(c *gin.Context) {
@@ -145,11 +184,81 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
+	// Optionally enable Trino in the same handler. Failures here roll
+	// back to a 500 — partial state (warehouse + user created but trino
+	// row missing) would mean the caller's next retry conflicts on the
+	// warehouse row but the trino opt-in was silently lost. We'd rather
+	// surface that so the caller knows to retry.
+	if req.Trino != nil && req.Trino.Enabled {
+		if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Trino.Tier}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enable trino: " + err.Error()})
+			return
+		}
+	}
+
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":   "provisioning started",
 		"org":      orgID,
 		"username": "root",
 		"password": plainPassword,
+	})
+}
+
+// enableTrino handles POST /orgs/:id/trino — opting an existing org
+// (provisioned previously without Trino) into the customer Trino cluster.
+// Idempotent: re-enabling updates the tier without flipping through a
+// disabled state.
+//
+// Note this does NOT require the org's ManagedWarehouse to exist — the
+// Trino provisioner gates on its own readiness signal (Iceberg-Ready in
+// Lakekeeper), not on the warehouse top-level state. Callers that need
+// the warehouse first should call /provision before /trino.
+func (h *handler) enableTrino(c *gin.Context) {
+	orgID := c.Param("id")
+	if orgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org id is required"})
+		return
+	}
+
+	var req trinoRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !req.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true; use DELETE to disable"})
+		return
+	}
+
+	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"status": "trino enable queued",
+		"org":    orgID,
+		"tier":   req.Tier,
+	})
+}
+
+// disableTrino handles DELETE /orgs/:id/trino — opting the org out of
+// the customer Trino cluster. The row is kept (with Enabled=false) so
+// the provisioner observes the transition and removes the catalog +
+// password file entry on its next reconcile tick. Idempotent.
+func (h *handler) disableTrino(c *gin.Context) {
+	orgID := c.Param("id")
+	if orgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org id is required"})
+		return
+	}
+	if err := h.store.DisableTrino(orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"status": "trino disable queued",
+		"org":    orgID,
 	})
 }
 

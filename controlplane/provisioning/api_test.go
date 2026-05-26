@@ -18,6 +18,7 @@ type fakeStore struct {
 	orgs       map[string]*configstore.Org
 	users      map[configstore.OrgUserKey]string
 	warehouses map[string]*configstore.ManagedWarehouse
+	trino      map[string]*configstore.ManagedWarehouseTrino
 }
 
 func newFakeStore() *fakeStore {
@@ -25,6 +26,7 @@ func newFakeStore() *fakeStore {
 		orgs:       make(map[string]*configstore.Org),
 		users:      make(map[configstore.OrgUserKey]string),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
+		trino:      make(map[string]*configstore.ManagedWarehouseTrino),
 	}
 }
 
@@ -88,6 +90,22 @@ func (s *fakeStore) IsDatabaseNameAvailable(name string) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+func (s *fakeStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
+	s.trino[orgID] = &configstore.ManagedWarehouseTrino{
+		OrgID:   orgID,
+		Enabled: true,
+		Tier:    settings.Tier,
+	}
+	return nil
+}
+
+func (s *fakeStore) DisableTrino(orgID string) error {
+	if row, ok := s.trino[orgID]; ok {
+		row.Enabled = false
+	}
+	return nil
 }
 
 func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error {
@@ -362,6 +380,116 @@ func TestGetWarehouseNotFound(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestProvisionEnablesTrinoWhenRequested(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestRouter(store)
+
+	body := []byte(`{
+		"database_name": "analytics-db",
+		"metadata_store": {"type": "aurora", "aurora": {"max_acu": 2}},
+		"trino": {"enabled": true, "tier": "free"}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	row := store.trino["analytics"]
+	if row == nil || !row.Enabled || row.Tier != "free" {
+		t.Fatalf("expected trino row with Enabled=true, Tier=free; got %+v", row)
+	}
+}
+
+func TestProvisionWithoutTrinoLeavesTrinoRowUnset(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "aurora", "aurora": {"max_acu": 1}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if _, ok := store.trino["analytics"]; ok {
+		t.Fatalf("expected no trino row when request omits trino block")
+	}
+}
+
+func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestRouter(store)
+
+	body := []byte(`{"enabled": true, "tier": "growth"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/trino", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	row := store.trino["analytics"]
+	if row == nil || !row.Enabled || row.Tier != "growth" {
+		t.Fatalf("expected trino row enabled with tier growth; got %+v", row)
+	}
+}
+
+func TestEnableTrinoRejectsEnabledFalse(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"enabled": false}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/trino", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestDisableTrinoEndpoint(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Enabled: true, Tier: "free"}
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics/trino", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	row := store.trino["analytics"]
+	if row == nil || row.Enabled {
+		t.Fatalf("expected trino row to be present but disabled; got %+v", row)
+	}
+}
+
+func TestDisableTrinoOnMissingRowIsNoOp(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/unknown/trino", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
 }
 

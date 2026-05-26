@@ -97,6 +97,20 @@ func (s *gormStore) IsDatabaseNameAvailable(name string) (bool, error) {
 	return count == 0, nil
 }
 
+// EnableTrino persists the per-org Trino opt-in. Idempotent — the
+// configstore implementation upserts on (org_id) so re-enabling updates
+// the tier without flipping Enabled false-then-true.
+func (s *gormStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
+	return s.cs.EnableTrino(orgID, settings)
+}
+
+// DisableTrino marks the org's Trino row as disabled. The row is kept
+// (with Enabled=false) so the provisioner observes the transition and
+// can clean up downstream state. No-op when no row exists.
+func (s *gormStore) DisableTrino(orgID string) error {
+	return s.cs.DisableTrino(orgID)
+}
+
 // SetWarehouseDeleting atomically transitions a warehouse from expectedState to deleting.
 // Returns gorm.ErrRecordNotFound if no warehouse exists, or an error if the CAS fails.
 func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error {
