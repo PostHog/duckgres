@@ -14,10 +14,11 @@ import (
 // of a non-O(1) policy (linear scan over user_catalogs, etc.) and fails
 // the build.
 //
-// The plan calls out 30-40 OPA decisions per Trino query, with low-tens of
-// thousands of orgs. 1ms per decision keeps the OPA portion of query
-// authorization under ~40ms, which is acceptable next to query planning.
-// If this number changes, update the plan reference too.
+// Trino issues roughly 30-40 OPA decisions per query (one per
+// catalog/schema/table/column access plus session-property checks). With
+// low-tens-of-thousands of orgs, 1ms per decision keeps the OPA portion
+// of query authorization under ~40ms, which is acceptable next to query
+// planning. Tighten this if the decision count per query goes up.
 const LatencyBudget = 1 * time.Millisecond
 
 // largeFixture builds a UserCatalogs with the requested number of orgs.
@@ -28,7 +29,9 @@ func largeFixture(orgs int) UserCatalogs {
 		user := fmt.Sprintf("%d", i)
 		uc[user] = map[string]bool{fmt.Sprintf("org_%d_iceberg", i): true}
 	}
-	// Admin owns everything (matches Stream A's planned bundle).
+	// Admin owns every catalog (matches the production bundle shape:
+	// the provisioner populates data.user_catalogs[__admin_provisioner]
+	// with the global catalog list so catalog-management ops work).
 	admin := make(map[string]bool, orgs)
 	for i := 0; i < orgs; i++ {
 		admin[fmt.Sprintf("org_%d_iceberg", i)] = true
@@ -84,9 +87,10 @@ func BenchmarkAccessCatalog1000Orgs(b *testing.B) {
 // ately measure p50 (not mean), because mean is skewed by occasional GC
 // pauses and Go scheduler latency in test environments.
 //
-// This is the test the plan calls out as the "reject naive Rego"
-// enforcement. If you're editing policy.rego, run this test and confirm
-// the new policy stays under budget BEFORE pushing.
+// This is the "reject naive Rego" enforcement: linear-scan Rego at
+// thousands of orgs is 10-50ms per decision and compounds badly across
+// the 30-40 decisions per query. If you're editing policy.rego, run
+// this test and confirm the new policy stays under budget BEFORE pushing.
 func TestAccessCatalogLatencyBudget(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping latency benchmark in -short mode")

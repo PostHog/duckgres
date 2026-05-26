@@ -423,8 +423,9 @@ func TestAdversarialInputs(t *testing.T) {
 
 // --------------------------------------------------------------------------
 // Cross-user enumeration: every user in a small fixture should only see
-// their own catalogs across all relevant ops. This is the matrix the
-// "Stream B self-smoke" calls out in the plan.
+// their own catalogs across all relevant ops. This is the load-bearing
+// isolation matrix — every cell must hold across catalog access, table
+// access, and metadata enumeration.
 // --------------------------------------------------------------------------
 
 func TestIsolationMatrix(t *testing.T) {

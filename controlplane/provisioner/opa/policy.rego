@@ -133,9 +133,9 @@ allow if {
 # Session-property allowlist.
 #
 # Narrow allowlist (execution_policy, query_priority, join_distribution_type).
-# Memory and concurrency knobs are explicitly NOT here -- the plan calls them
-# out as cross-tenant attack vectors. Adding any property to this set is a
-# threat-model decision; see "Tenant Isolation Invariants" #5 in the plan.
+# Memory and concurrency knobs are explicitly NOT here -- they're cross-tenant
+# attack vectors (a customer could starve other tenants by raising their own
+# memory cap). Adding any property to this set is a threat-model decision.
 # ---------------------------------------------------------------------------
 
 safe_session_properties := {
@@ -150,9 +150,9 @@ allow if {
 }
 
 # ---------------------------------------------------------------------------
-# ExecuteQuery: every authenticated user can submit queries. Resource group
-# isolation (Stream A) handles concurrency/queue limits; per-query caps in
-# config.properties cap individual queries.
+# ExecuteQuery: every authenticated user can submit queries. Trino resource
+# groups (configured per-org by the provisioner) handle concurrency and queue
+# limits; per-query caps in config.properties cap individual queries.
 # ---------------------------------------------------------------------------
 
 allow if {
@@ -182,10 +182,10 @@ allow if {
 # ---------------------------------------------------------------------------
 # Admin carve-out: catalog management.
 #
-# The provisioner connects as `__admin_provisioner` to run
-# CREATE/DROP CATALOG (Stream A). Customer principals never reach these
-# paths because we authenticate the provisioner against a separate
-# password-file entry mounted only into the provisioner workflow.
+# The Trino provisioner connects as `__admin_provisioner` to run
+# CREATE/DROP CATALOG. Customer principals never reach these paths because
+# we authenticate the provisioner against a separate password-file entry
+# mounted only into the provisioner workflow.
 #
 # `AlterCatalog` is not a distinct operation in the Trino OPA plugin (476)
 # -- catalog mutations happen via DROP+CREATE through the provisioner --
@@ -213,5 +213,5 @@ allow if {
 # above do (read its own catalogs, run queries, etc.) for smoke testing.
 # We deliberately do NOT grant the admin principal blanket access -- it
 # can only see catalogs that appear under data.user_catalogs[admin_principal]
-# just like any other user. Stream A populates that entry with the global
-# catalog list when it generates the bundle.
+# just like any other user. The provisioner populates that entry with the
+# global catalog list when it generates the bundle.

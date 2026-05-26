@@ -51,8 +51,8 @@ func NewBuilder() BundleBuilder {
 //
 // uc may be nil or empty -- the resulting bundle is still well-formed and
 // activates a deny-everything policy (since no user owns any catalog).
-// That is the correct bootstrap behaviour: until Stream A pushes a real
-// UserCatalogs, all customer queries are denied.
+// That is the correct bootstrap behaviour: until the provisioner pushes
+// a populated UserCatalogs, all customer queries are denied.
 func (defaultBuilder) BuildBundle(uc UserCatalogs) ([]byte, error) {
 	data, err := buildDataDocument(uc)
 	if err != nil {

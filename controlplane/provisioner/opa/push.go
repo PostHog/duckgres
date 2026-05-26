@@ -46,12 +46,12 @@ func WithTimeout(d time.Duration) PushOption {
 // serve it as the named bundle.
 //
 // On non-2xx responses, PushBundle returns an error that includes the HTTP
-// status and the first 4KB of the response body. This is the path Stream A
-// invokes from trino_provisioner.go; failures there should re-enqueue the
-// provisioning state and retry on next reconcile.
+// status and the first 4KB of the response body. The Trino provisioner
+// invokes this from its reconcile loop; failures there should re-enqueue
+// the provisioning state and retry on the next reconcile tick.
 //
-// Note: deploying / configuring OPA itself (sidecar manifest, bundle
-// service config) is Stream F's responsibility, not this package's.
+// Note: deploying and configuring OPA itself (sidecar manifest, bundle
+// service config) lives in the customer-Trino Helm chart, not this package.
 func PushBundle(ctx context.Context, endpoint string, bundleBytes []byte, opts ...PushOption) error {
 	o := pushOptions{
 		httpClient: http.DefaultClient,

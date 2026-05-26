@@ -64,9 +64,9 @@ func TestBuildBundleRoundTrip(t *testing.T) {
 }
 
 // TestBuildBundleEmptyInput verifies that a nil / empty UserCatalogs still
-// produces a well-formed bundle. The bootstrap before Stream A's first
-// push must be deny-everything, which is what an empty user_catalogs gives
-// us.
+// produces a well-formed bundle. The bootstrap state (before the provisioner
+// has published its first real bundle) must be deny-everything, which is
+// what an empty user_catalogs gives us.
 func TestBuildBundleEmptyInput(t *testing.T) {
 	for _, uc := range []UserCatalogs{nil, {}} {
 		raw, err := NewBuilder().BuildBundle(uc)
