@@ -26,6 +26,7 @@ import (
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/iceberg"
+	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
@@ -1667,6 +1668,13 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 	return rewritten
 }
 
+func (c *clientConn) loadIcebergColumnMetadata(ctx context.Context, query string) error {
+	if c == nil || c.passthrough {
+		return nil
+	}
+	return icebergmeta.LoadColumns(ctx, c.executor, query)
+}
+
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
 const physicalDuckLakeCatalog = "ducklake"
 
@@ -1690,6 +1698,17 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	defer func() {
 		c.logQueryFinished(query, execStart, queryRowsAff, queryFinalErr)
 	}()
+	if err := c.loadIcebergColumnMetadata(ctx, query); err != nil {
+		queryFinalErr = err
+		errCode := classifyErrorCode(err)
+		errMsg := err.Error()
+		c.logQueryError(query, err)
+		c.sendError("ERROR", errCode, errMsg)
+		c.setTxError()
+		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return 0, errCode, errMsg, nil
+	}
 	runQuery := func() (RowSet, error) {
 		return c.executor.QueryContext(ctx, query)
 	}
@@ -2161,6 +2180,17 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	// SELECT
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
+
+	if err := c.loadIcebergColumnMetadata(ctx, executedQuery); err != nil {
+		queryFinalErr = err
+		errCode := classifyErrorCode(err)
+		errMsg := err.Error()
+		c.logQueryError(executedQuery, err)
+		c.sendError("ERROR", errCode, errMsg)
+		c.setTxError()
+		c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
+		return true, nil
+	}
 
 	runQuery := func() (RowSet, error) {
 		return c.executor.QueryContext(ctx, executedQuery)
@@ -5931,6 +5961,12 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 	// us — log the cursor metadata phase as rows=0 / err=initial failure.
 	cursorStart := time.Now()
 	c.logQueryStarted(cursor.query)
+	if err := c.loadIcebergColumnMetadata(ctx, cursor.query); err != nil {
+		c.logQueryFinished(cursor.query, cursorStart, 0, err)
+		cleanup()
+		cursor.cleanup = nil
+		return err
+	}
 	rows, err := c.executor.QueryContext(ctx, cursor.query)
 	if err != nil {
 		c.logQueryFinished(cursor.query, cursorStart, 0, err)

@@ -83,6 +83,19 @@ go test -v ./tests/integration/...
 docker compose -f tests/integration/docker-compose.yml down -v
 ```
 
+The integration compose stack also includes local Lakekeeper services for
+Iceberg catalog QA:
+
+| Service | Host port | Purpose |
+|---------|-----------|---------|
+| `lakekeeper-metadata` | `35434` | PostgreSQL metadata store for Lakekeeper |
+| `lakekeeper-migrate` | none | One-shot Lakekeeper metadata migration |
+| `lakekeeper` | `38181` | Lakekeeper REST catalog, with catalog API at `http://localhost:38181/catalog` |
+
+Lakekeeper defaults are intentionally local-only: user/password/database are
+`lakekeeper`, authorization is `allowall`, and the image is pinned to
+`quay.io/lakekeeper/catalog:v0.12.2` to match the provisioner default.
+
 ### Running Specific Test Categories
 
 ```bash

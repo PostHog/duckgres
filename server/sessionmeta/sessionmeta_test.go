@@ -71,11 +71,11 @@ func (r *singleIntRow) Scan(dest ...any) error {
 	*ptr = int64(r.v)
 	return nil
 }
-func (r *singleIntRow) Close() error                  { return nil }
-func (r *singleIntRow) Err() error                    { return nil }
-func (r *singleIntRow) RowsAffected() (int64, error)  { return 0, nil }
-func (r *singleIntRow) LastInsertId() (int64, error)  { return 0, nil }
-func (r *singleIntRow) LastProfilingOutput() string   { return "" }
+func (r *singleIntRow) Close() error                 { return nil }
+func (r *singleIntRow) Err() error                   { return nil }
+func (r *singleIntRow) RowsAffected() (int64, error) { return 0, nil }
+func (r *singleIntRow) LastInsertId() (int64, error) { return 0, nil }
+func (r *singleIntRow) LastProfilingOutput() string  { return "" }
 
 func TestInitSessionDatabaseMetadataBatchesPerSessionStatements(t *testing.T) {
 	exec := &countingExecutor{
@@ -105,6 +105,7 @@ func TestBuildSessionMetadataSQLContainsAllExpectedStatements(t *testing.T) {
 
 	wants := []string{
 		"CREATE TABLE IF NOT EXISTS main.__duckgres_column_metadata",
+		"CREATE TABLE IF NOT EXISTS main.__duckgres_iceberg_column_metadata",
 		"CREATE OR REPLACE VIEW main.pg_database",
 		"CREATE OR REPLACE VIEW main.information_schema_columns_compat",
 		"CREATE OR REPLACE VIEW main.information_schema_tables_compat",
@@ -120,5 +121,21 @@ func TestBuildSessionMetadataSQLContainsAllExpectedStatements(t *testing.T) {
 	// Database literal should appear (used in pg_database view).
 	if !strings.Contains(got, "'analytics'") {
 		t.Errorf("buildSessionMetadataSQL did not interpolate database literal")
+	}
+}
+
+func TestInformationSchemaColumnsCompatUsesLoadedIcebergColumnsAndFiltersDummy(t *testing.T) {
+	got := buildSessionInformationSchemaColumnsViewSQL()
+
+	for _, want := range []string{
+		"FROM main.__duckgres_iceberg_column_metadata",
+		"c.table_catalog = 'iceberg'",
+		"c.column_name = '__'",
+		"UPPER(c.data_type) = 'UNKNOWN'",
+		"UNION ALL",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("columns compat SQL missing %q in:\n%s", want, got)
+		}
 	}
 }

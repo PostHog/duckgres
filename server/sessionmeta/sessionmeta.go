@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
@@ -123,6 +124,7 @@ func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, cat
 func buildSessionMetadataSQL(database string) string {
 	parts := []string{
 		sessionColumnMetadataTableSQL(),
+		sessionIcebergColumnMetadataTableSQL(),
 		buildSessionPgDatabaseViewSQL(database),
 		buildSessionInformationSchemaColumnsViewSQL(),
 		buildSessionInformationSchemaTablesViewSQL(),
@@ -144,6 +146,25 @@ func sessionColumnMetadataTableSQL() string {
 			PRIMARY KEY (table_schema, table_name, column_name)
 		)
 	`
+}
+
+func sessionIcebergColumnMetadataTableSQL() string {
+	return fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS main.%s (
+			table_schema VARCHAR NOT NULL,
+			table_name VARCHAR NOT NULL,
+			column_name VARCHAR NOT NULL,
+			ordinal_position INTEGER NOT NULL,
+			is_nullable VARCHAR NOT NULL,
+			data_type VARCHAR NOT NULL,
+			character_maximum_length INTEGER,
+			character_octet_length INTEGER,
+			numeric_precision INTEGER,
+			numeric_scale INTEGER,
+			datetime_precision INTEGER,
+			PRIMARY KEY (table_schema, table_name, column_name)
+		)
+	`, icebergmeta.ColumnMetadataTable)
 }
 
 func buildSessionPgDatabaseViewSQL(database string) string {
@@ -285,6 +306,103 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			ON c.table_schema = m.table_schema
 			AND c.table_name = m.table_name
 			AND c.column_name = m.column_name
+		WHERE NOT (
+			c.table_catalog = 'iceberg'
+			AND c.column_name = '__'
+			AND UPPER(c.data_type) = 'UNKNOWN'
+		)
+		UNION ALL
+		SELECT
+			table_catalog,
+			table_schema,
+			table_name,
+			column_name,
+			ordinal_position,
+			column_default,
+			is_nullable,
+			data_type,
+			character_maximum_length,
+			character_octet_length,
+			numeric_precision,
+			numeric_scale,
+			datetime_precision,
+			interval_type,
+			interval_precision,
+			character_set_catalog,
+			character_set_schema,
+			character_set_name,
+			collation_catalog,
+			collation_schema,
+			collation_name,
+			domain_catalog,
+			domain_schema,
+			domain_name,
+			udt_catalog,
+			udt_schema,
+			udt_name,
+			scope_catalog,
+			scope_schema,
+			scope_name,
+			maximum_cardinality,
+			dtd_identifier,
+			is_self_referencing,
+			is_identity,
+			identity_generation,
+			identity_start,
+			identity_increment,
+			identity_maximum,
+			identity_minimum,
+			identity_cycle,
+			is_generated,
+			generation_expression,
+			is_updatable
+		FROM (
+			SELECT
+				current_database() AS table_catalog,
+				table_schema,
+				table_name,
+				column_name,
+				ordinal_position,
+				NULL AS column_default,
+				is_nullable,
+				data_type,
+				character_maximum_length,
+				character_octet_length,
+				numeric_precision,
+				numeric_scale,
+				datetime_precision,
+				NULL AS interval_type,
+				NULL AS interval_precision,
+				NULL AS character_set_catalog,
+				NULL AS character_set_schema,
+				NULL AS character_set_name,
+				NULL AS collation_catalog,
+				NULL AS collation_schema,
+				NULL AS collation_name,
+				NULL AS domain_catalog,
+				NULL AS domain_schema,
+				NULL AS domain_name,
+				NULL AS udt_catalog,
+				NULL AS udt_schema,
+				NULL AS udt_name,
+				NULL AS scope_catalog,
+				NULL AS scope_schema,
+				NULL AS scope_name,
+				NULL AS maximum_cardinality,
+				NULL AS dtd_identifier,
+				'NO' AS is_self_referencing,
+				'NO' AS is_identity,
+				NULL AS identity_generation,
+				NULL AS identity_start,
+				NULL AS identity_increment,
+				NULL AS identity_maximum,
+				NULL AS identity_minimum,
+				NULL AS identity_cycle,
+				'NEVER' AS is_generated,
+				NULL AS generation_expression,
+				'YES' AS is_updatable
+			FROM main.__duckgres_iceberg_column_metadata
+		)
 	`
 }
 
