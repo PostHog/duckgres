@@ -17,22 +17,22 @@ func TestBuildIcebergConfig_S3TablesPath(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: "duckgres"}
 
-	warehouse := &configstore.ManagedWarehouseConfig{Iceberg: configstore.ManagedWarehouseIceberg{
+	src := &configstore.ManagedWarehouseIceberg{
 		Enabled:        true,
 		Backend:        iceberg.BackendS3Tables,
 		Namespace:      "main",
 		Region:         "us-east-1",
 		TableBucketArn: "arn:aws:s3tables:us-east-1:123:bucket/acme",
-	}}
-	ic, err := a.buildIcebergConfig(context.Background(), "acme", warehouse)
+	}
+	ic, err := a.buildIcebergConfig(context.Background(), "acme", src)
 	if err != nil {
 		t.Fatalf("buildIcebergConfig: %v", err)
 	}
 	if ic.Backend != iceberg.BackendS3Tables {
 		t.Errorf("Backend = %q, want s3_tables", ic.Backend)
 	}
-	if ic.TableBucket != warehouse.Iceberg.TableBucketArn {
-		t.Errorf("TableBucket = %q, want %q", ic.TableBucket, warehouse.Iceberg.TableBucketArn)
+	if ic.TableBucket != src.TableBucketArn {
+		t.Errorf("TableBucket = %q, want %q", ic.TableBucket, src.TableBucketArn)
 	}
 	if ic.LakekeeperClientSecret != "" {
 		t.Errorf("S3 Tables path should not populate LakekeeperClientSecret")
@@ -43,7 +43,7 @@ func TestBuildIcebergConfig_LakekeeperAllowall(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: "duckgres"}
 
-	warehouse := &configstore.ManagedWarehouseConfig{Iceberg: configstore.ManagedWarehouseIceberg{
+	src := &configstore.ManagedWarehouseIceberg{
 		Enabled:                   true,
 		Backend:                   iceberg.BackendLakekeeper,
 		Namespace:                 "main",
@@ -52,13 +52,13 @@ func TestBuildIcebergConfig_LakekeeperAllowall(t *testing.T) {
 		LakekeeperClientID:        "duckling-acme",
 		LakekeeperOAuth2ServerURI: "", // allowall mode
 		// LakekeeperClientCredentials is empty → no secret resolution
-	}}
-	ic, err := a.buildIcebergConfig(context.Background(), "acme", warehouse)
+	}
+	ic, err := a.buildIcebergConfig(context.Background(), "acme", src)
 	if err != nil {
 		t.Fatalf("buildIcebergConfig: %v", err)
 	}
-	if ic.LakekeeperEndpoint != warehouse.Iceberg.LakekeeperEndpoint {
-		t.Errorf("LakekeeperEndpoint = %q, want %q", ic.LakekeeperEndpoint, warehouse.Iceberg.LakekeeperEndpoint)
+	if ic.LakekeeperEndpoint != src.LakekeeperEndpoint {
+		t.Errorf("LakekeeperEndpoint = %q, want %q", ic.LakekeeperEndpoint, src.LakekeeperEndpoint)
 	}
 	if ic.LakekeeperWarehouse != "org-acme" {
 		t.Errorf("LakekeeperWarehouse = %q, want org-acme", ic.LakekeeperWarehouse)
@@ -76,7 +76,7 @@ func TestBuildIcebergConfig_LakekeeperResolvesOAuth2Secret(t *testing.T) {
 	})
 	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: ns}
 
-	warehouse := &configstore.ManagedWarehouseConfig{Iceberg: configstore.ManagedWarehouseIceberg{
+	src := &configstore.ManagedWarehouseIceberg{
 		Enabled:                   true,
 		Backend:                   iceberg.BackendLakekeeper,
 		LakekeeperEndpoint:        "http://lakekeeper-acme.lakekeeper.svc:8181/catalog",
@@ -88,8 +88,8 @@ func TestBuildIcebergConfig_LakekeeperResolvesOAuth2Secret(t *testing.T) {
 			Name:      "lakekeeper-acme",
 			Key:       "oauth2-client-secret",
 		},
-	}}
-	ic, err := a.buildIcebergConfig(context.Background(), "acme", warehouse)
+	}
+	ic, err := a.buildIcebergConfig(context.Background(), "acme", src)
 	if err != nil {
 		t.Fatalf("buildIcebergConfig: %v", err)
 	}
@@ -102,13 +102,13 @@ func TestBuildIcebergConfig_EmptyBackendDefaultsLakekeeper(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: "duckgres"}
 
-	warehouse := &configstore.ManagedWarehouseConfig{Iceberg: configstore.ManagedWarehouseIceberg{
+	src := &configstore.ManagedWarehouseIceberg{
 		Enabled: true,
 		// Backend left empty → ResolvedBackend returns lakekeeper
 		LakekeeperEndpoint:  "http://x/catalog",
 		LakekeeperWarehouse: "org-x",
-	}}
-	ic, err := a.buildIcebergConfig(context.Background(), "x", warehouse)
+	}
+	ic, err := a.buildIcebergConfig(context.Background(), "x", src)
 	if err != nil {
 		t.Fatalf("buildIcebergConfig: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestBuildIcebergConfig_SecretFetchErrorSurfaces(t *testing.T) {
 	cs := fake.NewSimpleClientset() // no secret pre-loaded
 	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: ns}
 
-	warehouse := &configstore.ManagedWarehouseConfig{Iceberg: configstore.ManagedWarehouseIceberg{
+	src := &configstore.ManagedWarehouseIceberg{
 		Enabled:                   true,
 		Backend:                   iceberg.BackendLakekeeper,
 		LakekeeperOAuth2ServerURI: "http://oidc/token",
@@ -131,8 +131,8 @@ func TestBuildIcebergConfig_SecretFetchErrorSurfaces(t *testing.T) {
 			Name:      "missing-secret",
 			Key:       "oauth2-client-secret",
 		},
-	}}
-	_, err := a.buildIcebergConfig(context.Background(), "x", warehouse)
+	}
+	_, err := a.buildIcebergConfig(context.Background(), "x", src)
 	if err == nil {
 		t.Fatal("expected error for missing secret, got nil")
 	}

@@ -356,7 +356,7 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
-	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, org.Warehouse)
+	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, &org.Warehouse.Iceberg)
 	if err != nil {
 		return TenantActivationPayload{}, err
 	}
@@ -536,11 +536,7 @@ func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Inte
 // For lakekeeper with a non-empty LakekeeperClientCredentials SecretRef, the
 // OAuth2 client_secret is resolved via readSecretValue just before sending.
 // Empty SecretRef is fine (PR1 allowall mode; PR3 wires OIDC SA-token auth).
-func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID string, warehouse *configstore.ManagedWarehouseConfig) (server.IcebergConfig, error) {
-	if warehouse == nil {
-		return server.IcebergConfig{}, fmt.Errorf("warehouse config is required")
-	}
-	src := &warehouse.Iceberg
+func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID string, src *configstore.ManagedWarehouseIceberg) (server.IcebergConfig, error) {
 	ic := server.IcebergConfig{
 		Enabled:   src.Enabled,
 		Backend:   src.Backend,
