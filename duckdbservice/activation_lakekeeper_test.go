@@ -68,13 +68,6 @@ func TestSameTenantActivationRuntime_LakekeeperFields(t *testing.T) {
 			wantSameRun: false,
 		},
 		{
-			name: "LakekeeperMetadataDSN differs → not same",
-			mutate: func(p *ActivationPayload) {
-				p.Iceberg.LakekeeperMetadataDSN = "postgres://lakekeeper_acme:pw@metadata/lakekeeper_acme"
-			},
-			wantSameRun: false,
-		},
-		{
 			name: "LakekeeperClientSecret intentionally NOT compared",
 			mutate: func(p *ActivationPayload) {
 				// The client_secret is rotated only via re-provisioning,

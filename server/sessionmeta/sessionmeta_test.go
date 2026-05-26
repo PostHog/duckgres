@@ -139,3 +139,13 @@ func TestInformationSchemaColumnsCompatUsesLoadedIcebergColumnsAndFiltersDummy(t
 		}
 	}
 }
+
+func TestInformationSchemaColumnsCompatLoadedIcebergColumnsKeepIcebergCatalog(t *testing.T) {
+	got := buildSessionInformationSchemaColumnsViewSQL()
+	if !strings.Contains(got, "'iceberg' AS table_catalog") {
+		t.Fatalf("loaded Iceberg columns should use the iceberg catalog in:\n%s", got)
+	}
+	if strings.Contains(got, "current_database() AS table_catalog,\n\t\t\t\ttable_schema") {
+		t.Fatalf("loaded Iceberg columns should not use current_database() as table_catalog in:\n%s", got)
+	}
+}

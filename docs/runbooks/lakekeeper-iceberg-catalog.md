@@ -132,12 +132,9 @@ the tenant's S3 bucket.
 
 DuckDB's Iceberg catalog can list tables before it has loaded each table's
 schema, so raw `information_schema.columns` may expose placeholder
-`__` / `unknown` rows. Duckgres hides those placeholders and, when
-`iceberg.lakekeeper_metadata_dsn` / `DUCKGRES_ICEBERG_LAKEKEEPER_METADATA_DSN`
-is configured alongside the Lakekeeper warehouse name, bulk-loads current
-column metadata directly from Lakekeeper's Postgres catalog
-(`table_current_schema` + `table_schema`). The default is empty, which keeps
-the compatibility path on the table-metadata fallback.
+`__` / `unknown` rows. Duckgres hides those placeholders and uses the
+Lakekeeper REST catalog to load current table schemas with bounded
+concurrency before returning `information_schema.columns` results.
 
 ## Troubleshooting
 

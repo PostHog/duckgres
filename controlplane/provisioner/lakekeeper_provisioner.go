@@ -402,12 +402,6 @@ func lakekeeperDBName(orgID string) string {
 	return "lakekeeper_" + lakekeeperResourceSuffix(orgID)
 }
 
-// LakekeeperDatabaseName derives the per-org Lakekeeper Postgres database
-// name. Exported for activation-time direct metadata readers.
-func LakekeeperDatabaseName(orgID string) string {
-	return lakekeeperDBName(orgID)
-}
-
 func lakekeeperWarehouseName(orgID string) string {
 	return "org-" + lakekeeperResourceSuffix(orgID)
 }

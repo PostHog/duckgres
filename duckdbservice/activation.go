@@ -324,8 +324,7 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 		ai.LakekeeperEndpoint == bi.LakekeeperEndpoint &&
 		ai.LakekeeperWarehouse == bi.LakekeeperWarehouse &&
 		ai.LakekeeperClientID == bi.LakekeeperClientID &&
-		ai.LakekeeperOAuth2ServerURI == bi.LakekeeperOAuth2ServerURI &&
-		ai.LakekeeperMetadataDSN == bi.LakekeeperMetadataDSN
+		ai.LakekeeperOAuth2ServerURI == bi.LakekeeperOAuth2ServerURI
 }
 
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {

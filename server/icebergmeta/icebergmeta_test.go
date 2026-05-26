@@ -3,7 +3,11 @@ package icebergmeta
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/posthog/duckgres/server/sqlcore"
@@ -34,115 +38,209 @@ func TestExtractFiltersHandlesEqualsAndInPredicates(t *testing.T) {
 	}
 }
 
-func TestLoadColumnsDescribesUnloadedIcebergTablesAndInsertsMetadata(t *testing.T) {
+func TestLoadColumnsRequiresLakekeeperRESTConfig(t *testing.T) {
 	exec := &scriptedExecutor{
 		rows: []sqlcore.RowSet{
-			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{{"billing_public", "public_api_keys"}}},
-			&rowSet{cols: []string{"column_name", "column_type", "null", "key", "default", "extra"}, rows: [][]any{
-				{"id", "VARCHAR", "NO", nil, nil, nil},
-				{"amount", "DECIMAL(10,2)", "YES", nil, nil, nil},
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{
+				{"billing_public", "public_api_keys"},
 			}},
 		},
 	}
 
 	err := LoadColumns(context.Background(), exec, "SELECT * FROM memory.main.information_schema_columns_compat WHERE table_schema = 'billing_public'")
+	if err == nil {
+		t.Fatal("expected missing REST config error")
+	}
+	if !strings.Contains(err.Error(), "Lakekeeper REST catalog metadata requires endpoint and warehouse") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadColumnsUsesLakekeeperREST(t *testing.T) {
+	var tableLoads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/config":
+			if got, want := r.URL.Query().Get("warehouse"), "org-acme"; got != want {
+				t.Fatalf("warehouse query = %q, want %q", got, want)
+			}
+			_, _ = w.Write([]byte(`{"defaults":{"prefix":"warehouse-id"}}`))
+		case "/v1/warehouse-id/namespaces/billing_public/tables/public_api_keys":
+			tableLoads.Add(1)
+			_, _ = w.Write([]byte(`{
+				"metadata": {
+					"current-schema-id": 7,
+					"schemas": [
+						{
+							"schema-id": 7,
+							"type": "struct",
+							"fields": [
+								{"id": 1, "name": "id", "type": "string", "required": true},
+								{"id": 2, "name": "amount", "type": "decimal(10,2)", "required": false}
+							]
+						}
+					]
+				}
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	exec := &scriptedExecutor{
+		rows: []sqlcore.RowSet{
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{{"billing_public", "public_api_keys"}}},
+		},
+	}
+
+	err := LoadColumns(context.Background(), exec, "SELECT * FROM memory.main.information_schema_columns_compat WHERE table_schema = 'billing_public'", Config{
+		LakekeeperEndpoint:  srv.URL,
+		LakekeeperWarehouse: "org-acme",
+	})
 	if err != nil {
 		t.Fatalf("LoadColumns: %v", err)
 	}
-
-	joinedQueries := strings.Join(exec.queries, "\n---\n")
-	for _, want := range []string{
-		"FROM information_schema.tables",
-		"table_catalog = 'iceberg'",
-		"FROM memory.main.__duckgres_iceberg_column_metadata",
-		"table_schema IN ('billing_public')",
-		`DESCRIBE SELECT * FROM iceberg."billing_public"."public_api_keys" LIMIT 0`,
-	} {
-		if !strings.Contains(joinedQueries, want) {
-			t.Fatalf("queries missing %q in:\n%s", want, joinedQueries)
-		}
+	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "DESCRIBE SELECT") {
+		t.Fatalf("REST metadata path should not describe Iceberg tables, queries:\n%s", got)
 	}
-
-	if len(exec.execs) != 1 {
-		t.Fatalf("ExecContext calls = %d, want 1", len(exec.execs))
+	if got, want := tableLoads.Load(), int32(1); got != want {
+		t.Fatalf("REST table loads = %d, want %d", got, want)
 	}
-	insert := exec.execs[0]
-	for _, want := range []string{
-		"INSERT OR IGNORE INTO memory.main.__duckgres_iceberg_column_metadata",
-		"'billing_public'",
-		"'public_api_keys'",
-		"'id'",
-		"'text'",
-		"'amount'",
-		"'numeric'",
-		"10",
-		"2",
-	} {
+	insert := strings.Join(exec.execs, "\n")
+	for _, want := range []string{"'public_api_keys'", "'id'", "'NO'", "'text'", "'amount'", "'numeric'", "10", "2"} {
 		if !strings.Contains(insert, want) {
 			t.Fatalf("insert missing %q in:\n%s", want, insert)
 		}
 	}
 }
 
-func TestLoadColumnsUsesDirectLakekeeperMetadataWhenConfigured(t *testing.T) {
+func TestLoadColumnsReturnsLakekeeperRESTUnavailableError(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+
 	exec := &scriptedExecutor{
 		rows: []sqlcore.RowSet{
-			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{
-				{"billing_public", "public_api_keys"},
-				{"billing_public", "billing_productseat"},
-			}},
-		},
-	}
-	source := &fakeMetadataSource{
-		cols: map[tableRef][]sourceColumn{
-			{Schema: "billing_public", Name: "public_api_keys"}: {
-				{Name: "id", Type: "string", Required: true},
-				{Name: "amount", Type: "decimal(10,2)"},
-			},
-			{Schema: "billing_public", Name: "billing_productseat"}: {
-				{Name: "active", Type: "boolean"},
-			},
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{{"billing_public", "public_api_keys"}}},
 		},
 	}
 
 	err := LoadColumns(context.Background(), exec, "SELECT * FROM memory.main.information_schema_columns_compat WHERE table_schema = 'billing_public'", Config{
-		LakekeeperWarehouse:      "org-acme",
-		LakekeeperMetadataSource: source,
+		LakekeeperEndpoint:  srv.URL,
+		LakekeeperWarehouse: "org-acme",
+	})
+	if err == nil {
+		t.Fatal("expected REST unavailable error")
+	}
+	if !errors.Is(err, errRESTCatalogUnavailable) {
+		t.Fatalf("error = %v, want errRESTCatalogUnavailable", err)
+	}
+	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "DESCRIBE SELECT") {
+		t.Fatalf("REST-only metadata path should not describe Iceberg tables, queries:\n%s", got)
+	}
+}
+
+func TestLoadColumnsPropagatesMalformedLakekeeperRESTMetadata(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/config":
+			_, _ = w.Write([]byte(`{"defaults":{"prefix":"warehouse-id"}}`))
+		case "/v1/warehouse-id/namespaces/billing_public/tables/public_api_keys":
+			_, _ = w.Write([]byte(`{"metadata":{"current-schema-id": 7, "schemas":[]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	exec := &scriptedExecutor{
+		rows: []sqlcore.RowSet{
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{{"billing_public", "public_api_keys"}}},
+		},
+	}
+
+	err := LoadColumns(context.Background(), exec, "SELECT * FROM memory.main.information_schema_columns_compat WHERE table_schema = 'billing_public'", Config{
+		LakekeeperEndpoint:  srv.URL,
+		LakekeeperWarehouse: "org-acme",
+	})
+	if err == nil {
+		t.Fatal("expected malformed REST metadata error")
+	}
+	if !strings.Contains(err.Error(), "current schema") {
+		t.Fatalf("error = %v, want current schema context", err)
+	}
+	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "DESCRIBE SELECT") {
+		t.Fatalf("malformed REST metadata should not silently fall back to DESCRIBE, queries:\n%s", got)
+	}
+}
+
+func TestLoadColumnsSkipsOAuth2ConfiguredLakekeeperREST(t *testing.T) {
+	exec := &scriptedExecutor{
+		rows: []sqlcore.RowSet{
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{{"billing_public", "public_api_keys"}}},
+		},
+	}
+
+	err := LoadColumns(context.Background(), exec, "SELECT * FROM memory.main.information_schema_columns_compat WHERE table_schema = 'billing_public'", Config{
+		LakekeeperEndpoint:        "http://lakekeeper.invalid/catalog",
+		LakekeeperWarehouse:       "org-acme",
+		LakekeeperOAuth2ServerURI: "http://127.0.0.1:9876/token",
 	})
 	if err != nil {
 		t.Fatalf("LoadColumns: %v", err)
 	}
+	if len(exec.queries) != 0 {
+		t.Fatalf("OAuth2 metadata loading should skip before catalog queries, got:\n%s", strings.Join(exec.queries, "\n"))
+	}
+	if len(exec.execs) != 0 {
+		t.Fatalf("OAuth2 metadata loading should not insert columns, got:\n%s", strings.Join(exec.execs, "\n"))
+	}
+}
 
-	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "DESCRIBE SELECT") {
-		t.Fatalf("direct Lakekeeper metadata path should not describe Iceberg tables, queries:\n%s", got)
-	}
-	if got, want := source.warehouse, "org-acme"; got != want {
-		t.Fatalf("source warehouse = %q, want %q", got, want)
-	}
-	if got, want := len(source.tables), 2; got != want {
-		t.Fatalf("source tables = %d, want %d", got, want)
-	}
-	if len(exec.execs) != 2 {
-		t.Fatalf("ExecContext calls = %d, want 2", len(exec.execs))
-	}
-	insert := strings.Join(exec.execs, "\n")
-	for _, want := range []string{
-		"'billing_public'",
-		"'public_api_keys'",
-		"'id'",
-		"'NO'",
-		"'text'",
-		"'amount'",
-		"'numeric'",
-		"10",
-		"2",
-		"'billing_productseat'",
-		"'active'",
-		"'boolean'",
-	} {
-		if !strings.Contains(insert, want) {
-			t.Fatalf("insert missing %q in:\n%s", want, insert)
+func TestRestCatalogMetadataSourceLimitsConcurrency(t *testing.T) {
+	const tableCount = restCatalogConcurrency + 3
+	var active atomic.Int32
+	var maxActive atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/config":
+			_, _ = w.Write([]byte(`{"defaults":{"prefix":"warehouse-id"}}`))
+		case strings.HasPrefix(r.URL.Path, "/v1/warehouse-id/namespaces/billing_public/tables/t_"):
+			now := active.Add(1)
+			for {
+				prev := maxActive.Load()
+				if now <= prev || maxActive.CompareAndSwap(prev, now) {
+					break
+				}
+			}
+			defer active.Add(-1)
+			_, _ = w.Write([]byte(`{
+				"metadata": {
+					"current-schema-id": 0,
+					"schemas": [{"schema-id": 0, "fields": [{"id": 1, "name": "id", "type": "int", "required": false}]}]
+				}
+			}`))
+		default:
+			http.NotFound(w, r)
 		}
+	}))
+	defer srv.Close()
+
+	tables := make([]tableRef, tableCount)
+	for i := range tables {
+		tables[i] = tableRef{Schema: "billing_public", Name: fmt.Sprintf("t_%02d", i)}
+	}
+
+	cols, err := restCatalogMetadataSource{endpoint: srv.URL}.LoadColumns(context.Background(), "org-acme", tables)
+	if err != nil {
+		t.Fatalf("LoadColumns: %v", err)
+	}
+	if got, want := len(cols), tableCount; got != want {
+		t.Fatalf("loaded tables = %d, want %d", got, want)
+	}
+	if got := maxActive.Load(); got > restCatalogConcurrency {
+		t.Fatalf("max concurrency = %d, want <= %d", got, restCatalogConcurrency)
 	}
 }
 
@@ -150,18 +248,6 @@ type scriptedExecutor struct {
 	rows    []sqlcore.RowSet
 	queries []string
 	execs   []string
-}
-
-type fakeMetadataSource struct {
-	warehouse string
-	tables    []tableRef
-	cols      map[tableRef][]sourceColumn
-}
-
-func (s *fakeMetadataSource) LoadColumns(_ context.Context, warehouse string, tables []tableRef) (map[tableRef][]sourceColumn, error) {
-	s.warehouse = warehouse
-	s.tables = append([]tableRef(nil), tables...)
-	return s.cols, nil
 }
 
 func (e *scriptedExecutor) QueryContext(_ context.Context, query string, _ ...any) (sqlcore.RowSet, error) {

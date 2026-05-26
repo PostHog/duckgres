@@ -1669,13 +1669,21 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 }
 
 func (c *clientConn) loadIcebergColumnMetadata(ctx context.Context, query string) error {
-	if c == nil || c.passthrough {
+	if c == nil || !shouldLoadIcebergColumnMetadata(c.server.cfg.Iceberg, c.passthrough) {
 		return nil
 	}
 	return icebergmeta.LoadColumns(ctx, c.executor, query, icebergmeta.Config{
-		LakekeeperMetadataDSN: c.server.cfg.Iceberg.LakekeeperMetadataDSN,
-		LakekeeperWarehouse:   c.server.cfg.Iceberg.LakekeeperWarehouse,
+		LakekeeperEndpoint:        c.server.cfg.Iceberg.LakekeeperEndpoint,
+		LakekeeperWarehouse:       c.server.cfg.Iceberg.LakekeeperWarehouse,
+		LakekeeperOAuth2ServerURI: c.server.cfg.Iceberg.LakekeeperOAuth2ServerURI,
 	})
+}
+
+func shouldLoadIcebergColumnMetadata(cfg IcebergConfig, passthrough bool) bool {
+	return !passthrough &&
+		cfg.Enabled &&
+		cfg.ResolvedBackend() == iceberg.BackendLakekeeper &&
+		cfg.LakekeeperOAuth2ServerURI == ""
 }
 
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.

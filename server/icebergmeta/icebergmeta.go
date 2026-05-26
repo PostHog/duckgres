@@ -4,17 +4,23 @@ package icebergmeta
 
 import (
 	"context"
-	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib" // registers pgx for direct Lakekeeper metadata reads
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 const ColumnMetadataTable = "__duckgres_iceberg_column_metadata"
 const QualifiedColumnMetadataTable = "memory.main." + ColumnMetadataTable
+const restCatalogConcurrency = 8
 
 type Filters struct {
 	Schemas []string
@@ -27,16 +33,9 @@ type tableRef struct {
 }
 
 type Config struct {
-	LakekeeperMetadataDSN string
-	LakekeeperWarehouse   string
-
-	// LakekeeperMetadataSource is a test hook. Production code should set
-	// LakekeeperMetadataDSN instead.
-	LakekeeperMetadataSource metadataSource
-}
-
-type metadataSource interface {
-	LoadColumns(ctx context.Context, warehouse string, tables []tableRef) (map[tableRef][]sourceColumn, error)
+	LakekeeperEndpoint        string
+	LakekeeperWarehouse       string
+	LakekeeperOAuth2ServerURI string
 }
 
 type sourceColumn struct {
@@ -60,6 +59,11 @@ func LoadColumns(ctx context.Context, executor sqlcore.QueryExecutor, query stri
 		return nil
 	}
 
+	cfg := firstConfig(configs)
+	if strings.TrimSpace(cfg.LakekeeperOAuth2ServerURI) != "" {
+		return nil
+	}
+
 	tables, err := listCandidateTables(ctx, executor, ExtractFilters(query))
 	if err != nil {
 		return err
@@ -68,28 +72,15 @@ func LoadColumns(ctx context.Context, executor sqlcore.QueryExecutor, query stri
 		return nil
 	}
 
-	cfg := firstConfig(configs)
-	if source := cfg.metadataSource(); source != nil && cfg.LakekeeperWarehouse != "" {
-		columns, err := source.LoadColumns(ctx, cfg.LakekeeperWarehouse, tables)
-		if err != nil {
-			return err
-		}
-		return insertSourceColumns(ctx, executor, columns)
+	source, err := cfg.restMetadataSource()
+	if err != nil {
+		return err
 	}
-
-	for _, table := range tables {
-		cols, err := describeTable(ctx, executor, table)
-		if err != nil {
-			return err
-		}
-		if len(cols) == 0 {
-			continue
-		}
-		if _, err := executor.ExecContext(ctx, buildInsertSQL(table, cols)); err != nil {
-			return fmt.Errorf("insert iceberg column metadata for %s.%s: %w", table.Schema, table.Name, err)
-		}
+	columns, err := source.LoadColumns(ctx, cfg.LakekeeperWarehouse, tables)
+	if err != nil {
+		return err
 	}
-	return nil
+	return insertSourceColumns(ctx, executor, columns)
 }
 
 func firstConfig(configs []Config) Config {
@@ -99,14 +90,16 @@ func firstConfig(configs []Config) Config {
 	return configs[0]
 }
 
-func (c Config) metadataSource() metadataSource {
-	if c.LakekeeperMetadataSource != nil {
-		return c.LakekeeperMetadataSource
+func (c Config) restMetadataSource() (restCatalogMetadataSource, error) {
+	endpoint := strings.TrimSpace(c.LakekeeperEndpoint)
+	warehouse := strings.TrimSpace(c.LakekeeperWarehouse)
+	if endpoint == "" || warehouse == "" {
+		return restCatalogMetadataSource{}, fmt.Errorf("Lakekeeper REST catalog metadata requires endpoint and warehouse")
 	}
-	if strings.TrimSpace(c.LakekeeperMetadataDSN) == "" {
-		return nil
-	}
-	return postgresMetadataSource{dsn: c.LakekeeperMetadataDSN}
+	return restCatalogMetadataSource{
+		endpoint: strings.TrimRight(endpoint, "/"),
+		client:   &http.Client{Timeout: 30 * time.Second},
+	}, nil
 }
 
 func ExtractFilters(query string) Filters {
@@ -159,44 +152,6 @@ func listCandidateTables(ctx context.Context, executor sqlcore.QueryExecutor, fi
 	return refs, nil
 }
 
-func describeTable(ctx context.Context, executor sqlcore.QueryExecutor, table tableRef) ([]describeColumn, error) {
-	query := fmt.Sprintf(
-		"DESCRIBE SELECT * FROM iceberg.%s.%s LIMIT 0",
-		quoteIdentifier(table.Schema),
-		quoteIdentifier(table.Name),
-	)
-	rows, err := executor.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("describe iceberg table %s.%s: %w", table.Schema, table.Name, err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var cols []describeColumn
-	for rows.Next() {
-		values := make([]any, 6)
-		dest := make([]any, len(values))
-		for i := range values {
-			dest[i] = &values[i]
-		}
-		if err := rows.Scan(dest...); err != nil {
-			return nil, fmt.Errorf("scan describe output for %s.%s: %w", table.Schema, table.Name, err)
-		}
-		name := asString(values[0])
-		if name == "" {
-			continue
-		}
-		cols = append(cols, describeColumn{
-			Name:       name,
-			ColumnType: asString(values[1]),
-			Nullable:   asString(values[2]),
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate describe output for %s.%s: %w", table.Schema, table.Name, err)
-	}
-	return cols, nil
-}
-
 func insertSourceColumns(ctx context.Context, executor sqlcore.QueryExecutor, columns map[tableRef][]sourceColumn) error {
 	for table, cols := range columns {
 		converted := make([]describeColumn, 0, len(cols))
@@ -221,87 +176,212 @@ func insertSourceColumns(ctx context.Context, executor sqlcore.QueryExecutor, co
 	return nil
 }
 
-type postgresMetadataSource struct {
-	dsn string
+var errRESTCatalogUnavailable = errors.New("lakekeeper REST catalog metadata unavailable")
+
+type restCatalogMetadataSource struct {
+	endpoint string
+	client   *http.Client
 }
 
-func (s postgresMetadataSource) LoadColumns(ctx context.Context, warehouse string, tables []tableRef) (map[tableRef][]sourceColumn, error) {
+type restConfigResponse struct {
+	Defaults  map[string]string `json:"defaults"`
+	Overrides map[string]string `json:"overrides"`
+}
+
+type restLoadTableResponse struct {
+	Metadata restTableMetadata `json:"metadata"`
+}
+
+type restTableMetadata struct {
+	CurrentSchemaID *int         `json:"current-schema-id"`
+	Schemas         []restSchema `json:"schemas"`
+	Schema          restSchema   `json:"schema"`
+}
+
+type restSchema struct {
+	SchemaID int         `json:"schema-id"`
+	Fields   []restField `json:"fields"`
+}
+
+type restField struct {
+	Name     string `json:"name"`
+	Type     any    `json:"type"`
+	Required bool   `json:"required"`
+}
+
+func (s restCatalogMetadataSource) LoadColumns(ctx context.Context, warehouse string, tables []tableRef) (map[tableRef][]sourceColumn, error) {
 	if len(tables) == 0 {
 		return nil, nil
 	}
-
-	db, err := sql.Open("pgx", s.dsn)
+	prefix, err := s.loadPrefix(ctx, warehouse)
 	if err != nil {
-		return nil, fmt.Errorf("open lakekeeper metadata database: %w", err)
+		return nil, err
 	}
-	defer func() { _ = db.Close() }()
 
-	query, args := buildLakekeeperMetadataQuery(warehouse, tables)
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query lakekeeper current schemas: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	out := make(map[tableRef][]sourceColumn)
-	for rows.Next() {
-		var schemaName, tableName, columnName, columnType string
-		var required bool
-		if err := rows.Scan(&schemaName, &tableName, &columnName, &columnType, &required); err != nil {
-			return nil, fmt.Errorf("scan lakekeeper column metadata: %w", err)
-		}
-		ref := tableRef{Schema: schemaName, Name: tableName}
-		out[ref] = append(out[ref], sourceColumn{Name: columnName, Type: columnType, Required: required})
+	sem := make(chan struct{}, restCatalogConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
+	for _, table := range tables {
+		table := table
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = ctx.Err()
+				}
+				mu.Unlock()
+				return
+			}
+
+			cols, err := s.loadTableColumns(ctx, prefix, table)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				return
+			}
+			out[table] = cols
+		}()
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate lakekeeper column metadata: %w", err)
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return out, nil
 }
 
-func buildLakekeeperMetadataQuery(warehouse string, tables []tableRef) (string, []any) {
-	args := make([]any, 0, 1+len(tables)*2)
-	args = append(args, warehouse)
-
-	values := make([]string, 0, len(tables))
-	for _, table := range tables {
-		args = append(args, table.Schema, table.Name)
-		values = append(values, fmt.Sprintf("($%d, $%d)", len(args)-1, len(args)))
+func (s restCatalogMetadataSource) loadPrefix(ctx context.Context, warehouse string) (string, error) {
+	var resp restConfigResponse
+	configURL := s.endpoint + "/v1/config?warehouse=" + url.QueryEscape(warehouse)
+	if err := s.getJSON(ctx, configURL, &resp); err != nil {
+		return "", err
 	}
+	if resp.Overrides != nil {
+		if prefix := strings.TrimSpace(resp.Overrides["prefix"]); prefix != "" {
+			return prefix, nil
+		}
+	}
+	if resp.Defaults != nil {
+		if prefix := strings.TrimSpace(resp.Defaults["prefix"]); prefix != "" {
+			return prefix, nil
+		}
+	}
+	return "", fmt.Errorf("lakekeeper REST catalog config response missing prefix")
+}
 
-	query := fmt.Sprintf(`
-		WITH wanted(table_schema, table_name) AS (
-			VALUES %s
-		)
-		SELECT
-			array_to_string(n.namespace_name, '.') AS table_schema,
-			tab.name AS table_name,
-			field.value->>'name' AS column_name,
-			field.value->>'type' AS column_type,
-			COALESCE((field.value->>'required')::boolean, false) AS required
-		FROM public.warehouse w
-		JOIN public.table_current_schema tcs
-			ON tcs.warehouse_id = w.warehouse_id
-		JOIN public.table_schema schema_version
-			ON schema_version.warehouse_id = tcs.warehouse_id
-			AND schema_version.table_id = tcs.table_id
-			AND schema_version.schema_id = tcs.schema_id
-		JOIN public.tabular tab
-			ON tab.warehouse_id = tcs.warehouse_id
-			AND tab.tabular_id = tcs.table_id
-		JOIN public.namespace n
-			ON n.warehouse_id = tab.warehouse_id
-			AND n.namespace_id = tab.namespace_id
-		JOIN wanted
-			ON wanted.table_schema = array_to_string(n.namespace_name, '.')
-			AND wanted.table_name = tab.name
-		CROSS JOIN LATERAL jsonb_array_elements(schema_version.schema->'fields') WITH ORDINALITY AS field(value, ordinality)
-		WHERE w.warehouse_name = $1
-			AND tab.typ::text = 'table'
-			AND tab.deleted_at IS NULL
-		ORDER BY table_schema, table_name, field.ordinality
-	`, strings.Join(values, ",\n"))
-	return query, args
+func (s restCatalogMetadataSource) loadTableColumns(ctx context.Context, prefix string, table tableRef) ([]sourceColumn, error) {
+	var resp restLoadTableResponse
+	tableURL := s.endpoint + "/v1/" + url.PathEscape(prefix) +
+		"/namespaces/" + encodeRESTNamespace(table.Schema) +
+		"/tables/" + url.PathEscape(table.Name)
+	if err := s.getJSON(ctx, tableURL, &resp); err != nil {
+		return nil, err
+	}
+	schema, err := currentRESTSchema(resp.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("load lakekeeper REST schema for %s.%s: %w", table.Schema, table.Name, err)
+	}
+	cols := make([]sourceColumn, 0, len(schema.Fields))
+	for _, field := range schema.Fields {
+		if strings.TrimSpace(field.Name) == "" {
+			return nil, fmt.Errorf("load lakekeeper REST schema for %s.%s: column name is empty", table.Schema, table.Name)
+		}
+		colType, err := restFieldTypeString(field.Type)
+		if err != nil {
+			return nil, fmt.Errorf("load lakekeeper REST schema for %s.%s column %q: %w", table.Schema, table.Name, field.Name, err)
+		}
+		cols = append(cols, sourceColumn{Name: field.Name, Type: colType, Required: field.Required})
+	}
+	return cols, nil
+}
+
+func (s restCatalogMetadataSource) getJSON(ctx context.Context, requestURL string, out any) error {
+	client := s.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return fmt.Errorf("%w: build request: %v", errRESTCatalogUnavailable, err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: GET %s: %v", errRESTCatalogUnavailable, requestURL, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("%w: read GET %s response: %v", errRESTCatalogUnavailable, requestURL, err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("%w: GET %s returned HTTP %d", errRESTCatalogUnavailable, requestURL, resp.StatusCode)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("lakekeeper REST catalog GET %s returned HTTP %d: %s", requestURL, resp.StatusCode, string(body))
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("decode lakekeeper REST catalog GET %s response: %w", requestURL, err)
+	}
+	return nil
+}
+
+func currentRESTSchema(metadata restTableMetadata) (restSchema, error) {
+	if metadata.CurrentSchemaID != nil {
+		for _, schema := range metadata.Schemas {
+			if schema.SchemaID == *metadata.CurrentSchemaID {
+				return schema, nil
+			}
+		}
+		if metadata.Schema.SchemaID == *metadata.CurrentSchemaID && len(metadata.Schema.Fields) > 0 {
+			return metadata.Schema, nil
+		}
+		return restSchema{}, fmt.Errorf("current schema id %d not found", *metadata.CurrentSchemaID)
+	}
+	if len(metadata.Schemas) == 1 {
+		return metadata.Schemas[0], nil
+	}
+	if len(metadata.Schema.Fields) > 0 {
+		return metadata.Schema, nil
+	}
+	return restSchema{}, fmt.Errorf("current schema id missing")
+}
+
+func restFieldTypeString(v any) (string, error) {
+	switch typed := v.(type) {
+	case nil:
+		return "", fmt.Errorf("type is missing")
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return "", fmt.Errorf("type is empty")
+		}
+		return typed, nil
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return "", fmt.Errorf("encode complex type: %w", err)
+		}
+		return string(encoded), nil
+	}
+}
+
+func encodeRESTNamespace(schema string) string {
+	parts := strings.Split(schema, ".")
+	return url.PathEscape(strings.Join(parts, "\x1f"))
 }
 
 func buildInsertSQL(table tableRef, cols []describeColumn) string {

@@ -179,11 +179,6 @@ ducklake:
   delta_catalog_enabled: false
   # delta_catalog_path: "s3://bucket/delta/"
 
-iceberg:
-  # Optional. Empty by default. When using the Lakekeeper backend, this enables
-  # direct Postgres reads for information_schema.columns metadata.
-  # lakekeeper_metadata_dsn: "postgres://lakekeeper:secret@host:5432/lakekeeper_org?sslmode=require"
-
 process:
   min_workers: 0
   max_workers: 0
@@ -223,7 +218,6 @@ Run with config file:
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
-| `DUCKGRES_ICEBERG_LAKEKEEPER_METADATA_DSN` | Optional pgx-compatible Lakekeeper metadata DB DSN for direct `information_schema.columns` loading | - |
 | `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org connection-limit queue admission; the managed K8s queue TTL uses this value | `60s` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |

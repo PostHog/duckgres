@@ -98,44 +98,6 @@ func TestBuildIcebergConfig_LakekeeperResolvesOAuth2Secret(t *testing.T) {
 	}
 }
 
-func TestBuildIcebergConfig_LakekeeperMetadataDSN(t *testing.T) {
-	const ns = "lakekeeper"
-	cs := fake.NewSimpleClientset(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "lakekeeper-acme", Namespace: ns},
-		Data: map[string][]byte{
-			"oauth2-client-secret": []byte("super-secret-token"),
-			"db-user":              []byte("lakekeeper_acme"),
-			"db-password":          []byte("pw-1"),
-		},
-	})
-	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: ns}
-
-	warehouse := &configstore.ManagedWarehouseConfig{
-		MetadataStore: configstore.ManagedWarehouseMetadataStore{
-			Endpoint: "metadata.example.internal",
-			Port:     5433,
-		},
-		Iceberg: configstore.ManagedWarehouseIceberg{
-			Enabled:             true,
-			Backend:             iceberg.BackendLakekeeper,
-			LakekeeperWarehouse: "org-acme",
-			LakekeeperClientCredentials: configstore.SecretRef{
-				Namespace: ns,
-				Name:      "lakekeeper-acme",
-				Key:       "oauth2-client-secret",
-			},
-		},
-	}
-	ic, err := a.buildIcebergConfig(context.Background(), "acme", warehouse)
-	if err != nil {
-		t.Fatalf("buildIcebergConfig: %v", err)
-	}
-	want := "postgres://lakekeeper_acme:pw-1@metadata.example.internal:5433/lakekeeper_acme?sslmode=require"
-	if ic.LakekeeperMetadataDSN != want {
-		t.Errorf("LakekeeperMetadataDSN = %q, want %q", ic.LakekeeperMetadataDSN, want)
-	}
-}
-
 func TestBuildIcebergConfig_EmptyBackendDefaultsLakekeeper(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: "duckgres"}

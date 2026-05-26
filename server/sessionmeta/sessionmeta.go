@@ -358,7 +358,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			is_updatable
 		FROM (
 			SELECT
-				current_database() AS table_catalog,
+				'iceberg' AS table_catalog,
 				table_schema,
 				table_name,
 				column_name,

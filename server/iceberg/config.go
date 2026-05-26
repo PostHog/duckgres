@@ -48,12 +48,6 @@ type Config struct {
 	LakekeeperClientID        string
 	LakekeeperClientSecret    string
 	LakekeeperOAuth2ServerURI string // empty means "Lakekeeper is in allowall mode" (PR1 deployment shape)
-
-	// LakekeeperMetadataDSN is an optional pgx-compatible read connection to
-	// Lakekeeper's Postgres metadata database. When set, Duckgres can populate
-	// information_schema.columns directly from Lakekeeper's current schema
-	// rows instead of forcing DuckDB to load each Iceberg table's metadata.
-	LakekeeperMetadataDSN string
 }
 
 // ResolvedBackend returns Backend with the empty-string default applied.

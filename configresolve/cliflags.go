@@ -47,7 +47,6 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	icebergTableBucket := fs.String("iceberg-table-bucket", "", "Iceberg S3 Tables bucket ARN, e.g. arn:aws:s3tables:us-east-1:<acct>:bucket/<name> (env: DUCKGRES_ICEBERG_TABLE_BUCKET)")
 	icebergRegion := fs.String("iceberg-region", "", "AWS region for the Iceberg table bucket (default: us-east-1) (env: DUCKGRES_ICEBERG_REGION)")
 	icebergNamespace := fs.String("iceberg-namespace", "", "Default Iceberg namespace (informational; default: main) (env: DUCKGRES_ICEBERG_NAMESPACE)")
-	icebergLakekeeperMetadataDSN := fs.String("iceberg-lakekeeper-metadata-dsn", "", "pgx-compatible Lakekeeper metadata database DSN for direct information_schema.columns loading (env: DUCKGRES_ICEBERG_LAKEKEEPER_METADATA_DSN)")
 	processMinWorkers := fs.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
 	processMaxWorkers := fs.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
 	processRetireOnSessionEnd := fs.Bool("process-retire-on-session-end", false, "Retire a process worker immediately after its last session ends instead of keeping it warm for reuse (control-plane mode) (env: DUCKGRES_PROCESS_RETIRE_ON_SESSION_END)")
@@ -115,7 +114,6 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.IcebergTableBucket = *icebergTableBucket
 		cli.IcebergRegion = *icebergRegion
 		cli.IcebergNamespace = *icebergNamespace
-		cli.IcebergLakekeeperMetadataDSN = *icebergLakekeeperMetadataDSN
 		cli.ProcessMinWorkers = *processMinWorkers
 		cli.ProcessMaxWorkers = *processMaxWorkers
 		cli.ProcessRetireOnSessionEnd = *processRetireOnSessionEnd

@@ -35,7 +35,6 @@ func fieldNameToFlagName(name string) string {
 		{"IcebergTableBucket", "iceberg-table-bucket"},
 		{"IcebergRegion", "iceberg-region"},
 		{"IcebergNamespace", "iceberg-namespace"},
-		{"IcebergLakekeeperMetadataDSN", "iceberg-lakekeeper-metadata-dsn"},
 		{"FlightSessionIdleTTL", "flight-session-idle-ttl"},
 		{"FlightSessionReapInterval", "flight-session-reap-interval"},
 		{"FlightHandleIdleTTL", "flight-handle-idle-ttl"},
