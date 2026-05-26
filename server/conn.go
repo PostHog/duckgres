@@ -1347,7 +1347,7 @@ func (c *clientConn) handleQuery(body []byte) error {
 	// Each statement gets its own results, with a single ReadyForQuery at the end.
 	tree, parseErr := pg_query.Parse(query)
 	if parseErr == nil && len(tree.Stmts) > 1 {
-		return c.handleMultiStatementQuery(tree)
+		return c.handleMultiStatementQuery(query)
 	}
 
 	// Transpile PostgreSQL SQL to DuckDB-compatible SQL
@@ -1847,7 +1847,19 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 // each statement gets its own RowDescription/DataRow/CommandComplete messages,
 // with a single ReadyForQuery at the end. If any statement fails, remaining
 // statements are skipped.
-func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error {
+func (c *clientConn) handleMultiStatementQuery(query string) error {
+	// Re-parse with long identifiers protected so that splitting the batch via
+	// Deparse below does not silently truncate names > 63 bytes (see
+	// transpiler/longident.go). executeSingleStatement transpiles each
+	// statement again, which re-applies the same protection.
+	parseSQL, longIdents := transpiler.ProtectLongIdentifiers(query)
+	tree, err := pg_query.Parse(parseSQL)
+	if err != nil {
+		c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
+		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
+		_ = c.writer.Flush()
+		return nil
+	}
 	slog.Debug("Multi-statement simple query.", "user", c.username, "count", len(tree.Stmts))
 
 	for _, stmt := range tree.Stmts {
@@ -1860,6 +1872,7 @@ func (c *clientConn) handleMultiStatementQuery(tree *pg_query.ParseResult) error
 			c.sendError("ERROR", "42601", fmt.Sprintf("syntax error: %v", err))
 			break
 		}
+		singleSQL = transpiler.RestoreLongIdentifiers(singleSQL, longIdents)
 
 		errSent, fatalErr := c.executeSingleStatement(singleSQL)
 		if fatalErr != nil {

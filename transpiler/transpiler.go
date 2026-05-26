@@ -189,8 +189,15 @@ func (t *Transpiler) TranspileAll(sql string) (*Result, error) {
 
 // transpileWithFlags parses the SQL and applies only transforms whose flag is set.
 func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Result, error) {
+	// Protect identifiers longer than PostgreSQL's NAMEDATALEN limit from being
+	// silently truncated by libpg_query during Parse/Deparse (see longident.go).
+	// We parse the placeholdered SQL, then restore the originals on any SQL we
+	// emit from the resulting AST. Paths that return the original `sql` need no
+	// restoration since `sql` is never the placeholdered form.
+	parseSQL, longIdents := protectLongIdentifiers(sql)
+
 	// Parse the SQL into an AST
-	tree, err := pg_query.Parse(sql)
+	tree, err := pg_query.Parse(parseSQL)
 	if err != nil {
 		// PostgreSQL parsing failed - signal that we should try native DuckDB execution
 		// Count parameters using regex since we can't use the AST
@@ -232,8 +239,8 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 		if len(transformResult.Statements) > 0 {
 			return &Result{
 				SQL:               sql, // Keep original for logging
-				Statements:        transformResult.Statements,
-				CleanupStatements: transformResult.CleanupStatements,
+				Statements:        restoreLongIdentifiersAll(transformResult.Statements, longIdents),
+				CleanupStatements: restoreLongIdentifiersAll(transformResult.CleanupStatements, longIdents),
 				ParamCount:        transformResult.ParamCount,
 			}, nil
 		}
@@ -258,7 +265,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 
 	if transformResult.SQLOverride != "" {
 		return &Result{
-			SQL:          transformResult.SQLOverride,
+			SQL:          restoreLongIdentifiers(transformResult.SQLOverride, longIdents),
 			ParamCount:   transformResult.ParamCount,
 			IsNoOp:       transformResult.IsNoOp,
 			NoOpTag:      transformResult.NoOpTag,
@@ -271,6 +278,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 	if err != nil {
 		return nil, err
 	}
+	deparsed = restoreLongIdentifiers(deparsed, longIdents)
 
 	return &Result{
 		SQL:          deparsed,
