@@ -1,0 +1,471 @@
+//go:build kubernetes
+
+package provisioner
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/provisioner/opa"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubefake "k8s.io/client-go/kubernetes/fake"
+)
+
+// --- fakes ---
+
+type fakeTrinoStore struct {
+	orgs []configstore.TrinoEnabledOrg
+}
+
+func (s *fakeTrinoStore) ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error) {
+	out := make([]configstore.TrinoEnabledOrg, len(s.orgs))
+	copy(out, s.orgs)
+	return out, nil
+}
+
+type fakeIcebergStore struct {
+	rows map[string]*configstore.ManagedWarehouseIceberg
+}
+
+func (s *fakeIcebergStore) GetManagedWarehouseIceberg(orgID string) (*configstore.ManagedWarehouseIceberg, error) {
+	row, ok := s.rows[orgID]
+	if !ok {
+		return nil, nil
+	}
+	cp := *row
+	return &cp, nil
+}
+
+type fakeCatalogClient struct {
+	mu        sync.Mutex
+	existing  []string
+	created   map[string]map[string]string
+	dropped   []string
+	listErr   error
+	createErr error
+}
+
+func (c *fakeCatalogClient) ListCatalogs(ctx context.Context) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.listErr != nil {
+		return nil, c.listErr
+	}
+	out := make([]string, len(c.existing))
+	copy(out, c.existing)
+	return out, nil
+}
+
+func (c *fakeCatalogClient) CreateCatalog(ctx context.Context, name string, props map[string]string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.createErr != nil {
+		return c.createErr
+	}
+	if c.created == nil {
+		c.created = make(map[string]map[string]string)
+	}
+	cp := make(map[string]string, len(props))
+	for k, v := range props {
+		cp[k] = v
+	}
+	c.created[name] = cp
+	c.existing = append(c.existing, name)
+	return nil
+}
+
+func (c *fakeCatalogClient) AlterCatalog(ctx context.Context, name string, props map[string]string) error {
+	return c.CreateCatalog(ctx, name, props)
+}
+
+func (c *fakeCatalogClient) DropCatalog(ctx context.Context, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dropped = append(c.dropped, name)
+	filtered := c.existing[:0]
+	for _, e := range c.existing {
+		if e != name {
+			filtered = append(filtered, e)
+		}
+	}
+	c.existing = filtered
+	return nil
+}
+
+type fakeOPAClient struct {
+	mu       sync.Mutex
+	pushed   [][]byte
+	pushErr  error
+}
+
+func (c *fakeOPAClient) PushBundle(ctx context.Context, bundle []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pushErr != nil {
+		return c.pushErr
+	}
+	cp := make([]byte, len(bundle))
+	copy(cp, bundle)
+	c.pushed = append(c.pushed, cp)
+	return nil
+}
+
+// --- pure-function tests ---
+
+func TestBuildTrinoAuthFiles_OneUserPerOrg(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", RootPasswordHash: "$2a$10$hash42"},
+		{OrgID: "43", RootPasswordHash: "$2a$10$hash43"},
+	}
+	pw, grp := BuildTrinoAuthFiles(orgs)
+
+	// Password file: <team_id>:<bcrypt hash>
+	wantPw := "42:$2a$10$hash42\n43:$2a$10$hash43\n"
+	if pw != wantPw {
+		t.Errorf("password.db mismatch:\n got=%q\nwant=%q", pw, wantPw)
+	}
+
+	// Group file: <group_name>:<comma-separated users> — group FIRST.
+	wantGrp := "org_42:42\norg_43:43\n"
+	if grp != wantGrp {
+		t.Errorf("group.db mismatch:\n got=%q\nwant=%q", grp, wantGrp)
+	}
+}
+
+func TestBuildTrinoAuthFiles_DeterministicOrder(t *testing.T) {
+	// Same input, same output — critical so re-runs of the reconcile loop
+	// don't churn the Secret on every tick.
+	in1 := []configstore.TrinoEnabledOrg{
+		{OrgID: "a", RootPasswordHash: "h1"},
+		{OrgID: "b", RootPasswordHash: "h2"},
+	}
+	in2 := []configstore.TrinoEnabledOrg{
+		{OrgID: "a", RootPasswordHash: "h1"},
+		{OrgID: "b", RootPasswordHash: "h2"},
+	}
+	pw1, grp1 := BuildTrinoAuthFiles(in1)
+	pw2, grp2 := BuildTrinoAuthFiles(in2)
+	if pw1 != pw2 || grp1 != grp2 {
+		t.Fatalf("non-deterministic auth file output:\n pw1=%q grp1=%q\n pw2=%q grp2=%q", pw1, grp1, pw2, grp2)
+	}
+}
+
+func TestBuildTrinoAuthFiles_SkipsEmptyHashes(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", RootPasswordHash: "$2a$10$ok"},
+		{OrgID: "43", RootPasswordHash: ""},
+		{OrgID: "", RootPasswordHash: "$2a$10$nope"},
+	}
+	pw, grp := BuildTrinoAuthFiles(orgs)
+	if pw != "42:$2a$10$ok\n" {
+		t.Errorf("password.db = %q, want only the 42 entry", pw)
+	}
+	if grp != "org_42:42\n" {
+		t.Errorf("group.db = %q, want only the org_42 entry", grp)
+	}
+}
+
+func TestBuildTrinoAuthFiles_Empty(t *testing.T) {
+	pw, grp := BuildTrinoAuthFiles(nil)
+	if pw != "" || grp != "" {
+		t.Errorf("expected empty strings on empty input, got pw=%q grp=%q", pw, grp)
+	}
+}
+
+func TestTrinoCatalogName(t *testing.T) {
+	cases := map[string]string{
+		"42":           "org_42_iceberg",
+		"acme":         "org_acme_iceberg",
+		"Acme-Corp":    "org_acme_corp_iceberg",
+		"42-numbers":   "org_42_numbers_iceberg",
+		"with.dot":     "org_with_dot_iceberg",
+	}
+	for in, want := range cases {
+		if got := TrinoCatalogName(in); got != want {
+			t.Errorf("TrinoCatalogName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", Tier: "free"},
+		{OrgID: "43", Tier: "growth"},
+		{OrgID: "44", Tier: "scale"},
+		{OrgID: "45", Tier: ""},
+	}
+	raw, err := BuildTrinoResourceGroups(orgs)
+	if err != nil {
+		t.Fatalf("BuildTrinoResourceGroups: %v", err)
+	}
+	var parsed resourceGroupsFile
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(parsed.RootGroups) != 1 || parsed.RootGroups[0].Name != "root" {
+		t.Fatalf("expected single root group named 'root', got %+v", parsed.RootGroups)
+	}
+	tenants := parsed.RootGroups[0].SubGroups
+	if len(tenants) != 1 || tenants[0].Name != "tenants" {
+		t.Fatalf("expected single tenants tier, got %+v", tenants)
+	}
+	subs := tenants[0].SubGroups
+	if len(subs) != 4 {
+		t.Fatalf("expected 4 org subgroups, got %d", len(subs))
+	}
+	// Selector + subgroup name == team_id; verify the join.
+	wantByName := map[string]int{ // hardConcurrencyLimit per tier
+		"42": 3,  // free
+		"43": 10, // growth
+		"44": 25, // scale
+		"45": 3,  // empty → default ("free")
+	}
+	for _, sg := range subs {
+		want, ok := wantByName[sg.Name]
+		if !ok {
+			t.Errorf("unexpected subgroup name %q", sg.Name)
+			continue
+		}
+		if sg.HardConcurrencyLimit != want {
+			t.Errorf("subgroup %s: HardConcurrencyLimit = %d, want %d", sg.Name, sg.HardConcurrencyLimit, want)
+		}
+	}
+	// Selectors: one per org, mapping user → root.tenants.<team_id>.
+	wantSel := map[string]string{
+		"42": "root.tenants.42",
+		"43": "root.tenants.43",
+		"44": "root.tenants.44",
+		"45": "root.tenants.45",
+	}
+	if len(parsed.Selectors) != 4 {
+		t.Fatalf("expected 4 selectors, got %d", len(parsed.Selectors))
+	}
+	for _, sel := range parsed.Selectors {
+		if want, ok := wantSel[sel.User]; !ok || sel.Group != want {
+			t.Errorf("selector %+v unexpected (want user→%q)", sel, wantSel[sel.User])
+		}
+	}
+}
+
+// --- reconcile path ---
+
+func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, ic map[string]*configstore.ManagedWarehouseIceberg) (*TrinoProvisioner, *kubefake.Clientset, *fakeCatalogClient, *fakeOPAClient) {
+	t.Helper()
+	kc := kubefake.NewClientset()
+	catalog := &fakeCatalogClient{}
+	opaClient := &fakeOPAClient{}
+	p, err := NewTrinoProvisioner(TrinoProvisionerOpts{
+		Store:         &fakeTrinoStore{orgs: orgs},
+		IcebergStore:  &fakeIcebergStore{rows: ic},
+		Kubernetes:    kc,
+		Namespace:     TrinoCustomerNamespace,
+		Catalog:       catalog,
+		OPA:           opaClient,
+		BundleBuilder: opa.NewStubBuilder(),
+		IAMAccountID:  "123456789012",
+		AWSRegion:     "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewTrinoProvisioner: %v", err)
+	}
+	return p, kc, catalog, opaClient
+}
+
+func TestReconcile_CreatesCatalogProjectsSecretAndConfigMap(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", Tier: "free", RootPasswordHash: "$2a$10$hash42"},
+	}
+	ic := map[string]*configstore.ManagedWarehouseIceberg{
+		"42": {
+			LakekeeperEndpoint:  "http://lakekeeper-42.lakekeeper.svc:8181/catalog",
+			LakekeeperWarehouse: "org-42",
+			Region:              "us-east-1",
+		},
+	}
+	p, kc, catalog, opaClient := newTestTrinoProvisioner(t, orgs, ic)
+
+	if err := p.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// Catalog issued via REST.
+	if _, ok := catalog.created[TrinoCatalogName("42")]; !ok {
+		t.Errorf("expected CREATE CATALOG for org_42_iceberg, got %+v", catalog.created)
+	}
+	// Role ARN includes the org id (per-org duckling-<orgid>).
+	props := catalog.created[TrinoCatalogName("42")]
+	if !strings.Contains(props["iceberg.s3.aws-role-arn"], "duckling-42") {
+		t.Errorf("expected duckling-42 role ARN, got %q", props["iceberg.s3.aws-role-arn"])
+	}
+
+	// Auth Secret.
+	sec, err := kc.CoreV1().Secrets(TrinoCustomerNamespace).Get(context.Background(), TrinoAuthSecretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get auth secret: %v", err)
+	}
+	if !strings.Contains(string(sec.Data[TrinoAuthSecretKeyPasswordDB]), "42:$2a$10$hash42") {
+		t.Errorf("password.db missing 42 entry: %q", sec.Data[TrinoAuthSecretKeyPasswordDB])
+	}
+	if !strings.Contains(string(sec.Data[TrinoAuthSecretKeyGroupDB]), "org_42:42") {
+		t.Errorf("group.db missing org_42 entry: %q", sec.Data[TrinoAuthSecretKeyGroupDB])
+	}
+
+	// ConfigMap.
+	cm, err := kc.CoreV1().ConfigMaps(TrinoCustomerNamespace).Get(context.Background(), TrinoResourceGroupsConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get resource-groups configmap: %v", err)
+	}
+	if !strings.Contains(cm.Data[TrinoResourceGroupsConfigMapKey], "root.tenants.42") {
+		t.Errorf("resource-groups.json missing root.tenants.42 selector: %q", cm.Data[TrinoResourceGroupsConfigMapKey])
+	}
+
+	// OPA bundle pushed at least once.
+	if len(opaClient.pushed) == 0 {
+		t.Errorf("expected at least one OPA bundle push")
+	}
+}
+
+func TestReconcile_SkipsCatalogWhenIcebergNotReady(t *testing.T) {
+	// Trino-enabled but Iceberg row missing or endpoint empty — skip
+	// catalog creation, but still project auth files for the row.
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", RootPasswordHash: "$2a$10$hash"},
+	}
+	p, kc, catalog, _ := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouseIceberg{
+		// no row for 42
+	})
+	if err := p.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(catalog.created) != 0 {
+		t.Errorf("expected no catalog creates, got %+v", catalog.created)
+	}
+	// Auth Secret still projected — that's important so password file
+	// is consistent regardless of catalog readiness.
+	sec, err := kc.CoreV1().Secrets(TrinoCustomerNamespace).Get(context.Background(), TrinoAuthSecretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get auth secret: %v", err)
+	}
+	if !strings.Contains(string(sec.Data[TrinoAuthSecretKeyPasswordDB]), "42:") {
+		t.Errorf("expected 42 entry in password.db, got %q", sec.Data[TrinoAuthSecretKeyPasswordDB])
+	}
+}
+
+func TestReconcile_DropsStaleCatalogs(t *testing.T) {
+	// org_99_iceberg exists in Trino but is not in the enabled list →
+	// should get DROP. system + jmx survive.
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", RootPasswordHash: "$2a$10$h"},
+	}
+	ic := map[string]*configstore.ManagedWarehouseIceberg{
+		"42": {LakekeeperEndpoint: "http://lk-42:8181/catalog", LakekeeperWarehouse: "org-42"},
+	}
+	p, _, catalog, _ := newTestTrinoProvisioner(t, orgs, ic)
+	catalog.existing = []string{"system", "jmx", "org_99_iceberg"}
+
+	if err := p.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	wantDropped := "org_99_iceberg"
+	found := false
+	for _, d := range catalog.dropped {
+		if d == wantDropped {
+			found = true
+		}
+		if d == "system" || d == "jmx" {
+			t.Errorf("system/jmx dropped — must only touch org_*_iceberg: %v", catalog.dropped)
+		}
+	}
+	if !found {
+		t.Errorf("expected %q in dropped, got %v", wantDropped, catalog.dropped)
+	}
+}
+
+func TestReconcile_IsIdempotentWhenCatalogExists(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", RootPasswordHash: "$2a$10$h"},
+	}
+	ic := map[string]*configstore.ManagedWarehouseIceberg{
+		"42": {LakekeeperEndpoint: "http://lk:8181/catalog", LakekeeperWarehouse: "org-42"},
+	}
+	p, _, catalog, _ := newTestTrinoProvisioner(t, orgs, ic)
+	// Pretend the catalog already exists.
+	catalog.existing = []string{TrinoCatalogName("42")}
+
+	if err := p.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := catalog.created[TrinoCatalogName("42")]; ok {
+		t.Errorf("expected no CREATE CATALOG when catalog already exists, got %+v", catalog.created)
+	}
+}
+
+func TestReconcile_SecretUpdateIsIdempotent(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", RootPasswordHash: "$2a$10$h"},
+	}
+	p, kc, _, _ := newTestTrinoProvisioner(t, orgs, nil)
+
+	if err := p.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile (1): %v", err)
+	}
+	// Second tick — same input, same Secret. Should not error.
+	if err := p.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile (2): %v", err)
+	}
+	sec, err := kc.CoreV1().Secrets(TrinoCustomerNamespace).Get(context.Background(), TrinoAuthSecretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	if !strings.Contains(string(sec.Data[TrinoAuthSecretKeyPasswordDB]), "42:") {
+		t.Errorf("expected 42 entry persisted across reconciles")
+	}
+}
+
+func TestRenderWithClauseDeterministic(t *testing.T) {
+	a := renderWithClause(map[string]string{"k1": "v1", "k2": "v2"})
+	b := renderWithClause(map[string]string{"k2": "v2", "k1": "v1"})
+	if a != b {
+		t.Errorf("renderWithClause not deterministic:\n a=%q\n b=%q", a, b)
+	}
+}
+
+func TestRenderWithClauseEscapesQuotes(t *testing.T) {
+	got := renderWithClause(map[string]string{"k": "v'with'quotes"})
+	if !strings.Contains(got, "v''with''quotes") {
+		t.Errorf("expected SQL-escaped quotes, got %q", got)
+	}
+}
+
+func TestNewTrinoProvisioner_RequiresAllDeps(t *testing.T) {
+	// Missing each required field → constructor error.
+	base := TrinoProvisionerOpts{
+		Store:         &fakeTrinoStore{},
+		IcebergStore:  &fakeIcebergStore{},
+		Kubernetes:    kubefake.NewClientset(),
+		Catalog:       &fakeCatalogClient{},
+		OPA:           &fakeOPAClient{},
+		BundleBuilder: opa.NewStubBuilder(),
+	}
+	if _, err := NewTrinoProvisioner(base); err != nil {
+		t.Fatalf("expected baseline to succeed, got %v", err)
+	}
+	for _, f := range []func(o *TrinoProvisionerOpts){
+		func(o *TrinoProvisionerOpts) { o.Store = nil },
+		func(o *TrinoProvisionerOpts) { o.IcebergStore = nil },
+		func(o *TrinoProvisionerOpts) { o.Kubernetes = nil },
+		func(o *TrinoProvisionerOpts) { o.Catalog = nil },
+		func(o *TrinoProvisionerOpts) { o.OPA = nil },
+		func(o *TrinoProvisionerOpts) { o.BundleBuilder = nil },
+	} {
+		o := base
+		f(&o)
+		if _, err := NewTrinoProvisioner(o); err == nil {
+			t.Errorf("expected error with missing dep, got nil for %+v", o)
+		}
+	}
+}
