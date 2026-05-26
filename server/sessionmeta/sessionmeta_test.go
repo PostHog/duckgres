@@ -128,6 +128,7 @@ func TestInformationSchemaColumnsCompatUsesLoadedIcebergColumnsAndFiltersDummy(t
 	got := buildSessionInformationSchemaColumnsViewSQL()
 
 	for _, want := range []string{
+		"WITH all_columns AS",
 		"FROM main.__duckgres_iceberg_column_metadata",
 		"c.table_catalog = 'iceberg'",
 		"c.column_name = '__'",
@@ -137,6 +138,9 @@ func TestInformationSchemaColumnsCompatUsesLoadedIcebergColumnsAndFiltersDummy(t
 		if !strings.Contains(got, want) {
 			t.Fatalf("columns compat SQL missing %q in:\n%s", want, got)
 		}
+	}
+	if count := strings.Count(got, " AS table_catalog"); count != 2 {
+		t.Fatalf("columns compat SQL should project table_catalog only for native and loaded CTE sources, got %d occurrences in:\n%s", count, got)
 	}
 }
 

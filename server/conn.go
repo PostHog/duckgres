@@ -1686,6 +1686,13 @@ func shouldLoadIcebergColumnMetadata(cfg IcebergConfig, passthrough bool) bool {
 		cfg.LakekeeperOAuth2ServerURI == ""
 }
 
+func (c *clientConn) queryContextWithMetadata(ctx context.Context, query string) (RowSet, error) {
+	if err := c.loadIcebergColumnMetadata(ctx, query); err != nil {
+		return nil, err
+	}
+	return c.executor.QueryContext(ctx, query)
+}
+
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
 const physicalDuckLakeCatalog = "ducklake"
 
@@ -1709,19 +1716,8 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 	defer func() {
 		c.logQueryFinished(query, execStart, queryRowsAff, queryFinalErr)
 	}()
-	if err := c.loadIcebergColumnMetadata(ctx, query); err != nil {
-		queryFinalErr = err
-		errCode := classifyErrorCode(err)
-		errMsg := err.Error()
-		c.logQueryError(query, err)
-		c.sendError("ERROR", errCode, errMsg)
-		c.setTxError()
-		_ = wire.WriteReadyForQuery(c.writer, c.txStatus)
-		_ = c.writer.Flush()
-		return 0, errCode, errMsg, nil
-	}
 	runQuery := func() (RowSet, error) {
-		return c.executor.QueryContext(ctx, query)
+		return c.queryContextWithMetadata(ctx, query)
 	}
 
 	rows, err := runQuery()
@@ -2192,19 +2188,8 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	ctx, cleanup := c.queryContext()
 	defer cleanup()
 
-	if err := c.loadIcebergColumnMetadata(ctx, executedQuery); err != nil {
-		queryFinalErr = err
-		errCode := classifyErrorCode(err)
-		errMsg := err.Error()
-		c.logQueryError(executedQuery, err)
-		c.sendError("ERROR", errCode, errMsg)
-		c.setTxError()
-		c.logQuery(start, query, executedQuery, cmdType, 0, 0, errCode, errMsg, "simple-batch")
-		return true, nil
-	}
-
 	runQuery := func() (RowSet, error) {
-		return c.executor.QueryContext(ctx, executedQuery)
+		return c.queryContextWithMetadata(ctx, executedQuery)
 	}
 
 	rows, err := runQuery()
@@ -5972,13 +5957,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 	// us — log the cursor metadata phase as rows=0 / err=initial failure.
 	cursorStart := time.Now()
 	c.logQueryStarted(cursor.query)
-	if err := c.loadIcebergColumnMetadata(ctx, cursor.query); err != nil {
-		c.logQueryFinished(cursor.query, cursorStart, 0, err)
-		cleanup()
-		cursor.cleanup = nil
-		return err
-	}
-	rows, err := c.executor.QueryContext(ctx, cursor.query)
+	rows, err := c.queryContextWithMetadata(ctx, cursor.query)
 	if err != nil {
 		c.logQueryFinished(cursor.query, cursorStart, 0, err)
 		cleanup()

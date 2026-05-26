@@ -22,22 +22,6 @@ func TestShouldLoadColumnsOnlyForCompatView(t *testing.T) {
 	}
 }
 
-func TestExtractFiltersHandlesEqualsAndInPredicates(t *testing.T) {
-	f := ExtractFilters(`
-		SELECT *
-		FROM memory.main.information_schema_columns_compat c
-		WHERE c.table_schema = 'billing_public'
-		  AND c.table_name IN ('public_api_keys', 'billing_productseat')
-	`)
-
-	if got, want := strings.Join(f.Schemas, ","), "billing_public"; got != want {
-		t.Fatalf("Schemas = %q, want %q", got, want)
-	}
-	if got, want := strings.Join(f.Tables, ","), "public_api_keys,billing_productseat"; got != want {
-		t.Fatalf("Tables = %q, want %q", got, want)
-	}
-}
-
 func TestLoadColumnsRequiresLakekeeperRESTConfig(t *testing.T) {
 	exec := &scriptedExecutor{
 		rows: []sqlcore.RowSet{
@@ -82,6 +66,22 @@ func TestLoadColumnsUsesLakekeeperREST(t *testing.T) {
 					]
 				}
 			}`))
+		case "/v1/warehouse-id/namespaces/billing_public/tables/billing_productseat":
+			tableLoads.Add(1)
+			_, _ = w.Write([]byte(`{
+				"metadata": {
+					"current-schema-id": 7,
+					"schemas": [
+						{
+							"schema-id": 7,
+							"type": "struct",
+							"fields": [
+								{"id": 1, "name": "active", "type": "boolean", "required": false}
+							]
+						}
+					]
+				}
+			}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -90,7 +90,10 @@ func TestLoadColumnsUsesLakekeeperREST(t *testing.T) {
 
 	exec := &scriptedExecutor{
 		rows: []sqlcore.RowSet{
-			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{{"billing_public", "public_api_keys"}}},
+			&rowSet{cols: []string{"table_schema", "table_name"}, rows: [][]any{
+				{"billing_public", "public_api_keys"},
+				{"billing_public", "billing_productseat"},
+			}},
 		},
 	}
 
@@ -104,14 +107,37 @@ func TestLoadColumnsUsesLakekeeperREST(t *testing.T) {
 	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "DESCRIBE SELECT") {
 		t.Fatalf("REST metadata path should not describe Iceberg tables, queries:\n%s", got)
 	}
-	if got, want := tableLoads.Load(), int32(1); got != want {
+	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "table_schema IN") || strings.Contains(got, "table_name IN") {
+		t.Fatalf("metadata loading should not parse user query predicates into table filters, queries:\n%s", got)
+	}
+	if got := strings.Join(exec.queries, "\n"); strings.Contains(got, "NOT EXISTS") {
+		t.Fatalf("metadata loading should refresh tables explicitly instead of relying on hidden session cache, queries:\n%s", got)
+	}
+	if got, want := tableLoads.Load(), int32(2); got != want {
 		t.Fatalf("REST table loads = %d, want %d", got, want)
 	}
 	insert := strings.Join(exec.execs, "\n")
-	for _, want := range []string{"'public_api_keys'", "'id'", "'NO'", "'text'", "'amount'", "'numeric'", "10", "2"} {
+	for _, want := range []string{
+		"DELETE FROM memory.main.__duckgres_iceberg_column_metadata",
+		"INSERT INTO memory.main.__duckgres_iceberg_column_metadata",
+		"'public_api_keys'",
+		"'id'",
+		"'NO'",
+		"'string'",
+		"'amount'",
+		"'decimal(10,2)'",
+		"10",
+		"2",
+		"'billing_productseat'",
+		"'active'",
+		"'boolean'",
+	} {
 		if !strings.Contains(insert, want) {
 			t.Fatalf("insert missing %q in:\n%s", want, insert)
 		}
+	}
+	if strings.Contains(insert, "INSERT OR IGNORE") {
+		t.Fatalf("metadata loading should replace rows, not ignore refreshes:\n%s", insert)
 	}
 }
 
