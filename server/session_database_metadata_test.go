@@ -56,12 +56,23 @@ type staticCountRowSet struct {
 	returned bool
 }
 
-func (r *staticCountRowSet) Columns() ([]string, error)                     { return []string{"count"}, nil }
-func (r *staticCountRowSet) ColumnTypes() ([]ColumnTyper, error)            { return []ColumnTyper{describeColumnType("BIGINT")}, nil }
-func (r *staticCountRowSet) Next() bool                                     { if r.returned { return false }; r.returned = true; return true }
-func (r *staticCountRowSet) Scan(dest ...any) error                         { *(dest[0].(*interface{})) = int64(r.count); return nil }
-func (r *staticCountRowSet) Close() error                                   { return nil }
-func (r *staticCountRowSet) Err() error                                     { return nil }
+func (r *staticCountRowSet) Columns() ([]string, error) { return []string{"count"}, nil }
+func (r *staticCountRowSet) ColumnTypes() ([]ColumnTyper, error) {
+	return []ColumnTyper{describeColumnType("BIGINT")}, nil
+}
+func (r *staticCountRowSet) Next() bool {
+	if r.returned {
+		return false
+	}
+	r.returned = true
+	return true
+}
+func (r *staticCountRowSet) Scan(dest ...any) error {
+	*(dest[0].(*interface{})) = int64(r.count)
+	return nil
+}
+func (r *staticCountRowSet) Close() error { return nil }
+func (r *staticCountRowSet) Err() error   { return nil }
 
 func TestHasAttachedCatalogEmbedsCatalogNameWithoutBoundArgs(t *testing.T) {
 	exec := &recordingQueryExecutor{
@@ -224,4 +235,114 @@ func TestInitSessionDatabaseMetadataExcludesInternalDuckLakeMetadataCatalogs(t *
 	if count != 0 {
 		t.Fatalf("internal DuckLake metadata catalogs leaked into schemata view: got %d rows", count)
 	}
+}
+
+func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
+		t.Fatalf("attach ducklake: %v", err)
+	}
+	if _, err := db.Exec(`ATTACH ':memory:' AS "iceberg"`); err != nil {
+		t.Fatalf("attach iceberg: %v", err)
+	}
+	if err := initInformationSchema(db, true); err != nil {
+		t.Fatalf("init information_schema: %v", err)
+	}
+	if _, err := db.Exec("USE ducklake"); err != nil {
+		t.Fatalf("use ducklake: %v", err)
+	}
+	if _, err := db.Exec("CREATE SCHEMA billing_public"); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	if _, err := db.Exec("CREATE TABLE billing_public.public_api_keys(id VARCHAR NOT NULL, permissions JSON)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec("CREATE SCHEMA iceberg.billing_public"); err != nil {
+		t.Fatalf("create iceberg schema: %v", err)
+	}
+
+	executor := NewLocalExecutor(db)
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "posthog"); err != nil {
+		t.Fatalf("init session database metadata: %v", err)
+	}
+
+	if _, err := db.Exec(`
+		INSERT INTO memory.main.__duckgres_iceberg_column_metadata (
+			table_schema,
+			table_name,
+			column_name,
+			ordinal_position,
+			is_nullable,
+			data_type,
+			character_maximum_length,
+			character_octet_length,
+			numeric_precision,
+			numeric_scale,
+			datetime_precision
+		)
+		VALUES
+			('billing_public', 'public_api_keys', 'id', 1, 'YES', 'STRING', NULL, NULL, NULL, NULL, NULL),
+			('billing_public', 'public_api_keys', 'permissions', 2, 'YES', 'STRING', NULL, NULL, NULL, NULL, NULL)
+	`); err != nil {
+		t.Fatalf("insert iceberg metadata: %v", err)
+	}
+
+	assertColumns := func(searchPath, wantCatalog, wantIDNullable, wantPermissionsType string) {
+		t.Helper()
+
+		if _, err := db.Exec("SET search_path = '" + searchPath + "'"); err != nil {
+			t.Fatalf("set search_path %q: %v", searchPath, err)
+		}
+
+		var duplicateCount int
+		if err := db.QueryRow(`
+			SELECT COUNT(*)
+			FROM memory.main.information_schema_columns_compat
+			WHERE table_schema = 'billing_public'
+				AND table_name = 'public_api_keys'
+				AND column_name = 'id'
+		`).Scan(&duplicateCount); err != nil {
+			t.Fatalf("query id duplicate count: %v", err)
+		}
+		if duplicateCount != 1 {
+			t.Fatalf("id row count with search_path %q = %d, want 1", searchPath, duplicateCount)
+		}
+
+		var gotCatalog, gotNullable string
+		if err := db.QueryRow(`
+			SELECT table_catalog, is_nullable
+			FROM memory.main.information_schema_columns_compat
+			WHERE table_schema = 'billing_public'
+				AND table_name = 'public_api_keys'
+				AND column_name = 'id'
+		`).Scan(&gotCatalog, &gotNullable); err != nil {
+			t.Fatalf("query id metadata: %v", err)
+		}
+		if gotCatalog != wantCatalog || gotNullable != wantIDNullable {
+			t.Fatalf("id metadata with search_path %q = (%q, %q), want (%q, %q)", searchPath, gotCatalog, gotNullable, wantCatalog, wantIDNullable)
+		}
+
+		var gotPermissionsType string
+		if err := db.QueryRow(`
+			SELECT data_type
+			FROM memory.main.information_schema_columns_compat
+			WHERE table_schema = 'billing_public'
+				AND table_name = 'public_api_keys'
+				AND column_name = 'permissions'
+		`).Scan(&gotPermissionsType); err != nil {
+			t.Fatalf("query permissions metadata: %v", err)
+		}
+		if gotPermissionsType != wantPermissionsType {
+			t.Fatalf("permissions type with search_path %q = %q, want %q", searchPath, gotPermissionsType, wantPermissionsType)
+		}
+	}
+
+	assertColumns("ducklake.billing_public,memory.main", "posthog", "NO", "json")
+	assertColumns("iceberg.billing_public,memory.main", "iceberg", "YES", "text")
 }
