@@ -83,3 +83,28 @@ const AdminPrincipal = "__admin_provisioner"
 //
 // Keep in sync with the Rego policy's `admin_group` constant.
 const AdminGroup = "__admin_provisioner"
+
+// ManagedCatalogPattern is the regex (RE2 / OPA `regex.match` syntax)
+// that defines the v1 catalog naming convention. It MUST stay in sync
+// with the Rego policy's managed_catalog_name rule AND with the
+// provisioner package's TrinoCatalogName / trinoSanitize functions.
+//
+// The pattern bounds:
+//   - prefix: "org_"
+//   - middle: one or more [a-z0-9_] characters (the sanitize grammar)
+//   - suffix: "_iceberg"
+//
+// Drift between this constant and either the policy's regex literal or
+// TrinoCatalogName's output silently breaks admin authority (admin
+// loses enumeration/management for catalogs the Go code creates, or
+// vice versa). Two tests guard the contract:
+//
+//   - opa/policy_test.go::TestPolicyRegoContainsManagedNamePattern
+//     asserts the embedded policy.rego contains this literal substring.
+//   - provisioner/trino_provisioner_test.go::TestTrinoCatalogNameMatchesManagedNamePattern
+//     compiles this pattern as a Go regex and asserts TrinoCatalogName
+//     outputs match for a representative set of inputs.
+//
+// If you change this string, update policy.rego's regex.match literal
+// to match, then re-run both tests.
+const ManagedCatalogPattern = `^org_[a-z0-9_]+_iceberg$`

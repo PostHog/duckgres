@@ -96,54 +96,104 @@ is_admin if {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: O(1) catalog-ownership lookup keyed on group membership. Iterates
-# over input.context.identity.groups (typically 1-2 elements) and probes
-# data.group_catalogs[g][catalog] for each. Missing keys evaluate to
-# undefined, the body fails, and the outer `allow` stays false.
+# Catalog-name shape: matches what trinoSanitize + TrinoCatalogName produce
+# (`org_<sanitized>_iceberg`, sanitized to [a-z0-9_]). Used as a defense-in-
+# depth name constraint on admin-scoped operations so admin authority is
+# always bounded to provisioner-managed names — admin cannot DROP `system`,
+# `jmx`, or hand-rolled catalogs, and the orphan-cleanup carve-out (below)
+# stays within the same naming convention.
 #
-# `admin_group` is excluded from this iteration: it is a privileged label
-# whose ownership listing covers every customer catalog, and we must NOT
-# grant read access purely on the basis of someone showing up with that
-# group label. The admin's smoke-test read access flows through the
-# separate is_admin-gated rule below.
+# Keep this regex in sync with opa.ManagedCatalogPattern (the exported
+# Go-side constant) and with the trinoSanitize grammar used by
+# TrinoCatalogName. Two tests guard the three-way contract:
+#   - opa/policy_test.go::TestPolicyRegoContainsManagedNamePattern
+#   - provisioner/trino_provisioner_test.go::TestTrinoCatalogNameMatchesManagedNamePattern
+# A change here without updating the constant (or vice versa) fails CI.
 # ---------------------------------------------------------------------------
 
-owns_catalog(catalog) if {
+managed_catalog_name(catalog) if {
+	is_string(catalog)
+	regex.match(`^org_[a-z0-9_]+_iceberg$`, catalog)
+}
+
+# ---------------------------------------------------------------------------
+# Ownership / readability / listability — three predicates kept distinct
+# so admin's orphan-cleanup carve-out doesn't leak into data-plane reads.
+#
+# tenant_owns_catalog(c): a customer group has c in data.group_catalogs.
+#   Excludes admin_group from iteration so a bare admin-group claim grants
+#   nothing (security regression in the file/JWT group provider would
+#   otherwise be a cross-tenant exposure).
+#
+# admin_bundle_catalog(c): admin has c listed in data.group_catalogs
+#   [admin_group]. Gated on is_admin (username + group conjunction) so a
+#   group-only claim grants nothing. This is the smoke-test read path.
+#
+# readable_catalog(c) = tenant_owns OR admin_bundle. Gates every read
+#   surface (AccessCatalog, ShowSchemas, ShowTables, SelectFromColumns,
+#   FilterSchemas, FilterTables, ShowColumns, FilterColumns). Catalogs
+#   outside the bundle CANNOT be read by anyone.
+#
+# listable_catalog(c) = readable OR (is_admin AND managed_catalog_name).
+#   The orphan-cleanup carve-out: admin sees `org_*_iceberg` catalogs
+#   regardless of bundle ownership SOLELY through FilterCatalogs, so
+#   reconcile can re-issue DROP CATALOG on a stale orphan. The orphan
+#   visibility never grants read access.
+# ---------------------------------------------------------------------------
+
+tenant_owns_catalog(catalog) if {
 	some g in input.context.identity.groups
 	g != admin_group
 	data.group_catalogs[g][catalog] == true
 }
 
-# Admin's read access to managed catalogs. Gated on is_admin (full
-# username + group conjunction) so a bare `admin_group` claim does not
-# unlock the global catalog list.
-owns_catalog(catalog) if {
+admin_bundle_catalog(catalog) if {
 	is_admin
 	data.group_catalogs[admin_group][catalog] == true
+}
+
+readable_catalog(catalog) if tenant_owns_catalog(catalog)
+readable_catalog(catalog) if admin_bundle_catalog(catalog)
+
+listable_catalog(catalog) if readable_catalog(catalog)
+
+# Orphan-cleanup carve-out: admin enumeration of managed-name catalogs
+# even when they're not in the bundle. SCOPED to FilterCatalogs only --
+# see the allow rule for FilterCatalogs below. Reads (AccessCatalog,
+# SelectFromColumns, etc.) stay gated on readable_catalog so an orphan
+# catalog's data is never reachable via this carve-out.
+listable_catalog(catalog) if {
+	is_admin
+	managed_catalog_name(catalog)
 }
 
 # ---------------------------------------------------------------------------
 # Catalog-scope decisions.
 # ---------------------------------------------------------------------------
 
-# AccessCatalog: caller's groups must own the catalog.
+# AccessCatalog: caller must be able to READ the catalog (bundle
+# ownership). The admin orphan-cleanup carve-out does NOT apply here --
+# only listable_catalog grants admin access to orphans, and only via
+# FilterCatalogs below.
 allow if {
 	input.action.operation == "AccessCatalog"
-	owns_catalog(input.action.resource.catalog.name)
+	readable_catalog(input.action.resource.catalog.name)
 }
 
 # FilterCatalogs: the Trino OPA plugin calls this once per candidate catalog
-# (parallelFilterFromOpa in OpaHighLevelClient.java). Same shape as
-# AccessCatalog -- return true only for owned catalogs.
+# (parallelFilterFromOpa in OpaHighLevelClient.java). This is the ONE
+# decision that uses listable_catalog -- so admin can SHOW CATALOGS and
+# see an orphan org_*_iceberg catalog even if the bundle has rotated
+# away from it, enabling reconcile to retry DROP CATALOG.
 allow if {
 	input.action.operation == "FilterCatalogs"
-	owns_catalog(input.action.resource.catalog.name)
+	listable_catalog(input.action.resource.catalog.name)
 }
 
-# ShowSchemas: scoped to catalogs the caller owns.
+# ShowSchemas: scoped to catalogs the caller can READ.
 allow if {
 	input.action.operation == "ShowSchemas"
-	owns_catalog(input.action.resource.catalog.name)
+	readable_catalog(input.action.resource.catalog.name)
 }
 
 # ---------------------------------------------------------------------------
@@ -152,12 +202,12 @@ allow if {
 
 allow if {
 	input.action.operation == "FilterSchemas"
-	owns_catalog(input.action.resource.schema.catalogName)
+	readable_catalog(input.action.resource.schema.catalogName)
 }
 
 allow if {
 	input.action.operation == "ShowTables"
-	owns_catalog(input.action.resource.schema.catalogName)
+	readable_catalog(input.action.resource.schema.catalogName)
 }
 
 # ---------------------------------------------------------------------------
@@ -167,22 +217,22 @@ allow if {
 
 allow if {
 	input.action.operation == "SelectFromColumns"
-	owns_catalog(input.action.resource.table.catalogName)
+	readable_catalog(input.action.resource.table.catalogName)
 }
 
 allow if {
 	input.action.operation == "FilterTables"
-	owns_catalog(input.action.resource.table.catalogName)
+	readable_catalog(input.action.resource.table.catalogName)
 }
 
 allow if {
 	input.action.operation == "ShowColumns"
-	owns_catalog(input.action.resource.table.catalogName)
+	readable_catalog(input.action.resource.table.catalogName)
 }
 
 allow if {
 	input.action.operation == "FilterColumns"
-	owns_catalog(input.action.resource.table.catalogName)
+	readable_catalog(input.action.resource.table.catalogName)
 }
 
 # ---------------------------------------------------------------------------
@@ -268,6 +318,12 @@ allow if {
 # we authenticate the provisioner against a separate password-file entry
 # mounted only into the provisioner workflow.
 #
+# Catalog management is ALSO bounded to the provisioner naming convention
+# (managed_catalog_name): an admin can CREATE/DROP/ALTER `org_<id>_iceberg`
+# catalogs, but not `system`, `jmx`, or any hand-rolled catalog. If admin
+# credentials are compromised, the blast radius is bounded to provisioner-
+# managed catalogs.
+#
 # `AlterCatalog` is not a distinct operation in the Trino OPA plugin (476)
 # -- catalog mutations happen via DROP+CREATE through the provisioner --
 # but we keep the rule for forward compatibility with future Trino versions
@@ -275,24 +331,19 @@ allow if {
 # costs nothing.
 # ---------------------------------------------------------------------------
 
-allow if {
-	is_admin
-	input.action.operation == "CreateCatalog"
-}
+catalog_management_ops := {"CreateCatalog", "DropCatalog", "AlterCatalog"}
 
 allow if {
 	is_admin
-	input.action.operation == "DropCatalog"
+	input.action.operation in catalog_management_ops
+	managed_catalog_name(input.action.resource.catalog.name)
 }
 
-allow if {
-	is_admin
-	input.action.operation == "AlterCatalog"
-}
-
-# Admin smoke-test access to catalogs flows through the second
-# `owns_catalog` rule above (is_admin + data.group_catalogs[admin_group]).
-# We do NOT grant the admin blanket access -- the admin can only see
-# catalogs that appear under data.group_catalogs[admin_group], so omitting
-# that entry yields a catalog-management-only admin. And a bare claim of
-# admin_group membership (without the admin username) grants nothing.
+# Admin smoke-test READ access to catalogs flows through readable_catalog
+# above (is_admin + data.group_catalogs[admin_group]). Admin can only
+# READ catalogs that appear under data.group_catalogs[admin_group];
+# omitting an entry yields a catalog-management-only admin for that
+# catalog. The orphan-cleanup carve-out (listable_catalog) lets admin
+# ENUMERATE managed-name catalogs not in the bundle but does NOT grant
+# them read access. And a bare claim of admin_group membership (without
+# the admin username) grants nothing.
