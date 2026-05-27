@@ -66,13 +66,7 @@ type provisionRequest struct {
 }
 
 type provisionMetadataReq struct {
-	Type   string              `json:"type"`
-	Aurora *provisionAuroraReq `json:"aurora,omitempty"`
-}
-
-type provisionAuroraReq struct {
-	MinACU float64 `json:"min_acu"`
-	MaxACU float64 `json:"max_acu"`
+	Type string `json:"type"`
 }
 
 func (h *handler) provisionWarehouse(c *gin.Context) {
@@ -94,37 +88,38 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// The control plane only provisions two metadata-store backends. An empty
-	// type stays backwards-compatible with existing callers (aurora). External
-	// metadata stores are applied out-of-band and are explicitly not
-	// provisionable here.
+	// The control plane provisions exactly one metadata-store backend for new
+	// warehouses: cnpg-shard (the per-tenant Lakekeeper Iceberg catalog on the
+	// shared CloudNativePG shard). DuckLake (aurora) and external are no longer
+	// provisionable.
+	//
+	// This gate is on *creation* only. Existing DuckLake and external ducklings
+	// keep running untouched: the worker activator still reads their Duckling
+	// CR / config-store metadata and attaches DuckLake, the controller still
+	// reconciles their existing CRs (reconcilePending skips Create when the CR
+	// already exists, and DucklingClient.Create still understands aurora), and
+	// admin read/mutate/deprovision are unaffected.
 	warehouse := &configstore.ManagedWarehouse{}
 	switch req.MetadataStore.Type {
-	case "", configstore.MetadataStoreKindAurora:
-		if req.MetadataStore.Aurora == nil || req.MetadataStore.Aurora.MaxACU <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.aurora.max_acu must be greater than 0"})
-			return
-		}
-		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindAurora
-		warehouse.AuroraMinACU = req.MetadataStore.Aurora.MinACU
-		warehouse.AuroraMaxACU = req.MetadataStore.Aurora.MaxACU
 	case configstore.MetadataStoreKindCnpgShard:
-		// cnpg-shard backs the per-tenant Lakekeeper Iceberg catalog on the
-		// shared CloudNativePG shard. It takes no aurora sizing and, per the
-		// Duckling XRD, must always have Iceberg enabled — so enable it here
-		// (Lakekeeper backend) rather than making the caller pass it
-		// redundantly. The composition picks the active shard from chart
-		// values; there is no per-claim placement knob.
+		// cnpg-shard takes no aurora sizing and, per the Duckling XRD, must
+		// always have Iceberg enabled — so enable it here (Lakekeeper backend)
+		// rather than making the caller pass it redundantly. The composition
+		// picks the active shard from chart values; there is no per-claim
+		// placement knob.
 		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindCnpgShard
 		warehouse.Iceberg = configstore.ManagedWarehouseIceberg{
 			Enabled: true,
 			Backend: configstore.IcebergBackendLakekeeper,
 		}
+	case configstore.MetadataStoreKindAurora:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "DuckLake (metadata_store.type 'aurora') is no longer provisionable; only 'cnpg-shard' is. Existing DuckLake deployments are unaffected."})
+		return
 	case "external":
-		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.type 'external' is not provisionable via the control plane; apply the Duckling CR out-of-band"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "external metadata stores are not provisionable via the control plane; existing external deployments are unaffected"})
 		return
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("metadata_store.type %q is not supported (use %q or %q)", req.MetadataStore.Type, configstore.MetadataStoreKindAurora, configstore.MetadataStoreKindCnpgShard)})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("metadata_store.type must be %q (got %q); 'aurora'/DuckLake and 'external' are no longer provisionable", configstore.MetadataStoreKindCnpgShard, req.MetadataStore.Type)})
 		return
 	}
 
