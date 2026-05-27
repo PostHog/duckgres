@@ -106,8 +106,8 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 
 	// Stage the writes into shadow maps so a mid-step failure can roll
 	// back without leaving partial state.
-	shadowOrg, _ := s.orgs[req.OrgID]
-	shadowWarehouse, _ := s.warehouses[req.OrgID]
+	shadowOrg := s.orgs[req.OrgID]
+	shadowWarehouse := s.warehouses[req.OrgID]
 	shadowUserHash, hadUser := s.users[configstore.OrgUserKey{OrgID: req.OrgID, Username: "root"}]
 	shadowTrino, hadTrino := s.trino[req.OrgID]
 
