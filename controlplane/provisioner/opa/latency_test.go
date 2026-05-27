@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/open-policy-agent/opa/rego"
+	"github.com/open-policy-agent/opa/v1/rego"
 )
 
 // LatencyBudget is the per-decision budget for the canonical AccessCatalog

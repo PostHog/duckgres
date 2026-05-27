@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/open-policy-agent/opa/bundle"
+	"github.com/open-policy-agent/opa/v1/bundle"
 )
 
 // TestBuildBundleRoundTrip builds a bundle, parses it back through OPA's
@@ -116,7 +116,7 @@ func TestBundleStoreAndHandler200(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status: want 200, got %d", resp.StatusCode)
@@ -154,7 +154,7 @@ func TestBundleHandler304OnIfNoneMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotModified {
 		t.Fatalf("status: want 304, got %d", resp.StatusCode)
 	}
@@ -180,7 +180,7 @@ func TestBundleHandler200OnEtagMiss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Do: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("etag miss: want 200, got %d", resp.StatusCode)
 	}
@@ -195,7 +195,7 @@ func TestBundleHandler503BeforeFirstBundle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("bootstrap status: want 503 (so OPA retries and Trino stays on deny-all), got %d", resp.StatusCode)
 	}
@@ -396,7 +396,7 @@ func TestBundleHasNoExportedMutableByteAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var got bytes.Buffer
 	_, _ = got.ReadFrom(resp.Body)
 	if !bytes.Equal(got.Bytes(), raw) {

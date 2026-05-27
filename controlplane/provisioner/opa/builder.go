@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/open-policy-agent/opa/bundle"
+	"github.com/open-policy-agent/opa/v1/bundle"
 )
 
 // policyRego is the policy file shipped inside every bundle this package
@@ -21,11 +21,6 @@ var policyRego []byte
 // pushes visible in OPA logs. The build encoding (data hash) further
 // disambiguates bundles with the same revision but different data.
 const bundleRevision = "v1"
-
-// dataJSONPath is where group_catalogs lives inside the bundle. OPA wires
-// /data.json under the package root, so the policy reads it via
-// data.group_catalogs[...].
-const dataJSONPath = "/data.json"
 
 // policyPath is the in-bundle path of policy.rego. The bundle library
 // requires .rego files to live under a path; the choice of name is
