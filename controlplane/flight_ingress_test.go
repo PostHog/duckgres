@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightsqlingress"
 )
 
@@ -16,6 +17,10 @@ type reconnectTestOrgRouter struct {
 func (r *reconnectTestOrgRouter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	r.stackByOrgCalls++
 	return nil, nil, nil, false
+}
+
+func (r *reconnectTestOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergConfig, bool) {
+	return server.IcebergConfig{}, false
 }
 
 func (r *reconnectTestOrgRouter) IsMigratingForOrg(_ string) bool { return false }

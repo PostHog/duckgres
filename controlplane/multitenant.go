@@ -42,6 +42,10 @@ func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManage
 	return stack.Pool, stack.Sessions, stack.Rebalancer, true
 }
 
+func (a *orgRouterAdapter) IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool) {
+	return a.router.IcebergConfigForOrg(orgID)
+}
+
 func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 	return a.router.IsMigrating(orgID)
 }

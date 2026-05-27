@@ -196,6 +196,7 @@ type ConfigStoreInterface interface {
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
+	IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool)
 	IsMigratingForOrg(orgID string) bool
 	SetWarmCapacityTarget(n int)
 	ShutdownAll()
@@ -1172,6 +1173,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Create real clientConn with FlightExecutor and worker assignment
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
+	if cp.orgRouter != nil && orgID != "" {
+		if icebergCfg, ok := cp.orgRouter.IcebergConfigForOrg(orgID); ok {
+			server.SetConnectionIcebergConfig(cc, icebergCfg)
+		}
+	}
 	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
 	server.SetPassthrough(cc, passthroughUser)
 	if orgID != "" {

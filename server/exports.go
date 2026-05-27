@@ -104,13 +104,23 @@ func SetPassthrough(cc *clientConn, enabled bool) {
 	}
 }
 
+// SetConnectionIcebergConfig records the per-tenant Iceberg config for
+// control-plane proxy connections. The proxy server's global config is not
+// tenant-specific, so query-time metadata loading must use this override.
+func SetConnectionIcebergConfig(cc *clientConn, cfg IcebergConfig) {
+	if cc != nil {
+		cc.tenantIcebergConfig = cfg
+		cc.hasTenantIcebergConfig = true
+	}
+}
+
 // HasAttachedCatalog and InitSessionDatabaseMetadata moved to
 // server/sessionmeta. Re-exports kept here for the dozen call sites in
 // the control plane and elsewhere; new code should import server/sessionmeta
 // directly.
 var (
-	HasAttachedCatalog           = sessionmeta.HasAttachedCatalog
-	InitSessionDatabaseMetadata  = sessionmeta.InitSessionDatabaseMetadata
+	HasAttachedCatalog          = sessionmeta.HasAttachedCatalog
+	InitSessionDatabaseMetadata = sessionmeta.InitSessionDatabaseMetadata
 )
 
 // SendInitialParams sends the initial parameter status messages and backend key data.
@@ -143,7 +153,6 @@ func InitMinimalServer(s *Server, cfg Config, queryCancelCh <-chan struct{}) {
 // that imported it from server keep compiling. New code should use
 // server/wire directly.
 var GenerateSecretKey = wire.GenerateSecretKey
-
 
 // SetQueryLogger sets the query logger on a Server. Used by the control plane
 // to attach a query logger to the minimal server after creation.
