@@ -77,6 +77,48 @@ func TestResolverFromDucklingCR(t *testing.T) {
 	}
 }
 
+func TestResolverFromCnpgShardCR(t *testing.T) {
+	// cnpg-shard: the Lakekeeper DB + role are pre-provisioned by provider-sql
+	// on the shard, and status carries the per-tenant role creds + the
+	// session-mode Pooler endpoint. The resolver must produce pre-provisioned
+	// inputs with NO AdminDSN (the provisioner must not attempt CREATE
+	// DATABASE/ROLE), taking the role creds verbatim.
+	resolve := func(context.Context, string) (*provisioner.DucklingStatus, error) {
+		s := &provisioner.DucklingStatus{}
+		s.MetadataStore.Type = "cnpg-shard"
+		s.MetadataStore.Endpoint = "shard-001-pooler.cnpg-shards.svc.cluster.local"
+		s.MetadataStore.User = "lakekeeper_acme"
+		s.MetadataStore.Password = "from-provider-sql"
+		s.MetadataStore.Database = "lakekeeper_acme"
+		s.DataStore.BucketName = "posthog-duckling-acme"
+		s.DataStore.S3Region = "us-east-1"
+		s.IAMRoleARN = "arn:aws:iam::123:role/duckling-acme"
+		return s, nil
+	}
+	r := newLakekeeperInputsResolver(resolve)
+
+	in, err := r(context.Background(), &configstore.ManagedWarehouse{OrgID: "acme"})
+	if err != nil {
+		t.Fatalf("resolver: %v", err)
+	}
+
+	if !in.PGPreProvisioned {
+		t.Fatalf("PGPreProvisioned = false, want true for cnpg-shard")
+	}
+	if in.AdminDSN != "" {
+		t.Errorf("AdminDSN = %q, want empty (no privileged DDL in cnpg-shard mode)", in.AdminDSN)
+	}
+	if in.PGUser != "lakekeeper_acme" || in.PGPassword != "from-provider-sql" || in.PGDatabase != "lakekeeper_acme" {
+		t.Errorf("PG creds = %q/%q/%q, want the provider-sql role verbatim", in.PGUser, in.PGPassword, in.PGDatabase)
+	}
+	if in.PGHost != "shard-001-pooler.cnpg-shards.svc.cluster.local" || in.PGPort != 5432 {
+		t.Errorf("PGHost/PGPort = %q/%d, want the session Pooler:5432", in.PGHost, in.PGPort)
+	}
+	if in.S3.Bucket != "posthog-duckling-acme" || in.S3.RoleARN != "arn:aws:iam::123:role/duckling-acme" {
+		t.Errorf("S3 = %+v, want bucket/roleARN from CR status", in.S3)
+	}
+}
+
 func TestResolverFromEnvFallback(t *testing.T) {
 	t.Setenv(envLakekeeperAdminDSN, "postgres://admin:pw@127.0.0.1:5432/postgres?sslmode=disable")
 	t.Setenv(envLakekeeperPGHost, "127.0.0.1")
