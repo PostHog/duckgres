@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
@@ -123,6 +124,7 @@ func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, cat
 func buildSessionMetadataSQL(database string) string {
 	parts := []string{
 		sessionColumnMetadataTableSQL(),
+		sessionIcebergColumnMetadataTableSQL(),
 		buildSessionPgDatabaseViewSQL(database),
 		buildSessionInformationSchemaColumnsViewSQL(),
 		buildSessionInformationSchemaTablesViewSQL(),
@@ -144,6 +146,25 @@ func sessionColumnMetadataTableSQL() string {
 			PRIMARY KEY (table_schema, table_name, column_name)
 		)
 	`
+}
+
+func sessionIcebergColumnMetadataTableSQL() string {
+	return fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS main.%s (
+			table_schema VARCHAR NOT NULL,
+			table_name VARCHAR NOT NULL,
+			column_name VARCHAR NOT NULL,
+			ordinal_position INTEGER NOT NULL,
+			is_nullable VARCHAR NOT NULL,
+			data_type VARCHAR NOT NULL,
+			character_maximum_length INTEGER,
+			character_octet_length INTEGER,
+			numeric_precision INTEGER,
+			numeric_scale INTEGER,
+			datetime_precision INTEGER,
+			PRIMARY KEY (table_schema, table_name, column_name)
+		)
+	`, icebergmeta.ColumnMetadataTable)
 }
 
 func buildSessionPgDatabaseViewSQL(database string) string {
@@ -205,9 +226,51 @@ func buildSessionPgDatabaseViewSQL(database string) string {
 func buildSessionInformationSchemaColumnsViewSQL() string {
 	return `
 		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
+		WITH all_columns AS (
+			SELECT
+				CASE WHEN c.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE c.table_catalog END AS table_catalog,
+				CASE WHEN c.table_schema = 'main' THEN 'public' ELSE c.table_schema END AS table_schema,
+				c.table_name,
+				c.column_name,
+				c.ordinal_position,
+				c.column_default,
+				c.is_nullable,
+				c.data_type,
+				COALESCE(m.character_maximum_length, c.character_maximum_length) AS character_maximum_length,
+				c.character_octet_length,
+				COALESCE(m.numeric_precision, c.numeric_precision) AS numeric_precision,
+				COALESCE(m.numeric_scale, c.numeric_scale) AS numeric_scale,
+				c.datetime_precision
+			FROM information_schema.columns c
+			LEFT JOIN main.__duckgres_column_metadata m
+				ON c.table_schema = m.table_schema
+				AND c.table_name = m.table_name
+				AND c.column_name = m.column_name
+			WHERE NOT (
+				c.table_catalog = 'iceberg'
+				AND c.column_name = '__'
+				AND UPPER(c.data_type) = 'UNKNOWN'
+			)
+			UNION ALL
+			SELECT
+				'iceberg' AS table_catalog,
+				table_schema,
+				table_name,
+				column_name,
+				ordinal_position,
+				NULL AS column_default,
+				is_nullable,
+				data_type,
+				character_maximum_length,
+				character_octet_length,
+				numeric_precision,
+				numeric_scale,
+				datetime_precision
+			FROM main.__duckgres_iceberg_column_metadata
+		)
 		SELECT
-			CASE WHEN c.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE c.table_catalog END AS table_catalog,
-			CASE WHEN c.table_schema = 'main' THEN 'public' ELSE c.table_schema END AS table_schema,
+			c.table_catalog,
+			c.table_schema,
 			c.table_name,
 			c.column_name,
 			c.ordinal_position,
@@ -224,14 +287,15 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 				WHEN UPPER(c.data_type) = 'VARCHAR' OR UPPER(c.data_type) LIKE 'VARCHAR(%' THEN 'text'
 				WHEN UPPER(c.data_type) = 'TEXT' THEN 'text'
 				WHEN UPPER(c.data_type) LIKE 'TEXT(%' THEN 'character'
-				WHEN UPPER(c.data_type) = 'BOOLEAN' THEN 'boolean'
+				WHEN UPPER(c.data_type) = 'STRING' THEN 'text'
+				WHEN UPPER(c.data_type) = 'BOOLEAN' OR UPPER(c.data_type) = 'BOOL' THEN 'boolean'
 				WHEN UPPER(c.data_type) = 'TINYINT' THEN 'smallint'
 				WHEN UPPER(c.data_type) = 'SMALLINT' THEN 'smallint'
-				WHEN UPPER(c.data_type) = 'INTEGER' THEN 'integer'
-				WHEN UPPER(c.data_type) = 'BIGINT' THEN 'bigint'
+				WHEN UPPER(c.data_type) = 'INTEGER' OR UPPER(c.data_type) = 'INT' THEN 'integer'
+				WHEN UPPER(c.data_type) = 'BIGINT' OR UPPER(c.data_type) = 'LONG' THEN 'bigint'
 				WHEN UPPER(c.data_type) = 'HUGEINT' THEN 'numeric'
 				WHEN UPPER(c.data_type) = 'REAL' OR UPPER(c.data_type) = 'FLOAT4' THEN 'real'
-				WHEN UPPER(c.data_type) = 'DOUBLE' OR UPPER(c.data_type) = 'FLOAT8' THEN 'double precision'
+				WHEN UPPER(c.data_type) = 'DOUBLE' OR UPPER(c.data_type) = 'FLOAT8' OR UPPER(c.data_type) = 'DOUBLE PRECISION' THEN 'double precision'
 				WHEN UPPER(c.data_type) LIKE 'DECIMAL%' THEN 'numeric'
 				WHEN UPPER(c.data_type) LIKE 'NUMERIC%' THEN 'numeric'
 				WHEN UPPER(c.data_type) = 'DATE' THEN 'date'
@@ -240,15 +304,16 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 				WHEN UPPER(c.data_type) = 'TIMESTAMPTZ' OR UPPER(c.data_type) = 'TIMESTAMP WITH TIME ZONE' THEN 'timestamp with time zone'
 				WHEN UPPER(c.data_type) = 'INTERVAL' THEN 'interval'
 				WHEN UPPER(c.data_type) = 'UUID' THEN 'uuid'
-				WHEN UPPER(c.data_type) = 'BLOB' OR UPPER(c.data_type) = 'BYTEA' THEN 'bytea'
+				WHEN UPPER(c.data_type) = 'BLOB' OR UPPER(c.data_type) = 'BYTEA' OR UPPER(c.data_type) = 'BINARY' OR UPPER(c.data_type) = 'FIXED' THEN 'bytea'
 				WHEN UPPER(c.data_type) = 'JSON' THEN 'json'
-				WHEN UPPER(c.data_type) LIKE '%[]' THEN 'ARRAY'
+				WHEN UPPER(c.data_type) LIKE '%[]' OR UPPER(c.data_type) LIKE 'LIST%' THEN 'ARRAY'
+				WHEN UPPER(c.data_type) LIKE 'STRUCT%' OR UPPER(c.data_type) LIKE 'MAP%' OR c.data_type LIKE '{%' THEN 'json'
 				ELSE LOWER(c.data_type)
 			END AS data_type,
-			COALESCE(m.character_maximum_length, c.character_maximum_length) AS character_maximum_length,
+			c.character_maximum_length,
 			c.character_octet_length,
-			COALESCE(m.numeric_precision, c.numeric_precision) AS numeric_precision,
-			COALESCE(m.numeric_scale, c.numeric_scale) AS numeric_scale,
+			c.numeric_precision,
+			c.numeric_scale,
 			c.datetime_precision,
 			NULL AS interval_type,
 			NULL AS interval_precision,
@@ -280,11 +345,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			'NEVER' AS is_generated,
 			NULL AS generation_expression,
 			'YES' AS is_updatable
-		FROM information_schema.columns c
-		LEFT JOIN main.__duckgres_column_metadata m
-			ON c.table_schema = m.table_schema
-			AND c.table_name = m.table_name
-			AND c.column_name = m.column_name
+		FROM all_columns c
 	`
 }
 
