@@ -355,6 +355,32 @@ func (h *handler) deprovisionWarehouse(c *gin.Context) {
 	var err error
 	for _, state := range deprovisionableStates {
 		if err = h.store.SetWarehouseDeleting(orgID, state); err == nil {
+			// Also disable Trino so the reconcile loop tears down
+			// the customer-Trino projections (catalog, password/
+			// group file entries, OPA bundle ownership, resource
+			// group). Without this, deprovisioning a warehouse
+			// leaves the Trino row enabled forever — the CASCADE
+			// only fires when the Org row itself is deleted, and
+			// `reconcileDeleting` doesn't touch the Org row. We'd
+			// otherwise keep projecting the deprovisioned org's
+			// credentials into Trino indefinitely.
+			//
+			// Best-effort: failure to disable Trino doesn't abort
+			// the warehouse deprovision (the warehouse state is
+			// already moved to Deleting). Operator can retry by
+			// calling DELETE /orgs/:id/trino directly.
+			if disableErr := h.store.DisableTrino(orgID); disableErr != nil {
+				// Log via the response — there's no slog on the
+				// gin handler, but the caller will see the warning
+				// alongside the 202. Soft-fail so the warehouse
+				// deprovision still proceeds.
+				c.JSON(http.StatusAccepted, gin.H{
+					"status":  "deprovisioning started",
+					"org":     orgID,
+					"warning": "failed to disable trino in the same call; retry DELETE /orgs/:id/trino: " + disableErr.Error(),
+				})
+				return
+			}
 			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
 			return
 		}

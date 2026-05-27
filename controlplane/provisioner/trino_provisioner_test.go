@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -227,6 +228,70 @@ func TestTrinoCatalogName(t *testing.T) {
 	}
 }
 
+// TestTrinoCatalogNameMatchesManagedNamePattern closes the Go side of
+// the Go ↔ Rego naming contract. The OPA policy authorizes admin
+// catalog management on names matching opa.ManagedCatalogPattern. Every
+// name Go-side code produces must therefore match that pattern, or the
+// admin loses the authority to manage catalogs Go just created
+// (silently — the reconcile loop would log "created" while admin's
+// next SHOW CATALOGS / DROP CATALOG hits permission-denied).
+//
+// Paired with opa/policy_test.go::TestPolicyRegoContainsManagedNamePattern,
+// which closes the other side of the contract: the pattern in
+// policy.rego must equal the constant. If both tests pass, the three
+// surfaces — Go constant, Rego regex literal, TrinoCatalogName output —
+// are in sync.
+func TestTrinoCatalogNameMatchesManagedNamePattern(t *testing.T) {
+	re, err := regexp.Compile(opa.ManagedCatalogPattern)
+	if err != nil {
+		t.Fatalf("opa.ManagedCatalogPattern is not a valid Go regex: %v", err)
+	}
+
+	// Positive cases: representative inputs the production path could
+	// produce. The v1 invariant enforced by trinoOrgIDPattern in
+	// provisioning/api.go is numeric team_ids, but trinoSanitize also
+	// handles non-numeric / punctuated inputs defensively (admin-API
+	// writes or future schema relaxation) — verify those too so any
+	// future relaxation that breaks the regex match is caught here.
+	positive := []string{
+		"42",
+		"100",
+		"999999",
+		"acme",
+		"acme_corp",
+		"with-dash",   // sanitize → with_dash
+		"with.dot",    // sanitize → with_dot
+		"Mixed-Case",  // sanitize → mixed_case
+	}
+	for _, id := range positive {
+		name := TrinoCatalogName(id)
+		if !re.MatchString(name) {
+			t.Errorf("TrinoCatalogName(%q) = %q does NOT match opa.ManagedCatalogPattern (%q).\n"+
+				"Either trinoSanitize/TrinoCatalogName drifted, or the pattern needs widening — both sides must agree.",
+				id, name, opa.ManagedCatalogPattern)
+		}
+	}
+
+	// Negative cases: catalog names that must NOT match the pattern so
+	// admin authority can't accidentally cover them. These mirror the
+	// non-managed names asserted in policy_test.go's adversarial suite.
+	negative := []string{
+		"system",
+		"jmx",
+		"iceberg_org_42",
+		"org_42",      // missing _iceberg suffix
+		"ORG_42_iceberg", // uppercase prefix
+		"org_42_iceberg_extra", // trailing junk
+	}
+	for _, name := range negative {
+		if re.MatchString(name) {
+			t.Errorf("opa.ManagedCatalogPattern incorrectly matches non-managed name %q.\n"+
+				"The pattern is too permissive — admin authority would leak onto names "+
+				"the provisioner never creates.", name)
+		}
+	}
+}
+
 func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
 		{OrgID: "42", Tier: "free"},
@@ -245,13 +310,33 @@ func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 	if len(parsed.RootGroups) != 1 || parsed.RootGroups[0].Name != "root" {
 		t.Fatalf("expected single root group named 'root', got %+v", parsed.RootGroups)
 	}
-	tenants := parsed.RootGroups[0].SubGroups
-	if len(tenants) != 1 || tenants[0].Name != "tenants" {
-		t.Fatalf("expected single tenants tier, got %+v", tenants)
+	tiers := parsed.RootGroups[0].SubGroups
+	// Expect two sibling tiers: "admin" (for catalog DDL) and
+	// "tenants" (for customer queries). Without the admin tier,
+	// the provisioner's reconcile-path queries hit Trino's
+	// "Query is not associated with any resource group" rejection.
+	if len(tiers) != 2 {
+		t.Fatalf("expected 2 tiers (admin + tenants), got %d: %+v", len(tiers), tiers)
 	}
-	subs := tenants[0].SubGroups
+	tiersByName := map[string]resourceGroupTier{}
+	for _, tier := range tiers {
+		tiersByName[tier.Name] = tier
+	}
+	adminTier, hasAdmin := tiersByName["admin"]
+	if !hasAdmin {
+		t.Fatalf("expected admin tier under root, got tiers=%+v", tiers)
+	}
+	if len(adminTier.SubGroups) != 1 || adminTier.SubGroups[0].Name != opa.AdminPrincipal {
+		t.Errorf("expected single admin subgroup named %q, got %+v", opa.AdminPrincipal, adminTier.SubGroups)
+	}
+
+	tenantsTier, hasTenants := tiersByName["tenants"]
+	if !hasTenants {
+		t.Fatalf("expected tenants tier under root, got tiers=%+v", tiers)
+	}
+	subs := tenantsTier.SubGroups
 	if len(subs) != 4 {
-		t.Fatalf("expected 4 org subgroups, got %d", len(subs))
+		t.Fatalf("expected 4 org subgroups under tenants, got %d", len(subs))
 	}
 	// Selector + subgroup name == team_id; verify the join.
 	wantByName := map[string]int{ // hardConcurrencyLimit per tier
@@ -270,15 +355,19 @@ func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 			t.Errorf("subgroup %s: HardConcurrencyLimit = %d, want %d", sg.Name, sg.HardConcurrencyLimit, want)
 		}
 	}
-	// Selectors: one per org, mapping user → root.tenants.<team_id>.
+	// Selectors: admin + one per org. Admin maps to root.admin.<admin>,
+	// each tenant maps to root.tenants.<team_id>. Without the admin
+	// selector the provisioner's own queries get rejected by Trino's
+	// resource-group manager before reaching OPA.
 	wantSel := map[string]string{
-		"42": "root.tenants.42",
-		"43": "root.tenants.43",
-		"44": "root.tenants.44",
-		"45": "root.tenants.45",
+		opa.AdminPrincipal: "root.admin." + opa.AdminPrincipal,
+		"42":               "root.tenants.42",
+		"43":               "root.tenants.43",
+		"44":               "root.tenants.44",
+		"45":               "root.tenants.45",
 	}
-	if len(parsed.Selectors) != 4 {
-		t.Fatalf("expected 4 selectors, got %d", len(parsed.Selectors))
+	if len(parsed.Selectors) != len(wantSel) {
+		t.Fatalf("expected %d selectors (admin + %d orgs), got %d", len(wantSel), len(orgs), len(parsed.Selectors))
 	}
 	for _, sel := range parsed.Selectors {
 		if want, ok := wantSel[sel.User]; !ok || sel.Group != want {

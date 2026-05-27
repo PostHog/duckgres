@@ -371,6 +371,16 @@ func SetupMultiTenant(
 	var trinoBundleHandler *opa.Handler
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
+		// Without the controller, the Trino reconcile loop cannot run.
+		// If the operator asked for Trino explicitly, that's a fatal
+		// startup failure — same "Trino is binary" stance as the
+		// wiring-failure branch below. Without this check, the Trino
+		// branch would be silently skipped (it's nested in the else)
+		// and password/group/bundle projections would stop updating.
+		if trinoProvisionerEnabled() {
+			return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s) but provisioning controller unavailable: %w",
+				envTrinoProvisionerEnabled, err)
+		}
 		slog.Warn("Provisioning controller unavailable.", "error", err)
 	} else {
 		// Opt-in: enable the per-org Lakekeeper provisioning branch. Off by
@@ -386,22 +396,36 @@ func SetupMultiTenant(
 				slog.Info("Lakekeeper provisioner enabled (allowall + NetworkPolicy mode).")
 			}
 		}
-		// Customer-Trino provisioner branch. Same opt-in posture as
-		// Lakekeeper: off by default, best-effort if the K8s client or
-		// required env is incomplete. When wired, the bundle handler is
-		// retained for mounting onto the API server below (separate auth
-		// from the admin internal-secret — uses its own bearer token
-		// against opa.BearerTokenAuth).
+		// Customer-Trino provisioner branch. Off by default; when
+		// explicitly enabled via DUCKGRES_TRINO_PROVISIONER_ENABLED,
+		// wiring failure is fatal — silently skipping would leave the
+		// customer-Trino OPA sidecar serving last-good bundle while
+		// password/group-file changes never propagate, which is worse
+		// than failing the rollout.
+		//
+		// Lakekeeper's branch above stays best-effort (log-and-skip)
+		// because its env shape was designed for opportunistic enable
+		// of S3-Tables-only deployments where Lakekeeper is optional.
+		// Trino is binary: if you asked for it, you need it.
 		if trinoProvisionerEnabled() {
-			if kc, tkErr := newTrinoKubeClient(); tkErr != nil {
-				slog.Warn("Trino provisioner enabled but K8s client unavailable; skipping.", "error", tkErr)
-			} else if trinoWire, twErr := buildTrinoWiring(store, kc); twErr != nil {
-				slog.Warn("Trino provisioner enabled but wiring failed; skipping.", "error", twErr)
-			} else if trinoWire != nil {
-				provCtrl.WithTrinoProvisioner(trinoWire.Provisioner)
-				trinoBundleHandler = trinoWire.BundleHandler
-				slog.Info("Trino provisioner enabled.")
+			kc, tkErr := newTrinoKubeClient()
+			if tkErr != nil {
+				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s) but K8s client unavailable: %w",
+					envTrinoProvisionerEnabled, tkErr)
 			}
+			trinoWire, twErr := buildTrinoWiring(store, kc)
+			if twErr != nil {
+				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
+			}
+			if trinoWire == nil {
+				// buildTrinoWiring returns (nil, nil) only when the
+				// env gate is off — and the outer if guarded against
+				// that. So a nil here is a wiring bug.
+				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
+			}
+			provCtrl.WithTrinoProvisioner(trinoWire.Provisioner)
+			trinoBundleHandler = trinoWire.BundleHandler
+			slog.Info("Trino provisioner enabled.")
 		}
 		go provCtrl.Run(context.Background())
 	}

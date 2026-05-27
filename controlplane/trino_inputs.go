@@ -68,10 +68,22 @@ const (
 	envTrinoBundleBearerToken = "DUCKGRES_TRINO_BUNDLE_BEARER_TOKEN" //nolint:gosec // env name only
 
 	// envTrinoIAMAccountID is the AWS account id used to assemble the
-	// per-org iceberg.s3.aws-role-arn (the duckling-<orgid> role).
-	// Required for AWS deployments; may be empty in dev clusters where
-	// per-org S3 access isn't exercised.
+	// per-org s3.iam-role property (`arn:aws:iam::<acct>:role/duckling-<orgid>`).
+	// Required for AWS deployments: an empty value silently omits the
+	// per-catalog IAM role, so every catalog would fall back to the
+	// Trino pod's ambient identity — which is the wildcard-assume
+	// duckling-* role per the plan's threat model. That collapses the
+	// per-tenant S3 boundary. Set DUCKGRES_TRINO_ALLOW_NO_IAM_ROLE=true
+	// in dev/test to bypass this gate; never set it in prod.
 	envTrinoIAMAccountID = "DUCKGRES_TRINO_IAM_ACCOUNT_ID"
+
+	// envTrinoAllowNoIAMRole is the explicit opt-out for the
+	// IAM-required check above. Off by default; setting it to "1" /
+	// "true" / "yes" lets buildTrinoWiring proceed with an empty
+	// IAM_ACCOUNT_ID. Use ONLY in dev/test where the per-tenant
+	// S3 isolation isn't exercised. Production deployments must
+	// supply DUCKGRES_TRINO_IAM_ACCOUNT_ID instead.
+	envTrinoAllowNoIAMRole = "DUCKGRES_TRINO_ALLOW_NO_IAM_ROLE"
 
 	// envTrinoAWSRegion is the AWS region for the per-org IAM role
 	// binding and Iceberg catalog config. Falls back to the per-org
@@ -89,6 +101,14 @@ const (
 // Off by default; matches lakekeeperProvisionerEnabled's gating style.
 func trinoProvisionerEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(envTrinoProvisionerEnabled)))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+// trinoAllowNoIAMRole reports whether the dev/test bypass for the
+// IAM_ACCOUNT_ID gate is set. Off by default — production wiring
+// fails if the IAM account id is missing.
+func trinoAllowNoIAMRole() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(envTrinoAllowNoIAMRole)))
 	return v == "1" || v == "true" || v == "yes"
 }
 
@@ -149,6 +169,19 @@ func buildTrinoWiring(store *configstore.ConfigStore, kc kubernetes.Interface) (
 			envTrinoAdminPasswordHash, envTrinoAdminPassword, err)
 	}
 
+	// Per-tenant S3 boundary check. An empty IAM_ACCOUNT_ID silently
+	// disables the `s3.iam-role` catalog property, collapsing every
+	// catalog onto the Trino pod's ambient identity (which is the
+	// wildcard-assume duckling-* role per the plan's threat model).
+	// That defeats the entire reason for per-org IAM roles. Require
+	// the env var unless the operator explicitly opts out for
+	// dev/test, where per-tenant S3 access isn't exercised anyway.
+	iamAccountID := strings.TrimSpace(os.Getenv(envTrinoIAMAccountID))
+	if iamAccountID == "" && !trinoAllowNoIAMRole() {
+		return nil, fmt.Errorf("%s is required when %s is set, or set %s=true to bypass in dev/test (do not bypass in production: empty IAM account id silently collapses the per-org S3 isolation boundary)",
+			envTrinoIAMAccountID, envTrinoProvisionerEnabled, envTrinoAllowNoIAMRole)
+	}
+
 	catalogClient := provisioner.NewTrinoCatalogHTTPClient(coordinatorURL, opa.AdminPrincipal, adminPassword)
 	bundleStore := &opa.BundleStore{}
 	bundleHandler := opa.NewHandler(bundleStore, opa.BearerTokenAuth(bundleToken))
@@ -162,7 +195,7 @@ func buildTrinoWiring(store *configstore.ConfigStore, kc kubernetes.Interface) (
 		BundleStore:       bundleStore,
 		BundleBuilder:     opa.NewBuilder(),
 		AdminPasswordHash: adminPasswordHash,
-		IAMAccountID:      strings.TrimSpace(os.Getenv(envTrinoIAMAccountID)),
+		IAMAccountID:      iamAccountID,
 		AWSRegion:         strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),
 	})
 	if err != nil {

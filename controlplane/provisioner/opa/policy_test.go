@@ -518,9 +518,19 @@ func TestAdversarialInputs(t *testing.T) {
 	// Verify the positive admin path still works with BOTH signals.
 	t.Run("admin with both username and admin group can manage and read", func(t *testing.T) {
 		// twoOrgFixture puts both catalogs under AdminGroup.
-		in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "CreateCatalog", catalogResource("any"))
+		// CreateCatalog now requires managed_catalog_name -- admin
+		// cannot CREATE arbitrary names like "any", only org_*_iceberg.
+		in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "CreateCatalog", catalogResource("org_new_iceberg"))
 		if !evalAllow(t, q, in) {
-			t.Error("admin with full identity must be able to CreateCatalog")
+			t.Error("admin with full identity must be able to CreateCatalog a managed-name catalog")
+		}
+		// Non-managed names must be denied even for admin -- defense
+		// in depth against an admin credential compromise.
+		for _, badName := range []string{"system", "jmx", "any", "iceberg_org_42"} {
+			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "CreateCatalog", catalogResource(badName))
+			if evalAllow(t, q, in) {
+				t.Errorf("admin CreateCatalog on non-managed name %q must be denied", badName)
+			}
 		}
 		in = buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "AccessCatalog", catalogResource("org_42_iceberg"))
 		if !evalAllow(t, q, in) {
@@ -528,48 +538,63 @@ func TestAdversarialInputs(t *testing.T) {
 		}
 	})
 
-	// Admin can see/manage prefix-matching catalogs that aren't
-	// listed under AdminGroup in the bundle. This is the orphan-drop
-	// recovery path: if a reconcile fails to drop a disabled org's
-	// catalog AFTER removing it from data.group_catalogs, the admin
-	// still needs to see the catalog on the next SHOW CATALOGS so the
-	// drop can be retried.
-	t.Run("admin can see prefix-matching catalog not in bundle", func(t *testing.T) {
-		// Bundle has nothing under AdminGroup for this catalog.
+	// Admin's orphan-cleanup carve-out is SCOPED to FilterCatalogs --
+	// admin can enumerate `org_*_iceberg` catalogs that aren't in the
+	// bundle (so reconcile can find orphans to drop) but CANNOT read
+	// their data (no AccessCatalog/Select/etc. on orphans). The
+	// previous broad-prefix rule has been replaced by this narrower
+	// listable_catalog/readable_catalog split.
+	t.Run("admin orphan visibility is FilterCatalogs-only", func(t *testing.T) {
+		// Bundle has nothing under AdminGroup for org_99_iceberg.
 		emptyAdmin := GroupCatalogs{
 			"org_42": {"org_42_iceberg": true},
 			// no AdminGroup entry, no org_99 entry
 		}
 		q2 := preparedPolicy(t, emptyAdmin)
 
-		// Admin (full identity) can FilterCatalogs / AccessCatalog
-		// on an orphan org_99_iceberg.
-		for _, op := range []string{"FilterCatalogs", "AccessCatalog"} {
+		// FilterCatalogs on an orphan managed-name catalog: allowed.
+		// This is the enumeration carve-out so reconcile can SHOW
+		// CATALOGS and find org_99_iceberg to retry DROP CATALOG.
+		in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "FilterCatalogs", catalogResource("org_99_iceberg"))
+		if !evalAllow(t, q2, in) {
+			t.Error("admin FilterCatalogs on orphan org_99_iceberg must be allowed via listable_catalog carve-out")
+		}
+
+		// AccessCatalog, ShowSchemas, SelectFromColumns, etc. on the
+		// same orphan: DENIED. The bundle is the audit trail for
+		// what admin can READ; orphans aren't in the bundle, so they
+		// can be enumerated but not read.
+		for _, op := range []string{"AccessCatalog", "ShowSchemas"} {
 			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, op, catalogResource("org_99_iceberg"))
-			if !evalAllow(t, q2, in) {
-				t.Errorf("admin %s on orphan org_99_iceberg should be allowed via prefix rule; was denied", op)
+			if evalAllow(t, q2, in) {
+				t.Errorf("admin %s on orphan org_99_iceberg must be DENIED (carve-out is FilterCatalogs-only)", op)
 			}
 		}
-		// Admin must NOT match catalogs that don't follow the v1
-		// naming convention — `system`, `jmx`, hand-rolled
-		// non-prefix names stay out of reach via this rule (admin
-		// still has CREATE/DROP authority, but cannot enumerate
-		// non-managed names through SHOW CATALOGS).
-		// Non-matching names must still be denied — admin's prefix
-		// authority is bounded to the v1 naming convention so
-		// hand-rolled catalogs (system, jmx, anything without the
-		// matching prefix+suffix) stay out of reach.
-		for _, name := range []string{"system", "jmx", "iceberg_org_42", "org_42_data"} {
-			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "AccessCatalog", catalogResource(name))
+		// Same for schema/table scope.
+		denyOp := func(op string, res map[string]interface{}) {
+			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, op, res)
 			if evalAllow(t, q2, in) {
-				t.Errorf("admin AccessCatalog on non-prefix-matching %q must be denied via this rule", name)
+				t.Errorf("admin %s on orphan must be denied; was allowed", op)
+			}
+		}
+		denyOp("SelectFromColumns", tableResource("org_99_iceberg", "s", "t"))
+		denyOp("ShowTables", schemaResource("org_99_iceberg", "s"))
+		denyOp("FilterTables", tableResource("org_99_iceberg", "s", "t"))
+
+		// FilterCatalogs on a non-managed name must still be denied
+		// — even for admin. The carve-out is bounded by the
+		// managed_catalog_name regex.
+		for _, name := range []string{"system", "jmx", "iceberg_org_42", "ORG_42_iceberg"} {
+			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "FilterCatalogs", catalogResource(name))
+			if evalAllow(t, q2, in) {
+				t.Errorf("admin FilterCatalogs on non-managed-name %q must be denied", name)
 			}
 		}
 		// Non-admin with the same group claim still gets nothing
-		// from the prefix rule (it's is_admin-gated).
-		in := buildInputWithGroups("42", []string{AdminGroup}, "AccessCatalog", catalogResource("org_99_iceberg"))
+		// from the carve-out (it's is_admin-gated).
+		in = buildInputWithGroups("42", []string{AdminGroup}, "FilterCatalogs", catalogResource("org_99_iceberg"))
 		if evalAllow(t, q2, in) {
-			t.Error("non-admin claiming admin_group must not benefit from the prefix rule")
+			t.Error("non-admin claiming admin_group must not benefit from the orphan carve-out")
 		}
 	})
 }
@@ -708,6 +733,25 @@ func TestPolicyDoesNotUseLinearScan(t *testing.T) {
 	// Positive check: the indexed lookup is present.
 	if !strings.Contains(src, "data.group_catalogs[g][catalog]") {
 		t.Error("policy.rego should contain the object-indexed lookup `data.group_catalogs[g][catalog]`")
+	}
+}
+
+// TestPolicyRegoContainsManagedNamePattern guards the contract between
+// the exported ManagedCatalogPattern constant and the regex literal
+// embedded in policy.rego. If someone edits one without the other, the
+// admin's catalog enumeration / management authority silently drifts
+// out of sync with the Go-side TrinoCatalogName grammar.
+//
+// Paired with TestTrinoCatalogNameMatchesManagedNamePattern in the
+// provisioner package, which closes the other side of the contract:
+// every name Go produces must match this pattern.
+func TestPolicyRegoContainsManagedNamePattern(t *testing.T) {
+	if !strings.Contains(string(policyRego), ManagedCatalogPattern) {
+		t.Fatalf("policy.rego does not contain the literal substring %q.\n"+
+			"This means the policy's `managed_catalog_name` regex has drifted from\n"+
+			"the exported ManagedCatalogPattern constant. Update either the constant\n"+
+			"in opa/types.go or the regex literal in opa/policy.rego so they agree.",
+			ManagedCatalogPattern)
 	}
 }
 

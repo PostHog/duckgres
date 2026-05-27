@@ -685,10 +685,24 @@ func tierLimits(tier string) resourceGroupSubGroup {
 //          └─ ...
 //
 // Selectors map Trino username (== team_id for customer principals) to
-// the root.tenants.<team_id> group.
+// the root.tenants.<team_id> group. The admin principal lives under a
+// sibling root.admin.<admin_user> path so its catalog-DDL traffic is
+// isolated from tenant traffic and so it matches a selector at all
+// (without an admin selector, Trino's resource-group manager rejects
+// the admin's SHOW/CREATE/DROP CATALOG queries with "Query is not
+// associated with any resource group" — which would silently break
+// every reconcile tick).
 func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error) {
 	subgroups := make([]resourceGroupSubGroup, 0, len(orgs))
-	selectors := make([]resourceGroupSelector, 0, len(orgs))
+	// Admin selector first so its match wins fast on the reconcile-DDL
+	// path; tenant selectors follow. (Selector order is first-match-
+	// wins in Trino's file-backed manager. With disjoint usernames the
+	// order is functionally irrelevant, but keeping admin first
+	// documents the intent and makes the file readable.)
+	selectors := []resourceGroupSelector{{
+		User:  opa.AdminPrincipal,
+		Group: "root.admin." + opa.AdminPrincipal,
+	}}
 	for _, o := range orgs {
 		if o.OrgID == "" {
 			continue
@@ -706,19 +720,39 @@ func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error
 		})
 	}
 
+	// Admin tier limits are deliberately small. The provisioner only
+	// issues DDL (SHOW / CREATE / DROP / ALTER CATALOG) which finishes
+	// in milliseconds; oversizing the admin lane is wasted budget that
+	// could be eating into the tenants tier.
+	adminTier := resourceGroupTier{
+		Name:                 "admin",
+		SoftMemoryLimit:      "5%",
+		HardConcurrencyLimit: 4,
+		MaxQueued:            20,
+		SubGroups: []resourceGroupSubGroup{{
+			Name:                 opa.AdminPrincipal,
+			SoftMemoryLimit:      "5%",
+			HardConcurrencyLimit: 4,
+			MaxQueued:            20,
+		}},
+	}
+
 	cfg := resourceGroupsFile{
 		RootGroups: []resourceGroupRoot{{
 			Name:                 "root",
 			SoftMemoryLimit:      "100%",
 			HardConcurrencyLimit: 200,
 			MaxQueued:            1000,
-			SubGroups: []resourceGroupTier{{
-				Name:                 "tenants",
-				SoftMemoryLimit:      "80%",
-				HardConcurrencyLimit: 100,
-				MaxQueued:            500,
-				SubGroups:            subgroups,
-			}},
+			SubGroups: []resourceGroupTier{
+				adminTier,
+				{
+					Name:                 "tenants",
+					SoftMemoryLimit:      "80%",
+					HardConcurrencyLimit: 100,
+					MaxQueued:            500,
+					SubGroups:            subgroups,
+				},
+			},
 		}},
 		Selectors: selectors,
 	}
