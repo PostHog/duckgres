@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -16,12 +17,12 @@ type captureControlPlaneExpiryStore struct {
 	expireErr              error
 	drainingCutoffs        []time.Time
 	drainingCount          int64
-	orphanedBefore         []time.Time
 	orphanedWorkers        []configstore.WorkerRecord
 	stuckSpawningBefore    []time.Time
 	stuckActivatingBefore  []time.Time
 	stuckWorkers           []configstore.WorkerRecord
 	expiredSessionsBefore  []time.Time
+	expiredHotIdleWorkers  []configstore.WorkerRecord
 	pruneMissBucketsBefore []time.Time
 	prunedMissBucketCount  int64
 	pruneMissBucketErr     error
@@ -49,22 +50,36 @@ func (s *captureControlPlaneExpiryStore) snapshot() []time.Time {
 	return out
 }
 
-func (s *captureControlPlaneExpiryStore) ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error) {
+// ListOrphanedWorkerSnapshots is the lifecycle-typed counterpart used
+// by the migrated janitor orphan path. The mock wraps the same orphan
+// slice through NewWorkerSnapshot so existing fixtures that
+// populate orphanedWorkers also drive the lifecycle path when a
+// lifecycle is wired.
+func (s *captureControlPlaneExpiryStore) ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.orphanedBefore = append(s.orphanedBefore, before)
-	out := make([]configstore.WorkerRecord, len(s.orphanedWorkers))
-	copy(out, s.orphanedWorkers)
+	if len(s.orphanedWorkers) == 0 {
+		return nil, nil
+	}
+	out := make([]configstore.WorkerSnapshot, 0, len(s.orphanedWorkers))
+	for _, rec := range s.orphanedWorkers {
+		out = append(out, configstore.NewWorkerSnapshot(rec))
+	}
 	return out, nil
 }
 
-func (s *captureControlPlaneExpiryStore) ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error) {
+func (s *captureControlPlaneExpiryStore) ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stuckSpawningBefore = append(s.stuckSpawningBefore, spawningBefore)
 	s.stuckActivatingBefore = append(s.stuckActivatingBefore, activatingBefore)
-	out := make([]configstore.WorkerRecord, len(s.stuckWorkers))
-	copy(out, s.stuckWorkers)
+	if len(s.stuckWorkers) == 0 {
+		return nil, nil
+	}
+	out := make([]configstore.WorkerSnapshot, 0, len(s.stuckWorkers))
+	for _, rec := range s.stuckWorkers {
+		out = append(out, configstore.NewWorkerSnapshot(rec))
+	}
 	return out, nil
 }
 
@@ -75,16 +90,21 @@ func (s *captureControlPlaneExpiryStore) ExpireFlightSessionRecords(before time.
 	return 0, nil
 }
 
-func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error) {
+// ListExpiredHotIdleSnapshots is the lifecycle-typed counterpart used
+// by the migrated janitor hot-idle path. The mock wraps the same
+// underlying slice through NewWorkerSnapshot so existing
+// tests can opt into the lifecycle path by setting expiredHotIdleWorkers.
+func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return nil, nil
-}
-
-func (s *captureControlPlaneExpiryStore) RetireHotIdleWorker(workerID int) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return true, nil
+	if len(s.expiredHotIdleWorkers) == 0 {
+		return nil, nil
+	}
+	out := make([]configstore.WorkerSnapshot, 0, len(s.expiredHotIdleWorkers))
+	for _, rec := range s.expiredHotIdleWorkers {
+		out = append(out, configstore.NewWorkerSnapshot(rec))
+	}
+	return out, nil
 }
 
 func (s *captureControlPlaneExpiryStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, error) {
@@ -122,6 +142,35 @@ func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
 		if !cutoff.Equal(wantDrainCutoff) {
 			t.Fatalf("draining call %d expected cutoff %v, got %v", i, wantDrainCutoff, cutoff)
 		}
+	}
+}
+
+func TestControlPlaneJanitorRunInvokesOnStop(t *testing.T) {
+	store := &captureControlPlaneExpiryStore{}
+	janitor := NewControlPlaneJanitor(store, time.Hour, 20*time.Second)
+	stopped := make(chan struct{})
+	janitor.onStop = func() {
+		close(stopped)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		janitor.Run(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("expected janitor onStop callback")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected janitor run loop to exit")
 	}
 }
 
@@ -163,51 +212,41 @@ func TestControlPlaneJanitorRunPrunesWarmCapacityMissBucketsWithConfiguredTTL(t 
 func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{
 		orphanedWorkers: []configstore.WorkerRecord{
-			{WorkerID: 7, PodName: "duckgres-worker-7"},
+			{WorkerID: 7, PodName: "duckgres-worker-7", State: configstore.WorkerStateHot, OwnerCPInstanceID: "cp-expired:boot-a", OwnerEpoch: 2},
 		},
 		stuckWorkers: []configstore.WorkerRecord{
-			{WorkerID: 9, PodName: "duckgres-worker-9", State: configstore.WorkerStateActivating},
+			{WorkerID: 9, PodName: "duckgres-worker-9", State: configstore.WorkerStateActivating, OwnerCPInstanceID: "cp-me:boot-b", OwnerEpoch: 1},
 		},
 	}
+	lifecycleStore := &fakeLifecycleStore{orphanReturn: true, terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
 	now := time.Date(2026, time.March, 26, 16, 0, 0, 0, time.UTC)
 	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
 	janitor.now = func() time.Time { return now }
-
-	var mu sync.Mutex
-	var retired []struct {
-		id     int
-		reason string
-	}
-	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
-		mu.Lock()
-		defer mu.Unlock()
-		retired = append(retired, struct {
-			id     int
-			reason string
-		}{id: record.WorkerID, reason: reason})
-	}
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
 
 	janitor.runOnce()
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(retired) != 2 {
-		t.Fatalf("expected janitor to retire exactly two workers, got %d", len(retired))
+	if got := lifecycleStore.orphanTransitions; len(got) != 1 || got[0].workerID != 7 || got[0].reason != janitorRetireReasonOrphaned {
+		t.Fatalf("expected one orphan CAS via lifecycle for worker 7, got %#v", got)
 	}
-	if retired[0].id != 7 || retired[0].reason != janitorRetireReasonOrphaned {
-		t.Fatalf("expected orphaned worker 7 with orphaned reason, got %+v", retired[0])
+	// The snapshot the janitor passed to RetireOrphanFromSnapshot must
+	// carry the listed row's identity verbatim — owner_cp_instance_id +
+	// state are what the underlying SQL fence keys off. The mock
+	// records both so a regression that strips fields from the
+	// snapshot in transit gets caught here, not just by the postgres
+	// integration tests.
+	if got := lifecycleStore.orphanTransitions[0]; got.state != configstore.WorkerStateHot {
+		t.Fatalf("expected orphan snapshot to carry state=hot, got %q", got.state)
 	}
-	if retired[1].id != 9 || retired[1].reason != janitorRetireReasonStuckActivating {
-		t.Fatalf("expected stuck worker 9 with stuck_activating, got %+v", retired[1])
+	if got := lifecycleStore.terminalTransitions; len(got) != 1 || got[0].workerID != 9 || got[0].reason != janitorRetireReasonStuckActivating || got[0].target != configstore.WorkerStateRetired {
+		t.Fatalf("expected one terminal CAS via lifecycle for stuck worker 9 → retired, got %#v", got)
 	}
-	if len(store.orphanedBefore) == 0 {
-		t.Fatal("expected orphaned worker cutoff lookup")
+	if got := lifecycleStore.terminalTransitions[0]; got.state != configstore.WorkerStateActivating {
+		t.Fatalf("expected stuck snapshot to carry state=activating, got %q", got.state)
 	}
-	wantOrphanedBefore := now.Add(-30 * time.Second)
-	for i, cutoff := range store.orphanedBefore {
-		if !cutoff.Equal(wantOrphanedBefore) {
-			t.Fatalf("orphaned cutoff call %d expected %v, got %v", i, wantOrphanedBefore, cutoff)
-		}
+	if got := cleanup.snapshot(); len(got) != 2 {
+		t.Fatalf("expected two cleanup calls (orphan + stuck), got %#v", got)
 	}
 	if len(store.stuckSpawningBefore) == 0 || len(store.stuckActivatingBefore) == 0 {
 		t.Fatal("expected stuck worker cutoff lookup")
@@ -237,6 +276,106 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 	defer mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("expected janitor to reconcile warm capacity exactly once, got %d", calls)
+	}
+}
+
+func TestControlPlaneJanitorSkipsHotIdlePodDeleteAfterLifecycleCASMiss(t *testing.T) {
+	// When the lifecycle's terminal CAS misses (the worker was reclaimed
+	// between the list and the CAS), the lifecycle does NOT schedule
+	// cleanup. The janitor must not paper over that by invoking any
+	// other cleanup path — observability of the miss is the desired
+	// signal.
+	now := time.Date(2026, time.May, 22, 14, 5, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          12,
+		PodName:           "duckgres-worker-12",
+		State:             configstore.WorkerStateHotIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{listed},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: false}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.hotIdleTTL = time.Minute
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+
+	janitor.runOnce()
+
+	if got := lifecycleStore.terminalTransitions; len(got) != 1 || got[0].workerID != 12 {
+		t.Fatalf("expected one terminal CAS attempt for worker 12, got %#v", got)
+	}
+	if got := cleanup.snapshot(); len(got) != 0 {
+		t.Fatalf("expected no cleanup after hot-idle CAS miss, got %#v", got)
+	}
+}
+
+func TestControlPlaneJanitorHotIdleGoesThroughLifecycleWhenWired(t *testing.T) {
+	now := time.Date(2026, time.May, 22, 14, 10, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          21,
+		PodName:           "duckgres-worker-21",
+		State:             configstore.WorkerStateHotIdle,
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{listed},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.hotIdleTTL = time.Minute
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+
+	janitor.runOnce()
+
+	if got := lifecycleStore.terminalTransitions; len(got) != 1 || got[0].workerID != 21 || got[0].target != configstore.WorkerStateRetired {
+		t.Fatalf("expected one terminal CAS via lifecycle for worker 21 → retired, got %#v", got)
+	}
+	if got := cleanup.snapshot(); len(got) != 1 || got[0].workerID != 21 || got[0].reason != "hot_idle_ttl_expired" {
+		t.Fatalf("expected lifecycle cleanup for worker 21, got %#v", got)
+	}
+}
+
+func TestControlPlaneJanitorOrphanGoesThroughLifecycleWhenWired(t *testing.T) {
+	// Symmetric to the hot-idle lifecycle test: when a lifecycle service is
+	// wired, the orphan path must flow through lifecycle.RetireOrphanFromSnapshot
+	// rather than the legacy retireOrphanWorker / retireWorker lambda chain.
+	// Guards against the orphan migration silently falling back to legacy
+	// because a future refactor accidentally clears the lifecycle field or
+	// adds a new fallback branch above the lifecycle check.
+	now := time.Date(2026, time.May, 22, 15, 20, 0, 0, time.UTC)
+	listed := configstore.WorkerRecord{
+		WorkerID:          31,
+		PodName:           "duckgres-worker-31",
+		State:             configstore.WorkerStateHot,
+		OwnerCPInstanceID: "cp-expired:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	store := &captureControlPlaneExpiryStore{
+		orphanedWorkers: []configstore.WorkerRecord{listed},
+	}
+	lifecycleStore := &fakeLifecycleStore{orphanReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+
+	janitor.runOnce()
+
+	if got := lifecycleStore.orphanTransitions; len(got) != 1 || got[0].workerID != 31 || got[0].reason != janitorRetireReasonOrphaned {
+		t.Fatalf("expected one orphan CAS via lifecycle for worker 31, got %#v", got)
+	}
+	if got := cleanup.snapshot(); len(got) != 1 || got[0].workerID != 31 || got[0].reason != janitorRetireReasonOrphaned {
+		t.Fatalf("expected lifecycle cleanup for orphan worker 31, got %#v", got)
 	}
 }
 
@@ -328,30 +467,21 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{
 		expireErr: errors.New("boom"),
 		orphanedWorkers: []configstore.WorkerRecord{
-			{WorkerID: 7, PodName: "duckgres-worker-7"},
+			{WorkerID: 7, PodName: "duckgres-worker-7", State: configstore.WorkerStateHot, OwnerCPInstanceID: "cp-expired:boot-a", OwnerEpoch: 2},
 		},
 		stuckWorkers: []configstore.WorkerRecord{
-			{WorkerID: 9, PodName: "duckgres-worker-9", State: configstore.WorkerStateActivating},
+			{WorkerID: 9, PodName: "duckgres-worker-9", State: configstore.WorkerStateActivating, OwnerCPInstanceID: "cp-me:boot-b", OwnerEpoch: 1},
 		},
 	}
+	lifecycleStore := &fakeLifecycleStore{orphanReturn: true, terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
 	now := time.Date(2026, time.March, 27, 18, 0, 0, 0, time.UTC)
 	janitor := NewControlPlaneJanitor(store, time.Second, 20*time.Second)
 	janitor.now = func() time.Time { return now }
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
 
 	var mu sync.Mutex
-	var retired []struct {
-		id     int
-		reason string
-	}
 	reconciled := 0
-	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
-		mu.Lock()
-		defer mu.Unlock()
-		retired = append(retired, struct {
-			id     int
-			reason string
-		}{id: record.WorkerID, reason: reason})
-	}
 	janitor.reconcileWarmCapacity = func() {
 		mu.Lock()
 		defer mu.Unlock()
@@ -363,21 +493,21 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	if len(store.cutoffs) != 1 {
 		t.Fatalf("expected stale control-plane expiry to run once, got %d", len(store.cutoffs))
 	}
-	if len(store.orphanedBefore) != 1 {
-		t.Fatalf("expected orphaned worker lookup despite expiry error, got %d", len(store.orphanedBefore))
-	}
 	if len(store.stuckSpawningBefore) != 1 || len(store.stuckActivatingBefore) != 1 {
 		t.Fatalf("expected stuck worker lookup despite expiry error, got spawning=%d activating=%d", len(store.stuckSpawningBefore), len(store.stuckActivatingBefore))
 	}
 	if len(store.expiredSessionsBefore) != 1 {
 		t.Fatalf("expected flight session expiry despite expiry error, got %d", len(store.expiredSessionsBefore))
 	}
+	if got := lifecycleStore.orphanTransitions; len(got) != 1 || got[0].workerID != 7 {
+		t.Fatalf("expected one orphan CAS for worker 7 despite expiry error, got %#v", got)
+	}
+	if got := lifecycleStore.terminalTransitions; len(got) != 1 || got[0].workerID != 9 {
+		t.Fatalf("expected one stuck-worker terminal CAS for worker 9 despite expiry error, got %#v", got)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(retired) != 2 {
-		t.Fatalf("expected orphaned and stuck workers to be retired, got %+v", retired)
-	}
 	if reconciled != 1 {
 		t.Fatalf("expected warm capacity reconciliation despite expiry error, got %d", reconciled)
 	}

@@ -75,6 +75,17 @@ type ManagedWarehouseDatabase struct {
 	Username     string `gorm:"size:255" json:"username"`
 }
 
+// Metadata-store kinds, stored verbatim in ManagedWarehouseMetadataStore.Kind
+// and mirrored onto the Duckling CR's spec.metadataStore.type. These are the
+// only backends the control plane creates: "external" is deliberately absent
+// (external metadata stores are applied out-of-band, never provisioned here),
+// and "cnpg-shard" backs the per-tenant Lakekeeper Iceberg catalog on the
+// shared CloudNativePG shard (always paired with iceberg.enabled=true).
+const (
+	MetadataStoreKindAurora    = "aurora"
+	MetadataStoreKindCnpgShard = "cnpg-shard"
+)
+
 // ManagedWarehouseMetadataStore stores org-scoped DuckLake metadata DB info.
 type ManagedWarehouseMetadataStore struct {
 	Kind         string `gorm:"size:64" json:"kind"`
@@ -382,12 +393,13 @@ type WarmCapacityMissAggregate struct {
 	Count  int64                 `json:"count"`
 }
 
-// WarmCapacityWorkerStats is the grouped warm-worker state used for
-// warm-capacity observability.
-type WarmCapacityWorkerStats struct {
-	Scope           string `json:"scope"`
-	ReadyWorkers    int64  `json:"ready_workers"`
-	SpawningWorkers int64  `json:"spawning_workers"`
+// WorkerLifecycleStats is the grouped worker lifecycle state used for
+// cluster-wide worker observability.
+type WorkerLifecycleStats struct {
+	Image   string      `json:"image"`
+	State   WorkerState `json:"state"`
+	Binding string      `json:"binding"`
+	Count   int64       `json:"count"`
 }
 
 // WorkerRecord is the durable runtime coordination record for one worker pod.

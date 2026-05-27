@@ -189,8 +189,15 @@ func (t *Transpiler) TranspileAll(sql string) (*Result, error) {
 
 // transpileWithFlags parses the SQL and applies only transforms whose flag is set.
 func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Result, error) {
+	// Protect identifiers longer than PostgreSQL's NAMEDATALEN limit from being
+	// silently truncated by libpg_query during Parse/Deparse (see longident.go).
+	// We parse the placeholdered SQL, then restore the originals on any SQL we
+	// emit from the resulting AST. Paths that return the original `sql` need no
+	// restoration since `sql` is never the placeholdered form.
+	parseSQL, longIdents := protectLongIdentifiers(sql)
+
 	// Parse the SQL into an AST
-	tree, err := pg_query.Parse(sql)
+	tree, err := pg_query.Parse(parseSQL)
 	if err != nil {
 		// PostgreSQL parsing failed - signal that we should try native DuckDB execution
 		// Count parameters using regex since we can't use the AST
@@ -232,8 +239,8 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 		if len(transformResult.Statements) > 0 {
 			return &Result{
 				SQL:               sql, // Keep original for logging
-				Statements:        transformResult.Statements,
-				CleanupStatements: transformResult.CleanupStatements,
+				Statements:        restoreLongIdentifiersAll(transformResult.Statements, longIdents),
+				CleanupStatements: restoreLongIdentifiersAll(transformResult.CleanupStatements, longIdents),
 				ParamCount:        transformResult.ParamCount,
 			}, nil
 		}
@@ -258,7 +265,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 
 	if transformResult.SQLOverride != "" {
 		return &Result{
-			SQL:          transformResult.SQLOverride,
+			SQL:          restoreLongIdentifiers(transformResult.SQLOverride, longIdents),
 			ParamCount:   transformResult.ParamCount,
 			IsNoOp:       transformResult.IsNoOp,
 			NoOpTag:      transformResult.NoOpTag,
@@ -271,6 +278,7 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 	if err != nil {
 		return nil, err
 	}
+	deparsed = restoreLongIdentifiers(deparsed, longIdents)
 
 	return &Result{
 		SQL:          deparsed,
@@ -703,6 +711,115 @@ func fixupAST(tree *pg_query.ParseResult) {
 			idx.IndexStmt.AccessMethod = ""
 		}
 	}
+
+	// Deparser-output compatibility fixes for type casts. These must run
+	// unconditionally (independent of which transforms the classifier selected)
+	// because they correct the SQL the pg_query deparser produces, not the
+	// user's input:
+	//
+	//   - The deparser canonicalizes built-in types as pg_catalog.<type>
+	//     (e.g. x::json -> x::pg_catalog.json), which DuckDB rejects.
+	//   - It renders a field-qualified interval cast ('2'::interval day) as
+	//     '2'::"interval"(8), which DuckDB cannot convert (no unit in the value).
+	//
+	// The flag-gated TypeMappingTransform strips pg_catalog too, but only when
+	// the classifier decided a query needs type mapping; a query that is parsed
+	// for some other transform but not flagged for type mapping would otherwise
+	// emit pg_catalog.<type>. Doing it here closes that gap.
+	transform.WalkFunc(tree, func(node *pg_query.Node) bool {
+		switch n := node.Node.(type) {
+		case *pg_query.Node_TypeCast:
+			if tc := n.TypeCast; tc != nil && tc.TypeName != nil {
+				if rewriteIntervalTypmodCast(tc) {
+					return true
+				}
+				stripPgCatalogFromTypeName(tc.TypeName)
+			}
+		case *pg_query.Node_ColumnDef:
+			if cd := n.ColumnDef; cd != nil && cd.TypeName != nil {
+				stripPgCatalogFromTypeName(cd.TypeName)
+			}
+		}
+		return true
+	})
+}
+
+// intervalTypmodUnit maps PostgreSQL interval typmod range masks (INTERVAL_MASK
+// of a single field) to the DuckDB unit keyword. These are the bitmask values
+// the parser stores for `interval <field>`: MONTH=1<<1, YEAR=1<<2, DAY=1<<3,
+// HOUR=1<<10, MINUTE=1<<11, SECOND=1<<12. Combined ranges (e.g. DAY TO HOUR)
+// are intentionally omitted — they are rare and have no clean DuckDB cast form.
+var intervalTypmodUnit = map[int32]string{
+	2:    "month",
+	4:    "year",
+	8:    "day",
+	1024: "hour",
+	2048: "minute",
+	4096: "second",
+}
+
+// rewriteIntervalTypmodCast rewrites a field-qualified interval cast such as
+// '2'::interval day into (2 || ' day')::interval, which DuckDB accepts. DuckDB
+// cannot infer a unit from a bare value cast to INTERVAL; a unit-bearing string
+// works, and concatenation handles both string and numeric operands. A bare
+// interval cast (no typmod) is not re-qualified to pg_catalog.interval by the
+// deparser, so the output survives deparsing. Returns true if it rewrote the cast.
+func rewriteIntervalTypmodCast(tc *pg_query.TypeCast) bool {
+	tn := tc.TypeName
+	if tn == nil || len(tn.Names) == 0 || tc.Arg == nil {
+		return false
+	}
+	last := tn.Names[len(tn.Names)-1].GetString_()
+	if last == nil || strings.ToLower(last.Sval) != "interval" {
+		return false
+	}
+	if len(tn.Typmods) != 1 {
+		return false
+	}
+	ac := tn.Typmods[0].GetAConst()
+	if ac == nil {
+		return false
+	}
+	iv := ac.GetIval()
+	if iv == nil {
+		return false
+	}
+	unit, ok := intervalTypmodUnit[iv.Ival]
+	if !ok {
+		return false
+	}
+
+	tc.Arg = &pg_query.Node{Node: &pg_query.Node_AExpr{AExpr: &pg_query.A_Expr{
+		Kind:  pg_query.A_Expr_Kind_AEXPR_OP,
+		Name:  []*pg_query.Node{{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "||"}}}},
+		Lexpr: tc.Arg,
+		Rexpr: &pg_query.Node{Node: &pg_query.Node_AConst{AConst: &pg_query.A_Const{
+			Val: &pg_query.A_Const_Sval{Sval: &pg_query.String{Sval: " " + unit}},
+		}}},
+	}}}
+	tn.Names = []*pg_query.Node{{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "interval"}}}}
+	tn.Typmods = nil
+	return true
+}
+
+// stripPgCatalogFromTypeName removes a leading pg_catalog qualifier from a type
+// name so the deparser emits e.g. json instead of pg_catalog.json (which DuckDB
+// rejects). Interval is deliberately left qualified: stripping pg_catalog from
+// interval regresses the deparser to '<n>'::"interval"(<mask>). Field-qualified
+// intervals are handled by rewriteIntervalTypmodCast before this runs.
+func stripPgCatalogFromTypeName(tn *pg_query.TypeName) {
+	if tn == nil || len(tn.Names) < 2 {
+		return
+	}
+	first := tn.Names[0].GetString_()
+	if first == nil || strings.ToLower(first.Sval) != "pg_catalog" {
+		return
+	}
+	last := tn.Names[len(tn.Names)-1].GetString_()
+	if last != nil && strings.ToLower(last.Sval) == "interval" {
+		return
+	}
+	tn.Names = tn.Names[1:]
 }
 
 // ConvertAlterTableToAlterView transforms an ALTER TABLE RENAME statement

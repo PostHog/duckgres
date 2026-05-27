@@ -313,6 +313,11 @@ func TestK8sWorkerCrashRecovery(t *testing.T) {
 	if err := retryQueryWithReconnect("SELECT 1", 60*time.Second); err != nil {
 		t.Fatalf("query failed after worker crash recovery: %v", err)
 	}
+
+	// Wait for the CP to finish housekeeping the deleted worker so the
+	// next test doesn't run while the apiserver is still busy with
+	// replenishment/cleanup churn.
+	waitForControlPlaneIdle(t, 60*time.Second)
 }
 
 func TestK8sMultipleConcurrentConnections(t *testing.T) {
@@ -413,8 +418,8 @@ func TestK8sVersionMismatchedWorkerIsReaped(t *testing.T) {
 	}
 
 	// Brief idle window so the worker settles back into idle state in the
-	// configstore — RetireIdleWorker is a state-conditional CAS that no-ops
-	// on busy/reserved/hot rows.
+	// configstore — RetireIdleOrHotIdleWorker is a state-conditional CAS
+	// that no-ops on busy/reserved/hot rows.
 	time.Sleep(3 * time.Second)
 
 	workerPods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{

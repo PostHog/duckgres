@@ -9,16 +9,6 @@ import (
 
 // --- Per-org metrics (multi-tenant mode) ---
 
-var orgWorkersActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_org_workers_active",
-	Help: "Number of active workers per org",
-}, []string{"org"})
-
-var orgWorkersIdleGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_org_workers_idle",
-	Help: "Number of idle workers per org",
-}, []string{"org"})
-
 var orgSessionsActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_org_sessions_active",
 	Help: "Number of active sessions per org",
@@ -52,14 +42,6 @@ var sniRoutingResolutionsCounter = promauto.NewCounterVec(prometheus.CounterOpts
 	Name: "duckgres_sni_routing_resolutions_total",
 	Help: "SNI hostname prefix resolutions, partitioned by whether a hostname_alias was used",
 }, []string{"protocol", "alias_used"})
-
-func observeOrgWorkersActive(org string, count int) {
-	orgWorkersActiveGauge.WithLabelValues(org).Set(float64(count))
-}
-
-func observeOrgWorkersIdle(org string, count int) {
-	orgWorkersIdleGauge.WithLabelValues(org).Set(float64(count))
-}
 
 func observeOrgSessionsActive(org string, count int) {
 	orgSessionsActiveGauge.WithLabelValues(org).Set(float64(count))

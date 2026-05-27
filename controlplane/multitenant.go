@@ -83,15 +83,10 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 		for _, s := range sessions {
 			sessionsByWorker[s.WorkerID]++
 		}
-		activeCount := 0
-		idleCount := 0
 		for wID, count := range sessionsByWorker {
 			status := "active"
 			if count == 0 {
 				status = "idle"
-				idleCount++
-			} else {
-				activeCount++
 			}
 			result = append(result, admin.WorkerStatus{
 				ID:             wID,
@@ -100,9 +95,6 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 				Status:         status,
 			})
 		}
-		// Emit per-org worker Prometheus metrics
-		observeOrgWorkersActive(name, activeCount)
-		observeOrgWorkersIdle(name, idleCount)
 	}
 	return result
 }
@@ -241,18 +233,19 @@ func SetupMultiTenant(
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
 	janitor.hotIdleTTL = defaultHotIdleTTL
 	janitor.warmCapacityMissBucketTTL = cfg.K8s.WarmCapacityDemandTTL
-	janitor.retireWorker = func(record configstore.WorkerRecord, reason string) {
-		router.sharedPool.retireClaimedWorker(&record, reason)
-	}
-	janitor.retireOrphanWorker = func(record configstore.WorkerRecord, reason string) {
-		router.sharedPool.retireOrphanWorker(&record, reason)
-	}
-	janitor.retireLocalWorker = func(workerID int, reason string) bool {
-		return router.sharedPool.retireWorkerWithReason(workerID, reason)
-	}
+	// Per-worker transitions (orphan retire, stuck reaper, hot-idle TTL)
+	// all flow through this lifecycle service. The legacy retireWorker /
+	// retireOrphanWorker / retireLocalWorker / deleteRetiredWorker
+	// lambda chain is gone — the snapshot/lease-typed API is the only
+	// path now.
+	janitor.lifecycle = router.sharedPool.lifecycle
+	// Reset leader-owned cluster-wide gauges when this janitor stops
+	// being the leader, so stale per-image counts from this CP don't
+	// linger in Prometheus while a peer takes over.
+	janitor.onStop = resetLeaderOwnedClusterMetrics
 	lastWarmCapacityTargets := map[string]int{}
-	var lastWarmCapacityRecentMisses []configstore.WarmCapacityMissAggregate
-	var lastWarmCapacityWorkerStats []configstore.WarmCapacityWorkerStats
+	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats
+	var lastWorkerLifecycleTargetImages []string
 	lastWarmCapacityGlobalCapBlocked := false
 	janitor.reconcileWarmCapacity = func() {
 		snap := store.Snapshot()
@@ -269,14 +262,14 @@ func SetupMultiTenant(
 		if err != nil {
 			slog.Warn("Janitor failed to read dynamic warm-capacity demand; reconciling base warm targets only.", "error", err)
 		}
-		observeWarmCapacityRecentMisses(targetSnapshot.RecentMisses, lastWarmCapacityRecentMisses)
-		lastWarmCapacityRecentMisses = cloneWarmCapacityMissAggregates(targetSnapshot.RecentMisses)
 		observeWarmCapacityTargets(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, cfg.K8s.MaxWorkers, lastWarmCapacityTargets)
-		if stats, statsErr := listWarmCapacityWorkerStats(store); statsErr != nil {
-			slog.Warn("Janitor failed to read warm-capacity worker stats.", "error", statsErr)
+		targetImages := warmCapacityTargetImages(targetSnapshot.EffectiveTargets)
+		if stats, statsErr := listWorkerLifecycleStats(store); statsErr != nil {
+			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", statsErr)
 		} else {
-			observeWarmCapacityWorkerStats(stats, lastWarmCapacityWorkerStats)
-			lastWarmCapacityWorkerStats = cloneWarmCapacityWorkerStats(stats)
+			observeWorkerLifecycleStatsForImages(stats, targetImages, lastWorkerLifecycleTargetImages, lastWorkerLifecycleStats)
+			lastWorkerLifecycleStats = cloneWorkerLifecycleStats(stats)
+			lastWorkerLifecycleTargetImages = cloneStringSlice(targetImages)
 		}
 		logWarmCapacityTargetChanges(lastWarmCapacityTargets, targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets)
 		lastWarmCapacityTargets = cloneWarmCapacityTargets(targetSnapshot.EffectiveTargets)
@@ -297,11 +290,24 @@ func SetupMultiTenant(
 		router.sharedPool.RetireOneMismatchedVersionWorker(ctx)
 	}
 	janitor.cleanupOrphanedWorkerPods = func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if n := router.sharedPool.cleanupOrphanedWorkerPods(ctx, 2*time.Minute); n > 0 {
+		// Pods and secrets each get their own 30s deadline so a slow
+		// pod-list (large namespace) can't starve the secret reaper
+		// behind it, and vice versa.
+		podCtx, podCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if n := router.sharedPool.cleanupOrphanedWorkerPods(podCtx, 2*time.Minute); n > 0 {
 			slog.Info("Stranded worker pods reconciled.", "count", n)
 		}
+		podCancel()
+
+		// Sibling reconciler that catches a secret created without a
+		// pod (spawn crashed between createSecret and createPod). The
+		// pod-cleanup loop above only iterates pods, so this is the
+		// only place that reclaims those orphans.
+		secretCtx, secretCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if n := router.sharedPool.cleanupOrphanedWorkerSecrets(secretCtx, 2*time.Minute); n > 0 {
+			slog.Info("Stranded worker RPC secrets reconciled.", "count", n)
+		}
+		secretCancel()
 	}
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance
@@ -429,8 +435,8 @@ type warmCapacityMissAggregateLister interface {
 	ListWarmCapacityMissesSince(since time.Time, reasons ...configstore.WorkerClaimMissReason) ([]configstore.WarmCapacityMissAggregate, error)
 }
 
-type warmCapacityWorkerStatsLister interface {
-	ListWarmCapacityWorkerStats() ([]configstore.WarmCapacityWorkerStats, error)
+type workerLifecycleStatsLister interface {
+	ListWorkerLifecycleStats() ([]configstore.WorkerLifecycleStats, error)
 }
 
 type warmCapacityTargetSnapshot struct {
@@ -472,15 +478,15 @@ func computeEffectiveWarmCapacityTargetSnapshot(baseTargets map[string]int, list
 	return snap, nil
 }
 
-func listWarmCapacityWorkerStats(lister warmCapacityWorkerStatsLister) ([]configstore.WarmCapacityWorkerStats, error) {
+func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.WorkerLifecycleStats, error) {
 	if lister == nil {
 		return nil, nil
 	}
-	return lister.ListWarmCapacityWorkerStats()
+	return lister.ListWorkerLifecycleStats()
 }
 
 func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[string]int) {
-	for _, image := range warmCapacityTargetScopes(previous, baseTargets, effectiveTargets) {
+	for _, image := range warmCapacityTargetImages(previous, baseTargets, effectiveTargets) {
 		effective := positiveMapValue(effectiveTargets, image)
 		if positiveMapValue(previous, image) == effective {
 			continue
@@ -491,7 +497,7 @@ func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[st
 			demand = 0
 		}
 		slog.Info("Warm capacity target changed.",
-			"scope", warmCapacityImageScope(image),
+			"image", image,
 			"base_target", base,
 			"demand_target", demand,
 			"effective_target", effective,
@@ -510,21 +516,21 @@ func cloneWarmCapacityTargets(targets map[string]int) map[string]int {
 	return out
 }
 
-func cloneWarmCapacityMissAggregates(aggregates []configstore.WarmCapacityMissAggregate) []configstore.WarmCapacityMissAggregate {
-	if len(aggregates) == 0 {
-		return nil
-	}
-	out := make([]configstore.WarmCapacityMissAggregate, len(aggregates))
-	copy(out, aggregates)
-	return out
-}
-
-func cloneWarmCapacityWorkerStats(stats []configstore.WarmCapacityWorkerStats) []configstore.WarmCapacityWorkerStats {
+func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []configstore.WorkerLifecycleStats {
 	if len(stats) == 0 {
 		return nil
 	}
-	out := make([]configstore.WarmCapacityWorkerStats, len(stats))
+	out := make([]configstore.WorkerLifecycleStats, len(stats))
 	copy(out, stats)
+	return out
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
 	return out
 }
 

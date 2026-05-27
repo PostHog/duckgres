@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -17,11 +18,10 @@ const (
 type controlPlaneExpiryStore interface {
 	ExpireControlPlaneInstances(cutoff time.Time) (int64, error)
 	ExpireDrainingControlPlaneInstances(before time.Time) (int64, error)
-	ListOrphanedWorkers(before time.Time) ([]configstore.WorkerRecord, error)
-	ListStuckWorkers(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerRecord, error)
+	ListOrphanedWorkerSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
+	ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerSnapshot, error)
+	ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error)
 	ExpireFlightSessionRecords(before time.Time) (int64, error)
-	ListExpiredHotIdleWorkers(before time.Time) ([]configstore.WorkerRecord, error)
-	RetireHotIdleWorker(workerID int) (bool, error)
 }
 
 type warmCapacityMissBucketPruner interface {
@@ -39,10 +39,10 @@ type ControlPlaneJanitor struct {
 	hotIdleTTL                    time.Duration
 	warmCapacityMissBucketTTL     time.Duration
 	now                           func() time.Time
-	retireWorker                  func(record configstore.WorkerRecord, reason string)
-	retireOrphanWorker            func(record configstore.WorkerRecord, reason string) // orphan-cleanup variant: handles any active state, skips local-pool bookkeeping
-	retireLocalWorker             func(workerID int, reason string) bool               // retires from in-memory pool + pod, returns false if not local
+	lifecycle                     *WorkerLifecycle // every per-worker transition flows through this; nil disables per-worker reaping for that tick.
+	lifecycleNilWarned            sync.Once        // one-shot guard so the misconfiguration error doesn't flood at the janitor tick rate.
 	reconcileWarmCapacity         func()
+	onStop                        func()
 	retireMismatchedVersionWorker func() // reaps one warm idle worker whose Deployment version differs from this CP's (leader-only)
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 }
@@ -71,6 +71,11 @@ func (j *ControlPlaneJanitor) Run(ctx context.Context) {
 	if j == nil || j.store == nil {
 		return
 	}
+	defer func() {
+		if j.onStop != nil {
+			j.onStop()
+		}
+	}()
 
 	j.runOnce()
 
@@ -106,61 +111,57 @@ func (j *ControlPlaneJanitor) runOnce() {
 		}
 	}
 
-	orphanedBefore := j.now().Add(-j.orphanGrace)
-	orphaned, err := j.store.ListOrphanedWorkers(orphanedBefore)
-	if err != nil {
-		slog.Warn("Janitor failed to list orphaned workers.", "error", err)
+	// Per-worker reaping paths (orphan, stuck, hot-idle) all flow
+	// through the lifecycle service. A nil lifecycle here is a wiring
+	// bug — the only janitor constructor (multitenant.go) sets it
+	// unconditionally. The guard remains as a fail-soft so that
+	// misconfiguration doesn't NPE the entire tick (the rest of
+	// runOnce — flight session expiry, bucket pruning,
+	// warm-capacity reconciliation — still runs); the slog.Error
+	// makes the misconfiguration loud rather than silent.
+	if j.lifecycle == nil {
+		j.lifecycleNilWarned.Do(func() {
+			slog.Error("Janitor running without a lifecycle service; per-worker reaping disabled. This is a wiring bug — fix the constructor.")
+		})
 	} else {
-		if len(orphaned) > 0 {
-			slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
-		}
-		for _, worker := range orphaned {
-			// Prefer the orphan-specific retire path so workers in any
-			// active state transition to retired (not just idle/hot_idle
-			// like the older retireRuntimeWorker chain). Fall back to the
-			// legacy path if a caller hasn't wired the new lambda.
-			if j.retireOrphanWorker != nil {
-				j.retireOrphanWorker(worker, janitorRetireReasonOrphaned)
-			} else {
-				j.retireRuntimeWorker(worker, janitorRetireReasonOrphaned)
-			}
-		}
-	}
-
-	spawningBefore := j.now().Add(-j.spawnTimeout)
-	activatingBefore := j.now().Add(-j.activateTimeout)
-	stuckWorkers, err := j.store.ListStuckWorkers(spawningBefore, activatingBefore)
-	if err != nil {
-		slog.Warn("Janitor failed to list stuck workers.", "error", err)
-	} else {
-		for _, worker := range stuckWorkers {
-			j.retireRuntimeWorker(worker, janitorRetireReasonStuckActivating)
-		}
-	}
-
-	if j.hotIdleTTL > 0 {
-		cutoff := j.now().Add(-j.hotIdleTTL)
-		expired, err := j.store.ListExpiredHotIdleWorkers(cutoff)
+		orphanedBefore := j.now().Add(-j.orphanGrace)
+		orphaned, err := j.store.ListOrphanedWorkerSnapshots(orphanedBefore)
 		if err != nil {
-			slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
+			slog.Warn("Janitor failed to list orphaned workers.", "error", err)
+		} else {
+			if len(orphaned) > 0 {
+				slog.Info("Janitor retiring orphaned workers.", "count", len(orphaned))
+			}
+			for _, snap := range orphaned {
+				if _, err := j.lifecycle.RetireOrphanFromSnapshot(snap, janitorRetireReasonOrphaned, LifecycleOriginJanitorOrphan); err != nil {
+					slog.Warn("Janitor failed to retire orphan worker.", "worker_id", snap.WorkerID(), "error", err)
+				}
+			}
 		}
-		for _, record := range expired {
-			// Atomically transition from hot_idle to retired in the DB.
-			// If the worker was concurrently reclaimed (no longer hot_idle),
-			// the conditional update returns false and we skip retirement.
-			retired, err := j.store.RetireHotIdleWorker(record.WorkerID)
+
+		spawningBefore := j.now().Add(-j.spawnTimeout)
+		activatingBefore := j.now().Add(-j.activateTimeout)
+		stuckWorkers, err := j.store.ListStuckWorkerSnapshots(spawningBefore, activatingBefore)
+		if err != nil {
+			slog.Warn("Janitor failed to list stuck workers.", "error", err)
+		} else {
+			for _, snap := range stuckWorkers {
+				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, janitorRetireReasonStuckActivating, LifecycleOriginJanitorStuckActivating); err != nil {
+					slog.Warn("Janitor failed to retire stuck worker.", "worker_id", snap.WorkerID(), "error", err)
+				}
+			}
+		}
+
+		if j.hotIdleTTL > 0 {
+			cutoff := j.now().Add(-j.hotIdleTTL)
+			expired, err := j.store.ListExpiredHotIdleSnapshots(cutoff)
 			if err != nil {
-				slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", record.WorkerID, "error", err)
-				continue
+				slog.Warn("Janitor failed to list expired hot-idle workers.", "error", err)
 			}
-			if !retired {
-				continue // Worker was reclaimed concurrently
-			}
-			// Try local retire first (removes from in-memory pool + deletes pod).
-			// Falls back to remote retire if the worker isn't in our local pool.
-			localRetired := j.retireLocalWorker != nil && j.retireLocalWorker(record.WorkerID, "hot_idle_ttl_expired")
-			if !localRetired {
-				j.retireRuntimeWorker(record, "hot_idle_ttl_expired")
+			for _, snap := range expired {
+				if _, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, "hot_idle_ttl_expired", LifecycleOriginJanitorHotIdleTTL); err != nil {
+					slog.Warn("Janitor failed to retire hot-idle worker.", "worker_id", snap.WorkerID(), "error", err)
+				}
 			}
 		}
 	}
@@ -204,9 +205,3 @@ func (j *ControlPlaneJanitor) runOnce() {
 	}
 }
 
-func (j *ControlPlaneJanitor) retireRuntimeWorker(record configstore.WorkerRecord, reason string) {
-	if j == nil || j.retireWorker == nil {
-		return
-	}
-	j.retireWorker(record, reason)
-}

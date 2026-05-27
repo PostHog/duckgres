@@ -241,37 +241,29 @@ func TestPruneWarmCapacityMissBucketsPostgres(t *testing.T) {
 	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, newBucketStart, 1)
 }
 
-func TestListWarmCapacityWorkerStatsPostgres(t *testing.T) {
+func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
-	now := time.Date(2026, time.March, 26, 14, 30, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 26, 14, 45, 0, 0, time.UTC)
 	records := []configstore.WorkerRecord{
 		{
-			WorkerID:          1001,
-			PodName:           "duckgres-worker-test-cp-1001",
+			WorkerID:          1101,
+			PodName:           "duckgres-worker-test-cp-1101",
 			Image:             "duckgres:default",
 			State:             configstore.WorkerStateIdle,
 			OwnerCPInstanceID: "cp-a",
 			LastHeartbeatAt:   now,
 		},
 		{
-			WorkerID:          1002,
-			PodName:           "duckgres-worker-test-cp-1002",
+			WorkerID:          1102,
+			PodName:           "duckgres-worker-test-cp-1102",
 			Image:             "duckgres:default",
 			State:             configstore.WorkerStateSpawning,
 			OwnerCPInstanceID: "cp-a",
 			LastHeartbeatAt:   now,
 		},
 		{
-			WorkerID:          1003,
-			PodName:           "duckgres-worker-test-cp-1003",
-			Image:             "duckgres:pinned",
-			State:             configstore.WorkerStateIdle,
-			OwnerCPInstanceID: "cp-b",
-			LastHeartbeatAt:   now,
-		},
-		{
-			WorkerID:          1004,
-			PodName:           "duckgres-worker-test-cp-1004",
+			WorkerID:          1103,
+			PodName:           "duckgres-worker-test-cp-1103",
 			Image:             "duckgres:default",
 			State:             configstore.WorkerStateHot,
 			OrgID:             "analytics",
@@ -279,9 +271,36 @@ func TestListWarmCapacityWorkerStatsPostgres(t *testing.T) {
 			LastHeartbeatAt:   now,
 		},
 		{
-			WorkerID:          1005,
-			PodName:           "duckgres-worker-test-cp-1005",
-			State:             configstore.WorkerStateIdle,
+			WorkerID:          1104,
+			PodName:           "duckgres-worker-test-cp-1104",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-a",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1105,
+			PodName:           "duckgres-worker-test-cp-1105",
+			Image:             "duckgres:pinned",
+			State:             configstore.WorkerStateDraining,
+			OrgID:             "science",
+			OwnerCPInstanceID: "cp-b",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1106,
+			PodName:           "duckgres-worker-test-cp-1106",
+			Image:             "duckgres:pinned",
+			State:             configstore.WorkerStateLost,
+			OwnerCPInstanceID: "cp-b",
+			LastHeartbeatAt:   now,
+		},
+		{
+			WorkerID:          1107,
+			PodName:           "duckgres-worker-test-cp-1107",
+			State:             configstore.WorkerStateHot,
+			OrgID:             "analytics",
 			OwnerCPInstanceID: "cp-a",
 			LastHeartbeatAt:   now,
 		},
@@ -292,21 +311,24 @@ func TestListWarmCapacityWorkerStatsPostgres(t *testing.T) {
 		}
 	}
 
-	stats, err := store.ListWarmCapacityWorkerStats()
+	stats, err := store.ListWorkerLifecycleStats()
 	if err != nil {
-		t.Fatalf("ListWarmCapacityWorkerStats: %v", err)
+		t.Fatalf("ListWorkerLifecycleStats: %v", err)
 	}
 
-	got := map[string][2]int64{}
+	got := map[string]int64{}
 	for _, stat := range stats {
-		got[stat.Scope] = [2]int64{stat.ReadyWorkers, stat.SpawningWorkers}
+		got[fmt.Sprintf("%s|%s|%s", stat.Image, stat.State, stat.Binding)] = stat.Count
 	}
-	want := map[string][2]int64{
-		"image:duckgres:default": {1, 1},
-		"image:duckgres:pinned":  {1, 0},
+	want := map[string]int64{
+		"duckgres:default|idle|neutral":       1,
+		"duckgres:default|spawning|neutral":   1,
+		"duckgres:default|hot|org_bound":      1,
+		"duckgres:default|hot_idle|org_bound": 1,
+		"duckgres:pinned|draining|org_bound":  1,
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("expected warm worker stats %v, got %v", want, got)
+		t.Fatalf("expected worker lifecycle stats %v, got %v", want, got)
 	}
 }
 
@@ -647,7 +669,7 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(second): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics")
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -724,7 +746,7 @@ func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) 
 		}
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics")
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -746,6 +768,137 @@ func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) 
 		if persisted.OwnerEpoch != 2 {
 			t.Fatalf("expected worker %d owner epoch to remain 2, got %d", workerID, persisted.OwnerEpoch)
 		}
+	}
+}
+
+func TestClaimHotIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 14, 20, 0, 0, time.UTC)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          14,
+		PodName:           "duckgres-worker-active-org-slot",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-active:boot-a",
+		OwnerEpoch:        4,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(active): %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          15,
+		PodName:           "duckgres-worker-hot-idle-over-cap",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
+	}
+
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker: %v", err)
+	}
+	if claimed != nil {
+		t.Fatalf("expected org cap to block hot-idle claim, got %#v", claimed)
+	}
+	if missReason != configstore.WorkerClaimMissReasonOrgCap {
+		t.Fatalf("expected org-cap miss reason, got %q", missReason)
+	}
+
+	persisted, err := store.GetWorkerRecord(15)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHotIdle {
+		t.Fatalf("expected hot-idle worker to remain hot_idle, got %q", persisted.State)
+	}
+	if persisted.OwnerCPInstanceID != "cp-old:boot-a" || persisted.OwnerEpoch != 2 {
+		t.Fatalf("expected hot-idle owner to remain cp-old epoch 2, got owner=%q epoch=%d", persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+}
+
+func TestClaimHotIdleWorkerAllowsOnlyHotIdleAtCapPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 14, 25, 0, 0, time.UTC)
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          16,
+		PodName:           "duckgres-worker-only-hot-idle",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord: %v", err)
+	}
+
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected sole hot-idle worker to be reclaimable at org cap")
+		return
+	}
+	if missReason != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("expected no miss reason, got %q", missReason)
+	}
+	if claimed.WorkerID != 16 || claimed.State != configstore.WorkerStateReserved {
+		t.Fatalf("expected worker 16 to be reserved, got %#v", claimed)
+	}
+}
+
+func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	now := time.Date(2026, time.March, 26, 14, 30, 0, 0, time.UTC)
+	for _, workerID := range []int{17, 18} {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          workerID,
+			PodName:           fmt.Sprintf("duckgres-worker-hot-idle-%d", workerID),
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-old:boot-a",
+			OwnerEpoch:        2,
+			LastHeartbeatAt:   now,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", workerID, err)
+		}
+	}
+
+	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 1)
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker(first): %v", err)
+	}
+	if first == nil || first.WorkerID != 17 {
+		t.Fatalf("expected first claim to reserve worker 17, got %#v", first)
+	}
+	if missReason != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("expected first claim to have no miss reason, got %q", missReason)
+	}
+
+	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", 1)
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker(second): %v", err)
+	}
+	if second != nil {
+		t.Fatalf("expected org cap to block second hot-idle claim, got %#v", second)
+	}
+	if missReason != configstore.WorkerClaimMissReasonOrgCap {
+		t.Fatalf("expected org-cap miss reason on second claim, got %q", missReason)
+	}
+
+	persisted, err := store.GetWorkerRecord(18)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord(18): %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHotIdle {
+		t.Fatalf("expected second hot-idle worker to remain hot_idle, got %q", persisted.State)
 	}
 }
 
@@ -1261,6 +1414,45 @@ func TestListOrphanedWorkersIncludesOwnerlessIdleWorkers(t *testing.T) {
 	}
 }
 
+func TestRetireOrphanWorkerHandlesNullOwnerPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 14, 5, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          101,
+		PodName:           "duckgres-worker-101",
+		State:             configstore.WorkerStateIdle,
+		OrgID:             "",
+		OwnerCPInstanceID: "",
+		OwnerEpoch:        0,
+		LastHeartbeatAt:   now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(ownerless idle): %v", err)
+	}
+	if err := store.DB().Table(store.RuntimeSchema()+".worker_records").
+		Where("worker_id = ?", 101).
+		Update("owner_cp_instance_id", nil).Error; err != nil {
+		t.Fatalf("set owner_cp_instance_id null: %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	if len(orphaned) != 1 || orphaned[0].WorkerID != 101 || orphaned[0].OwnerCPInstanceID != "" {
+		t.Fatalf("expected null-owner worker 101 to be listed with empty owner, got %#v", orphaned)
+	}
+
+	retired, err := store.RetireOrphanWorker(&orphaned[0], "orphaned")
+	if err != nil {
+		t.Fatalf("RetireOrphanWorker(null owner): %v", err)
+	}
+	if !retired {
+		t.Fatal("expected null-owner orphan snapshot to retire")
+	}
+	assertWorkerStateAndReason(t, store, 101, configstore.WorkerStateRetired, "orphaned")
+}
+
 // TestListOrphanedWorkersIncludesDanglingOwnerWorkers covers the
 // "owner_cp_instance_id is set but no matching cp_instances row exists"
 // case — the CP row was hard-deleted (or somehow skipped insertion) but
@@ -1356,7 +1548,12 @@ func TestRetireOrphanWorkerHandlesAllActiveStates(t *testing.T) {
 				t.Fatalf("UpsertWorkerRecord(%s): %v", tc.state, err)
 			}
 
-			retired, err := store.RetireOrphanWorker(workerID, "test_orphan_cleanup")
+			observed, err := store.GetWorkerRecord(workerID)
+			if err != nil {
+				t.Fatalf("GetWorkerRecord(%s): %v", tc.state, err)
+			}
+
+			retired, err := store.RetireOrphanWorker(observed, "test_orphan_cleanup")
 			if err != nil {
 				t.Fatalf("RetireOrphanWorker(%s): %v", tc.state, err)
 			}
@@ -1365,7 +1562,7 @@ func TestRetireOrphanWorkerHandlesAllActiveStates(t *testing.T) {
 			}
 
 			// Verify final DB state via a follow-up no-op call (returns false).
-			retiredAgain, err := store.RetireOrphanWorker(workerID, "test_orphan_cleanup")
+			retiredAgain, err := store.RetireOrphanWorker(observed, "test_orphan_cleanup")
 			if err != nil {
 				t.Fatalf("RetireOrphanWorker(%s) follow-up: %v", tc.state, err)
 			}
@@ -1404,7 +1601,12 @@ func TestRetireOrphanWorkerNoOpOnTerminalStates(t *testing.T) {
 				t.Fatalf("UpsertWorkerRecord(%s): %v", tc.state, err)
 			}
 
-			retired, err := store.RetireOrphanWorker(workerID, "should_be_ignored")
+			observed, err := store.GetWorkerRecord(workerID)
+			if err != nil {
+				t.Fatalf("GetWorkerRecord(%s): %v", tc.state, err)
+			}
+
+			retired, err := store.RetireOrphanWorker(observed, "should_be_ignored")
 			if err != nil {
 				t.Fatalf("RetireOrphanWorker(%s): %v", tc.state, err)
 			}
@@ -1965,6 +2167,510 @@ func TestGetFlightSessionRecordReturnsNilWhenMissing(t *testing.T) {
 	}
 }
 
+func TestMarkWorkerLostIfCurrentLeasePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 12, 0, 0, 0, time.UTC)
+
+	liveStates := []configstore.WorkerState{
+		configstore.WorkerStateSpawning,
+		configstore.WorkerStateIdle,
+		configstore.WorkerStateReserved,
+		configstore.WorkerStateActivating,
+		configstore.WorkerStateHot,
+		configstore.WorkerStateHotIdle,
+	}
+	for i, state := range liveStates {
+		t.Run(string(state), func(t *testing.T) {
+			workerID := 3100 + i
+			upsertMarkLostWorker(t, store, workerID, state, "cp-me:boot-a", 4, "", now)
+
+			updated, err := store.MarkWorkerLostIfCurrentLease(workerID, "cp-me:boot-a", 4, "crash")
+			if err != nil {
+				t.Fatalf("MarkWorkerLostIfCurrentLease(%s): %v", state, err)
+			}
+			if !updated {
+				t.Fatalf("expected current %s lease to mark worker lost", state)
+			}
+			assertWorkerStateAndReason(t, store, workerID, configstore.WorkerStateLost, "crash")
+		})
+	}
+
+	upsertMarkLostWorker(t, store, 3200, configstore.WorkerStateHot, "cp-other:boot-b", 9, "", now)
+	updated, err := store.MarkWorkerLostIfCurrentLease(3200, "cp-me:boot-a", 9, "crash")
+	if err != nil {
+		t.Fatalf("MarkWorkerLostIfCurrentLease owner mismatch: %v", err)
+	}
+	if updated {
+		t.Fatal("expected owner mismatch to return false")
+	}
+	assertWorkerStateAndReason(t, store, 3200, configstore.WorkerStateHot, "")
+
+	upsertMarkLostWorker(t, store, 3201, configstore.WorkerStateHot, "cp-me:boot-a", 4, "", now)
+	updated, err = store.MarkWorkerLostIfCurrentLease(3201, "cp-me:boot-a", 3, "crash")
+	if err != nil {
+		t.Fatalf("MarkWorkerLostIfCurrentLease epoch mismatch: %v", err)
+	}
+	if updated {
+		t.Fatal("expected epoch mismatch to return false")
+	}
+	assertWorkerStateAndReason(t, store, 3201, configstore.WorkerStateHot, "")
+
+	noOpStates := []configstore.WorkerState{
+		configstore.WorkerStateDraining,
+		configstore.WorkerStateRetired,
+		configstore.WorkerStateLost,
+	}
+	for i, state := range noOpStates {
+		t.Run("noop_"+string(state), func(t *testing.T) {
+			workerID := 3300 + i
+			upsertMarkLostWorker(t, store, workerID, state, "cp-me:boot-a", 4, "original", now)
+
+			updated, err := store.MarkWorkerLostIfCurrentLease(workerID, "cp-me:boot-a", 4, "crash")
+			if err != nil {
+				t.Fatalf("MarkWorkerLostIfCurrentLease(%s): %v", state, err)
+			}
+			if updated {
+				t.Fatalf("expected %s worker to remain owned by its current lifecycle path", state)
+			}
+			assertWorkerStateAndReason(t, store, workerID, state, "original")
+		})
+	}
+}
+
+func TestUpsertWorkerRecordDoesNotResurrectTerminalWorkerPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 12, 30, 0, 0, time.UTC)
+
+	cases := []struct {
+		name  string
+		state configstore.WorkerState
+	}{
+		{"draining", configstore.WorkerStateDraining},
+		{"lost", configstore.WorkerStateLost},
+		{"retired", configstore.WorkerStateRetired},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workerID := 3400 + i
+			upsertMarkLostWorker(t, store, workerID, tc.state, "cp-me:boot-a", 4, "original", now)
+
+			err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+				WorkerID:          workerID,
+				PodName:           fmt.Sprintf("duckgres-worker-%d", workerID),
+				State:             configstore.WorkerStateHot,
+				OrgID:             "acme",
+				OwnerCPInstanceID: "cp-me:boot-a",
+				OwnerEpoch:        5,
+				RetireReason:      "",
+				LastHeartbeatAt:   now.Add(time.Minute),
+			})
+			if !errors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+				t.Fatalf("expected fenced terminal upsert for worker %d, got %v", workerID, err)
+			}
+
+			assertWorkerStateAndReason(t, store, workerID, tc.state, "original")
+		})
+	}
+}
+
+func TestUpsertWorkerRecordDoesNotOverwriteNewerLeasePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 0, 0, 0, time.UTC)
+
+	insertCurrent := func(workerID int) {
+		t.Helper()
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          workerID,
+			PodName:           fmt.Sprintf("duckgres-worker-%d", workerID),
+			State:             configstore.WorkerStateReserved,
+			OrgID:             "analytics",
+			OwnerCPInstanceID: "cp-new:boot-b",
+			OwnerEpoch:        10,
+			LastHeartbeatAt:   now,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(current %d): %v", workerID, err)
+		}
+	}
+
+	insertCurrent(3600)
+	err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3600,
+		PodName:           "duckgres-worker-3600",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        9,
+		LastHeartbeatAt:   now.Add(time.Minute),
+	})
+	if !errors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+		t.Fatalf("expected stale upsert fence miss, got %v", err)
+	}
+
+	persisted, err := store.GetWorkerRecord(3600)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateReserved ||
+		persisted.OwnerCPInstanceID != "cp-new:boot-b" ||
+		persisted.OwnerEpoch != 10 {
+		t.Fatalf("stale upsert overwrote newer lease: state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+
+	insertCurrent(3606)
+	err = store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3606,
+		PodName:           "duckgres-worker-3606",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        10,
+		LastHeartbeatAt:   now.Add(time.Minute),
+	})
+	if !errors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+		t.Fatalf("expected equal-epoch different-owner upsert fence miss, got %v", err)
+	}
+
+	persisted, err = store.GetWorkerRecord(3606)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord(equal epoch): %v", err)
+	}
+	if persisted.State != configstore.WorkerStateReserved ||
+		persisted.OwnerCPInstanceID != "cp-new:boot-b" ||
+		persisted.OwnerEpoch != 10 {
+		t.Fatalf("equal-epoch different-owner upsert overwrote lease: state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+}
+
+func TestRetireOrphanWorkerRejectsRevivedOwnerControlPlanePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 10, 0, 0, time.UTC)
+
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-revived:boot-a",
+		PodName:         "duckgres-old",
+		PodUID:          "pod-old",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-2 * time.Hour),
+		LastHeartbeatAt: now.Add(-time.Hour),
+		ExpiredAt:       ptrTime(now.Add(-time.Hour)),
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(expired): %v", err)
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3604,
+		PodName:           "duckgres-worker-3604",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-revived:boot-a",
+		OwnerEpoch:        3,
+		LastHeartbeatAt:   now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(orphan candidate): %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	if len(orphaned) != 1 || orphaned[0].WorkerID != 3604 {
+		t.Fatalf("expected worker 3604 orphan snapshot, got %#v", orphaned)
+	}
+
+	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
+		ID:              "cp-revived:boot-a",
+		PodName:         "duckgres-new",
+		PodUID:          "pod-new",
+		BootID:          "boot-a",
+		State:           configstore.ControlPlaneInstanceStateActive,
+		StartedAt:       now.Add(-2 * time.Hour),
+		LastHeartbeatAt: now,
+		ExpiredAt:       nil,
+	}); err != nil {
+		t.Fatalf("UpsertControlPlaneInstance(revived): %v", err)
+	}
+
+	retired, err := store.RetireOrphanWorker(&orphaned[0], "orphaned")
+	if err != nil {
+		t.Fatalf("RetireOrphanWorker(revived CP): %v", err)
+	}
+	if retired {
+		t.Fatal("expected revived owner CP to fence orphan retirement")
+	}
+
+	persisted, err := store.GetWorkerRecord(3604)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHot || persisted.OwnerCPInstanceID != "cp-revived:boot-a" || persisted.OwnerEpoch != 3 {
+		t.Fatalf("expected revived CP's worker to survive, got state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+}
+
+func TestRetireOrphanWorkerRejectsStaleListSnapshotAfterTakeoverPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 15, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3601,
+		PodName:           "duckgres-worker-3601",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        5,
+		LastHeartbeatAt:   now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(orphan candidate): %v", err)
+	}
+
+	orphaned, err := store.ListOrphanedWorkers(now.Add(-30 * time.Second))
+	if err != nil {
+		t.Fatalf("ListOrphanedWorkers: %v", err)
+	}
+	if len(orphaned) != 1 || orphaned[0].WorkerID != 3601 {
+		t.Fatalf("expected worker 3601 orphan snapshot, got %#v", orphaned)
+	}
+
+	taken, err := store.TakeOverWorker(3601, "cp-new:boot-b", "analytics", 5)
+	if err != nil {
+		t.Fatalf("TakeOverWorker: %v", err)
+	}
+	if taken == nil {
+		t.Fatal("expected takeover to succeed")
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3601,
+		PodName:           "duckgres-worker-3601",
+		State:             configstore.WorkerStateHot,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-new:boot-b",
+		OwnerEpoch:        taken.OwnerEpoch,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(new owner hot): %v", err)
+	}
+
+	retired, err := store.RetireOrphanWorker(&orphaned[0], "orphaned")
+	if err != nil {
+		t.Fatalf("RetireOrphanWorker(stale snapshot): %v", err)
+	}
+	if retired {
+		t.Fatal("expected stale orphan snapshot not to retire a newer lease")
+	}
+
+	persisted, err := store.GetWorkerRecord(3601)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHot ||
+		persisted.OwnerCPInstanceID != "cp-new:boot-b" ||
+		persisted.OwnerEpoch != 6 {
+		t.Fatalf("expected newer hot lease to survive, got state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+}
+
+func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 30, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3602,
+		PodName:           "duckgres-worker-3602",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
+	}
+
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	if len(expired) != 1 || expired[0].WorkerID != 3602 {
+		t.Fatalf("expected worker 3602 hot-idle snapshot, got %#v", expired)
+	}
+
+	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", 0)
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker: %v", err)
+	}
+	if claimed == nil {
+		t.Fatal("expected hot-idle reclaim to succeed")
+	}
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3602,
+		PodName:           "duckgres-worker-3602",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-new:boot-b",
+		OwnerEpoch:        claimed.OwnerEpoch,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(released hot-idle): %v", err)
+	}
+
+	retired, err := store.RetireHotIdleWorker(&expired[0])
+	if err != nil {
+		t.Fatalf("RetireHotIdleWorker(stale snapshot): %v", err)
+	}
+	if retired {
+		t.Fatal("expected stale hot-idle snapshot not to retire a reclaimed worker")
+	}
+
+	persisted, err := store.GetWorkerRecord(3602)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHotIdle ||
+		persisted.OwnerCPInstanceID != "cp-new:boot-b" ||
+		persisted.OwnerEpoch != 3 {
+		t.Fatalf("expected reclaimed hot-idle lease to survive, got state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+}
+
+func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterTouchPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 35, 0, 0, time.UTC)
+
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          3607,
+		PodName:           "duckgres-worker-3607",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		LastHeartbeatAt:   now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
+	}
+
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	if len(expired) != 1 || expired[0].WorkerID != 3607 {
+		t.Fatalf("expected worker 3607 hot-idle snapshot, got %#v", expired)
+	}
+
+	advancedUpdatedAt := expired[0].UpdatedAt.Add(time.Second)
+	if err := store.DB().Table(store.RuntimeSchema()+".worker_records").
+		Where("worker_id = ?", 3607).
+		Update("updated_at", advancedUpdatedAt).Error; err != nil {
+		t.Fatalf("advance worker updated_at: %v", err)
+	}
+
+	retired, err := store.RetireHotIdleWorker(&expired[0])
+	if err != nil {
+		t.Fatalf("RetireHotIdleWorker(stale updated_at): %v", err)
+	}
+	if retired {
+		t.Fatal("expected stale hot-idle snapshot not to retire after same-owner touch")
+	}
+
+	persisted, err := store.GetWorkerRecord(3607)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHotIdle ||
+		persisted.OwnerCPInstanceID != "cp-old:boot-a" ||
+		persisted.OwnerEpoch != 2 {
+		t.Fatalf("expected touched hot-idle lease to survive, got state=%q owner=%q epoch=%d", persisted.State, persisted.OwnerCPInstanceID, persisted.OwnerEpoch)
+	}
+}
+
+func TestRetireHotIdleWorkerNoOpOnNonHotIdleSnapshotPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 40, 0, 0, time.UTC)
+
+	upsertMarkLostWorker(t, store, 3604, configstore.WorkerStateHot, "cp-me:boot-a", 4, "", now)
+	observed, err := store.GetWorkerRecord(3604)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+
+	retired, err := store.RetireHotIdleWorker(observed)
+	if err != nil {
+		t.Fatalf("RetireHotIdleWorker(non-hot-idle): %v", err)
+	}
+	if retired {
+		t.Fatal("expected non-hot-idle snapshot not to retire through RetireHotIdleWorker")
+	}
+	assertWorkerStateAndReason(t, store, 3604, configstore.WorkerStateHot, "")
+}
+
+func TestMarkWorkerDrainingRejectsStaleSameCPLeasePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 45, 0, 0, time.UTC)
+
+	upsertMarkLostWorker(t, store, 3603, configstore.WorkerStateHot, "cp-me:boot-a", 4, "", now)
+	upsertMarkLostWorker(t, store, 3603, configstore.WorkerStateHot, "cp-me:boot-a", 5, "", now.Add(time.Minute))
+
+	draining, err := store.MarkWorkerDraining(3603, "cp-me:boot-a", 4)
+	if err != nil {
+		t.Fatalf("MarkWorkerDraining(stale epoch): %v", err)
+	}
+	if draining {
+		t.Fatal("expected stale same-CP epoch not to mark worker draining")
+	}
+
+	persisted, err := store.GetWorkerRecord(3603)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if persisted.State != configstore.WorkerStateHot || persisted.OwnerEpoch != 5 {
+		t.Fatalf("expected newer hot lease to survive, got state=%q epoch=%d", persisted.State, persisted.OwnerEpoch)
+	}
+}
+
+func TestRetireDrainingWorkerRejectsStaleSameCPLeasePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 13, 50, 0, 0, time.UTC)
+
+	upsertMarkLostWorker(t, store, 3605, configstore.WorkerStateDraining, "cp-me:boot-a", 5, "", now)
+
+	retired, err := store.RetireDrainingWorker(3605, "cp-me:boot-a", 4, "shutdown")
+	if err != nil {
+		t.Fatalf("RetireDrainingWorker(stale epoch): %v", err)
+	}
+	if retired {
+		t.Fatal("expected stale same-CP epoch not to retire draining worker")
+	}
+	assertWorkerStateAndReason(t, store, 3605, configstore.WorkerStateDraining, "")
+}
+
+func upsertMarkLostWorker(t *testing.T, store *configstore.ConfigStore, workerID int, state configstore.WorkerState, ownerCPInstanceID string, ownerEpoch int64, retireReason string, lastHeartbeatAt time.Time) {
+	t.Helper()
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          workerID,
+		PodName:           fmt.Sprintf("duckgres-worker-%d", workerID),
+		State:             state,
+		OrgID:             "acme",
+		OwnerCPInstanceID: ownerCPInstanceID,
+		OwnerEpoch:        ownerEpoch,
+		RetireReason:      retireReason,
+		LastHeartbeatAt:   lastHeartbeatAt,
+	}); err != nil {
+		t.Fatalf("UpsertWorkerRecord(%d): %v", workerID, err)
+	}
+}
+
+func assertWorkerStateAndReason(t *testing.T, store *configstore.ConfigStore, workerID int, wantState configstore.WorkerState, wantReason string) {
+	t.Helper()
+	record, err := store.GetWorkerRecord(workerID)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord(%d): %v", workerID, err)
+	}
+	if record == nil {
+		t.Fatalf("expected worker %d to exist", workerID)
+	}
+	if record.State != wantState || record.RetireReason != wantReason {
+		t.Fatalf("worker %d = state %q reason %q, want state %q reason %q", workerID, record.State, record.RetireReason, wantState, wantReason)
+	}
+}
+
 func TestTakeOverWorkerPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 17, 0, 0, 0, time.UTC)
@@ -2008,6 +2714,35 @@ func TestTakeOverWorkerPostgres(t *testing.T) {
 	}
 	if missed != nil {
 		t.Fatalf("expected stale takeover attempt to fail, got %#v", missed)
+	}
+}
+
+func TestTakeOverWorkerSkipsNonReclaimableStatesPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.May, 22, 12, 45, 0, 0, time.UTC)
+
+	cases := []struct {
+		name  string
+		state configstore.WorkerState
+	}{
+		{"draining", configstore.WorkerStateDraining},
+		{"retired", configstore.WorkerStateRetired},
+		{"lost", configstore.WorkerStateLost},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workerID := 3500 + i
+			upsertMarkLostWorker(t, store, workerID, tc.state, "cp-old:boot-a", 5, "original", now)
+
+			claimed, err := store.TakeOverWorker(workerID, "cp-new:boot-b", "analytics", 5)
+			if err != nil {
+				t.Fatalf("TakeOverWorker(%s): %v", tc.state, err)
+			}
+			if claimed != nil {
+				t.Fatalf("expected %s worker not to be claimed, got %#v", tc.state, claimed)
+			}
+			assertWorkerStateAndReason(t, store, workerID, tc.state, "original")
+		})
 	}
 }
 

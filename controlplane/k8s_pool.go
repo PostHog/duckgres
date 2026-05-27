@@ -96,6 +96,8 @@ type K8sWorkerPool struct {
 	healthCheckFunc               func(context.Context, *ManagedWorker) error
 	connectWorkerFunc             func(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error)
 	runtimeStore                  RuntimeWorkerStore
+	lifecycle                     *WorkerLifecycle // typed lifecycle transitions; lazily wired via ensureLifecycle().
+	lifecycleOnce                 sync.Once        // guards lazy initialization of lifecycle from concurrent first-callers.
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 
@@ -186,6 +188,21 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		retireSem:             make(chan struct{}, retireConcurrency),
 		nodeFirstSeen:         make(map[string]time.Time),
 	}
+	if cfg.RuntimeStore != nil {
+		// The lifecycle service is the typed seam for every post-CAS
+		// pod cleanup. Wire it to the pool's own DeleteWorkerArtifacts
+		// so callers schedule the standard K8s cleanup goroutine.
+		// RuntimeWorkerStore intentionally omits the worker-id-only
+		// CAS methods (MarkWorkerDraining/RetireDrainingWorker/
+		// BumpWorkerEpoch) — they're reachable only through the
+		// lifecycle. We extract them here via a type assertion against
+		// the concrete store. Tests that bypass this constructor and
+		// set runtimeStore directly trigger lazy initialization via
+		// ensureLifecycle().
+		if ls, ok := cfg.RuntimeStore.(workerLifecycleStore); ok {
+			pool.lifecycle = NewWorkerLifecycle(ls, pool)
+		}
+	}
 
 	// Resolve CP pod UID for owner references
 	if err := pool.resolveCPUID(context.Background()); err != nil {
@@ -255,12 +272,12 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			continue
 		}
 
-		var record *configstore.WorkerRecord
+		var snap *configstore.WorkerSnapshot
 		if p.runtimeStore != nil {
 			var err error
-			record, err = p.runtimeStore.GetWorkerRecord(workerID)
+			snap, err = p.runtimeStore.ObserveWorker(workerID)
 			if err != nil {
-				slog.Warn("Version-aware reaper failed to load worker record.", "worker_id", workerID, "error", err)
+				slog.Warn("Version-aware reaper failed to observe worker.", "worker_id", workerID, "error", err)
 			}
 		}
 
@@ -269,8 +286,8 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 		// For assigned workers, the target is the tenant's configured image.
 		var isMismatched bool
 		podOrgID := pod.Labels["duckgres/org"]
-		if podOrgID == "" && record != nil {
-			podOrgID = record.OrgID
+		if podOrgID == "" && snap != nil {
+			podOrgID = snap.OrgID()
 		}
 
 		if podOrgID != "" && p.resolveOrgConfig != nil {
@@ -286,8 +303,8 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			}
 
 			actualImage := workerImageForPod(&pod)
-			if actualImage == "" && record != nil {
-				actualImage = record.Image
+			if actualImage == "" && snap != nil {
+				actualImage = snap.Image()
 			}
 			if actualImage != "" && actualImage != targetImage {
 				isMismatched = true
@@ -305,14 +322,19 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			continue
 		}
 
-		retired, err := p.runtimeStore.RetireIdleOrHotIdleWorker(workerID, RetireReasonMismatchedVersion)
+		lifecycle := p.ensureLifecycle()
+		if snap == nil || lifecycle == nil {
+			continue
+		}
+		outcome, err := lifecycle.RetireIdleVariantFromSnapshot(*snap, RetireReasonMismatchedVersion, LifecycleOriginMismatchedVersionReaper)
 		if err != nil {
 			slog.Warn("Version-aware reaper failed to retire idle row.", "worker_id", workerID, "error", err)
 			continue
 		}
-		if !retired {
+		if !outcome.Transitioned {
 			// Not currently idle or hot-idle (busy, reserved, or already
-			// retired). Leave it for a later tick.
+			// retired). Leave it for a later tick. The lifecycle service
+			// also skips physical pod delete on a CAS miss.
 			continue
 		}
 		slog.Info("Retiring mismatched-version worker pod.",
@@ -320,6 +342,13 @@ func (p *K8sWorkerPool) RetireOneMismatchedVersionWorker(ctx context.Context) bo
 			"org", podOrgID,
 			"worker_pod", pod.Name,
 		)
+		// The lifecycle service already scheduled an async pod + secret
+		// delete via DeleteWorkerArtifacts. We additionally issue a
+		// synchronous Delete here so the reaper's one-per-call contract
+		// is observable to callers (and to tests) without waiting for
+		// the async cleanup goroutine. The second async Delete is
+		// idempotent — it returns NotFound on the already-gone pod and
+		// just logs at Warn, which is harmless.
 		gracePeriod := int64(10)
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
@@ -358,7 +387,11 @@ func workerImageForPod(pod *corev1.Pod) string {
 // upserting the DB row, so there's a brief window where a live pod has no DB
 // record. Without the age gate the reconciler would race the spawner.
 //
-// Returns the number of pods deleted this call.
+// Returns the number of pods deleted this call. Per-pod delete failures
+// are recorded against
+// duckgres_worker_stranded_pods_reconciled_total{outcome="delete_failed"}
+// and do not bubble up here — they don't disqualify the sweep, just one
+// candidate.
 func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge time.Duration) int {
 	if p.runtimeStore == nil || p.clientset == nil {
 		return 0
@@ -391,21 +424,97 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 			continue
 		}
 		dbState := "missing"
+		outcome := StrandedOutcomeDeletedMissingRow
 		if rec != nil {
 			if rec.State != configstore.WorkerStateRetired && rec.State != configstore.WorkerStateLost {
+				// Pod is still claimed by an active runtime row — not
+				// stranded. Record it under "kept" so dashboards can
+				// see reconciler saturation (large kept counts =
+				// reaper iterating many healthy pods per tick).
+				observeStrandedPodReconciled(StrandedOutcomeKept)
 				continue
 			}
 			dbState = string(rec.State)
+			outcome = StrandedOutcomeDeletedTerminalRow
 		}
 		gracePeriod := int64(10)
 		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
 		}); err != nil && !errors.IsNotFound(err) {
 			slog.Warn("Stranded-pod reconciler failed to delete pod.", "worker_pod", pod.Name, "worker_id", workerID, "error", err)
+			observeStrandedPodReconciled(StrandedOutcomeDeleteFailed)
 			continue
 		}
 		_ = p.deleteWorkerRPCSecret(ctx, pod.Name)
 		slog.Info("Stranded worker pod reconciled.", "worker_pod", pod.Name, "worker_id", workerID, "db_state", dbState)
+		observeStrandedPodReconciled(outcome)
+		deleted++
+	}
+	return deleted
+}
+
+// cleanupOrphanedWorkerSecrets deletes worker RPC secrets whose pod
+// no longer exists. Closes the recovery gap where a CP crashes
+// between secret creation and pod creation — the secret would
+// otherwise leak indefinitely because cleanupOrphanedWorkerPods
+// only iterates pods. Runs from the janitor leader on the same
+// tick as cleanupOrphanedWorkerPods.
+//
+// minAge protects newly-created secrets the spawner is still using
+// (the spawn flow creates the secret first, then the pod).
+//
+// Returns the number of secrets deleted this call.
+func (p *K8sWorkerPool) cleanupOrphanedWorkerSecrets(ctx context.Context, minAge time.Duration) int {
+	if p.clientset == nil {
+		return 0
+	}
+	// Worker RPC secrets are labeled at creation (worker_rpc_security.go
+	// ensureWorkerRPCSecret) with app=duckgres +
+	// duckgres/control-plane=<p.cpID> + duckgres/worker-pod=<podName>.
+	// The selector narrows by control-plane so each CP only reaps
+	// its own secrets — critical during rolling restarts and blue/green
+	// deployments where multiple CP replicas share the namespace and
+	// a peer's freshly-created secret (whose pod hasn't been spawned
+	// yet) must not be reaped. p.cpID is used unsanitized to match
+	// the value the creation path stamps.
+	secrets, err := p.clientset.CoreV1().Secrets(p.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=duckgres,duckgres/control-plane=%s,duckgres/worker-pod", p.cpID),
+	})
+	if err != nil {
+		slog.Warn("Stranded-secret reconciler failed to list worker RPC secrets.", "error", err)
+		return 0
+	}
+	cutoff := time.Now().Add(-minAge)
+	deleted := 0
+	for i := range secrets.Items {
+		secret := &secrets.Items[i]
+		if secret.CreationTimestamp.Time.After(cutoff) {
+			continue
+		}
+		podName := secret.Labels["duckgres/worker-pod"]
+		if podName == "" {
+			continue
+		}
+		if _, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{}); err == nil {
+			// Pod exists — leave the secret alone, the regular
+			// cleanupOrphanedWorkerPods path will reap both
+			// together when the pod's DB row is terminal. Recorded
+			// as "kept" for symmetry with the pods sweep, so
+			// dashboards comparing the two reapers' kept counts
+			// see parallel behavior.
+			observeStrandedSecretReconciled(StrandedOutcomeKept)
+			continue
+		} else if !errors.IsNotFound(err) {
+			slog.Warn("Stranded-secret reconciler failed to load worker pod.", "worker_pod", podName, "error", err)
+			continue
+		}
+		if err := p.clientset.CoreV1().Secrets(p.namespace).Delete(ctx, secret.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+			slog.Warn("Stranded-secret reconciler failed to delete secret.", "secret", secret.Name, "worker_pod", podName, "error", err)
+			observeStrandedSecretReconciled(StrandedOutcomeDeleteFailed)
+			continue
+		}
+		slog.Info("Stranded worker RPC secret reconciled.", "secret", secret.Name, "worker_pod", podName)
+		observeStrandedSecretReconciled(StrandedOutcomeDeleted)
 		deleted++
 	}
 	return deleted
@@ -480,7 +589,7 @@ func (p *K8sWorkerPool) startInformer() {
 				}
 			}
 			if ch, loaded := p.podReady.LoadAndDelete(pod.Name); loaded {
-				close(ch.(chan string))
+				close(ch.(chan podReadyInfo))
 			}
 			p.onPodTerminated(pod)
 		},
@@ -540,10 +649,12 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	case p.spawnSem <- struct{}{}:
 		defer func() { <-p.spawnSem }()
 	case <-ctx.Done():
+		observeSpawnFailure(SpawnFailureReasonContextCanceled, image)
 		return ctx.Err()
 	}
 
 	if err := p.validateSharedStartupConfigMap(ctx); err != nil {
+		observeSpawnFailure(SpawnFailureReasonConfigMap, image)
 		return err
 	}
 
@@ -551,6 +662,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	_ = p.deleteWorkerRPCSecret(ctx, podName)
 	secretName, err := p.ensureWorkerRPCSecret(ctx, podName)
 	if err != nil {
+		observeSpawnFailure(SpawnFailureReasonSecretCreate, image)
 		return fmt.Errorf("ensure worker RPC secret: %w", err)
 	}
 
@@ -766,12 +878,13 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	})
 
 	if publishIdle {
-		p.persistWorkerRecord(p.workerRecordFor(id, nil, 0, configstore.WorkerStateSpawning, "", nil))
+		_ = p.persistWorkerRecord(p.workerRecordFor(id, nil, 0, configstore.WorkerStateSpawning, "", nil))
 	}
 
 	// Create pod with exponential backoff on transient errors.
 	if err := p.createPodWithBackoff(ctx, pod); err != nil {
 		_ = p.deleteWorkerRPCSecret(ctx, podName)
+		observeSpawnFailure(SpawnFailureReasonPodCreate, image)
 		return err
 	}
 
@@ -782,6 +895,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			GracePeriodSeconds: int64Ptr(0),
 		})
 		_ = p.deleteWorkerRPCSecret(ctx, podName)
+		observeSpawnFailure(SpawnFailureReasonPodReady, image)
 		return fmt.Errorf("worker pod %s failed to start: %w", podName, err)
 	}
 
@@ -789,6 +903,13 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	addr := fmt.Sprintf("%s:%d", ready.ip, p.workerPort)
 	token, serverCertPEM, err := p.readWorkerRPCSecurity(ctx, podName)
 	if err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{
+			GracePeriodSeconds: int64Ptr(0),
+		})
+		_ = p.deleteWorkerRPCSecret(cleanupCtx, podName)
+		observeSpawnFailure(SpawnFailureReasonSecretRead, image)
 		return fmt.Errorf("read worker RPC security: %w", err)
 	}
 	client, err := waitForWorkerTCP(addr, token, serverCertPEM, 90*time.Second)
@@ -797,6 +918,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 			GracePeriodSeconds: int64Ptr(0),
 		})
 		_ = p.deleteWorkerRPCSecret(ctx, podName)
+		observeSpawnFailure(SpawnFailureReasonGRPCConnect, image)
 		return fmt.Errorf("worker %d gRPC connection failed: %w", id, err)
 	}
 
@@ -815,10 +937,9 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	p.workers[id] = w
 	p.stampNodeFirstSeenLocked(ready.nodeName)
 	workerCount := len(p.workers)
-	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
 	if publishIdle {
-		p.persistWorkerRecord(p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil))
+		_ = p.persistWorkerRecord(p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateIdle, "", nil))
 	}
 	observeControlPlaneWorkers(workerCount)
 
@@ -1128,19 +1249,25 @@ func (p *K8sWorkerPool) ReleaseWorker(id int) {
 
 // RetireWorker removes a worker from the pool and deletes its pod.
 func (p *K8sWorkerPool) RetireWorker(id int) {
-	p.retireWorkerWithReason(id, RetireReasonNormal)
+	p.retireWorkerWithReason(id, RetireReasonNormal, LifecycleOriginPublicAPI)
 }
 
 // retireWorkerWithReason retires a worker and deletes its pod.
-// Returns true if the worker was found and retired.
-func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) bool {
+// Returns true if the worker was found and retired. origin labels the
+// originating subsystem on the retire_local metric; it is required and
+// has no default fallback so every call site is forced to declare its
+// context.
+func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string, origin LifecycleOrigin) bool {
 	p.mu.Lock()
 	w, ok := p.workers[id]
 	if !ok {
 		p.mu.Unlock()
 		return false
 	}
-	p.markWorkerRetiredLocked(w, reason)
+	if !p.markWorkerRetiredLocked(w, reason, origin) {
+		p.mu.Unlock()
+		return false
+	}
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	p.mu.Unlock()
@@ -1152,10 +1279,10 @@ func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string) bool {
 
 // RetireWorkerIfNoSessions retires a worker only if it has no active sessions.
 func (p *K8sWorkerPool) RetireWorkerIfNoSessions(id int) bool {
-	return p.retireWorkerIfNoSessionsWithReason(id, RetireReasonNormal)
+	return p.retireWorkerIfNoSessionsWithReason(id, RetireReasonNormal, LifecycleOriginPublicAPI)
 }
 
-func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string) bool {
+func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string, origin LifecycleOrigin) bool {
 	p.mu.Lock()
 	w, ok := p.workers[id]
 	if !ok {
@@ -1166,7 +1293,10 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 		w.activeSessions--
 	}
 	if w.activeSessions == 0 {
-		p.markWorkerRetiredLocked(w, reason)
+		if !p.markWorkerRetiredLocked(w, reason, origin) {
+			p.mu.Unlock()
+			return false
+		}
 		delete(p.workers, id)
 		workerCount := len(p.workers)
 		p.mu.Unlock()
@@ -1181,7 +1311,22 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 // RetireIfDrainingAndEmpty retires a worker that is draining and has no active
 // sessions. Does NOT decrement activeSessions (caller must have already done so).
 // Used by ReleaseWorker when TransitionToHotIdleIfNoSessions skips a non-hot worker.
-func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int) {
+//
+// The transition is draining → retired, which has to go through the
+// lifecycle service's dedicated RetireDrainingWorker CAS — NOT the
+// generic UpsertWorkerRecord path that markWorkerRetiredLocked uses,
+// because UpsertWorkerRecord's ON CONFLICT WHERE clause rejects
+// updates against existing rows in {draining, retired, lost}. Routing
+// this transition through UpsertWorkerRecord would always fence-miss
+// and (post-P1-gate) leave the drained empty worker stuck in both the
+// in-memory map and on K8s.
+//
+// On CAS miss / DB error the durable row stays in draining for the
+// orphan sweep on a peer leader to reconcile; we don't touch the
+// in-memory worker or the K8s pod because we haven't proven we still
+// own the lease — the same peer-pod-delete safety that motivated the
+// markWorkerRetiredLocked gate.
+func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int, origin LifecycleOrigin) {
 	p.mu.Lock()
 	w, ok := p.workers[id]
 	if !ok || w.activeSessions > 0 {
@@ -1192,7 +1337,33 @@ func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int) {
 		p.mu.Unlock()
 		return
 	}
-	p.markWorkerRetiredLocked(w, RetireReasonNormal)
+	lifecycle := p.ensureLifecycle()
+	if lifecycle == nil {
+		// No durable store wired (process backend / minimal test pool):
+		// fall back to the in-memory + upsert path. persistWorkerRecord
+		// is a no-op when runtimeStore is nil, so there's no fence-miss
+		// to worry about.
+		if !p.markWorkerRetiredLocked(w, RetireReasonNormal, origin) {
+			p.mu.Unlock()
+			return
+		}
+	} else {
+		lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+		outcome, err := lifecycle.RetireDrained(lease, RetireReasonNormal, origin)
+		if err != nil {
+			slog.Warn("RetireIfDrainingAndEmpty: CAS to retired failed; orphan sweep will reconcile.",
+				"worker_id", id, "error", err)
+			p.mu.Unlock()
+			return
+		}
+		if !outcome.Transitioned {
+			slog.Debug("RetireIfDrainingAndEmpty: retire-drained CAS missed; orphan sweep will reconcile.",
+				"worker_id", id)
+			p.mu.Unlock()
+			return
+		}
+		p.markWorkerRetiredInMemoryLocked(w)
+	}
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	p.mu.Unlock()
@@ -1234,9 +1405,8 @@ func (p *K8sWorkerPool) TransitionToHotIdleIfNoSessions(id int) bool {
 	}
 	w.lastUsed = time.Now()
 	hotIdleRecord := p.workerRecordFor(id, w, w.OwnerEpoch(), configstore.WorkerStateHotIdle, "", nil)
-	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
-	p.persistWorkerRecord(hotIdleRecord)
+	_ = p.persistWorkerRecord(hotIdleRecord)
 	return true
 }
 
@@ -1280,7 +1450,7 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 	if err != nil {
 		return err
 	}
-	p.persistWorkerRecord(activatingRecord)
+	_ = p.persistWorkerRecord(activatingRecord)
 
 	activate := p.activateTenantFunc
 	if activate == nil {
@@ -1304,7 +1474,7 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 			_ = worker.SetSharedState(prevState)
 			p.mu.Unlock()
 		}
-		p.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure)
+		p.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure, LifecycleOriginActivationFailure)
 		return err
 	}
 
@@ -1327,9 +1497,8 @@ func (p *K8sWorkerPool) ActivateReservedWorker(ctx context.Context, worker *Mana
 		return setErr
 	}
 	hotRecord := p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateHot, "", nil)
-	observeWarmPoolLifecycleGauges(p.workers)
 	p.mu.Unlock()
-	p.persistWorkerRecord(hotRecord)
+	_ = p.persistWorkerRecord(hotRecord)
 	return nil
 }
 
@@ -1350,15 +1519,19 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			// Try reclaiming a hot-idle worker for the same org first (fast path:
 			// DuckLake is already attached, only needs epoch bump).
 			if assignment.OrgID != "" {
-				hotClaimed, _, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID)
+				hotClaimed, hotMissReason, err := p.runtimeStore.ClaimHotIdleWorker(p.cpInstanceID, assignment.OrgID, assignment.MaxWorkers)
 				if err != nil {
 					return nil, err
+				}
+				if hotClaimed == nil && hotMissReason != configstore.WorkerClaimMissReasonNone && hotMissReason != configstore.WorkerClaimMissReasonNoIdle {
+					p.recordWarmCapacityMiss(assignment, hotMissReason)
+					return nil, NewWarmCapacityExhaustedErrorForReason(hotMissReason, DefaultWarmCapacityRetryAfter)
 				}
 				if hotClaimed != nil {
 					// Check if image matches (hot-idle reclamation is strict on version)
 					if assignment.Image != "" && hotClaimed.Image != assignment.Image {
 						slog.Info("Hot-idle worker image mismatch, retiring mismatched worker.", "worker_id", hotClaimed.WorkerID, "expected", assignment.Image, "got", hotClaimed.Image)
-						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion)
+						p.retireClaimedWorker(hotClaimed, RetireReasonMismatchedVersion, LifecycleOriginReserveImageMismatch)
 						// Fall through to neutral idle claim or capacity backpressure.
 					} else {
 						worker, reserveErr := p.reserveClaimedWorker(ctx, hotClaimed, assignment)
@@ -1371,7 +1544,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 							continue
 						}
 						slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker_id", hotClaimed.WorkerID, "error", reserveErr)
-						p.retireClaimedWorker(hotClaimed, RetireReasonCrash)
+						p.retireClaimedWorker(hotClaimed, RetireReasonCrash, LifecycleOriginReserveFailure)
 						// Fall through to neutral idle claim.
 					}
 				}
@@ -1396,7 +1569,7 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 					continue
 				}
 				slog.Warn("Claimed idle worker could not be reserved, retiring claimed pod.", "worker_id", claimed.WorkerID, "worker_pod", claimed.PodName, "error", reserveErr)
-				p.retireClaimedWorker(claimed, RetireReasonCrash)
+				p.retireClaimedWorker(claimed, RetireReasonCrash, LifecycleOriginReserveFailure)
 				continue
 			}
 
@@ -1436,7 +1609,6 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 			idle.IncrementOwnerEpoch()
 			idle.reservedAt = time.Now()
 			reservedRecord := p.workerRecordFor(idle.ID, idle, idle.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
-			observeWarmPoolLifecycleGauges(p.workers)
 			shouldReplenish := p.shouldReplenishWarmCapacityLocked()
 			var replenishID int
 			if shouldReplenish {
@@ -1444,11 +1616,11 @@ func (p *K8sWorkerPool) ReserveSharedWorker(ctx context.Context, assignment *Wor
 				p.spawning++
 			}
 			p.mu.Unlock()
-			p.persistWorkerRecord(reservedRecord)
+			_ = p.persistWorkerRecord(reservedRecord)
 
 			if err := p.checkReservedWorkerLiveness(ctx, idle); err != nil {
 				slog.Warn("Reserved warm worker failed liveness recheck.", "worker", idle.ID, "error", err)
-				p.retireWorkerWithReason(idle.ID, RetireReasonCrash)
+				p.retireWorkerWithReason(idle.ID, RetireReasonCrash, LifecycleOriginReserveFailure)
 				p.mu.Lock()
 				if shouldReplenish {
 					p.spawning--
@@ -1484,16 +1656,16 @@ func (p *K8sWorkerPool) recordWarmCapacityMiss(assignment *WorkerAssignment, rea
 		return
 	}
 
-	scope := "image:" + image
-	observeWarmCapacityMiss(scope, policy.reason)
+	observeWarmCapacityMiss(image, policy.reason)
 	if !policy.recordDynamicDemand {
 		return
 	}
 	if p.runtimeStore == nil {
 		return
 	}
+	scope := warmCapacityScopeForImage(image)
 	if err := p.runtimeStore.RecordWarmCapacityMiss(scope, policy.reason, time.Now()); err != nil {
-		slog.Warn("Failed to record warm capacity miss.", "scope", scope, "reason", policy.reason, "error", err)
+		slog.Warn("Failed to record warm capacity miss.", "image", image, "reason", policy.reason, "error", err)
 	}
 }
 
@@ -1556,17 +1728,16 @@ func (p *K8sWorkerPool) reserveClaimedWorker(ctx context.Context, claimed *confi
 		return nil, err
 	}
 	worker.reservedAt = time.Now()
-	observeWarmPoolLifecycleGauges(p.workers)
 	if claimed.State != configstore.WorkerStateReserved {
 		reservedRecord = p.workerRecordFor(worker.ID, worker, worker.OwnerEpoch(), configstore.WorkerStateReserved, "", nil)
 	}
 	p.mu.Unlock()
 	if reservedRecord != nil {
-		p.persistWorkerRecord(reservedRecord)
+		_ = p.persistWorkerRecord(reservedRecord)
 	}
 	if err := p.checkReservedWorkerLiveness(ctx, worker); err != nil {
 		slog.Warn("Claimed worker failed liveness recheck.", "worker", worker.ID, "worker_pod", worker.PodName(), "error", err)
-		p.retireWorkerWithReason(worker.ID, RetireReasonCrash)
+		p.retireWorkerWithReason(worker.ID, RetireReasonCrash, LifecycleOriginReserveFailure)
 		return nil, err
 	}
 	return worker, nil
@@ -1719,48 +1890,133 @@ func (p *K8sWorkerPool) connectWorkerWithHealthCheck(ctx context.Context, podNam
 	return client, nil
 }
 
-func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string) {
+func (p *K8sWorkerPool) retireCurrentRuntimeWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
+	if claimed == nil {
+		return
+	}
+	current := claimed
 	if p.runtimeStore != nil {
-		// Mark retired in DB immediately so the next capacity check doesn't
-		// count this slot.
-		_, _ = p.runtimeStore.RetireIdleOrHotIdleWorker(claimed.WorkerID, reason)
+		// Refresh the row so the snapshot we hand to retireClaimedWorker
+		// (and through it, lifecycle.RetireFromSnapshot) carries the
+		// latest updated_at — without this, an inter-spawn touch could
+		// CAS-miss even though we still own the row at the right epoch.
+		// We could rely solely on the CAS to fence (and it does), but
+		// the extra read is cheap and lets us short-circuit before
+		// scheduling pod cleanup against a moved row.
+		refreshed, err := p.runtimeStore.ObserveWorker(claimed.WorkerID)
+		switch {
+		case err != nil:
+			slog.Warn("Failed to refresh worker runtime row before retirement.",
+				"worker_id", claimed.WorkerID, "reason", reason, "origin", origin, "error", err)
+		case refreshed == nil:
+			slog.Debug("Worker runtime row missing before retirement; skipping cleanup.",
+				"worker_id", claimed.WorkerID, "reason", reason, "origin", origin)
+			return
+		default:
+			if refreshed.OwnerCPInstanceID() != claimed.OwnerCPInstanceID || refreshed.OwnerEpoch() != claimed.OwnerEpoch {
+				slog.Debug("Worker ownership changed before retirement; skipping cleanup.",
+					"worker_id", claimed.WorkerID, "reason", reason, "origin", origin)
+				return
+			}
+			rec := refreshed.Record()
+			current = &rec
+		}
 	}
-
-	worker := &ManagedWorker{
-		ID:      claimed.WorkerID,
-		podName: claimed.PodName,
-		done:    make(chan struct{}),
-	}
-	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
-	worker.SetOwnerEpoch(claimed.OwnerEpoch)
-	p.mu.Lock()
-	p.markWorkerRetiredLocked(worker, reason)
-	p.mu.Unlock()
-	go p.retireWorkerPod(worker.ID, worker)
+	p.retireClaimedWorker(current, reason, origin)
 }
 
-// retireOrphanWorker retires a worker the orphan janitor has identified
-// (its owning CP is expired, missing, or never existed). Unlike
-// retireClaimedWorker, this path skips the in-memory pool bookkeeping
-// (the worker isn't owned by this CP) and uses the broader
-// RetireOrphanWorker DB transition that handles every active state, not
-// just idle/hot_idle. The K8s pod delete is fire-and-forget and harmless
-// if the pod is already gone.
-func (p *K8sWorkerPool) retireOrphanWorker(record *configstore.WorkerRecord, reason string) {
-	if p.runtimeStore == nil || record == nil {
+func (p *K8sWorkerPool) retireClaimedWorker(claimed *configstore.WorkerRecord, reason string, origin LifecycleOrigin) {
+	if claimed == nil {
 		return
 	}
-	if _, err := p.runtimeStore.RetireOrphanWorker(record.WorkerID, reason); err != nil {
-		slog.Warn("Failed to retire orphan worker.",
-			"worker_id", record.WorkerID, "reason", reason, "error", err)
+	lifecycle := p.ensureLifecycle()
+	if lifecycle == nil {
 		return
 	}
+	terminalState := configstore.WorkerStateRetired
+	if reason == RetireReasonCrash {
+		terminalState = configstore.WorkerStateLost
+	}
+	// The claimed record is fresh enough to act as a snapshot — it came
+	// back from a Claim*/TakeOver*/Create*Slot call and any concurrent
+	// change will simply CAS-miss inside MarkWorkerTerminalIfCurrent.
+	// Pod cleanup is scheduled by the lifecycle on a successful CAS via
+	// the WorkerPhysicalCleanup (this pool's DeleteWorkerArtifacts).
+	snap := configstore.NewWorkerSnapshot(*claimed)
+	if _, err := lifecycle.RetireFromSnapshot(snap, terminalState, reason, origin); err != nil {
+		slog.Warn("Failed to retire claimed worker.",
+			"worker_id", claimed.WorkerID, "reason", reason, "origin", origin, "error", err)
+	}
+}
+
+// DeleteWorkerArtifacts implements WorkerPhysicalCleanup. Schedules pod
+// + RPC secret + local-pool cleanup for the named worker, called by
+// WorkerLifecycle after a durable CAS to terminal has landed.
+func (p *K8sWorkerPool) DeleteWorkerArtifacts(workerID int, podName, reason string) {
+	p.deleteRetiredRuntimeWorker(&configstore.WorkerRecord{WorkerID: workerID, PodName: podName}, reason)
+}
+
+// ensureLifecycle returns the pool's lifecycle service, lazily wiring
+// it on first use when a runtimeStore is set but lifecycle is nil.
+// Production paths go through newK8sWorkerPool which initializes
+// lifecycle eagerly; this lazy path exists for tests that construct
+// the pool struct directly and set runtimeStore after the fact.
+// Returns nil when no runtime store is available, or when the store
+// doesn't satisfy workerLifecycleStore (process backend / minimal
+// mocks that intentionally don't implement the CAS methods).
+//
+// Guarded by sync.Once so concurrent first-callers (e.g. idleReaper
+// and janitor goroutines) don't race on the field assignment. The Once
+// is per-pool, so test pools that build a fresh pool per test still
+// get fresh lifecycle initialization.
+func (p *K8sWorkerPool) ensureLifecycle() *WorkerLifecycle {
+	p.lifecycleOnce.Do(func() {
+		if p.lifecycle != nil {
+			return
+		}
+		if p.runtimeStore == nil {
+			return
+		}
+		if ls, ok := p.runtimeStore.(workerLifecycleStore); ok {
+			p.lifecycle = NewWorkerLifecycle(ls, p)
+		}
+	})
+	return p.lifecycle
+}
+
+// deleteRetiredRuntimeWorker performs the post-CAS cleanup for a worker whose
+// runtime-store row is already terminal. It intentionally avoids another DB
+// transition so janitor paths can retire once, then reliably remove local state
+// and delete the pod.
+func (p *K8sWorkerPool) deleteRetiredRuntimeWorker(record *configstore.WorkerRecord, reason string) {
+	if record == nil {
+		return
+	}
+
 	worker := &ManagedWorker{
 		ID:      record.WorkerID,
 		podName: record.PodName,
 		done:    make(chan struct{}),
 	}
-	go p.retireWorkerPod(worker.ID, worker)
+	worker.SetOwnerCPInstanceID(record.OwnerCPInstanceID)
+	worker.SetOwnerEpoch(record.OwnerEpoch)
+
+	removedLocal := false
+	workerCount := 0
+	p.mu.Lock()
+	if local, ok := p.workers[record.WorkerID]; ok {
+		worker = local
+		p.markWorkerRetiredInMemoryLocked(worker)
+		delete(p.workers, record.WorkerID)
+		workerCount = len(p.workers)
+		removedLocal = true
+	}
+	p.mu.Unlock()
+	if removedLocal {
+		observeControlPlaneWorkers(workerCount)
+	}
+
+	go p.retireWorkerPod(record.WorkerID, worker)
 }
 
 func (p *K8sWorkerPool) checkReservedWorkerLiveness(ctx context.Context, worker *ManagedWorker) error {
@@ -1806,7 +2062,7 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 				// Retire already-claimed slots so they don't strand
 				// as durable spawning rows with no pod behind them.
 				for _, s := range slots {
-					p.retireClaimedWorker(s, RetireReasonCrash)
+					p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
 				}
 				return err
 			}
@@ -1835,13 +2091,10 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 				p.mu.Lock()
 				p.spawning--
-				if err == nil {
-					observeWarmPoolLifecycleGauges(p.workers)
-				}
 				p.mu.Unlock()
 
 				if err != nil {
-					p.retireClaimedWorker(slot, RetireReasonCrash)
+					p.retireCurrentRuntimeWorker(slot, RetireReasonCrash, LifecycleOriginSpawnFailure)
 					errs[i] = err
 				}
 			}(i, slot)
@@ -1882,9 +2135,6 @@ func (p *K8sWorkerPool) SpawnMinWorkers(count int) error {
 
 			p.mu.Lock()
 			p.spawning--
-			if err == nil {
-				observeWarmPoolLifecycleGauges(p.workers)
-			}
 			p.mu.Unlock()
 
 			errs[i] = err
@@ -1969,9 +2219,8 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 			p.maxWorkers,
 		)
 		if err != nil {
-			observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "error", len(slots))
 			for _, s := range slots {
-				p.retireClaimedWorker(s, RetireReasonCrash)
+				p.retireCurrentRuntimeWorker(s, RetireReasonCrash, LifecycleOriginSpawnFailure)
 			}
 			return err
 		}
@@ -1999,31 +2248,16 @@ func (p *K8sWorkerPool) SpawnMinWorkersForImage(ctx context.Context, image strin
 
 			p.mu.Lock()
 			p.spawning--
-			if err == nil {
-				observeWarmPoolLifecycleGauges(p.workers)
-			}
 			p.mu.Unlock()
 
 			if err != nil {
-				p.retireClaimedWorker(slot, RetireReasonCrash)
+				p.retireCurrentRuntimeWorker(slot, RetireReasonCrash, LifecycleOriginSpawnFailure)
 				errs[i] = err
 			}
 		}(i, slot)
 	}
 	wg.Wait()
-	err := stderrors.Join(errs...)
-	successes := 0
-	failures := 0
-	for _, spawnErr := range errs {
-		if spawnErr != nil {
-			failures++
-		} else {
-			successes++
-		}
-	}
-	observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "success", successes)
-	observeWarmCapacityReconcileSpawns(warmCapacityImageScope(image), "error", failures)
-	return err
+	return stderrors.Join(errs...)
 }
 
 // HealthCheckLoop periodically checks worker health.
@@ -2032,7 +2266,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 	defer ticker.Stop()
 
 	var mu sync.Mutex
-	failures := make(map[int]int)
+	failures := make(map[workerLeaseSnapshot]int)
 
 	for {
 		select {
@@ -2044,43 +2278,76 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 				p.mu.RUnlock()
 				return
 			}
-			workers := make([]*ManagedWorker, 0, len(p.workers))
+			type healthCheckTarget struct {
+				worker *ManagedWorker
+				lease  workerLeaseSnapshot
+			}
+			targets := make([]healthCheckTarget, 0, len(p.workers))
 			for _, w := range p.workers {
-				workers = append(workers, w)
+				targets = append(targets, healthCheckTarget{
+					worker: w,
+					lease:  p.workerLeaseSnapshot(w),
+				})
 			}
 			p.mu.RUnlock()
 
 			var wg sync.WaitGroup
-			for _, w := range workers {
+			for _, target := range targets {
 				wg.Add(1)
-				go func(w *ManagedWorker) {
+				go func(w *ManagedWorker, lease workerLeaseSnapshot) {
 					defer wg.Done()
 
 					select {
 					case <-ctx.Done():
 						return
 					case <-w.done:
-						// Pod terminated (detected by informer)
+						// Pod terminated (detected by informer) — distinct
+						// from the periodic-probe path below, which uses
+						// LifecycleOriginHealthCheckCrash.
 						mu.Lock()
-						delete(failures, w.ID)
+						delete(failures, lease)
 						mu.Unlock()
 
+						lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
+						if err != nil {
+							slog.Error("K8s worker terminated but lease validation failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+							return
+						}
+						if lostDisposition == workerLostLeaseRetry {
+							slog.Warn("K8s worker terminated while runtime lease is newer for this CP; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch)
+							return
+						}
+						if lostDisposition == workerLostLeaseStale {
+							p.mu.Lock()
+							removedWorker, workerCount := p.dropLocalWorkerIfSameLeaseLocked(lease)
+							p.mu.Unlock()
+							if removedWorker == nil {
+								return
+							}
+							observeControlPlaneWorkers(workerCount)
+							slog.Warn("K8s worker terminated under stale lease; dropping local worker without pod delete.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch)
+							if removedWorker.client != nil {
+								_ = removedWorker.client.Close()
+							}
+							return
+						}
+
 						p.mu.Lock()
-						removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerLocked(w.ID)
+						removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerAfterLostLeaseLocked(lease)
 						p.mu.Unlock()
 						if removedWorker == nil {
 							return
 						}
 						observeControlPlaneWorkers(workerCount)
-						slog.Warn("K8s worker crashed.", "id", w.ID)
+						slog.Warn("K8s worker crashed.", "id", lease.workerID)
 						if onCrash != nil {
-							onCrash(w.ID)
+							onCrash(lease.workerID)
 						}
-						if w.client != nil {
-							_ = w.client.Close()
+						if removedWorker.client != nil {
+							_ = removedWorker.client.Close()
 						}
 						// Delete the failed pod from K8s
-						podName := p.podNameForWorker(w.ID)
+						podName := p.workerPodName(removedWorker)
 						delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
 						_ = p.clientset.CoreV1().Pods(p.namespace).Delete(delCtx, podName, metav1.DeleteOptions{
 							GracePeriodSeconds: int64Ptr(0),
@@ -2096,42 +2363,88 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						func() {
 							defer recoverWorkerPanic(&healthErr)
 							hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForWorker(w))
+							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForLease(lease))
 							cancel()
 						}()
+						// Skip both metric emission AND failure-counter
+						// increment when the parent loop ctx was canceled
+						// (CP shutting down). Without this guard:
+						// (a) every graceful rollout would spike
+						//     duckgres_worker_health_checks_total{result=fail}
+						//     indistinguishably from real worker crashes;
+						// (b) a worker one failure short of
+						//     maxConsecutiveHealthFailures could be tipped
+						//     over by a shutdown-induced Canceled and
+						//     erroneously marked Lost.
+						// Per-probe deadline (DeadlineExceeded) is a real
+						// failure and still counted via the else branch.
+						if stderrors.Is(healthErr, context.Canceled) {
+							return
+						}
+						if healthErr != nil {
+							observeHealthCheck(HealthCheckResultFail, lease.image)
+						} else {
+							observeHealthCheck(HealthCheckResultPass, lease.image)
+						}
 
 						if healthErr != nil {
 							mu.Lock()
-							failures[w.ID]++
-							count := failures[w.ID]
+							failures[lease]++
+							count := failures[lease]
 							mu.Unlock()
 
-							slog.Warn("K8s worker health check failed.", "id", w.ID, "error", healthErr, "consecutive_failures", count)
+							slog.Warn("K8s worker health check failed.", "id", lease.workerID, "error", healthErr, "consecutive_failures", count)
 
 							if count >= maxConsecutiveHealthFailures {
+								lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginHealthCheckCrash)
+								if err != nil {
+									slog.Error("K8s worker unresponsive but lease validation failed; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count, "error", err)
+									return
+								}
+
+								if lostDisposition == workerLostLeaseRetry {
+									slog.Warn("K8s worker unresponsive while runtime lease is newer for this CP; leaving cleanup to retry.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
+									return
+								}
+
 								mu.Lock()
-								delete(failures, w.ID)
+								delete(failures, lease)
 								mu.Unlock()
 
+								if lostDisposition == workerLostLeaseStale {
+									p.mu.Lock()
+									removedWorker, workerCount := p.dropLocalWorkerIfSameLeaseLocked(lease)
+									p.mu.Unlock()
+									if removedWorker == nil {
+										return
+									}
+									observeControlPlaneWorkers(workerCount)
+									slog.Warn("K8s worker unresponsive under stale lease; dropping local worker without crash notification or pod delete.", "id", lease.workerID, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
+									if removedWorker.client != nil {
+										_ = removedWorker.client.Close()
+									}
+									return
+								}
+
 								p.mu.Lock()
-								removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerLocked(w.ID)
+								removedWorker, workerCount, replacementID, shouldReplenish := p.removeWorkerAfterLostLeaseLocked(lease)
 								p.mu.Unlock()
 								if removedWorker == nil {
 									return
 								}
 								observeControlPlaneWorkers(workerCount)
 
-								slog.Error("K8s worker unresponsive, deleting pod.", "id", w.ID, "consecutive_failures", count)
+								slog.Error("K8s worker unresponsive, deleting pod.", "id", lease.workerID, "consecutive_failures", count)
 								if onCrash != nil {
-									onCrash(w.ID)
+									onCrash(lease.workerID)
 								}
 								// Delete the pod to force cleanup
-								podName := p.podNameForWorker(w.ID)
+								podName := p.workerPodName(removedWorker)
 								_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 									GracePeriodSeconds: int64Ptr(10),
 								})
-								if w.client != nil {
-									_ = w.client.Close()
+								if removedWorker.client != nil {
+									_ = removedWorker.client.Close()
 								}
 								if shouldReplenish {
 									p.spawnWarmWorkerBackground(replacementID, p.workerImage)
@@ -2139,18 +2452,18 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							}
 						} else {
 							mu.Lock()
-							delete(failures, w.ID)
+							delete(failures, lease)
 							mu.Unlock()
 
 							// Forward progress data to the control plane.
 							if onProgress != nil && hcResult != nil {
 								if sp := hcResult.toSessionProgress(); len(sp) > 0 {
-									onProgress(w.ID, sp)
+									onProgress(lease.workerID, sp)
 								}
 							}
 						}
 					}
-				}(w)
+				}(target.worker, target.lease)
 			}
 			wg.Wait()
 		}
@@ -2223,50 +2536,97 @@ func (p *K8sWorkerPool) ShutdownAll() {
 
 		// Step 1: CAS to draining. Skip the worker on CAS miss or error —
 		// there's no safe way to proceed if we don't own the row.
-		if p.runtimeStore != nil {
-			transitioned, err := p.runtimeStore.MarkWorkerDraining(w.ID, p.cpInstanceID)
+		// Mint the lease right before the CAS so the in-memory epoch
+		// reflects any concurrent cred-refresh bump that landed between
+		// the workers-list snapshot above and now. Step 3 below re-mints
+		// for the same reason — see the comment there.
+		lifecycle := p.ensureLifecycle()
+		if lifecycle == nil {
+			continue
+		}
+		// Wrap the per-worker drain in a closure. Returns true when
+		// the in-memory worker should be flipped to Retired — i.e.
+		// whenever this CP has taken any irreversible local action
+		// against the worker (closed its gRPC client). That covers
+		// both the fully-successful drain and the pod-delete-error
+		// branch (where the pod is still alive but we closed the
+		// client because this CP is shutting down). Returns false
+		// only when Drain itself missed and no local mutation
+		// happened.
+		shouldMarkRetired := func() bool {
+			drainStart := time.Now()
+
+			lease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+			outcome, err := lifecycle.Drain(lease, LifecycleOriginShutdownAll)
 			if err != nil {
 				slog.Warn("ShutdownAll: CAS to draining failed; orphan sweep will reconcile.",
 					"worker_id", w.ID, "error", err)
-				continue
+				return false
 			}
-			if !transitioned {
+			if !outcome.Transitioned {
 				slog.Debug("ShutdownAll: worker not owned by us or already terminal; skipping.",
 					"worker_id", w.ID)
-				continue
+				return false
 			}
-		}
 
-		// Step 2: delete pod. Leave the row in draining on any error other
-		// than NotFound so recovery paths pick it up.
-		gracePeriod := int64(10)
-		if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
-			GracePeriodSeconds: &gracePeriod,
-		}); err != nil && !errors.IsNotFound(err) {
-			slog.Warn("ShutdownAll: pod delete failed; worker left in draining for orphan sweep/reconciler.",
-				"id", w.ID, "worker_pod", podName, "error", err)
+			// Step 2: delete pod. On API error other than NotFound we
+			// leave the durable row in draining for the orphan sweep
+			// AND close the client — this CP is going away regardless
+			// and the gRPC client serves no further purpose. Returning
+			// true keeps the in-memory state consistent with the
+			// closed client (no goroutine holding `w` should see
+			// Idle/Hot while reaching for a dead connection).
+			gracePeriod := int64(10)
+			if err := p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriod,
+			}); err != nil && !errors.IsNotFound(err) {
+				slog.Warn("ShutdownAll: pod delete failed; worker left in draining for orphan sweep/reconciler.",
+					"id", w.ID, "worker_pod", podName, "error", err)
+				if w.client != nil {
+					_ = w.client.Close()
+				}
+				return true
+			}
+			_ = p.deleteWorkerRPCSecret(ctx, podName)
+			if w.client != nil {
+				_ = w.client.Close()
+			}
+			// Record drain duration at the pod-delete-success
+			// milestone — every sample reflects a real
+			// gone-from-the-cluster event, so p99 alerts track the
+			// operationally meaningful tail. The terminal CAS below
+			// is best-effort cleanup against an already-dead worker.
+			observeDrainTotalDuration(time.Since(drainStart))
+
+			// Step 3: best-effort terminal CAS. Re-read w.OwnerEpoch()
+			// so a cred-refresh bump that landed between Step 1 and
+			// now uses the fresh epoch. CAS-miss (Transitioned=false,
+			// err=nil) is logged at Debug for diagnostic
+			// continuity — the durable row stays in draining for the
+			// orphan sweep on a peer CP to reconcile.
+			lateLease := configstore.NewWorkerLease(w.ID, p.cpInstanceID, w.OwnerEpoch(), w.image)
+			retireOutcome, err := lifecycle.RetireDrained(lateLease, RetireReasonShutdown, LifecycleOriginShutdownAll)
+			switch {
+			case err != nil:
+				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile durable row.",
+					"worker_id", w.ID, "error", err)
+			case !retireOutcome.Transitioned:
+				slog.Debug("ShutdownAll: retire-drained CAS missed; orphan sweep will reconcile durable row.",
+					"worker_id", w.ID)
+			}
+			return true
+		}()
+
+		if !shouldMarkRetired {
 			continue
 		}
-		_ = p.deleteWorkerRPCSecret(ctx, podName)
-		if w.client != nil {
-			_ = w.client.Close()
-		}
 
-		// Step 3: final CAS to retired. If this fails (network blip during
-		// shutdown) the row stays in draining and the orphan sweep handles
-		// it once this CP's heartbeat expires.
-		if p.runtimeStore != nil {
-			if _, err := p.runtimeStore.RetireDrainingWorker(w.ID, RetireReasonShutdown); err != nil {
-				slog.Warn("ShutdownAll: CAS to retired failed; orphan sweep will reconcile.",
-					"worker_id", w.ID, "error", err)
-				continue
-			}
-		}
-
-		// In-memory lifecycle + metrics. Intentionally skips persistence
-		// (we've already persisted the retired state via the CAS chain).
+		// In-memory lifecycle bookkeeping. Intentionally skips
+		// persistence (the CAS chain already persisted retired/draining)
+		// and the retire_local metric (lifecycle.RetireDrained already
+		// observed retire_drained for this transition).
 		p.mu.Lock()
-		p.markWorkerRetiredInMemoryLocked(w, RetireReasonShutdown)
+		p.markWorkerRetiredInMemoryLocked(w)
 		p.mu.Unlock()
 	}
 
@@ -2363,7 +2723,9 @@ func (p *K8sWorkerPool) reapIdleWorkers() {
 		}
 		{
 			id, w := c.id, c.w
-			p.markWorkerRetiredLocked(w, RetireReasonIdleTimeout)
+			if !p.markWorkerRetiredLocked(w, RetireReasonIdleTimeout, LifecycleOriginIdleTimeout) {
+				continue
+			}
 			toRetire = append(toRetire, struct {
 				id int
 				w  *ManagedWorker
@@ -2408,7 +2770,9 @@ func (p *K8sWorkerPool) reapStuckActivatingWorkers() {
 		lifecycle := w.SharedState().NormalizedLifecycle()
 		if (lifecycle == WorkerLifecycleReserved || lifecycle == WorkerLifecycleActivating) &&
 			!w.reservedAt.IsZero() && now.Sub(w.reservedAt) > timeout {
-			p.markWorkerRetiredLocked(w, RetireReasonStuckActivating)
+			if !p.markWorkerRetiredLocked(w, RetireReasonStuckActivating, LifecycleOriginPoolStuckActivating) {
+				continue
+			}
 			toRetire = append(toRetire, struct {
 				id int
 				w  *ManagedWorker
@@ -2546,7 +2910,31 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 	for id, w := range p.workers {
 		select {
 		case <-w.done:
-			removedWorker, _, replacementID, shouldReplenish := p.removeWorkerLocked(id)
+			var removedWorker *ManagedWorker
+			var replacementID int
+			var shouldReplenish bool
+			deletePod := true
+			if p.runtimeStore != nil {
+				lease := p.workerLeaseSnapshot(w)
+				// cleanDeadWorkersLocked sweeps for pods whose informer
+				// fired w.done — cluster-driven termination (eviction,
+				// OOM, manual delete), not our health-check decision.
+				lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
+				if err != nil {
+					slog.Warn("Clean dead worker: lease validation failed; leaving cleanup to retry.",
+						"id", id, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+					continue
+				}
+				switch lostDisposition {
+				case workerLostLeaseStale:
+					deletePod = false
+					removedWorker, _ = p.dropLocalWorkerIfSameLeaseLocked(lease)
+				case workerLostLeaseCurrent, workerLostLeaseAlreadyLost, workerLostLeaseRetry:
+					continue
+				}
+			} else {
+				removedWorker, _, replacementID, shouldReplenish = p.removeWorkerLocked(id)
+			}
 			if removedWorker == nil {
 				continue
 			}
@@ -2554,8 +2942,11 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 			if shouldReplenish {
 				spawnIDs = append(spawnIDs, replacementID)
 			}
-			if w.client != nil {
-				go func(c *flightsql.Client) { _ = c.Close() }(w.client)
+			if removedWorker.client != nil {
+				go func(c *flightsql.Client) { _ = c.Close() }(removedWorker.client)
+			}
+			if !deletePod {
+				continue
 			}
 			// Delete the failed pod from K8s to avoid accumulating terminated pods
 			go func(worker *ManagedWorker) {
@@ -2565,7 +2956,7 @@ func (p *K8sWorkerPool) cleanDeadWorkersLocked() {
 				_ = p.clientset.CoreV1().Pods(p.namespace).Delete(ctx, podName, metav1.DeleteOptions{
 					GracePeriodSeconds: int64Ptr(0),
 				})
-			}(w)
+			}(removedWorker)
 		default:
 		}
 	}
@@ -2625,7 +3016,13 @@ func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bo
 	if !ok {
 		return nil, len(p.workers), 0, false
 	}
-	p.markWorkerRetiredLocked(w, RetireReasonCrash)
+	// Reached from cleanDeadWorkersLocked's no-runtime-store fallback
+	// (informer fired w.done). Not the periodic health-check path —
+	// that goes through markWorkerLostForHealthLease above and never
+	// calls into here.
+	if !p.markWorkerRetiredLocked(w, RetireReasonCrash, LifecycleOriginInformerCrash) {
+		return nil, len(p.workers), 0, false
+	}
 	delete(p.workers, id)
 	workerCount := len(p.workers)
 	if !p.shouldReplenishWarmCapacityLocked() {
@@ -2634,6 +3031,119 @@ func (p *K8sWorkerPool) removeWorkerLocked(id int) (*ManagedWorker, int, int, bo
 	replacementID := p.allocateBackgroundSpawnIDLocked()
 	p.spawning++
 	return w, workerCount, replacementID, true
+}
+
+type workerLeaseSnapshot struct {
+	workerID          int
+	ownerCPInstanceID string
+	ownerEpoch        int64
+	image             string
+}
+
+func (p *K8sWorkerPool) workerLeaseSnapshot(w *ManagedWorker) workerLeaseSnapshot {
+	ownerCPInstanceID := w.OwnerCPInstanceID()
+	if ownerCPInstanceID == "" {
+		ownerCPInstanceID = p.cpInstanceID
+	}
+	return workerLeaseSnapshot{
+		workerID:          w.ID,
+		ownerCPInstanceID: ownerCPInstanceID,
+		ownerEpoch:        w.OwnerEpoch(),
+		image:             w.image,
+	}
+}
+
+func (p *K8sWorkerPool) workerMatchesLease(w *ManagedWorker, lease workerLeaseSnapshot) bool {
+	return w != nil && p.workerLeaseSnapshot(w) == lease
+}
+
+type workerLostLeaseDisposition int
+
+const (
+	workerLostLeaseCurrent workerLostLeaseDisposition = iota
+	workerLostLeaseStale
+	workerLostLeaseRetry
+	workerLostLeaseAlreadyLost
+)
+
+func (p *K8sWorkerPool) markWorkerLostForHealthLease(lease workerLeaseSnapshot, origin LifecycleOrigin) (workerLostLeaseDisposition, error) {
+	if p.runtimeStore == nil {
+		return workerLostLeaseCurrent, nil
+	}
+	if lease.ownerCPInstanceID != p.cpInstanceID {
+		return workerLostLeaseStale, nil
+	}
+	currentLease, err := p.markWorkerLostIfCurrentLease(lease, origin)
+	if err != nil {
+		return workerLostLeaseRetry, err
+	}
+	if currentLease {
+		return workerLostLeaseCurrent, nil
+	}
+
+	record, err := p.runtimeStore.GetWorkerRecord(lease.workerID)
+	if err != nil {
+		return workerLostLeaseRetry, err
+	}
+	if record == nil || record.OwnerCPInstanceID != p.cpInstanceID {
+		return workerLostLeaseStale, nil
+	}
+	if record.OwnerEpoch != lease.ownerEpoch {
+		return workerLostLeaseRetry, nil
+	}
+	if record.State == configstore.WorkerStateLost && record.RetireReason == RetireReasonCrash {
+		return workerLostLeaseAlreadyLost, nil
+	}
+	return workerLostLeaseStale, nil
+}
+
+func (p *K8sWorkerPool) markWorkerLostIfCurrentLease(lease workerLeaseSnapshot, origin LifecycleOrigin) (bool, error) {
+	lc := p.ensureLifecycle()
+	if lc == nil {
+		// No durable store wired (process backend / minimal test pool).
+		// The health-check caller treats true here as "CAS landed";
+		// for the no-store case we let it proceed to its in-memory
+		// cleanup path, which is the same behavior the old direct-
+		// store call had when runtimeStore was nil.
+		return true, nil
+	}
+	if lease.ownerCPInstanceID != p.cpInstanceID {
+		return false, nil
+	}
+	outcome, err := lc.MarkLostFromLease(
+		configstore.NewWorkerLease(lease.workerID, p.cpInstanceID, lease.ownerEpoch, lease.image),
+		RetireReasonCrash,
+		origin,
+	)
+	if err != nil {
+		return false, err
+	}
+	return outcome.Transitioned, nil
+}
+
+func (p *K8sWorkerPool) removeWorkerAfterLostLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int, int, bool) {
+	current, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(current, lease) {
+		return nil, len(p.workers), 0, false
+	}
+	p.markWorkerRetiredInMemoryLocked(current)
+	delete(p.workers, current.ID)
+	workerCount := len(p.workers)
+	if !p.shouldReplenishWarmCapacityLocked() {
+		return current, workerCount, 0, false
+	}
+	replacementID := p.allocateBackgroundSpawnIDLocked()
+	p.spawning++
+	return current, workerCount, replacementID, true
+}
+
+func (p *K8sWorkerPool) dropLocalWorkerIfSameLeaseLocked(lease workerLeaseSnapshot) (*ManagedWorker, int) {
+	current, ok := p.workers[lease.workerID]
+	if !ok || !p.workerMatchesLease(current, lease) {
+		return nil, len(p.workers)
+	}
+	delete(p.workers, current.ID)
+	return current, len(p.workers)
 }
 
 func (p *K8sWorkerPool) isGenericSessionSchedulableWorkerLocked(w *ManagedWorker) bool {
@@ -2726,6 +3236,7 @@ func (p *K8sWorkerPool) spawnWarmWorker(ctx context.Context, id int, image strin
 			p.maxWorkers,
 		)
 		if err != nil {
+			observeSpawnFailure(SpawnFailureReasonRuntimeStore, image)
 			return err
 		}
 		if slot == nil {
@@ -2748,42 +3259,116 @@ func (p *K8sWorkerPool) spawnWarmWorkerBackground(id int, image string) {
 	go p.spawnWorkerBackground(id, image)
 }
 
-func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string) {
-	p.markWorkerRetiredInMemoryLocked(w, reason)
+// markWorkerRetiredLocked is the in-memory retire wrapper for paths
+// that bypass the WorkerLifecycle CAS service: it upserts the durable
+// row first, then (on success) transitions the in-memory shared state
+// and emits a duckgres_worker_lifecycle_transitions_total sample under
+// operation=retire_local with the caller-supplied origin. Used by
+// retireWorkerWithReason (idle reaper, stuck-activating reaper, public
+// RetireWorker, activation-failure / liveness-recheck fallbacks,
+// per-org ShutdownAll). Callers that have already gone through the
+// lifecycle service (deleteRetiredRuntimeWorker, ShutdownAll's drain
+// chain, removeWorkerAfterLostLeaseLocked) call
+// markWorkerRetiredInMemoryLocked directly to avoid double-counting.
+//
+// origin is required so the metric label reflects the actual call site
+// (e.g. pool-local reaper vs. janitor reaper, per-org vs. CP-wide
+// shutdown) — the prior reason→origin mapping was lossy because the
+// same RetireReason* constant is reused across distinct call sites.
+//
+// Ordering: persist BEFORE the in-memory transition so a fence-miss
+// (peer CP advanced the lease) doesn't leave this CP with a stale
+// in-memory view that pretends we still own the worker. On any
+// persistWorkerRecord error (fence-miss or real DB error), the
+// in-memory state is left untouched, a retire_local failure outcome is
+// emitted, and callers must skip local removal plus pod deletion.
+func (p *K8sWorkerPool) markWorkerRetiredLocked(w *ManagedWorker, reason string, origin LifecycleOrigin) bool {
 	workerState := configstore.WorkerStateRetired
 	if reason == RetireReasonCrash {
 		workerState = configstore.WorkerStateLost
 	}
-	p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil))
+	if err := p.persistWorkerRecord(p.workerRecordFor(w.ID, w, w.OwnerEpoch(), workerState, reason, nil)); err != nil {
+		outcome := configstore.TransitionOutcomeStoreError
+		if stderrors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+			outcome = configstore.TransitionOutcomeFenceMissLease
+		}
+		observeLifecycleTransition(
+			LifecycleOpRetireLocal,
+			outcome,
+			w.image,
+			origin,
+		)
+		return false
+	}
+	// markWorkerRetiredInMemoryLocked returns false only when the
+	// SharedState machine refuses Retired (e.g., already terminal).
+	// Under p.mu that's unreachable in practice — the worker is in
+	// p.workers and no one else can have flipped the state — but we
+	// don't gate the return on it for two reasons:
+	// (1) the durable retire HAS landed (persist succeeded above), so
+	//     "transitioned" is honest at the lifecycle level even if the
+	//     local mirror was a no-op;
+	// (2) returning false would strand the now-durably-retired worker
+	//     in p.workers (caller skips delete()) with the K8s pod still
+	//     up — the orphan reconciler would eventually delete the pod
+	//     but never the in-memory entry, breaking local capacity
+	//     accounting.
+	// The discarded bool stays for diagnostic value if the state
+	// machine ever surfaces a real refusal.
+	_ = p.markWorkerRetiredInMemoryLocked(w)
+	observeLifecycleTransition(
+		LifecycleOpRetireLocal,
+		configstore.TransitionOutcomeTransitioned,
+		w.image,
+		origin,
+	)
+	return true
 }
 
 // markWorkerRetiredInMemoryLocked performs only the in-memory lifecycle
-// transition and metrics bookkeeping for a worker retirement, without
-// persisting to the runtime store. Used by callers that have already
-// advanced the DB state via a scoped CAS (e.g. ShutdownAll's draining
-// chain) and don't want an unconditional UpsertWorkerRecord to overwrite
-// fields set by that CAS.
-func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker, reason string) {
-	lifecycle := w.SharedState().NormalizedLifecycle()
-	if lifecycle == WorkerLifecycleHot || lifecycle == WorkerLifecycleHotIdle {
-		observeHotWorkerSessions(w.peakSessions)
-	}
+// transition for a worker retirement, without persisting to the runtime
+// store and without emitting any metric. Used by callers that have
+// already advanced the DB state via a scoped CAS (e.g. ShutdownAll's
+// draining chain, the lifecycle service's post-CAS cleanup hook,
+// removeWorkerAfterLostLease) and don't want an unconditional
+// UpsertWorkerRecord to overwrite fields set by that CAS. Returns true
+// when the transition actually happened.
+//
+// Metric emission lives in markWorkerRetiredLocked (the wrapper that
+// also persists) because the CAS-bypassing path is the only one not
+// already observed via the lifecycle service.
+func (p *K8sWorkerPool) markWorkerRetiredInMemoryLocked(w *ManagedWorker) bool {
 	nextState, err := w.SharedState().Transition(WorkerLifecycleRetired, nil)
 	if err != nil {
-		return
+		return false
 	}
 	_ = w.SetSharedState(nextState)
-	observeWorkerRetirement(reason)
-	observeWarmPoolLifecycleGauges(p.workers)
+	return true
 }
 
-func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) {
+// persistWorkerRecord upserts the record and returns the underlying
+// error (including ErrWorkerRecordUpsertFenceMiss when the CP no longer
+// owns the lease). Callers that don't care about the result discard it
+// with `_ =`; markWorkerRetiredLocked uses it to gate metric emission
+// so retire_local samples reflect transitions that actually persisted.
+func (p *K8sWorkerPool) persistWorkerRecord(record *configstore.WorkerRecord) error {
 	if p.runtimeStore == nil || record == nil {
-		return
+		return nil
 	}
-	if err := p.runtimeStore.UpsertWorkerRecord(record); err != nil {
-		slog.Warn("Persisting worker runtime record failed.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+	err := p.runtimeStore.UpsertWorkerRecord(record)
+	if err == nil {
+		return nil
 	}
+	// Fence misses are expected when a peer CP has already advanced the
+	// worker's lease (terminal state, newer owner_epoch, or different
+	// owner at the same epoch). They prove the fence is doing its job —
+	// log at Debug so they don't masquerade as persistence failures.
+	if stderrors.Is(err, configstore.ErrWorkerRecordUpsertFenceMiss) {
+		slog.Debug("Worker runtime upsert fenced by newer lease.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+		return err
+	}
+	slog.Warn("Persisting worker runtime record failed.", "worker_id", record.WorkerID, "state", record.State, "error", err)
+	return err
 }
 
 func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoch int64, state configstore.WorkerState, retireReason string, activationStartedAt *time.Time) *configstore.WorkerRecord {
@@ -2827,11 +3412,15 @@ func (p *K8sWorkerPool) workerRecordFor(id int, worker *ManagedWorker, ownerEpoc
 }
 
 func (p *K8sWorkerPool) healthCheckPayloadForWorker(worker *ManagedWorker) server.WorkerHealthCheckPayload {
+	return p.healthCheckPayloadForLease(p.workerLeaseSnapshot(worker))
+}
+
+func (p *K8sWorkerPool) healthCheckPayloadForLease(lease workerLeaseSnapshot) server.WorkerHealthCheckPayload {
 	payload := server.WorkerHealthCheckPayload{
 		WorkerControlMetadata: server.WorkerControlMetadata{
-			WorkerID:     worker.ID,
-			OwnerEpoch:   worker.OwnerEpoch(),
-			CPInstanceID: worker.OwnerCPInstanceID(),
+			WorkerID:     lease.workerID,
+			OwnerEpoch:   lease.ownerEpoch,
+			CPInstanceID: lease.ownerCPInstanceID,
 		},
 	}
 	return payload

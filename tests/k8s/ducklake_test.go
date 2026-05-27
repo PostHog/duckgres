@@ -116,6 +116,13 @@ func TestK8sDuckLakeDurabilityAcrossWorkerRestart(t *testing.T) {
 	if count != rows {
 		t.Fatalf("post-restart row count = %d, want %d (data did not survive worker restart)", count, rows)
 	}
+
+	// Wait for the CP to finish housekeeping the killed worker (cleanup
+	// of the orphan pod/secret, warm-pool replenishment activation)
+	// before returning. Without this, the trailing apiserver activity
+	// drops the next test's port-forward at an arbitrary point and the
+	// retry layer can re-issue in-flight queries.
+	waitForControlPlaneIdle(t, 60*time.Second)
 }
 
 // TestK8sDuckLakeConcurrentWriters exercises the PostHog DuckLake fork's
@@ -128,7 +135,9 @@ func TestK8sDuckLakeDurabilityAcrossWorkerRestart(t *testing.T) {
 //
 // We deliberately don't assert no-conflicts-occurred: that's the wrong
 // invariant. The invariant is no-rows-lost — conflicts are fine as long
-// as the retry layer makes every writer eventually succeed.
+// as the retry layer makes every writer eventually succeed, and we
+// assert on COUNT(*) so a regression that produces duplicate rows is
+// caught here rather than silently masked.
 func TestK8sDuckLakeConcurrentWriters(t *testing.T) {
 	tableName := fmt.Sprintf("ducklake.dl_concurrent_%d", time.Now().UnixNano())
 	const writers = 4

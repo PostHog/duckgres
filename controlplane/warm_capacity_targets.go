@@ -90,7 +90,13 @@ func imageWarmCapacityMissCounts(aggregates []configstore.WarmCapacityMissAggreg
 		if !policy.recordDynamicDemand {
 			continue
 		}
-		image, ok := strings.CutPrefix(strings.TrimSpace(aggregate.Scope), "image:")
+		scope := strings.TrimSpace(aggregate.Scope)
+		// Only image-prefixed scopes contribute to per-image dynamic
+		// demand. The strict prefix check (replacing an earlier
+		// HasPrefix("org:") + TrimPrefix("image:") combo) prevents a
+		// future malformed scope value from silently being treated as
+		// an image key.
+		image, ok := strings.CutPrefix(scope, "image:")
 		if !ok {
 			continue
 		}

@@ -13,94 +13,54 @@ import (
 
 var warmCapacityMissesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_warm_capacity_misses_total",
-	Help: "Total foreground warm-capacity misses, partitioned by image scope and reason.",
-}, []string{"scope", "reason"})
-
-var warmCapacityRecentMissesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_warm_capacity_recent_misses",
-	Help: "Recent warm-capacity misses read by dynamic target reconciliation, partitioned by scope and reason.",
-}, []string{"scope", "reason"})
-
-var warmCapacityBaseTargetGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_warm_capacity_base_target",
-	Help: "Configured/base warm-capacity target by scope.",
-}, []string{"scope"})
-
-var warmCapacityDemandTargetGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_warm_capacity_demand_target",
-	Help: "Dynamic warm-capacity target added above the base target by scope.",
-}, []string{"scope"})
+	Help: "Total foreground warm-capacity misses, partitioned by image and reason.",
+}, []string{"image", "reason"})
 
 var warmCapacityEffectiveTargetGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_warm_capacity_effective_target",
-	Help: "Effective warm-capacity target after applying dynamic demand and caps by scope.",
-}, []string{"scope"})
+	Help: "Effective warm-capacity target after applying dynamic demand and caps, by image.",
+}, []string{"image"})
 
-var warmCapacityReadyWorkersGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_warm_capacity_ready_workers",
-	Help: "Cluster-wide ready neutral warm workers by scope.",
-}, []string{"scope"})
-
-var warmCapacitySpawningWorkersGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
-	Name: "duckgres_warm_capacity_spawning_workers",
-	Help: "Cluster-wide spawning neutral warm workers by scope.",
-}, []string{"scope"})
-
-var warmCapacityHeadroomGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+var warmCapacityHeadroomGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "duckgres_warm_capacity_headroom",
-	Help: "Remaining global warm-capacity target headroom by scope; -1 means unbounded.",
-}, []string{"scope"})
+	Help: "Remaining global warm-capacity target headroom; -1 means unbounded.",
+})
 
-var warmCapacityReconcileSpawnsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_warm_capacity_reconcile_spawns_total",
-	Help: "Warm-capacity worker spawn slots accepted by reconciliation, partitioned by scope and result.",
-}, []string{"scope", "result"})
+var workerLifecycleCountGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_worker_lifecycle_count",
+	Help: "Cluster-wide active worker count by image, lifecycle state, and tenant binding.",
+}, []string{"image", "state", "binding"})
 
-func observeWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason) {
-	scope = strings.TrimSpace(scope)
-	if scope == "" {
+func init() {
+	warmCapacityHeadroomGauge.Set(-1)
+}
+
+func observeWarmCapacityMiss(image string, reason configstore.WorkerClaimMissReason) {
+	image = strings.TrimSpace(image)
+	if image == "" {
 		return
 	}
 	policy := warmCapacityMissPolicyForReason(reason)
-	warmCapacityMissesCounter.WithLabelValues(scope, string(policy.reason)).Inc()
+	warmCapacityMissesCounter.WithLabelValues(image, string(policy.reason)).Inc()
 }
 
-func observeWarmCapacityRecentMisses(aggregates []configstore.WarmCapacityMissAggregate, previous ...[]configstore.WarmCapacityMissAggregate) {
-	for _, prev := range previous {
-		for _, aggregate := range prev {
-			scope := strings.TrimSpace(aggregate.Scope)
-			if scope == "" {
-				continue
-			}
-			policy := warmCapacityMissPolicyForReason(aggregate.Reason)
-			warmCapacityRecentMissesGauge.WithLabelValues(scope, string(policy.reason)).Set(0)
-		}
-	}
-	for _, aggregate := range aggregates {
-		scope := strings.TrimSpace(aggregate.Scope)
-		if scope == "" || aggregate.Count < 0 {
-			continue
-		}
-		policy := warmCapacityMissPolicyForReason(aggregate.Reason)
-		warmCapacityRecentMissesGauge.WithLabelValues(scope, string(policy.reason)).Set(float64(aggregate.Count))
-	}
-}
-
+// observeWarmCapacityTargets refreshes the effective-target gauge per
+// image plus the global headroom gauge. baseTargets is still accepted
+// so the signature stays stable for callers (and so future deltas
+// against base can be reintroduced cheaply); it is otherwise unused.
 func observeWarmCapacityTargets(baseTargets, effectiveTargets map[string]int, maxWorkers int, previousTargets ...map[string]int) {
-	scopeMaps := []map[string]int{baseTargets, effectiveTargets}
-	scopeMaps = append(scopeMaps, previousTargets...)
-	scopes := warmCapacityTargetScopes(scopeMaps...)
-	for _, image := range scopes {
-		scope := warmCapacityImageScope(image)
-		base := positiveMapValue(baseTargets, image)
-		effective := positiveMapValue(effectiveTargets, image)
-		demand := effective - base
-		if demand < 0 {
-			demand = 0
+	_ = baseTargets
+	currentImages := warmCapacityTargetImages(effectiveTargets)
+	previousImages := warmCapacityTargetImages(previousTargets...)
+	currentSet := stringSet(currentImages)
+	for _, image := range previousImages {
+		if _, ok := currentSet[image]; !ok {
+			warmCapacityEffectiveTargetGauge.DeleteLabelValues(image)
 		}
-		warmCapacityBaseTargetGauge.WithLabelValues(scope).Set(float64(base))
-		warmCapacityDemandTargetGauge.WithLabelValues(scope).Set(float64(demand))
-		warmCapacityEffectiveTargetGauge.WithLabelValues(scope).Set(float64(effective))
+	}
+	for _, image := range currentImages {
+		effective := positiveMapValue(effectiveTargets, image)
+		warmCapacityEffectiveTargetGauge.WithLabelValues(image).Set(float64(effective))
 	}
 
 	headroom := -1.0
@@ -110,40 +70,96 @@ func observeWarmCapacityTargets(baseTargets, effectiveTargets map[string]int, ma
 			headroom = 0
 		}
 	}
-	warmCapacityHeadroomGauge.WithLabelValues("global").Set(headroom)
+	warmCapacityHeadroomGauge.Set(headroom)
 }
 
-func observeWarmCapacityWorkerStats(stats []configstore.WarmCapacityWorkerStats, previous ...[]configstore.WarmCapacityWorkerStats) {
+func observeWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats, previous ...[]configstore.WorkerLifecycleStats) {
+	observeWorkerLifecycleStatsForImages(stats, nil, nil, previous...)
+}
+
+func observeWorkerLifecycleStatsForImages(stats []configstore.WorkerLifecycleStats, targetImages, previousTargetImages []string, previous ...[]configstore.WorkerLifecycleStats) {
+	currentImages := workerLifecycleImages(stats)
+	for _, image := range targetImages {
+		image = strings.TrimSpace(image)
+		if image != "" {
+			currentImages[image] = struct{}{}
+		}
+	}
+	previousImages := map[string]struct{}{}
 	for _, prev := range previous {
 		for _, stat := range prev {
-			scope := strings.TrimSpace(stat.Scope)
-			if scope == "" {
-				continue
+			image := strings.TrimSpace(stat.Image)
+			if image != "" {
+				previousImages[image] = struct{}{}
 			}
-			warmCapacityReadyWorkersGauge.WithLabelValues(scope).Set(0)
-			warmCapacitySpawningWorkersGauge.WithLabelValues(scope).Set(0)
+		}
+	}
+	for _, image := range previousTargetImages {
+		image = strings.TrimSpace(image)
+		if image != "" {
+			previousImages[image] = struct{}{}
+		}
+	}
+	for image := range previousImages {
+		if _, ok := currentImages[image]; !ok {
+			for _, state := range observedWorkerLifecycleStates {
+				for _, binding := range observedWorkerLifecycleBindings {
+					workerLifecycleCountGauge.DeleteLabelValues(image, string(state), binding)
+				}
+			}
+		}
+	}
+	for image := range currentImages {
+		for _, state := range observedWorkerLifecycleStates {
+			for _, binding := range observedWorkerLifecycleBindings {
+				workerLifecycleCountGauge.WithLabelValues(image, string(state), binding).Set(0)
+			}
 		}
 	}
 	for _, stat := range stats {
-		scope := strings.TrimSpace(stat.Scope)
-		if scope == "" {
+		image := strings.TrimSpace(stat.Image)
+		state := strings.TrimSpace(string(stat.State))
+		binding := strings.TrimSpace(stat.Binding)
+		if image == "" || state == "" || binding == "" {
 			continue
 		}
-		warmCapacityReadyWorkersGauge.WithLabelValues(scope).Set(float64(nonNegativeInt64(stat.ReadyWorkers)))
-		warmCapacitySpawningWorkersGauge.WithLabelValues(scope).Set(float64(nonNegativeInt64(stat.SpawningWorkers)))
+		workerLifecycleCountGauge.WithLabelValues(image, state, binding).Set(float64(nonNegativeInt64(stat.Count)))
 	}
 }
 
-func observeWarmCapacityReconcileSpawns(scope, result string, count int) {
-	scope = strings.TrimSpace(scope)
-	result = strings.TrimSpace(result)
-	if scope == "" || result == "" || count <= 0 {
-		return
-	}
-	warmCapacityReconcileSpawnsCounter.WithLabelValues(scope, result).Add(float64(count))
+var observedWorkerLifecycleStates = []configstore.WorkerState{
+	configstore.WorkerStateSpawning,
+	configstore.WorkerStateIdle,
+	configstore.WorkerStateReserved,
+	configstore.WorkerStateActivating,
+	configstore.WorkerStateHot,
+	configstore.WorkerStateHotIdle,
+	configstore.WorkerStateDraining,
 }
 
-func warmCapacityImageScope(image string) string {
+var observedWorkerLifecycleBindings = []string{"neutral", "org_bound"}
+
+func workerLifecycleImages(stats []configstore.WorkerLifecycleStats) map[string]struct{} {
+	images := make(map[string]struct{})
+	for _, stat := range stats {
+		image := strings.TrimSpace(stat.Image)
+		if image != "" {
+			images[image] = struct{}{}
+		}
+	}
+	return images
+}
+
+func resetLeaderOwnedClusterMetrics() {
+	warmCapacityEffectiveTargetGauge.Reset()
+	// Reset headroom to the "unbounded / unknown" sentinel rather than
+	// 0 — 0 is the alertable capacity-exhausted state and would page
+	// spuriously every time leadership hands off during a rollout.
+	warmCapacityHeadroomGauge.Set(-1)
+	workerLifecycleCountGauge.Reset()
+}
+
+func warmCapacityScopeForImage(image string) string {
 	image = strings.TrimSpace(image)
 	if image == "" {
 		return ""
@@ -151,7 +167,7 @@ func warmCapacityImageScope(image string) string {
 	return "image:" + image
 }
 
-func warmCapacityTargetScopes(maps ...map[string]int) []string {
+func warmCapacityTargetImages(maps ...map[string]int) []string {
 	seen := make(map[string]struct{})
 	for _, values := range maps {
 		for image, value := range values {
@@ -167,6 +183,14 @@ func warmCapacityTargetScopes(maps ...map[string]int) []string {
 		out = append(out, image)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func stringSet(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		out[value] = struct{}{}
+	}
 	return out
 }
 

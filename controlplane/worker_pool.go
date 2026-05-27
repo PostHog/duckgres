@@ -113,21 +113,27 @@ type K8sWorkerPoolConfig struct {
 	RuntimeStore          RuntimeWorkerStore
 }
 
+// RuntimeWorkerStore is the durable-store surface exposed to the K8s
+// worker pool. Every lifecycle CAS method is now absent from this
+// interface — they are reachable only through WorkerLifecycle so
+// callers physically cannot bypass the typed snapshot/lease seam.
+//
+// The lifecycle service uses workerLifecycleStore (defined in
+// worker_lifecycle.go), which is the larger interface that includes
+// the CAS methods. Production wires it via a type assertion in
+// newK8sWorkerPool / ensureLifecycle, because *configstore.ConfigStore
+// satisfies both interfaces.
 type RuntimeWorkerStore interface {
 	UpsertWorkerRecord(record *configstore.WorkerRecord) error
 	ClaimIdleWorker(ownerCPInstanceID, orgID, image string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
-	ClaimHotIdleWorker(ownerCPInstanceID, orgID string) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
+	ClaimHotIdleWorker(ownerCPInstanceID, orgID string, maxOrgWorkers int) (*configstore.WorkerRecord, configstore.WorkerClaimMissReason, error)
 	RecordWarmCapacityMiss(scope string, reason configstore.WorkerClaimMissReason, now time.Time) error
 	CreateSpawningWorkerSlot(ownerCPInstanceID, orgID, image string, ownerEpoch int64, podNamePrefix string, maxOrgWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlot(ownerCPInstanceID, podNamePrefix, image string, targetWarmWorkers, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	CreateNeutralWarmWorkerSlotForImage(ownerCPInstanceID, podNamePrefix, image string, perImageTarget, maxGlobalWorkers int) (*configstore.WorkerRecord, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
+	ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error)
 	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
-	RetireIdleWorker(workerID int, reason string) (bool, error)
-	RetireIdleOrHotIdleWorker(workerID int, reason string) (bool, error)
-	RetireOrphanWorker(workerID int, reason string) (bool, error)
-	MarkWorkerDraining(workerID int, ownerCPInstanceID string) (bool, error)
-	RetireDrainingWorker(workerID int, reason string) (bool, error)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the
