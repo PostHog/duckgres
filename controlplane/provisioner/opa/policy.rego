@@ -122,6 +122,30 @@ owns_catalog(catalog) if {
 	data.group_catalogs[admin_group][catalog] == true
 }
 
+# Admin's read access to ANY catalog matching the v1 naming convention
+# (`org_<sanitized>_iceberg`), regardless of bundle ownership. This is
+# narrower than "admin sees everything" — it scopes admin authority to
+# catalogs the provisioner could plausibly have created.
+#
+# Why this exists: when an org is disabled, the next reconcile tick
+# removes its catalog from data.group_catalogs but the catalog itself
+# may not be dropped on the same tick (e.g. transient Trino error).
+# Without this rule, the admin's SHOW CATALOGS filters the orphan out
+# and the next reconcile tick can't see it to retry the drop. The
+# catalog becomes a persistent orphan until manual cleanup.
+#
+# Security: admin already has CREATE CATALOG / DROP CATALOG authority
+# (gated on is_admin), so this doesn't expand the blast radius — it
+# only lets admin ENUMERATE catalogs it could already manipulate. The
+# `org_*_iceberg` prefix bounds the scope to provisioner-managed names,
+# so hand-rolled catalogs (e.g. on the maintenance cluster, were that
+# ever to share an OPA bundle) stay out of admin's reach via this rule.
+owns_catalog(catalog) if {
+	is_admin
+	startswith(catalog, "org_")
+	endswith(catalog, "_iceberg")
+}
+
 # ---------------------------------------------------------------------------
 # Catalog-scope decisions.
 # ---------------------------------------------------------------------------

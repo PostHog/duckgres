@@ -641,7 +641,12 @@ func (cs *ConfigStore) EnableTrino(orgID string, settings TrinoSettings) error {
 		OrgID:   orgID,
 		Enabled: true,
 		Tier:    settings.Tier,
+		State:   ManagedWarehouseStatePending,
 	}
+	// On conflict update Enabled+Tier+UpdatedAt only. Do NOT touch
+	// State / StatusMessage / ReadyAt / FailedAt — those are owned by
+	// the reconcile loop. A re-enable on an already-Ready row stays
+	// Ready; the reconcile loop's next tick will refresh status.
 	if err := cs.db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "org_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"enabled", "tier", "updated_at"}),
@@ -651,11 +656,87 @@ func (cs *ConfigStore) EnableTrino(orgID string, settings TrinoSettings) error {
 	return nil
 }
 
-// DisableTrino marks the org as no longer Trino-enabled. The row is kept
-// (rather than deleted) so the provisioner can observe the transition and
-// clean up the catalog + password file entry on its next reconcile tick.
-// Returns nil if no row exists — disabling something that was never enabled
-// is a no-op, not an error.
+// TrinoStateUpdate is the small set of columns the reconcile loop
+// writes through UpdateTrinoState. The State + StatusMessage are
+// always set; the timestamp pointers are optional ("nil" == don't
+// touch). Callers that want to clear an existing timestamp can pass a
+// pointer to a zero time.Time, but in practice the next state
+// transition just overwrites.
+type TrinoStateUpdate struct {
+	State         ManagedWarehouseProvisioningState
+	StatusMessage string
+	ReadyAt       *time.Time
+	FailedAt      *time.Time
+}
+
+// UpdateTrinoState writes the reconcile loop's per-tick outcome onto
+// an org's Trino row. Predicates on enabled=true: if DisableTrino
+// raced ahead during the reconcile tick, the row is no longer enabled
+// and any state write is a stale leftover that would mis-represent
+// the org's operational status. Returning nil on RowsAffected==0
+// keeps that race silent (the next reconcile tick won't see the
+// disabled org and won't try again).
+//
+// No CAS on state — the provisioning controller runs single-threaded
+// per pod, so the only race is between reconcile and DisableTrino.
+//
+// StatusMessage is truncated to the column width (1024 chars) so a
+// long joined-error message can't trip a Postgres "value too long"
+// error and silently fail the state record.
+func (cs *ConfigStore) UpdateTrinoState(orgID string, upd TrinoStateUpdate) error {
+	if orgID == "" {
+		return errors.New("UpdateTrinoState: orgID is required")
+	}
+	msg := upd.StatusMessage
+	if len(msg) > 1024 {
+		// Leave a trailing marker so anyone reading the row knows it
+		// was clipped; the full error went to the slog stream.
+		msg = msg[:1021] + "..."
+	}
+	updates := map[string]interface{}{
+		"state":          upd.State,
+		"status_message": msg,
+		"updated_at":     time.Now().UTC(),
+	}
+	// Pointer fields participate only when explicitly set. nil means
+	// "leave the column alone"; a non-nil zero time.Time clears it.
+	if upd.ReadyAt != nil {
+		updates["ready_at"] = upd.ReadyAt
+	}
+	if upd.FailedAt != nil {
+		// Distinguish "clear" (zero value pointer) from "set to a
+		// specific timestamp" by passing nil into the SQL UPDATE when
+		// the pointer points at a zero time.
+		if upd.FailedAt.IsZero() {
+			updates["failed_at"] = nil
+		} else {
+			updates["failed_at"] = upd.FailedAt
+		}
+	}
+	result := cs.db.Model(&ManagedWarehouseTrino{}).
+		Where("org_id = ? AND enabled = ?", orgID, true).
+		Updates(updates)
+	if result.Error != nil {
+		return fmt.Errorf("update trino state for %q: %w", orgID, result.Error)
+	}
+	return nil
+}
+
+// DisableTrino marks the org as no longer Trino-enabled. The row is
+// kept (rather than deleted) so the provisioner can observe the
+// transition and clean up the catalog + password file entry on its
+// next reconcile tick. Returns nil if no row exists — disabling
+// something that was never enabled is a no-op, not an error.
+//
+// State is reset to Pending alongside the enabled flip so operators
+// see the lifecycle restart: the previous Ready/Failed status no
+// longer reflects current reality (the catalog is being torn down).
+// status_message + failed_at are cleared since they belong to the
+// previous enabled lifecycle. The reconcile loop will not advance
+// state for disabled orgs (UpdateTrinoState predicates on enabled),
+// so state stays at Pending until either:
+//   - EnableTrino re-activates the org, OR
+//   - the row is deleted (e.g. via the FK CASCADE when the Org row goes).
 func (cs *ConfigStore) DisableTrino(orgID string) error {
 	if orgID == "" {
 		return errors.New("DisableTrino: orgID is required")
@@ -663,8 +744,11 @@ func (cs *ConfigStore) DisableTrino(orgID string) error {
 	result := cs.db.Model(&ManagedWarehouseTrino{}).
 		Where("org_id = ?", orgID).
 		Updates(map[string]interface{}{
-			"enabled":    false,
-			"updated_at": time.Now().UTC(),
+			"enabled":        false,
+			"state":          ManagedWarehouseStatePending,
+			"status_message": "",
+			"failed_at":      nil,
+			"updated_at":     time.Now().UTC(),
 		})
 	if result.Error != nil {
 		return fmt.Errorf("disable trino for %q: %w", orgID, result.Error)
@@ -690,7 +774,8 @@ func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
 		Select(`t.org_id AS org_id,
 		         COALESCE(o.database_name, '') AS database_name,
 		         t.tier AS tier,
-		         u.password AS root_password_hash`).
+		         u.password AS root_password_hash,
+		         t.state AS state`).
 		Joins(`INNER JOIN duckgres_org_users AS u
 		        ON u.org_id = t.org_id AND u.username = 'root'`).
 		Joins(`LEFT JOIN duckgres_orgs AS o ON o.name = t.org_id`).

@@ -19,6 +19,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
+	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
 )
@@ -367,6 +368,7 @@ func SetupMultiTenant(
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
+	var trinoBundleHandler *opa.Handler
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		slog.Warn("Provisioning controller unavailable.", "error", err)
@@ -382,6 +384,23 @@ func SetupMultiTenant(
 				lkProv := provisioner.NewLakekeeperProvisioner(store, k8sClient)
 				provCtrl.WithLakekeeperProvisioner(lkProv, newLakekeeperInputsResolver(resolveDucklingStatus))
 				slog.Info("Lakekeeper provisioner enabled (allowall + NetworkPolicy mode).")
+			}
+		}
+		// Customer-Trino provisioner branch. Same opt-in posture as
+		// Lakekeeper: off by default, best-effort if the K8s client or
+		// required env is incomplete. When wired, the bundle handler is
+		// retained for mounting onto the API server below (separate auth
+		// from the admin internal-secret — uses its own bearer token
+		// against opa.BearerTokenAuth).
+		if trinoProvisionerEnabled() {
+			if kc, tkErr := newTrinoKubeClient(); tkErr != nil {
+				slog.Warn("Trino provisioner enabled but K8s client unavailable; skipping.", "error", tkErr)
+			} else if trinoWire, twErr := buildTrinoWiring(store, kc); twErr != nil {
+				slog.Warn("Trino provisioner enabled but wiring failed; skipping.", "error", twErr)
+			} else if trinoWire != nil {
+				provCtrl.WithTrinoProvisioner(trinoWire.Provisioner)
+				trinoBundleHandler = trinoWire.BundleHandler
+				slog.Info("Trino provisioner enabled.")
 			}
 		}
 		go provCtrl.Run(context.Background())
@@ -417,6 +436,16 @@ func SetupMultiTenant(
 	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
 	admin.RegisterAPI(api, store, adpt)
 	provisioning.RegisterAPI(api, provisioning.NewGormStore(store))
+
+	// Customer-Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1
+	// admin group on purpose — it does its own bearer-token auth (the
+	// bundle exposes the customer roster; a separate shared secret
+	// between provisioner and the OPA sidecar). When the Trino
+	// provisioner is disabled (the default), trinoBundleHandler is nil
+	// and the route isn't registered.
+	if trinoBundleHandler != nil {
+		engine.Any("/bundles/trino", gin.WrapH(trinoBundleHandler))
+	}
 
 	// Dashboard
 	admin.RegisterDashboard(engine, internalSecret)

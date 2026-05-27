@@ -527,6 +527,51 @@ func TestAdversarialInputs(t *testing.T) {
 			t.Error("admin with full identity must be able to AccessCatalog admin-listed catalogs")
 		}
 	})
+
+	// Admin can see/manage prefix-matching catalogs that aren't
+	// listed under AdminGroup in the bundle. This is the orphan-drop
+	// recovery path: if a reconcile fails to drop a disabled org's
+	// catalog AFTER removing it from data.group_catalogs, the admin
+	// still needs to see the catalog on the next SHOW CATALOGS so the
+	// drop can be retried.
+	t.Run("admin can see prefix-matching catalog not in bundle", func(t *testing.T) {
+		// Bundle has nothing under AdminGroup for this catalog.
+		emptyAdmin := GroupCatalogs{
+			"org_42": {"org_42_iceberg": true},
+			// no AdminGroup entry, no org_99 entry
+		}
+		q2 := preparedPolicy(t, emptyAdmin)
+
+		// Admin (full identity) can FilterCatalogs / AccessCatalog
+		// on an orphan org_99_iceberg.
+		for _, op := range []string{"FilterCatalogs", "AccessCatalog"} {
+			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, op, catalogResource("org_99_iceberg"))
+			if !evalAllow(t, q2, in) {
+				t.Errorf("admin %s on orphan org_99_iceberg should be allowed via prefix rule; was denied", op)
+			}
+		}
+		// Admin must NOT match catalogs that don't follow the v1
+		// naming convention — `system`, `jmx`, hand-rolled
+		// non-prefix names stay out of reach via this rule (admin
+		// still has CREATE/DROP authority, but cannot enumerate
+		// non-managed names through SHOW CATALOGS).
+		// Non-matching names must still be denied — admin's prefix
+		// authority is bounded to the v1 naming convention so
+		// hand-rolled catalogs (system, jmx, anything without the
+		// matching prefix+suffix) stay out of reach.
+		for _, name := range []string{"system", "jmx", "iceberg_org_42", "org_42_data"} {
+			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "AccessCatalog", catalogResource(name))
+			if evalAllow(t, q2, in) {
+				t.Errorf("admin AccessCatalog on non-prefix-matching %q must be denied via this rule", name)
+			}
+		}
+		// Non-admin with the same group claim still gets nothing
+		// from the prefix rule (it's is_admin-gated).
+		in := buildInputWithGroups("42", []string{AdminGroup}, "AccessCatalog", catalogResource("org_99_iceberg"))
+		if evalAllow(t, q2, in) {
+			t.Error("non-admin claiming admin_group must not benefit from the prefix rule")
+		}
+	})
 }
 
 // --------------------------------------------------------------------------

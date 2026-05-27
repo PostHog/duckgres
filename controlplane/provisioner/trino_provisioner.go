@@ -3,7 +3,6 @@
 package provisioner
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -52,11 +51,6 @@ const TrinoResourceGroupsConfigMapName = "trino-resource-groups"
 // resource-groups.config-file mount.
 const TrinoResourceGroupsConfigMapKey = "resource-groups.json"
 
-// TrinoAdminProvisionerUser is the reserved Trino principal the
-// provisioner uses for catalog management. OPA distinguishes this
-// principal from customer users to scope CREATE/ALTER/DROP CATALOG.
-const TrinoAdminProvisionerUser = "__admin_provisioner"
-
 // trinoCatalogIdentifier is the Trino catalog identifier grammar
 // ([a-z0-9_]+). Anything outside this set in Org.Name is replaced with
 // `_` before forming the catalog name.
@@ -86,11 +80,15 @@ func TrinoGroupName(orgName string) string {
 	return "org_" + trinoSanitize(orgName)
 }
 
-// TrinoResourceGroupName returns the resource-group selector key for an
-// org. Customer principals' Trino username == orgName (numeric team_id);
-// selectors match on that, scoping the org into root.tenants.<orgName>.
+// TrinoResourceGroupName returns the resource-group selector key for
+// an org. Sanitized like the catalog name so a `.` in orgName doesn't
+// get re-interpreted as a hierarchy separator in Trino's resource-
+// group path (and so the selector + subgroup names stay aligned across
+// the catalog, group, and resource-group projections). Customer
+// principals' Trino username == orgName (numeric team_id in v1), but
+// the underlying type is still a string so we sanitize defensively.
 func TrinoResourceGroupName(orgName string) string {
-	return "root.tenants." + orgName
+	return "root.tenants." + trinoSanitize(orgName)
 }
 
 // TrinoCatalogClient is the REST surface the provisioner needs against
@@ -102,15 +100,6 @@ type TrinoCatalogClient interface {
 	CreateCatalog(ctx context.Context, name string, props map[string]string) error
 	AlterCatalog(ctx context.Context, name string, props map[string]string) error
 	DropCatalog(ctx context.Context, name string) error
-}
-
-// OPABundleClient is the surface the provisioner uses to push a generated
-// bundle to the customer Trino cluster's OPA sidecar via the bundle API.
-// One pod hosts the OPA sidecar (alongside the coordinator); the push is
-// over loopback / NetworkPolicy-restricted egress. Interface lets tests
-// substitute a fake.
-type OPABundleClient interface {
-	PushBundle(ctx context.Context, bundle []byte) error
 }
 
 // TrinoProvisionerOpts groups all the dependencies trino_provisioner.go
@@ -136,20 +125,31 @@ type TrinoProvisionerOpts struct {
 	Namespace string
 
 	// Catalog is the Trino REST client used to issue CREATE / ALTER /
-	// DROP CATALOG. The provisioner authenticates as
-	// TrinoAdminProvisionerUser; the underlying HTTP client owns the
-	// admin Basic-auth credential.
+	// DROP CATALOG. The provisioner authenticates as opa.AdminPrincipal;
+	// the underlying HTTP client owns the admin Basic-auth credential
+	// (loaded from a provisioner-only K8s Secret, not from configstore).
 	Catalog TrinoCatalogClient
 
-	// OPA is the bundle push client. Bundle bytes come from
-	// BundleBuilder.
-	OPA OPABundleClient
+	// BundleStore is the in-memory holder of the most recently built OPA
+	// bundle. The provisioner Set()s into it on every reconcile tick;
+	// the customer-Trino OPA sidecar's bundle plugin polls an HTTP
+	// endpoint (opa.Handler) backed by this same store, so distribution
+	// is pull-based (see plan "Open Questions #6"). Owned and exposed by
+	// the caller (typically multitenant.go) so the same store can be
+	// mounted onto the provisioning HTTP server.
+	BundleStore *opa.BundleStore
 
-	// BundleBuilder builds the OPA bundle from the user→catalogs map.
-	// Construct with opa.NewStubBuilder() until the real Rego-backed
-	// builder ships in a sibling PR (which swaps in a real constructor
-	// without touching this call site).
+	// BundleBuilder builds the OPA bundle (gzip tarball) from a
+	// GroupCatalogs map. In production, pass opa.NewBuilder().
 	BundleBuilder opa.BundleBuilder
+
+	// AdminPasswordHash is the bcrypt hash of the password the
+	// provisioner authenticates with against the customer Trino cluster
+	// as opa.AdminPrincipal. Projected verbatim into password.db (Trino
+	// file authenticator expects bcrypt hashes). Required in production;
+	// empty in unit tests (where the catalog client is a fake and
+	// auth.db content doesn't reach Trino).
+	AdminPasswordHash string
 
 	// IAMAccountID is the AWS account id the per-org Iceberg catalogs
 	// reference via iceberg.s3.aws-role-arn (the duckling-<orgid> role).
@@ -167,6 +167,7 @@ type TrinoProvisionerOpts struct {
 // import everywhere.
 type TrinoStore interface {
 	ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error)
+	UpdateTrinoState(orgID string, upd configstore.TrinoStateUpdate) error
 }
 
 // TrinoIcebergStore reads a single org's Iceberg config to populate the
@@ -183,15 +184,16 @@ type TrinoIcebergStore interface {
 // configstore-derived input. Same input → same output (deterministic
 // projection), so a re-run is a no-op against settled state.
 type TrinoProvisioner struct {
-	store         TrinoStore
-	icebergStore  TrinoIcebergStore
-	kubernetes    kubernetes.Interface
-	namespace     string
-	catalog       TrinoCatalogClient
-	opa           OPABundleClient
-	bundleBuilder opa.BundleBuilder
-	iamAccountID  string
-	awsRegion     string
+	store             TrinoStore
+	icebergStore      TrinoIcebergStore
+	kubernetes        kubernetes.Interface
+	namespace         string
+	catalog           TrinoCatalogClient
+	bundleStore       *opa.BundleStore
+	bundleBuilder     opa.BundleBuilder
+	adminPasswordHash string
+	iamAccountID      string
+	awsRegion         string
 }
 
 // NewTrinoProvisioner constructs a TrinoProvisioner from required deps.
@@ -210,8 +212,8 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if opts.Catalog == nil {
 		return nil, errors.New("TrinoProvisioner: Catalog client is required")
 	}
-	if opts.OPA == nil {
-		return nil, errors.New("TrinoProvisioner: OPA client is required")
+	if opts.BundleStore == nil {
+		return nil, errors.New("TrinoProvisioner: BundleStore is required")
 	}
 	if opts.BundleBuilder == nil {
 		return nil, errors.New("TrinoProvisioner: BundleBuilder is required")
@@ -221,15 +223,16 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		ns = TrinoCustomerNamespace
 	}
 	return &TrinoProvisioner{
-		store:         opts.Store,
-		icebergStore:  opts.IcebergStore,
-		kubernetes:    opts.Kubernetes,
-		namespace:     ns,
-		catalog:       opts.Catalog,
-		opa:           opts.OPA,
-		bundleBuilder: opts.BundleBuilder,
-		iamAccountID:  opts.IAMAccountID,
-		awsRegion:     opts.AWSRegion,
+		store:             opts.Store,
+		icebergStore:      opts.IcebergStore,
+		kubernetes:        opts.Kubernetes,
+		namespace:         ns,
+		catalog:           opts.Catalog,
+		bundleStore:       opts.BundleStore,
+		bundleBuilder:     opts.BundleBuilder,
+		adminPasswordHash: opts.AdminPasswordHash,
+		iamAccountID:      opts.IAMAccountID,
+		awsRegion:         opts.AWSRegion,
 	}, nil
 }
 
@@ -255,32 +258,138 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	var errs []error
 
 	// 1. Catalogs (REST). Per-org idempotent CREATE; orgs disabled since
-	// last tick get DROP. Failing one org doesn't block the others.
-	if err := p.reconcileCatalogs(ctx, orgs); err != nil {
-		errs = append(errs, fmt.Errorf("reconcile catalogs: %w", err))
+	// last tick get DROP. Failing one org doesn't block the others. The
+	// per-org outcome (catalog exists / pending / errored) is captured
+	// so the trailing state-write step can attribute per-org status
+	// correctly — the other three steps below are global (one K8s API
+	// write each), so their failure attaches to every org uniformly.
+	catalogOutcomes, catErr := p.reconcileCatalogs(ctx, orgs)
+	if catErr != nil {
+		errs = append(errs, fmt.Errorf("reconcile catalogs: %w", catErr))
 	}
 
 	// 2. Auth file projection (K8s Secret). Atomic Secret update.
-	if err := p.reconcileAuthSecret(ctx, orgs); err != nil {
-		errs = append(errs, fmt.Errorf("reconcile auth secret: %w", err))
+	authErr := p.reconcileAuthSecret(ctx, orgs)
+	if authErr != nil {
+		errs = append(errs, fmt.Errorf("reconcile auth secret: %w", authErr))
 	}
 
 	// 3. Resource groups (K8s ConfigMap). Generated from the per-org
 	// tier; rebuilt every tick.
-	if err := p.reconcileResourceGroups(ctx, orgs); err != nil {
-		errs = append(errs, fmt.Errorf("reconcile resource groups: %w", err))
+	rgErr := p.reconcileResourceGroups(ctx, orgs)
+	if rgErr != nil {
+		errs = append(errs, fmt.Errorf("reconcile resource groups: %w", rgErr))
 	}
 
-	// 4. OPA bundle (push via OPA bundle API). user_catalogs map keyed
-	// by team_id, value is the org's owned catalog set.
-	if err := p.reconcileOPABundle(ctx, orgs); err != nil {
-		errs = append(errs, fmt.Errorf("reconcile opa bundle: %w", err))
+	// 4. OPA bundle. GroupCatalogs keyed by Trino group name; Set into
+	// the in-memory store the bundle HTTP handler serves.
+	opaErr := p.reconcileOPABundle(ctx, orgs)
+	if opaErr != nil {
+		errs = append(errs, fmt.Errorf("reconcile opa bundle: %w", opaErr))
 	}
+
+	// Per-org state writes. The global steps' (auth/rg/opa) outcomes
+	// are the same for every org since each is a single K8s API write
+	// — wrap them once.
+	globalErr := errors.Join(authErr, rgErr, opaErr)
+	p.writePerOrgStates(orgs, catalogOutcomes, globalErr)
 
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+// catalogOutcome is the per-org result of the catalog reconcile step.
+// Exactly one of (Created, Existed, Pending) is true when Err == nil;
+// Err != nil means CREATE CATALOG itself failed and the org should
+// land in Failed state with the error message.
+type catalogOutcome struct {
+	Created bool   // catalog was just created this tick
+	Existed bool   // catalog already present, no action taken
+	Pending bool   // skipped because Iceberg isn't ready yet (provisioning, not a failure)
+	Err     error  // CREATE CATALOG error; mutually exclusive with the booleans
+}
+
+// writePerOrgStates writes the per-org state transition after one full
+// reconcile tick. Per-org variance lives entirely at the catalog step;
+// the global steps' failure (if any) applies uniformly to every
+// Trino-enabled org.
+//
+// Priority of attribution (worst wins):
+//
+//   1. Per-org catalog error -> Failed + "catalog: <err>".
+//   2. Global step error     -> Failed + "projection: <err>".
+//   3. Catalog still pending -> Provisioning + "waiting for iceberg".
+//   4. Everything succeeded  -> Ready + ReadyAt=now.
+//
+// Errors from UpdateTrinoState itself are logged and swallowed —
+// failing to record state is non-fatal; the next reconcile tick will
+// re-attempt.
+func (p *TrinoProvisioner) writePerOrgStates(
+	orgs []configstore.TrinoEnabledOrg,
+	catalogOutcomes map[string]catalogOutcome,
+	globalErr error,
+) {
+	now := time.Now().UTC()
+	zero := time.Time{} // pointer-to-zero signals "clear failed_at" to UpdateTrinoState
+	for _, o := range orgs {
+		out := catalogOutcomes[o.OrgID]
+		var (
+			nextState configstore.ManagedWarehouseProvisioningState
+			msg       string
+		)
+		switch {
+		case out.Err != nil:
+			nextState = configstore.ManagedWarehouseStateFailed
+			msg = "catalog: " + out.Err.Error()
+		case globalErr != nil:
+			nextState = configstore.ManagedWarehouseStateFailed
+			msg = "projection: " + globalErr.Error()
+		case out.Pending:
+			nextState = configstore.ManagedWarehouseStateProvisioning
+			msg = "waiting for iceberg / Lakekeeper to become ready"
+		default:
+			// Created or Existed + no global failure == Ready.
+			nextState = configstore.ManagedWarehouseStateReady
+			msg = ""
+		}
+
+		// Transition-aware timestamps, matching the surrounding
+		// ManagedWarehouse pattern in controller.go: ready_at stamps
+		// the first transition into Ready and is preserved on
+		// subsequent ticks; failed_at stamps the transition into
+		// Failed and is cleared on transition out so the column reads
+		// as "currently failing since X" rather than "ever failed."
+		upd := configstore.TrinoStateUpdate{
+			State:         nextState,
+			StatusMessage: msg,
+		}
+		if nextState == configstore.ManagedWarehouseStateReady && o.State != configstore.ManagedWarehouseStateReady {
+			// Transitioning INTO Ready — stamp ready_at, clear any
+			// stale failed_at from the previous Failed lifecycle.
+			upd.ReadyAt = &now
+			upd.FailedAt = &zero
+		}
+		if nextState == configstore.ManagedWarehouseStateFailed && o.State != configstore.ManagedWarehouseStateFailed {
+			// Transitioning INTO Failed — stamp failed_at. Leave
+			// ready_at as-is (it records the historic first-Ready
+			// transition; the row's currently-failing-ness is
+			// represented by state+failed_at).
+			upd.FailedAt = &now
+		}
+		if nextState != configstore.ManagedWarehouseStateFailed && o.State == configstore.ManagedWarehouseStateFailed {
+			// Transitioning OUT of Failed into a non-Ready state
+			// (e.g. Provisioning while waiting on Iceberg) — clear
+			// failed_at since the row is no longer failed.
+			upd.FailedAt = &zero
+		}
+
+		if err := p.store.UpdateTrinoState(o.OrgID, upd); err != nil {
+			slog.Warn("Trino reconcile: failed to write per-org state.",
+				"org", o.OrgID, "error", err)
+		}
+	}
 }
 
 // reconcileCatalogs issues CREATE CATALOG for each Trino-enabled org
@@ -291,10 +400,18 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 // We intentionally only touch catalogs whose name matches the
 // org_*_iceberg prefix so other catalogs (system, jmx, hand-rolled
 // ones for the maintenance use case) survive untouched.
-func (p *TrinoProvisioner) reconcileCatalogs(ctx context.Context, orgs []configstore.TrinoEnabledOrg) error {
+func (p *TrinoProvisioner) reconcileCatalogs(ctx context.Context, orgs []configstore.TrinoEnabledOrg) (map[string]catalogOutcome, error) {
+	outcomes := make(map[string]catalogOutcome, len(orgs))
+
 	existing, err := p.catalog.ListCatalogs(ctx)
 	if err != nil {
-		return fmt.Errorf("list trino catalogs: %w", err)
+		// Listing failed — we can't safely attribute per-org outcomes,
+		// so flag every org as failed-with-this-error so they don't
+		// transition to ready spuriously.
+		for _, o := range orgs {
+			outcomes[o.OrgID] = catalogOutcome{Err: fmt.Errorf("list trino catalogs: %w", err)}
+		}
+		return outcomes, fmt.Errorf("list trino catalogs: %w", err)
 	}
 	existingSet := make(map[string]bool, len(existing))
 	for _, c := range existing {
@@ -313,27 +430,39 @@ func (p *TrinoProvisioner) reconcileCatalogs(ctx context.Context, orgs []configs
 			// Already there. Drift-correct properties (ALTER) is post-v1
 			// — Lakekeeper auth stays allowall so catalog properties
 			// don't drift; revisit when OAuth2 lands.
+			outcomes[o.OrgID] = catalogOutcome{Existed: true}
 			continue
 		}
 		iceberg, err := p.icebergStore.GetManagedWarehouseIceberg(o.OrgID)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("org %s: read iceberg config: %w", o.OrgID, err))
+			perOrgErr := fmt.Errorf("read iceberg config: %w", err)
+			errs = append(errs, fmt.Errorf("org %s: %w", o.OrgID, perOrgErr))
+			outcomes[o.OrgID] = catalogOutcome{Err: perOrgErr}
 			continue
 		}
-		if iceberg == nil || iceberg.LakekeeperEndpoint == "" {
-			// Org opted into Trino but Iceberg isn't ready in Lakekeeper
-			// yet. Skip silently — the next reconcile picks it up once
-			// the Lakekeeper provisioner finishes.
+		if iceberg == nil || iceberg.LakekeeperEndpoint == "" || iceberg.LakekeeperWarehouse == "" {
+			// Org opted into Trino but Iceberg isn't fully ready yet —
+			// both the REST endpoint AND the warehouse name are
+			// required (iceberg.rest-catalog.warehouse rendered as ''
+			// makes Trino reject CREATE CATALOG every tick, silently).
+			// Skip; the next reconcile picks it up once Lakekeeper
+			// provisioning completes.
 			slog.Debug("Trino reconcile: iceberg not ready yet, skipping catalog create.",
-				"org", o.OrgID)
+				"org", o.OrgID,
+				"endpoint_set", iceberg != nil && iceberg.LakekeeperEndpoint != "",
+				"warehouse_set", iceberg != nil && iceberg.LakekeeperWarehouse != "")
+			outcomes[o.OrgID] = catalogOutcome{Pending: true}
 			continue
 		}
 		props := p.buildCatalogProperties(o.OrgID, iceberg)
 		if err := p.catalog.CreateCatalog(ctx, name, props); err != nil {
-			errs = append(errs, fmt.Errorf("create catalog %s: %w", name, err))
+			perOrgErr := fmt.Errorf("create catalog %s: %w", name, err)
+			errs = append(errs, perOrgErr)
+			outcomes[o.OrgID] = catalogOutcome{Err: perOrgErr}
 			continue
 		}
 		slog.Info("Trino reconcile: catalog created.", "org", o.OrgID, "catalog", name)
+		outcomes[o.OrgID] = catalogOutcome{Created: true}
 	}
 
 	for _, c := range existing {
@@ -351,24 +480,39 @@ func (p *TrinoProvisioner) reconcileCatalogs(ctx context.Context, orgs []configs
 	}
 
 	if len(errs) > 0 {
-		return errors.Join(errs...)
+		return outcomes, errors.Join(errs...)
 	}
-	return nil
+	return outcomes, nil
 }
 
 // buildCatalogProperties returns the Trino catalog property set for an
 // org's Iceberg catalog. Lakekeeper stays allowall in v1, so no OAuth2
 // credentials are embedded here — just the endpoint, the warehouse
 // name, and the per-org S3 IAM role.
+//
+// Property names follow Trino's current file-system / Iceberg-REST
+// surface (matching the working maintenance chart at
+// charts/charts/trino/files/trino_maintenance.py):
+//
+//	fs.s3.enabled=true              enable the unified S3 file system
+//	s3.region=<region>              forwarded to the AWS SDK
+//	s3.iam-role=<arn>               per-org duckling-<orgid> role
+//
+// The OLD `iceberg.s3.aws-role-arn` / `iceberg.s3.region` properties
+// referenced in the design plan are stale for current Trino — they
+// silently get ignored by some versions and outright rejected by
+// others, both of which break the catalog. Keep this list in sync
+// with the maintenance chart.
 func (p *TrinoProvisioner) buildCatalogProperties(orgID string, ic *configstore.ManagedWarehouseIceberg) map[string]string {
 	props := map[string]string{
-		"connector.name":              "iceberg",
-		"iceberg.catalog.type":        "rest",
-		"iceberg.rest-catalog.uri":    ic.LakekeeperEndpoint,
+		"connector.name":                 "iceberg",
+		"iceberg.catalog.type":           "rest",
+		"iceberg.rest-catalog.uri":       ic.LakekeeperEndpoint,
 		"iceberg.rest-catalog.warehouse": ic.LakekeeperWarehouse,
+		"fs.s3.enabled":                  "true",
 	}
 	if p.iamAccountID != "" {
-		props["iceberg.s3.aws-role-arn"] = fmt.Sprintf("arn:aws:iam::%s:role/duckling-%s", p.iamAccountID, orgID)
+		props["s3.iam-role"] = fmt.Sprintf("arn:aws:iam::%s:role/duckling-%s", p.iamAccountID, orgID)
 	}
 	if p.awsRegion != "" {
 		props["s3.region"] = p.awsRegion
@@ -385,7 +529,7 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, ic *configstore.
 // Mounted into the coordinator pod only (chart configuration in Stream
 // F). Workers never see this Secret.
 func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []configstore.TrinoEnabledOrg) error {
-	passwordDB, groupDB := BuildTrinoAuthFiles(orgs)
+	passwordDB, groupDB := BuildTrinoAuthFiles(orgs, p.adminPasswordHash)
 	return p.upsertSecret(ctx, TrinoAuthSecretName, map[string][]byte{
 		TrinoAuthSecretKeyPasswordDB: []byte(passwordDB),
 		TrinoAuthSecretKeyGroupDB:    []byte(groupDB),
@@ -410,8 +554,24 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 // Orgs without a RootPasswordHash are skipped silently (the listing
 // query already filters to (org, root-user) pairs, so this is just
 // defensive against future changes).
-func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg) (passwordDB, groupDB string) {
+//
+// adminPasswordHash is the bcrypt for opa.AdminPrincipal — the
+// provisioner's own catalog-management identity. When non-empty, the
+// admin entry is unconditionally prepended to both files (regardless of
+// orgs). The plan ("Internal admin principal for catalog management")
+// requires the admin in *both* password.db and group.db so OPA's
+// is_admin = (admin username AND admin group) conjunction holds; the
+// provisioner cannot do CREATE/DROP CATALOG otherwise. Empty hash skips
+// the admin lines (acceptable in unit tests where the catalog client is
+// a fake; never acceptable in production — see NewTrinoProvisioner).
+func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, adminPasswordHash string) (passwordDB, groupDB string) {
 	var pwLines, grpLines []string
+	if adminPasswordHash != "" {
+		// Prepend so the admin is always present even if every org row
+		// is filtered out (empty cluster bootstrap).
+		pwLines = append(pwLines, fmt.Sprintf("%s:%s", opa.AdminPrincipal, adminPasswordHash))
+		grpLines = append(grpLines, fmt.Sprintf("%s:%s", opa.AdminGroup, opa.AdminPrincipal))
+	}
 	for _, o := range orgs {
 		if o.RootPasswordHash == "" || o.OrgID == "" {
 			continue
@@ -534,7 +694,11 @@ func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error
 			continue
 		}
 		sg := tierLimits(o.Tier)
-		sg.Name = o.OrgID
+		// Subgroup name is sanitized to match TrinoResourceGroupName's
+		// final path component. The selector's User field stays raw —
+		// it matches against Trino's `current_user`, which is the
+		// auth-time username (raw orgID).
+		sg.Name = trinoSanitize(o.OrgID)
 		subgroups = append(subgroups, sg)
 		selectors = append(selectors, resourceGroupSelector{
 			User:  o.OrgID,
@@ -565,27 +729,45 @@ func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error
 	return out, nil
 }
 
-// reconcileOPABundle builds the user_catalogs map and asks the bundle
-// builder to render a bundle, then pushes it via the OPA bundle API.
+// reconcileOPABundle builds the GroupCatalogs map and Set()s a freshly
+// built bundle into the in-memory BundleStore. The customer-Trino OPA
+// sidecar polls opa.Handler (mounted by the caller on the provisioning
+// HTTP server, backed by this same store) with If-None-Match; an
+// unchanged input produces a byte-equal bundle, the ETag matches, and
+// OPA's poll returns 304 without re-activating.
 //
-// While the bundle builder is the stub (returns "{}"), this step still
-// exercises the code path end-to-end so a regression landing alongside
-// the real builder's merge is loud, not silent.
-func (p *TrinoProvisioner) reconcileOPABundle(ctx context.Context, orgs []configstore.TrinoEnabledOrg) error {
-	uc := make(opa.UserCatalogs, len(orgs))
+// Keying is by *group*, not by username — the policy authorises via
+// `data.group_catalogs[group][catalog]`. Customer principals' groups
+// are `org_<team_id>` (TrinoGroupName); the admin group owns every
+// managed catalog so the provisioner's own SHOW CATALOGS idempotency
+// check (run as opa.AdminPrincipal) is allowed.
+//
+// ctx is currently unused (the builder is pure and the store Set is
+// in-memory), but kept on the signature for parity with the other
+// reconcile* steps and to permit instrumented builders later.
+func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configstore.TrinoEnabledOrg) error {
+	gc := make(opa.GroupCatalogs, len(orgs)+1)
+	adminCatalogs := make(map[string]bool, len(orgs))
 	for _, o := range orgs {
 		if o.OrgID == "" {
 			continue
 		}
-		uc[o.OrgID] = map[string]bool{TrinoCatalogName(o.OrgID): true}
+		catalog := TrinoCatalogName(o.OrgID)
+		gc[TrinoGroupName(o.OrgID)] = map[string]bool{catalog: true}
+		adminCatalogs[catalog] = true
 	}
-	bundle, err := p.bundleBuilder.BuildBundle(uc)
+	if len(adminCatalogs) > 0 {
+		// Admin owns every managed catalog so SHOW CATALOGS / catalog
+		// management succeeds. Reads still require is_admin (the
+		// admin-group claim alone grants nothing — see opa.AdminGroup
+		// docstring).
+		gc[opa.AdminGroup] = adminCatalogs
+	}
+	bundle, err := p.bundleBuilder.BuildBundle(gc)
 	if err != nil {
 		return fmt.Errorf("build opa bundle: %w", err)
 	}
-	if err := p.opa.PushBundle(ctx, bundle); err != nil {
-		return fmt.Errorf("push opa bundle: %w", err)
-	}
+	p.bundleStore.Set(opa.NewBundle(bundle))
 	return nil
 }
 
@@ -659,14 +841,14 @@ func (p *TrinoProvisioner) upsertConfigMap(ctx context.Context, name string, dat
 }
 
 // =====================================================================
-// HTTP implementations of TrinoCatalogClient + OPABundleClient.
+// HTTP implementation of TrinoCatalogClient.
 // =====================================================================
 
 // trinoCatalogHTTPClient drives the Trino REST API for catalog
 // management. Authentication is HTTP Basic (Trino's standard for the
 // file password authenticator); the configured user is
-// TrinoAdminProvisionerUser, with the password living in a K8s Secret
-// mounted only into the provisioner pod.
+// opa.AdminPrincipal, with the password living in a K8s Secret mounted
+// only into the provisioner pod.
 //
 // One client per provisioner instance — the underlying http.Client is
 // goroutine-safe but the cached Basic-auth header is set once at
@@ -681,10 +863,10 @@ type trinoCatalogHTTPClient struct {
 // NewTrinoCatalogHTTPClient builds an HTTP-backed TrinoCatalogClient.
 // baseURL is the customer Trino coordinator endpoint (typically the
 // in-cluster Service: http://trino:8080). Username defaults to
-// TrinoAdminProvisionerUser if empty.
+// opa.AdminPrincipal if empty.
 func NewTrinoCatalogHTTPClient(baseURL, username, password string) TrinoCatalogClient {
 	if username == "" {
-		username = TrinoAdminProvisionerUser
+		username = opa.AdminPrincipal
 	}
 	return &trinoCatalogHTTPClient{
 		baseURL:  strings.TrimRight(baseURL, "/"),
@@ -740,10 +922,21 @@ func (c *trinoCatalogHTTPClient) runStatement(ctx context.Context, sql string) (
 // drainStatement reads the nextUri chain until the statement
 // completes. Each hop is a GET; the final body carries the result
 // data (already-accumulated rows from earlier hops are kept).
+//
+// Bounded to maxDrainHops to defend against a pathological Trino
+// (or test fake) that perpetually returns a nextUri without ever
+// completing. Catalog management statements are DDL and finish in a
+// handful of hops in practice; 1000 is generous for any sane Trino.
+// Each hop also honors ctx — a cancelled reconcile context aborts
+// promptly rather than waiting for the next request to time out.
 func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []byte) ([][]interface{}, error) {
+	const maxDrainHops = 1000
 	var all [][]interface{}
 	body := initial
-	for {
+	for hop := 0; hop < maxDrainHops; hop++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("statement drain aborted: %w", err)
+		}
 		var r trinoStatementResponse
 		if err := json.Unmarshal(body, &r); err != nil {
 			return nil, fmt.Errorf("parse statement response: %w (body=%q)", err, string(body))
@@ -771,6 +964,7 @@ func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []b
 			return nil, fmt.Errorf("get nextUri: status %d: %s", resp.StatusCode, string(body))
 		}
 	}
+	return nil, fmt.Errorf("statement drain exceeded %d hops without completing", maxDrainHops)
 }
 
 // ListCatalogs runs SHOW CATALOGS and returns the catalog names.
@@ -798,8 +992,17 @@ func (c *trinoCatalogHTTPClient) CreateCatalog(ctx context.Context, name string,
 	if connector == "" {
 		return fmt.Errorf("CreateCatalog %q: connector.name property is required", name)
 	}
-	withProps := props
-	delete(withProps, "connector.name")
+	// Copy props minus connector.name into withProps; do not mutate the
+	// caller's map. (Earlier versions did `withProps := props; delete(withProps, "connector.name")`,
+	// which silently shared backing storage with the caller and stripped
+	// connector.name from their copy too.)
+	withProps := make(map[string]string, len(props))
+	for k, v := range props {
+		if k == "connector.name" {
+			continue
+		}
+		withProps[k] = v
+	}
 	sql := fmt.Sprintf("CREATE CATALOG %s USING %s%s", quoteTrinoIdentifier(name), connector, renderWithClause(withProps))
 	_, err := c.runStatement(ctx, sql)
 	return err
@@ -855,51 +1058,8 @@ func basicAuth(username, password string) string {
 	return base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 }
 
-// =====================================================================
-// OPA bundle HTTP client.
-// =====================================================================
-
-// opaBundleHTTPClient pushes a bundle to the OPA sidecar's bundle API
-// (PUT /v1/policies or the bundle service endpoint; specific path is
-// configurable). The bundle bytes are uploaded as the request body.
-//
-// For v1 the OPA sidecar runs alongside the customer Trino coordinator
-// pod, so the URL is typically http://localhost:8181 from the
-// provisioner's perspective (port-forward in dev) or
-// http://trino-coordinator-opa:8181 from the provisioner pod in K8s.
-type opaBundleHTTPClient struct {
-	baseURL string
-	hc      *http.Client
-}
-
-// NewOPABundleHTTPClient builds an OPABundleClient. baseURL is the OPA
-// sidecar's bundle API root.
-func NewOPABundleHTTPClient(baseURL string) OPABundleClient {
-	return &opaBundleHTTPClient{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		hc:      &http.Client{Timeout: 30 * time.Second},
-	}
-}
-
-// PushBundle uploads the bundle bytes to the OPA bundle endpoint.
-// We use PUT /v1/policies/duckgres so the bundle replaces the
-// previously-pushed one rather than appending. OPA's bundle API path
-// can vary by configuration; the path may need to match the real
-// builder PR's PushBundle helper before merge.
-func (c *opaBundleHTTPClient) PushBundle(ctx context.Context, bundle []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/v1/policies/duckgres", bytes.NewReader(bundle))
-	if err != nil {
-		return fmt.Errorf("build opa request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return fmt.Errorf("opa push: %w", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("opa push: status %d: %s", resp.StatusCode, string(body))
-	}
-	return nil
-}
+// Bundle distribution is pull-based (plan "Open Questions #6"): the
+// provisioner Set()s built bundles into an opa.BundleStore; the
+// customer-Trino OPA sidecar polls opa.Handler with If-None-Match.
+// There is no provisioner-side push client. See reconcileOPABundle and
+// TrinoProvisionerOpts.BundleStore.

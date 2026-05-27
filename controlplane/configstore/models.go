@@ -19,10 +19,11 @@ type Org struct {
 	IdleTimeoutS        int               `gorm:"default:0" json:"idle_timeout_s"`
 	WorkerCPURequest    string            `gorm:"size:32" json:"worker_cpu_request"`
 	WorkerMemoryRequest string            `gorm:"size:32" json:"worker_memory_request"`
-	Users               []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse           *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	CreatedAt           time.Time         `json:"created_at"`
-	UpdatedAt           time.Time         `json:"updated_at"`
+	Users               []OrgUser              `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse           *ManagedWarehouse      `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	Trino               *ManagedWarehouseTrino `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"trino,omitempty"`
+	CreatedAt           time.Time              `json:"created_at"`
+	UpdatedAt           time.Time              `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
@@ -217,6 +218,30 @@ type ManagedWarehouseTrino struct {
 	// post-v1 work once tier shape stabilizes.
 	Tier string `gorm:"size:64" json:"tier"`
 
+	// State / StatusMessage / ReadyAt / FailedAt mirror the
+	// ManagedWarehouse lifecycle fields so operators can see what the
+	// Trino reconcile loop is doing. The Trino reconcile is a single
+	// batched output per tick (catalog + auth + resource-groups +
+	// bundle); these fields summarize the most recent tick's outcome.
+	//
+	// State transitions:
+	//   - pending (default after EnableTrino, before first reconcile)
+	//   - provisioning (a reconcile tick is mid-flight or a previous
+	//     tick partially failed and is retrying)
+	//   - ready (the most recent tick succeeded across all four steps)
+	//   - failed (the most recent tick errored — StatusMessage carries
+	//     the per-step detail; ready_at is preserved, failed_at is set)
+	//
+	// On the next successful reconcile after a failed state, the row
+	// flips back to ready and failed_at is cleared. We don't model the
+	// plan's per-step sub-states (CatalogCreating, ProjectionReady,
+	// etc.) — for v1 the four-state summary plus StatusMessage detail
+	// is sufficient observability without growing the model.
+	State         ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
+	StatusMessage string                            `gorm:"size:1024" json:"status_message"`
+	ReadyAt       *time.Time                        `json:"ready_at,omitempty"`
+	FailedAt      *time.Time                        `json:"failed_at,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -227,11 +252,18 @@ func (ManagedWarehouseTrino) TableName() string { return "duckgres_managed_wareh
 // root-user bcrypt hash. The provisioner needs both at once — the password
 // file projection keys org_<team_id> by the password hash — so a single
 // query avoids an N+1 read pattern as the Trino-enabled org count grows.
+//
+// State is the row's CURRENT operational state at the time of the read,
+// so the reconcile loop can decide whether each per-tick write is a
+// transition (set ReadyAt / FailedAt) or a no-op preservation
+// (matches the surrounding ManagedWarehouse pattern in controller.go,
+// which only stamps ready_at on the first transition into ready).
 type TrinoEnabledOrg struct {
 	OrgID            string
 	DatabaseName     string
 	Tier             string
-	RootPasswordHash string // bcrypt hash from OrgUser row where Username = "root"
+	RootPasswordHash string                            // bcrypt hash from OrgUser row where Username = "root"
+	State            ManagedWarehouseProvisioningState // current state at read time
 }
 
 // ResolvedBackend returns Backend with the empty-string default applied.

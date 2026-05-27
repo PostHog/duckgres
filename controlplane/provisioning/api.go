@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -11,10 +12,45 @@ import (
 	"gorm.io/gorm"
 )
 
+// isUniqueViolation reports whether err comes from a Postgres
+// 23505 unique-constraint violation. The pgx/jackc driver surfaces
+// the SQLSTATE through a method on the returned error; we match
+// against that without importing pgconn directly (mirrors the
+// pattern in controlplane/provisioner/postgres_admin.go).
+//
+// Mapped to HTTP 409 by the provision handler so callers see a
+// clear "your input conflicts with existing state" rather than a
+// generic 500.
+func isUniqueViolation(err error) bool {
+	type sqlStater interface{ SQLState() string }
+	var s sqlStater
+	return errors.As(err, &s) && s.SQLState() == "23505"
+}
+
+// trinoOrgIDPattern is the team_id shape Trino's customer-facing path
+// requires: ASCII digits only. The plan establishes the v1 invariant
+// that Org.Name (== posthog team_id) is an integer string; Trino's
+// catalog naming and group-file projection don't tolerate punctuation,
+// and silently sanitizing it would let two distinct team_ids collide
+// into one catalog. Rejecting non-numeric IDs at the API boundary is
+// safer than catching the collision downstream.
+//
+// Org IDs flowing into the existing /provision endpoint are not
+// constrained by this — only the Trino opt-in surfaces (the standalone
+// /trino enable endpoint and the optional trino block on /provision).
+var trinoOrgIDPattern = regexp.MustCompile(`^[0-9]+$`)
+
 // Store defines the config store operations needed by the provisioning API.
 type Store interface {
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	GetOrg(orgID string) (*configstore.Org, error)
+	// Provision is the all-or-nothing entrypoint for POST /provision —
+	// wraps warehouse + root-user + optional Trino-opt-in writes in a
+	// single configstore transaction so partial failure rolls back
+	// cleanly. Use this for the public provision endpoint; the older
+	// per-step methods below are kept for the standalone surfaces
+	// (reset-password, enable/disable trino on an existing org).
+	Provision(req ProvisionRequest) error
 	CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error
 	CreateOrgUser(orgID, username, passwordHash string) error
 	UpdateOrgUserPassword(orgID, username, passwordHash string) error
@@ -162,13 +198,21 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if err := h.store.CreatePendingWarehouse(orgID, req.DatabaseName, warehouse); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-		return
+	// Validate Trino opt-in BEFORE generating the password — the
+	// numeric-orgID check is a request-validation failure (400), and
+	// running it inside the tx would just roll back and waste a hash.
+	var trinoSettings *configstore.TrinoSettings
+	if req.Trino != nil && req.Trino.Enabled {
+		if !trinoOrgIDPattern.MatchString(orgID) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "trino.enabled requires a numeric org id (posthog team_id); got: " + orgID})
+			return
+		}
+		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier}
 	}
 
-	// Create root user with a generated password. The plaintext is returned
-	// in this response only — it is never stored, only the bcrypt hash is persisted.
+	// Generate the root password. The plaintext is returned in this
+	// response only — it is never stored, only the bcrypt hash is
+	// persisted via the transactional Provision below.
 	plainPassword, err := configstore.GeneratePassword()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate password"})
@@ -179,21 +223,37 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
 		return
 	}
-	if err := h.store.CreateOrgUser(orgID, "root", hash); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create root user"})
-		return
-	}
 
-	// Optionally enable Trino in the same handler. Failures here roll
-	// back to a 500 — partial state (warehouse + user created but trino
-	// row missing) would mean the caller's next retry conflicts on the
-	// warehouse row but the trino opt-in was silently lost. We'd rather
-	// surface that so the caller knows to retry.
-	if req.Trino != nil && req.Trino.Enabled {
-		if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Trino.Tier}); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to enable trino: " + err.Error()})
+	// One transaction wraps warehouse + root user + optional Trino
+	// opt-in. Failure of any sub-step rolls the others back so the
+	// caller's retry sees the same starting state (no half-provisioned
+	// row blocking re-creation).
+	if err := h.store.Provision(ProvisionRequest{
+		OrgID:        orgID,
+		DatabaseName: req.DatabaseName,
+		Warehouse:    warehouse,
+		RootUserHash: hash,
+		Trino:        trinoSettings,
+	}); err != nil {
+		// The warehouse-already-exists conflict is the only error
+		// shape that maps to 409. Everything else (DB write failure,
+		// OnConflict surprise) is internal. The sentinel here
+		// replaces an earlier `strings.Contains` match, so that
+		// rewording the error message can't silently break the 409
+		// branch.
+		if errors.Is(err, ErrWarehouseNonTerminal) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
+		if isUniqueViolation(err) {
+			// Most likely: database_name already in use by another
+			// org. Map to 409 with a clear message; the underlying
+			// error still includes the constraint name for ops.
+			c.JSON(http.StatusConflict, gin.H{"error": "provision conflicts with existing state (likely database_name in use): " + err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "provision failed: " + err.Error()})
+		return
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{
@@ -219,6 +279,10 @@ func (h *handler) enableTrino(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "org id is required"})
 		return
 	}
+	if !trinoOrgIDPattern.MatchString(orgID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org id must be numeric (posthog team_id); got: " + orgID})
+		return
+	}
 
 	var req trinoRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -228,6 +292,21 @@ func (h *handler) enableTrino(c *gin.Context) {
 
 	if !req.Enabled {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true; use DELETE to disable"})
+		return
+	}
+
+	// Preflight: the FK on ManagedWarehouseTrino requires the Org row
+	// to exist. Without this check, EnableTrino's INSERT hits a
+	// foreign-key violation and we'd return a 500 with the raw Postgres
+	// error. 404 is the right shape: "the resource you're trying to
+	// modify doesn't exist." Callers that need to /provision first
+	// see the clear 404 here rather than parsing an FK error string.
+	if _, err := h.store.GetOrg(orgID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found; call /provision first"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
