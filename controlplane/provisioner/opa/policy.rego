@@ -7,11 +7,20 @@
 # Inputs (Trino OPA plugin schema, verified against trinodb/trino tag 476
 # at plugin/trino-opa/src/main/java/io/trino/plugin/opa/):
 #
-#   input.context.identity.user        -- the Trino current_user. For
-#                                         customer principals this is the
-#                                         stringified team_id; the
-#                                         provisioner uses __admin_provisioner.
-#   input.context.identity.groups      -- group memberships (org_<team_id>).
+#   input.context.identity.user        -- the Trino current_user. Used only
+#                                         for the admin-principal carve-out
+#                                         (catalog management).
+#   input.context.identity.groups      -- group memberships resolved by
+#                                         Trino's file group provider (v1)
+#                                         or OIDC group claim (post-v1).
+#                                         Customer principals get
+#                                         `org_<team_id>`; the admin gets
+#                                         the admin group. Customer access
+#                                         decisions key on this, not on the
+#                                         username -- so the bundle schema
+#                                         is stable across v1's
+#                                         password-file auth and v2's OIDC
+#                                         per-user identity.
 #   input.action.operation             -- one of the operation strings from
 #                                         OpaAccessControl.java; we enumerate
 #                                         only the ones we explicitly allow.
@@ -20,15 +29,32 @@
 #   input.action.resource.table.catalogName / .schemaName / .tableName
 #   input.action.resource.systemSessionProperty.name
 #
-# Data (mounted via the bundle's data.json under user_catalogs):
+# Data (mounted via the bundle's data.json under group_catalogs):
 #
-#   data.user_catalogs[<user>][<catalog>] == true
-#       iff <user> owns <catalog>. Object-indexed, NOT a linear scan over
-#       orgs. At thousands of orgs a linear-scan policy is 10-50ms per
-#       decision; the latency benchmark in the Go side rejects bundles
-#       that take that path.
+#   data.group_catalogs[<group>][<catalog>] == true
+#       iff members of <group> own <catalog>. Object-indexed, NOT a linear
+#       scan over orgs. At thousands of orgs a linear-scan policy is
+#       10-50ms per decision; the latency benchmark in the Go side rejects
+#       bundles that take that path. The per-decision `some g in
+#       input.context.identity.groups` iterates over a typically 1-2
+#       element list and is bounded.
 #
 # Defaults: deny everything not explicitly allowed below.
+#
+# !!! Cross-component invariant: this policy is the NON-BATCHED OPA
+# contract. Trino 476's batched access control (OpaBatchAccessControl,
+# enabled via `opa.policy.batched-uri` on the trino-opa plugin) sends
+# candidates under `input.action.filterResources` (plural) instead of
+# `input.action.resource` (singular). Every filter rule below reads
+# `input.action.resource.*`, so under the batched shape they all fail
+# their body and fall through to `default allow := false`. That is
+# fail-closed — safe by the threat model — but operationally it means
+# enabling batched mode in the chart silently denies every filter
+# query, which looks like a tenant-isolation bug from the outside.
+# DO NOT set `opa.policy.batched-uri` in the customer-Trino chart
+# without first extending this policy to handle the batched shape (and
+# the bundle generator's tests). TestBatchedInputDeniesByDefault below
+# locks the fail-closed behaviour as a regression guard.
 
 package trino
 
@@ -41,39 +67,69 @@ import rego.v1
 default allow := false
 
 # ---------------------------------------------------------------------------
-# Admin principal constant. Catalog-management operations are only ever
-# allowed for this principal. Keep in sync with opa.AdminPrincipal in
-# types.go.
+# Admin principal and group constants. The admin identity is the
+# provisioner's catalog-management role; it requires BOTH the admin
+# username AND admin_group membership (`is_admin` below). This conjunction
+# is defense in depth: in v1 both signals come from the same K8s Secret
+# (password.db + group.db projected by the provisioner), but the
+# conjunction guards against a regression in projection logic that lets
+# a customer's team_id collide with the admin name OR be added to the
+# admin group. Under v2 OIDC, the username + group claim ride together
+# in a signed JWT; the conjunction still hardens the boundary should
+# any future identity flow split them.
+#
+# Keep in sync with opa.AdminPrincipal / opa.AdminGroup in types.go.
 # ---------------------------------------------------------------------------
 
 admin_principal := "__admin_provisioner"
 
-# ---------------------------------------------------------------------------
-# Helper: O(1) catalog-ownership lookup. Uses object indexing so that the
-# query plan is a single hash probe regardless of the number of orgs in
-# the bundle.
-#
-# Returns true iff the requesting user owns the given catalog name.
-# Safe to call with missing user / catalog -- absent keys evaluate to
-# undefined, the rule body fails, and the outer `allow` stays false.
-# ---------------------------------------------------------------------------
+admin_group := "__admin_provisioner"
 
-owns_catalog(user, catalog) if {
-	data.user_catalogs[user][catalog] == true
+# Convenience binding for rules below.
+user := input.context.identity.user
+
+# Admin identity check: both the principal name AND the admin group must
+# be present. Either alone is insufficient.
+is_admin if {
+	user == admin_principal
+	admin_group in input.context.identity.groups
 }
 
-# Convenience for ops whose resource carries a `catalogName` field on the
-# schema/table object (FilterSchemas, ShowTables, SelectFromColumns, ...).
-user := input.context.identity.user
+# ---------------------------------------------------------------------------
+# Helper: O(1) catalog-ownership lookup keyed on group membership. Iterates
+# over input.context.identity.groups (typically 1-2 elements) and probes
+# data.group_catalogs[g][catalog] for each. Missing keys evaluate to
+# undefined, the body fails, and the outer `allow` stays false.
+#
+# `admin_group` is excluded from this iteration: it is a privileged label
+# whose ownership listing covers every customer catalog, and we must NOT
+# grant read access purely on the basis of someone showing up with that
+# group label. The admin's smoke-test read access flows through the
+# separate is_admin-gated rule below.
+# ---------------------------------------------------------------------------
+
+owns_catalog(catalog) if {
+	some g in input.context.identity.groups
+	g != admin_group
+	data.group_catalogs[g][catalog] == true
+}
+
+# Admin's read access to managed catalogs. Gated on is_admin (full
+# username + group conjunction) so a bare `admin_group` claim does not
+# unlock the global catalog list.
+owns_catalog(catalog) if {
+	is_admin
+	data.group_catalogs[admin_group][catalog] == true
+}
 
 # ---------------------------------------------------------------------------
 # Catalog-scope decisions.
 # ---------------------------------------------------------------------------
 
-# AccessCatalog: caller must own the catalog.
+# AccessCatalog: caller's groups must own the catalog.
 allow if {
 	input.action.operation == "AccessCatalog"
-	owns_catalog(user, input.action.resource.catalog.name)
+	owns_catalog(input.action.resource.catalog.name)
 }
 
 # FilterCatalogs: the Trino OPA plugin calls this once per candidate catalog
@@ -81,13 +137,13 @@ allow if {
 # AccessCatalog -- return true only for owned catalogs.
 allow if {
 	input.action.operation == "FilterCatalogs"
-	owns_catalog(user, input.action.resource.catalog.name)
+	owns_catalog(input.action.resource.catalog.name)
 }
 
 # ShowSchemas: scoped to catalogs the caller owns.
 allow if {
 	input.action.operation == "ShowSchemas"
-	owns_catalog(user, input.action.resource.catalog.name)
+	owns_catalog(input.action.resource.catalog.name)
 }
 
 # ---------------------------------------------------------------------------
@@ -96,12 +152,12 @@ allow if {
 
 allow if {
 	input.action.operation == "FilterSchemas"
-	owns_catalog(user, input.action.resource.schema.catalogName)
+	owns_catalog(input.action.resource.schema.catalogName)
 }
 
 allow if {
 	input.action.operation == "ShowTables"
-	owns_catalog(user, input.action.resource.schema.catalogName)
+	owns_catalog(input.action.resource.schema.catalogName)
 }
 
 # ---------------------------------------------------------------------------
@@ -111,36 +167,59 @@ allow if {
 
 allow if {
 	input.action.operation == "SelectFromColumns"
-	owns_catalog(user, input.action.resource.table.catalogName)
+	owns_catalog(input.action.resource.table.catalogName)
 }
 
 allow if {
 	input.action.operation == "FilterTables"
-	owns_catalog(user, input.action.resource.table.catalogName)
+	owns_catalog(input.action.resource.table.catalogName)
 }
 
 allow if {
 	input.action.operation == "ShowColumns"
-	owns_catalog(user, input.action.resource.table.catalogName)
+	owns_catalog(input.action.resource.table.catalogName)
 }
 
 allow if {
 	input.action.operation == "FilterColumns"
-	owns_catalog(user, input.action.resource.table.catalogName)
+	owns_catalog(input.action.resource.table.catalogName)
 }
 
 # ---------------------------------------------------------------------------
 # Session-property allowlist.
 #
-# Narrow allowlist (execution_policy, query_priority, join_distribution_type).
-# Memory and concurrency knobs are explicitly NOT here -- they're cross-tenant
-# attack vectors (a customer could starve other tenants by raising their own
-# memory cap). Adding any property to this set is a threat-model decision.
+# Narrow allowlist (execution_policy, join_distribution_type). Both are
+# query-tuning hints that affect the SUBMITTING query's own shape (execution
+# strategy, join distribution), bounded by per-query memory/CPU caps in
+# config.properties and the per-org resource-group memory limit. They do
+# not influence cross-tenant scheduling.
+#
+# Memory, concurrency, and cross-tenant scheduling knobs are explicitly
+# NOT here -- they're cross-tenant attack vectors. Notably absent:
+#
+#   - `query_priority`: under Trino's `query_priority` and `weighted_fair`
+#     scheduling policies this would let one tenant degrade another's
+#     queue position. The plan currently locks every resource group to
+#     `fair`, under which `query_priority` is ignored, so allowing it
+#     would be inert today -- but coupling the safety of this allowlist
+#     to the chart's scheduling-policy choice is a load-bearing
+#     invariant we don't need. Denied across the board; if we ever
+#     adopt a non-fair scheduling policy intentionally, revisit this
+#     allowlist as part of the same change.
+#   - `query_max_memory*`, `query_max_total_memory`, `resource_overcommit`:
+#     direct memory-budget escapes.
+#   - `query_max_cpu_time`, `query_max_execution_time`: per-query caps the
+#     cluster admin sets; letting customers raise them defeats per-query
+#     bounds.
+#
+# Adding any property to this set is a threat-model decision: it must
+# either be confined to the submitting query's own shape, OR there must
+# be a clear argument why a tenant's setting cannot affect any other
+# tenant's queries, queue position, or resource share.
 # ---------------------------------------------------------------------------
 
 safe_session_properties := {
 	"execution_policy",
-	"query_priority",
 	"join_distribution_type",
 }
 
@@ -169,21 +248,23 @@ allow if {
 #
 # - ImpersonateUser: NEVER allowed. There is no carve-out, not even for
 #   the admin principal -- the provisioner has no need to impersonate.
-# - WriteSystemInformation, KillQueryOwnedBy, ViewQueryOwnedBy: cross-org
-#   visibility / mutation surfaces that don't belong to customer principals.
+# - WriteSystemInformation, KillQueryOwnedBy, ViewQueryOwnedBy: in Trino
+#   476 these are gated by the `opa.allow-permission-management-operations`
+#   config knob and not actually sent to OPA, so the unit tests covering
+#   them are forward-compat only. They remain default-deny here regardless.
 # - GRANT-related ops, view/function creation, table mutation: not part of
 #   v1's per-org Iceberg-catalog model.
 #
 # All of the above fall through to default-deny; no explicit rule needed.
-# We do however explicitly deny catalog-management ops for non-admins, so
-# the admin carve-out below is symmetric with the deny path.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Admin carve-out: catalog management.
 #
 # The Trino provisioner connects as `__admin_provisioner` to run
-# CREATE/DROP CATALOG. Customer principals never reach these paths because
+# CREATE/DROP CATALOG. The carve-out is keyed on the username -- not on
+# group membership -- because catalog management is a provisioner workflow,
+# not a tenant role. Customer principals never reach these paths because
 # we authenticate the provisioner against a separate password-file entry
 # mounted only into the provisioner workflow.
 #
@@ -195,23 +276,23 @@ allow if {
 # ---------------------------------------------------------------------------
 
 allow if {
-	user == admin_principal
+	is_admin
 	input.action.operation == "CreateCatalog"
 }
 
 allow if {
-	user == admin_principal
+	is_admin
 	input.action.operation == "DropCatalog"
 }
 
 allow if {
-	user == admin_principal
+	is_admin
 	input.action.operation == "AlterCatalog"
 }
 
-# Admin principal is also allowed to do everything the customer-facing ops
-# above do (read its own catalogs, run queries, etc.) for smoke testing.
-# We deliberately do NOT grant the admin principal blanket access -- it
-# can only see catalogs that appear under data.user_catalogs[admin_principal]
-# just like any other user. The provisioner populates that entry with the
-# global catalog list when it generates the bundle.
+# Admin smoke-test access to catalogs flows through the second
+# `owns_catalog` rule above (is_admin + data.group_catalogs[admin_group]).
+# We do NOT grant the admin blanket access -- the admin can only see
+# catalogs that appear under data.group_catalogs[admin_group], so omitting
+# that entry yields a catalog-management-only admin. And a bare claim of
+# admin_group membership (without the admin username) grants nothing.

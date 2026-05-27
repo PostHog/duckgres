@@ -11,7 +11,7 @@ import (
 
 // LatencyBudget is the per-decision budget for the canonical AccessCatalog
 // evaluation against a 1000-org bundle. Anything above this is the symptom
-// of a non-O(1) policy (linear scan over user_catalogs, etc.) and fails
+// of a non-O(1) policy (linear scan over group_catalogs, etc.) and fails
 // the build.
 //
 // Trino issues roughly 30-40 OPA decisions per query (one per
@@ -21,23 +21,23 @@ import (
 // planning. Tighten this if the decision count per query goes up.
 const LatencyBudget = 1 * time.Millisecond
 
-// largeFixture builds a UserCatalogs with the requested number of orgs.
-// Each user owns exactly one catalog named org_<i>_iceberg.
-func largeFixture(orgs int) UserCatalogs {
-	uc := make(UserCatalogs, orgs+1)
+// largeFixture builds a GroupCatalogs with the requested number of orgs.
+// Each org_<i> group owns exactly one catalog named org_<i>_iceberg.
+func largeFixture(orgs int) GroupCatalogs {
+	gc := make(GroupCatalogs, orgs+1)
 	for i := 0; i < orgs; i++ {
-		user := fmt.Sprintf("%d", i)
-		uc[user] = map[string]bool{fmt.Sprintf("org_%d_iceberg", i): true}
+		group := fmt.Sprintf("org_%d", i)
+		gc[group] = map[string]bool{fmt.Sprintf("org_%d_iceberg", i): true}
 	}
-	// Admin owns every catalog (matches the production bundle shape:
-	// the provisioner populates data.user_catalogs[__admin_provisioner]
-	// with the global catalog list so catalog-management ops work).
+	// Admin group owns every catalog (matches the production bundle
+	// shape: the provisioner populates data.group_catalogs[AdminGroup]
+	// with the global catalog list so the admin can smoke-test).
 	admin := make(map[string]bool, orgs)
 	for i := 0; i < orgs; i++ {
 		admin[fmt.Sprintf("org_%d_iceberg", i)] = true
 	}
-	uc[AdminPrincipal] = admin
-	return uc
+	gc[AdminGroup] = admin
+	return gc
 }
 
 // preparedLargeBundle compiles the policy against a 1000-org dataset. We
@@ -126,7 +126,7 @@ func TestAccessCatalogLatencyBudget(t *testing.T) {
 	p99 := percentile(durations, 99)
 	t.Logf("AccessCatalog @1000 orgs: p50=%s p99=%s budget=%s", p50, p99, LatencyBudget)
 	if p50 > LatencyBudget {
-		t.Fatalf("AccessCatalog @1000 orgs p50=%s exceeds budget %s -- policy is likely doing a linear scan over user_catalogs", p50, LatencyBudget)
+		t.Fatalf("AccessCatalog @1000 orgs p50=%s exceeds budget %s -- policy is likely doing a linear scan over group_catalogs", p50, LatencyBudget)
 	}
 	// p99 budget is more lenient because of GC; allow 5x.
 	if p99 > 5*LatencyBudget {

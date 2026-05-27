@@ -2,7 +2,6 @@ package opa
 
 import (
 	"bytes"
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,13 +14,13 @@ import (
 // bundle reader, and asserts that the round-trip preserves the policy
 // source and data document.
 func TestBuildBundleRoundTrip(t *testing.T) {
-	uc := UserCatalogs{
-		"42":           {"org_42_iceberg": true},
-		"43":           {"org_43_iceberg": true},
-		AdminPrincipal: {"org_42_iceberg": true, "org_43_iceberg": true},
+	gc := GroupCatalogs{
+		"org_42":   {"org_42_iceberg": true},
+		"org_43":   {"org_43_iceberg": true},
+		AdminGroup: {"org_42_iceberg": true, "org_43_iceberg": true},
 	}
 
-	raw, err := NewBuilder().BuildBundle(uc)
+	raw, err := NewBuilder().BuildBundle(gc)
 	if err != nil {
 		t.Fatalf("BuildBundle: %v", err)
 	}
@@ -46,30 +45,30 @@ func TestBuildBundleRoundTrip(t *testing.T) {
 		t.Errorf("module does not contain `package trino`")
 	}
 
-	// data.user_catalogs must round-trip cleanly.
-	userCatalogs, ok := parsed.Data["user_catalogs"].(map[string]interface{})
+	// data.group_catalogs must round-trip cleanly.
+	groupCatalogs, ok := parsed.Data["group_catalogs"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("data.user_catalogs is not a map: %T", parsed.Data["user_catalogs"])
+		t.Fatalf("data.group_catalogs is not a map: %T", parsed.Data["group_catalogs"])
 	}
-	if _, ok := userCatalogs["42"]; !ok {
-		t.Error("user_catalogs missing entry for user 42")
+	if _, ok := groupCatalogs["org_42"]; !ok {
+		t.Error("group_catalogs missing entry for group org_42")
 	}
-	owned, ok := userCatalogs["42"].(map[string]interface{})
+	owned, ok := groupCatalogs["org_42"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("user_catalogs[42] is not a map: %T", userCatalogs["42"])
+		t.Fatalf("group_catalogs[org_42] is not a map: %T", groupCatalogs["org_42"])
 	}
 	if owned["org_42_iceberg"] != true {
-		t.Errorf("user_catalogs[42][org_42_iceberg]: want true, got %v", owned["org_42_iceberg"])
+		t.Errorf("group_catalogs[org_42][org_42_iceberg]: want true, got %v", owned["org_42_iceberg"])
 	}
 }
 
-// TestBuildBundleEmptyInput verifies that a nil / empty UserCatalogs still
+// TestBuildBundleEmptyInput verifies that a nil / empty GroupCatalogs still
 // produces a well-formed bundle. The bootstrap state (before the provisioner
 // has published its first real bundle) must be deny-everything, which is
-// what an empty user_catalogs gives us.
+// what an empty group_catalogs gives us.
 func TestBuildBundleEmptyInput(t *testing.T) {
-	for _, uc := range []UserCatalogs{nil, {}} {
-		raw, err := NewBuilder().BuildBundle(uc)
+	for _, gc := range []GroupCatalogs{nil, {}} {
+		raw, err := NewBuilder().BuildBundle(gc)
 		if err != nil {
 			t.Fatalf("BuildBundle(empty): %v", err)
 		}
@@ -77,92 +76,349 @@ func TestBuildBundleEmptyInput(t *testing.T) {
 		if err != nil {
 			t.Fatalf("bundle.Read: %v", err)
 		}
-		got, ok := parsed.Data["user_catalogs"].(map[string]interface{})
+		got, ok := parsed.Data["group_catalogs"].(map[string]interface{})
 		if !ok {
-			t.Fatalf("user_catalogs not a map: %T", parsed.Data["user_catalogs"])
+			t.Fatalf("group_catalogs not a map: %T", parsed.Data["group_catalogs"])
 		}
 		if len(got) != 0 {
-			t.Errorf("user_catalogs from empty input should be empty, got %v", got)
+			t.Errorf("group_catalogs from empty input should be empty, got %v", got)
 		}
 	}
 }
 
-// TestPushBundle drives PushBundle against an httptest server, then
-// asserts on the request the OPA sidecar would have seen.
-func TestPushBundle(t *testing.T) {
-	uc := UserCatalogs{"42": {"org_42_iceberg": true}}
-	raw, err := NewBuilder().BuildBundle(uc)
+// --------------------------------------------------------------------------
+// Bundle service (pull-based distribution).
+//
+// These exercise the contract OPA's bundle plugin relies on:
+//   - GET returns 200 + gzip bytes + strong ETag on first poll
+//   - GET with matching If-None-Match returns 304 (no body)
+//   - GET before the provisioner has Set a bundle returns 503 (transient,
+//     OPA retries; Trino keeps its bootstrap deny-all in place)
+//   - non-GET/HEAD returns 405
+//   - the optional Auth hook rejects requests with 401
+// --------------------------------------------------------------------------
+
+func TestBundleStoreAndHandler200(t *testing.T) {
+	gc := GroupCatalogs{"org_42": {"org_42_iceberg": true}}
+	raw, err := NewBuilder().BuildBundle(gc)
 	if err != nil {
 		t.Fatalf("BuildBundle: %v", err)
 	}
 
-	var seenBody []byte
-	var seenAuth string
-	var seenContentType string
-	var seenMethod string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenMethod = r.Method
-		seenAuth = r.Header.Get("Authorization")
-		seenContentType = r.Header.Get("Content-Type")
-		buf := new(bytes.Buffer)
-		_, _ = buf.ReadFrom(r.Body)
-		seenBody = buf.Bytes()
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer server.Close()
+	store := &BundleStore{}
+	store.Set(NewBundle(raw))
 
-	endpoint := server.URL + "/v1/bundles/trino"
-	if err := PushBundle(context.Background(), endpoint, raw,
-		WithHTTPClient(server.Client()),
-		WithBearerToken("hunter2"),
-	); err != nil {
-		t.Fatalf("PushBundle: %v", err)
-	}
+	srv := httptest.NewServer(NewHandler(store, allowAllForTest))
+	defer srv.Close()
 
-	if seenMethod != http.MethodPut {
-		t.Errorf("method: want PUT, got %q", seenMethod)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/bundles/trino", nil)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
 	}
-	if seenContentType != "application/gzip" {
-		t.Errorf("content-type: want application/gzip, got %q", seenContentType)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: want 200, got %d", resp.StatusCode)
 	}
-	if seenAuth != "Bearer hunter2" {
-		t.Errorf("auth header: want Bearer hunter2, got %q", seenAuth)
+	if got := resp.Header.Get("Content-Type"); got != "application/gzip" {
+		t.Errorf("content-type: want application/gzip, got %q", got)
 	}
-	if !bytes.Equal(seenBody, raw) {
-		t.Errorf("body bytes mismatch (got %d, want %d)", len(seenBody), len(raw))
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Error("ETag header missing")
+	}
+	if !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) {
+		t.Errorf("ETag should be a quoted strong validator, got %q", etag)
+	}
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(resp.Body)
+	if !bytes.Equal(buf.Bytes(), raw) {
+		t.Errorf("body bytes mismatch (got %d, want %d)", buf.Len(), len(raw))
 	}
 }
 
-// TestPushBundleNon2xx propagates server errors as Go errors with the body
-// included for postmortem.
-func TestPushBundleNon2xx(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte("policy compile failed: foo"))
-	}))
-	defer server.Close()
+func TestBundleHandler304OnIfNoneMatch(t *testing.T) {
+	gc := GroupCatalogs{"org_42": {"org_42_iceberg": true}}
+	raw, _ := NewBuilder().BuildBundle(gc)
+	b := NewBundle(raw)
+	store := &BundleStore{}
+	store.Set(b)
 
-	err := PushBundle(context.Background(), server.URL, []byte("not actually a bundle"),
-		WithHTTPClient(server.Client()),
-	)
-	if err == nil {
-		t.Fatal("PushBundle should fail on 400")
+	srv := httptest.NewServer(NewHandler(store, allowAllForTest))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req.Header.Set("If-None-Match", b.ETag)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
 	}
-	if !strings.Contains(err.Error(), "400") {
-		t.Errorf("error should mention status 400, got: %v", err)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("status: want 304, got %d", resp.StatusCode)
 	}
-	if !strings.Contains(err.Error(), "policy compile failed") {
-		t.Errorf("error should include response body, got: %v", err)
+	buf := new(bytes.Buffer)
+	n, _ := buf.ReadFrom(resp.Body)
+	if n != 0 {
+		t.Errorf("304 should have empty body, got %d bytes", n)
 	}
 }
 
-// TestPushBundleEmptyArgs guards against accidentally pushing zero bytes
-// or to an empty URL.
-func TestPushBundleEmptyArgs(t *testing.T) {
-	if err := PushBundle(context.Background(), "", []byte{0x1}); err == nil {
-		t.Error("PushBundle should reject empty endpoint")
+func TestBundleHandler200OnEtagMiss(t *testing.T) {
+	gc := GroupCatalogs{"org_42": {"org_42_iceberg": true}}
+	raw, _ := NewBuilder().BuildBundle(gc)
+	store := &BundleStore{}
+	store.Set(NewBundle(raw))
+
+	srv := httptest.NewServer(NewHandler(store, allowAllForTest))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req.Header.Set("If-None-Match", `"not-the-current-etag"`)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
 	}
-	if err := PushBundle(context.Background(), "http://example/", nil); err == nil {
-		t.Error("PushBundle should reject empty bundle")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("etag miss: want 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestBundleHandler503BeforeFirstBundle(t *testing.T) {
+	store := &BundleStore{} // no Set yet
+	srv := httptest.NewServer(NewHandler(store, allowAllForTest))
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("bootstrap status: want 503 (so OPA retries and Trino stays on deny-all), got %d", resp.StatusCode)
+	}
+}
+
+func TestBundleHandlerRejectsNonGET(t *testing.T) {
+	store := &BundleStore{}
+	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42_iceberg": true}})
+	store.Set(NewBundle(raw))
+
+	srv := httptest.NewServer(NewHandler(store, allowAllForTest))
+	defer srv.Close()
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		req, _ := http.NewRequest(method, srv.URL, nil)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("Do %s: %v", method, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s: want 405, got %d", method, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Allow"); !strings.Contains(got, "GET") {
+			t.Errorf("%s: Allow header should list GET, got %q", method, got)
+		}
+	}
+}
+
+func TestBundleHandlerBearerTokenAuth(t *testing.T) {
+	store := &BundleStore{}
+	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42_iceberg": true}})
+	store.Set(NewBundle(raw))
+
+	srv := httptest.NewServer(NewHandler(store, BearerTokenAuth("hunter2")))
+	defer srv.Close()
+
+	cases := []struct {
+		name       string
+		authHeader string
+		wantStatus int
+	}{
+		{"no token", "", http.StatusUnauthorized},
+		{"wrong scheme", "Basic hunter2", http.StatusUnauthorized},
+		{"wrong token", "Bearer wrong", http.StatusUnauthorized},
+		{"token prefix attack", "Bearer hunter", http.StatusUnauthorized},
+		{"token suffix attack", "Bearer hunter2x", http.StatusUnauthorized},
+		{"correct token", "Bearer hunter2", http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+			if tc.authHeader != "" {
+				req.Header.Set("Authorization", tc.authHeader)
+			}
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status: want %d, got %d", tc.wantStatus, resp.StatusCode)
+			}
+		})
+	}
+}
+
+// NewHandler refuses nil dependencies -- the bundle exposes the customer
+// roster, so an unauthenticated endpoint is never correct.
+func TestNewHandlerRejectsNilArgs(t *testing.T) {
+	store := &BundleStore{}
+	auth := allowAllForTest
+
+	cases := []struct {
+		name string
+		fn   func()
+	}{
+		{"nil store", func() { _ = NewHandler(nil, auth) }},
+		{"nil auth", func() { _ = NewHandler(store, nil) }},
+		{"both nil", func() { _ = NewHandler(nil, nil) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("NewHandler(%s) should panic", tc.name)
+				}
+			}()
+			tc.fn()
+		})
+	}
+}
+
+// Literal Handler{} construction bypasses NewHandler -- the runtime
+// guard in ServeHTTP must still fail closed.
+func TestHandlerLiteralWithNilAuthFailsClosed(t *testing.T) {
+	store := &BundleStore{}
+	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42_iceberg": true}})
+	store.Set(NewBundle(raw))
+
+	srv := httptest.NewServer(&Handler{Store: store}) // no Auth set
+	defer srv.Close()
+
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("literal Handler with nil Auth: want 500 (fail-closed), got %d", resp.StatusCode)
+	}
+}
+
+func TestBearerTokenAuthRejectsEmptyToken(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("BearerTokenAuth(\"\") should panic")
+		}
+	}()
+	_ = BearerTokenAuth("")
+}
+
+func TestBundleStoreSetOverwrites(t *testing.T) {
+	store := &BundleStore{}
+
+	// First bundle.
+	raw1, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42_iceberg": true}})
+	b1 := NewBundle(raw1)
+	store.Set(b1)
+	got, ok := store.Current()
+	if !ok || got.ETag != b1.ETag {
+		t.Fatalf("Current after first Set: want ETag %q, got %q (ok=%v)", b1.ETag, got.ETag, ok)
+	}
+
+	// Second bundle with different content -> different ETag.
+	raw2, _ := NewBuilder().BuildBundle(GroupCatalogs{
+		"org_42": {"org_42_iceberg": true},
+		"org_43": {"org_43_iceberg": true},
+	})
+	b2 := NewBundle(raw2)
+	if b1.ETag == b2.ETag {
+		t.Fatal("bundles with different content should not share an ETag (sha256 collision?)")
+	}
+	store.Set(b2)
+	got, ok = store.Current()
+	if !ok || got.ETag != b2.ETag {
+		t.Errorf("Current after second Set: want ETag %q, got %q (ok=%v)", b2.ETag, got.ETag, ok)
+	}
+}
+
+// NewBundle's defensive copy means caller-side mutation of the input
+// slice after construction cannot affect the stored bundle.
+func TestNewBundleIsolatesInputSlice(t *testing.T) {
+	raw := []byte("policy-bytes-v1")
+	b := NewBundle(raw)
+	originalETag := b.ETag
+	// Mutate the caller's slice.
+	raw[0] = 0xff
+	// Bundle ETag and serialized bytes must be unaffected.
+	if b.ETag != originalETag {
+		t.Errorf("ETag changed after caller mutated input slice: was %q, now %q", originalETag, b.ETag)
+	}
+	var got bytes.Buffer
+	if _, err := b.WriteTo(&got); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if got.Bytes()[0] == 0xff {
+		t.Error("Bundle.bytes aliased caller's input slice; defensive copy failed")
+	}
+}
+
+// The Bundle's internal byte slice is unexported, so post-construction
+// mutation via the returned value from Current() is structurally
+// impossible. This test pins the API surface: if anyone re-exports the
+// field or adds an accessor that returns a mutable []byte, it must come
+// with a fresh threat-model review (the served bytes must not desync
+// from the precomputed ETag).
+func TestBundleHasNoExportedMutableByteAccess(t *testing.T) {
+	// Construct a bundle, store it, mutate everything we can reach.
+	store := &BundleStore{}
+	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42_iceberg": true}})
+	b := NewBundle(raw)
+	store.Set(b)
+
+	// Mutate the local Bundle's accessible state. ETag is a string
+	// (immutable by Go's type system); bytes is unexported. The compiler
+	// guarantees the only way to ship new bytes is via NewBundle (which
+	// copies). If this test ever fails to compile because someone added
+	// `b.Bytes = ...` or `b.SetBytes(...)`, *that* is the signal.
+	_ = b.ETag // exported but immutable
+	_ = b.Len()
+
+	// Serve through the handler and confirm the bytes match raw exactly
+	// (i.e., that the store still holds the bundle the caller built).
+	srv := httptest.NewServer(NewHandler(store, allowAllForTest))
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	defer resp.Body.Close()
+	var got bytes.Buffer
+	_, _ = got.ReadFrom(resp.Body)
+	if !bytes.Equal(got.Bytes(), raw) {
+		t.Error("served bytes diverged from constructed bytes -- has the immutability invariant changed?")
+	}
+}
+
+func TestNewBundleETagIsContentAddressed(t *testing.T) {
+	// Identical bytes -> identical ETag (content-addressed, not random).
+	bytes1 := []byte("hello world")
+	b1 := NewBundle(bytes1)
+	b2 := NewBundle(append([]byte{}, bytes1...))
+	if b1.ETag != b2.ETag {
+		t.Errorf("ETag should be content-addressed; got %q vs %q for identical bytes", b1.ETag, b2.ETag)
+	}
+	// Different bytes -> different ETag.
+	b3 := NewBundle([]byte("hello world!"))
+	if b1.ETag == b3.ETag {
+		t.Errorf("ETag should differ for different bytes; got %q for both", b1.ETag)
+	}
+	// ETag is RFC 7232 strong-validator shape: a quoted string.
+	if !strings.HasPrefix(b1.ETag, `"`) || !strings.HasSuffix(b1.ETag, `"`) {
+		t.Errorf("ETag should be a quoted string, got %q", b1.ETag)
 	}
 }

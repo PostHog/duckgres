@@ -12,10 +12,10 @@ import (
 // PreparedEvalQuery against `data.trino.allow`. Reused across the
 // table-driven tests below so we pay the compile cost once per test
 // binary, not once per case.
-func preparedPolicy(t *testing.T, uc UserCatalogs) rego.PreparedEvalQuery {
+func preparedPolicy(t *testing.T, gc GroupCatalogs) rego.PreparedEvalQuery {
 	t.Helper()
 	ctx := context.Background()
-	data, err := buildDataDocument(uc)
+	data, err := buildDataDocument(gc)
 	if err != nil {
 		t.Fatalf("buildDataDocument: %v", err)
 	}
@@ -51,28 +51,47 @@ func evalAllow(t *testing.T, q rego.PreparedEvalQuery, input map[string]interfac
 	return v
 }
 
-// twoOrgFixture is the canonical UserCatalogs used by most tests:
-// user "42" owns org_42_iceberg; user "43" owns org_43_iceberg; the
-// provisioner admin owns both (so it can manage them).
-func twoOrgFixture() UserCatalogs {
-	return UserCatalogs{
-		"42": {"org_42_iceberg": true},
-		"43": {"org_43_iceberg": true},
-		AdminPrincipal: {
+// twoOrgFixture is the canonical GroupCatalogs used by most tests:
+// group org_42 owns org_42_iceberg; group org_43 owns org_43_iceberg; the
+// admin group owns both (so the admin can smoke-test them).
+func twoOrgFixture() GroupCatalogs {
+	return GroupCatalogs{
+		"org_42": {"org_42_iceberg": true},
+		"org_43": {"org_43_iceberg": true},
+		AdminGroup: {
 			"org_42_iceberg": true,
 			"org_43_iceberg": true,
 		},
 	}
 }
 
+// groupsFor returns the Trino group memberships we model for a given user.
+// Mirrors the provisioner's projection logic: customers belong to
+// `org_<team_id>`; the admin user belongs to AdminGroup.
+func groupsFor(user string) []string {
+	if user == AdminPrincipal {
+		return []string{AdminGroup}
+	}
+	if user == "" {
+		return nil
+	}
+	return []string{"org_" + user}
+}
+
 // buildInput is a small helper for assembling the input.action.resource
 // shape the Trino OPA plugin sends. Keeps the test cases readable.
 func buildInput(user, operation string, resource map[string]interface{}) map[string]interface{} {
+	return buildInputWithGroups(user, groupsFor(user), operation, resource)
+}
+
+// buildInputWithGroups is the lower-level builder used by adversarial
+// tests that need to set groups independently of user.
+func buildInputWithGroups(user string, groups []string, operation string, resource map[string]interface{}) map[string]interface{} {
 	in := map[string]interface{}{
 		"context": map[string]interface{}{
 			"identity": map[string]interface{}{
 				"user":   user,
-				"groups": []string{"org_" + user},
+				"groups": groups,
 			},
 			"softwareStack": map[string]interface{}{
 				"trinoVersion": "476",
@@ -124,8 +143,6 @@ func sessionPropertyResource(name string) map[string]interface{} {
 // --------------------------------------------------------------------------
 
 func TestAccessCatalog(t *testing.T) {
-	q := preparedPolicy(t, twoOrgFixture())
-
 	cases := []struct {
 		name string
 		user string
@@ -139,13 +156,14 @@ func TestAccessCatalog(t *testing.T) {
 		{"empty user", "", "org_42_iceberg", false},
 		{"empty catalog", "42", "", false},
 		{"catalog name that almost matches", "42", "org_42_iceberg2", false},
-		// Adversarial: a user "42" that maps to no catalogs at all.
+		// Adversarial: a user whose group maps to no catalogs at all.
 		{"user with no catalogs", "no_catalogs", "org_42_iceberg", false},
 	}
-	// Add the no-catalogs user to the fixture for the last case.
-	uc := twoOrgFixture()
-	uc["no_catalogs"] = map[string]bool{}
-	q = preparedPolicy(t, uc)
+	// Add a no-catalogs group for the last case so the group exists but
+	// owns nothing.
+	gc := twoOrgFixture()
+	gc["org_no_catalogs"] = map[string]bool{}
+	q := preparedPolicy(t, gc)
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -229,16 +247,23 @@ func TestTableScopeOps(t *testing.T) {
 func TestSetSystemSessionProperty(t *testing.T) {
 	q := preparedPolicy(t, twoOrgFixture())
 
-	allowed := []string{"execution_policy", "query_priority", "join_distribution_type"}
+	// Allowed: query-tuning hints that affect only the submitting query's
+	// own shape and stay bounded by the per-query / per-resource-group
+	// caps. Adding to this set is a threat-model decision.
+	allowed := []string{"execution_policy", "join_distribution_type"}
 	for _, prop := range allowed {
 		if !evalAllow(t, q, buildInput("42", "SetSystemSessionProperty", sessionPropertyResource(prop))) {
 			t.Errorf("session property %q should be allowed", prop)
 		}
 	}
 
-	// Memory and concurrency knobs MUST be denied -- these are the
-	// cross-tenant attack vectors per the plan.
+	// Cross-tenant attack vectors -- memory budget, CPU/time bounds,
+	// cluster-shared scheduling priority. All denied. `query_priority` is
+	// here even though the plan's `fair` scheduling policy makes it inert
+	// in v1: we don't want the safety of this allowlist coupled to the
+	// chart's scheduling-policy choice.
 	denied := []string{
+		"query_priority",
 		"query_max_memory",
 		"query_max_memory_per_node",
 		"query_max_total_memory",
@@ -246,8 +271,9 @@ func TestSetSystemSessionProperty(t *testing.T) {
 		"query_max_execution_time",
 		"max_concurrent_queries",
 		"resource_overcommit",
-		"query_priority2", // close-but-not-equal: must not pass
-		"",                // empty
+		"query_priority2",       // close-but-not-equal: must not pass
+		"execution_policy_evil", // ditto, against the allowed prefix
+		"",                      // empty
 	}
 	for _, prop := range denied {
 		if evalAllow(t, q, buildInput("42", "SetSystemSessionProperty", sessionPropertyResource(prop))) {
@@ -284,12 +310,16 @@ func TestImpersonateUserAlwaysDenied(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Catalog-management ops: only the admin principal.
+// Catalog-management ops: only the admin principal (by username).
 // --------------------------------------------------------------------------
 
 func TestCatalogManagementAdminOnly(t *testing.T) {
 	q := preparedPolicy(t, twoOrgFixture())
 
+	// AlterCatalog isn't emitted by Trino 476's OPA plugin (catalog
+	// mutations happen via DROP+CREATE); kept as forward-compat coverage
+	// so a future Trino version flipping it on doesn't silently allow
+	// customers.
 	for _, op := range []string{"CreateCatalog", "DropCatalog", "AlterCatalog"} {
 		// Admin: allowed.
 		if !evalAllow(t, q, buildInput(AdminPrincipal, op, catalogResource("org_new_iceberg"))) {
@@ -299,7 +329,9 @@ func TestCatalogManagementAdminOnly(t *testing.T) {
 		if evalAllow(t, q, buildInput("42", op, catalogResource("org_42_iceberg"))) {
 			t.Errorf("%s by customer 42 on their own catalog must deny", op)
 		}
-		// Customer trying admin's name: denied.
+		// Customer trying admin's name: denied. The carve-out is on the
+		// username, so an exact match is required -- a lookalike like
+		// `__admin_provisioner_not_me` must NOT pass.
 		if evalAllow(t, q, buildInput("__admin_provisioner_not_me", op, catalogResource("org_42_iceberg"))) {
 			t.Errorf("%s by lookalike admin name must deny", op)
 		}
@@ -321,15 +353,18 @@ func TestExecuteQueryAllowed(t *testing.T) {
 
 // --------------------------------------------------------------------------
 // Default deny: any operation we don't recognize must be denied.
+//
+// Note on coverage: in Trino 476, several of these (WriteSystemInformation,
+// KillQueryOwnedBy, ViewQueryOwnedBy, GRANT-related ops) are NOT actually
+// queried through OPA -- they're gated at the plugin level by
+// `opa.allow-permission-management-operations`. Keeping them here is
+// forward-compat: if a future Trino version starts routing them to OPA,
+// they remain default-deny rather than silently allowing.
 // --------------------------------------------------------------------------
 
 func TestDefaultDeny(t *testing.T) {
 	q := preparedPolicy(t, twoOrgFixture())
 
-	// Sample of operations the policy doesn't explicitly allow. If
-	// Trino's OPA plugin ever sends one of these and a future policy
-	// edit decides to allow it, the test must be updated deliberately
-	// (with a security review note).
 	denied := []string{
 		"WriteSystemInformation",
 		"ReadSystemInformation",
@@ -352,6 +387,10 @@ func TestDefaultDeny(t *testing.T) {
 		"RevokeSchemaPrivilege",
 		"ExecuteProcedure",
 		"ExecuteFunction",
+		"ExecuteTableProcedure",
+		"ShowFunctions",
+		"FilterFunctions",
+		"ShowCreateFunction",
 		"NonExistentOp",
 		"",
 	}
@@ -366,14 +405,14 @@ func TestDefaultDeny(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Adversarial: confirm that the user-vs-catalog axis is correctly enforced
+// Adversarial: confirm that the group-vs-catalog axis is correctly enforced
 // even when the input is intentionally malformed or has surprising shape.
 // --------------------------------------------------------------------------
 
 func TestAdversarialInputs(t *testing.T) {
 	q := preparedPolicy(t, twoOrgFixture())
 
-	// Missing identity entirely -> policy can't bind `user` -> deny.
+	// Missing identity entirely -> policy can't iterate groups -> deny.
 	t.Run("missing identity", func(t *testing.T) {
 		in := map[string]interface{}{
 			"action": map[string]interface{}{
@@ -402,21 +441,90 @@ func TestAdversarialInputs(t *testing.T) {
 		}
 	})
 
-	// Identity user set to admin name but admin not in user_catalogs.
-	t.Run("admin not in user_catalogs", func(t *testing.T) {
-		uc := UserCatalogs{
-			"42": {"org_42_iceberg": true},
-			// no AdminPrincipal entry
+	// Empty groups list -> no group to iterate -> deny even for a known
+	// catalog. This is the bedrock isolation invariant: identity without
+	// group membership grants nothing.
+	t.Run("empty groups deny", func(t *testing.T) {
+		in := buildInputWithGroups("42", []string{}, "AccessCatalog", catalogResource("org_42_iceberg"))
+		if evalAllow(t, q, in) {
+			t.Error("AccessCatalog with empty groups must deny")
 		}
-		q2 := preparedPolicy(t, uc)
-		// Admin can still create/drop catalogs (the carve-out is by
-		// principal name, not catalog ownership).
-		if !evalAllow(t, q2, buildInput(AdminPrincipal, "CreateCatalog", catalogResource("any"))) {
-			t.Error("admin should be able to CreateCatalog regardless of user_catalogs")
+	})
+
+	// User claims membership in a group that exists but owns a different
+	// catalog -- must deny on the target catalog.
+	t.Run("forged group membership for someone else's catalog", func(t *testing.T) {
+		in := buildInputWithGroups("42", []string{"org_43"}, "AccessCatalog", catalogResource("org_42_iceberg"))
+		if evalAllow(t, q, in) {
+			t.Error("group org_43 must NOT grant access to org_42_iceberg")
 		}
-		// But admin still can't AccessCatalog without owning it.
-		if evalAllow(t, q2, buildInput(AdminPrincipal, "AccessCatalog", catalogResource("org_42_iceberg"))) {
-			t.Error("admin without ownership entry must not AccessCatalog")
+		// But the forged group SHOULD grant access to ITS OWN catalog.
+		// This isn't a policy bug -- it just confirms that group
+		// membership is what authorizes, so the file group provider /
+		// JWT claim issuer is the actual trust anchor. The policy gives
+		// what the identity says it has.
+		in2 := buildInputWithGroups("42", []string{"org_43"}, "AccessCatalog", catalogResource("org_43_iceberg"))
+		if !evalAllow(t, q, in2) {
+			t.Error("group org_43 should grant access to org_43_iceberg (this confirms the policy trusts identity.groups -- the group provider is the trust boundary)")
+		}
+	})
+
+	// Admin username without admin-group membership: catalog management
+	// is denied (is_admin requires BOTH the username AND the group). This
+	// is the defense-in-depth conjunction described in policy.rego --
+	// neither signal alone unlocks admin operations.
+	t.Run("admin username without admin group cannot manage catalogs", func(t *testing.T) {
+		adminNoGroups := buildInputWithGroups(AdminPrincipal, nil, "CreateCatalog", catalogResource("any"))
+		if evalAllow(t, q, adminNoGroups) {
+			t.Error("admin username alone (without admin-group membership) must NOT grant CreateCatalog -- is_admin requires both")
+		}
+		// Same identity also cannot AccessCatalog -- no group means no
+		// owns_catalog rule body succeeds.
+		adminAccess := buildInputWithGroups(AdminPrincipal, nil, "AccessCatalog", catalogResource("org_42_iceberg"))
+		if evalAllow(t, q, adminAccess) {
+			t.Error("admin username without admin-group membership must not AccessCatalog")
+		}
+	})
+
+	// Admin-group membership without the admin username: catalog
+	// management is denied (is_admin requires username) AND read access
+	// to AdminGroup-listed catalogs is also denied (owns_catalog's
+	// admin-path requires is_admin). This guards against a customer who
+	// somehow ends up with admin_group in their groups list -- they get
+	// nothing.
+	t.Run("non-admin user with admin group claim gets nothing", func(t *testing.T) {
+		// User 42's identity, but claiming admin_group membership. The
+		// admin-listed catalogs (org_42_iceberg, org_43_iceberg in the
+		// twoOrgFixture) must NOT be reachable through this path -- the
+		// admin-group ownership rule is gated on is_admin (full
+		// username + group conjunction).
+		for _, cat := range []string{"org_42_iceberg", "org_43_iceberg"} {
+			in := buildInputWithGroups("42", []string{AdminGroup}, "AccessCatalog", catalogResource(cat))
+			if evalAllow(t, q, in) {
+				t.Errorf("non-admin user claiming admin_group must NOT access %s through the admin path", cat)
+			}
+			in = buildInputWithGroups("42", []string{AdminGroup}, "SelectFromColumns", tableResource(cat, "s", "t"))
+			if evalAllow(t, q, in) {
+				t.Errorf("non-admin user claiming admin_group must NOT SelectFromColumns on %s", cat)
+			}
+		}
+		// And catalog management is denied for the same reason.
+		mgmt := buildInputWithGroups("42", []string{AdminGroup}, "CreateCatalog", catalogResource("anything"))
+		if evalAllow(t, q, mgmt) {
+			t.Error("non-admin user with admin_group claim must NOT get catalog management")
+		}
+	})
+
+	// Verify the positive admin path still works with BOTH signals.
+	t.Run("admin with both username and admin group can manage and read", func(t *testing.T) {
+		// twoOrgFixture puts both catalogs under AdminGroup.
+		in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "CreateCatalog", catalogResource("any"))
+		if !evalAllow(t, q, in) {
+			t.Error("admin with full identity must be able to CreateCatalog")
+		}
+		in = buildInputWithGroups(AdminPrincipal, []string{AdminGroup}, "AccessCatalog", catalogResource("org_42_iceberg"))
+		if !evalAllow(t, q, in) {
+			t.Error("admin with full identity must be able to AccessCatalog admin-listed catalogs")
 		}
 	})
 }
@@ -430,12 +538,12 @@ func TestAdversarialInputs(t *testing.T) {
 
 func TestIsolationMatrix(t *testing.T) {
 	// Three orgs, three catalogs.
-	uc := UserCatalogs{
-		"42": {"org_42_iceberg": true},
-		"43": {"org_43_iceberg": true},
-		"44": {"org_44_iceberg": true},
+	gc := GroupCatalogs{
+		"org_42": {"org_42_iceberg": true},
+		"org_43": {"org_43_iceberg": true},
+		"org_44": {"org_44_iceberg": true},
 	}
-	q := preparedPolicy(t, uc)
+	q := preparedPolicy(t, gc)
 
 	users := []string{"42", "43", "44"}
 	catalogs := []string{"org_42_iceberg", "org_43_iceberg", "org_44_iceberg"}
@@ -470,24 +578,81 @@ func TestIsolationMatrix(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// Batched OPA shape: the policy is the NON-BATCHED contract. Trino's
+// batched access control (OpaBatchAccessControl, behind
+// `opa.policy.batched-uri`) sends candidates under `action.filterResources`
+// (plural list), not `action.resource` (singular object). Our filter rules
+// read `action.resource.*`, so under the batched shape they all fail their
+// body and fall through to default-deny. That's fail-closed -- safe by the
+// threat model -- but it means enabling batched mode in the chart silently
+// denies every filter query.
+//
+// This test locks in the fail-closed behaviour: if someone later extends
+// the policy to support batched decisions, this test must be updated
+// deliberately (and the new batched contract reviewed for cross-tenant
+// safety). Default-deny is the floor.
+// --------------------------------------------------------------------------
+
+func TestBatchedInputDeniesByDefault(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	// Construct a batched-shape input the way Trino 476's
+	// OpaBatchAccessControl does: `action.filterResources` is a list of
+	// resource objects. The non-batched `action.resource` is absent.
+	for _, op := range []string{
+		"FilterCatalogs",
+		"FilterSchemas",
+		"FilterTables",
+		"FilterColumns",
+	} {
+		batched := map[string]interface{}{
+			"context": map[string]interface{}{
+				"identity": map[string]interface{}{
+					"user":   "42",
+					"groups": []string{"org_42"},
+				},
+				"softwareStack": map[string]interface{}{
+					"trinoVersion": "476",
+				},
+			},
+			"action": map[string]interface{}{
+				"operation": op,
+				"filterResources": []map[string]interface{}{
+					{"catalog": map[string]interface{}{"name": "org_42_iceberg"}},
+					{"catalog": map[string]interface{}{"name": "org_43_iceberg"}},
+				},
+			},
+		}
+		if evalAllow(t, q, batched) {
+			t.Errorf("%s under batched input shape must NOT allow -- the policy is the non-batched contract; enabling opa.policy.batched-uri without updating the policy would otherwise be a cross-tenant exposure", op)
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
 // Sanity check: the Rego file itself uses object-indexed lookups.
 // This is a static guard against accidentally re-introducing a linear-scan
-// rule. If someone replaces the indexed lookup with `some org in data.orgs`
+// rule. If someone replaces the indexed lookup with `some group in data.groups`
 // the test fires; the bench would also fire but this gives a faster signal.
+//
+// The bounded `some g in input.context.identity.groups` iteration in
+// owns_catalog is intentional: identity.groups is typically 1-2 elements
+// and is O(1) in catalog count. We allow it; we ban data-side iteration.
 // --------------------------------------------------------------------------
 
 func TestPolicyDoesNotUseLinearScan(t *testing.T) {
 	src := stripRegoComments(string(policyRego))
 
-	// Heuristics for linear-scan idioms; tighten over time. Any of these
+	// Heuristics for linear-scan idioms on the data document. Any of these
 	// in the policy is a strong signal we lost the O(1) property.
 	banned := []string{
-		"some org in",
-		"some user in",
+		"some org in data",
+		"some user in data",
+		"some group in data",
 		"some i, j in",
-		"every ",                // every ... iterates
-		"walk(",                 // walk() iterates entire trees
-		"data.user_catalogs[_]", // wildcard index = iteration
+		"every ",                 // every ... iterates
+		"walk(",                  // walk() iterates entire trees
+		"data.group_catalogs[_]", // wildcard index = iteration
 	}
 	for _, needle := range banned {
 		if strings.Contains(src, needle) {
@@ -496,8 +661,8 @@ func TestPolicyDoesNotUseLinearScan(t *testing.T) {
 	}
 
 	// Positive check: the indexed lookup is present.
-	if !strings.Contains(src, "data.user_catalogs[user][catalog]") {
-		t.Error("policy.rego should contain the object-indexed lookup `data.user_catalogs[user][catalog]`")
+	if !strings.Contains(src, "data.group_catalogs[g][catalog]") {
+		t.Error("policy.rego should contain the object-indexed lookup `data.group_catalogs[g][catalog]`")
 	}
 }
 

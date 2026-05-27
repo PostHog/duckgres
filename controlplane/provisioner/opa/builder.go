@@ -5,7 +5,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/open-policy-agent/opa/bundle"
 )
@@ -23,9 +22,9 @@ var policyRego []byte
 // disambiguates bundles with the same revision but different data.
 const bundleRevision = "v1"
 
-// dataJSONPath is where user_catalogs lives inside the bundle. OPA wires
+// dataJSONPath is where group_catalogs lives inside the bundle. OPA wires
 // /data.json under the package root, so the policy reads it via
-// data.user_catalogs[...].
+// data.group_catalogs[...].
 const dataJSONPath = "/data.json"
 
 // policyPath is the in-bundle path of policy.rego. The bundle library
@@ -34,13 +33,13 @@ const dataJSONPath = "/data.json"
 const policyPath = "/policy.rego"
 
 // defaultBuilder is the production implementation of BundleBuilder. It
-// has no state; the embedded policy and the input UserCatalogs are the
+// has no state; the embedded policy and the input GroupCatalogs are the
 // only things that vary between builds.
 type defaultBuilder struct{}
 
 // NewBuilder returns a BundleBuilder that produces gzip-tarball OPA
 // bundles containing this package's policy.rego and a data document
-// populated from UserCatalogs.
+// populated from GroupCatalogs.
 func NewBuilder() BundleBuilder {
 	return defaultBuilder{}
 }
@@ -49,12 +48,12 @@ func NewBuilder() BundleBuilder {
 // returns the compressed bytes. The output is suitable for POSTing through
 // OPA's bundle service API or serving from a static bundle endpoint.
 //
-// uc may be nil or empty -- the resulting bundle is still well-formed and
-// activates a deny-everything policy (since no user owns any catalog).
+// gc may be nil or empty -- the resulting bundle is still well-formed and
+// activates a deny-everything policy (since no group owns any catalog).
 // That is the correct bootstrap behaviour: until the provisioner pushes
-// a populated UserCatalogs, all customer queries are denied.
-func (defaultBuilder) BuildBundle(uc UserCatalogs) ([]byte, error) {
-	data, err := buildDataDocument(uc)
+// a populated GroupCatalogs, all customer queries are denied.
+func (defaultBuilder) BuildBundle(gc GroupCatalogs) ([]byte, error) {
+	data, err := buildDataDocument(gc)
 	if err != nil {
 		return nil, fmt.Errorf("build data document: %w", err)
 	}
@@ -62,7 +61,7 @@ func (defaultBuilder) BuildBundle(uc UserCatalogs) ([]byte, error) {
 	b := bundle.Bundle{
 		Manifest: bundle.Manifest{
 			Revision: bundleRevision,
-			Roots:    &[]string{"trino", "user_catalogs"},
+			Roots:    &[]string{"trino", "group_catalogs"},
 		},
 		Modules: []bundle.ModuleFile{
 			{
@@ -88,40 +87,30 @@ func (defaultBuilder) BuildBundle(uc UserCatalogs) ([]byte, error) {
 }
 
 // buildDataDocument builds the JSON-decoded map[string]interface{} that OPA
-// stores under data.<root>. We always emit `user_catalogs` even when uc is
-// nil so the policy's `data.user_catalogs[user][catalog]` lookup is well-
-// formed (undefined-on-missing-key, not error-on-missing-document).
-func buildDataDocument(uc UserCatalogs) (map[string]interface{}, error) {
+// stores under data.<root>. We always emit `group_catalogs` even when gc is
+// nil so the policy's `data.group_catalogs[group][catalog]` lookup is
+// well-formed (undefined-on-missing-key, not error-on-missing-document).
+func buildDataDocument(gc GroupCatalogs) (map[string]interface{}, error) {
 	// JSON round-trip ensures we emit canonical JSON-decoded types
 	// (map[string]interface{} and bool) regardless of what the caller
 	// passes in. OPA's bundle loader expects these types and treats
 	// concrete map[string]map[string]bool as opaque if it ever leaks
 	// through. Round-tripping is also a stable serialization for tests.
 	raw, err := json.Marshal(struct {
-		UserCatalogs UserCatalogs `json:"user_catalogs"`
-	}{UserCatalogs: uc})
+		GroupCatalogs GroupCatalogs `json:"group_catalogs"`
+	}{GroupCatalogs: gc})
 	if err != nil {
-		return nil, fmt.Errorf("marshal user_catalogs: %w", err)
+		return nil, fmt.Errorf("marshal group_catalogs: %w", err)
 	}
-	if uc == nil {
+	if gc == nil {
 		// Marshalling a nil map emits "null"; substitute an empty object
-		// so the policy sees `data.user_catalogs == {}` not `null`.
-		raw = []byte(`{"user_catalogs":{}}`)
+		// so the policy sees `data.group_catalogs == {}` not `null`.
+		raw = []byte(`{"group_catalogs":{}}`)
 	}
 	var data map[string]interface{}
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, fmt.Errorf("unmarshal user_catalogs: %w", err)
+		return nil, fmt.Errorf("unmarshal group_catalogs: %w", err)
 	}
 	return data, nil
 }
 
-// BundleTimestamp returns the timestamp stamped into newly built bundles.
-// Exposed for tests that need to assert on the bundle metadata; production
-// callers should not depend on this.
-//
-// Today the bundle library writes the current time into the manifest's
-// build metadata; this helper is a placeholder for future use if we move
-// to deterministic timestamps for content addressing.
-func BundleTimestamp() time.Time {
-	return time.Now().UTC()
-}
