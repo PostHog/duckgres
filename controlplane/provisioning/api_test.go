@@ -406,3 +406,66 @@ func TestResetPasswordRequiresReadyWarehouse(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
 	}
 }
+
+func TestProvisionCnpgShard(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["shardco"] = &configstore.Org{Name: "shardco"}
+	router := newTestRouter(store)
+
+	// No aurora block — cnpg-shard takes no sizing and auto-enables iceberg.
+	body := []byte(`{"database_name": "shardco-db", "metadata_store": {"type": "cnpg-shard"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/shardco/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	w := store.warehouses["shardco"]
+	if w == nil {
+		t.Fatal("expected warehouse to be created")
+	}
+	if w.MetadataStore.Kind != configstore.MetadataStoreKindCnpgShard {
+		t.Errorf("metadata store kind = %q, want cnpg-shard", w.MetadataStore.Kind)
+	}
+	if !w.Iceberg.Enabled || w.Iceberg.Backend != configstore.IcebergBackendLakekeeper {
+		t.Errorf("expected iceberg enabled with lakekeeper backend, got %+v", w.Iceberg)
+	}
+	if w.AuroraMaxACU != 0 {
+		t.Errorf("cnpg-shard must not set aurora sizing, got max_acu=%f", w.AuroraMaxACU)
+	}
+}
+
+func TestProvisionRejectsExternalMetadataStore(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "ext-db", "metadata_store": {"type": "external"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extco/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.warehouses["extco"]; ok {
+		t.Error("warehouse must not be created for an external metadata store")
+	}
+}
+
+func TestProvisionRejectsUnsupportedMetadataStore(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "x-db", "metadata_store": {"type": "neon"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/xco/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}

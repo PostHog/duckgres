@@ -2,6 +2,7 @@ package provisioning
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -38,16 +39,16 @@ type handler struct {
 // warehouseStatusResponse is the public-facing view of warehouse state.
 // Exposes lifecycle status and, when ready, connection details (without password).
 type warehouseStatusResponse struct {
-	OrgID              string                                       `json:"org_id"`
+	OrgID              string                                        `json:"org_id"`
 	State              configstore.ManagedWarehouseProvisioningState `json:"state"`
-	StatusMessage      string                                       `json:"status_message"`
+	StatusMessage      string                                        `json:"status_message"`
 	S3State            configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
 	MetadataStoreState configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
 	IdentityState      configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
 	SecretsState       configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
-	ReadyAt            *time.Time                                   `json:"ready_at,omitempty"`
-	FailedAt           *time.Time                                   `json:"failed_at,omitempty"`
-	Connection         *connectionDetails                           `json:"connection,omitempty"`
+	ReadyAt            *time.Time                                    `json:"ready_at,omitempty"`
+	FailedAt           *time.Time                                    `json:"failed_at,omitempty"`
+	Connection         *connectionDetails                            `json:"connection,omitempty"`
 }
 
 // connectionDetails is returned in status (without password) and in provision/reset-password (with password).
@@ -88,14 +89,43 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if req.MetadataStore == nil || req.MetadataStore.Aurora == nil || req.MetadataStore.Aurora.MaxACU <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.aurora.max_acu must be greater than 0"})
+	if req.MetadataStore == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store is required"})
 		return
 	}
 
-	warehouse := &configstore.ManagedWarehouse{
-		AuroraMinACU: req.MetadataStore.Aurora.MinACU,
-		AuroraMaxACU: req.MetadataStore.Aurora.MaxACU,
+	// The control plane only provisions two metadata-store backends. An empty
+	// type stays backwards-compatible with existing callers (aurora). External
+	// metadata stores are applied out-of-band and are explicitly not
+	// provisionable here.
+	warehouse := &configstore.ManagedWarehouse{}
+	switch req.MetadataStore.Type {
+	case "", configstore.MetadataStoreKindAurora:
+		if req.MetadataStore.Aurora == nil || req.MetadataStore.Aurora.MaxACU <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.aurora.max_acu must be greater than 0"})
+			return
+		}
+		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindAurora
+		warehouse.AuroraMinACU = req.MetadataStore.Aurora.MinACU
+		warehouse.AuroraMaxACU = req.MetadataStore.Aurora.MaxACU
+	case configstore.MetadataStoreKindCnpgShard:
+		// cnpg-shard backs the per-tenant Lakekeeper Iceberg catalog on the
+		// shared CloudNativePG shard. It takes no aurora sizing and, per the
+		// Duckling XRD, must always have Iceberg enabled — so enable it here
+		// (Lakekeeper backend) rather than making the caller pass it
+		// redundantly. The composition picks the active shard from chart
+		// values; there is no per-claim placement knob.
+		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindCnpgShard
+		warehouse.Iceberg = configstore.ManagedWarehouseIceberg{
+			Enabled: true,
+			Backend: configstore.IcebergBackendLakekeeper,
+		}
+	case "external":
+		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.type 'external' is not provisionable via the control plane; apply the Duckling CR out-of-band"})
+		return
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("metadata_store.type %q is not supported (use %q or %q)", req.MetadataStore.Type, configstore.MetadataStoreKindAurora, configstore.MetadataStoreKindCnpgShard)})
+		return
 	}
 
 	if err := h.store.CreatePendingWarehouse(orgID, req.DatabaseName, warehouse); err != nil {
