@@ -228,6 +228,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 		CREATE OR REPLACE VIEW main.information_schema_columns_compat AS
 		WITH all_columns AS (
 			SELECT
+				c.table_catalog AS source_catalog,
 				CASE WHEN c.table_catalog IN ('ducklake', 'memory') THEN current_database() ELSE c.table_catalog END AS table_catalog,
 				CASE WHEN c.table_schema = 'main' THEN 'public' ELSE c.table_schema END AS table_schema,
 				c.table_name,
@@ -253,6 +254,7 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			)
 			UNION ALL
 			SELECT
+				'iceberg' AS source_catalog,
 				'iceberg' AS table_catalog,
 				table_schema,
 				table_name,
@@ -267,6 +269,41 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 				numeric_scale,
 				datetime_precision
 			FROM main.__duckgres_iceberg_column_metadata
+		),
+		active_search_path AS (
+			SELECT
+				',' || COALESCE(
+					(
+						SELECT lower(regexp_replace(value, '\s+', '', 'g'))
+						FROM duckdb_settings()
+						WHERE name = 'search_path'
+					),
+					''
+				) || ',' AS search_path
+		),
+		ranked_columns AS (
+			SELECT
+				c.*,
+				ROW_NUMBER() OVER (
+					PARTITION BY c.table_schema, c.table_name, c.column_name
+					ORDER BY
+						COALESCE(
+							NULLIF(strpos(sp.search_path, ',' || lower(c.source_catalog || '.' || c.table_schema) || ','), 0),
+							CASE
+								WHEN c.source_catalog IN ('ducklake', 'memory') THEN NULLIF(strpos(sp.search_path, ',' || lower(c.table_schema) || ','), 0)
+								ELSE NULL
+							END,
+							1000000
+						),
+						CASE
+							WHEN c.source_catalog IN ('ducklake', 'memory') THEN 0
+							WHEN c.source_catalog = 'iceberg' THEN 1
+							ELSE 2
+						END,
+						c.source_catalog
+				) AS search_path_rank
+			FROM all_columns c
+			CROSS JOIN active_search_path sp
 		)
 		SELECT
 			c.table_catalog,
@@ -345,7 +382,8 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 			'NEVER' AS is_generated,
 			NULL AS generation_expression,
 			'YES' AS is_updatable
-		FROM all_columns c
+		FROM ranked_columns c
+		WHERE c.search_path_rank = 1
 	`
 }
 
