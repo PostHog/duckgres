@@ -181,11 +181,12 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		"pgbouncer_enabled", w.PgBouncer.Enabled,
 		"iceberg_enabled", w.Iceberg.Enabled)
 	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
-		MinACU:           w.AuroraMinACU,
-		MaxACU:           w.AuroraMaxACU,
-		PgBouncerEnabled: w.PgBouncer.Enabled,
-		IcebergEnabled:   w.Iceberg.Enabled,
-		IcebergNamespace: w.Iceberg.Namespace,
+		MetadataStoreType: w.MetadataStore.Kind,
+		MinACU:            w.AuroraMinACU,
+		MaxACU:            w.AuroraMaxACU,
+		PgBouncerEnabled:  w.PgBouncer.Enabled,
+		IcebergEnabled:    w.Iceberg.Enabled,
+		IcebergNamespace:  w.Iceberg.Namespace,
 	}); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
@@ -336,6 +337,18 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 			log.Warn("Failed to update warehouse state.", "error", err)
 		}
 	}
+
+	// Provision the per-org Lakekeeper as part of turn-up, not only as a
+	// post-Ready late-enable. A cnpg-shard Duckling is required by the XRD to
+	// have iceberg.enabled=true, so its warehouse can never reach Ready until
+	// iceberg_state flips — and for the Lakekeeper backend that only happens
+	// once EnsureForOrg has stood the catalog up (there's no S3 Tables bucket
+	// whose ARN would otherwise trigger it). reconcileLakekeeper is idempotent,
+	// no-ops for non-Lakekeeper backends, and returns quietly until the
+	// Duckling status carries the metadata creds and the Lakekeeper CR has
+	// bootstrapped; the poll loop is the requeue. The iceberg_state=Ready it
+	// writes is picked up by the readiness check on a subsequent tick.
+	c.reconcileLakekeeper(ctx, w)
 }
 
 // reconcileReady handles drift correction for Ready warehouses. The
@@ -452,7 +465,10 @@ func applyIcebergUpdatesToWarehouse(w *configstore.ManagedWarehouse, updates map
 }
 
 // reconcileLakekeeper provisions a per-org Lakekeeper instance when the
-// warehouse selects the lakekeeper backend and isn't yet provisioned.
+// warehouse selects the lakekeeper backend and isn't yet provisioned. Called
+// from both reconcileProvisioning (initial turn-up — required for cnpg-shard,
+// which must have iceberg enabled and so can't reach Ready until the catalog
+// is up) and reconcileReady (late-enable on an already-Ready warehouse).
 // Idempotent: a warehouse with LakekeeperEndpoint already populated is a
 // no-op. ErrBootstrapPending from the underlying EnsureForOrg is logged
 // at debug and treated as "retry on the next tick" — the controller's

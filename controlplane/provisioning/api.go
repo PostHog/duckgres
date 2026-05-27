@@ -2,6 +2,7 @@ package provisioning
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -38,16 +39,16 @@ type handler struct {
 // warehouseStatusResponse is the public-facing view of warehouse state.
 // Exposes lifecycle status and, when ready, connection details (without password).
 type warehouseStatusResponse struct {
-	OrgID              string                                       `json:"org_id"`
+	OrgID              string                                        `json:"org_id"`
 	State              configstore.ManagedWarehouseProvisioningState `json:"state"`
-	StatusMessage      string                                       `json:"status_message"`
+	StatusMessage      string                                        `json:"status_message"`
 	S3State            configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
 	MetadataStoreState configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
 	IdentityState      configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
 	SecretsState       configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
-	ReadyAt            *time.Time                                   `json:"ready_at,omitempty"`
-	FailedAt           *time.Time                                   `json:"failed_at,omitempty"`
-	Connection         *connectionDetails                           `json:"connection,omitempty"`
+	ReadyAt            *time.Time                                    `json:"ready_at,omitempty"`
+	FailedAt           *time.Time                                    `json:"failed_at,omitempty"`
+	Connection         *connectionDetails                            `json:"connection,omitempty"`
 }
 
 // connectionDetails is returned in status (without password) and in provision/reset-password (with password).
@@ -65,13 +66,7 @@ type provisionRequest struct {
 }
 
 type provisionMetadataReq struct {
-	Type   string              `json:"type"`
-	Aurora *provisionAuroraReq `json:"aurora,omitempty"`
-}
-
-type provisionAuroraReq struct {
-	MinACU float64 `json:"min_acu"`
-	MaxACU float64 `json:"max_acu"`
+	Type string `json:"type"`
 }
 
 func (h *handler) provisionWarehouse(c *gin.Context) {
@@ -88,14 +83,44 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if req.MetadataStore == nil || req.MetadataStore.Aurora == nil || req.MetadataStore.Aurora.MaxACU <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.aurora.max_acu must be greater than 0"})
+	if req.MetadataStore == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store is required"})
 		return
 	}
 
-	warehouse := &configstore.ManagedWarehouse{
-		AuroraMinACU: req.MetadataStore.Aurora.MinACU,
-		AuroraMaxACU: req.MetadataStore.Aurora.MaxACU,
+	// The control plane provisions exactly one metadata-store backend for new
+	// warehouses: cnpg-shard (the per-tenant Lakekeeper Iceberg catalog on the
+	// shared CloudNativePG shard). DuckLake (aurora) and external are no longer
+	// provisionable.
+	//
+	// This gate is on *creation* only. Existing DuckLake and external ducklings
+	// keep running untouched: the worker activator still reads their Duckling
+	// CR / config-store metadata and attaches DuckLake, the controller still
+	// reconciles their existing CRs (reconcilePending skips Create when the CR
+	// already exists, and DucklingClient.Create still understands aurora), and
+	// admin read/mutate/deprovision are unaffected.
+	warehouse := &configstore.ManagedWarehouse{}
+	switch req.MetadataStore.Type {
+	case configstore.MetadataStoreKindCnpgShard:
+		// cnpg-shard takes no aurora sizing and, per the Duckling XRD, must
+		// always have Iceberg enabled — so enable it here (Lakekeeper backend)
+		// rather than making the caller pass it redundantly. The composition
+		// picks the active shard from chart values; there is no per-claim
+		// placement knob.
+		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindCnpgShard
+		warehouse.Iceberg = configstore.ManagedWarehouseIceberg{
+			Enabled: true,
+			Backend: configstore.IcebergBackendLakekeeper,
+		}
+	case configstore.MetadataStoreKindAurora:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "DuckLake (metadata_store.type 'aurora') is no longer provisionable; only 'cnpg-shard' is. Existing DuckLake deployments are unaffected."})
+		return
+	case "external":
+		c.JSON(http.StatusBadRequest, gin.H{"error": "external metadata stores are not provisionable via the control plane; existing external deployments are unaffected"})
+		return
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("metadata_store.type must be %q (got %q); 'aurora'/DuckLake and 'external' are no longer provisionable", configstore.MetadataStoreKindCnpgShard, req.MetadataStore.Type)})
+		return
 	}
 
 	if err := h.store.CreatePendingWarehouse(orgID, req.DatabaseName, warehouse); err != nil {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -88,9 +89,15 @@ func ducklingName(orgID string) string {
 
 // CreateOptions carries per-org knobs that shape the generated Duckling CR.
 type CreateOptions struct {
-	MinACU           float64
-	MaxACU           float64
-	PgBouncerEnabled bool
+	// MetadataStoreType selects the Duckling's metadata-store backend. Empty
+	// is treated as configstore.MetadataStoreKindAurora (the historical
+	// default). The only other accepted value is
+	// configstore.MetadataStoreKindCnpgShard; any other value (notably
+	// "external") is rejected by Create.
+	MetadataStoreType string
+	MinACU            float64
+	MaxACU            float64
+	PgBouncerEnabled  bool
 	// IcebergEnabled toggles spec.iceberg.enabled on the Duckling CR. The
 	// composition only provisions a per-tenant S3 Tables bucket when this
 	// is true; flipping it post-create is handled by the controller's
@@ -104,18 +111,42 @@ type CreateOptions struct {
 // Create creates a Duckling CR for the given org.
 func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOptions) error {
 	name := ducklingName(orgID)
-	metadataStore := map[string]interface{}{
-		"type": "aurora",
-		"aurora": map[string]interface{}{
-			"minACU": opts.MinACU,
-			"maxACU": opts.MaxACU,
-		},
-	}
-	if opts.PgBouncerEnabled {
-		metadataStore["pgbouncer"] = map[string]interface{}{
-			"enabled": true,
+
+	var metadataStore map[string]interface{}
+	switch opts.MetadataStoreType {
+	case configstore.MetadataStoreKindCnpgShard:
+		// The cnpg-shard metadata store backs the per-tenant Lakekeeper
+		// Iceberg catalog on the shared CloudNativePG shard. It carries no
+		// per-claim config — the composition reads the active shard from chart
+		// values and provisions a lakekeeper_<org> role + database via
+		// provider-sql. The XRD admission rule requires iceberg.enabled=true
+		// for this type, so refuse to emit a CR that would be rejected (and
+		// that would have no usable catalog).
+		if !opts.IcebergEnabled {
+			return fmt.Errorf("create duckling CR %q: metadata store type %q requires iceberg enabled", name, configstore.MetadataStoreKindCnpgShard)
 		}
+		// No aurora block and no pgbouncer block: cnpg-shard tenants reach
+		// Postgres through the shard's own session-mode Pooler, not a
+		// per-Duckling PgBouncer.
+		metadataStore = map[string]interface{}{"type": configstore.MetadataStoreKindCnpgShard}
+	case "", configstore.MetadataStoreKindAurora:
+		metadataStore = map[string]interface{}{
+			"type": configstore.MetadataStoreKindAurora,
+			"aurora": map[string]interface{}{
+				"minACU": opts.MinACU,
+				"maxACU": opts.MaxACU,
+			},
+		}
+		if opts.PgBouncerEnabled {
+			metadataStore["pgbouncer"] = map[string]interface{}{
+				"enabled": true,
+			}
+		}
+	default:
+		return fmt.Errorf("create duckling CR %q: unsupported metadata store type %q (control plane creates only %q or %q)",
+			name, opts.MetadataStoreType, configstore.MetadataStoreKindAurora, configstore.MetadataStoreKindCnpgShard)
 	}
+
 	spec := map[string]interface{}{
 		"metadataStore": metadataStore,
 		"dataStore": map[string]interface{}{
