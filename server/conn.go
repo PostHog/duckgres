@@ -156,24 +156,26 @@ const (
 )
 
 type clientConn struct {
-	server                *Server
-	conn                  net.Conn
-	reader                *bufio.Reader
-	writer                *bufio.Writer
-	username              string
-	orgID                 string
-	database              string
-	executor              QueryExecutor
-	pid                   int32
-	secretKey             int32                    // unique key for cancel requests
-	stmts                 map[string]*preparedStmt // prepared statements by name
-	portals               map[string]*portal       // portals by name
-	txStatus              byte                     // current transaction status ('I', 'T', or 'E')
-	passthrough           bool                     // true for passthrough users (skip transpiler + pg_catalog)
-	cursors               map[string]*cursorState  // server-side cursor emulation
-	logicalCatalogMapping bool                     // true when the session has an attached ducklake catalog and logical catalog masking is active
-	ctx                   context.Context          // connection context, cancelled when connection is closed
-	cancel                context.CancelFunc       // cancels the connection context
+	server                 *Server
+	conn                   net.Conn
+	reader                 *bufio.Reader
+	writer                 *bufio.Writer
+	username               string
+	orgID                  string
+	database               string
+	executor               QueryExecutor
+	pid                    int32
+	secretKey              int32                    // unique key for cancel requests
+	stmts                  map[string]*preparedStmt // prepared statements by name
+	portals                map[string]*portal       // portals by name
+	txStatus               byte                     // current transaction status ('I', 'T', or 'E')
+	passthrough            bool                     // true for passthrough users (skip transpiler + pg_catalog)
+	cursors                map[string]*cursorState  // server-side cursor emulation
+	logicalCatalogMapping  bool                     // true when the session has an attached ducklake catalog and logical catalog masking is active
+	tenantIcebergConfig    IcebergConfig
+	hasTenantIcebergConfig bool
+	ctx                    context.Context    // connection context, cancelled when connection is closed
+	cancel                 context.CancelFunc // cancels the connection context
 
 	// sharedDB is true when this connection uses a shared file-persistence DB pool.
 	// Cleanup differs: we return the pinned conn to the pool instead of closing the DB.
@@ -1669,14 +1671,25 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 }
 
 func (c *clientConn) loadIcebergColumnMetadata(ctx context.Context, query string) error {
-	if c == nil || !shouldLoadIcebergColumnMetadata(c.server.cfg.Iceberg, c.passthrough) {
+	cfg := c.effectiveIcebergConfig()
+	if c == nil || !shouldLoadIcebergColumnMetadata(cfg, c.passthrough) {
 		return nil
 	}
 	return icebergmeta.LoadColumns(ctx, c.executor, query, icebergmeta.Config{
-		LakekeeperEndpoint:        c.server.cfg.Iceberg.LakekeeperEndpoint,
-		LakekeeperWarehouse:       c.server.cfg.Iceberg.LakekeeperWarehouse,
-		LakekeeperOAuth2ServerURI: c.server.cfg.Iceberg.LakekeeperOAuth2ServerURI,
+		LakekeeperEndpoint:        cfg.LakekeeperEndpoint,
+		LakekeeperWarehouse:       cfg.LakekeeperWarehouse,
+		LakekeeperOAuth2ServerURI: cfg.LakekeeperOAuth2ServerURI,
 	})
+}
+
+func (c *clientConn) effectiveIcebergConfig() IcebergConfig {
+	if c != nil && c.hasTenantIcebergConfig {
+		return c.tenantIcebergConfig
+	}
+	if c != nil && c.server != nil {
+		return c.server.cfg.Iceberg
+	}
+	return IcebergConfig{}
 }
 
 func shouldLoadIcebergColumnMetadata(cfg IcebergConfig, passthrough bool) bool {

@@ -28,3 +28,26 @@ func TestShouldLoadIcebergColumnMetadataOnlyForLakekeeper(t *testing.T) {
 		t.Fatal("passthrough connections should not load Iceberg column metadata")
 	}
 }
+
+func TestLoadIcebergColumnMetadataUsesConnectionIcebergConfig(t *testing.T) {
+	cc := &clientConn{
+		server: &Server{cfg: Config{}},
+	}
+	SetConnectionIcebergConfig(cc, IcebergConfig{
+		Enabled:             true,
+		Backend:             iceberg.BackendLakekeeper,
+		LakekeeperEndpoint:  "http://lakekeeper.example/catalog",
+		LakekeeperWarehouse: "org-acme",
+	})
+
+	cfg := cc.effectiveIcebergConfig()
+	if !shouldLoadIcebergColumnMetadata(cfg, false) {
+		t.Fatalf("expected tenant Iceberg config to enable metadata loading")
+	}
+	if cfg.LakekeeperEndpoint != "http://lakekeeper.example/catalog" {
+		t.Fatalf("tenant endpoint not preserved: %q", cfg.LakekeeperEndpoint)
+	}
+	if cfg.LakekeeperWarehouse != "org-acme" {
+		t.Fatalf("tenant warehouse not preserved: %q", cfg.LakekeeperWarehouse)
+	}
+}

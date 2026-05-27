@@ -3,6 +3,7 @@ package server
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +51,39 @@ func TestPgDatabaseView(t *testing.T) {
 		}
 		if columns[i] != expected {
 			t.Errorf("Column %d: expected %q, got %q", i, expected, columns[i])
+		}
+	}
+}
+
+func TestInitInformationSchemaColumnsCompatFiltersIcebergDummyRows(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := initInformationSchema(db, true); err != nil {
+		t.Fatalf("Failed to init information_schema: %v", err)
+	}
+
+	var viewSQL string
+	if err := db.QueryRow(`
+		SELECT sql
+		FROM duckdb_views()
+		WHERE database_name = 'memory'
+			AND schema_name = 'main'
+			AND view_name = 'information_schema_columns_compat'
+	`).Scan(&viewSQL); err != nil {
+		t.Fatalf("Failed to query compat view definition: %v", err)
+	}
+
+	for _, want := range []string{
+		"table_catalog = 'iceberg'",
+		"column_name = '__'",
+		"UNKNOWN",
+	} {
+		if !strings.Contains(viewSQL, want) {
+			t.Fatalf("columns compat view definition missing %q in:\n%s", want, viewSQL)
 		}
 	}
 }
@@ -305,7 +339,6 @@ func TestUptimeMacros(t *testing.T) {
 		}
 	}
 }
-
 
 func TestUtilityMacrosWithoutPgCatalog(t *testing.T) {
 	// Verify that initUtilityMacros works independently of initPgCatalog,
