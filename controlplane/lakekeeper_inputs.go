@@ -109,10 +109,49 @@ func lakekeeperInputsFromDuckling(
 		return provisioner.ProvisioningInputs{}, false, fmt.Errorf("duckling CR for org %q has no data-store bucket/region", orgID)
 	}
 
-	// Admin DDL (CREATE DATABASE/ROLE) goes to the direct Aurora endpoint, not
-	// the PgBouncer pooler — transaction pooling breaks CREATE DATABASE and the
-	// session-level statements EnsureRole runs. We connect to the existing
-	// metadata-store database; CREATE DATABASE can be issued from any database.
+	s3 := provisioner.S3StorageConfig{
+		Bucket: status.DataStore.BucketName,
+		// Keep the catalog's data under a stable prefix so it never
+		// collides with DuckLake's own layout in the shared bucket.
+		KeyPrefix: "lakekeeper",
+		Region:    status.DataStore.S3Region,
+		Flavor:    "aws",
+		// Prod: Lakekeeper uses its pod IRSA identity (no static creds).
+		// RoleARN is the per-org duckling role Lakekeeper assumes to vend
+		// scoped S3 creds (sts-role-arn). It's the same role the Lakekeeper
+		// pod runs as via Pod Identity, self-assumed (the role trusts its
+		// own ARN). Sourced from the Duckling CR status.
+		RoleARN: status.IAMRoleARN,
+	}
+
+	// cnpg-shard: the Lakekeeper database + role are pre-provisioned on the
+	// CNPG shard by provider-sql, and status carries the per-tenant role
+	// credentials (not a privileged admin). We have no superuser DSN here, so
+	// the provisioner must NOT attempt CREATE DATABASE/ROLE — it takes these
+	// creds verbatim. The shard's Pooler is session-mode, so the Lakekeeper
+	// pod's migrations + pooled prepared statements work through it.
+	if status.MetadataStore.Type == "cnpg-shard" {
+		return provisioner.ProvisioningInputs{
+			PGPreProvisioned: true,
+			PGUser:           status.MetadataStore.User,
+			PGPassword:       status.MetadataStore.Password,
+			PGDatabase:       status.MetadataStore.Database,
+			PGHost:           status.MetadataStore.Endpoint,
+			PGPort:           5432,
+			PGSSLMode:        "require",
+			S3:               s3,
+			// Allowall + NetworkPolicy deployment shape — no OIDC audiences yet.
+			KubernetesAuthAudiences: nil,
+		}, true, nil
+	}
+
+	// aurora/external: status carries the metadata-store master credentials,
+	// which double as the admin connection that can CREATE the
+	// lakekeeper_<orgid> database/role. Admin DDL (CREATE DATABASE/ROLE) goes
+	// to the direct Aurora endpoint, not the PgBouncer pooler — transaction
+	// pooling breaks CREATE DATABASE and the session-level statements
+	// EnsureRole runs. We connect to the existing metadata-store database;
+	// CREATE DATABASE can be issued from any database.
 	adminDSN := buildAdminURLDSN(
 		status.MetadataStore.Endpoint, 5432,
 		status.MetadataStore.User, status.MetadataStore.Password,
@@ -124,24 +163,10 @@ func lakekeeperInputsFromDuckling(
 		// The Lakekeeper pod also connects to the direct endpoint: it runs its
 		// own migrations and connection pool, which a transaction pooler would
 		// break.
-		PGHost:    status.MetadataStore.Endpoint,
-		PGPort:    5432,
-		PGSSLMode: "require",
-		S3: provisioner.S3StorageConfig{
-			Bucket: status.DataStore.BucketName,
-			// Keep the catalog's data under a stable prefix so it never
-			// collides with DuckLake's own layout in the shared bucket.
-			KeyPrefix: "lakekeeper",
-			Region:    status.DataStore.S3Region,
-			Flavor:    "aws",
-			// Prod: Lakekeeper uses its pod IRSA identity (no static creds).
-			// RoleARN is the per-org duckling role Lakekeeper assumes to vend
-			// scoped S3 creds (sts-role-arn). It's the same role the Lakekeeper
-			// pod runs as via Pod Identity, self-assumed (the role trusts its
-			// own ARN). Sourced from the Duckling CR status.
-			RoleARN: status.IAMRoleARN,
-		},
-		// Allowall + NetworkPolicy deployment shape — no OIDC audiences yet.
+		PGHost:                  status.MetadataStore.Endpoint,
+		PGPort:                  5432,
+		PGSSLMode:               "require",
+		S3:                      s3,
 		KubernetesAuthAudiences: nil,
 	}, true, nil
 }
