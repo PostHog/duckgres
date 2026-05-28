@@ -303,24 +303,22 @@ func TestK8sDucklakeExtensionIsBundledFork(t *testing.T) {
 // that lets DuckDB fall through to the upstream httpfs (path skew, broken
 // release URL, deleted seed) would silently disable the stoull fix and
 // reintroduce the intermittent S3 Content-Length crash.
+//
+// Mirrors the ducklake test pattern: query duckdb_extensions() directly.
+// We don't filter on `loaded` because httpfs autoloads only on first
+// http/s3 access — but the version string is embedded in the bundled
+// binary at /app/extensions/v<duckdb_ver>/linux_<arch>/httpfs.duckdb_extension
+// and reported by duckdb_extensions() as soon as the install_path is
+// recognized, regardless of whether the extension has been LOAD'd in
+// the current session.
 func TestK8sHttpfsExtensionIsBundledFork(t *testing.T) {
 	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
 		t.Fatalf("warm-up query failed: %v", err)
 	}
 
-	// httpfs is autoloaded the first time the worker references an http/s3
-	// URL. The session connection is fresh, so trigger a load via INSTALL —
-	// it's a no-op if already loaded and idempotent.
-	if err := retryQueryWithReconnect("INSTALL httpfs", 30*time.Second); err != nil {
-		t.Fatalf("install httpfs: %v", err)
-	}
-	if err := retryQueryWithReconnect("LOAD httpfs", 30*time.Second); err != nil {
-		t.Fatalf("load httpfs: %v", err)
-	}
-
 	var version string
 	if err := retryScanStringWithReconnect(
-		"SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'httpfs' AND loaded",
+		"SELECT COALESCE(extension_version, '') FROM duckdb_extensions() WHERE extension_name = 'httpfs'",
 		60*time.Second, &version,
 	); err != nil {
 		t.Fatalf("query httpfs extension_version: %v", err)
