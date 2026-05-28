@@ -19,15 +19,16 @@ ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # may need the nightly repo to match what was previously published).
 ARG POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
-# `set -o pipefail` so a curl failure on the gzipped extensions (json,
-# postgres_scanner) actually aborts the build instead of being masked by
-# gunzip's exit status. `: ${VAR:?msg}` asserts every required input is
-# non-empty — catches a CI matrix row that forgets to pass a build-arg
-# and would otherwise silently fall back to the ARG default, producing
-# a cross-version bundle (the failure class the L77-90 binding-pin check
-# in Dockerfile.worker exists to prevent).
-RUN set -o pipefail \
-    && : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
+# `: ${VAR:?msg}` asserts every required input is non-empty — catches a
+# CI matrix row that forgets to pass a build-arg and would otherwise
+# silently fall back to the ARG default, producing a cross-version
+# bundle (the failure class the L77-90 binding-pin check in
+# Dockerfile.worker exists to prevent). The per-file `[ -s ... ]` size
+# check below catches the curl|gunzip failure modes — a curl -fsSL 404
+# writes nothing, gunzip on empty input exits non-zero, the && chain
+# breaks. (`set -o pipefail` would be cleaner but /bin/sh here is dash,
+# which rejects -o pipefail.)
+RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
     && : "${HTTPFS_EXTENSION_TAG:?must be set}" \
     && : "${DUCKLAKE_EXTENSION_TAG:?must be set}" \
     && : "${DUCKDB_EXTENSION_REPOSITORY:?must be set}" \
