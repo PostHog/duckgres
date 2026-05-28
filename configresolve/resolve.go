@@ -156,7 +156,7 @@ func DefaultServerConfig() server.Config {
 		Users: map[string]string{
 			"postgres": "postgres",
 		},
-		Extensions: []string{"ducklake"},
+		Extensions: []string{"ducklake", "quack FROM core_nightly"},
 		DuckLake: server.DuckLakeConfig{
 			CheckpointInterval:              24 * time.Hour,
 			DataInliningRowLimit:            intPtr(0),

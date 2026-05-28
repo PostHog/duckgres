@@ -97,6 +97,7 @@ func TestParseExtensionName(t *testing.T) {
 		{"cache_httpfs FROM COMMUNITY", "cache_httpfs", "cache_httpfs FROM COMMUNITY"},
 		{"my_ext FROM my_repo", "my_ext", "my_ext FROM my_repo"},
 		{"ext  FROM  source", "ext", "ext  FROM  source"},
+		{"quack FROM core_nightly", "quack", "quack FROM core_nightly"},
 	}
 
 	for _, tt := range tests {

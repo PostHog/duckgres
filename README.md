@@ -49,7 +49,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - **Password Authentication**: Cleartext password authentication over TLS
 - **Extended Query Protocol**: Support for prepared statements, binary format, and parameterized queries
 - **COPY Protocol**: Bulk data import/export with `COPY FROM STDIN` and `COPY TO STDOUT`
-- **DuckDB Extensions**: Configurable extension loading (ducklake enabled by default)
+- **DuckDB Extensions**: Configurable extension loading (ducklake and quack FROM core_nightly enabled by default)
 - **DuckLake Integration**: Auto-attach DuckLake catalogs for lakehouse workflows
 - **Rate Limiting**: Built-in protection against brute-force attacks
 - **Graceful Shutdown**: Waits for in-flight queries before exiting
@@ -165,6 +165,7 @@ users:
 
 extensions:
   - ducklake
+  - "quack FROM core_nightly"
   - httpfs
 
 ducklake:
@@ -308,11 +309,12 @@ Options:
 
 ## DuckDB Extensions
 
-Extensions are automatically installed and loaded when a user's database is first opened. The `ducklake` extension is enabled by default.
+Extensions are automatically installed and loaded when a user's database is first opened. The `ducklake` and `quack` extensions are enabled by default.
 
 ```yaml
 extensions:
   - ducklake    # Default - DuckLake lakehouse format
+  - "quack FROM core_nightly"  # Default - DuckDB quack extension
   - httpfs      # HTTP/S3 file system access
   - parquet     # Parquet file support (built-in)
   - json        # JSON support (built-in)

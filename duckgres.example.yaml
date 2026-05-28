@@ -39,9 +39,10 @@ users:
 # DuckDB extensions to load on database initialization
 # Extensions are installed (downloaded if needed) and loaded automatically
 # Common extensions: httpfs, parquet, json, sqlite, postgres, mysql, excel
-# Default: ducklake (loaded even without config file)
+# Default: ducklake, quack FROM core_nightly (loaded even without config file)
 extensions:
   - ducklake
+  - "quack FROM core_nightly"
   # - "cache_httpfs FROM community"  # Caches S3/HTTP requests locally (requires internet)
   # - parquet
 

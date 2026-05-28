@@ -141,7 +141,7 @@ func (h *TestHarness) startDuckgres(harnessCfg HarnessConfig) error {
 		Users: map[string]string{
 			"testuser": "testpass",
 		},
-		Extensions: []string{"ducklake"},
+		Extensions: []string{"ducklake", "quack FROM core_nightly"},
 		RateLimit: server.RateLimitConfig{
 			MaxConnections: 100,
 		},
