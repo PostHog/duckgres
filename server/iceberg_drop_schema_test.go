@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 func TestParseDropSchemaCascadeTarget(t *testing.T) {
@@ -20,9 +22,8 @@ func TestParseDropSchemaCascadeTarget(t *testing.T) {
 			query:  "DROP SCHEMA IF EXISTS iceberg.fivetran_testing_schema_abc CASCADE",
 			wantOK: true,
 			want: dropSchemaCascadeTarget{
-				Catalog:  "iceberg",
-				Schema:   "fivetran_testing_schema_abc",
-				IfExists: true,
+				Catalog: "iceberg",
+				Schema:  "fivetran_testing_schema_abc",
 			},
 		},
 		{
@@ -38,9 +39,8 @@ func TestParseDropSchemaCascadeTarget(t *testing.T) {
 			query:  `DROP SCHEMA IF EXISTS "iceberg"."MixedSchema" CASCADE`,
 			wantOK: true,
 			want: dropSchemaCascadeTarget{
-				Catalog:  "iceberg",
-				Schema:   "MixedSchema",
-				IfExists: true,
+				Catalog: "iceberg",
+				Schema:  "MixedSchema",
 			},
 		},
 		{
@@ -48,9 +48,8 @@ func TestParseDropSchemaCascadeTarget(t *testing.T) {
 			query:  `/*Fivetran*/ DROP SCHEMA IF EXISTS ICEBERG.Fivetran_Testing_Schema_ABC CASCADE;`,
 			wantOK: true,
 			want: dropSchemaCascadeTarget{
-				Catalog:  "iceberg",
-				Schema:   "fivetran_testing_schema_abc",
-				IfExists: true,
+				Catalog: "iceberg",
+				Schema:  "fivetran_testing_schema_abc",
 			},
 		},
 		{
@@ -113,8 +112,8 @@ func TestDropIcebergSchemaCascadeDropsTablesThenSchema(t *testing.T) {
 
 func TestDropIcebergSchemaCascadeUsesCurrentSearchPathForUnqualifiedSchema(t *testing.T) {
 	exec := &icebergDropSchemaCascadeExecutor{
-		defaultCatalog: "iceberg",
-		tableNames:     []string{`person`},
+		searchPath: `"iceberg"."public",memory.main`,
+		tableNames: []string{`person`},
 	}
 	c := &clientConn{executor: exec}
 
@@ -133,8 +132,8 @@ func TestDropIcebergSchemaCascadeUsesCurrentSearchPathForUnqualifiedSchema(t *te
 
 func TestDropIcebergSchemaCascadeRejectsNonIcebergSearchPath(t *testing.T) {
 	exec := &icebergDropSchemaCascadeExecutor{
-		defaultCatalog: "ducklake",
-		tableNames:     []string{`person`},
+		searchPath: "ducklake.main,memory.main",
+		tableNames: []string{`person`},
 	}
 	c := &clientConn{executor: exec}
 
@@ -146,22 +145,22 @@ func TestDropIcebergSchemaCascadeRejectsNonIcebergSearchPath(t *testing.T) {
 	}
 }
 
-func TestQuoteDuckDBIdentifier(t *testing.T) {
-	if got := quoteDuckDBIdentifier(`a"b`); got != `"a""b"` {
-		t.Fatalf("quoteDuckDBIdentifier = %q", got)
+func TestQuoteIdentifier(t *testing.T) {
+	if got := sqlcore.QuoteIdentifier(`a"b`); got != `"a""b"` {
+		t.Fatalf("QuoteIdentifier = %q", got)
 	}
 }
 
 type icebergDropSchemaCascadeExecutor struct {
 	noopProfiling
-	defaultCatalog string
-	execQueries    []string
-	tableNames     []string
+	searchPath  string
+	execQueries []string
+	tableNames  []string
 }
 
 func (e *icebergDropSchemaCascadeExecutor) QueryContext(_ context.Context, query string, _ ...any) (RowSet, error) {
 	if strings.Contains(query, "duckdb_settings()") {
-		return &icebergDropSchemaCascadeRows{values: []string{e.defaultCatalog}}, nil
+		return &icebergDropSchemaCascadeRows{values: []string{e.searchPath}}, nil
 	}
 	return &icebergDropSchemaCascadeRows{values: e.tableNames}, nil
 }

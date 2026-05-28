@@ -6,16 +6,16 @@ import (
 	"strings"
 
 	"github.com/posthog/duckgres/server/iceberg"
+	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 type dropSchemaCascadeTarget struct {
-	Catalog  string
-	Schema   string
-	IfExists bool
+	Catalog string
+	Schema  string
 }
 
 func parseDropSchemaCascadeTarget(query string) (dropSchemaCascadeTarget, bool) {
-	s := strings.TrimSpace(stripLeadingComments(query))
+	s := strings.TrimSpace(sqlcore.StripLeadingComments(query))
 	s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
 
 	pos, ok := consumeSQLKeyword(s, 0, "DROP")
@@ -33,7 +33,6 @@ func parseDropSchemaCascadeTarget(query string) (dropSchemaCascadeTarget, bool) 
 		if !ok {
 			return dropSchemaCascadeTarget{}, false
 		}
-		target.IfExists = true
 		pos = next
 	}
 
@@ -41,7 +40,7 @@ func parseDropSchemaCascadeTarget(query string) (dropSchemaCascadeTarget, bool) 
 	if !ok {
 		return dropSchemaCascadeTarget{}, false
 	}
-	parts, ok := splitDropSchemaTarget(targetSQL)
+	parts, ok := sqlcore.ParseQualifiedIdentifier(targetSQL)
 	if !ok || len(parts) == 0 || len(parts) > 2 {
 		return dropSchemaCascadeTarget{}, false
 	}
@@ -80,70 +79,6 @@ func trimTrailingSQLKeyword(s string, keyword string) (string, bool) {
 	}
 	target := strings.TrimSpace(s[:end])
 	return target, target != ""
-}
-
-func splitDropSchemaTarget(s string) ([]string, bool) {
-	var parts []string
-	inQuotes := false
-	partStart := 0
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if ch == '"' {
-			if inQuotes && i+1 < len(s) && s[i+1] == '"' {
-				i++
-				continue
-			}
-			inQuotes = !inQuotes
-			continue
-		}
-		if ch == '.' && !inQuotes {
-			part, ok := parseDropSchemaIdentifierPart(s[partStart:i])
-			if !ok {
-				return nil, false
-			}
-			parts = append(parts, part)
-			partStart = i + 1
-			continue
-		}
-	}
-	if inQuotes {
-		return nil, false
-	}
-	part, ok := parseDropSchemaIdentifierPart(s[partStart:])
-	if !ok {
-		return nil, false
-	}
-	parts = append(parts, part)
-	return parts, true
-}
-
-func parseDropSchemaIdentifierPart(s string) (string, bool) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "", false
-	}
-	if s[0] != '"' {
-		if strings.Contains(s, `"`) {
-			return "", false
-		}
-		return strings.ToLower(s), true
-	}
-	if len(s) < 2 || s[len(s)-1] != '"' {
-		return "", false
-	}
-	var ident strings.Builder
-	for i := 1; i < len(s)-1; i++ {
-		if s[i] == '"' {
-			if i+1 >= len(s)-1 || s[i+1] != '"' {
-				return "", false
-			}
-			ident.WriteByte('"')
-			i++
-			continue
-		}
-		ident.WriteByte(s[i])
-	}
-	return ident.String(), true
 }
 
 func skipSQLSpace(s string, pos int) int {
@@ -217,9 +152,9 @@ func (c *clientConn) dropIcebergSchemaCascade(ctx context.Context, query string)
 
 	for _, table := range tables {
 		dropTable := fmt.Sprintf("DROP TABLE IF EXISTS %s.%s.%s",
-			quoteDuckDBIdentifier(iceberg.CatalogName),
-			quoteDuckDBIdentifier(target.Schema),
-			quoteDuckDBIdentifier(table),
+			sqlcore.QuoteIdentifier(iceberg.CatalogName),
+			sqlcore.QuoteIdentifier(target.Schema),
+			sqlcore.QuoteIdentifier(table),
 		)
 		if _, err := c.executor.ExecContext(ctx, dropTable); err != nil {
 			return nil, fmt.Errorf("drop iceberg table %s.%s: %w", target.Schema, table, err)
@@ -227,15 +162,15 @@ func (c *clientConn) dropIcebergSchemaCascade(ctx context.Context, query string)
 	}
 
 	dropSchema := fmt.Sprintf("DROP SCHEMA IF EXISTS %s.%s",
-		quoteDuckDBIdentifier(iceberg.CatalogName),
-		quoteDuckDBIdentifier(target.Schema),
+		sqlcore.QuoteIdentifier(iceberg.CatalogName),
+		sqlcore.QuoteIdentifier(target.Schema),
 	)
 	return c.executor.ExecContext(ctx, dropSchema)
 }
 
 func (c *clientConn) currentSearchPathCatalog(ctx context.Context) (string, error) {
 	rows, err := c.executor.QueryContext(ctx, `
-		SELECT lower(regexp_extract(regexp_replace(value, '\s+', '', 'g'), '^([A-Za-z0-9_]+)\.', 1))
+		SELECT value
 		FROM duckdb_settings()
 		WHERE name = 'search_path'
 	`)
@@ -246,16 +181,12 @@ func (c *clientConn) currentSearchPathCatalog(ctx context.Context) (string, erro
 	if !rows.Next() {
 		return "", rows.Err()
 	}
-	var catalog string
-	if err := rows.Scan(&catalog); err != nil {
-		return "", fmt.Errorf("scan search_path catalog: %w", err)
+	var searchPath string
+	if err := rows.Scan(&searchPath); err != nil {
+		return "", fmt.Errorf("scan search_path: %w", err)
 	}
 	if err := rows.Err(); err != nil {
 		return "", err
 	}
-	return catalog, nil
-}
-
-func quoteDuckDBIdentifier(s string) string {
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	return sqlcore.CatalogFromSearchPath(searchPath), nil
 }

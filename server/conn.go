@@ -1448,22 +1448,9 @@ func (c *clientConn) handleQuery(body []byte) error {
 		runExec := func() (ExecResult, error) {
 			execResult, err := c.executor.ExecContext(ctx, query)
 			if err != nil {
-				// Retry ALTER TABLE as ALTER VIEW if target is a view
-				if isAlterTableNotTableError(err) {
-					if alteredQuery, ok := transpiler.ConvertAlterTableToAlterView(query); ok {
-						return c.executor.ExecContext(ctx, alteredQuery)
-					}
-				}
-				// Retry DROP TABLE as DROP VIEW if target is a view
-				if isDropTableOnViewError(err) {
-					if alteredQuery, ok := transpiler.ConvertDropTableToDropView(query); ok {
-						return c.executor.ExecContext(ctx, alteredQuery)
-					}
-				}
-				if isIcebergDropSchemaCascadeUnsupported(err) {
-					if fallbackResult, fallbackErr := c.dropIcebergSchemaCascade(ctx, query); fallbackErr == nil {
-						return fallbackResult, nil
-					}
+				fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(ctx, query, err)
+				if handled {
+					return fallbackResult, fallbackErr
 				}
 			}
 			return execResult, err
