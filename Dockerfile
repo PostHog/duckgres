@@ -12,7 +12,7 @@ ARG BUILD_TAGS=""
 ARG TARGETARCH
 ARG DUCKDB_EXTENSION_VERSION=1.5.3
 ARG HTTPFS_EXTENSION_TAG=v1.5.3-stoi-fix
-ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.3
+ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 ARG DUCKDB_NIGHTLY_EXTENSION_REPOSITORY=http://nightly-extensions.duckdb.org
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
