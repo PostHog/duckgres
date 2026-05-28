@@ -1460,6 +1460,11 @@ func (c *clientConn) handleQuery(body []byte) error {
 						return c.executor.ExecContext(ctx, alteredQuery)
 					}
 				}
+				if isIcebergDropSchemaCascadeUnsupported(err) {
+					if fallbackResult, fallbackErr := c.dropIcebergSchemaCascade(ctx, query); fallbackErr == nil {
+						return fallbackResult, nil
+					}
+				}
 			}
 			return execResult, err
 		}
