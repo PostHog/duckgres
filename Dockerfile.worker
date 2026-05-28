@@ -52,7 +52,10 @@ ARG DUCKDB_EXTENSION_VERSION=1.5.3
 ARG HTTPFS_EXTENSION_TAG=v1.5.3-stoi-fix
 ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
-ARG DUCKDB_NIGHTLY_EXTENSION_REPOSITORY=http://nightly-extensions.duckdb.org
+# Repository for postgres_scanner specifically. Defaults to the stable
+# extensions repo, overridable per-row in CI (e.g. legacy DuckDB versions
+# may need the nightly repo to match what was previously published).
+ARG POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
 
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" \
     -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -76,15 +79,50 @@ RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
       echo "Verified: duckgres-worker linked against duckdb-go-bindings@$embedded" ; \
     fi
 
-RUN mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
+# Cross-check that DUCKDB_EXTENSION_VERSION (which keys the bundled-extension
+# directory layout) matches the DuckDB version implied by DUCKDB_BINDINGS_VERSION.
+# Encoding is `v0.<major><minor:02d><patch:02d>.0`, so 1.5.3 ↔ v0.10503.0.
+# Without this, a CI matrix slip (e.g. extension_version=1.5.3 while bindings=v0.10502.0)
+# would seed extensions under v1.5.3/ for a 1.5.2 engine that looks under v1.5.2/,
+# silently falling back to upstream extensions.duckdb.org for httpfs/ducklake
+# — the bundled PostHog forks would never load.
+RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ] && [ -n "$DUCKDB_EXTENSION_VERSION" ]; then \
+      IFS=. read -r major minor patch <<EOF
+$DUCKDB_EXTENSION_VERSION
+EOF
+      expected=$(printf 'v0.%d%02d%02d.0' "$major" "$minor" "$patch") ; \
+      if [ "$expected" != "$DUCKDB_BINDINGS_VERSION" ]; then \
+        echo "ERROR: extension/bindings version mismatch — DUCKDB_EXTENSION_VERSION=$DUCKDB_EXTENSION_VERSION implies bindings $expected, but got $DUCKDB_BINDINGS_VERSION" >&2 ; \
+        exit 1 ; \
+      fi ; \
+      echo "Verified: DUCKDB_EXTENSION_VERSION=$DUCKDB_EXTENSION_VERSION matches DUCKDB_BINDINGS_VERSION=$DUCKDB_BINDINGS_VERSION" ; \
+    fi
+
+# `set -o pipefail` so a curl failure on the gzipped extensions (json,
+# postgres_scanner) actually aborts the build instead of being masked by
+# gunzip's exit status. `: ${VAR:?msg}` asserts every required input is
+# non-empty — catches a CI matrix row that forgets to pass a build-arg
+# and would otherwise silently fall back to the ARG default, producing
+# a cross-version bundle.
+RUN set -o pipefail \
+    && : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
+    && : "${HTTPFS_EXTENSION_TAG:?must be set}" \
+    && : "${DUCKLAKE_EXTENSION_TAG:?must be set}" \
+    && : "${DUCKDB_EXTENSION_REPOSITORY:?must be set}" \
+    && : "${POSTGRES_SCANNER_REPOSITORY:?must be set}" \
+    && mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
     && curl -fsSL "https://github.com/PostHog/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
       -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension" \
     && curl -fsSL "https://github.com/PostHog/ducklake/releases/download/${DUCKLAKE_EXTENSION_TAG}/ducklake-linux-${TARGETARCH}.duckdb_extension" \
       -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/ducklake.duckdb_extension" \
     && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension.gz" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension" \
-    && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension.gz" \
-      | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension"
+    && curl -fsSL "${POSTGRES_SCANNER_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension.gz" \
+      | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension" \
+    && for f in httpfs ducklake json postgres_scanner; do \
+         [ -s "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/$f.duckdb_extension" ] \
+           || { echo "ERROR: $f.duckdb_extension is empty after fetch" >&2; exit 1; }; \
+       done
 
 FROM debian:bookworm-slim
 

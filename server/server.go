@@ -982,9 +982,28 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 	})
 }
 
+// shouldRefreshBundledExtension returns true for bundled extensions whose
+// on-disk copy in DataDir/extensions/v<ver>/<platform>/ must be overwritten
+// at startup even when a file with the same name already exists. The path
+// is keyed by DuckDB version, so a fresh major/minor/patch always seeds
+// cleanly — these names are the ones that can change *within* a DuckDB
+// version (intra-patch bundled-fork hotfixes), where the cached copy on
+// persistent volumes would otherwise pin the previous binary.
+//
+// httpfs and ducklake are PostHog forks (stoull patch and the lakehouse
+// metadata work) and ship updated binaries between DuckDB releases.
+// postgres_scanner is here because PR #447 originally bundled it from the
+// nightly repo to overwrite stale stable copies seeded on prior worker
+// upgrades; even now that we pull from stable, refreshing on every boot
+// keeps the on-disk extension cache in sync with whatever the running
+// image bundles. json is a stock DuckDB extension that we pull from the
+// stable repo for the engine's version — it doesn't ship intra-version
+// changes, so it's intentionally omitted.
 func shouldRefreshBundledExtension(srcPath string) bool {
 	switch filepath.Base(srcPath) {
-	case "postgres_scanner.duckdb_extension", "ducklake.duckdb_extension":
+	case "httpfs.duckdb_extension",
+		"ducklake.duckdb_extension",
+		"postgres_scanner.duckdb_extension":
 		return true
 	}
 	return false
@@ -1318,6 +1337,12 @@ func applyDuckLakePreAttachSettings(db *sql.DB, dlCfg DuckLakeConfig) error {
 }
 
 func configureDuckLakeMetadataPool(db duckLakeSQLExecer) {
+	// This is the only thing keeping the DuckLake metadata postgres_scanner
+	// connection pool from leaking RDS connections (see the reaper-config
+	// comment in AttachDuckLake). A silent failure here re-introduces the
+	// steady-state RDS connection climb the SET exists to prevent — so
+	// surface it at Error, not Warn, even though we don't abort the attach
+	// (the catalog still works; only the reaper is missing).
 	_, err := db.Exec(`SELECT * FROM postgres_configure_pool(
 		catalog_name := '__ducklake_metadata_ducklake',
 		enable_reaper_thread := true,
@@ -1325,7 +1350,7 @@ func configureDuckLakeMetadataPool(db duckLakeSQLExecer) {
 		max_lifetime_millis := 600000
 	)`)
 	if err != nil {
-		slog.Warn("Failed to configure DuckLake metadata pg pool.", "error", err)
+		slog.Error("Failed to configure DuckLake metadata pg pool — connection-pool reaper disabled, RDS connection count may climb.", "error", err)
 	}
 }
 

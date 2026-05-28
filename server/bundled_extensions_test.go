@@ -115,6 +115,11 @@ func TestSeedBundledExtensionsReplacesExistingFilesWithUpdatedContents(t *testin
 }
 
 func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
+	// json is intentionally not in shouldRefreshBundledExtension's list (it's
+	// a stock DuckDB extension that doesn't ship intra-version changes), so a
+	// pre-existing dst copy must be left alone. httpfs, ducklake, and
+	// postgres_scanner are in the refresh list — their parallel test is the
+	// "ReplacesExistingFilesWithUpdatedContents" case above.
 	srcRoot := t.TempDir()
 	dstRoot := t.TempDir()
 
@@ -122,8 +127,8 @@ func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
-	srcExt := filepath.Join(srcDir, "httpfs.duckdb_extension")
-	if err := os.WriteFile(srcExt, []byte("new-httpfs"), 0o644); err != nil {
+	srcExt := filepath.Join(srcDir, "json.duckdb_extension")
+	if err := os.WriteFile(srcExt, []byte("new-json"), 0o644); err != nil {
 		t.Fatalf("write src extension: %v", err)
 	}
 
@@ -131,8 +136,8 @@ func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		t.Fatalf("mkdir dst: %v", err)
 	}
-	dstExt := filepath.Join(dstDir, "httpfs.duckdb_extension")
-	if err := os.WriteFile(dstExt, []byte("existing-httpfs"), 0o644); err != nil {
+	dstExt := filepath.Join(dstDir, "json.duckdb_extension")
+	if err := os.WriteFile(dstExt, []byte("existing-json"), 0o644); err != nil {
 		t.Fatalf("write dst extension: %v", err)
 	}
 
@@ -144,7 +149,7 @@ func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read dst extension: %v", err)
 	}
-	if string(got) != "existing-httpfs" {
+	if string(got) != "existing-json" {
 		t.Fatalf("expected non-targeted extension to be preserved, got %q", string(got))
 	}
 }

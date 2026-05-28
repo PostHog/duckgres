@@ -27,11 +27,43 @@ env:
 # so DuckDB 1.5.2 → v0.10502.0 / v2.10502.0 and 1.5.3 → v0.10503.0 /
 # v2.10503.0. See scripts/ducklake_version_matrix.sh for the same
 # mapping in test code.
+#
+# Each row must declare every field below — Dockerfile.worker asserts the
+# build-args are non-empty (`:?must be set`) so a forgotten key produces a
+# loud build failure rather than a silent fallback to the ARG default.
+# Exactly one row must set `default: true`; the validate-matrix job
+# enforces this invariant against BOTH the build and manifest matrices.
 
 jobs:
+    validate-matrix:
+        name: Validate matrix invariants
+        if: github.repository == 'PostHog/duckgres'
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+            - name: Exactly one default:true row in build + manifest matrices
+              run: |
+                  set -euo pipefail
+                  WF=.github/workflows/container-image-worker-cd.yml
+                  for path in '.jobs.build.strategy.matrix.duckdb' '.jobs.manifest.strategy.matrix.duckdb'; do
+                      n=$(yq "$path | [.[] | select(.default == true)] | length" "$WF")
+                      if [ "$n" != "1" ]; then
+                          echo "ERROR: $path has $n rows with default:true (expected exactly 1)" >&2
+                          yq "$path" "$WF" >&2
+                          exit 1
+                      fi
+                      echo "✓ $path has exactly 1 default:true row"
+                  done
+
     build:
         name: Build worker ${{ matrix.duckdb.version }} ${{ matrix.platform.platform }}
+        needs: validate-matrix
         if: github.repository == 'PostHog/duckgres'
+        # Don't let a flaky legacy/fallback row block the default version's
+        # multi-arch manifest publish. Default-row failures still fail the
+        # workflow (the unsuffixed `:<sha>`/`:latest` tags that downstream
+        # Charts dispatch picks up must come from a green build).
+        continue-on-error: ${{ !matrix.duckdb.default }}
         strategy:
             fail-fast: false
             matrix:
@@ -41,12 +73,24 @@ jobs:
                       bindings: "v0.10503.0"
                       httpfs: "v1.5.3-stoi-fix"
                       ducklake: "v1.0-posthog.4"
+                      # Stable repo hosts postgres_scanner for 1.5.3; nightly
+                      # does not. See scripts/ducklake_version_matrix.sh
+                      # commit history for the rationale on each row.
+                      pg_scanner_repo: "https://extensions.duckdb.org"
                       default: true
                     - version: "1.5.2"
                       go: "v2.10502.0"
                       bindings: "v0.10502.0"
                       httpfs: "v1.5.2-stoi-fix"
                       ducklake: "v1.0-posthog.2"
+                      # Nightly repo: preserves byte-identity with the
+                      # previously-published 1.5.2 worker image, which
+                      # bundled the nightly build for the DuckLake
+                      # metadata-pool reaper fix (PR #447). Stable v1.5.2
+                      # postgres_scanner exists too but the binary differs;
+                      # keep this row aligned with what was last shipped so
+                      # it remains a true rollback target.
+                      pg_scanner_repo: "http://nightly-extensions.duckdb.org"
                       default: false
                 platform:
                     - platform: linux/arm64
@@ -103,6 +147,7 @@ jobs:
                       DUCKDB_EXTENSION_VERSION=${{ matrix.duckdb.version }}
                       HTTPFS_EXTENSION_TAG=${{ matrix.duckdb.httpfs }}
                       DUCKLAKE_EXTENSION_TAG=${{ matrix.duckdb.ducklake }}
+                      POSTGRES_SCANNER_REPOSITORY=${{ matrix.duckdb.pg_scanner_repo }}
                   cache-from: type=gha,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
                   cache-to: type=gha,mode=max,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
 
@@ -218,6 +263,11 @@ jobs:
         name: Multi-arch manifest worker ${{ matrix.duckdb.version }}
         needs: build
         if: github.repository == 'PostHog/duckgres'
+        # Mirror the build job's tolerance: if the 1.5.2 manifest fails
+        # (e.g. because that row's build was continue-on-errored), the
+        # default 1.5.3 manifest still publishes and Charts dispatch
+        # proceeds.
+        continue-on-error: ${{ !matrix.duckdb.default }}
         strategy:
             fail-fast: false
             matrix:

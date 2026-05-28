@@ -8,7 +8,7 @@
 # Usage:
 #   ./scripts/ducklake_version_matrix.sh                   # run matrix
 #   ./scripts/ducklake_version_matrix.sh --current-only    # benchmark current version only
-#   DUCKLAKE_VERSIONS="v2.10501.0" ./scripts/ducklake_version_matrix.sh  # custom versions
+#   DUCKLAKE_VERSIONS="v2.10502.0" ./scripts/ducklake_version_matrix.sh  # custom versions
 #   DUCKGRES_BENCH_LATENCIES=0ms,50ms,100ms ./scripts/ducklake_version_matrix.sh  # latency sweep
 #
 # Requires: Docker running (for DuckLake infra), go, git, jq (for comparison)

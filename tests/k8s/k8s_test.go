@@ -257,7 +257,21 @@ func TestK8sSharedWarmWorkerActivation(t *testing.T) {
 // EXT_VERSION_DUCKLAKE macro embeds this string at build time and exposes
 // it via duckdb_extensions().extension_version. Bump this in lock-step
 // with DUCKLAKE_EXTENSION_TAG in Dockerfile / Dockerfile.worker.
+//
+// The fork's release CI (PostHog/extension-ci-tools scripts/configure_helper.py)
+// derives this value by trying `git tag --points-at HEAD` first and falling
+// back to `git log -1 --format=%h` when that's empty. The shallow checkout
+// extension-ci-tools performs doesn't include tag refs, so the SHA path
+// always wins — but if the fork ever switches to fetch-tags: true (e.g. to
+// generate release notes), the embedded value would become the tag name
+// and this assertion would need updating to match the format.
 const expectedDucklakeExtensionVersion = "e4ac5150"
+
+// expectedHttpfsExtensionVersion is the short SHA of the commit
+// PostHog/duckdb-httpfs's v1.5.3-stoi-fix tag points at. Bump this in
+// lock-step with HTTPFS_EXTENSION_TAG in Dockerfile / Dockerfile.worker.
+// See the SHA-derivation note on expectedDucklakeExtensionVersion above.
+const expectedHttpfsExtensionVersion = "c727795"
 
 // TestK8sDucklakeExtensionIsBundledFork asserts the worker pods load the
 // PostHog ducklake fork bundled by Dockerfile.worker, not the upstream
@@ -279,6 +293,42 @@ func TestK8sDucklakeExtensionIsBundledFork(t *testing.T) {
 		t.Fatalf("ducklake extension_version = %q, want %q (PostHog fork v1.0-posthog.4). "+
 			"If the bundled fork was upgraded, update expectedDucklakeExtensionVersion alongside DUCKLAKE_EXTENSION_TAG.",
 			version, expectedDucklakeExtensionVersion)
+	}
+}
+
+// TestK8sHttpfsExtensionIsBundledFork asserts the worker pods load the
+// PostHog httpfs fork (stoull Content-Length overflow patch) bundled by
+// Dockerfile.worker — not the upstream build that DuckDB would otherwise
+// fetch from extensions.duckdb.org. Without this assertion, a regression
+// that lets DuckDB fall through to the upstream httpfs (path skew, broken
+// release URL, deleted seed) would silently disable the stoull fix and
+// reintroduce the intermittent S3 Content-Length crash.
+func TestK8sHttpfsExtensionIsBundledFork(t *testing.T) {
+	if err := retryQueryWithReconnect("SELECT 1", 30*time.Second); err != nil {
+		t.Fatalf("warm-up query failed: %v", err)
+	}
+
+	// httpfs is autoloaded the first time the worker references an http/s3
+	// URL. The session connection is fresh, so trigger a load via INSTALL —
+	// it's a no-op if already loaded and idempotent.
+	if err := retryQueryWithReconnect("INSTALL httpfs", 30*time.Second); err != nil {
+		t.Fatalf("install httpfs: %v", err)
+	}
+	if err := retryQueryWithReconnect("LOAD httpfs", 30*time.Second); err != nil {
+		t.Fatalf("load httpfs: %v", err)
+	}
+
+	var version string
+	if err := retryScanStringWithReconnect(
+		"SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'httpfs' AND loaded",
+		60*time.Second, &version,
+	); err != nil {
+		t.Fatalf("query httpfs extension_version: %v", err)
+	}
+	if version != expectedHttpfsExtensionVersion {
+		t.Fatalf("httpfs extension_version = %q, want %q (PostHog fork v1.5.3-stoi-fix). "+
+			"If the bundled fork was upgraded, update expectedHttpfsExtensionVersion alongside HTTPFS_EXTENSION_TAG.",
+			version, expectedHttpfsExtensionVersion)
 	}
 }
 
