@@ -441,16 +441,22 @@ func storageCredFor(s3 S3StorageConfig) WarehouseStorageCredential {
 	}
 }
 
+// lakekeeperDBName is the Postgres database (and role) name for the org's
+// Lakekeeper backend. It's a Postgres identifier, so hyphens are sanitized to
+// underscores via pgIdentSuffix — matching the cnpg-shard composition's
+// $pgIdent so the external and cnpg-shard paths agree.
 func lakekeeperDBName(orgID string) string {
-	return "lakekeeper_" + lakekeeperResourceSuffix(orgID)
+	return "lakekeeper_" + pgIdentSuffix(orgID)
 }
 
+// lakekeeperWarehouseName and oauthClientID are free-form strings (the Iceberg
+// REST warehouse name and the OAuth2 client_id), so they preserve hyphens.
 func lakekeeperWarehouseName(orgID string) string {
-	return "org-" + lakekeeperResourceSuffix(orgID)
+	return "org-" + ducklingName(orgID)
 }
 
 func oauthClientID(orgID string) string {
-	return "duckling-" + lakekeeperResourceSuffix(orgID)
+	return "duckling-" + ducklingName(orgID)
 }
 
 func mustRandomHex(byteLen int) string {

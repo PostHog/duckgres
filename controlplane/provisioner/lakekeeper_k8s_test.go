@@ -31,10 +31,11 @@ func newFakeLakekeeperClient() (*LakekeeperK8sClient, *dynamicfake.FakeDynamicCl
 }
 
 func TestLakekeeperResourceName(t *testing.T) {
+	// k8s resource names preserve hyphens (only lowercasing is applied).
 	cases := map[string]string{
-		"acme":                 "lakekeeper-acme",
-		"019e417b-18c4-7a41":   "lakekeeper-019e417b18c47a41",
-		"00000000-0000-0000-0000-000000000000": "lakekeeper-00000000000000000000000000000000",
+		"acme":                                 "lakekeeper-acme",
+		"019e417b-18c4-7a41":                   "lakekeeper-019e417b-18c4-7a41",
+		"00000000-0000-0000-0000-000000000000": "lakekeeper-00000000-0000-0000-0000-000000000000",
 	}
 	for in, want := range cases {
 		if got := LakekeeperResourceName(in); got != want {
@@ -336,15 +337,15 @@ func TestEnsureSecret_RejectsUnsafeOrgID(t *testing.T) {
 
 func TestIsValidOrgIDLabel(t *testing.T) {
 	cases := map[string]bool{
-		"acme":                                    true,
-		"019e417b-18c4-7a41-bfec-e9ae3a02deb8":    true, // UUID
-		"a":                                       true,
-		"a.b_c-d":                                 true,
-		"":                                        false,
-		"-leading":                                false,
-		"trailing-":                               false,
-		".":                                       false,
-		"has space":                               false,
+		"acme":                                 true,
+		"019e417b-18c4-7a41-bfec-e9ae3a02deb8": true, // UUID
+		"a":                                    true,
+		"a.b_c-d":                              true,
+		"":                                     false,
+		"-leading":                             false,
+		"trailing-":                            false,
+		".":                                    false,
+		"has space":                            false,
 		// 64 chars (over the 63 limit)
 		"a234567890123456789012345678901234567890123456789012345678901234": false,
 	}
