@@ -1011,26 +1011,60 @@ func TestReconcilePendingCreatesCnpgShardCR(t *testing.T) {
 	if !ok || iceberg["enabled"] != true {
 		t.Errorf("expected iceberg.enabled=true on cnpg-shard CR, got %v", spec["iceberg"])
 	}
+	// DuckLake is emitted explicitly (false here — iceberg-only cnpg).
+	ducklake, ok := spec["ducklake"].(map[string]interface{})
+	if !ok || ducklake["enabled"] != false {
+		t.Errorf("expected ducklake.enabled=false on iceberg-only cnpg-shard CR, got %v", spec["ducklake"])
+	}
 	if fs.warehouses["org-cnpg"].State != configstore.ManagedWarehouseStateProvisioning {
 		t.Fatalf("expected provisioning state, got %q", fs.warehouses["org-cnpg"].State)
 	}
 }
 
-// TestDucklingCreateCnpgShardRequiresIceberg verifies the Create guard: a
-// cnpg-shard CR is rejected when iceberg isn't enabled, because the XRD
-// admission rule would reject it and the tenant would have no usable catalog.
-func TestDucklingCreateCnpgShardRequiresIceberg(t *testing.T) {
+// TestReconcilePendingCreatesDuckLakeOnlyCnpgCR verifies the decoupled combo:
+// cnpg-shard with DuckLake on and Iceberg off → ducklake.enabled=true, no
+// iceberg block.
+func TestReconcilePendingCreatesDuckLakeOnlyCnpgCR(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-dlcnpg"] = &configstore.ManagedWarehouse{
+		OrgID:         "org-dlcnpg",
+		State:         configstore.ManagedWarehouseStatePending,
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{Kind: configstore.MetadataStoreKindCnpgShard},
+		DuckLake:      configstore.ManagedWarehouseDuckLake{Enabled: true},
+	}
+	ctx := context.Background()
+	NewControllerWithClient(fs, dc, time.Second).reconcile(ctx)
+
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-dlcnpg"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected CR to exist: %v", err)
+	}
+	spec := cr.Object["spec"].(map[string]interface{})
+	if dl, ok := spec["ducklake"].(map[string]interface{}); !ok || dl["enabled"] != true {
+		t.Errorf("expected ducklake.enabled=true, got %v", spec["ducklake"])
+	}
+	if _, present := spec["iceberg"]; present {
+		t.Errorf("ducklake-only cnpg CR must not carry an iceberg block, got %v", spec["iceberg"])
+	}
+}
+
+// TestDucklingCreateCnpgShardRequiresCatalog verifies the Create guard: a
+// cnpg-shard CR with neither DuckLake nor Iceberg has nothing to attach and is
+// rejected.
+func TestDucklingCreateCnpgShardRequiresCatalog(t *testing.T) {
 	dc, fakeK8s := newFakeDucklingClient()
 	ctx := context.Background()
 
-	err := dc.Create(ctx, "no-iceberg", CreateOptions{
+	err := dc.Create(ctx, "no-catalog", CreateOptions{
 		MetadataStoreType: configstore.MetadataStoreKindCnpgShard,
 		IcebergEnabled:    false,
+		DuckLakeEnabled:   false,
 	})
 	if err == nil {
-		t.Fatal("expected error creating cnpg-shard CR without iceberg")
+		t.Fatal("expected error creating cnpg-shard CR with no catalog enabled")
 	}
-	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("no-iceberg"), metav1.GetOptions{}); getErr == nil {
+	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("no-catalog"), metav1.GetOptions{}); getErr == nil {
 		t.Error("CR should not have been created when validation failed")
 	}
 }
@@ -1301,5 +1335,31 @@ func TestDucklingGetFallsBackToLegacyName(t *testing.T) {
 	}
 	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, legacy, metav1.GetOptions{}); getErr == nil {
 		t.Error("legacy CR should have been deleted via the fallback")
+	}
+}
+
+// TestParseDucklingStatusDuckLakeEnabled locks in the present/absent contract
+// for spec.ducklake.enabled: nil (legacy CR) lets the activator apply the
+// type-based default; an explicit true/false is authoritative.
+func TestParseDucklingStatusDuckLakeEnabled(t *testing.T) {
+	mk := func(spec map[string]interface{}) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "k8s.posthog.com/v1alpha1",
+			"kind":       "Duckling",
+			"spec":       spec,
+			"status":     map[string]interface{}{},
+		}}
+	}
+	ds, _ := parseDucklingStatus(mk(map[string]interface{}{}))
+	if ds.DuckLakeEnabled != nil {
+		t.Errorf("absent ducklake block → nil, got %v", *ds.DuckLakeEnabled)
+	}
+	ds, _ = parseDucklingStatus(mk(map[string]interface{}{"ducklake": map[string]interface{}{"enabled": true}}))
+	if ds.DuckLakeEnabled == nil || !*ds.DuckLakeEnabled {
+		t.Errorf("ducklake.enabled=true → *true, got %v", ds.DuckLakeEnabled)
+	}
+	ds, _ = parseDucklingStatus(mk(map[string]interface{}{"ducklake": map[string]interface{}{"enabled": false}}))
+	if ds.DuckLakeEnabled == nil || *ds.DuckLakeEnabled {
+		t.Errorf("ducklake.enabled=false → *false, got %v", ds.DuckLakeEnabled)
 	}
 }

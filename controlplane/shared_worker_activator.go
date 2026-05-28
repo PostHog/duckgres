@@ -430,14 +430,20 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 		S3URLStyle:  "vhost",
 	}
 
-	// cnpg-shard tenants are iceberg-only: their metadata store is the
-	// Lakekeeper Postgres backend (not a DuckLake catalog), and the worker has
-	// no egress to reach it. Leave MetadataStore empty so the worker attaches
-	// Iceberg only (server.ActivateDBConnection takes its iceberg-only branch).
-	// External/aurora tenants keep DuckLake — they get the metadata DSN below.
-	if status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard {
+	// DuckLake is attached iff this tenant has it enabled. The CR's
+	// spec.ducklake.enabled is authoritative (decoupled ducklings); legacy CRs
+	// that predate the field fall back to the historical coupling — DuckLake on
+	// for external/aurora, off for cnpg-shard. When on, the catalog lives in the
+	// metadata Postgres (the per-tenant lakekeeper_<org> DB on cnpg, or the
+	// metadata DB on external/aurora); when off the worker attaches Iceberg only
+	// (server.ActivateDBConnection takes its iceberg-only branch).
+	ducklakeEnabled := status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
+	if status.DuckLakeEnabled != nil {
+		ducklakeEnabled = *status.DuckLakeEnabled
+	}
+	if ducklakeEnabled {
 		if status.MetadataStore.Password == "" {
-			return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no metadata store password", orgID)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has DuckLake enabled but no metadata store password", orgID)
 		}
 		host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
 		if err != nil {
