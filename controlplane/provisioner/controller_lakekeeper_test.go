@@ -13,8 +13,61 @@ import (
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestReconcileDeleting_TearsDownLakekeeper(t *testing.T) {
+	dc, _ := newFakeDucklingClient()
+	k8sClient, dyn, kc := newFakeLakekeeperClient()
+	ctx := context.Background()
+	orgID := "tenant-x"
+
+	// Seed the per-org Lakekeeper resources EnsureForOrg would have created.
+	// The Duckling CR is intentionally left absent — reconcileDeleting tolerates
+	// NotFound on the CR delete and must still proceed to Lakekeeper teardown.
+	if err := k8sClient.EnsureSecret(ctx, orgID, LakekeeperSecretData{
+		DBUser: "u", DBPassword: "p", EncryptionKey: "k", OAuth2ClientSecret: "o",
+	}); err != nil {
+		t.Fatalf("seed secret: %v", err)
+	}
+	if err := k8sClient.EnsureServiceAccount(ctx, orgID); err != nil {
+		t.Fatalf("seed service account: %v", err)
+	}
+	if err := k8sClient.EnsureCR(ctx, LakekeeperCRSpec{
+		OrgID: orgID, Image: "stub", PGHost: "stub", PGDatabase: "stub",
+		SecretName: "stub", BaseURI: "http://stub",
+	}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+
+	fs := newFakeStore()
+	fs.warehouses[orgID] = &configstore.ManagedWarehouse{
+		OrgID: orgID,
+		State: configstore.ManagedWarehouseStateDeleting,
+	}
+
+	p := NewLakekeeperProvisioner(fs, k8sClient)
+	c := NewControllerWithClient(fs, dc, 0).
+		WithLakekeeperProvisioner(p, func(context.Context, *configstore.ManagedWarehouse) (ProvisioningInputs, error) {
+			return ProvisioningInputs{}, nil
+		})
+
+	c.reconcileDeleting(ctx, fs.warehouses[orgID])
+
+	if _, err := dyn.Resource(lakekeeperGVR).Namespace(k8sClient.namespace).Get(ctx, LakekeeperResourceName(orgID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("Lakekeeper CR not torn down: err=%v", err)
+	}
+	if _, err := kc.CoreV1().Secrets(k8sClient.namespace).Get(ctx, LakekeeperResourceName(orgID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("Lakekeeper Secret not torn down: err=%v", err)
+	}
+	if _, err := kc.CoreV1().ServiceAccounts(k8sClient.namespace).Get(ctx, LakekeeperServiceAccountName(orgID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("Lakekeeper ServiceAccount not torn down: err=%v", err)
+	}
+	if fs.warehouses[orgID].State != configstore.ManagedWarehouseStateDeleted {
+		t.Errorf("warehouse state = %q, want deleted", fs.warehouses[orgID].State)
+	}
+}
 
 func TestReconcileLakekeeper_SkipsWhenProvisionerNotConfigured(t *testing.T) {
 	store := newFakeStore()
