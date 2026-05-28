@@ -253,11 +253,11 @@ func TestK8sSharedWarmWorkerActivation(t *testing.T) {
 }
 
 // expectedDucklakeExtensionVersion is the short SHA of the commit
-// PostHog/ducklake's v1.0-posthog.2 tag points at. DuckDB's
+// PostHog/ducklake's v1.0-posthog.3 tag points at. DuckDB's
 // EXT_VERSION_DUCKLAKE macro embeds this string at build time and exposes
 // it via duckdb_extensions().extension_version. Bump this in lock-step
 // with DUCKLAKE_EXTENSION_TAG in Dockerfile / Dockerfile.worker.
-const expectedDucklakeExtensionVersion = "4a9d2f00"
+const expectedDucklakeExtensionVersion = "e4ac5150"
 
 // TestK8sDucklakeExtensionIsBundledFork asserts the worker pods load the
 // PostHog ducklake fork bundled by Dockerfile.worker, not the upstream
@@ -276,7 +276,7 @@ func TestK8sDucklakeExtensionIsBundledFork(t *testing.T) {
 		t.Fatalf("query ducklake extension_version: %v", err)
 	}
 	if version != expectedDucklakeExtensionVersion {
-		t.Fatalf("ducklake extension_version = %q, want %q (PostHog fork v1.0-posthog.2). "+
+		t.Fatalf("ducklake extension_version = %q, want %q (PostHog fork v1.0-posthog.3). "+
 			"If the bundled fork was upgraded, update expectedDucklakeExtensionVersion alongside DUCKLAKE_EXTENSION_TAG.",
 			version, expectedDucklakeExtensionVersion)
 	}

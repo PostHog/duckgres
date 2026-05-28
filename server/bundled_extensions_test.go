@@ -14,7 +14,7 @@ func TestSeedBundledExtensionsCopiesMissingFiles(t *testing.T) {
 	srcRoot := t.TempDir()
 	dstRoot := t.TempDir()
 
-	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
+	srcDir := filepath.Join(srcRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
@@ -32,8 +32,8 @@ func TestSeedBundledExtensionsCopiesMissingFiles(t *testing.T) {
 	}
 
 	for _, rel := range []string{
-		filepath.Join("v1.5.2", "linux_arm64", "httpfs.duckdb_extension"),
-		filepath.Join("v1.5.2", "linux_arm64", "httpfs.duckdb_extension.info"),
+		filepath.Join("v1.5.3", "linux_arm64", "httpfs.duckdb_extension"),
+		filepath.Join("v1.5.3", "linux_arm64", "httpfs.duckdb_extension.info"),
 	} {
 		got, err := os.ReadFile(filepath.Join(dstRoot, rel))
 		if err != nil {
@@ -49,7 +49,7 @@ func TestSeedBundledExtensionsPreservesExistingFilesWithMatchingContents(t *test
 	srcRoot := t.TempDir()
 	dstRoot := t.TempDir()
 
-	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
+	srcDir := filepath.Join(srcRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestSeedBundledExtensionsPreservesExistingFilesWithMatchingContents(t *test
 		t.Fatalf("write src extension: %v", err)
 	}
 
-	dstDir := filepath.Join(dstRoot, "v1.5.2", "linux_arm64")
+	dstDir := filepath.Join(dstRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		t.Fatalf("mkdir dst: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestSeedBundledExtensionsReplacesExistingFilesWithUpdatedContents(t *testin
 	srcRoot := t.TempDir()
 	dstRoot := t.TempDir()
 
-	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
+	srcDir := filepath.Join(srcRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestSeedBundledExtensionsReplacesExistingFilesWithUpdatedContents(t *testin
 		t.Fatalf("write src extension: %v", err)
 	}
 
-	dstDir := filepath.Join(dstRoot, "v1.5.2", "linux_arm64")
+	dstDir := filepath.Join(dstRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		t.Fatalf("mkdir dst: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
 	srcRoot := t.TempDir()
 	dstRoot := t.TempDir()
 
-	srcDir := filepath.Join(srcRoot, "v1.5.2", "linux_arm64")
+	srcDir := filepath.Join(srcRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestSeedBundledExtensionsPreservesNonTargetedChangedFiles(t *testing.T) {
 		t.Fatalf("write src extension: %v", err)
 	}
 
-	dstDir := filepath.Join(dstRoot, "v1.5.2", "linux_arm64")
+	dstDir := filepath.Join(dstRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		t.Fatalf("mkdir dst: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestBootstrapBundledExtensionsSeedsBundledExtensions(t *testing.T) {
 	bundledRoot := t.TempDir()
 	dataDir := t.TempDir()
 
-	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
+	srcDir := filepath.Join(bundledRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestBootstrapBundledExtensionsSeedsBundledExtensions(t *testing.T) {
 	}
 
 	extDir := filepath.Join(dataDir, "extensions")
-	dstExt := filepath.Join(extDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
+	dstExt := filepath.Join(extDir, "v1.5.3", "linux_arm64", "postgres_scanner.duckdb_extension")
 	got, err := os.ReadFile(dstExt)
 	if err != nil {
 		t.Fatalf("read dst extension: %v", err)
@@ -191,7 +191,7 @@ func TestBootstrapBundledExtensionsRunsOncePerExtensionDirectory(t *testing.T) {
 	dataDir := t.TempDir()
 	extDir := filepath.Join(dataDir, "extensions")
 
-	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
+	srcDir := filepath.Join(bundledRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestBootstrapBundledExtensionsRunsOncePerExtensionDirectory(t *testing.T) {
 		t.Fatalf("second bootstrapBundledExtensions: %v", err)
 	}
 
-	dstExt := filepath.Join(extDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
+	dstExt := filepath.Join(extDir, "v1.5.3", "linux_arm64", "postgres_scanner.duckdb_extension")
 	got, err := os.ReadFile(dstExt)
 	if err != nil {
 		t.Fatalf("read dst extension: %v", err)
@@ -234,7 +234,7 @@ func TestSetExtensionDirectorySetsPathAfterBootstrap(t *testing.T) {
 	bundledRoot := t.TempDir()
 	dataDir := t.TempDir()
 
-	srcDir := filepath.Join(bundledRoot, "v1.5.2", "linux_arm64")
+	srcDir := filepath.Join(bundledRoot, "v1.5.3", "linux_arm64")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestSetExtensionDirectorySetsPathAfterBootstrap(t *testing.T) {
 		t.Fatalf("extension_directory = %q, want %q", gotExtDir, wantExtDir)
 	}
 
-	dstExt := filepath.Join(wantExtDir, "v1.5.2", "linux_arm64", "postgres_scanner.duckdb_extension")
+	dstExt := filepath.Join(wantExtDir, "v1.5.3", "linux_arm64", "postgres_scanner.duckdb_extension")
 	got, err := os.ReadFile(dstExt)
 	if err != nil {
 		t.Fatalf("read dst extension: %v", err)

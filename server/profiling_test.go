@@ -82,7 +82,7 @@ func TestProfilingOutputToFile(t *testing.T) {
 // some non-SELECT statements (notably INSERT and bare CREATE TABLE), so
 // the worker's gRPC trailer comes back empty and EnrichSpanWithProfiling
 // no-ops on the control plane. INSERT is used here because in DuckDB
-// v1.5.2 it's the cleanest reproduction — CTAS already gets profiled
+// v1.5.3 it's the cleanest reproduction — CTAS already gets profiled
 // under the default because of its embedded SELECT.
 func TestProfilingCoverageAllCoversNonSelect(t *testing.T) {
 	mustExec := func(t *testing.T, db *sql.DB, stmts ...string) {

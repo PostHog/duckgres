@@ -1490,7 +1490,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
 
-	// Reclaim idle metadata connections. DuckDB 1.5.2 / DuckLake 1.0 enabled
+	// Reclaim idle metadata connections. DuckDB 1.5.3 / DuckLake 1.0 enabled
 	// thread-local connection caching for postgres_scanner by default but ships
 	// with reaper_thread=off and idle/lifetime timeouts=0, so every connection
 	// a worker thread ever caches stays pinned forever — producing a steady-state
