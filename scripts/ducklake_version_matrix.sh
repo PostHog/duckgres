@@ -8,7 +8,7 @@
 # Usage:
 #   ./scripts/ducklake_version_matrix.sh                   # run matrix
 #   ./scripts/ducklake_version_matrix.sh --current-only    # benchmark current version only
-#   DUCKLAKE_VERSIONS="v2.10501.0" ./scripts/ducklake_version_matrix.sh  # custom versions
+#   DUCKLAKE_VERSIONS="v2.10502.0" ./scripts/ducklake_version_matrix.sh  # custom versions
 #   DUCKGRES_BENCH_LATENCIES=0ms,50ms,100ms ./scripts/ducklake_version_matrix.sh  # latency sweep
 #
 # Requires: Docker running (for DuckLake infra), go, git, jq (for comparison)
@@ -22,9 +22,9 @@ TEST_TIMEOUT="${DUCKLAKE_TEST_TIMEOUT:-300s}"
 
 # DuckDB Go driver versions to test.
 # Format: "module_version" — maps to duckdb-go/v2 + duckdb-go-bindings.
-#   v2.10501.0 → DuckDB 1.5.1 (DuckLake 0.4)
 #   v2.10502.0 → DuckDB 1.5.2 (DuckLake 1.0)
-DEFAULT_VERSIONS="v2.10502.0 v2.10501.0"
+#   v2.10503.0 → DuckDB 1.5.3 (DuckLake 1.0)
+DEFAULT_VERSIONS="v2.10503.0 v2.10502.0"
 VERSIONS="${DUCKLAKE_VERSIONS:-$DEFAULT_VERSIONS}"
 
 CURRENT_ONLY=false
