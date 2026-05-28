@@ -1127,3 +1127,133 @@ func TestReconcileProvisioningCnpgShardGatedOnIceberg(t *testing.T) {
 		t.Fatalf("expected ready state after iceberg ready, got %q", fs.warehouses["org-cs"].State)
 	}
 }
+
+// --- external metadata store (iceberg+external and ducklake+external) ---
+
+// TestReconcilePendingCreatesIcebergExternalCR verifies a warehouse with an
+// external metadata store + iceberg produces a Duckling CR with
+// metadataStore.type=external (carrying endpoint/passwordAwsSecret/user/
+// database), an external dataStore reusing the named bucket, and iceberg on.
+func TestReconcilePendingCreatesIcebergExternalCR(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-ext"] = &configstore.ManagedWarehouse{
+		OrgID: "org-ext",
+		State: configstore.ManagedWarehouseStatePending,
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind:              configstore.MetadataStoreKindExternal,
+			Endpoint:          "rds.example.us-east-1.rds.amazonaws.com",
+			Username:          "postgres",
+			DatabaseName:      "postgres",
+			PasswordAWSSecret: "duckling-example-rds-password",
+		},
+		DataStore: configstore.ManagedWarehouseDataStore{
+			Kind:       "external",
+			BucketName: "posthog-duckling-example",
+			Region:     "us-east-1",
+		},
+		Iceberg: configstore.ManagedWarehouseIceberg{
+			Enabled: true,
+			Backend: configstore.IcebergBackendLakekeeper,
+		},
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctx := context.Background()
+	ctrl.reconcile(ctx)
+
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-ext"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected CR to exist: %v", err)
+	}
+	spec := cr.Object["spec"].(map[string]interface{})
+	ms := spec["metadataStore"].(map[string]interface{})
+	if ms["type"] != configstore.MetadataStoreKindExternal {
+		t.Fatalf("metadataStore.type = %v, want external", ms["type"])
+	}
+	ext, ok := ms["external"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected metadataStore.external block, got %v", ms)
+	}
+	if ext["endpoint"] != "rds.example.us-east-1.rds.amazonaws.com" || ext["passwordAwsSecret"] != "duckling-example-rds-password" {
+		t.Errorf("external endpoint/secret wrong: %v", ext)
+	}
+	if ext["user"] != "postgres" || ext["database"] != "postgres" {
+		t.Errorf("external user/database wrong: %v", ext)
+	}
+	ds := spec["dataStore"].(map[string]interface{})
+	if ds["type"] != "external" {
+		t.Fatalf("dataStore.type = %v, want external", ds["type"])
+	}
+	dsExt, ok := ds["external"].(map[string]interface{})
+	if !ok || dsExt["bucketName"] != "posthog-duckling-example" || dsExt["region"] != "us-east-1" {
+		t.Errorf("dataStore.external wrong: %v", ds["external"])
+	}
+	iceberg, ok := spec["iceberg"].(map[string]interface{})
+	if !ok || iceberg["enabled"] != true {
+		t.Errorf("expected iceberg.enabled=true, got %v", spec["iceberg"])
+	}
+}
+
+// TestReconcilePendingCreatesDuckLakeExternalCR verifies external metadata
+// WITHOUT iceberg yields a CR with no iceberg block (DuckLake-on-external).
+func TestReconcilePendingCreatesDuckLakeExternalCR(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.warehouses["org-dl"] = &configstore.ManagedWarehouse{
+		OrgID: "org-dl",
+		State: configstore.ManagedWarehouseStatePending,
+		MetadataStore: configstore.ManagedWarehouseMetadataStore{
+			Kind:              configstore.MetadataStoreKindExternal,
+			Endpoint:          "rds.example.us-east-1.rds.amazonaws.com",
+			PasswordAWSSecret: "duckling-example-rds-password",
+		},
+		DataStore: configstore.ManagedWarehouseDataStore{
+			Kind: "external", BucketName: "posthog-duckling-example", Region: "us-east-1",
+		},
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctx := context.Background()
+	ctrl.reconcile(ctx)
+
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("org-dl"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected CR to exist: %v", err)
+	}
+	spec := cr.Object["spec"].(map[string]interface{})
+	if spec["metadataStore"].(map[string]interface{})["type"] != configstore.MetadataStoreKindExternal {
+		t.Fatalf("metadataStore.type wrong: %v", spec["metadataStore"])
+	}
+	if _, present := spec["iceberg"]; present {
+		t.Errorf("ducklake+external CR must not carry an iceberg block, got %v", spec["iceberg"])
+	}
+}
+
+// TestDucklingCreateExternalRequiresFields verifies the Create guard: an
+// external CR is rejected without endpoint + passwordAwsSecret.
+func TestDucklingCreateExternalRequiresFields(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	ctx := context.Background()
+	if err := dc.Create(ctx, "ext-bad", CreateOptions{MetadataStoreType: configstore.MetadataStoreKindExternal}); err == nil {
+		t.Fatal("expected error creating external CR without endpoint/passwordAwsSecret")
+	}
+	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, ducklingName("ext-bad"), metav1.GetOptions{}); getErr == nil {
+		t.Error("CR should not have been created when external validation failed")
+	}
+}
+
+// TestDucklingCreateExternalDataStoreRequiresBucket verifies the dataStore
+// guard: an external dataStore needs a bucket name.
+func TestDucklingCreateExternalDataStoreRequiresBucket(t *testing.T) {
+	dc, _ := newFakeDucklingClient()
+	err := dc.Create(context.Background(), "ext-nobucket", CreateOptions{
+		MetadataStoreType:         configstore.MetadataStoreKindExternal,
+		ExternalEndpoint:          "h",
+		ExternalPasswordAWSSecret: "s",
+		DataStoreType:             "external",
+	})
+	if err == nil {
+		t.Fatal("expected error: external dataStore without a bucket name")
+	}
+}

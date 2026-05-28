@@ -10,15 +10,15 @@ import "time"
 // alias", multiple orgs can share the NULL state, but any non-NULL alias must
 // be unique across orgs (Postgres ignores NULL in UNIQUE).
 type Org struct {
-	Name                string            `gorm:"primaryKey;size:255" json:"name"`
-	DatabaseName        string            `gorm:"size:255;uniqueIndex" json:"database_name"`
-	HostnameAlias       *string           `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
-	MaxWorkers          int               `gorm:"default:0" json:"max_workers"`
-	MaxConnections      int               `gorm:"default:0" json:"max_connections"`
-	MemoryBudget        string            `gorm:"size:32" json:"memory_budget"`
-	IdleTimeoutS        int               `gorm:"default:0" json:"idle_timeout_s"`
-	WorkerCPURequest    string            `gorm:"size:32" json:"worker_cpu_request"`
-	WorkerMemoryRequest string            `gorm:"size:32" json:"worker_memory_request"`
+	Name                string                 `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName        string                 `gorm:"size:255;uniqueIndex" json:"database_name"`
+	HostnameAlias       *string                `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
+	MaxWorkers          int                    `gorm:"default:0" json:"max_workers"`
+	MaxConnections      int                    `gorm:"default:0" json:"max_connections"`
+	MemoryBudget        string                 `gorm:"size:32" json:"memory_budget"`
+	IdleTimeoutS        int                    `gorm:"default:0" json:"idle_timeout_s"`
+	WorkerCPURequest    string                 `gorm:"size:32" json:"worker_cpu_request"`
+	WorkerMemoryRequest string                 `gorm:"size:32" json:"worker_memory_request"`
 	Users               []OrgUser              `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
 	Warehouse           *ManagedWarehouse      `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
 	Trino               *ManagedWarehouseTrino `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"trino,omitempty"`
@@ -77,14 +77,22 @@ type ManagedWarehouseDatabase struct {
 }
 
 // Metadata-store kinds, stored verbatim in ManagedWarehouseMetadataStore.Kind
-// and mirrored onto the Duckling CR's spec.metadataStore.type. These are the
-// only backends the control plane creates: "external" is deliberately absent
-// (external metadata stores are applied out-of-band, never provisioned here),
-// and "cnpg-shard" backs the per-tenant Lakekeeper Iceberg catalog on the
-// shared CloudNativePG shard (always paired with iceberg.enabled=true).
+// and mirrored onto the Duckling CR's spec.metadataStore.type. The control
+// plane provisions two of these:
+//
+//   - "cnpg-shard": the per-tenant Lakekeeper Iceberg catalog Postgres backend
+//     on the shared CloudNativePG shard (always paired with iceberg.enabled).
+//   - "external": a pre-existing Postgres (e.g. RDS), referenced by endpoint +
+//     an AWS Secrets Manager secret for the password. Backs either a DuckLake
+//     catalog (iceberg disabled) or the Lakekeeper catalog (iceberg enabled).
+//
+// "aurora" is no longer provisionable (the control plane never stands up a new
+// Aurora cluster); the constant is retained so DucklingClient.Create can still
+// reconcile pre-existing aurora ducklings.
 const (
 	MetadataStoreKindAurora    = "aurora"
 	MetadataStoreKindCnpgShard = "cnpg-shard"
+	MetadataStoreKindExternal  = "external"
 )
 
 // ManagedWarehouseMetadataStore stores org-scoped DuckLake metadata DB info.
@@ -96,6 +104,29 @@ type ManagedWarehouseMetadataStore struct {
 	Port         int    `json:"port"`
 	DatabaseName string `gorm:"size:255" json:"database_name"`
 	Username     string `gorm:"size:255" json:"username"`
+
+	// PasswordAWSSecret is the AWS Secrets Manager secret NAME that holds the
+	// metadata DB password. Only meaningful when Kind == "external": it's
+	// passed through to the Duckling CR's spec.metadataStore.external.
+	// passwordAwsSecret, where the composition resolves it (via ESO) into the
+	// status password the worker activator reads. Empty for aurora/cnpg-shard
+	// (those mint their own credentials).
+	PasswordAWSSecret string `gorm:"size:255" json:"password_aws_secret,omitempty"`
+}
+
+// ManagedWarehouseDataStore captures the org's object-store provisioning
+// intent — the shape the Duckling CR's spec.dataStore takes. Distinct from
+// ManagedWarehouseS3 (the resolved, activation-time object-store config):
+// this records what to ask the composition for.
+//
+//   - Kind "s3bucket" (default): the composition provisions a fresh per-org
+//     bucket. BucketName/Region are ignored.
+//   - Kind "external": reuse an existing bucket (BucketName required); the
+//     composition provisions no bucket.
+type ManagedWarehouseDataStore struct {
+	Kind       string `gorm:"size:32" json:"kind"`
+	BucketName string `gorm:"size:255" json:"bucket_name,omitempty"`
+	Region     string `gorm:"size:64" json:"region,omitempty"`
 }
 
 // ManagedWarehousePgBouncer captures per-org opt-in state for the per-Duckling
@@ -287,6 +318,7 @@ type ManagedWarehouse struct {
 
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
+	DataStore         ManagedWarehouseDataStore      `gorm:"embedded;embeddedPrefix:data_store_" json:"data_store"`
 	PgBouncer         ManagedWarehousePgBouncer      `gorm:"embedded;embeddedPrefix:pgbouncer_" json:"pgbouncer"`
 	S3                ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
 	Iceberg           ManagedWarehouseIceberg        `gorm:"embedded;embeddedPrefix:iceberg_" json:"iceberg"`

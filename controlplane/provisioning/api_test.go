@@ -705,21 +705,116 @@ func TestProvisionCnpgShard(t *testing.T) {
 	}
 }
 
-func TestProvisionRejectsExternalMetadataStore(t *testing.T) {
+func TestProvisionIcebergExternal(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
 
-	body := []byte(`{"database_name": "ext-db", "metadata_store": {"type": "external"}}`)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extco/provision", bytes.NewReader(body))
+	body := []byte(`{
+		"database_name": "extice-db",
+		"metadata_store": {"type": "external", "external": {
+			"endpoint": "rds.example.us-east-1.rds.amazonaws.com",
+			"password_aws_secret": "duckling-example-rds-password",
+			"user": "postgres", "database": "postgres"
+		}},
+		"data_store": {"type": "external", "bucket_name": "posthog-duckling-example", "region": "us-east-1"},
+		"iceberg": {"enabled": true}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extice/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	if _, ok := store.warehouses["extco"]; ok {
-		t.Error("warehouse must not be created for an external metadata store")
+	w := store.warehouses["extice"]
+	if w == nil {
+		t.Fatal("expected warehouse to be created")
+	}
+	if w.MetadataStore.Kind != configstore.MetadataStoreKindExternal {
+		t.Errorf("metadata store kind = %q, want external", w.MetadataStore.Kind)
+	}
+	if w.MetadataStore.Endpoint != "rds.example.us-east-1.rds.amazonaws.com" || w.MetadataStore.PasswordAWSSecret != "duckling-example-rds-password" {
+		t.Errorf("external creds not persisted: %+v", w.MetadataStore)
+	}
+	if w.MetadataStore.Username != "postgres" || w.MetadataStore.DatabaseName != "postgres" {
+		t.Errorf("user/database not persisted: %+v", w.MetadataStore)
+	}
+	if w.DataStore.Kind != "external" || w.DataStore.BucketName != "posthog-duckling-example" || w.DataStore.Region != "us-east-1" {
+		t.Errorf("data store not persisted: %+v", w.DataStore)
+	}
+	if !w.Iceberg.Enabled || w.Iceberg.Backend != configstore.IcebergBackendLakekeeper {
+		t.Errorf("expected iceberg enabled with lakekeeper backend, got %+v", w.Iceberg)
+	}
+}
+
+func TestProvisionDuckLakeExternal(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	// No iceberg block → DuckLake-on-external (iceberg disabled).
+	body := []byte(`{
+		"database_name": "extdl-db",
+		"metadata_store": {"type": "external", "external": {
+			"endpoint": "rds.example.us-east-1.rds.amazonaws.com",
+			"password_aws_secret": "duckling-example-rds-password"
+		}},
+		"data_store": {"type": "external", "bucket_name": "posthog-duckling-example", "region": "us-east-1"}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/extdl/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	w := store.warehouses["extdl"]
+	if w == nil {
+		t.Fatal("expected warehouse to be created")
+	}
+	if w.MetadataStore.Kind != configstore.MetadataStoreKindExternal {
+		t.Errorf("metadata store kind = %q, want external", w.MetadataStore.Kind)
+	}
+	if w.Iceberg.Enabled {
+		t.Errorf("ducklake+external must NOT enable iceberg, got %+v", w.Iceberg)
+	}
+}
+
+func TestProvisionExternalRequiresEndpointAndSecret(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing external block": `{"database_name":"e-db","metadata_store":{"type":"external"}}`,
+		"missing endpoint":       `{"database_name":"e-db","metadata_store":{"type":"external","external":{"password_aws_secret":"s"}}}`,
+		"missing secret":         `{"database_name":"e-db","metadata_store":{"type":"external","external":{"endpoint":"h"}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := newFakeStore()
+			router := newTestRouter(store)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/eco/provision", bytes.NewReader([]byte(body)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+			}
+			if _, ok := store.warehouses["eco"]; ok {
+				t.Error("warehouse must not be created when required external fields are missing")
+			}
+		})
+	}
+}
+
+func TestProvisionExternalDataStoreRequiresBucket(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+	// data_store.type=external without bucket_name → 400.
+	body := []byte(`{"database_name":"e-db","metadata_store":{"type":"external","external":{"endpoint":"h","password_aws_secret":"s"}},"data_store":{"type":"external"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/eco/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
 }
 
