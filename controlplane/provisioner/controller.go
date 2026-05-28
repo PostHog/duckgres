@@ -43,6 +43,12 @@ type Controller struct {
 	// Lakekeeper path), reconcileLakekeeper is skipped silently.
 	lakekeeperProvisioner *LakekeeperProvisioner
 	lakekeeperInputs      LakekeeperInputsResolver
+
+	// Trino-side reconcile dependency. Optional: if nil (the default in
+	// deployments without the customer Trino cluster, or in tests that
+	// don't exercise the Trino path), the Trino reconcile step is
+	// skipped silently. See WithTrinoProvisioner.
+	trinoProvisioner *TrinoProvisioner
 }
 
 // LakekeeperInputsResolver is the function shape the controller uses to
@@ -102,6 +108,22 @@ func (c *Controller) WithLakekeeperProvisioner(p *LakekeeperProvisioner, inputs 
 	return c
 }
 
+// WithTrinoProvisioner enables the customer-Trino reconcile branch.
+// The Trino reconcile runs once per controller tick — it doesn't iterate
+// per-warehouse like the Lakekeeper branch does, because the Trino
+// projection is a single batched output (one Secret + one ConfigMap +
+// one OPA bundle for the whole cluster).
+//
+// Skipped entirely if p is nil so deployments without a customer Trino
+// cluster don't need to know about it.
+func (c *Controller) WithTrinoProvisioner(p *TrinoProvisioner) *Controller {
+	if p == nil {
+		panic("WithTrinoProvisioner: provisioner is nil; call NewTrinoProvisioner first")
+	}
+	c.trinoProvisioner = p
+	return c
+}
+
 // Run starts the reconciliation loop. Blocks until ctx is cancelled.
 func (c *Controller) Run(ctx context.Context) {
 	slog.Info("Provisioning controller started.", "poll_interval", c.pollInterval)
@@ -154,6 +176,16 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.reconcileDeleting(ctx, &w)
 		}
 	}
+
+	// Trino reconcile runs once per tick (not per warehouse) — the
+	// projection is a single batched output for the customer cluster.
+	// Errors are logged but don't block other reconcile branches; the
+	// next tick re-runs everything.
+	if c.trinoProvisioner != nil && ctx.Err() == nil {
+		if err := c.trinoProvisioner.Reconcile(ctx); err != nil {
+			slog.Warn("Trino provisioner reconcile failed.", "error", err)
+		}
+	}
 }
 
 func (c *Controller) reconcilePending(ctx context.Context, w *configstore.ManagedWarehouse) {
@@ -181,11 +213,20 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		"pgbouncer_enabled", w.PgBouncer.Enabled,
 		"iceberg_enabled", w.Iceberg.Enabled)
 	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
-		MinACU:           w.AuroraMinACU,
-		MaxACU:           w.AuroraMaxACU,
-		PgBouncerEnabled: w.PgBouncer.Enabled,
-		IcebergEnabled:   w.Iceberg.Enabled,
-		IcebergNamespace: w.Iceberg.Namespace,
+		MetadataStoreType:         w.MetadataStore.Kind,
+		MinACU:                    w.AuroraMinACU,
+		MaxACU:                    w.AuroraMaxACU,
+		PgBouncerEnabled:          w.PgBouncer.Enabled,
+		ExternalEndpoint:          w.MetadataStore.Endpoint,
+		ExternalPasswordAWSSecret: w.MetadataStore.PasswordAWSSecret,
+		ExternalUser:              w.MetadataStore.Username,
+		ExternalDatabase:          w.MetadataStore.DatabaseName,
+		DataStoreType:             w.DataStore.Kind,
+		DataStoreBucket:           w.DataStore.BucketName,
+		DataStoreRegion:           w.DataStore.Region,
+		IcebergEnabled:            w.Iceberg.Enabled,
+		IcebergNamespace:          w.Iceberg.Namespace,
+		DuckLakeEnabled:           w.DuckLake.Enabled,
 	}); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
@@ -336,6 +377,18 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 			log.Warn("Failed to update warehouse state.", "error", err)
 		}
 	}
+
+	// Provision the per-org Lakekeeper as part of turn-up, not only as a
+	// post-Ready late-enable. A cnpg-shard Duckling is required by the XRD to
+	// have iceberg.enabled=true, so its warehouse can never reach Ready until
+	// iceberg_state flips — and for the Lakekeeper backend that only happens
+	// once EnsureForOrg has stood the catalog up (there's no S3 Tables bucket
+	// whose ARN would otherwise trigger it). reconcileLakekeeper is idempotent,
+	// no-ops for non-Lakekeeper backends, and returns quietly until the
+	// Duckling status carries the metadata creds and the Lakekeeper CR has
+	// bootstrapped; the poll loop is the requeue. The iceberg_state=Ready it
+	// writes is picked up by the readiness check on a subsequent tick.
+	c.reconcileLakekeeper(ctx, w)
 }
 
 // reconcileReady handles drift correction for Ready warehouses. The
@@ -452,7 +505,10 @@ func applyIcebergUpdatesToWarehouse(w *configstore.ManagedWarehouse, updates map
 }
 
 // reconcileLakekeeper provisions a per-org Lakekeeper instance when the
-// warehouse selects the lakekeeper backend and isn't yet provisioned.
+// warehouse selects the lakekeeper backend and isn't yet provisioned. Called
+// from both reconcileProvisioning (initial turn-up — required for cnpg-shard,
+// which must have iceberg enabled and so can't reach Ready until the catalog
+// is up) and reconcileReady (late-enable on an already-Ready warehouse).
 // Idempotent: a warehouse with LakekeeperEndpoint already populated is a
 // no-op. ErrBootstrapPending from the underlying EnsureForOrg is logged
 // at debug and treated as "retry on the next tick" — the controller's
@@ -532,6 +588,21 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 		// marking as deleted while AWS resources still exist.
 		if !apierrors.IsNotFound(err) {
 			log.Warn("Failed to delete Duckling CR, will retry.", "error", err)
+			return
+		}
+	}
+
+	// Tear down the per-org Lakekeeper instance the control plane provisioned
+	// out-of-band (CR + Secret + ServiceAccount in the lakekeeper namespace).
+	// The Crossplane Duckling composition doesn't own these, so without an
+	// explicit teardown they leak after the warehouse is gone. Idempotent and
+	// NotFound-tolerant — a clean no-op for ducklings that never enabled
+	// Iceberg. Skipped silently when the provisioner isn't wired (mirrors
+	// reconcileLakekeeper). On error we return without marking the warehouse
+	// deleted so the next reconcile pass retries.
+	if c.lakekeeperProvisioner != nil {
+		if err := c.lakekeeperProvisioner.DeleteForOrg(ctx, w.OrgID); err != nil {
+			log.Warn("Failed to tear down Lakekeeper resources, will retry.", "error", err)
 			return
 		}
 	}

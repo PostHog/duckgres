@@ -52,6 +52,19 @@ type ProvisioningInputs struct {
 	PGHost string
 	PGPort int32
 
+	// PGPreProvisioned is set when the org's Lakekeeper database and role
+	// already exist, created out-of-band — specifically by provider-sql on a
+	// CloudNativePG shard (the cnpg-shard metadata-store type). In that mode
+	// the provisioner does NOT run CREATE DATABASE / CREATE ROLE (it has no
+	// privileged AdminDSN — the connection is the per-tenant lakekeeper_<org>
+	// role itself), and instead takes the role credentials below verbatim:
+	// PGUser/PGPassword go into the Lakekeeper pod's Secret, PGDatabase is the
+	// database it connects to. AdminDSN is not required when this is true.
+	PGPreProvisioned bool
+	PGUser           string
+	PGPassword       string
+	PGDatabase       string
+
 	// PGSSLMode the Lakekeeper pod sets when connecting. Default "require".
 	// Set to "disable" for local/dev environments where PG has no TLS.
 	PGSSLMode string
@@ -174,16 +187,26 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	// In-cluster Service DNS — operator names the Service after the CR.
 	baseURL := fmt.Sprintf("http://%s.%s.svc:8181", resourceName, p.k8s.namespace)
 
-	// 1. CREATE DATABASE lakekeeper_<orgid> if absent.
-	if err := EnsureDatabase(ctx, in.AdminDSN, dbName); err != nil {
-		return fmt.Errorf("ensure lakekeeper db: %w", err)
+	// In pre-provisioned mode (cnpg-shard) the database + role were already
+	// created by provider-sql on the shard, and the connection we have is the
+	// non-privileged per-tenant role — so skip the CREATE DATABASE / CREATE
+	// ROLE DDL and take the role's name/password verbatim from the inputs.
+	if in.PGPreProvisioned {
+		dbName = in.PGDatabase
+	} else {
+		// 1. CREATE DATABASE lakekeeper_<orgid> if absent.
+		if err := EnsureDatabase(ctx, in.AdminDSN, dbName); err != nil {
+			return fmt.Errorf("ensure lakekeeper db: %w", err)
+		}
 	}
 
 	// 2. Resolve or generate the per-org credentials, and ensure the K8s
 	// Secret holds them. On re-runs we read the existing Secret rather than
 	// rotating its values — Lakekeeper's DB password would otherwise drift
-	// from the Postgres user's actual password.
-	creds, err := p.resolveOrGenerateSecret(ctx, w.OrgID, dbName, secretName)
+	// from the Postgres user's actual password. In pre-provisioned mode the
+	// DB user/password come from the inputs (the provider-sql role); the
+	// Lakekeeper-internal EncryptionKey/OAuth2ClientSecret are still generated.
+	creds, err := p.resolveOrGenerateSecret(ctx, w.OrgID, dbName, secretName, in.PGUser, in.PGPassword)
 	if err != nil {
 		return fmt.Errorf("ensure lakekeeper secret: %w", err)
 	}
@@ -192,9 +215,12 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	// Secret. A freshly-created database has no users by default; without
 	// this, the Lakekeeper pod's CreateAdminUser-style startup would fail
 	// with "role does not exist". EnsureRole is idempotent and rotates the
-	// password to match the Secret on re-runs.
-	if err := EnsureRole(ctx, in.AdminDSN, creds.DBUser, creds.DBPassword, dbName); err != nil {
-		return fmt.Errorf("ensure lakekeeper pg role: %w", err)
+	// password to match the Secret on re-runs. Skipped when pre-provisioned —
+	// provider-sql owns the role and our connection can't CREATE ROLE.
+	if !in.PGPreProvisioned {
+		if err := EnsureRole(ctx, in.AdminDSN, creds.DBUser, creds.DBPassword, dbName); err != nil {
+			return fmt.Errorf("ensure lakekeeper pg role: %w", err)
+		}
 	}
 
 	// 2c. Ensure the per-org ServiceAccount the Lakekeeper pod runs under.
@@ -242,11 +268,11 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	whReq := CreateWarehouseRequest{
 		WarehouseName: lakekeeperWarehouseName(w.OrgID),
 		StorageProfile: WarehouseStorageProfile{
-			Type:                 "s3",
-			Bucket:               in.S3.Bucket,
-			KeyPrefix:            in.S3.KeyPrefix,
-			Endpoint:             in.S3.Endpoint,
-			Region:               in.S3.Region,
+			Type:            "s3",
+			Bucket:          in.S3.Bucket,
+			KeyPrefix:       in.S3.KeyPrefix,
+			Endpoint:        in.S3.Endpoint,
+			Region:          in.S3.Region,
 			PathStyleAccess: in.S3.Flavor == "s3-compat",
 			Flavor:          in.S3.Flavor,
 			// STS credential vending is OFF: Lakekeeper would assume a role
@@ -308,6 +334,31 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	return nil
 }
 
+// DeleteForOrg tears down the per-org Lakekeeper instance that EnsureForOrg
+// created: the CR (which cascades to the operator-managed Deployment, Service,
+// and migration Job via ownerReferences) plus the standalone Secret and
+// ServiceAccount (which don't carry an ownerReference and so must be deleted
+// explicitly). Idempotent and NotFound-tolerant, so it's a safe no-op for orgs
+// that never had Iceberg enabled.
+//
+// What it does NOT touch: the lakekeeper_<org> Postgres database/role. On
+// cnpg-shard it's provider-sql-managed and torn down with the Duckling CR; on
+// aurora the whole cluster is torn down with the Duckling CR; on an external
+// (shared) metadata store it currently persists — dropping a database on a
+// shared RDS is destructive and out of scope for this teardown.
+func (p *LakekeeperProvisioner) DeleteForOrg(ctx context.Context, orgID string) error {
+	if err := p.k8s.DeleteCR(ctx, orgID); err != nil {
+		return err
+	}
+	if err := p.k8s.DeleteSecret(ctx, orgID); err != nil {
+		return err
+	}
+	if err := p.k8s.DeleteServiceAccount(ctx, orgID); err != nil {
+		return err
+	}
+	return nil
+}
+
 // checkBootstrap reads the Lakekeeper CR status once. Returns nil when
 // bootstrappedAt is non-empty, ErrBootstrapPending otherwise. The caller —
 // typically the warehouse-reconcile loop — is responsible for requeueing on
@@ -331,7 +382,13 @@ func (p *LakekeeperProvisioner) checkBootstrap(ctx context.Context, orgID string
 // generates fresh credentials and writes a new Secret. Generating ONLY on
 // first run keeps the Postgres user's password stable across re-runs —
 // rotating the Secret would silently de-sync it from the actual PG password.
-func (p *LakekeeperProvisioner) resolveOrGenerateSecret(ctx context.Context, orgID, dbName, secretName string) (LakekeeperSecretData, error) {
+//
+// The DB user/password are generated unless pgUser/pgPassword are supplied
+// (pre-provisioned cnpg-shard mode), in which case they're taken verbatim so
+// the Lakekeeper pod authenticates as the provider-sql-created role. The
+// Lakekeeper-internal EncryptionKey and OAuth2ClientSecret are always
+// generated regardless of mode.
+func (p *LakekeeperProvisioner) resolveOrGenerateSecret(ctx context.Context, orgID, dbName, secretName, pgUser, pgPassword string) (LakekeeperSecretData, error) {
 	existing, err := p.k8s.kubernetes.CoreV1().Secrets(p.k8s.namespace).Get(ctx, secretName, metav1.GetOptions{})
 	if err == nil {
 		return secretFromExisting(existing), nil
@@ -339,10 +396,17 @@ func (p *LakekeeperProvisioner) resolveOrGenerateSecret(ctx context.Context, org
 	if !apierrors.IsNotFound(err) {
 		return LakekeeperSecretData{}, fmt.Errorf("get existing secret: %w", err)
 	}
-	// Generate fresh credentials.
+	// DB credentials: pre-provisioned values win; otherwise generate. Default
+	// user is a role named after the DB (matches EnsureRole).
+	dbUser := dbName
+	dbPassword := mustRandomHex(32)
+	if pgUser != "" {
+		dbUser = pgUser
+		dbPassword = pgPassword
+	}
 	data := LakekeeperSecretData{
-		DBUser:             dbName, // Lakekeeper connects as a role named after its DB
-		DBPassword:         mustRandomHex(32),
+		DBUser:             dbUser,
+		DBPassword:         dbPassword,
 		EncryptionKey:      mustRandomHex(32), // 32 bytes ⇒ 64 hex chars; safely covers any 256-bit key expectation
 		OAuth2ClientSecret: mustRandomHex(32),
 	}
@@ -368,7 +432,11 @@ func secretFromExisting(s *corev1.Secret) LakekeeperSecretData {
 }
 
 func validateInputs(in ProvisioningInputs) error {
-	if in.AdminDSN == "" {
+	if in.PGPreProvisioned {
+		if in.PGUser == "" || in.PGPassword == "" || in.PGDatabase == "" {
+			return errors.New("ProvisioningInputs: PGPreProvisioned requires PGUser, PGPassword, and PGDatabase")
+		}
+	} else if in.AdminDSN == "" {
 		return errors.New("ProvisioningInputs.AdminDSN is required")
 	}
 	if in.PGHost == "" {
@@ -398,16 +466,22 @@ func storageCredFor(s3 S3StorageConfig) WarehouseStorageCredential {
 	}
 }
 
+// lakekeeperDBName is the Postgres database (and role) name for the org's
+// Lakekeeper backend. It's a Postgres identifier, so hyphens are sanitized to
+// underscores via pgIdentSuffix — matching the cnpg-shard composition's
+// $pgIdent so the external and cnpg-shard paths agree.
 func lakekeeperDBName(orgID string) string {
-	return "lakekeeper_" + lakekeeperResourceSuffix(orgID)
+	return "lakekeeper_" + pgIdentSuffix(orgID)
 }
 
+// lakekeeperWarehouseName and oauthClientID are free-form strings (the Iceberg
+// REST warehouse name and the OAuth2 client_id), so they preserve hyphens.
 func lakekeeperWarehouseName(orgID string) string {
-	return "org-" + lakekeeperResourceSuffix(orgID)
+	return "org-" + ducklingName(orgID)
 }
 
 func oauthClientID(orgID string) string {
-	return "duckling-" + lakekeeperResourceSuffix(orgID)
+	return "duckling-" + ducklingName(orgID)
 }
 
 func mustRandomHex(byteLen int) string {

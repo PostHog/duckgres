@@ -695,6 +695,7 @@ Managed-warehouse contract notes:
 
 - At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
 - The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
+- User rows support an optional `default_catalog` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. The default is empty, which preserves the standard DuckLake-first session behavior. Set `default_catalog` to `iceberg` for users whose sessions should resolve schema-qualified names and compatibility metadata through the Iceberg catalog by default; a client-supplied startup `search_path` still takes precedence.
 - The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared warm mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.
 - Secret references only are stored in the config store. Secret material remains outside the database.
 - The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.

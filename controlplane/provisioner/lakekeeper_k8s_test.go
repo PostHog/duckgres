@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,10 +32,11 @@ func newFakeLakekeeperClient() (*LakekeeperK8sClient, *dynamicfake.FakeDynamicCl
 }
 
 func TestLakekeeperResourceName(t *testing.T) {
+	// k8s resource names preserve hyphens (only lowercasing is applied).
 	cases := map[string]string{
-		"acme":                 "lakekeeper-acme",
-		"019e417b-18c4-7a41":   "lakekeeper-019e417b18c47a41",
-		"00000000-0000-0000-0000-000000000000": "lakekeeper-00000000000000000000000000000000",
+		"acme":                                 "lakekeeper-acme",
+		"019e417b-18c4-7a41":                   "lakekeeper-019e417b-18c4-7a41",
+		"00000000-0000-0000-0000-000000000000": "lakekeeper-00000000-0000-0000-0000-000000000000",
 	}
 	for in, want := range cases {
 		if got := LakekeeperResourceName(in); got != want {
@@ -336,15 +338,15 @@ func TestEnsureSecret_RejectsUnsafeOrgID(t *testing.T) {
 
 func TestIsValidOrgIDLabel(t *testing.T) {
 	cases := map[string]bool{
-		"acme":                                    true,
-		"019e417b-18c4-7a41-bfec-e9ae3a02deb8":    true, // UUID
-		"a":                                       true,
-		"a.b_c-d":                                 true,
-		"":                                        false,
-		"-leading":                                false,
-		"trailing-":                               false,
-		".":                                       false,
-		"has space":                               false,
+		"acme":                                 true,
+		"019e417b-18c4-7a41-bfec-e9ae3a02deb8": true, // UUID
+		"a":                                    true,
+		"a.b_c-d":                              true,
+		"":                                     false,
+		"-leading":                             false,
+		"trailing-":                            false,
+		".":                                    false,
+		"has space":                            false,
 		// 64 chars (over the 63 limit)
 		"a234567890123456789012345678901234567890123456789012345678901234": false,
 	}
@@ -389,5 +391,64 @@ func TestGetCR_ParsesStatus(t *testing.T) {
 	}
 	if !st.Bootstrapped || st.ServerID != "abc-123" || st.ReadyReplicas != 2 {
 		t.Errorf("status parse mismatch: %+v", st)
+	}
+}
+
+func TestDeleteResources_RemovesProvisionedResources(t *testing.T) {
+	c, dc, kc := newFakeLakekeeperClient()
+	ctx := context.Background()
+	orgID := "acme"
+
+	// Provision the three resources DeleteForOrg is responsible for.
+	if err := c.EnsureSecret(ctx, orgID, LakekeeperSecretData{
+		DBUser: "lakekeeper_acme", DBPassword: "pw", EncryptionKey: "key", OAuth2ClientSecret: "oauth",
+	}); err != nil {
+		t.Fatalf("EnsureSecret: %v", err)
+	}
+	if err := c.EnsureServiceAccount(ctx, orgID); err != nil {
+		t.Fatalf("EnsureServiceAccount: %v", err)
+	}
+	if err := c.EnsureCR(ctx, LakekeeperCRSpec{
+		OrgID: orgID, Image: "quay.io/lakekeeper/catalog:v0.12.2",
+		PGHost: "acme-pg.local", PGDatabase: "lakekeeper_acme", SecretName: "lakekeeper-acme",
+		BaseURI: "http://lakekeeper-acme.lakekeeper.svc:8181",
+	}); err != nil {
+		t.Fatalf("EnsureCR: %v", err)
+	}
+
+	if err := c.DeleteCR(ctx, orgID); err != nil {
+		t.Fatalf("DeleteCR: %v", err)
+	}
+	if err := c.DeleteSecret(ctx, orgID); err != nil {
+		t.Fatalf("DeleteSecret: %v", err)
+	}
+	if err := c.DeleteServiceAccount(ctx, orgID); err != nil {
+		t.Fatalf("DeleteServiceAccount: %v", err)
+	}
+
+	if _, err := dc.Resource(lakekeeperGVR).Namespace("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("CR still present after delete: err=%v", err)
+	}
+	if _, err := kc.CoreV1().Secrets("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("Secret still present after delete: err=%v", err)
+	}
+	if _, err := kc.CoreV1().ServiceAccounts("lakekeeper").Get(ctx, "lakekeeper-acme", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("ServiceAccount still present after delete: err=%v", err)
+	}
+}
+
+func TestDeleteResources_NotFoundIsNoOp(t *testing.T) {
+	c, _, _ := newFakeLakekeeperClient()
+	ctx := context.Background()
+	// Deleting resources that were never created must be a clean no-op so the
+	// teardown path is safe for ducklings that never enabled Iceberg.
+	if err := c.DeleteCR(ctx, "never-existed"); err != nil {
+		t.Errorf("DeleteCR on missing CR: %v", err)
+	}
+	if err := c.DeleteSecret(ctx, "never-existed"); err != nil {
+		t.Errorf("DeleteSecret on missing secret: %v", err)
+	}
+	if err := c.DeleteServiceAccount(ctx, "never-existed"); err != nil {
+		t.Errorf("DeleteServiceAccount on missing SA: %v", err)
 	}
 }

@@ -196,6 +196,7 @@ type ConfigStoreInterface interface {
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
+	IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool)
 	IsMigratingForOrg(orgID string) bool
 	SetWarmCapacityTarget(n int)
 	ShutdownAll()
@@ -906,6 +907,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	var (
 		orgID           string
 		passthroughUser bool
+		defaultCatalog  string
 	)
 	if cp.configStore != nil {
 		// Resolve the effective database name based on SNI routing mode.
@@ -980,6 +982,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 		orgID = resolution.OrgID
 		passthroughUser = resolution.Passthrough
+		defaultCatalog = resolution.DefaultCatalog
 		// From here on, `database` reflects the effective routing database.
 		// This is what gets passed to the worker as the logical database
 		// (drives the `current_database()` macro and pg_database view) so
@@ -1145,24 +1148,27 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// Apply the client's connect-time search_path (from the startup `options`
-		// parameter, e.g. `options=-c search_path=iceberg.public`) AFTER metadata
-		// init. It must run here, not on the worker at session create: (1)
+		// Apply the effective connect-time session default AFTER metadata init.
+		// It must run here, not on the worker at session create: (1)
 		// InitSessionDatabaseMetadata's defer resets search_path to the ducklake
 		// default, so an earlier value is clobbered; and (2) running metadata init
-		// while the session default points at the iceberg REST catalog fails. We
-		// append memory.main so pg_catalog macros stay resolvable; on failure
-		// (e.g. the schema doesn't exist) we log and keep the default.
-		if clientSearchPath != "" {
-			sp := clientSearchPath
-			if !strings.Contains(strings.ToLower(sp), "memory.main") {
-				sp += ",memory.main"
-			}
+		// while the session default points at the iceberg REST catalog fails.
+		// Client-supplied search_path keeps the previous best-effort behavior;
+		// configured per-user catalog defaults fail closed because silently
+		// falling back would route the user to the wrong catalog.
+		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, defaultCatalog); cmd != "" {
 			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-			if _, err := executor.ExecContext(spCtx, fmt.Sprintf("SET search_path = '%s'", sp)); err != nil {
+			_, err := executor.ExecContext(spCtx, cmd)
+			spCancel()
+			if err != nil {
+				if source == sessionDefaultSourceConfiguredCatalog {
+					slog.Error("Failed to apply configured default catalog.", "user", username, "org", orgID, "catalog", defaultCatalog, "error", err)
+					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply configured default catalog")
+					_ = writer.Flush()
+					return
+				}
 				slog.Warn("Failed to apply client connect-time search_path; using default.", "user", username, "org", orgID, "search_path", clientSearchPath, "error", err)
 			}
-			spCancel()
 		}
 	}
 
@@ -1172,6 +1178,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Create real clientConn with FlightExecutor and worker assignment
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
+	if cp.orgRouter != nil && orgID != "" {
+		if icebergCfg, ok := cp.orgRouter.IcebergConfigForOrg(orgID); ok {
+			server.SetConnectionIcebergConfig(cc, icebergCfg)
+		}
+	}
 	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
 	server.SetPassthrough(cc, passthroughUser)
 	if orgID != "" {

@@ -128,6 +128,14 @@ A successful `INSERT` writes a parquet data file plus Iceberg metadata
 (`*.metadata.json`, manifest/snapshot `*.avro`) under the warehouse prefix in
 the tenant's S3 bucket.
 
+## `information_schema.columns`
+
+DuckDB's Iceberg catalog can list tables before it has loaded each table's
+schema, so raw `information_schema.columns` may expose placeholder
+`__` / `unknown` rows. Duckgres hides those placeholders and uses the
+Lakekeeper REST catalog to load current table schemas with bounded
+concurrency before returning `information_schema.columns` results.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Action |

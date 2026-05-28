@@ -419,31 +419,44 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 	if err != nil {
 		return server.DuckLakeConfig{}, nil, fmt.Errorf("resolve duckling CR %q: %w", orgID, err)
 	}
-	if status.MetadataStore.Password == "" {
-		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no metadata store password", orgID)
-	}
 	if status.DataStore.BucketName == "" {
 		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no data store bucket", orgID)
 	}
 
-	host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
-	if err != nil {
-		return server.DuckLakeConfig{}, nil, err
+	dl := server.DuckLakeConfig{
+		ObjectStore: fmt.Sprintf("s3://%s/", status.DataStore.BucketName),
+		S3Region:    status.DataStore.S3Region,
+		S3UseSSL:    true,
+		S3URLStyle:  "vhost",
 	}
 
-	dl := server.DuckLakeConfig{
-		MetadataStore: buildDuckLakeMetadataStoreDSN(
+	// DuckLake is attached iff this tenant has it enabled. The CR's
+	// spec.ducklake.enabled is authoritative (decoupled ducklings); legacy CRs
+	// that predate the field fall back to the historical coupling — DuckLake on
+	// for external/aurora, off for cnpg-shard. When on, the catalog lives in the
+	// metadata Postgres (the per-tenant lakekeeper_<org> DB on cnpg, or the
+	// metadata DB on external/aurora); when off the worker attaches Iceberg only
+	// (server.ActivateDBConnection takes its iceberg-only branch).
+	ducklakeEnabled := status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
+	if status.DuckLakeEnabled != nil {
+		ducklakeEnabled = *status.DuckLakeEnabled
+	}
+	if ducklakeEnabled {
+		if status.MetadataStore.Password == "" {
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has DuckLake enabled but no metadata store password", orgID)
+		}
+		host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
+		if err != nil {
+			return server.DuckLakeConfig{}, nil, err
+		}
+		dl.MetadataStore = buildDuckLakeMetadataStoreDSN(
 			host,
 			port,
 			status.MetadataStore.User,
 			status.MetadataStore.Password,
 			status.MetadataStore.Database,
-		),
-		ViaPgBouncer: viaPgBouncer,
-		ObjectStore:  fmt.Sprintf("s3://%s/", status.DataStore.BucketName),
-		S3Region:     status.DataStore.S3Region,
-		S3UseSSL:     true,
-		S3URLStyle:   "vhost",
+		)
+		dl.ViaPgBouncer = viaPgBouncer
 	}
 
 	// Broker S3 credentials via STS AssumeRole

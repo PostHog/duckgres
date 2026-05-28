@@ -295,6 +295,9 @@ func TestResolvePostgresConnection(t *testing.T) {
 			OrgUserPassthrough: map[OrgUserKey]bool{
 				{OrgID: "test-org-smoke-1778167994", Username: "root"}: true,
 			},
+			OrgUserDefaultCatalog: map[OrgUserKey]string{
+				{OrgID: "billing", Username: "root"}: "iceberg",
+			},
 		},
 	}
 
@@ -381,6 +384,22 @@ func TestResolvePostgresConnection(t *testing.T) {
 		)
 		if got.EffectiveDatabase != "ghostorg" || got.DatabaseExists {
 			t.Fatalf("unknown SNI fallback = (%q, exists=%v), want ghostorg missing", got.EffectiveDatabase, got.DatabaseExists)
+		}
+	})
+
+	t.Run("valid user includes configured default catalog", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection(
+			"billing_db",
+			"billing-alias",
+			true,
+			"root",
+			"secret",
+		)
+		if !got.Valid {
+			t.Fatalf("expected valid auth: %+v", got)
+		}
+		if got.DefaultCatalog != "iceberg" {
+			t.Fatalf("DefaultCatalog = %q, want iceberg", got.DefaultCatalog)
 		}
 	})
 }

@@ -59,6 +59,39 @@ func (l *recordingOrgRouterLease) Release(ctx context.Context) error {
 	return nil
 }
 
+func TestOrgRouterIcebergConfigForOrg(t *testing.T) {
+	router := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"org-acme": {
+				Config: &configstore.OrgConfig{
+					Name: "org-acme",
+					Warehouse: &configstore.ManagedWarehouseConfig{
+						Iceberg: configstore.ManagedWarehouseIceberg{
+							Enabled:             true,
+							Backend:             configstore.IcebergBackendLakekeeper,
+							Namespace:           "main",
+							Region:              "us-east-1",
+							LakekeeperEndpoint:  "http://lakekeeper/catalog",
+							LakekeeperWarehouse: "org-acme",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cfg, ok := router.IcebergConfigForOrg("org-acme")
+	if !ok {
+		t.Fatal("expected Iceberg config for org")
+	}
+	if !cfg.Enabled || cfg.LakekeeperEndpoint != "http://lakekeeper/catalog" || cfg.LakekeeperWarehouse != "org-acme" {
+		t.Fatalf("unexpected Iceberg config: %+v", cfg)
+	}
+	if cfg.Namespace != "main" || cfg.Region != "us-east-1" {
+		t.Fatalf("expected namespace and region to be preserved, got %+v", cfg)
+	}
+}
+
 func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSessionLeases(t *testing.T) {
 	events := []string{}
 	pool := &recordingOrgRouterPool{events: &events}

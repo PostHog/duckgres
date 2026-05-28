@@ -1133,30 +1133,49 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 // ActivateDBConnection applies tenant-specific DuckLake runtime to an already
 // initialized generic DuckDB connection used by a shared warm worker.
 func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, username string) error {
-	if cfg.DuckLake.MetadataStore == "" {
-		return fmt.Errorf("tenant activation requires ducklake metadata_store")
+	// Iceberg-only activation (no DuckLake): used by cnpg-shard tenants, whose
+	// "metadata store" is the Lakekeeper Postgres backend, not a DuckLake
+	// catalog (and which the worker has no egress to reach). The control plane
+	// signals this by leaving DuckLake.MetadataStore empty while enabling
+	// Iceberg. External/aurora tenants keep DuckLake (+ optional Iceberg) and
+	// take the branch below unchanged.
+	icebergOnly := cfg.DuckLake.MetadataStore == ""
+	if icebergOnly && !cfg.Iceberg.Enabled {
+		return fmt.Errorf("tenant activation requires a ducklake metadata_store or an enabled iceberg catalog")
 	}
 
-	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
-		return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
-	}
-	if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
-		return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
+	if !icebergOnly {
+		if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
+			return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
+		}
+		if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
+			return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
+		}
 	}
 	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
 		return fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
 	}
 
-	if err := recreatePgClassForDuckLake(db); err != nil {
-		slog.Warn("Failed to recreate pg_class_full for DuckLake during activation.", "user", username, "error", err)
+	// The pg_class/pg_namespace recreation and the duckLakeMode information_schema
+	// reflect the DuckLake catalog; skip the DuckLake-specific rewrites when
+	// there's no DuckLake attached.
+	if !icebergOnly {
+		if err := recreatePgClassForDuckLake(db); err != nil {
+			slog.Warn("Failed to recreate pg_class_full for DuckLake during activation.", "user", username, "error", err)
+		}
+		if err := recreatePgNamespaceForDuckLake(db); err != nil {
+			slog.Warn("Failed to recreate pg_namespace for DuckLake during activation.", "user", username, "error", err)
+		}
 	}
-	if err := recreatePgNamespaceForDuckLake(db); err != nil {
-		slog.Warn("Failed to recreate pg_namespace for DuckLake during activation.", "user", username, "error", err)
-	}
-	if err := initInformationSchema(db, true); err != nil {
+	if err := initInformationSchema(db, !icebergOnly); err != nil {
 		slog.Warn("Failed to initialize information_schema during activation.", "user", username, "error", err)
 	}
-	if err := setDuckLakeDefault(db); err != nil {
+
+	if icebergOnly {
+		if err := setIcebergDefault(db); err != nil {
+			return fmt.Errorf("failed to set Iceberg as default: %w", err)
+		}
+	} else if err := setDuckLakeDefault(db); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default: %w", err)
 	}
 
@@ -1984,6 +2003,21 @@ func setDuckLakeDefault(db *sql.DB) error {
 		return fmt.Errorf("failed to set DuckLake as default catalog: %w", err)
 	}
 	slog.Info("Set DuckLake as default catalog.")
+	return nil
+}
+
+// setIcebergDefault makes the Iceberg catalog the session default for
+// iceberg-only (cnpg-shard) tenants, so unqualified DDL/DML lands in Iceberg
+// rather than the ephemeral in-memory catalog — the analogue of
+// setDuckLakeDefault for the no-DuckLake path. Targets iceberg.<DefaultSchema>
+// (not a bare `USE iceberg`) because DuckDB shadows `main` on a REST catalog;
+// attachLakekeeperCatalog guarantees that schema exists.
+func setIcebergDefault(db *sql.DB) error {
+	stmt := fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
+	if _, err := db.Exec(stmt); err != nil {
+		return fmt.Errorf("failed to set Iceberg as default catalog: %w", err)
+	}
+	slog.Info("Set Iceberg as default catalog.", "schema", iceberg.DefaultSchema)
 	return nil
 }
 

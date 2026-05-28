@@ -192,6 +192,78 @@ func TestEnsureForOrg_HappyPath_Fakes(t *testing.T) {
 	}
 }
 
+// TestEnsureForOrg_PreProvisioned exercises the cnpg-shard path: the database
+// and role were already created (by provider-sql on the shard), so EnsureForOrg
+// must NOT run CREATE DATABASE / CREATE ROLE (it has no AdminDSN — a connection
+// attempt would fail), and must put the supplied PG credentials into the
+// Lakekeeper Secret verbatim. Unlike the happy-path test this needs no real
+// Postgres, precisely because the DDL steps are skipped.
+func TestEnsureForOrg_PreProvisioned(t *testing.T) {
+	c, _, kube := newFakeLakekeeperClient()
+	fake := newFakeLakekeeperServer(t)
+	store := newFakeProvisionerStore("acme", configstore.ManagedWarehouseStateProvisioning)
+	p := NewLakekeeperProvisioner(store, c,
+		WithImage("img:test"),
+		WithClientFactory(func(baseURL string) *LakekeeperClient {
+			return NewLakekeeperClient(fake.srv.URL)
+		}),
+	)
+
+	// Pre-create + bootstrap the CR (the fake k8s client doesn't run the operator).
+	if err := c.EnsureCR(context.Background(), LakekeeperCRSpec{
+		OrgID: "acme", Image: "stub", PGHost: "stub", PGDatabase: "stub", SecretName: "stub", BaseURI: "http://stub",
+	}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+	markBootstrapped(t, c, "acme")
+
+	in := ProvisioningInputs{
+		PGPreProvisioned: true,
+		PGUser:           "lakekeeper_acme",
+		PGPassword:       "from-provider-sql",
+		PGDatabase:       "lakekeeper_acme",
+		PGHost:           "shard-001-pooler.cnpg-shards.svc.cluster.local",
+		PGPort:           5432,
+		PGSSLMode:        "require",
+		S3: S3StorageConfig{
+			Bucket: "warehouse", KeyPrefix: "lakekeeper",
+			Region: "us-east-1", Flavor: "aws",
+			RoleARN: "arn:aws:iam::123456789012:role/duckling-acme",
+		},
+	}
+
+	// No PG_ADMIN_DSN, no real Postgres: succeeding proves the DDL steps were
+	// skipped (a nil/blank AdminDSN connection would otherwise error).
+	if err := p.EnsureForOrg(context.Background(), store.warehouses["acme"], in); err != nil {
+		t.Fatalf("EnsureForOrg (pre-provisioned): %v", err)
+	}
+
+	// The Secret must carry the supplied DB creds verbatim (not generated).
+	sec, err := kube.CoreV1().Secrets(c.namespace).Get(context.Background(), LakekeeperResourceName("acme"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get lakekeeper secret: %v", err)
+	}
+	if got := string(sec.Data[SecretKeyDBUser]); got != "lakekeeper_acme" {
+		t.Errorf("db-user = %q, want lakekeeper_acme", got)
+	}
+	if got := string(sec.Data[SecretKeyDBPassword]); got != "from-provider-sql" {
+		t.Errorf("db-password = %q, want from-provider-sql", got)
+	}
+	// Lakekeeper-internal secrets are still generated even in pre-provisioned mode.
+	if len(sec.Data[SecretKeyEncryptionKey]) == 0 {
+		t.Errorf("encryption-key should still be generated")
+	}
+
+	// Warehouse created + iceberg flipped on.
+	w := store.warehouses["acme"]
+	if !w.Iceberg.Enabled || w.Iceberg.Backend != configstore.IcebergBackendLakekeeper {
+		t.Errorf("iceberg not configured: %+v", w.Iceberg)
+	}
+	if len(fake.warehouses) != 1 {
+		t.Fatalf("warehouse creates = %d, want 1", len(fake.warehouses))
+	}
+}
+
 // EnsureForOrg returns ErrBootstrapPending when the operator hasn't yet
 // flipped status.bootstrappedAt — caller (the warehouse-reconcile loop)
 // is responsible for requeueing without blocking other orgs.

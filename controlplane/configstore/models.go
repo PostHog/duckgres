@@ -10,19 +10,20 @@ import "time"
 // alias", multiple orgs can share the NULL state, but any non-NULL alias must
 // be unique across orgs (Postgres ignores NULL in UNIQUE).
 type Org struct {
-	Name                string            `gorm:"primaryKey;size:255" json:"name"`
-	DatabaseName        string            `gorm:"size:255;uniqueIndex" json:"database_name"`
-	HostnameAlias       *string           `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
-	MaxWorkers          int               `gorm:"default:0" json:"max_workers"`
-	MaxConnections      int               `gorm:"default:0" json:"max_connections"`
-	MemoryBudget        string            `gorm:"size:32" json:"memory_budget"`
-	IdleTimeoutS        int               `gorm:"default:0" json:"idle_timeout_s"`
-	WorkerCPURequest    string            `gorm:"size:32" json:"worker_cpu_request"`
-	WorkerMemoryRequest string            `gorm:"size:32" json:"worker_memory_request"`
-	Users               []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse           *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	CreatedAt           time.Time         `json:"created_at"`
-	UpdatedAt           time.Time         `json:"updated_at"`
+	Name                string                 `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName        string                 `gorm:"size:255;uniqueIndex" json:"database_name"`
+	HostnameAlias       *string                `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
+	MaxWorkers          int                    `gorm:"default:0" json:"max_workers"`
+	MaxConnections      int                    `gorm:"default:0" json:"max_connections"`
+	MemoryBudget        string                 `gorm:"size:32" json:"memory_budget"`
+	IdleTimeoutS        int                    `gorm:"default:0" json:"idle_timeout_s"`
+	WorkerCPURequest    string                 `gorm:"size:32" json:"worker_cpu_request"`
+	WorkerMemoryRequest string                 `gorm:"size:32" json:"worker_memory_request"`
+	Users               []OrgUser              `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse           *ManagedWarehouse      `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	Trino               *ManagedWarehouseTrino `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"trino,omitempty"`
+	CreatedAt           time.Time              `json:"created_at"`
+	UpdatedAt           time.Time              `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
@@ -35,12 +36,13 @@ func (Org) TableName() string { return "duckgres_orgs" }
 // (org_id, username) so the same login name can be passthrough in one tenant
 // and not in another.
 type OrgUser struct {
-	OrgID       string    `gorm:"primaryKey;size:255" json:"org_id"`
-	Username    string    `gorm:"primaryKey;size:255" json:"username"`
-	Password    string    `gorm:"size:255;not null" json:"-"`
-	Passthrough bool      `gorm:"not null;default:false" json:"passthrough"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	OrgID          string    `gorm:"primaryKey;size:255" json:"org_id"`
+	Username       string    `gorm:"primaryKey;size:255" json:"username"`
+	Password       string    `gorm:"size:255;not null" json:"-"`
+	Passthrough    bool      `gorm:"not null;default:false" json:"passthrough"`
+	DefaultCatalog string    `gorm:"size:255" json:"default_catalog,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 func (OrgUser) TableName() string { return "duckgres_org_users" }
@@ -75,6 +77,25 @@ type ManagedWarehouseDatabase struct {
 	Username     string `gorm:"size:255" json:"username"`
 }
 
+// Metadata-store kinds, stored verbatim in ManagedWarehouseMetadataStore.Kind
+// and mirrored onto the Duckling CR's spec.metadataStore.type. The control
+// plane provisions two of these:
+//
+//   - "cnpg-shard": the per-tenant Lakekeeper Iceberg catalog Postgres backend
+//     on the shared CloudNativePG shard (always paired with iceberg.enabled).
+//   - "external": a pre-existing Postgres (e.g. RDS), referenced by endpoint +
+//     an AWS Secrets Manager secret for the password. Backs either a DuckLake
+//     catalog (iceberg disabled) or the Lakekeeper catalog (iceberg enabled).
+//
+// "aurora" is no longer provisionable (the control plane never stands up a new
+// Aurora cluster); the constant is retained so DucklingClient.Create can still
+// reconcile pre-existing aurora ducklings.
+const (
+	MetadataStoreKindAurora    = "aurora"
+	MetadataStoreKindCnpgShard = "cnpg-shard"
+	MetadataStoreKindExternal  = "external"
+)
+
 // ManagedWarehouseMetadataStore stores org-scoped DuckLake metadata DB info.
 type ManagedWarehouseMetadataStore struct {
 	Kind         string `gorm:"size:64" json:"kind"`
@@ -84,6 +105,29 @@ type ManagedWarehouseMetadataStore struct {
 	Port         int    `json:"port"`
 	DatabaseName string `gorm:"size:255" json:"database_name"`
 	Username     string `gorm:"size:255" json:"username"`
+
+	// PasswordAWSSecret is the AWS Secrets Manager secret NAME that holds the
+	// metadata DB password. Only meaningful when Kind == "external": it's
+	// passed through to the Duckling CR's spec.metadataStore.external.
+	// passwordAwsSecret, where the composition resolves it (via ESO) into the
+	// status password the worker activator reads. Empty for aurora/cnpg-shard
+	// (those mint their own credentials).
+	PasswordAWSSecret string `gorm:"size:255" json:"password_aws_secret,omitempty"`
+}
+
+// ManagedWarehouseDataStore captures the org's object-store provisioning
+// intent — the shape the Duckling CR's spec.dataStore takes. Distinct from
+// ManagedWarehouseS3 (the resolved, activation-time object-store config):
+// this records what to ask the composition for.
+//
+//   - Kind "s3bucket" (default): the composition provisions a fresh per-org
+//     bucket. BucketName/Region are ignored.
+//   - Kind "external": reuse an existing bucket (BucketName required); the
+//     composition provisions no bucket.
+type ManagedWarehouseDataStore struct {
+	Kind       string `gorm:"size:32" json:"kind"`
+	BucketName string `gorm:"size:255" json:"bucket_name,omitempty"`
+	Region     string `gorm:"size:64" json:"region,omitempty"`
 }
 
 // ManagedWarehousePgBouncer captures per-org opt-in state for the per-Duckling
@@ -114,6 +158,21 @@ type ManagedWarehouseWorkerIdentity struct {
 	Namespace          string `gorm:"size:255" json:"namespace"`
 	ServiceAccountName string `gorm:"size:255" json:"service_account_name"`
 	IAMRoleARN         string `gorm:"size:512" json:"iam_role_arn"`
+}
+
+// ManagedWarehouseDuckLake captures whether the org's DuckLake catalog is
+// enabled. Decoupled from the metadata-store type and from Iceberg: a duckling
+// may run DuckLake, Iceberg, or both, on any metadata backend (cnpg / external
+// / aurora). The DuckLake catalog lives in the metadata Postgres — the
+// per-tenant database for cnpg-shard, or the metadata database for
+// external/aurora.
+//
+// For ducklings created before this field existed the column is absent/false;
+// the worker activator does NOT key off it directly — it reads the Duckling
+// CR's spec.ducklake.enabled (present/absent) so legacy ducklings keep their
+// implied behavior (external/aurora ⇒ DuckLake, cnpg ⇒ none).
+type ManagedWarehouseDuckLake struct {
+	Enabled bool `json:"enabled"`
 }
 
 // ManagedWarehouseIceberg captures per-org Iceberg catalog config. Two
@@ -179,6 +238,81 @@ const (
 	IcebergBackendS3Tables   = "s3_tables"
 )
 
+// ManagedWarehouseTrino captures per-org opt-in for the customer-facing Trino
+// cluster. Trino access is granted at the org level: when Enabled is true, the
+// provisioner extension (controlplane/provisioner/trino_provisioner.go)
+// projects the org's `root` OrgUser bcrypt hash into the Trino file
+// password authenticator, creates a per-org Iceberg catalog via the Trino
+// REST API, and rebuilds the OPA bundle + resource-groups config.
+//
+// v1 is intentionally minimal — Enabled gates the projection, Tier picks
+// resource-group limits. Per-user identity within an org is post-v1.
+//
+// FK'd by OrgID like the other sibling rows; consumed by the Trino
+// provisioner sub-component in controlplane/provisioner/trino_provisioner.go.
+type ManagedWarehouseTrino struct {
+	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
+
+	// Enabled gates inclusion in every projection the Trino provisioner owns
+	// (password file, group file, OPA bundle catalog map, resource-groups
+	// config, REST CREATE CATALOG). Defaults to false so existing
+	// configstore rows never start projecting after a schema migration.
+	Enabled bool `gorm:"not null;default:false" json:"enabled"`
+
+	// Tier picks the resource-group limits applied to the org. Empty string
+	// is treated as the default tier by the resource-groups generator.
+	// Kept as a free-form string for now; refining into an enum is
+	// post-v1 work once tier shape stabilizes.
+	Tier string `gorm:"size:64" json:"tier"`
+
+	// State / StatusMessage / ReadyAt / FailedAt mirror the
+	// ManagedWarehouse lifecycle fields so operators can see what the
+	// Trino reconcile loop is doing. The Trino reconcile is a single
+	// batched output per tick (catalog + auth + resource-groups +
+	// bundle); these fields summarize the most recent tick's outcome.
+	//
+	// State transitions:
+	//   - pending (default after EnableTrino, before first reconcile)
+	//   - provisioning (a reconcile tick is mid-flight or a previous
+	//     tick partially failed and is retrying)
+	//   - ready (the most recent tick succeeded across all four steps)
+	//   - failed (the most recent tick errored — StatusMessage carries
+	//     the per-step detail; ready_at is preserved, failed_at is set)
+	//
+	// On the next successful reconcile after a failed state, the row
+	// flips back to ready and failed_at is cleared. We don't model the
+	// plan's per-step sub-states (CatalogCreating, ProjectionReady,
+	// etc.) — for v1 the four-state summary plus StatusMessage detail
+	// is sufficient observability without growing the model.
+	State         ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
+	StatusMessage string                            `gorm:"size:1024" json:"status_message"`
+	ReadyAt       *time.Time                        `json:"ready_at,omitempty"`
+	FailedAt      *time.Time                        `json:"failed_at,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (ManagedWarehouseTrino) TableName() string { return "duckgres_managed_warehouse_trino" }
+
+// TrinoEnabledOrg is the join shape returned by ListTrinoEnabledOrgs: org +
+// root-user bcrypt hash. The provisioner needs both at once — the password
+// file projection keys org_<team_id> by the password hash — so a single
+// query avoids an N+1 read pattern as the Trino-enabled org count grows.
+//
+// State is the row's CURRENT operational state at the time of the read,
+// so the reconcile loop can decide whether each per-tick write is a
+// transition (set ReadyAt / FailedAt) or a no-op preservation
+// (matches the surrounding ManagedWarehouse pattern in controller.go,
+// which only stamps ready_at on the first transition into ready).
+type TrinoEnabledOrg struct {
+	OrgID            string
+	DatabaseName     string
+	Tier             string
+	RootPasswordHash string                            // bcrypt hash from OrgUser row where Username = "root"
+	State            ManagedWarehouseProvisioningState // current state at read time
+}
+
 // ResolvedBackend returns Backend with the empty-string default applied.
 // Callers should prefer this over reading Backend directly so that rows
 // migrated from earlier schemas (no Backend column) behave correctly.
@@ -200,8 +334,10 @@ type ManagedWarehouse struct {
 
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
+	DataStore         ManagedWarehouseDataStore      `gorm:"embedded;embeddedPrefix:data_store_" json:"data_store"`
 	PgBouncer         ManagedWarehousePgBouncer      `gorm:"embedded;embeddedPrefix:pgbouncer_" json:"pgbouncer"`
 	S3                ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
+	DuckLake          ManagedWarehouseDuckLake       `gorm:"embedded;embeddedPrefix:ducklake_" json:"ducklake"`
 	Iceberg           ManagedWarehouseIceberg        `gorm:"embedded;embeddedPrefix:iceberg_" json:"iceberg"`
 	WorkerIdentity    ManagedWarehouseWorkerIdentity `gorm:"embedded;embeddedPrefix:worker_identity_" json:"worker_identity"`
 

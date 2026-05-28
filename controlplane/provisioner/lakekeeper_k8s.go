@@ -73,33 +73,20 @@ func NewLakekeeperK8sClientWithClients(dc dynamic.Interface, kc kubernetes.Inter
 	return &LakekeeperK8sClient{dynamic: dc, kubernetes: kc, namespace: namespace}
 }
 
-// LakekeeperResourceName derives the K8s resource name (CR + Secret) for an
-// org. Matches the ducklingName transform — strips hyphens so UUID-style
-// org IDs land under the 63-char K8s name limit.
+// LakekeeperResourceName derives the K8s resource name (CR + Secret + SA) for
+// an org. Uses ducklingName so it preserves hyphens, matching the Duckling CR
+// and the rest of the in-cluster resources.
 func LakekeeperResourceName(orgID string) string {
-	return "lakekeeper-" + lakekeeperResourceSuffix(orgID)
-}
-
-func lakekeeperResourceSuffix(orgID string) string {
-	// Inline to avoid coupling to ducklingName which lives in another file
-	// under the same build tag.
-	out := make([]byte, 0, len(orgID))
-	for i := 0; i < len(orgID); i++ {
-		if orgID[i] == '-' {
-			continue
-		}
-		out = append(out, orgID[i])
-	}
-	return string(out)
+	return "lakekeeper-" + ducklingName(orgID)
 }
 
 // LakekeeperSecretData is the strongly-typed contents of the per-org Secret
 // that the CR's *SecretRef fields point at. All values are required.
 type LakekeeperSecretData struct {
-	DBUser              string
-	DBPassword          string
-	EncryptionKey       string // 32-byte key used by Lakekeeper for at-rest secret encryption
-	OAuth2ClientSecret  string // client_secret minted for the duckling
+	DBUser             string
+	DBPassword         string
+	EncryptionKey      string // 32-byte key used by Lakekeeper for at-rest secret encryption
+	OAuth2ClientSecret string // client_secret minted for the duckling
 }
 
 // SecretKey* are the keys inside the Secret. Stable contract with the CR.
@@ -432,4 +419,50 @@ func (c *LakekeeperK8sClient) GetCR(ctx context.Context, orgID string) (*Lakekee
 		st.ReadyReplicas = int32(v)
 	}
 	return st, nil
+}
+
+// backgroundDeletion propagates deletion to dependents (the operator-managed
+// Deployment, Service, and migration Job are owned by the CR via
+// ownerReferences). Without this, the dynamic client uses the API server's
+// per-resource default, which can orphan those children.
+var backgroundDeletion = metav1.DeletePropagationBackground
+
+// DeleteCR deletes the org's Lakekeeper CR. The operator-managed Deployment /
+// Service / migration Job carry the CR as their controller ownerReference, so
+// background-propagation deletion cascades to them. NotFound is treated as
+// success (idempotent teardown).
+func (c *LakekeeperK8sClient) DeleteCR(ctx context.Context, orgID string) error {
+	name := LakekeeperResourceName(orgID)
+	err := c.dynamic.Resource(lakekeeperGVR).Namespace(c.namespace).Delete(ctx, name, metav1.DeleteOptions{
+		PropagationPolicy: &backgroundDeletion,
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete lakekeeper CR %s: %w", name, err)
+	}
+	return nil
+}
+
+// DeleteSecret deletes the org's Lakekeeper Secret. The Secret has no
+// ownerReference to the CR (EnsureSecret creates it standalone), so deleting
+// the CR does not remove it — it must be torn down explicitly. NotFound is
+// treated as success.
+func (c *LakekeeperK8sClient) DeleteSecret(ctx context.Context, orgID string) error {
+	name := LakekeeperResourceName(orgID)
+	err := c.kubernetes.CoreV1().Secrets(c.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete lakekeeper secret %s: %w", name, err)
+	}
+	return nil
+}
+
+// DeleteServiceAccount deletes the org's Lakekeeper ServiceAccount. Like the
+// Secret, it is created standalone (no ownerReference) so it must be deleted
+// explicitly. NotFound is treated as success.
+func (c *LakekeeperK8sClient) DeleteServiceAccount(ctx context.Context, orgID string) error {
+	name := LakekeeperServiceAccountName(orgID)
+	err := c.kubernetes.CoreV1().ServiceAccounts(c.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete lakekeeper service account %s: %w", name, err)
+	}
+	return nil
 }

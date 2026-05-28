@@ -26,6 +26,7 @@ import (
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/iceberg"
+	"github.com/posthog/duckgres/server/icebergmeta"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/sqlcore"
@@ -155,24 +156,26 @@ const (
 )
 
 type clientConn struct {
-	server                *Server
-	conn                  net.Conn
-	reader                *bufio.Reader
-	writer                *bufio.Writer
-	username              string
-	orgID                 string
-	database              string
-	executor              QueryExecutor
-	pid                   int32
-	secretKey             int32                    // unique key for cancel requests
-	stmts                 map[string]*preparedStmt // prepared statements by name
-	portals               map[string]*portal       // portals by name
-	txStatus              byte                     // current transaction status ('I', 'T', or 'E')
-	passthrough           bool                     // true for passthrough users (skip transpiler + pg_catalog)
-	cursors               map[string]*cursorState  // server-side cursor emulation
-	logicalCatalogMapping bool                     // true when the session has an attached ducklake catalog and logical catalog masking is active
-	ctx                   context.Context          // connection context, cancelled when connection is closed
-	cancel                context.CancelFunc       // cancels the connection context
+	server                 *Server
+	conn                   net.Conn
+	reader                 *bufio.Reader
+	writer                 *bufio.Writer
+	username               string
+	orgID                  string
+	database               string
+	executor               QueryExecutor
+	pid                    int32
+	secretKey              int32                    // unique key for cancel requests
+	stmts                  map[string]*preparedStmt // prepared statements by name
+	portals                map[string]*portal       // portals by name
+	txStatus               byte                     // current transaction status ('I', 'T', or 'E')
+	passthrough            bool                     // true for passthrough users (skip transpiler + pg_catalog)
+	cursors                map[string]*cursorState  // server-side cursor emulation
+	logicalCatalogMapping  bool                     // true when the session has an attached ducklake catalog and logical catalog masking is active
+	tenantIcebergConfig    IcebergConfig
+	hasTenantIcebergConfig bool
+	ctx                    context.Context    // connection context, cancelled when connection is closed
+	cancel                 context.CancelFunc // cancels the connection context
 
 	// sharedDB is true when this connection uses a shared file-persistence DB pool.
 	// Cleanup differs: we return the pinned conn to the pool instead of closing the DB.
@@ -1667,6 +1670,42 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 	return rewritten
 }
 
+func (c *clientConn) loadIcebergColumnMetadata(ctx context.Context, query string) error {
+	cfg := c.effectiveIcebergConfig()
+	if c == nil || !shouldLoadIcebergColumnMetadata(cfg, c.passthrough) {
+		return nil
+	}
+	return icebergmeta.LoadColumns(ctx, c.executor, query, icebergmeta.Config{
+		LakekeeperEndpoint:        cfg.LakekeeperEndpoint,
+		LakekeeperWarehouse:       cfg.LakekeeperWarehouse,
+		LakekeeperOAuth2ServerURI: cfg.LakekeeperOAuth2ServerURI,
+	})
+}
+
+func (c *clientConn) effectiveIcebergConfig() IcebergConfig {
+	if c != nil && c.hasTenantIcebergConfig {
+		return c.tenantIcebergConfig
+	}
+	if c != nil && c.server != nil {
+		return c.server.cfg.Iceberg
+	}
+	return IcebergConfig{}
+}
+
+func shouldLoadIcebergColumnMetadata(cfg IcebergConfig, passthrough bool) bool {
+	return !passthrough &&
+		cfg.Enabled &&
+		cfg.ResolvedBackend() == iceberg.BackendLakekeeper &&
+		cfg.LakekeeperOAuth2ServerURI == ""
+}
+
+func (c *clientConn) queryContextWithMetadata(ctx context.Context, query string) (RowSet, error) {
+	if err := c.loadIcebergColumnMetadata(ctx, query); err != nil {
+		return nil, err
+	}
+	return c.executor.QueryContext(ctx, query)
+}
+
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.
 const physicalDuckLakeCatalog = "ducklake"
 
@@ -1691,7 +1730,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string) (int64, st
 		c.logQueryFinished(query, execStart, queryRowsAff, queryFinalErr)
 	}()
 	runQuery := func() (RowSet, error) {
-		return c.executor.QueryContext(ctx, query)
+		return c.queryContextWithMetadata(ctx, query)
 	}
 
 	rows, err := runQuery()
@@ -2176,7 +2215,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	defer cleanup()
 
 	runQuery := func() (RowSet, error) {
-		return c.executor.QueryContext(ctx, executedQuery)
+		return c.queryContextWithMetadata(ctx, executedQuery)
 	}
 
 	rows, err := runQuery()
@@ -5944,7 +5983,7 @@ func (c *clientConn) openCursor(cursor *cursorState) error {
 	// us — log the cursor metadata phase as rows=0 / err=initial failure.
 	cursorStart := time.Now()
 	c.logQueryStarted(cursor.query)
-	rows, err := c.executor.QueryContext(ctx, cursor.query)
+	rows, err := c.queryContextWithMetadata(ctx, cursor.query)
 	if err != nil {
 		c.logQueryFinished(cursor.query, cursorStart, 0, err)
 		cleanup()
