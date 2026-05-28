@@ -136,7 +136,7 @@ func (c *clientConn) dropIcebergSchemaCascade(ctx context.Context, query string)
 	if err != nil {
 		return nil, fmt.Errorf("list iceberg schema tables: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var tables []string
 	for rows.Next() {
@@ -177,7 +177,7 @@ func (c *clientConn) currentSearchPathCatalog(ctx context.Context) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("read search_path: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	if !rows.Next() {
 		return "", rows.Err()
 	}
