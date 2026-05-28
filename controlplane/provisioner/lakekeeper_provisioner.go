@@ -334,6 +334,31 @@ func (p *LakekeeperProvisioner) EnsureForOrg(ctx context.Context, w *configstore
 	return nil
 }
 
+// DeleteForOrg tears down the per-org Lakekeeper instance that EnsureForOrg
+// created: the CR (which cascades to the operator-managed Deployment, Service,
+// and migration Job via ownerReferences) plus the standalone Secret and
+// ServiceAccount (which don't carry an ownerReference and so must be deleted
+// explicitly). Idempotent and NotFound-tolerant, so it's a safe no-op for orgs
+// that never had Iceberg enabled.
+//
+// What it does NOT touch: the lakekeeper_<org> Postgres database/role. On
+// cnpg-shard it's provider-sql-managed and torn down with the Duckling CR; on
+// aurora the whole cluster is torn down with the Duckling CR; on an external
+// (shared) metadata store it currently persists — dropping a database on a
+// shared RDS is destructive and out of scope for this teardown.
+func (p *LakekeeperProvisioner) DeleteForOrg(ctx context.Context, orgID string) error {
+	if err := p.k8s.DeleteCR(ctx, orgID); err != nil {
+		return err
+	}
+	if err := p.k8s.DeleteSecret(ctx, orgID); err != nil {
+		return err
+	}
+	if err := p.k8s.DeleteServiceAccount(ctx, orgID); err != nil {
+		return err
+	}
+	return nil
+}
+
 // checkBootstrap reads the Lakekeeper CR status once. Returns nil when
 // bootstrappedAt is non-empty, ErrBootstrapPending otherwise. The caller —
 // typically the warehouse-reconcile loop — is responsible for requeueing on

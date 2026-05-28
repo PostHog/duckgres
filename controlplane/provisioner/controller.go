@@ -592,6 +592,21 @@ func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.Manag
 		}
 	}
 
+	// Tear down the per-org Lakekeeper instance the control plane provisioned
+	// out-of-band (CR + Secret + ServiceAccount in the lakekeeper namespace).
+	// The Crossplane Duckling composition doesn't own these, so without an
+	// explicit teardown they leak after the warehouse is gone. Idempotent and
+	// NotFound-tolerant — a clean no-op for ducklings that never enabled
+	// Iceberg. Skipped silently when the provisioner isn't wired (mirrors
+	// reconcileLakekeeper). On error we return without marking the warehouse
+	// deleted so the next reconcile pass retries.
+	if c.lakekeeperProvisioner != nil {
+		if err := c.lakekeeperProvisioner.DeleteForOrg(ctx, w.OrgID); err != nil {
+			log.Warn("Failed to tear down Lakekeeper resources, will retry.", "error", err)
+			return
+		}
+	}
+
 	if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateDeleting, map[string]interface{}{
 		"state":          configstore.ManagedWarehouseStateDeleted,
 		"status_message": "Resources deleted",

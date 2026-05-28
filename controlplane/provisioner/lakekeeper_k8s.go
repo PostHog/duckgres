@@ -420,3 +420,49 @@ func (c *LakekeeperK8sClient) GetCR(ctx context.Context, orgID string) (*Lakekee
 	}
 	return st, nil
 }
+
+// backgroundDeletion propagates deletion to dependents (the operator-managed
+// Deployment, Service, and migration Job are owned by the CR via
+// ownerReferences). Without this, the dynamic client uses the API server's
+// per-resource default, which can orphan those children.
+var backgroundDeletion = metav1.DeletePropagationBackground
+
+// DeleteCR deletes the org's Lakekeeper CR. The operator-managed Deployment /
+// Service / migration Job carry the CR as their controller ownerReference, so
+// background-propagation deletion cascades to them. NotFound is treated as
+// success (idempotent teardown).
+func (c *LakekeeperK8sClient) DeleteCR(ctx context.Context, orgID string) error {
+	name := LakekeeperResourceName(orgID)
+	err := c.dynamic.Resource(lakekeeperGVR).Namespace(c.namespace).Delete(ctx, name, metav1.DeleteOptions{
+		PropagationPolicy: &backgroundDeletion,
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete lakekeeper CR %s: %w", name, err)
+	}
+	return nil
+}
+
+// DeleteSecret deletes the org's Lakekeeper Secret. The Secret has no
+// ownerReference to the CR (EnsureSecret creates it standalone), so deleting
+// the CR does not remove it — it must be torn down explicitly. NotFound is
+// treated as success.
+func (c *LakekeeperK8sClient) DeleteSecret(ctx context.Context, orgID string) error {
+	name := LakekeeperResourceName(orgID)
+	err := c.kubernetes.CoreV1().Secrets(c.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete lakekeeper secret %s: %w", name, err)
+	}
+	return nil
+}
+
+// DeleteServiceAccount deletes the org's Lakekeeper ServiceAccount. Like the
+// Secret, it is created standalone (no ownerReference) so it must be deleted
+// explicitly. NotFound is treated as success.
+func (c *LakekeeperK8sClient) DeleteServiceAccount(ctx context.Context, orgID string) error {
+	name := LakekeeperServiceAccountName(orgID)
+	err := c.kubernetes.CoreV1().ServiceAccounts(c.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete lakekeeper service account %s: %w", name, err)
+	}
+	return nil
+}
