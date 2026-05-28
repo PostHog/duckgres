@@ -36,12 +36,13 @@ func (Org) TableName() string { return "duckgres_orgs" }
 // (org_id, username) so the same login name can be passthrough in one tenant
 // and not in another.
 type OrgUser struct {
-	OrgID       string    `gorm:"primaryKey;size:255" json:"org_id"`
-	Username    string    `gorm:"primaryKey;size:255" json:"username"`
-	Password    string    `gorm:"size:255;not null" json:"-"`
-	Passthrough bool      `gorm:"not null;default:false" json:"passthrough"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	OrgID             string    `gorm:"primaryKey;size:255" json:"org_id"`
+	Username          string    `gorm:"primaryKey;size:255" json:"username"`
+	Password          string    `gorm:"size:255;not null" json:"-"`
+	Passthrough       bool      `gorm:"not null;default:false" json:"passthrough"`
+	DefaultSearchPath string    `gorm:"size:512" json:"default_search_path,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 func (OrgUser) TableName() string { return "duckgres_org_users" }
