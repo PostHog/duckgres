@@ -40,11 +40,13 @@ jobs:
                       go: "v2.10503.0"
                       bindings: "v0.10503.0"
                       httpfs: "v1.5.3-stoi-fix"
+                      ducklake: "v1.0-posthog.4"
                       default: true
                     - version: "1.5.2"
                       go: "v2.10502.0"
                       bindings: "v0.10502.0"
                       httpfs: "v1.5.2-stoi-fix"
+                      ducklake: "v1.0-posthog.2"
                       default: false
                 platform:
                     - platform: linux/arm64
@@ -100,6 +102,7 @@ jobs:
                       DUCKDB_BINDINGS_VERSION=${{ matrix.duckdb.bindings }}
                       DUCKDB_EXTENSION_VERSION=${{ matrix.duckdb.version }}
                       HTTPFS_EXTENSION_TAG=${{ matrix.duckdb.httpfs }}
+                      DUCKLAKE_EXTENSION_TAG=${{ matrix.duckdb.ducklake }}
                   cache-from: type=gha,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
                   cache-to: type=gha,mode=max,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
 
