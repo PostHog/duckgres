@@ -33,15 +33,16 @@ var ErrWorkerRecordUpsertFenceMiss = errors.New("worker record upsert fence miss
 
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
-	Orgs               map[string]*OrgConfig
-	DatabaseOrg        map[string]string     // database name -> org ID
-	HostnameAliasOrg   map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
-	OrgUserPassword    map[OrgUserKey]string // (orgID, username) -> bcrypt hash
-	OrgUserPassthrough map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
-	Global             GlobalConfig
-	DuckLake           DuckLakeConfig
-	RateLimit          RateLimitConfig
-	QueryLog           QueryLogConfig
+	Orgs                     map[string]*OrgConfig
+	DatabaseOrg              map[string]string     // database name -> org ID
+	HostnameAliasOrg         map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
+	OrgUserPassword          map[OrgUserKey]string // (orgID, username) -> bcrypt hash
+	OrgUserPassthrough       map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
+	OrgUserDefaultSearchPath map[OrgUserKey]string // (orgID, username) -> default session search_path
+	Global                   GlobalConfig
+	DuckLake                 DuckLakeConfig
+	RateLimit                RateLimitConfig
+	QueryLog                 QueryLogConfig
 }
 
 // PostgresConnectionResolution is the result of resolving and authenticating a
@@ -59,6 +60,7 @@ type PostgresConnectionResolution struct {
 	HostnameMatches     bool
 	Valid               bool
 	Passthrough         bool
+	DefaultSearchPath   string
 }
 
 // ConfigStore manages configuration stored in a PostgreSQL database.
@@ -201,15 +203,16 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	cs.db.First(&queryLog, 1)
 
 	snap := &Snapshot{
-		Orgs:               make(map[string]*OrgConfig),
-		DatabaseOrg:        make(map[string]string),
-		HostnameAliasOrg:   make(map[string]string),
-		OrgUserPassword:    make(map[OrgUserKey]string),
-		OrgUserPassthrough: make(map[OrgUserKey]bool),
-		Global:             global,
-		DuckLake:           duckLake,
-		RateLimit:          rateLimit,
-		QueryLog:           queryLog,
+		Orgs:                     make(map[string]*OrgConfig),
+		DatabaseOrg:              make(map[string]string),
+		HostnameAliasOrg:         make(map[string]string),
+		OrgUserPassword:          make(map[OrgUserKey]string),
+		OrgUserPassthrough:       make(map[OrgUserKey]bool),
+		OrgUserDefaultSearchPath: make(map[OrgUserKey]string),
+		Global:                   global,
+		DuckLake:                 duckLake,
+		RateLimit:                rateLimit,
+		QueryLog:                 queryLog,
 	}
 
 	for _, o := range orgs {
@@ -242,6 +245,9 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			snap.OrgUserPassword[key] = u.Password
 			if u.Passthrough {
 				snap.OrgUserPassthrough[key] = true
+			}
+			if u.DefaultSearchPath != "" {
+				snap.OrgUserDefaultSearchPath[key] = u.DefaultSearchPath
 			}
 		}
 		snap.Orgs[o.Name] = oc
@@ -403,6 +409,7 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	}
 	result.Valid = true
 	result.Passthrough = cs.snapshot.OrgUserPassthrough[key]
+	result.DefaultSearchPath = cs.snapshot.OrgUserDefaultSearchPath[key]
 	return result
 }
 
