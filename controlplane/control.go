@@ -905,9 +905,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// In multi-tenant mode, the database name maps to an org.
 	// User uniqueness is scoped to the org.
 	var (
-		orgID             string
-		passthroughUser   bool
-		defaultSearchPath string
+		orgID           string
+		passthroughUser bool
+		defaultCatalog  string
 	)
 	if cp.configStore != nil {
 		// Resolve the effective database name based on SNI routing mode.
@@ -982,16 +982,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 		orgID = resolution.OrgID
 		passthroughUser = resolution.Passthrough
-		if resolution.DefaultSearchPath != "" {
-			sp, ok := server.SanitizeSearchPath(resolution.DefaultSearchPath)
-			if !ok {
-				slog.Error("Connection rejected: configured default search_path is unsafe.", "user", username, "org", orgID, "search_path", resolution.DefaultSearchPath)
-				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "configured default search_path is invalid")
-				_ = writer.Flush()
-				return
-			}
-			defaultSearchPath = sp
-		}
+		defaultCatalog = resolution.DefaultCatalog
 		// From here on, `database` reflects the effective routing database.
 		// This is what gets passed to the worker as the logical database
 		// (drives the `current_database()` macro and pg_database view) so
@@ -1157,23 +1148,22 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// Apply the effective connect-time search_path AFTER metadata init. It
-		// must run here, not on the worker at session create: (1)
+		// Apply the effective connect-time session default AFTER metadata init.
+		// It must run here, not on the worker at session create: (1)
 		// InitSessionDatabaseMetadata's defer resets search_path to the ducklake
 		// default, so an earlier value is clobbered; and (2) running metadata init
-		// while the session default points at the iceberg REST catalog fails. We
-		// append memory.main so pg_catalog macros stay resolvable. Client-supplied
-		// search_path keeps the previous best-effort behavior; configured per-user
-		// defaults fail closed because silently falling back would route the user
-		// to the wrong catalog.
-		if sp, source := effectiveSessionSearchPath(clientSearchPath, defaultSearchPath); sp != "" {
+		// while the session default points at the iceberg REST catalog fails.
+		// Client-supplied search_path keeps the previous best-effort behavior;
+		// configured per-user catalog defaults fail closed because silently
+		// falling back would route the user to the wrong catalog.
+		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, defaultCatalog); cmd != "" {
 			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-			_, err := executor.ExecContext(spCtx, fmt.Sprintf("SET search_path = '%s'", sp))
+			_, err := executor.ExecContext(spCtx, cmd)
 			spCancel()
 			if err != nil {
-				if source == sessionSearchPathSourceConfiguredDefault {
-					slog.Error("Failed to apply configured default search_path.", "user", username, "org", orgID, "search_path", defaultSearchPath, "error", err)
-					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply configured default search_path")
+				if source == sessionDefaultSourceConfiguredCatalog {
+					slog.Error("Failed to apply configured default catalog.", "user", username, "org", orgID, "catalog", defaultCatalog, "error", err)
+					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply configured default catalog")
 					_ = writer.Flush()
 					return
 				}

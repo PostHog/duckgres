@@ -122,7 +122,7 @@ func (s *fakeAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &clone, nil
 }
 
-func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultSearchPath *string) (*configstore.OrgUser, bool, error) {
+func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error) {
 	key := orgID + "/" + username
 	user, ok := s.users[key]
 	if !ok {
@@ -134,8 +134,8 @@ func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	if passthrough != nil {
 		user.Passthrough = *passthrough
 	}
-	if defaultSearchPath != nil {
-		user.DefaultSearchPath = *defaultSearchPath
+	if defaultCatalog != nil {
+		user.DefaultCatalog = *defaultCatalog
 	}
 	clone := *user
 	return &clone, true, nil
@@ -315,7 +315,7 @@ func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 	store.warehouses[name] = warehouse
 }
 
-func TestCreateUserAcceptsDefaultSearchPath(t *testing.T) {
+func TestCreateUserAcceptsDefaultCatalog(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
@@ -323,7 +323,7 @@ func TestCreateUserAcceptsDefaultSearchPath(t *testing.T) {
 		"org_id": "analytics",
 		"username": "iceberg_reader",
 		"password": "secret",
-		"default_search_path": "iceberg.main,memory.main"
+		"default_catalog": "iceberg"
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -337,20 +337,20 @@ func TestCreateUserAcceptsDefaultSearchPath(t *testing.T) {
 	if user == nil {
 		t.Fatal("expected user to be created")
 	}
-	if user.DefaultSearchPath != "iceberg.main,memory.main" {
-		t.Fatalf("DefaultSearchPath = %q, want iceberg.main,memory.main", user.DefaultSearchPath)
+	if user.DefaultCatalog != "iceberg" {
+		t.Fatalf("DefaultCatalog = %q, want iceberg", user.DefaultCatalog)
 	}
 
 	var response configstore.OrgUser
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	if response.DefaultSearchPath != "iceberg.main,memory.main" {
-		t.Fatalf("response DefaultSearchPath = %q, want iceberg.main,memory.main", response.DefaultSearchPath)
+	if response.DefaultCatalog != "iceberg" {
+		t.Fatalf("response DefaultCatalog = %q, want iceberg", response.DefaultCatalog)
 	}
 }
 
-func TestCreateUserRejectsUnsafeDefaultSearchPath(t *testing.T) {
+func TestCreateUserRejectsInvalidDefaultCatalog(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
@@ -358,7 +358,7 @@ func TestCreateUserRejectsUnsafeDefaultSearchPath(t *testing.T) {
 		"org_id": "analytics",
 		"username": "iceberg_reader",
 		"password": "secret",
-		"default_search_path": "iceberg.main';DROP TABLE x;--"
+		"default_catalog": "iceberg;DROP TABLE x"
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -373,13 +373,13 @@ func TestCreateUserRejectsUnsafeDefaultSearchPath(t *testing.T) {
 	}
 }
 
-func TestUpdateUserDefaultSearchPathPreserveSetAndClear(t *testing.T) {
+func TestUpdateUserDefaultCatalogPreserveSetAndClear(t *testing.T) {
 	store := newFakeAPIStore()
 	store.users["analytics/iceberg_reader"] = &configstore.OrgUser{
-		OrgID:             "analytics",
-		Username:          "iceberg_reader",
-		Password:          "hash",
-		DefaultSearchPath: "iceberg.main,memory.main",
+		OrgID:          "analytics",
+		Username:       "iceberg_reader",
+		Password:       "hash",
+		DefaultCatalog: "iceberg",
 	}
 	router := newTestAPIRouter(store)
 
@@ -390,30 +390,30 @@ func TestUpdateUserDefaultSearchPathPreserveSetAndClear(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("preserve status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultSearchPath; got != "iceberg.main,memory.main" {
-		t.Fatalf("preserved DefaultSearchPath = %q, want iceberg.main,memory.main", got)
+	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "iceberg" {
+		t.Fatalf("preserved DefaultCatalog = %q, want iceberg", got)
 	}
 
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_search_path":"iceberg.billing_public,memory.main"}`)))
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_catalog":"iceberg"}`)))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("set status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultSearchPath; got != "iceberg.billing_public,memory.main" {
-		t.Fatalf("updated DefaultSearchPath = %q, want iceberg.billing_public,memory.main", got)
+	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "iceberg" {
+		t.Fatalf("updated DefaultCatalog = %q, want iceberg", got)
 	}
 
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_search_path":""}`)))
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_catalog":""}`)))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("clear status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultSearchPath; got != "" {
-		t.Fatalf("cleared DefaultSearchPath = %q, want empty", got)
+	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "" {
+		t.Fatalf("cleared DefaultCatalog = %q, want empty", got)
 	}
 }
 

@@ -295,8 +295,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 			OrgUserPassthrough: map[OrgUserKey]bool{
 				{OrgID: "test-org-smoke-1778167994", Username: "root"}: true,
 			},
-			OrgUserDefaultSearchPath: map[OrgUserKey]string{
-				{OrgID: "billing", Username: "root"}: "iceberg.main,memory.main",
+			OrgUserDefaultCatalog: map[OrgUserKey]string{
+				{OrgID: "billing", Username: "root"}: "iceberg",
 			},
 		},
 	}
@@ -387,7 +387,7 @@ func TestResolvePostgresConnection(t *testing.T) {
 		}
 	})
 
-	t.Run("valid user includes configured default search path", func(t *testing.T) {
+	t.Run("valid user includes configured default catalog", func(t *testing.T) {
 		got := cs.ResolvePostgresConnection(
 			"billing_db",
 			"billing-alias",
@@ -398,8 +398,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 		if !got.Valid {
 			t.Fatalf("expected valid auth: %+v", got)
 		}
-		if got.DefaultSearchPath != "iceberg.main,memory.main" {
-			t.Fatalf("DefaultSearchPath = %q, want iceberg.main,memory.main", got.DefaultSearchPath)
+		if got.DefaultCatalog != "iceberg" {
+			t.Fatalf("DefaultCatalog = %q, want iceberg", got.DefaultCatalog)
 		}
 	})
 }

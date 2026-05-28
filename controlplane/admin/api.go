@@ -13,7 +13,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
-	"github.com/posthog/duckgres/server"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -127,7 +126,7 @@ type apiStore interface {
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
-	UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultSearchPath *string) (*configstore.OrgUser, bool, error)
+	UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
@@ -260,7 +259,7 @@ func (s *gormAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &user, nil
 }
 
-func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultSearchPath *string) (*configstore.OrgUser, bool, error) {
+func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error) {
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
@@ -268,8 +267,8 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	if passthrough != nil {
 		updates["passthrough"] = *passthrough
 	}
-	if defaultSearchPath != nil {
-		updates["default_search_path"] = *defaultSearchPath
+	if defaultCatalog != nil {
+		updates["default_catalog"] = *defaultCatalog
 	}
 	if len(updates) == 0 {
 		// Nothing to change — return the current row so callers can still
@@ -929,11 +928,11 @@ func (h *apiHandler) listUsers(c *gin.Context) {
 func (h *apiHandler) createUser(c *gin.Context) {
 	// Use a raw struct because OrgUser.Password has json:"-"
 	var raw struct {
-		Username          string `json:"username"`
-		Password          string `json:"password"`
-		OrgID             string `json:"org_id"`
-		Passthrough       bool   `json:"passthrough"`
-		DefaultSearchPath string `json:"default_search_path"`
+		Username       string `json:"username"`
+		Password       string `json:"password"`
+		OrgID          string `json:"org_id"`
+		Passthrough    bool   `json:"passthrough"`
+		DefaultCatalog string `json:"default_catalog"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -947,11 +946,11 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
 		return
 	}
-	if sp, err := validateDefaultSearchPath(raw.DefaultSearchPath); err != nil {
+	if catalog, err := validateDefaultCatalog(raw.DefaultCatalog); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	} else {
-		raw.DefaultSearchPath = sp
+		raw.DefaultCatalog = catalog
 	}
 	hash, err := configstore.HashPassword(raw.Password)
 	if err != nil {
@@ -959,11 +958,11 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		return
 	}
 	user := configstore.OrgUser{
-		Username:          raw.Username,
-		Password:          hash,
-		OrgID:             raw.OrgID,
-		Passthrough:       raw.Passthrough,
-		DefaultSearchPath: raw.DefaultSearchPath,
+		Username:       raw.Username,
+		Password:       hash,
+		OrgID:          raw.OrgID,
+		Passthrough:    raw.Passthrough,
+		DefaultCatalog: raw.DefaultCatalog,
 	}
 	if err := h.store.CreateUser(&user); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -989,9 +988,9 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 	// Passthrough is *bool so omitting it preserves the stored value; sending
 	// `false` explicitly clears the flag.
 	var raw struct {
-		Password          string  `json:"password"`
-		Passthrough       *bool   `json:"passthrough,omitempty"`
-		DefaultSearchPath *string `json:"default_search_path,omitempty"`
+		Password       string  `json:"password"`
+		Passthrough    *bool   `json:"passthrough,omitempty"`
+		DefaultCatalog *string `json:"default_catalog,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1006,15 +1005,15 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		}
 		passwordHash = hash
 	}
-	if raw.DefaultSearchPath != nil {
-		sp, err := validateDefaultSearchPath(*raw.DefaultSearchPath)
+	if raw.DefaultCatalog != nil {
+		catalog, err := validateDefaultCatalog(*raw.DefaultCatalog)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		raw.DefaultSearchPath = &sp
+		raw.DefaultCatalog = &catalog
 	}
-	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultSearchPath)
+	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultCatalog)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1026,14 +1025,14 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 	c.JSON(http.StatusOK, user)
 }
 
-func validateDefaultSearchPath(raw string) (string, error) {
+func validateDefaultCatalog(raw string) (string, error) {
 	if raw == "" {
 		return "", nil
 	}
-	if sp, ok := server.SanitizeSearchPath(raw); ok {
-		return sp, nil
+	if raw == "iceberg" {
+		return raw, nil
 	}
-	return "", errors.New("default_search_path contains unsafe characters or is too long")
+	return "", errors.New("default_catalog must be empty or iceberg")
 }
 
 func (h *apiHandler) deleteUser(c *gin.Context) {
