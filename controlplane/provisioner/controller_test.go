@@ -1257,3 +1257,49 @@ func TestDucklingCreateExternalDataStoreRequiresBucket(t *testing.T) {
 		t.Fatal("expected error: external dataStore without a bucket name")
 	}
 }
+
+// TestDucklingGetFallsBackToLegacyName verifies the backward-compat path: a CR
+// created before ducklingName preserved hyphens (i.e. named with hyphens
+// stripped) is still found when looked up by its hyphenated org ID. Without
+// this, switching ducklingName to keep hyphens would orphan existing prod
+// ducklings whose org IDs contain hyphens (e.g. UUID-named tenants).
+func TestDucklingGetFallsBackToLegacyName(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	ctx := context.Background()
+
+	org := "018d351a-9ff7-0000-eaff-4628875ad045"
+	legacy := legacyDucklingName(org) // "018d351a9ff70000eaff4628875ad045"
+	if ducklingName(org) == legacy {
+		t.Fatal("test premise: hyphenated org id must differ from its legacy de-hyphenated name")
+	}
+
+	// Seed a CR under the legacy (de-hyphenated) name, as the old code would have.
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata":   map[string]interface{}{"name": legacy, "namespace": ducklingNamespace},
+		"status":     map[string]interface{}{"iamRoleArn": "arn:aws:iam::123:role/duckling-" + legacy},
+	}}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed legacy CR: %v", err)
+	}
+
+	st, err := dc.Get(ctx, org)
+	if err != nil {
+		t.Fatalf("Get must fall back to the legacy de-hyphenated name, got: %v", err)
+	}
+	if st.IAMRoleARN == "" {
+		t.Error("expected to parse the legacy CR's status")
+	}
+
+	// And iceberg/pgbouncer reads + delete must resolve it too.
+	if _, err := dc.GetIcebergEnabled(ctx, org); err != nil {
+		t.Errorf("GetIcebergEnabled fallback: %v", err)
+	}
+	if err := dc.Delete(ctx, org); err != nil {
+		t.Errorf("Delete fallback: %v", err)
+	}
+	if _, getErr := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, legacy, metav1.GetOptions{}); getErr == nil {
+		t.Error("legacy CR should have been deleted via the fallback")
+	}
+}

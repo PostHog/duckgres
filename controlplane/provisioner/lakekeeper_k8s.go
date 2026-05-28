@@ -73,33 +73,20 @@ func NewLakekeeperK8sClientWithClients(dc dynamic.Interface, kc kubernetes.Inter
 	return &LakekeeperK8sClient{dynamic: dc, kubernetes: kc, namespace: namespace}
 }
 
-// LakekeeperResourceName derives the K8s resource name (CR + Secret) for an
-// org. Matches the ducklingName transform — strips hyphens so UUID-style
-// org IDs land under the 63-char K8s name limit.
+// LakekeeperResourceName derives the K8s resource name (CR + Secret + SA) for
+// an org. Uses ducklingName so it preserves hyphens, matching the Duckling CR
+// and the rest of the in-cluster resources.
 func LakekeeperResourceName(orgID string) string {
-	return "lakekeeper-" + lakekeeperResourceSuffix(orgID)
-}
-
-func lakekeeperResourceSuffix(orgID string) string {
-	// Inline to avoid coupling to ducklingName which lives in another file
-	// under the same build tag.
-	out := make([]byte, 0, len(orgID))
-	for i := 0; i < len(orgID); i++ {
-		if orgID[i] == '-' {
-			continue
-		}
-		out = append(out, orgID[i])
-	}
-	return string(out)
+	return "lakekeeper-" + ducklingName(orgID)
 }
 
 // LakekeeperSecretData is the strongly-typed contents of the per-org Secret
 // that the CR's *SecretRef fields point at. All values are required.
 type LakekeeperSecretData struct {
-	DBUser              string
-	DBPassword          string
-	EncryptionKey       string // 32-byte key used by Lakekeeper for at-rest secret encryption
-	OAuth2ClientSecret  string // client_secret minted for the duckling
+	DBUser             string
+	DBPassword         string
+	EncryptionKey      string // 32-byte key used by Lakekeeper for at-rest secret encryption
+	OAuth2ClientSecret string // client_secret minted for the duckling
 }
 
 // SecretKey* are the keys inside the Secret. Stable contract with the CR.

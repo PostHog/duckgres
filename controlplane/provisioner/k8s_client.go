@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -80,11 +82,43 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 	return &DucklingClient{client: client}
 }
 
-// ducklingName converts an org ID to a valid K8s/AWS resource name by stripping
-// hyphens. This keeps names under the 63-char limit for RDS cluster identifiers
-// when the org ID is a full UUID.
+// ducklingName is the k8s/AWS resource name derived from an org ID, used for
+// the Duckling CR, the IAM role (duckling-<name>), the S3 bucket, the
+// Lakekeeper CR/SA/Secret, etc. Org IDs are validated as DNS-1123 labels at
+// provision time (lowercase alphanumerics + hyphens), so this only lowercases:
+// hyphens are preserved, keeping in-cluster names human-readable and injective
+// with the org ID.
+//
+// (It used to strip hyphens to keep per-org Aurora RDS cluster identifiers
+// short, but the control plane no longer provisions per-org Aurora clusters,
+// and stripping was lossy — "a-b" and "ab" collided.)
 func ducklingName(orgID string) string {
-	return strings.ReplaceAll(orgID, "-", "")
+	return strings.ToLower(orgID)
+}
+
+// pgIdentSanitizeRe matches characters not allowed in an unquoted Postgres
+// identifier fragment.
+var pgIdentSanitizeRe = regexp.MustCompile(`[^a-z0-9_]`)
+
+// pgIdentSuffix sanitizes an org ID into a valid unquoted Postgres identifier
+// fragment: lowercase, with every non-[a-z0-9_] character (notably hyphens)
+// mapped to '_'. Postgres identifiers can't contain hyphens unquoted, so PG
+// object names can't preserve them the way k8s names do. This mirrors the
+// Crossplane composition's $pgIdent transform for cnpg-shard, so the external
+// (provisioner-created) and cnpg-shard (composition-created) Lakekeeper
+// databases follow the same convention. Injective for org IDs restricted to
+// [a-z0-9-], which the provision-time validation guarantees.
+func pgIdentSuffix(orgID string) string {
+	return pgIdentSanitizeRe.ReplaceAllString(strings.ToLower(orgID), "_")
+}
+
+// legacyDucklingName is the pre-hyphen-preservation transform (hyphens
+// stripped). Retained ONLY so lookups can still find Duckling CRs created
+// before ducklingName started preserving hyphens — e.g. a CR named
+// "018d351a9ff70000eaff4628875ad045" for org "018d351a-9ff7-0000-eaff-...".
+// New CRs are always created under ducklingName (hyphen-preserving).
+func legacyDucklingName(orgID string) string {
+	return strings.ReplaceAll(strings.ToLower(orgID), "-", "")
 }
 
 // CreateOptions carries per-org knobs that shape the generated Duckling CR.
@@ -240,22 +274,44 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	return nil
 }
 
-// Get fetches the Duckling CR and parses its status.
-func (d *DucklingClient) Get(ctx context.Context, orgID string) (*DucklingStatus, error) {
+// getCR fetches the org's Duckling CR, trying the current hyphen-preserving
+// name first and falling back to the legacy de-hyphenated name for CRs created
+// before ducklingName preserved hyphens. Returns the CR and the name it was
+// found under (callers that mutate need the actual name). When neither exists,
+// returns the current-name NotFound error so callers see the new scheme.
+func (d *DucklingClient) getCR(ctx context.Context, orgID string) (*unstructured.Unstructured, string, error) {
 	name := ducklingName(orgID)
 	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return cr, name, nil
+	}
+	if legacy := legacyDucklingName(orgID); legacy != name && apierrors.IsNotFound(err) {
+		if lcr, lerr := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, legacy, metav1.GetOptions{}); lerr == nil {
+			return lcr, legacy, nil
+		}
+	}
+	return nil, name, err
+}
+
+// Get fetches the Duckling CR and parses its status.
+func (d *DucklingClient) Get(ctx context.Context, orgID string) (*DucklingStatus, error) {
+	cr, name, err := d.getCR(ctx, orgID)
 	if err != nil {
 		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
 	return parseDucklingStatus(cr)
 }
 
-// Delete removes the Duckling CR for the given org.
+// Delete removes the Duckling CR for the given org. Resolves the legacy name so
+// pre-rename CRs are still deletable.
 func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
-	name := ducklingName(orgID)
-	err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, name, metav1.DeleteOptions{})
-	if err != nil {
-		return fmt.Errorf("delete duckling CR %q: %w", name, err)
+	_, name, err := d.getCR(ctx, orgID)
+	if apierrors.IsNotFound(err) {
+		// Already gone — nothing to delete. (reconcileDeleting treats this as success.)
+		return err
+	}
+	if derr := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, name, metav1.DeleteOptions{}); derr != nil {
+		return fmt.Errorf("delete duckling CR %q: %w", name, derr)
 	}
 	return nil
 }
@@ -265,8 +321,7 @@ func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
 // carried a pgbouncer section) are reported as false — same as an explicit
 // opt-out — so the caller just needs to compare against the desired value.
 func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, orgID string) (bool, error) {
-	name := ducklingName(orgID)
-	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	cr, name, err := d.getCR(ctx, orgID)
 	if err != nil {
 		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
@@ -291,7 +346,10 @@ func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, orgID string) 
 // call is idempotent and only touches the pgbouncer block — sibling fields
 // under metadataStore (aurora, type) are left untouched.
 func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, enabled bool) error {
-	name := ducklingName(orgID)
+	_, name, err := d.getCR(ctx, orgID)
+	if err != nil {
+		return fmt.Errorf("resolve duckling CR for %q: %w", orgID, err)
+	}
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
@@ -318,8 +376,7 @@ func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, 
 // reported as false — same as an explicit opt-out — so the caller can just
 // compare against the desired value.
 func (d *DucklingClient) GetIcebergEnabled(ctx context.Context, orgID string) (bool, error) {
-	name := ducklingName(orgID)
-	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	cr, name, err := d.getCR(ctx, orgID)
 	if err != nil {
 		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
@@ -344,7 +401,10 @@ func (d *DucklingClient) GetIcebergEnabled(ctx context.Context, orgID string) (b
 // this method intentionally only patches enabled — namespace changes have
 // to go through warehouse re-creation.
 func (d *DucklingClient) SetIcebergEnabled(ctx context.Context, orgID string, enabled bool) error {
-	name := ducklingName(orgID)
+	_, name, err := d.getCR(ctx, orgID)
+	if err != nil {
+		return fmt.Errorf("resolve duckling CR for %q: %w", orgID, err)
+	}
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
 			"iceberg": map[string]interface{}{

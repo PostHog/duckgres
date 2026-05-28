@@ -832,3 +832,36 @@ func TestProvisionRejectsUnsupportedMetadataStore(t *testing.T) {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 }
+
+func TestProvisionRejectsInvalidOrgID(t *testing.T) {
+	for _, bad := range []string{"ben.iceberg", "Ben-Iceberg", "ben_iceberg", "-bad", "bad-"} {
+		t.Run(bad, func(t *testing.T) {
+			store := newFakeStore()
+			router := newTestRouter(store)
+			body := []byte(`{"database_name":"d","metadata_store":{"type":"cnpg-shard"}}`)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+bad+"/provision", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("orgID %q: status = %d, want 400: %s", bad, rec.Code, rec.Body.String())
+			}
+			if _, ok := store.warehouses[bad]; ok {
+				t.Errorf("warehouse must not be created for invalid org id %q", bad)
+			}
+		})
+	}
+}
+
+func TestProvisionAcceptsHyphenatedOrgID(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+	body := []byte(`{"database_name":"d","metadata_store":{"type":"cnpg-shard"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ben-iceberg-cnpg/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("hyphenated org id should be accepted, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
