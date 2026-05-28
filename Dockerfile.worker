@@ -87,9 +87,10 @@ RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
 # silently falling back to upstream extensions.duckdb.org for httpfs/ducklake
 # — the bundled PostHog forks would never load.
 RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ] && [ -n "$DUCKDB_EXTENSION_VERSION" ]; then \
-      IFS=. read -r major minor patch <<EOF
-$DUCKDB_EXTENSION_VERSION
-EOF
+      major="${DUCKDB_EXTENSION_VERSION%%.*}" ; \
+      rest="${DUCKDB_EXTENSION_VERSION#*.}" ; \
+      minor="${rest%%.*}" ; \
+      patch="${rest##*.}" ; \
       expected=$(printf 'v0.%d%02d%02d.0' "$major" "$minor" "$patch") ; \
       if [ "$expected" != "$DUCKDB_BINDINGS_VERSION" ]; then \
         echo "ERROR: extension/bindings version mismatch — DUCKDB_EXTENSION_VERSION=$DUCKDB_EXTENSION_VERSION implies bindings $expected, but got $DUCKDB_BINDINGS_VERSION" >&2 ; \
