@@ -57,6 +57,12 @@ type DucklingStatus struct {
 	IAMRoleARN         string
 	ReadyCondition     bool
 	SyncedFalseMessage string
+
+	// DuckLakeEnabled is spec.ducklake.enabled, read present/absent: nil when
+	// the CR predates the decoupled ducklake field (the worker activator then
+	// falls back to the legacy type-based default — DuckLake on for
+	// external/aurora, off for cnpg-shard). Non-nil for decoupled ducklings.
+	DuckLakeEnabled *bool
 }
 
 // DucklingClient wraps a Kubernetes dynamic client for Duckling CR operations.
@@ -157,6 +163,11 @@ type CreateOptions struct {
 	// IcebergNamespace is the Iceberg namespace within the tenant's catalog.
 	// Empty falls back to the XRD default ("main").
 	IcebergNamespace string
+
+	// DuckLakeEnabled toggles spec.ducklake.enabled. Independent of Iceberg and
+	// of the metadata-store type; at least one of DuckLakeEnabled/IcebergEnabled
+	// must be true (Create rejects a CR with neither).
+	DuckLakeEnabled bool
 }
 
 // Create creates a Duckling CR for the given org.
@@ -166,15 +177,14 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	var metadataStore map[string]interface{}
 	switch opts.MetadataStoreType {
 	case configstore.MetadataStoreKindCnpgShard:
-		// The cnpg-shard metadata store backs the per-tenant Lakekeeper
-		// Iceberg catalog on the shared CloudNativePG shard. It carries no
+		// The cnpg-shard metadata store is the per-tenant Postgres on the shared
+		// CloudNativePG shard, provisioned via provider-sql. It carries no
 		// per-claim config — the composition reads the active shard from chart
-		// values and provisions a lakekeeper_<org> role + database via
-		// provider-sql. The XRD admission rule requires iceberg.enabled=true
-		// for this type, so refuse to emit a CR that would be rejected (and
-		// that would have no usable catalog).
-		if !opts.IcebergEnabled {
-			return fmt.Errorf("create duckling CR %q: metadata store type %q requires iceberg enabled", name, configstore.MetadataStoreKindCnpgShard)
+		// values. It hosts the DuckLake catalog and/or the Lakekeeper PG
+		// depending on the catalog flags; a CR with neither catalog has nothing
+		// to attach, so refuse it.
+		if !opts.IcebergEnabled && !opts.DuckLakeEnabled {
+			return fmt.Errorf("create duckling CR %q: metadata store type %q requires at least one of ducklake or iceberg enabled", name, configstore.MetadataStoreKindCnpgShard)
 		}
 		// No aurora block and no pgbouncer block: cnpg-shard tenants reach
 		// Postgres through the shard's own session-mode Pooler, not a
@@ -247,6 +257,11 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	spec := map[string]interface{}{
 		"metadataStore": metadataStore,
 		"dataStore":     dataStore,
+		// DuckLake is set explicitly (true or false) so the catalog choice is
+		// unambiguous on the CR — the worker activator reads spec.ducklake.enabled
+		// and only falls back to the legacy type-based default when the field is
+		// absent (i.e. for ducklings created before decoupling).
+		"ducklake": map[string]interface{}{"enabled": opts.DuckLakeEnabled},
 	}
 	if opts.IcebergEnabled {
 		iceberg := map[string]interface{}{"enabled": true}
@@ -424,14 +439,39 @@ func (d *DucklingClient) SetIcebergEnabled(ctx context.Context, orgID string, en
 	return nil
 }
 
+// readSpecDuckLakeEnabled returns spec.ducklake.enabled as *bool — nil when the
+// ducklake block (or its enabled key) is absent, so callers can distinguish a
+// legacy CR (apply the type-based default) from an explicit true/false.
+func readSpecDuckLakeEnabled(cr *unstructured.Unstructured) *bool {
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	dl, ok := spec["ducklake"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	v, ok := dl["enabled"].(bool)
+	if !ok {
+		return nil
+	}
+	return &v
+}
+
 func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error) {
+	// spec.ducklake.enabled lives in .spec (not .status) — read it first so it's
+	// captured even before the composition writes any status. Present/absent is
+	// significant: absent (legacy CR) leaves DuckLakeEnabled nil.
+	duckLakeEnabled := readSpecDuckLakeEnabled(cr)
+
 	status, ok := cr.Object["status"].(map[string]interface{})
 	if !ok {
-		return &DucklingStatus{}, nil
+		return &DucklingStatus{DuckLakeEnabled: duckLakeEnabled}, nil
 	}
 
 	ds := &DucklingStatus{
-		IAMRoleARN: getNestedString(status, "iamRoleArn"),
+		IAMRoleARN:      getNestedString(status, "iamRoleArn"),
+		DuckLakeEnabled: duckLakeEnabled,
 	}
 
 	// Parse status.metadataStore

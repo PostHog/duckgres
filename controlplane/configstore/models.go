@@ -159,6 +159,21 @@ type ManagedWarehouseWorkerIdentity struct {
 	IAMRoleARN         string `gorm:"size:512" json:"iam_role_arn"`
 }
 
+// ManagedWarehouseDuckLake captures whether the org's DuckLake catalog is
+// enabled. Decoupled from the metadata-store type and from Iceberg: a duckling
+// may run DuckLake, Iceberg, or both, on any metadata backend (cnpg / external
+// / aurora). The DuckLake catalog lives in the metadata Postgres — the
+// per-tenant database for cnpg-shard, or the metadata database for
+// external/aurora.
+//
+// For ducklings created before this field existed the column is absent/false;
+// the worker activator does NOT key off it directly — it reads the Duckling
+// CR's spec.ducklake.enabled (present/absent) so legacy ducklings keep their
+// implied behavior (external/aurora ⇒ DuckLake, cnpg ⇒ none).
+type ManagedWarehouseDuckLake struct {
+	Enabled bool `json:"enabled"`
+}
+
 // ManagedWarehouseIceberg captures per-org Iceberg catalog config. Two
 // backends are supported, selected by Backend:
 //
@@ -321,6 +336,7 @@ type ManagedWarehouse struct {
 	DataStore         ManagedWarehouseDataStore      `gorm:"embedded;embeddedPrefix:data_store_" json:"data_store"`
 	PgBouncer         ManagedWarehousePgBouncer      `gorm:"embedded;embeddedPrefix:pgbouncer_" json:"pgbouncer"`
 	S3                ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
+	DuckLake          ManagedWarehouseDuckLake       `gorm:"embedded;embeddedPrefix:ducklake_" json:"ducklake"`
 	Iceberg           ManagedWarehouseIceberg        `gorm:"embedded;embeddedPrefix:iceberg_" json:"iceberg"`
 	WorkerIdentity    ManagedWarehouseWorkerIdentity `gorm:"embedded;embeddedPrefix:worker_identity_" json:"worker_identity"`
 

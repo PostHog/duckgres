@@ -121,6 +121,7 @@ type provisionRequest struct {
 	DatabaseName  string                 `json:"database_name"`
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
 	DataStore     *provisionDataStoreReq `json:"data_store,omitempty"`
+	DuckLake      *provisionDuckLakeReq  `json:"ducklake,omitempty"`
 	Iceberg       *provisionIcebergReq   `json:"iceberg,omitempty"`
 
 	// Trino is the opt-in flag for the customer-facing Trino cluster.
@@ -136,6 +137,23 @@ type provisionMetadataReq struct {
 	// External is required when Type == "external": a pre-existing Postgres
 	// referenced by host + an AWS Secrets Manager secret for the password.
 	External *provisionExternalReq `json:"external,omitempty"`
+	// Aurora is required when Type == "aurora": serverless v2 sizing for the
+	// per-org Aurora cluster the composition provisions.
+	Aurora *provisionAuroraReq `json:"aurora,omitempty"`
+}
+
+// provisionAuroraReq is the serverless-v2 ACU sizing for an aurora metadata
+// store. MaxACU must be > 0; MinACU defaults to 0 (scale-to-zero).
+type provisionAuroraReq struct {
+	MinACU float64 `json:"min_acu"`
+	MaxACU float64 `json:"max_acu"`
+}
+
+// provisionDuckLakeReq toggles the DuckLake catalog. Independent of Iceberg and
+// of the metadata-store type: enable DuckLake, Iceberg, or both. At least one
+// catalog must be enabled.
+type provisionDuckLakeReq struct {
+	Enabled bool `json:"enabled"`
 }
 
 // provisionExternalReq describes a pre-existing (external) Postgres metadata
@@ -242,41 +260,51 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// The control plane provisions three duckling shapes:
-	//   - iceberg+cnpg     metadata_store.type=cnpg-shard          (iceberg implied)
-	//   - iceberg+external  metadata_store.type=external + iceberg.enabled
-	//   - ducklake+external metadata_store.type=external           (iceberg omitted)
-	//
-	// "aurora" is no longer provisionable (the control plane never stands up a
-	// new Aurora cluster). Validation is strict: each shape's required fields
-	// must be present, or the request is rejected before any write.
-	warehouse := &configstore.ManagedWarehouse{}
-	switch req.MetadataStore.Type {
-	case configstore.MetadataStoreKindCnpgShard:
-		// cnpg-shard takes no per-claim config: the composition picks the active
-		// shard from chart values and provisions a fresh per-org bucket. Per the
-		// Duckling XRD it must always have Iceberg enabled (Lakekeeper backend),
-		// so enable it here rather than making the caller pass it redundantly.
-		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindCnpgShard
+	// Catalogs are decoupled from the metadata backend: a duckling can run
+	// DuckLake, Iceberg, or both, on any of the three metadata stores. At least
+	// one catalog must be enabled (a warehouse with neither has nothing to
+	// attach).
+	ducklakeEnabled := req.DuckLake != nil && req.DuckLake.Enabled
+	icebergEnabled := req.Iceberg != nil && req.Iceberg.Enabled
+	if !ducklakeEnabled && !icebergEnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of ducklake.enabled or iceberg.enabled must be true"})
+		return
+	}
+
+	ds, derr := resolveDataStore(req.DataStore)
+	if derr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": derr.Error()})
+		return
+	}
+
+	warehouse := &configstore.ManagedWarehouse{
+		DataStore: ds,
+		DuckLake:  configstore.ManagedWarehouseDuckLake{Enabled: ducklakeEnabled},
+	}
+	if icebergEnabled {
 		warehouse.Iceberg = configstore.ManagedWarehouseIceberg{
 			Enabled:   true,
 			Backend:   configstore.IcebergBackendLakekeeper,
 			Namespace: icebergNamespace(req.Iceberg),
 		}
+	}
+
+	// Metadata backend (the Postgres that hosts the DuckLake catalog and/or the
+	// Lakekeeper PG). Provisioning shape differs per type; the catalog choice
+	// above is orthogonal.
+	switch req.MetadataStore.Type {
+	case configstore.MetadataStoreKindCnpgShard:
+		// No per-claim config — the composition picks the active shard from
+		// chart values and provisions the per-tenant role+database there.
+		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindCnpgShard
 
 	case configstore.MetadataStoreKindExternal:
 		// A pre-existing Postgres. Endpoint (RDS host) + the AWS Secrets Manager
 		// secret name for the password are required; user/database default to
-		// "postgres". Iceberg is optional: enabled → iceberg+external, omitted →
-		// ducklake+external.
+		// "postgres" at the XRD.
 		ext := req.MetadataStore.External
 		if ext == nil || ext.Endpoint == "" || ext.PasswordAWSSecret == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.type 'external' requires metadata_store.external.endpoint and metadata_store.external.password_aws_secret"})
-			return
-		}
-		ds, derr := resolveDataStore(req.DataStore)
-		if derr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": derr.Error()})
 			return
 		}
 		warehouse.MetadataStore = configstore.ManagedWarehouseMetadataStore{
@@ -286,20 +314,20 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 			DatabaseName:      ext.Database,
 			PasswordAWSSecret: ext.PasswordAWSSecret,
 		}
-		warehouse.DataStore = ds
-		if req.Iceberg != nil && req.Iceberg.Enabled {
-			warehouse.Iceberg = configstore.ManagedWarehouseIceberg{
-				Enabled:   true,
-				Backend:   configstore.IcebergBackendLakekeeper,
-				Namespace: icebergNamespace(req.Iceberg),
-			}
-		}
 
 	case configstore.MetadataStoreKindAurora:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "DuckLake on a fresh Aurora cluster (metadata_store.type 'aurora') is no longer provisionable; use 'cnpg-shard' or 'external'"})
-		return
+		// A per-org Aurora serverless-v2 cluster the composition provisions.
+		a := req.MetadataStore.Aurora
+		if a == nil || a.MaxACU <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "metadata_store.type 'aurora' requires metadata_store.aurora.max_acu > 0"})
+			return
+		}
+		warehouse.MetadataStore.Kind = configstore.MetadataStoreKindAurora
+		warehouse.AuroraMinACU = a.MinACU
+		warehouse.AuroraMaxACU = a.MaxACU
+
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("metadata_store.type must be %q or %q (got %q)", configstore.MetadataStoreKindCnpgShard, configstore.MetadataStoreKindExternal, req.MetadataStore.Type)})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("metadata_store.type must be %q, %q, or %q (got %q)", configstore.MetadataStoreKindCnpgShard, configstore.MetadataStoreKindExternal, configstore.MetadataStoreKindAurora, req.MetadataStore.Type)})
 		return
 	}
 

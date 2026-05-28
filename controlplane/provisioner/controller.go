@@ -226,6 +226,7 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		DataStoreRegion:           w.DataStore.Region,
 		IcebergEnabled:            w.Iceberg.Enabled,
 		IcebergNamespace:          w.Iceberg.Namespace,
+		DuckLakeEnabled:           w.DuckLake.Enabled,
 	}); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{
