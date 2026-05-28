@@ -266,6 +266,9 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 	if _, err := db.Exec("CREATE SCHEMA iceberg.billing_public"); err != nil {
 		t.Fatalf("create iceberg schema: %v", err)
 	}
+	if _, err := db.Exec("CREATE SCHEMA iceberg.public"); err != nil {
+		t.Fatalf("create iceberg public schema: %v", err)
+	}
 
 	executor := NewLocalExecutor(db)
 	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, "posthog"); err != nil {
@@ -345,4 +348,21 @@ func TestInformationSchemaColumnsCompatDeduplicatesBySearchPathCatalogPrecedence
 
 	assertColumns("ducklake.billing_public,memory.main", "posthog", "NO", "json")
 	assertColumns("iceberg.billing_public,memory.main", "iceberg", "YES", "text")
+
+	if _, err := db.Exec("USE iceberg.public"); err != nil {
+		t.Fatalf("use iceberg.public: %v", err)
+	}
+	var gotCatalog, gotNullable string
+	if err := db.QueryRow(`
+		SELECT table_catalog, is_nullable
+		FROM memory.main.information_schema_columns_compat
+		WHERE table_schema = 'billing_public'
+			AND table_name = 'public_api_keys'
+			AND column_name = 'id'
+	`).Scan(&gotCatalog, &gotNullable); err != nil {
+		t.Fatalf("query id metadata after USE iceberg.public: %v", err)
+	}
+	if gotCatalog != "iceberg" || gotNullable != "YES" {
+		t.Fatalf("id metadata after USE iceberg.public = (%q, %q), want (iceberg, YES)", gotCatalog, gotNullable)
+	}
 }

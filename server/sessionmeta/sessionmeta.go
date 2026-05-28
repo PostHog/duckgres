@@ -279,7 +279,15 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 						WHERE name = 'search_path'
 					),
 					''
-				) || ',' AS search_path
+				) || ',' AS search_path,
+				COALESCE(
+					(
+						SELECT lower(regexp_extract(regexp_replace(value, '\s+', '', 'g'), '^([A-Za-z0-9_]+)\.', 1))
+						FROM duckdb_settings()
+						WHERE name = 'search_path'
+					),
+					''
+				) AS default_catalog
 		),
 		ranked_columns AS (
 			SELECT
@@ -291,6 +299,10 @@ func buildSessionInformationSchemaColumnsViewSQL() string {
 							NULLIF(strpos(sp.search_path, ',' || lower(c.source_catalog || '.' || c.table_schema) || ','), 0),
 							CASE
 								WHEN c.source_catalog IN ('ducklake', 'memory') THEN NULLIF(strpos(sp.search_path, ',' || lower(c.table_schema) || ','), 0)
+								ELSE NULL
+							END,
+							CASE
+								WHEN lower(c.source_catalog) = sp.default_catalog THEN 500000
 								ELSE NULL
 							END,
 							1000000
