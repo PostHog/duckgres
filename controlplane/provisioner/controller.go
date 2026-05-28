@@ -213,12 +213,19 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 		"pgbouncer_enabled", w.PgBouncer.Enabled,
 		"iceberg_enabled", w.Iceberg.Enabled)
 	if err := c.duckling.Create(ctx, w.OrgID, CreateOptions{
-		MetadataStoreType: w.MetadataStore.Kind,
-		MinACU:            w.AuroraMinACU,
-		MaxACU:            w.AuroraMaxACU,
-		PgBouncerEnabled:  w.PgBouncer.Enabled,
-		IcebergEnabled:    w.Iceberg.Enabled,
-		IcebergNamespace:  w.Iceberg.Namespace,
+		MetadataStoreType:         w.MetadataStore.Kind,
+		MinACU:                    w.AuroraMinACU,
+		MaxACU:                    w.AuroraMaxACU,
+		PgBouncerEnabled:          w.PgBouncer.Enabled,
+		ExternalEndpoint:          w.MetadataStore.Endpoint,
+		ExternalPasswordAWSSecret: w.MetadataStore.PasswordAWSSecret,
+		ExternalUser:              w.MetadataStore.Username,
+		ExternalDatabase:          w.MetadataStore.DatabaseName,
+		DataStoreType:             w.DataStore.Kind,
+		DataStoreBucket:           w.DataStore.BucketName,
+		DataStoreRegion:           w.DataStore.Region,
+		IcebergEnabled:            w.Iceberg.Enabled,
+		IcebergNamespace:          w.Iceberg.Namespace,
 	}); err != nil {
 		log.Error("Failed to create Duckling CR.", "error", err)
 		_ = c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStatePending, map[string]interface{}{

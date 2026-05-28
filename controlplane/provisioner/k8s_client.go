@@ -91,13 +91,30 @@ func ducklingName(orgID string) string {
 type CreateOptions struct {
 	// MetadataStoreType selects the Duckling's metadata-store backend. Empty
 	// is treated as configstore.MetadataStoreKindAurora (the historical
-	// default). The only other accepted value is
-	// configstore.MetadataStoreKindCnpgShard; any other value (notably
-	// "external") is rejected by Create.
+	// default, retained only for reconciling pre-existing aurora ducklings).
+	// The control plane creates cnpg-shard and external; any other value is
+	// rejected by Create.
 	MetadataStoreType string
 	MinACU            float64
 	MaxACU            float64
 	PgBouncerEnabled  bool
+
+	// External metadata store (MetadataStoreType == "external"). Endpoint and
+	// ExternalPasswordAWSSecret are required for that type; User/Database
+	// default to "postgres" at the XRD level when empty.
+	ExternalEndpoint          string
+	ExternalPasswordAWSSecret string
+	ExternalUser              string
+	ExternalDatabase          string
+
+	// DataStoreType selects spec.dataStore.type. Empty defaults to "s3bucket"
+	// (the composition provisions a fresh per-org bucket). "external" reuses an
+	// existing bucket — DataStoreBucket is then required, DataStoreRegion
+	// optional (XRD/composition default applies when empty).
+	DataStoreType   string
+	DataStoreBucket string
+	DataStoreRegion string
+
 	// IcebergEnabled toggles spec.iceberg.enabled on the Duckling CR. The
 	// composition only provisions a per-tenant S3 Tables bucket when this
 	// is true; flipping it post-create is handled by the controller's
@@ -129,6 +146,34 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		// Postgres through the shard's own session-mode Pooler, not a
 		// per-Duckling PgBouncer.
 		metadataStore = map[string]interface{}{"type": configstore.MetadataStoreKindCnpgShard}
+	case configstore.MetadataStoreKindExternal:
+		// A pre-existing Postgres (e.g. RDS), referenced by endpoint + an AWS
+		// Secrets Manager secret name for the password (resolved by the
+		// composition via ESO). Backs a DuckLake catalog (iceberg disabled) or
+		// the Lakekeeper catalog (iceberg enabled). User/Database are omitted
+		// when empty so the XRD defaults ("postgres") apply.
+		if opts.ExternalEndpoint == "" || opts.ExternalPasswordAWSSecret == "" {
+			return fmt.Errorf("create duckling CR %q: metadata store type %q requires endpoint and passwordAwsSecret", name, configstore.MetadataStoreKindExternal)
+		}
+		external := map[string]interface{}{
+			"endpoint":          opts.ExternalEndpoint,
+			"passwordAwsSecret": opts.ExternalPasswordAWSSecret,
+		}
+		if opts.ExternalUser != "" {
+			external["user"] = opts.ExternalUser
+		}
+		if opts.ExternalDatabase != "" {
+			external["database"] = opts.ExternalDatabase
+		}
+		metadataStore = map[string]interface{}{
+			"type":     configstore.MetadataStoreKindExternal,
+			"external": external,
+		}
+		if opts.PgBouncerEnabled {
+			metadataStore["pgbouncer"] = map[string]interface{}{
+				"enabled": true,
+			}
+		}
 	case "", configstore.MetadataStoreKindAurora:
 		metadataStore = map[string]interface{}{
 			"type": configstore.MetadataStoreKindAurora,
@@ -144,14 +189,30 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		}
 	default:
 		return fmt.Errorf("create duckling CR %q: unsupported metadata store type %q (control plane creates only %q or %q)",
-			name, opts.MetadataStoreType, configstore.MetadataStoreKindAurora, configstore.MetadataStoreKindCnpgShard)
+			name, opts.MetadataStoreType, configstore.MetadataStoreKindCnpgShard, configstore.MetadataStoreKindExternal)
+	}
+
+	var dataStore map[string]interface{}
+	switch opts.DataStoreType {
+	case "external":
+		// Reuse an existing bucket (the composition provisions none).
+		if opts.DataStoreBucket == "" {
+			return fmt.Errorf("create duckling CR %q: dataStore type %q requires a bucket name", name, "external")
+		}
+		external := map[string]interface{}{"bucketName": opts.DataStoreBucket}
+		if opts.DataStoreRegion != "" {
+			external["region"] = opts.DataStoreRegion
+		}
+		dataStore = map[string]interface{}{"type": "external", "external": external}
+	case "", "s3bucket":
+		dataStore = map[string]interface{}{"type": "s3bucket"}
+	default:
+		return fmt.Errorf("create duckling CR %q: unsupported data store type %q", name, opts.DataStoreType)
 	}
 
 	spec := map[string]interface{}{
 		"metadataStore": metadataStore,
-		"dataStore": map[string]interface{}{
-			"type": "s3bucket",
-		},
+		"dataStore":     dataStore,
 	}
 	if opts.IcebergEnabled {
 		iceberg := map[string]interface{}{"enabled": true}
