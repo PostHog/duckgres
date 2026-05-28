@@ -419,31 +419,38 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 	if err != nil {
 		return server.DuckLakeConfig{}, nil, fmt.Errorf("resolve duckling CR %q: %w", orgID, err)
 	}
-	if status.MetadataStore.Password == "" {
-		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no metadata store password", orgID)
-	}
 	if status.DataStore.BucketName == "" {
 		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no data store bucket", orgID)
 	}
 
-	host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
-	if err != nil {
-		return server.DuckLakeConfig{}, nil, err
+	dl := server.DuckLakeConfig{
+		ObjectStore: fmt.Sprintf("s3://%s/", status.DataStore.BucketName),
+		S3Region:    status.DataStore.S3Region,
+		S3UseSSL:    true,
+		S3URLStyle:  "vhost",
 	}
 
-	dl := server.DuckLakeConfig{
-		MetadataStore: buildDuckLakeMetadataStoreDSN(
+	// cnpg-shard tenants are iceberg-only: their metadata store is the
+	// Lakekeeper Postgres backend (not a DuckLake catalog), and the worker has
+	// no egress to reach it. Leave MetadataStore empty so the worker attaches
+	// Iceberg only (server.ActivateDBConnection takes its iceberg-only branch).
+	// External/aurora tenants keep DuckLake — they get the metadata DSN below.
+	if status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard {
+		if status.MetadataStore.Password == "" {
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no metadata store password", orgID)
+		}
+		host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
+		if err != nil {
+			return server.DuckLakeConfig{}, nil, err
+		}
+		dl.MetadataStore = buildDuckLakeMetadataStoreDSN(
 			host,
 			port,
 			status.MetadataStore.User,
 			status.MetadataStore.Password,
 			status.MetadataStore.Database,
-		),
-		ViaPgBouncer: viaPgBouncer,
-		ObjectStore:  fmt.Sprintf("s3://%s/", status.DataStore.BucketName),
-		S3Region:     status.DataStore.S3Region,
-		S3UseSSL:     true,
-		S3URLStyle:   "vhost",
+		)
+		dl.ViaPgBouncer = viaPgBouncer
 	}
 
 	// Broker S3 credentials via STS AssumeRole
