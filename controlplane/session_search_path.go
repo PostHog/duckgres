@@ -14,6 +14,12 @@ const (
 	sessionDefaultSourceConfiguredCatalog sessionSearchPathSource = "configured_catalog"
 )
 
+// physicalDuckLakeCatalog is the name the per-tenant DuckLake catalog is
+// attached as on the worker (the `ATTACH ... AS ducklake` performed during
+// activation; matches server.physicalDuckLakeCatalog). Keep this and the
+// HasAttachedCatalog probe in control.go in sync.
+const physicalDuckLakeCatalog = "ducklake"
+
 func effectiveSessionDefaultCommand(clientSearchPath, defaultCatalog string) (string, sessionSearchPathSource) {
 	switch {
 	case clientSearchPath != "":
@@ -37,7 +43,7 @@ func passthroughSessionDefaultCatalogCommand(defaultCatalog string, duckLakeAtta
 	case defaultCatalog == iceberg.CatalogName:
 		return fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
 	case duckLakeAttached:
-		return "USE ducklake"
+		return "USE " + physicalDuckLakeCatalog
 	default:
 		return ""
 	}

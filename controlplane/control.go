@@ -1180,13 +1180,20 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// server.setDuckLakeDefault/setIcebergDefault; the remote-worker path
 		// has to issue the equivalent explicitly here.
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-		duckLakeAttached, err = sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
+		duckLakeAttached, err = sessionmeta.HasAttachedCatalog(initCtx, executor, physicalDuckLakeCatalog)
 		if err != nil {
 			initCancel()
 			slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
 			_ = writer.Flush()
 			return
+		}
+		// Passthrough doesn't apply a client-supplied search_path (the
+		// non-passthrough best-effort path does). Surface it rather than
+		// dropping it silently — passthrough clients can issue SET search_path
+		// themselves once connected.
+		if clientSearchPath != "" {
+			slog.Warn("Ignoring client connect-time search_path for passthrough session.", "user", username, "org", orgID, "search_path", clientSearchPath, "remote_addr", remoteAddr)
 		}
 		if cmd := passthroughSessionDefaultCatalogCommand(defaultCatalog, duckLakeAttached); cmd != "" {
 			if _, err := executor.ExecContext(initCtx, cmd); err != nil {
