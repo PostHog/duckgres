@@ -25,6 +25,24 @@ func effectiveSessionDefaultCommand(clientSearchPath, defaultCatalog string) (st
 	}
 }
 
+// passthroughSessionDefaultCatalogCommand returns the connect-time command that
+// points a passthrough session at the tenant's catalog. Passthrough users skip
+// InitSessionDatabaseMetadata (whose defer issues `USE ducklake` for the
+// standard path), so without this the session stays in DuckDB's empty in-memory
+// catalog — current_database() reports "memory" and unqualified DDL/DML never
+// reaches the warehouse. Mirrors server.setIcebergDefault / setDuckLakeDefault
+// used by the standalone passthrough path.
+func passthroughSessionDefaultCatalogCommand(defaultCatalog string, duckLakeAttached bool) string {
+	switch {
+	case defaultCatalog == iceberg.CatalogName:
+		return fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
+	case duckLakeAttached:
+		return "USE ducklake"
+	default:
+		return ""
+	}
+}
+
 func ensureMemoryMainInSearchPath(searchPath string) string {
 	if strings.Contains(strings.ToLower(searchPath), "memory.main") {
 		return searchPath

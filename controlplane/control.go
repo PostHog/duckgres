@@ -1126,9 +1126,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 	}()
 
-	// Passthrough users skip pg_catalog initialization and DuckLake catalog
-	// detection — they bypass the PG compatibility layer entirely, so the
-	// metadata setup that drives logical catalog mapping is unused for them.
+	// Passthrough users skip pg_catalog initialization and logical-catalog
+	// mapping — they bypass the PG compatibility layer entirely. They still
+	// need a default catalog, though: without one the worker session stays in
+	// DuckDB's empty in-memory catalog, so current_database() reports "memory"
+	// and unqualified DDL/DML never reaches the warehouse (see the passthrough
+	// branch below).
 	var duckLakeAttached bool
 	if !passthroughUser {
 		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
@@ -1170,6 +1173,31 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 				slog.Warn("Failed to apply client connect-time search_path; using default.", "user", username, "org", orgID, "search_path", clientSearchPath, "error", err)
 			}
 		}
+	} else {
+		// Passthrough: no pg_catalog views and no logical-catalog rewriting, but
+		// the session must still land in the tenant's catalog instead of the
+		// empty in-memory one. Standalone passthrough does this via
+		// server.setDuckLakeDefault/setIcebergDefault; the remote-worker path
+		// has to issue the equivalent explicitly here.
+		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+		duckLakeAttached, err = sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
+		if err != nil {
+			initCancel()
+			slog.Error("Failed to detect ducklake catalog attachment.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect ducklake catalog attachment")
+			_ = writer.Flush()
+			return
+		}
+		if cmd := passthroughSessionDefaultCatalogCommand(defaultCatalog, duckLakeAttached); cmd != "" {
+			if _, err := executor.ExecContext(initCtx, cmd); err != nil {
+				initCancel()
+				slog.Error("Failed to apply passthrough session default catalog.", "user", username, "org", orgID, "command", cmd, "error", err, "worker", workerID, "worker_pod", workerPod)
+				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
+				_ = writer.Flush()
+				return
+			}
+		}
+		initCancel()
 	}
 
 	// Register the TCP connection so OnWorkerCrash can close it to unblock
@@ -1183,7 +1211,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			server.SetConnectionIcebergConfig(cc, icebergCfg)
 		}
 	}
-	server.SetLogicalCatalogMapping(cc, duckLakeAttached)
+	// Logical-catalog mapping (current_database masking + USE/qualified-name
+	// rewriting) is a non-passthrough feature; passthrough sessions talk raw
+	// DuckDB against the physical catalog name, so keep it disabled for them
+	// even though duckLakeAttached is now populated on the passthrough path.
+	server.SetLogicalCatalogMapping(cc, duckLakeAttached && !passthroughUser)
 	server.SetPassthrough(cc, passthroughUser)
 	if orgID != "" {
 		observeOrgPgSessionAccepted(orgID, passthroughUser)
