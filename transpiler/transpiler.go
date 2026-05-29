@@ -158,6 +158,20 @@ func (t *Transpiler) Transpile(sql string) (*Result, error) {
 		return &Result{SQL: rewritten}, nil
 	}
 
+	// CREATE OR REPLACE TABLE is DuckDB-only syntax that PostgreSQL can't
+	// parse. Strip OR REPLACE so the statement runs through the full transform
+	// pipeline (critically, the logical-catalog rewrite), then restore it.
+	// Without this the statement would FallbackToNative and be forwarded raw,
+	// reaching the worker with the un-rewritten logical catalog name.
+	if inner, ok := stripCreateOrReplaceTable(sql); ok {
+		res, err := t.Transpile(inner)
+		if err != nil {
+			return res, err
+		}
+		res.SQL = reinjectOrReplace(res.SQL)
+		return res, nil
+	}
+
 	// Tier 0: Pre-parse classification
 	cls := Classify(sql, t.config)
 	if cls.Direct {

@@ -301,6 +301,92 @@ func TestTranspile_LogicalCatalogMapping_DuckLakeMode(t *testing.T) {
 	}
 }
 
+func TestTranspile_CreateOrReplaceTable_LogicalCatalog(t *testing.T) {
+	// CREATE OR REPLACE TABLE is DuckDB-only syntax (PostgreSQL has no
+	// OR REPLACE for TABLE). Before the pre-parse interceptor this fell back
+	// to native and was forwarded raw, so the logical catalog name was never
+	// rewritten to the physical catalog — breaking multi-tenant dbt/SQLMesh
+	// table materializations with "Catalog \"portola\" does not exist".
+	tests := []struct {
+		name     string
+		input    string
+		contains []string
+		excludes string
+	}{
+		{
+			name:     "CTAS target and source both rewritten, OR REPLACE preserved",
+			input:    `CREATE OR REPLACE TABLE "portola"."core"."payment_events" AS SELECT * FROM "portola"."core"."raw_payments"`,
+			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.payment_events", "ducklake.core.raw_payments"},
+			excludes: "portola",
+		},
+		{
+			name:     "public schema maps to main; OR REPLACE preserved",
+			input:    `CREATE OR REPLACE TABLE portola.public.t AS SELECT 1 AS x`,
+			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.main.t"},
+			excludes: "portola",
+		},
+		{
+			name:     "multi-line AS SELECT body still rewritten",
+			input:    "CREATE OR REPLACE TABLE portola.core.t AS\nSELECT a\nFROM portola.core.src\nWHERE a > 0",
+			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.t", "ducklake.core.src"},
+			excludes: "portola",
+		},
+		{
+			name:     "TEMP variant preserves OR REPLACE and TEMP",
+			input:    `CREATE OR REPLACE TEMP TABLE t AS SELECT * FROM portola.core.src`,
+			contains: []string{"OR REPLACE", "TEMP", "ducklake.core.src"},
+			excludes: "portola.core.src",
+		},
+		{
+			name:     "plain column-def form (no AS) rewrites target",
+			input:    `CREATE OR REPLACE TABLE portola.core.t (id INTEGER)`,
+			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.t"},
+			excludes: "portola",
+		},
+	}
+
+	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "portola", PhysicalCatalogName: "ducklake"})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if result.FallbackToNative {
+				t.Fatalf("Transpile(%q) fell back to native; expected transpilation. SQL=%q", tt.input, result.SQL)
+			}
+			for _, want := range tt.contains {
+				if !strings.Contains(result.SQL, want) {
+					t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, want)
+				}
+			}
+			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
+			}
+		})
+	}
+}
+
+// CREATE OR REPLACE VIEW is valid PostgreSQL and must NOT be touched by the
+// CREATE OR REPLACE TABLE interceptor.
+func TestTranspile_CreateOrReplaceView_Unaffected(t *testing.T) {
+	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "portola", PhysicalCatalogName: "ducklake"})
+	result, err := tr.Transpile(`CREATE OR REPLACE VIEW portola.core.v AS SELECT * FROM portola.core.t`)
+	if err != nil {
+		t.Fatalf("Transpile error: %v", err)
+	}
+	if !strings.Contains(result.SQL, "CREATE OR REPLACE VIEW") {
+		t.Errorf("CREATE OR REPLACE VIEW not preserved: %q", result.SQL)
+	}
+	if !strings.Contains(result.SQL, "ducklake.core.v") || !strings.Contains(result.SQL, "ducklake.core.t") {
+		t.Errorf("view logical catalog not rewritten: %q", result.SQL)
+	}
+	if strings.Contains(result.SQL, "portola") {
+		t.Errorf("portola should have been rewritten away: %q", result.SQL)
+	}
+}
+
 func TestTranspile_PgCatalog_DuckLakeMode(t *testing.T) {
 	tests := []struct {
 		name     string
