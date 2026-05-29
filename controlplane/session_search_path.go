@@ -14,6 +14,12 @@ const (
 	sessionDefaultSourceConfiguredCatalog sessionSearchPathSource = "configured_catalog"
 )
 
+// physicalDuckLakeCatalog is the name the per-tenant DuckLake catalog is
+// attached as on the worker (the `ATTACH ... AS ducklake` performed during
+// activation; matches server.physicalDuckLakeCatalog). Keep this and the
+// HasAttachedCatalog probe in control.go in sync.
+const physicalDuckLakeCatalog = "ducklake"
+
 func effectiveSessionDefaultCommand(clientSearchPath, defaultCatalog string) (string, sessionSearchPathSource) {
 	switch {
 	case clientSearchPath != "":
@@ -22,6 +28,24 @@ func effectiveSessionDefaultCommand(clientSearchPath, defaultCatalog string) (st
 		return fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema), sessionDefaultSourceConfiguredCatalog
 	default:
 		return "", ""
+	}
+}
+
+// passthroughSessionDefaultCatalogCommand returns the connect-time command that
+// points a passthrough session at the tenant's catalog. Passthrough users skip
+// InitSessionDatabaseMetadata (whose defer issues `USE ducklake` for the
+// standard path), so without this the session stays in DuckDB's empty in-memory
+// catalog — current_database() reports "memory" and unqualified DDL/DML never
+// reaches the warehouse. Mirrors server.setIcebergDefault / setDuckLakeDefault
+// used by the standalone passthrough path.
+func passthroughSessionDefaultCatalogCommand(defaultCatalog string, duckLakeAttached bool) string {
+	switch {
+	case defaultCatalog == iceberg.CatalogName:
+		return fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
+	case duckLakeAttached:
+		return "USE " + physicalDuckLakeCatalog
+	default:
+		return ""
 	}
 }
 
