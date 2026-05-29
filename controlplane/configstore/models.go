@@ -295,6 +295,21 @@ type ManagedWarehouseTrino struct {
 
 func (ManagedWarehouseTrino) TableName() string { return "duckgres_managed_warehouse_trino" }
 
+// Customer-Trino CLUSTER-level credential lifecycle:
+//
+// The three cluster credentials (internal-communication shared secret,
+// __admin_provisioner password + bcrypt hash, OPA bundle bearer token)
+// are machine-generated and live ONLY as K8s Secrets in the
+// trino-customer namespace — the K8s Secret is the single source of
+// truth for each value (mirrors controlplane/worker_rpc_security.go).
+// The configstore deliberately stores NO credential bytes and NO
+// SecretRefs for them; the Secret names are a fixed naming contract
+// (constants in the provisioner), so there's nothing to persist except
+// a one-bit "have we ever bootstrapped" sentinel — see
+// TrinoClusterBootstrap in trino_cluster_secrets.go. Credential
+// rotation (version/history/grace-window) is a separate follow-up
+// rotation-API concern and adds its own state then.
+
 // TrinoEnabledOrg is the join shape returned by ListTrinoEnabledOrgs: org +
 // root-user bcrypt hash. The provisioner needs both at once — the password
 // file projection keys org_<team_id> by the password hash — so a single

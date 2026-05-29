@@ -143,15 +143,17 @@ func NewHandler(store *BundleStore, auth func(*http.Request) bool) *Handler {
 // non-empty; passing "" panics to surface a misconfiguration loudly
 // rather than serve unauthenticated.
 //
+// Single-token by design: the bundle bearer token is generated once at
+// cluster bootstrap and is stable for the process lifetime. Rotating it
+// (with a multi-token grace window so in-flight OPA polls using the
+// previous token still validate) is a rotation-API concern and lands
+// with that PR — not built speculatively here.
+//
 // Timing properties: once the Authorization header is the same length
 // as the expected `"Bearer " + token` string, the byte comparison is
 // constant-time (crypto/subtle.ConstantTimeCompare). The length check
-// itself is observable -- an attacker can distinguish "wrong length"
-// from "right length, wrong bytes" through timing. For fixed-length
-// random bearer tokens (the only sane production deployment) this
-// reveals nothing useful, since the attacker must guess the exact
-// length AND the token bytes. Do not use short or predictable-length
-// tokens.
+// itself is observable, but for fixed-length random tokens that reveals
+// nothing useful.
 func BearerTokenAuth(token string) func(*http.Request) bool {
 	if token == "" {
 		panic("opa: BearerTokenAuth requires a non-empty token")
@@ -163,9 +165,9 @@ func BearerTokenAuth(token string) func(*http.Request) bool {
 			return false
 		}
 		if len(got) != len(expected) {
-			// Run a dummy constant-time compare so the wall-clock for
-			// the length-mismatch path doesn't degenerate to "no
-			// compare at all" relative to the equal-length path.
+			// Dummy constant-time compare so the length-mismatch path's
+			// wall-clock doesn't degenerate relative to the equal-length
+			// path.
 			_ = subtle.ConstantTimeCompare(expected, expected)
 			return false
 		}

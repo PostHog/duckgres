@@ -372,14 +372,14 @@ func SetupMultiTenant(
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		// Without the controller, the Trino reconcile loop cannot run.
-		// If the operator asked for Trino explicitly, that's a fatal
-		// startup failure — same "Trino is binary" stance as the
+		// If the operator asked for Trino explicitly (URL set), that's a
+		// fatal startup failure — same "Trino is binary" stance as the
 		// wiring-failure branch below. Without this check, the Trino
 		// branch would be silently skipped (it's nested in the else)
 		// and password/group/bundle projections would stop updating.
 		if trinoProvisionerEnabled() {
-			return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s) but provisioning controller unavailable: %w",
-				envTrinoProvisionerEnabled, err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but provisioning controller unavailable: %w",
+				envTrinoCoordinatorURL, err)
 		}
 		slog.Warn("Provisioning controller unavailable.", "error", err)
 	} else {
@@ -396,12 +396,13 @@ func SetupMultiTenant(
 				slog.Info("Lakekeeper provisioner enabled (allowall + NetworkPolicy mode).")
 			}
 		}
-		// Customer-Trino provisioner branch. Off by default; when
-		// explicitly enabled via DUCKGRES_TRINO_PROVISIONER_ENABLED,
-		// wiring failure is fatal — silently skipping would leave the
-		// customer-Trino OPA sidecar serving last-good bundle while
-		// password/group-file changes never propagate, which is worse
-		// than failing the rollout.
+		// Customer-Trino provisioner branch. Enablement is signaled by
+		// setting DUCKGRES_TRINO_COORDINATOR_URL (no separate boolean
+		// gate — the URL is the intent). When enabled, wiring failure
+		// is fatal: silently skipping would leave the customer-Trino
+		// OPA sidecar serving last-good bundle while password/group-
+		// file changes never propagate, which is worse than failing
+		// the rollout.
 		//
 		// Lakekeeper's branch above stays best-effort (log-and-skip)
 		// because its env shape was designed for opportunistic enable
@@ -410,8 +411,8 @@ func SetupMultiTenant(
 		if trinoProvisionerEnabled() {
 			kc, tkErr := newTrinoKubeClient()
 			if tkErr != nil {
-				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s) but K8s client unavailable: %w",
-					envTrinoProvisionerEnabled, tkErr)
+				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but K8s client unavailable: %w",
+					envTrinoCoordinatorURL, tkErr)
 			}
 			trinoWire, twErr := buildTrinoWiring(store, kc)
 			if twErr != nil {

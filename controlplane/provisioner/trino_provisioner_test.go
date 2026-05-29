@@ -385,20 +385,51 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, i
 	bundleStore := &opa.BundleStore{}
 	trinoStore := &fakeTrinoStore{orgs: orgs}
 	p, err := NewTrinoProvisioner(TrinoProvisionerOpts{
-		Store:         trinoStore,
-		IcebergStore:  &fakeIcebergStore{rows: ic},
-		Kubernetes:    kc,
-		Namespace:     TrinoCustomerNamespace,
-		Catalog:       catalog,
-		BundleStore:   bundleStore,
-		BundleBuilder: opa.NewBuilder(),
-		IAMAccountID:  "123456789012",
-		AWSRegion:     "us-east-1",
+		Store:             trinoStore,
+		BootstrapSentinel: newFakeSentinel(),
+		IcebergStore:      &fakeIcebergStore{rows: ic},
+		Kubernetes:        kc,
+		Namespace:         TrinoCustomerNamespace,
+		Catalog:           catalog,
+		BundleStore:       bundleStore,
+		BundleBuilder:     opa.NewBuilder(),
+		IAMAccountID:      "123456789012",
+		AWSRegion:         "us-east-1",
 	})
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)
 	}
 	return p, kc, catalog, bundleStore, trinoStore
+}
+
+// fakeSentinel is an in-memory TrinoBootstrapSentinelStore. The real
+// provisioner now generates + writes the K8s Secrets itself (against the
+// kubefake clientset), so the only thing to fake here is the one-bit
+// "ever bootstrapped" marker.
+type fakeSentinel struct {
+	mu           sync.Mutex
+	bootstrapped map[string]bool
+	failRead     error // injectable: simulate a transient sentinel read error
+}
+
+func newFakeSentinel() *fakeSentinel {
+	return &fakeSentinel{bootstrapped: map[string]bool{}}
+}
+
+func (f *fakeSentinel) IsTrinoClusterBootstrapped(_ context.Context, namespace string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failRead != nil {
+		return false, f.failRead
+	}
+	return f.bootstrapped[namespace], nil
+}
+
+func (f *fakeSentinel) MarkTrinoClusterBootstrapped(_ context.Context, namespace string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bootstrapped[namespace] = true
+	return nil
 }
 
 func TestReconcile_CreatesCatalogProjectsSecretAndConfigMap(t *testing.T) {
@@ -650,18 +681,20 @@ func TestRenderWithClauseEscapesQuotes(t *testing.T) {
 func TestNewTrinoProvisioner_RequiresAllDeps(t *testing.T) {
 	// Missing each required field → constructor error.
 	base := TrinoProvisionerOpts{
-		Store:         &fakeTrinoStore{},
-		IcebergStore:  &fakeIcebergStore{},
-		Kubernetes:    kubefake.NewClientset(),
-		Catalog:       &fakeCatalogClient{},
-		BundleStore:   &opa.BundleStore{},
-		BundleBuilder: opa.NewBuilder(),
+		Store:             &fakeTrinoStore{},
+		BootstrapSentinel: newFakeSentinel(),
+		IcebergStore:      &fakeIcebergStore{},
+		Kubernetes:        kubefake.NewClientset(),
+		Catalog:           &fakeCatalogClient{},
+		BundleStore:       &opa.BundleStore{},
+		BundleBuilder:     opa.NewBuilder(),
 	}
 	if _, err := NewTrinoProvisioner(base); err != nil {
 		t.Fatalf("expected baseline to succeed, got %v", err)
 	}
 	for _, f := range []func(o *TrinoProvisionerOpts){
 		func(o *TrinoProvisionerOpts) { o.Store = nil },
+		func(o *TrinoProvisionerOpts) { o.BootstrapSentinel = nil },
 		func(o *TrinoProvisionerOpts) { o.IcebergStore = nil },
 		func(o *TrinoProvisionerOpts) { o.Kubernetes = nil },
 		func(o *TrinoProvisionerOpts) { o.Catalog = nil },
